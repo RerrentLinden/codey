@@ -1,0 +1,253 @@
+import { memo } from "react";
+import {
+  IconCheck as Check,
+  IconFolderOpen as FolderOpen,
+  IconLoader2 as LoaderCircle,
+  IconRefresh as RefreshCw,
+  IconSearch as Search,
+  IconTrash as Trash2,
+} from "@tabler/icons-react";
+
+import type { Confirmation, ModelState } from "./App.types";
+import {
+  Badge,
+  Button,
+  Checkbox,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  Input,
+} from "./components/semi";
+
+type ModelPickerDialogProps = {
+  open: boolean;
+  isBusy: boolean;
+  busy: string | null;
+  container: HTMLElement | null;
+  modelQuery: string;
+  filteredUpstreamModels: string[];
+  modelState: ModelState;
+  officialSlugs: Set<string>;
+  draftModelSet: Set<string>;
+  onOpenChange: (open: boolean) => void;
+  onModelQueryChange: (query: string) => void;
+  onDraftModelsChange: (models: string[]) => void;
+  onToggleDraftModel: (model: string, checked: boolean) => void;
+  onSave: () => void;
+};
+
+function ModelPickerDialogComponent({
+  open,
+  isBusy,
+  busy,
+  container,
+  modelQuery,
+  filteredUpstreamModels,
+  modelState,
+  officialSlugs,
+  draftModelSet,
+  onOpenChange,
+  onModelQueryChange,
+  onDraftModelsChange,
+  onToggleDraftModel,
+  onSave,
+}: ModelPickerDialogProps) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="model-picker-dialog"
+        container={container}
+        onEscapeKeyDown={(event) => {
+          if (isBusy) event.preventDefault();
+        }}
+        onPointerDownOutside={(event) => {
+          if (isBusy) event.preventDefault();
+        }}
+      >
+        <DialogHeader>
+          <DialogTitle>添加三方模型</DialogTitle>
+          <DialogDescription>从当前线路发现的上游模型中选择要显示的三方模型。</DialogDescription>
+        </DialogHeader>
+        <div className="model-picker-toolbar">
+          <div className="input-shell">
+            <Search size={15} aria-hidden="true" />
+            <Input
+              value={modelQuery}
+              onChange={(event) => onModelQueryChange(event.target.value)}
+              placeholder="搜索模型"
+              spellCheck={false}
+              aria-label="搜索上游模型"
+            />
+          </div>
+          <div>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => onDraftModelsChange(
+                modelState.upstreamModels.filter((model) => !officialSlugs.has(model)),
+              )}
+            >
+              全选三方
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => onDraftModelsChange([])}>
+              清空
+            </Button>
+          </div>
+        </div>
+        <div className="model-picker-list">
+          {filteredUpstreamModels.map((model) => {
+            const officialModel = officialSlugs.has(model);
+            return (
+              <div className={`model-picker-row${officialModel ? " official" : ""}`} key={model}>
+                <Checkbox
+                  checked={officialModel || draftModelSet.has(model)}
+                  disabled={officialModel}
+                  onCheckedChange={(checked) => onToggleDraftModel(model, checked === true)}
+                  aria-label={`添加 ${model}`}
+                />
+                <span>{model}</span>
+                {officialModel && <Badge variant="info">官方模型</Badge>}
+              </div>
+            );
+          })}
+          {filteredUpstreamModels.length === 0 && <div className="empty-state">没有匹配的模型</div>}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" disabled={isBusy} onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button
+            disabled={isBusy && busy !== "save-models"}
+            onClick={onSave}
+          >
+            {busy === "save-models"
+              ? <LoaderCircle className="spinner" aria-hidden="true" />
+              : <Check aria-hidden="true" />}
+            添加到模型列表
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+type ConfirmationDialogProps = {
+  confirmation: Confirmation | null;
+  container: HTMLElement | null;
+  onClose: () => void;
+  onConfirm: (confirmation: Confirmation) => void;
+};
+
+function ConfirmationDialogComponent({
+  confirmation,
+  container,
+  onClose,
+  onConfirm,
+}: ConfirmationDialogProps) {
+  return (
+    <Dialog open={Boolean(confirmation)} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="confirmation-dialog" container={container}>
+        <DialogHeader>
+          <DialogTitle>{confirmation?.title}</DialogTitle>
+          <DialogDescription>{confirmation?.description}</DialogDescription>
+        </DialogHeader>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose}>取消</Button>
+          <Button
+            variant={
+              confirmation?.action === "clear"
+                ? "destructive"
+                : confirmation?.action === "restart"
+                  ? "warning"
+                  : "default"
+            }
+            onClick={() => {
+              if (confirmation) onConfirm(confirmation);
+            }}
+          >
+            {confirmation?.action === "clear"
+              ? <Trash2 aria-hidden="true" />
+              : confirmation?.action === "restart"
+              ? <RefreshCw aria-hidden="true" />
+              : <Check aria-hidden="true" />}
+            {confirmation?.confirmLabel}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+type CodexAppPathDialogProps = {
+  open: boolean;
+  selectedPath: string;
+  error: string;
+  isBusy: boolean;
+  busy: string | null;
+  container: HTMLElement | null;
+  onOpenChange: (open: boolean) => void;
+  onChooseDirectory: () => void;
+  onConfirm: () => void;
+};
+
+function CodexAppPathDialogComponent({
+  open,
+  selectedPath,
+  error,
+  isBusy,
+  busy,
+  container,
+  onOpenChange,
+  onChooseDirectory,
+  onConfirm,
+}: CodexAppPathDialogProps) {
+  const choosing = busy === "pick-codex-app-directory";
+  const confirming = busy === "set-codex-app-path";
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        className="codex-app-path-dialog"
+        container={container}
+        onEscapeKeyDown={(event) => {
+          if (isBusy) event.preventDefault();
+        }}
+        onPointerDownOutside={(event) => {
+          if (isBusy) event.preventDefault();
+        }}
+      >
+        <DialogHeader>
+          <DialogTitle>未找到 Codex 桌面应用</DialogTitle>
+          <DialogDescription>
+            自动扫描没有发现 Codex。请选择 Codex 桌面应用所在的目录；确认时会校验目录及可执行文件。
+          </DialogDescription>
+        </DialogHeader>
+        <div className="codex-app-path-selection">
+          <span>所选目录</span>
+          <code>{selectedPath || "尚未选择"}</code>
+        </div>
+        {error && <p className="codex-app-path-error" role="alert">{error}</p>}
+        <DialogFooter>
+          <Button variant="outline" disabled={isBusy} onClick={onChooseDirectory}>
+            {choosing
+              ? <LoaderCircle className="spinner" aria-hidden="true" />
+              : <FolderOpen aria-hidden="true" />}
+            选择目录
+          </Button>
+          <Button disabled={isBusy || !selectedPath} onClick={onConfirm}>
+            {confirming
+              ? <LoaderCircle className="spinner" aria-hidden="true" />
+              : <Check aria-hidden="true" />}
+            确认并启动
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export const ModelPickerDialog = memo(ModelPickerDialogComponent);
+export const ConfirmationDialog = memo(ConfirmationDialogComponent);
+export const CodexAppPathDialog = memo(CodexAppPathDialogComponent);

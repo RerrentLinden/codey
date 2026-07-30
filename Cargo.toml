@@ -1,0 +1,25 @@
+[workspace]
+members = ["backend"]
+exclude = ["vendor/CodeyRuntime"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.4.5"
+license = "AGPL-3.0-only"
+
+[profile.dev.package.codey-runtime-data]
+opt-level = 3
+
+[profile.dev.package.memchr]
+opt-level = 3
+
+[profile.dev.package.serde_json]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
