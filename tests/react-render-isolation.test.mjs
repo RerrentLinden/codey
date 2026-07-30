@@ -7,6 +7,7 @@ const root = new URL("../", import.meta.url);
 test("settings panels keep stable handlers and skip unrelated parent renders", async () => {
   const [
     app,
+    appUpdates,
     sections,
     dialogs,
     trace,
@@ -16,6 +17,7 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     channelRegistry,
   ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
+    readFile(new URL("src/useAppUpdates.ts", root), "utf8"),
     Promise.all(
       [
         "OperationsPanel.tsx",
@@ -43,6 +45,12 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   ]);
 
   assert.match(app, /function useStableEvent</);
+  assert.match(app, /useAppUpdates\(\{/);
+  assert.doesNotMatch(app, /async function checkForUpdates\(/);
+  assert.match(appUpdates, /export function useAppUpdates/);
+  assert.match(appUpdates, /invoke<UpdateCheck>\("check_for_updates"\)/);
+  assert.match(appUpdates, /invoke<UpdateDownload>\("download_update"\)/);
+  assert.match(appUpdates, /invoke\("install_downloaded_update"/);
   assert.match(app, /onRepairPluginMarketplace=\{handleRepairPluginMarketplace\}/);
   assert.match(app, /onRefresh=\{handleRefreshTraceLogStats\}/);
   assert.match(app, /onToggleDraftModel=\{handleToggleDraftModel\}/);
