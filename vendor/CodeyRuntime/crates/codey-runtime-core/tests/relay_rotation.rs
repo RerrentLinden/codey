@@ -198,6 +198,20 @@ fn weighted_rotation_repeats_members_by_configured_weight() {
 }
 
 #[test]
+fn weighted_rotation_handles_extreme_weights_without_expanding_a_schedule() {
+    let mut settings = settings(AggregateRelayStrategy::WeightedRoundRobin);
+    settings.aggregate_relay_profiles[0].members[0].weight = u32::MAX;
+    let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
+
+    for _ in 0..4 {
+        let selected = selector
+            .select(&settings, RotationContext::default())
+            .unwrap();
+        assert_eq!(selected.id, "relay-a");
+    }
+}
+
+#[test]
 fn aggregate_members_must_reference_existing_relay_profiles() {
     let mut settings = settings(AggregateRelayStrategy::RequestRoundRobin);
     settings.aggregate_relay_profiles[0]

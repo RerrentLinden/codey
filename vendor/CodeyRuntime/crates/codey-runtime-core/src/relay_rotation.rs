@@ -77,7 +77,7 @@ pub struct RelayRotationSelector {
     aggregate: AggregateRelayProfile,
     failover_index: usize,
     request_index: usize,
-    weighted_index: usize,
+    weighted_index: u64,
     conversation_assignments: HashMap<String, String>,
     conversation_assignment_order: VecDeque<String>,
 }
@@ -125,8 +125,7 @@ impl RelayRotationSelector {
             AggregateRelayStrategy::ConversationRoundRobin
             | AggregateRelayStrategy::RequestRoundRobin => self.member_id_at(self.request_index),
             AggregateRelayStrategy::WeightedRoundRobin => {
-                let schedule = self.weighted_schedule();
-                schedule[self.weighted_index % schedule.len()].clone()
+                self.weighted_member_id_at(self.weighted_index)
             }
         };
         relay_profile_by_id(settings, &relay_id).ok_or_else(|| SelectionError::UnknownMemberRelay {
@@ -176,20 +175,30 @@ impl RelayRotationSelector {
     }
 
     fn select_next_weighted(&mut self) -> String {
-        let schedule = self.weighted_schedule();
-        let relay_id = schedule[self.weighted_index % schedule.len()].clone();
-        self.weighted_index = (self.weighted_index + 1) % schedule.len();
+        let total_weight = self.total_weight();
+        let relay_id = self.weighted_member_id_at(self.weighted_index);
+        self.weighted_index = (self.weighted_index + 1) % total_weight;
         relay_id
     }
 
-    fn weighted_schedule(&self) -> Vec<String> {
+    fn total_weight(&self) -> u64 {
         self.aggregate
             .members
             .iter()
-            .flat_map(|member| {
-                std::iter::repeat_n(member.relay_id.clone(), member.weight.max(1) as usize)
-            })
-            .collect()
+            .map(|member| u64::from(member.weight.max(1)))
+            .sum()
+    }
+
+    fn weighted_member_id_at(&self, index: u64) -> String {
+        let mut slot = index % self.total_weight();
+        for member in &self.aggregate.members {
+            let weight = u64::from(member.weight.max(1));
+            if slot < weight {
+                return member.relay_id.clone();
+            }
+            slot -= weight;
+        }
+        self.member_id_at(0)
     }
 
     fn member_id_at(&self, index: usize) -> String {
