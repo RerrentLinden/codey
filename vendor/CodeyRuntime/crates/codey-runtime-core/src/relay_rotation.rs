@@ -1,12 +1,14 @@
 /**
  * @description 聚合供应商轮转选择器，负责按失败、对话、请求和权重策略选择已有中转配置。
  */
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
 
 use crate::settings::{
     AggregateRelayProfile, AggregateRelayStrategy, BackendSettings, RelayProfile,
 };
+
+const MAX_CONVERSATION_ASSIGNMENTS: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectionError {
@@ -77,6 +79,7 @@ pub struct RelayRotationSelector {
     request_index: usize,
     weighted_index: usize,
     conversation_assignments: HashMap<String, String>,
+    conversation_assignment_order: VecDeque<String>,
 }
 
 static GLOBAL_SELECTOR: OnceLock<Mutex<Option<RelayRotationSelector>>> = OnceLock::new();
@@ -91,6 +94,7 @@ impl RelayRotationSelector {
             request_index: 0,
             weighted_index: 0,
             conversation_assignments: HashMap::new(),
+            conversation_assignment_order: VecDeque::new(),
         })
     }
 
@@ -149,6 +153,17 @@ impl RelayRotationSelector {
         }
 
         let relay_id = self.select_next_request();
+        while self.conversation_assignments.len() >= MAX_CONVERSATION_ASSIGNMENTS {
+            let Some(oldest_conversation_id) = self.conversation_assignment_order.pop_front()
+            else {
+                self.conversation_assignments.clear();
+                break;
+            };
+            self.conversation_assignments
+                .remove(&oldest_conversation_id);
+        }
+        self.conversation_assignment_order
+            .push_back(conversation_id.clone());
         self.conversation_assignments
             .insert(conversation_id, relay_id.clone());
         relay_id

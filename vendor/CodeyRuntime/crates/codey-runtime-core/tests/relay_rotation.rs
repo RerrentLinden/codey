@@ -128,6 +128,34 @@ fn conversation_rotation_sticks_each_conversation_to_a_stable_member() {
 }
 
 #[test]
+fn conversation_rotation_evicts_the_oldest_assignment_at_capacity() {
+    let settings = settings(AggregateRelayStrategy::ConversationRoundRobin);
+    let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
+
+    for index in 0..1_024 {
+        selector
+            .select(
+                &settings,
+                RotationContext::for_conversation(format!("chat-{index}")),
+            )
+            .unwrap();
+    }
+
+    let overflow = selector
+        .select(
+            &settings,
+            RotationContext::for_conversation("chat-overflow"),
+        )
+        .unwrap();
+    let evicted_first = selector
+        .select(&settings, RotationContext::for_conversation("chat-0"))
+        .unwrap();
+
+    assert_eq!(overflow.id, "relay-b");
+    assert_eq!(evicted_first.id, "relay-c");
+}
+
+#[test]
 fn request_rotation_advances_on_every_request() {
     let settings = settings(AggregateRelayStrategy::RequestRoundRobin);
     let mut selector = RelayRotationSelector::from_settings(&settings).unwrap();
