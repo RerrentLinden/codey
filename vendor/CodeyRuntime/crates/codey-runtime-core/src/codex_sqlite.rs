@@ -173,8 +173,7 @@ fn sanitize_thread_model_suffixes_in_db(db_path: &Path) -> anyhow::Result<(usize
     let mut stmt = tx.prepare("SELECT id, model FROM threads WHERE model LIKE '%[%'")?;
     let rows: Vec<(String, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
     let scanned = rows.len();
@@ -221,15 +220,14 @@ fn sanitize_logs_model_suffixes(home: &Path) -> anyhow::Result<()> {
     }
     // 用保守模式匹配：包含 '[' 且以 ']%' 或包含 '[1M]' 等常见后缀。
     // 这里只替换明确符合 parse_model_suffix 规则的模型名，避免误改无关日志文本。
-    let mut stmt = conn
-        .prepare("SELECT rowid, feedback_log_body FROM logs WHERE feedback_log_body LIKE '%[%'")?;
+    let tx = conn.transaction()?;
+    let mut stmt =
+        tx.prepare("SELECT rowid, feedback_log_body FROM logs WHERE feedback_log_body LIKE '%[%'")?;
     let rows: Vec<(i64, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
 
-    let tx = conn.transaction()?;
     let mut update = tx.prepare("UPDATE logs SET feedback_log_body = ?1 WHERE rowid = ?2")?;
     for (rowid, body) in rows {
         let sanitized = sanitize_model_suffixes_in_text(&body);
@@ -292,7 +290,10 @@ mod tests {
     use rusqlite::Connection;
     use tempfile::tempdir;
 
-    use super::{codex_session_db_paths_from_home, sanitize_model_suffixes_in_text};
+    use super::{
+        codex_session_db_paths_from_home, sanitize_logs_model_suffixes,
+        sanitize_model_suffixes_in_text, sanitize_thread_model_suffixes_in_db,
+    };
 
     #[test]
     fn discovers_catalog_only_session_databases() {
@@ -344,5 +345,40 @@ mod tests {
     fn leaves_text_without_brackets_unchanged() {
         let text = "no suffix here";
         assert_eq!(sanitize_model_suffixes_in_text(text), text);
+    }
+
+    #[test]
+    fn thread_cleanup_reports_incompatible_rows_instead_of_skipping_them() {
+        let temp = tempdir().unwrap();
+        let db_path = temp.path().join("threads.sqlite");
+        let db = Connection::open(&db_path).unwrap();
+        db.execute("CREATE TABLE threads (id INTEGER, model TEXT)", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO threads (id, model) VALUES (1, 'model[1M]')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let error = sanitize_thread_model_suffixes_in_db(&db_path).unwrap_err();
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
+    }
+
+    #[test]
+    fn log_cleanup_reports_incompatible_rows_instead_of_skipping_them() {
+        let home = tempdir().unwrap();
+        let db = Connection::open(home.path().join("logs_2.sqlite")).unwrap();
+        db.execute("CREATE TABLE logs (feedback_log_body BLOB)", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO logs (feedback_log_body) VALUES (x'5b314d5d')",
+            [],
+        )
+        .unwrap();
+        drop(db);
+
+        let error = sanitize_logs_model_suffixes(home.path()).unwrap_err();
+        assert!(error.downcast_ref::<rusqlite::Error>().is_some());
     }
 }
