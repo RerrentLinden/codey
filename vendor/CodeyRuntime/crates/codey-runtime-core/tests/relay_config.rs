@@ -1272,9 +1272,9 @@ model_provider = "vendor_alpha"
         auth_contents: r#"{"OPENAI_API_KEY":"old"}"#.to_string(),
         ..RelayProfile::default()
     };
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
 
     assert!(
         profile
@@ -1665,12 +1665,12 @@ command = "npx"
     )
     .unwrap();
     let mut profile = RelayProfile::default();
-    let mut common = r#"[mcp_servers.context7]
+    let common = r#"[mcp_servers.context7]
 command = "npx"
 "#
     .to_string();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
 
     assert_eq!(profile.model, "gpt-5");
     assert!(!profile.config_contents.contains("[mcp_servers.context7]"));
@@ -1701,12 +1701,12 @@ command = "npx"
     )
     .unwrap();
     let mut profile = RelayProfile::default();
-    let mut common = r#"[mcp_servers.context7]
+    let common = r#"[mcp_servers.context7]
 command = "npx"
 "#
     .to_string();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
     apply_relay_profile_files_to_home_with_context(temp.path(), &profile, &common).unwrap();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
@@ -1742,12 +1742,12 @@ enabled = true
     )
     .unwrap();
     let mut profile = RelayProfile::default();
-    let mut common = r#"[plugins."superpowers@openai-curated"]
+    let common = r#"[plugins."superpowers@openai-curated"]
 enabled = true
 "#
     .to_string();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
 
     assert_eq!(profile.model, "gpt-5.5");
     assert!(
@@ -1792,9 +1792,9 @@ experimental_bearer_token = "sk-live-token"
     )
     .unwrap();
     let mut profile = RelayProfile::default();
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
 
     assert!(
         !profile
@@ -1831,9 +1831,9 @@ experimental_bearer_token = "sk-old"
         auth_contents: r#"{"OPENAI_API_KEY":"sk-old"}"#.to_string(),
         ..RelayProfile::default()
     };
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
 
     let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
     assert_eq!(auth["OPENAI_API_KEY"], "sk-edited");
@@ -1880,9 +1880,8 @@ model = "gpt-5.4"
     assert!(live_config.contains("[model_providers.aihubmix]"));
     assert!(!live_config.contains("[model_providers.custom]"));
 
-    let mut common = String::new();
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut provider_b, &mut common)
-        .unwrap();
+    let common = String::new();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut provider_b, &common).unwrap();
 
     assert!(
         provider_b
@@ -1948,9 +1947,9 @@ requires_openai_auth = true
         auth_contents: r#"{"OPENAI_API_KEY":"sk-old"}"#.to_string(),
         ..RelayProfile::default()
     };
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &common).unwrap();
 
     assert!(
         current
@@ -1998,9 +1997,9 @@ requires_openai_auth = true
             .to_string(),
         ..RelayProfile::default()
     };
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &common).unwrap();
     normalize_relay_profile_for_storage(&mut current).unwrap();
 
     assert_eq!(current.relay_mode, RelayMode::Official);
@@ -2040,9 +2039,9 @@ experimental_bearer_token = "sk-mix"
         auth_contents: r#"{"auth_mode":"chatgpt","tokens":{"access_token":"old"}}"#.to_string(),
         ..RelayProfile::default()
     };
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &common).unwrap();
     normalize_relay_profile_for_storage(&mut current).unwrap();
 
     assert_eq!(current.relay_mode, RelayMode::Official);
@@ -2082,9 +2081,9 @@ requires_openai_auth = true
             .to_string(),
         ..RelayProfile::default()
     };
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &common).unwrap();
     normalize_relay_profile_for_storage(&mut current).unwrap();
 
     assert_eq!(current.relay_mode, RelayMode::Official);
@@ -2124,9 +2123,9 @@ requires_openai_auth = true
             .to_string(),
         ..RelayProfile::default()
     };
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut current, &common).unwrap();
     normalize_relay_profile_for_storage(&mut current).unwrap();
 
     assert_eq!(current.relay_mode, RelayMode::Official);
@@ -2177,9 +2176,9 @@ experimental_bearer_token = "sk-saved-mix"
             .to_string(),
         ..RelayProfile::default()
     };
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
     normalize_relay_profile_for_storage(&mut profile).unwrap();
 
     assert_eq!(profile.relay_mode, RelayMode::Official);
@@ -2236,9 +2235,9 @@ experimental_bearer_token = "22222222222222222222222222222222222"
             .to_string(),
         ..RelayProfile::default()
     };
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
     normalize_relay_profile_for_storage(&mut profile).unwrap();
 
     assert_eq!(profile.relay_mode, RelayMode::Official);
@@ -2851,8 +2850,8 @@ experimental_bearer_token = "sk-old"
         use_common_config: true,
         ..RelayProfile::default()
     };
-    let mut common = String::new();
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut official, &mut common).unwrap();
+    let common = String::new();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut official, &common).unwrap();
 
     let mut relay = RelayProfile {
         id: "relay-a".to_string(),
@@ -2899,9 +2898,9 @@ goals = true
     )
     .unwrap();
     let mut profile = RelayProfile::default();
-    let mut common = String::new();
+    let common = String::new();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut common).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
 
     assert!(profile.config_contents.contains(r#"model = "gpt-5""#));
     assert!(!profile.auth_contents.is_empty());

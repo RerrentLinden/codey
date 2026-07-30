@@ -16,10 +16,11 @@ use serde_json::json;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 #[test]
 fn responses_request_converts_to_chat_completions() {
@@ -1377,7 +1378,7 @@ async fn upstream_request_returns_when_provider_accepts_but_never_sends_headers(
 
 #[tokio::test]
 async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock().lock().await;
     let first = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -1416,7 +1417,7 @@ async fn aggregate_proxy_fails_over_to_next_member_in_same_request() {
 
 #[tokio::test]
 async fn aggregate_stream_request_sends_sse_accept_header() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock().lock().await;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
@@ -1526,7 +1527,7 @@ fn aggregate_proxy_settings(
 }
 #[tokio::test]
 async fn chat_completions_proxy_uses_configured_user_agent() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock().lock().await;
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let server = spawn_chat_server();
@@ -1546,7 +1547,7 @@ async fn chat_completions_proxy_uses_configured_user_agent() {
 
 #[tokio::test]
 async fn chat_completions_proxy_passes_through_original_user_agent_when_unconfigured() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock().lock().await;
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let server = spawn_chat_server();
@@ -1566,7 +1567,7 @@ async fn chat_completions_proxy_passes_through_original_user_agent_when_unconfig
 
 #[tokio::test]
 async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock().lock().await;
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let server = spawn_chat_server();
@@ -1586,7 +1587,7 @@ async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() 
 
 #[tokio::test]
 async fn models_proxy_passes_through_original_user_agent_when_unconfigured() {
-    let _lock = settings_path_test_lock().lock().unwrap();
+    let _lock = settings_path_test_lock().lock().await;
     let temp = tempfile::tempdir().unwrap();
     let _guard = SettingsPathGuard::set(temp.path().join("settings.json"));
     let server = spawn_chat_server();

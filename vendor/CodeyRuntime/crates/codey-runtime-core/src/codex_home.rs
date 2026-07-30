@@ -1,13 +1,13 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub fn default_codex_home_dir() -> PathBuf {
     std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
-        .filter(|path| codex_home_env_dir_is_valid(path))
+        .filter(|path| codex_home_env_dir_is_valid(path.as_path()))
         .unwrap_or_else(default_user_codex_home_dir)
 }
 
-fn codex_home_env_dir_is_valid(path: &PathBuf) -> bool {
+fn codex_home_env_dir_is_valid(path: &Path) -> bool {
     !path.as_os_str().is_empty() && !path.to_string_lossy().trim().is_empty() && path.is_dir()
 }
 

@@ -20,15 +20,15 @@ pub fn parse_model_suffix(raw: &str) -> (String, Option<u64>) {
     let raw = raw.trim();
     if let Some(close) = raw.rfind(']') {
         // 仅当 ] 是最后一个字符时才视为后缀
-        if close == raw.len() - 1 {
-            if let Some(open) = raw[..close].rfind('[') {
-                let inner = raw[open + 1..close].trim();
-                let slug = raw[..open].trim();
-                if !slug.is_empty() {
-                    if let Some(window) = parse_window_token(inner) {
-                        return (slug.to_string(), Some(window));
-                    }
-                }
+        if close == raw.len() - 1
+            && let Some(open) = raw[..close].rfind('[')
+        {
+            let inner = raw[open + 1..close].trim();
+            let slug = raw[..open].trim();
+            if !slug.is_empty()
+                && let Some(window) = parse_window_token(inner)
+            {
+                return (slug.to_string(), Some(window));
             }
         }
     }
@@ -174,7 +174,7 @@ pub fn build_model_catalog_json_with_template(
 ) -> String {
     let mut template = template
         .cloned()
-        .or_else(|| load_bundled_template_entry())
+        .or_else(load_bundled_template_entry)
         .unwrap_or_else(|| json!({}));
     remove_model_prompt_fields(&mut template);
 

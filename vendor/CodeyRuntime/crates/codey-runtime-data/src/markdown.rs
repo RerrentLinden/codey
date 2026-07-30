@@ -161,11 +161,7 @@ fn lookup_thread_record(
             "''"
         };
         let sql = format!("SELECT {title_expr} FROM automation_runs WHERE thread_id = ?1");
-        let row = db.query_row(
-            &sql,
-            [thread_id],
-            |row| Ok(row.get::<_, Option<String>>(0)?),
-        );
+        let row = db.query_row(&sql, [thread_id], |row| row.get::<_, Option<String>>(0));
         return match row {
             Ok(title) => Ok(ThreadLookup::Found(ThreadRecord {
                 title,
@@ -207,10 +203,10 @@ fn codex_home_candidates(db_path: &Path) -> Vec<PathBuf> {
             homes.push(ancestor.to_path_buf());
         }
     }
-    if homes.is_empty() {
-        if let Some(parent) = db_path.parent().and_then(Path::parent) {
-            homes.push(parent.to_path_buf());
-        }
+    if homes.is_empty()
+        && let Some(parent) = db_path.parent().and_then(Path::parent)
+    {
+        homes.push(parent.to_path_buf());
     }
     homes
 }
@@ -266,13 +262,13 @@ fn has_columns(db: &Connection, table: &str, columns: &[&str]) -> anyhow::Result
 }
 
 fn table_columns(db: &Connection, table: &str) -> anyhow::Result<Vec<String>> {
-    if !db
+    if db
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
             [table],
             |_| Ok(()),
         )
-        .is_ok()
+        .is_err()
     {
         return Ok(Vec::new());
     }

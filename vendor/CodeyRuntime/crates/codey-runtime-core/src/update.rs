@@ -157,7 +157,7 @@ pub fn select_update_asset(assets: &[(String, String)]) -> Option<ReleaseAsset> 
         if rank >= 2 {
             continue;
         }
-        if best.map_or(true, |(r, _, _)| rank < r) {
+        if best.is_none_or(|(r, _, _)| rank < r) {
             best = Some((rank, name.as_str(), url.as_str()));
         }
     }

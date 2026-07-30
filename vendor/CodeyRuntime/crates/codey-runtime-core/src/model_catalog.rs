@@ -33,17 +33,17 @@ struct CodexConfig {
 pub async fn read_codex_model_catalog() -> Value {
     let home = codex_home_dir();
     let settings_path = crate::paths::default_settings_path();
-    if settings_path.exists() {
-        if let Ok(settings) = SettingsStore::new(settings_path).load() {
-            let profile = settings.active_relay_profile();
-            let catalog = relay_profile_model_catalog_value(&home, &profile);
-            if catalog
-                .get("models")
-                .and_then(Value::as_array)
-                .map_or(false, |m| !m.is_empty())
-            {
-                return catalog;
-            }
+    if settings_path.exists()
+        && let Ok(settings) = SettingsStore::new(settings_path).load()
+    {
+        let profile = settings.active_relay_profile();
+        let catalog = relay_profile_model_catalog_value(&home, &profile);
+        if catalog
+            .get("models")
+            .and_then(Value::as_array)
+            .is_some_and(|m| !m.is_empty())
+        {
+            return catalog;
         }
     }
     let env = std::env::vars().collect::<HashMap<_, _>>();
@@ -151,15 +151,13 @@ pub async fn read_codex_model_catalog_from_home(
     }
 
     let mut sources = model_sources_from_environment(env, &auth_api_key);
-    if error.is_none() {
-        if let Some(source) = model_source_from_config(&config, &effective, env, &auth_api_key) {
-            if sources
-                .iter()
-                .all(|existing| trim_url(&existing.base_url) != trim_url(&source.base_url))
-            {
-                sources.push(source);
-            }
-        }
+    if error.is_none()
+        && let Some(source) = model_source_from_config(&config, &effective, env, &auth_api_key)
+        && sources
+            .iter()
+            .all(|existing| trim_url(&existing.base_url) != trim_url(&source.base_url))
+    {
+        sources.push(source);
     }
 
     let mut source_statuses = Vec::new();
@@ -241,10 +239,10 @@ fn load_codex_config(path: &Path) -> (CodexConfig, HashMap<String, String>, Opti
     };
     let config = parse_codex_config(&contents);
     let mut effective = config.root.clone();
-    if let Some(profile) = config.root.get("profile") {
-        if let Some(profile_values) = config.profiles.get(profile) {
-            effective.extend(profile_values.clone());
-        }
+    if let Some(profile) = config.root.get("profile")
+        && let Some(profile_values) = config.profiles.get(profile)
+    {
+        effective.extend(profile_values.clone());
     }
     (config, effective, None)
 }
@@ -346,10 +344,10 @@ fn provider_config_for_model_provider(
             config.model_providers.get(model_provider).cloned(),
         );
     }
-    if config.model_providers.len() == 1 {
-        if let Some((name, provider)) = config.model_providers.iter().next() {
-            return (name.clone(), Some(provider.clone()));
-        }
+    if config.model_providers.len() == 1
+        && let Some((name, provider)) = config.model_providers.iter().next()
+    {
+        return (name.clone(), Some(provider.clone()));
     }
     (model_provider.to_string(), None)
 }
@@ -773,10 +771,10 @@ fn string_value(value: Option<&String>) -> String {
 
 fn unquote_toml_string(value: &str) -> String {
     let value = value.trim();
-    if let Ok(parsed) = toml::from_str::<toml::Value>(&format!("value = {value}")) {
-        if let Some(value) = parsed.get("value").and_then(toml::Value::as_str) {
-            return value.to_string();
-        }
+    if let Ok(parsed) = toml::from_str::<toml::Value>(&format!("value = {value}"))
+        && let Some(value) = parsed.get("value").and_then(toml::Value::as_str)
+    {
+        return value.to_string();
     }
     value
         .strip_prefix('"')

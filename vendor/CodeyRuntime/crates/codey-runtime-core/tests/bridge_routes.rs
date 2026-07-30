@@ -113,7 +113,7 @@ async fn settings_get_includes_runtime_codex_app_version() {
     let ctx = BridgeContext::new(
         Arc::new(FakeSettings::with_codex_app_version("26.601.21317")),
         Arc::new(FakeRuntime::default()),
-        Arc::new(FakeData::default()),
+        Arc::new(FakeData),
     );
 
     let result = handle_bridge_request(ctx, "/settings/get", json!({})).await;
@@ -133,7 +133,7 @@ async fn settings_get_does_not_expose_stepwise_api_key_to_renderer() {
     let ctx = BridgeContext::new(
         Arc::new(FakeSettings::with_settings(settings)),
         Arc::new(FakeRuntime::default()),
-        Arc::new(FakeData::default()),
+        Arc::new(FakeData),
     );
 
     let result = handle_bridge_request(ctx, "/settings/get", json!({})).await;
@@ -151,7 +151,7 @@ async fn settings_set_does_not_persist_runtime_codex_app_version() {
     let ctx = BridgeContext::new(
         settings.clone(),
         Arc::new(FakeRuntime::default()),
-        Arc::new(FakeData::default()),
+        Arc::new(FakeData),
     );
 
     let result = handle_bridge_request(
@@ -183,7 +183,7 @@ async fn bridge_context_core_with_app_dir_exposes_runtime_codex_app_version() {
     std::fs::write(app_dir.join("Codex.exe"), "").unwrap();
     let ctx = BridgeContext::core_with_data_and_app_dir(
         Arc::new(FakeRuntime::default()),
-        Arc::new(FakeData::default()),
+        Arc::new(FakeData),
         app_dir,
     );
 
@@ -256,7 +256,7 @@ async fn stepwise_routes_use_settings_service() {
     let ctx = BridgeContext::new(
         Arc::new(FakeSettings::with_settings(settings)),
         Arc::new(FakeRuntime::default()),
-        Arc::new(FakeData::default()),
+        Arc::new(FakeData),
     );
 
     let public_settings = handle_bridge_request(ctx.clone(), "/stepwise/settings", json!({})).await;
@@ -550,7 +550,7 @@ async fn data_routes_forward_payloads_to_data_service() {
 async fn bridge_context_core_with_data_uses_injected_data_service() {
     let ctx = BridgeContext::core_with_data(
         Arc::new(CoreRuntimeService::new(9229, StatusStore::default())),
-        Arc::new(FakeData::default()),
+        Arc::new(FakeData),
     );
 
     let result = handle_bridge_request(
@@ -701,7 +701,7 @@ async fn core_runtime_reload_evaluates_enabled_user_bundle_and_status_is_ok() {
             })
         })
         .with_websocket_url("ws://page");
-    let ctx = BridgeContext::core_with_data(Arc::new(runtime), Arc::new(FakeData::default()));
+    let ctx = BridgeContext::core_with_data(Arc::new(runtime), Arc::new(FakeData));
 
     let status = handle_bridge_request(ctx.clone(), "/backend/status", json!({})).await;
     let reloaded = handle_bridge_request(ctx, "/user-scripts/reload", json!({})).await;
@@ -729,7 +729,7 @@ async fn core_runtime_open_devtools_uses_inspector_url_opener() {
             })
         })
         .with_devtools_target_id("page-1");
-    let ctx = BridgeContext::core_with_data(Arc::new(runtime), Arc::new(FakeData::default()));
+    let ctx = BridgeContext::core_with_data(Arc::new(runtime), Arc::new(FakeData));
 
     let result = handle_bridge_request(ctx, "/devtools/open", json!({})).await;
 
@@ -788,7 +788,7 @@ fn user_script_manager_tolerates_bad_config_fields_and_updates_atomically() {
         config_path.clone(),
     );
 
-    assert_eq!(manager.load_config().enabled, true);
+    assert!(manager.load_config().enabled);
     assert_eq!(manager.load_config().scripts.get("user:a.js"), Some(&false));
     assert!(!manager.load_config().scripts.contains_key("user:b.js"));
 
@@ -978,7 +978,7 @@ fn test_context() -> BridgeContext {
     BridgeContext::new(
         Arc::new(FakeSettings::default()),
         Arc::new(FakeRuntime::default()),
-        Arc::new(FakeData::default()),
+        Arc::new(FakeData),
     )
 }
 

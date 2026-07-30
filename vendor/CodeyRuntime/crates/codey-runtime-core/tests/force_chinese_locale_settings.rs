@@ -36,8 +36,10 @@ fn force_chinese_locale_missing_from_old_json_defaults_to_true() {
 
 #[test]
 fn force_chinese_locale_false_round_trips_through_json() {
-    let mut settings = BackendSettings::default();
-    settings.codex_app_force_chinese_locale = false;
+    let settings = BackendSettings {
+        codex_app_force_chinese_locale: false,
+        ..BackendSettings::default()
+    };
 
     let json = serde_json::to_value(&settings).expect("serialize");
     assert_eq!(
@@ -68,9 +70,11 @@ fn force_chinese_locale_config_reflects_setting() {
 
 #[test]
 fn injection_script_includes_force_chinese_locale_global_and_patch() {
-    let mut settings = BackendSettings::default();
-    settings.codex_app_force_chinese_locale = true;
-    settings.codex_app_fast_startup = true;
+    let mut settings = BackendSettings {
+        codex_app_force_chinese_locale: true,
+        codex_app_fast_startup: true,
+        ..BackendSettings::default()
+    };
     let script = injection_script_with_settings(0, &settings);
     assert!(script.contains(
         "window.__CODEY_FORCE_CHINESE_LOCALE__ = {\"enabled\":true,\"locale\":\"zh-CN\"};"

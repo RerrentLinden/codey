@@ -370,10 +370,10 @@ where
             if helper_started {
                 hooks.shutdown_helper(helper_port).await;
             }
-            if let Some(launch) = &launched {
-                if !keep_launched_on_error {
-                    hooks.terminate_codex(launch).await;
-                }
+            if let Some(launch) = &launched
+                && !keep_launched_on_error
+            {
+                hooks.terminate_codex(launch).await;
             }
             let message = error.to_string();
             let failure = launch_status("failed", &message, debug_port, helper_port, &app_dir);
@@ -1070,9 +1070,7 @@ async fn handle_helper_connection(
         }),
     );
     let response = if method == "OPTIONS" {
-        format!(
-            "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        )
+        "HTTP/1.1 204 No Content\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
     } else {
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1562,10 +1560,10 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result
                 content_length = content_length_from_headers(&buffer[..end]).unwrap_or(0);
             }
         }
-        if let Some(end) = header_end {
-            if buffer.len() >= end + 4 + content_length {
-                break;
-            }
+        if let Some(end) = header_end
+            && buffer.len() >= end + 4 + content_length
+        {
+            break;
         }
         if buffer.len() > 32 * 1024 * 1024 {
             anyhow::bail!("HTTP 请求过大");

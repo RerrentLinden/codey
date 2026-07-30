@@ -59,7 +59,7 @@ fn backfill_profile_before_switch(
     backfill_relay_profile_from_home_with_common(
         home,
         profile,
-        &mut settings.relay_context_config_contents,
+        &settings.relay_context_config_contents,
     )
     .with_context(|| "回填当前供应商配置失败")
 }

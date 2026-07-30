@@ -45,6 +45,13 @@ struct ZedRemoteProjectRegistry {
     projects: Vec<ZedRemoteProject>,
 }
 
+struct ProjectMetadata {
+    label: String,
+    source: ZedRemoteProjectSource,
+    last_opened_at_ms: Option<i64>,
+    is_current: bool,
+}
+
 pub fn list_zed_remote_projects_response(payload: &Value) -> Value {
     let state = match fs::read_to_string(codex_global_state_path()) {
         Ok(data) => match serde_json::from_str::<Value>(&data) {
@@ -139,10 +146,12 @@ pub(super) fn remember_zed_remote_project(
         target,
         &path,
         &url,
-        label,
-        ZedRemoteProjectSource::Recent,
-        Some(now_ms()),
-        false,
+        ProjectMetadata {
+            label,
+            source: ZedRemoteProjectSource::Recent,
+            last_opened_at_ms: Some(now_ms()),
+            is_current: false,
+        },
     );
     let registry_path = default_zed_remote_project_registry_path();
     let mut projects = read_registry_projects(&registry_path)?;
@@ -223,10 +232,12 @@ fn collect_current_project(state: &Value, payload: &Value, projects: &mut Vec<Ze
         target,
         &path,
         &url,
-        String::new(),
-        ZedRemoteProjectSource::CurrentThread,
-        None,
-        true,
+        ProjectMetadata {
+            label: String::new(),
+            source: ZedRemoteProjectSource::CurrentThread,
+            last_opened_at_ms: None,
+            is_current: true,
+        },
     );
     push_project(projects, project);
 }
@@ -254,10 +265,12 @@ fn collect_codex_remote_projects(state: &Value, projects: &mut Vec<ZedRemoteProj
             target,
             &path,
             &url,
-            label,
-            ZedRemoteProjectSource::CodexRemoteProject,
-            None,
-            false,
+            ProjectMetadata {
+                label,
+                source: ZedRemoteProjectSource::CodexRemoteProject,
+                last_opened_at_ms: None,
+                is_current: false,
+            },
         );
         push_project(projects, project);
     }
@@ -291,10 +304,12 @@ fn collect_thread_workspace_hints(state: &Value, projects: &mut Vec<ZedRemotePro
             target,
             &path,
             &url,
-            String::new(),
-            ZedRemoteProjectSource::ThreadWorkspaceHint,
-            None,
-            false,
+            ProjectMetadata {
+                label: String::new(),
+                source: ZedRemoteProjectSource::ThreadWorkspaceHint,
+                last_opened_at_ms: None,
+                is_current: false,
+            },
         );
         push_project(projects, project);
     }
@@ -337,10 +352,12 @@ fn collect_sqlite_thread_cwds(
             target,
             &cwd,
             &url,
-            String::new(),
-            ZedRemoteProjectSource::SqliteThreadCwd,
-            None,
-            false,
+            ProjectMetadata {
+                label: String::new(),
+                source: ZedRemoteProjectSource::SqliteThreadCwd,
+                last_opened_at_ms: None,
+                is_current: false,
+            },
         );
         push_project(projects, project);
     }
@@ -432,12 +449,9 @@ fn project_from_parts(
     target: SshTarget,
     path: &str,
     url: &str,
-    label: String,
-    source: ZedRemoteProjectSource,
-    last_opened_at_ms: Option<i64>,
-    is_current: bool,
+    metadata: ProjectMetadata,
 ) -> ZedRemoteProject {
-    let label = label.or_else_nonempty(|| label_from_path(path));
+    let label = metadata.label.or_else_nonempty(|| label_from_path(path));
     ZedRemoteProject {
         id: project_id(&target, path),
         label,
@@ -445,9 +459,9 @@ fn project_from_parts(
         ssh: target,
         path: path.trim().to_string(),
         url: url.to_string(),
-        source,
-        last_opened_at_ms,
-        is_current,
+        source: metadata.source,
+        last_opened_at_ms: metadata.last_opened_at_ms,
+        is_current: metadata.is_current,
     }
 }
 

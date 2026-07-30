@@ -67,17 +67,12 @@ struct CodexFunctionToolSpec {
     name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum CodexCustomToolKind {
+    #[default]
     Raw,
     ApplyPatch,
     BuiltIn,
-}
-
-impl Default for CodexCustomToolKind {
-    fn default() -> Self {
-        Self::Raw
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,22 +341,12 @@ pub async fn send_upstream_request_with_header_timeout(
         .context("上游请求失败")
 }
 
+#[derive(Default)]
 pub struct ChatSseToResponsesConverter {
     buffer: String,
     utf8_remainder: Vec<u8>,
     state: ChatSseState,
     failed: bool,
-}
-
-impl Default for ChatSseToResponsesConverter {
-    fn default() -> Self {
-        Self {
-            buffer: String::new(),
-            utf8_remainder: Vec::new(),
-            state: ChatSseState::default(),
-            failed: false,
-        }
-    }
 }
 
 impl ChatSseToResponsesConverter {
@@ -1053,10 +1038,10 @@ impl ChatSseState {
         if let Some(id) = chunk.get("id").and_then(Value::as_str) {
             self.response_id = response_id_from_chat_id(Some(id));
         }
-        if let Some(model) = chunk.get("model").and_then(Value::as_str) {
-            if !model.is_empty() {
-                self.model = model.to_string();
-            }
+        if let Some(model) = chunk.get("model").and_then(Value::as_str)
+            && !model.is_empty()
+        {
+            self.model = model.to_string();
         }
         if let Some(created) = chunk.get("created").and_then(Value::as_u64) {
             self.created_at = created;
@@ -1080,10 +1065,10 @@ impl ChatSseState {
                 self.push_reasoning_delta_into(&reasoning, output);
             }
 
-            if let Some(content) = delta.get("content").and_then(Value::as_str) {
-                if !content.is_empty() {
-                    self.push_content_delta_into(content, output);
-                }
+            if let Some(content) = delta.get("content").and_then(Value::as_str)
+                && !content.is_empty()
+            {
+                self.push_content_delta_into(content, output);
             }
 
             if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
@@ -1328,10 +1313,10 @@ impl ChatSseState {
             if let Some(id) = id_delta {
                 state.call_id = id;
             }
-            if let Some(name) = name_delta {
-                if !name.is_empty() {
-                    state.name = name;
-                }
+            if let Some(name) = name_delta
+                && !name.is_empty()
+            {
+                state.name = name;
             }
             if !args_delta.is_empty() {
                 state.arguments.push_str(&args_delta);
@@ -1369,31 +1354,31 @@ impl ChatSseState {
                     &self.tool_context,
                 );
             }
-        } else if !args_delta.is_empty() {
-            if let Some(output_index) = output_index {
-                let state = ToolCallState {
-                    output_index: Some(output_index),
-                    item_id,
-                    name: self
-                        .tools
-                        .get(&chat_index)
-                        .map(|state| state.name.clone())
-                        .unwrap_or_default(),
-                    call_id: self
-                        .tools
-                        .get(&chat_index)
-                        .map(|state| state.call_id.clone())
-                        .unwrap_or_default(),
-                    ..ToolCallState::default()
-                };
-                push_tool_call_delta_sse(
-                    output,
-                    &state,
-                    output_index,
-                    &args_delta,
-                    &self.tool_context,
-                );
-            }
+        } else if !args_delta.is_empty()
+            && let Some(output_index) = output_index
+        {
+            let state = ToolCallState {
+                output_index: Some(output_index),
+                item_id,
+                name: self
+                    .tools
+                    .get(&chat_index)
+                    .map(|state| state.name.clone())
+                    .unwrap_or_default(),
+                call_id: self
+                    .tools
+                    .get(&chat_index)
+                    .map(|state| state.call_id.clone())
+                    .unwrap_or_default(),
+                ..ToolCallState::default()
+            };
+            push_tool_call_delta_sse(
+                output,
+                &state,
+                output_index,
+                &args_delta,
+                &self.tool_context,
+            );
         }
     }
 
@@ -1737,35 +1722,35 @@ fn upstream_error_parts(
     content_type: &str,
     body: &[u8],
 ) -> (String, Option<String>, Option<String>, Option<String>) {
-    if content_type.to_ascii_lowercase().contains("json") {
-        if let Ok(value) = serde_json::from_slice::<Value>(body) {
-            let error = value.get("error").unwrap_or(&value);
-            let message = error
-                .get("message")
-                .or_else(|| error.get("detail"))
-                .or_else(|| error.get("error"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
+    if content_type.to_ascii_lowercase().contains("json")
+        && let Ok(value) = serde_json::from_slice::<Value>(body)
+    {
+        let error = value.get("error").unwrap_or(&value);
+        let message = error
+            .get("message")
+            .or_else(|| error.get("detail"))
+            .or_else(|| error.get("error"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| truncate_error_preview(&value.to_string()));
+        let error_type = error
+            .get("type")
+            .or_else(|| error.get("error_type"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        let code = error.get("code").and_then(|value| {
+            value
+                .as_str()
                 .map(ToString::to_string)
-                .unwrap_or_else(|| truncate_error_preview(&value.to_string()));
-            let error_type = error
-                .get("type")
-                .or_else(|| error.get("error_type"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            let code = error.get("code").and_then(|value| {
-                value
-                    .as_str()
-                    .map(ToString::to_string)
-                    .or_else(|| value.as_i64().map(|number| number.to_string()))
-            });
-            let param = error
-                .get("param")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            return (message, error_type, code, param);
-        }
+                .or_else(|| value.as_i64().map(|number| number.to_string()))
+        });
+        let param = error
+            .get("param")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+        return (message, error_type, code, param);
     }
 
     let preview = truncate_error_preview(&String::from_utf8_lossy(body));
@@ -2018,13 +2003,13 @@ fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
     let mut rest = Vec::with_capacity(messages.len());
 
     for message in messages {
-        if message.get("role").and_then(Value::as_str) == Some("system") {
-            if let Some(text) = message.get("content").and_then(Value::as_str) {
-                if !text.trim().is_empty() {
-                    system_chunks.push(text.to_string());
-                }
-                continue;
+        if message.get("role").and_then(Value::as_str) == Some("system")
+            && let Some(text) = message.get("content").and_then(Value::as_str)
+        {
+            if !text.trim().is_empty() {
+                system_chunks.push(text.to_string());
             }
+            continue;
         }
         rest.push(message);
     }
@@ -2060,11 +2045,11 @@ fn flush_tool_calls(
         return;
     }
 
-    if let Some(last) = messages.last_mut() {
-        if last.get("role").and_then(Value::as_str) == Some("assistant") {
-            merge_tool_calls_into_message(last, std::mem::take(pending_tool_calls));
-            return;
-        }
+    if let Some(last) = messages.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("assistant")
+    {
+        merge_tool_calls_into_message(last, std::mem::take(pending_tool_calls));
+        return;
     }
 
     let mut message = json!({
@@ -2083,11 +2068,11 @@ fn flush_reasoning(messages: &mut Vec<Value>, pending_reasoning: &mut Vec<String
         return;
     }
     let reasoning = std::mem::take(pending_reasoning).join("\n");
-    if let Some(last) = messages.last_mut() {
-        if last.get("role").and_then(Value::as_str) == Some("assistant") {
-            append_reasoning_to_assistant_message(last, &reasoning);
-            return;
-        }
+    if let Some(last) = messages.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some("assistant")
+    {
+        append_reasoning_to_assistant_message(last, &reasoning);
+        return;
     }
     messages.push(json!({
         "role": "assistant",
@@ -2159,17 +2144,17 @@ fn responses_content_to_chat_content(_role: &str, content: &Value) -> Value {
     for part in parts {
         match part.get("type").and_then(Value::as_str).unwrap_or("") {
             "input_text" | "output_text" | "text" => {
-                if let Some(value) = part.get("text").and_then(Value::as_str) {
-                    if !value.is_empty() {
-                        chat_parts.push(json!({ "type": "text", "text": value }));
-                    }
+                if let Some(value) = part.get("text").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    chat_parts.push(json!({ "type": "text", "text": value }));
                 }
             }
             "refusal" => {
-                if let Some(value) = part.get("refusal").and_then(Value::as_str) {
-                    if !value.is_empty() {
-                        chat_parts.push(json!({ "type": "text", "text": value }));
-                    }
+                if let Some(value) = part.get("refusal").and_then(Value::as_str)
+                    && !value.is_empty()
+                {
+                    chat_parts.push(json!({ "type": "text", "text": value }));
                 }
             }
             "input_image" => {
@@ -2422,13 +2407,12 @@ fn detect_codex_custom_tool_kind(tool: &Value, name: &str) -> CodexCustomToolKin
     if name == "apply_patch" {
         return CodexCustomToolKind::ApplyPatch;
     }
-    if let Some(definition) = tool.pointer("/format/definition").and_then(Value::as_str) {
-        if definition.contains("begin_patch")
-            && definition.contains("end_patch")
-            && definition.contains("add_hunk")
-        {
-            return CodexCustomToolKind::ApplyPatch;
-        }
+    if let Some(definition) = tool.pointer("/format/definition").and_then(Value::as_str)
+        && definition.contains("begin_patch")
+        && definition.contains("end_patch")
+        && definition.contains("add_hunk")
+    {
+        return CodexCustomToolKind::ApplyPatch;
     }
     if matches!(
         tool.get("type").and_then(Value::as_str),
@@ -2500,7 +2484,7 @@ fn namespace_tool_to_chat_tools(namespace_tool: &Value, context: &CodexToolConte
             continue;
         };
         let flat = flatten_namespace_tool_name(namespace, name);
-        if namespace != ""
+        if !namespace.is_empty()
             && context
                 .function_tools
                 .get(&flat)
@@ -2803,16 +2787,16 @@ fn responses_tool_choice_to_chat(tool_choice: &Value, context: &CodexToolContext
                     }
                 }));
             }
-            if let Some(function) = object.get("function").and_then(Value::as_object) {
-                if let Some(namespace) = function.get("namespace").and_then(Value::as_str) {
-                    let name = function.get("name").and_then(Value::as_str).unwrap_or("");
-                    return Some(json!({
-                        "type": "function",
-                        "function": {
-                            "name": flatten_namespace_tool_name(namespace, name)
-                        }
-                    }));
-                }
+            if let Some(function) = object.get("function").and_then(Value::as_object)
+                && let Some(namespace) = function.get("namespace").and_then(Value::as_str)
+            {
+                let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+                return Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": flatten_namespace_tool_name(namespace, name)
+                    }
+                }));
             }
             Some(json!({
                 "type": "function",
@@ -2856,12 +2840,11 @@ fn chat_reasoning_text(message: &Value) -> Option<String> {
         return Some(reasoning);
     }
 
-    if let Some(content) = message.get("content").and_then(Value::as_str) {
-        if let Some((reasoning, _answer)) = split_leading_think_block(content) {
-            if !reasoning.is_empty() {
-                return Some(reasoning);
-            }
-        }
+    if let Some(content) = message.get("content").and_then(Value::as_str)
+        && let Some((reasoning, _answer)) = split_leading_think_block(content)
+        && !reasoning.is_empty()
+    {
+        return Some(reasoning);
     }
 
     None
@@ -2880,29 +2863,29 @@ fn chat_message_to_response_output_item(message: &Value, response_id: &str) -> O
         for part in parts {
             match part.get("type").and_then(Value::as_str).unwrap_or("") {
                 "text" | "output_text" => {
-                    if let Some(text) = part.get("text").and_then(Value::as_str) {
-                        if !text.is_empty() {
-                            content.push(
-                                json!({ "type": "output_text", "text": text, "annotations": [] }),
-                            );
-                        }
+                    if let Some(text) = part.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        content.push(
+                            json!({ "type": "output_text", "text": text, "annotations": [] }),
+                        );
                     }
                 }
                 "refusal" => {
-                    if let Some(refusal) = part.get("refusal").and_then(Value::as_str) {
-                        if !refusal.is_empty() {
-                            content.push(json!({ "type": "refusal", "refusal": refusal }));
-                        }
+                    if let Some(refusal) = part.get("refusal").and_then(Value::as_str)
+                        && !refusal.is_empty()
+                    {
+                        content.push(json!({ "type": "refusal", "refusal": refusal }));
                     }
                 }
                 _ => {}
             }
         }
     }
-    if let Some(refusal) = message.get("refusal").and_then(Value::as_str) {
-        if !refusal.is_empty() {
-            content.push(json!({ "type": "refusal", "refusal": refusal }));
-        }
+    if let Some(refusal) = message.get("refusal").and_then(Value::as_str)
+        && !refusal.is_empty()
+    {
+        content.push(json!({ "type": "refusal", "refusal": refusal }));
     }
 
     if content.is_empty() {
@@ -3137,19 +3120,19 @@ fn strip_think_answer_separator(text: &str) -> &str {
 
 fn extract_reasoning_field_text(value: &Value) -> Option<String> {
     for key in ["reasoning_content", "reasoning"] {
-        if let Some(text) = value.get(key).and_then(Value::as_str) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
+        if let Some(text) = value.get(key).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            return Some(text.to_string());
         }
     }
 
     if let Some(reasoning) = value.get("reasoning") {
         for key in ["content", "text", "summary"] {
-            if let Some(text) = reasoning.get(key).and_then(Value::as_str) {
-                if !text.is_empty() {
-                    return Some(text.to_string());
-                }
+            if let Some(text) = reasoning.get(key).and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                return Some(text.to_string());
             }
         }
     }
@@ -3178,10 +3161,10 @@ fn extract_reasoning_details_text(value: &Value) -> Option<String> {
 
 fn extract_reasoning_detail_part_text(value: &Value) -> Option<String> {
     for key in ["text", "content", "summary"] {
-        if let Some(text) = value.get(key).and_then(Value::as_str) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
+        if let Some(text) = value.get(key).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            return Some(text.to_string());
         }
     }
 
@@ -3200,10 +3183,10 @@ fn extract_reasoning_detail_part_text(value: &Value) -> Option<String> {
 
 fn extract_reasoning_summary_text(value: &Value) -> Option<String> {
     for key in ["reasoning_content", "content", "text"] {
-        if let Some(text) = value.get(key).and_then(Value::as_str) {
-            if !text.is_empty() {
-                return Some(text.to_string());
-            }
+        if let Some(text) = value.get(key).and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            return Some(text.to_string());
         }
     }
 
@@ -3414,10 +3397,10 @@ fn reconstruct_custom_tool_call_input_with_context(
     upstream_name: &str,
     arguments: &str,
 ) -> String {
-    if let Some(spec) = tool_context.custom_tools.get(upstream_name) {
-        if spec.kind == CodexCustomToolKind::ApplyPatch {
-            return reconstruct_apply_patch_input(spec.proxy_action, arguments);
-        }
+    if let Some(spec) = tool_context.custom_tools.get(upstream_name)
+        && spec.kind == CodexCustomToolKind::ApplyPatch
+    {
+        return reconstruct_apply_patch_input(spec.proxy_action, arguments);
     }
     reconstruct_custom_tool_call_input(arguments)
 }
@@ -3500,10 +3483,10 @@ fn build_apply_patch_text(operations: &[Value]) -> String {
             }
             "update_file" => {
                 text.push_str(&format!("\n*** Update File: {path}"));
-                if let Some(move_to) = operation.get("move_to").and_then(Value::as_str) {
-                    if !move_to.is_empty() {
-                        text.push_str(&format!("\n*** Move to: {move_to}"));
-                    }
+                if let Some(move_to) = operation.get("move_to").and_then(Value::as_str)
+                    && !move_to.is_empty()
+                {
+                    text.push_str(&format!("\n*** Move to: {move_to}"));
                 }
                 if let Some(hunks) = operation.get("hunks").and_then(Value::as_array) {
                     for hunk in hunks {
@@ -3711,10 +3694,10 @@ fn build_apply_patch_operation_arguments(
                 "hunks": operation.get("hunks").cloned().unwrap_or_else(|| json!([])),
                 "path": operation.get("path").and_then(Value::as_str).unwrap_or("")
             });
-            if let Some(move_to) = operation.get("move_to").and_then(Value::as_str) {
-                if !move_to.is_empty() {
-                    args["move_to"] = json!(move_to);
-                }
+            if let Some(move_to) = operation.get("move_to").and_then(Value::as_str)
+                && !move_to.is_empty()
+            {
+                args["move_to"] = json!(move_to);
             }
             args.to_string()
         }

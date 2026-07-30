@@ -309,9 +309,9 @@ fn wrap_script(script: &UserScriptFile, source: &str) -> String {
   }}
 }})();
 "#,
-        key = json!(script.key).to_string(),
-        name = json!(script.name).to_string(),
-        source_name = json!(script.source).to_string(),
+        key = json!(script.key),
+        name = json!(script.name),
+        source_name = json!(script.source),
         source = source
     )
 }

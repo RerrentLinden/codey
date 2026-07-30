@@ -797,8 +797,8 @@ fn to_desktop_workspace_path(value: &str) -> Option<String> {
     if lower.starts_with(r"\\?\unc\") {
         return Some(format!(r"\\{}", stripped[8..].replace('/', r"\")));
     }
-    if stripped.starts_with(r"\\?\") {
-        return Some(stripped[4..].replace('\\', "/"));
+    if let Some(stripped) = stripped.strip_prefix(r"\\?\") {
+        return Some(stripped.replace('\\', "/"));
     }
     Some(stripped.to_string())
 }
@@ -1125,11 +1125,13 @@ fn apply_sqlite_update(
         return Ok(SqliteUpdateCounts::default());
     }
     let tx = db.transaction()?;
-    let mut counts = SqliteUpdateCounts::default();
-    counts.provider_rows = tx.execute(
-        "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
-        [target_provider],
-    )?;
+    let mut counts = SqliteUpdateCounts {
+        provider_rows: tx.execute(
+            "UPDATE threads SET model_provider = ?1 WHERE COALESCE(model_provider, '') <> ?1",
+            [target_provider],
+        )?,
+        ..SqliteUpdateCounts::default()
+    };
     if columns.contains("has_user_event") {
         for thread_id in user_event_thread_ids {
             counts.user_event_rows += tx.execute(

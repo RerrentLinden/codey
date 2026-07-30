@@ -113,15 +113,15 @@ fn write_bundle(bundle: &MacosAppBundle) -> anyhow::Result<()> {
     fs::create_dir_all(&macos)?;
     fs::create_dir_all(&resources)?;
     fs::write(contents.join("Info.plist"), &bundle.info_plist)?;
-    if let (Some(source), Some(target_name)) = (&bundle.binary_source, &bundle.binary_target_name) {
-        if source.exists() {
-            let target = macos.join(target_name);
-            if source != &target {
-                fs::copy(source, &target)?;
-                let mut permissions = fs::metadata(&target)?.permissions();
-                permissions.set_mode(0o755);
-                fs::set_permissions(target, permissions)?;
-            }
+    if let (Some(source), Some(target_name)) = (&bundle.binary_source, &bundle.binary_target_name)
+        && source.exists()
+    {
+        let target = macos.join(target_name);
+        if source != &target {
+            fs::copy(source, &target)?;
+            let mut permissions = fs::metadata(&target)?.permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(target, permissions)?;
         }
     }
     let executable = macos.join(executable_name_from_plist(&bundle.info_plist));

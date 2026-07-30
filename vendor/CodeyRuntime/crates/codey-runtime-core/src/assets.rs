@@ -164,7 +164,7 @@ fn local_plugin_marketplaces() -> Value {
 }
 
 fn local_plugin_marketplaces_from_home(home: &Path) -> Value {
-    let installed_plugins = installed_plugins_from_config(&home);
+    let installed_plugins = installed_plugins_from_config(home);
     let marketplace_dir = home
         .join(".tmp")
         .join("plugins")
@@ -184,7 +184,7 @@ fn local_plugin_marketplaces_from_home(home: &Path) -> Value {
         .filter_map(|path| {
             let text = std::fs::read_to_string(path).ok()?;
             let mut marketplace: Value = serde_json::from_str(&text).ok()?;
-            expand_local_plugin_marketplace(&mut marketplace, path, &home, &installed_plugins);
+            expand_local_plugin_marketplace(&mut marketplace, path, home, &installed_plugins);
             if let Some(object) = marketplace.as_object_mut() {
                 object
                     .entry("path")

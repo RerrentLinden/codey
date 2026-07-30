@@ -19,6 +19,7 @@ pub enum LaunchMode {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub struct RelayContextSelection {
     #[serde(default)]
     pub mcp_servers: Vec<String>,
@@ -26,16 +27,6 @@ pub struct RelayContextSelection {
     pub skills: Vec<String>,
     #[serde(default)]
     pub plugins: Vec<String>,
-}
-
-impl Default for RelayContextSelection {
-    fn default() -> Self {
-        Self {
-            mcp_servers: Vec::new(),
-            skills: Vec::new(),
-            plugins: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -784,10 +775,10 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     merge_bool_setting(target, source, "codexAppConversationView");
     merge_bool_setting(target, source, "codexAppThreadScrollRestore");
     merge_bool_setting(target, source, "codexAppZedRemoteOpen");
-    if let Some(value) = source.get("zedRemoteOpenStrategy") {
-        if serde_json::from_value::<ZedOpenStrategy>(value.clone()).is_ok() {
-            target.insert("zedRemoteOpenStrategy".to_string(), value.clone());
-        }
+    if let Some(value) = source.get("zedRemoteOpenStrategy")
+        && serde_json::from_value::<ZedOpenStrategy>(value.clone()).is_ok()
+    {
+        target.insert("zedRemoteOpenStrategy".to_string(), value.clone());
     }
     merge_bool_setting(target, source, "zedRemoteProjectRegistryEnabled");
     merge_bool_setting(target, source, "zedRemoteSyncToZedSettings");
@@ -906,10 +897,10 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("codexGoalsEnabled").and_then(Value::as_bool) {
         target.insert("codexGoalsEnabled".to_string(), Value::Bool(value));
     }
-    if let Some(value) = source.get("launchMode").and_then(Value::as_str) {
-        if matches!(value, "patch" | "relay") {
-            target.insert("launchMode".to_string(), Value::String(value.to_string()));
-        }
+    if let Some(value) = source.get("launchMode").and_then(Value::as_str)
+        && matches!(value, "patch" | "relay")
+    {
+        target.insert("launchMode".to_string(), Value::String(value.to_string()));
     }
     if let Some(value) = source.get("relayBaseUrl").and_then(Value::as_str) {
         target.insert("relayBaseUrl".to_string(), Value::String(value.to_string()));

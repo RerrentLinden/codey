@@ -141,14 +141,13 @@ pub fn default_install_root() -> Option<PathBuf> {
         {
             return Some(sys_apps);
         }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = macos_applications_dir_from_exe(&exe) {
-                if is_macos_applications_dir(&dir) {
-                    return Some(dir);
-                }
-            }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = macos_applications_dir_from_exe(&exe)
+            && is_macos_applications_dir(&dir)
+        {
+            return Some(dir);
         }
-        return Some(sys_apps);
+        Some(sys_apps)
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
@@ -337,13 +336,11 @@ fn macos_companion_binary_from_exe(exe: &Path, binary: &str) -> Option<PathBuf> 
             .join(format!("{SILENT_NAME}.app"))
             .join("Contents")
             .join("MacOS");
-        return Some(
-            macos
-                .join(SILENT_BINARY)
-                .exists()
-                .then(|| macos.join(SILENT_BINARY))
-                .unwrap_or_else(|| macos.join("CodeyRuntime")),
-        );
+        return Some(if macos.join(SILENT_BINARY).exists() {
+            macos.join(SILENT_BINARY)
+        } else {
+            macos.join("CodeyRuntime")
+        });
     }
     if binary == MANAGER_BINARY {
         if app_name == format!("{MANAGER_NAME}.app") {
@@ -357,13 +354,11 @@ fn macos_companion_binary_from_exe(exe: &Path, binary: &str) -> Option<PathBuf> 
             .join(format!("{MANAGER_NAME}.app"))
             .join("Contents")
             .join("MacOS");
-        return Some(
-            macos
-                .join(MANAGER_BINARY)
-                .exists()
-                .then(|| macos.join(MANAGER_BINARY))
-                .unwrap_or_else(|| macos.join("CodeyRuntimeManager")),
-        );
+        return Some(if macos.join(MANAGER_BINARY).exists() {
+            macos.join(MANAGER_BINARY)
+        } else {
+            macos.join("CodeyRuntimeManager")
+        });
     }
     None
 }

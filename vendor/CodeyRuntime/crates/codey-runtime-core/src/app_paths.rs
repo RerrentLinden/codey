@@ -56,7 +56,7 @@ pub fn find_latest_codex_app_dir_from_roots(roots: &[PathBuf]) -> Option<PathBuf
     roots
         .iter()
         .filter_map(|root| find_latest_codex_app_dir(root))
-        .max_by(compare_app_dir_candidates)
+        .max_by(|left, right| compare_app_dir_candidates(left, right))
 }
 
 pub fn find_latest_codex_app_dir_default() -> Option<PathBuf> {
@@ -159,7 +159,7 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
         return find_macos_codex_app_default();
     }
     // Windows: try MS Store version first, then standalone install
-    find_latest_codex_app_dir_default().or_else(|| find_standalone_codex_app_dir())
+    find_latest_codex_app_dir_default().or_else(find_standalone_codex_app_dir)
 }
 
 /// Search for standalone Codex installations (non-MS Store).
@@ -184,10 +184,10 @@ pub fn find_standalone_codex_app_dir() -> Option<PathBuf> {
     ];
 
     for candidate in candidates {
-        if let Some(path) = normalize_codex_app_path(candidate) {
-            if build_codex_executable(&path).exists() {
-                return Some(path);
-            }
+        if let Some(path) = normalize_codex_app_path(candidate)
+            && build_codex_executable(&path).exists()
+        {
+            return Some(path);
         }
     }
     None
@@ -203,10 +203,9 @@ pub fn resolve_codex_app_dir_with_saved(
     if let Some(saved) = saved_app_path
         .map(str::trim)
         .filter(|saved| !saved.is_empty())
+        && let Some(path) = normalize_codex_app_path(Path::new(saved))
     {
-        if let Some(path) = normalize_codex_app_path(Path::new(saved)) {
-            return Some(path);
-        }
+        return Some(path);
     }
     resolve_codex_app_dir(None)
 }
@@ -442,7 +441,7 @@ fn package_spec_from_path(path: &Path) -> Option<AppPackageSpec> {
     Some(spec)
 }
 
-fn compare_app_dir_candidates(left: &PathBuf, right: &PathBuf) -> std::cmp::Ordering {
+fn compare_app_dir_candidates(left: &Path, right: &Path) -> std::cmp::Ordering {
     app_dir_sort_key(left).cmp(&app_dir_sort_key(right))
 }
 

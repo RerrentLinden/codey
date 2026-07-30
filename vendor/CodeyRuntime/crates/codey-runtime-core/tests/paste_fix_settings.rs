@@ -16,8 +16,10 @@ fn paste_fix_defaults_to_false() {
 
 #[test]
 fn paste_fix_round_trips_through_json() {
-    let mut settings = BackendSettings::default();
-    settings.codex_app_paste_fix = true;
+    let settings = BackendSettings {
+        codex_app_paste_fix: true,
+        ..BackendSettings::default()
+    };
 
     let json = serde_json::to_value(&settings).expect("serialize");
     assert_eq!(
@@ -61,8 +63,10 @@ fn paste_fix_config_reflects_setting() {
 fn injection_script_includes_paste_fix_global() {
     use codey_runtime_core::assets::injection_script_with_settings;
 
-    let mut settings = BackendSettings::default();
-    settings.codex_app_paste_fix = true;
+    let mut settings = BackendSettings {
+        codex_app_paste_fix: true,
+        ..BackendSettings::default()
+    };
     let script = injection_script_with_settings(0, &settings);
     assert!(
         script.contains("window.__CODEY_PASTE_FIX__ = {\"enabled\":true};"),

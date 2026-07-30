@@ -35,17 +35,13 @@ pub struct SshTarget {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 pub enum ZedOpenStrategy {
+    #[default]
     AddToFocusedWorkspace,
     ReuseWindow,
     NewWindow,
     Default,
-}
-
-impl Default for ZedOpenStrategy {
-    fn default() -> Self {
-        Self::AddToFocusedWorkspace
-    }
 }
 
 pub fn candidate_zed_app_paths() -> Vec<PathBuf> {
@@ -329,16 +325,16 @@ pub fn launch_zed_url_with_strategy(
             .map_err(ZedRemoteError::Launch)?;
         return Ok(());
     }
-    if cfg!(target_os = "macos") {
-        if let Some(app_path) = find_zed_app_path() {
-            Command::new("open")
-                .arg("-a")
-                .arg(app_path)
-                .arg(url)
-                .spawn()
-                .map_err(ZedRemoteError::Launch)?;
-            return Ok(());
-        }
+    if cfg!(target_os = "macos")
+        && let Some(app_path) = find_zed_app_path()
+    {
+        Command::new("open")
+            .arg("-a")
+            .arg(app_path)
+            .arg(url)
+            .spawn()
+            .map_err(ZedRemoteError::Launch)?;
+        return Ok(());
     }
     Err(ZedRemoteError::Validation(
         "Zed CLI is not installed or not available on PATH",

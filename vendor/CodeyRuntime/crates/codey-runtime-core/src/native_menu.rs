@@ -113,8 +113,7 @@ pub async fn install_native_menu_localizer(inspector_port: u16) -> anyhow::Resul
 }
 
 pub fn native_menu_localizer_script() -> anyhow::Result<String> {
-    let translations =
-        serde_json::to_string(&MENU_LABEL_TRANSLATIONS.iter().copied().collect::<Vec<_>>())?;
+    let translations = serde_json::to_string(&MENU_LABEL_TRANSLATIONS.to_vec())?;
     Ok(format!(
         r#"
 (() => {{
