@@ -79,7 +79,7 @@ pnpm run release -- 0.2.1 --include-existing-changes
 
 未配置上述 variable 或 secret 时，现有 GitHub Release 发布不受影响，R2 同步会被跳过。默认构建不内置任何更新源；只有设置 `CODEY_UPDATE_BASE_URL` 后才会启用检查更新。配置页面不允许用户改写更新源。检查更新会经 HTTPS 拉取清单，校验版本、下载地址和 SHA-256 格式后显示是否有新版本。当前 macOS 包仍是未签名包，Windows 包也尚未进行代码签名，因此检查更新不会自动下载或静默安装。
 
-Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周期和会话扫描优化也已直接合并其中。本地与 CI 构建不需要额外的运行时源码目录或补丁。
+Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周期和会话扫描优化也已直接合并其中。本地与 CI 构建不需要额外的运行时源码目录或补丁。PR 与桌面发布质量门会分别对根 workspace 和 CodeyRuntime workspace 执行格式检查、完整测试及零警告 Clippy。
 
 运行时只内置不含提示词的 Codex 模型兼容元数据。上游模型缓存中的基础指令、消息模板、模板变量和人格提示字段会在克隆模板及写入 `model-catalogs/codey-official.json` 前递归删除，完整 system/developer prompt 不进入仓库资产、CodeyRuntime 二进制或 Codey 生成目录。
 
