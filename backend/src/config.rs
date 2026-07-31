@@ -314,16 +314,19 @@ pub fn default_true() -> bool {
     true
 }
 
-pub fn default_update_manifest_url() -> String {
-    let base_url = option_env!("CODEY_UPDATE_BASE_URL")
-        .unwrap_or_default()
-        .trim()
+const DEFAULT_UPDATE_BASE_URL: &str = "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev";
+
+fn update_manifest_url_from_base(configured_base_url: Option<&str>) -> String {
+    let base_url = configured_base_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .unwrap_or(DEFAULT_UPDATE_BASE_URL)
         .trim_end_matches('/');
-    if base_url.is_empty() {
-        String::new()
-    } else {
-        format!("{base_url}/latest.json")
-    }
+    format!("{base_url}/latest.json")
+}
+
+pub fn default_update_manifest_url() -> String {
+    update_manifest_url_from_base(option_env!("CODEY_UPDATE_BASE_URL"))
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -560,6 +563,18 @@ mod tests {
 
         assert_eq!(config.update_manifest_url, default_update_manifest_url());
         assert!(serialized.get("updateManifestUrl").is_none());
+    }
+
+    #[test]
+    fn update_manifest_url_defaults_to_the_public_source_for_local_builds() {
+        let expected = format!("{DEFAULT_UPDATE_BASE_URL}/latest.json");
+
+        assert_eq!(update_manifest_url_from_base(None), expected);
+        assert_eq!(update_manifest_url_from_base(Some("  ")), expected);
+        assert_eq!(
+            update_manifest_url_from_base(Some("https://updates.example.com/codey/")),
+            "https://updates.example.com/codey/latest.json"
+        );
     }
 
     #[test]
