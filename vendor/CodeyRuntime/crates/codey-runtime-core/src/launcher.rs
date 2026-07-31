@@ -1944,16 +1944,14 @@ async fn run_pet_real_mouse_cursor_driver(debug_port: u16) {
         for target in targets.iter().cloned() {
             drivers.spawn(run_pet_real_mouse_target_driver(debug_port, target));
         }
-        if let Some(result) = drivers.join_next().await {
-            if let Err(error) = result {
-                let _ = crate::diagnostic_log::append_diagnostic_log(
-                    "pet.real_mouse_cursor_driver_join_failed",
-                    serde_json::json!({
-                        "debug_port": debug_port,
-                        "message": error.to_string()
-                    }),
-                );
-            }
+        if let Some(Err(error)) = drivers.join_next().await {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "pet.real_mouse_cursor_driver_join_failed",
+                serde_json::json!({
+                    "debug_port": debug_port,
+                    "message": error.to_string()
+                }),
+            );
         }
         for target in &targets {
             if let Some(websocket_url) = target.web_socket_debugger_url.as_deref() {

@@ -233,15 +233,16 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
 
-    for nested in [
+    let nested = [
         path.join("app"),
         path.join("bin"),
         path.join("current"),
         path.join("versions").join("current"),
-    ] {
-        if executable_in_dir(&nested).is_some() {
-            return Some(nested);
-        }
+    ]
+    .into_iter()
+    .find(|nested| executable_in_dir(nested).is_some());
+    if nested.is_some() {
+        return nested;
     }
 
     #[cfg(not(windows))]

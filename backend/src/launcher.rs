@@ -1604,6 +1604,7 @@ fn startup_patch_detail() -> String {
     }
 }
 
+#[cfg(not(windows))]
 fn spawn_command(command: Vec<String>) -> Result<SpawnedCodex> {
     let executable = command
         .first()
@@ -1612,11 +1613,6 @@ fn spawn_command(command: Vec<String>) -> Result<SpawnedCodex> {
     child_command.args(&command[1..]);
     #[cfg(unix)]
     child_command.process_group(0);
-    #[cfg(windows)]
-    {
-        child_command.env_remove("WSL_DISTRO_NAME");
-        child_command.creation_flags(codey_runtime_core::windows_create_no_window());
-    }
     let child = child_command
         .spawn()
         .with_context(|| format!("启动 Codex 失败：{executable}"))?;

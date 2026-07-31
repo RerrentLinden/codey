@@ -463,10 +463,10 @@ pub(crate) fn ensure_openai_bundled_marketplace(home: &Path) -> anyhow::Result<O
     if is_complete_openai_bundled_marketplace(&active) {
         return Ok(Some(active));
     }
-    if let Some(configured) = configured_openai_bundled_marketplace(home) {
-        if is_complete_openai_bundled_marketplace(&configured) {
-            return Ok(Some(configured));
-        }
+    if let Some(configured) = configured_openai_bundled_marketplace(home)
+        && is_complete_openai_bundled_marketplace(&configured)
+    {
+        return Ok(Some(configured));
     }
 
     let parent = active
