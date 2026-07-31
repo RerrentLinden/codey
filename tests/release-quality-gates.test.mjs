@@ -48,4 +48,20 @@ test("every desktop release build enforces the Rust quality gates", () => {
 test("pull requests enforce Rust quality gates for both workspaces", () => {
   assert.match(ciWorkflow, /^\s*RUSTFLAGS: -D warnings$/m);
   assertRustQualityGates(ciWorkflow);
+  const windowsJob = ciWorkflow.slice(ciWorkflow.indexOf("\n  windows-rust:"));
+  assert.match(windowsJob, /runs-on: windows-latest/);
+  assert.match(windowsJob, /components: clippy/);
+  assert.match(windowsJob, /cargo test --workspace --locked/);
+  assert.match(
+    windowsJob,
+    /cargo test --manifest-path vendor\/CodeyRuntime\/Cargo\.toml --workspace --locked/,
+  );
+  assert.match(
+    windowsJob,
+    /cargo clippy --workspace --all-targets --locked -- -D warnings/,
+  );
+  assert.match(
+    windowsJob,
+    /cargo clippy --manifest-path vendor\/CodeyRuntime\/Cargo\.toml --workspace --all-targets --locked -- -D warnings/,
+  );
 });
