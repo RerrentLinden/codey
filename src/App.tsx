@@ -788,7 +788,6 @@ export function App({
             <div className="dashboard-column upper-right-column">
               <NotificationChannelsCard
                 config={config}
-                container={portalContainer}
                 busy={busy}
                 isBusy={isBusy}
                 webhookResults={webhookResults}
