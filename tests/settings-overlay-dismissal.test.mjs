@@ -32,6 +32,9 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
     /header=\{\([\s\S]*codey-settings-modal-header[\s\S]*configHeaderContent/,
   );
   assert.match(appSource, /aria-label="关闭配置"/);
+  assert.match(appSource, /className="title-restart-button"/);
+  assert.match(appSource, /onClick=\{handleRestartCodex\}/);
+  assert.match(appSource, /showRestartAction=\{!embedded\}/);
   assert.match(
     appSource,
     /\{!embedded && \(\s*<header className="config-header">\{configHeaderContent\}<\/header>/,

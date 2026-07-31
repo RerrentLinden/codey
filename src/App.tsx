@@ -13,6 +13,7 @@ import {
   IconDeviceFloppy as Save,
   IconGitBranch as GitBranch,
   IconLoader2 as LoaderCircle,
+  IconRefresh as RefreshCw,
   IconX,
 } from "@tabler/icons-react";
 import SemiModal from "@douyinfe/semi-ui/lib/es/modal";
@@ -679,8 +680,28 @@ export function App({
 
       <div className="config-header-right">
         <div className="config-header-actions">
+          {embedded && (
+            <Button
+              aria-label={status.running ? "重启 Codex" : "Codex 未运行"}
+              className="title-restart-button"
+              disabled={isBusy || status.restartInProgress || !status.running}
+              onClick={handleRestartCodex}
+              size="sm"
+              variant="warning"
+            >
+              {busy === "restart" || status.restartInProgress ? (
+                <LoaderCircle className="spinner" aria-hidden="true" />
+              ) : (
+                <RefreshCw aria-hidden="true" />
+              )}
+              <span className="title-action-label">
+                {status.running ? "重启 Codex" : "未运行"}
+              </span>
+            </Button>
+          )}
           <SaveButton
-            className={`save-button${dirty ? " dirty" : ""}`}
+            aria-label={dirty ? "保存更改" : "已保存"}
+            className={`save-button${embedded ? " title-save-button" : ""}${dirty ? " dirty" : ""}`}
             disabled={!dirty || isBusy}
             onClick={handleSaveCurrent}
           >
@@ -691,7 +712,9 @@ export function App({
             ) : (
               <Check aria-hidden="true" />
             )}
-            {dirty ? "保存更改" : "已保存"}
+            <span className="title-action-label">
+              {dirty ? "保存更改" : "已保存"}
+            </span>
           </SaveButton>
           {embedded && (
             <Button
@@ -762,6 +785,7 @@ export function App({
             pluginMarketplaceStatus={pluginMarketplaceStatus}
             onRepairPluginMarketplace={handleRepairPluginMarketplace}
             onRestart={handleRestartCodex}
+            showRestartAction={!embedded}
           />
 
           {/* 中间区域：分左右两栏 (左侧: 应用更新与试验性功能; 右侧: 消息通知与功能策略) */}

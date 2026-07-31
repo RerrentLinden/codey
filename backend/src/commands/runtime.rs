@@ -11,8 +11,8 @@ use super::webhooks::{
     start_waiting_webhook_watcher, stop_waiting_webhook_watcher, webhook_watcher_should_run,
 };
 use super::{
-    AppState, RestartInProgressGuard, ScheduledRestart, config_requires_restart,
-    current_update_platform, make_bridge_handler, sync_provider_models_for_launch,
+    AppState, RestartInProgressGuard, ScheduledRestart, current_update_platform,
+    make_bridge_handler, runtime_config_requires_restart, sync_provider_models_for_launch,
 };
 use crate::codex_config::codex_home;
 use crate::error_log;
@@ -22,9 +22,7 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
     let runtime = state.runtime.lock().await.clone();
     let config = state.config.read().await;
     let profile = config.active_profile();
-    let restart_required = runtime
-        .as_ref()
-        .is_some_and(|runtime| config_requires_restart(&runtime.applied_config, &config));
+    let restart_required = runtime_config_requires_restart(state, &config).await;
     let mut status = json!({
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),

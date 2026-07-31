@@ -17,10 +17,12 @@ use serde::Serialize;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, RwLock, oneshot};
 
+use crate::cc_switch::{self, RouteTakeoverState};
 use crate::cdp;
 use crate::codex_config::{
-    apply_runtime_provider_config, codex_home, ensure_global_model_provider,
-    restore_runtime_provider_config,
+    active_model_provider, apply_runtime_provider_config,
+    apply_runtime_provider_config_preserving_route, codex_home, ensure_global_model_provider,
+    reconcile_runtime_config_overlay, restore_runtime_provider_config,
 };
 use crate::config::{CodeyConfig, ExperimentalFeaturesConfig, GpuLaunchMode};
 use crate::error_log;
@@ -35,6 +37,7 @@ use crate::trace_log_guard;
 
 const CDP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const CDP_WATCHDOG_FAILURE_THRESHOLD: u8 = 2;
+const ROUTE_OVERLAY_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 pub const CODEX_APP_NOT_FOUND_ERROR: &str = "找不到 Codex App，请在 Codey 配置中填写路径";
 pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效或指向了 Codex CLI；请选择 Codex 桌面 App，不要选择 codex.exe 命令行程序";
 const DISABLE_GPU_ARGUMENT: &str = "--disable-gpu";
@@ -89,10 +92,28 @@ struct SessionMaintenanceSummary {
     ghost_tasks_pruned: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeModelConfig {
+    selected_models: Vec<String>,
+    upstream_models: Vec<String>,
+    default_model: Option<String>,
+}
+
+impl RuntimeModelConfig {
+    pub fn from_config(config: &CodeyConfig) -> Self {
+        Self {
+            selected_models: config.selected_models().to_vec(),
+            upstream_models: config.upstream_models().to_vec(),
+            default_model: config.default_model().map(ToString::to_string),
+        }
+    }
+}
+
 pub struct CodeyRuntime {
     pub codex_app_path: PathBuf,
     pub maintenance: MaintenanceStatus,
     pub applied_config: CodeyConfig,
+    applied_model_config: RwLock<RuntimeModelConfig>,
     pub injection_statuses: Arc<RwLock<Arc<[cdp::InjectionScriptStatus]>>>,
     pub experimental_feature_runtime: Arc<RwLock<cdp::ExperimentalFeatureRuntimeStatus>>,
     injection_scripts: cdp::PreparedInjectionScripts,
@@ -105,12 +126,22 @@ pub struct CodeyRuntime {
     inspector_argument: Option<String>,
     watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     watchdog_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    route_overlay_shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    route_overlay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     exit_watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl CodeyRuntime {
     pub async fn renderer_websocket_url(&self) -> Arc<str> {
         self.injection_websocket_url.read().await.clone()
+    }
+
+    pub async fn applied_model_config(&self) -> RuntimeModelConfig {
+        self.applied_model_config.read().await.clone()
+    }
+
+    pub async fn mark_model_config_applied(&self, config: &CodeyConfig) {
+        *self.applied_model_config.write().await = RuntimeModelConfig::from_config(config);
     }
 
     pub async fn refresh_injection_statuses(&self) -> Arc<[cdp::InjectionScriptStatus]> {
@@ -157,13 +188,47 @@ impl CodeyRuntime {
         let initial_trace_guard = tokio::task::spawn_blocking(move || {
             trace_log_guard::configure(&trace_guard_home, disable_trace_log_writes)
         });
-        let original_provider = ensure_global_model_provider(&home).map_err(|error| {
+        let route_takeover = cc_switch::route_takeover_state(&home).map_err(|error| {
             error_log::record_failure(
                 "patch_failed",
-                "ensure_global_model_provider",
+                "detect_cc_switch_route_takeover",
                 format!("{error:#}"),
                 serde_json::json!({
                     "codexHome": home,
+                }),
+            );
+            error
+        })?;
+        let preserve_provider_route =
+            preserve_cc_switch_route(route_takeover).map_err(|error| {
+                error_log::record_failure(
+                    "patch_failed",
+                    "validate_cc_switch_route_takeover",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "managed": route_takeover.managed,
+                        "live": route_takeover.live,
+                    }),
+                );
+                error
+            })?;
+        let original_provider = if preserve_provider_route {
+            active_model_provider(&home)
+        } else {
+            ensure_global_model_provider(&home)
+        }
+        .map_err(|error| {
+            error_log::record_failure(
+                "patch_failed",
+                if preserve_provider_route {
+                    "read_cc_switch_live_provider"
+                } else {
+                    "ensure_global_model_provider"
+                },
+                format!("{error:#}"),
+                serde_json::json!({
+                    "codexHome": home,
+                    "preserveProviderRoute": preserve_provider_route,
                 }),
             );
             error
@@ -326,72 +391,87 @@ impl CodeyRuntime {
         let current_profile = config
             .active_profile()
             .ok_or_else(|| anyhow::anyhow!("找不到当前 Codex 线路"))?;
-        let official_provider = current_profile.cc_switch_read_only;
-        let use_official_catalog = match model_catalog::refresh_for_provider(
-            &home,
-            official_provider,
-            config.upstream_models_snapshot(),
-            config.selected_models(),
-        ) {
-            Ok(_) => true,
-            Err(error) if model_catalog::is_available(&home) => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "refresh_model_catalog",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "fallback": "last_valid_catalog",
-                        "officialProvider": official_provider,
-                    }),
-                );
-                eprintln!("刷新官方账号模型目录失败，沿用上一份合法镜像：{error:#}");
-                true
-            }
-            Err(error) => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "refresh_model_catalog",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "fallback": "codex_builtin_catalog",
-                        "officialProvider": official_provider,
-                    }),
-                );
-                eprintln!("刷新官方账号模型目录失败，临时使用 Codex 内置目录：{error:#}");
-                false
-            }
+        let (use_official_catalog, default_model) = if preserve_provider_route {
+            (false, String::new())
+        } else {
+            let official_provider = current_profile.cc_switch_read_only;
+            let use_official_catalog = match model_catalog::refresh_for_provider(
+                &home,
+                official_provider,
+                config.upstream_models_snapshot(),
+                config.selected_models(),
+            ) {
+                Ok(_) => true,
+                Err(error) if model_catalog::is_available(&home) => {
+                    error_log::record_failure(
+                        "patch_failed",
+                        "refresh_model_catalog",
+                        format!("{error:#}"),
+                        serde_json::json!({
+                            "fallback": "last_valid_catalog",
+                            "officialProvider": official_provider,
+                        }),
+                    );
+                    eprintln!("刷新官方账号模型目录失败，沿用上一份合法镜像：{error:#}");
+                    true
+                }
+                Err(error) => {
+                    error_log::record_failure(
+                        "patch_failed",
+                        "refresh_model_catalog",
+                        format!("{error:#}"),
+                        serde_json::json!({
+                            "fallback": "codex_builtin_catalog",
+                            "officialProvider": official_provider,
+                        }),
+                    );
+                    eprintln!("刷新官方账号模型目录失败，临时使用 Codex 内置目录：{error:#}");
+                    false
+                }
+            };
+            let default_model = match model_catalog::selection_state(
+                &home,
+                official_provider,
+                config.upstream_models_snapshot(),
+                config.selected_models(),
+                config.default_model(),
+            ) {
+                Ok(state) => state.default_model,
+                Err(error) => {
+                    error_log::record_failure(
+                        "patch_failed",
+                        "read_model_catalog_selection",
+                        format!("{error:#}"),
+                        serde_json::json!({
+                            "fallback": "empty_default_model",
+                            "officialProvider": official_provider,
+                        }),
+                    );
+                    String::new()
+                }
+            };
+            (use_official_catalog, default_model)
         };
-        let default_model = match model_catalog::selection_state(
-            &home,
-            official_provider,
-            config.upstream_models_snapshot(),
-            config.selected_models(),
-            config.default_model(),
-        ) {
-            Ok(state) => state.default_model,
-            Err(error) => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "read_model_catalog_selection",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "fallback": "empty_default_model",
-                        "officialProvider": official_provider,
-                    }),
-                );
-                String::new()
-            }
+        let runtime_config = if preserve_provider_route {
+            apply_runtime_provider_config_preserving_route(
+                &home,
+                &current_profile,
+                &original_provider,
+                config.fast_context_tools,
+                config.subagent_optimization,
+            )
+        } else {
+            apply_runtime_provider_config(
+                &home,
+                &current_profile,
+                &original_provider,
+                use_official_catalog,
+                (!default_model.is_empty()).then_some(default_model.as_str()),
+                config.fast_context_tools,
+                config.subagent_optimization,
+            )
         };
-        apply_runtime_provider_config(
-            &home,
-            &current_profile,
-            &original_provider,
-            use_official_catalog,
-            (!default_model.is_empty()).then_some(default_model.as_str()),
-            config.fast_context_tools,
-            config.subagent_optimization,
-        )
-        .map_err(|error| {
+        runtime_config.map_err(|error| {
             error_log::record_failure(
                 "patch_failed",
                 "apply_runtime_provider_config",
@@ -401,6 +481,7 @@ impl CodeyRuntime {
                     "provider": original_provider,
                     "fastContextTools": config.fast_context_tools,
                     "subagentOptimization": config.subagent_optimization,
+                    "preserveProviderRoute": preserve_provider_route,
                 }),
             );
             error
@@ -596,6 +677,12 @@ impl CodeyRuntime {
             cdp::ExperimentalFeatureRuntimeStatus::pending(config.experimental_features),
         ));
         let injection_websocket_url = Arc::new(RwLock::new(injected_target.websocket_url_arc()));
+        let (route_overlay_shutdown, route_overlay_task) = if preserve_provider_route {
+            let (shutdown, task) = spawn_route_overlay_watcher(home.clone());
+            (Some(shutdown), Some(task))
+        } else {
+            (None, None)
+        };
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let watchdog_handler = handler.clone();
         let watchdog_debug_port = debug_port;
@@ -698,6 +785,7 @@ impl CodeyRuntime {
                 codex_app_path: app_dir,
                 maintenance,
                 applied_config: config.clone(),
+                applied_model_config: RwLock::new(RuntimeModelConfig::from_config(config)),
                 injection_statuses,
                 experimental_feature_runtime,
                 injection_scripts,
@@ -710,6 +798,8 @@ impl CodeyRuntime {
                 inspector_argument,
                 watchdog_shutdown: Mutex::new(Some(shutdown_tx)),
                 watchdog_task: Mutex::new(Some(watchdog_task)),
+                route_overlay_shutdown: Mutex::new(route_overlay_shutdown),
+                route_overlay_task: Mutex::new(route_overlay_task),
                 exit_watchdog_shutdown: Mutex::new(Some(exit_watchdog_shutdown)),
             },
             codex_exit,
@@ -717,6 +807,21 @@ impl CodeyRuntime {
     }
 
     pub async fn stop(&self) -> Result<()> {
+        if let Some(sender) = self.route_overlay_shutdown.lock().await.take() {
+            let _ = sender.send(());
+        }
+        let route_overlay_task = self.route_overlay_task.lock().await.take();
+        if let Some(task) = route_overlay_task
+            && let Err(error) = task.await
+        {
+            error_log::record_failure(
+                "route_overlay_watch_failed",
+                "stop_cc_switch_route_overlay_watcher",
+                error.to_string(),
+                serde_json::json!({}),
+            );
+            eprintln!("CC Switch 路由配置监听器关闭失败：{error}");
+        }
         if let Some(sender) = self.watchdog_shutdown.lock().await.take() {
             let _ = sender.send(());
         }
@@ -795,6 +900,102 @@ impl CodeyRuntime {
     }
 }
 
+fn preserve_cc_switch_route(state: RouteTakeoverState) -> Result<bool> {
+    if state.managed && !state.live {
+        anyhow::bail!(
+            "检测到 CC Switch 已开启 Codex 路由，但当前 Live 配置未处于接管状态。\
+             为避免 Codey 覆盖路由，已停止启动；请在 CC Switch 中关闭并重新开启 Codex 路由后重试"
+        );
+    }
+    Ok(state.live)
+}
+
+fn spawn_route_overlay_watcher(
+    home: PathBuf,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let config_path = home.join("config.toml");
+        let mut interval = tokio::time::interval(ROUTE_OVERLAY_WATCH_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let mut last_applied: Option<Vec<u8>> = None;
+        let mut pending_external: Option<Vec<u8>> = None;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
+                _ = interval.tick() => {}
+            }
+            let current = match tokio::fs::read(&config_path).await {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    pending_external = None;
+                    continue;
+                }
+                Err(error) => {
+                    error_log::record_failure(
+                        "route_overlay_watch_failed",
+                        "read_cc_switch_live_config",
+                        error.to_string(),
+                        serde_json::json!({
+                            "configPath": config_path,
+                        }),
+                    );
+                    continue;
+                }
+            };
+            if last_applied.as_deref() == Some(current.as_slice()) {
+                pending_external = None;
+                continue;
+            }
+            if pending_external.as_deref() != Some(current.as_slice()) {
+                pending_external = Some(current);
+                continue;
+            }
+
+            let reconcile_home = home.clone();
+            match tokio::task::spawn_blocking(move || {
+                reconcile_runtime_config_overlay(&reconcile_home)
+            })
+            .await
+            {
+                Ok(Ok(Some(applied))) => {
+                    last_applied = Some(applied);
+                    pending_external = None;
+                }
+                Ok(Ok(None)) => {
+                    pending_external = None;
+                }
+                Ok(Err(error)) => {
+                    error_log::record_failure(
+                        "route_overlay_watch_failed",
+                        "reapply_cc_switch_route_overlay",
+                        format!("{error:#}"),
+                        serde_json::json!({
+                            "codexHome": home,
+                        }),
+                    );
+                    eprintln!("重新应用 Codey 路由增强失败，将自动重试：{error:#}");
+                }
+                Err(error) => {
+                    error_log::record_failure(
+                        "route_overlay_watch_failed",
+                        "join_cc_switch_route_overlay_reapply",
+                        error.to_string(),
+                        serde_json::json!({
+                            "codexHome": home,
+                        }),
+                    );
+                    eprintln!("Codey 路由增强任务异常退出，将自动重试：{error}");
+                }
+            }
+        }
+    });
+    (shutdown_tx, task)
+}
+
 fn watchdog_should_reinject(consecutive_failures: &mut u8, healthy: bool) -> bool {
     if healthy {
         *consecutive_failures = 0;
@@ -847,6 +1048,34 @@ fn session_maintenance_summary(
         files_fixed: provider_sync.changed_session_files,
         sqlite_rows_updated: provider_sync.sqlite_rows_updated,
         ghost_tasks_pruned: pruned_entries,
+    }
+}
+
+#[cfg(test)]
+mod route_takeover_tests {
+    use super::*;
+
+    #[test]
+    fn managed_route_with_a_broken_live_config_blocks_startup() {
+        let error = preserve_cc_switch_route(RouteTakeoverState {
+            managed: true,
+            live: false,
+        })
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("关闭并重新开启 Codex 路由"));
+    }
+
+    #[test]
+    fn live_route_is_preserved_and_normal_config_is_not() {
+        assert!(
+            preserve_cc_switch_route(RouteTakeoverState {
+                managed: true,
+                live: true,
+            })
+            .unwrap()
+        );
+        assert!(!preserve_cc_switch_route(RouteTakeoverState::default()).unwrap());
     }
 }
 
