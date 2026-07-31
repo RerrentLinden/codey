@@ -1386,18 +1386,25 @@ mod tests {
     }
 
     #[test]
-    fn update_manifest_selects_the_current_platform_installer() {
+    fn update_manifest_selects_only_a_supported_current_platform_installer() {
         let platform = current_update_platform();
         let arch = current_update_arch();
-        let package_type = if platform == "windows" {
-            "nsis"
-        } else {
-            "app-zip"
-        };
-        let file_name = if platform == "windows" {
-            "Codey-0.2.0-windows-x64-setup.exe"
-        } else {
-            "Codey-0.2.0-macos-arm64-unsigned.zip"
+        let (package_type, file_name, expected_package_type) = match platform {
+            "windows" => (
+                "nsis",
+                format!("Codey-0.2.0-windows-{arch}-setup.exe"),
+                Some("nsis"),
+            ),
+            "macos" => (
+                "app-zip",
+                format!("Codey-0.2.0-macos-{arch}-unsigned.zip"),
+                Some("app-zip"),
+            ),
+            _ => (
+                "app-zip",
+                format!("Codey-0.2.0-{platform}-{arch}-unsupported.zip"),
+                None,
+            ),
         };
         let manifest = serde_json::from_value::<UpdateManifest>(json!({
             "schema_version": 1,
@@ -1417,7 +1424,7 @@ mod tests {
                     "platform": platform,
                     "arch": arch,
                     "package_type": package_type,
-                    "file_name": file_name,
+                    "file_name": &file_name,
                     "url": format!("https://updates.example.com/releases/v0.2.0/{file_name}"),
                     "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                     "size": 2048
@@ -1433,14 +1440,21 @@ mod tests {
                 .selected_asset
                 .as_ref()
                 .map(|asset| asset.package_type.as_str()),
-            Some(package_type)
+            expected_package_type
         );
         assert_eq!(
             result
                 .selected_asset
                 .as_ref()
                 .map(|asset| asset.arch.as_str()),
-            Some(arch)
+            expected_package_type.map(|_| arch)
+        );
+        assert_eq!(
+            result
+                .selected_asset
+                .as_ref()
+                .map(|asset| asset.file_name.as_str()),
+            expected_package_type.map(|_| file_name.as_str())
         );
     }
 
