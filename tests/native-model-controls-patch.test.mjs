@@ -528,8 +528,8 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
     assert.equal(await serviceTierRequestAllowed({}, "host"), true);
 
     // Third-party catalogs may not meet Codex's native power-selection threshold.
-    // Codey still uses the modern trigger, whose Fast indicator is filled, while
-    // model rows and model options remain free of speed-tier badges.
+    // Codey still uses the modern trigger and preserves Codex's native Fast
+    // indicators for models that expose the selected speed tier.
     const fastModelPresentationSource = [
       "const nativeModelPickerMarkers=[",
       "`composer.intelligenceDropdown.model.title`,",
@@ -565,9 +565,9 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
       "app://-/assets/codex-composer-adapter-DDUHejoe.js",
     );
     assert.match(patchedFastModelPresentation, /configEnabled=!hideLabel/);
-    assert.match(patchedFastModelPresentation, /selectedIcon=null/);
-    assert.match(patchedFastModelPresentation, /rowIcon=null/);
-    assert.match(
+    assert.doesNotMatch(patchedFastModelPresentation, /selectedIcon=null/);
+    assert.doesNotMatch(patchedFastModelPresentation, /rowIcon=null/);
+    assert.doesNotMatch(
       patchedFastModelPresentation,
       /selectedServiceTierIconKind:null,stripGptPrefix:/,
     );
@@ -594,10 +594,10 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
     );
     assert.ok(thirdPartyTrigger.modelPickerTriggerConfig);
     assert.equal(thirdPartyPresentation.kind, "solid");
-    assert.equal(thirdPartyPresentation.rowIcon, null);
-    assert.equal(thirdPartyPresentation.selectedIcon, null);
+    assert.equal(thirdPartyPresentation.rowIcon, "fast");
+    assert.equal(thirdPartyPresentation.selectedIcon, "fast");
     assert.ok(thirdPartyPresentation.options.every(
-      (option) => option.selectedServiceTierIconKind === null,
+      (option) => option.selectedServiceTierIconKind === "fast",
     ));
     assert.equal(
       nativeModelPicker.triggerConfig(true, []).modelPickerTriggerConfig,

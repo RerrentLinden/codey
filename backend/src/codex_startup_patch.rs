@@ -131,23 +131,6 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
     }
     return patched;
   };
-  const replaceRendererGates = (source, pattern, replacement, name) => {
-    let count = 0;
-    const patched = source.replace(pattern, (...args) => {
-      count += 1;
-      return typeof replacement === "function" ? replacement(...args) : replacement;
-    });
-    if (count === 0) {
-      const message =
-        `Codey skipped an incompatible Codex renderer patch: ${name} gate matched 0 times`;
-      recordCodeyPatchFailure(`renderer_patch:${name}`, message, { matchCount: count });
-      try {
-        console.error(message);
-      } catch {}
-      return source;
-    }
-    return patched;
-  };
   const patchCodexRendererAsset = (source) => {
     let patched = source;
     if (
@@ -343,21 +326,8 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
         ) => `${assignment}!${hideLabelName}`,
         "fast model trigger availability",
       );
-      // Fast is a speed selection, not a per-model badge. Remove the outlined
-      // icon from the selected-model row and every model option while leaving
-      // the trigger's separate filled Fast indicator untouched.
-      patched = replaceRendererGates(
-        patched,
-        /(\b([$A-Z_a-z][$\w]*)\s*=\s*)(?:!\s*[$A-Z_a-z][$\w]*\s*&&\s*)?([$A-Z_a-z][$\w]*)\s*!==?\s*null\s*&&\s*[$A-Z_a-z][$\w]*\s*\(\s*[$A-Z_a-z][$\w]*\s*,\s*[$A-Z_a-z][$\w]*\s*\)\s*\?\s*\3\s*:\s*null(?=[,;][\s\S]{0,8192}?serviceTierIconKind\s*:\s*\2\b)/g,
-        (_match, assignment) => `${assignment}null`,
-        "model row fast icon",
-      );
-      patched = replaceUniqueRendererGate(
-        patched,
-        /selectedServiceTierIconKind\s*:\s*[$A-Z_a-z][$\w]*\s*\?\s*null\s*:\s*[$A-Z_a-z][$\w]*\s*,\s*stripGptPrefix\s*:/g,
-        "selectedServiceTierIconKind:null,stripGptPrefix:",
-        "model list fast icons",
-      );
+      // Preserve Codex's native Fast indicators. Its own model/tier support
+      // checks already prevent them from appearing on unsupported models.
       patched = replaceUniqueRendererGate(
         patched,
         /(modelPickerTriggerConfig\s*:\s*([$A-Z_a-z][$\w]*)\s*[,}][\s\S]{0,2048}?selectedServiceTierIconKind\s*:[\s\S]{0,12288}?)if\s*\(\s*[$A-Z_a-z][$\w]*\s*&&\s*\2\s*!=\s*null\s*\)|if\s*\(\s*[$A-Z_a-z][$\w]*\s*&&\s*modelPickerTriggerConfig\s*!=\s*null\s*\)/g,
