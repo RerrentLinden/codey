@@ -525,11 +525,11 @@
         .filter((control) => control instanceof HTMLElement && control !== sectionToggle);
       const optionsControl = headerControls.find((control) => {
         const label = String(control.getAttribute("aria-label") || "").trim();
-        return /任务侧边栏选项|task sidebar options/i.test(label);
+        return /任务侧边栏选项|聊天侧边栏选项|task sidebar options|chat sidebar options/i.test(label);
       });
       const newTaskControl = headerControls.find((control) => {
         const label = String(control.getAttribute("aria-label") || "").trim();
-        return /新建任务|new task/i.test(label);
+        return /新建任务|新对话|new task|new chat/i.test(label);
       });
       if (!(optionsControl instanceof HTMLElement) || !(optionsControl.parentElement instanceof HTMLElement)) return;
       const button = document.createElement("button");
@@ -546,7 +546,7 @@
         stopSidebarActionEvent(event);
         chooseSessionImportFile("", button);
       }, true);
-      optionsControl.insertAdjacentElement("afterend", button);
+      optionsControl.insertAdjacentElement("beforebegin", button);
     });
   };
 
