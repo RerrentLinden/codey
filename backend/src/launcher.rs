@@ -1343,10 +1343,10 @@ async fn spawn_codex(
                     }),
                 );
                 error
-            })?;
+        })?;
         let inspector_arg = crate::codex_startup_patch::inspector_argument(inspector_port);
         let mut launch_arguments = vec![inspector_arg];
-        launch_arguments.extend(runtime_arguments);
+        launch_arguments.extend(runtime_arguments.iter().cloned());
         let mut spawned = spawn_windows_codex(app_dir, debug_port, &launch_arguments).await?;
         match crate::codex_startup_patch::install(inspector_port, patch_options).await {
             Ok(()) => {
