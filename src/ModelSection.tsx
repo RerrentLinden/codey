@@ -104,7 +104,10 @@ function ModelSectionComponent({
                 <small>
                   {provider.official
                     ? "官方目录"
-                    : `已发现 ${modelState.upstreamModels.length} 个上游模型`}
+                    : `已确认 ${
+                        modelState.officialModels.filter((model) => model.supported).length +
+                        modelState.thirdPartyModels.length
+                      } 个可用模型`}
                 </small>
               </div>
             </div>
@@ -186,7 +189,7 @@ function ModelSectionComponent({
               <section className="model-group">
                 <div className="model-group-title">
                   <div>
-                    <strong>三方模型</strong>
+                    <strong>其他模型</strong>
                     <small>{modelState.thirdPartyModels.length}</small>
                   </div>
                   <Badge variant="brand">API</Badge>
@@ -210,7 +213,7 @@ function ModelSectionComponent({
                         </span>
                         <div>
                           <strong>{model}</strong>
-                          <small>第三方模型</small>
+                          <small>当前线路模型</small>
                         </div>
                         <div className="catalog-model-actions">
                           {isDefault && <Badge variant="brand">默认</Badge>}
@@ -240,9 +243,9 @@ function ModelSectionComponent({
                       </span>
                       <div className="catalog-empty-copy">
                         <strong id="third-party-empty-title">
-                          尚未添加三方模型
+                          尚未添加其他模型
                         </strong>
-                        <p>当前线路还没有已选模型。</p>
+                        <p>可同步发现，也可手动输入模型 ID 添加。</p>
                       </div>
                       <Button
                         variant="secondary"
@@ -258,7 +261,7 @@ function ModelSectionComponent({
                         ) : (
                           <RefreshCw aria-hidden="true" />
                         )}
-                        {busy === "fetch-models" ? "同步中" : "同步并选择模型"}
+                        {busy === "fetch-models" ? "同步中" : "同步或手动配置"}
                       </Button>
                     </div>
                   )}

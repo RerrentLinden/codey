@@ -191,7 +191,7 @@ function FeaturePolicyCardComponent({
             <div className="feature-card-body">
               <small>
                 {config.fastContextTools
-                  ? "可显著提高模型完成任务速度和准确性"
+                  ? "优先复用已配置的 FastCtx；未配置时加载 Codey 内置工具"
                   : "保持 Codex 默认文件工具，不加载额外 MCP"}
               </small>
             </div>

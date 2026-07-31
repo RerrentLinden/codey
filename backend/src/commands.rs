@@ -22,8 +22,10 @@ use tokio::sync::{Mutex, Notify, RwLock, oneshot, watch};
 
 #[cfg(test)]
 use models::{
-    config_with_current_provider_models, renderer_model_catalog_value,
-    should_refresh_model_catalog, startup_model_sync_models_or_default, sync_cc_switch_state_with,
+    config_with_current_provider_models, preserve_selected_third_party_models,
+    renderer_model_catalog_value, should_refresh_model_catalog,
+    startup_model_sync_models_or_fallback, sync_cc_switch_state_with,
+    validate_manual_model_selection,
 };
 use models::{
     current_model_state, current_renderer_model_catalog, sync_provider_models_for_launch,
@@ -426,9 +428,14 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "sync_current_provider" => sync_current_provider_command(state).await,
         "sync_official_experimental_features" => sync_official_experimental_features(state).await,
         "fetch_current_provider_models" => fetch_current_provider_models(state).await,
-        "save_selected_models" => match argument::<Vec<String>>(&args, "models") {
-            Ok(models) => save_selected_models(state, models).await,
-            Err(error) => Err(error),
+        "save_selected_models" => match (
+            argument::<Vec<String>>(&args, "officialModels"),
+            argument::<Vec<String>>(&args, "thirdPartyModels"),
+        ) {
+            (Ok(official_models), Ok(third_party_models)) => {
+                save_selected_models(state, official_models, third_party_models).await
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
         },
         "save_default_model" => match string_argument(&args, "model") {
             Ok(model) => save_default_model(state, model).await,
@@ -975,7 +982,7 @@ mod restart_tests {
             .default_model_by_provider
             .insert(provider_id, "provider-fast-coder".into());
         let expected = model_catalog::default_official_model_slugs();
-        let (fallback_models, synced) = startup_model_sync_models_or_default(Vec::new());
+        let (fallback_models, synced) = startup_model_sync_models_or_fallback(Vec::new(), None);
         assert!(!synced);
         assert_eq!(fallback_models, expected);
         let fallback = config_with_current_provider_models(&config, fallback_models);
@@ -1001,6 +1008,62 @@ mod restart_tests {
         );
         assert!(state.third_party_models.is_empty());
         assert_eq!(state.default_model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn failed_startup_model_sync_preserves_a_saved_manual_selection() {
+        let saved = vec!["gpt-5.6-luna".into(), "provider-manual-model".into()];
+
+        let (fallback_models, synced) =
+            startup_model_sync_models_or_fallback(Vec::new(), Some(&saved));
+
+        assert!(!synced);
+        assert_eq!(fallback_models, saved);
+    }
+
+    #[test]
+    fn successful_model_sync_preserves_user_confirmed_other_models() {
+        let merged = preserve_selected_third_party_models(
+            vec!["gpt-5.6-sol".into(), "provider-listed".into()],
+            &[
+                "provider-manual".into(),
+                "provider-listed".into(),
+                "gpt-5.4".into(),
+            ],
+        );
+
+        assert_eq!(
+            merged,
+            ["gpt-5.6-sol", "provider-listed", "provider-manual",]
+        );
+    }
+
+    #[test]
+    fn manual_model_selection_separates_official_and_other_models() {
+        let official = model_catalog::default_official_model_slugs();
+
+        let (supported_official, selected_third_party) = validate_manual_model_selection(
+            &official,
+            &["gpt-5.6-luna".into(), "gpt-5.4".into()],
+            &[
+                " provider-manual-model ".into(),
+                "provider-manual-model".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(supported_official, ["gpt-5.6-luna", "gpt-5.4"]);
+        assert_eq!(selected_third_party, ["provider-manual-model"]);
+    }
+
+    #[test]
+    fn manual_model_selection_rejects_official_models_in_the_other_model_input() {
+        let official = model_catalog::default_official_model_slugs();
+
+        let error =
+            validate_manual_model_selection(&official, &[], &[" GPT-5.6-SOL ".into()]).unwrap_err();
+
+        assert!(error.contains("已在官方模型列表中"));
     }
 }
 

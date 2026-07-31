@@ -656,14 +656,21 @@ fn restore_legacy_owned_config_changes(
         .get("developer_instructions")
         .and_then(Item::as_str)
         .unwrap_or_default();
-    if !original_guidance.contains(LEGACY_CODEY_FASTCTX_GUIDANCE)
-        && current_guidance.contains(LEGACY_CODEY_FASTCTX_GUIDANCE)
-    {
-        let applied_guidance = if original_guidance.trim().is_empty() {
-            LEGACY_CODEY_FASTCTX_GUIDANCE.to_string()
+    let mut applied_guidance = original_guidance.to_string();
+    let mut fastctx_guidance_was_applied = false;
+    for guidance in [CODEY_FASTCTX_GUIDANCE, LEGACY_CODEY_FASTCTX_GUIDANCE] {
+        if original_guidance.contains(guidance) || !current_guidance.contains(guidance) {
+            continue;
+        }
+        if applied_guidance.trim().is_empty() {
+            applied_guidance = guidance.to_string();
         } else {
-            format!("{original_guidance}\n\n{LEGACY_CODEY_FASTCTX_GUIDANCE}")
-        };
+            applied_guidance.push_str("\n\n");
+            applied_guidance.push_str(guidance);
+        }
+        fastctx_guidance_was_applied = true;
+    }
+    if fastctx_guidance_was_applied {
         applied_document["developer_instructions"] = value(applied_guidance);
     }
 
@@ -877,6 +884,11 @@ fn restore_fastctx_owned_value(
             let Some(current) = current else {
                 return false;
             };
+            let Some(text) = current.as_str() else {
+                return false;
+            };
+            let mut restored = text.to_string();
+            let mut changed = false;
             for guidance in [CODEY_FASTCTX_GUIDANCE, LEGACY_CODEY_FASTCTX_GUIDANCE] {
                 let original_has_guidance = original
                     .and_then(Item::as_str)
@@ -887,23 +899,16 @@ fn restore_fastctx_owned_value(
                 if original_has_guidance || !applied_has_guidance {
                     continue;
                 }
-                let Some(text) = current.as_str() else {
-                    return false;
-                };
-                let separator_and_guidance = format!("\n\n{guidance}");
-                let restored = if text.contains(&separator_and_guidance) {
-                    text.replacen(&separator_and_guidance, "", 1)
-                } else if let Some(remainder) = text.strip_prefix(guidance) {
-                    remainder.trim_start_matches('\n').to_string()
-                } else if text.contains(guidance) {
-                    text.replacen(guidance, "", 1)
-                } else {
-                    continue;
-                };
-                *current = value(restored);
-                return true;
+                while let Some(without_guidance) = remove_owned_guidance_block(&restored, guidance)
+                {
+                    restored = without_guidance;
+                    changed = true;
+                }
             }
-            false
+            if changed {
+                *current = value(restored);
+            }
+            changed
         }
         _ => false,
     }
@@ -1053,10 +1058,21 @@ fn patch_config_with_fastctx(
     let mut doc = parse_document(existing)?;
     ensure_provider_table(&mut doc)?;
     let provider_id = normalized_provider_id(provider_id);
+    let existing_local_provider = profile
+        .cc_switch_provider_id
+        .is_none()
+        .then(|| {
+            doc.get("model_providers")
+                .and_then(Item::as_table)
+                .and_then(|providers| providers.get(&provider_id))
+                .and_then(Item::as_table)
+                .cloned()
+        })
+        .flatten();
     let provider = if profile.cc_switch_read_only {
         official_provider_table()
     } else {
-        direct_provider_table(profile)?
+        direct_provider_table(profile, existing_local_provider)?
     };
     doc["model_providers"]
         .as_table_mut()
@@ -1072,6 +1088,8 @@ fn patch_config_with_fastctx(
     set_model_selection(&mut doc, default_model);
     if let Some(command) = fastctx_command {
         enable_fast_context_tools(&mut doc, command)?;
+    } else {
+        disable_fast_context_tools(&mut doc);
     }
     if subagent_optimization {
         enable_subagent_optimization(&mut doc)?;
@@ -1099,6 +1117,10 @@ fn enable_subagent_optimization(doc: &mut DocumentMut) -> Result<()> {
 }
 
 fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()> {
+    if has_configured_fastctx_server(doc) {
+        return Ok(());
+    }
+
     let mcp_servers = ensure_root_table(doc, "mcp_servers")?;
     let mut server = Table::new();
     server["command"] = value(command.to_string_lossy().to_string());
@@ -1157,19 +1179,172 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()
     Ok(())
 }
 
-fn direct_provider_table(profile: &ProviderProfile) -> Result<Table> {
+fn disable_fast_context_tools(doc: &mut DocumentMut) {
+    let codey_owned_server_removed =
+        if let Some(mcp_servers) = doc.get_mut("mcp_servers").and_then(Item::as_table_mut) {
+            let codey_owned_server = mcp_servers
+                .get(CODEY_FASTCTX_SERVER_ID)
+                .and_then(Item::as_table)
+                .is_some_and(legacy_fastctx_server_is_codey_owned);
+            if codey_owned_server {
+                mcp_servers.remove(CODEY_FASTCTX_SERVER_ID);
+            }
+            codey_owned_server
+        } else {
+            false
+        };
+
+    let existing_guidance = doc
+        .get("developer_instructions")
+        .and_then(Item::as_str)
+        .map(ToString::to_string);
+    let restored_guidance =
+        existing_guidance.and_then(|guidance| remove_codey_fastctx_guidance(&guidance));
+    let codey_guidance_removed = restored_guidance.is_some();
+    if let Some(restored_guidance) = restored_guidance {
+        if restored_guidance.trim().is_empty() {
+            doc.as_table_mut().remove("developer_instructions");
+        } else {
+            doc["developer_instructions"] = value(restored_guidance);
+        }
+    }
+
+    let reserved_server_remains = doc
+        .get("mcp_servers")
+        .and_then(Item::as_table)
+        .is_some_and(|mcp_servers| mcp_servers.contains_key(CODEY_FASTCTX_SERVER_ID));
+    if (codey_owned_server_removed || codey_guidance_removed)
+        && !reserved_server_remains
+        && let Some(namespaces) = doc
+            .get_mut("features")
+            .and_then(Item::as_table_mut)
+            .and_then(|features| features.get_mut("code_mode"))
+            .and_then(Item::as_table_mut)
+            .and_then(|code_mode| code_mode.get_mut("direct_only_tool_namespaces"))
+            .and_then(Item::as_array_mut)
+    {
+        loop {
+            let index = namespaces
+                .iter()
+                .position(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE));
+            let Some(index) = index else {
+                break;
+            };
+            namespaces.remove(index);
+        }
+    }
+}
+
+fn has_configured_fastctx_server(doc: &DocumentMut) -> bool {
+    let Some(mcp_servers) = doc.get("mcp_servers").and_then(Item::as_table) else {
+        return false;
+    };
+
+    mcp_servers.iter().any(|(server_id, server)| {
+        mentions_fastctx(server_id)
+            || server.as_table().is_some_and(|server| {
+                server
+                    .get("command")
+                    .and_then(Item::as_str)
+                    .is_some_and(mentions_fastctx)
+                    || server
+                        .get("args")
+                        .and_then(Item::as_array)
+                        .is_some_and(|arguments| {
+                            arguments
+                                .iter()
+                                .filter_map(toml_edit::Value::as_str)
+                                .any(mentions_fastctx)
+                        })
+            })
+            || matches!(
+                server,
+                Item::Value(Value::InlineTable(server))
+                    if server
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(mentions_fastctx)
+                        || server
+                            .get("args")
+                            .and_then(Value::as_array)
+                            .is_some_and(|arguments| {
+                                arguments
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .any(mentions_fastctx)
+                            })
+            )
+    })
+}
+
+fn mentions_fastctx(value: &str) -> bool {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| part.eq_ignore_ascii_case("fastctx"))
+}
+
+fn remove_codey_fastctx_guidance(current: &str) -> Option<String> {
+    let mut restored = current.to_string();
+    let mut changed = false;
+    for guidance in [CODEY_FASTCTX_GUIDANCE, LEGACY_CODEY_FASTCTX_GUIDANCE] {
+        while let Some(without_guidance) = remove_guidance_paragraph(&restored, guidance) {
+            restored = without_guidance;
+            changed = true;
+        }
+    }
+    changed.then_some(restored)
+}
+
+fn remove_owned_guidance_block(current: &str, guidance: &str) -> Option<String> {
+    let guidance_start = current.find(guidance)?;
+    Some(remove_guidance_at(current, guidance_start, guidance.len()))
+}
+
+fn remove_guidance_paragraph(current: &str, guidance: &str) -> Option<String> {
+    let guidance_start = current.match_indices(guidance).find_map(|(start, _)| {
+        let end = start + guidance.len();
+        let starts_paragraph = start == 0 || current[..start].ends_with("\n\n");
+        let ends_paragraph = end == current.len() || current[end..].starts_with("\n\n");
+        (starts_paragraph && ends_paragraph).then_some(start)
+    })?;
+    Some(remove_guidance_at(current, guidance_start, guidance.len()))
+}
+
+fn remove_guidance_at(current: &str, guidance_start: usize, guidance_len: usize) -> String {
+    let guidance_end = guidance_start + guidance_len;
+    let (owned_start, owned_end) = if current[..guidance_start].ends_with("\n\n") {
+        (guidance_start - 2, guidance_end)
+    } else if current[guidance_end..].starts_with("\n\n") {
+        (guidance_start, guidance_end + 2)
+    } else if current[..guidance_start].ends_with('\n') {
+        (guidance_start - 1, guidance_end)
+    } else if current[guidance_end..].starts_with('\n') {
+        (guidance_start, guidance_end + 1)
+    } else {
+        (guidance_start, guidance_end)
+    };
+    format!("{}{}", &current[..owned_start], &current[owned_end..])
+}
+
+fn direct_provider_table(
+    profile: &ProviderProfile,
+    existing_local_provider: Option<Table>,
+) -> Result<Table> {
     let base_url = profile.normalized_base_url();
     if base_url.is_empty() {
         anyhow::bail!("第三方线路缺少 API 地址");
     }
-    let mut provider = Table::new();
+    let preserves_manual_settings = existing_local_provider.is_some();
+    let mut provider = existing_local_provider.unwrap_or_default();
     provider["name"] = value(profile.name.trim());
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value(match profile.protocol {
         RelayProtocol::Responses => "responses",
         RelayProtocol::ChatCompletions => "chat",
     });
-    provider["requires_openai_auth"] = value(true);
+    if !preserves_manual_settings {
+        provider["requires_openai_auth"] = value(true);
+    }
     if !profile.api_key.trim().is_empty() {
         provider["experimental_bearer_token"] = value(profile.api_key.trim());
     }
@@ -1561,7 +1736,7 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
     }
 
     #[test]
-    fn fast_context_tools_register_the_embedded_server_without_overwriting_user_fastctx() {
+    fn fast_context_tools_reuse_user_fastctx_without_registering_the_embedded_server() {
         let existing = r#"
 developer_instructions = "Keep my guidance."
 tool_output_token_limit = 16000
@@ -1571,7 +1746,7 @@ command = "/custom/fastctx"
 args = ["serve", "--enable-shell"]
 
 [features.code_mode]
-direct_only_tool_namespaces = ["mcp__existing"]
+direct_only_tool_namespaces = ["mcp__existing", "mcp__fastctx"]
 "#;
         let result = patch_config_with_fastctx(
             existing,
@@ -1589,18 +1764,12 @@ direct_only_tool_namespaces = ["mcp__existing"]
             document["mcp_servers"]["fastctx"]["command"].as_str(),
             Some("/custom/fastctx")
         );
-        assert_eq!(
-            document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]["command"].as_str(),
-            Some("/Applications/Codey.app/Contents/MacOS/codey")
-        );
-        assert_eq!(
-            document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]["args"][0].as_str(),
-            Some("--codey-fastctx-mcp")
-        );
-        assert_eq!(
-            document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]["env"]["FASTCTX_TOKEN_BUDGET"]
-                .as_str(),
-            Some(CODEY_FASTCTX_TOKEN_BUDGET)
+        assert!(
+            document["mcp_servers"]
+                .as_table()
+                .unwrap()
+                .get(CODEY_FASTCTX_SERVER_ID)
+                .is_none()
         );
         assert_eq!(
             document["tool_output_token_limit"].as_integer(),
@@ -1612,14 +1781,239 @@ direct_only_tool_namespaces = ["mcp__existing"]
         assert!(
             namespaces
                 .iter()
-                .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
+                .any(|entry| entry.as_str() == Some("mcp__fastctx"))
+        );
+        assert!(
+            namespaces
+                .iter()
+                .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE))
         );
         let guidance = document["developer_instructions"].as_str().unwrap();
-        assert!(guidance.starts_with("Keep my guidance."));
-        assert!(guidance.contains(CODEY_FASTCTX_GUIDANCE));
-        assert!(guidance.contains("always use `mcp__codey_fastctx__read`"));
-        assert!(guidance.contains("Do not use cat, sed, rg, grep, find, or recursive ls"));
-        assert!(guidance.contains("Use exec only for builds, tests, Git, package managers"));
+        assert_eq!(guidance, "Keep my guidance.");
+        assert!(!guidance.contains(CODEY_FASTCTX_GUIDANCE));
+    }
+
+    #[test]
+    fn fast_context_tools_detect_fastctx_invoked_by_another_server_id() {
+        let existing = r#"
+[mcp_servers.context_tools]
+command = "uvx"
+args = ["fastctx", "--stdio"]
+"#;
+        let result = patch_config_with_fastctx(
+            existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            Some(Path::new("/tmp/codey")),
+            false,
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+
+        assert!(
+            document["mcp_servers"]
+                .as_table()
+                .unwrap()
+                .get(CODEY_FASTCTX_SERVER_ID)
+                .is_none()
+        );
+        assert!(document.get("developer_instructions").is_none());
+        assert!(document.get("tool_output_token_limit").is_none());
+    }
+
+    #[test]
+    fn fast_context_tools_detect_fastctx_in_the_command_case_insensitively() {
+        let existing = r#"
+[mcp_servers]
+context_tools = { command = "/opt/tools/FASTCTX.exe", args = ["--stdio"] }
+"#;
+        let result = patch_config_with_fastctx(
+            existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            Some(Path::new("/tmp/codey")),
+            false,
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+
+        assert!(
+            document["mcp_servers"]
+                .as_table()
+                .unwrap()
+                .get(CODEY_FASTCTX_SERVER_ID)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn fast_context_tools_do_not_confuse_fastctx_substrings_with_the_server() {
+        let existing = r#"
+[mcp_servers.breakfastctx]
+command = "/custom/breakfastctx"
+"#;
+        let result = patch_config_with_fastctx(
+            existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            Some(Path::new("/tmp/codey")),
+            false,
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+
+        assert_eq!(
+            document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]["command"].as_str(),
+            Some("/tmp/codey")
+        );
+    }
+
+    #[test]
+    fn disabling_fast_context_tools_removes_only_codey_owned_artifacts() {
+        let original = r#"
+developer_instructions = "User guidance."
+tool_output_token_limit = 16000
+
+[mcp_servers.user_tools]
+command = "/custom/context-server"
+
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__existing"]
+"#;
+        let enabled = patch_config_with_fastctx(
+            original,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            Some(Path::new("/tmp/codey")),
+            false,
+        )
+        .unwrap();
+        let mut stale = enabled.parse::<DocumentMut>().unwrap();
+        let guidance = stale["developer_instructions"].as_str().unwrap();
+        stale["developer_instructions"] = value(format!(
+            "{guidance}\n\n{LEGACY_CODEY_FASTCTX_GUIDANCE}\n\nConcurrent guidance."
+        ));
+
+        let disabled = patch_config_with_fastctx(
+            &document_string(&stale).unwrap(),
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let document = disabled.parse::<DocumentMut>().unwrap();
+
+        let mcp_servers = document["mcp_servers"].as_table().unwrap();
+        assert!(mcp_servers.get(CODEY_FASTCTX_SERVER_ID).is_none());
+        assert_eq!(
+            mcp_servers["user_tools"]["command"].as_str(),
+            Some("/custom/context-server")
+        );
+        assert_eq!(
+            document["developer_instructions"].as_str(),
+            Some("User guidance.\n\nConcurrent guidance.")
+        );
+        assert_eq!(
+            document["tool_output_token_limit"].as_integer(),
+            Some(16_000)
+        );
+        let namespaces = document["features"]["code_mode"]["direct_only_tool_namespaces"]
+            .as_array()
+            .unwrap();
+        assert_eq!(
+            namespaces
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["mcp__existing"]
+        );
+    }
+
+    #[test]
+    fn disabling_fast_context_tools_preserves_a_user_replacement_under_the_reserved_id() {
+        let existing = format!(
+            r#"developer_instructions = "{CODEY_FASTCTX_GUIDANCE}"
+
+[mcp_servers.codey_fastctx]
+command = "/user/server"
+args = ["serve"]
+
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__codey_fastctx"]
+"#
+        );
+        let disabled = patch_config_with_fastctx(
+            &existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let document = disabled.parse::<DocumentMut>().unwrap();
+
+        assert_eq!(
+            document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]["command"].as_str(),
+            Some("/user/server")
+        );
+        assert!(document.get("developer_instructions").is_none());
+        assert!(
+            document["features"]["code_mode"]["direct_only_tool_namespaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
+        );
+    }
+
+    #[test]
+    fn disabling_fast_context_tools_preserves_an_unproven_user_namespace() {
+        let existing = r#"
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__codey_fastctx", "mcp__user"]
+"#;
+        let disabled = patch_config_with_fastctx(
+            existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let document = disabled.parse::<DocumentMut>().unwrap();
+        let namespaces = document["features"]["code_mode"]["direct_only_tool_namespaces"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(
+            namespaces
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["mcp__codey_fastctx", "mcp__user"]
+        );
+    }
+
+    #[test]
+    fn fastctx_guidance_cleanup_requires_complete_paragraph_boundaries() {
+        let embedded = format!("User prefix {CODEY_FASTCTX_GUIDANCE} user suffix");
+
+        assert_eq!(remove_codey_fastctx_guidance(&embedded), None);
     }
 
     #[test]
@@ -1934,6 +2328,103 @@ custom_setting = "preserved"
     }
 
     #[test]
+    fn first_direct_runtime_lease_preserves_chatgpt_auth_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"free-account-token"}}"#;
+        fs::write(home.join("auth.json"), auth).unwrap();
+
+        apply_runtime_provider_config_at(
+            &home,
+            &direct_profile(RelayProtocol::Responses),
+            GLOBAL_PROVIDER_ID,
+            false,
+            None,
+            None,
+            false,
+            &marker,
+            &backup_root,
+        )
+        .unwrap();
+
+        let temporary = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(
+            provider_base_url(&temporary, GLOBAL_PROVIDER_ID).as_deref(),
+            Some("https://relay.example/v1")
+        );
+        assert!(temporary.contains("experimental_bearer_token = \"sk-direct\""));
+        assert!(!temporary.contains("base_url = \"https://chatgpt.com/backend-api/codex\""));
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+
+        assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+        assert!(!home.join("config.toml").exists());
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+    }
+
+    #[test]
+    fn manual_local_provider_settings_survive_the_runtime_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        let original = br#"model_provider = "manual"
+
+[model_providers.manual]
+name = "Manual Relay"
+base_url = "https://manual.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+env_key = "MANUAL_RELAY_API_KEY"
+request_max_retries = 7
+
+[model_providers.manual.http_headers]
+X-Route = "manual"
+"#;
+        let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"free-account-token"}}"#;
+        fs::write(home.join("config.toml"), original).unwrap();
+        fs::write(home.join("auth.json"), auth).unwrap();
+        let mut profile = ProviderProfile::new("Manual Relay");
+        profile.id = "manual".to_string();
+        profile.base_url = "https://manual.example/v1".to_string();
+
+        apply_runtime_provider_config_at(
+            &home,
+            &profile,
+            "manual",
+            false,
+            None,
+            None,
+            false,
+            &marker,
+            &backup_root,
+        )
+        .unwrap();
+
+        let temporary = fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let provider = temporary["model_providers"]["manual"].as_table().unwrap();
+        assert_eq!(
+            provider["base_url"].as_str(),
+            Some("https://manual.example/v1")
+        );
+        assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+        assert_eq!(provider["env_key"].as_str(), Some("MANUAL_RELAY_API_KEY"));
+        assert_eq!(provider["request_max_retries"].as_integer(), Some(7));
+        assert_eq!(provider["http_headers"]["X-Route"].as_str(), Some("manual"));
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+
+        assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+    }
+
+    #[test]
     fn legacy_lease_reverts_owned_fields_without_overwriting_concurrent_config() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
@@ -1971,7 +2462,7 @@ direct_only_tool_namespaces = ["mcp__existing"]
             r#"model_provider = "codey_global"
 model_catalog_json = "model-catalogs/codey-official.json"
 profile = "work"
-developer_instructions = "Original guidance\n\n{LEGACY_CODEY_FASTCTX_GUIDANCE}\n\nConcurrent guidance"
+developer_instructions = "Original guidance\n\n{LEGACY_CODEY_FASTCTX_GUIDANCE}\n\n{CODEY_FASTCTX_GUIDANCE}\n\nConcurrent guidance"
 tool_output_token_limit = 10000
 approval_policy = "never"
 service_tier = "fast"

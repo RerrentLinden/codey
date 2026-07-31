@@ -9,7 +9,7 @@ use directories::BaseDirs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::config::{CodeyConfig, ProviderProfile};
 
@@ -225,19 +225,29 @@ fn provider_connection(record: &ProviderRecord) -> Result<ProviderConnection> {
         .and_then(Item::as_str)
         .unwrap_or("responses");
     let auth = settings.get("auth").and_then(Value::as_object);
-    let api_key = auth
+    let auth_api_key = auth
         .and_then(|auth| auth.get("OPENAI_API_KEY"))
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let config_api_key = provider_config_api_key(&document, provider_table);
+    // CC Switch keeps the canonical provider key in auth.OPENAI_API_KEY, but
+    // its "keep official login" compatibility mode may leave ChatGPT OAuth in
+    // auth.json and put the active third-party token in config.toml instead.
+    let api_key = auth_api_key
+        .map(ToString::to_string)
+        .or(config_api_key)
+        .unwrap_or_default();
     let auth_mode = auth
         .and_then(|auth| auth.get("auth_mode"))
         .and_then(Value::as_str);
+    let official_auth_route =
+        auth_mode == Some("chatgpt") && is_official_base_url(&base_url) && api_key.is_empty();
     let official = record.id == OFFICIAL_PROVIDER_ID
         || record.category.as_deref() == Some("official")
-        || auth_mode == Some("chatgpt")
         || provider_key.is_empty()
-        || base_url.is_empty();
+        || base_url.is_empty()
+        || official_auth_route;
     if !(official || base_url.starts_with("http://") || base_url.starts_with("https://")) {
         bail!("cc-switch 当前第三方线路缺少有效的 API 地址");
     }
@@ -295,15 +305,19 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         .as_ref()
         .and_then(|auth| auth.get("auth_mode"))
         .and_then(Value::as_str);
-    let api_key = auth
+    let auth_api_key = auth
         .as_ref()
         .and_then(|auth| auth.get("OPENAI_API_KEY"))
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
-    let official_endpoint = base_url.is_empty()
-        || base_url.contains("chatgpt.com/backend-api/codex")
-        || base_url.contains("api.openai.com");
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let config_api_key = provider_config_api_key(&document, table);
+    // The provider-scoped token describes the active live route and must win
+    // over a long-lived auth.json login retained by CC Switch.
+    let api_key = config_api_key
+        .or_else(|| auth_api_key.map(ToString::to_string))
+        .unwrap_or_default();
+    let official_endpoint = base_url.is_empty() || is_official_base_url(&base_url);
     let official = official_endpoint && (auth_mode == Some("chatgpt") || api_key.is_empty());
     if !official && base_url.is_empty() {
         base_url = "https://api.openai.com/v1".to_string();
@@ -327,6 +341,39 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         source: "local".to_string(),
     };
     Ok((provider, if official { String::new() } else { api_key }))
+}
+
+fn provider_config_api_key(
+    document: &DocumentMut,
+    provider: Option<&dyn TableLike>,
+) -> Option<String> {
+    const PROVIDER_KEYS: &[&str] = &[
+        "experimental_bearer_token",
+        "api_key",
+        "apikey",
+        "bearer_token",
+        "token",
+    ];
+    PROVIDER_KEYS
+        .iter()
+        .find_map(|key| {
+            provider
+                .and_then(|provider| provider.get(key))
+                .and_then(Item::as_str)
+        })
+        .or_else(|| {
+            document
+                .get("experimental_bearer_token")
+                .and_then(Item::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn is_official_base_url(base_url: &str) -> bool {
+    let base_url = base_url.to_ascii_lowercase();
+    base_url.contains("chatgpt.com/backend-api/codex") || base_url.contains("api.openai.com")
 }
 
 fn protocol_from_wire_api(value: &str) -> RelayProtocol {
@@ -426,6 +473,57 @@ mod tests {
     }
 
     #[test]
+    fn preserved_chatgpt_login_does_not_replace_a_cc_switch_api_route() {
+        let (_directory, path, home) = fixture();
+        let settings = json!({
+            "auth": {
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": "free-account-token"}
+            },
+            "config": r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "sk-relay"
+"#
+        });
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO providers
+                 (id, app_type, name, settings_config, sort_index, is_current)
+                 VALUES ('route-a', 'codex', '线路 A', ?1, 0, 1)",
+                [settings.to_string()],
+            )
+            .unwrap();
+        let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"free-account-token"}}"#;
+        fs::write(home.join("auth.json"), auth).unwrap();
+
+        let (synced, status) =
+            sync_current_provider_from_paths(&CodeyConfig::default(), &path, &home).unwrap();
+
+        assert!(!status.provider.official);
+        assert_eq!(status.provider.base_url, "https://relay.example/v1");
+        assert_eq!(synced.profiles[0].api_key, "sk-relay");
+        assert!(!synced.profiles[0].cc_switch_read_only);
+        let patched = crate::codex_config::patch_config(
+            "model_provider = \"custom\"\n",
+            &synced.profiles[0],
+            "custom",
+            false,
+        )
+        .unwrap();
+        assert!(patched.contains("base_url = \"https://relay.example/v1\""));
+        assert!(patched.contains("experimental_bearer_token = \"sk-relay\""));
+        assert!(!patched.contains("base_url = \"https://chatgpt.com/backend-api/codex\""));
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+    }
+
+    #[test]
     fn falls_back_to_local_official_login_without_cc_switch() {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("codex-home");
@@ -447,6 +545,98 @@ mod tests {
         assert!(status.provider.official);
         assert_eq!(status.provider.source, "local");
         assert!(synced.profiles[0].api_key.is_empty());
+    }
+
+    #[test]
+    fn local_api_route_uses_provider_token_while_preserving_chatgpt_login() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "Relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "sk-provider"
+"#,
+        )
+        .unwrap();
+        let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"free-account-token"}}"#;
+        fs::write(home.join("auth.json"), auth).unwrap();
+
+        let (synced, status) = sync_current_provider_from_paths(
+            &CodeyConfig::default(),
+            &directory.path().join("missing.db"),
+            &home,
+        )
+        .unwrap();
+
+        assert!(!status.available);
+        assert!(!status.provider.official);
+        assert_eq!(status.provider.base_url, "https://relay.example/v1");
+        assert_eq!(synced.profiles[0].api_key, "sk-provider");
+        let patched = crate::codex_config::patch_config(
+            "model_provider = \"custom\"\n",
+            &synced.profiles[0],
+            "custom",
+            false,
+        )
+        .unwrap();
+        assert!(patched.contains("base_url = \"https://relay.example/v1\""));
+        assert!(patched.contains("experimental_bearer_token = \"sk-provider\""));
+        assert!(!patched.contains("base_url = \"https://chatgpt.com/backend-api/codex\""));
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+    }
+
+    #[test]
+    fn manual_api_route_reads_auth_json_api_key_without_cc_switch() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"
+model_provider = "manual"
+
+[model_providers.manual]
+name = "Manual Relay"
+base_url = "https://manual.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#,
+        )
+        .unwrap();
+        let auth = br#"{"OPENAI_API_KEY":"sk-manual"}"#;
+        fs::write(home.join("auth.json"), auth).unwrap();
+
+        let (synced, status) = sync_current_provider_from_paths(
+            &CodeyConfig::default(),
+            &directory.path().join("missing.db"),
+            &home,
+        )
+        .unwrap();
+
+        assert!(!status.available);
+        assert!(!status.provider.official);
+        assert_eq!(status.provider.source, "local");
+        assert_eq!(status.provider.base_url, "https://manual.example/v1");
+        assert_eq!(synced.profiles[0].api_key, "sk-manual");
+        let patched = crate::codex_config::patch_config(
+            "model_provider = \"manual\"\n",
+            &synced.profiles[0],
+            "manual",
+            false,
+        )
+        .unwrap();
+        assert!(patched.contains("base_url = \"https://manual.example/v1\""));
+        assert!(patched.contains("experimental_bearer_token = \"sk-manual\""));
+        assert!(!patched.contains("base_url = \"https://chatgpt.com/backend-api/codex\""));
+        assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
     }
 
     #[test]

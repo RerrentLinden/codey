@@ -18,7 +18,7 @@ test("FastCtx optimization is opt-in and exposed through the settings switch", a
   assert.match(commandSource, /config\.fast_context_tools = config_input\.fast_context_tools/);
   assert.match(uiSource, /checked=\{config\.fastContextTools\}/);
   assert.match(uiSource, /aria-label="启用 FastCtx 上下文工具"/);
-  assert.match(uiSource, /可显著提高模型完成任务速度和准确性/);
+  assert.match(uiSource, /优先复用已配置的 FastCtx；未配置时加载 Codey 内置工具/);
   assert.doesNotMatch(uiSource, /下次启动提供分页读取、搜索、文件发现与批量替换/);
 });
 

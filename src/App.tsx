@@ -175,15 +175,16 @@ export function App({
     setModelState,
     modelPickerVisible,
     setModelPickerVisible,
-    modelQuery,
-    setModelQuery,
-    setDraftModels,
-    officialSlugs,
+    customModelInput,
+    modelInputError,
+    modelSyncWarning,
     draftModelSet,
-    filteredUpstreamModels,
+    thirdPartyModelOptions,
     fetchCurrentModels,
     updateSubagentOptimization,
     toggleDraftModel,
+    updateCustomModelInput,
+    addCustomModel,
     saveModelSelection,
     setDefaultModel,
   } = useModelSelection({
@@ -603,6 +604,8 @@ export function App({
   const handleModelPickerOpenChange = useStableEvent((open: boolean) => {
     if (!isBusy || open) setModelPickerVisible(open);
   });
+  const handleCustomModelInputChange = useStableEvent(updateCustomModelInput);
+  const handleAddCustomModel = useStableEvent(addCustomModel);
   const handleToggleDraftModel = useStableEvent(toggleDraftModel);
   const handleSaveModelSelection = useStableEvent(
     () => void saveModelSelection(),
@@ -871,14 +874,15 @@ export function App({
         isBusy={isBusy}
         busy={busy}
         container={portalContainer}
-        modelQuery={modelQuery}
-        filteredUpstreamModels={filteredUpstreamModels}
+        customModelInput={customModelInput}
+        modelInputError={modelInputError}
+        modelSyncWarning={modelSyncWarning}
+        thirdPartyModelOptions={thirdPartyModelOptions}
         modelState={modelState}
-        officialSlugs={officialSlugs}
         draftModelSet={draftModelSet}
         onOpenChange={handleModelPickerOpenChange}
-        onModelQueryChange={setModelQuery}
-        onDraftModelsChange={setDraftModels}
+        onCustomModelInputChange={handleCustomModelInputChange}
+        onAddCustomModel={handleAddCustomModel}
         onToggleDraftModel={handleToggleDraftModel}
         onSave={handleSaveModelSelection}
       />

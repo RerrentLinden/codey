@@ -221,14 +221,6 @@ pub fn effective_default_model(
         .unwrap_or_default()
 }
 
-pub fn official_model_slugs(home: &Path) -> Result<HashSet<String>> {
-    Ok(read_official_entries(home)?
-        .iter()
-        .filter_map(|model| model.get("slug").and_then(Value::as_str))
-        .map(ToString::to_string)
-        .collect())
-}
-
 pub fn is_available(home: &Path) -> bool {
     read_catalog_value(&home.join(relative_path())).is_some_and(|value| {
         let models = catalog_models_from_value(&value);

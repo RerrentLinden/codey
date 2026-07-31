@@ -107,9 +107,10 @@ if (import.meta.env.DEV) {
       },
     };
     let previewModelState = {
-      officialModels: previewOfficialModels
-        .filter((model) => previewUpstreamModels.includes(model.slug))
-        .map((model) => ({ ...model, supported: true })),
+      officialModels: previewOfficialModels.map((model) => ({
+        ...model,
+        supported: previewUpstreamModels.includes(model.slug),
+      })),
       officialModelIds: previewOfficialModels.map((model) => model.slug),
       thirdPartyModels: ["provider-fast-coder", "claude-sonnet-4-5"],
       upstreamModels: previewUpstreamModels,
@@ -281,6 +282,17 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "fetch_current_provider_models") {
+        previewModelState = {
+          ...previewModelState,
+          officialModels: previewOfficialModels.map((model) => ({
+            ...model,
+            supported: previewUpstreamModels.includes(model.slug),
+          })),
+          thirdPartyModels: previewModelState.thirdPartyModels.filter((model) =>
+            previewUpstreamModels.includes(model)
+          ),
+          upstreamModels: previewUpstreamModels,
+        };
         return {
           status: "ok",
           models: previewUpstreamModels,
@@ -289,16 +301,33 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "save_selected_models") {
-        const requested = new Set(args.models as string[]);
+        const officialModels = (args.officialModels as string[]) || [];
+        const thirdPartyModels = (args.thirdPartyModels as string[]) || [];
+        const requestedOfficial = new Set(officialModels);
+        const supportedModels = [...officialModels, ...thirdPartyModels];
+        previewConfig = {
+          ...previewConfig,
+          selectedModelsByProvider: {
+            ...previewConfig.selectedModelsByProvider,
+            primary: thirdPartyModels,
+          },
+          upstreamModelsByProvider: {
+            ...previewConfig.upstreamModelsByProvider,
+            primary: supportedModels,
+          },
+        };
+        const defaultModel = supportedModels.includes(previewModelState.defaultModel)
+          ? previewModelState.defaultModel
+          : supportedModels[0] || "";
         previewModelState = {
           ...previewModelState,
-          thirdPartyModels: previewUpstreamModels.filter(
-            (model) =>
-              requested.has(model) &&
-              !previewOfficialModels.some(
-                (official) => official.slug === model,
-              ),
-          ),
+          officialModels: previewOfficialModels.map((model) => ({
+            ...model,
+            supported: requestedOfficial.has(model.slug),
+          })),
+          thirdPartyModels,
+          upstreamModels: supportedModels,
+          defaultModel,
         };
         return {
           status: "ok",
