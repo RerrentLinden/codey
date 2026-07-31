@@ -17,7 +17,9 @@ async function loadPatch(catalogResponse, clients, { bridgeReady = true } = {}) 
   };
   const bridge = async (path) => {
     assert.equal(path, "/codex-model-catalog");
-    return catalogResponse;
+    return typeof catalogResponse === "function"
+      ? catalogResponse()
+      : catalogResponse;
   };
   const window = {
     __STATSIG__: {
@@ -143,6 +145,93 @@ test("runtime whitelist keeps Spark and removes unsupported channel models", asy
   assert.equal(expected.includes("gpt-5.3-codex"), false);
   assert.equal(expected.includes("gpt-5.6-terra"), false);
   patch.dispose();
+});
+
+test("an explicit refresh hot updates the native model list and default", async () => {
+  const client = statsigClient();
+  const catalogResponse = {
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+  };
+  const { patch } = await loadPatch(catalogResponse, [client]);
+
+  catalogResponse.models = ["gpt-5.6-sol", "provider-hot-added"];
+  catalogResponse.default_model = "provider-hot-added";
+  await patch.refresh();
+
+  assert.deepEqual(patch.snapshot(), {
+    loaded: true,
+    models: ["gpt-5.6-sol", "provider-hot-added"],
+    defaultModel: "provider-hot-added",
+  });
+  assert.deepEqual(client.external.value.available_models, [
+    "gpt-5.6-sol",
+    "provider-hot-added",
+  ]);
+  assert.equal(client.external.value.default_model, "provider-hot-added");
+  patch.dispose();
+});
+
+test("a backend-pushed catalog updates immediately without a nested bridge request", async () => {
+  const client = statsigClient();
+  const { patch } = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+  }, [client]);
+
+  assert.equal(patch.version, "2");
+  assert.equal(patch.setCatalog({
+    status: "ok",
+    models: ["gpt-5.6-sol", "provider-hot-pushed"],
+    default_model: "provider-hot-pushed",
+  }), true);
+  assert.deepEqual(patch.snapshot(), {
+    loaded: true,
+    models: ["gpt-5.6-sol", "provider-hot-pushed"],
+    defaultModel: "provider-hot-pushed",
+  });
+  assert.deepEqual(client.external.value.available_models, [
+    "gpt-5.6-sol",
+    "provider-hot-pushed",
+  ]);
+  assert.equal(client.external.value.default_model, "provider-hot-pushed");
+  patch.dispose();
+});
+
+test("a stale bridge response cannot overwrite a backend-pushed catalog", async () => {
+  const client = statsigClient();
+  let resolveCatalog;
+  const staleCatalog = new Promise((resolve) => {
+    resolveCatalog = resolve;
+  });
+  const runtime = await loadPatch(() => staleCatalog, [client], {
+    bridgeReady: false,
+  });
+  runtime.connectBridge();
+  await Promise.resolve();
+  await Promise.resolve();
+  const staleRefresh = runtime.patch.refresh();
+
+  assert.equal(runtime.patch.setCatalog({
+    status: "ok",
+    models: ["provider-current"],
+    default_model: "provider-current",
+  }), true);
+  resolveCatalog({
+    status: "ok",
+    models: ["provider-stale"],
+    default_model: "provider-stale",
+  });
+  await staleRefresh;
+
+  assert.deepEqual(runtime.patch.snapshot(), {
+    loaded: true,
+    models: ["provider-current"],
+    defaultModel: "provider-current",
+  });
+  runtime.patch.dispose();
 });
 
 test("a synced channel with no supported models clears the native allowlist", async () => {

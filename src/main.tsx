@@ -298,6 +298,7 @@ if (import.meta.env.DEV) {
           models: previewUpstreamModels,
           modelState: previewModelState,
           restartRequired: false,
+          modelHotReloaded: true,
         };
       }
       if (command === "save_selected_models") {
@@ -333,7 +334,8 @@ if (import.meta.env.DEV) {
           status: "ok",
           config: previewConfig,
           modelState: previewModelState,
-          restartRequired: true,
+          restartRequired: false,
+          modelHotReloaded: true,
         };
       }
       if (command === "save_default_model") {
@@ -350,7 +352,8 @@ if (import.meta.env.DEV) {
           status: "ok",
           config: previewConfig,
           modelState: previewModelState,
-          restartRequired: true,
+          restartRequired: false,
+          modelHotReloaded: true,
         };
       }
       if (command === "restart_codey") {

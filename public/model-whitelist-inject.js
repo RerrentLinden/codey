@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "1";
+  const patchVersion = "2";
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion) {
     void existingPatch.refresh();
@@ -19,6 +19,7 @@
   let refreshTimer = 0;
   let refreshUntil = 0;
   let catalogLoadPromise = null;
+  let catalogRevision = 0;
   let disposed = false;
 
   const uniqueModelNames = (values) => Array.from(new Set(
@@ -220,6 +221,7 @@
 
   const loadModelCatalog = () => {
     if (catalogLoadPromise) return catalogLoadPromise;
+    const requestedRevision = catalogRevision;
     catalogLoadPromise = (async () => {
       if (disposed || typeof window.__codexSessionDeleteBridge !== "function") {
         scheduleRefresh();
@@ -232,6 +234,8 @@
           if (!catalog.loaded) scheduleRefresh();
           return false;
         }
+        if (requestedRevision !== catalogRevision) return false;
+        catalogRevision += 1;
         catalog = nextCatalog;
         applyModelWhitelist();
         scheduleRefresh();
@@ -245,6 +249,17 @@
       catalogLoadPromise = null;
     });
     return catalogLoadPromise;
+  };
+
+  const setModelCatalog = (value) => {
+    if (disposed) return false;
+    const nextCatalog = normalizedCatalog(value);
+    if (!nextCatalog) return false;
+    catalogRevision += 1;
+    catalog = nextCatalog;
+    applyModelWhitelist();
+    scheduleRefresh();
+    return true;
   };
 
   // The wrapped getDynamicConfig already patches results on read, so the
@@ -271,6 +286,7 @@
     version: patchVersion,
     apply: applyModelWhitelist,
     refresh: loadModelCatalog,
+    setCatalog: setModelCatalog,
     snapshot: () => ({
       loaded: catalog.loaded,
       models: [...catalog.models],

@@ -38,6 +38,12 @@ type UseModelSelectionOptions = {
   setSubagentOptimization: (enabled: boolean) => void;
 };
 
+type ModelRuntimeUpdate = {
+  restartRequired?: boolean;
+  modelHotReloaded?: boolean;
+  modelHotReloadError?: string;
+};
+
 export function useModelSelection({
   provider,
   runOperation,
@@ -105,7 +111,7 @@ export function useModelSelection({
     await runOperation("fetch-models", async () => {
       try {
         const result = await withTimeout(
-          invoke<{ modelState: ModelState; restartRequired?: boolean }>(
+          invoke<{ modelState: ModelState } & ModelRuntimeUpdate>(
             "fetch_current_provider_models",
           ),
           15_000,
@@ -154,8 +160,7 @@ export function useModelSelection({
         let result: {
           models: string[];
           modelState: ModelState;
-          restartRequired?: boolean;
-        };
+        } & ModelRuntimeUpdate;
         try {
           result = await withTimeout(
             invoke("fetch_current_provider_models"),
@@ -240,8 +245,10 @@ export function useModelSelection({
       const result = await invoke<{
         config: Config;
         modelState: ModelState;
-        restartRequired?: boolean;
-      }>("save_selected_models", { officialModels, thirdPartyModels });
+      } & ModelRuntimeUpdate>("save_selected_models", {
+        officialModels,
+        thirdPartyModels,
+      });
       setPersistedConfig(result.config);
       setModelState(result.modelState);
       setStatus((current) => ({
@@ -249,11 +256,20 @@ export function useModelSelection({
         restartRequired: result.restartRequired ?? current.restartRequired,
       }));
       setModelPickerVisible(false);
+      const summary =
+        `已更新模型支持情况：${officialModels.length} 个官方模型、` +
+        `${thirdPartyModels.length} 个其他模型`;
+      const hotReloadFailed = Boolean(result.modelHotReloadError);
       setNotice({
-        tone: result.restartRequired ? "info" : "success",
-        text: result.restartRequired
-          ? `已更新模型支持情况：${officialModels.length} 个官方模型、${thirdPartyModels.length} 个其他模型；重启 Codex 后生效`
-          : `已更新模型支持情况：${officialModels.length} 个官方模型、${thirdPartyModels.length} 个其他模型`,
+        tone:
+          hotReloadFailed || result.restartRequired ? "info" : "success",
+        text: result.modelHotReloaded
+          ? result.restartRequired
+            ? `${summary}；Codex 模型列表已立即更新，其他设置仍需重启`
+            : `${summary}；Codex 模型列表已立即更新`
+          : hotReloadFailed || result.restartRequired
+            ? `${summary}；当前 Codex 模型列表暂未能刷新，重启 Codex 后生效`
+            : summary,
       });
     });
   }
@@ -263,19 +279,25 @@ export function useModelSelection({
       const result = await invoke<{
         config: Config;
         modelState: ModelState;
-        restartRequired?: boolean;
-      }>("save_default_model", { model });
+      } & ModelRuntimeUpdate>("save_default_model", { model });
       setPersistedConfig(result.config);
       setModelState(result.modelState);
       setStatus((current) => ({
         ...current,
         restartRequired: result.restartRequired ?? current.restartRequired,
       }));
+      const summary = `已将 ${result.modelState.defaultModel} 设为默认模型`;
+      const hotReloadFailed = Boolean(result.modelHotReloadError);
       setNotice({
-        tone: result.restartRequired ? "info" : "success",
-        text: result.restartRequired
-          ? `已将 ${result.modelState.defaultModel} 设为默认模型；重启 Codex 后新对话生效`
-          : `已将 ${result.modelState.defaultModel} 设为默认模型`,
+        tone:
+          hotReloadFailed || result.restartRequired ? "info" : "success",
+        text: result.modelHotReloaded
+          ? result.restartRequired
+            ? `${summary}；默认模型已立即更新，其他设置仍需重启`
+            : `${summary}；Codex 模型选择器已立即更新，新对话将使用该模型`
+          : hotReloadFailed || result.restartRequired
+            ? `${summary}；当前 Codex 暂未能热更新，重启后新对话生效`
+            : summary,
       });
     });
   }

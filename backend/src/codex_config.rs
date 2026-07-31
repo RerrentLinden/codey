@@ -122,7 +122,13 @@ const RESERVED_PROVIDER_IDS: [&str; 6] = [
 #[serde(rename_all = "camelCase")]
 struct RuntimeConfigLease {
     backup_dir: PathBuf,
+    #[serde(default)]
+    config_snapshot_dir: Option<PathBuf>,
     original_config_exists: bool,
+    #[serde(default)]
+    preserve_provider_route: bool,
+    #[serde(default)]
+    fastctx_command: Option<PathBuf>,
     #[serde(default)]
     subagent_optimization_applied: bool,
     #[serde(default)]
@@ -166,7 +172,7 @@ pub fn apply_runtime_provider_config(
         .then(std::env::current_exe)
         .transpose()
         .context("定位 Codey 内嵌 FastCtx 服务失败")?;
-    apply_runtime_provider_config_at(
+    apply_runtime_provider_config_at_mode(
         home,
         profile,
         provider_id,
@@ -176,9 +182,41 @@ pub fn apply_runtime_provider_config(
         subagent_optimization,
         &marker,
         &backup_root,
+        false,
     )
 }
 
+pub fn apply_runtime_provider_config_preserving_route(
+    home: &Path,
+    profile: &ProviderProfile,
+    provider_id: &str,
+    fast_context_tools: bool,
+    subagent_optimization: bool,
+) -> Result<PathBuf> {
+    let marker = lease_marker_path();
+    let backup_root = marker
+        .parent()
+        .unwrap_or_else(|| Path::new(".codey"))
+        .join("codex-backups");
+    let fastctx_command = fast_context_tools
+        .then(std::env::current_exe)
+        .transpose()
+        .context("定位 Codey 内嵌 FastCtx 服务失败")?;
+    apply_runtime_provider_config_at_mode(
+        home,
+        profile,
+        provider_id,
+        false,
+        None,
+        fastctx_command.as_deref(),
+        subagent_optimization,
+        &marker,
+        &backup_root,
+        true,
+    )
+}
+
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn apply_runtime_provider_config_at(
     home: &Path,
@@ -190,6 +228,33 @@ fn apply_runtime_provider_config_at(
     subagent_optimization: bool,
     marker: &Path,
     backup_root: &Path,
+) -> Result<PathBuf> {
+    apply_runtime_provider_config_at_mode(
+        home,
+        profile,
+        provider_id,
+        use_official_catalog,
+        default_model,
+        fastctx_command,
+        subagent_optimization,
+        marker,
+        backup_root,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_runtime_provider_config_at_mode(
+    home: &Path,
+    profile: &ProviderProfile,
+    provider_id: &str,
+    use_official_catalog: bool,
+    default_model: Option<&str>,
+    fastctx_command: Option<&Path>,
+    subagent_optimization: bool,
+    marker: &Path,
+    backup_root: &Path,
+    preserve_provider_route: bool,
 ) -> Result<PathBuf> {
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
@@ -224,12 +289,16 @@ fn apply_runtime_provider_config_at(
     } else {
         None
     };
-    let provider_id = normalized_provider_id(provider_id);
+    let provider_id = if preserve_provider_route {
+        provider_id.trim().to_string()
+    } else {
+        normalized_provider_id(provider_id)
+    };
     // Codex resolves this path from the app-server working directory, which is
     // `/` for the packaged macOS app, rather than from CODEX_HOME.
     let model_catalog_path =
         use_official_catalog.then(|| home.join(crate::model_catalog::relative_path()));
-    let updated = patch_config_with_fastctx(
+    let updated = patch_config_with_fastctx_mode(
         &existing,
         profile,
         &provider_id,
@@ -237,6 +306,7 @@ fn apply_runtime_provider_config_at(
         default_model,
         fastctx_command,
         subagent_optimization,
+        preserve_provider_route,
     )?;
     let applied_base_url = provider_base_url(&updated, &provider_id);
     if let Err(error) =
@@ -267,7 +337,10 @@ fn apply_runtime_provider_config_at(
     }
     let state = RuntimeConfigLease {
         backup_dir: backup_dir.clone(),
+        config_snapshot_dir: None,
         original_config_exists: original_config.is_some(),
+        preserve_provider_route,
+        fastctx_command: fastctx_command.map(Path::to_path_buf),
         subagent_optimization_applied: subagent_optimization,
         original_agents_md_exists: original_agents_md.is_some(),
         original_default_agent_exists: original_default_agent.is_some(),
@@ -367,6 +440,89 @@ fn write_lease(path: &Path, state: &RuntimeConfigLease) -> Result<()> {
     atomic_write(path, &serde_json::to_vec_pretty(state)?)
 }
 
+pub fn reconcile_runtime_config_overlay(home: &Path) -> Result<Option<Vec<u8>>> {
+    reconcile_runtime_config_overlay_at(home, &lease_marker_path())
+}
+
+fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Option<Vec<u8>>> {
+    let mut state = match fs::read_to_string(marker) {
+        Ok(contents) => serde_json::from_str::<RuntimeConfigLease>(&contents)
+            .with_context(|| format!("解析 Codey Codex lease 失败：{}", marker.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !state.preserve_provider_route {
+        return Ok(None);
+    }
+
+    let config_path = home.join("config.toml");
+    let Some(current_bytes) = read_optional(&config_path)? else {
+        // CC Switch writes its Live file independently. Do not recreate a file
+        // that may be between replacement steps; the watcher will retry.
+        return Ok(None);
+    };
+    let current =
+        String::from_utf8(current_bytes.clone()).context("Codex config.toml 不是 UTF-8")?;
+    let snapshot_dir = state
+        .config_snapshot_dir
+        .as_deref()
+        .unwrap_or(&state.backup_dir);
+    let applied_path = snapshot_dir.join(APPLIED_CONFIG_FILE);
+    let applied_bytes = fs::read(&applied_path)
+        .with_context(|| format!("读取 Codey 已应用配置快照失败：{}", applied_path.display()))?;
+    if current_bytes == applied_bytes {
+        return Ok(Some(current_bytes));
+    }
+
+    let original = if state.original_config_exists {
+        let original_path = snapshot_dir.join("config.toml");
+        fs::read_to_string(&original_path)
+            .with_context(|| format!("找不到 Codex 原配置备份：{}", original_path.display()))?
+    } else {
+        String::new()
+    };
+    let applied = String::from_utf8(applied_bytes).context("Codey 已应用配置快照不是 UTF-8")?;
+    let baseline = restore_owned_config_changes(&original, &applied, &current)
+        .context("提取 CC Switch 最新 Live 配置失败")?;
+    let updated = patch_config_preserving_provider_route(
+        &baseline,
+        state.fastctx_command.as_deref(),
+        state.subagent_optimization_applied,
+    )
+    .context("重新应用 Codey 运行时增强失败")?;
+
+    if read_optional(&config_path)?.as_deref() != Some(current_bytes.as_slice()) {
+        anyhow::bail!("Codex Live 配置在 Codey 准备重新应用增强时再次变化");
+    }
+
+    let snapshots_root = state.backup_dir.join("route-snapshots");
+    create_private_dir_all(&snapshots_root)?;
+    let next_snapshot_dir =
+        snapshots_root.join(format!("{}-{}", timestamp_millis(), std::process::id()));
+    create_private_dir_all(&next_snapshot_dir)?;
+    write_private_file(&next_snapshot_dir.join("config.toml"), baseline.as_bytes())?;
+    write_private_file(
+        &next_snapshot_dir.join(APPLIED_CONFIG_FILE),
+        updated.as_bytes(),
+    )?;
+
+    state.config_snapshot_dir = Some(next_snapshot_dir);
+    state.original_config_exists = true;
+    state.provider_id = root_key_string(&updated, "model_provider");
+    state.applied_base_url = state
+        .provider_id
+        .as_deref()
+        .and_then(|provider_id| provider_base_url(&updated, provider_id));
+    write_lease(marker, &state)?;
+    if read_optional(&config_path)?.as_deref() != Some(current_bytes.as_slice()) {
+        anyhow::bail!("Codex Live 配置在 Codey 保存增强快照后再次变化");
+    }
+    if updated.as_bytes() != current_bytes {
+        atomic_write(&config_path, updated.as_bytes())?;
+    }
+    Ok(Some(updated.into_bytes()))
+}
+
 pub fn restore_runtime_provider_config(home: &Path) -> Result<bool> {
     restore_runtime_provider_config_at(home, &lease_marker_path())
 }
@@ -393,20 +549,24 @@ fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool
     let endpoint_matches = state.applied_base_url.as_deref().is_none_or(|base_url| {
         provider_base_url(&current, provider_id).as_deref() == Some(base_url)
     });
-    if !provider_matches || !endpoint_matches {
+    if !state.preserve_provider_route && (!provider_matches || !endpoint_matches) {
         restore_runtime_subagent_files(home, &state)?;
         remove_optional(marker)?;
         return Ok(false);
     }
 
-    let backup_config = state.backup_dir.join("config.toml");
+    let config_snapshot_dir = state
+        .config_snapshot_dir
+        .as_deref()
+        .unwrap_or(&state.backup_dir);
+    let backup_config = config_snapshot_dir.join("config.toml");
     let original = if state.original_config_exists {
         fs::read_to_string(&backup_config)
             .with_context(|| format!("找不到 Codex 原配置备份：{}", backup_config.display()))?
     } else {
         String::new()
     };
-    let applied_config = state.backup_dir.join(APPLIED_CONFIG_FILE);
+    let applied_config = config_snapshot_dir.join(APPLIED_CONFIG_FILE);
     let restored = if applied_config.exists() {
         let applied = fs::read_to_string(&applied_config).with_context(|| {
             format!(
@@ -975,6 +1135,17 @@ fn values_semantically_equal(left: &Value, right: &Value) -> bool {
     }
 }
 
+/// Reads the provider selected by an external Live-route owner without
+/// normalizing or rewriting the surrounding Codex configuration.
+pub fn active_model_provider(home: &Path) -> Result<String> {
+    let config_path = home.join("config.toml");
+    let contents = fs::read_to_string(&config_path)
+        .with_context(|| format!("读取 Codex 配置失败：{}", config_path.display()))?;
+    root_key_string(&contents, "model_provider")
+        .filter(|provider| !provider.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("CC Switch 路由配置缺少活动 model_provider"))
+}
+
 /// Installs a stable non-reserved provider for the official account flow.
 /// Direct third-party profiles temporarily reuse this provider id while Codey
 /// runs, then the exact original configuration is restored.
@@ -1046,6 +1217,7 @@ pub fn patch_config(
     )
 }
 
+#[cfg(test)]
 fn patch_config_with_fastctx(
     existing: &str,
     profile: &ProviderProfile,
@@ -1055,37 +1227,65 @@ fn patch_config_with_fastctx(
     fastctx_command: Option<&Path>,
     subagent_optimization: bool,
 ) -> Result<String> {
+    patch_config_with_fastctx_mode(
+        existing,
+        profile,
+        provider_id,
+        model_catalog_path,
+        default_model,
+        fastctx_command,
+        subagent_optimization,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn patch_config_with_fastctx_mode(
+    existing: &str,
+    profile: &ProviderProfile,
+    provider_id: &str,
+    model_catalog_path: Option<&Path>,
+    default_model: Option<&str>,
+    fastctx_command: Option<&Path>,
+    subagent_optimization: bool,
+    preserve_provider_route: bool,
+) -> Result<String> {
     let mut doc = parse_document(existing)?;
-    ensure_provider_table(&mut doc)?;
-    let provider_id = normalized_provider_id(provider_id);
-    let existing_local_provider = profile
-        .cc_switch_provider_id
-        .is_none()
-        .then(|| {
-            doc.get("model_providers")
-                .and_then(Item::as_table)
-                .and_then(|providers| providers.get(&provider_id))
-                .and_then(Item::as_table)
-                .cloned()
-        })
-        .flatten();
-    let provider = if profile.cc_switch_read_only {
-        official_provider_table()
-    } else {
-        direct_provider_table(profile, existing_local_provider)?
-    };
-    doc["model_providers"]
-        .as_table_mut()
-        .expect("model_providers was initialized")[&provider_id] = Item::Table(provider);
-    doc["model_provider"] = value(provider_id);
-    if let Some(model_catalog_path) = model_catalog_path {
-        doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().into_owned());
-    } else {
-        doc.as_table_mut().remove("model_catalog_json");
+    // CC Switch owns all routing and model-selection fields while Live
+    // takeover is active. Codey only layers its independent runtime
+    // enhancements onto the current Live document.
+    if !preserve_provider_route {
+        ensure_provider_table(&mut doc)?;
+        let provider_id = normalized_provider_id(provider_id);
+        let existing_local_provider = profile
+            .cc_switch_provider_id
+            .is_none()
+            .then(|| {
+                doc.get("model_providers")
+                    .and_then(Item::as_table)
+                    .and_then(|providers| providers.get(&provider_id))
+                    .and_then(Item::as_table)
+                    .cloned()
+            })
+            .flatten();
+        let provider = if profile.cc_switch_read_only {
+            official_provider_table()
+        } else {
+            direct_provider_table(profile, existing_local_provider)?
+        };
+        doc["model_providers"]
+            .as_table_mut()
+            .expect("model_providers was initialized")[&provider_id] = Item::Table(provider);
+        doc["model_provider"] = value(provider_id);
+        if let Some(model_catalog_path) = model_catalog_path {
+            doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().into_owned());
+        } else {
+            doc.as_table_mut().remove("model_catalog_json");
+        }
+        set_model_selection(&mut doc, default_model);
     }
     enable_desktop_reasoning_efforts(&mut doc)?;
     ensure_default_service_tier(&mut doc);
-    set_model_selection(&mut doc, default_model);
     if let Some(command) = fastctx_command {
         enable_fast_context_tools(&mut doc, command)?;
     } else {
@@ -1095,6 +1295,23 @@ fn patch_config_with_fastctx(
         enable_subagent_optimization(&mut doc)?;
     }
     document_string(&doc)
+}
+
+fn patch_config_preserving_provider_route(
+    existing: &str,
+    fastctx_command: Option<&Path>,
+    subagent_optimization: bool,
+) -> Result<String> {
+    patch_config_with_fastctx_mode(
+        existing,
+        &ProviderProfile::new("route-preserve"),
+        "",
+        None,
+        None,
+        fastctx_command,
+        subagent_optimization,
+        true,
+    )
 }
 
 fn enable_subagent_optimization(doc: &mut DocumentMut) -> Result<()> {
@@ -1618,7 +1835,10 @@ mod tests {
             marker,
             &RuntimeConfigLease {
                 backup_dir: backup_dir.to_path_buf(),
+                config_snapshot_dir: None,
                 original_config_exists: original.is_some(),
+                preserve_provider_route: false,
+                fastctx_command: None,
                 subagent_optimization_applied: false,
                 original_agents_md_exists: false,
                 original_default_agent_exists: false,
@@ -1733,6 +1953,65 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
             root_key_string(&result, "model_provider").as_deref(),
             Some(GLOBAL_PROVIDER_ID)
         );
+    }
+
+    #[test]
+    fn route_preserving_patch_keeps_cc_switch_routing_and_model_fields() {
+        let existing = r#"
+model_provider = "cc-switch-official"
+model = "route-model"
+model_catalog_json = "/cc-switch/catalog.json"
+
+[model_providers.cc-switch-official]
+name = "CC Switch Proxy"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+experimental_bearer_token = "PROXY_MANAGED"
+
+[features.cc_switch_owned]
+enabled = true
+"#;
+        let result = patch_config_with_fastctx_mode(
+            existing,
+            &direct_profile(RelayProtocol::Responses),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            Some("codey-model"),
+            Some(Path::new("/opt/codey")),
+            true,
+            true,
+        )
+        .unwrap();
+        let before = parse_document(existing).unwrap();
+        let after = parse_document(&result).unwrap();
+
+        assert_eq!(
+            root_key_string(&result, "model_provider").as_deref(),
+            Some("cc-switch-official")
+        );
+        assert_eq!(
+            root_key_string(&result, "model").as_deref(),
+            Some("route-model")
+        );
+        assert_eq!(
+            root_key_string(&result, "model_catalog_json").as_deref(),
+            Some("/cc-switch/catalog.json")
+        );
+        assert!(items_semantically_equal(
+            before.get("model_providers").unwrap(),
+            after.get("model_providers").unwrap()
+        ));
+        assert!(
+            after["features"]["cc_switch_owned"]["enabled"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(
+            after["features"]["multi_agent_v2"]["enabled"]
+                .as_bool()
+                .unwrap()
+        );
+        assert!(after["mcp_servers"][CODEY_FASTCTX_SERVER_ID].is_table());
     }
 
     #[test]
@@ -2324,6 +2603,111 @@ custom_setting = "preserved"
         );
         assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
         assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn route_lease_rebases_after_cc_switch_hot_swap_and_restores_latest_route() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        let route_a = r#"
+model_provider = "route-a"
+model = "model-a"
+model_catalog_json = "/cc-switch/catalog-a.json"
+
+[model_providers.route-a]
+name = "Route A"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+experimental_bearer_token = "PROXY_MANAGED"
+
+[mcp_servers.cc-switch]
+command = "cc-switch-tool"
+"#;
+        fs::write(home.join("config.toml"), route_a).unwrap();
+
+        apply_runtime_provider_config_at_mode(
+            &home,
+            &direct_profile(RelayProtocol::Responses),
+            "route-a",
+            false,
+            None,
+            Some(Path::new("/opt/codey")),
+            false,
+            &marker,
+            &backup_root,
+            true,
+        )
+        .unwrap();
+        let applied_a = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(
+            root_key_string(&applied_a, "model_provider").as_deref(),
+            Some("route-a")
+        );
+        assert_eq!(
+            root_key_string(&applied_a, "model").as_deref(),
+            Some("model-a")
+        );
+
+        let route_b = r#"
+model_provider = "route-b"
+model = "model-b"
+model_catalog_json = "/cc-switch/catalog-b.json"
+cc_switch_generation = 2
+
+[model_providers.route-b]
+name = "Route B"
+base_url = "http://localhost:15721/v1"
+wire_api = "responses"
+experimental_bearer_token = "PROXY_MANAGED"
+
+[mcp_servers.cc-switch]
+command = "cc-switch-tool-v2"
+"#;
+        fs::write(home.join("config.toml"), route_b).unwrap();
+
+        let reconciled = reconcile_runtime_config_overlay_at(&home, &marker)
+            .unwrap()
+            .unwrap();
+        let applied_b = String::from_utf8(reconciled).unwrap();
+        assert_eq!(
+            root_key_string(&applied_b, "model_provider").as_deref(),
+            Some("route-b")
+        );
+        assert_eq!(
+            root_key_string(&applied_b, "model").as_deref(),
+            Some("model-b")
+        );
+        assert_eq!(
+            root_key_string(&applied_b, "model_catalog_json").as_deref(),
+            Some("/cc-switch/catalog-b.json")
+        );
+        assert_eq!(
+            provider_base_url(&applied_b, "route-b").as_deref(),
+            Some("http://localhost:15721/v1")
+        );
+        let applied_b_doc = parse_document(&applied_b).unwrap();
+        assert_eq!(
+            applied_b_doc["mcp_servers"]["cc-switch"]["command"].as_str(),
+            Some("cc-switch-tool-v2")
+        );
+        assert!(
+            applied_b_doc["mcp_servers"][CODEY_FASTCTX_SERVER_ID]
+                .as_table()
+                .is_some()
+        );
+
+        assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+        let restored = fs::read_to_string(home.join("config.toml")).unwrap();
+        let expected = parse_document(route_b).unwrap();
+        let actual = parse_document(&restored).unwrap();
+        assert!(tables_semantically_equal(
+            expected.as_table(),
+            actual.as_table()
+        ));
         assert!(!marker.exists());
     }
 

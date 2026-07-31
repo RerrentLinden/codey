@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -16,6 +17,8 @@ use crate::config::{CodeyConfig, ProviderProfile};
 const APP_TYPE: &str = "codex";
 const OFFICIAL_PROVIDER_ID: &str = "codex-official";
 const LOCAL_OFFICIAL_PROVIDER_ID: &str = "local-official";
+const PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
+const PROXY_OFFICIAL_PROVIDER_ID: &str = "cc-switch-official";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -37,6 +40,12 @@ pub struct CcSwitchStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     pub provider: CurrentProvider,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouteTakeoverState {
+    pub managed: bool,
+    pub live: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +71,157 @@ pub fn default_db_path() -> PathBuf {
     BaseDirs::new()
         .map(|dirs| dirs.home_dir().join(".cc-switch/cc-switch.db"))
         .unwrap_or_else(|| PathBuf::from(".cc-switch/cc-switch.db"))
+}
+
+pub fn route_takeover_state(codex_home: &Path) -> Result<RouteTakeoverState> {
+    route_takeover_state_from_paths(&default_db_path(), codex_home)
+}
+
+fn route_takeover_state_from_paths(
+    db_path: &Path,
+    codex_home: &Path,
+) -> Result<RouteTakeoverState> {
+    let managed = if db_path.is_file() {
+        read_route_takeover_managed(db_path)?
+    } else {
+        false
+    };
+    let live = live_config_uses_proxy_route(codex_home)?;
+    Ok(RouteTakeoverState { managed, live })
+}
+
+fn read_route_takeover_managed(path: &Path) -> Result<bool> {
+    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("打开 cc-switch 数据库失败：{}", path.display()))?;
+    connection.busy_timeout(Duration::from_secs(2))?;
+
+    let proxy_columns = table_columns(&connection, "proxy_config")?;
+    let proxy_enabled = if proxy_columns.contains("enabled") {
+        let query = if proxy_columns.contains("app_type") {
+            "SELECT COALESCE(MAX(enabled), 0) FROM proxy_config WHERE app_type=?1"
+        } else {
+            "SELECT COALESCE(MAX(enabled), 0) FROM proxy_config"
+        };
+        if proxy_columns.contains("app_type") {
+            connection.query_row(query, params![APP_TYPE], |row| row.get::<_, i64>(0))? != 0
+        } else {
+            connection.query_row(query, [], |row| row.get::<_, i64>(0))? != 0
+        }
+    } else if proxy_columns.contains("live_takeover_active") {
+        connection.query_row(
+            "SELECT COALESCE(MAX(live_takeover_active), 0) FROM proxy_config",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0
+    } else {
+        false
+    };
+
+    let backup_columns = table_columns(&connection, "proxy_live_backup")?;
+    let has_live_backup = if backup_columns.contains("app_type") {
+        connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM proxy_live_backup WHERE app_type=?1
+             )",
+            params![APP_TYPE],
+            |row| row.get::<_, i64>(0),
+        )? != 0
+    } else if backup_columns.is_empty() {
+        false
+    } else {
+        connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM proxy_live_backup)",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0
+    };
+
+    let settings_columns = table_columns(&connection, "settings")?;
+    let legacy_enabled = if settings_columns.contains("key") && settings_columns.contains("value") {
+        connection.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM settings
+                WHERE key='proxy_takeover_codex'
+                  AND lower(trim(value)) IN ('true', '1')
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? != 0
+    } else {
+        false
+    };
+
+    Ok(proxy_enabled || has_live_backup || legacy_enabled)
+}
+
+fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String>> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    rows.collect::<rusqlite::Result<BTreeSet<_>>>()
+        .map_err(Into::into)
+}
+
+fn live_config_uses_proxy_route(codex_home: &Path) -> Result<bool> {
+    let config_path = codex_home.join("config.toml");
+    let config = match fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 Codex Live 配置失败：{}", config_path.display()));
+        }
+    };
+    let document = DocumentMut::from_str(&config)
+        .with_context(|| format!("解析 Codex Live 配置失败：{}", config_path.display()))?;
+    let provider_id = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty());
+    let Some(provider_id) = provider_id else {
+        return Ok(false);
+    };
+    let provider = document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table_like);
+    let managed_token = provider
+        .and_then(|provider| provider.get("experimental_bearer_token"))
+        .and_then(Item::as_str)
+        .or_else(|| {
+            document
+                .get("experimental_bearer_token")
+                .and_then(Item::as_str)
+        })
+        .is_some_and(|token| token.trim() == PROXY_MANAGED_TOKEN);
+    let official_loopback = provider_id == PROXY_OFFICIAL_PROVIDER_ID
+        && provider
+            .and_then(|provider| provider.get("base_url"))
+            .and_then(Item::as_str)
+            .is_some_and(is_loopback_url);
+    Ok(managed_token || official_loopback)
+}
+
+fn is_loopback_url(url: &str) -> bool {
+    let authority_and_path = url
+        .trim()
+        .split_once("://")
+        .map_or(url.trim(), |(_, rest)| rest);
+    let authority = authority_and_path
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or_default()
+    } else {
+        authority.split(':').next().unwrap_or_default()
+    };
+    host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
 }
 
 pub fn sync_current_provider(
@@ -414,6 +574,40 @@ mod tests {
         (directory, path, home)
     }
 
+    fn install_proxy_schema(path: &Path) {
+        Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE proxy_config (
+                    app_type TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE proxy_live_backup (
+                    app_type TEXT PRIMARY KEY,
+                    original_config TEXT NOT NULL,
+                    backed_up_at TEXT NOT NULL
+                );
+                CREATE TABLE settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                );",
+            )
+            .unwrap();
+    }
+
+    fn write_live_route(home: &Path, provider_id: &str, base_url: &str, token: &str) {
+        fs::write(
+            home.join("config.toml"),
+            format!(
+                "model_provider = \"{provider_id}\"\n\n\
+                 [model_providers.{provider_id}]\n\
+                 base_url = \"{base_url}\"\n\
+                 experimental_bearer_token = \"{token}\"\n"
+            ),
+        )
+        .unwrap();
+    }
+
     fn insert_provider(path: &Path, id: &str, name: &str, url: &str, current: bool) {
         let settings = json!({
             "auth": {"OPENAI_API_KEY": format!("{id}-secret")},
@@ -651,5 +845,100 @@ requires_openai_auth = true
         let (synced, _) = sync_current_provider_from_paths(&config, &path, &home).unwrap();
 
         assert_eq!(synced.selected_models(), &["custom-model"]);
+    }
+
+    #[test]
+    fn route_takeover_reads_proxy_config_and_live_marker() {
+        let (_directory, path, home) = fixture();
+        install_proxy_schema(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO proxy_config (app_type, enabled) VALUES ('codex', 1)",
+                [],
+            )
+            .unwrap();
+        write_live_route(
+            &home,
+            "relay",
+            "http://127.0.0.1:15721/v1",
+            PROXY_MANAGED_TOKEN,
+        );
+
+        assert_eq!(
+            route_takeover_state_from_paths(&path, &home).unwrap(),
+            RouteTakeoverState {
+                managed: true,
+                live: true,
+            }
+        );
+    }
+
+    #[test]
+    fn route_takeover_treats_a_live_backup_as_managed() {
+        let (_directory, path, home) = fixture();
+        install_proxy_schema(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO proxy_live_backup (app_type, original_config, backed_up_at)
+                 VALUES ('codex', '{}', 'now')",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            route_takeover_state_from_paths(&path, &home).unwrap(),
+            RouteTakeoverState {
+                managed: true,
+                live: false,
+            }
+        );
+    }
+
+    #[test]
+    fn official_proxy_provider_requires_a_loopback_endpoint() {
+        let (_directory, path, home) = fixture();
+        write_live_route(
+            &home,
+            PROXY_OFFICIAL_PROVIDER_ID,
+            "http://localhost:15721/v1",
+            "",
+        );
+        assert!(route_takeover_state_from_paths(&path, &home).unwrap().live);
+
+        write_live_route(
+            &home,
+            PROXY_OFFICIAL_PROVIDER_ID,
+            "https://relay.example/v1",
+            "",
+        );
+        assert!(!route_takeover_state_from_paths(&path, &home).unwrap().live);
+    }
+
+    #[test]
+    fn ordinary_loopback_provider_is_not_mistaken_for_cc_switch_routing() {
+        let (_directory, path, home) = fixture();
+        write_live_route(
+            &home,
+            "my-local-relay",
+            "http://127.0.0.1:8080/v1",
+            "sk-local",
+        );
+
+        assert_eq!(
+            route_takeover_state_from_paths(&path, &home).unwrap(),
+            RouteTakeoverState::default()
+        );
+    }
+
+    #[test]
+    fn route_takeover_safely_degrades_for_an_old_database_schema() {
+        let (_directory, path, home) = fixture();
+
+        assert_eq!(
+            route_takeover_state_from_paths(&path, &home).unwrap(),
+            RouteTakeoverState::default()
+        );
     }
 }

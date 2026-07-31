@@ -632,6 +632,95 @@ pub async fn read_official_experimental_features(
     serde_json::from_str(payload).context("解析 Codex 官方试验性功能配置失败")
 }
 
+pub async fn refresh_model_whitelist(
+    websocket_url: &str,
+    expected_models: &[String],
+    expected_default_model: &str,
+) -> Result<()> {
+    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise(
+        websocket_url,
+        &model_whitelist_refresh_script(expected_models, expected_default_model),
+        true,
+    )
+    .await
+    .context("请求 Codex 刷新模型列表失败")?;
+    verify_model_whitelist_refresh_response(&response)
+}
+
+fn model_whitelist_refresh_script(
+    expected_models: &[String],
+    expected_default_model: &str,
+) -> String {
+    let expected_models =
+        serde_json::to_string(expected_models).expect("model ids should serialize");
+    let expected_default_model =
+        serde_json::to_string(expected_default_model).expect("default model should serialize");
+    format!(
+        r#"(async () => {{
+  const expectedModels = {expected_models};
+  const expectedDefaultModel = {expected_default_model};
+  const expectedCatalog = {{
+    status: expectedModels.length > 0 ? "ok" : "not_configured",
+    model: expectedDefaultModel,
+    default_model: expectedDefaultModel,
+    models: expectedModels,
+  }};
+  const matchesExpected = (snapshot) => (
+    snapshot?.loaded === true
+    && Array.isArray(snapshot.models)
+    && snapshot.models.length === expectedModels.length
+    && snapshot.models.every((model, index) => model === expectedModels[index])
+    && snapshot.defaultModel === expectedDefaultModel
+  );
+  let snapshot = null;
+  let lastError = "模型白名单补丁尚未就绪";
+  for (const delay of [0, 80, 200, 500]) {{
+    if (delay > 0) {{
+      await new Promise((resolve) => window.setTimeout(resolve, delay));
+    }}
+    const patch = window.__codeyModelWhitelistPatch;
+    if (
+      !patch
+      || typeof patch.setCatalog !== "function"
+      || typeof patch.snapshot !== "function"
+    ) {{
+      lastError = "模型白名单补丁尚未就绪";
+      continue;
+    }}
+    try {{
+      const updated = patch.setCatalog(expectedCatalog);
+      snapshot = patch.snapshot();
+      if (updated === true && matchesExpected(snapshot)) {{
+        return JSON.stringify({{ ok: true, snapshot }});
+      }}
+      lastError = updated === true
+        ? "模型白名单快照与已保存配置不一致"
+        : "模型白名单拒绝了后端推送的目录";
+    }} catch (error) {{
+      lastError = error instanceof Error ? error.message : String(error);
+    }}
+  }}
+  return JSON.stringify({{ ok: false, error: lastError, snapshot }});
+}})()"#
+    )
+}
+
+fn verify_model_whitelist_refresh_response(response: &serde_json::Value) -> Result<()> {
+    let payload = runtime_value(response)
+        .and_then(serde_json::Value::as_str)
+        .context("Codex 模型列表热更新未返回可解析结果")?;
+    let report = serde_json::from_str::<serde_json::Value>(payload)
+        .context("解析 Codex 模型列表热更新结果失败")?;
+    if report.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+    let error = report
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("模型白名单刷新结果未通过校验");
+    anyhow::bail!("Codex 模型列表热更新失败：{error}")
+}
+
 fn experimental_feature_runtime_status_script() -> &'static str {
     r#"(() => {
   const snapshot = globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__;
@@ -1086,6 +1175,47 @@ mod tests {
             "result": { "result": { "type": "boolean", "value": true } }
         });
         assert_eq!(runtime_value(&response), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn model_whitelist_refresh_script_retries_and_verifies_the_expected_snapshot() {
+        let script = model_whitelist_refresh_script(
+            &["gpt-5.6-sol".into(), "provider-\"quoted".into()],
+            "provider-\"quoted",
+        );
+
+        assert!(script.contains("window.__codeyModelWhitelistPatch"));
+        assert!(script.contains("patch.setCatalog(expectedCatalog)"));
+        assert!(script.contains("patch.snapshot()"));
+        assert!(!script.contains("patch.refresh()"));
+        assert!(!script.contains("/codex-model-catalog"));
+        assert!(script.contains("[0, 80, 200, 500]"));
+        assert!(script.contains(r#"provider-\"quoted"#));
+        assert!(script.contains("snapshot.defaultModel === expectedDefaultModel"));
+    }
+
+    #[test]
+    fn model_whitelist_refresh_response_requires_a_verified_result() {
+        let success = serde_json::json!({
+            "result": {
+                "result": {
+                    "type": "string",
+                    "value": r#"{"ok":true,"snapshot":{"loaded":true}}"#
+                }
+            }
+        });
+        assert!(verify_model_whitelist_refresh_response(&success).is_ok());
+
+        let mismatch = serde_json::json!({
+            "result": {
+                "result": {
+                    "type": "string",
+                    "value": r#"{"ok":false,"error":"模型白名单快照与已保存配置不一致"}"#
+                }
+            }
+        });
+        let error = verify_model_whitelist_refresh_response(&mismatch).unwrap_err();
+        assert!(format!("{error:#}").contains("快照与已保存配置不一致"));
     }
 
     #[test]

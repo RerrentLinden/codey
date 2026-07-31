@@ -36,6 +36,7 @@ type OperationsPanelProps = {
   pluginMarketplaceStatus: PluginMarketplaceStatus | null;
   onRepairPluginMarketplace: () => void;
   onRestart: () => void;
+  showRestartAction?: boolean;
 };
 
 function OperationsPanelComponent({
@@ -46,6 +47,7 @@ function OperationsPanelComponent({
   pluginMarketplaceStatus,
   onRepairPluginMarketplace,
   onRestart,
+  showRestartAction = true,
 }: OperationsPanelProps) {
   const operationsHubRef = useRef<HTMLElement>(null);
   const [activeCardTitle, setActiveCardTitle] = useState<string | null>(null);
@@ -380,19 +382,21 @@ function OperationsPanelComponent({
                   ? "运行中"
                   : "未启动"}
             </Badge>
-            <Button
-              variant="warning"
-              size="sm"
-              disabled={isBusy || status.restartInProgress || !status.running}
-              onClick={onRestart}
-            >
-              {busy === "restart" || status.restartInProgress ? (
-                <LoaderCircle className="spinner" aria-hidden="true" />
-              ) : (
-                <RefreshCw aria-hidden="true" />
-              )}
-              {status.running ? "重启 Codex" : "未运行"}
-            </Button>
+            {showRestartAction && (
+              <Button
+                variant="warning"
+                size="sm"
+                disabled={isBusy || status.restartInProgress || !status.running}
+                onClick={onRestart}
+              >
+                {busy === "restart" || status.restartInProgress ? (
+                  <LoaderCircle className="spinner" aria-hidden="true" />
+                ) : (
+                  <RefreshCw aria-hidden="true" />
+                )}
+                {status.running ? "重启 Codex" : "未运行"}
+              </Button>
+            )}
           </div>
         </div>
 

@@ -11,8 +11,27 @@ use crate::cdp;
 use crate::codex_config::codex_home;
 use crate::config::CodeyConfig;
 use crate::error_log;
+use crate::launcher::RuntimeModelConfig;
 use crate::model_catalog;
 use crate::provider_models;
+
+#[derive(Default)]
+struct ModelHotReloadOutcome {
+    reloaded: bool,
+    error: Option<String>,
+}
+
+impl ModelHotReloadOutcome {
+    fn add_to_response(self, mut response: Value) -> Value {
+        if let Some(object) = response.as_object_mut() {
+            object.insert("modelHotReloaded".into(), Value::Bool(self.reloaded));
+            if let Some(error) = self.error {
+                object.insert("modelHotReloadError".into(), Value::String(error));
+            }
+        }
+        response
+    }
+}
 
 pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Value, String> {
     let cc_switch = sync_cc_switch_state(state).await;
@@ -294,13 +313,14 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
     state.store.save(&next).map_err(|error| error.to_string())?;
     *state.config.write().await = next.clone();
     drop(_config_write_guard);
+    let hot_reload = hot_reload_runtime_models(state, &next, &model_state).await;
     let restart_required = runtime_config_requires_restart(state, &next).await;
-    Ok(json!({
+    Ok(hot_reload.add_to_response(json!({
         "status":"ok",
         "models":fetched_models,
         "modelState":model_state,
         "restartRequired":restart_required,
-    }))
+    })))
 }
 
 pub async fn save_selected_models(
@@ -350,13 +370,14 @@ pub async fn save_selected_models(
     let model_state = current_model_state(&config)?;
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
+    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
-    Ok(json!({
+    Ok(hot_reload.add_to_response(json!({
         "status":"ok",
         "config":public_config,
         "modelState":model_state,
         "restartRequired":restart_required,
-    }))
+    })))
 }
 
 pub(super) fn validate_manual_model_selection(
@@ -441,13 +462,62 @@ pub async fn save_default_model(
     let model_state = current_model_state(&config)?;
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
+    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
-    Ok(json!({
+    Ok(hot_reload.add_to_response(json!({
         "status":"ok",
         "config":public_config,
         "modelState":model_state,
         "restartRequired":restart_required,
-    }))
+    })))
+}
+
+async fn hot_reload_runtime_models(
+    state: &Arc<AppState>,
+    config: &CodeyConfig,
+    model_state: &model_catalog::ModelSelectionState,
+) -> ModelHotReloadOutcome {
+    let runtime = state.runtime.lock().await.clone();
+    let Some(runtime) = runtime else {
+        return ModelHotReloadOutcome::default();
+    };
+    let next_model_config = RuntimeModelConfig::from_config(config);
+    if runtime.applied_model_config().await == next_model_config {
+        return ModelHotReloadOutcome {
+            reloaded: true,
+            error: None,
+        };
+    }
+
+    let expected_models = renderer_model_ids(model_state);
+    let websocket_url = runtime.renderer_websocket_url().await;
+    match cdp::refresh_model_whitelist(&websocket_url, &expected_models, &model_state.default_model)
+        .await
+    {
+        Ok(()) => {
+            runtime.mark_model_config_applied(config).await;
+            ModelHotReloadOutcome {
+                reloaded: true,
+                error: None,
+            }
+        }
+        Err(error) => {
+            let error = format!("{error:#}");
+            error_log::record_failure(
+                "patch_verification_failed",
+                "refresh_model_whitelist",
+                error.clone(),
+                json!({
+                    "modelCount": expected_models.len(),
+                    "websocketUrl": websocket_url,
+                }),
+            );
+            ModelHotReloadOutcome {
+                reloaded: false,
+                error: Some(error),
+            }
+        }
+    }
 }
 
 pub(super) fn current_model_state(
@@ -477,13 +547,7 @@ pub(super) fn renderer_model_catalog_value(
     config: &CodeyConfig,
     model_state: &model_catalog::ModelSelectionState,
 ) -> Value {
-    let models = model_state
-        .official_models
-        .iter()
-        .filter(|model| model.supported)
-        .map(|model| model.slug.clone())
-        .chain(model_state.third_party_models.iter().cloned())
-        .collect::<Vec<_>>();
+    let models = renderer_model_ids(model_state);
     let active_profile = config
         .profiles
         .iter()
@@ -506,6 +570,16 @@ pub(super) fn renderer_model_catalog_value(
             "message": ""
         }
     })
+}
+
+fn renderer_model_ids(model_state: &model_catalog::ModelSelectionState) -> Vec<String> {
+    model_state
+        .official_models
+        .iter()
+        .filter(|model| model.supported)
+        .map(|model| model.slug.clone())
+        .chain(model_state.third_party_models.iter().cloned())
+        .collect()
 }
 
 pub(super) fn should_refresh_model_catalog(

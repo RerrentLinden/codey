@@ -54,9 +54,9 @@ use crate::cdp;
 use crate::codex_config::codex_home;
 use crate::config::{CodeyConfig, ConfigStore};
 use crate::error_log;
-use crate::launcher::CodeyRuntime;
 #[cfg(windows)]
 use crate::launcher::{CODEX_APP_NOT_FOUND_ERROR, CODEX_APP_PATH_INVALID_ERROR};
+use crate::launcher::{CodeyRuntime, RuntimeModelConfig};
 use crate::message_delete::delete_messages;
 #[cfg(test)]
 use crate::model_catalog;
@@ -760,7 +760,11 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
     public
 }
 
-fn config_requires_restart(applied: &CodeyConfig, current: &CodeyConfig) -> bool {
+fn config_requires_restart(
+    applied: &CodeyConfig,
+    applied_models: &RuntimeModelConfig,
+    current: &CodeyConfig,
+) -> bool {
     applied.active_profile() != current.active_profile()
         || applied.codex_app_path != current.codex_app_path
         || applied.user_scripts != current.user_scripts
@@ -771,18 +775,16 @@ fn config_requires_restart(applied: &CodeyConfig, current: &CodeyConfig) -> bool
         || applied.fast_codex_startup != current.fast_codex_startup
         || applied.subagent_optimization != current.subagent_optimization
         || applied.experimental_features != current.experimental_features
-        || applied.selected_models() != current.selected_models()
-        || applied.upstream_models() != current.upstream_models()
-        || applied.default_model() != current.default_model()
+        || applied_models != &RuntimeModelConfig::from_config(current)
 }
 
 async fn runtime_config_requires_restart(state: &Arc<AppState>, current: &CodeyConfig) -> bool {
-    state
-        .runtime
-        .lock()
-        .await
-        .as_ref()
-        .is_some_and(|runtime| config_requires_restart(&runtime.applied_config, current))
+    let runtime = state.runtime.lock().await.clone();
+    let Some(runtime) = runtime else {
+        return false;
+    };
+    let applied_models = runtime.applied_model_config().await;
+    config_requires_restart(&runtime.applied_config, &applied_models, current)
 }
 
 #[cfg(test)]
@@ -842,25 +844,66 @@ mod restart_tests {
     #[test]
     fn restart_sensitive_config_changes_are_detected() {
         let applied = CodeyConfig::default();
+        let applied_models = RuntimeModelConfig::from_config(&applied);
 
         let mut model_change = applied.clone();
         let provider_id = model_change.current_provider_id().unwrap().to_string();
         model_change
             .selected_models_by_provider
             .insert(provider_id, vec!["third-party-model".into()]);
-        assert!(config_requires_restart(&applied, &model_change));
+        assert!(config_requires_restart(
+            &applied,
+            &applied_models,
+            &model_change
+        ));
+        assert!(!config_requires_restart(
+            &applied,
+            &RuntimeModelConfig::from_config(&model_change),
+            &model_change
+        ));
+
+        let mut default_model_change = applied.clone();
+        let provider_id = default_model_change
+            .current_provider_id()
+            .unwrap()
+            .to_string();
+        default_model_change
+            .default_model_by_provider
+            .insert(provider_id, "provider-default".into());
+        assert!(config_requires_restart(
+            &applied,
+            &applied_models,
+            &default_model_change
+        ));
+        assert!(!config_requires_restart(
+            &applied,
+            &RuntimeModelConfig::from_config(&default_model_change),
+            &default_model_change
+        ));
 
         let mut startup_change = applied.clone();
         startup_change.slim_codex_voice = !startup_change.slim_codex_voice;
-        assert!(config_requires_restart(&applied, &startup_change));
+        assert!(config_requires_restart(
+            &applied,
+            &applied_models,
+            &startup_change
+        ));
 
         let mut gpu_mode_change = applied.clone();
         gpu_mode_change.gpu_launch_mode = crate::config::GpuLaunchMode::DisableGpuRasterization;
-        assert!(config_requires_restart(&applied, &gpu_mode_change));
+        assert!(config_requires_restart(
+            &applied,
+            &applied_models,
+            &gpu_mode_change
+        ));
 
         let mut fast_startup_change = applied.clone();
         fast_startup_change.fast_codex_startup = !fast_startup_change.fast_codex_startup;
-        assert!(config_requires_restart(&applied, &fast_startup_change));
+        assert!(config_requires_restart(
+            &applied,
+            &applied_models,
+            &fast_startup_change
+        ));
 
         let mut experimental_feature_change = applied.clone();
         experimental_feature_change
@@ -870,6 +913,7 @@ mod restart_tests {
             .unified_exec;
         assert!(config_requires_restart(
             &applied,
+            &applied_models,
             &experimental_feature_change
         ));
     }
@@ -913,6 +957,7 @@ mod restart_tests {
     #[test]
     fn live_config_changes_do_not_require_restart() {
         let applied = CodeyConfig::default();
+        let applied_models = RuntimeModelConfig::from_config(&applied);
         let mut current = applied.clone();
         current.webhook.channels.push(NotificationChannelConfig {
             url: "https://example.test/webhook".into(),
@@ -920,7 +965,11 @@ mod restart_tests {
         });
         current.disable_trace_log_writes = !current.disable_trace_log_writes;
 
-        assert!(!config_requires_restart(&applied, &current));
+        assert!(!config_requires_restart(
+            &applied,
+            &applied_models,
+            &current
+        ));
     }
 
     #[tokio::test]

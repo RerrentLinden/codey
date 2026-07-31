@@ -20,7 +20,7 @@ test("third-party model sync can fall back to manual model support configuration
   assert.match(hookSource, /已在上方官方模型列表中，请直接勾选，不可重复输入/);
   assert.match(
     hookSource,
-    /"save_selected_models", \{ officialModels, thirdPartyModels \}/,
+    /"save_selected_models",\s*\{\s*officialModels,\s*thirdPartyModels,/,
   );
   assert.match(commandSource, /argument::<Vec<String>>\(&args, "officialModels"\)/);
   assert.match(commandSource, /argument::<Vec<String>>\(&args, "thirdPartyModels"\)/);
@@ -32,4 +32,9 @@ test("third-party model sync can fall back to manual model support configuration
     modelCommandSource,
     /startup_model_sync_models_or_fallback\([\s\S]*saved_models/,
   );
+  assert.match(modelCommandSource, /cdp::refresh_model_whitelist/);
+  assert.match(modelCommandSource, /"modelHotReloaded"/);
+  assert.match(hookSource, /modelHotReloaded/);
+  assert.match(hookSource, /Codex 模型列表已立即更新/);
+  assert.match(hookSource, /重启 Codex 后生效/);
 });
