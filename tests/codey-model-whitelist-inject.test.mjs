@@ -4,14 +4,35 @@ import test from "node:test";
 
 const MODEL_CONFIG_ID = "107580212";
 
-async function loadPatch(catalogResponse, clients, { bridgeReady = true } = {}) {
+async function loadPatch(
+  catalogResponse,
+  clients,
+  { bridgeReady = true, queryClient = null } = {},
+) {
   const source = await readFile(
     new URL("../public/model-whitelist-inject.js", import.meta.url),
     "utf8",
   );
   let nextTimer = 0;
   const timers = new Map();
+  const windowListeners = new Map();
+  const body = {};
+  if (queryClient) {
+    body.__reactFiber$codeyTest = {
+      memoizedProps: {
+        queryClient,
+      },
+    };
+  }
   const document = {
+    body,
+    documentElement: {},
+    getElementById() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
     addEventListener() {},
     removeEventListener() {},
   };
@@ -26,8 +47,14 @@ async function loadPatch(catalogResponse, clients, { bridgeReady = true } = {}) 
       firstInstance: clients[0],
       instances: Object.fromEntries(clients.slice(1).map((client, index) => [index, client])),
     },
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(name, listener) {
+      const listeners = windowListeners.get(name) || new Set();
+      listeners.add(listener);
+      windowListeners.set(name, listeners);
+    },
+    removeEventListener(name, listener) {
+      windowListeners.get(name)?.delete(listener);
+    },
     setTimeout(callback) {
       nextTimer += 1;
       timers.set(nextTimer, callback);
@@ -50,6 +77,11 @@ async function loadPatch(catalogResponse, clients, { bridgeReady = true } = {}) 
     patch,
     connectBridge() {
       window.__codexSessionDeleteBridge = bridge;
+    },
+    dispatchWindowEvent(name, event) {
+      for (const listener of windowListeners.get(name) || []) {
+        listener(event);
+      }
     },
     async runNextTimer() {
       const next = timers.entries().next().value;
@@ -78,10 +110,12 @@ function statsigClient(initialModels = ["gpt-5.6-sol", "gpt-5.3-codex"]) {
   const memo = modelConfig(initialModels, "gpt-5.4");
   const external = modelConfig(initialModels, "gpt-5.4");
   const internal = modelConfig(initialModels, "gpt-5.4");
+  const events = [];
   return {
     memo,
     external,
     internal,
+    events,
     _memoCache: {
       [`c|${MODEL_CONFIG_ID}`]: memo,
     },
@@ -103,6 +137,61 @@ function statsigClient(initialModels = ["gpt-5.6-sol", "gpt-5.3-codex"]) {
       return name === MODEL_CONFIG_ID
         ? modelConfig(initialModels, "gpt-5.4")
         : { value: { available_models: ["unrelated-model"] } };
+    },
+    $emt(event) {
+      events.push(event);
+    },
+  };
+}
+
+function modelDescriptor(model, isDefault = false) {
+  return {
+    model,
+    id: model,
+    displayName: model,
+    hidden: false,
+    isDefault,
+    defaultReasoningEffort: "medium",
+    supportedReasoningEfforts: [{
+      reasoningEffort: "medium",
+      description: "medium effort",
+    }],
+  };
+}
+
+function activeModelQueryClient(initialModels) {
+  const queryKey = ["models", "list", "local", "apikey", 100];
+  const entries = new Map([[
+    JSON.stringify(queryKey),
+    {
+      queryKey,
+      data: {
+        data: initialModels.map((model, index) => modelDescriptor(model, index === 0)),
+        nextCursor: null,
+      },
+    },
+  ]]);
+  let invalidations = 0;
+  return {
+    get invalidations() {
+      return invalidations;
+    },
+    getQueriesData({ queryKey: prefix }) {
+      return [...entries.values()]
+        .filter((entry) => prefix.every((value, index) => entry.queryKey[index] === value))
+        .map((entry) => [entry.queryKey, entry.data]);
+    },
+    setQueryData(queryKeyValue, value) {
+      const entry = entries.get(JSON.stringify(queryKeyValue));
+      assert.ok(entry, "the active model query should exist");
+      entry.data = typeof value === "function" ? value(entry.data) : value;
+    },
+    async invalidateQueries({ queryKey: prefix }) {
+      assert.deepEqual(prefix, ["models", "list"]);
+      invalidations += 1;
+    },
+    models() {
+      return entries.get(JSON.stringify(queryKey)).data.data.map((model) => model.model);
     },
   };
 }
@@ -175,14 +264,17 @@ test("an explicit refresh hot updates the native model list and default", async 
 
 test("a backend-pushed catalog updates immediately without a nested bridge request", async () => {
   const client = statsigClient();
-  const { patch } = await loadPatch({
+  const queryClient = activeModelQueryClient(["gpt-5.6-sol"]);
+  const runtime = await loadPatch({
     status: "ok",
     models: ["gpt-5.6-sol"],
     default_model: "gpt-5.6-sol",
-  }, [client]);
+  }, [client], { queryClient });
+  const { patch } = runtime;
+  const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "2");
-  assert.equal(patch.setCatalog({
+  assert.equal(patch.version, "3");
+  assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
     default_model: "provider-hot-pushed",
@@ -197,6 +289,50 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
     "provider-hot-pushed",
   ]);
   assert.equal(client.external.value.default_model, "provider-hot-pushed");
+  assert.ok(client.events.length > eventsBeforePush);
+  assert.equal(client.events.at(-1).name, "values_updated");
+  assert.deepEqual(queryClient.models(), [
+    "gpt-5.6-sol",
+    "provider-hot-pushed",
+  ]);
+  assert.ok(queryClient.invalidations > 0);
+  assert.deepEqual(patch.delivery(), {
+    revision: 2,
+    statsigClients: 1,
+    notifiedClients: 1,
+    queryClients: 1,
+    queryEntries: 1,
+    reactContainers: 0,
+    responsePatchInstalled: true,
+  });
+
+  runtime.dispatchWindowEvent("codex-message-from-view", {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: 41,
+        method: "model/list",
+        params: {},
+      },
+    },
+  });
+  const response = {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: 41,
+        result: {
+          data: [modelDescriptor("provider-stale")],
+          nextCursor: null,
+        },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("message", response);
+  assert.deepEqual(
+    response.data.message.result.data.map((model) => model.model),
+    ["gpt-5.6-sol", "provider-hot-pushed"],
+  );
   patch.dispose();
 });
 
@@ -214,7 +350,7 @@ test("a stale bridge response cannot overwrite a backend-pushed catalog", async 
   await Promise.resolve();
   const staleRefresh = runtime.patch.refresh();
 
-  assert.equal(runtime.patch.setCatalog({
+  assert.equal(await runtime.patch.setCatalog({
     status: "ok",
     models: ["provider-current"],
     default_model: "provider-current",

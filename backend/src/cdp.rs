@@ -672,7 +672,15 @@ fn model_whitelist_refresh_script(
     && snapshot.models.every((model, index) => model === expectedModels[index])
     && snapshot.defaultModel === expectedDefaultModel
   );
+  const reachedActiveModelPicker = (delivery) => (
+    delivery?.responsePatchInstalled === true
+    && Number(delivery.statsigClients) > 0
+    && Number(delivery.notifiedClients) > 0
+    && Number(delivery.queryClients) > 0
+    && Number(delivery.queryEntries) > 0
+  );
   let snapshot = null;
+  let delivery = null;
   let lastError = "模型白名单补丁尚未就绪";
   for (const delay of [0, 80, 200, 500]) {{
     if (delay > 0) {{
@@ -682,25 +690,35 @@ fn model_whitelist_refresh_script(
     if (
       !patch
       || typeof patch.setCatalog !== "function"
+      || typeof patch.delivery !== "function"
       || typeof patch.snapshot !== "function"
     ) {{
       lastError = "模型白名单补丁尚未就绪";
       continue;
     }}
     try {{
-      const updated = patch.setCatalog(expectedCatalog);
+      const updated = await patch.setCatalog(expectedCatalog);
       snapshot = patch.snapshot();
-      if (updated === true && matchesExpected(snapshot)) {{
-        return JSON.stringify({{ ok: true, snapshot }});
+      delivery = patch.delivery();
+      if (
+        updated === true
+        && matchesExpected(snapshot)
+        && reachedActiveModelPicker(delivery)
+      ) {{
+        return JSON.stringify({{ ok: true, snapshot, delivery }});
       }}
-      lastError = updated === true
-        ? "模型白名单快照与已保存配置不一致"
-        : "模型白名单拒绝了后端推送的目录";
+      if (updated !== true) {{
+        lastError = "模型白名单拒绝了后端推送的目录";
+      }} else if (!matchesExpected(snapshot)) {{
+        lastError = "模型白名单快照与已保存配置不一致";
+      }} else {{
+        lastError = "未能刷新 Codex 当前对话的模型查询缓存";
+      }}
     }} catch (error) {{
       lastError = error instanceof Error ? error.message : String(error);
     }}
   }}
-  return JSON.stringify({{ ok: false, error: lastError, snapshot }});
+  return JSON.stringify({{ ok: false, error: lastError, snapshot, delivery }});
 }})()"#
     )
 }
@@ -1170,13 +1188,15 @@ mod tests {
         );
 
         assert!(script.contains("window.__codeyModelWhitelistPatch"));
-        assert!(script.contains("patch.setCatalog(expectedCatalog)"));
+        assert!(script.contains("await patch.setCatalog(expectedCatalog)"));
+        assert!(script.contains("patch.delivery()"));
         assert!(script.contains("patch.snapshot()"));
         assert!(!script.contains("patch.refresh()"));
         assert!(!script.contains("/codex-model-catalog"));
         assert!(script.contains("[0, 80, 200, 500]"));
         assert!(script.contains(r#"provider-\"quoted"#));
         assert!(script.contains("snapshot.defaultModel === expectedDefaultModel"));
+        assert!(script.contains("delivery.queryEntries"));
     }
 
     #[test]

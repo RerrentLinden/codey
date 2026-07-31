@@ -11,7 +11,6 @@ use crate::cdp;
 use crate::codex_config::codex_home;
 use crate::config::CodeyConfig;
 use crate::error_log;
-use crate::launcher::RuntimeModelConfig;
 use crate::model_catalog;
 use crate::provider_models;
 
@@ -481,14 +480,6 @@ async fn hot_reload_runtime_models(
     let Some(runtime) = runtime else {
         return ModelHotReloadOutcome::default();
     };
-    let next_model_config = RuntimeModelConfig::from_config(config);
-    if runtime.applied_model_config().await == next_model_config {
-        return ModelHotReloadOutcome {
-            reloaded: true,
-            error: None,
-        };
-    }
-
     let expected_models = renderer_model_ids(model_state);
     let websocket_url = runtime.renderer_websocket_url().await;
     match cdp::refresh_model_whitelist(&websocket_url, &expected_models, &model_state.default_model)
