@@ -1089,12 +1089,15 @@ async fn spawn_codex(
     experimental_features: ExperimentalFeaturesConfig,
     gpu_launch_mode: GpuLaunchMode,
 ) -> Result<SpawnedCodex> {
+    #[cfg(any(windows, target_os = "macos"))]
     let patch_options = crate::codex_startup_patch::PatchOptions {
         disable_pet: disable_codex_pet,
         disable_voice: disable_codex_voice,
         fast_codex_startup,
         experimental_features,
     };
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let _ = (fast_codex_startup, experimental_features);
     let runtime_arguments = codex_runtime_arguments(gpu_launch_mode, !cfg!(target_os = "macos"));
 
     #[cfg(windows)]
@@ -1334,6 +1337,7 @@ async fn prepare_codex_for_launch(app_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(windows, target_os = "macos"))]
 fn startup_patch_detail() -> String {
     #[cfg(windows)]
     {
