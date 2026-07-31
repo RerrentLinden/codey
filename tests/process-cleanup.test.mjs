@@ -51,6 +51,7 @@ test("every shutdown path reaps Codex and Codey process trees", async () => {
   );
   assert.match(runtimeStop, /terminate_unix_codex_processes/);
   assert.match(runtimeStop, /terminate_windows_codex_processes/);
+  assert.match(launcher, /windows_terminate_process_if_matches/);
   assert.doesNotMatch(runtimeStop, /if !self\.codex_exited/);
   assert.match(launcher, /child_command\.process_group\(0\)/);
   assert.match(
