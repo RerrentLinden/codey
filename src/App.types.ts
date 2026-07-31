@@ -148,7 +148,7 @@ export type InlineResult = {
 };
 
 export type Confirmation = {
-  action: "clear" | "restart" | "install-update";
+  action: "clear" | "restart" | "install-update" | "delete-notification-channel";
   title: string;
   description: string;
   confirmLabel: string;

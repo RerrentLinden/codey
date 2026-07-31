@@ -16,5 +16,6 @@ export type NotificationChannel = {
 export type NotificationChannelEditorProps = {
   channel: NotificationChannel;
   disabled: boolean;
+  revealSecrets?: boolean;
   onChange: (patch: Partial<NotificationChannel>) => void;
 };

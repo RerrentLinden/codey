@@ -1,10 +1,11 @@
 import { memo } from "react";
 import {
+  IconAlertTriangle as AlertTriangle,
   IconCheck as Check,
   IconFolderOpen as FolderOpen,
   IconLoader2 as LoaderCircle,
+  IconPlus as Plus,
   IconRefresh as RefreshCw,
-  IconSearch as Search,
   IconTrash as Trash2,
 } from "@tabler/icons-react";
 
@@ -27,14 +28,15 @@ type ModelPickerDialogProps = {
   isBusy: boolean;
   busy: string | null;
   container: HTMLElement | null;
-  modelQuery: string;
-  filteredUpstreamModels: string[];
+  customModelInput: string;
+  modelInputError: string;
+  modelSyncWarning: string;
+  thirdPartyModelOptions: string[];
   modelState: ModelState;
-  officialSlugs: Set<string>;
   draftModelSet: Set<string>;
   onOpenChange: (open: boolean) => void;
-  onModelQueryChange: (query: string) => void;
-  onDraftModelsChange: (models: string[]) => void;
+  onCustomModelInputChange: (model: string) => void;
+  onAddCustomModel: () => void;
   onToggleDraftModel: (model: string, checked: boolean) => void;
   onSave: () => void;
 };
@@ -44,14 +46,15 @@ function ModelPickerDialogComponent({
   isBusy,
   busy,
   container,
-  modelQuery,
-  filteredUpstreamModels,
+  customModelInput,
+  modelInputError,
+  modelSyncWarning,
+  thirdPartyModelOptions,
   modelState,
-  officialSlugs,
   draftModelSet,
   onOpenChange,
-  onModelQueryChange,
-  onDraftModelsChange,
+  onCustomModelInputChange,
+  onAddCustomModel,
   onToggleDraftModel,
   onSave,
 }: ModelPickerDialogProps) {
@@ -68,65 +71,106 @@ function ModelPickerDialogComponent({
         }}
       >
         <DialogHeader>
-          <DialogTitle>添加三方模型</DialogTitle>
-          <DialogDescription>从当前线路发现的上游模型中选择要显示的三方模型。</DialogDescription>
+          <DialogTitle>配置当前线路支持的模型</DialogTitle>
+          <DialogDescription>
+            默认展示 7 个官方模型，请按线路实际能力勾选；其他模型可输入模型 ID 手动添加。
+          </DialogDescription>
         </DialogHeader>
-        <div className="model-picker-toolbar">
+        {modelSyncWarning && (
+          <div className="model-picker-warning" role="alert">
+            <AlertTriangle size={17} aria-hidden="true" />
+            <span>{modelSyncWarning}</span>
+          </div>
+        )}
+        <div className="model-picker-add">
           <div className="input-shell">
-            <Search size={15} aria-hidden="true" />
             <Input
-              value={modelQuery}
-              onChange={(event) => onModelQueryChange(event.target.value)}
-              placeholder="搜索模型"
+              value={customModelInput}
+              onChange={(event) => onCustomModelInputChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  onAddCustomModel();
+                }
+              }}
+              placeholder="输入其他模型 ID，例如 provider-model-v2"
               spellCheck={false}
-              aria-label="搜索上游模型"
+              aria-label="输入其他模型 ID"
+              aria-invalid={Boolean(modelInputError)}
+              disabled={isBusy}
             />
           </div>
-          <div>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => onDraftModelsChange(
-                modelState.upstreamModels.filter((model) => !officialSlugs.has(model)),
-              )}
-            >
-              全选三方
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => onDraftModelsChange([])}>
-              清空
-            </Button>
-          </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={isBusy || !customModelInput.trim()}
+            onClick={onAddCustomModel}
+          >
+            <Plus aria-hidden="true" />
+            添加
+          </Button>
         </div>
+        {modelInputError && (
+          <p className="model-picker-input-error" role="alert">{modelInputError}</p>
+        )}
         <div className="model-picker-list">
-          {filteredUpstreamModels.map((model) => {
-            const officialModel = officialSlugs.has(model);
-            return (
-              <div className={`model-picker-row${officialModel ? " official" : ""}`} key={model}>
-                <Checkbox
-                  checked={officialModel || draftModelSet.has(model)}
-                  disabled={officialModel}
-                  onCheckedChange={(checked) => onToggleDraftModel(model, checked === true)}
-                  aria-label={`添加 ${model}`}
-                />
-                <span>{model}</span>
-                {officialModel && <Badge variant="info">官方模型</Badge>}
+          <div className="model-picker-list-heading">
+            <div>
+              <strong>官方模型</strong>
+              <small>勾选当前第三方线路实际支持的模型</small>
+            </div>
+            <Badge variant="info">{modelState.officialModels.length} 个</Badge>
+          </div>
+          {modelState.officialModels.map((model) => (
+            <div className="model-picker-row official" key={model.slug}>
+              <Checkbox
+                checked={draftModelSet.has(model.slug)}
+                disabled={isBusy}
+                onCheckedChange={(checked) =>
+                  onToggleDraftModel(model.slug, checked === true)}
+                aria-label={`当前线路支持 ${model.slug}`}
+              />
+              <div className="model-picker-model-copy">
+                <strong>{model.displayName}</strong>
+                <small>{model.slug}</small>
               </div>
-            );
-          })}
-          {filteredUpstreamModels.length === 0 && <div className="empty-state">没有匹配的模型</div>}
+              <Badge variant="info">官方模型</Badge>
+            </div>
+          ))}
+          <div className="model-picker-list-heading other-models">
+            <div>
+              <strong>其他模型</strong>
+              <small>可选择同步发现的模型，也可在上方手动输入</small>
+            </div>
+            <Badge variant="secondary">{thirdPartyModelOptions.length} 个</Badge>
+          </div>
+          {thirdPartyModelOptions.map((model) => (
+            <div className="model-picker-row" key={model}>
+              <Checkbox
+                checked={draftModelSet.has(model)}
+                disabled={isBusy}
+                onCheckedChange={(checked) => onToggleDraftModel(model, checked === true)}
+                aria-label={`当前线路支持 ${model}`}
+              />
+              <span className="model-picker-model-id">{model}</span>
+            </div>
+          ))}
+          {thirdPartyModelOptions.length === 0 && (
+            <div className="empty-state">尚无其他模型，可在上方输入模型 ID 添加</div>
+          )}
         </div>
         <DialogFooter>
           <Button variant="outline" disabled={isBusy} onClick={() => onOpenChange(false)}>
             取消
           </Button>
           <Button
-            disabled={isBusy && busy !== "save-models"}
+            disabled={isBusy}
             onClick={onSave}
           >
             {busy === "save-models"
               ? <LoaderCircle className="spinner" aria-hidden="true" />
               : <Check aria-hidden="true" />}
-            添加到模型列表
+            保存模型支持情况
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -147,6 +191,9 @@ function ConfirmationDialogComponent({
   onClose,
   onConfirm,
 }: ConfirmationDialogProps) {
+  const destructive =
+    confirmation?.action === "clear" ||
+    confirmation?.action === "delete-notification-channel";
   return (
     <Dialog open={Boolean(confirmation)} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="confirmation-dialog" container={container}>
@@ -158,7 +205,7 @@ function ConfirmationDialogComponent({
           <Button variant="outline" onClick={onClose}>取消</Button>
           <Button
             variant={
-              confirmation?.action === "clear"
+              destructive
                 ? "destructive"
                 : confirmation?.action === "restart"
                   ? "warning"
@@ -168,7 +215,7 @@ function ConfirmationDialogComponent({
               if (confirmation) onConfirm(confirmation);
             }}
           >
-            {confirmation?.action === "clear"
+            {destructive
               ? <Trash2 aria-hidden="true" />
               : confirmation?.action === "restart"
               ? <RefreshCw aria-hidden="true" />

@@ -125,12 +125,41 @@ pub(super) fn config_with_current_provider_models(
     next.normalize()
 }
 
-pub(super) fn startup_model_sync_models_or_default(models: Vec<String>) -> (Vec<String>, bool) {
+pub(super) fn startup_model_sync_models_or_fallback(
+    models: Vec<String>,
+    saved_models: Option<&[String]>,
+) -> (Vec<String>, bool) {
     if models.is_empty() {
-        (model_catalog::default_official_model_slugs(), false)
+        (
+            saved_models
+                .map(<[String]>::to_vec)
+                .unwrap_or_else(model_catalog::default_official_model_slugs),
+            false,
+        )
     } else {
         (models, true)
     }
+}
+
+pub(super) fn preserve_selected_third_party_models(
+    mut upstream_models: Vec<String>,
+    selected_models: &[String],
+) -> Vec<String> {
+    let official_model_keys = model_catalog::default_official_model_slugs()
+        .into_iter()
+        .map(|model| model.to_lowercase())
+        .collect::<HashSet<_>>();
+    for model in selected_models {
+        let model = model.trim();
+        if model.is_empty()
+            || official_model_keys.contains(model.to_lowercase().as_str())
+            || upstream_models.iter().any(|existing| existing == model)
+        {
+            continue;
+        }
+        upstream_models.push(model.to_string());
+    }
+    upstream_models
 }
 
 pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> CodeyConfig {
@@ -152,12 +181,23 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
     .await
     {
         Ok(Ok(models)) => {
-            let (models, synced) = startup_model_sync_models_or_default(models);
+            let fetched_model_count = models.len();
+            let (models, synced) =
+                startup_model_sync_models_or_fallback(models, config.upstream_models_snapshot());
+            let models = if synced {
+                preserve_selected_third_party_models(models, config.selected_models())
+            } else {
+                models
+            };
             if synced {
                 eprintln!(
                     "启动时已从「{}」同步 {} 个上游模型",
-                    profile.name,
-                    models.len()
+                    profile.name, fetched_model_count
+                );
+            } else if config.upstream_models_snapshot().is_some() {
+                eprintln!(
+                    "启动时「{}」返回空模型列表，沿用已保存的模型支持配置",
+                    profile.name
                 );
             } else {
                 eprintln!(
@@ -168,18 +208,40 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
             (models, synced)
         }
         Ok(Err(error)) => {
-            eprintln!(
-                "启动时同步「{}」上游模型失败，使用默认 7 个模型：{error:#}",
-                profile.name
+            let (models, synced) = startup_model_sync_models_or_fallback(
+                Vec::new(),
+                config.upstream_models_snapshot(),
             );
-            (model_catalog::default_official_model_slugs(), false)
+            if config.upstream_models_snapshot().is_some() {
+                eprintln!(
+                    "启动时同步「{}」上游模型失败，沿用已保存的模型支持配置：{error:#}",
+                    profile.name
+                );
+            } else {
+                eprintln!(
+                    "启动时同步「{}」上游模型失败，使用默认 7 个模型：{error:#}",
+                    profile.name
+                );
+            }
+            (models, synced)
         }
         Err(_) => {
-            eprintln!(
-                "启动时同步「{}」上游模型超时，使用默认 7 个模型",
-                profile.name
+            let (models, synced) = startup_model_sync_models_or_fallback(
+                Vec::new(),
+                config.upstream_models_snapshot(),
             );
-            (model_catalog::default_official_model_slugs(), false)
+            if config.upstream_models_snapshot().is_some() {
+                eprintln!(
+                    "启动时同步「{}」上游模型超时，沿用已保存的模型支持配置",
+                    profile.name
+                );
+            } else {
+                eprintln!(
+                    "启动时同步「{}」上游模型超时，使用默认 7 个模型",
+                    profile.name
+                );
+            }
+            (models, synced)
         }
     };
     let _config_write_guard = state.config_write_lock.lock().await;
@@ -211,7 +273,7 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
         .current_provider_id()
         .ok_or_else(|| "当前线路缺少标识".to_string())?
         .to_string();
-    let models = provider_models::fetch(&profile, &state.http_client)
+    let fetched_models = provider_models::fetch(&profile, &state.http_client)
         .await
         .map_err(|error| error.to_string())?;
     let _config_write_guard = state.config_write_lock.lock().await;
@@ -219,6 +281,8 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
     if latest.current_provider_id() != Some(provider_id.as_str()) {
         return Err("同步模型期间当前线路已变化，请重试".to_string());
     }
+    let models =
+        preserve_selected_third_party_models(fetched_models.clone(), latest.selected_models());
     let mut next = latest;
     next.upstream_models_by_provider
         .insert(provider_id, models.clone());
@@ -233,7 +297,7 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
     let restart_required = runtime_config_requires_restart(state, &next).await;
     Ok(json!({
         "status":"ok",
-        "models":models,
+        "models":fetched_models,
         "modelState":model_state,
         "restartRequired":restart_required,
     }))
@@ -241,7 +305,8 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
 
 pub async fn save_selected_models(
     state: &Arc<AppState>,
-    requested_models: Vec<String>,
+    requested_official_models: Vec<String>,
+    requested_third_party_models: Vec<String>,
 ) -> Result<Value, String> {
     let _config_write_guard = state.config_write_lock.lock().await;
     let mut config = state.config.read().await.clone();
@@ -253,25 +318,21 @@ pub async fn save_selected_models(
     if profile.cc_switch_read_only {
         return Err("官方线路不支持添加第三方模型".to_string());
     }
-    let official = model_catalog::official_model_slugs(&codex_home())
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let requested = requested_models
-        .iter()
-        .map(|model| model.trim())
-        .filter(|model| !model.is_empty())
-        .collect::<HashSet<_>>();
-    let selected = config
-        .upstream_models()
-        .iter()
-        .filter(|model| requested.contains(model.as_str()) && !official.contains(model.as_str()))
-        .cloned()
-        .collect::<Vec<_>>();
+    let (supported_official, selected) = validate_manual_model_selection(
+        &model_catalog::default_official_model_slugs(),
+        &requested_official_models,
+        &requested_third_party_models,
+    )?;
     let provider_id = config
         .current_provider_id()
         .ok_or_else(|| "当前线路缺少标识".to_string())?
         .to_string();
+    let supported_models =
+        preserve_selected_third_party_models(supported_official, config.upstream_models());
+    let supported_models = preserve_selected_third_party_models(supported_models, &selected);
+    config
+        .upstream_models_by_provider
+        .insert(provider_id.clone(), supported_models);
     if selected.is_empty() {
         config.selected_models_by_provider.remove(&provider_id);
     } else {
@@ -296,6 +357,50 @@ pub async fn save_selected_models(
         "modelState":model_state,
         "restartRequired":restart_required,
     }))
+}
+
+pub(super) fn validate_manual_model_selection(
+    official_model_ids: &[String],
+    requested_official_models: &[String],
+    requested_third_party_models: &[String],
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let official_by_key = official_model_ids
+        .iter()
+        .map(|model| (model.to_lowercase(), model.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let requested_official = requested_official_models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .map(|model| model.to_lowercase())
+        .collect::<HashSet<_>>();
+    if let Some(model) = requested_official
+        .iter()
+        .find(|model| !official_by_key.contains_key(model.as_str()))
+    {
+        return Err(format!("模型 {model} 不在官方模型列表中"));
+    }
+    let supported_official = official_model_ids
+        .iter()
+        .filter(|model| requested_official.contains(model.to_lowercase().as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let selected_third_party = requested_third_party_models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .try_fold(Vec::<String>::new(), |mut models, model| {
+            if official_by_key.contains_key(model.to_lowercase().as_str()) {
+                return Err(format!(
+                    "模型 {model} 已在官方模型列表中，请直接勾选，不可作为其他模型手动添加"
+                ));
+            }
+            if !models.iter().any(|existing| existing == model) {
+                models.push(model.to_string());
+            }
+            Ok(models)
+        })?;
+    Ok((supported_official, selected_third_party))
 }
 
 pub async fn save_default_model(

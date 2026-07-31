@@ -107,9 +107,10 @@ if (import.meta.env.DEV) {
       },
     };
     let previewModelState = {
-      officialModels: previewOfficialModels
-        .filter((model) => previewUpstreamModels.includes(model.slug))
-        .map((model) => ({ ...model, supported: true })),
+      officialModels: previewOfficialModels.map((model) => ({
+        ...model,
+        supported: previewUpstreamModels.includes(model.slug),
+      })),
       officialModelIds: previewOfficialModels.map((model) => model.slug),
       thirdPartyModels: ["provider-fast-coder", "claude-sonnet-4-5"],
       upstreamModels: previewUpstreamModels,
@@ -243,6 +244,15 @@ if (import.meta.env.DEV) {
           restartRequired: false,
         };
       }
+      if (command === "reveal_notification_channel") {
+        const channelId = String(args.channelId || "");
+        const channel = previewConfig.webhook.channels.find(
+          (candidate) => candidate.id === channelId,
+        );
+        return channel
+          ? { channel }
+          : { status: "failed", message: "找不到要编辑的通知渠道" };
+      }
       if (command === "sync_current_provider") {
         return {
           config: previewConfig,
@@ -272,6 +282,17 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "fetch_current_provider_models") {
+        previewModelState = {
+          ...previewModelState,
+          officialModels: previewOfficialModels.map((model) => ({
+            ...model,
+            supported: previewUpstreamModels.includes(model.slug),
+          })),
+          thirdPartyModels: previewModelState.thirdPartyModels.filter((model) =>
+            previewUpstreamModels.includes(model)
+          ),
+          upstreamModels: previewUpstreamModels,
+        };
         return {
           status: "ok",
           models: previewUpstreamModels,
@@ -280,16 +301,33 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "save_selected_models") {
-        const requested = new Set(args.models as string[]);
+        const officialModels = (args.officialModels as string[]) || [];
+        const thirdPartyModels = (args.thirdPartyModels as string[]) || [];
+        const requestedOfficial = new Set(officialModels);
+        const supportedModels = [...officialModels, ...thirdPartyModels];
+        previewConfig = {
+          ...previewConfig,
+          selectedModelsByProvider: {
+            ...previewConfig.selectedModelsByProvider,
+            primary: thirdPartyModels,
+          },
+          upstreamModelsByProvider: {
+            ...previewConfig.upstreamModelsByProvider,
+            primary: supportedModels,
+          },
+        };
+        const defaultModel = supportedModels.includes(previewModelState.defaultModel)
+          ? previewModelState.defaultModel
+          : supportedModels[0] || "";
         previewModelState = {
           ...previewModelState,
-          thirdPartyModels: previewUpstreamModels.filter(
-            (model) =>
-              requested.has(model) &&
-              !previewOfficialModels.some(
-                (official) => official.slug === model,
-              ),
-          ),
+          officialModels: previewOfficialModels.map((model) => ({
+            ...model,
+            supported: requestedOfficial.has(model.slug),
+          })),
+          thirdPartyModels,
+          upstreamModels: supportedModels,
+          defaultModel,
         };
         return {
           status: "ok",
@@ -360,6 +398,20 @@ if (import.meta.env.DEV) {
       }
       if (command === "test_webhook") {
         return { status: 200 };
+      }
+      if (command === "test_notification_channel") {
+        const channel = args.channel as {
+          kind?: string;
+          url?: string;
+          botToken?: string;
+          chatId?: string;
+        } | undefined;
+        const configured = channel?.kind === "telegram"
+          ? Boolean(channel.botToken?.trim() && channel.chatId?.trim())
+          : Boolean(channel?.url?.trim());
+        return configured
+          ? { status: "ok", eventId: "preview-notification-test" }
+          : { status: "failed", message: "请先完成渠道配置" };
       }
       return { status: "ok" };
     };

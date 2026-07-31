@@ -132,8 +132,9 @@ pub struct CodeyConfig {
     /// by cc-switch (or the local Codex configuration).
     #[serde(default)]
     pub selected_models_by_provider: BTreeMap<String, Vec<String>>,
-    /// Last successful upstream model response, used to keep unsupported
-    /// official models disabled between launches.
+    /// Last synchronized or manually confirmed provider model support. This
+    /// keeps unsupported official models disabled between launches and lets
+    /// providers without a model-list endpoint retain manual selections.
     #[serde(default)]
     pub upstream_models_by_provider: BTreeMap<String, Vec<String>>,
     /// Codey-owned default model selection per provider. Empty or unavailable

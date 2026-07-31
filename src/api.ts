@@ -15,6 +15,8 @@ export const CODEY_API_COMMANDS = [
   "restart_codey",
   "clear_codex_trace_logs",
   "test_webhook",
+  "test_notification_channel",
+  "reveal_notification_channel",
   "check_for_updates",
   "download_update",
   "install_downloaded_update",

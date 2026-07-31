@@ -20,6 +20,15 @@ const SUBAGENT_MODEL = "gpt-5.6-luna";
 const supportsModel = (models: string[], expected: string) =>
   models.some((model) => model.trim().toLowerCase() === expected);
 
+const modelKey = (model: string) => model.trim().toLowerCase();
+
+const pickerSelection = (state: ModelState) => [
+  ...state.officialModels
+    .filter((model) => model.supported)
+    .map((model) => model.slug),
+  ...state.thirdPartyModels,
+];
+
 type UseModelSelectionOptions = {
   provider: CcSwitchStatus["provider"] | undefined;
   runOperation: (name: string, action: () => Promise<void>) => Promise<void>;
@@ -45,43 +54,81 @@ export function useModelSelection({
     defaultModel: "",
   });
   const [modelPickerVisible, setModelPickerVisible] = useState(false);
-  const [modelQuery, setModelQuery] = useState("");
   const [draftModels, setDraftModels] = useState<string[]>([]);
+  const [customModelInput, setCustomModelInput] = useState("");
+  const [modelInputError, setModelInputError] = useState("");
+  const [modelSyncWarning, setModelSyncWarning] = useState("");
 
   const officialSlugs = useMemo(
     () => new Set(modelState.officialModelIds),
     [modelState.officialModelIds],
   );
+  const officialSlugKeys = useMemo(
+    () => new Set(modelState.officialModelIds.map(modelKey)),
+    [modelState.officialModelIds],
+  );
   const draftModelSet = useMemo(() => new Set(draftModels), [draftModels]);
-  const filteredUpstreamModels = useMemo(() => {
-    const query = modelQuery.trim().toLowerCase();
-    return query
-      ? modelState.upstreamModels.filter((model) =>
-          model.toLowerCase().includes(query),
-        )
-      : modelState.upstreamModels;
-  }, [modelQuery, modelState.upstreamModels]);
+  const thirdPartyModelOptions = useMemo(
+    () => [
+      ...modelState.upstreamModels,
+      ...modelState.thirdPartyModels,
+      ...draftModels,
+    ].reduce<string[]>((models, model) => {
+      const normalized = model.trim();
+      if (
+        normalized &&
+        !officialSlugKeys.has(modelKey(normalized)) &&
+        !models.includes(normalized)
+      ) {
+        models.push(normalized);
+      }
+      return models;
+    }, []),
+    [
+      draftModels,
+      modelState.thirdPartyModels,
+      modelState.upstreamModels,
+      officialSlugKeys,
+    ],
+  );
+
+  function openModelPicker(state: ModelState, warning = "") {
+    setDraftModels(pickerSelection(state));
+    setCustomModelInput("");
+    setModelInputError("");
+    setModelSyncWarning(warning);
+    setModelPickerVisible(true);
+  }
 
   async function fetchCurrentModels() {
     if (!provider || provider.official) return;
     await runOperation("fetch-models", async () => {
-      const result = await withTimeout(
-        invoke<{ modelState: ModelState; restartRequired?: boolean }>(
-          "fetch_current_provider_models",
-        ),
-        15_000,
-        "获取上游模型超时，请检查当前线路",
-      );
-      setModelState(result.modelState);
-      if (typeof result.restartRequired === "boolean") {
-        setStatus((current) => ({
-          ...current,
-          restartRequired: result.restartRequired,
-        }));
+      try {
+        const result = await withTimeout(
+          invoke<{ modelState: ModelState; restartRequired?: boolean }>(
+            "fetch_current_provider_models",
+          ),
+          15_000,
+          "获取上游模型超时，请检查当前线路",
+        );
+        setModelState(result.modelState);
+        if (typeof result.restartRequired === "boolean") {
+          setStatus((current) => ({
+            ...current,
+            restartRequired: result.restartRequired,
+          }));
+        }
+        openModelPicker(result.modelState);
+      } catch (error) {
+        const warning =
+          `自动同步失败：${errorText(error)}。当前线路可能不支持 /v1/models 或 /models 接口，` +
+          "请手动确认支持的官方模型，或输入其他模型 ID。";
+        openModelPicker(modelState, warning);
+        setNotice({
+          tone: "error",
+          text: "第三方模型同步失败，当前线路可能不支持 /v1/models 或 /models 接口，已打开手动配置。",
+        });
       }
-      setDraftModels(result.modelState.thirdPartyModels);
-      setModelQuery("");
-      setModelPickerVisible(true);
     });
   }
 
@@ -155,13 +202,46 @@ export function useModelSelection({
     );
   }
 
+  function updateCustomModelInput(value: string) {
+    setCustomModelInput(value);
+    if (modelInputError) setModelInputError("");
+  }
+
+  function addCustomModel() {
+    const model = customModelInput.trim();
+    if (!model) {
+      setModelInputError("请输入要添加的模型 ID");
+      return;
+    }
+    const officialModel = modelState.officialModelIds.find(
+      (official) => modelKey(official) === modelKey(model),
+    );
+    if (officialModel) {
+      setModelInputError(
+        `${officialModel} 已在上方官方模型列表中，请直接勾选，不可重复输入`,
+      );
+      return;
+    }
+    setDraftModels((current) =>
+      current.includes(model) ? current : [...current, model],
+    );
+    setCustomModelInput("");
+    setModelInputError("");
+  }
+
   async function saveModelSelection() {
     await runOperation("save-models", async () => {
+      const officialModels = draftModels.filter((model) =>
+        officialSlugs.has(model)
+      );
+      const thirdPartyModels = draftModels.filter((model) =>
+        !officialSlugs.has(model)
+      );
       const result = await invoke<{
         config: Config;
         modelState: ModelState;
         restartRequired?: boolean;
-      }>("save_selected_models", { models: draftModels });
+      }>("save_selected_models", { officialModels, thirdPartyModels });
       setPersistedConfig(result.config);
       setModelState(result.modelState);
       setStatus((current) => ({
@@ -172,8 +252,8 @@ export function useModelSelection({
       setNotice({
         tone: result.restartRequired ? "info" : "success",
         text: result.restartRequired
-          ? `已更新模型列表，共 ${result.modelState.thirdPartyModels.length} 个三方模型；重启 Codex 后生效`
-          : `已更新模型列表，共 ${result.modelState.thirdPartyModels.length} 个三方模型`,
+          ? `已更新模型支持情况：${officialModels.length} 个官方模型、${thirdPartyModels.length} 个其他模型；重启 Codex 后生效`
+          : `已更新模型支持情况：${officialModels.length} 个官方模型、${thirdPartyModels.length} 个其他模型`,
       });
     });
   }
@@ -206,15 +286,16 @@ export function useModelSelection({
     setModelState,
     modelPickerVisible,
     setModelPickerVisible,
-    modelQuery,
-    setModelQuery,
-    setDraftModels,
-    officialSlugs,
+    customModelInput,
+    modelInputError,
+    modelSyncWarning,
     draftModelSet,
-    filteredUpstreamModels,
+    thirdPartyModelOptions,
     fetchCurrentModels,
     updateSubagentOptimization,
     toggleDraftModel,
+    updateCustomModelInput,
+    addCustomModel,
     saveModelSelection,
     setDefaultModel,
   };

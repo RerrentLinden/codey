@@ -7,6 +7,7 @@ import type { NotificationChannelEditorProps } from "./types";
 function FeishuChannelEditorComponent({
   channel,
   disabled,
+  revealSecrets = false,
   onChange,
 }: NotificationChannelEditorProps) {
   return (
@@ -16,7 +17,7 @@ function FeishuChannelEditorComponent({
         <div className="input-shell">
           <IconSend size={15} aria-hidden="true" />
           <Input
-            type="password"
+            type={revealSecrets ? "text" : "password"}
             value={channel.url}
             disabled={disabled}
             onChange={(event) =>
