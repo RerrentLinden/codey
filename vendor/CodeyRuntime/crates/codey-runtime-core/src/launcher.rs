@@ -809,11 +809,11 @@ impl LaunchHooks for DefaultLaunchHooks {
 
     async fn start_computer_use_guard_watchdog(
         &self,
-        settings: &BackendSettings,
+        _settings: &BackendSettings,
     ) -> anyhow::Result<()> {
         #[cfg(windows)]
         {
-            if !settings.computer_use_guard_enabled {
+            if !_settings.computer_use_guard_enabled {
                 return Ok(());
             }
             let home = crate::relay_config::default_codex_home_dir();
@@ -834,7 +834,6 @@ impl LaunchHooks for DefaultLaunchHooks {
         }
         #[cfg(target_os = "macos")]
         {
-            let _ = &settings;
             let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
             let task = tokio::spawn(async move {
                 loop {
