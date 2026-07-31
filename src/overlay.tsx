@@ -42,34 +42,48 @@ if (!window.__codeySettingsOverlay) {
   const shadow = host.attachShadow({ mode: "open" });
   const style = document.createElement("style");
   style.textContent = `${componentStyles}\n${overlayStyles}\n${appStyles}`;
-  const backdrop = document.createElement("div");
-  backdrop.className = "codey-overlay-backdrop";
-  const dialog = document.createElement("section");
-  dialog.className = "codey-overlay-dialog";
-  dialog.setAttribute("role", "dialog");
-  dialog.setAttribute("aria-modal", "true");
-  dialog.setAttribute("aria-label", "Codey 配置");
-  dialog.tabIndex = -1;
   const rootElement = document.createElement("div");
   rootElement.id = "codey-overlay-root";
-  dialog.appendChild(rootElement);
-  backdrop.appendChild(dialog);
-  shadow.append(style, backdrop);
+  const modalContainer = document.createElement("div");
+  modalContainer.id = "codey-overlay-modal-container";
+  shadow.append(style, rootElement, modalContainer);
   document.documentElement.appendChild(host);
 
-  const close = () => {
+  let hideTimer: number | undefined;
+  const hide = () => {
+    window.clearTimeout(hideTimer);
+    hideTimer = undefined;
     host.style.display = "none";
     host.setAttribute("aria-hidden", "true");
   };
+  const reactRoot = ReactDOM.createRoot(rootElement);
+  const render = (visible: boolean) => {
+    reactRoot.render(
+      <App
+        embedded
+        modalContainer={modalContainer}
+        modalVisible={visible}
+        onAfterClose={hide}
+        onClose={close}
+      />,
+    );
+  };
+  const close = () => {
+    render(false);
+    window.clearTimeout(hideTimer);
+    hideTimer = window.setTimeout(hide, 250);
+  };
   const open = () => {
+    window.clearTimeout(hideTimer);
+    hideTimer = undefined;
     host.style.display = "block";
     host.setAttribute("aria-hidden", "false");
+    render(true);
     window.dispatchEvent(new CustomEvent(SETTINGS_OPENED_EVENT));
-    requestAnimationFrame(() => dialog.focus({ preventScroll: true }));
   };
   const isOpen = () => host.style.display !== "none";
 
-  ReactDOM.createRoot(rootElement).render(<App embedded onClose={close} />);
+  render(false);
   window.__codeySettingsOverlay = {
     open,
     close,

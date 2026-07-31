@@ -192,5 +192,8 @@ export type UpdateDownload = {
 
 export type AppProps = {
   embedded?: boolean;
+  modalContainer?: HTMLElement | null;
+  modalVisible?: boolean;
+  onAfterClose?: () => void;
   onClose?: () => void;
 };

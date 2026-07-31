@@ -4,7 +4,7 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("settings overlay only closes explicitly and restores unsaved config", async () => {
+test("settings Semi modal dismissal restores unsaved config", async () => {
   const [appSource, overlaySource] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/overlay.tsx", root), "utf8"),
@@ -20,12 +20,28 @@ test("settings overlay only closes explicitly and restores unsaved config", asyn
   );
   assert.match(
     appSource,
-    /onClick=\{embedded \? handleCloseSettings : undefined\}/,
+    /import SemiModal from "@douyinfe\/semi-ui\/lib\/es\/modal"/,
   );
-  assert.doesNotMatch(appSource, /aria-label="关闭设置"/);
+  assert.match(
+    appSource,
+    /<SemiModal[\s\S]*closeOnEsc[\s\S]*closable[\s\S]*maskClosable[\s\S]*onCancel=\{onCancel\}/,
+  );
+  assert.match(appSource, /onCancel=\{handleCloseSettings\}/);
+  assert.match(
+    appSource,
+    /header=\{\([\s\S]*codey-settings-modal-header[\s\S]*configHeaderContent/,
+  );
+  assert.match(appSource, /aria-label="关闭配置"/);
+  assert.match(
+    appSource,
+    /\{!embedded && \(\s*<header className="config-header">\{configHeaderContent\}<\/header>/,
+  );
+  assert.match(appSource, /\{!embedded && \(/);
 
-  assert.doesNotMatch(overlaySource, /backdrop\.addEventListener\("click"/);
-  assert.doesNotMatch(overlaySource, /addEventListener\("keydown"/);
+  assert.doesNotMatch(overlaySource, /codey-overlay-backdrop/);
+  assert.doesNotMatch(overlaySource, /codey-overlay-dialog/);
+  assert.match(overlaySource, /modalVisible=\{visible\}/);
+  assert.match(overlaySource, /onClose=\{close\}/);
   assert.match(overlaySource, /codey-settings-opened/);
   assert.match(overlaySource, /toggle: open/);
 });

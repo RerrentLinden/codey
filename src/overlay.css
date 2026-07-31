@@ -1,44 +1,102 @@
 :host {
   all: initial;
-  color-scheme: dark;
+  color-scheme: light;
 }
 
-.codey-overlay-backdrop {
-  -webkit-app-region: no-drag !important;
-  align-items: center;
-  background: rgba(2, 6, 23, 0.68);
-  backdrop-filter: blur(10px);
-  display: flex;
+#codey-overlay-root,
+#codey-overlay-modal-container {
   inset: 0;
-  justify-content: center;
-  padding: 22px;
-  pointer-events: auto;
   position: fixed;
-  z-index: 2147483646;
-}
-
-.codey-overlay-dialog {
-  background: #0b1120;
-  border: 1px solid rgba(71, 85, 105, 0.68);
-  border-radius: 16px;
-  box-shadow: 0 30px 100px rgba(0, 0, 0, 0.48);
-  height: min(820px, calc(100vh - 40px));
-  max-width: 1040px;
-  overflow: hidden;
-  position: relative;
-  width: min(1040px, calc(100vw - 40px));
-}
-
-#codey-overlay-root {
-  height: 100%;
   width: 100%;
 }
 
+#codey-overlay-root {
+  pointer-events: none;
+}
+
+.codey-settings-modal-layer {
+  -webkit-app-region: no-drag !important;
+}
+
+.codey-settings-modal-layer .semi-modal-wrap {
+  padding: 22px;
+}
+
+.codey-settings-modal-layer .semi-modal {
+  height: min(820px, calc(100vh - 40px));
+  max-width: calc(100vw - 40px);
+}
+
+.codey-settings-modal-content {
+  height: 100%;
+  overflow: hidden;
+  padding: 0;
+}
+
+.codey-settings-modal-content .semi-modal-header {
+  flex: 0 0 auto;
+  margin: 0;
+  border-bottom: 1px solid var(--semi-color-border);
+  padding: 18px 24px;
+}
+
+.codey-settings-modal-content .semi-modal-body {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+.codey-settings-modal-header {
+  align-items: center;
+}
+
+.codey-settings-modal-header .config-header-inner {
+  width: 100%;
+  min-width: 0;
+}
+
+.codey-settings-modal-close {
+  flex: 0 0 auto;
+}
+
 @media (max-width: 760px) {
-  .codey-overlay-backdrop { padding: 8px; }
-  .codey-overlay-dialog {
-    border-radius: 12px;
+  .codey-settings-modal-layer .semi-modal-wrap {
+    padding: 8px;
+  }
+
+  .codey-settings-modal-layer .semi-modal {
     height: calc(100vh - 16px);
-    width: calc(100vw - 16px);
+    max-width: calc(100vw - 16px);
+  }
+
+  .codey-settings-modal-content .codey-settings-modal-header {
+    padding: 12px 14px;
+  }
+
+  .codey-settings-modal-header .config-header-inner {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .codey-settings-modal-header .config-brand {
+    min-width: 0;
+    gap: 8px;
+  }
+
+  .codey-settings-modal-header .config-brand-mark {
+    width: 32px;
+    height: 32px;
+  }
+
+  .codey-settings-modal-header .config-brand-copy p {
+    display: none;
+  }
+
+  .codey-settings-modal-header .config-header-right {
+    width: auto;
+    flex-direction: row;
   }
 }
