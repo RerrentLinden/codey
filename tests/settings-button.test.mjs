@@ -176,6 +176,115 @@ test("moves the Codey button beside the visible header's trailing action region"
   assert.deepEqual(visibleHeader.children, [codeyButton, rightRegion]);
 });
 
+test("renders official account usage before the header settings action", async () => {
+  const visibleHeader = new FakeElement("header", { right: 1200 });
+  const sessionTitle = new FakeElement("div", { right: 700, width: 240 });
+  sessionTitle.textContent = "当前会话";
+  const rightRegion = new FakeElement("div", { right: 1200, width: 70 });
+  const nativeButton = new FakeElement("button", { right: 1192, width: 28 });
+  rightRegion.appendChild(nativeButton);
+  visibleHeader.appendChild(sessionTitle);
+  visibleHeader.appendChild(rightRegion);
+
+  const documentElement = new FakeElement("html", {
+    right: 1200,
+    width: 1200,
+    height: 800,
+  });
+  const findById = (id) => {
+    let result = null;
+    const visit = (element) => {
+      if (result) return;
+      if (element.id === id) {
+        result = element;
+        return;
+      }
+      element.children.forEach(visit);
+    };
+    visit(documentElement);
+    visit(visibleHeader);
+    return result;
+  };
+  const document = {
+    body: new FakeElement("body"),
+    documentElement,
+    visibilityState: "visible",
+    createElement: (tagName) => new FakeElement(tagName),
+    getElementById: findById,
+    querySelector: () => null,
+    querySelectorAll: (selector) =>
+      selector === "header" ? [visibleHeader] : [],
+  };
+  const todayResetAt = new Date();
+  todayResetAt.setHours(23, 45, 0, 0);
+  const tomorrowResetAt = new Date(todayResetAt);
+  tomorrowResetAt.setDate(todayResetAt.getDate() + 1);
+  let accountUsageResult = {
+    status: "ok",
+    planType: "pro",
+    primary: {
+      usedPercent: 15,
+      windowMinutes: 300,
+      resetsAt: Math.floor(todayResetAt.getTime() / 1000),
+    },
+    secondary: {
+      usedPercent: 40,
+      windowMinutes: 10080,
+      resetsAt: Math.floor(tomorrowResetAt.getTime() / 1000),
+    },
+  };
+  const window = {
+    __codexSessionDeleteBridge: async (path) => {
+      assert.equal(path, "/account/usage");
+      return accountUsageResult;
+    },
+    addEventListener() {},
+    alert() {},
+    clearTimeout() {},
+    dispatchEvent() {},
+    getComputedStyle: () => ({ display: "flex", visibility: "visible" }),
+    innerWidth: 1200,
+    setTimeout: () => 1,
+  };
+  window.window = window;
+
+  vm.runInNewContext(source, {
+    console,
+    document,
+    HTMLElement: FakeElement,
+    location: { pathname: "/", search: "" },
+    MutationObserver: class {
+      observe() {}
+    },
+    URLSearchParams,
+    window,
+  });
+
+  await window.__codeyRefreshAccountUsage();
+
+  const usage = findById("codey-account-usage");
+  const settingsButton = findById("codey-settings-button");
+  assert.ok(usage);
+  assert.ok(settingsButton);
+  assert.equal(usage.parentElement, visibleHeader);
+  assert.equal(usage.nextElementSibling, settingsButton);
+  assert.equal(sessionTitle.parentElement, visibleHeader);
+  assert.equal(visibleHeader.children[0], sessionTitle);
+  assert.equal(visibleHeader.getAttribute("data-codey-usage-host"), "true");
+  assert.match(usage.innerHTML, /5 小时/);
+  assert.match(usage.innerHTML, /85%/);
+  assert.match(usage.innerHTML, /7 天/);
+  assert.match(usage.innerHTML, /60%/);
+  assert.match(usage.innerHTML, /今天 \d{2}:\d{2} 刷新/);
+  assert.match(usage.innerHTML, /明天 \d{2}:\d{2} 刷新/);
+  assert.match(usage.getAttribute("aria-label"), /5 小时额度剩余 85%/);
+
+  accountUsageResult = { status: "unavailable", reason: "third_party" };
+  await window.__codeyRefreshAccountUsage();
+  assert.equal(findById("codey-account-usage"), null);
+  assert.equal(visibleHeader.getAttribute("data-codey-usage-host"), null);
+});
+
 test("marks the Codey button when a silent update check finds a new version", async () => {
   const visibleHeader = new FakeElement("header", { right: 1200 });
   const documentElement = new FakeElement("html");

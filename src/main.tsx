@@ -81,6 +81,7 @@ if (import.meta.env.DEV) {
       fastCodexStartup: true,
       subagentOptimization: false,
       hideFullAccessWarning: false,
+      showAccountUsageInHeader: false,
       experimentalFeatures: {
         unifiedExec: false,
         shellSnapshot: false,

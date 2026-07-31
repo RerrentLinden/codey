@@ -592,6 +592,13 @@ export function App({
   const handleSyncCurrentProvider = useStableEvent(
     () => void syncCurrentProvider(),
   );
+  const handleShowAccountUsageInHeaderChange = useStableEvent(
+    (checked: boolean) => {
+      if (config) {
+        editConfig({ ...config, showAccountUsageInHeader: checked });
+      }
+    },
+  );
   const handleFetchCurrentModels = useStableEvent(
     () => void fetchCurrentModels(),
   );
@@ -846,9 +853,13 @@ export function App({
               dirty={dirty}
               isBusy={isBusy}
               busy={busy}
+              showAccountUsageInHeader={config.showAccountUsageInHeader}
               onSyncCurrentProvider={handleSyncCurrentProvider}
               onFetchCurrentModels={handleFetchCurrentModels}
               onSetDefaultModel={handleSetDefaultModel}
+              onShowAccountUsageInHeaderChange={
+                handleShowAccountUsageInHeaderChange
+              }
             />
           </div>
 

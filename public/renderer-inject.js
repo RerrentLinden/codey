@@ -8,11 +8,16 @@
 
   const sessionToolsLoadPath = "/internal/codey/session-tools/load";
   const updateCheckPath = "/api/check_for_updates";
+  const accountUsagePath = "/account/usage";
   const buttonId = "codey-settings-button";
+  const accountUsageId = "codey-account-usage";
   const styleId = "codey-core-injected-style";
   const updateAvailableEvent = "codey-update-availability-changed";
+  const configChangedEvent = "codey:config-changed";
   const updateCheckIntervalMs = 30 * 60 * 1000;
   const updateCheckTimeoutMs = 12_000;
+  const accountUsageRefreshIntervalMs = 60_000;
+  const accountUsageTimeoutMs = 8_000;
   const sidebarSelector = [
     "[data-app-action-sidebar-section]",
     "[data-app-action-sidebar-thread-row]",
@@ -36,6 +41,10 @@
   let scanTimer = 0;
   let updateCheckTimer = 0;
   let updateCheckInFlight = false;
+  let accountUsageTimer = 0;
+  let accountUsageCheckInFlight = false;
+  let accountUsageLastResult = null;
+  let accountUsageMountedHeader = null;
   let sessionToolsInteractionArmed = false;
   let bootstrapObserver = null;
   let headerMountDirty = true;
@@ -73,6 +82,31 @@
       #${buttonId}::after { content: ""; position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 999px; background: #ff3b30; box-shadow: 0 0 0 2px Canvas; opacity: 0; transform: scale(.7); transition: opacity .15s ease, transform .15s ease; pointer-events: none; }
       #${buttonId}[data-codey-update-available="true"]::after { opacity: 1; transform: scale(1); }
       #${buttonId}[data-codey-header-actions="true"]::after { top: 4px; right: 4px; }
+      #${accountUsageId} { -webkit-app-region: no-drag !important; pointer-events: none; position: relative; z-index: 2147483640; display: inline-flex; min-height: 40px; max-width: min(360px, 38vw); flex: 0 0 auto; align-items: stretch; overflow: hidden; border: 1px solid color-mix(in srgb, CanvasText 11%, transparent); border-radius: 9px; margin-inline: 4px 2px; background: color-mix(in srgb, Canvas 91%, transparent); box-shadow: 0 1px 3px color-mix(in srgb, CanvasText 8%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 72%, transparent); color: CanvasText; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; font-size: 11px; line-height: 1.1; opacity: .94; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); user-select: none; }
+      #${accountUsageId}[data-state="stale"] { opacity: .68; }
+      #${accountUsageId}[data-state="error"] { min-width: 118px; align-items: center; justify-content: center; padding: 0 10px; color: color-mix(in srgb, CanvasText 66%, transparent); }
+      #${accountUsageId} .codey-usage-segment { display: grid; min-width: 104px; grid-template-columns: minmax(0, 1fr) auto; align-content: center; column-gap: 8px; padding: 5px 9px 4px; }
+      #${accountUsageId} .codey-usage-segment + .codey-usage-segment { border-inline-start: 1px solid color-mix(in srgb, CanvasText 9%, transparent); }
+      #${accountUsageId} .codey-usage-window { overflow: hidden; color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 9px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-value { font-variant-numeric: tabular-nums; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-meter { grid-column: 1 / -1; height: 2px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, CanvasText 10%, transparent); }
+      #${accountUsageId} .codey-usage-meter > span { display: block; width: 100%; height: 100%; border-radius: inherit; background: #0a84ff; transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; }
+      #${accountUsageId} .codey-usage-reset { grid-column: 1 / -1; overflow: hidden; margin-top: 3px; color: color-mix(in srgb, CanvasText 48%, transparent); font-size: 8px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-segment[data-tone="warning"] .codey-usage-meter > span { background: #ff9f0a; }
+      #${accountUsageId} .codey-usage-segment[data-tone="critical"] .codey-usage-meter > span { background: #ff453a; }
+      @media (max-width: 860px) {
+        #${accountUsageId} { max-width: 34vw; }
+        #${accountUsageId} .codey-usage-segment { min-width: 82px; padding-inline: 7px; }
+        #${accountUsageId} .codey-usage-window { display: none; }
+        #${accountUsageId} .codey-usage-value { grid-column: 1 / -1; text-align: center; }
+        #${accountUsageId} .codey-usage-reset { text-align: center; }
+      }
+      @media (max-width: 680px) {
+        #${accountUsageId} { display: none; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #${accountUsageId}, #${accountUsageId} * { transition: none !important; }
+      }
     `;
     document.documentElement.appendChild(style);
   };
@@ -158,6 +192,230 @@
     } finally {
       updateCheckInFlight = false;
       if (!hasDetectedUpdate()) scheduleUpdateCheck();
+    }
+  };
+
+  const accountUsageWindowLabel = (minutes) => {
+    const value = Math.max(1, Math.round(Number(minutes) || 0));
+    if (value % (24 * 60) === 0) return `${value / (24 * 60)} 天`;
+    if (value % 60 === 0) return `${value / 60} 小时`;
+    return `${value} 分钟`;
+  };
+
+  const accountUsageResetLabel = (resetsAt) => {
+    const timestamp = Number(resetsAt);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return "";
+    const remainingMinutes = Math.max(
+      0,
+      Math.ceil((timestamp * 1000 - Date.now()) / 60_000),
+    );
+    if (remainingMinutes < 60) return `${remainingMinutes} 分钟后重置`;
+    if (remainingMinutes < 24 * 60) {
+      const hours = Math.floor(remainingMinutes / 60);
+      const minutes = remainingMinutes % 60;
+      return minutes ? `${hours} 小时 ${minutes} 分钟后重置` : `${hours} 小时后重置`;
+    }
+    const days = Math.floor(remainingMinutes / (24 * 60));
+    const hours = Math.floor((remainingMinutes % (24 * 60)) / 60);
+    return hours ? `${days} 天 ${hours} 小时后重置` : `${days} 天后重置`;
+  };
+
+  const accountUsageResetTimeLabel = (resetsAt) => {
+    const timestamp = Number(resetsAt);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return "";
+    const resetAt = new Date(timestamp * 1000);
+    if (Number.isNaN(resetAt.getTime())) return "";
+    const now = new Date();
+    const startOfToday = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate(),
+    ).getTime();
+    const startOfResetDay = new Date(
+      resetAt.getFullYear(),
+      resetAt.getMonth(),
+      resetAt.getDate(),
+    ).getTime();
+    const dayOffset = Math.round(
+      (startOfResetDay - startOfToday) / (24 * 60 * 60 * 1000),
+    );
+    const time = resetAt.toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    if (dayOffset === 0) return `今天 ${time} 刷新`;
+    if (dayOffset === 1) return `明天 ${time} 刷新`;
+    return `${resetAt.getMonth() + 1}月${resetAt.getDate()}日 ${time} 刷新`;
+  };
+
+  const escapeAccountUsageText = (value) => String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+
+  const accountUsageWindowSegment = (window) => {
+    if (!window || !Number.isFinite(Number(window.usedPercent))) return null;
+    const remaining = Math.max(0, Math.min(100, 100 - Number(window.usedPercent)));
+    const roundedRemaining = Math.round(remaining);
+    const label = accountUsageWindowLabel(window.windowMinutes);
+    const reset = accountUsageResetLabel(window.resetsAt);
+    const resetTime = accountUsageResetTimeLabel(window.resetsAt);
+    const tone = roundedRemaining <= 20
+      ? "critical"
+      : roundedRemaining <= 40
+        ? "warning"
+        : "normal";
+    return {
+      aria: `${label}额度剩余 ${roundedRemaining}%${reset ? `，${reset}` : ""}`,
+      html: `
+        <span class="codey-usage-segment" data-tone="${tone}" style="--codey-usage-remaining:${remaining / 100}">
+          <span class="codey-usage-window">${label}</span>
+          <span class="codey-usage-value">${roundedRemaining}%</span>
+          <span class="codey-usage-meter"><span></span></span>
+          ${resetTime ? `<span class="codey-usage-reset">${resetTime}</span>` : ""}
+        </span>
+      `,
+    };
+  };
+
+  const accountCreditsSegment = (credits) => {
+    if (!credits || (!credits.hasCredits && !credits.unlimited)) return null;
+    const balance = credits.unlimited ? "不限" : String(credits.balance || "0");
+    return {
+      aria: `账号额度余额 ${balance}`,
+      html: `
+        <span class="codey-usage-segment" style="--codey-usage-remaining:1">
+          <span class="codey-usage-window">余额</span>
+          <span class="codey-usage-value">${escapeAccountUsageText(balance)}</span>
+          <span class="codey-usage-meter"><span></span></span>
+        </span>
+      `,
+    };
+  };
+
+  const removeAccountUsage = () => {
+    document.getElementById(accountUsageId)?.remove?.();
+    accountUsageMountedHeader?.removeAttribute?.("data-codey-usage-host");
+    accountUsageMountedHeader = null;
+  };
+
+  const accountUsageMount = () => {
+    const header = findHeaderMount()?.header;
+    if (!(header instanceof HTMLElement)) return null;
+    let usage = document.getElementById(accountUsageId);
+    if (!(usage instanceof HTMLElement)) {
+      usage = document.createElement("div");
+      usage.id = accountUsageId;
+      usage.setAttribute("role", "status");
+      usage.setAttribute("aria-live", "polite");
+      usage.setAttribute("aria-atomic", "true");
+    }
+    if (accountUsageMountedHeader && accountUsageMountedHeader !== header) {
+      accountUsageMountedHeader.removeAttribute?.("data-codey-usage-host");
+    }
+    header.setAttribute("data-codey-usage-host", "true");
+    const settingsButton = document.getElementById(buttonId);
+    if (
+      settingsButton instanceof HTMLElement
+      && settingsButton.parentElement === header
+    ) {
+      if (
+        usage.parentElement !== header
+        || usage.nextElementSibling !== settingsButton
+      ) {
+        header.insertBefore(usage, settingsButton);
+      }
+    } else if (usage.parentElement !== header) {
+      header.appendChild(usage);
+    }
+    accountUsageMountedHeader = header;
+    return usage;
+  };
+
+  const renderAccountUsage = (result) => {
+    if (!result || result.status === "disabled" || result.status === "unavailable") {
+      accountUsageLastResult = null;
+      removeAccountUsage();
+      return;
+    }
+    if (result.status === "error") {
+      const usage = accountUsageMount();
+      if (!usage) return;
+      if (accountUsageLastResult?.status === "ok") {
+        usage.dataset.state = "stale";
+        usage.title = "官方账号额度暂时无法更新，当前显示上次获取结果";
+        return;
+      }
+      usage.dataset.state = "error";
+      usage.setAttribute("aria-label", "官方账号额度暂不可用");
+      usage.title = String(result.message || "官方账号额度暂不可用");
+      usage.textContent = "额度暂不可用";
+      return;
+    }
+    if (result.status !== "ok") return;
+
+    const segments = [
+      accountUsageWindowSegment(result.primary),
+      accountUsageWindowSegment(result.secondary),
+      accountCreditsSegment(result.credits),
+    ].filter(Boolean);
+    if (!segments.length) {
+      renderAccountUsage({
+        status: "error",
+        message: "官方账号额度响应中没有可展示的信息",
+      });
+      return;
+    }
+    accountUsageLastResult = result;
+    const usage = accountUsageMount();
+    if (!usage) return;
+    const aria = segments.map((segment) => segment.aria).join("；");
+    const plan = String(result.planType || "").trim();
+    usage.dataset.state = "ready";
+    usage.setAttribute("aria-label", aria);
+    usage.title = plan ? `${aria}；账号方案 ${plan}` : aria;
+    usage.innerHTML = segments.map((segment) => segment.html).join("");
+  };
+
+  const scheduleAccountUsageCheck = (delayMs = accountUsageRefreshIntervalMs) => {
+    window.clearTimeout(accountUsageTimer);
+    accountUsageTimer = window.setTimeout(() => {
+      accountUsageTimer = 0;
+      void checkAccountUsage();
+    }, delayMs);
+  };
+
+  const checkAccountUsage = async () => {
+    if (accountUsageCheckInFlight || document.visibilityState === "hidden") {
+      scheduleAccountUsageCheck();
+      return null;
+    }
+    accountUsageCheckInFlight = true;
+    try {
+      const result = await withTimeout(
+        callBridge(accountUsagePath, {}),
+        accountUsageTimeoutMs,
+      );
+      renderAccountUsage(result);
+      return result;
+    } catch (error) {
+      renderAccountUsage({
+        status: "error",
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    } finally {
+      accountUsageCheckInFlight = false;
+      scheduleAccountUsageCheck();
+    }
+  };
+
+  const syncAccountUsageMount = () => {
+    if (accountUsageLastResult?.status === "ok") {
+      renderAccountUsage(accountUsageLastResult);
     }
   };
 
@@ -709,6 +967,7 @@
 
   const scan = (root = document) => {
     mountButton();
+    syncAccountUsageMount();
     if (sidebarDetected(root)) armSessionToolsInteraction();
   };
 
@@ -734,14 +993,24 @@
     setUpdateAvailability(result, { dispatch: false });
     if (!hasDetectedUpdate()) scheduleUpdateCheck();
   });
+  window.addEventListener?.(configChangedEvent, () => {
+    scheduleAccountUsageCheck(0);
+  });
   scan();
   scheduleUpdateCheck(0);
+  scheduleAccountUsageCheck(250);
 
   bootstrapObserver = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
         : mutation.target?.parentElement;
+      if (
+        target?.id === accountUsageId
+        || target?.closest?.(`#${accountUsageId}`)
+      ) {
+        continue;
+      }
       if (mutation.type === "attributes") {
         if (target?.matches?.(headerSelector) || target?.matches?.(sidebarSelector)) {
           if (target.matches?.(headerSelector)) headerMountDirty = true;
@@ -756,7 +1025,11 @@
       const headerChildrenChanged = targetHeader && [
         ...(mutation.addedNodes || []),
         ...(mutation.removedNodes || []),
-      ].some((node) => node instanceof HTMLElement && node.id !== buttonId);
+      ].some((node) => (
+        node instanceof HTMLElement
+        && node.id !== buttonId
+        && node.id !== accountUsageId
+      ));
       if (headerChildrenChanged) {
         headerMountDirty = true;
         scheduleScan(targetHeader);
@@ -797,7 +1070,11 @@
   window.__codeyLoadSessionTools = loadSessionTools;
   window.__codeyRendererScan = scan;
   window.__codeyRendererInvalidateHeaderMount = invalidateHeaderMount;
+  window.__codeyRefreshAccountUsage = checkAccountUsage;
 
-  window.addEventListener?.("focus", () => scan());
+  window.addEventListener?.("focus", () => {
+    scan();
+    scheduleAccountUsageCheck(0);
+  });
   window.addEventListener?.("pageshow", () => scan());
 })();

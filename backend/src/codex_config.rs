@@ -19,6 +19,8 @@ use crate::provider_lease::CODEY_PROVIDER_ID;
 
 pub const GLOBAL_PROVIDER_ID: &str = "codey_global";
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const OPENAI_PROVIDER_NAME: &str = "OpenAI";
+const LEGACY_CODEY_GLOBAL_PROVIDER_NAME: &str = "OpenAI (Codey Global)";
 const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
 const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_TOKEN_BUDGET: &str = "8500";
@@ -1188,10 +1190,12 @@ pub fn ensure_global_model_provider(home: &Path) -> Result<String> {
     }
 
     ensure_provider_table(&mut doc)?;
+    let mut global_provider =
+        current_provider_config.unwrap_or_else(|| Item::Table(official_provider_table()));
+    migrate_legacy_official_provider_name(&mut global_provider);
     doc["model_providers"]
         .as_table_mut()
-        .expect("model_providers was initialized")[GLOBAL_PROVIDER_ID] =
-        current_provider_config.unwrap_or_else(|| Item::Table(official_provider_table()));
+        .expect("model_providers was initialized")[GLOBAL_PROVIDER_ID] = global_provider;
     doc["model_provider"] = value(GLOBAL_PROVIDER_ID);
     write_global_provider_migration_if_changed(home, &config_path, &existing, &doc, original)?;
     Ok(GLOBAL_PROVIDER_ID.to_string())
@@ -1570,11 +1574,26 @@ fn direct_provider_table(
 
 fn official_provider_table() -> Table {
     let mut provider = Table::new();
-    provider["name"] = value("OpenAI (Codey Global)");
+    provider["name"] = value(OPENAI_PROVIDER_NAME);
     provider["base_url"] = value(CHATGPT_CODEX_BASE_URL);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
     provider
+}
+
+fn migrate_legacy_official_provider_name(provider: &mut Item) {
+    let is_legacy_official_provider = provider.as_table_like().is_some_and(|provider| {
+        provider.get("name").and_then(Item::as_str) == Some(LEGACY_CODEY_GLOBAL_PROVIDER_NAME)
+            && provider
+                .get("base_url")
+                .and_then(Item::as_str)
+                .is_some_and(|base_url| {
+                    base_url.trim().trim_end_matches('/') == CHATGPT_CODEX_BASE_URL
+                })
+    });
+    if is_legacy_official_provider && let Some(provider) = provider.as_table_like_mut() {
+        provider.insert("name", value(OPENAI_PROVIDER_NAME));
+    }
 }
 
 fn parse_document(existing: &str) -> Result<DocumentMut> {
@@ -3356,7 +3375,50 @@ note = "user replacement"
             provider_base_url(&config, GLOBAL_PROVIDER_ID).as_deref(),
             Some(CHATGPT_CODEX_BASE_URL)
         );
+        let document = config.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            document["model_providers"][GLOBAL_PROVIDER_ID]["name"].as_str(),
+            Some("OpenAI")
+        );
         assert!(!config.contains("[model_providers.openai]"));
+    }
+
+    #[test]
+    fn migrates_the_legacy_codey_name_for_the_official_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"model_provider = "codey_global"
+
+[model_providers.codey_global]
+name = "OpenAI (Codey Global)"
+base_url = "https://chatgpt.com/backend-api/codex/"
+wire_api = "responses"
+requires_openai_auth = true
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ensure_global_model_provider(&home).unwrap(),
+            GLOBAL_PROVIDER_ID
+        );
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document = config.parse::<DocumentMut>().unwrap();
+        let provider = document["model_providers"][GLOBAL_PROVIDER_ID]
+            .as_table_like()
+            .unwrap();
+
+        assert_eq!(
+            provider.get("name").and_then(Item::as_str),
+            Some(OPENAI_PROVIDER_NAME)
+        );
+        assert_eq!(
+            provider.get("base_url").and_then(Item::as_str),
+            Some("https://chatgpt.com/backend-api/codex/")
+        );
     }
 
     #[test]
@@ -3388,6 +3450,10 @@ experimental_bearer_token = "sk-existing"
             .as_table_like()
             .unwrap();
 
+        assert_eq!(
+            provider.get("name").and_then(Item::as_str),
+            Some("Private Relay")
+        );
         assert_eq!(
             provider.get("base_url").and_then(Item::as_str),
             Some("https://relay.example/v1")

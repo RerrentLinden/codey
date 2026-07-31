@@ -49,6 +49,7 @@ use webhooks::{
     notify_webhook_waiting, sync_waiting_webhook_watcher, test_notification_channel, test_webhook,
 };
 
+use crate::account_usage;
 use crate::cc_switch;
 use crate::cdp;
 use crate::codex_config::codex_home;
@@ -228,6 +229,7 @@ impl AppState {
                 }
                 value
             }
+            "/account/usage" => account_usage_snapshot(self).await,
             "/session/wake-watcher" => {
                 self.session_scan_wake.notify_one();
                 json!({"status":"ok"})
@@ -643,6 +645,7 @@ async fn save_codey_config_locked(
     config.fast_codex_startup = config_input.fast_codex_startup;
     config.subagent_optimization = config_input.subagent_optimization;
     config.hide_full_access_warning = config_input.hide_full_access_warning;
+    config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     config.experimental_features = config_input.experimental_features;
     let mut config = config.normalize();
     config.settings_revision = previous.settings_revision.saturating_add(1);
@@ -758,6 +761,34 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
         channel.bot_token.clear();
     }
     public
+}
+
+async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
+    let config = state.config.read().await.clone();
+    if !config.show_account_usage_in_header {
+        return json!({"status": "disabled"});
+    }
+    if !cc_switch::status_from_config(&config).provider.official {
+        return json!({
+            "status": "unavailable",
+            "reason": "third_party",
+            "message": "顶部额度仅支持官方账号线路",
+        });
+    }
+
+    match account_usage::fetch_official_account_usage(&state.http_client, &codex_home()).await {
+        Ok(snapshot) => {
+            let mut value = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
+            if let Some(object) = value.as_object_mut() {
+                object.insert("status".into(), Value::String("ok".into()));
+            }
+            value
+        }
+        Err(error) => json!({
+            "status": "error",
+            "message": error.to_string(),
+        }),
+    }
 }
 
 fn config_requires_restart(
@@ -895,6 +926,14 @@ mod restart_tests {
             &applied,
             &applied_models,
             &gpu_mode_change
+        ));
+
+        let mut account_usage_change = applied.clone();
+        account_usage_change.show_account_usage_in_header = true;
+        assert!(!config_requires_restart(
+            &applied,
+            &applied_models,
+            &account_usage_change
         ));
 
         let mut fast_startup_change = applied.clone();

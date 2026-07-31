@@ -41,6 +41,7 @@ export type Config = {
   fastCodexStartup: boolean;
   subagentOptimization: boolean;
   hideFullAccessWarning: boolean;
+  showAccountUsageInHeader: boolean;
   experimentalFeatures: ExperimentalFeaturesConfig;
 };
 
