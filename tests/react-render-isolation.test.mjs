@@ -12,6 +12,7 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     dialogs,
     trace,
     notificationCard,
+    notificationDialog,
     feishuEditor,
     telegramEditor,
     channelRegistry,
@@ -31,6 +32,10 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     readFile(new URL("src/TraceLogModule.tsx", root), "utf8"),
     readFile(
       new URL("src/notifications/NotificationChannelsCard.tsx", root),
+      "utf8",
+    ),
+    readFile(
+      new URL("src/notifications/NotificationChannelDialog.tsx", root),
       "utf8",
     ),
     readFile(
@@ -80,6 +85,19 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     notificationCard,
     /export const NotificationChannelsCard = memo\(/,
   );
+  assert.match(
+    notificationDialog,
+    /export const NotificationChannelDialog = memo\(/,
+  );
+  assert.match(notificationDialog, /notification-channel-picker/);
+  assert.match(notificationDialog, /reveal_notification_channel/);
+  assert.match(notificationDialog, /notification-enabled-control/);
+  assert.match(notificationDialog, /test_notification_channel/);
+  assert.match(notificationDialog, /hasSuccessfulTest/);
+  assert.match(notificationCard, /onRequestRemoveChannel/);
+  assert.doesNotMatch(notificationCard, /待完成配置/);
+  assert.doesNotMatch(notificationCard, /测试通知/);
+  assert.match(app, /delete-notification-channel/);
   assert.match(feishuEditor, /export const FeishuChannelEditor = memo\(/);
   assert.match(telegramEditor, /export const TelegramChannelEditor = memo\(/);
   assert.match(channelRegistry, /feishu:\s*\{/);

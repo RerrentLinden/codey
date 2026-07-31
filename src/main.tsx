@@ -243,6 +243,15 @@ if (import.meta.env.DEV) {
           restartRequired: false,
         };
       }
+      if (command === "reveal_notification_channel") {
+        const channelId = String(args.channelId || "");
+        const channel = previewConfig.webhook.channels.find(
+          (candidate) => candidate.id === channelId,
+        );
+        return channel
+          ? { channel }
+          : { status: "failed", message: "找不到要编辑的通知渠道" };
+      }
       if (command === "sync_current_provider") {
         return {
           config: previewConfig,
@@ -360,6 +369,20 @@ if (import.meta.env.DEV) {
       }
       if (command === "test_webhook") {
         return { status: 200 };
+      }
+      if (command === "test_notification_channel") {
+        const channel = args.channel as {
+          kind?: string;
+          url?: string;
+          botToken?: string;
+          chatId?: string;
+        } | undefined;
+        const configured = channel?.kind === "telegram"
+          ? Boolean(channel.botToken?.trim() && channel.chatId?.trim())
+          : Boolean(channel?.url?.trim());
+        return configured
+          ? { status: "ok", eventId: "preview-notification-test" }
+          : { status: "failed", message: "请先完成渠道配置" };
       }
       return { status: "ok" };
     };

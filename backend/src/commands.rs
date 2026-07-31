@@ -44,7 +44,7 @@ use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 pub use updates::{check_for_updates, download_update, install_downloaded_update};
 use webhooks::{
     WebhookNotificationState, initial_waiting_notifications, notify_webhook_completion,
-    notify_webhook_waiting, sync_waiting_webhook_watcher, test_webhook,
+    notify_webhook_waiting, sync_waiting_webhook_watcher, test_notification_channel, test_webhook,
 };
 
 use crate::cc_switch;
@@ -58,7 +58,6 @@ use crate::launcher::{CODEX_APP_NOT_FOUND_ERROR, CODEX_APP_PATH_INVALID_ERROR};
 use crate::message_delete::delete_messages;
 #[cfg(test)]
 use crate::model_catalog;
-#[cfg(test)]
 use crate::notifications::NotificationChannelConfig;
 use crate::pending_approval;
 use crate::plugin_marketplace;
@@ -448,6 +447,16 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 .map(ToString::to_string);
             test_webhook(state, channel_id).await
         }
+        "test_notification_channel" => {
+            match argument::<NotificationChannelConfig>(&args, "channel") {
+                Ok(channel) => test_notification_channel(state, channel).await,
+                Err(error) => Err(error),
+            }
+        }
+        "reveal_notification_channel" => match string_argument(&args, "channelId") {
+            Ok(channel_id) => reveal_notification_channel(state, channel_id).await,
+            Err(error) => Err(error),
+        },
         "check_for_updates" => check_for_updates(state).await,
         "download_update" => download_update(state).await,
         "install_downloaded_update" => match string_argument(&args, "filePath") {
@@ -480,6 +489,24 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         "ccSwitch": cc_switch,
         "modelState": model_state,
     }))
+}
+
+async fn reveal_notification_channel(
+    state: &Arc<AppState>,
+    channel_id: String,
+) -> Result<Value, String> {
+    let channel_id = channel_id.trim();
+    let channel = state
+        .config
+        .read()
+        .await
+        .webhook
+        .channels
+        .iter()
+        .find(|channel| channel.id == channel_id)
+        .cloned()
+        .ok_or_else(|| "找不到要编辑的通知渠道".to_string())?;
+    Ok(json!({"channel": channel}))
 }
 
 async fn pick_codex_app_directory() -> Result<Value, String> {
@@ -1224,6 +1251,63 @@ mod tests {
         assert!(!public.to_string().contains("renderer-secret"));
         assert!(!public.to_string().contains("telegram-secret"));
         assert!(!public.to_string().contains("legacy-secret"));
+    }
+
+    #[tokio::test]
+    async fn explicit_notification_channel_reveal_returns_only_the_selected_channel() {
+        let state = Arc::new(AppState::default());
+        state.config.write().await.webhook.channels.extend([
+            NotificationChannelConfig {
+                id: "feishu-1".to_string(),
+                url: "https://open.feishu.cn/open-apis/bot/v2/hook/reveal-secret".to_string(),
+                ..NotificationChannelConfig::default()
+            },
+            NotificationChannelConfig {
+                id: "telegram-1".to_string(),
+                kind: crate::notifications::NotificationChannelKind::Telegram,
+                bot_token: "telegram-reveal-secret".to_string(),
+                chat_id: "-100123".to_string(),
+                ..NotificationChannelConfig::default()
+            },
+        ]);
+
+        let revealed = reveal_notification_channel(&state, "telegram-1".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(revealed["channel"]["id"], "telegram-1");
+        assert_eq!(revealed["channel"]["botToken"], "telegram-reveal-secret");
+        assert!(!revealed.to_string().contains("hook/reveal-secret"));
+        assert!(
+            reveal_notification_channel(&state, "unknown".to_string())
+                .await
+                .unwrap_err()
+                .contains("找不到")
+        );
+    }
+
+    #[tokio::test]
+    async fn testing_an_incomplete_notification_draft_does_not_save_it() {
+        let state = Arc::new(AppState::default());
+        let before = state.config.read().await.clone();
+
+        let result = invoke_api(
+            &state,
+            "test_notification_channel",
+            json!({
+                "channel": {
+                    "id": "incomplete-telegram",
+                    "kind": "telegram",
+                    "enabled": true,
+                    "botToken": "",
+                    "chatId": ""
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(result["status"], "failed");
+        assert_eq!(*state.config.read().await, before);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

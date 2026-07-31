@@ -147,6 +147,9 @@ function ConfirmationDialogComponent({
   onClose,
   onConfirm,
 }: ConfirmationDialogProps) {
+  const destructive =
+    confirmation?.action === "clear" ||
+    confirmation?.action === "delete-notification-channel";
   return (
     <Dialog open={Boolean(confirmation)} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="confirmation-dialog" container={container}>
@@ -158,7 +161,7 @@ function ConfirmationDialogComponent({
           <Button variant="outline" onClick={onClose}>取消</Button>
           <Button
             variant={
-              confirmation?.action === "clear"
+              destructive
                 ? "destructive"
                 : confirmation?.action === "restart"
                   ? "warning"
@@ -168,7 +171,7 @@ function ConfirmationDialogComponent({
               if (confirmation) onConfirm(confirmation);
             }}
           >
-            {confirmation?.action === "clear"
+            {destructive
               ? <Trash2 aria-hidden="true" />
               : confirmation?.action === "restart"
               ? <RefreshCw aria-hidden="true" />

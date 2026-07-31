@@ -35,6 +35,7 @@ import {
   OperationsPanel,
 } from "./AppSections";
 import { NotificationChannelsCard } from "./notifications";
+import type { NotificationChannel } from "./notifications";
 import { errorText, withTimeout } from "./appUtils";
 import { useModelSelection } from "./useModelSelection";
 import { useNotifications } from "./useNotifications";
@@ -194,19 +195,12 @@ export function App({
     setSubagentOptimization,
   });
   const {
-    webhookResults,
     addNotificationChannel,
     updateNotificationChannel,
     removeNotificationChannel,
-    testWebhook,
   } = useNotifications({
-    config,
-    isBusy,
     setConfig,
     setDirty,
-    setBusy,
-    setNotice,
-    persist,
   });
   const {
     updateResult,
@@ -470,6 +464,18 @@ export function App({
     });
   }
 
+  function askRemoveNotificationChannel(channel: NotificationChannel) {
+    const channelName = channel.kind === "telegram" ? "Telegram" : "飞书";
+    setConfirmation({
+      action: "delete-notification-channel",
+      title: `删除${channelName}通知渠道？`,
+      description:
+        "将从当前设置中移除这个通知渠道。删除后不会再接收自动通知；如果尚未保存，可关闭设置页面撤销本次更改。",
+      confirmLabel: "删除渠道",
+      run: () => removeNotificationChannel(channel.id),
+    });
+  }
+
   async function restartCodex() {
     if (!config) return;
     await runOperation("restart", async () => {
@@ -575,11 +581,8 @@ export function App({
   const handleNotificationChannelChange = useStableEvent(
     updateNotificationChannel,
   );
-  const handleRemoveNotificationChannel = useStableEvent(
-    removeNotificationChannel,
-  );
-  const handleTestWebhook = useStableEvent(
-    (channelId: string) => void testWebhook(channelId),
+  const handleRequestRemoveNotificationChannel = useStableEvent(
+    askRemoveNotificationChannel,
   );
   const handleSubagentOptimizationChange = useStableEvent(
     (checked: boolean) => void updateSubagentOptimization(checked),
@@ -789,13 +792,10 @@ export function App({
               <NotificationChannelsCard
                 config={config}
                 container={portalContainer}
-                busy={busy}
                 isBusy={isBusy}
-                webhookResults={webhookResults}
                 onAddChannel={handleAddNotificationChannel}
                 onChannelChange={handleNotificationChannelChange}
-                onRemoveChannel={handleRemoveNotificationChannel}
-                onTestWebhook={handleTestWebhook}
+                onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
               />
 
               <FeaturePolicyCard

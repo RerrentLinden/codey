@@ -627,6 +627,13 @@ pub(super) async fn test_webhook(
             .next()
             .ok_or_else(|| "请先添加通知渠道".to_string())?,
     };
+    test_notification_channel(state, channel).await
+}
+
+pub(super) async fn test_notification_channel(
+    state: &Arc<AppState>,
+    channel: NotificationChannelConfig,
+) -> Result<Value, String> {
     let dispatcher =
         NotificationDispatcher::with_client(state.webhook_http_client.clone(), channel);
     dispatcher.test().await.map_err(|error| error.to_string())

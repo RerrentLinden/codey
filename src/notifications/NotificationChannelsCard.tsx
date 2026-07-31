@@ -1,158 +1,155 @@
-import { memo } from "react";
+import { memo, useState } from "react";
 import {
   IconBell,
-  IconLoader2 as LoaderCircle,
+  IconPencil,
   IconPlus,
-  IconSend,
   IconTrash,
 } from "@tabler/icons-react";
 
-import type { Config, InlineResult } from "../App.types";
-import { Button, Card, Switch } from "../components/semi";
-import {
-  getNotificationChannelDefinition,
-  notificationChannelDefinitions,
-} from "./channelRegistry";
-import type {
-  NotificationChannel,
-  NotificationChannelKind,
-} from "./types";
+import type { Config } from "../App.types";
+import { Badge, Button, Card } from "../components/semi";
+import { getNotificationChannelDefinition } from "./channelRegistry";
+import { NotificationChannelDialog } from "./NotificationChannelDialog";
+import type { NotificationChannel } from "./types";
 
 type NotificationChannelsCardProps = {
   config: Config;
-  busy: string | null;
+  container: HTMLElement | null;
   isBusy: boolean;
-  webhookResults: Record<string, InlineResult>;
-  onAddChannel: (kind: NotificationChannelKind) => void;
+  onAddChannel: (channel: NotificationChannel) => void;
   onChannelChange: (
     channelId: string,
     patch: Partial<NotificationChannel>,
   ) => void;
-  onRemoveChannel: (channelId: string) => void;
-  onTestWebhook: (channelId: string) => void;
+  onRequestRemoveChannel: (channel: NotificationChannel) => void;
 };
 
 function NotificationChannelsCardComponent({
   config,
-  busy,
+  container,
   isBusy,
-  webhookResults,
   onAddChannel,
   onChannelChange,
-  onRemoveChannel,
-  onTestWebhook,
+  onRequestRemoveChannel,
 }: NotificationChannelsCardProps) {
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
+  const editingChannel = editingChannelId
+    ? config.webhook.channels.find((channel) => channel.id === editingChannelId) ?? null
+    : null;
+
+  function openAddDialog() {
+    setEditingChannelId(null);
+    setDialogOpen(true);
+  }
+
+  function openEditDialog(channelId: string) {
+    setEditingChannelId(channelId);
+    setDialogOpen(true);
+  }
+
+  function handleDialogOpenChange(open: boolean) {
+    if (!open) setEditingChannelId(null);
+    setDialogOpen(open);
+  }
+
+  function saveChannel(channel: NotificationChannel) {
+    if (editingChannelId) {
+      onChannelChange(editingChannelId, channel);
+    } else {
+      onAddChannel(channel);
+    }
+  }
+
   return (
-    <section className="secondary-section" aria-labelledby="notification-title">
-      <div className="section-title compact">
-        <div>
-          <h2 id="notification-title">消息通知</h2>
-          <p>按需添加渠道，完成、失败和等待提醒会同时发送。</p>
-        </div>
-        <div className="notification-add-actions">
-          {notificationChannelDefinitions.map((definition) => (
+    <>
+      <section className="secondary-section" aria-labelledby="notification-title">
+        <div className="section-title compact">
+          <div>
+            <h2 id="notification-title">消息通知</h2>
+            <p>已配置渠道会同时接收完成、失败和等待提醒。</p>
+          </div>
+          <div className="notification-add-actions">
             <Button
-              key={definition.kind}
               variant="secondary"
               size="xs"
               disabled={isBusy}
-              onClick={() => onAddChannel(definition.kind)}
+              onClick={openAddDialog}
             >
               <IconPlus aria-hidden="true" />
-              {definition.addLabel}
+              添加渠道
             </Button>
-          ))}
+          </div>
         </div>
-      </div>
-      <div className="notification-channel-list">
         {config.webhook.channels.length === 0 ? (
           <Card className="secondary-card notification-empty">
             <IconBell size={20} aria-hidden="true" />
             <strong>还没有通知渠道</strong>
-            <small>点击上方按钮添加通知渠道。</small>
+            <small>点击“添加渠道”选择推送方式并完成配置。</small>
           </Card>
         ) : (
-          config.webhook.channels.map((channel) => {
-            const definition = getNotificationChannelDefinition(channel.kind);
-            const result = webhookResults[channel.id] ?? {
-              tone: "idle",
-              text: "",
-            };
-            const isTesting = busy === `test-webhook-${channel.id}`;
-            const ChannelIcon = definition.Icon;
-            const ChannelEditor = definition.Editor;
-            return (
-              <Card
-                className={`secondary-card notification-card ${channel.enabled ? "active" : ""}`}
-                key={channel.id}
-              >
-                <div className="notification-card-header">
-                  <div className="notification-title">
-                    <span className={definition.iconClassName}>
-                      <ChannelIcon size={18} aria-hidden="true" />
-                    </span>
-                    <div>
-                      <strong>{definition.title}</strong>
-                      <small>{definition.description}</small>
+          <ul className="notification-channel-list" aria-label="已配置通知渠道">
+            {config.webhook.channels.map((channel) => {
+              const definition = getNotificationChannelDefinition(channel.kind);
+              const status = channel.enabled
+                ? { label: "已启用", variant: "success" as const }
+                : { label: "未启用", variant: "secondary" as const };
+              const ChannelIcon = definition.Icon;
+              return (
+                <li key={channel.id}>
+                  <Card
+                    className={`secondary-card notification-card ${channel.enabled ? "active" : "inactive"}`}
+                  >
+                    <div className="notification-card-header">
+                      <div className="notification-title">
+                        <span className={definition.iconClassName}>
+                          <ChannelIcon size={18} aria-hidden="true" />
+                        </span>
+                        <div>
+                          <strong>{definition.title}</strong>
+                          <small>{definition.description}</small>
+                        </div>
+                      </div>
+                      <div className="notification-channel-controls">
+                        <Badge variant={status.variant}>{status.label}</Badge>
+                        <Button
+                          className="notification-edit-button"
+                          variant="ghost"
+                          size="xs"
+                          disabled={isBusy}
+                          onClick={() => openEditDialog(channel.id)}
+                        >
+                          <IconPencil aria-hidden="true" />
+                          编辑
+                        </Button>
+                        <Button
+                          className="notification-remove-button"
+                          variant="ghost"
+                          size="icon-sm"
+                          disabled={isBusy}
+                          onClick={() => onRequestRemoveChannel(channel)}
+                          aria-label={`删除${definition.addLabel}通知渠道`}
+                        >
+                          <IconTrash size={15} aria-hidden="true" />
+                        </Button>
+                      </div>
                     </div>
-                  </div>
-                  <div className="notification-channel-controls">
-                    <span>{channel.enabled ? "已开启" : "已关闭"}</span>
-                    <Switch
-                      checked={channel.enabled}
-                      disabled={isBusy}
-                      onCheckedChange={(checked) =>
-                        onChannelChange(channel.id, { enabled: checked })
-                      }
-                      aria-label={`启用${definition.addLabel}通知`}
-                    />
-                    <Button
-                      className="notification-remove-button"
-                      variant="ghost"
-                      size="icon-sm"
-                      disabled={isBusy}
-                      onClick={() => onRemoveChannel(channel.id)}
-                      aria-label={`删除${definition.addLabel}通知渠道`}
-                    >
-                      <IconTrash size={15} aria-hidden="true" />
-                    </Button>
-                  </div>
-                </div>
-                <div className="notification-fields">
-                  <ChannelEditor
-                    channel={channel}
-                    disabled={isBusy}
-                    onChange={(patch) => onChannelChange(channel.id, patch)}
-                  />
-                </div>
-                <div className="notification-action">
-                  <span
-                    className={`inline-result ${result.tone}`}
-                    role="status"
-                    aria-live="polite"
-                  >
-                    {result.text || ""}
-                  </span>
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    disabled={isBusy || !definition.isConfigured(channel)}
-                    onClick={() => onTestWebhook(channel.id)}
-                  >
-                    {isTesting ? (
-                      <LoaderCircle className="spinner" aria-hidden="true" />
-                    ) : (
-                      <IconSend aria-hidden="true" />
-                    )}
-                    测试通知
-                  </Button>
-                </div>
-              </Card>
-            );
-          })
+                  </Card>
+                </li>
+              );
+            })}
+          </ul>
         )}
-      </div>
-    </section>
+      </section>
+      <NotificationChannelDialog
+        container={container}
+        editingChannel={editingChannel}
+        isBusy={isBusy}
+        open={dialogOpen}
+        onOpenChange={handleDialogOpenChange}
+        onSave={saveChannel}
+      />
+    </>
   );
 }
 
