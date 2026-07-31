@@ -1355,10 +1355,11 @@ async fn spawn_codex(
                 Ok(spawned)
             }
             Err(error) => {
+                let patch_error = format!("{error:#}");
                 error_log::record_failure(
                     "patch_failed",
                     "install_startup_patch",
-                    format!("{error:#}"),
+                    patch_error.clone(),
                     serde_json::json!({
                         "platform": "windows",
                         "inspectorPort": inspector_port,
@@ -1368,8 +1369,33 @@ async fn spawn_codex(
                         "fastCodexStartup": patch_options.fast_codex_startup,
                     }),
                 );
-                stop_windows_spawned_codex(&mut spawned).await;
-                Err(error).context("Codex 启动硬补丁未能安装；已停止 Codex，未降级为仅隐藏 UI")
+                if let Err(cleanup_error) = stop_windows_spawned_codex(&mut spawned, app_dir).await
+                {
+                    anyhow::bail!(
+                        "Codex 启动补丁未能安装，且无法安全清理暂停的启动进程：{patch_error}；{cleanup_error:#}"
+                    );
+                }
+                match spawn_windows_codex(app_dir, debug_port, &runtime_arguments).await {
+                    Ok(mut fallback) => {
+                        fallback.performance_status = "degraded".to_string();
+                        fallback.performance_detail =
+                            "启动补丁未能安装，已自动以兼容模式启动；启动优化将在下次启动时重试"
+                                .to_string();
+                        error_log::record_failure(
+                            "patch_degraded",
+                            "restart_without_startup_patch",
+                            patch_error,
+                            serde_json::json!({
+                                "platform": "windows",
+                                "processId": fallback.process_id,
+                            }),
+                        );
+                        Ok(fallback)
+                    }
+                    Err(fallback_error) => anyhow::bail!(
+                        "Codex 启动补丁未能安装，且兼容模式重启失败：{patch_error}；{fallback_error:#}"
+                    ),
+                }
             }
         }
     }
@@ -1663,23 +1689,28 @@ async fn spawn_windows_codex(
 }
 
 #[cfg(windows)]
-async fn stop_windows_spawned_codex(spawned: &mut SpawnedCodex) {
-    if let Some(process_id) = spawned.process_id.take() {
-        if let Err(error) = terminate_windows_process(process_id).await {
-            error_log::record_failure(
-                "cleanup_failed",
-                "cleanup_windows_after_startup_patch_failure",
-                format!("{error:#}"),
-                serde_json::json!({
-                    "processId": process_id,
-                }),
-            );
-            eprintln!("Codex 启动失败后的进程清理失败：{error:#}");
-        }
-    }
+async fn stop_windows_spawned_codex(
+    spawned: &mut SpawnedCodex,
+    app_dir: &std::path::Path,
+) -> Result<()> {
+    let process_id = spawned.process_id.take();
+    let process_stop = terminate_windows_codex_processes(app_dir, process_id).await;
     if let Some(child) = spawned.child.take() {
         reap_child_after_cleanup(child, "reap_child_after_startup_patch_failure").await;
     }
+    if let Err(error) = &process_stop {
+        error_log::record_failure(
+            "cleanup_failed",
+            "cleanup_windows_after_startup_patch_failure",
+            format!("{error:#}"),
+            serde_json::json!({
+                "appPath": app_dir,
+                "processId": process_id,
+            }),
+        );
+        eprintln!("Codex 启动失败后的进程清理失败：{error:#}");
+    }
+    process_stop
 }
 
 #[cfg(target_os = "macos")]
@@ -1910,18 +1941,49 @@ async fn terminate_windows_codex_processes(app_dir: &Path, process_id: Option<u3
         }
     }
     process_ids.remove(&std::process::id());
+    let mut taskkill_fallback = Vec::new();
     for process_id in &process_ids {
-        terminate_windows_process(*process_id).await?;
+        let terminated_natively = processes
+            .iter()
+            .find(|process| process.process_id == *process_id)
+            .is_some_and(
+                |process| match (&process.executable_path, process.creation_time) {
+                    (Some(path), Some(creation_time)) => {
+                        codey_runtime_core::windows_terminate_process_if_matches(
+                            process.process_id,
+                            path,
+                            creation_time,
+                        )
+                    }
+                    _ => false,
+                },
+            );
+        if !terminated_natively
+            && codey_runtime_core::windows_enumerate_processes()
+                .iter()
+                .any(|process| process.process_id == *process_id)
+        {
+            taskkill_fallback.push(*process_id);
+        }
     }
-    let remaining = codey_runtime_core::windows_enumerate_processes()
-        .into_iter()
-        .filter(|process| process_ids.contains(&process.process_id))
-        .map(|process| process.process_id)
-        .collect::<Vec<_>>();
-    if !remaining.is_empty() {
-        anyhow::bail!("强制停止 Windows Codex 进程超时：{remaining:?}");
+    for process_id in taskkill_fallback {
+        terminate_windows_process(process_id).await?;
     }
-    Ok(())
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = codey_runtime_core::windows_enumerate_processes()
+            .into_iter()
+            .filter(|process| process_ids.contains(&process.process_id))
+            .map(|process| process.process_id)
+            .collect::<Vec<_>>();
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("强制停止 Windows Codex 进程超时：{remaining:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 #[cfg(windows)]

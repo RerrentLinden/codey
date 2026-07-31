@@ -148,3 +148,34 @@ test("official synchronization reads raw Statsig gates and applies the official 
     concurrentReasoningSummaries: true,
   });
 });
+
+test("official synchronization treats removed Statsig gates as disabled", async () => {
+  const { cdp } = await sources();
+  const script = cdp.match(
+    /fn official_experimental_features_script\(\) -> &'static str \{\n\s+r#\"([\s\S]*?)\"#\n\}/,
+  )?.[1];
+  assert.ok(script);
+
+  const payload = Function(
+    "globalThis",
+    `return ${script}`,
+  )({
+    __STATSIG__: {
+      firstInstance: {
+        _store: { _valuesForExternalUse: { feature_gates: {} } },
+      },
+    },
+  });
+
+  assert.deepEqual(JSON.parse(payload), {
+    unifiedExec: false,
+    shellSnapshot: false,
+    responsesWebsocketsV2: false,
+    toolSearchAlwaysDeferMcpTools: false,
+    standaloneWebSearch: false,
+    enableRequestCompression: false,
+    remoteCompactionV2: false,
+    applyPatchStreamingEvents: false,
+    concurrentReasoningSummaries: false,
+  });
+});

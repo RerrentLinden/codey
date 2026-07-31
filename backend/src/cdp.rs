@@ -745,35 +745,20 @@ fn official_experimental_features_script() -> &'static str {
   if (!gates || typeof gates !== "object") {
     throw new Error("Codex Statsig 官方功能门数据不可用");
   }
-  const readGate = (id, key) => {
+  const readGate = (id) => {
     const value = gates[id]?.value;
-    if (typeof value !== "boolean") {
-      throw new Error(`Codex Statsig 缺少 ${key}（${id}）`);
-    }
-    return value;
+    return typeof value === "boolean" ? value : false;
   };
   const result = {
-    unifiedExec: readGate("1786883712", "unified_exec"),
-    shellSnapshot: readGate("1615536597", "shell_snapshot"),
-    responsesWebsocketsV2: readGate("2734851136", "responses_websockets_v2"),
-    toolSearchAlwaysDeferMcpTools: readGate(
-      "2701734443",
-      "tool_search_always_defer_mcp_tools",
-    ),
-    standaloneWebSearch: readGate("3701003275", "standalone_web_search"),
-    enableRequestCompression: readGate(
-      "30039772",
-      "enable_request_compression",
-    ),
-    remoteCompactionV2: readGate("321109023", "remote_compaction_v2"),
-    applyPatchStreamingEvents: readGate(
-      "358284800",
-      "apply_patch_streaming_events",
-    ),
-    concurrentReasoningSummaries: readGate(
-      "2508143457",
-      "concurrent_reasoning_summaries",
-    ),
+    unifiedExec: readGate("1786883712"),
+    shellSnapshot: readGate("1615536597"),
+    responsesWebsocketsV2: readGate("2734851136"),
+    toolSearchAlwaysDeferMcpTools: readGate("2701734443"),
+    standaloneWebSearch: readGate("3701003275"),
+    enableRequestCompression: readGate("30039772"),
+    remoteCompactionV2: readGate("321109023"),
+    applyPatchStreamingEvents: readGate("358284800"),
+    concurrentReasoningSummaries: readGate("2508143457"),
   };
   const configs = values.dynamic_configs ?? values.dynamicConfigs ?? {};
   const layers = values.layer_configs ?? values.layerConfigs ?? {};
@@ -1222,7 +1207,8 @@ mod tests {
     fn official_feature_sync_reads_gates_then_applies_the_feature_override_layer() {
         let script = official_experimental_features_script();
 
-        assert!(script.contains(r#"readGate("1786883712", "unified_exec")"#));
+        assert!(script.contains(r#"readGate("1786883712")"#));
+        assert!(script.contains("typeof value === \"boolean\" ? value : false"));
         assert!(script.contains(r#""30039772""#));
         assert!(script.contains(r#"configs["3902942138"] ?? layers["3902942138"]"#));
         assert!(script.contains("feature_overrides"));
