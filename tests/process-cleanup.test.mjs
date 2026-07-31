@@ -28,14 +28,22 @@ test("every shutdown path reaps Codex and Codey process trees", async () => {
   ]);
 
   const finalShutdown = library.slice(
-    library.indexOf("let cleanup = match commands::stop_codey_runtime"),
+    library.indexOf("let shutdown_reason = tokio::select!"),
     library.indexOf("cleanup.map_err"),
   );
+  assert.match(finalShutdown, /stop_runtime_with_retry\(&state\)\.await/);
   assert.match(finalShutdown, /terminate_other_codey_processes\(\)\.await/);
   assert.doesNotMatch(
     finalShutdown,
     /if shutdown_reason == ShutdownReason::CodexExited/,
   );
+
+  const stopWithRetry = library.slice(
+    library.indexOf("async fn stop_runtime_with_retry"),
+    library.indexOf("fn initial_startup_failure_error"),
+  );
+  assert.equal(stopWithRetry.match(/stop_codey_runtime\(state\)/g)?.length, 2);
+  assert.match(stopWithRetry, /tokio::time::sleep/);
 
   const runtimeStop = launcher.slice(
     launcher.indexOf("pub async fn stop(&self)"),

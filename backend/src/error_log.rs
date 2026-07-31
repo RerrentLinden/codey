@@ -109,13 +109,15 @@ fn repair_incomplete_tail(path: &Path) -> std::io::Result<()> {
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |index| index.saturating_add(1));
-    let mut file = OpenOptions::new().append(true).open(path)?;
     if serde_json::from_slice::<Value>(&bytes[line_start..]).is_ok() {
+        let mut file = OpenOptions::new().append(true).open(path)?;
         file.write_all(b"\n")?;
+        file.flush()
     } else {
+        let mut file = OpenOptions::new().write(true).open(path)?;
         file.set_len(u64::try_from(line_start).unwrap_or(0))?;
+        file.flush()
     }
-    file.flush()
 }
 
 pub fn initialize() {

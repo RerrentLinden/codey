@@ -1349,6 +1349,7 @@ fn startup_patch_detail() -> String {
     }
 }
 
+#[cfg(not(windows))]
 fn spawn_command(command: Vec<String>) -> Result<SpawnedCodex> {
     let executable = command
         .first()
@@ -1357,11 +1358,6 @@ fn spawn_command(command: Vec<String>) -> Result<SpawnedCodex> {
     child_command.args(&command[1..]);
     #[cfg(unix)]
     child_command.process_group(0);
-    #[cfg(windows)]
-    {
-        child_command.env_remove("WSL_DISTRO_NAME");
-        child_command.creation_flags(codey_runtime_core::windows_create_no_window());
-    }
     let child = child_command
         .spawn()
         .with_context(|| format!("启动 Codex 失败：{executable}"))?;
@@ -1435,18 +1431,18 @@ async fn spawn_windows_codex(
 
 #[cfg(windows)]
 async fn stop_windows_spawned_codex(spawned: &mut SpawnedCodex) {
-    if let Some(process_id) = spawned.process_id.take() {
-        if let Err(error) = terminate_windows_process(process_id).await {
-            error_log::record_failure(
-                "cleanup_failed",
-                "cleanup_windows_after_startup_patch_failure",
-                format!("{error:#}"),
-                serde_json::json!({
-                    "processId": process_id,
-                }),
-            );
-            eprintln!("Codex 启动失败后的进程清理失败：{error:#}");
-        }
+    if let Some(process_id) = spawned.process_id.take()
+        && let Err(error) = terminate_windows_process(process_id).await
+    {
+        error_log::record_failure(
+            "cleanup_failed",
+            "cleanup_windows_after_startup_patch_failure",
+            format!("{error:#}"),
+            serde_json::json!({
+                "processId": process_id,
+            }),
+        );
+        eprintln!("Codex 启动失败后的进程清理失败：{error:#}");
     }
     if let Some(child) = spawned.child.take() {
         reap_child_after_cleanup(child, "reap_child_after_startup_patch_failure").await;

@@ -22,6 +22,41 @@ test("Windows builds Codey as a GUI process without a console window", async () 
   assert.doesNotMatch(manifest, /Win32_System_Console|Win32_UI_WindowsAndMessaging/);
 });
 
+test("Windows startup failures are visible and terminate the background process", async () => {
+  const library = normalizeLineEndings(
+    await readFile(new URL("../backend/src/lib.rs", import.meta.url), "utf8"),
+  );
+  const failureStart = library.indexOf(
+    "if let Err(error) = commands::launch_codey_runtime(&state).await",
+  );
+  const shutdownWait = library.indexOf("let shutdown_reason = tokio::select!");
+
+  assert.notEqual(failureStart, -1);
+  assert.notEqual(shutdownWait, -1);
+  assert.ok(failureStart < shutdownWait);
+
+  const failureBranch = library.slice(failureStart, shutdownWait);
+  assert.match(failureBranch, /stop_runtime_with_retry\(&state\)\.await/);
+  assert.match(failureBranch, /show_initial_startup_failure\(&error\)\.await/);
+  assert.match(failureBranch, /return Err\(/);
+
+  const cleanupHelper = library.slice(
+    library.indexOf("async fn stop_runtime_with_retry"),
+    library.indexOf("fn initial_startup_failure_error"),
+  );
+  assert.match(cleanupHelper, /stop_codey_runtime\(state\)\.await/);
+  assert.match(cleanupHelper, /tokio::time::sleep/);
+  assert.equal(cleanupHelper.match(/stop_codey_runtime\(state\)/g)?.length, 2);
+
+  assert.match(
+    library,
+    /rfd::MessageDialog::new\(\)[\s\S]*?MessageLevel::Error[\s\S]*?MessageButtons::Ok[\s\S]*?\.show\(\)/,
+  );
+  assert.match(library, /tokio::task::spawn_blocking/);
+  assert.match(library, /\.set_title\("Codey 启动失败"\)/);
+  assert.match(library, /Codey 将退出。处理上述问题后，请重新启动 Codey。/);
+});
+
 test("Windows background helpers never create console windows", async () => {
   const [launcher, processCleanup] = await Promise.all([
     readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8")
@@ -34,7 +69,7 @@ test("Windows background helpers never create console windows", async () => {
     launcher.match(
       /creation_flags\(codey_runtime_core::windows_create_no_window\(\)\)/g,
     )?.length,
-    3,
+    2,
   );
   assert.doesNotMatch(processCleanup, /Command::new\("taskkill"\)/);
   assert.match(

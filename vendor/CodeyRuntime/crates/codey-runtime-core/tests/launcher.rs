@@ -174,7 +174,12 @@ fn app_paths_resolves_portable_current_link_to_directory_version() {
     std::fs::create_dir_all(&target).unwrap();
     std::fs::write(target.join("Codex.exe"), "").unwrap();
     std::fs::write(target.join("version"), "42.1.0\n").unwrap();
-    std::os::windows::fs::symlink_dir(&target, &current).unwrap();
+    if let Err(error) = std::os::windows::fs::symlink_dir(&target, &current) {
+        if error.raw_os_error() == Some(1314) {
+            return;
+        }
+        panic!("failed to create the portable current symlink: {error}");
+    }
 
     assert_eq!(
         codex_app_version(&current).as_deref(),

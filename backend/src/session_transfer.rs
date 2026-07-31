@@ -1156,7 +1156,11 @@ mod tests {
         assert_eq!(row.2, crate::codex_config::GLOBAL_PROVIDER_ID);
         assert!(row.4 > 20);
         let rollout = fs::read_to_string(row.3).unwrap();
-        assert!(rollout.contains(imported_project.path().to_str().unwrap()));
+        let session_meta: Value = serde_json::from_str(rollout.lines().next().unwrap()).unwrap();
+        assert_eq!(
+            PathBuf::from(session_meta["payload"]["cwd"].as_str().unwrap()),
+            imported_project.path().canonicalize().unwrap()
+        );
         assert!(rollout.contains(source_id));
     }
 

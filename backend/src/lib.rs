@@ -28,7 +28,9 @@ mod update_helper;
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 
 use commands::{AppShutdownReason, AppState};
 
@@ -80,6 +82,19 @@ pub async fn run() -> Result<()> {
             serde_json::json!({}),
         );
         eprintln!("Codey 自动启动 Codex 失败：{error:#}");
+        let cleanup = stop_runtime_with_retry(&state).await;
+        if let Err(cleanup_error) = &cleanup {
+            error_log::record_failure(
+                "restore_failed",
+                "restore_runtime_after_startup_failure",
+                cleanup_error.clone(),
+                serde_json::json!({}),
+            );
+        }
+        let error =
+            initial_startup_failure_error(&error, cleanup.as_ref().err().map(String::as_str));
+        show_initial_startup_failure(&error).await;
+        return Err(anyhow::Error::msg(error));
     }
 
     let shutdown_reason = tokio::select! {
@@ -90,17 +105,7 @@ pub async fn run() -> Result<()> {
         _ = shutdown_signal() => ShutdownReason::Signal,
     };
 
-    let cleanup = match commands::stop_codey_runtime(&state).await {
-        Ok(_) => Ok(()),
-        Err(first_error) => {
-            eprintln!("Codey 恢复 Codex 配置失败，正在重试：{first_error}");
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            commands::stop_codey_runtime(&state)
-                .await
-                .map(|_| ())
-                .map_err(|retry_error| format!("{first_error}；重试失败：{retry_error}"))
-        }
-    };
+    let cleanup = stop_runtime_with_retry(&state).await;
     if let Err(error) = &cleanup {
         error_log::record_failure(
             "restore_failed",
@@ -132,6 +137,55 @@ pub async fn run() -> Result<()> {
     cleanup.map_err(anyhow::Error::msg)
 }
 
+async fn stop_runtime_with_retry(state: &Arc<AppState>) -> Result<(), String> {
+    match commands::stop_codey_runtime(state).await {
+        Ok(_) => Ok(()),
+        Err(first_error) => {
+            eprintln!("Codey 恢复 Codex 配置失败，正在重试：{first_error}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            commands::stop_codey_runtime(state)
+                .await
+                .map(|_| ())
+                .map_err(|retry_error| format!("{first_error}；重试失败：{retry_error}"))
+        }
+    }
+}
+
+fn initial_startup_failure_error(startup_error: &str, cleanup_error: Option<&str>) -> String {
+    match cleanup_error {
+        Some(cleanup_error) => {
+            format!("{startup_error}；启动失败后的清理也失败：{cleanup_error}")
+        }
+        None => startup_error.to_string(),
+    }
+}
+
+#[cfg(windows)]
+async fn show_initial_startup_failure(error: &str) {
+    let description = format!("{error}\n\nCodey 将退出。处理上述问题后，请重新启动 Codey。");
+    if let Err(dialog_error) = tokio::task::spawn_blocking(move || {
+        rfd::MessageDialog::new()
+            .set_title("Codey 启动失败")
+            .set_description(description)
+            .set_level(rfd::MessageLevel::Error)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show()
+    })
+    .await
+    {
+        error_log::record_failure(
+            "dialog_failed",
+            "show_initial_startup_failure",
+            dialog_error.to_string(),
+            serde_json::json!({}),
+        );
+        eprintln!("Codey 启动失败提示框显示异常：{dialog_error}");
+    }
+}
+
+#[cfg(not(windows))]
+async fn show_initial_startup_failure(_error: &str) {}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -154,5 +208,26 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::initial_startup_failure_error;
+
+    #[test]
+    fn startup_failure_keeps_the_cleanup_error() {
+        assert_eq!(
+            initial_startup_failure_error("Codex 启动失败", Some("配置恢复失败")),
+            "Codex 启动失败；启动失败后的清理也失败：配置恢复失败"
+        );
+    }
+
+    #[test]
+    fn startup_failure_is_unchanged_after_successful_cleanup() {
+        assert_eq!(
+            initial_startup_failure_error("Codex 启动失败", None),
+            "Codex 启动失败"
+        );
     }
 }
