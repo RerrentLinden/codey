@@ -1343,7 +1343,7 @@ async fn spawn_codex(
                     }),
                 );
                 error
-        })?;
+            })?;
         let inspector_arg = crate::codex_startup_patch::inspector_argument(inspector_port);
         let mut launch_arguments = vec![inspector_arg];
         launch_arguments.extend(runtime_arguments.iter().cloned());
