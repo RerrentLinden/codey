@@ -6,7 +6,7 @@
   "packageManager": "pnpm@11.5.2",
   "type": "module",
   "scripts": {
-    "dev": "cargo run --manifest-path Cargo.toml",
+    "dev": "node scripts/dev.mjs",
     "build": "node scripts/build.mjs",
     "check": "tsc --noEmit",
     "release": "node scripts/release.mjs",
