@@ -70,7 +70,7 @@ impl NotificationChannelConfig {
 
     pub(crate) fn feishu_webhook_url(&self) -> Result<reqwest::Url, &'static str> {
         const INVALID_URL: &str =
-            "飞书机器人 Webhook 仅支持 open.feishu.cn 或 open.larksuite.com 的官方 HTTPS 地址";
+            "飞书机器人 Webhook 必须使用 HTTPS 地址和 /open-apis/bot/v2/hook/... 路径";
         let value = self.url.trim();
         if value.is_empty() {
             return Err("请先填写飞书机器人 Webhook 地址");
@@ -80,16 +80,12 @@ impl NotificationChannelConfig {
         if self.allow_insecure_test_url {
             return Ok(url);
         }
-        let allowed_host = matches!(
-            url.host_str(),
-            Some("open.feishu.cn" | "open.larksuite.com")
-        );
         let hook = url
             .path()
             .strip_prefix("/open-apis/bot/v2/hook/")
             .filter(|hook| !hook.is_empty() && !hook.contains('/'));
         if url.scheme() != "https"
-            || !allowed_host
+            || url.host_str().is_none()
             || url.port_or_known_default() != Some(443)
             || !url.username().is_empty()
             || url.password().is_some()
@@ -235,11 +231,12 @@ mod tests {
     }
 
     #[test]
-    fn feishu_webhooks_require_an_official_https_endpoint() {
+    fn feishu_webhooks_accept_custom_https_hosts() {
         for accepted in [
             "https://open.feishu.cn/open-apis/bot/v2/hook/secret",
             "https://open.larksuite.com/open-apis/bot/v2/hook/secret",
             "https://open.feishu.cn:443/open-apis/bot/v2/hook/secret",
+            "https://feishu.corp.example/open-apis/bot/v2/hook/secret",
         ] {
             let config = NotificationChannelConfig {
                 url: accepted.to_string(),
@@ -250,8 +247,7 @@ mod tests {
 
         for rejected in [
             "http://open.feishu.cn/open-apis/bot/v2/hook/secret",
-            "https://127.0.0.1/open-apis/bot/v2/hook/secret",
-            "https://open.feishu.cn.evil.example/open-apis/bot/v2/hook/secret",
+            "https://feishu.corp.example:8443/open-apis/bot/v2/hook/secret",
             "https://open.feishu.cn/other/path",
             "https://open.feishu.cn/open-apis/bot/v2/hook/secret?redirect=1",
             "https://user@open.feishu.cn/open-apis/bot/v2/hook/secret",
