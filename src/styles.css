@@ -362,6 +362,30 @@ input:focus-visible,
   flex-shrink: 0;
 }
 
+.header-usage-toggle {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 10px 4px 12px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.75);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
+}
+
+.header-usage-toggle.active {
+  border-color: rgba(0, 122, 255, 0.32);
+  background: rgba(0, 122, 255, 0.06);
+}
+
+.header-usage-toggle span {
+  color: #1d1d1f;
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
 /* ==========================================================================
    Dashboard Cards & Grid
    ========================================================================== */

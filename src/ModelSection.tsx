@@ -53,12 +53,17 @@ function ModelSectionComponent({
         </div>
         <div className="route-heading-actions">
           {provider.official && (
-            <Switch
-              checked={showAccountUsageInHeader}
-              disabled={isBusy}
-              onCheckedChange={onShowAccountUsageInHeaderChange}
-              aria-label="在 Codex 顶部展示官方账号额度"
-            />
+            <div
+              className={`header-usage-toggle${showAccountUsageInHeader ? " active" : ""}`}
+            >
+              <span>在顶部展示额度</span>
+              <Switch
+                checked={showAccountUsageInHeader}
+                disabled={isBusy}
+                onCheckedChange={onShowAccountUsageInHeaderChange}
+                aria-label="在 Codex 顶部展示官方账号额度"
+              />
+            </div>
           )}
           <Button
             variant="outline"
