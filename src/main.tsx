@@ -37,7 +37,7 @@ if (import.meta.env.DEV) {
           name: "备用中转 (Claude)",
           baseUrl: previewEndpoints.backup,
           apiKey: "",
-          protocol: "chatCompletions" as const,
+          protocol: "responses" as const,
           ccSwitchProviderId: "backup",
           ccSwitchReadOnly: false,
         },

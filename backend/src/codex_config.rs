@@ -258,6 +258,9 @@ fn apply_runtime_provider_config_at_mode(
     backup_root: &Path,
     preserve_provider_route: bool,
 ) -> Result<PathBuf> {
+    if !preserve_provider_route {
+        ensure_supported_provider_protocol(profile.protocol)?;
+    }
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let agents_md_path = home.join("AGENTS.md");
@@ -1254,7 +1257,13 @@ fn patch_config_with_fastctx_mode(
     subagent_optimization: bool,
     preserve_provider_route: bool,
 ) -> Result<String> {
+    if !preserve_provider_route {
+        ensure_supported_provider_protocol(profile.protocol)?;
+    }
     let mut doc = parse_document(existing)?;
+    if preserve_provider_route {
+        ensure_active_provider_uses_responses(&doc)?;
+    }
     // CC Switch owns all routing and model-selection fields while Live
     // takeover is active. Codey only layers its independent runtime
     // enhancements onto the current Live document.
@@ -1559,10 +1568,7 @@ fn direct_provider_table(
     let mut provider = existing_local_provider.unwrap_or_default();
     provider["name"] = value(profile.name.trim());
     provider["base_url"] = value(base_url);
-    provider["wire_api"] = value(match profile.protocol {
-        RelayProtocol::Responses => "responses",
-        RelayProtocol::ChatCompletions => "chat",
-    });
+    provider["wire_api"] = value("responses");
     if !preserves_manual_settings {
         provider["requires_openai_auth"] = value(true);
     }
@@ -1570,6 +1576,40 @@ fn direct_provider_table(
         provider["experimental_bearer_token"] = value(profile.api_key.trim());
     }
     Ok(provider)
+}
+
+fn ensure_supported_provider_protocol(protocol: RelayProtocol) -> Result<()> {
+    match protocol {
+        RelayProtocol::Responses => Ok(()),
+        RelayProtocol::ChatCompletions => anyhow::bail!(
+            "当前 Codex 已移除 wire_api = \"chat\"；请将第三方线路改为 Responses API 后重试"
+        ),
+    }
+}
+
+fn ensure_active_provider_uses_responses(doc: &DocumentMut) -> Result<()> {
+    let provider_id = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("CC Switch Live 配置缺少活动 model_provider"))?;
+    let wire_api = doc
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table_like)
+        .and_then(|provider| provider.get("wire_api"))
+        .and_then(Item::as_str)
+        .unwrap_or("responses")
+        .trim();
+    if wire_api.eq_ignore_ascii_case("responses") {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "当前 Codex 已移除 wire_api = {wire_api:?}；请将 CC Switch Live 线路改为 Responses API 后重试"
+        )
+    }
 }
 
 fn official_provider_table() -> Table {
@@ -1956,21 +1996,38 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
     }
 
     #[test]
-    fn direct_patch_configures_the_provider_without_a_loopback_endpoint() {
+    fn direct_patch_configures_a_responses_provider_without_a_loopback_endpoint() {
         let result = patch_config(
             "model_provider = \"openai\"\n",
-            &direct_profile(RelayProtocol::ChatCompletions),
+            &direct_profile(RelayProtocol::Responses),
             "openai",
             false,
         )
         .unwrap();
         assert!(result.contains("base_url = \"https://relay.example/v1\""));
-        assert!(result.contains("wire_api = \"chat\""));
+        assert!(result.contains("wire_api = \"responses\""));
         assert!(result.contains("experimental_bearer_token = \"sk-direct\""));
         assert!(!result.contains("127.0.0.1"));
         assert_eq!(
             root_key_string(&result, "model_provider").as_deref(),
             Some(GLOBAL_PROVIDER_ID)
+        );
+    }
+
+    #[test]
+    fn direct_patch_rejects_the_removed_chat_wire_api() {
+        let error = patch_config(
+            "model_provider = \"openai\"\n",
+            &direct_profile(RelayProtocol::ChatCompletions),
+            "openai",
+            false,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("当前 Codex 已移除 wire_api = \"chat\"")
         );
     }
 
@@ -1992,7 +2049,7 @@ enabled = true
 "#;
         let result = patch_config_with_fastctx_mode(
             existing,
-            &direct_profile(RelayProtocol::Responses),
+            &direct_profile(RelayProtocol::ChatCompletions),
             GLOBAL_PROVIDER_ID,
             relative_model_catalog_path(),
             Some("codey-model"),
@@ -2031,6 +2088,35 @@ enabled = true
                 .unwrap()
         );
         assert!(after["mcp_servers"][CODEY_FASTCTX_SERVER_ID].is_table());
+    }
+
+    #[test]
+    fn route_preserving_patch_rejects_a_live_chat_wire_api() {
+        let existing = r#"
+model_provider = "cc-switch-live"
+
+[model_providers.cc-switch-live]
+name = "CC Switch Live"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "chat"
+"#;
+        let error = patch_config_with_fastctx_mode(
+            existing,
+            &direct_profile(RelayProtocol::Responses),
+            GLOBAL_PROVIDER_ID,
+            None,
+            None,
+            None,
+            false,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("请将 CC Switch Live 线路改为 Responses API")
+        );
     }
 
     #[test]
