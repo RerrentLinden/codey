@@ -275,20 +275,36 @@ test("renders official account usage before the header settings action", async (
   assert.match(usage.innerHTML, /85%/);
   assert.match(usage.innerHTML, /7 天/);
   assert.match(usage.innerHTML, /60%/);
+  assert.equal(usage.dataset.plan, "pro-20x");
+  assert.match(usage.innerHTML, /class="codey-usage-plan" data-plan="pro-20x">Pro 20x/);
   assert.match(usage.innerHTML, /data-tone="healthy"[\s\S]*?85%/);
   assert.match(usage.innerHTML, /data-tone="normal"[\s\S]*?60%/);
   assert.match(usage.innerHTML, /今天 \d{2}:\d{2} 刷新/);
   assert.match(usage.innerHTML, /明天 \d{2}:\d{2} 刷新/);
+  assert.match(usage.getAttribute("aria-label"), /当前套餐 Pro 20x/);
   assert.match(usage.getAttribute("aria-label"), /5 小时额度剩余 85%/);
 
   accountUsageResult = {
     ...accountUsageResult,
+    planType: "pro_5x",
     primary: { ...accountUsageResult.primary, usedPercent: 65 },
     secondary: { ...accountUsageResult.secondary, usedPercent: 85 },
   };
   await window.__codeyRefreshAccountUsage();
+  assert.equal(usage.dataset.plan, "pro-5x");
+  assert.match(usage.innerHTML, /class="codey-usage-plan" data-plan="pro-5x">Pro 5x/);
   assert.match(usage.innerHTML, /data-tone="warning"[\s\S]*?35%/);
   assert.match(usage.innerHTML, /data-tone="critical"[\s\S]*?15%/);
+
+  accountUsageResult = { ...accountUsageResult, planType: "plus" };
+  await window.__codeyRefreshAccountUsage();
+  assert.equal(usage.dataset.plan, "plus");
+  assert.match(usage.innerHTML, /class="codey-usage-plan" data-plan="plus">Plus/);
+
+  accountUsageResult = { ...accountUsageResult, planType: "free" };
+  await window.__codeyRefreshAccountUsage();
+  assert.equal(usage.dataset.plan, "free");
+  assert.match(usage.innerHTML, /class="codey-usage-plan" data-plan="free">Free/);
 
   accountUsageResult = { status: "unavailable", reason: "third_party" };
   await window.__codeyRefreshAccountUsage();

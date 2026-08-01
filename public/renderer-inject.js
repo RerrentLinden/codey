@@ -87,7 +87,9 @@
       #${accountUsageId}[data-state="error"] { min-width: 118px; align-items: center; justify-content: center; padding: 0 10px; color: color-mix(in srgb, CanvasText 66%, transparent); }
       #${accountUsageId} .codey-usage-segment { display: grid; min-width: 104px; grid-template-columns: minmax(0, 1fr) auto; align-content: center; column-gap: 8px; padding: 5px 9px 4px; }
       #${accountUsageId} .codey-usage-segment + .codey-usage-segment { border-inline-start: 1px solid color-mix(in srgb, CanvasText 9%, transparent); }
-      #${accountUsageId} .codey-usage-window { overflow: hidden; color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 9px; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-window { display: flex; min-width: 0; align-items: center; gap: 4px; overflow: hidden; color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 9px; font-weight: 550; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-window-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+      #${accountUsageId} .codey-usage-plan { flex: 0 0 auto; border: 1px solid color-mix(in srgb, #0a84ff 24%, transparent); border-radius: 4px; padding: 1px 4px; background: color-mix(in srgb, #0a84ff 9%, transparent); color: color-mix(in srgb, #0a84ff 78%, CanvasText); font-size: 8px; font-weight: 700; letter-spacing: .01em; line-height: 1.15; }
       #${accountUsageId} .codey-usage-value { font-variant-numeric: tabular-nums; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
       #${accountUsageId} .codey-usage-meter { grid-column: 1 / -1; height: 2px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, CanvasText 10%, transparent); }
       #${accountUsageId} .codey-usage-meter > span { display: block; width: 100%; height: 100%; border-radius: inherit; background: #0a84ff; transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; }
@@ -250,6 +252,34 @@
     return `${resetAt.getMonth() + 1}月${resetAt.getDate()}日 ${time} 刷新`;
   };
 
+  const accountUsagePlan = (planType) => {
+    const raw = String(planType || "").trim();
+    if (!raw) return null;
+    const compact = raw.toLowerCase().replace(/[\s_$-]+/g, "");
+    if (
+      compact === "5x"
+      || compact.includes("pro5x")
+      || compact.includes("pro100")
+    ) {
+      return { key: "pro-5x", label: "Pro 5x" };
+    }
+    if (
+      compact === "pro"
+      || compact.includes("pro20x")
+      || compact.includes("pro200")
+    ) {
+      return { key: "pro-20x", label: "Pro 20x" };
+    }
+    if (compact.includes("plus")) return { key: "plus", label: "Plus" };
+    if (compact.includes("free")) return { key: "free", label: "Free" };
+    return {
+      key: "other",
+      label: raw
+        .replace(/[_-]+/g, " ")
+        .replace(/\b\w/g, (character) => character.toUpperCase()),
+    };
+  };
+
   const escapeAccountUsageText = (value) => String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -257,7 +287,11 @@
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 
-  const accountUsageWindowSegment = (window) => {
+  const accountUsagePlanMarkup = (plan) => plan
+    ? `<span class="codey-usage-plan" data-plan="${plan.key}">${escapeAccountUsageText(plan.label)}</span>`
+    : "";
+
+  const accountUsageWindowSegment = (window, plan = null) => {
     if (!window || !Number.isFinite(Number(window.usedPercent))) return null;
     const remaining = Math.max(0, Math.min(100, 100 - Number(window.usedPercent)));
     const roundedRemaining = Math.round(remaining);
@@ -275,7 +309,10 @@
       aria: `${label}额度剩余 ${roundedRemaining}%${reset ? `，${reset}` : ""}`,
       html: `
         <span class="codey-usage-segment" data-tone="${tone}" style="--codey-usage-remaining:${remaining / 100}">
-          <span class="codey-usage-window">${label}</span>
+          <span class="codey-usage-window">
+            ${accountUsagePlanMarkup(plan)}
+            <span class="codey-usage-window-label">${label}</span>
+          </span>
           <span class="codey-usage-value">${roundedRemaining}%</span>
           <span class="codey-usage-meter"><span></span></span>
           ${resetTime ? `<span class="codey-usage-reset">${resetTime}</span>` : ""}
@@ -284,14 +321,17 @@
     };
   };
 
-  const accountCreditsSegment = (credits) => {
+  const accountCreditsSegment = (credits, plan = null) => {
     if (!credits || (!credits.hasCredits && !credits.unlimited)) return null;
     const balance = credits.unlimited ? "不限" : String(credits.balance || "0");
     return {
       aria: `账号额度余额 ${balance}`,
       html: `
         <span class="codey-usage-segment" style="--codey-usage-remaining:1">
-          <span class="codey-usage-window">余额</span>
+          <span class="codey-usage-window">
+            ${accountUsagePlanMarkup(plan)}
+            <span class="codey-usage-window-label">余额</span>
+          </span>
           <span class="codey-usage-value">${escapeAccountUsageText(balance)}</span>
           <span class="codey-usage-meter"><span></span></span>
         </span>
@@ -360,11 +400,17 @@
     }
     if (result.status !== "ok") return;
 
-    const segments = [
-      accountUsageWindowSegment(result.primary),
-      accountUsageWindowSegment(result.secondary),
-      accountCreditsSegment(result.credits),
-    ].filter(Boolean);
+    const plan = accountUsagePlan(result.planType);
+    const primary = accountUsageWindowSegment(result.primary, plan);
+    const secondary = accountUsageWindowSegment(
+      result.secondary,
+      primary ? null : plan,
+    );
+    const credits = accountCreditsSegment(
+      result.credits,
+      primary || secondary ? null : plan,
+    );
+    const segments = [primary, secondary, credits].filter(Boolean);
     if (!segments.length) {
       renderAccountUsage({
         status: "error",
@@ -375,11 +421,15 @@
     accountUsageLastResult = result;
     const usage = accountUsageMount();
     if (!usage) return;
-    const aria = segments.map((segment) => segment.aria).join("；");
-    const plan = String(result.planType || "").trim();
+    const aria = [
+      plan ? `当前套餐 ${plan.label}` : null,
+      ...segments.map((segment) => segment.aria),
+    ].filter(Boolean).join("；");
     usage.dataset.state = "ready";
+    if (plan) usage.dataset.plan = plan.key;
+    else delete usage.dataset.plan;
     usage.setAttribute("aria-label", aria);
-    usage.title = plan ? `${aria}；账号方案 ${plan}` : aria;
+    usage.title = aria;
     usage.innerHTML = segments.map((segment) => segment.html).join("");
   };
 
