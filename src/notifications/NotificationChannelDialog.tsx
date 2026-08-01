@@ -1,8 +1,6 @@
 import { memo, useEffect, useLayoutEffect, useState } from "react";
 import {
-  IconArrowLeft,
   IconCheck,
-  IconChevronRight,
   IconLoader2 as LoaderCircle,
   IconSend,
 } from "@tabler/icons-react";
@@ -25,6 +23,8 @@ import {
   notificationChannelDefinitions,
 } from "./channelRegistry";
 import type { NotificationChannel, NotificationChannelKind } from "./types";
+
+const defaultNotificationChannelKind = notificationChannelDefinitions[0].kind;
 
 type NotificationChannelDialogProps = {
   container: HTMLElement | null;
@@ -67,7 +67,11 @@ function NotificationChannelDialogComponent({
       setHasSuccessfulTest(false);
       return;
     }
-    setDraft(editingChannel ? { ...editingChannel } : null);
+    setDraft(
+      editingChannel
+        ? { ...editingChannel }
+        : createNotificationChannel(defaultNotificationChannelKind),
+    );
     setIsRevealing(editingChannel !== null);
     setRevealError("");
     setIsTesting(false);
@@ -97,6 +101,7 @@ function NotificationChannelDialogComponent({
   }, [editingChannel?.id, open]);
 
   function selectChannel(kind: NotificationChannelKind) {
+    if (draft?.kind === kind) return;
     setDraft(createNotificationChannel(kind));
     resetTestResult();
   }
@@ -159,7 +164,6 @@ function NotificationChannelDialogComponent({
     }
   }
 
-  const ChannelIcon = definition?.Icon;
   const ChannelEditor = definition?.Editor;
   const formBusy = isBusy || isRevealing || isTesting;
   const canTest = Boolean(draft && definition?.isConfigured(draft));
@@ -199,41 +203,58 @@ function NotificationChannelDialogComponent({
               </Button>
             </DialogFooter>
           </>
-        ) : draft && definition && ChannelIcon && ChannelEditor ? (
+        ) : draft && definition && ChannelEditor ? (
           <>
             <DialogHeader>
               <DialogTitle>
-                {isEditing ? `编辑${definition.addLabel}渠道` : `配置${definition.addLabel}渠道`}
+                {isEditing ? `编辑${definition.addLabel}渠道` : "添加通知渠道"}
               </DialogTitle>
               <DialogDescription>
-                填写渠道专属配置；启用状态也会在这里一起保存。
+                {isEditing
+                  ? "更新渠道配置；启用状态也会在这里一起保存。"
+                  : "选择发送渠道，并填写该渠道需要的专属配置。"}
               </DialogDescription>
             </DialogHeader>
-            <div className="notification-dialog-channel">
-              <div className="notification-title">
-                <span className={definition.iconClassName}>
-                  <ChannelIcon size={18} aria-hidden="true" />
-                </span>
-                <div>
-                  <strong>{definition.title}</strong>
-                  <small>{definition.description}</small>
-                </div>
+            <fieldset
+              className="notification-channel-picker"
+              disabled={isEditing || formBusy}
+            >
+              <legend className="notification-channel-picker-legend">
+                发送渠道
+              </legend>
+              <div className="notification-channel-picker-options">
+                {notificationChannelDefinitions.map((item) => {
+                  const PickerIcon = item.Icon;
+                  const selected = draft.kind === item.kind;
+                  const iconClassName = [
+                    "notification-channel-picker-icon",
+                    item.iconClassName,
+                  ].filter(Boolean).join(" ");
+                  return (
+                    <label
+                      className={`notification-channel-picker-item ${selected ? "selected" : ""}`}
+                      key={item.kind}
+                    >
+                      <input
+                        type="radio"
+                        name="notification-channel-kind"
+                        value={item.kind}
+                        checked={selected}
+                        disabled={isEditing || formBusy}
+                        onChange={() => selectChannel(item.kind)}
+                      />
+                      <span className={iconClassName}>
+                        <PickerIcon size={18} aria-hidden="true" />
+                      </span>
+                      <span className="notification-channel-picker-copy">
+                        <strong>{item.title}</strong>
+                        <small>{item.description}</small>
+                      </span>
+                    </label>
+                  );
+                })}
               </div>
-              {!isEditing ? (
-                <Button
-                  variant="ghost"
-                  size="xs"
-                  disabled={isBusy}
-                  onClick={() => {
-                    setDraft(null);
-                    resetTestResult();
-                  }}
-                >
-                  <IconArrowLeft aria-hidden="true" />
-                  更换渠道
-                </Button>
-              ) : null}
-            </div>
+            </fieldset>
             <div className="notification-fields notification-dialog-fields">
               <ChannelEditor
                 channel={draft}
@@ -308,45 +329,7 @@ function NotificationChannelDialogComponent({
               </Button>
             </DialogFooter>
           </>
-        ) : (
-          <>
-            <DialogHeader>
-              <DialogTitle>添加通知渠道</DialogTitle>
-              <DialogDescription>
-                选择一个发送渠道，再填写该渠道需要的专属配置。
-              </DialogDescription>
-            </DialogHeader>
-            <div className="notification-channel-picker" role="list">
-              {notificationChannelDefinitions.map((item) => {
-                const PickerIcon = item.Icon;
-                return (
-                  <Button
-                    className="notification-channel-picker-item"
-                    key={item.kind}
-                    variant="outline"
-                    disabled={isBusy}
-                    role="listitem"
-                    onClick={() => selectChannel(item.kind)}
-                  >
-                    <span className={item.iconClassName}>
-                      <PickerIcon size={18} aria-hidden="true" />
-                    </span>
-                    <span className="notification-channel-picker-copy">
-                      <strong>{item.title}</strong>
-                      <small>{item.description}</small>
-                    </span>
-                    <IconChevronRight aria-hidden="true" />
-                  </Button>
-                );
-              })}
-            </div>
-            <DialogFooter>
-              <Button variant="outline" disabled={isBusy} onClick={closeDialog}>
-                取消
-              </Button>
-            </DialogFooter>
-          </>
-        )}
+        ) : null}
       </DialogContent>
     </Dialog>
   );

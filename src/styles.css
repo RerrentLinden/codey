@@ -1759,36 +1759,74 @@ input:focus-visible,
   display: grid;
   gap: 8px;
   margin-top: 20px;
+  padding: 0;
+  border: 0;
 }
 
 .notification-channel-picker-item {
-  display: block !important;
+  display: grid;
+  grid-template-columns: 18px 36px minmax(0, 1fr);
   width: 100%;
   min-height: 72px;
-  height: auto !important;
-  padding: 0 !important;
-  border-color: rgba(0, 0, 0, 0.1) !important;
-  background: #fbfbfc !important;
-  color: #1d1d1f !important;
-  text-align: left;
-}
-
-.notification-channel-picker-item:hover:not(:disabled) {
-  border-color: rgba(0, 122, 255, 0.35) !important;
-  background: #f4f8ff !important;
-}
-
-.notification-channel-picker-item .semi-button-content {
-  display: grid;
-  grid-template-columns: 36px minmax(0, 1fr) 16px;
-  width: 100%;
-  min-width: 0;
   align-items: center;
   gap: 12px;
   padding: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 10px;
+  background: #fbfbfc;
+  color: #1d1d1f;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
 }
 
-.notification-channel-picker-item .semi-button-content > span:first-child {
+.notification-channel-picker-legend {
+  margin-bottom: 8px;
+  color: #6e6e73;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.notification-channel-picker-options {
+  display: grid;
+  gap: 8px;
+}
+
+.notification-channel-picker-item:hover {
+  border-color: rgba(0, 122, 255, 0.35);
+  background: #f4f8ff;
+}
+
+.notification-channel-picker-item.selected {
+  border-color: rgba(0, 122, 255, 0.45);
+  background: #f4f8ff;
+}
+
+.notification-channel-picker-item input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--mac-blue);
+}
+
+.notification-channel-picker:disabled .notification-channel-picker-item {
+  cursor: default;
+}
+
+.notification-channel-picker:disabled .notification-channel-picker-item:not(.selected) {
+  opacity: 0.62;
+}
+
+.notification-channel-picker:disabled .notification-channel-picker-item:hover {
+  border-color: rgba(0, 0, 0, 0.1);
+  background: #fbfbfc;
+}
+
+.notification-channel-picker:disabled .notification-channel-picker-item.selected {
+  border-color: rgba(0, 122, 255, 0.32);
+  background: #f4f8ff;
+}
+
+.notification-channel-picker-icon {
   display: grid;
   width: 36px;
   height: 36px;
@@ -1798,7 +1836,7 @@ input:focus-visible,
   color: var(--mac-blue);
 }
 
-.notification-channel-picker-item .semi-button-content > span.telegram {
+.notification-channel-picker-icon.telegram {
   background: rgba(34, 158, 217, 0.12);
   color: #229ed9;
 }
@@ -1821,10 +1859,6 @@ input:focus-visible,
   line-height: 1.35;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.notification-channel-picker-item .semi-button-content > svg {
-  color: #8e8e93;
 }
 
 .notification-secret-action {
