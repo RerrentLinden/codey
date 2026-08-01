@@ -89,7 +89,7 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     notificationDialog,
     /export const NotificationChannelDialog = memo\(/,
   );
-  assert.match(notificationDialog, /notification-channel-picker/);
+  assert.match(notificationDialog, /notification-channel-select/);
   assert.match(notificationDialog, /reveal_notification_channel/);
   assert.match(notificationDialog, /notification-enabled-control/);
   assert.match(notificationDialog, /test_notification_channel/);

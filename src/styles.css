@@ -1629,9 +1629,16 @@ input:focus-visible,
   flex-shrink: 0;
 }
 
+.notification-title span.feishu,
 .notification-title span.telegram {
-  background: rgba(34, 158, 217, 0.12);
-  color: #229ed9;
+  background: #ffffff;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06);
+  color: inherit;
+}
+
+.notification-title span.feishu svg,
+.notification-title span.telegram svg {
+  display: block;
 }
 
 .notification-title strong {
@@ -1779,110 +1786,108 @@ input:focus-visible,
   line-height: 1.5;
 }
 
-.notification-channel-picker {
+.notification-channel-select {
   display: grid;
-  gap: 8px;
-  margin-top: 20px;
-  padding: 0;
-  border: 0;
+  gap: 7px;
+  margin-top: 18px;
 }
 
-.notification-channel-picker-item {
-  display: grid;
-  grid-template-columns: 18px 36px minmax(0, 1fr);
-  width: 100%;
-  min-height: 72px;
-  align-items: center;
-  gap: 12px;
-  padding: 12px;
-  border: 1px solid rgba(0, 0, 0, 0.1);
-  border-radius: 10px;
-  background: #fbfbfc;
-  color: #1d1d1f;
-  cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
-}
-
-.notification-channel-picker-legend {
-  margin-bottom: 8px;
+.notification-channel-select-label {
   color: #6e6e73;
   font-size: 11px;
   font-weight: 600;
 }
 
-.notification-channel-picker-options {
-  display: grid;
+.notification-channel-select-shell {
+  position: relative;
+  width: min(100%, 260px);
+}
+
+.notification-channel-select-trigger,
+.notification-channel-select-option {
+  display: flex;
+  align-items: center;
   gap: 8px;
-}
-
-.notification-channel-picker-item:hover {
-  border-color: rgba(0, 122, 255, 0.35);
-  background: #f4f8ff;
-}
-
-.notification-channel-picker-item.selected {
-  border-color: rgba(0, 122, 255, 0.45);
-  background: #f4f8ff;
-}
-
-.notification-channel-picker-item input {
-  width: 16px;
-  height: 16px;
-  margin: 0;
-  accent-color: var(--mac-blue);
-}
-
-.notification-channel-picker:disabled .notification-channel-picker-item {
-  cursor: default;
-}
-
-.notification-channel-picker:disabled .notification-channel-picker-item:not(.selected) {
-  opacity: 0.62;
-}
-
-.notification-channel-picker:disabled .notification-channel-picker-item:hover {
-  border-color: rgba(0, 0, 0, 0.1);
-  background: #fbfbfc;
-}
-
-.notification-channel-picker:disabled .notification-channel-picker-item.selected {
-  border-color: rgba(0, 122, 255, 0.32);
-  background: #f4f8ff;
-}
-
-.notification-channel-picker-icon {
-  display: grid;
-  width: 36px;
-  height: 36px;
-  place-items: center;
-  border-radius: 9px;
-  background: rgba(0, 122, 255, 0.1);
-  color: var(--mac-blue);
-}
-
-.notification-channel-picker-icon.telegram {
-  background: rgba(34, 158, 217, 0.12);
-  color: #229ed9;
-}
-
-.notification-channel-picker-copy {
-  display: grid;
-  min-width: 0;
-  gap: 2px;
-}
-
-.notification-channel-picker-copy strong {
-  font-size: 13px;
+  color: #1d1d1f;
+  font: inherit;
+  font-size: 12px;
   font-weight: 650;
 }
 
-.notification-channel-picker-copy small {
-  overflow: hidden;
-  color: #6e6e73;
-  font-size: 11px;
-  line-height: 1.35;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+.notification-channel-select-trigger {
+  width: 100%;
+  height: 40px;
+  padding: 0 10px;
+  border: 1px solid rgba(0, 0, 0, 0.13);
+  border-radius: 8px;
+  background: #ffffff;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.15s ease, border-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.notification-channel-select-trigger:hover:not(:disabled),
+.notification-channel-select-trigger.open {
+  border-color: rgba(0, 122, 255, 0.38);
+  background: #fbfdff;
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.08);
+}
+
+.notification-channel-select-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.72;
+}
+
+.notification-channel-select-trigger > svg {
+  margin-left: auto;
+  color: #8e8e93;
+  transition: transform 0.15s ease;
+}
+
+.notification-channel-select-trigger.open > svg {
+  transform: rotate(180deg);
+}
+
+.notification-channel-select-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 6px);
+  left: 0;
+  display: grid;
+  width: 100%;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid rgba(0, 0, 0, 0.11);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
+}
+
+.notification-channel-select-option {
+  height: 34px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.notification-channel-select-option:hover,
+.notification-channel-select-option.selected {
+  background: rgba(0, 122, 255, 0.08);
+}
+
+.notification-channel-app-icon {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 22px;
+  place-items: center;
+}
+
+.notification-channel-app-icon svg {
+  display: block;
 }
 
 .notification-secret-action {
