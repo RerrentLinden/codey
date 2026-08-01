@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,43 +9,30 @@ use serde::{Serialize, Serializer};
 
 use crate::trace_log_guard;
 
-const RECENT_DAYS: u8 = 7;
-const TOP_TARGETS: usize = 8;
-
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TraceLogStatsSnapshot {
     pub pending: bool,
     pub captured_at: u64,
-    pub recent_days_window: u8,
     pub databases_found: usize,
     pub databases_scanned: usize,
     pub database_bytes: u64,
     pub row_count: u64,
     pub estimated_log_bytes: u64,
-    pub recent_row_count: u64,
-    pub recent_estimated_bytes: u64,
     pub oldest_timestamp: Option<i64>,
     pub newest_timestamp: Option<i64>,
-    pub daily: Vec<TraceLogDailyStats>,
-    pub levels: Vec<TraceLogGroupStats>,
-    pub top_targets: Vec<TraceLogGroupStats>,
     pub errors: Vec<String>,
 }
 
 impl TraceLogStatsSnapshot {
     pub fn idle() -> Self {
-        Self {
-            recent_days_window: RECENT_DAYS,
-            ..Self::default()
-        }
+        Self::default()
     }
 
     pub fn pending() -> Self {
         Self {
             pending: true,
             captured_at: timestamp_seconds(),
-            recent_days_window: RECENT_DAYS,
             ..Self::default()
         }
     }
@@ -101,26 +88,9 @@ impl Serialize for TraceLogStatsHandle {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TraceLogDailyStats {
-    pub date: String,
-    pub rows: u64,
-    pub estimated_bytes: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TraceLogGroupStats {
-    pub name: String,
-    pub rows: u64,
-    pub estimated_bytes: u64,
-}
-
 pub fn snapshot(home: &Path) -> TraceLogStatsSnapshot {
     let mut snapshot = TraceLogStatsSnapshot {
         captured_at: timestamp_seconds(),
-        recent_days_window: RECENT_DAYS,
         ..TraceLogStatsSnapshot::default()
     };
     let paths = match trace_log_guard::log_database_paths(home) {
@@ -131,9 +101,6 @@ pub fn snapshot(home: &Path) -> TraceLogStatsSnapshot {
         }
     };
 
-    let mut daily = BTreeMap::<String, TraceLogDailyStats>::new();
-    let mut levels = BTreeMap::<String, TraceLogGroupStats>::new();
-    let mut targets = BTreeMap::<String, TraceLogGroupStats>::new();
     for path in paths {
         snapshot.databases_found += 1;
         snapshot.database_bytes = snapshot
@@ -150,9 +117,6 @@ pub fn snapshot(home: &Path) -> TraceLogStatsSnapshot {
                     min_timestamp(snapshot.oldest_timestamp, database.oldest_timestamp);
                 snapshot.newest_timestamp =
                     max_timestamp(snapshot.newest_timestamp, database.newest_timestamp);
-                merge_daily(&mut daily, database.daily);
-                merge_groups(&mut levels, database.levels);
-                merge_groups(&mut targets, database.targets);
             }
             Ok(None) => {}
             Err(error) => snapshot.errors.push(format!(
@@ -164,11 +128,6 @@ pub fn snapshot(home: &Path) -> TraceLogStatsSnapshot {
         }
     }
 
-    snapshot.daily = daily.into_values().collect();
-    snapshot.recent_row_count = snapshot.daily.iter().map(|item| item.rows).sum();
-    snapshot.recent_estimated_bytes = snapshot.daily.iter().map(|item| item.estimated_bytes).sum();
-    snapshot.levels = sorted_groups(levels, usize::MAX);
-    snapshot.top_targets = sorted_groups(targets, TOP_TARGETS);
     snapshot
 }
 
@@ -178,9 +137,6 @@ struct DatabaseStats {
     estimated_log_bytes: u64,
     oldest_timestamp: Option<i64>,
     newest_timestamp: Option<i64>,
-    daily: Vec<TraceLogDailyStats>,
-    levels: Vec<TraceLogGroupStats>,
-    targets: Vec<TraceLogGroupStats>,
 }
 
 fn read_database(path: &Path) -> Result<Option<DatabaseStats>> {
@@ -229,30 +185,11 @@ fn read_database(path: &Path) -> Result<Option<DatabaseStats>> {
             ))
         })?;
 
-    let daily = if columns.contains("ts") {
-        query_daily(&connection, estimate_expression)?
-    } else {
-        Vec::new()
-    };
-    let level_expression = if columns.contains("level") {
-        "COALESCE(NULLIF(TRIM(level), ''), 'UNKNOWN')"
-    } else {
-        "'UNKNOWN'"
-    };
-    let target_expression = if columns.contains("target") {
-        "COALESCE(NULLIF(TRIM(target), ''), 'UNKNOWN')"
-    } else {
-        "'UNKNOWN'"
-    };
-
     Ok(Some(DatabaseStats {
         row_count: rows,
         estimated_log_bytes: estimated_bytes,
         oldest_timestamp,
         newest_timestamp,
-        daily,
-        levels: query_groups(&connection, level_expression, estimate_expression)?,
-        targets: query_groups(&connection, target_expression, estimate_expression)?,
     }))
 }
 
@@ -262,106 +199,6 @@ fn table_columns(connection: &Connection) -> Result<HashSet<String>> {
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<HashSet<_>>>()?;
     Ok(columns)
-}
-
-fn query_daily(
-    connection: &Connection,
-    estimate_expression: &str,
-) -> Result<Vec<TraceLogDailyStats>> {
-    let sql = format!(
-        "SELECT date(ts, 'unixepoch', 'localtime') AS day,
-                COUNT(*), COALESCE(SUM({estimate_expression}), 0)
-         FROM logs
-         WHERE ts >= CAST(strftime('%s', 'now', 'start of day', '-6 days') AS INTEGER)
-         GROUP BY day
-         ORDER BY day"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    let values = statement
-        .query_map([], |row| {
-            Ok(TraceLogDailyStats {
-                date: row.get::<_, Option<String>>(0)?.unwrap_or_default(),
-                rows: nonnegative(row.get::<_, i64>(1)?),
-                estimated_bytes: nonnegative(row.get::<_, i64>(2)?),
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(values
-        .into_iter()
-        .filter(|value| !value.date.is_empty())
-        .collect())
-}
-
-fn query_groups(
-    connection: &Connection,
-    group_expression: &str,
-    estimate_expression: &str,
-) -> Result<Vec<TraceLogGroupStats>> {
-    let sql = format!(
-        "SELECT {group_expression} AS group_name,
-                COUNT(*), COALESCE(SUM({estimate_expression}), 0)
-         FROM logs
-         GROUP BY group_name"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    let values = statement
-        .query_map([], |row| {
-            Ok(TraceLogGroupStats {
-                name: row.get::<_, String>(0)?,
-                rows: nonnegative(row.get::<_, i64>(1)?),
-                estimated_bytes: nonnegative(row.get::<_, i64>(2)?),
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(values)
-}
-
-fn merge_daily(
-    destination: &mut BTreeMap<String, TraceLogDailyStats>,
-    values: Vec<TraceLogDailyStats>,
-) {
-    for value in values {
-        let entry = destination
-            .entry(value.date.clone())
-            .or_insert_with(|| TraceLogDailyStats {
-                date: value.date,
-                ..TraceLogDailyStats::default()
-            });
-        entry.rows = entry.rows.saturating_add(value.rows);
-        entry.estimated_bytes = entry.estimated_bytes.saturating_add(value.estimated_bytes);
-    }
-}
-
-fn merge_groups(
-    destination: &mut BTreeMap<String, TraceLogGroupStats>,
-    values: Vec<TraceLogGroupStats>,
-) {
-    for value in values {
-        let entry = destination
-            .entry(value.name.clone())
-            .or_insert_with(|| TraceLogGroupStats {
-                name: value.name,
-                ..TraceLogGroupStats::default()
-            });
-        entry.rows = entry.rows.saturating_add(value.rows);
-        entry.estimated_bytes = entry.estimated_bytes.saturating_add(value.estimated_bytes);
-    }
-}
-
-fn sorted_groups(
-    values: BTreeMap<String, TraceLogGroupStats>,
-    limit: usize,
-) -> Vec<TraceLogGroupStats> {
-    let mut values = values.into_values().collect::<Vec<_>>();
-    values.sort_by(|left, right| {
-        right
-            .estimated_bytes
-            .cmp(&left.estimated_bytes)
-            .then_with(|| right.rows.cmp(&left.rows))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    values.truncate(limit);
-    values
 }
 
 fn min_timestamp(left: Option<i64>, right: Option<i64>) -> Option<i64> {
@@ -444,13 +281,9 @@ mod tests {
         assert_eq!(snapshot.databases_scanned, 2);
         assert_eq!(snapshot.row_count, 3);
         assert_eq!(snapshot.estimated_log_bytes, 500);
-        assert_eq!(snapshot.recent_row_count, 3);
-        assert_eq!(snapshot.recent_estimated_bytes, 500);
         assert!(snapshot.database_bytes > 0);
-        assert_eq!(snapshot.levels[0].name, "TRACE");
-        assert_eq!(snapshot.levels[0].rows, 2);
-        assert_eq!(snapshot.top_targets[0].name, "network");
-        assert_eq!(snapshot.top_targets[0].estimated_bytes, 420);
+        assert_eq!(snapshot.oldest_timestamp, Some(now - 86_400));
+        assert_eq!(snapshot.newest_timestamp, Some(now - 60));
         assert!(snapshot.errors.is_empty());
     }
 
@@ -477,8 +310,8 @@ mod tests {
 
         assert_eq!(snapshot.row_count, 1);
         assert_eq!(snapshot.estimated_log_bytes, 6);
-        assert_eq!(snapshot.recent_estimated_bytes, 6);
-        assert_eq!(snapshot.levels[0].name, "WARN");
+        assert!(snapshot.oldest_timestamp.is_some());
+        assert_eq!(snapshot.oldest_timestamp, snapshot.newest_timestamp);
     }
 
     #[test]
@@ -509,6 +342,12 @@ mod tests {
         assert_eq!(value["databasesFound"], 3);
         assert_eq!(value["rowCount"], 42);
         assert!(value.get("snapshot").is_none());
+        assert!(value.get("recentDaysWindow").is_none());
+        assert!(value.get("recentRowCount").is_none());
+        assert!(value.get("recentEstimatedBytes").is_none());
+        assert!(value.get("daily").is_none());
+        assert!(value.get("levels").is_none());
+        assert!(value.get("topTargets").is_none());
     }
 
     #[test]
@@ -522,7 +361,6 @@ mod tests {
         assert_eq!(pending["pending"], true);
         assert_eq!(idle["pending"], false);
         assert_eq!(idle["capturedAt"], 0);
-        assert_eq!(idle["recentDaysWindow"], RECENT_DAYS);
         assert_eq!(completed["pending"], false);
     }
 

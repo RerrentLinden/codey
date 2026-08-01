@@ -29,7 +29,7 @@ Codey 是一个无界面的 Rust 桌面辅助进程，通过 CDP 连接官方 Co
 - 可选的子代理协作优化默认关闭。打开后，Codey 会在下次启动 Codex 时临时启用 `features.multi_agent_v2`、移除冲突的 V1 `[agents]`、追加用户级探索委派提示词，并生成锁定 `gpt-5.6-luna` 低推理强度的 `agents/default.toml`；正常退出或下次异常恢复时还原启动前内容，运行期间发生的独立用户修改会保守保留。
 - Windows 原生 EXE 启动会移除继承到子进程的陈旧 `WSL_DISTRO_NAME`，避免新版客户端无意同步探测 `wsl.exe`；用户在 Codex 中明确启用的 WSL 模式不受影响。
 - 配置页提供“清理日志库”按钮：在线清空诊断日志、截断 WAL 并压缩数据库以回收磁盘空间，不直接删除运行中仍被 Codex 持有的文件，也不触碰会话、账号、配置或插件数据。
-- Trace 功能使用独立统计模块；Codex 可用后在后台读取一次日志库并原子替换内存快照，展示日志条数、SQLite 实际占用、近 7 天内容写入估算、级别分布和高占用 target。配置页刷新和状态查询不会再次扫描日志库。
+- Trace 功能使用独立统计模块；Codex 可用后在后台读取一次日志库并原子替换内存快照，仅展示日志条数、SQLite 实际占用和内容字节估算。每个日志库只执行一次汇总扫描，不再额外计算近 7 天走势、级别分布、高占用 target 或 SSD 寿命影响；配置页刷新和状态查询不会再次扫描日志库。
 - 侧边栏相对时间批量查询会话排序键时，只探测一次 `threads` 表的时间列并复用同一条预编译语句，不再为每个会话重复执行 `PRAGMA table_info` 与语句准备。
 - 会话与插件修复在每次启动 Codex 前自动执行；所有 rollout JSONL 的 `session_meta.payload.model_provider` 与全部 Codex SQLite 中的 `threads.model_provider` 会永久归一到非保留全局 ID `codey_global`（已有自定义 provider 时沿用原 ID），同时补齐 `has_user_event`、`cwd` 和工作区路径。Codey 不在退出时回滚这些改动，修复后直接启动原版 Codex 仍能看到历史会话。
 - 启动官方 Codex 前会清理 `session_index.jsonl` 中既不存在于 rollout、也没有任何 SQLite 引用的精确格式幽灵任务。索引缺失或没有可清理条目时直接跳过，不再为此遍历全部 rollout 并对每个 Codex 数据库做全表扫描。写入前保存原始索引并做快照一致性校验，备份位于 `~/.codex/backups_state/provider-sync`，保留最近 5 份 Codey 索引清理备份。

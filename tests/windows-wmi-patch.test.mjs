@@ -97,11 +97,12 @@ test("trace guard, stats, pet, and voice remain user-configurable", async () => 
   assert.match(configSource, /pub disable_trace_log_writes: bool/);
   assert.match(traceSource, /onProtectionChange|protectionEnabled/);
   assert.match(traceSource, /刷新统计/);
-  assert.match(traceSource, /SSD 写入寿命粗略估算/);
-  assert.match(traceSource, /统计范围：/);
-  assert.match(traceSource, /已清理、轮转或覆盖的历史记录/);
-  assert.match(traceSource, /REFERENCE_SSD_TBW_BYTES/);
-  assert.match(traceSource, /MAX_WRITE_AMPLIFICATION/);
+  assert.match(traceSource, /日志总条数/);
+  assert.match(traceSource, /磁盘占用空间/);
+  assert.match(traceSource, /内容字节估算/);
+  assert.doesNotMatch(traceSource, /近 7 天写入/);
+  assert.doesNotMatch(traceSource, /SSD 写入寿命粗略估算/);
+  assert.doesNotMatch(traceSource, /级别分布|高占用 Targets/);
   assert.match(appSource, /refresh_trace_log_stats/);
   assert.match(commandsSource, /"refresh_trace_log_stats"/);
   assert.doesNotMatch(launcherSource, /spawn_startup_trace_stats_refresh/);
