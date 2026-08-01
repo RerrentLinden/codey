@@ -92,7 +92,8 @@
       #${accountUsageId} .codey-usage-meter { grid-column: 1 / -1; height: 2px; margin-top: 4px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, CanvasText 10%, transparent); }
       #${accountUsageId} .codey-usage-meter > span { display: block; width: 100%; height: 100%; border-radius: inherit; background: #0a84ff; transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; }
       #${accountUsageId} .codey-usage-reset { grid-column: 1 / -1; overflow: hidden; margin-top: 3px; color: color-mix(in srgb, CanvasText 48%, transparent); font-size: 8px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-segment[data-tone="warning"] .codey-usage-meter > span { background: #ff9f0a; }
+      #${accountUsageId} .codey-usage-segment[data-tone="healthy"] .codey-usage-meter > span { background: #30d158; }
+      #${accountUsageId} .codey-usage-segment[data-tone="warning"] .codey-usage-meter > span { background: #ffd60a; }
       #${accountUsageId} .codey-usage-segment[data-tone="critical"] .codey-usage-meter > span { background: #ff453a; }
       @media (max-width: 860px) {
         #${accountUsageId} { max-width: 34vw; }
@@ -267,7 +268,9 @@
       ? "critical"
       : roundedRemaining <= 40
         ? "warning"
-        : "normal";
+        : roundedRemaining <= 70
+          ? "normal"
+          : "healthy";
     return {
       aria: `${label}额度剩余 ${roundedRemaining}%${reset ? `，${reset}` : ""}`,
       html: `
