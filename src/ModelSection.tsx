@@ -1,7 +1,6 @@
 import { memo } from "react";
 import {
   IconCheck as Check,
-  IconChartDonut as ChartDonut,
   IconGitBranch as GitBranch,
   IconLoader2 as LoaderCircle,
   IconPlugConnected as PlugZap,
@@ -53,6 +52,14 @@ function ModelSectionComponent({
           </p>
         </div>
         <div className="route-heading-actions">
+          {provider.official && (
+            <Switch
+              checked={showAccountUsageInHeader}
+              disabled={isBusy}
+              onCheckedChange={onShowAccountUsageInHeaderChange}
+              aria-label="在 Codex 顶部展示官方账号额度"
+            />
+          )}
           <Button
             variant="outline"
             size="sm"
@@ -97,26 +104,6 @@ function ModelSectionComponent({
             </div>
           </div>
         </div>
-
-        {provider.official && (
-          <div
-            className={`header-usage-control${showAccountUsageInHeader ? " active" : ""}`}
-          >
-            <span className="header-usage-control-icon" aria-hidden="true">
-              <ChartDonut size={17} />
-            </span>
-            <div className="header-usage-control-copy">
-              <strong>在顶部展示额度</strong>
-              <small>保存后在 Codex Header 中间显示账号的 5 小时和 7 天剩余额度，无需重启。</small>
-            </div>
-            <Switch
-              checked={showAccountUsageInHeader}
-              disabled={isBusy}
-              onCheckedChange={onShowAccountUsageInHeaderChange}
-              aria-label="在 Codex 顶部展示官方账号额度"
-            />
-          </div>
-        )}
 
         <div className="catalog-workspace">
           <div className="catalog-heading">
