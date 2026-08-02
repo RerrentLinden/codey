@@ -24,8 +24,17 @@ test("startup keeps the original loading page without progress tracing", async (
   await assert.rejects(access(new URL("src/StartupLoading.tsx", root)));
 });
 
-test("error log is failure-only, daily, and cross-process serialized", async () => {
-  const [errorLog, launcher, cdp, commands, runtimeCommands, lib, startupPatch] =
+test("error log is failure-only, daily, structured, and cross-process serialized", async () => {
+  const [
+    errorLog,
+    launcher,
+    cdp,
+    commands,
+    runtimeCommands,
+    lib,
+    startupPatch,
+    renderer,
+  ] =
     await Promise.all([
       source("backend/src/error_log.rs"),
       source("backend/src/launcher.rs"),
@@ -34,6 +43,7 @@ test("error log is failure-only, daily, and cross-process serialized", async () 
       source("backend/src/commands/runtime.rs"),
       source("backend/src/lib.rs"),
       source("backend/src/codex_startup_patch.rs"),
+      source("public/renderer-inject.js"),
     ]);
 
   assert.match(errorLog, /codey-errors\.log/);
@@ -42,6 +52,21 @@ test("error log is failure-only, daily, and cross-process serialized", async () 
   assert.match(errorLog, /lock_exclusive/);
   assert.match(errorLog, /--codey-record-error/);
   assert.match(errorLog, /repair_incomplete_tail/);
+  assert.match(errorLog, /struct FailureMetadata/);
+  for (const field of [
+    "stage",
+    "duration_ms",
+    "attempts",
+    "timeout_ms",
+    "recoverable",
+  ]) {
+    assert.match(errorLog, new RegExp(`${field}: Option`));
+  }
+  assert.match(errorLog, /record_renderer_failure/);
+  assert.match(errorLog, /renderer_failure_descriptor/);
+  assert.match(errorLog, /renderer_failure_context/);
+  assert.match(commands, /"\/diagnostics\/error"/);
+  assert.match(cdp, /timeout_at\(\s*deadline/);
 
   for (const operation of [
     "inject_cdp_bridge",
@@ -58,7 +83,16 @@ test("error log is failure-only, daily, and cross-process serialized", async () 
   assert.match(cdp, /"injection_status_failed"/);
   assert.match(runtimeCommands, /"runtime_restart_failed"/);
   assert.match(commands, /"repair_plugin_marketplace"/);
-  assert.match(lib, /"auto_launch_codey_runtime"/);
+  assert.match(runtimeCommands, /"launch_codey_runtime"/);
+  assert.doesNotMatch(lib, /"auto_launch_codey_runtime"/);
   assert.match(startupPatch, /recordCodeyPatchFailure/);
   assert.match(startupPatch, /spawnSync/);
+  assert.match(startupPatch, /startup\.renderer_asset_patch/);
+  assert.match(startupPatch, /electronVersion/);
+  assert.match(renderer, /"startup_stalled"/);
+  assert.match(renderer, /"wait_for_electron_bridge"/);
+  assert.match(renderer, /"wait_for_codex_host_shell"/);
+  assert.match(renderer, /hostShellReadyTimeoutMs = 20_000/);
+  assert.match(renderer, /reportRendererFailure/);
+  assert.doesNotMatch(renderer, /error\.stack/);
 });

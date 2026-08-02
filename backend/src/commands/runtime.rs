@@ -183,13 +183,23 @@ pub(super) async fn launch_codey_inner(state: &Arc<AppState>) -> Result<Value, S
 }
 
 pub async fn launch_codey_runtime(state: &Arc<AppState>) -> Result<Value, String> {
+    let started_at = std::time::Instant::now();
     let result = launch_codey_inner(state).await;
     *state.startup_error.write().await = result.as_ref().err().cloned();
     if let Err(error) = &result {
-        error_log::record_failure(
+        error_log::record_failure_with_metadata(
             "runtime_start_failed",
             "launch_codey_runtime",
             error.clone(),
+            error_log::FailureMetadata {
+                stage: Some("startup.runtime".to_string()),
+                duration_ms: Some(
+                    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
+                attempts: Some(1),
+                timeout_ms: None,
+                recoverable: Some(false),
+            },
             json!({
                 "restart": false,
             }),

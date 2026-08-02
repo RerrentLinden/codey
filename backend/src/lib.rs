@@ -55,11 +55,21 @@ pub fn run_error_log_helper_if_requested() -> Result<bool> {
 pub async fn run() -> Result<()> {
     error_log::initialize();
     let state = Arc::new(AppState::default());
+    let restore_started_at = std::time::Instant::now();
     if let Err(error) = launcher::restore_previous_runtime_state(&codex_config::codex_home()) {
-        error_log::record_failure(
+        error_log::record_failure_with_metadata(
             "restore_failed",
             "restore_previous_runtime_state_at_startup",
             format!("{error:#}"),
+            error_log::FailureMetadata {
+                stage: Some("startup.restore_previous_state".to_string()),
+                duration_ms: Some(
+                    u64::try_from(restore_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ),
+                attempts: Some(1),
+                timeout_ms: None,
+                recoverable: Some(true),
+            },
             serde_json::json!({}),
         );
         eprintln!("Codey 启动前恢复上次临时配置失败：{error:#}");
@@ -67,12 +77,6 @@ pub async fn run() -> Result<()> {
     commands::sync_cc_switch_state(&state).await;
 
     if let Err(error) = commands::launch_codey_runtime(&state).await {
-        error_log::record_failure(
-            "runtime_start_failed",
-            "auto_launch_codey_runtime",
-            format!("{error:#}"),
-            serde_json::json!({}),
-        );
         eprintln!("Codey 自动启动 Codex 失败：{error:#}");
         let cleanup = stop_runtime_with_retry(&state).await;
         if let Err(cleanup_error) = &cleanup {

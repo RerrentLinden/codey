@@ -216,6 +216,13 @@ impl AppState {
             return invoke_api(self, command, payload).await;
         }
         match path.as_str() {
+            "/diagnostics/error" => match error_log::record_renderer_failure(&payload) {
+                Ok(()) => json!({
+                    "status": "ok",
+                    "message": "Renderer 错误诊断已记录",
+                }),
+                Err(error) => api_error_message(error),
+            },
             "/settings/get" => {
                 let config = self.config.read().await.clone();
                 serde_json::to_value(redacted_config(&config))

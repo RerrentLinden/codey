@@ -593,14 +593,23 @@ impl CodeyRuntime {
             {
                 Ok(target) => target,
                 Err(error) => {
-                    error_log::record_failure(
+                    let error_message = format!("{error:#}");
+                    let failure_metadata = error_log::FailureMetadata {
+                        stage: Some("startup.renderer_injection".to_string()),
+                        duration_ms: Some(error.duration_ms()),
+                        attempts: Some(error.attempts()),
+                        timeout_ms: Some(error.timeout_ms()),
+                        recoverable: Some(false),
+                    };
+                    let error = error.into_error();
+                    error_log::record_failure_with_metadata(
                         "injection_failed",
                         "inject_cdp_bridge",
-                        format!("{error:#}"),
+                        error_message,
+                        failure_metadata,
                         serde_json::json!({
                             "appPath": app_dir,
                             "debugPort": debug_port,
-                            "attempts": 30,
                             "processId": spawned.process_id,
                         }),
                     );
@@ -747,23 +756,30 @@ impl CodeyRuntime {
                         consecutive_failures = 0;
                     }
                     Err(error) => {
-                        error_log::record_failure(
+                        let error_message = format!("{error:#}");
+                        error_log::record_failure_with_metadata(
                             "injection_failed",
                             "reinject_cdp_bridge",
-                            format!("{error:#}"),
+                            error_message.clone(),
+                            error_log::FailureMetadata {
+                                stage: Some("runtime.renderer_reinjection".to_string()),
+                                duration_ms: Some(error.duration_ms()),
+                                attempts: Some(error.attempts()),
+                                timeout_ms: Some(error.timeout_ms()),
+                                recoverable: Some(true),
+                            },
                             serde_json::json!({
                                 "debugPort": watchdog_debug_port,
-                                "attempts": 30,
                             }),
                         );
                         *watchdog_injection_statuses.write().await = watchdog_injection_scripts
-                            .statuses_with_error(format!("脚本重新注入失败：{error:#}"));
+                            .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
                         *watchdog_experimental_feature_runtime.write().await =
                             cdp::ExperimentalFeatureRuntimeStatus::failed(
-                                format!("脚本重新注入失败：{error:#}"),
+                                format!("脚本重新注入失败：{error_message}"),
                                 watchdog_experimental_features,
                             );
-                        eprintln!("Codey CDP bridge 恢复失败：{error:#}");
+                        eprintln!("Codey CDP bridge 恢复失败：{error_message}");
                         consecutive_failures = CDP_WATCHDOG_FAILURE_THRESHOLD.saturating_sub(1);
                     }
                 }

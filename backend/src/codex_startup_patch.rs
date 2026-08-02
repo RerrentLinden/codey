@@ -43,6 +43,14 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
           : process.platform === "darwin"
             ? "macos"
             : process.platform;
+      const optionalPatch =
+        operation.startsWith("renderer_patch:") ||
+        operation.startsWith("optional_main_bundle_patch:");
+      const stage = operation.startsWith("renderer_patch:")
+        ? "startup.renderer_asset_patch"
+        : operation.startsWith("optional_main_bundle_patch:")
+          ? "startup.optional_main_bundle_patch"
+          : "startup.main_process_patch";
       const result = process.getBuiltinModule("child_process").spawnSync(
         codeyErrorLoggerExecutable,
         ["--codey-record-error"],
@@ -55,7 +63,14 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
           event: "patch_failed",
           operation,
           error: message,
-          context,
+          stage,
+          recoverable: optionalPatch,
+          context: {
+            ...context,
+            electronVersion: process.versions?.electron || "",
+            chromeVersion: process.versions?.chrome || "",
+            nodeVersion: process.versions?.node || "",
+          },
           }),
           encoding: "utf8",
           maxBuffer: 64 * 1024,

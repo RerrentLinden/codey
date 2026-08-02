@@ -16,6 +16,7 @@ use crate::error_log;
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const FAST_STARTUP_STATSIG_TIMEOUT_MS: u64 = 1500;
+const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const FAST_STARTUP_SHIELD_SCRIPT: &str = include_str!("../../dist-overlay/inject/fast-startup-shield.js");
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
 const MODEL_WHITELIST_INJECT_SCRIPT: &str = include_str!("../../dist-overlay/inject/model-whitelist-inject.js");
@@ -141,6 +142,43 @@ pub struct InjectedTarget {
     websocket_url: Arc<str>,
     pump: BridgePumpHandle,
     injection_statuses: Arc<[InjectionScriptStatus]>,
+}
+
+#[derive(Debug)]
+pub struct InjectionRetryFailure {
+    error: anyhow::Error,
+    attempts: u64,
+    duration_ms: u64,
+}
+
+impl InjectionRetryFailure {
+    pub fn attempts(&self) -> u64 {
+        self.attempts
+    }
+
+    pub fn duration_ms(&self) -> u64 {
+        self.duration_ms
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        u64::try_from(CDP_INJECTION_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    pub fn into_error(self) -> anyhow::Error {
+        self.error
+    }
+}
+
+impl std::fmt::Display for InjectionRetryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for InjectionRetryFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.error.source()
+    }
 }
 
 impl InjectedTarget {
@@ -427,24 +465,42 @@ pub async fn retry_inject_with_scripts(
     debug_port: u16,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
-) -> Result<InjectedTarget> {
+) -> std::result::Result<InjectedTarget, InjectionRetryFailure> {
     // 与原 30x500ms 相同的 ~15 秒总预算，指数退避减少 Codex 尚未就绪时的
     // 无效尝试。
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let started_at = tokio::time::Instant::now();
+    let deadline = started_at + CDP_INJECTION_TIMEOUT;
     let mut delay = Duration::from_millis(100);
+    let mut attempts = 0_u64;
     let last_error = loop {
-        match inject_with_scripts(debug_port, handler.clone(), scripts).await {
-            Ok(target) => return Ok(target),
-            Err(error) => {
+        attempts = attempts.saturating_add(1);
+        match tokio::time::timeout_at(
+            deadline,
+            inject_with_scripts(debug_port, handler.clone(), scripts),
+        )
+        .await
+        {
+            Ok(Ok(target)) => return Ok(target),
+            Ok(Err(error)) => {
                 if tokio::time::Instant::now() + delay > deadline {
                     break error;
                 }
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(2));
             }
+            Err(_) => {
+                break anyhow::anyhow!(
+                    "等待 Codex CDP bridge 注入超时（{} ms）",
+                    CDP_INJECTION_TIMEOUT.as_millis()
+                );
+            }
         }
     };
-    Err(last_error)
+    Err(InjectionRetryFailure {
+        error: last_error,
+        attempts,
+        duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    })
 }
 
 async fn inject_with_scripts(
