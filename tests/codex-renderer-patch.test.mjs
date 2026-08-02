@@ -4,7 +4,10 @@ import test from "node:test";
 
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
-async function loadStartupPatchExpression(experimentalFeatureOverrides = {}) {
+async function loadStartupPatchExpression(
+  experimentalFeatureOverrides = {},
+  disablePet = true,
+) {
   const source = normalizeLineEndings(
     await readFile(
       new URL("../backend/src/codex_startup_patch.rs", import.meta.url),
@@ -16,7 +19,7 @@ async function loadStartupPatchExpression(experimentalFeatureOverrides = {}) {
   )?.[1];
   assert.ok(template);
   return template
-    .replaceAll("__DISABLE_PET__", "false")
+    .replaceAll("__DISABLE_PET__", disablePet ? "true" : "false")
     .replaceAll("__DISABLE_VOICE__", "false")
     .replaceAll("__FAST_CODEX_STARTUP__", "true")
     .replaceAll(
@@ -86,6 +89,50 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     for (const [message] of patchErrors) {
       assert.match(String(message), /incompatible Codex renderer patch/);
     }
+
+    const petSettingsSource = [
+      "import{AvatarPreview as P,builtInPets as L}",
+      "from\"./codex-avatar-BpKnWN_W.js\";",
+      "const petSettingsId=`settings.appearance.pets.title`;",
+      "function renderPetSettings(){return [P(),L.map(()=>1),petSettingsId]}",
+    ].join("");
+    electron.protocol.handle("app", async () => new Response(petSettingsSource));
+    const petSettingsResponse = await installedHandler({
+      url: "app://-/assets/general-settings-current-build.js",
+    });
+    const patchedPetSettingsSource = await petSettingsResponse.text();
+    assert.doesNotMatch(patchedPetSettingsSource, /codex-avatar-/);
+    assert.match(
+      patchedPetSettingsSource,
+      /const P=\(\(\)=>\{const target=function\(\)\{return null\}/,
+    );
+    const renderPetSettings = Function(
+      `${patchedPetSettingsSource};return renderPetSettings`,
+    )();
+    assert.deepEqual(renderPetSettings(), [
+      null,
+      [],
+      "settings.appearance.pets.title",
+    ]);
+
+    const sideEffectPetSettingsSource = [
+      "import\"./codex-avatar-next-build.js\";",
+      "const petSettingsId=`settings.pets.title`;",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(sideEffectPetSettingsSource),
+    );
+    const sideEffectPetSettingsResponse = await installedHandler({
+      url: "app://-/assets/pet-settings-next-build.js",
+    });
+    const patchedSideEffectPetSettingsSource =
+      await sideEffectPetSettingsResponse.text();
+    assert.doesNotMatch(patchedSideEffectPetSettingsSource, /codex-avatar-/);
+    assert.match(
+      patchedSideEffectPetSettingsSource,
+      /const petSettingsId=`settings\.pets\.title`/,
+    );
 
     const statsigSource = [
       "function Ftu(e){",

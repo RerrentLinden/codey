@@ -3,6 +3,11 @@
 
   const enabled = "__CODEY_SLIM_PET__" === "true";
   const petControlIds = new Set([
+    "settings.appearance.pets",
+    "settings.personalization.pets",
+    "settings.pets",
+    "settings.nav.pets",
+    "settings.section.pets",
     "settings.personalization.pets.openPet",
     "settings.personalization.pets.tuckAwayPet",
     "codex.profileFooter.showPet",
@@ -13,12 +18,23 @@
     "tuckAwayAvatarOverlay",
     "avatar-overlay-open",
   ]);
-  const fallbackLabelPattern = /^(?:wake pet|show pet|tuck away pet|hide pet|唤醒宠物|显示宠物|收起宠物|隐藏宠物|喚醒寵物|顯示寵物|收起寵物|隱藏寵物)$/i;
+  const petControlIdPrefixes = [
+    "settings.appearance.pets.",
+    "settings.nav.pets.",
+    "settings.personalization.pets.",
+    "settings.section.pets.",
+    "settings.pets.",
+  ];
+  const fallbackLabelPattern = /^(?:pet|pets|wake pet|show pet|tuck away pet|hide pet|refresh custom pets|create your own pet|open custom pets folder|宠物|唤醒宠物|显示宠物|收起宠物|隐藏宠物|刷新自定义宠物|创建自己的宠物|打开自定义宠物文件夹|寵物|喚醒寵物|顯示寵物|收起寵物|隱藏寵物|重新整理自訂寵物|建立自己的寵物|開啟自訂寵物資料夾)$/i;
   const reactInternalKeyPattern = /^__(?:reactProps|reactFiber|reactInternalInstance)\$.*/;
-  const controlSelector = "button, [role=button], [role=menuitem]";
+  const controlSelector = "button, [role=button], [role=menuitem], [role=option], [role=tab]";
+
+  const isPetControlId = (value) =>
+    petControlIds.has(value)
+      || petControlIdPrefixes.some((prefix) => value.startsWith(prefix));
 
   const containsPetControlId = (value, depth = 0, seen = new WeakSet()) => {
-    if (typeof value === "string") return petControlIds.has(value);
+    if (typeof value === "string") return isPetControlId(value);
     if (!value || typeof value !== "object" || depth > 7 || seen.has(value)) return false;
     seen.add(value);
     for (const [key, child] of Object.entries(value)) {

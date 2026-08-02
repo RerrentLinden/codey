@@ -68,9 +68,25 @@ function loadShield(enabled) {
   semantic.__reactProps$test = {
     children: { props: { id: "settings.personalization.pets.openPet" } },
   };
+  const settingsMenu = new FakeElement("外观设置");
+  settingsMenu.__reactProps$test = {
+    children: { props: { id: "settings.appearance.pets.title" } },
+  };
+  const nestedSettingsMenu = new FakeElement("设置分区");
+  nestedSettingsMenu.__reactProps$test = {
+    children: { props: { id: "settings.nav.pets.title" } },
+  };
+  const localizedSettingsMenu = new FakeElement("宠物");
   const localized = new FakeElement("唤醒宠物");
   const unrelated = new FakeElement("打开设置");
-  const controls = [semantic, localized, unrelated];
+  const controls = [
+    semantic,
+    settingsMenu,
+    nestedSettingsMenu,
+    localizedSettingsMenu,
+    localized,
+    unrelated,
+  ];
   const listeners = new Map();
   let mutationCallback = null;
   let observerOptions = null;
@@ -150,7 +166,9 @@ function loadShield(enabled) {
     },
     listeners,
     localized,
+    localizedSettingsMenu,
     mutationCallback,
+    nestedSettingsMenu,
     observerOptions,
     get pendingTimerCount() {
       return pendingTimers.size;
@@ -167,6 +185,7 @@ function loadShield(enabled) {
       return scheduledFlushes;
     },
     semantic,
+    settingsMenu,
     unrelated,
     window,
   };
@@ -176,6 +195,15 @@ test("pet slim mode blocks semantic and localized native pet controls", () => {
   const runtime = loadShield(true);
 
   assert.equal(runtime.semantic.getAttribute("data-codey-pet-control-blocked"), "true");
+  assert.equal(runtime.settingsMenu.getAttribute("data-codey-pet-control-blocked"), "true");
+  assert.equal(
+    runtime.nestedSettingsMenu.getAttribute("data-codey-pet-control-blocked"),
+    "true",
+  );
+  assert.equal(
+    runtime.localizedSettingsMenu.getAttribute("data-codey-pet-control-blocked"),
+    "true",
+  );
   assert.equal(runtime.localized.getAttribute("data-codey-pet-control-blocked"), "true");
   assert.equal(runtime.semantic.disabled, true);
   assert.equal(runtime.semantic.style.display, "none:important");
@@ -193,11 +221,32 @@ test("pet slim mode blocks semantic and localized native pet controls", () => {
   assert.equal(stopped, true);
 });
 
+test("pet slim mode stops the current settings menu before lazy pet resources load", () => {
+  const runtime = loadShield(true);
+  let petResourceLoads = 0;
+  let stopped = false;
+  runtime.settingsMenu.activate = () => {
+    petResourceLoads += 1;
+  };
+
+  runtime.listeners.get("click")({
+    target: runtime.settingsMenu,
+    preventDefault: () => {},
+    stopPropagation: () => { stopped = true; },
+    stopImmediatePropagation: () => { stopped = true; },
+  });
+  if (!stopped) runtime.settingsMenu.activate();
+
+  assert.equal(stopped, true);
+  assert.equal(petResourceLoads, 0);
+});
+
 test("disabling pet slim mode restores native pet controls", () => {
   const runtime = loadShield(false);
 
   assert.equal(runtime.window.__codeyPetControlShield.enabled, false);
   assert.equal(runtime.semantic.getAttribute("data-codey-pet-control-blocked"), null);
+  assert.equal(runtime.settingsMenu.getAttribute("data-codey-pet-control-blocked"), null);
   assert.equal(runtime.localized.getAttribute("data-codey-pet-control-blocked"), null);
   assert.equal(runtime.mutationCallback, null);
   assert.equal(runtime.window.__codeyBlockNativePetControls(), 0);

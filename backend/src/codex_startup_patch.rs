@@ -131,8 +131,66 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
     }
     return patched;
   };
+  const replacePetRendererImportWithStubs = (match, importClause) => {
+    if (typeof importClause !== "string" || importClause.trim() === "") {
+      return "";
+    }
+    const localBindings = [];
+    const rememberBinding = (binding) => {
+      if (
+        /^[$A-Z_a-z][$\w]*$/.test(binding)
+        && !localBindings.includes(binding)
+      ) {
+        localBindings.push(binding);
+      }
+    };
+    const defaultBinding = importClause.match(/^\s*([$A-Z_a-z][$\w]*)/);
+    if (defaultBinding) rememberBinding(defaultBinding[1]);
+    for (const specifier of importClause.matchAll(
+      /(?:^|[,{])\s*([$A-Z_a-z][$\w]*)(?:\s+as\s+([$A-Z_a-z][$\w]*))?\s*(?=[,}])/g,
+    )) {
+      rememberBinding(specifier[2] ?? specifier[1]);
+    }
+    for (const namespace of importClause.matchAll(
+      /\*\s+as\s+([$A-Z_a-z][$\w]*)/g,
+    )) {
+      rememberBinding(namespace[1]);
+    }
+    if (!localBindings.length) {
+      const message =
+        "Codey could not identify Codex pet settings renderer import bindings";
+      recordCodeyPatchFailure("renderer_patch:pet settings avatar resources", message);
+      try {
+        console.error(message);
+      } catch {}
+      return match;
+    }
+    const [firstBinding, ...aliases] = localBindings;
+    const aliasDeclarations = aliases
+      .map((binding) => `,${binding}=${firstBinding}`)
+      .join("");
+    return `const ${firstBinding}=(()=>{const target=function(){return null};return new Proxy(target,{get(target,property,receiver){if(property===Symbol.iterator)return function*(){};if(property===\`map\`||property===\`filter\`||property===\`flatMap\`||property===\`slice\`)return()=>[];if(property===\`then\`)return void 0;return Reflect.get(target,property,receiver)},construct(){return{}}})})()${aliasDeclarations};`;
+  };
   const patchCodexRendererAsset = (source) => {
     let patched = source;
+    if (
+      disablePet
+      && /settings\.(?:(?:appearance|personalization)\.)?pets(?:[."`]|$)/.test(source)
+      && /import(?:\s*[^;"']+?\s*from)?\s*["']\.\/codex-avatar(?:[~-][^/"']*)?\.js["']/.test(source)
+    ) {
+      // Recent Codex builds keep the Pets settings preview in a regular
+      // settings chunk and statically import codex-avatar from it. Hiding the
+      // controls after React mounts is too late: that import has already pulled
+      // the avatar renderer and every bundled spritesheet into the main window.
+      // Replace only that settings-side dependency with inert callable/iterable
+      // bindings. The real overlay route is blocked independently below.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /import(?:\s*([^;"']+?)\s*from)?\s*["']\.\/codex-avatar(?:[~-][^/"']*)?\.js["'];?/g,
+        replacePetRendererImportWithStubs,
+        "pet settings avatar resources",
+      );
+    }
     if (
       source.includes("72216192") &&
       source.includes("enable_i18n") &&
@@ -427,8 +485,16 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
       return (
         url.protocol === "app:" &&
         url.pathname.includes("/assets/") &&
-        /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request)(?:[~-][^/]*)?)\.js$/i.test(
-          url.pathname,
+        (
+          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request)(?:[~-][^/]*)?)\.js$/i.test(
+            url.pathname,
+          )
+          || (
+            disablePet
+            && /\/(?:(?:appearance-settings|pet-settings|pets-settings)(?:[~-][^/]*)?)\.js$/i.test(
+              url.pathname,
+            )
+          )
         )
       );
     } catch {
