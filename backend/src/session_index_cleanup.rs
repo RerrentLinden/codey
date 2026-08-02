@@ -2,11 +2,11 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use rusqlite::{Connection, OpenFlags, params_from_iter};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -16,6 +16,9 @@ use crate::sqlite_util::table_columns;
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const BACKUP_KEEP_COUNT: usize = 5;
 const MANAGED_BY: &str = "Codey session index cleanup";
+const CLEANUP_MARKER_VERSION: u32 = 1;
+const CLEANUP_MARKER_FILE: &str = "tmp/codey-session-index-cleanup-marker-v1.json";
+const SQLITE_ID_QUERY_CHUNK_SIZE: usize = 900;
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +44,21 @@ struct CleanupPlan {
     snapshot_sha256: String,
     scanned_entries: usize,
     candidates: Vec<CleanupCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexSignature {
+    len: u64,
+    modified_ns: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupMarker {
+    version: u32,
+    index: IndexSignature,
+    validated_at_ms: u128,
 }
 
 struct CleanupLock {
@@ -89,17 +107,31 @@ pub fn cleanup(home: &Path) -> Result<SessionIndexCleanupReport> {
     if !index_path.exists() {
         return Ok(SessionIndexCleanupReport::default());
     }
+    if cleanup_marker_matches(home, &index_path) {
+        return Ok(SessionIndexCleanupReport::default());
+    }
     let _lock = CleanupLock::acquire(home)?;
+    // A concurrent cleanup can finish between the lock-free fast-path check
+    // above and acquiring the directory lock.
+    if cleanup_marker_matches(home, &index_path) {
+        return Ok(SessionIndexCleanupReport::default());
+    }
     let Some(plan) = plan_cleanup_matching(&index_path, |_| true)? else {
         return Ok(SessionIndexCleanupReport::default());
     };
     if plan.candidates.is_empty() {
+        record_cleanup_marker_for_unchanged_plan(home, &plan);
         return Ok(SessionIndexCleanupReport {
             scanned_entries: plan.scanned_entries,
             ..SessionIndexCleanupReport::default()
         });
     }
-    let live_thread_ids = collect_live_thread_ids(home)?;
+    let candidate_ids = plan
+        .candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect::<HashSet<_>>();
+    let live_thread_ids = collect_live_thread_ids(home, &candidate_ids)?;
     let plan = CleanupPlan {
         candidates: plan
             .candidates
@@ -109,13 +141,16 @@ pub fn cleanup(home: &Path) -> Result<SessionIndexCleanupReport> {
         ..plan
     };
     if plan.candidates.is_empty() {
+        record_cleanup_marker_for_unchanged_plan(home, &plan);
         return Ok(SessionIndexCleanupReport {
             scanned_entries: plan.scanned_entries,
             live_threads: live_thread_ids.len(),
             ..SessionIndexCleanupReport::default()
         });
     }
-    apply_cleanup_plan(home, plan, live_thread_ids.len(), true)
+    let report = apply_cleanup_plan(home, plan, live_thread_ids.len(), true)?;
+    record_cleanup_marker(home, &index_path);
+    Ok(report)
 }
 
 /// Removes one known thread from the legacy index as part of an explicit
@@ -187,15 +222,23 @@ fn apply_cleanup_plan(
     })
 }
 
-fn collect_live_thread_ids(home: &Path) -> Result<HashSet<String>> {
+fn collect_live_thread_ids(
+    home: &Path,
+    candidate_ids: &HashSet<String>,
+) -> Result<HashSet<String>> {
     let mut ids = HashSet::new();
-    for path in rollout_files(home)? {
+    'rollouts: for path in rollout_files(home)? {
         if let Some(id) = path
             .file_name()
             .and_then(|name| name.to_str())
             .and_then(rollout_thread_id_from_filename)
         {
-            ids.insert(id);
+            if candidate_ids.contains(&id) {
+                ids.insert(id);
+                if ids.len() == candidate_ids.len() {
+                    break 'rollouts;
+                }
+            }
             // Standard Codex rollout names already contain the authoritative
             // thread UUID. Avoid rereading the complete JSONL history merely
             // to discover the same session_meta id.
@@ -218,13 +261,24 @@ fn collect_live_thread_ids(home: &Path) -> Result<HashSet<String>> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
+                .filter(|id| candidate_ids.contains(*id))
             {
                 ids.insert(id.to_string());
+                if ids.len() == candidate_ids.len() {
+                    break 'rollouts;
+                }
             }
         }
     }
     for path in sqlite_paths(home)? {
-        ids.extend(sqlite_thread_ids(&path)?);
+        if ids.len() == candidate_ids.len() {
+            break;
+        }
+        let remaining = candidate_ids
+            .difference(&ids)
+            .cloned()
+            .collect::<HashSet<_>>();
+        ids.extend(sqlite_thread_ids(&path, &remaining)?);
     }
     Ok(ids)
 }
@@ -302,11 +356,16 @@ fn sqlite_paths(home: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn sqlite_thread_ids(path: &Path) -> Result<HashSet<String>> {
+fn sqlite_thread_ids(path: &Path, candidate_ids: &HashSet<String>) -> Result<HashSet<String>> {
+    if candidate_ids.is_empty() {
+        return Ok(HashSet::new());
+    }
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("只读打开 Codex 数据库失败：{}", path.display()))?;
     db.busy_timeout(Duration::from_secs(5))?;
     let mut ids = HashSet::new();
+    let mut candidates = candidate_ids.iter().collect::<Vec<_>>();
+    candidates.sort();
     for (table, column) in [
         ("threads", "id"),
         ("local_thread_catalog", "thread_id"),
@@ -324,16 +383,80 @@ fn sqlite_thread_ids(path: &Path) -> Result<HashSet<String>> {
         if !table_columns(&db, table)?.contains(column) {
             continue;
         }
-        let mut statement = db.prepare(&format!(
-            "SELECT DISTINCT {column} FROM {table} WHERE COALESCE({column}, '') <> ''"
-        ))?;
-        ids.extend(
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<HashSet<_>>>()?,
-        );
+        for chunk in candidates.chunks(SQLITE_ID_QUERY_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut statement = db.prepare(&format!(
+                "SELECT DISTINCT {column} FROM {table} WHERE {column} IN ({placeholders})"
+            ))?;
+            ids.extend(
+                statement
+                    .query_map(params_from_iter(chunk.iter().copied()), |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<HashSet<_>>>()?,
+            );
+        }
     }
     Ok(ids)
+}
+
+fn cleanup_marker_path(home: &Path) -> PathBuf {
+    home.join(CLEANUP_MARKER_FILE)
+}
+
+fn index_signature(path: &Path) -> Result<IndexSignature> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("读取会话索引元数据失败：{}", path.display()))?;
+    let modified_ns = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+    Ok(IndexSignature {
+        len: metadata.len(),
+        modified_ns,
+    })
+}
+
+fn cleanup_marker_matches(home: &Path, index_path: &Path) -> bool {
+    let Ok(index) = index_signature(index_path) else {
+        return false;
+    };
+    if index.modified_ns.is_none() {
+        return false;
+    }
+    let Ok(bytes) = fs::read(cleanup_marker_path(home)) else {
+        return false;
+    };
+    serde_json::from_slice::<CleanupMarker>(&bytes)
+        .is_ok_and(|marker| marker.version == CLEANUP_MARKER_VERSION && marker.index == index)
+}
+
+fn write_cleanup_marker(home: &Path, index_path: &Path) -> Result<()> {
+    let path = cleanup_marker_path(home);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let marker = CleanupMarker {
+        version: CLEANUP_MARKER_VERSION,
+        index: index_signature(index_path)?,
+        validated_at_ms: timestamp_millis(),
+    };
+    atomic_write(&path, &serde_json::to_vec_pretty(&marker)?)
+}
+
+fn record_cleanup_marker(home: &Path, index_path: &Path) {
+    // The marker is only a performance hint. A write failure must not turn a
+    // successful, already-committed cleanup into a startup failure.
+    let _ = write_cleanup_marker(home, index_path);
+}
+
+fn record_cleanup_marker_for_unchanged_plan(home: &Path, plan: &CleanupPlan) {
+    if fs::read(&plan.path).is_ok_and(|current| current == plan.original_bytes) {
+        record_cleanup_marker(home, &plan.path);
+    }
 }
 
 fn plan_cleanup_matching(
@@ -624,5 +747,63 @@ mod tests {
         let report = cleanup(home).unwrap();
         assert_eq!(report.pruned_entries, 0);
         assert!(report.backup_dir.is_none());
+    }
+
+    #[test]
+    fn unchanged_index_defers_cleanup_until_its_signature_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let sqlite = home.join("sqlite");
+        fs::create_dir_all(&sqlite).unwrap();
+        let database = sqlite.join("codex.db");
+        let db = Connection::open(&database).unwrap();
+        db.execute_batch(
+            "CREATE TABLE local_thread_catalog (thread_id TEXT);\
+             INSERT INTO local_thread_catalog VALUES ('temporarily-live');",
+        )
+        .unwrap();
+        drop(db);
+        let index = format!("{}\n", index_line("temporarily-live", "kept"));
+        let index_path = home.join("session_index.jsonl");
+        fs::write(&index_path, &index).unwrap();
+
+        assert_eq!(cleanup(home).unwrap().pruned_entries, 0);
+        assert!(cleanup_marker_path(home).exists());
+        fs::remove_file(database).unwrap();
+
+        // The accepted gate semantics intentionally defer external-reference
+        // changes while the legacy index itself is unchanged.
+        assert_eq!(cleanup(home).unwrap().pruned_entries, 0);
+        assert_eq!(fs::read_to_string(&index_path).unwrap(), index);
+
+        fs::write(&index_path, format!("{index}\n")).unwrap();
+        assert_eq!(cleanup(home).unwrap().pruned_entries, 1);
+        assert!(
+            !fs::read_to_string(index_path)
+                .unwrap()
+                .contains("temporarily-live")
+        );
+    }
+
+    #[test]
+    fn sqlite_candidate_probe_chunks_large_id_sets() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state_5.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute("CREATE TABLE messages (session_id TEXT)", [])
+            .unwrap();
+        db.execute(
+            "INSERT INTO messages (session_id) VALUES (?1)",
+            ["candidate-1001"],
+        )
+        .unwrap();
+        drop(db);
+        let candidates = (0..=1_001)
+            .map(|index| format!("candidate-{index}"))
+            .collect::<HashSet<_>>();
+
+        let ids = sqlite_thread_ids(&path, &candidates).unwrap();
+
+        assert_eq!(ids, HashSet::from(["candidate-1001".to_string()]));
     }
 }

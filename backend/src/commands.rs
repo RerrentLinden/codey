@@ -87,11 +87,13 @@ pub struct AppState {
     restart_task: Mutex<Option<ScheduledRestart>>,
     runtime_generation: AtomicU64,
     session_titles: RwLock<HashMap<String, String>>,
+    session_metadata_cache: Mutex<Option<session_metadata::SessionMetadataCache>>,
     webhook_notifications: Mutex<WebhookNotificationState>,
     persisted_waiting_notifications: Mutex<WaitingLedgerState>,
     recent_session_event_cache: Mutex<Option<pending_approval::RecentSessionEventCache>>,
     waiting_watcher_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     waiting_watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    waiting_watcher_sync: Mutex<()>,
     session_scan_wake: Notify,
     restart_settled: Notify,
     shutdown_reason: watch::Sender<Option<AppShutdownReason>>,
@@ -147,6 +149,9 @@ impl Default for AppState {
             restart_task: Mutex::new(None),
             runtime_generation: AtomicU64::new(0),
             session_titles: RwLock::new(HashMap::new()),
+            session_metadata_cache: Mutex::new(Some(
+                session_metadata::SessionMetadataCache::default(),
+            )),
             webhook_notifications: Mutex::new(WebhookNotificationState::from_settled(
                 persisted_waiting_notifications.iter().cloned(),
             )),
@@ -156,6 +161,7 @@ impl Default for AppState {
             )),
             waiting_watcher_shutdown: Mutex::new(None),
             waiting_watcher_task: Mutex::new(None),
+            waiting_watcher_sync: Mutex::new(()),
             session_scan_wake: Notify::new(),
             restart_settled: Notify::new(),
             shutdown_reason,
@@ -224,7 +230,7 @@ impl AppState {
                 Err(error) => api_error_message(error),
             },
             "/settings/get" => {
-                let config = self.config.read().await.clone();
+                let config = self.config.read().await;
                 serde_json::to_value(redacted_config(&config))
                     .unwrap_or_else(|_| json!({"status":"failed"}))
             }
@@ -267,10 +273,14 @@ impl AppState {
                     })
                     .collect::<Vec<_>>();
                 let home = codex_home();
-                blocking_value("读取线程排序键", move || {
-                    Ok(session_metadata::thread_sort_keys(&home, &sessions))
+                match with_session_metadata_cache(self, "读取线程排序键", move |cache| {
+                    cache.thread_sort_keys(&home, &sessions)
                 })
                 .await
+                {
+                    Ok(value) => value,
+                    Err(error) => api_error_message(error),
+                }
             }
             "/session/delete" => {
                 let session_id = bridge_string(&payload, "sessionId");
@@ -411,6 +421,46 @@ pub fn make_bridge_handler(state: &Arc<AppState>) -> codey_runtime_core::bridge:
         let state_ref = state_ref.clone();
         async move { state_ref.bridge_request(path, payload).await }
     })
+}
+
+async fn with_session_metadata_cache<T, F>(
+    state: &Arc<AppState>,
+    operation: &'static str,
+    task: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut session_metadata::SessionMetadataCache) -> T + Send + 'static,
+{
+    let mut slot = state.session_metadata_cache.lock().await;
+    let mut cache = slot.take().unwrap_or_default();
+    match tokio::task::spawn_blocking(move || {
+        let value = task(&mut cache);
+        (cache, value)
+    })
+    .await
+    {
+        Ok((cache, value)) => {
+            *slot = Some(cache);
+            Ok(value)
+        }
+        Err(error) => {
+            *slot = Some(session_metadata::SessionMetadataCache::default());
+            Err(format!("{operation}任务异常退出：{error}"))
+        }
+    }
+}
+
+async fn resolve_session_name_cached(
+    state: &Arc<AppState>,
+    home: PathBuf,
+    session_id: String,
+    preferred_title: Option<String>,
+) -> Result<String, String> {
+    with_session_metadata_cache(state, "读取通知会话名称", move |cache| {
+        cache.resolve_session_name_with_preferred(&home, &session_id, preferred_title.as_deref())
+    })
+    .await
 }
 
 pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Value {
@@ -603,24 +653,35 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
 
 async fn set_codex_app_path(state: &Arc<AppState>, path: String) -> Result<Value, String> {
     let app_dir = validate_codex_app_path(&path)?;
-    let _config_write_guard = state.config_write_lock.lock().await;
-    let mut config = state.config.read().await.clone();
-    config.codex_app_path = app_dir.to_string_lossy().to_string();
-    save_codey_config_locked(state, config).await
+    let saved = {
+        let _config_write_guard = state.config_write_lock.lock().await;
+        let mut config = state.config.read().await.clone();
+        config.codex_app_path = app_dir.to_string_lossy().to_string();
+        save_codey_config_locked(state, config).await
+    }?;
+    finish_codey_config_save(state, saved).await
 }
 
 pub async fn save_codey_config(
     state: &Arc<AppState>,
     config_input: CodeyConfig,
 ) -> Result<Value, String> {
-    let _config_write_guard = state.config_write_lock.lock().await;
-    save_codey_config_locked(state, config_input).await
+    let saved = {
+        let _config_write_guard = state.config_write_lock.lock().await;
+        save_codey_config_locked(state, config_input).await
+    }?;
+    finish_codey_config_save(state, saved).await
+}
+
+struct SavedCodeyConfig {
+    config: CodeyConfig,
+    restart_required: bool,
 }
 
 async fn save_codey_config_locked(
     state: &Arc<AppState>,
     mut config_input: CodeyConfig,
-) -> Result<Value, String> {
+) -> Result<SavedCodeyConfig, String> {
     let previous = state.config.read().await.clone();
     if config_input.settings_revision != previous.settings_revision {
         return Err("Codey 设置已被其他操作更新，请关闭后重新打开设置页面再保存".to_string());
@@ -674,16 +735,26 @@ async fn save_codey_config_locked(
         .save(&config)
         .map_err(|error| error.to_string())?;
     *state.config.write().await = config.clone();
-    sync_waiting_webhook_watcher(state, &config).await;
-    let cc_switch = cc_switch::status_from_config(&config);
-    let model_state = current_model_state(&config)?;
-    let public_config = redacted_config(&config);
+    Ok(SavedCodeyConfig {
+        config,
+        restart_required,
+    })
+}
+
+async fn finish_codey_config_save(
+    state: &Arc<AppState>,
+    saved: SavedCodeyConfig,
+) -> Result<Value, String> {
+    sync_waiting_webhook_watcher(state).await;
+    let cc_switch = cc_switch::status_from_config(&saved.config);
+    let model_state = current_model_state(&saved.config)?;
+    let public_config = redacted_config(&saved.config);
     Ok(json!({
         "status":"ok",
         "config":public_config,
         "ccSwitch":cc_switch,
         "modelState":model_state,
-        "restartRequired":restart_required,
+        "restartRequired":saved.restart_required,
     }))
 }
 
@@ -1402,6 +1473,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_bridge_matches_the_redacted_config_contract() {
+        let state = Arc::new(AppState::default());
+        let mut config = state.config.read().await.clone();
+        config.profiles[0].api_key = "bridge-provider-secret".to_string();
+        config.webhook.channels.push(NotificationChannelConfig {
+            id: "bridge-feishu".to_string(),
+            url: "https://open.feishu.cn/open-apis/bot/v2/hook/bridge-secret".to_string(),
+            ..NotificationChannelConfig::default()
+        });
+        let expected = serde_json::to_value(redacted_config(&config)).unwrap();
+        *state.config.write().await = config;
+
+        let actual = state
+            .bridge_request("/settings/get".to_string(), json!({}))
+            .await;
+
+        assert_eq!(actual, expected);
+        assert!(!actual.to_string().contains("bridge-provider-secret"));
+        assert!(!actual.to_string().contains("bridge-secret"));
+    }
+
+    #[tokio::test]
     async fn explicit_notification_channel_reveal_returns_only_the_selected_channel() {
         let state = Arc::new(AppState::default());
         state.config.write().await.webhook.channels.extend([
@@ -1502,6 +1595,45 @@ mod tests {
         assert_eq!(disk, memory);
         assert_eq!(memory.settings_revision, 1);
         assert_eq!(memory.user_scripts.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_join_does_not_hold_the_config_write_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let initial = CodeyConfig::default();
+        let state = Arc::new(AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
+            config: RwLock::new(initial.clone()),
+            ..AppState::default()
+        });
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (shutdown_seen_tx, shutdown_seen_rx) = oneshot::channel();
+        let release = Arc::new(Notify::new());
+        let watcher_release = Arc::clone(&release);
+        let watcher_task = tokio::spawn(async move {
+            let _ = shutdown_rx.await;
+            let _ = shutdown_seen_tx.send(());
+            watcher_release.notified().await;
+        });
+        *state.waiting_watcher_shutdown.lock().await = Some(shutdown_tx);
+        *state.waiting_watcher_task.lock().await = Some(watcher_task);
+
+        let mut input = initial;
+        input.slim_codex_pet = !input.slim_codex_pet;
+        let save_state = Arc::clone(&state);
+        let save_task = tokio::spawn(async move { save_codey_config(&save_state, input).await });
+        tokio::time::timeout(Duration::from_secs(1), shutdown_seen_rx)
+            .await
+            .expect("watcher shutdown should start")
+            .unwrap();
+
+        let config_guard =
+            tokio::time::timeout(Duration::from_millis(100), state.config_write_lock.lock())
+                .await
+                .expect("watcher join must happen after releasing the config write lock");
+        drop(config_guard);
+        release.notify_one();
+        save_task.await.unwrap().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

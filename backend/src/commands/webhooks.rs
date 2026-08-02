@@ -15,7 +15,6 @@ use crate::config::{CodeyConfig, ConfigStore};
 use crate::notifications::{NotificationChannelConfig, NotificationDispatcher, NotificationEvent};
 use crate::pending_approval;
 use crate::pending_approval::{CompletedTurn, RecentSessionEvents, SessionLifecycleStatus};
-use crate::session_metadata;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -531,9 +530,14 @@ pub(super) fn webhook_watcher_should_run(config: &CodeyConfig) -> bool {
     config.webhook.has_enabled_channel()
 }
 
-pub(super) async fn sync_waiting_webhook_watcher(state: &Arc<AppState>, config: &CodeyConfig) {
+pub(super) async fn sync_waiting_webhook_watcher(state: &Arc<AppState>) {
+    let _sync_guard = state.waiting_watcher_sync.lock().await;
+    let should_run = {
+        let config = state.config.read().await;
+        webhook_watcher_should_run(&config)
+    };
     let runtime_running = state.runtime.lock().await.is_some();
-    if runtime_running && webhook_watcher_should_run(config) {
+    if runtime_running && should_run {
         start_waiting_webhook_watcher_from_cache(state).await;
     } else {
         stop_waiting_webhook_watcher(state).await;
@@ -772,15 +776,7 @@ async fn webhook_session_name(state: &Arc<AppState>, payload: &Value, session_id
     let fallback_title = cached_title.clone();
     let home = codex_home();
     let session_id = session_id.to_string();
-    match tokio::task::spawn_blocking(move || {
-        session_metadata::resolve_session_name_with_preferred(
-            &home,
-            &session_id,
-            cached_title.as_deref(),
-        )
-    })
-    .await
-    {
+    match super::resolve_session_name_cached(state, home, session_id, cached_title).await {
         Ok(session_name) => session_name,
         Err(error) => {
             eprintln!("读取通知会话名称任务异常退出：{error}");

@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
@@ -18,6 +19,8 @@ use crate::sqlite_util::table_columns;
 
 const MARKER_VERSION: u32 = 1;
 const MARKER_FILE: &str = "provider-sync-marker-v1.json";
+const ROLLOUT_HEADER_CACHE_VERSION: u32 = 1;
+const ROLLOUT_HEADER_CACHE_FILE: &str = "provider-sync-rollout-headers-v1.json";
 const PROVIDER_SYNC_MANAGED_BY: &str = "Codey provider sync";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const MAX_ROLLOUT_HEADER_BYTES: u64 = 256 * 1024;
@@ -36,11 +39,52 @@ struct ProviderSyncMarker {
     validated_at_ms: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutHeaderSignature {
+    len: u64,
+    modified_ns: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutHeaderCacheEntry {
+    path: PathBuf,
+    signature: RolloutHeaderSignature,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutHeaderCache {
+    version: u32,
+    target_provider: String,
+    entries: Vec<RolloutHeaderCacheEntry>,
+    validated_at_ms: u128,
+}
+
+#[derive(Debug)]
+struct RolloutFile {
+    path: PathBuf,
+    cache_key: PathBuf,
+    signature: RolloutHeaderSignature,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RolloutHeaderValidation {
+    matches: bool,
+    headers_read: usize,
+}
+
 pub fn provider_sync_plan(home: &Path, target_provider: &str) -> Result<ProviderSyncPlan> {
     provider_sync_plan_at(home, target_provider, &marker_path())
 }
 
-pub fn record_provider_sync_success(target_provider: &str) -> Result<()> {
+pub fn record_provider_sync_success(home: &Path, target_provider: &str) -> Result<()> {
+    let validation =
+        validate_rollout_headers_at(home, target_provider, &rollout_header_cache_path())?;
+    if !validation.matches {
+        anyhow::bail!("Provider 同步完成后会话头仍未全部匹配 {target_provider}");
+    }
     write_marker(&marker_path(), target_provider)
 }
 
@@ -68,6 +112,20 @@ fn marker_path() -> PathBuf {
         .join(MARKER_FILE)
 }
 
+fn rollout_header_cache_path() -> PathBuf {
+    marker_path()
+        .parent()
+        .unwrap_or_else(|| Path::new(".codey"))
+        .join(ROLLOUT_HEADER_CACHE_FILE)
+}
+
+fn rollout_header_cache_path_for_marker(marker: &Path) -> PathBuf {
+    marker
+        .parent()
+        .unwrap_or_else(|| Path::new(".codey"))
+        .join(ROLLOUT_HEADER_CACHE_FILE)
+}
+
 fn provider_sync_plan_at(
     home: &Path,
     target_provider: &str,
@@ -78,7 +136,8 @@ fn provider_sync_plan_at(
     });
     let previous_sync_matches =
         marker_matches || has_legacy_provider_sync(home, target_provider).unwrap_or(false);
-    if !previous_sync_matches || !provider_state_matches(home, target_provider)? {
+    let rollout_cache = rollout_header_cache_path_for_marker(marker);
+    if !previous_sync_matches || !provider_state_matches(home, target_provider, &rollout_cache)? {
         return Ok(ProviderSyncPlan::Full);
     }
     if !marker_matches {
@@ -132,8 +191,12 @@ fn has_legacy_provider_sync(home: &Path, target_provider: &str) -> Result<bool> 
     Ok(false)
 }
 
-fn provider_state_matches(home: &Path, target_provider: &str) -> Result<bool> {
-    if !rollout_headers_match(home, target_provider)? {
+fn provider_state_matches(
+    home: &Path,
+    target_provider: &str,
+    rollout_cache: &Path,
+) -> Result<bool> {
+    if !validate_rollout_headers_at(home, target_provider, rollout_cache)?.matches {
         return Ok(false);
     }
     sqlite_providers_match(home, target_provider)
@@ -141,26 +204,68 @@ fn provider_state_matches(home: &Path, target_provider: &str) -> Result<bool> {
 
 const HEADER_VALIDATION_MAX_THREADS: usize = 4;
 
-/// Validates rollout headers across session directories. Work is sharded by
-/// directory rather than by a precollected file list, so hundreds of small
-/// header reads overlap without holding every rollout path in memory.
-fn rollout_headers_match(home: &Path, target_provider: &str) -> Result<bool> {
-    let mut directories = Vec::new();
+/// Enumerates rollout paths on every launch so additions and removals are
+/// visible, but only opens files whose `(path, size, mtime)` signature changed.
+fn validate_rollout_headers_at(
+    home: &Path,
+    target_provider: &str,
+    cache_path: &Path,
+) -> Result<RolloutHeaderValidation> {
+    let mut files = Vec::new();
     for dirname in SESSION_DIRS {
         let root = home.join(dirname);
         if root.exists() {
-            collect_rollout_directories(&root, &mut directories)?;
+            collect_rollout_files(home, &root, &mut files)?;
         }
     }
-    if directories.is_empty() {
-        return Ok(true);
+    files.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
+
+    let cached = read_rollout_header_cache(cache_path, target_provider);
+    let changed = files
+        .iter()
+        .filter(|file| {
+            file.signature.modified_ns.is_none()
+                || cached.get(&file.cache_key) != Some(&file.signature)
+        })
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    if !rollout_file_headers_match(&changed, target_provider)? {
+        return Ok(RolloutHeaderValidation {
+            matches: false,
+            headers_read: changed.len(),
+        });
     }
 
+    let cache = RolloutHeaderCache {
+        version: ROLLOUT_HEADER_CACHE_VERSION,
+        target_provider: target_provider.to_string(),
+        entries: files
+            .into_iter()
+            .map(|file| RolloutHeaderCacheEntry {
+                path: file.cache_key,
+                signature: file.signature,
+            })
+            .collect(),
+        validated_at_ms: timestamp_millis(),
+    };
+    // This cache only avoids repeat reads. Failing to persist it must not turn
+    // a correct provider validation into a failed startup.
+    let _ = write_rollout_header_cache(cache_path, &cache);
+    Ok(RolloutHeaderValidation {
+        matches: true,
+        headers_read: changed.len(),
+    })
+}
+
+fn rollout_file_headers_match(files: &[PathBuf], target_provider: &str) -> Result<bool> {
+    if files.is_empty() {
+        return Ok(true);
+    }
     let workers = thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(1)
         .min(HEADER_VALIDATION_MAX_THREADS)
-        .min(directories.len())
+        .min(files.len())
         .max(1);
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
@@ -172,10 +277,10 @@ fn rollout_headers_match(home: &Path, target_provider: &str) -> Result<bool> {
             scope.spawn(|| {
                 while !stop.load(Ordering::Relaxed) {
                     let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(directory) = directories.get(index) else {
+                    let Some(path) = files.get(index) else {
                         break;
                     };
-                    match rollout_directory_headers_match(directory, target_provider) {
+                    match rollout_header_matches(path, target_provider) {
                         Ok(true) => {}
                         Ok(false) => {
                             mismatch.store(true, Ordering::Relaxed);
@@ -204,27 +309,13 @@ fn rollout_headers_match(home: &Path, target_provider: &str) -> Result<bool> {
     Ok(!mismatch.load(Ordering::Relaxed))
 }
 
-fn collect_rollout_directories(root: &Path, directories: &mut Vec<PathBuf>) -> Result<()> {
-    directories.push(root.to_path_buf());
+fn collect_rollout_files(home: &Path, root: &Path, files: &mut Vec<RolloutFile>) -> Result<()> {
     for entry in
         fs::read_dir(root).with_context(|| format!("扫描会话目录失败：{}", root.display()))?
     {
         let path = entry?.path();
         if path.is_dir() {
-            collect_rollout_directories(&path, directories)?;
-        }
-    }
-    Ok(())
-}
-
-/// Checks the rollout headers directly inside `root`; subdirectories are
-/// scheduled separately by `rollout_headers_match`.
-fn rollout_directory_headers_match(root: &Path, target_provider: &str) -> Result<bool> {
-    for entry in
-        fs::read_dir(root).with_context(|| format!("扫描会话目录失败：{}", root.display()))?
-    {
-        let path = entry?.path();
-        if path.is_dir() {
+            collect_rollout_files(home, &path, files)?;
             continue;
         }
         if !path
@@ -234,37 +325,77 @@ fn rollout_directory_headers_match(root: &Path, target_provider: &str) -> Result
         {
             continue;
         }
-        let file =
-            fs::File::open(&path).with_context(|| format!("读取会话头失败：{}", path.display()))?;
-        let reader = BufReader::new(file).take(MAX_ROLLOUT_HEADER_BYTES);
-        let mut found_session_meta = false;
-        for line in reader.lines() {
-            let line = line?;
-            if !line.contains("session_meta") {
-                continue;
-            }
-            let Ok(record) = serde_json::from_str::<Value>(&line) else {
-                continue;
-            };
-            if record.get("type").and_then(Value::as_str) != Some("session_meta") {
-                continue;
-            }
-            found_session_meta = true;
-            let provider = record
-                .pointer("/payload/model_provider")
-                .and_then(Value::as_str);
-            if provider != Some(target_provider) {
-                return Ok(false);
-            }
-            // `session_meta` is the rollout header. Once its provider is
-            // validated, do not stream another 256 KiB of conversation data.
-            break;
-        }
-        if !found_session_meta {
-            return Ok(false);
-        }
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("读取会话头元数据失败：{}", path.display()))?;
+        let modified_ns = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| u64::try_from(duration.as_nanos()).ok());
+        files.push(RolloutFile {
+            cache_key: path.strip_prefix(home).unwrap_or(&path).to_path_buf(),
+            path,
+            signature: RolloutHeaderSignature {
+                len: metadata.len(),
+                modified_ns,
+            },
+        });
     }
-    Ok(true)
+    Ok(())
+}
+
+fn rollout_header_matches(path: &Path, target_provider: &str) -> Result<bool> {
+    let file =
+        fs::File::open(path).with_context(|| format!("读取会话头失败：{}", path.display()))?;
+    let reader = BufReader::new(file).take(MAX_ROLLOUT_HEADER_BYTES);
+    for line in reader.lines() {
+        let line = line?;
+        if !line.contains("session_meta") {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("session_meta") {
+            continue;
+        }
+        let provider = record
+            .pointer("/payload/model_provider")
+            .and_then(Value::as_str);
+        return Ok(provider == Some(target_provider));
+    }
+    Ok(false)
+}
+
+fn read_rollout_header_cache(
+    path: &Path,
+    target_provider: &str,
+) -> BTreeMap<PathBuf, RolloutHeaderSignature> {
+    let Ok(bytes) = fs::read(path) else {
+        return BTreeMap::new();
+    };
+    let Ok(cache) = serde_json::from_slice::<RolloutHeaderCache>(&bytes) else {
+        return BTreeMap::new();
+    };
+    if cache.version != ROLLOUT_HEADER_CACHE_VERSION || cache.target_provider != target_provider {
+        return BTreeMap::new();
+    }
+    cache
+        .entries
+        .into_iter()
+        .map(|entry| (entry.path, entry.signature))
+        .collect()
+}
+
+fn write_rollout_header_cache(path: &Path, cache: &RolloutHeaderCache) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Provider 会话头缓存路径没有父目录"))?;
+    fs::create_dir_all(parent)?;
+    let temp = crate::fs_util::unique_temp_path(path);
+    fs::write(&temp, serde_json::to_vec_pretty(cache)?)?;
+    crate::fs_util::persist_temp_file(&temp, path)?;
+    Ok(())
 }
 
 fn sqlite_providers_match(home: &Path, target_provider: &str) -> Result<bool> {
@@ -416,5 +547,76 @@ mod tests {
         let plan = provider_sync_plan_at(temp.path(), "codey_global", &marker).unwrap();
 
         assert_eq!(plan, ProviderSyncPlan::Cached);
+    }
+
+    #[test]
+    fn unchanged_rollout_headers_reuse_the_metadata_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        write_rollout(temp.path(), "rollout-thread-1.jsonl", "codey_global");
+        let cache = temp.path().join("codey/rollout-headers.json");
+
+        let first = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+        let second = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+
+        assert_eq!(
+            first,
+            RolloutHeaderValidation {
+                matches: true,
+                headers_read: 1
+            }
+        );
+        assert_eq!(
+            second,
+            RolloutHeaderValidation {
+                matches: true,
+                headers_read: 0
+            }
+        );
+    }
+
+    #[test]
+    fn changed_and_added_rollouts_are_revalidated() {
+        let temp = tempfile::tempdir().unwrap();
+        write_rollout(temp.path(), "rollout-thread-1.jsonl", "codey_global");
+        let cache = temp.path().join("codey/rollout-headers.json");
+        assert!(
+            validate_rollout_headers_at(temp.path(), "codey_global", &cache)
+                .unwrap()
+                .matches
+        );
+        let sessions = temp.path().join("sessions/2026/07/20");
+        fs::write(
+            sessions.join("rollout-thread-1.jsonl"),
+            format!(
+                "{}\n{}\n{}\n",
+                json!({
+                    "type": "session_meta",
+                    "payload": {"id": "thread-1", "model_provider": "codey_global"}
+                }),
+                json!({"type": "response_item", "payload": "changed-history"}),
+                json!({"type": "response_item", "payload": "more-history"}),
+            ),
+        )
+        .unwrap();
+        write_rollout(temp.path(), "rollout-thread-2.jsonl", "codey_global");
+
+        let validation = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+
+        assert!(validation.matches);
+        assert_eq!(validation.headers_read, 2);
+    }
+
+    #[test]
+    fn corrupt_header_cache_falls_back_to_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        write_rollout(temp.path(), "rollout-thread-1.jsonl", "codey_global");
+        let cache = temp.path().join("codey/rollout-headers.json");
+        fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        fs::write(&cache, b"not-json").unwrap();
+
+        let validation = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+
+        assert!(validation.matches);
+        assert_eq!(validation.headers_read, 1);
     }
 }

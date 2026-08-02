@@ -271,8 +271,10 @@ impl CodeyRuntime {
                     );
                     if result.status == ProviderSyncStatus::Synced
                         && result.skipped_locked_rollout_files.is_empty()
-                        && let Err(error) =
-                            startup_maintenance::record_provider_sync_success(&maintenance_provider)
+                        && let Err(error) = startup_maintenance::record_provider_sync_success(
+                            &maintenance_home,
+                            &maintenance_provider,
+                        )
                     {
                         error_log::record_failure(
                             "patch_failed",
