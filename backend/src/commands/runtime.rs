@@ -26,12 +26,23 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
         Some(runtime) => Some(runtime.applied_model_config().await),
         None => None,
     };
+    let applied_subagent = match runtime.as_ref() {
+        Some(runtime) => Some(runtime.applied_subagent_config().await),
+        None => None,
+    };
     let config = state.config.read().await;
     let profile = config.active_profile();
-    let restart_required = match (runtime.as_ref(), applied_models.as_ref()) {
-        (Some(runtime), Some(applied_models)) => {
-            config_requires_restart(&runtime.applied_config, applied_models, &config)
-        }
+    let restart_required = match (
+        runtime.as_ref(),
+        applied_models.as_ref(),
+        applied_subagent.as_ref(),
+    ) {
+        (Some(runtime), Some(applied_models), Some(applied_subagent)) => config_requires_restart(
+            &runtime.applied_config,
+            applied_models,
+            applied_subagent,
+            &config,
+        ),
         _ => false,
     };
     let mut status = json!({

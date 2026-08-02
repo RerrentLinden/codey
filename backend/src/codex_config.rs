@@ -13,7 +13,9 @@ use codey_runtime_core::settings::RelayProtocol;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
-use crate::config::{ProviderProfile, default_config_path};
+use crate::config::{
+    DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, ProviderProfile, default_config_path,
+};
 use crate::fs_util::timestamp_millis;
 use crate::provider_lease::CODEY_PROVIDER_ID;
 
@@ -75,11 +77,7 @@ const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 特别注意：子代理自派生起累计运行 10 分钟仍未完成：视为异常，主代理必须介入、不得继续盲等；检查代理状态或运行记录，已有可用 MESSAGE 时采用其部分结果，然后停止这个子代理。并自行判断是否需要再派生或拆分更小任务重新分派。"#;
 const DEFAULT_AGENT_CONFIG: &str = r#####"name = "default"
 
-description = "General-purpose subagent locked to gpt-5.6-luna with low reasoning."
-
-model = "gpt-5.6-luna"
-
-model_reasoning_effort = "low"
+description = "General-purpose exploration subagent using the configured default model and reasoning effort."
 
 developer_instructions = """
 你是通用子代理，是主代理派出去的探子。你只做探索、检索、核验：不改动任何东西，不做方案取舍或者最终判断——那些是主代理的事。
@@ -134,6 +132,10 @@ struct RuntimeConfigLease {
     #[serde(default)]
     subagent_optimization_applied: bool,
     #[serde(default)]
+    subagent_model: String,
+    #[serde(default)]
+    subagent_reasoning_effort: String,
+    #[serde(default)]
     original_agents_md_exists: bool,
     #[serde(default)]
     original_default_agent_exists: bool,
@@ -164,6 +166,8 @@ pub fn apply_runtime_provider_config(
     default_model: Option<&str>,
     fast_context_tools: bool,
     subagent_optimization: bool,
+    subagent_model: &str,
+    subagent_reasoning_effort: &str,
 ) -> Result<PathBuf> {
     let marker = lease_marker_path();
     let backup_root = marker
@@ -179,6 +183,8 @@ pub fn apply_runtime_provider_config(
         default_model,
         fastctx_command.as_deref(),
         subagent_optimization,
+        subagent_model,
+        subagent_reasoning_effort,
         &marker,
         &backup_root,
         false,
@@ -191,6 +197,8 @@ pub fn apply_runtime_provider_config_preserving_route(
     provider_id: &str,
     fast_context_tools: bool,
     subagent_optimization: bool,
+    subagent_model: &str,
+    subagent_reasoning_effort: &str,
 ) -> Result<PathBuf> {
     let marker = lease_marker_path();
     let backup_root = marker
@@ -206,6 +214,8 @@ pub fn apply_runtime_provider_config_preserving_route(
         None,
         fastctx_command.as_deref(),
         subagent_optimization,
+        subagent_model,
+        subagent_reasoning_effort,
         &marker,
         &backup_root,
         true,
@@ -273,6 +283,8 @@ fn apply_runtime_provider_config_at(
         default_model,
         fastctx_command,
         subagent_optimization,
+        DEFAULT_SUBAGENT_MODEL,
+        DEFAULT_SUBAGENT_REASONING_EFFORT,
         marker,
         backup_root,
         false,
@@ -288,6 +300,8 @@ fn apply_runtime_provider_config_at_mode(
     default_model: Option<&str>,
     fastctx_command: Option<&Path>,
     subagent_optimization: bool,
+    subagent_model: &str,
+    subagent_reasoning_effort: &str,
     marker: &Path,
     backup_root: &Path,
     preserve_provider_route: bool,
@@ -346,6 +360,8 @@ fn apply_runtime_provider_config_at_mode(
         default_model,
         fastctx_command,
         subagent_optimization,
+        subagent_model,
+        subagent_reasoning_effort,
         preserve_provider_route,
     )?;
     let applied_base_url = provider_base_url(&updated, &provider_id);
@@ -382,6 +398,8 @@ fn apply_runtime_provider_config_at_mode(
         preserve_provider_route,
         fastctx_command: fastctx_command.map(Path::to_path_buf),
         subagent_optimization_applied: subagent_optimization,
+        subagent_model: subagent_model.to_string(),
+        subagent_reasoning_effort: subagent_reasoning_effort.to_string(),
         original_agents_md_exists: original_agents_md.is_some(),
         original_default_agent_exists: original_default_agent.is_some(),
         original_agents_dir_exists,
@@ -528,6 +546,16 @@ fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Opt
         &baseline,
         state.fastctx_command.as_deref(),
         state.subagent_optimization_applied,
+        if state.subagent_model.trim().is_empty() {
+            DEFAULT_SUBAGENT_MODEL
+        } else {
+            state.subagent_model.as_str()
+        },
+        if state.subagent_reasoning_effort.trim().is_empty() {
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        } else {
+            state.subagent_reasoning_effort.as_str()
+        },
     )
     .context("重新应用 Codey 运行时增强失败")?;
 
@@ -1284,6 +1312,8 @@ fn patch_config_with_fastctx(
         default_model,
         fastctx_command,
         subagent_optimization,
+        DEFAULT_SUBAGENT_MODEL,
+        DEFAULT_SUBAGENT_REASONING_EFFORT,
         false,
     )
 }
@@ -1297,6 +1327,8 @@ fn patch_config_with_fastctx_mode(
     default_model: Option<&str>,
     fastctx_command: Option<&Path>,
     subagent_optimization: bool,
+    subagent_model: &str,
+    subagent_reasoning_effort: &str,
     preserve_provider_route: bool,
 ) -> Result<String> {
     if !preserve_provider_route {
@@ -1347,7 +1379,7 @@ fn patch_config_with_fastctx_mode(
         disable_fast_context_tools(&mut doc);
     }
     if subagent_optimization {
-        enable_subagent_optimization(&mut doc)?;
+        enable_subagent_optimization(&mut doc, subagent_model, subagent_reasoning_effort)?;
     }
     document_string(&doc)
 }
@@ -1356,6 +1388,8 @@ fn patch_config_preserving_provider_route(
     existing: &str,
     fastctx_command: Option<&Path>,
     subagent_optimization: bool,
+    subagent_model: &str,
+    subagent_reasoning_effort: &str,
 ) -> Result<String> {
     patch_config_with_fastctx_mode(
         existing,
@@ -1365,12 +1399,22 @@ fn patch_config_preserving_provider_route(
         None,
         fastctx_command,
         subagent_optimization,
+        subagent_model,
+        subagent_reasoning_effort,
         true,
     )
 }
 
-fn enable_subagent_optimization(doc: &mut DocumentMut) -> Result<()> {
+fn enable_subagent_optimization(
+    doc: &mut DocumentMut,
+    subagent_model: &str,
+    subagent_reasoning_effort: &str,
+) -> Result<()> {
     doc.as_table_mut().remove("agents");
+    let agents = ensure_root_table(doc, "agents")?;
+    agents["default_subagent_model"] = value(subagent_model.trim());
+    agents["default_subagent_reasoning_effort"] =
+        value(subagent_reasoning_effort.trim().to_ascii_lowercase());
     let features = ensure_root_table(doc, "features")?;
     if features.get("multi_agent_v2").is_none() {
         features["multi_agent_v2"] = Item::Table(Table::new());
@@ -1987,6 +2031,8 @@ mod tests {
                 preserve_provider_route: false,
                 fastctx_command: None,
                 subagent_optimization_applied: false,
+                subagent_model: String::new(),
+                subagent_reasoning_effort: String::new(),
                 original_agents_md_exists: false,
                 original_default_agent_exists: false,
                 original_agents_dir_exists: false,
@@ -2143,6 +2189,8 @@ enabled = true
             Some("codey-model"),
             Some(Path::new("/opt/codey")),
             true,
+            DEFAULT_SUBAGENT_MODEL,
+            DEFAULT_SUBAGENT_REASONING_EFFORT,
             true,
         )
         .unwrap();
@@ -2196,6 +2244,8 @@ wire_api = "chat"
             None,
             None,
             false,
+            DEFAULT_SUBAGENT_MODEL,
+            DEFAULT_SUBAGENT_REASONING_EFFORT,
             true,
         )
         .unwrap_err();
@@ -2540,7 +2590,7 @@ interrupt_message = true
 enabled = false
 custom_setting = "preserved"
 "#;
-        let result = patch_config_with_fastctx(
+        let result = patch_config_with_fastctx_mode(
             existing,
             &official_profile(),
             GLOBAL_PROVIDER_ID,
@@ -2548,12 +2598,26 @@ custom_setting = "preserved"
             None,
             None,
             true,
+            "gpt-5.6-sol",
+            "high",
+            false,
         )
         .unwrap();
         let document = result.parse::<DocumentMut>().unwrap();
+        let agents = document["agents"].as_table().unwrap();
         let multi_agent = document["features"]["multi_agent_v2"].as_table().unwrap();
 
-        assert!(document.get("agents").is_none());
+        assert!(agents.get("max_threads").is_none());
+        assert!(agents.get("max_depth").is_none());
+        assert!(agents.get("interrupt_message").is_none());
+        assert_eq!(
+            agents["default_subagent_model"].as_str(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            agents["default_subagent_reasoning_effort"].as_str(),
+            Some("high")
+        );
         assert_eq!(multi_agent["enabled"].as_bool(), Some(true));
         assert_eq!(
             multi_agent["hide_spawn_agent_metadata"].as_bool(),
@@ -2608,7 +2672,14 @@ custom_setting = "preserved"
 
         let temporary_config = fs::read_to_string(home.join("config.toml")).unwrap();
         let document = temporary_config.parse::<DocumentMut>().unwrap();
-        assert!(document.get("agents").is_none());
+        assert_eq!(
+            document["agents"]["default_subagent_model"].as_str(),
+            Some(DEFAULT_SUBAGENT_MODEL)
+        );
+        assert_eq!(
+            document["agents"]["default_subagent_reasoning_effort"].as_str(),
+            Some(DEFAULT_SUBAGENT_REASONING_EFFORT)
+        );
         assert_eq!(
             document["model_catalog_json"].as_str(),
             Some(
@@ -2830,6 +2901,8 @@ command = "cc-switch-tool"
             None,
             Some(Path::new("/opt/codey")),
             false,
+            DEFAULT_SUBAGENT_MODEL,
+            DEFAULT_SUBAGENT_REASONING_EFFORT,
             &marker,
             &backup_root,
             true,

@@ -40,6 +40,8 @@ export type Config = {
   fastContextTools: boolean;
   fastCodexStartup: boolean;
   subagentOptimization: boolean;
+  subagentModel: string;
+  subagentReasoningEffort: string;
   hideFullAccessWarning: boolean;
   showAccountUsageInHeader: boolean;
   experimentalFeatures: ExperimentalFeaturesConfig;
@@ -49,6 +51,8 @@ export type OfficialModelState = {
   slug: string;
   displayName: string;
   supported: boolean;
+  supportedReasoningEfforts: string[];
+  defaultReasoningEffort: string;
 };
 
 export type ModelState = {

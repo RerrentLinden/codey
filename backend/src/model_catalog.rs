@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,19 @@ const OFFICIAL_MODELS: [(&str, &str); 7] = [
     ("gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark"),
 ];
 
+#[derive(Debug)]
+struct RuntimeModelCacheUnavailable;
+
+impl fmt::Display for RuntimeModelCacheUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(
+            "本机 Codex 模型缓存缺少运行时必需字段；请先直接启动官方 Codex 完成模型缓存刷新",
+        )
+    }
+}
+
+impl std::error::Error for RuntimeModelCacheUnavailable {}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OfficialModel {
@@ -33,6 +47,8 @@ pub struct OfficialModelAvailability {
     pub slug: String,
     pub display_name: String,
     pub supported: bool,
+    pub supported_reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
@@ -150,6 +166,9 @@ pub fn selection_state(
     let official_models: Vec<OfficialModelAvailability> = official_entries
         .iter()
         .filter_map(|model| {
+            let supported_reasoning_efforts = reasoning_efforts_from_value(model);
+            let default_reasoning_effort =
+                default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
             let model = official_model_from_value(model)?;
             let supported = official_provider
                 || !provider_models_synced
@@ -158,6 +177,8 @@ pub fn selection_state(
                 slug: model.slug,
                 display_name: model.display_name,
                 supported,
+                supported_reasoning_efforts,
+                default_reasoning_effort,
             })
         })
         .collect();
@@ -228,12 +249,17 @@ pub fn is_available(home: &Path) -> bool {
     })
 }
 
+pub fn is_runtime_model_cache_unavailable(error: &anyhow::Error) -> bool {
+    error.is::<RuntimeModelCacheUnavailable>()
+}
+
 /// Signature of the catalog source files, used to reuse a parse across the
 /// back-to-back `refresh_for_provider` + `selection_state` calls on every
 /// launch and across repeated config-page lookups. The paths are part of the
 /// key so entries can never leak between Codex homes.
 type CatalogSignature = Vec<(PathBuf, u64, Option<std::time::SystemTime>)>;
-type OfficialEntriesCache = std::sync::Mutex<Option<(CatalogSignature, std::sync::Arc<Vec<Value>>)>>;
+type OfficialEntriesCache =
+    std::sync::Mutex<Option<(CatalogSignature, std::sync::Arc<Vec<Value>>)>>;
 
 static OFFICIAL_ENTRIES_CACHE: std::sync::OnceLock<OfficialEntriesCache> =
     std::sync::OnceLock::new();
@@ -360,6 +386,46 @@ fn official_model_from_value(model: &Value) -> Option<OfficialModel> {
     })
 }
 
+fn reasoning_efforts_from_value(model: &Value) -> Vec<String> {
+    model
+        .get("supported_reasoning_levels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|level| {
+            level
+                .get("effort")
+                .and_then(Value::as_str)
+                .or_else(|| level.as_str())
+        })
+        .map(str::trim)
+        .filter(|effort| !effort.is_empty())
+        .fold(Vec::<String>::new(), |mut efforts, effort| {
+            if !efforts.iter().any(|existing| existing == effort) {
+                efforts.push(effort.to_string());
+            }
+            efforts
+        })
+}
+
+fn default_reasoning_effort_from_value(model: &Value, supported: &[String]) -> String {
+    let configured = model
+        .get("default_reasoning_level")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|effort| supported.iter().any(|candidate| candidate == effort));
+    configured
+        .map(ToString::to_string)
+        .or_else(|| {
+            supported
+                .iter()
+                .find(|effort| effort.as_str() == "low")
+                .cloned()
+        })
+        .or_else(|| supported.first().cloned())
+        .unwrap_or_else(|| "low".to_string())
+}
+
 fn official_models_from_value(value: &Value) -> Vec<Value> {
     catalog_models_from_value(value)
         .into_iter()
@@ -390,7 +456,7 @@ fn ensure_runtime_compatible_models(models: &[Value]) -> Result<()> {
     if runtime_compatible_models(models) {
         return Ok(());
     }
-    bail!("本机 Codex 模型缓存缺少运行时必需字段；请先直接启动官方 Codex 完成模型缓存刷新")
+    Err(RuntimeModelCacheUnavailable.into())
 }
 
 fn runtime_compatible_models(models: &[Value]) -> bool {
@@ -1001,6 +1067,7 @@ mod tests {
         let error = refresh_for_provider(home.path(), true, None, &[]).unwrap_err();
 
         assert!(error.to_string().contains("模型缓存缺少运行时必需字段"));
+        assert!(is_runtime_model_cache_unavailable(&error));
         assert!(!home.path().join(MODEL_CATALOG_RELATIVE_PATH).exists());
         assert!(!is_available(home.path()));
         let state = selection_state(home.path(), true, None, &[], None).unwrap();
@@ -1202,6 +1269,16 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.default_model, "third-model");
+        let sol = state
+            .official_models
+            .iter()
+            .find(|model| model.slug == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.default_reasoning_effort, "low");
+        assert_eq!(
+            sol.supported_reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        );
     }
 
     #[test]

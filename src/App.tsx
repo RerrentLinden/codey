@@ -171,7 +171,7 @@ export function App({
   const isBusy = busy !== null;
   const configLoaded = config !== null;
   const {
-    subagentModel,
+    subagentModelOptions,
     modelState,
     setModelState,
     modelPickerVisible,
@@ -302,6 +302,8 @@ export function App({
       ccSwitch?: CcSwitchStatus;
       modelState?: ModelState;
       restartRequired?: boolean;
+      subagentDefaultsHotReloaded?: boolean;
+      subagentDefaultsHotReloadError?: string;
     }>("save_codey_config", { config: next });
     setPersistedConfig(result.config);
     window.dispatchEvent(
@@ -425,11 +427,21 @@ export function App({
     if (!config) return;
     await runOperation("save", async () => {
       const result = await persist(config);
+      const subagentHotReloadFailed = Boolean(
+        result.subagentDefaultsHotReloadError,
+      );
       setNotice({
-        tone: result.restartRequired ? "info" : "success",
-        text: result.restartRequired
-          ? "Codey 设置已保存，启动参数将在重启 Codex 后生效"
-          : "Codey 设置已保存",
+        tone:
+          result.restartRequired || subagentHotReloadFailed
+            ? "info"
+            : "success",
+        text: result.subagentDefaultsHotReloaded
+          ? "Codey 设置已保存；子代理模型和思考深度已实时更新"
+          : subagentHotReloadFailed
+            ? "Codey 设置已保存；子代理配置暂未能热更新，重启 Codex 后生效"
+            : result.restartRequired
+              ? "Codey 设置已保存，启动参数将在重启 Codex 后生效"
+              : "Codey 设置已保存",
       });
     });
   }
@@ -587,7 +599,11 @@ export function App({
     askRemoveNotificationChannel,
   );
   const handleSubagentOptimizationChange = useStableEvent(
-    (checked: boolean) => void updateSubagentOptimization(checked),
+    (checked: boolean) =>
+      void updateSubagentOptimization(
+        checked,
+        config?.subagentModel ?? "",
+      ),
   );
   const handleSyncCurrentProvider = useStableEvent(
     () => void syncCurrentProvider(),
@@ -837,7 +853,7 @@ export function App({
                 status={status}
                 busy={busy}
                 isBusy={isBusy}
-                subagentModel={subagentModel}
+                subagentModelOptions={subagentModelOptions}
                 onConfigChange={handleConfigChange}
                 onSubagentOptimizationChange={handleSubagentOptimizationChange}
               />

@@ -15,10 +15,12 @@ import type {
 } from "./App.types";
 import { errorText, withTimeout } from "./appUtils";
 
-const SUBAGENT_MODEL = "gpt-5.6-luna";
+const THIRD_PARTY_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
 
 const supportsModel = (models: string[], expected: string) =>
-  models.some((model) => model.trim().toLowerCase() === expected);
+  models.some(
+    (model) => model.trim().toLowerCase() === expected.trim().toLowerCase(),
+  );
 
 const modelKey = (model: string) => model.trim().toLowerCase();
 
@@ -28,6 +30,13 @@ const pickerSelection = (state: ModelState) => [
     .map((model) => model.slug),
   ...state.thirdPartyModels,
 ];
+
+export type SubagentModelOption = {
+  value: string;
+  label: string;
+  supportedReasoningEfforts: string[];
+  defaultReasoningEffort: string;
+};
 
 type UseModelSelectionOptions = {
   provider: CcSwitchStatus["provider"] | undefined;
@@ -97,6 +106,28 @@ export function useModelSelection({
       officialSlugKeys,
     ],
   );
+  const subagentModelOptions = useMemo<SubagentModelOption[]>(
+    () => [
+      ...modelState.officialModels
+        .filter((model) => model.supported)
+        .map((model) => ({
+          value: model.slug,
+          label: model.displayName,
+          supportedReasoningEfforts:
+            model.supportedReasoningEfforts.length > 0
+              ? model.supportedReasoningEfforts
+              : ["low"],
+          defaultReasoningEffort: model.defaultReasoningEffort || "low",
+        })),
+      ...modelState.thirdPartyModels.map((model) => ({
+        value: model,
+        label: model,
+        supportedReasoningEfforts: THIRD_PARTY_REASONING_EFFORTS,
+        defaultReasoningEffort: "low",
+      })),
+    ],
+    [modelState.officialModels, modelState.thirdPartyModels],
+  );
 
   function openModelPicker(state: ModelState, warning = "") {
     setDraftModels(pickerSelection(state));
@@ -138,7 +169,10 @@ export function useModelSelection({
     });
   }
 
-  async function updateSubagentOptimization(checked: boolean) {
+  async function updateSubagentOptimization(
+    checked: boolean,
+    selectedModel: string,
+  ) {
     if (!checked) {
       setSubagentOptimization(false);
       return;
@@ -150,11 +184,19 @@ export function useModelSelection({
       });
       return;
     }
+    const subagentModel = selectedModel.trim();
+    if (!subagentModel || !subagentModelOptions.some((option) => option.value === subagentModel)) {
+      setNotice({
+        tone: "error",
+        text: "请先从当前已选模型列表中选择子代理模型",
+      });
+      return;
+    }
     await runOperation("check-subagent-model", async () => {
       let supported = false;
       if (provider.official) {
         supported = modelState.officialModels.some(
-          (model) => model.slug === SUBAGENT_MODEL && model.supported,
+          (model) => model.slug === subagentModel && model.supported,
         );
       } else {
         let result: {
@@ -169,7 +211,7 @@ export function useModelSelection({
           );
         } catch (error) {
           throw new Error(
-            `无法确认当前第三方 API 是否支持 ${SUBAGENT_MODEL}：${errorText(error)}`,
+            `无法确认当前第三方 API 是否支持 ${subagentModel}：${errorText(error)}`,
           );
         }
         setModelState(result.modelState);
@@ -179,20 +221,20 @@ export function useModelSelection({
             restartRequired: result.restartRequired,
           }));
         }
-        supported = supportsModel(result.models, SUBAGENT_MODEL);
+        supported = supportsModel(result.models, subagentModel);
       }
 
       if (!supported) {
         setNotice({
           tone: "error",
-          text: `当前${provider.official ? "官方账号" : "第三方 API"}不支持 ${SUBAGENT_MODEL}，无法开启子代理协作优化`,
+          text: `当前${provider.official ? "官方账号" : "第三方 API"}不支持 ${subagentModel}，无法开启子代理协作优化`,
         });
         return;
       }
       setSubagentOptimization(true);
       setNotice({
         tone: "success",
-        text: `已确认当前线路支持 ${SUBAGENT_MODEL}，保存并重启 Codex 后生效`,
+        text: `已确认当前线路支持 ${subagentModel}，保存并重启 Codex 后生效`,
       });
     });
   }
@@ -303,7 +345,7 @@ export function useModelSelection({
   }
 
   return {
-    subagentModel: SUBAGENT_MODEL,
+    subagentModelOptions,
     modelState,
     setModelState,
     modelPickerVisible,

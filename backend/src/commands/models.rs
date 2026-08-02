@@ -306,9 +306,8 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
         .insert(provider_id, models.clone());
     next = next.normalize();
     let model_state = current_model_state(&next)?;
-    if should_refresh_model_catalog(&model_state) {
-        refresh_model_catalog(&next)?;
-    }
+    let model_catalog_fallback = should_refresh_model_catalog(&model_state)
+        && refresh_model_catalog_for_provider_sync(&next)?;
     state.store.save(&next).map_err(|error| error.to_string())?;
     *state.config.write().await = next.clone();
     drop(_config_write_guard);
@@ -318,6 +317,7 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
         "status":"ok",
         "models":fetched_models,
         "modelState":model_state,
+        "modelCatalogFallback":model_catalog_fallback,
         "restartRequired":restart_required,
     })))
 }
@@ -580,6 +580,22 @@ pub(super) fn should_refresh_model_catalog(
 }
 
 pub(super) fn refresh_model_catalog(config: &CodeyConfig) -> Result<(), String> {
+    try_refresh_model_catalog(config).map_err(|error| error.to_string())
+}
+
+fn refresh_model_catalog_for_provider_sync(config: &CodeyConfig) -> Result<bool, String> {
+    provider_sync_catalog_fallback(try_refresh_model_catalog(config))
+}
+
+fn provider_sync_catalog_fallback(result: anyhow::Result<()>) -> Result<bool, String> {
+    match result {
+        Ok(()) => Ok(false),
+        Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => Ok(true),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn try_refresh_model_catalog(config: &CodeyConfig) -> anyhow::Result<()> {
     let official = config
         .profiles
         .iter()
@@ -592,5 +608,23 @@ pub(super) fn refresh_model_catalog(config: &CodeyConfig) -> Result<(), String> 
         config.selected_models(),
     )
     .map(|_| ())
-    .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_sync_accepts_only_the_known_builtin_catalog_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let missing_cache =
+            model_catalog::refresh_for_provider(home.path(), false, Some(&[]), &[]).unwrap_err();
+
+        assert!(provider_sync_catalog_fallback(Err(missing_cache)).unwrap());
+        assert!(!provider_sync_catalog_fallback(Ok(())).unwrap());
+        assert_eq!(
+            provider_sync_catalog_fallback(Err(anyhow::anyhow!("模型目录写入失败"))).unwrap_err(),
+            "模型目录写入失败"
+        );
+    }
 }

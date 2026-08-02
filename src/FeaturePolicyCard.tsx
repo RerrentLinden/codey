@@ -2,6 +2,7 @@ import { memo, type CSSProperties } from "react";
 
 import type { Config, RuntimeStatus } from "./App.types";
 import { Badge, Card, Switch } from "./components/semi";
+import type { SubagentModelOption } from "./useModelSelection";
 
 const GPU_LAUNCH_MODES = [
   { value: "off", label: "关闭" },
@@ -11,12 +12,21 @@ const GPU_LAUNCH_MODES = [
   value: Config["gpuLaunchMode"];
   label: string;
 }>;
+const REASONING_EFFORT_LABELS: Record<string, string> = {
+  low: "低",
+  medium: "中",
+  high: "高",
+  xhigh: "极高",
+  max: "最大",
+  ultra: "超高",
+};
+
 type FeaturePolicyCardProps = {
   config: Config;
   status: RuntimeStatus;
   busy: string | null;
   isBusy: boolean;
-  subagentModel: string;
+  subagentModelOptions: SubagentModelOption[];
   onConfigChange: (config: Config) => void;
   onSubagentOptimizationChange: (checked: boolean) => void;
 };
@@ -26,7 +36,7 @@ function FeaturePolicyCardComponent({
   status,
   busy,
   isBusy,
-  subagentModel,
+  subagentModelOptions,
   onConfigChange,
   onSubagentOptimizationChange,
 }: FeaturePolicyCardProps) {
@@ -41,6 +51,11 @@ function FeaturePolicyCardComponent({
   const gpuLaunchModeStyle = {
     "--gpu-mode-offset": `${gpuLaunchModeIndex * 100}%`,
   } as CSSProperties;
+  const selectedSubagentModel = subagentModelOptions.find(
+    (option) => option.value === config.subagentModel,
+  );
+  const subagentReasoningEfforts =
+    selectedSubagentModel?.supportedReasoningEfforts ?? [];
 
   return (
     <section className="secondary-section" aria-labelledby="runtime-title">
@@ -224,7 +239,7 @@ function FeaturePolicyCardComponent({
             <div className="feature-card-header">
               <div className="feature-card-title">
                 <strong>子代理协作优化</strong>
-                <Badge variant="warning">需支持 GPT-5.6-Luna</Badge>
+                <Badge variant="warning">模型与深度可配置</Badge>
               </div>
               <Switch
                 checked={config.subagentOptimization}
@@ -236,12 +251,74 @@ function FeaturePolicyCardComponent({
                 aria-label="启用子代理协作优化"
               />
             </div>
-            <div className="feature-card-body">
+            <div className="feature-card-body subagent-policy-body">
+              <div className="subagent-policy-controls">
+                <label>
+                  <span>子代理模型</span>
+                  <select
+                    aria-label="选择子代理模型"
+                    value={selectedSubagentModel?.value ?? ""}
+                    disabled={isBusy || subagentModelOptions.length === 0}
+                    onChange={(event) => {
+                      const option = subagentModelOptions.find(
+                        (candidate) => candidate.value === event.target.value,
+                      );
+                      if (!option) return;
+                      const reasoningEffort =
+                        option.supportedReasoningEfforts.includes(
+                          config.subagentReasoningEffort,
+                        )
+                          ? config.subagentReasoningEffort
+                          : option.defaultReasoningEffort;
+                      onConfigChange({
+                        ...config,
+                        subagentModel: option.value,
+                        subagentReasoningEffort: reasoningEffort,
+                      });
+                    }}
+                  >
+                    {!selectedSubagentModel && (
+                      <option value="">请选择已启用的模型</option>
+                    )}
+                    {subagentModelOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>思考深度</span>
+                  <select
+                    aria-label="选择子代理思考深度"
+                    value={
+                      subagentReasoningEfforts.includes(
+                        config.subagentReasoningEffort,
+                      )
+                        ? config.subagentReasoningEffort
+                        : ""
+                    }
+                    disabled={isBusy || subagentReasoningEfforts.length === 0}
+                    onChange={(event) =>
+                      onConfigChange({
+                        ...config,
+                        subagentReasoningEffort: event.target.value,
+                      })
+                    }
+                  >
+                    {subagentReasoningEfforts.map((effort) => (
+                      <option key={effort} value={effort}>
+                        {REASONING_EFFORT_LABELS[effort] ?? effort}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
               <small>
                 {busy === "check-subagent-model"
-                  ? `正在校验当前线路是否支持 ${subagentModel}`
+                  ? `正在校验当前线路是否支持 ${config.subagentModel}`
                   : config.subagentOptimization
-                    ? "启用v2并行配置"
+                    ? "保存后立即用于当前任务后续新启动的子代理，无需重启"
                     : "保持 Codex 默认子代理配置，不注入协作提示词"}
               </small>
             </div>

@@ -57,7 +57,7 @@ use crate::config::{CodeyConfig, ConfigStore};
 use crate::error_log;
 #[cfg(windows)]
 use crate::launcher::{CODEX_APP_NOT_FOUND_ERROR, CODEX_APP_PATH_INVALID_ERROR};
-use crate::launcher::{CodeyRuntime, RuntimeModelConfig};
+use crate::launcher::{CodeyRuntime, RuntimeModelConfig, RuntimeSubagentConfig};
 use crate::message_delete::delete_messages;
 #[cfg(test)]
 use crate::model_catalog;
@@ -676,6 +676,7 @@ pub async fn save_codey_config(
 struct SavedCodeyConfig {
     config: CodeyConfig,
     restart_required: bool,
+    refresh_subagent_defaults: bool,
 }
 
 async fn save_codey_config_locked(
@@ -703,10 +704,16 @@ async fn save_codey_config_locked(
     config.fast_context_tools = config_input.fast_context_tools;
     config.fast_codex_startup = config_input.fast_codex_startup;
     config.subagent_optimization = config_input.subagent_optimization;
+    config.subagent_model = config_input.subagent_model;
+    config.subagent_reasoning_effort = config_input.subagent_reasoning_effort;
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     config.experimental_features = config_input.experimental_features;
     let mut config = config.normalize();
+    let refresh_subagent_defaults = previous.subagent_optimization
+        && config.subagent_optimization
+        && (previous.subagent_model != config.subagent_model
+            || previous.subagent_reasoning_effort != config.subagent_reasoning_effort);
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let restart_required = runtime_config_requires_restart(state, &config).await;
     if config.disable_trace_log_writes != previous.disable_trace_log_writes {
@@ -738,6 +745,7 @@ async fn save_codey_config_locked(
     Ok(SavedCodeyConfig {
         config,
         restart_required,
+        refresh_subagent_defaults,
     })
 }
 
@@ -746,6 +754,21 @@ async fn finish_codey_config_save(
     saved: SavedCodeyConfig,
 ) -> Result<Value, String> {
     sync_waiting_webhook_watcher(state).await;
+    let mut subagent_defaults_hot_reloaded = false;
+    let mut subagent_defaults_hot_reload_error = None;
+    if saved.refresh_subagent_defaults
+        && let Some(result) = hot_reload_runtime_subagent_defaults(state, &saved.config).await
+    {
+        match result {
+            Ok(()) => subagent_defaults_hot_reloaded = true,
+            Err(error) => subagent_defaults_hot_reload_error = Some(error),
+        }
+    }
+    let restart_required = if saved.refresh_subagent_defaults {
+        runtime_config_requires_restart(state, &saved.config).await
+    } else {
+        saved.restart_required
+    };
     let cc_switch = cc_switch::status_from_config(&saved.config);
     let model_state = current_model_state(&saved.config)?;
     let public_config = redacted_config(&saved.config);
@@ -754,8 +777,44 @@ async fn finish_codey_config_save(
         "config":public_config,
         "ccSwitch":cc_switch,
         "modelState":model_state,
-        "restartRequired":saved.restart_required,
+        "restartRequired":restart_required,
+        "subagentDefaultsHotReloaded":subagent_defaults_hot_reloaded,
+        "subagentDefaultsHotReloadError":subagent_defaults_hot_reload_error,
     }))
+}
+
+async fn hot_reload_runtime_subagent_defaults(
+    state: &Arc<AppState>,
+    config: &CodeyConfig,
+) -> Option<Result<(), String>> {
+    let runtime = state.runtime.lock().await.clone()?;
+    let websocket_url = runtime.renderer_websocket_url().await;
+    let result = cdp::refresh_subagent_defaults(
+        &websocket_url,
+        &config.subagent_model,
+        &config.subagent_reasoning_effort,
+    )
+    .await;
+    match result {
+        Ok(()) => {
+            runtime.mark_subagent_config_applied(config).await;
+            Some(Ok(()))
+        }
+        Err(error) => {
+            let error = format!("{error:#}");
+            error_log::record_failure(
+                "patch_verification_failed",
+                "refresh_subagent_defaults",
+                error.clone(),
+                json!({
+                    "model": config.subagent_model,
+                    "reasoningEffort": config.subagent_reasoning_effort,
+                    "websocketUrl": websocket_url,
+                }),
+            );
+            Some(Err(error))
+        }
+    }
 }
 
 pub async fn clear_codex_trace_logs(state: &Arc<AppState>) -> Result<Value, String> {
@@ -863,6 +922,7 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
 fn config_requires_restart(
     applied: &CodeyConfig,
     applied_models: &RuntimeModelConfig,
+    applied_subagent: &RuntimeSubagentConfig,
     current: &CodeyConfig,
 ) -> bool {
     applied.active_profile() != current.active_profile()
@@ -876,6 +936,8 @@ fn config_requires_restart(
         || applied.subagent_optimization != current.subagent_optimization
         || applied.experimental_features != current.experimental_features
         || applied_models != &RuntimeModelConfig::from_config(current)
+        || ((applied.subagent_optimization || current.subagent_optimization)
+            && applied_subagent != &RuntimeSubagentConfig::from_config(current))
 }
 
 async fn runtime_config_requires_restart(state: &Arc<AppState>, current: &CodeyConfig) -> bool {
@@ -884,7 +946,13 @@ async fn runtime_config_requires_restart(state: &Arc<AppState>, current: &CodeyC
         return false;
     };
     let applied_models = runtime.applied_model_config().await;
-    config_requires_restart(&runtime.applied_config, &applied_models, current)
+    let applied_subagent = runtime.applied_subagent_config().await;
+    config_requires_restart(
+        &runtime.applied_config,
+        &applied_models,
+        &applied_subagent,
+        current,
+    )
 }
 
 #[cfg(test)]
@@ -910,6 +978,13 @@ mod restart_tests {
                 slug: slug.into(),
                 display_name: display_name.into(),
                 supported: !matches!(slug, "gpt-5.6-terra" | "gpt-5.4-mini"),
+                supported_reasoning_efforts: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                ],
+                default_reasoning_effort: "low".into(),
             },
         )
         .collect::<Vec<_>>();
@@ -945,6 +1020,7 @@ mod restart_tests {
     fn restart_sensitive_config_changes_are_detected() {
         let applied = CodeyConfig::default();
         let applied_models = RuntimeModelConfig::from_config(&applied);
+        let applied_subagent = RuntimeSubagentConfig::from_config(&applied);
 
         let mut model_change = applied.clone();
         let provider_id = model_change.current_provider_id().unwrap().to_string();
@@ -954,11 +1030,13 @@ mod restart_tests {
         assert!(config_requires_restart(
             &applied,
             &applied_models,
+            &applied_subagent,
             &model_change
         ));
         assert!(!config_requires_restart(
             &applied,
             &RuntimeModelConfig::from_config(&model_change),
+            &applied_subagent,
             &model_change
         ));
 
@@ -973,11 +1051,13 @@ mod restart_tests {
         assert!(config_requires_restart(
             &applied,
             &applied_models,
+            &applied_subagent,
             &default_model_change
         ));
         assert!(!config_requires_restart(
             &applied,
             &RuntimeModelConfig::from_config(&default_model_change),
+            &applied_subagent,
             &default_model_change
         ));
 
@@ -986,6 +1066,7 @@ mod restart_tests {
         assert!(config_requires_restart(
             &applied,
             &applied_models,
+            &applied_subagent,
             &startup_change
         ));
 
@@ -994,6 +1075,7 @@ mod restart_tests {
         assert!(config_requires_restart(
             &applied,
             &applied_models,
+            &applied_subagent,
             &gpu_mode_change
         ));
 
@@ -1002,6 +1084,7 @@ mod restart_tests {
         assert!(!config_requires_restart(
             &applied,
             &applied_models,
+            &applied_subagent,
             &account_usage_change
         ));
 
@@ -1010,6 +1093,7 @@ mod restart_tests {
         assert!(config_requires_restart(
             &applied,
             &applied_models,
+            &applied_subagent,
             &fast_startup_change
         ));
 
@@ -1022,7 +1106,37 @@ mod restart_tests {
         assert!(config_requires_restart(
             &applied,
             &applied_models,
+            &applied_subagent,
             &experimental_feature_change
+        ));
+
+        let mut disabled_subagent_change = applied.clone();
+        disabled_subagent_change.subagent_model = "gpt-5.6-sol".into();
+        assert!(!config_requires_restart(
+            &applied,
+            &applied_models,
+            &applied_subagent,
+            &disabled_subagent_change
+        ));
+
+        let mut enabled_subagents = applied.clone();
+        enabled_subagents.subagent_optimization = true;
+        let enabled_models = RuntimeModelConfig::from_config(&enabled_subagents);
+        let enabled_subagent = RuntimeSubagentConfig::from_config(&enabled_subagents);
+        let mut changed_subagent = enabled_subagents.clone();
+        changed_subagent.subagent_model = "gpt-5.6-sol".into();
+        changed_subagent.subagent_reasoning_effort = "high".into();
+        assert!(config_requires_restart(
+            &enabled_subagents,
+            &enabled_models,
+            &enabled_subagent,
+            &changed_subagent
+        ));
+        assert!(!config_requires_restart(
+            &enabled_subagents,
+            &enabled_models,
+            &RuntimeSubagentConfig::from_config(&changed_subagent),
+            &changed_subagent
         ));
     }
 
@@ -1066,6 +1180,7 @@ mod restart_tests {
     fn live_config_changes_do_not_require_restart() {
         let applied = CodeyConfig::default();
         let applied_models = RuntimeModelConfig::from_config(&applied);
+        let applied_subagent = RuntimeSubagentConfig::from_config(&applied);
         let mut current = applied.clone();
         current.webhook.channels.push(NotificationChannelConfig {
             url: "https://example.test/webhook".into(),
@@ -1076,6 +1191,7 @@ mod restart_tests {
         assert!(!config_requires_restart(
             &applied,
             &applied_models,
+            &applied_subagent,
             &current
         ));
     }

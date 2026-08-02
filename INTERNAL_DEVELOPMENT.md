@@ -27,7 +27,7 @@ Codey 是一个无界面的 Rust 桌面辅助进程，通过 CDP 连接官方 Co
 - macOS / Windows 默认开启宠物硬阉割：Codey 先把 Codex 自带的 `electron-avatar-overlay-open` 启动状态设为关闭，再在主进程执行前安装仅存在于本次进程内的断路补丁。补丁在 V8 编译 Codex 主 bundle 前把宠物 manager 构造替换成无状态桩，并拒绝创建 356×320 宠物 BrowserWindow、`Pet Surface`、专用 preload 和 macOS 原生 `avatar-overlay.node`；因此不会注册宠物生命周期、计时器、原生合成或额外 Renderer。Codex 设置页的 Pets 入口会在激活前按新旧语义 ID 屏蔽，设置 chunk 对 `codex-avatar` 的静态依赖也会替换成无资源桩，避免设置页预先载入宠物 Renderer 和内置精灵图；个人菜单和命令菜单中的宠物控件继续屏蔽。关闭开关后会在下一次由 Codey 启动 Codex 时撤掉断路补丁并恢复宠物及其控件，不改写 `app.asar`。
 - macOS / Windows 默认开启语音精简：除旧版听写与全局听写外，也会屏蔽新版 GPT Voice / Realtime Voice 的首页推广、Composer、设置和快捷键入口，并拒绝麦克风设备枚举、音频采集、WebRTC 会话与听写网络连接。关闭开关后会在下一次由 Codey 启动 Codex 时恢复完整语音能力，不改写 `app.asar`。
 - 可选的 FastCtx 上下文优化默认关闭。打开后，Codey 会在下次启动 Codex 时优先沿用用户已经配置的 FastCtx；没有现有配置时才把内嵌版本作为本地 STDIO MCP 临时注册，提供带分页和输出预算的 `read`、`grep`、`glob` 与 `replace` 工具，减少文件读取、搜索和机械替换产生的命令拼装与冗余上下文；无需另外安装 FastCtx、npm 包或 Node.js。
-- 可选的子代理协作优化默认关闭。打开后，Codey 会在下次启动 Codex 时临时启用 `features.multi_agent_v2`、移除冲突的 V1 `[agents]`、追加用户级探索委派提示词，并生成锁定 `gpt-5.6-luna` 低推理强度的 `agents/default.toml`；正常退出或下次异常恢复时还原启动前内容，运行期间发生的独立用户修改会保守保留。
+- 可选的子代理协作优化默认关闭。打开后，Codey 会在下次启动 Codex 时临时启用 `features.multi_agent_v2`、移除冲突的 V1 `[agents]` 字段、写入官方 `[agents].default_subagent_model` 与 `default_subagent_reasoning_effort`、追加用户级探索委派提示词，并生成不再固定模型与推理强度的 `agents/default.toml`；模型来源限定为当前模型选择器已启用的官方或第三方模型，官方模型的推理档位直接来自本机模型目录。功能已经在当前运行时启用时，保存新的模型或推理档位会通过 Renderer 持有的 app-server 客户端覆盖后续 `thread/start` / `thread/resume` 请求，并用带 `config.agents` 覆盖的 `thread/resume` 立即更新当前任务；后端只有在 Renderer 确认应用成功后才推进子代理运行时基线，失败则保留重启标记。正常退出或下次异常恢复时还原启动前内容，运行期间发生的独立用户修改会保守保留。
 - Windows 原生 EXE 启动会移除继承到子进程的陈旧 `WSL_DISTRO_NAME`，避免新版客户端无意同步探测 `wsl.exe`；用户在 Codex 中明确启用的 WSL 模式不受影响。
 - 配置页提供“清理日志库”按钮：在线清空诊断日志、截断 WAL 并压缩数据库以回收磁盘空间，不直接删除运行中仍被 Codex 持有的文件，也不触碰会话、账号、配置或插件数据。
 - Trace 功能使用独立统计模块；Codex 可用后在后台读取一次日志库并原子替换内存快照，仅展示日志条数、SQLite 实际占用和内容字节估算。每个日志库只执行一次汇总扫描，不再额外计算近 7 天走势、级别分布、高占用 target 或 SSD 寿命影响；配置页刷新和状态查询不会再次扫描日志库。
@@ -86,7 +86,7 @@ pnpm run release -- 0.2.1 --include-existing-changes
 
 Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周期和会话扫描优化也已直接合并其中。本地与 CI 构建不需要额外的运行时源码目录或补丁。PR 与桌面发布质量门会分别对根 workspace 和 CodeyRuntime workspace 执行格式检查、完整测试及零警告 Clippy。
 
-运行时只内置不含提示词的 Codex 模型兼容元数据，完整 system/developer prompt 不进入仓库资产或 CodeyRuntime 二进制。Codex 当前要求自定义模型目录的每个条目都保留 `base_instructions`；因此 Codey 只从用户本机已有的官方 `models_cache.json` 派生运行目录，原样保留本机缓存中的必需字段，并把生成文件权限收紧为仅当前用户可读写。缺少兼容的本机缓存时不生成不完整目录，官方线路回退 Codex 内置目录；这类本机派生内容不得写入日志、测试夹具、发布包或版本库。
+运行时只内置不含提示词的 Codex 模型兼容元数据，完整 system/developer prompt 不进入仓库资产或 CodeyRuntime 二进制。Codex 当前要求自定义模型目录的每个条目都保留 `base_instructions`；因此 Codey 只从用户本机已有的官方 `models_cache.json` 派生运行目录，原样保留本机缓存中的必需字段，并把生成文件权限收紧为仅当前用户可读写。缺少兼容的本机缓存时不生成不完整目录，官方线路回退 Codex 内置目录，第三方线路仍可完成上游模型探测与子代理能力校验；这是可恢复的内置目录回退，不记录为补丁失败。这类本机派生内容不得写入日志、测试夹具、发布包或版本库。
 
 ## 配置与路径
 

@@ -163,6 +163,13 @@ pub struct CodeyConfig {
     /// the next runtime. Disabled by default and restored on shutdown.
     #[serde(default)]
     pub subagent_optimization: bool,
+    /// Default model used by newly spawned subagents while Codey's
+    /// multi-agent optimization is enabled.
+    #[serde(default = "default_subagent_model")]
+    pub subagent_model: String,
+    /// Default reasoning effort used by newly spawned subagents.
+    #[serde(default = "default_subagent_reasoning_effort")]
+    pub subagent_reasoning_effort: String,
     /// Automatically dismisses Codex's full-access safety notice in the
     /// renderer. Opt-in so the native warning remains visible by default.
     #[serde(default)]
@@ -206,6 +213,8 @@ impl Default for CodeyConfig {
             fast_context_tools: false,
             fast_codex_startup: true,
             subagent_optimization: false,
+            subagent_model: default_subagent_model(),
+            subagent_reasoning_effort: default_subagent_reasoning_effort(),
             hide_full_access_warning: false,
             show_account_usage_in_header: false,
             experimental_features: ExperimentalFeaturesConfig::default(),
@@ -234,6 +243,14 @@ impl CodeyConfig {
         normalize_model_lists(&mut self.selected_models_by_provider);
         normalize_upstream_model_lists(&mut self.upstream_models_by_provider);
         normalize_model_map(&mut self.default_model_by_provider);
+        self.subagent_model = self.subagent_model.trim().to_string();
+        if self.subagent_model.is_empty() {
+            self.subagent_model = default_subagent_model();
+        }
+        self.subagent_reasoning_effort = self.subagent_reasoning_effort.trim().to_ascii_lowercase();
+        if !SUBAGENT_REASONING_EFFORTS.contains(&self.subagent_reasoning_effort.as_str()) {
+            self.subagent_reasoning_effort = default_subagent_reasoning_effort();
+        }
         self.webhook.normalize();
         self
     }
@@ -318,6 +335,19 @@ fn normalize_model_map(models_by_provider: &mut BTreeMap<String, String>) {
 
 fn default_true() -> bool {
     true
+}
+
+pub const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-luna";
+pub const DEFAULT_SUBAGENT_REASONING_EFFORT: &str = "low";
+pub const SUBAGENT_REASONING_EFFORTS: [&str; 6] =
+    ["low", "medium", "high", "xhigh", "max", "ultra"];
+
+fn default_subagent_model() -> String {
+    DEFAULT_SUBAGENT_MODEL.to_string()
+}
+
+fn default_subagent_reasoning_effort() -> String {
+    DEFAULT_SUBAGENT_REASONING_EFFORT.to_string()
 }
 
 const DEFAULT_UPDATE_BASE_URL: &str = "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev";
@@ -671,6 +701,26 @@ mod tests {
             .normalize();
 
         assert!(!config.subagent_optimization);
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(
+            config.subagent_reasoning_effort,
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        );
+    }
+
+    #[test]
+    fn subagent_defaults_are_trimmed_and_invalid_effort_falls_back() {
+        let config = serde_json::from_str::<CodeyConfig>(
+            r#"{"activeProfileId":"","profiles":[],"subagentModel":"  provider-coder  ","subagentReasoningEffort":"unsupported"}"#,
+        )
+        .unwrap()
+        .normalize();
+
+        assert_eq!(config.subagent_model, "provider-coder");
+        assert_eq!(
+            config.subagent_reasoning_effort,
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        );
     }
 
     #[test]

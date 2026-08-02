@@ -107,11 +107,27 @@ impl RuntimeModelConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeSubagentConfig {
+    model: String,
+    reasoning_effort: String,
+}
+
+impl RuntimeSubagentConfig {
+    pub fn from_config(config: &CodeyConfig) -> Self {
+        Self {
+            model: config.subagent_model.clone(),
+            reasoning_effort: config.subagent_reasoning_effort.clone(),
+        }
+    }
+}
+
 pub struct CodeyRuntime {
     pub codex_app_path: PathBuf,
     pub maintenance: MaintenanceStatus,
     pub applied_config: CodeyConfig,
     applied_model_config: RwLock<RuntimeModelConfig>,
+    applied_subagent_config: RwLock<RuntimeSubagentConfig>,
     pub injection_statuses: Arc<RwLock<Arc<[cdp::InjectionScriptStatus]>>>,
     pub experimental_feature_runtime: Arc<RwLock<cdp::ExperimentalFeatureRuntimeStatus>>,
     injection_scripts: cdp::PreparedInjectionScripts,
@@ -140,6 +156,14 @@ impl CodeyRuntime {
 
     pub async fn mark_model_config_applied(&self, config: &CodeyConfig) {
         *self.applied_model_config.write().await = RuntimeModelConfig::from_config(config);
+    }
+
+    pub async fn applied_subagent_config(&self) -> RuntimeSubagentConfig {
+        self.applied_subagent_config.read().await.clone()
+    }
+
+    pub async fn mark_subagent_config_applied(&self, config: &CodeyConfig) {
+        *self.applied_subagent_config.write().await = RuntimeSubagentConfig::from_config(config);
     }
 
     pub async fn refresh_injection_statuses(&self) -> Arc<[cdp::InjectionScriptStatus]> {
@@ -402,6 +426,17 @@ impl CodeyRuntime {
                 config.selected_models(),
             ) {
                 Ok(_) => true,
+                Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => {
+                    let use_last_valid_catalog = model_catalog::is_available(&home);
+                    if use_last_valid_catalog {
+                        eprintln!("本机官方模型缓存暂不含自定义目录必需字段，沿用上一份合法镜像");
+                    } else {
+                        eprintln!(
+                            "本机官方模型缓存暂不含自定义目录必需字段，使用 Codex 内置模型目录"
+                        );
+                    }
+                    use_last_valid_catalog
+                }
                 Err(error) if model_catalog::is_available(&home) => {
                     error_log::record_failure(
                         "patch_failed",
@@ -459,6 +494,8 @@ impl CodeyRuntime {
                 &original_provider,
                 config.fast_context_tools,
                 config.subagent_optimization,
+                &config.subagent_model,
+                &config.subagent_reasoning_effort,
             )
         } else {
             apply_runtime_provider_config(
@@ -469,6 +506,8 @@ impl CodeyRuntime {
                 (!default_model.is_empty()).then_some(default_model.as_str()),
                 config.fast_context_tools,
                 config.subagent_optimization,
+                &config.subagent_model,
+                &config.subagent_reasoning_effort,
             )
         };
         runtime_config.map_err(|error| {
@@ -801,6 +840,7 @@ impl CodeyRuntime {
                 maintenance,
                 applied_config: config.clone(),
                 applied_model_config: RwLock::new(RuntimeModelConfig::from_config(config)),
+                applied_subagent_config: RwLock::new(RuntimeSubagentConfig::from_config(config)),
                 injection_statuses,
                 experimental_feature_runtime,
                 injection_scripts,
