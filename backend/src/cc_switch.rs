@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -13,6 +12,7 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::config::{CodeyConfig, ProviderProfile};
+use crate::sqlite_util::table_columns;
 
 const APP_TYPE: &str = "codex";
 const OFFICIAL_PROVIDER_ID: &str = "codex-official";
@@ -97,16 +97,20 @@ fn read_route_takeover_managed(path: &Path) -> Result<bool> {
 
     let proxy_columns = table_columns(&connection, "proxy_config")?;
     let proxy_enabled = if proxy_columns.contains("enabled") {
-        let query = if proxy_columns.contains("app_type") {
-            "SELECT COALESCE(MAX(enabled), 0) FROM proxy_config WHERE app_type=?1"
+        let enabled = if proxy_columns.contains("app_type") {
+            connection.query_row(
+                "SELECT COALESCE(MAX(enabled), 0) FROM proxy_config WHERE app_type=?1",
+                params![APP_TYPE],
+                |row| row.get::<_, i64>(0),
+            )?
         } else {
-            "SELECT COALESCE(MAX(enabled), 0) FROM proxy_config"
+            connection.query_row(
+                "SELECT COALESCE(MAX(enabled), 0) FROM proxy_config",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?
         };
-        if proxy_columns.contains("app_type") {
-            connection.query_row(query, params![APP_TYPE], |row| row.get::<_, i64>(0))? != 0
-        } else {
-            connection.query_row(query, [], |row| row.get::<_, i64>(0))? != 0
-        }
+        enabled != 0
     } else if proxy_columns.contains("live_takeover_active") {
         connection.query_row(
             "SELECT COALESCE(MAX(live_takeover_active), 0) FROM proxy_config",
@@ -153,13 +157,6 @@ fn read_route_takeover_managed(path: &Path) -> Result<bool> {
     };
 
     Ok(proxy_enabled || has_live_backup || legacy_enabled)
-}
-
-fn table_columns(connection: &Connection, table: &str) -> Result<BTreeSet<String>> {
-    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-    rows.collect::<rusqlite::Result<BTreeSet<_>>>()
-        .map_err(Into::into)
 }
 
 fn live_config_uses_proxy_route(codex_home: &Path) -> Result<bool> {

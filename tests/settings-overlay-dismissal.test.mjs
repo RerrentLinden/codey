@@ -45,7 +45,7 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
   assert.doesNotMatch(overlaySource, /codey-overlay-dialog/);
   assert.match(overlaySource, /modalVisible=\{visible\}/);
   assert.match(overlaySource, /onClose=\{close\}/);
-  assert.match(overlaySource, /codey-settings-opened/);
+  assert.match(overlaySource, /SETTINGS_OPENED_EVENT \} from "\.\/useRuntimeStatus"/);
   assert.match(overlaySource, /toggle: open/);
 });
 

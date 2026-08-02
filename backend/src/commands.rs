@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,8 +45,8 @@ use updates::current_update_platform;
 use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 pub use updates::{check_for_updates, download_update, install_downloaded_update};
 use webhooks::{
-    WebhookNotificationState, initial_waiting_notifications, notify_webhook_completion,
-    notify_webhook_waiting, sync_waiting_webhook_watcher, test_notification_channel, test_webhook,
+    WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
+    sync_waiting_webhook_watcher, test_notification_channel, test_webhook,
 };
 
 use crate::account_usage;
@@ -88,11 +88,12 @@ pub struct AppState {
     runtime_generation: AtomicU64,
     session_titles: RwLock<HashMap<String, String>>,
     webhook_notifications: Mutex<WebhookNotificationState>,
-    persisted_waiting_notifications: Mutex<HashSet<String>>,
+    persisted_waiting_notifications: Mutex<WaitingLedgerState>,
     recent_session_event_cache: Mutex<Option<pending_approval::RecentSessionEventCache>>,
     waiting_watcher_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     waiting_watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     session_scan_wake: Notify,
+    restart_settled: Notify,
     shutdown_reason: watch::Sender<Option<AppShutdownReason>>,
 }
 
@@ -110,6 +111,7 @@ impl Drop for RestartInProgressGuard {
         self.state
             .restart_in_progress
             .store(false, Ordering::Release);
+        self.state.restart_settled.notify_waiters();
     }
 }
 
@@ -155,6 +157,7 @@ impl Default for AppState {
             waiting_watcher_shutdown: Mutex::new(None),
             waiting_watcher_task: Mutex::new(None),
             session_scan_wake: Notify::new(),
+            restart_settled: Notify::new(),
             shutdown_reason,
         }
     }
@@ -218,11 +221,11 @@ impl AppState {
                 serde_json::to_value(redacted_config(&config))
                     .unwrap_or_else(|_| json!({"status":"failed"}))
             }
-            "/codex-model-catalog" | "/codex-config-model" => {
+            "/codex-model-catalog" => {
                 let config = self.config.read().await.clone();
                 current_renderer_model_catalog(&config).unwrap_or_else(api_error_message)
             }
-            "/runtime/status" | "/backend/status" => {
+            "/backend/status" => {
                 let mut value = runtime_status(self).await.unwrap_or_else(api_error_message);
                 if let Some(object) = value.as_object_mut() {
                     object.insert("status".into(), Value::String("ok".into()));
@@ -352,16 +355,10 @@ impl AppState {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                delete_selected_messages(self, session_id, message_ids)
+                delete_selected_messages(session_id, message_ids)
                     .await
                     .unwrap_or_else(api_error_message)
             }
-            "/webhook/session-completed" => notify_webhook_completion(self, &payload)
-                .await
-                .unwrap_or_else(api_error_message),
-            "/webhook/session-waiting" => notify_webhook_waiting(self, &payload)
-                .await
-                .unwrap_or_else(api_error_message),
             "/plugins/list" => {
                 let home = codex_home();
                 let plugins_home = home.clone();
@@ -396,12 +393,6 @@ impl AppState {
                     }
                 }
             }
-            "/plugins/status" => plugin_marketplace_status()
-                .await
-                .unwrap_or_else(api_error_message),
-            "/plugins/repair" => repair_plugin_marketplace()
-                .await
-                .unwrap_or_else(api_error_message),
             _ => json!({"status":"failed","message":format!("未知 Codey 路由：{path}")}),
         }
     }
@@ -1184,7 +1175,6 @@ async fn cache_session_titles(state: &Arc<AppState>, payload: &Value) -> Value {
 }
 
 pub async fn delete_selected_messages(
-    _state: &Arc<AppState>,
     session_id: String,
     message_ids: Vec<String>,
 ) -> Result<Value, String> {

@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-pub const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
+const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 const ALLOWED_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
@@ -148,9 +148,9 @@ pub fn selection_state(
         .map(String::as_str)
         .collect::<HashSet<_>>();
     let official_models: Vec<OfficialModelAvailability> = official_entries
-        .into_iter()
+        .iter()
         .filter_map(|model| {
-            let model = official_model_from_value(&model)?;
+            let model = official_model_from_value(model)?;
             let supported = official_provider
                 || !provider_models_synced
                 || upstream.contains(model.slug.as_str());
@@ -197,7 +197,7 @@ pub fn selection_state(
     })
 }
 
-pub fn effective_default_model(
+fn effective_default_model(
     official_models: &[OfficialModelAvailability],
     third_party_models: &[String],
     requested_default_model: Option<&str>,
@@ -233,7 +233,7 @@ pub fn is_available(home: &Path) -> bool {
 /// launch and across repeated config-page lookups. The paths are part of the
 /// key so entries can never leak between Codex homes.
 type CatalogSignature = Vec<(PathBuf, u64, Option<std::time::SystemTime>)>;
-type OfficialEntriesCache = std::sync::Mutex<Option<(CatalogSignature, Vec<Value>)>>;
+type OfficialEntriesCache = std::sync::Mutex<Option<(CatalogSignature, std::sync::Arc<Vec<Value>>)>>;
 
 static OFFICIAL_ENTRIES_CACHE: std::sync::OnceLock<OfficialEntriesCache> =
     std::sync::OnceLock::new();
@@ -248,7 +248,7 @@ fn catalog_signature(paths: &[PathBuf]) -> CatalogSignature {
         .collect()
 }
 
-fn read_official_entries(home: &Path) -> Result<Vec<Value>> {
+fn read_official_entries(home: &Path) -> Result<std::sync::Arc<Vec<Value>>> {
     let paths = vec![home.join("models_cache.json"), home.join(relative_path())];
     let signature = catalog_signature(&paths);
     let cache = OFFICIAL_ENTRIES_CACHE.get_or_init(|| std::sync::Mutex::new(None));
@@ -256,11 +256,13 @@ fn read_official_entries(home: &Path) -> Result<Vec<Value>> {
         && let Some((cached_signature, entries)) = guard.as_ref()
         && *cached_signature == signature
     {
-        return Ok(entries.clone());
+        // 缓存命中只递增引用计数；下游要么只读、要么本来就会拷贝出自己的
+        // 工作副本，无需整目录深拷贝。
+        return Ok(std::sync::Arc::clone(entries));
     }
-    let entries = read_official_entries_uncached(&paths)?;
+    let entries = std::sync::Arc::new(read_official_entries_uncached(&paths)?);
     if let Ok(mut guard) = cache.lock() {
-        *guard = Some((signature, entries.clone()));
+        *guard = Some((signature, std::sync::Arc::clone(&entries)));
     }
     Ok(entries)
 }
@@ -555,7 +557,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Codey 模型目录路径没有父目录"))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("创建 Codey 模型目录失败：{}", parent.display()))?;
-    let temp_path = temp_path_for(path, parent);
+    let temp_path = crate::fs_util::unique_temp_path(path);
     if let Err(error) = fs::write(&temp_path, bytes) {
         let _ = fs::remove_file(&temp_path);
         return Err(error)
@@ -565,10 +567,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&temp_path);
         return Err(error);
     }
-    if let Err(error) = replace_file(&temp_path, path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error).with_context(|| format!("替换模型目录失败：{}", path.display()));
-    }
+    crate::fs_util::persist_temp_file(&temp_path, path)
+        .with_context(|| format!("替换模型目录失败：{}", path.display()))?;
     protect_catalog_file(path)
 }
 
@@ -582,30 +582,6 @@ fn protect_catalog_file(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     let _ = path;
     Ok(())
-}
-
-fn temp_path_for(path: &Path, parent: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("codey-official.json");
-    parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()))
-}
-
-fn replace_file(temp: &Path, destination: &Path) -> std::io::Result<()> {
-    match fs::rename(temp, destination) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            #[cfg(windows)]
-            {
-                if destination.exists() {
-                    fs::remove_file(destination)?;
-                    return fs::rename(temp, destination);
-                }
-            }
-            Err(error)
-        }
-    }
 }
 
 #[cfg(test)]

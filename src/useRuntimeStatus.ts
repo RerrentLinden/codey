@@ -4,7 +4,7 @@ import { invoke } from "./api";
 import type { RuntimeStatus } from "./App.types";
 
 const INJECTION_STATUS_CHANGED_EVENT = "codey-injection-status-changed";
-const SETTINGS_OPENED_EVENT = "codey-settings-opened";
+export const SETTINGS_OPENED_EVENT = "codey-settings-opened";
 
 type UseRuntimeStatusOptions = {
   embedded: boolean;

@@ -9,6 +9,7 @@ fn main() {
         "../pnpm-lock.yaml",
         "icons/Codey.ico",
         "../scripts/build-overlay.mjs",
+        "../public",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }

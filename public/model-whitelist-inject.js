@@ -21,6 +21,7 @@
   };
   let refreshTimer = 0;
   let refreshUntil = 0;
+  let refreshRetryDelay = 120;
   let catalogLoadPromise = null;
   let catalogRevision = 0;
   let disposed = false;
@@ -606,14 +607,28 @@
     refreshUntil = Math.max(refreshUntil, Date.now() + durationMs);
     if (refreshTimer) return;
     const tick = () => {
-      refreshTimer = 0;
+      // Keep the fired handle truthy while the tick body runs: the
+      // bridge-missing path inside loadModelCatalog calls scheduleRefresh
+      // synchronously, and a cleared handle here would let it start a second
+      // timer chain that can never be cancelled.
+      if (disposed) {
+        refreshTimer = 0;
+        return;
+      }
       if (catalog.loaded) {
+        refreshRetryDelay = 120;
         void deliverModelCatalog({ invalidate: false });
       } else {
+        refreshRetryDelay = Math.min(refreshRetryDelay * 2, 2000);
         void loadModelCatalog();
       }
-      if (!disposed && Date.now() < refreshUntil) {
-        refreshTimer = window.setTimeout(tick, 120);
+      if (Date.now() < refreshUntil) {
+        refreshTimer = window.setTimeout(
+          tick,
+          catalog.loaded ? 120 : refreshRetryDelay,
+        );
+      } else {
+        refreshTimer = 0;
       }
     };
     refreshTimer = window.setTimeout(tick, 0);
@@ -635,6 +650,16 @@
           return false;
         }
         if (requestedRevision !== catalogRevision) return false;
+        const unchanged = catalog.loaded
+          && sameModelNames(catalog.models, nextCatalog.models)
+          && catalog.defaultModel === nextCatalog.defaultModel;
+        if (unchanged) {
+          // Window-focus reloads land here when nothing changed upstream:
+          // skip the invalidating re-delivery (full client scan plus query
+          // invalidation) and keep only a short non-invalidating window.
+          scheduleRefresh(1000);
+          return true;
+        }
         catalogRevision += 1;
         catalog = nextCatalog;
         await deliverModelCatalog();

@@ -11,8 +11,8 @@ use super::webhooks::{
     start_waiting_webhook_watcher, stop_waiting_webhook_watcher, webhook_watcher_should_run,
 };
 use super::{
-    AppState, RestartInProgressGuard, ScheduledRestart, current_update_platform,
-    make_bridge_handler, runtime_config_requires_restart, sync_provider_models_for_launch,
+    AppState, RestartInProgressGuard, ScheduledRestart, config_requires_restart,
+    current_update_platform, make_bridge_handler, sync_provider_models_for_launch,
 };
 use crate::codex_config::codex_home;
 use crate::error_log;
@@ -20,9 +20,20 @@ use crate::launcher::{CodeyRuntime, restore_previous_runtime_state, restore_runt
 
 pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
     let runtime = state.runtime.lock().await.clone();
+    // 先在无锁状态取运行时模型基线，再持配置读锁做同步比较：读守卫跨
+    // await 会让排队写者阻塞所有新的桥接请求。
+    let applied_models = match runtime.as_ref() {
+        Some(runtime) => Some(runtime.applied_model_config().await),
+        None => None,
+    };
     let config = state.config.read().await;
     let profile = config.active_profile();
-    let restart_required = runtime_config_requires_restart(state, &config).await;
+    let restart_required = match (runtime.as_ref(), applied_models.as_ref()) {
+        (Some(runtime), Some(applied_models)) => {
+            config_requires_restart(&runtime.applied_config, applied_models, &config)
+        }
+        _ => false,
+    };
     let mut status = json!({
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),
@@ -148,7 +159,13 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     tokio::spawn(async move {
         if codex_exit.await.is_ok() {
             while exit_state.restart_in_progress.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                let settled = exit_state.restart_settled.notified();
+                if !exit_state.restart_in_progress.load(Ordering::Acquire) {
+                    break;
+                }
+                // 兜底超时只是防丢通知，正常路径由 RestartInProgressGuard
+                // 的析构即时唤醒。
+                let _ = tokio::time::timeout(Duration::from_millis(250), settled).await;
             }
             if exit_state.runtime_generation.load(Ordering::Acquire) == runtime_generation {
                 exit_state.request_shutdown();

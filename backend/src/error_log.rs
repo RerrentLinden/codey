@@ -96,26 +96,44 @@ fn with_log_file_lock<T>(
 }
 
 fn repair_incomplete_tail(path: &Path) -> std::io::Result<()> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    use std::io::{Read, Seek, SeekFrom};
+
+    // 只探测文件尾部：修复目标只有最后一行，整文件读取会让持续失败的记录
+    // 路径退化为 O(日志大小)。窗口内没有换行时按倍扩大，语义与全量读一致。
+    const TAIL_PROBE_BYTES: u64 = 64 * 1024;
+    let mut file = match OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
-    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+    let len = file.metadata()?.len();
+    if len == 0 {
         return Ok(());
     }
-
-    let line_start = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index.saturating_add(1));
-    if serde_json::from_slice::<Value>(&bytes[line_start..]).is_ok() {
-        let mut file = OpenOptions::new().append(true).open(path)?;
+    let mut probe = TAIL_PROBE_BYTES;
+    let (line_start, tail) = loop {
+        let start = len.saturating_sub(probe);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::with_capacity(usize::try_from(len - start).unwrap_or_default());
+        file.read_to_end(&mut bytes)?;
+        if bytes.last() == Some(&b'\n') {
+            return Ok(());
+        }
+        if let Some(index) = bytes.iter().rposition(|byte| *byte == b'\n') {
+            let line_start = start.saturating_add(index as u64).saturating_add(1);
+            break (line_start, bytes.split_off(index.saturating_add(1)));
+        }
+        if start == 0 {
+            break (0, bytes);
+        }
+        probe = probe.saturating_mul(2);
+    };
+    if serde_json::from_slice::<Value>(&tail).is_ok() {
+        file.seek(SeekFrom::End(0))?;
         file.write_all(b"\n")?;
         file.flush()
     } else {
-        let mut file = OpenOptions::new().write(true).open(path)?;
-        file.set_len(u64::try_from(line_start).unwrap_or(0))?;
+        file.set_len(line_start)?;
         file.flush()
     }
 }

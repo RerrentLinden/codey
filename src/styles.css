@@ -324,20 +324,6 @@ input:focus-visible,
   align-items: center;
 }
 
-.enable-control {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
-.enable-control span {
-  font-size: 12px;
-  font-weight: 600;
-  color: #6e6e73;
-  user-select: none;
-}
-
 .section-title h1,
 .section-title h2 {
   margin: 2px 0 2px;
@@ -531,12 +517,6 @@ input:focus-visible,
   background: currentColor;
   display: inline-block;
   margin-right: 4px;
-}
-
-.operations-footer-metrics {
-  display: flex;
-  align-items: center;
-  gap: 6px;
 }
 
 .operations-status-icons {

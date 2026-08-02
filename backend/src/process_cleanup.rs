@@ -38,20 +38,25 @@ async fn terminate_other_unix_codey_processes() -> Result<usize> {
     let targets =
         crate::process_tree::identities_for_process_ids(&initial_snapshot, &initial_targets);
 
-    let before_terminate = crate::process_tree::unix_process_snapshot().await?;
-    let initial_matches = crate::process_tree::matching_process_ids(&before_terminate, &targets);
+    // 身份集合来自同一份初始快照，直接对其匹配结果发 SIGTERM；已退出的
+    // 进程只会得到无害的 ESRCH。
+    let initial_matches = crate::process_tree::matching_process_ids(&initial_snapshot, &targets);
     crate::process_tree::signal_processes(&initial_matches, libc::SIGTERM)?;
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    let remaining = loop {
+    // 等待阶段只用 kill(0) 探测存活，不再每 50ms fork 一次 ps；PID 复用只会
+    // 让等待更保守。真正强杀前再用一次完整快照复核启动身份。
+    let mut alive = initial_matches;
+    loop {
         tokio::time::sleep(Duration::from_millis(50)).await;
+        alive.retain(|process_id| crate::process_tree::unix_process_alive(*process_id));
+        if alive.is_empty() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+    }
+    if !alive.is_empty() {
         let snapshot = crate::process_tree::unix_process_snapshot().await?;
         let remaining = crate::process_tree::matching_process_ids(&snapshot, &targets);
-        if remaining.is_empty() || tokio::time::Instant::now() >= deadline {
-            break remaining;
-        }
-    };
-    if !remaining.is_empty() {
         crate::process_tree::signal_processes(&remaining, libc::SIGKILL)?;
     }
     Ok(targets.len())

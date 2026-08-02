@@ -11,6 +11,13 @@ const FALLBACK_SESSION_NAME: &str = "未命名会话";
 const MAX_SESSION_NAME_CHARS: usize = 80;
 const MAX_THREAD_SORT_KEYS: usize = 200;
 
+/// 会话 ID 归一：允许 `local:` 前缀与两侧空白。此前 5 处各自实现，trim
+/// 顺序互不一致。
+pub(crate) fn normalize_session_id(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed.strip_prefix("local:").unwrap_or(trimmed).trim()
+}
+
 pub fn thread_sort_keys(home: &Path, sessions: &[SessionRef]) -> Value {
     let sessions = sessions
         .iter()
@@ -48,13 +55,7 @@ pub fn thread_sort_keys(home: &Path, sessions: &[SessionRef]) -> Value {
 
     let sort_keys = sessions
         .iter()
-        .filter_map(|session| {
-            let session_id = session
-                .session_id
-                .strip_prefix("local:")
-                .unwrap_or(&session.session_id);
-            latest_by_session.remove(session_id)
-        })
+        .filter_map(|session| latest_by_session.remove(normalize_session_id(&session.session_id)))
         .collect::<Vec<_>>();
     json!({"status": "ok", "sort_keys": sort_keys})
 }
@@ -98,10 +99,7 @@ pub fn resolve_session_name_with_preferred(
     session_id: &str,
     preferred_title: Option<&str>,
 ) -> String {
-    let session_id = session_id
-        .trim()
-        .strip_prefix("local:")
-        .unwrap_or(session_id.trim());
+    let session_id = normalize_session_id(session_id);
     if session_id.is_empty() {
         return FALLBACK_SESSION_NAME.to_string();
     }

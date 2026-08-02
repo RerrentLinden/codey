@@ -7,7 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
+use tokio::sync::{Mutex, oneshot};
 
 use super::AppState;
 use crate::codex_config::codex_home;
@@ -94,19 +94,88 @@ fn waiting_notification_ledger_path(store: &ConfigStore) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("webhook-notifications.json"))
 }
 
-fn load_waiting_notification_ledger(path: &Path) -> HashSet<String> {
+/// Persisted "waiting" reservation keys in insertion order so the ledger stays
+/// bounded like the in-memory settled history: once the cap is exceeded the
+/// oldest reservations fall off. Evicting a key that old only weakens dedup
+/// toward the documented at-most-once boundary (a suppressed resend can become
+/// possible again), never toward duplicate sends of recent notifications.
+#[derive(Debug, Default)]
+pub(super) struct WaitingLedgerState {
+    keys: HashSet<String>,
+    order: VecDeque<String>,
+    revision: u64,
+    io: Arc<Mutex<u64>>,
+}
+
+impl WaitingLedgerState {
+    fn contains(&self, key: &str) -> bool {
+        self.keys.contains(key)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = &String> {
+        self.order.iter()
+    }
+
+    fn ordered_keys(&self) -> Vec<String> {
+        self.order.iter().cloned().collect()
+    }
+
+    fn insert(&mut self, key: String) -> bool {
+        if !self.keys.insert(key.clone()) {
+            return false;
+        }
+        self.order.push_back(key);
+        while self.order.len() > WEBHOOK_NOTIFICATION_HISTORY_LIMIT {
+            if let Some(oldest) = self.order.pop_front() {
+                self.keys.remove(&oldest);
+            }
+        }
+        self.revision += 1;
+        true
+    }
+
+    fn remove(&mut self, key: &str) -> bool {
+        if !self.keys.remove(key) {
+            return false;
+        }
+        self.order.retain(|candidate| candidate != key);
+        self.revision += 1;
+        true
+    }
+
+    fn extend(&mut self, keys: impl IntoIterator<Item = String>) -> bool {
+        let mut changed = false;
+        for key in keys {
+            changed |= self.insert(key);
+        }
+        changed
+    }
+}
+
+fn load_waiting_notification_entries(path: &Path) -> Vec<String> {
     let Ok(contents) = fs::read_to_string(path) else {
-        return HashSet::new();
+        return Vec::new();
     };
-    serde_json::from_str::<WaitingNotificationLedger>(&contents)
-        .map(|ledger| {
-            ledger
-                .notification_keys
-                .into_iter()
-                .filter(|key| key.starts_with("waiting:"))
-                .collect()
-        })
-        .unwrap_or_default()
+    let Ok(ledger) = serde_json::from_str::<WaitingNotificationLedger>(&contents) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    ledger
+        .notification_keys
+        .into_iter()
+        .filter(|key| key.starts_with("waiting:") && seen.insert(key.clone()))
+        .collect()
+}
+
+#[cfg(test)]
+fn load_waiting_notification_ledger(path: &Path) -> HashSet<String> {
+    load_waiting_notification_entries(path)
+        .into_iter()
+        .collect()
 }
 
 fn waiting_notification_key(session_id: &str, turn_id: &str, waiting_id: &str) -> String {
@@ -301,17 +370,19 @@ fn unix_timestamp_seconds() -> i64 {
         .as_secs() as i64
 }
 
-fn initialize_waiting_notifications(path: &Path, baseline: HashSet<String>) -> HashSet<String> {
+fn initialize_waiting_notifications(path: &Path, baseline: HashSet<String>) -> WaitingLedgerState {
     let path_existed = path.exists();
-    let mut initialized = if path_existed {
-        load_waiting_notification_ledger(path)
-    } else {
-        HashSet::new()
-    };
-    let previous_len = initialized.len();
-    initialized.extend(baseline);
-    if !initialized.is_empty() && (!path_existed || initialized.len() != previous_len) {
-        let _ = save_waiting_notification_ledger(path, &initialized);
+    let mut initialized = WaitingLedgerState::default();
+    let mut loaded_matches_file = true;
+    if path_existed {
+        let entries = load_waiting_notification_entries(path);
+        let entry_count = entries.len();
+        initialized.extend(entries);
+        loaded_matches_file = initialized.order.len() == entry_count;
+    }
+    let baseline_changed = initialized.extend(baseline);
+    if !initialized.is_empty() && (!path_existed || !loaded_matches_file || baseline_changed) {
+        let _ = save_waiting_notification_ledger(path, initialized.ordered_keys());
     }
     initialized
 }
@@ -319,7 +390,7 @@ fn initialize_waiting_notifications(path: &Path, baseline: HashSet<String>) -> H
 pub(super) fn initial_waiting_notifications(
     store: &ConfigStore,
     pending_approvals: &[pending_approval::PendingApproval],
-) -> HashSet<String> {
+) -> WaitingLedgerState {
     let path = waiting_notification_ledger_path(store);
     initialize_waiting_notifications(&path, waiting_notification_keys(pending_approvals))
 }
@@ -341,34 +412,18 @@ fn waiting_notification_keys(
 
 fn save_waiting_notification_ledger(
     path: &Path,
-    notification_keys: &HashSet<String>,
+    notification_keys: Vec<String>,
 ) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| "消息通知记录路径无父目录".to_string())?;
     fs::create_dir_all(parent).map_err(|error| format!("创建消息通知记录目录失败：{error}"))?;
-    let mut notification_keys = notification_keys.iter().cloned().collect::<Vec<_>>();
-    notification_keys.sort();
     let bytes = serde_json::to_vec_pretty(&WaitingNotificationLedger { notification_keys })
         .map_err(|error| format!("序列化消息通知记录失败：{error}"))?;
-    let temp = parent.join(format!(
-        ".{}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy()
-    ));
+    let temp = crate::fs_util::unique_temp_path(path);
     fs::write(&temp, bytes).map_err(|error| format!("写入消息通知记录失败：{error}"))?;
-    if let Err(error) = fs::rename(&temp, path) {
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)
-                .map_err(|remove_error| format!("替换消息通知记录失败：{remove_error}"))?;
-            fs::rename(&temp, path)
-                .map_err(|rename_error| format!("替换消息通知记录失败：{rename_error}"))?;
-        } else {
-            return Err(format!("替换消息通知记录失败：{error}"));
-        }
-        #[cfg(not(windows))]
-        return Err(format!("替换消息通知记录失败：{error}"));
-    }
+    crate::fs_util::persist_temp_file(&temp, path)
+        .map_err(|error| format!("替换消息通知记录失败：{error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -378,20 +433,52 @@ fn save_waiting_notification_ledger(
     Ok(())
 }
 
+/// Writes the current ledger snapshot to disk without holding the state lock
+/// across IO. The write itself runs on a blocking thread; the per-ledger `io`
+/// mutex serializes writers, and the revision check skips writes that a later
+/// snapshot already covered (a higher revision is always a more recent state).
+async fn persist_waiting_ledger(state: &Arc<AppState>) -> Result<(), String> {
+    let io = {
+        let ledger = state.persisted_waiting_notifications.lock().await;
+        ledger.io.clone()
+    };
+    let mut written = io.lock().await;
+    let (snapshot, revision) = {
+        let ledger = state.persisted_waiting_notifications.lock().await;
+        if ledger.revision <= *written {
+            return Ok(());
+        }
+        (ledger.ordered_keys(), ledger.revision)
+    };
+    let path = waiting_notification_ledger_path(&state.store);
+    tokio::task::spawn_blocking(move || save_waiting_notification_ledger(&path, snapshot))
+        .await
+        .map_err(|error| format!("写入消息通知记录任务失败：{error}"))??;
+    *written = revision;
+    Ok(())
+}
+
 async fn reserve_waiting_notification(
     state: &Arc<AppState>,
     notification_key: &str,
 ) -> Result<bool, String> {
-    let mut persisted = state.persisted_waiting_notifications.lock().await;
-    if persisted.contains(notification_key) {
-        return Ok(false);
+    {
+        let mut persisted = state.persisted_waiting_notifications.lock().await;
+        if persisted.contains(notification_key) {
+            return Ok(false);
+        }
+        persisted.insert(notification_key.to_string());
     }
-    persisted.insert(notification_key.to_string());
-    if let Err(error) = save_waiting_notification_ledger(
-        &waiting_notification_ledger_path(&state.store),
-        &persisted,
-    ) {
-        persisted.remove(notification_key);
+    // The write-ahead contract stays: the reservation must be durable before
+    // the caller sends. Failure rolls the key back; a concurrent duplicate
+    // that skipped on the in-flight key stays suppressed, which matches the
+    // documented at-most-once boundary.
+    if let Err(error) = persist_waiting_ledger(state).await {
+        state
+            .persisted_waiting_notifications
+            .lock()
+            .await
+            .remove(notification_key);
         return Err(error);
     }
     Ok(true)
@@ -401,15 +488,18 @@ async fn release_waiting_notification(
     state: &Arc<AppState>,
     notification_key: &str,
 ) -> Result<(), String> {
-    let mut persisted = state.persisted_waiting_notifications.lock().await;
-    if !persisted.remove(notification_key) {
-        return Ok(());
+    {
+        let mut persisted = state.persisted_waiting_notifications.lock().await;
+        if !persisted.remove(notification_key) {
+            return Ok(());
+        }
     }
-    if let Err(error) = save_waiting_notification_ledger(
-        &waiting_notification_ledger_path(&state.store),
-        &persisted,
-    ) {
-        persisted.insert(notification_key.to_string());
+    if let Err(error) = persist_waiting_ledger(state).await {
+        state
+            .persisted_waiting_notifications
+            .lock()
+            .await
+            .insert(notification_key.to_string());
         return Err(error);
     }
     Ok(())
@@ -424,22 +514,17 @@ async fn baseline_waiting_notifications(
         return;
     }
 
-    let persisted_snapshot = {
+    let changed = {
         let mut persisted = state.persisted_waiting_notifications.lock().await;
-        let previous_len = persisted.len();
-        persisted.extend(baseline.iter().cloned());
-        (persisted.len() != previous_len).then(|| persisted.clone())
+        persisted.extend(baseline.iter().cloned())
     };
     state
         .webhook_notifications
         .lock()
         .await
         .extend_settled(baseline);
-    if let Some(persisted) = persisted_snapshot {
-        let _ = save_waiting_notification_ledger(
-            &waiting_notification_ledger_path(&state.store),
-            &persisted,
-        );
+    if changed {
+        let _ = persist_waiting_ledger(state).await;
     }
 }
 pub(super) fn webhook_watcher_should_run(config: &CodeyConfig) -> bool {
@@ -850,7 +935,7 @@ async fn dispatch_settled_webhook_failure(
     Ok(json!({"status":"ok","eventId":event.event_id}))
 }
 
-pub(super) async fn notify_webhook_completion(
+async fn notify_webhook_completion(
     state: &Arc<AppState>,
     payload: &Value,
 ) -> Result<Value, String> {
@@ -972,10 +1057,7 @@ pub(super) async fn notify_webhook_completion(
     Ok(json!({"status":"ok","eventId":event.event_id}))
 }
 
-pub(super) async fn notify_webhook_waiting(
-    state: &Arc<AppState>,
-    payload: &Value,
-) -> Result<Value, String> {
+async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Result<Value, String> {
     let session_id = payload
         .get("sessionId")
         .and_then(Value::as_str)
@@ -1280,7 +1362,7 @@ mod tests {
             "waiting:session-2:turn-2:approval-2".to_string(),
         ]);
 
-        save_waiting_notification_ledger(&path, &expected).unwrap();
+        save_waiting_notification_ledger(&path, expected.iter().cloned().collect()).unwrap();
 
         assert_eq!(load_waiting_notification_ledger(&path), expected);
         #[cfg(unix)]
@@ -1330,7 +1412,7 @@ mod tests {
             store: ConfigStore::new(directory.path().join("config.json")),
             config: RwLock::new(config),
             webhook_notifications: Mutex::new(WebhookNotificationState::default()),
-            persisted_waiting_notifications: Mutex::new(HashSet::new()),
+            persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
             ..AppState::default()
         });
         let notification_key =
@@ -1385,7 +1467,7 @@ mod tests {
             store: ConfigStore::new(directory.path().join("config.json")),
             config: RwLock::new(config),
             webhook_notifications: Mutex::new(WebhookNotificationState::default()),
-            persisted_waiting_notifications: Mutex::new(HashSet::new()),
+            persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
             ..AppState::default()
         });
         let notification_key =
@@ -1455,7 +1537,7 @@ mod tests {
                 .build()
                 .unwrap(),
             webhook_notifications: Mutex::new(WebhookNotificationState::default()),
-            persisted_waiting_notifications: Mutex::new(HashSet::new()),
+            persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
             ..AppState::default()
         });
         let notification_key =
@@ -1494,11 +1576,29 @@ mod tests {
         let path = directory.path().join("webhook-notifications.json");
         let baseline = HashSet::from(["waiting:session-old:turn-old:approval-old".to_string()]);
 
+        let initialized = initialize_waiting_notifications(&path, baseline.clone());
         assert_eq!(
-            initialize_waiting_notifications(&path, baseline.clone()),
+            initialized.iter().cloned().collect::<HashSet<_>>(),
             baseline
         );
         assert_eq!(load_waiting_notification_ledger(&path), baseline);
+    }
+
+    #[test]
+    fn waiting_ledger_evicts_oldest_keys_beyond_the_cap() {
+        let mut ledger = WaitingLedgerState::default();
+        for index in 0..=WEBHOOK_NOTIFICATION_HISTORY_LIMIT {
+            ledger.insert(format!("waiting:session:{index}:approval"));
+        }
+
+        assert_eq!(
+            ledger.ordered_keys().len(),
+            WEBHOOK_NOTIFICATION_HISTORY_LIMIT
+        );
+        assert!(!ledger.contains("waiting:session:0:approval"));
+        assert!(ledger.contains(&format!(
+            "waiting:session:{WEBHOOK_NOTIFICATION_HISTORY_LIMIT}:approval"
+        )));
     }
 
     #[test]
@@ -1506,7 +1606,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("webhook-notifications.json");
         let persisted = HashSet::from(["waiting:session-sent:turn-sent:approval-sent".to_string()]);
-        save_waiting_notification_ledger(&path, &persisted).unwrap();
+        save_waiting_notification_ledger(&path, persisted.iter().cloned().collect()).unwrap();
         let existing_wait = "waiting:session-old:turn-old:approval-old".to_string();
 
         let loaded =
@@ -1516,7 +1616,7 @@ mod tests {
             .into_iter()
             .chain([existing_wait])
             .collect::<HashSet<_>>();
-        assert_eq!(loaded, expected);
+        assert_eq!(loaded.iter().cloned().collect::<HashSet<_>>(), expected);
         assert_eq!(load_waiting_notification_ledger(&path), expected);
     }
 
@@ -1526,7 +1626,7 @@ mod tests {
         let state = Arc::new(AppState {
             store: ConfigStore::new(directory.path().join("config.json")),
             webhook_notifications: Mutex::new(WebhookNotificationState::default()),
-            persisted_waiting_notifications: Mutex::new(HashSet::new()),
+            persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
             ..AppState::default()
         });
         let before_start = PendingApproval {

@@ -7,6 +7,9 @@ use reqwest::{Client, StatusCode, header::ACCEPT};
 use serde::Serialize;
 use serde_json::Value;
 
+static LAST_GOOD_USAGE_ENDPOINT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 const USAGE_ENDPOINTS: [&str; 2] = [
     "https://chatgpt.com/backend-api/wham/usage",
     "https://chatgpt.com/backend-api/api/codex/usage",
@@ -57,7 +60,12 @@ pub async fn fetch_official_account_usage(
     let auth = read_official_auth(&codex_home.join("auth.json"))?;
     let mut last_error = None;
 
-    for endpoint in USAGE_ENDPOINTS {
+    // 从上次成功的端点开始轮询，失败仍会回退到完整列表，结果不变但稳定
+    // 状态下每次刷新只发一个请求。
+    let start = LAST_GOOD_USAGE_ENDPOINT.load(std::sync::atomic::Ordering::Relaxed);
+    for offset in 0..USAGE_ENDPOINTS.len() {
+        let index = (start + offset) % USAGE_ENDPOINTS.len();
+        let endpoint = USAGE_ENDPOINTS[index];
         let mut request = client
             .get(endpoint)
             .timeout(Duration::from_secs(8))
@@ -85,6 +93,7 @@ pub async fn fetch_official_account_usage(
             .json::<Value>()
             .await
             .with_context(|| "官方额度响应格式无效")?;
+        LAST_GOOD_USAGE_ENDPOINT.store(index, std::sync::atomic::Ordering::Relaxed);
         return parse_account_usage(&payload, unix_timestamp());
     }
 

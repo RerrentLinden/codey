@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -158,7 +157,7 @@ fn read_database(path: &Path) -> Result<Option<DatabaseStats>> {
         return Ok(None);
     }
 
-    let columns = table_columns(&connection)?;
+    let columns = crate::sqlite_util::table_columns(&connection, "logs")?;
     let estimate_expression = if columns.contains("estimated_bytes") {
         "CASE WHEN estimated_bytes > 0 THEN estimated_bytes ELSE 0 END"
     } else if columns.contains("feedback_log_body") {
@@ -191,14 +190,6 @@ fn read_database(path: &Path) -> Result<Option<DatabaseStats>> {
         oldest_timestamp,
         newest_timestamp,
     }))
-}
-
-fn table_columns(connection: &Connection) -> Result<HashSet<String>> {
-    let mut statement = connection.prepare("PRAGMA table_info(logs)")?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?;
-    Ok(columns)
 }
 
 fn min_timestamp(left: Option<i64>, right: Option<i64>) -> Option<i64> {

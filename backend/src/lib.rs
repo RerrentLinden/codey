@@ -6,6 +6,7 @@ mod codex_startup_patch;
 mod commands;
 mod config;
 mod error_log;
+mod fs_util;
 mod launcher;
 mod maintenance_lock;
 mod message_delete;
@@ -22,6 +23,7 @@ mod session_delete;
 mod session_index_cleanup;
 mod session_metadata;
 mod session_transfer;
+mod sqlite_util;
 mod startup_maintenance;
 mod trace_log_guard;
 mod trace_log_stats;
@@ -51,17 +53,6 @@ pub fn run_error_log_helper_if_requested() -> Result<bool> {
 }
 
 pub async fn run() -> Result<()> {
-    if std::env::args_os()
-        .nth(1)
-        .is_some_and(|argument| argument == "--codey-fastctx-mcp")
-    {
-        fastctx::cli::run_server()
-            .await
-            .map(|_| ())
-            .map_err(anyhow::Error::msg)?;
-        return Ok(());
-    }
-
     error_log::initialize();
     let state = Arc::new(AppState::default());
     if let Err(error) = launcher::restore_previous_runtime_state(&codex_config::codex_home()) {

@@ -316,7 +316,7 @@ fn normalize_model_map(models_by_provider: &mut BTreeMap<String, String>) {
     });
 }
 
-pub fn default_true() -> bool {
+fn default_true() -> bool {
     true
 }
 
@@ -395,7 +395,7 @@ impl ConfigStore {
             Uuid::new_v4().simple()
         ));
         let replace_result = write_private_temp(&temp, &bytes).and_then(|()| {
-            atomic_replace(&temp, &self.path)
+            crate::fs_util::persist_temp_file(&temp, &self.path)
                 .with_context(|| format!("替换 Codey 配置失败：{}", self.path.display()))
         });
         if replace_result.is_err() {
@@ -426,26 +426,6 @@ fn write_private_temp(path: &Path, bytes: &[u8]) -> Result<()> {
         .with_context(|| format!("写入 Codey 配置临时文件失败：{}", path.display()))?;
     file.sync_all()
         .with_context(|| format!("同步 Codey 配置临时文件失败：{}", path.display()))
-}
-
-fn atomic_replace(temp: &Path, destination: &Path) -> std::io::Result<()> {
-    match fs::rename(temp, destination) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            #[cfg(windows)]
-            {
-                // MoveFileEx used by std::fs::rename cannot replace an open
-                // destination on some Windows versions. Keep the operation
-                // in the same directory and retry after removing the old
-                // file; Unix remains a single atomic rename.
-                if destination.exists() {
-                    fs::remove_file(destination)?;
-                    return fs::rename(temp, destination);
-                }
-            }
-            Err(error)
-        }
-    }
 }
 
 #[cfg(test)]

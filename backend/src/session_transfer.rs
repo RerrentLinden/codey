@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -15,6 +15,8 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::codex_config::ensure_global_model_provider;
+use crate::fs_util::timestamp_millis;
+use crate::sqlite_util::table_columns;
 
 const SESSION_BUNDLE_FORMAT: &str = "codey.session";
 const SESSION_BUNDLE_VERSION: u32 = 1;
@@ -145,7 +147,10 @@ pub fn start_export_transfer(home: &Path, session_id: &str) -> Result<SessionExp
             .open(&path)
             .with_context(|| format!("创建会话导出临时文件失败：{}", path.display()))?;
         let size = {
-            let mut writer = LimitedWriter::new(&mut file, SESSION_TRANSFER_MAX_BYTES);
+            let mut writer = LimitedWriter::new(
+                std::io::BufWriter::with_capacity(64 * 1024, &mut file),
+                SESSION_TRANSFER_MAX_BYTES,
+            );
             write_session_bundle(&mut writer, &source.thread, &source.rollout_path)?;
             writer
                 .flush()
@@ -413,14 +418,20 @@ fn import_session_bundle(
             .write(true)
             .open(&rollout_path)
             .with_context(|| format!("创建导入会话文件失败：{}", rollout_path.display()))?;
-        rewrite_rollout_to(
-            &mut rollout_file,
-            &bundle.rollout,
-            original_id,
-            &session_id,
-            &project.to_string_lossy(),
-            &provider_id,
-        )?;
+        {
+            let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut rollout_file);
+            rewrite_rollout_to(
+                &mut writer,
+                &bundle.rollout,
+                original_id,
+                &session_id,
+                &project.to_string_lossy(),
+                &provider_id,
+            )?;
+            writer
+                .flush()
+                .with_context(|| format!("写入导入会话文件失败：{}", rollout_path.display()))?;
+        }
         rollout_file
             .sync_all()
             .with_context(|| format!("保存导入会话文件失败：{}", rollout_path.display()))
@@ -955,20 +966,7 @@ fn has_table(db: &Connection, table: &str) -> Result<bool> {
         .unwrap_or(false))
 }
 
-fn table_columns(db: &Connection, table: &str) -> Result<Vec<String>> {
-    let mut statement = db.prepare(&format!(
-        "PRAGMA table_info(\"{}\")",
-        table.replace('"', "\"\"")
-    ))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(columns)
-}
-
-fn normalize_session_id(value: &str) -> &str {
-    value.strip_prefix("local:").unwrap_or(value).trim()
-}
+use crate::session_metadata::normalize_session_id;
 
 fn short_session_id(value: &str) -> String {
     value
@@ -1000,13 +998,6 @@ fn safe_filename(value: &str) -> String {
     } else {
         sanitized.chars().take(80).collect()
     }
-}
-
-fn timestamp_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 #[cfg(test)]

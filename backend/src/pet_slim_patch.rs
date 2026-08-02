@@ -67,14 +67,7 @@ fn read_state_file(path: &Path) -> Result<Option<Map<String, Value>>> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Codex 全局状态路径没有父目录"))?;
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("Codex 全局状态路径没有文件名"))?
-        .to_string_lossy();
-    let temp = parent.join(format!(".{file_name}.codey-{}.tmp", std::process::id()));
+    let temp = crate::fs_util::unique_temp_path(path);
     fs::write(&temp, bytes)
         .with_context(|| format!("写入 Codex 宠物精简临时状态失败：{}", temp.display()))?;
     #[cfg(unix)]
@@ -82,22 +75,8 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
     }
-    replace_file(&temp, path)
+    crate::fs_util::persist_temp_file(&temp, path)
         .with_context(|| format!("更新 Codex 宠物状态失败：{}", path.display()))
-}
-
-fn replace_file(temp: &Path, destination: &Path) -> std::io::Result<()> {
-    match fs::rename(temp, destination) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            #[cfg(windows)]
-            if destination.exists() {
-                fs::remove_file(destination)?;
-                return fs::rename(temp, destination);
-            }
-            Err(error)
-        }
-    }
 }
 
 #[cfg(test)]

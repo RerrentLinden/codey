@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::config::ExperimentalFeaturesConfig;
 
-pub const PATCH_RESULT: &str = "codey-startup-patch-installed-v19";
+const PATCH_RESULT: &str = "codey-startup-patch-installed-v19";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
@@ -675,7 +675,7 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
       if (rewritten === args) {
         return Reflect.apply(NativeSpawn, this, arguments);
       }
-      if (rewritten !== args) appServerAnalyticsPatchCount += 1;
+      appServerAnalyticsPatchCount += 1;
       return Reflect.apply(NativeSpawn, this, [command, rewritten, ...rest]);
     };
     Object.defineProperty(

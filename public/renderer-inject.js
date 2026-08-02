@@ -430,7 +430,13 @@
     else delete usage.dataset.plan;
     usage.setAttribute("aria-label", aria);
     usage.title = aria;
-    usage.innerHTML = segments.map((segment) => segment.html).join("");
+    const nextHtml = segments.map((segment) => segment.html).join("");
+    // 额度未变化时跳过重建，避免每 60 秒的轮询都触发 DOM 重排和 aria-live
+    // 重复播报。
+    if (usage.__codeyLastUsageHtml !== nextHtml) {
+      usage.__codeyLastUsageHtml = nextHtml;
+      usage.innerHTML = nextHtml;
+    }
   };
 
   const scheduleAccountUsageCheck = (delayMs = accountUsageRefreshIntervalMs) => {

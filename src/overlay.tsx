@@ -4,8 +4,7 @@ import { App } from "./App";
 import appStyles from "./styles.css?inline";
 import overlayStyles from "./overlay.css?inline";
 import { codeyApiPath } from "./api";
-
-const SETTINGS_OPENED_EVENT = "codey-settings-opened";
+import { SETTINGS_OPENED_EVENT } from "./useRuntimeStatus";
 
 type OverlayController = {
   open: () => void;

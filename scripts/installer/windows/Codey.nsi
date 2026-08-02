@@ -34,6 +34,7 @@ Section "Codey" SEC_CODEY
   SectionIn RO
   SetOutPath "$INSTDIR"
   File "/oname=Codey.exe" "${PROJECT_ROOT}\target\release\codey.exe"
+  File "${PROJECT_ROOT}\target\release\codey-fastctx.exe"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\Codey"
@@ -59,6 +60,7 @@ Section "Uninstall"
   Delete "$SMPROGRAMS\Codey\Uninstall Codey.lnk"
   RMDir "$SMPROGRAMS\Codey"
   Delete "$INSTDIR\Codey.exe"
+  Delete "$INSTDIR\codey-fastctx.exe"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
   DeleteRegKey HKCU "${UNINSTALL_KEY}"

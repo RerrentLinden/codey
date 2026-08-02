@@ -141,7 +141,7 @@ test("full-access warning shield is opt-in and persisted by Codey settings", asy
   assert.match(commandSource, /config\.hide_full_access_warning = config_input\.hide_full_access_warning/);
   assert.match(sectionsSource, /checked=\{config\.hideFullAccessWarning\}/);
   assert.match(sectionsSource, /aria-label="屏蔽完全访问安全提示"/);
-  assert.match(cdpSource, /public\/security-warning-shield\.js/);
+  assert.match(cdpSource, /dist-overlay\/inject\/security-warning-shield\.js/);
 });
 
 test("disabled shield preserves the native full-access warning", async () => {

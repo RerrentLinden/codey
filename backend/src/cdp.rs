@@ -16,18 +16,18 @@ use crate::error_log;
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const FAST_STARTUP_STATSIG_TIMEOUT_MS: u64 = 1500;
-const FAST_STARTUP_SHIELD_SCRIPT: &str = include_str!("../../public/fast-startup-shield.js");
-const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../public/codey-bridge.js");
-const MODEL_WHITELIST_INJECT_SCRIPT: &str = include_str!("../../public/model-whitelist-inject.js");
-const RENDERER_INJECT_SCRIPT: &str = include_str!("../../public/renderer-inject.js");
-const CODEY_SESSION_TOOLS_SCRIPT: &str = include_str!("../../public/codey-inject.js");
-const PET_CONTROL_SHIELD_SCRIPT: &str = include_str!("../../public/pet-control-shield.js");
-const VOICE_CONTROL_SHIELD_SCRIPT: &str = include_str!("../../public/voice-control-shield.js");
+const FAST_STARTUP_SHIELD_SCRIPT: &str = include_str!("../../dist-overlay/inject/fast-startup-shield.js");
+const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
+const MODEL_WHITELIST_INJECT_SCRIPT: &str = include_str!("../../dist-overlay/inject/model-whitelist-inject.js");
+const RENDERER_INJECT_SCRIPT: &str = include_str!("../../dist-overlay/inject/renderer-inject.js");
+const CODEY_SESSION_TOOLS_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-inject.js");
+const PET_CONTROL_SHIELD_SCRIPT: &str = include_str!("../../dist-overlay/inject/pet-control-shield.js");
+const VOICE_CONTROL_SHIELD_SCRIPT: &str = include_str!("../../dist-overlay/inject/voice-control-shield.js");
 const SECURITY_WARNING_SHIELD_SCRIPT: &str =
-    include_str!("../../public/security-warning-shield.js");
+    include_str!("../../dist-overlay/inject/security-warning-shield.js");
 const SETTINGS_OVERLAY_SCRIPT: &str = include_str!("../../dist-overlay/codey-overlay.js");
 const SETTINGS_OVERLAY_STYLES: &str = include_str!("../../dist-overlay/codey.css");
-const PLUGIN_MARKETPLACE_FIX_SCRIPT: &str = include_str!("../../public/plugin-marketplace-fix.js");
+const PLUGIN_MARKETPLACE_FIX_SCRIPT: &str = include_str!("../../dist-overlay/inject/plugin-marketplace-fix.js");
 const MAX_INJECTION_ERROR_CHARS: usize = 500;
 static SETTINGS_OVERLAY_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
 static SESSION_TOOLS_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
@@ -428,17 +428,23 @@ pub async fn retry_inject_with_scripts(
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
 ) -> Result<InjectedTarget> {
-    let mut last_error = None;
-    for _ in 0..30 {
+    // 与原 30x500ms 相同的 ~15 秒总预算，指数退避减少 Codex 尚未就绪时的
+    // 无效尝试。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut delay = Duration::from_millis(100);
+    let last_error = loop {
         match inject_with_scripts(debug_port, handler.clone(), scripts).await {
             Ok(target) => return Ok(target),
             Err(error) => {
-                last_error = Some(error);
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                if tokio::time::Instant::now() + delay > deadline {
+                    break error;
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
             }
         }
-    }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Codey CDP 注入失败")))
+    };
+    Err(last_error)
 }
 
 async fn inject_with_scripts(
@@ -1305,7 +1311,8 @@ mod tests {
         );
         let session_tools_load_script = prepared_session_tools_load_script();
         assert!(session_tools_load_script.contains("window.__codeySessionToolsInjectLoaded"));
-        assert!(session_tools_load_script.contains("hardDeletedMessageKeys"));
+        // 压缩会改写内部标识符，锚点必须用不会被改名的 window 属性。
+        assert!(session_tools_load_script.contains("__codeyDeleteSelectedMessages"));
     }
 
     #[test]

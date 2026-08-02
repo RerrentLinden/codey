@@ -2,13 +2,16 @@ use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+
+use crate::fs_util::timestamp_millis;
+use crate::sqlite_util::table_columns;
 
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const BACKUP_KEEP_COUNT: usize = 5;
@@ -119,10 +122,7 @@ pub fn cleanup(home: &Path) -> Result<SessionIndexCleanupReport> {
 /// deletion, regardless of stale catalog references that are being deleted in
 /// the same operation.
 pub fn remove_thread(home: &Path, thread_id: &str) -> Result<SessionIndexCleanupReport> {
-    let thread_id = thread_id
-        .trim()
-        .strip_prefix("local:")
-        .unwrap_or(thread_id.trim());
+    let thread_id = crate::session_metadata::normalize_session_id(thread_id);
     if !home.exists() || thread_id.is_empty() {
         return Ok(SessionIndexCleanupReport::default());
     }
@@ -336,14 +336,6 @@ fn sqlite_thread_ids(path: &Path) -> Result<HashSet<String>> {
     Ok(ids)
 }
 
-fn table_columns(db: &Connection, table: &str) -> Result<HashSet<String>> {
-    let escaped = table.replace('"', "\"\"");
-    let mut statement = db.prepare(&format!("PRAGMA table_info(\"{escaped}\")"))?;
-    Ok(statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?)
-}
-
 fn plan_cleanup_matching(
     path: &Path,
     mut should_remove: impl FnMut(&CleanupCandidate) -> bool,
@@ -479,34 +471,15 @@ fn prune_backups(home: &Path) -> Result<()> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("路径没有父目录：{}", path.display()))?;
-    let temp = parent.join(format!(
-        ".{}.codey-{}-{}.tmp",
-        path.file_name()
-            .unwrap_or_else(|| OsStr::new("session-index"))
-            .to_string_lossy(),
-        std::process::id(),
-        timestamp_millis()
-    ));
+    let temp = crate::fs_util::unique_temp_path(path);
     fs::write(&temp, bytes)?;
-    if let Ok(metadata) = fs::metadata(path) {
-        fs::set_permissions(&temp, metadata.permissions())?;
-    }
-    let replace_result = fs::rename(&temp, path);
-    if let Err(error) = replace_result {
-        #[cfg(windows)]
-        {
-            if path.exists() {
-                fs::remove_file(path)?;
-                fs::rename(&temp, path)?;
-                return Ok(());
-            }
-        }
+    if let Ok(metadata) = fs::metadata(path)
+        && let Err(error) = fs::set_permissions(&temp, metadata.permissions())
+    {
         let _ = fs::remove_file(&temp);
         return Err(error.into());
     }
+    crate::fs_util::persist_temp_file(&temp, path)?;
     Ok(())
 }
 
@@ -522,13 +495,6 @@ fn split_line_ending(segment: &str) -> (&str, &str) {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
-}
-
-fn timestamp_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 #[cfg(test)]

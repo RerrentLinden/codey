@@ -3,7 +3,7 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 
 use super::{NotificationChannelAdapter, bounded_remote_message};
-use crate::notifications::formatting::{format_duration, format_timestamp};
+use crate::notifications::formatting::{format_duration, format_timestamp, plain_text_value};
 use crate::notifications::{NotificationChannelConfig, NotificationEvent};
 
 pub(super) struct FeishuChannel<'a> {
@@ -123,21 +123,22 @@ fn feishu_body(event: &NotificationEvent) -> Result<Value> {
 }
 
 fn feishu_markdown_value(value: &str, fallback: &str) -> String {
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let value = if normalized.is_empty() {
-        fallback
-    } else {
-        normalized.as_str()
-    };
-    value
-        .replace('\\', "\\\\")
-        .replace('*', "\\*")
-        .replace('_', "\\_")
-        .replace('`', "\\`")
-        .replace('[', "\\[")
-        .replace(']', "\\]")
-        .replace('<', "＜")
-        .replace('>', "＞")
+    let normalized = plain_text_value(value, fallback);
+    let mut escaped = String::with_capacity(normalized.len());
+    for character in normalized.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '*' => escaped.push_str("\\*"),
+            '_' => escaped.push_str("\\_"),
+            '`' => escaped.push_str("\\`"),
+            '[' => escaped.push_str("\\["),
+            ']' => escaped.push_str("\\]"),
+            '<' => escaped.push('＜'),
+            '>' => escaped.push('＞'),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 fn validate_feishu_response(body: &str) -> std::result::Result<(), String> {

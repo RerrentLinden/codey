@@ -220,6 +220,7 @@
       #${toastId}[data-tone="error"] { border-color: rgba(248, 113, 113, .6); color: #fecaca; }
       [data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-title],
       [data-app-action-sidebar-project-row][data-app-action-sidebar-project-id] { position: relative; }
+      :where([data-codey-message-row]) { position: relative; }
       [data-app-action-sidebar-thread-row] [${threadUpdatedAtAttribute}] { display: block; flex: 0 0 auto; min-width: 26px; margin-inline-start: auto; color: inherit; font: 400 12px/16px system-ui, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: end; opacity: .52; pointer-events: none; white-space: nowrap; }
       [data-app-action-sidebar-thread-row]:hover [${threadUpdatedAtAttribute}],
       [data-app-action-sidebar-thread-row]:has(:focus-visible) [${threadUpdatedAtAttribute}] { opacity: 0; }
@@ -1739,7 +1740,9 @@
         event.stopPropagation();
         selectRow(row, event);
       });
-      if (getComputedStyle(row).position === "static") row.style.position = "relative";
+      // 行的定位交给零特异性的 :where 规则：默认 static 的行得到 relative，
+      // Codex 自己定位过的行不受影响；避免在安装循环里读取布局。
+      row.dataset.codeyMessageRow = "true";
       row.appendChild(button);
       messageSelectButtons?.set(row, button);
       installed = true;

@@ -1,11 +1,10 @@
-use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
@@ -14,6 +13,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::default_config_path;
+use crate::fs_util::timestamp_millis;
+use crate::sqlite_util::table_columns;
 
 const MARKER_VERSION: u32 = 1;
 const MARKER_FILE: &str = "provider-sync-marker-v1.json";
@@ -100,22 +101,9 @@ fn write_marker(path: &Path, target_provider: &str) -> Result<()> {
         target_provider: target_provider.to_string(),
         validated_at_ms: timestamp_millis(),
     };
-    let temp = parent.join(format!(
-        ".{MARKER_FILE}.{}-{}.tmp",
-        std::process::id(),
-        timestamp_millis()
-    ));
+    let temp = crate::fs_util::unique_temp_path(path);
     fs::write(&temp, serde_json::to_vec_pretty(&marker)?)?;
-    if let Err(error) = fs::rename(&temp, path) {
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(path)?;
-            fs::rename(&temp, path)?;
-            return Ok(());
-        }
-        let _ = fs::remove_file(&temp);
-        return Err(error.into());
-    }
+    crate::fs_util::persist_temp_file(&temp, path)?;
     Ok(())
 }
 
@@ -304,21 +292,6 @@ fn sqlite_providers_match(home: &Path, target_provider: &str) -> Result<bool> {
         }
     }
     Ok(true)
-}
-
-fn table_columns(db: &Connection, table: &str) -> Result<HashSet<String>> {
-    let escaped = table.replace('"', "\"\"");
-    let mut statement = db.prepare(&format!("PRAGMA table_info(\"{escaped}\")"))?;
-    Ok(statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<HashSet<_>>>()?)
-}
-
-fn timestamp_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 #[cfg(test)]

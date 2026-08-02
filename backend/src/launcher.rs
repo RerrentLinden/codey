@@ -73,7 +73,6 @@ mod app_path_selection_tests {
 pub struct MaintenanceStatus {
     pub session_status: String,
     pub session_detail: String,
-    pub session_threads: usize,
     pub session_files_fixed: usize,
     pub sqlite_rows_updated: usize,
     pub ghost_tasks_pruned: usize,
@@ -86,7 +85,6 @@ pub struct MaintenanceStatus {
 struct SessionMaintenanceSummary {
     status: String,
     detail: String,
-    threads: usize,
     files_fixed: usize,
     sqlite_rows_updated: usize,
     ghost_tasks_pruned: usize,
@@ -578,7 +576,6 @@ impl CodeyRuntime {
         let maintenance = MaintenanceStatus {
             session_status: session_maintenance.status,
             session_detail: session_maintenance.detail,
-            session_threads: session_maintenance.threads,
             session_files_fixed: session_maintenance.files_fixed,
             sqlite_rows_updated: session_maintenance.sqlite_rows_updated,
             ghost_tasks_pruned: session_maintenance.ghost_tasks_pruned,
@@ -1044,7 +1041,6 @@ fn session_maintenance_summary(
     SessionMaintenanceSummary {
         status: status.to_string(),
         detail,
-        threads: provider_sync.changed_session_files,
         files_fixed: provider_sync.changed_session_files,
         sqlite_rows_updated: provider_sync.sqlite_rows_updated,
         ghost_tasks_pruned: pruned_entries,
@@ -1110,7 +1106,6 @@ mod maintenance_status_tests {
         let status = MaintenanceStatus {
             session_status: summary.status,
             session_detail: summary.detail,
-            session_threads: summary.threads,
             session_files_fixed: summary.files_fixed,
             sqlite_rows_updated: summary.sqlite_rows_updated,
             ghost_tasks_pruned: summary.ghost_tasks_pruned,

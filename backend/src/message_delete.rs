@@ -24,10 +24,7 @@ pub fn delete_messages(
     if session_id.trim().is_empty() || message_ids.is_empty() {
         anyhow::bail!("session_id 和 message_ids 不能为空");
     }
-    let session_id = session_id
-        .strip_prefix("local:")
-        .unwrap_or(session_id)
-        .trim();
+    let session_id = crate::session_metadata::normalize_session_id(session_id);
     let mut result = MessageDeleteResult {
         deleted: 0,
         unsupported_databases: Vec::new(),
@@ -182,13 +179,9 @@ fn rewrite_in_place(destination: &Path, contents: &[u8]) -> std::io::Result<()> 
     file.sync_all()
 }
 
-fn table_columns(path: &Path, table: &str) -> Result<Vec<String>> {
+fn table_columns(path: &Path, table: &str) -> Result<std::collections::HashSet<String>> {
     let connection = Connection::open(path)?;
-    let mut statement = connection.prepare(&format!("PRAGMA table_info(\"{table}\")"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(columns)
+    Ok(crate::sqlite_util::table_columns(&connection, table)?)
 }
 
 #[derive(Debug, Clone)]
@@ -205,27 +198,15 @@ fn find_message_targets(path: &Path) -> Result<Option<Vec<MessageTarget>>> {
         if columns.is_empty() {
             continue;
         }
-        let Some(id_column) = columns
-            .iter()
-            .find(|column| matches!(column.as_str(), "id" | "message_id" | "item_id"))
-            .map(|column| match column.as_str() {
-                "message_id" => "message_id",
-                "item_id" => "item_id",
-                _ => "id",
-            })
+        let Some(id_column) = ["id", "message_id", "item_id"]
+            .into_iter()
+            .find(|candidate| columns.contains(*candidate))
         else {
             continue;
         };
-        let Some(session_column) = columns
-            .iter()
-            .find(|column| matches!(column.as_str(), "session_id" | "thread_id"))
-            .map(|column| {
-                if column == "thread_id" {
-                    "thread_id"
-                } else {
-                    "session_id"
-                }
-            })
+        let Some(session_column) = ["session_id", "thread_id"]
+            .into_iter()
+            .find(|candidate| columns.contains(*candidate))
         else {
             continue;
         };

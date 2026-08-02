@@ -89,6 +89,7 @@ jobs:
           set -euo pipefail
           APP="target/release/bundle/macos/Codey.app"
           test -x "$APP/Contents/MacOS/codey"
+          test -x "$APP/Contents/MacOS/codey-fastctx"
           test -f "$APP/Contents/Resources/Codey.icns"
           plutil -lint "$APP/Contents/Info.plist"
           if codesign --verify "$APP" >/dev/null 2>&1; then
@@ -194,6 +195,7 @@ jobs:
           $portable = "dist\windows\portable"
           New-Item -ItemType Directory -Force $portable | Out-Null
           Copy-Item "target\release\codey.exe" "$portable\Codey.exe"
+          Copy-Item "target\release\codey-fastctx.exe" "$portable\codey-fastctx.exe"
           Copy-Item "README.md" "$portable\README.md"
 
           $archive = "dist\windows\Codey-$version-windows-x64-portable.zip"

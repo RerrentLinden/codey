@@ -7,7 +7,6 @@ use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use codey_runtime_core::settings::RelayProtocol;
@@ -15,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::config::{ProviderProfile, default_config_path};
+use crate::fs_util::timestamp_millis;
 use crate::provider_lease::CODEY_PROVIDER_ID;
 
 pub const GLOBAL_PROVIDER_ID: &str = "codey_global";
@@ -149,7 +149,7 @@ pub fn codex_home() -> PathBuf {
     codey_runtime_core::relay_config::default_codex_home_dir()
 }
 
-pub fn lease_marker_path() -> PathBuf {
+fn lease_marker_path() -> PathBuf {
     default_config_path()
         .parent()
         .unwrap_or_else(|| Path::new(".codey"))
@@ -170,10 +170,7 @@ pub fn apply_runtime_provider_config(
         .parent()
         .unwrap_or_else(|| Path::new(".codey"))
         .join("codex-backups");
-    let fastctx_command = fast_context_tools
-        .then(std::env::current_exe)
-        .transpose()
-        .context("定位 Codey 内嵌 FastCtx 服务失败")?;
+    let fastctx_command = resolve_fastctx_command(fast_context_tools);
     apply_runtime_provider_config_at_mode(
         home,
         profile,
@@ -200,10 +197,7 @@ pub fn apply_runtime_provider_config_preserving_route(
         .parent()
         .unwrap_or_else(|| Path::new(".codey"))
         .join("codex-backups");
-    let fastctx_command = fast_context_tools
-        .then(std::env::current_exe)
-        .transpose()
-        .context("定位 Codey 内嵌 FastCtx 服务失败")?;
+    let fastctx_command = resolve_fastctx_command(fast_context_tools);
     apply_runtime_provider_config_at_mode(
         home,
         profile,
@@ -216,6 +210,46 @@ pub fn apply_runtime_provider_config_preserving_route(
         &backup_root,
         true,
     )
+}
+
+const FASTCTX_SERVER_BINARY: &str = if cfg!(windows) {
+    "codey-fastctx.exe"
+} else {
+    "codey-fastctx"
+};
+
+/// FastCtx 以 sidecar 程序随 Codey 一起分发，主程序因此不携带内嵌分词器
+/// 常量。启用了 FastCtx 但 sidecar 缺失时降级为本次不注册该工具：损失的是
+/// 可选增强，而中止启动会让 Codex 完全用不了；缺失会记入错误日志便于定位
+/// 打包问题。
+fn resolve_fastctx_command(fast_context_tools: bool) -> Option<PathBuf> {
+    if !fast_context_tools {
+        return None;
+    }
+    match fastctx_server_command() {
+        Ok(command) => Some(command),
+        Err(error) => {
+            eprintln!("Codey 本次未启用 FastCtx：{error:#}");
+            crate::error_log::record_failure(
+                "fastctx_sidecar_missing",
+                "resolve_fastctx_command",
+                format!("{error:#}"),
+                serde_json::json!({}),
+            );
+            None
+        }
+    }
+}
+
+fn fastctx_server_command() -> Result<PathBuf> {
+    let current = std::env::current_exe().context("定位 Codey FastCtx 服务失败")?;
+    current
+        .parent()
+        .map(|dir| dir.join(FASTCTX_SERVER_BINARY))
+        .filter(|path| path.is_file())
+        .ok_or_else(|| {
+            anyhow::anyhow!("未在 Codey 程序目录找到 FastCtx 服务程序 {FASTCTX_SERVER_BINARY}")
+        })
 }
 
 #[cfg(test)]
@@ -279,18 +313,19 @@ fn apply_runtime_provider_config_at_mode(
     };
     let original_agents_dir_exists = agents_dir.is_dir();
     create_private_dir_all(backup_root)?;
+    prune_stale_backup_dirs(backup_root, marker);
     let backup_dir = backup_root.join(format!("{}-{}", timestamp_millis(), std::process::id()));
     create_private_dir_all(&backup_dir)?;
     if let Some(bytes) = original_config.as_deref() {
         write_private_file(&backup_dir.join("config.toml"), bytes)?;
     }
 
-    let existing = String::from_utf8(original_config.clone().unwrap_or_default())
+    let existing = str::from_utf8(original_config.as_deref().unwrap_or_default())
         .context("Codex config.toml 不是 UTF-8")?;
     let updated_agents_md = if subagent_optimization {
-        let existing_agents_md = String::from_utf8(original_agents_md.clone().unwrap_or_default())
+        let existing_agents_md = str::from_utf8(original_agents_md.as_deref().unwrap_or_default())
             .context("Codex AGENTS.md 不是 UTF-8")?;
-        Some(append_subagent_guidance(&existing_agents_md))
+        Some(append_subagent_guidance(existing_agents_md))
     } else {
         None
     };
@@ -304,7 +339,7 @@ fn apply_runtime_provider_config_at_mode(
     let model_catalog_path =
         use_official_catalog.then(|| home.join(crate::model_catalog::relative_path()));
     let updated = patch_config_with_fastctx_mode(
-        &existing,
+        existing,
         profile,
         &provider_id,
         model_catalog_path.as_deref(),
@@ -511,7 +546,7 @@ fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Opt
         updated.as_bytes(),
     )?;
 
-    state.config_snapshot_dir = Some(next_snapshot_dir);
+    let previous_snapshot_dir = state.config_snapshot_dir.replace(next_snapshot_dir);
     state.original_config_exists = true;
     state.provider_id = root_key_string(&updated, "model_provider");
     state.applied_base_url = state
@@ -524,6 +559,13 @@ fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Opt
     }
     if updated.as_bytes() != current_bytes {
         atomic_write(&config_path, updated.as_bytes())?;
+    }
+    // The rolled lease now points at the new snapshot, so the superseded one
+    // is unreachable for every recovery path and can be dropped immediately.
+    if let Some(previous) = previous_snapshot_dir
+        .filter(|previous| Some(previous) != state.config_snapshot_dir.as_ref())
+    {
+        let _ = fs::remove_dir_all(previous);
     }
     Ok(Some(updated.into_bytes()))
 }
@@ -1809,27 +1851,9 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("路径没有父目录：{}", path.display()))?;
     fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(
-        ".{}.codey-tmp",
-        path.file_name().unwrap().to_string_lossy()
-    ));
+    let temp = crate::fs_util::unique_temp_path(path);
     write_private_file(&temp, bytes)?;
-    match fs::rename(&temp, path) {
-        Ok(()) => {}
-        Err(error) => {
-            #[cfg(windows)]
-            {
-                if path.exists() {
-                    fs::remove_file(path)?;
-                    fs::rename(&temp, path)?;
-                } else {
-                    return Err(error.into());
-                }
-            }
-            #[cfg(not(windows))]
-            return Err(error.into());
-        }
-    }
+    crate::fs_util::persist_temp_file(&temp, path)?;
     Ok(())
 }
 
@@ -1849,16 +1873,80 @@ fn remove_optional(path: &Path) -> Result<()> {
     }
 }
 
-fn timestamp_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
+const BACKUP_RETENTION_COUNT: usize = 5;
+
+/// Best-effort retention for the launch backup root: keeps the newest few
+/// `{timestamp}-{pid}` run directories plus any directory a live lease still
+/// references, so crash recovery always finds its snapshot while stale runs
+/// stop accumulating forever.
+fn prune_stale_backup_dirs(backup_root: &Path, marker: &Path) {
+    let protected = fs::read_to_string(marker)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<RuntimeConfigLease>(&contents).ok())
+        .map(|lease| lease.backup_dir);
+    let Ok(entries) = fs::read_dir(backup_root) else {
+        return;
+    };
+    let mut runs = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            let name = entry.file_name();
+            let (timestamp, pid) = name.to_str()?.split_once('-')?;
+            if timestamp.is_empty()
+                || pid.is_empty()
+                || !timestamp.bytes().all(|byte| byte.is_ascii_digit())
+                || !pid.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return None;
+            }
+            let path = entry.path();
+            if protected.as_deref() == Some(path.as_path()) {
+                return None;
+            }
+            Some((timestamp.parse::<u128>().ok()?, path))
+        })
+        .collect::<Vec<_>>();
+    if runs.len() <= BACKUP_RETENTION_COUNT {
+        return;
+    }
+    runs.sort_by_key(|run| std::cmp::Reverse(run.0));
+    for (_, path) in runs.drain(BACKUP_RETENTION_COUNT..) {
+        let _ = fs::remove_dir_all(&path);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_backup_dirs_are_pruned_beyond_retention() {
+        let temp = tempfile::tempdir().unwrap();
+        let backup_root = temp.path().join("codex-backups");
+        for index in 0..8_u32 {
+            fs::create_dir_all(backup_root.join(format!("{}-42", 1000 + index))).unwrap();
+        }
+        fs::create_dir_all(backup_root.join("unrelated")).unwrap();
+        let marker = temp.path().join("codex-lease.json");
+        let lease = serde_json::json!({
+            "backupDir": backup_root.join("1000-42"),
+            "originalConfigExists": true,
+        });
+        fs::write(&marker, lease.to_string()).unwrap();
+
+        prune_stale_backup_dirs(&backup_root, &marker);
+
+        assert!(backup_root.join("1000-42").is_dir(), "lease dir kept");
+        assert!(!backup_root.join("1001-42").is_dir(), "oldest pruned");
+        assert!(!backup_root.join("1002-42").is_dir(), "oldest pruned");
+        for index in 3..8_u32 {
+            assert!(backup_root.join(format!("{}-42", 1000 + index)).is_dir());
+        }
+        assert!(backup_root.join("unrelated").is_dir(), "foreign dir kept");
+    }
 
     fn official_profile() -> ProviderProfile {
         let mut profile = ProviderProfile::new("OpenAI Official");
