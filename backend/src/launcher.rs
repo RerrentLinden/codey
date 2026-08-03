@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
-use codey_runtime_core::app_paths::{build_codex_executable, resolve_codex_app_dir_with_saved};
+use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved;
 use codey_runtime_core::launcher::build_codex_command;
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
 use serde::Serialize;
@@ -1952,7 +1952,7 @@ fn macos_main_executable_is_running(
 #[cfg(target_os = "macos")]
 async fn macos_codex_is_running(app_dir: &std::path::Path) -> Result<bool> {
     // 启动前只检查 App 的主可执行文件，忽略 app-server 和 Chromium helper。
-    let executable = build_codex_executable(app_dir);
+    let executable = codey_runtime_core::app_paths::build_codex_executable(app_dir);
     let processes = crate::process_tree::unix_process_snapshot().await?;
     Ok(macos_main_executable_is_running(&processes, &executable))
 }
