@@ -1517,22 +1517,39 @@ fn enable_subagent_optimization(
 }
 
 fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()> {
-    if has_configured_fastctx_server(doc) {
+    let codey_owned_server = doc
+        .get("mcp_servers")
+        .and_then(Item::as_table)
+        .and_then(|servers| servers.get(CODEY_FASTCTX_SERVER_ID))
+        .and_then(Item::as_table)
+        .is_some_and(legacy_fastctx_server_is_codey_owned);
+    if has_configured_fastctx_server(doc) && !codey_owned_server {
         return Ok(());
     }
 
     let mcp_servers = ensure_root_table(doc, "mcp_servers")?;
-    let mut server = Table::new();
+    if !codey_owned_server {
+        mcp_servers.insert(CODEY_FASTCTX_SERVER_ID, Item::Table(Table::new()));
+    }
+    let server = mcp_servers
+        .get_mut(CODEY_FASTCTX_SERVER_ID)
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| {
+            anyhow::anyhow!("mcp_servers.{CODEY_FASTCTX_SERVER_ID} 必须是 TOML table")
+        })?;
     server["command"] = value(command.to_string_lossy().to_string());
     let mut args = Array::new();
     args.push("--codey-fastctx-mcp");
     server["args"] = Item::Value(toml_edit::Value::Array(args));
     server["startup_timeout_sec"] = value(CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS);
     server["tool_timeout_sec"] = value(120);
-    let mut env = Table::new();
+    let mut env = server
+        .get("env")
+        .and_then(Item::as_table)
+        .cloned()
+        .unwrap_or_default();
     env["FASTCTX_TOKEN_BUDGET"] = value(CODEY_FASTCTX_TOKEN_BUDGET);
     server["env"] = Item::Table(env);
-    mcp_servers[CODEY_FASTCTX_SERVER_ID] = Item::Table(server);
 
     let features = ensure_root_table(doc, "features")?;
     if features.get("code_mode").is_none() {
@@ -2401,6 +2418,58 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__fastctx"]
         let guidance = document["developer_instructions"].as_str().unwrap();
         assert_eq!(guidance, "Keep my guidance.");
         assert!(!guidance.contains(CODEY_FASTCTX_GUIDANCE));
+    }
+
+    #[test]
+    fn fast_context_tools_migrate_the_owned_main_executable_proxy_to_the_sidecar() {
+        let existing = r#"
+[mcp_servers.codey_fastctx]
+command = "/Applications/Codey.app/Contents/MacOS/codey"
+args = ["--codey-fastctx-mcp"]
+startup_timeout_sec = 15
+runtime_note = "preserve"
+
+[mcp_servers.codey_fastctx.env]
+CONCURRENT = "preserve"
+"#;
+        let result = patch_config_with_fastctx(
+            existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            Some(Path::new(
+                "/Applications/Codey.app/Contents/MacOS/codey-fastctx",
+            )),
+            false,
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+        let server = document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]
+            .as_table()
+            .unwrap();
+
+        assert_eq!(
+            server["command"].as_str(),
+            Some("/Applications/Codey.app/Contents/MacOS/codey-fastctx")
+        );
+        assert_eq!(
+            server["args"]
+                .as_array()
+                .and_then(|arguments| arguments.get(0))
+                .and_then(Value::as_str),
+            Some("--codey-fastctx-mcp")
+        );
+        assert_eq!(
+            server["startup_timeout_sec"].as_integer(),
+            Some(CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS)
+        );
+        assert_eq!(server["runtime_note"].as_str(), Some("preserve"));
+        assert_eq!(server["env"]["CONCURRENT"].as_str(), Some("preserve"));
+        assert_eq!(
+            server["env"]["FASTCTX_TOKEN_BUDGET"].as_str(),
+            Some(CODEY_FASTCTX_TOKEN_BUDGET)
+        );
     }
 
     #[test]
