@@ -61,12 +61,12 @@ function ModelSectionComponent({
             <div
               className={`header-usage-toggle${showAccountUsageInHeader ? " active" : ""}`}
             >
-              <span>在顶部展示额度</span>
+              <span>显示额度浮窗</span>
               <Switch
                 checked={showAccountUsageInHeader}
                 disabled={isBusy}
                 onCheckedChange={onShowAccountUsageInHeaderChange}
-                aria-label="在 Codex 顶部展示官方账号额度"
+                aria-label="显示官方账号额度浮窗"
               />
             </div>
           )}

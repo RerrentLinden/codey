@@ -19,12 +19,33 @@ class FakeElement {
     this.style = {};
     this.textContent = "";
     this.attributes = new Map();
+    this.listeners = new Map();
     this.visible = visible;
     this.isConnected = false;
     this.rectReads = 0;
   }
 
-  addEventListener() {}
+  addEventListener(type, handler) {
+    if (typeof handler !== "function") return;
+    const handlers = this.listeners.get(type) || [];
+    handlers.push(handler);
+    this.listeners.set(type, handlers);
+  }
+
+  removeEventListener(type, handler) {
+    const handlers = this.listeners.get(type) || [];
+    this.listeners.set(type, handlers.filter((candidate) => candidate !== handler));
+  }
+
+  dispatchEvent(event) {
+    if (!event?.type) return true;
+    if (!event.target) event.target = this;
+    event.currentTarget = this;
+    for (const handler of [...(this.listeners.get(event.type) || [])]) {
+      handler.call(this, event);
+    }
+    return true;
+  }
 
   get nextElementSibling() {
     if (!this.parentElement) return null;
@@ -176,7 +197,7 @@ test("moves the Codey button beside the visible header's trailing action region"
   assert.deepEqual(visibleHeader.children, [codeyButton, rightRegion]);
 });
 
-test("renders official account usage before the header settings action", async () => {
+test("renders official account usage as a draggable floating card", async () => {
   const visibleHeader = new FakeElement("header", { right: 1200 });
   const sessionTitle = new FakeElement("div", { right: 700, width: 240 });
   sessionTitle.textContent = "当前会话";
@@ -202,6 +223,7 @@ test("renders official account usage before the header settings action", async (
       element.children.forEach(visit);
     };
     visit(documentElement);
+    visit(document.body);
     visit(visibleHeader);
     return result;
   };
@@ -214,6 +236,22 @@ test("renders official account usage before the header settings action", async (
     querySelector: () => null,
     querySelectorAll: (selector) =>
       selector === "header" ? [visibleHeader] : [],
+  };
+  const storedItems = new Map();
+  const windowListeners = new Map();
+  const addWindowListener = (type, handler) => {
+    const handlers = windowListeners.get(type) || [];
+    handlers.push(handler);
+    windowListeners.set(type, handlers);
+  };
+  const removeWindowListener = (type, handler) => {
+    const handlers = windowListeners.get(type) || [];
+    windowListeners.set(type, handlers.filter((candidate) => candidate !== handler));
+  };
+  const dispatchWindowEvent = (event) => {
+    for (const handler of [...(windowListeners.get(event.type) || [])]) {
+      handler(event);
+    }
   };
   const todayResetAt = new Date();
   todayResetAt.setHours(23, 45, 0, 0);
@@ -238,12 +276,20 @@ test("renders official account usage before the header settings action", async (
       assert.equal(path, "/account/usage");
       return accountUsageResult;
     },
-    addEventListener() {},
+    addEventListener: addWindowListener,
     alert() {},
     clearTimeout() {},
-    dispatchEvent() {},
+    dispatchEvent: dispatchWindowEvent,
     getComputedStyle: () => ({ display: "flex", visibility: "visible" }),
+    innerHeight: 800,
     innerWidth: 1200,
+    localStorage: {
+      getItem: (key) => storedItems.get(key) || null,
+      key: () => null,
+      length: 0,
+      setItem: (key, value) => storedItems.set(key, String(value)),
+    },
+    removeEventListener: removeWindowListener,
     setTimeout: () => 1,
   };
   window.window = window;
@@ -266,11 +312,17 @@ test("renders official account usage before the header settings action", async (
   const settingsButton = findById("codey-settings-button");
   assert.ok(usage);
   assert.ok(settingsButton);
-  assert.equal(usage.parentElement, visibleHeader);
-  assert.equal(usage.nextElementSibling, settingsButton);
+  assert.equal(usage.parentElement, document.body);
+  assert.notEqual(usage.nextElementSibling, settingsButton);
+  assert.equal(usage.style.right, "24px");
+  assert.equal(usage.style.bottom, "24px");
+  assert.equal(usage.style.left, "auto");
+  assert.equal(usage.style.top, "auto");
   assert.equal(sessionTitle.parentElement, visibleHeader);
   assert.equal(visibleHeader.children[0], sessionTitle);
-  assert.equal(visibleHeader.getAttribute("data-codey-usage-host"), "true");
+  assert.equal(visibleHeader.getAttribute("data-codey-usage-host"), null);
+  assert.match(usage.innerHTML, /class="codey-usage-heading-title">官方额度/);
+  assert.match(usage.innerHTML, /class="codey-usage-list"/);
   assert.match(usage.innerHTML, /5 小时/);
   assert.match(usage.innerHTML, /85%/);
   assert.match(usage.innerHTML, /7 天/);
@@ -283,6 +335,42 @@ test("renders official account usage before the header settings action", async (
   assert.match(usage.innerHTML, /明天 \d{2}:\d{2} 刷新/);
   assert.match(usage.getAttribute("aria-label"), /当前套餐 Pro 20x/);
   assert.match(usage.getAttribute("aria-label"), /5 小时额度剩余 85%/);
+
+  usage.right = 1140;
+  usage.width = 224;
+  usage.height = 128;
+  usage.top = 600;
+  let pointerDownPrevented = false;
+  usage.dispatchEvent({
+    type: "pointerdown",
+    button: 0,
+    pointerId: 7,
+    clientX: 1030,
+    clientY: 620,
+    preventDefault: () => {
+      pointerDownPrevented = true;
+    },
+    stopPropagation() {},
+  });
+  assert.equal(pointerDownPrevented, true);
+  assert.equal(usage.getAttribute("data-dragging"), "true");
+  dispatchWindowEvent({
+    type: "pointermove",
+    pointerId: 7,
+    clientX: 860,
+    clientY: 450,
+    preventDefault() {},
+  });
+  dispatchWindowEvent({ type: "pointerup", pointerId: 7 });
+  assert.equal(usage.getAttribute("data-dragging"), null);
+  assert.equal(usage.style.left, "746px");
+  assert.equal(usage.style.top, "430px");
+  assert.equal(usage.style.right, "auto");
+  assert.equal(usage.style.bottom, "auto");
+  assert.deepEqual(
+    JSON.parse(storedItems.get("codey.accountUsage.position.v1")),
+    { left: 746, top: 430 },
+  );
 
   accountUsageResult = {
     ...accountUsageResult,
@@ -310,6 +398,22 @@ test("renders official account usage before the header settings action", async (
   await window.__codeyRefreshAccountUsage();
   assert.equal(findById("codey-account-usage"), null);
   assert.equal(visibleHeader.getAttribute("data-codey-usage-host"), null);
+
+  accountUsageResult = {
+    status: "ok",
+    planType: "plus",
+    primary: {
+      usedPercent: 20,
+      windowMinutes: 300,
+      resetsAt: Math.floor(todayResetAt.getTime() / 1000),
+    },
+  };
+  await window.__codeyRefreshAccountUsage();
+  const remountedUsage = findById("codey-account-usage");
+  assert.ok(remountedUsage);
+  assert.equal(remountedUsage.parentElement, document.body);
+  assert.equal(remountedUsage.style.left, "746px");
+  assert.equal(remountedUsage.style.top, "430px");
 });
 
 test("marks the Codey button when a silent update check finds a new version", async () => {
