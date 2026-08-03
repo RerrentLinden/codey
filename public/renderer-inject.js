@@ -116,27 +116,29 @@
       #${buttonId}::after { content: ""; position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 999px; background: #ff3b30; box-shadow: 0 0 0 2px Canvas; opacity: 0; transform: scale(.7); transition: opacity .15s ease, transform .15s ease; pointer-events: none; }
       #${buttonId}[data-codey-update-available="true"]::after { opacity: 1; transform: scale(1); }
       #${buttonId}[data-codey-header-actions="true"]::after { top: 4px; right: 4px; }
-      #${accountUsageId} { -webkit-app-region: no-drag !important; pointer-events: auto !important; position: fixed; right: ${accountUsageViewportMargin}px; bottom: ${accountUsageViewportMargin}px; z-index: 2147483640; display: flex; width: 224px; max-width: calc(100vw - ${accountUsageViewportMargin * 2}px); max-height: calc(100vh - ${accountUsageViewportMargin * 2}px); flex-direction: column; gap: 8px; overflow: hidden; border: 1px solid color-mix(in srgb, CanvasText 12%, transparent); border-radius: 8px; padding: 10px; background: color-mix(in srgb, Canvas 88%, transparent); box-shadow: 0 10px 28px color-mix(in srgb, CanvasText 14%, transparent), 0 2px 8px color-mix(in srgb, CanvasText 10%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 74%, transparent); color: CanvasText; cursor: grab; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; font-size: 11px; line-height: 1.15; opacity: .96; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); touch-action: none; user-select: none; }
-      #${accountUsageId}[data-state="stale"] { opacity: .72; }
-      #${accountUsageId}[data-state="error"] { width: auto; min-width: 132px; align-items: center; justify-content: center; padding: 10px 12px; color: color-mix(in srgb, CanvasText 66%, transparent); }
-      #${accountUsageId}[data-dragging="true"] { cursor: grabbing; opacity: .9; }
-      #${accountUsageId} .codey-usage-heading { display: flex; min-width: 0; align-items: center; gap: 8px; padding-bottom: 1px; }
+      #${accountUsageId} { -webkit-app-region: no-drag !important; pointer-events: auto !important; position: fixed; right: ${accountUsageViewportMargin}px; bottom: ${accountUsageViewportMargin}px; z-index: 2147483640; display: flex; width: 176px; max-width: calc(100vw - ${accountUsageViewportMargin * 2}px); max-height: calc(100vh - ${accountUsageViewportMargin * 2}px); flex-direction: column; gap: 6px; overflow: hidden; border: 1px solid color-mix(in srgb, CanvasText 9%, transparent); border-radius: 8px; padding: 8px; background: color-mix(in srgb, Canvas 58%, transparent); box-shadow: 0 7px 20px color-mix(in srgb, CanvasText 9%, transparent), 0 1px 5px color-mix(in srgb, CanvasText 7%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 44%, transparent); color: CanvasText; cursor: grab; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; font-size: 11px; line-height: 1.12; opacity: .66; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); touch-action: none; transition: background .16s ease, border-color .16s ease, box-shadow .16s ease, opacity .16s ease; user-select: none; }
+      #${accountUsageId}:hover { border-color: color-mix(in srgb, CanvasText 13%, transparent); background: color-mix(in srgb, Canvas 93%, transparent); box-shadow: 0 10px 28px color-mix(in srgb, CanvasText 14%, transparent), 0 2px 8px color-mix(in srgb, CanvasText 10%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 74%, transparent); opacity: .98; }
+      #${accountUsageId}[data-state="stale"] { opacity: .5; }
+      #${accountUsageId}[data-state="stale"]:hover { opacity: .86; }
+      #${accountUsageId}[data-state="error"] { width: auto; min-width: 118px; align-items: center; justify-content: center; padding: 8px 10px; color: color-mix(in srgb, CanvasText 66%, transparent); }
+      #${accountUsageId}[data-dragging="true"] { cursor: grabbing; opacity: .92; }
+      #${accountUsageId} .codey-usage-heading { display: flex; min-width: 0; align-items: center; gap: 6px; padding-bottom: 1px; }
       #${accountUsageId} .codey-usage-heading-title { min-width: 0; overflow: hidden; margin-inline-end: auto; color: color-mix(in srgb, CanvasText 68%, transparent); font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-heading::before { content: ""; flex: 0 0 auto; width: 14px; height: 8px; border-block: 2px dotted color-mix(in srgb, CanvasText 22%, transparent); }
-      #${accountUsageId} .codey-usage-list { display: flex; min-width: 0; flex-direction: column; gap: 7px; overflow: auto; }
-      #${accountUsageId} .codey-usage-segment { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto; align-content: center; column-gap: 10px; border-radius: 7px; padding: 7px 8px 6px; background: color-mix(in srgb, CanvasText 4%, transparent); }
+      #${accountUsageId} .codey-usage-heading::before { content: ""; flex: 0 0 auto; width: 12px; height: 7px; border-block: 2px dotted color-mix(in srgb, CanvasText 22%, transparent); }
+      #${accountUsageId} .codey-usage-list { display: flex; min-width: 0; flex-direction: column; gap: 5px; overflow: auto; }
+      #${accountUsageId} .codey-usage-segment { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto; align-content: center; column-gap: 8px; border-radius: 6px; padding: 6px 7px 5px; background: color-mix(in srgb, CanvasText 4%, transparent); }
       #${accountUsageId} .codey-usage-window { display: flex; min-width: 0; align-items: center; gap: 4px; overflow: hidden; color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 10px; font-weight: 600; white-space: nowrap; }
       #${accountUsageId} .codey-usage-window-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-      #${accountUsageId} .codey-usage-plan { flex: 0 0 auto; border: 1px solid color-mix(in srgb, #0a84ff 24%, transparent); border-radius: 4px; padding: 1px 4px; background: color-mix(in srgb, #0a84ff 9%, transparent); color: color-mix(in srgb, #0a84ff 78%, CanvasText); font-size: 8px; font-weight: 700; letter-spacing: .01em; line-height: 1.15; }
+      #${accountUsageId} .codey-usage-plan { flex: 0 0 auto; border: 1px solid color-mix(in srgb, #0a84ff 24%, transparent); border-radius: 4px; padding: 1px 4px; background: color-mix(in srgb, #0a84ff 9%, transparent); color: color-mix(in srgb, #0a84ff 78%, CanvasText); font-size: 9px; font-weight: 700; letter-spacing: .01em; line-height: 1.15; }
       #${accountUsageId} .codey-usage-value { font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 700; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-meter { grid-column: 1 / -1; height: 3px; margin-top: 6px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, CanvasText 10%, transparent); }
+      #${accountUsageId} .codey-usage-meter { grid-column: 1 / -1; height: 2px; margin-top: 5px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, CanvasText 10%, transparent); }
       #${accountUsageId} .codey-usage-meter > span { display: block; width: 100%; height: 100%; border-radius: inherit; background: #0a84ff; transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; }
-      #${accountUsageId} .codey-usage-reset { grid-column: 1 / -1; overflow: hidden; margin-top: 5px; color: color-mix(in srgb, CanvasText 48%, transparent); font-size: 9px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-reset { grid-column: 1 / -1; overflow: hidden; margin-top: 4px; color: color-mix(in srgb, CanvasText 48%, transparent); font-size: 9px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
       #${accountUsageId} .codey-usage-segment[data-tone="healthy"] .codey-usage-meter > span { background: #30d158; }
       #${accountUsageId} .codey-usage-segment[data-tone="warning"] .codey-usage-meter > span { background: #ffd60a; }
       #${accountUsageId} .codey-usage-segment[data-tone="critical"] .codey-usage-meter > span { background: #ff453a; }
       @media (max-width: 860px) {
-        #${accountUsageId} { right: 16px; bottom: 16px; width: 204px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); }
+        #${accountUsageId} { right: 16px; bottom: 16px; width: 164px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); }
       }
       @media (prefers-reduced-motion: reduce) {
         #${accountUsageId}, #${accountUsageId} * { transition: none !important; }
@@ -390,7 +392,7 @@
     const next = constrainAccountUsagePosition(
       stored.left,
       stored.top,
-      Number(rect.width) || 224,
+      Number(rect.width) || 176,
       Number(rect.height) || 120,
     );
     usage.style.left = `${next.left}px`;
@@ -455,7 +457,7 @@
       startY: Number(event.clientY) || 0,
       startLeft: start.left,
       startTop: start.top,
-      width: Number(rect.width) || 224,
+      width: Number(rect.width) || 176,
       height: Number(rect.height) || 120,
       latest: start,
     };

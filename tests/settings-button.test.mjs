@@ -337,7 +337,7 @@ test("renders official account usage as a draggable floating card", async () => 
   assert.match(usage.getAttribute("aria-label"), /5 小时额度剩余 85%/);
 
   usage.right = 1140;
-  usage.width = 224;
+  usage.width = 176;
   usage.height = 128;
   usage.top = 600;
   let pointerDownPrevented = false;
@@ -363,13 +363,13 @@ test("renders official account usage as a draggable floating card", async () => 
   });
   dispatchWindowEvent({ type: "pointerup", pointerId: 7 });
   assert.equal(usage.getAttribute("data-dragging"), null);
-  assert.equal(usage.style.left, "746px");
+  assert.equal(usage.style.left, "794px");
   assert.equal(usage.style.top, "430px");
   assert.equal(usage.style.right, "auto");
   assert.equal(usage.style.bottom, "auto");
   assert.deepEqual(
     JSON.parse(storedItems.get("codey.accountUsage.position.v1")),
-    { left: 746, top: 430 },
+    { left: 794, top: 430 },
   );
 
   accountUsageResult = {
@@ -412,7 +412,7 @@ test("renders official account usage as a draggable floating card", async () => 
   const remountedUsage = findById("codey-account-usage");
   assert.ok(remountedUsage);
   assert.equal(remountedUsage.parentElement, document.body);
-  assert.equal(remountedUsage.style.left, "746px");
+  assert.equal(remountedUsage.style.left, "794px");
   assert.equal(remountedUsage.style.top, "430px");
 });
 
