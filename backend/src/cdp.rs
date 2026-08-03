@@ -892,20 +892,25 @@ fn official_experimental_features_script() -> &'static str {
   if (!gates || typeof gates !== "object") {
     throw new Error("Codex Statsig 官方功能门数据不可用");
   }
-  const readGate = (id) => {
+  const runtimeSnapshot = globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__;
+  const fallbackFeatures =
+    runtimeSnapshot?.officialFeatures ?? runtimeSnapshot?.configuredFeatures ?? {};
+  const readGate = (id, configKey) => {
     const value = gates[id]?.value;
-    return typeof value === "boolean" ? value : false;
+    if (typeof value === "boolean") return value;
+    const fallback = fallbackFeatures[configKey];
+    return typeof fallback === "boolean" ? fallback : false;
   };
   const result = {
-    unifiedExec: readGate("1786883712"),
-    shellSnapshot: readGate("1615536597"),
-    responsesWebsocketsV2: readGate("2734851136"),
-    toolSearchAlwaysDeferMcpTools: readGate("2701734443"),
-    standaloneWebSearch: readGate("3701003275"),
-    enableRequestCompression: readGate("30039772"),
-    remoteCompactionV2: readGate("321109023"),
-    applyPatchStreamingEvents: readGate("358284800"),
-    concurrentReasoningSummaries: readGate("2508143457"),
+    unifiedExec: readGate("1786883712", "unifiedExec"),
+    shellSnapshot: readGate("1615536597", "shellSnapshot"),
+    responsesWebsocketsV2: readGate("2734851136", "responsesWebsocketsV2"),
+    toolSearchAlwaysDeferMcpTools: readGate("2701734443", "toolSearchAlwaysDeferMcpTools"),
+    standaloneWebSearch: readGate("3701003275", "standaloneWebSearch"),
+    enableRequestCompression: readGate("30039772", "enableRequestCompression"),
+    remoteCompactionV2: readGate("321109023", "remoteCompactionV2"),
+    applyPatchStreamingEvents: readGate("358284800", "applyPatchStreamingEvents"),
+    concurrentReasoningSummaries: readGate("2508143457", "concurrentReasoningSummaries"),
   };
   const configs = values.dynamic_configs ?? values.dynamicConfigs ?? {};
   const layers = values.layer_configs ?? values.layerConfigs ?? {};
@@ -916,6 +921,11 @@ fn official_experimental_features_script() -> &'static str {
     shell_snapshot: "shellSnapshot",
     responses_websockets_v2: "responsesWebsocketsV2",
     tool_search_always_defer_mcp_tools: "toolSearchAlwaysDeferMcpTools",
+    standalone_web_search: "standaloneWebSearch",
+    enable_request_compression: "enableRequestCompression",
+    remote_compaction_v2: "remoteCompactionV2",
+    apply_patch_streaming_events: "applyPatchStreamingEvents",
+    concurrent_reasoning_summaries: "concurrentReasoningSummaries",
   };
   if (layerOverrides && typeof layerOverrides === "object") {
     for (const [rawKey, value] of Object.entries(layerOverrides)) {
@@ -1367,11 +1377,13 @@ mod tests {
     fn official_feature_sync_reads_gates_then_applies_the_feature_override_layer() {
         let script = official_experimental_features_script();
 
-        assert!(script.contains(r#"readGate("1786883712")"#));
-        assert!(script.contains("typeof value === \"boolean\" ? value : false"));
+        assert!(script.contains(r#"readGate("1786883712", "unifiedExec")"#));
+        assert!(script.contains("runtimeSnapshot?.officialFeatures"));
+        assert!(script.contains("typeof fallback === \"boolean\" ? fallback : false"));
         assert!(script.contains(r#""30039772""#));
         assert!(script.contains(r#"configs["3902942138"] ?? layers["3902942138"]"#));
         assert!(script.contains("feature_overrides"));
+        assert!(script.contains(r#"remote_compaction_v2: "remoteCompactionV2""#));
         assert!(script.contains("result[configKey] = value"));
     }
 

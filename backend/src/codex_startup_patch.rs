@@ -4,7 +4,7 @@ use anyhow::Result;
 
 use crate::config::ExperimentalFeaturesConfig;
 
-const PATCH_RESULT: &str = "codey-startup-patch-installed-v19";
+const PATCH_RESULT: &str = "codey-startup-patch-installed-v20";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
@@ -488,7 +488,7 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
         patched,
         /(\b([$A-Z_a-z][$\w]*)\s*=\s*\{\.\.\.[$A-Z_a-z][$\w]*,\.\.\.[$A-Z_a-z][$\w]*,\[[$A-Z_a-z][$\w]*\]:[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*,`2380644311`\)\}\s*;\s*)return/g,
         (_match, assignment, resultName) =>
-          `${assignment}${resultName}={...${resultName},...${JSON.stringify(experimentalFeatureOverrides)}};globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__={status:"effective",updatedAt:Date.now(),configuredFeatures:${JSON.stringify(codeyExperimentalFeatureConfigured)},effectiveFeatures:((values)=>{const map=${codeyExperimentalFeatureKeyMapLiteral},result={};for(const flag of Object.keys(map)){const value=values?.[flag];if(typeof value==="boolean")result[map[flag]]=value}return result})(${resultName})};return`,
+          `${assignment}const codeyOfficialFeatures=((values)=>{const map=${codeyExperimentalFeatureKeyMapLiteral},result={};for(const flag of Object.keys(map)){const value=values?.[flag];if(typeof value==="boolean")result[map[flag]]=value}return result})(${resultName});${resultName}={...${resultName},...${JSON.stringify(experimentalFeatureOverrides)}};globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__={status:"effective",updatedAt:Date.now(),configuredFeatures:${JSON.stringify(codeyExperimentalFeatureConfigured)},officialFeatures:codeyOfficialFeatures,effectiveFeatures:((values)=>{const map=${codeyExperimentalFeatureKeyMapLiteral},result={};for(const flag of Object.keys(map)){const value=values?.[flag];if(typeof value==="boolean")result[map[flag]]=value}return result})(${resultName})};return`,
         "experimental feature overrides",
       );
     }
@@ -1626,7 +1626,7 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
   setImmediate(() => {
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v19";
+  return "codey-startup-patch-installed-v20";
 })()
 "#;
 
@@ -1873,7 +1873,7 @@ mod tests {
 
     #[test]
     fn patch_result_is_stable_for_launch_status_validation() {
-        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v19");
+        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v20");
     }
 
     #[test]

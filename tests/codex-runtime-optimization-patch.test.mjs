@@ -36,7 +36,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
 
   try {
     const expression = await loadPatchExpression();
-    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v19");
+    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v20");
 
     const directArgs = [
       "-c",

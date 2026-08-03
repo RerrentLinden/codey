@@ -62,7 +62,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
           remote_compaction_v2: false,
         }),
       ),
-      "codey-startup-patch-installed-v19",
+      "codey-startup-patch-installed-v20",
     );
     const electron = Module._load("electron", undefined, false);
     const upstreamHandler = async () =>
@@ -281,6 +281,15 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       {
         unifiedExec: true,
         remoteCompactionV2: false,
+      },
+    );
+    assert.deepEqual(
+      globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__.officialFeatures,
+      {
+        unifiedExec: false,
+        remoteCompactionV2: true,
+        shellSnapshot: true,
+        concurrentReasoningSummaries: true,
       },
     );
     assert.deepEqual(

@@ -91,7 +91,7 @@ test("user feature settings persist, require restart, and override official valu
     /\.\.\.\$\{JSON\.stringify\(experimentalFeatureOverrides\)\}/,
   );
   assert.match(patch, /__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__/);
-  assert.match(patch, /codey-startup-patch-installed-v19/);
+  assert.match(patch, /codey-startup-patch-installed-v20/);
 });
 
 test("official synchronization reads raw Statsig gates and applies the official layer", async () => {
@@ -175,6 +175,43 @@ test("official synchronization treats removed Statsig gates as disabled", async 
     standaloneWebSearch: false,
     enableRequestCompression: false,
     remoteCompactionV2: false,
+    applyPatchStreamingEvents: false,
+    concurrentReasoningSummaries: false,
+  });
+});
+
+test("official synchronization preserves native values when Statsig gates are retired", async () => {
+  const { cdp } = await sources();
+  const script = cdp.match(
+    /fn official_experimental_features_script\(\) -> &'static str \{\n\s+r#\"([\s\S]*?)\"#\n\}/,
+  )?.[1];
+  assert.ok(script);
+
+  const payload = Function(
+    "globalThis",
+    `return ${script}`,
+  )({
+    __STATSIG__: {
+      firstInstance: {
+        _store: { _valuesForExternalUse: { feature_gates: {} } },
+      },
+    },
+    __CODEY_EXPERIMENTAL_FEATURE_RUNTIME__: {
+      officialFeatures: {
+        remoteCompactionV2: true,
+        enableRequestCompression: true,
+      },
+    },
+  });
+
+  assert.deepEqual(JSON.parse(payload), {
+    unifiedExec: false,
+    shellSnapshot: false,
+    responsesWebsocketsV2: false,
+    toolSearchAlwaysDeferMcpTools: false,
+    standaloneWebSearch: false,
+    enableRequestCompression: true,
+    remoteCompactionV2: true,
     applyPatchStreamingEvents: false,
     concurrentReasoningSummaries: false,
   });

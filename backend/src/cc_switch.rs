@@ -26,6 +26,7 @@ pub struct CurrentProvider {
     pub id: String,
     pub name: String,
     pub official: bool,
+    pub supports_remote_compaction: bool,
     pub base_url: String,
     pub protocol: RelayProtocol,
     pub source: String,
@@ -62,6 +63,7 @@ struct ProviderConnection {
     api_key: String,
     protocol: RelayProtocol,
     official: bool,
+    supports_remote_compaction: bool,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -242,6 +244,7 @@ fn sync_current_provider_from_paths(
             id: record.id.clone(),
             name: record.name.clone(),
             official: connection.official,
+            supports_remote_compaction: connection.supports_remote_compaction,
             base_url: connection.base_url.clone(),
             protocol: connection.protocol,
             source: "cc-switch".to_string(),
@@ -291,6 +294,7 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
                 .unwrap_or_else(|| profile.id.clone()),
             name: profile.name.clone(),
             official: profile.cc_switch_read_only,
+            supports_remote_compaction: profile.supports_remote_compaction,
             base_url: profile.base_url.clone(),
             protocol: profile.protocol,
             source: if available { "cc-switch" } else { "local" }.to_string(),
@@ -299,6 +303,7 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
             id: LOCAL_OFFICIAL_PROVIDER_ID.to_string(),
             name: "OpenAI 官方直登".to_string(),
             official: true,
+            supports_remote_compaction: true,
             base_url: String::new(),
             protocol: RelayProtocol::Responses,
             source: "local".to_string(),
@@ -325,6 +330,7 @@ fn profile_from_provider(
         protocol: provider.protocol,
         cc_switch_provider_id: cc_switch_managed.then(|| provider.id.clone()),
         cc_switch_read_only: provider.official,
+        supports_remote_compaction: provider.supports_remote_compaction,
     }
 }
 
@@ -381,6 +387,11 @@ fn provider_connection(record: &ProviderRecord) -> Result<ProviderConnection> {
         .and_then(|table| table.get("wire_api"))
         .and_then(Item::as_str)
         .unwrap_or("responses");
+    let provider_name = provider_table
+        .and_then(|table| table.get("name"))
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
     let auth = settings.get("auth").and_then(Value::as_object);
     let auth_api_key = auth
         .and_then(|auth| auth.get("OPENAI_API_KEY"))
@@ -413,6 +424,7 @@ fn provider_connection(record: &ProviderRecord) -> Result<ProviderConnection> {
         api_key: if official { String::new() } else { api_key },
         protocol: protocol_from_wire_api(wire_api),
         official,
+        supports_remote_compaction: official || provider_name == "OpenAI",
     })
 }
 
@@ -493,6 +505,7 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
             name.to_string()
         },
         official,
+        supports_remote_compaction: official || name == "OpenAI",
         base_url,
         protocol: protocol_from_wire_api(wire_api),
         source: "local".to_string(),
@@ -712,6 +725,57 @@ experimental_bearer_token = "sk-relay"
         assert!(patched.contains("experimental_bearer_token = \"sk-relay\""));
         assert!(!patched.contains("base_url = \"https://chatgpt.com/backend-api/codex\""));
         assert_eq!(fs::read(home.join("auth.json")).unwrap(), auth);
+    }
+
+    #[test]
+    fn remote_compaction_identity_survives_cc_switch_import_and_runtime_patch() {
+        let (_directory, path, home) = fixture();
+        let settings = json!({
+            "auth": {"OPENAI_API_KEY": "sk-relay"},
+            "config": r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "OpenAI"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+requires_openai_auth = true
+"#
+        });
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO providers
+                 (id, app_type, name, settings_config, sort_index, is_current)
+                 VALUES ('remote-compact', 'codex', '远程压缩线路', ?1, 0, 1)",
+                [settings.to_string()],
+            )
+            .unwrap();
+
+        let (synced, status) =
+            sync_current_provider_from_paths(&CodeyConfig::default(), &path, &home).unwrap();
+
+        assert!(!status.provider.official);
+        assert!(status.provider.supports_remote_compaction);
+        assert!(synced.profiles[0].supports_remote_compaction);
+
+        let patched = crate::codex_config::patch_config(
+            "model_provider = \"custom\"\n",
+            &synced.profiles[0],
+            "custom",
+            false,
+        )
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+        assert_eq!(
+            patched["model_providers"]["custom"]["name"].as_str(),
+            Some("OpenAI")
+        );
+        assert_eq!(
+            patched["model_providers"]["custom"]["base_url"].as_str(),
+            Some("https://relay.example/v1")
+        );
     }
 
     #[test]

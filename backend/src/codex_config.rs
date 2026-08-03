@@ -1736,7 +1736,11 @@ fn direct_provider_table(
     }
     let preserves_manual_settings = existing_local_provider.is_some();
     let mut provider = existing_local_provider.unwrap_or_default();
-    provider["name"] = value(profile.name.trim());
+    provider["name"] = value(if profile.supports_remote_compaction {
+        OPENAI_PROVIDER_NAME
+    } else {
+        profile.name.trim()
+    });
     provider["base_url"] = value(base_url);
     provider["wire_api"] = value("responses");
     if !preserves_manual_settings {
