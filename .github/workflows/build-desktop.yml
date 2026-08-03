@@ -197,6 +197,8 @@ jobs:
           }
           $version = $version -replace '[\\/]', '-'
 
+          New-Item -ItemType Directory -Force "dist\windows" | Out-Null
+
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) {
             $makensis = "makensis"

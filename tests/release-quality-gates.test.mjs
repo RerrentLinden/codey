@@ -92,8 +92,21 @@ test("desktop packages include FastCtx license and notice files", () => {
 });
 
 test("Windows release publishes the installer without a portable zip", () => {
+  const windowsPackageStep = workflow.slice(
+    workflow.indexOf("      - name: Build Windows packages"),
+    workflow.indexOf("      - name: Upload Windows installer"),
+  );
+
   assert.match(workflow, /name: codey-windows-x64-installer/);
   assert.match(workflow, /windows-x64-setup\.exe/);
+  assert.match(
+    windowsPackageStep,
+    /New-Item -ItemType Directory -Force "dist\\windows" \| Out-Null/,
+  );
+  assert.ok(
+    windowsPackageStep.indexOf('New-Item -ItemType Directory -Force "dist\\windows"') <
+      windowsPackageStep.indexOf("& $makensis"),
+  );
   assert.doesNotMatch(workflow, /windows-x64-portable\.zip/);
   assert.doesNotMatch(workflow, /codey-windows-x64-portable/);
 });
