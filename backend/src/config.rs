@@ -186,7 +186,7 @@ pub struct CodeyConfig {
     pub hide_full_access_warning: bool,
     /// Shows the current ChatGPT account rate-limit windows in the Codex
     /// header. The renderer only activates this for an official login route.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub show_account_usage_in_header: bool,
     /// Codey-owned Codex feature overrides. These values remain stable until
     /// the user edits them or explicitly synchronizes the current official
@@ -227,7 +227,7 @@ impl Default for CodeyConfig {
             subagent_model: default_subagent_model(),
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
             hide_full_access_warning: false,
-            show_account_usage_in_header: false,
+            show_account_usage_in_header: true,
             experimental_features: ExperimentalFeaturesConfig::default(),
             update_manifest_url: default_update_manifest_url(),
         }
@@ -757,12 +757,12 @@ mod tests {
     }
 
     #[test]
-    fn header_account_usage_defaults_to_disabled_for_existing_configs() {
+    fn header_account_usage_defaults_to_enabled_for_supported_configs() {
         let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
             .unwrap()
             .normalize();
 
-        assert!(!config.show_account_usage_in_header);
+        assert!(config.show_account_usage_in_header);
     }
 
     #[test]
