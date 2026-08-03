@@ -680,7 +680,8 @@ test("restarting Codex stops the current runtime and relaunches it with Codey", 
     launcherSource,
     /stop_macos_codex\([\s\S]*?inspector_argument,[\s\S]*?&self\.codex_app_path,[\s\S]*?self\.process_id,[\s\S]*?self\.process_group_id/,
   );
-  assert.match(launcherSource, /macos_codex_process_ids\(app_dir\)/);
+  assert.match(launcherSource, /macos_codex_is_running\(app_dir\)\.await\?/);
+  assert.match(launcherSource, /build_codex_executable\(app_dir\)/);
   assert.match(launcherSource, /owned_unix_codex_process_ids/);
   assert.match(launcherSource, /libc::SIGKILL/);
   assert.doesNotMatch(runtimeSource, /"close_codex"/);
