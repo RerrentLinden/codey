@@ -41,6 +41,14 @@ function assertRustQualityGates(job) {
   );
 }
 
+function workflowStep(from, to) {
+  const fromIndex = workflow.indexOf(from);
+  assert.notEqual(fromIndex, -1);
+  const toIndex = workflow.indexOf(to, fromIndex);
+  assert.notEqual(toIndex, -1);
+  return workflow.slice(fromIndex, toIndex);
+}
+
 test("every desktop release build enforces the Rust quality gates", () => {
   assert.match(workflow, /^\s*RUSTFLAGS: -D warnings$/m);
   const jobs = [
@@ -92,13 +100,21 @@ test("desktop packages include FastCtx license and notice files", () => {
 });
 
 test("Windows release publishes the installer without a portable zip", () => {
-  const windowsPackageStep = workflow.slice(
-    workflow.indexOf("      - name: Build Windows packages"),
-    workflow.indexOf("      - name: Upload Windows installer"),
+  const nsisInstallStep = workflowStep(
+    "- name: Install NSIS",
+    "- name: Install frontend dependencies",
+  );
+  const windowsPackageStep = workflowStep(
+    "- name: Build Windows packages",
+    "- name: Upload Windows installer",
   );
 
   assert.match(workflow, /name: codey-windows-x64-installer/);
   assert.match(workflow, /windows-x64-setup\.exe/);
+  assert.match(nsisInstallStep, /choco install nsis --yes --no-progress/);
+  assert.match(nsisInstallStep, /NSIS\\Bin\\makensis\.exe/);
+  assert.match(nsisInstallStep, /GITHUB_PATH/);
+  assert.match(nsisInstallStep, /MAKENSIS=/);
   assert.match(
     windowsPackageStep,
     /New-Item -ItemType Directory -Force "dist\\windows" \| Out-Null/,
@@ -107,6 +123,12 @@ test("Windows release publishes the installer without a portable zip", () => {
     windowsPackageStep.indexOf('New-Item -ItemType Directory -Force "dist\\windows"') <
       windowsPackageStep.indexOf("& $makensis"),
   );
+  assert.match(windowsPackageStep, /\$makensis = \$env:MAKENSIS/);
+  assert.match(
+    windowsPackageStep,
+    /Get-Command makensis -ErrorAction SilentlyContinue/,
+  );
+  assert.doesNotMatch(windowsPackageStep, /\$makensis = "makensis"/);
   assert.doesNotMatch(workflow, /windows-x64-portable\.zip/);
   assert.doesNotMatch(workflow, /codey-windows-x64-portable/);
 });

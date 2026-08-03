@@ -154,7 +154,25 @@ jobs:
 
       - name: Install NSIS
         shell: pwsh
-        run: choco install nsis --yes --no-progress
+        run: |
+          choco install nsis --yes --no-progress
+          $makensis = @(
+            "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+            "${env:ProgramFiles}\NSIS\makensis.exe",
+            "${env:ProgramFiles(x86)}\NSIS\Bin\makensis.exe",
+            "${env:ProgramFiles}\NSIS\Bin\makensis.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $makensis) {
+            $command = Get-Command makensis -ErrorAction SilentlyContinue
+            if ($command) {
+              $makensis = $command.Source
+            }
+          }
+          if (-not $makensis) {
+            throw "makensis.exe was not found after installing NSIS"
+          }
+          Split-Path $makensis | Out-File -FilePath $env:GITHUB_PATH -Append
+          "MAKENSIS=$makensis" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
@@ -199,9 +217,23 @@ jobs:
 
           New-Item -ItemType Directory -Force "dist\windows" | Out-Null
 
-          $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
-          if (-not (Test-Path $makensis)) {
-            $makensis = "makensis"
+          $makensis = $env:MAKENSIS
+          if (-not $makensis -or -not (Test-Path $makensis)) {
+            $makensis = @(
+              "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
+              "${env:ProgramFiles}\NSIS\makensis.exe",
+              "${env:ProgramFiles(x86)}\NSIS\Bin\makensis.exe",
+              "${env:ProgramFiles}\NSIS\Bin\makensis.exe"
+            ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $makensis) {
+            $command = Get-Command makensis -ErrorAction SilentlyContinue
+            if ($command) {
+              $makensis = $command.Source
+            }
+          }
+          if (-not $makensis) {
+            throw "makensis.exe was not found. The NSIS install step must expose it before packaging."
           }
           $installerScript = (Resolve-Path "scripts\installer\windows\Codey.nsi").Path
           & $makensis "/INPUTCHARSET" "UTF8" "/DVERSION=$version" "/DPROJECT_ROOT=$env:GITHUB_WORKSPACE" $installerScript
