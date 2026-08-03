@@ -31,7 +31,7 @@ test("Codey keeps FastCtx in the dedicated sidecar", async () => {
     readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
   ]);
 
-  assert.match(manifest, /fastctx = \{ git = "https:\/\/github\.com\/yc-duan\/fastctx", rev = "8056641e3969bc10ffc4871b5fa01ca8a91544e4", default-features = false \}/);
+  assert.match(manifest, /fastctx = \{ git = "https:\/\/github\.com\/yc-duan\/fastctx", rev = "86dac0c99efae7859ed2be468f68c16e58f5e16a", default-features = false \}/);
   assert.match(manifest, /name = "codey-fastctx"/);
   assert.match(sidecarSource, /fastctx::cli::run_server/);
   // 主程序既不链接 FastCtx，也不再充当启动 sidecar 的兼容代理。

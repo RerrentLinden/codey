@@ -10,6 +10,14 @@ const ciWorkflow = fs.readFileSync(
   new URL("../.github/workflows/ci.yml", import.meta.url),
   "utf8",
 );
+const macBuildScript = fs.readFileSync(
+  new URL("../scripts/build.mjs", import.meta.url),
+  "utf8",
+);
+const windowsInstallerScript = fs.readFileSync(
+  new URL("../scripts/installer/windows/Codey.nsi", import.meta.url),
+  "utf8",
+);
 
 function assertRustQualityGates(job) {
   assert.match(job, /components: rustfmt, clippy/);
@@ -64,4 +72,23 @@ test("pull requests enforce Rust quality gates for both workspaces", () => {
     windowsJob,
     /cargo clippy --manifest-path vendor\/CodeyRuntime\/Cargo\.toml --workspace --all-targets --locked -- -D warnings/,
   );
+});
+
+test("desktop packages include FastCtx license and notice files", () => {
+  for (const expected of [
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "licenses/FastCtx/LICENSE-APACHE",
+    "licenses/FastCtx/NOTICE",
+  ]) {
+    assert.match(macBuildScript, new RegExp(expected.replaceAll("/", "\\/")));
+  }
+
+  assert.match(workflow, /Contents\/Resources\/licenses\/FastCtx\/LICENSE-APACHE/);
+  assert.match(workflow, /Contents\/Resources\/licenses\/FastCtx\/NOTICE/);
+  assert.match(workflow, /Copy-Item "licenses\\FastCtx\\LICENSE-APACHE"/);
+  assert.match(workflow, /Copy-Item "licenses\\FastCtx\\NOTICE"/);
+  assert.match(windowsInstallerScript, /licenses\\FastCtx\\LICENSE-APACHE/);
+  assert.match(windowsInstallerScript, /licenses\\FastCtx\\NOTICE/);
 });

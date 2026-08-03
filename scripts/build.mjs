@@ -30,6 +30,17 @@ mkdirSync(resources, { recursive: true });
 copyFileSync(binary, bundledBinary);
 copyFileSync(fastctxBinary, bundledFastctxBinary);
 copyFileSync(join(root, "backend", "icons", "Codey.icns"), join(resources, "Codey.icns"));
+for (const [source, destination] of [
+  ["README.md", "README.md"],
+  ["LICENSE", "LICENSE"],
+  ["THIRD_PARTY_NOTICES.md", "THIRD_PARTY_NOTICES.md"],
+  ["licenses/FastCtx/LICENSE-APACHE", "licenses/FastCtx/LICENSE-APACHE"],
+  ["licenses/FastCtx/NOTICE", "licenses/FastCtx/NOTICE"],
+]) {
+  const bundledDestination = join(resources, ...destination.split("/"));
+  mkdirSync(dirname(bundledDestination), { recursive: true });
+  copyFileSync(join(root, ...source.split("/")), bundledDestination);
+}
 chmodSync(bundledBinary, 0o755);
 chmodSync(bundledFastctxBinary, 0o755);
 writeFileSync(

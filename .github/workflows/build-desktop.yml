@@ -91,6 +91,11 @@ jobs:
           test -x "$APP/Contents/MacOS/codey"
           test -x "$APP/Contents/MacOS/codey-fastctx"
           test -f "$APP/Contents/Resources/Codey.icns"
+          test -f "$APP/Contents/Resources/README.md"
+          test -f "$APP/Contents/Resources/LICENSE"
+          test -f "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
+          test -f "$APP/Contents/Resources/licenses/FastCtx/LICENSE-APACHE"
+          test -f "$APP/Contents/Resources/licenses/FastCtx/NOTICE"
           plutil -lint "$APP/Contents/Info.plist"
           if codesign --verify "$APP" >/dev/null 2>&1; then
             echo "Expected an unsigned macOS bundle, but codesign verification succeeded." >&2
@@ -197,6 +202,11 @@ jobs:
           Copy-Item "target\release\codey.exe" "$portable\Codey.exe"
           Copy-Item "target\release\codey-fastctx.exe" "$portable\codey-fastctx.exe"
           Copy-Item "README.md" "$portable\README.md"
+          Copy-Item "LICENSE" "$portable\LICENSE"
+          Copy-Item "THIRD_PARTY_NOTICES.md" "$portable\THIRD_PARTY_NOTICES.md"
+          New-Item -ItemType Directory -Force "$portable\licenses\FastCtx" | Out-Null
+          Copy-Item "licenses\FastCtx\LICENSE-APACHE" "$portable\licenses\FastCtx\LICENSE-APACHE"
+          Copy-Item "licenses\FastCtx\NOTICE" "$portable\licenses\FastCtx\NOTICE"
 
           $archive = "dist\windows\Codey-$version-windows-x64-portable.zip"
           Compress-Archive -Path "$portable\*" -DestinationPath $archive -Force
