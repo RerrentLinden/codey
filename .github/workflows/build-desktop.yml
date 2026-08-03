@@ -197,20 +197,6 @@ jobs:
           }
           $version = $version -replace '[\\/]', '-'
 
-          $portable = "dist\windows\portable"
-          New-Item -ItemType Directory -Force $portable | Out-Null
-          Copy-Item "target\release\codey.exe" "$portable\Codey.exe"
-          Copy-Item "target\release\codey-fastctx.exe" "$portable\codey-fastctx.exe"
-          Copy-Item "README.md" "$portable\README.md"
-          Copy-Item "LICENSE" "$portable\LICENSE"
-          Copy-Item "THIRD_PARTY_NOTICES.md" "$portable\THIRD_PARTY_NOTICES.md"
-          New-Item -ItemType Directory -Force "$portable\licenses\FastCtx" | Out-Null
-          Copy-Item "licenses\FastCtx\LICENSE-APACHE" "$portable\licenses\FastCtx\LICENSE-APACHE"
-          Copy-Item "licenses\FastCtx\NOTICE" "$portable\licenses\FastCtx\NOTICE"
-
-          $archive = "dist\windows\Codey-$version-windows-x64-portable.zip"
-          Compress-Archive -Path "$portable\*" -DestinationPath $archive -Force
-
           $makensis = "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
           if (-not (Test-Path $makensis)) {
             $makensis = "makensis"
@@ -225,15 +211,7 @@ jobs:
           if (-not (Test-Path $installer)) {
             throw "NSIS installer was not created: $installer"
           }
-          "archive=$archive" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "installer=$installer" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-
-      - name: Upload Windows portable package
-        uses: actions/upload-artifact@v4
-        with:
-          name: codey-windows-x64-portable
-          path: ${{ steps.package.outputs.archive }}
-          if-no-files-found: error
 
       - name: Upload Windows installer
         uses: actions/upload-artifact@v4

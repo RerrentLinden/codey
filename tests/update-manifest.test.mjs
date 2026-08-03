@@ -13,7 +13,6 @@ const manifestScript = fileURLToPath(new URL("../scripts/generate-update-manifes
 const artifacts = [
   ["Codey-1.2.3-macos-arm64-unsigned.zip", "macos-arm64"],
   ["Codey-1.2.3-macos-x64-unsigned.zip", "macos-x64"],
-  ["Codey-1.2.3-windows-x64-portable.zip", "windows-portable"],
   ["Codey-1.2.3-windows-x64-setup.exe", "windows-setup"],
 ];
 
@@ -45,7 +44,7 @@ test("generates a public update manifest with checksummed platform assets", asyn
   assert.equal(manifest.schema_version, 1);
   assert.equal(manifest.version, "1.2.3");
   assert.equal(manifest.tag, "v1.2.3");
-  assert.equal(manifest.assets.length, 4);
+  assert.equal(manifest.assets.length, 3);
 
   const windowsInstaller = manifest.assets.find((asset) => asset.package_type === "nsis");
   assert.deepEqual(

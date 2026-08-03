@@ -1972,26 +1972,15 @@ mod tests {
             "schema_version": 1,
             "version": "0.2.0",
             "tag": "v0.2.0",
-            "assets": [
-                {
-                    "platform": "windows",
-                    "arch": "x64",
-                    "package_type": "portable-zip",
-                    "file_name": "Codey-0.2.0-windows-x64-portable.zip",
-                    "url": "https://updates.example.com/releases/v0.2.0/Codey-0.2.0-windows-x64-portable.zip",
-                    "sha256": "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                    "size": 1024
-                },
-                {
-                    "platform": platform,
-                    "arch": arch,
-                    "package_type": package_type,
-                    "file_name": &file_name,
-                    "url": format!("https://updates.example.com/releases/v0.2.0/{file_name}"),
-                    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                    "size": 2048
-                }
-            ]
+            "assets": [{
+                "platform": platform,
+                "arch": arch,
+                "package_type": package_type,
+                "file_name": &file_name,
+                "url": format!("https://updates.example.com/releases/v0.2.0/{file_name}"),
+                "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                "size": 2048
+            }]
         }))
         .unwrap();
 
