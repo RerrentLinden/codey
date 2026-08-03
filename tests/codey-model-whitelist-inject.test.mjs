@@ -193,6 +193,13 @@ function activeModelQueryClient(initialModels) {
     models() {
       return entries.get(JSON.stringify(queryKey)).data.data.map((model) => model.model);
     },
+    model(modelName) {
+      return entries
+        .get(JSON.stringify(queryKey))
+        .data
+        .data
+        .find((model) => model.model === modelName);
+    },
   };
 }
 
@@ -273,7 +280,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "3");
+  assert.equal(patch.version, "4");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -333,6 +340,83 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
     response.data.message.result.data.map((model) => model.model),
     ["gpt-5.6-sol", "provider-hot-pushed"],
   );
+  patch.dispose();
+});
+
+test("an unchanged model list repairs missing reasoning effort options", async () => {
+  const client = statsigClient();
+  const queryClient = activeModelQueryClient(["gpt-5.6-sol"]);
+  const existing = queryClient.model("gpt-5.6-sol");
+  existing.supportedReasoningEfforts = [];
+  delete existing.defaultReasoningEffort;
+
+  const { patch } = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+  }, [client], { queryClient });
+
+  const repaired = queryClient.model("gpt-5.6-sol");
+  assert.deepEqual(
+    repaired.supportedReasoningEfforts.map((effort) => effort.reasoningEffort),
+    ["minimal", "low", "medium", "high", "xhigh"],
+  );
+  assert.equal(repaired.defaultReasoningEffort, "medium");
+  patch.dispose();
+});
+
+test("catalog model metadata overrides stale native reasoning efforts", async () => {
+  const client = statsigClient();
+  const queryClient = activeModelQueryClient(["gpt-5.6-sol"]);
+
+  const { patch } = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [{
+      model: "gpt-5.6-sol",
+      supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      default_reasoning_effort: "low",
+    }],
+  }, [client], { queryClient });
+
+  const repaired = queryClient.model("gpt-5.6-sol");
+  assert.deepEqual(
+    repaired.supportedReasoningEfforts.map((effort) => effort.reasoningEffort),
+    ["low", "medium", "high", "xhigh", "max", "ultra"],
+  );
+  assert.equal(repaired.defaultReasoningEffort, "low");
+  patch.dispose();
+});
+
+test("a refresh applies changed reasoning metadata when model ids stay unchanged", async () => {
+  const client = statsigClient();
+  const queryClient = activeModelQueryClient(["gpt-5.6-sol"]);
+  const catalogResponse = {
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [{
+      model: "gpt-5.6-sol",
+      supported_reasoning_efforts: ["low", "medium"],
+      default_reasoning_effort: "low",
+    }],
+  };
+  const { patch } = await loadPatch(catalogResponse, [client], { queryClient });
+
+  catalogResponse.model_metadata[0] = {
+    model: "gpt-5.6-sol",
+    supported_reasoning_efforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    default_reasoning_effort: "high",
+  };
+  await patch.refresh();
+
+  const refreshed = queryClient.model("gpt-5.6-sol");
+  assert.deepEqual(
+    refreshed.supportedReasoningEfforts.map((effort) => effort.reasoningEffort),
+    ["low", "medium", "high", "xhigh", "max", "ultra"],
+  );
+  assert.equal(refreshed.defaultReasoningEffort, "high");
   patch.dispose();
 });
 

@@ -29,6 +29,7 @@ Codey 是 Codex 桌面客户端的增强启动器。打开 Codey 后，它会自
 - 删除、导入和恢复类会话操作会尽量保留备份，但仍建议谨慎使用。
 - Windows 和 macOS 上的部分运行策略需要先完全退出已有 Codex，再由 Codey 重新启动后生效。
 - 部分增强能力依赖当前 Codex 版本和当前线路支持情况，遇到不兼容时请以 Codey 控制台提示为准。
+- mac arm版本因无签名原因会报损坏，运行`xattr -dr com.apple.quarantine /Applications/Codey.app`即可跳过
 
 ## 第三方声明
 

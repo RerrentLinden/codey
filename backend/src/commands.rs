@@ -1053,6 +1053,15 @@ mod restart_tests {
         );
         assert_eq!(catalog["default_model"], "gpt-5.6-sol");
         assert_eq!(catalog["model_provider"], "cc-switch-provider");
+        assert_eq!(
+            catalog["model_metadata"][0],
+            json!({
+                "model": "gpt-5.6-sol",
+                "supported_reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "default_reasoning_effort": "low",
+            })
+        );
+        assert_eq!(catalog["model_metadata"].as_array().unwrap().len(), 5);
     }
 
     #[test]

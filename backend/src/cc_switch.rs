@@ -11,7 +11,10 @@ use serde::Serialize;
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
 
-use crate::config::{CodeyConfig, ProviderProfile};
+use crate::config::{
+    CodeyConfig, DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, ProviderProfile,
+};
+use crate::model_catalog;
 use crate::sqlite_util::table_columns;
 
 const APP_TYPE: &str = "codex";
@@ -262,9 +265,13 @@ fn sync_current_provider_from_paths(
         )
     };
 
+    let previous_provider_id = config.current_provider_id().map(ToString::to_string);
     let mut next = config.clone();
     next.active_profile_id = profile.id.clone();
     next.profiles = vec![profile];
+    if previous_provider_id.as_deref() != Some(provider.id.as_str()) {
+        reset_subagent_defaults_for_current_provider(&mut next, codex_home, provider.official);
+    }
     next = next.normalize();
     let changed = &next != config;
     let status = CcSwitchStatus {
@@ -275,6 +282,80 @@ fn sync_current_provider_from_paths(
         provider,
     };
     Ok((next, status))
+}
+
+fn reset_subagent_defaults_for_current_provider(
+    config: &mut CodeyConfig,
+    codex_home: &Path,
+    official_provider: bool,
+) {
+    let (model, reasoning_effort) =
+        subagent_defaults_for_current_provider(config, codex_home, official_provider);
+    config.subagent_model = model;
+    config.subagent_reasoning_effort = reasoning_effort;
+}
+
+fn subagent_defaults_for_current_provider(
+    config: &CodeyConfig,
+    codex_home: &Path,
+    official_provider: bool,
+) -> (String, String) {
+    let Ok(state) = model_catalog::selection_state_with_manual_models(
+        codex_home,
+        official_provider,
+        config.upstream_models_snapshot(),
+        config.selected_models(),
+        config.manual_third_party_models(),
+        Some(DEFAULT_SUBAGENT_MODEL),
+    ) else {
+        return (
+            DEFAULT_SUBAGENT_MODEL.to_string(),
+            DEFAULT_SUBAGENT_REASONING_EFFORT.to_string(),
+        );
+    };
+    let model = if subagent_model_available(&state, DEFAULT_SUBAGENT_MODEL) {
+        DEFAULT_SUBAGENT_MODEL.to_string()
+    } else if !state.default_model.trim().is_empty() {
+        state.default_model.clone()
+    } else {
+        DEFAULT_SUBAGENT_MODEL.to_string()
+    };
+    let reasoning_effort = subagent_reasoning_effort_for_model(&state, &model);
+    (model, reasoning_effort)
+}
+
+fn subagent_model_available(state: &model_catalog::ModelSelectionState, model: &str) -> bool {
+    state
+        .official_models
+        .iter()
+        .any(|candidate| candidate.supported && candidate.slug == model)
+        || state
+            .third_party_models
+            .iter()
+            .any(|candidate| candidate == model)
+}
+
+fn subagent_reasoning_effort_for_model(
+    state: &model_catalog::ModelSelectionState,
+    model: &str,
+) -> String {
+    if let Some(official_model) = state
+        .official_models
+        .iter()
+        .find(|candidate| candidate.supported && candidate.slug == model)
+    {
+        if official_model
+            .supported_reasoning_efforts
+            .iter()
+            .any(|effort| effort == DEFAULT_SUBAGENT_REASONING_EFFORT)
+        {
+            return DEFAULT_SUBAGENT_REASONING_EFFORT.to_string();
+        }
+        if !official_model.default_reasoning_effort.trim().is_empty() {
+            return official_model.default_reasoning_effort.clone();
+        }
+    }
+    DEFAULT_SUBAGENT_REASONING_EFFORT.to_string()
 }
 
 pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
@@ -636,6 +717,19 @@ mod tests {
             .unwrap();
     }
 
+    fn saved_route_profile(id: &str) -> ProviderProfile {
+        ProviderProfile {
+            id: id.to_string(),
+            name: format!("线路 {id}"),
+            base_url: format!("https://{id}.example/v1"),
+            api_key: format!("{id}-secret"),
+            protocol: RelayProtocol::Responses,
+            cc_switch_provider_id: Some(id.to_string()),
+            cc_switch_read_only: false,
+            supports_remote_compaction: false,
+        }
+    }
+
     #[test]
     fn imports_only_the_current_cc_switch_provider() {
         let (_directory, path, home) = fixture();
@@ -906,6 +1000,93 @@ requires_openai_auth = true
         let (synced, _) = sync_current_provider_from_paths(&config, &path, &home).unwrap();
 
         assert_eq!(synced.selected_models(), &["custom-model"]);
+    }
+
+    #[test]
+    fn provider_switch_resets_subagent_defaults_when_default_model_is_supported() {
+        let (_directory, path, home) = fixture();
+        insert_provider(
+            &path,
+            "route-b",
+            "线路 B",
+            "https://route-b.example/v1",
+            true,
+        );
+        let mut config = CodeyConfig {
+            active_profile_id: "route-a".into(),
+            profiles: vec![saved_route_profile("route-a")],
+            subagent_model: "provider-old-model".into(),
+            subagent_reasoning_effort: "xhigh".into(),
+            ..CodeyConfig::default()
+        };
+        config
+            .upstream_models_by_provider
+            .insert("route-b".into(), vec![DEFAULT_SUBAGENT_MODEL.into()]);
+
+        let (synced, status) = sync_current_provider_from_paths(&config, &path, &home).unwrap();
+
+        assert_eq!(status.provider.id, "route-b");
+        assert_eq!(synced.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(
+            synced.subagent_reasoning_effort,
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        );
+    }
+
+    #[test]
+    fn provider_switch_uses_available_subagent_model_when_default_is_unsupported() {
+        let (_directory, path, home) = fixture();
+        insert_provider(
+            &path,
+            "route-b",
+            "线路 B",
+            "https://route-b.example/v1",
+            true,
+        );
+        let mut config = CodeyConfig {
+            active_profile_id: "route-a".into(),
+            profiles: vec![saved_route_profile("route-a")],
+            subagent_model: "provider-old-model".into(),
+            subagent_reasoning_effort: "xhigh".into(),
+            ..CodeyConfig::default()
+        };
+        config
+            .upstream_models_by_provider
+            .insert("route-b".into(), vec!["gpt-5.6-sol".into()]);
+
+        let (synced, status) = sync_current_provider_from_paths(&config, &path, &home).unwrap();
+
+        assert_eq!(status.provider.id, "route-b");
+        assert_eq!(synced.subagent_model, "gpt-5.6-sol");
+        assert_eq!(
+            synced.subagent_reasoning_effort,
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        );
+    }
+
+    #[test]
+    fn provider_sync_preserves_subagent_defaults_when_provider_is_unchanged() {
+        let (_directory, path, home) = fixture();
+        insert_provider(
+            &path,
+            "route-a",
+            "线路 route-a",
+            "https://route-a.example/v1",
+            true,
+        );
+        let config = CodeyConfig {
+            active_profile_id: "route-a".into(),
+            profiles: vec![saved_route_profile("route-a")],
+            subagent_model: "provider-custom-model".into(),
+            subagent_reasoning_effort: "high".into(),
+            ..CodeyConfig::default()
+        };
+
+        let (synced, status) = sync_current_provider_from_paths(&config, &path, &home).unwrap();
+
+        assert_eq!(status.provider.id, "route-a");
+        assert_eq!(synced.subagent_model, "provider-custom-model");
+        assert_eq!(synced.subagent_reasoning_effort, "high");
     }
 
     #[test]

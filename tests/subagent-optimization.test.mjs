@@ -30,6 +30,18 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
   assert.match(uiSource, /aria-label="启用子代理协作优化"/);
   assert.match(uiSource, /aria-label="选择子代理模型"/);
   assert.match(uiSource, /aria-label="选择子代理思考深度"/);
+  assert.match(
+    uiSource,
+    /const subagentPolicyControlsDisabled =\s*isBusy \|\| !config\.subagentOptimization/,
+  );
+  assert.match(
+    uiSource,
+    /subagentPolicyControlsDisabled \|\|\s*subagentModelOptions\.length === 0/,
+  );
+  assert.match(
+    uiSource,
+    /subagentPolicyControlsDisabled \|\|\s*subagentReasoningEfforts\.length === 0/,
+  );
   assert.match(uiSource, /subagentModelOptions/);
   assert.match(modelSource, /invoke\("fetch_current_provider_models"\)/);
   assert.match(modelSource, /supportsModel\(result\.models, subagentModel\)/);

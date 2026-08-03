@@ -56,6 +56,8 @@ function FeaturePolicyCardComponent({
   );
   const subagentReasoningEfforts =
     selectedSubagentModel?.supportedReasoningEfforts ?? [];
+  const subagentPolicyControlsDisabled =
+    isBusy || !config.subagentOptimization;
 
   return (
     <section className="secondary-section" aria-labelledby="runtime-title">
@@ -258,7 +260,10 @@ function FeaturePolicyCardComponent({
                   <select
                     aria-label="选择子代理模型"
                     value={selectedSubagentModel?.value ?? ""}
-                    disabled={isBusy || subagentModelOptions.length === 0}
+                    disabled={
+                      subagentPolicyControlsDisabled ||
+                      subagentModelOptions.length === 0
+                    }
                     onChange={(event) => {
                       const option = subagentModelOptions.find(
                         (candidate) => candidate.value === event.target.value,
@@ -298,7 +303,10 @@ function FeaturePolicyCardComponent({
                         ? config.subagentReasoningEffort
                         : ""
                     }
-                    disabled={isBusy || subagentReasoningEfforts.length === 0}
+                    disabled={
+                      subagentPolicyControlsDisabled ||
+                      subagentReasoningEfforts.length === 0
+                    }
                     onChange={(event) =>
                       onConfigChange({
                         ...config,

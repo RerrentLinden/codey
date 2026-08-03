@@ -741,6 +741,18 @@ pub(super) fn renderer_model_catalog_value(
     model_state: &model_catalog::ModelSelectionState,
 ) -> Value {
     let models = renderer_model_ids(model_state);
+    let model_metadata = model_state
+        .official_models
+        .iter()
+        .filter(|model| model.supported)
+        .map(|model| {
+            json!({
+                "model": model.slug,
+                "supported_reasoning_efforts": model.supported_reasoning_efforts,
+                "default_reasoning_effort": model.default_reasoning_effort,
+            })
+        })
+        .collect::<Vec<_>>();
     let active_profile = config
         .profiles
         .iter()
@@ -757,6 +769,7 @@ pub(super) fn renderer_model_catalog_value(
         "model_provider": provider_id,
         "provider_name": provider_name,
         "models": models,
+        "model_metadata": model_metadata,
         "sources": [],
         "responses_api": {
             "status": "unknown",

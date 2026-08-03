@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "3";
+  const patchVersion = "4";
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion) {
     void existingPatch.refresh();
@@ -18,6 +18,7 @@
     loaded: false,
     models: [],
     defaultModel: "",
+    modelMetadata: {},
   };
   let refreshTimer = 0;
   let refreshUntil = 0;
@@ -61,49 +62,123 @@
     const models = uniqueModelNames(value.models);
     const requestedDefault = [value.default_model, value.model]
       .find((model) => typeof model === "string" && models.includes(model.trim()));
+    const modelMetadata = Object.fromEntries(
+      (Array.isArray(value.model_metadata) ? value.model_metadata : [])
+        .filter((metadata) => (
+          metadata
+          && typeof metadata === "object"
+          && typeof metadata.model === "string"
+          && models.includes(metadata.model.trim())
+        ))
+        .map((metadata) => [metadata.model.trim(), metadata]),
+    );
     return {
       loaded: true,
       models,
       defaultModel: requestedDefault?.trim() || models[0] || "",
+      modelMetadata,
     };
   };
 
-  const modelReasoningEfforts = () => [
+  const reasoningEffortName = (value) => (
+    typeof value === "string"
+      ? value.trim()
+      : typeof value?.reasoningEffort === "string"
+        ? value.reasoningEffort.trim()
+        : ""
+  );
+
+  const reasoningEffortDescriptors = (values) => uniqueModelNames(
+    (Array.isArray(values) ? values : []).map(reasoningEffortName),
+  ).map((reasoningEffort) => ({
+    reasoningEffort,
+    description: `${reasoningEffort} effort`,
+  }));
+
+  const fallbackReasoningEfforts = () => reasoningEffortDescriptors([
     "minimal",
     "low",
     "medium",
     "high",
     "xhigh",
-  ].map((reasoningEffort) => ({
-    reasoningEffort,
-    description: `${reasoningEffort} effort`,
-  }));
+  ]);
 
-  const modelDescriptor = (modelName, current = null) => ({
-    ...(current && typeof current === "object" ? current : {}),
-    model: modelName,
-    id: typeof current?.id === "string" && current.id ? current.id : modelName,
-    slug: typeof current?.slug === "string" && current.slug ? current.slug : modelName,
-    name: typeof current?.name === "string" && current.name ? current.name : modelName,
-    displayName: typeof current?.displayName === "string" && current.displayName
-      ? current.displayName
-      : modelName,
-    description: typeof current?.description === "string" && current.description
-      ? current.description
-      : "Custom model",
-    hidden: false,
-    isDefault: modelName === catalog.defaultModel,
-    defaultReasoningEffort: typeof current?.defaultReasoningEffort === "string"
-      ? current.defaultReasoningEffort
-      : "medium",
-    supportedReasoningEfforts: Array.isArray(current?.supportedReasoningEfforts)
-      && current.supportedReasoningEfforts.length > 0
-      ? current.supportedReasoningEfforts
-      : modelReasoningEfforts(),
-    serviceTiers: Array.isArray(current?.serviceTiers) ? current.serviceTiers : [],
-    additionalSpeedTiers: Array.isArray(current?.additionalSpeedTiers)
-      ? current.additionalSpeedTiers
-      : [],
+  const modelDescriptor = (modelName, current = null) => {
+    const metadata = catalog.modelMetadata[modelName];
+    const supportedReasoningEfforts = reasoningEffortDescriptors(
+      metadata?.supported_reasoning_efforts,
+    );
+    const currentReasoningEfforts = reasoningEffortDescriptors(
+      current?.supportedReasoningEfforts,
+    );
+    const resolvedReasoningEfforts = supportedReasoningEfforts.length > 0
+      ? supportedReasoningEfforts
+      : currentReasoningEfforts.length > 0
+        ? currentReasoningEfforts
+        : fallbackReasoningEfforts();
+    const supportedNames = resolvedReasoningEfforts.map(reasoningEffortName);
+    const requestedDefault = [
+      metadata?.default_reasoning_effort,
+      current?.defaultReasoningEffort,
+      "medium",
+      "low",
+      supportedNames[0],
+    ].find((effort) => (
+      typeof effort === "string" && supportedNames.includes(effort.trim())
+    ));
+    return {
+      ...(current && typeof current === "object" ? current : {}),
+      model: modelName,
+      id: typeof current?.id === "string" && current.id ? current.id : modelName,
+      slug: typeof current?.slug === "string" && current.slug ? current.slug : modelName,
+      name: typeof current?.name === "string" && current.name ? current.name : modelName,
+      displayName: typeof current?.displayName === "string" && current.displayName
+        ? current.displayName
+        : modelName,
+      description: typeof current?.description === "string" && current.description
+        ? current.description
+        : "Custom model",
+      hidden: false,
+      isDefault: modelName === catalog.defaultModel,
+      defaultReasoningEffort: requestedDefault?.trim() || "medium",
+      supportedReasoningEfforts: resolvedReasoningEfforts,
+      serviceTiers: Array.isArray(current?.serviceTiers) ? current.serviceTiers : [],
+      additionalSpeedTiers: Array.isArray(current?.additionalSpeedTiers)
+        ? current.additionalSpeedTiers
+        : [],
+    };
+  };
+
+  const sameReasoningEffortNames = (left, right) => (
+    Array.isArray(left)
+    && left.length === right.length
+    && left.every((value, index) => (
+      reasoningEffortName(value) === reasoningEffortName(right[index])
+    ))
+  );
+
+  const sameReasoningEfforts = (left, right) => (
+    Array.isArray(left)
+    && left.every((value) => (
+      value
+      && typeof value === "object"
+      && typeof value.reasoningEffort === "string"
+      && value.reasoningEffort.trim()
+    ))
+    && sameReasoningEffortNames(left, right)
+  );
+
+  const sameModelMetadata = (left, right, models) => models.every((modelName) => {
+    const leftMetadata = left[modelName];
+    const rightMetadata = right[modelName];
+    if (!leftMetadata || !rightMetadata) return leftMetadata === rightMetadata;
+    return (
+      leftMetadata.default_reasoning_effort === rightMetadata.default_reasoning_effort
+      && sameReasoningEffortNames(
+        leftMetadata.supported_reasoning_efforts,
+        rightMetadata.supported_reasoning_efforts,
+      )
+    );
   });
 
   const modelArrayLooksPatchable = (value, allowEmpty = false) => (
@@ -128,6 +203,11 @@
         model?.model === nextModels[index]?.model
         && model?.hidden === false
         && model?.isDefault === nextModels[index]?.isDefault
+        && model?.defaultReasoningEffort === nextModels[index]?.defaultReasoningEffort
+        && sameReasoningEfforts(
+          model?.supportedReasoningEfforts,
+          nextModels[index]?.supportedReasoningEfforts,
+        )
       ))
     );
     return unchanged ? null : nextModels;
@@ -652,7 +732,12 @@
         if (requestedRevision !== catalogRevision) return false;
         const unchanged = catalog.loaded
           && sameModelNames(catalog.models, nextCatalog.models)
-          && catalog.defaultModel === nextCatalog.defaultModel;
+          && catalog.defaultModel === nextCatalog.defaultModel
+          && sameModelMetadata(
+            catalog.modelMetadata,
+            nextCatalog.modelMetadata,
+            nextCatalog.models,
+          );
         if (unchanged) {
           // Window-focus reloads land here when nothing changed upstream:
           // skip the invalidating re-delivery (full client scan plus query
