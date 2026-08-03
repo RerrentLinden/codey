@@ -55,20 +55,21 @@ test("subagent optimization owns the requested V2 and default-agent settings", a
   assert.match(source, /const SUBAGENT_GUIDANCE: &str/);
 });
 
-test("subagent defaults are hot-reloaded through the active app-server client", async () => {
-  const [commandSource, cdpSource, rendererSource] = await Promise.all([
+test("subagent defaults are hot-reloaded through the packaged app-server bridge", async () => {
+  const [commandSource, cdpSource, rendererSource, sessionToolsSource] = await Promise.all([
     readFile(new URL("backend/src/commands.rs", root), "utf8"),
     readFile(new URL("backend/src/cdp.rs", root), "utf8"),
-    readFile(
-      new URL("vendor/CodeyRuntime/assets/inject/renderer-inject.js", root),
-      "utf8",
-    ),
+    readFile(new URL("public/renderer-inject.js", root), "utf8"),
+    readFile(new URL("public/codey-inject.js", root), "utf8"),
   ]);
 
   assert.match(commandSource, /hot_reload_runtime_subagent_defaults/);
+  assert.match(commandSource, /mark_runtime_subagent_defaults_applied/);
   assert.match(cdpSource, /window\.__codeyApplySubagentDefaults/);
-  assert.match(rendererSource, /default_subagent_model/);
-  assert.match(rendererSource, /default_subagent_reasoning_effort/);
-  assert.match(rendererSource, /thread\/resume/);
-  assert.match(rendererSource, /thread\/start/);
+  assert.match(rendererSource, /window\.__codeyApplySubagentDefaults/);
+  assert.match(rendererSource, /method: "config\/batchWrite"/);
+  assert.match(rendererSource, /keyPath: "agents\.default_subagent_model"/);
+  assert.match(rendererSource, /keyPath: "agents\.default_subagent_reasoning_effort"/);
+  assert.match(rendererSource, /reloadUserConfig: true/);
+  assert.match(sessionToolsSource, /window\.__codeyLoadCodexSignalDispatcher/);
 });

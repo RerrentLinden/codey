@@ -52,7 +52,7 @@ use webhooks::{
 use crate::account_usage;
 use crate::cc_switch;
 use crate::cdp;
-use crate::codex_config::codex_home;
+use crate::codex_config::{codex_home, mark_runtime_subagent_defaults_applied};
 use crate::config::{CodeyConfig, ConfigStore};
 use crate::error_log;
 #[cfg(windows)]
@@ -797,6 +797,27 @@ async fn hot_reload_runtime_subagent_defaults(
     .await;
     match result {
         Ok(()) => {
+            let home = codex_home();
+            let model = config.subagent_model.clone();
+            let reasoning_effort = config.subagent_reasoning_effort.clone();
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                mark_runtime_subagent_defaults_applied(&home, &model, &reasoning_effort)
+            })
+            .await
+            .map_err(|error| format!("子代理运行时租约更新任务异常退出：{error}"))
+            .and_then(|result| result.map_err(|error| format!("{error:#}")))
+            {
+                error_log::record_failure(
+                    "patch_verification_failed",
+                    "adopt_subagent_defaults_lease",
+                    error.clone(),
+                    json!({
+                        "model": config.subagent_model,
+                        "reasoningEffort": config.subagent_reasoning_effort,
+                    }),
+                );
+                return Some(Err(error));
+            }
             runtime.mark_subagent_config_applied(config).await;
             Some(Ok(()))
         }

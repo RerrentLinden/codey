@@ -58,6 +58,7 @@ pub(crate) fn normalize_session_id(value: &str) -> &str {
     trimmed.strip_prefix("local:").unwrap_or(trimmed).trim()
 }
 
+#[cfg(test)]
 pub fn thread_sort_keys(home: &Path, sessions: &[SessionRef]) -> Value {
     SessionMetadataCache::default().thread_sort_keys(home, sessions)
 }
@@ -359,6 +360,7 @@ fn json_i64(value: &Value) -> Option<i64> {
         .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
 }
 
+#[cfg(test)]
 pub fn resolve_session_name_with_preferred(
     home: &Path,
     session_id: &str,
@@ -371,10 +373,9 @@ pub fn resolve_session_name_with_preferred(
     )
 }
 
-fn session_name_row(
-    connection: &Connection,
-    session_id: &str,
-) -> Result<Option<(Option<String>, Option<String>, Option<String>)>> {
+type SessionNameRow = (Option<String>, Option<String>, Option<String>);
+
+fn session_name_row(connection: &Connection, session_id: &str) -> Result<Option<SessionNameRow>> {
     let columns = table_columns(connection, "threads")?;
     if !["id", "title", "first_user_message", "preview"]
         .iter()

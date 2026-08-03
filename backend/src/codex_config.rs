@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::config::{
-    DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, ProviderProfile, default_config_path,
+    DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, ProviderProfile,
+    SUBAGENT_REASONING_EFFORTS, default_config_path,
 };
 use crate::fs_util::timestamp_millis;
 use crate::provider_lease::CODEY_PROVIDER_ID;
@@ -158,6 +159,7 @@ fn lease_marker_path() -> PathBuf {
         .join("codex-lease.json")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn apply_runtime_provider_config(
     home: &Path,
     profile: &ProviderProfile,
@@ -496,6 +498,88 @@ fn write_lease(path: &Path, state: &RuntimeConfigLease) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     atomic_write(path, &serde_json::to_vec_pretty(state)?)
+}
+
+pub fn mark_runtime_subagent_defaults_applied(
+    home: &Path,
+    model: &str,
+    reasoning_effort: &str,
+) -> Result<()> {
+    mark_runtime_subagent_defaults_applied_at(home, &lease_marker_path(), model, reasoning_effort)
+}
+
+fn mark_runtime_subagent_defaults_applied_at(
+    home: &Path,
+    marker: &Path,
+    model: &str,
+    reasoning_effort: &str,
+) -> Result<()> {
+    let model = model.trim();
+    let reasoning_effort = reasoning_effort.trim().to_ascii_lowercase();
+    anyhow::ensure!(!model.is_empty(), "子代理模型不能为空");
+    anyhow::ensure!(
+        SUBAGENT_REASONING_EFFORTS.contains(&reasoning_effort.as_str()),
+        "子代理思考深度无效：{reasoning_effort}"
+    );
+
+    let mut state = fs::read_to_string(marker)
+        .with_context(|| format!("读取 Codey Codex lease 失败：{}", marker.display()))
+        .and_then(|contents| {
+            serde_json::from_str::<RuntimeConfigLease>(&contents)
+                .with_context(|| format!("解析 Codey Codex lease 失败：{}", marker.display()))
+        })?;
+    anyhow::ensure!(
+        state.subagent_optimization_applied,
+        "当前 Codey 运行时未启用子代理协作优化"
+    );
+
+    let config_path = home.join("config.toml");
+    let current_bytes = fs::read(&config_path)
+        .with_context(|| format!("读取 Codex 配置失败：{}", config_path.display()))?;
+    let current =
+        String::from_utf8(current_bytes.clone()).context("Codex config.toml 不是 UTF-8")?;
+    let current_doc = current
+        .parse::<DocumentMut>()
+        .context("解析 Codex config.toml 失败")?;
+    let current_agents = current_doc
+        .get("agents")
+        .and_then(Item::as_table)
+        .context("Codex config.toml 缺少 [agents] 配置")?;
+    anyhow::ensure!(
+        current_agents
+            .get("default_subagent_model")
+            .and_then(Item::as_str)
+            == Some(model)
+            && current_agents
+                .get("default_subagent_reasoning_effort")
+                .and_then(Item::as_str)
+                == Some(reasoning_effort.as_str()),
+        "Codex config.toml 尚未写入新的子代理默认配置"
+    );
+
+    let snapshot_dir = state
+        .config_snapshot_dir
+        .as_deref()
+        .unwrap_or(&state.backup_dir);
+    let applied_path = snapshot_dir.join(APPLIED_CONFIG_FILE);
+    let applied = fs::read_to_string(&applied_path)
+        .with_context(|| format!("读取 Codey 已应用配置快照失败：{}", applied_path.display()))?;
+    let mut applied_doc = applied
+        .parse::<DocumentMut>()
+        .context("解析 Codey 已应用配置快照失败")?;
+    let agents = ensure_root_table(&mut applied_doc, "agents")?;
+    agents["default_subagent_model"] = value(model);
+    agents["default_subagent_reasoning_effort"] = value(&reasoning_effort);
+    let updated_applied = document_string(&applied_doc)?;
+
+    anyhow::ensure!(
+        read_optional(&config_path)?.as_deref() == Some(current_bytes.as_slice()),
+        "Codex config.toml 在 Codey 更新租约快照前再次变化"
+    );
+    atomic_write(&applied_path, updated_applied.as_bytes())?;
+    state.subagent_model = model.to_string();
+    state.subagent_reasoning_effort = reasoning_effort;
+    write_lease(marker, &state)
 }
 
 pub fn reconcile_runtime_config_overlay(home: &Path) -> Result<Option<Vec<u8>>> {
@@ -2713,6 +2797,65 @@ custom_setting = "preserved"
             original_default_agent
         );
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn hot_reloaded_subagent_defaults_are_adopted_by_runtime_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        let original_config = b"model_provider = \"codey_global\"\n\n[agents]\ncustom = \"keep\"\n\n[model_providers.codey_global]\nbase_url = \"https://chatgpt.com/backend-api/codex\"\n";
+        fs::write(home.join("config.toml"), original_config).unwrap();
+
+        apply_runtime_provider_config_at(
+            &home,
+            &direct_profile(RelayProtocol::Responses),
+            GLOBAL_PROVIDER_ID,
+            true,
+            None,
+            None,
+            true,
+            &marker,
+            &backup_root,
+        )
+        .unwrap();
+
+        let mut current = fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        current["agents"]["default_subagent_model"] = value("gpt-5.6-sol");
+        current["agents"]["default_subagent_reasoning_effort"] = value("high");
+        fs::write(home.join("config.toml"), document_string(&current).unwrap()).unwrap();
+
+        mark_runtime_subagent_defaults_applied_at(&home, &marker, "gpt-5.6-sol", "high").unwrap();
+
+        let state =
+            serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap())
+                .unwrap();
+        assert_eq!(state.subagent_model, "gpt-5.6-sol");
+        assert_eq!(state.subagent_reasoning_effort, "high");
+        let snapshot_dir = state
+            .config_snapshot_dir
+            .as_deref()
+            .unwrap_or(&state.backup_dir);
+        let applied = fs::read_to_string(snapshot_dir.join(APPLIED_CONFIG_FILE))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            applied["agents"]["default_subagent_model"].as_str(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            applied["agents"]["default_subagent_reasoning_effort"].as_str(),
+            Some("high")
+        );
+
+        assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
     }
 
     #[test]

@@ -1018,13 +1018,17 @@
       try {
         const module = await import(url);
         const dispatcher = signalDispatcherFromModule(module, namedSignalAsset);
-        if (dispatcher) return dispatcher;
+        if (dispatcher) {
+          window.__codeyCodexSignalDispatcher = dispatcher;
+          return dispatcher;
+        }
       } catch {
         continue;
       }
     }
     throw new Error("Codex 会话刷新接口不可用");
   };
+  window.__codeyLoadCodexSignalDispatcher = loadCodexSignalDispatcher;
 
   const refreshRecentLocalSessions = async () => {
     try {
