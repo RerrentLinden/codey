@@ -1,4 +1,4 @@
-import { memo, useRef, useState } from "react";
+import { memo, useMemo, useRef, useState } from "react";
 import {
   IconActivity as Activity,
   IconAdjustmentsHorizontal,
@@ -27,6 +27,9 @@ import { Badge, Button, Card, Tooltip } from "./components/semi";
 const Cpu = IconCpu;
 const FolderOpen = IconFolderOpen;
 const History = IconHistory;
+const EMPTY_INJECTION_SCRIPTS: NonNullable<
+  RuntimeStatus["injectionScripts"]
+> = [];
 
 type OperationsPanelProps = {
   config: Config;
@@ -66,18 +69,30 @@ function OperationsPanelComponent({
   const pluginStatusError = pluginMarketplaceStatus?.status === "error";
   const pluginRepairing = busy === "repair-plugin-marketplace";
   const performanceError = maintenance?.performanceStatus === "error";
-  const injectionScripts = status.injectionScripts ?? [];
-  const effectiveScriptCount = injectionScripts.filter(
-    (script) => script.status === "effective",
-  ).length;
-  const unverifiedInjectionScripts = injectionScripts.filter(
-    (script) => script.status === "executed",
-  );
-  const failedInjectionScripts = injectionScripts.filter(
-    (script) => script.status === "failed" || script.status === "unknown",
-  );
+  const injectionScripts = status.injectionScripts ?? EMPTY_INJECTION_SCRIPTS;
+  const {
+    effectiveScriptCount,
+    failedInjectionScriptCount,
+    unverifiedInjectionScriptCount,
+  } = useMemo(() => {
+    let effective = 0;
+    let failed = 0;
+    let unverified = 0;
+    for (const script of injectionScripts) {
+      if (script.status === "effective") effective += 1;
+      else if (script.status === "executed") unverified += 1;
+      else if (script.status === "failed" || script.status === "unknown") {
+        failed += 1;
+      }
+    }
+    return {
+      effectiveScriptCount: effective,
+      failedInjectionScriptCount: failed,
+      unverifiedInjectionScriptCount: unverified,
+    };
+  }, [injectionScripts]);
   const injectionStatusPending = injectionScripts.length === 0;
-  const injectionError = failedInjectionScripts.length > 0;
+  const injectionError = failedInjectionScriptCount > 0;
   const isWindowsClient = status.clientPlatform === "windows";
   const windowsPatchReady = maintenance?.performanceStatus === "ready";
   const windowsPatchFailed = performanceError || Boolean(status.startupError);
@@ -111,109 +126,138 @@ function OperationsPanelComponent({
     tone?: "success" | "warning" | "destructive" | "info";
   };
 
-  const sessionMetrics: MetricItem[] = [
-    {
-      id: "session-files",
-      icon: IconFileCheck,
-      tooltip: `会话文件：已修复 ${maintenance?.sessionFilesFixed ?? 0} 个会话文件`,
-      tone: sessionOk ? "success" : "warning",
-    },
-    {
-      id: "session-db",
-      icon: IconDatabase,
-      tooltip: `数据库索引：已更新 ${maintenance?.sqliteRowsUpdated ?? 0} 行数据库索引`,
-      tone: sessionOk ? "success" : "warning",
-    },
-    {
-      id: "session-ghost",
-      icon: IconShieldCheck,
-      tooltip: `幽灵任务：已清理 ${maintenance?.ghostTasksPruned ?? 0} 条幽灵任务`,
-      tone: sessionOk ? "success" : "warning",
-    },
-  ];
+  const sessionMetrics = useMemo<MetricItem[]>(
+    () => [
+      {
+        id: "session-files",
+        icon: IconFileCheck,
+        tooltip: `会话文件：已修复 ${maintenance?.sessionFilesFixed ?? 0} 个会话文件`,
+        tone: sessionOk ? "success" : "warning",
+      },
+      {
+        id: "session-db",
+        icon: IconDatabase,
+        tooltip: `数据库索引：已更新 ${maintenance?.sqliteRowsUpdated ?? 0} 行数据库索引`,
+        tone: sessionOk ? "success" : "warning",
+      },
+      {
+        id: "session-ghost",
+        icon: IconShieldCheck,
+        tooltip: `幽灵任务：已清理 ${maintenance?.ghostTasksPruned ?? 0} 条幽灵任务`,
+        tone: sessionOk ? "success" : "warning",
+      },
+    ],
+    [
+      maintenance?.ghostTasksPruned,
+      maintenance?.sessionFilesFixed,
+      maintenance?.sqliteRowsUpdated,
+      sessionOk,
+    ],
+  );
 
   // System Optimization Metrics
-  const optimizationMetrics: MetricItem[] = [
-    {
-      id: "opt-fastctx",
-      icon: Zap,
-      tooltip: config.fastContextTools
-        ? "FastCtx 上下文加速：已按当前配置启用"
-        : "FastCtx 上下文加速：未启用",
-      tone: config.fastContextTools ? "success" : "info",
-    },
-    {
-      id: "opt-slim",
-      icon: IconAdjustmentsHorizontal,
-      tooltip:
-        config.slimCodexPet || config.slimCodexVoice
-          ? `客户端精简：已开启${config.slimCodexPet ? "宠物" : ""}${config.slimCodexVoice ? "/语音" : ""}精简`
-          : "客户端精简：保留完整功能",
-      tone: config.slimCodexPet || config.slimCodexVoice ? "success" : "info",
-    },
-    {
-      id: "opt-patch",
-      icon: isWindowsClient ? IconBrandWindows : IconCpu,
-      tooltip: windowsPatchReady
-        ? "性能策略已生效：采样与泄漏修复"
-        : "性能策略：运行确认中",
-      tone: windowsPatchReady ? "success" : "warning",
-    },
-    {
-      id: "opt-injection",
-      icon: Code,
-      tooltip: injectionError
-        ? `脚本注入：${failedInjectionScripts.length} 个异常`
-        : unverifiedInjectionScripts.length > 0
-          ? `脚本注入：${unverifiedInjectionScripts.length} 个未验证生效`
-          : injectionScripts.length > 0
-            ? `脚本注入：${effectiveScriptCount}/${injectionScripts.length} 已生效`
-            : "脚本注入：等待 Codex 启动后检测",
-      tone: injectionError
-        ? "destructive"
-        : unverifiedInjectionScripts.length > 0
-          ? "warning"
-          : injectionScripts.length > 0
-            ? "success"
-            : "warning",
-    },
-  ];
+  const optimizationMetrics = useMemo<MetricItem[]>(
+    () => [
+      {
+        id: "opt-fastctx",
+        icon: Zap,
+        tooltip: config.fastContextTools
+          ? "FastCtx 上下文加速：已按当前配置启用"
+          : "FastCtx 上下文加速：未启用",
+        tone: config.fastContextTools ? "success" : "info",
+      },
+      {
+        id: "opt-slim",
+        icon: IconAdjustmentsHorizontal,
+        tooltip:
+          config.slimCodexPet || config.slimCodexVoice
+            ? `客户端精简：已开启${config.slimCodexPet ? "宠物" : ""}${config.slimCodexVoice ? "/语音" : ""}精简`
+            : "客户端精简：保留完整功能",
+        tone: config.slimCodexPet || config.slimCodexVoice ? "success" : "info",
+      },
+      {
+        id: "opt-patch",
+        icon: isWindowsClient ? IconBrandWindows : IconCpu,
+        tooltip: windowsPatchReady
+          ? "性能策略已生效：采样与泄漏修复"
+          : "性能策略：运行确认中",
+        tone: windowsPatchReady ? "success" : "warning",
+      },
+      {
+        id: "opt-injection",
+        icon: Code,
+        tooltip: injectionError
+          ? `脚本注入：${failedInjectionScriptCount} 个异常`
+          : unverifiedInjectionScriptCount > 0
+            ? `脚本注入：${unverifiedInjectionScriptCount} 个未验证生效`
+            : injectionScripts.length > 0
+              ? `脚本注入：${effectiveScriptCount}/${injectionScripts.length} 已生效`
+              : "脚本注入：等待 Codex 启动后检测",
+        tone: injectionError
+          ? "destructive"
+          : unverifiedInjectionScriptCount > 0
+            ? "warning"
+            : injectionScripts.length > 0
+              ? "success"
+              : "warning",
+      },
+    ],
+    [
+      config.fastContextTools,
+      config.slimCodexPet,
+      config.slimCodexVoice,
+      effectiveScriptCount,
+      failedInjectionScriptCount,
+      injectionError,
+      injectionScripts.length,
+      isWindowsClient,
+      unverifiedInjectionScriptCount,
+      windowsPatchReady,
+    ],
+  );
 
   // Plugin Marketplace Metrics
-  const pluginMetrics: MetricItem[] = [
-    {
-      id: "plugin-official",
-      icon: IconShoppingBag,
-      tooltip:
-        pluginMarketplaceStatus?.officialMarketplace !== false
-          ? "官方市场：快照与注册完整"
-          : "官方市场：快照缺失或尚未注册",
-      tone:
-        pluginMarketplaceStatus?.officialMarketplace !== false
-          ? "success"
-          : "warning",
-    },
-    {
-      id: "plugin-remote",
-      icon: IconCloudCheck,
-      tooltip:
-        pluginMarketplaceStatus?.remoteMarketplace !== false
-          ? "远程市场：快照与注册完整"
-          : "远程市场：快照缺失或尚未注册",
-      tone:
-        pluginMarketplaceStatus?.remoteMarketplace !== false
-          ? "success"
-          : "warning",
-    },
-    {
-      id: "plugin-host",
-      icon: PlugZap,
-      tooltip: pluginOk
-        ? "插件托管：插件服务正常且链路已就绪"
-        : "插件托管：正在检查或等待修复",
-      tone: pluginOk ? "success" : "warning",
-    },
-  ];
+  const pluginMetrics = useMemo<MetricItem[]>(
+    () => [
+      {
+        id: "plugin-official",
+        icon: IconShoppingBag,
+        tooltip:
+          pluginMarketplaceStatus?.officialMarketplace !== false
+            ? "官方市场：快照与注册完整"
+            : "官方市场：快照缺失或尚未注册",
+        tone:
+          pluginMarketplaceStatus?.officialMarketplace !== false
+            ? "success"
+            : "warning",
+      },
+      {
+        id: "plugin-remote",
+        icon: IconCloudCheck,
+        tooltip:
+          pluginMarketplaceStatus?.remoteMarketplace !== false
+            ? "远程市场：快照与注册完整"
+            : "远程市场：快照缺失或尚未注册",
+        tone:
+          pluginMarketplaceStatus?.remoteMarketplace !== false
+            ? "success"
+            : "warning",
+      },
+      {
+        id: "plugin-host",
+        icon: PlugZap,
+        tooltip: pluginOk
+          ? "插件托管：插件服务正常且链路已就绪"
+          : "插件托管：正在检查或等待修复",
+        tone: pluginOk ? "success" : "warning",
+      },
+    ],
+    [
+      pluginMarketplaceStatus?.officialMarketplace,
+      pluginMarketplaceStatus?.remoteMarketplace,
+      pluginOk,
+    ],
+  );
 
   const statusCards: Array<{
     title: string;
@@ -243,9 +287,9 @@ function OperationsPanelComponent({
     {
       title: "系统优化",
       description: injectionError
-        ? `${failedInjectionScripts.length} 个脚本注入异常，可展开查看错误。`
-        : unverifiedInjectionScripts.length > 0
-          ? `${unverifiedInjectionScripts.length} 个脚本已执行，但未验证实际效果。`
+        ? `${failedInjectionScriptCount} 个脚本注入异常，可展开查看错误。`
+        : unverifiedInjectionScriptCount > 0
+          ? `${unverifiedInjectionScriptCount} 个脚本已执行，但未验证实际效果。`
           : injectionStatusPending
             ? status.running
               ? "正在读取最近一次脚本注入结果。"
@@ -255,9 +299,9 @@ function OperationsPanelComponent({
               : "部分精简策略尚未启用，保留完整功能。",
       metrics: optimizationMetrics,
       label: injectionError
-        ? `${failedInjectionScripts.length} 个异常`
-        : unverifiedInjectionScripts.length > 0
-          ? `${unverifiedInjectionScripts.length} 个未验证`
+        ? `${failedInjectionScriptCount} 个异常`
+        : unverifiedInjectionScriptCount > 0
+          ? `${unverifiedInjectionScriptCount} 个未验证`
           : injectionStatusPending
             ? status.running
               ? "检测中"
@@ -268,7 +312,7 @@ function OperationsPanelComponent({
       tone:
         injectionError || performanceError
           ? "destructive"
-          : injectionStatusPending || unverifiedInjectionScripts.length > 0
+          : injectionStatusPending || unverifiedInjectionScriptCount > 0
             ? "warning"
             : "success",
       icon: Cpu,

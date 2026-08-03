@@ -242,9 +242,13 @@ export function Dialog({
     if (open === undefined) setInternalOpen(nextOpen);
     onOpenChange?.(nextOpen);
   }, [onOpenChange, open]);
+  const contextValue = React.useMemo(
+    () => ({ open: currentOpen, setOpen }),
+    [currentOpen, setOpen],
+  );
 
   return (
-    <DialogContext.Provider value={{ open: currentOpen, setOpen }}>
+    <DialogContext.Provider value={contextValue}>
       {children}
     </DialogContext.Provider>
   );
@@ -289,6 +293,10 @@ export function DialogContent({
   const generatedId = React.useId().replace(/:/g, "");
   const titleId = `codey-dialog-title-${generatedId}`;
   const descriptionId = `codey-dialog-description-${generatedId}`;
+  const labelContextValue = React.useMemo(
+    () => ({ descriptionId, titleId }),
+    [descriptionId, titleId],
+  );
 
   const handleCancel = (event: React.MouseEvent) => {
     const originalEvent = event?.nativeEvent as Event | undefined;
@@ -324,7 +332,7 @@ export function DialogContent({
       visible={dialog.open}
       width={512}
     >
-      <DialogLabelContext.Provider value={{ descriptionId, titleId }}>
+      <DialogLabelContext.Provider value={labelContextValue}>
         <SemiButton
           aria-label="关闭"
           className="codey-dialog-close"

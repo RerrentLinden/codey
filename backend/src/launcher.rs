@@ -143,6 +143,7 @@ pub struct CodeyRuntime {
     route_overlay_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     route_overlay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     exit_watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    exit_watchdog_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl CodeyRuntime {
@@ -210,7 +211,25 @@ impl CodeyRuntime {
         let initial_trace_guard = tokio::task::spawn_blocking(move || {
             trace_log_guard::configure(&trace_guard_home, disable_trace_log_writes)
         });
-        let route_takeover = cc_switch::route_takeover_state(&home).map_err(|error| {
+        let route_takeover_home = home.clone();
+        let route_takeover = tokio::task::spawn_blocking(move || {
+            cc_switch::route_takeover_state(&route_takeover_home)
+        })
+        .await
+        .map_err(|error| {
+            let error = anyhow::Error::new(error).context("检测 CC Switch 路由接管任务异常退出");
+            error_log::record_failure(
+                "patch_failed",
+                "detect_cc_switch_route_takeover",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "codexHome": home,
+                    "taskJoinFailed": true,
+                }),
+            );
+            error
+        })?
+        .map_err(|error| {
             error_log::record_failure(
                 "patch_failed",
                 "detect_cc_switch_route_takeover",
@@ -830,10 +849,10 @@ impl CodeyRuntime {
         });
         let codex_exited = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
-        let (exit_watchdog_shutdown, codex_exit) =
+        let (exit_watchdog_shutdown, codex_exit, exit_watchdog_task) =
             spawn_codex_exit_watcher(child.clone(), spawned.process_id, codex_exited.clone());
         #[cfg(not(windows))]
-        let (exit_watchdog_shutdown, codex_exit) =
+        let (exit_watchdog_shutdown, codex_exit, exit_watchdog_task) =
             spawn_codex_exit_watcher(child.clone(), codex_exited.clone());
         Ok((
             Self {
@@ -857,6 +876,7 @@ impl CodeyRuntime {
                 route_overlay_shutdown: Mutex::new(route_overlay_shutdown),
                 route_overlay_task: Mutex::new(route_overlay_task),
                 exit_watchdog_shutdown: Mutex::new(Some(exit_watchdog_shutdown)),
+                exit_watchdog_task: Mutex::new(Some(exit_watchdog_task)),
             },
             codex_exit,
         ))
@@ -895,6 +915,18 @@ impl CodeyRuntime {
         }
         if let Some(sender) = self.exit_watchdog_shutdown.lock().await.take() {
             let _ = sender.send(());
+        }
+        let exit_watchdog_task = self.exit_watchdog_task.lock().await.take();
+        if let Some(task) = exit_watchdog_task
+            && let Err(error) = task.await
+        {
+            error_log::record_failure(
+                "process_watch_failed",
+                "stop_codex_exit_watcher",
+                error.to_string(),
+                serde_json::json!({}),
+            );
+            eprintln!("Codex 退出监听器关闭失败：{error}");
         }
         #[cfg(target_os = "macos")]
         let process_stop = if let Some(inspector_argument) = self.inspector_argument.as_deref() {
@@ -1247,6 +1279,7 @@ fn restore_runtime_config_after_error(
     }
 }
 
+#[cfg(windows)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildProcessState {
     Running,
@@ -1254,6 +1287,7 @@ enum ChildProcessState {
     Untracked,
 }
 
+#[cfg(windows)]
 async fn child_process_state(child: &Arc<Mutex<Option<Child>>>) -> ChildProcessState {
     let mut slot = child.lock().await;
     let state = match slot.as_mut() {
@@ -1274,29 +1308,46 @@ async fn child_process_state(child: &Arc<Mutex<Option<Child>>>) -> ChildProcessS
 fn spawn_codex_exit_watcher(
     child: Arc<Mutex<Option<Child>>>,
     codex_exited: Arc<AtomicBool>,
-) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
+) -> (
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let (exit_tx, exit_rx) = oneshot::channel();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(500));
-        let natural_exit = loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => break false,
-                _ = interval.tick() => match child_process_state(&child).await {
-                    ChildProcessState::Running => {}
-                    ChildProcessState::Exited => {
-                        codex_exited.store(true, Ordering::Release);
-                        break true;
-                    }
-                    ChildProcessState::Untracked => break false,
-                }
+    let task = tokio::spawn(async move {
+        let Some(mut process) = child.lock().await.take() else {
+            return;
+        };
+        let wait_result = tokio::select! {
+            _ = &mut shutdown_rx => None,
+            result = process.wait() => Some(result),
+        };
+        let natural_exit = match wait_result {
+            Some(Ok(_)) => true,
+            Some(Err(error)) => {
+                error_log::record_failure(
+                    "process_watch_failed",
+                    "wait_for_codex_exit",
+                    error.to_string(),
+                    serde_json::json!({
+                        "processId": process.id(),
+                    }),
+                );
+                *child.lock().await = Some(process);
+                false
+            }
+            None => {
+                *child.lock().await = Some(process);
+                false
             }
         };
         if natural_exit {
+            codex_exited.store(true, Ordering::Release);
             let _ = exit_tx.send(());
         }
     });
-    (shutdown_tx, exit_rx)
+    (shutdown_tx, exit_rx, task)
 }
 
 #[cfg(windows)]
@@ -1304,10 +1355,14 @@ fn spawn_codex_exit_watcher(
     child: Arc<Mutex<Option<Child>>>,
     process_id: Option<u32>,
     codex_exited: Arc<AtomicBool>,
-) -> (oneshot::Sender<()>, oneshot::Receiver<()>) {
+) -> (
+    oneshot::Sender<()>,
+    oneshot::Receiver<()>,
+    tokio::task::JoinHandle<()>,
+) {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
     let (exit_tx, exit_rx) = oneshot::channel();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let natural_exit = if let Some(process_id) = process_id {
             tokio::select! {
                 _ = &mut shutdown_rx => false,
@@ -1349,7 +1404,7 @@ fn spawn_codex_exit_watcher(
             let _ = exit_tx.send(());
         }
     });
-    (shutdown_tx, exit_rx)
+    (shutdown_tx, exit_rx, task)
 }
 
 struct SpawnedCodex {
@@ -2200,13 +2255,37 @@ mod tests {
             .expect("spawn short-lived child");
         let child = Arc::new(Mutex::new(Some(child)));
         let exited = Arc::new(AtomicBool::new(false));
-        let (_shutdown, exit_rx) = spawn_codex_exit_watcher(child, exited.clone());
+        let (_shutdown, exit_rx, task) = spawn_codex_exit_watcher(child, exited.clone());
 
         tokio::time::timeout(Duration::from_secs(2), exit_rx)
             .await
             .expect("watcher timed out")
             .expect("watcher was cancelled");
+        task.await.expect("watcher task failed");
         assert!(exited.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn exit_watcher_returns_the_child_to_stop_on_shutdown() {
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn long-lived child");
+        let child = Arc::new(Mutex::new(Some(child)));
+        let exited = Arc::new(AtomicBool::new(false));
+        let (shutdown, _exit_rx, task) = spawn_codex_exit_watcher(child.clone(), exited.clone());
+
+        shutdown.send(()).expect("send watcher shutdown");
+        task.await.expect("watcher task failed");
+
+        assert!(!exited.load(Ordering::Acquire));
+        let mut process = child
+            .lock()
+            .await
+            .take()
+            .expect("watcher should return the child");
+        process.kill().await.expect("kill child");
+        process.wait().await.expect("reap child");
     }
 
     #[test]
