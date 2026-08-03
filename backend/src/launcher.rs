@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
-use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved;
+use codey_runtime_core::app_paths::{build_codex_executable, resolve_codex_app_dir_with_saved};
 use codey_runtime_core::launcher::build_codex_command;
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
 use serde::Serialize;
@@ -1939,22 +1939,23 @@ async fn terminate_unix_codex_processes(
     }
     Ok(known_processes.len())
 }
-
 #[cfg(target_os = "macos")]
-async fn macos_codex_process_ids(app_dir: &std::path::Path) -> Result<Vec<u32>> {
-    let processes = crate::process_tree::unix_process_snapshot().await?;
-    Ok(
-        owned_unix_codex_process_ids(&processes, app_dir, None, None, None)
-            .into_iter()
-            .collect(),
-    )
+fn macos_main_executable_is_running(
+    processes: &[crate::process_tree::UnixProcessInfo],
+    executable: &std::path::Path,
+) -> bool {
+    processes
+        .iter()
+        .any(|process| crate::process_tree::command_uses_path(&process.command, executable))
 }
 
 #[cfg(target_os = "macos")]
 async fn macos_codex_is_running(app_dir: &std::path::Path) -> Result<bool> {
-    Ok(!macos_codex_process_ids(app_dir).await?.is_empty())
+    // 启动前只检查 App 的主可执行文件，忽略 app-server 和 Chromium helper。
+    let executable = build_codex_executable(app_dir);
+    let processes = crate::process_tree::unix_process_snapshot().await?;
+    Ok(macos_main_executable_is_running(&processes, &executable))
 }
-
 #[cfg(windows)]
 fn windows_path_is_within(path: &Path, directory: &Path) -> bool {
     let path = normalized_windows_path(path);
@@ -2127,6 +2128,24 @@ mod tests {
         .await
         .unwrap();
         assert!(!running);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_running_check_matches_only_the_app_main_executable() {
+        let processes = crate::process_tree::parse_unix_process_snapshot(
+            b"100 1 100 Thu Jul 23 19:23:12 2026 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9229\n\
+              101 100 100 Thu Jul 23 19:23:13 2026 /Applications/ChatGPT.app/Contents/Resources/codex app-server\n\
+              102 101 102 Thu Jul 23 19:23:14 2026 /Applications/ChatGPT.app/Contents/Frameworks/Chromium Helper\n",
+        );
+        assert!(macos_main_executable_is_running(
+            &processes,
+            Path::new("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+        ));
+        assert!(!macos_main_executable_is_running(
+            &processes[1..],
+            Path::new("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+        ));
     }
 
     #[test]
