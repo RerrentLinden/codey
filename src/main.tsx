@@ -71,6 +71,9 @@ if (import.meta.env.DEV) {
       selectedModelsByProvider: {
         primary: ["provider-fast-coder", "claude-sonnet-4-5"],
       },
+      manualThirdPartyModelsByProvider: {
+        primary: ["provider-fast-coder"],
+      },
       upstreamModelsByProvider: { primary: previewUpstreamModels },
       defaultModelByProvider: {},
       disableTraceLogWrites: true,
@@ -114,6 +117,7 @@ if (import.meta.env.DEV) {
       })),
       officialModelIds: previewOfficialModels.map((model) => model.slug),
       thirdPartyModels: ["provider-fast-coder", "claude-sonnet-4-5"],
+      manualThirdPartyModels: ["provider-fast-coder"],
       upstreamModels: previewUpstreamModels,
       defaultModel: "gpt-5.6-sol",
     };
@@ -292,6 +296,9 @@ if (import.meta.env.DEV) {
           thirdPartyModels: previewModelState.thirdPartyModels.filter((model) =>
             previewUpstreamModels.includes(model)
           ),
+          manualThirdPartyModels: previewModelState.manualThirdPartyModels.filter((model) =>
+            !previewUpstreamModels.includes(model)
+          ),
           upstreamModels: previewUpstreamModels,
         };
         return {
@@ -305,6 +312,7 @@ if (import.meta.env.DEV) {
       if (command === "save_selected_models") {
         const officialModels = (args.officialModels as string[]) || [];
         const thirdPartyModels = (args.thirdPartyModels as string[]) || [];
+        const manualThirdPartyModels = (args.manualThirdPartyModels as string[]) || [];
         const requestedOfficial = new Set(officialModels);
         const supportedModels = [...officialModels, ...thirdPartyModels];
         previewConfig = {
@@ -312,6 +320,10 @@ if (import.meta.env.DEV) {
           selectedModelsByProvider: {
             ...previewConfig.selectedModelsByProvider,
             primary: thirdPartyModels,
+          },
+          manualThirdPartyModelsByProvider: {
+            ...previewConfig.manualThirdPartyModelsByProvider,
+            primary: manualThirdPartyModels,
           },
           upstreamModelsByProvider: {
             ...previewConfig.upstreamModelsByProvider,
@@ -328,6 +340,9 @@ if (import.meta.env.DEV) {
             supported: requestedOfficial.has(model.slug),
           })),
           thirdPartyModels,
+          manualThirdPartyModels: manualThirdPartyModels.filter((model) =>
+            thirdPartyModels.includes(model)
+          ),
           upstreamModels: supportedModels,
           defaultModel,
         };

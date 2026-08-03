@@ -23,9 +23,9 @@ use tokio::sync::{Mutex, Notify, RwLock, oneshot, watch};
 #[cfg(test)]
 use models::{
     config_with_current_provider_models, preserve_selected_third_party_models,
-    renderer_model_catalog_value, should_refresh_model_catalog,
-    startup_model_sync_models_or_fallback, sync_cc_switch_state_with,
-    validate_manual_model_selection,
+    preserve_selected_third_party_models_except, renderer_model_catalog_value,
+    should_refresh_model_catalog, startup_model_sync_models_or_fallback, sync_cc_switch_state_with,
+    validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
     current_model_state, current_renderer_model_catalog, sync_provider_models_for_launch,
@@ -481,11 +481,28 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "save_selected_models" => match (
             argument::<Vec<String>>(&args, "officialModels"),
             argument::<Vec<String>>(&args, "thirdPartyModels"),
+            optional_argument::<Vec<String>>(&args, "manualThirdPartyModels"),
+            optional_argument::<Vec<String>>(&args, "deletedThirdPartyModels"),
         ) {
-            (Ok(official_models), Ok(third_party_models)) => {
-                save_selected_models(state, official_models, third_party_models).await
+            (
+                Ok(official_models),
+                Ok(third_party_models),
+                Ok(manual_third_party_models),
+                Ok(deleted_third_party_models),
+            ) => {
+                save_selected_models(
+                    state,
+                    official_models,
+                    third_party_models,
+                    manual_third_party_models.unwrap_or_default(),
+                    deleted_third_party_models.unwrap_or_default(),
+                )
+                .await
             }
-            (Err(error), _) | (_, Err(error)) => Err(error),
+            (Err(error), _, _, _)
+            | (_, Err(error), _, _)
+            | (_, _, Err(error), _)
+            | (_, _, _, Err(error)) => Err(error),
         },
         "save_default_model" => match string_argument(&args, "model") {
             Ok(model) => save_default_model(state, model).await,
@@ -1016,6 +1033,7 @@ mod restart_tests {
                 .collect(),
             official_models,
             third_party_models: vec!["provider-fast-coder".into()],
+            manual_third_party_models: vec!["provider-fast-coder".into()],
             upstream_models: vec!["provider-fast-coder".into()],
             default_model: "gpt-5.6-sol".into(),
         };
@@ -1333,6 +1351,41 @@ mod restart_tests {
     }
 
     #[test]
+    fn manual_model_selection_deletion_removes_saved_other_model_support() {
+        let official = model_catalog::default_official_model_slugs();
+        let deleted =
+            validate_deleted_third_party_models(&official, &["provider-manual".into()]).unwrap();
+        let mut supported_models = vec!["gpt-5.6-sol".into()];
+
+        preserve_selected_third_party_models_except(
+            &mut supported_models,
+            &[
+                "provider-listed".into(),
+                "provider-manual".into(),
+                "gpt-5.4".into(),
+            ],
+            &deleted,
+        );
+        preserve_selected_third_party_models_except(
+            &mut supported_models,
+            &["provider-listed".into()],
+            &std::collections::HashSet::new(),
+        );
+
+        assert_eq!(supported_models, ["gpt-5.6-sol", "provider-listed"]);
+    }
+
+    #[test]
+    fn manual_model_selection_deletion_rejects_official_models() {
+        let official = model_catalog::default_official_model_slugs();
+
+        let error =
+            validate_deleted_third_party_models(&official, &[" GPT-5.6-SOL ".into()]).unwrap_err();
+
+        assert!(error.contains("官方模型"));
+    }
+
+    #[test]
     fn manual_model_selection_separates_official_and_other_models() {
         let official = model_catalog::default_official_model_slugs();
 
@@ -1520,6 +1573,14 @@ fn argument<T: DeserializeOwned>(args: &Value, name: &str) -> Result<T, String> 
             .ok_or_else(|| format!("缺少参数：{name}"))?,
     )
     .map_err(|error| format!("参数 {name} 无效：{error}"))
+}
+
+fn optional_argument<T: DeserializeOwned>(args: &Value, name: &str) -> Result<Option<T>, String> {
+    args.get(name)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| format!("参数 {name} 无效：{error}"))
 }
 
 fn string_argument(args: &Value, name: &str) -> Result<String, String> {

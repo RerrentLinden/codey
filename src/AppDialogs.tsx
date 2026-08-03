@@ -34,10 +34,12 @@ type ModelPickerDialogProps = {
   thirdPartyModelOptions: string[];
   modelState: ModelState;
   draftModelSet: Set<string>;
+  manualThirdPartyModelKeys: Set<string>;
   onOpenChange: (open: boolean) => void;
   onCustomModelInputChange: (model: string) => void;
   onAddCustomModel: () => void;
   onToggleDraftModel: (model: string, checked: boolean) => void;
+  onDeleteThirdPartyModel: (model: string) => void;
   onSave: () => void;
 };
 
@@ -52,10 +54,12 @@ function ModelPickerDialogComponent({
   thirdPartyModelOptions,
   modelState,
   draftModelSet,
+  manualThirdPartyModelKeys,
   onOpenChange,
   onCustomModelInputChange,
   onAddCustomModel,
   onToggleDraftModel,
+  onDeleteThirdPartyModel,
   onSave,
 }: ModelPickerDialogProps) {
   return (
@@ -144,17 +148,35 @@ function ModelPickerDialogComponent({
             </div>
             <Badge variant="secondary">{thirdPartyModelOptions.length} 个</Badge>
           </div>
-          {thirdPartyModelOptions.map((model) => (
-            <div className="model-picker-row" key={model}>
-              <Checkbox
-                checked={draftModelSet.has(model)}
-                disabled={isBusy}
-                onCheckedChange={(checked) => onToggleDraftModel(model, checked === true)}
-                aria-label={`当前线路支持 ${model}`}
-              />
-              <span className="model-picker-model-id">{model}</span>
-            </div>
-          ))}
+          {thirdPartyModelOptions.map((model) => {
+            const added =
+              draftModelSet.has(model) || modelState.thirdPartyModels.includes(model);
+            const manual = manualThirdPartyModelKeys.has(model.trim().toLowerCase());
+            return (
+              <div className="model-picker-row" key={model}>
+                <Checkbox
+                  checked={draftModelSet.has(model)}
+                  disabled={isBusy}
+                  onCheckedChange={(checked) => onToggleDraftModel(model, checked === true)}
+                  aria-label={`当前线路支持 ${model}`}
+                />
+                <span className="model-picker-model-id">{model}</span>
+                {added && manual && (
+                  <Button
+                    variant="ghost"
+                    size="xs"
+                    className="model-picker-delete-button"
+                    disabled={isBusy}
+                    onClick={() => onDeleteThirdPartyModel(model)}
+                    aria-label={`删除其他模型 ${model}`}
+                  >
+                    <Trash2 aria-hidden="true" />
+                    删除
+                  </Button>
+                )}
+              </div>
+            );
+          })}
           {thirdPartyModelOptions.length === 0 && (
             <div className="empty-state">尚无其他模型，可在上方输入模型 ID 添加</div>
           )}

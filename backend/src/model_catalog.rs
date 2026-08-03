@@ -57,6 +57,7 @@ pub struct ModelSelectionState {
     pub official_models: Vec<OfficialModelAvailability>,
     pub official_model_ids: Vec<String>,
     pub third_party_models: Vec<String>,
+    pub manual_third_party_models: Vec<String>,
     pub upstream_models: Vec<String>,
     pub default_model: String,
 }
@@ -140,11 +141,30 @@ pub fn refresh_for_provider(
     Ok(catalog_models.len())
 }
 
+#[cfg(test)]
 pub fn selection_state(
     home: &Path,
     official_provider: bool,
     upstream_models: Option<&[String]>,
     selected_models: &[String],
+    requested_default_model: Option<&str>,
+) -> Result<ModelSelectionState> {
+    selection_state_with_manual_models(
+        home,
+        official_provider,
+        upstream_models,
+        selected_models,
+        &[],
+        requested_default_model,
+    )
+}
+
+pub fn selection_state_with_manual_models(
+    home: &Path,
+    official_provider: bool,
+    upstream_models: Option<&[String]>,
+    selected_models: &[String],
+    manual_third_party_models: &[String],
     requested_default_model: Option<&str>,
 ) -> Result<ModelSelectionState> {
     let official_entries = read_official_entries(home)?;
@@ -200,6 +220,19 @@ pub fn selection_state(
                 models
             })
     };
+    let manual_model_keys = manual_third_party_models
+        .iter()
+        .map(|model| model.trim().to_lowercase())
+        .collect::<HashSet<_>>();
+    let manual_third_party_models = if official_provider {
+        Vec::new()
+    } else {
+        third_party_models
+            .iter()
+            .filter(|model| manual_model_keys.contains(model.to_lowercase().as_str()))
+            .cloned()
+            .collect()
+    };
     let default_model = effective_default_model(
         &official_models,
         &third_party_models,
@@ -209,6 +242,7 @@ pub fn selection_state(
         official_models,
         official_model_ids,
         third_party_models,
+        manual_third_party_models,
         upstream_models: if official_provider {
             Vec::new()
         } else {
@@ -1157,11 +1191,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
         let upstream = vec!["gpt-5.6-sol".into(), "third-model".into()];
-        let state = selection_state(
+        let state = selection_state_with_manual_models(
             home.path(),
             false,
             Some(&upstream),
             &["gpt-5.6-sol".into(), "third-model".into()],
+            &["third-model".into()],
             None,
         )
         .unwrap();
@@ -1189,6 +1224,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(state.third_party_models, ["third-model"]);
+        assert_eq!(state.manual_third_party_models, ["third-model"]);
         assert_eq!(state.default_model, "gpt-5.6-sol");
     }
 

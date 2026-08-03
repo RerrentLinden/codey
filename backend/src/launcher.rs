@@ -464,11 +464,12 @@ impl CodeyRuntime {
                     false
                 }
             };
-            let default_model = match model_catalog::selection_state(
+            let default_model = match model_catalog::selection_state_with_manual_models(
                 &home,
                 official_provider,
                 config.upstream_models_snapshot(),
                 config.selected_models(),
+                config.manual_third_party_models(),
                 config.default_model(),
             ) {
                 Ok(state) => state.default_model,

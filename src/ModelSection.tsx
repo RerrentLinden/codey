@@ -6,6 +6,7 @@ import {
   IconPlugConnected as PlugZap,
   IconRefresh as RefreshCw,
   IconServer as Server,
+  IconTrash as Trash,
   IconX as X,
 } from "@tabler/icons-react";
 
@@ -20,9 +21,11 @@ type ModelSectionProps = {
   isBusy: boolean;
   busy: string | null;
   showAccountUsageInHeader: boolean;
+  manualThirdPartyModelKeys: Set<string>;
   onSyncCurrentProvider: () => void;
   onFetchCurrentModels: () => void;
   onSetDefaultModel: (model: string) => void;
+  onDeleteThirdPartyModel: (model: string) => void;
   onShowAccountUsageInHeaderChange: (checked: boolean) => void;
 };
 
@@ -34,9 +37,11 @@ function ModelSectionComponent({
   isBusy,
   busy,
   showAccountUsageInHeader,
+  manualThirdPartyModelKeys,
   onSyncCurrentProvider,
   onFetchCurrentModels,
   onSetDefaultModel,
+  onDeleteThirdPartyModel,
   onShowAccountUsageInHeaderChange,
 }: ModelSectionProps) {
   const defaultModel = modelState.defaultModel;
@@ -242,6 +247,19 @@ function ModelSectionComponent({
                               onClick={() => onSetDefaultModel(model)}
                             >
                               设为默认
+                            </Button>
+                          )}
+                          {manualThirdPartyModelKeys.has(model.toLowerCase()) && (
+                            <Button
+                              variant="ghost"
+                              size="xs"
+                              className="catalog-model-delete"
+                              disabled={isBusy}
+                              onClick={() => onDeleteThirdPartyModel(model)}
+                              aria-label={`删除其他模型 ${model}`}
+                            >
+                              <Trash aria-hidden="true" />
+                              删除
                             </Button>
                           )}
                         </div>

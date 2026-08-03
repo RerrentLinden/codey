@@ -131,6 +131,7 @@ where
     }
 }
 
+#[cfg(test)]
 pub(super) fn config_with_current_provider_models(
     config: &CodeyConfig,
     models: Vec<String>,
@@ -140,6 +141,65 @@ pub(super) fn config_with_current_provider_models(
     };
     let mut next = config.clone();
     next.upstream_models_by_provider.insert(provider_id, models);
+    next.normalize()
+}
+
+fn selected_models_not_in_upstream(
+    selected_models: &[String],
+    upstream_models: &[String],
+) -> Vec<String> {
+    let official_model_keys = model_catalog::default_official_model_slugs()
+        .into_iter()
+        .map(|model| model.to_lowercase())
+        .collect::<HashSet<_>>();
+    let upstream_model_keys = upstream_models
+        .iter()
+        .map(|model| model.trim().to_lowercase())
+        .collect::<HashSet<_>>();
+    selected_models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| {
+            !model.is_empty()
+                && !official_model_keys.contains(model.to_lowercase().as_str())
+                && !upstream_model_keys.contains(model.to_lowercase().as_str())
+        })
+        .fold(Vec::<String>::new(), |mut models, model| {
+            if !models.iter().any(|existing| existing == model) {
+                models.push(model.to_string());
+            }
+            models
+        })
+}
+
+fn config_with_current_provider_model_sync(
+    config: &CodeyConfig,
+    provider_models: Vec<String>,
+    synced: bool,
+) -> CodeyConfig {
+    let Some(provider_id) = config.current_provider_id().map(ToString::to_string) else {
+        return config.clone();
+    };
+    let manual_models = if synced {
+        selected_models_not_in_upstream(config.selected_models(), &provider_models)
+    } else {
+        preserve_selected_third_party_models(Vec::new(), config.manual_third_party_models())
+    };
+    let supported_models = if synced {
+        preserve_selected_third_party_models(provider_models, config.selected_models())
+    } else {
+        provider_models
+    };
+    let mut next = config.clone();
+    next.upstream_models_by_provider
+        .insert(provider_id.clone(), supported_models);
+    if manual_models.is_empty() {
+        next.manual_third_party_models_by_provider
+            .remove(&provider_id);
+    } else {
+        next.manual_third_party_models_by_provider
+            .insert(provider_id, manual_models);
+    }
     next.normalize()
 }
 
@@ -163,21 +223,35 @@ pub(super) fn preserve_selected_third_party_models(
     mut upstream_models: Vec<String>,
     selected_models: &[String],
 ) -> Vec<String> {
+    preserve_selected_third_party_models_except(
+        &mut upstream_models,
+        selected_models,
+        &HashSet::new(),
+    );
+    upstream_models
+}
+
+pub(super) fn preserve_selected_third_party_models_except(
+    upstream_models: &mut Vec<String>,
+    selected_models: &[String],
+    deleted_model_keys: &HashSet<String>,
+) {
     let official_model_keys = model_catalog::default_official_model_slugs()
         .into_iter()
         .map(|model| model.to_lowercase())
         .collect::<HashSet<_>>();
     for model in selected_models {
         let model = model.trim();
+        let key = model.to_lowercase();
         if model.is_empty()
-            || official_model_keys.contains(model.to_lowercase().as_str())
+            || official_model_keys.contains(key.as_str())
+            || deleted_model_keys.contains(key.as_str())
             || upstream_models.iter().any(|existing| existing == model)
         {
             continue;
         }
         upstream_models.push(model.to_string());
     }
-    upstream_models
 }
 
 pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> CodeyConfig {
@@ -200,13 +274,8 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
     {
         Ok(Ok(models)) => {
             let fetched_model_count = models.len();
-            let (models, synced) =
+            let (provider_models, synced) =
                 startup_model_sync_models_or_fallback(models, config.upstream_models_snapshot());
-            let models = if synced {
-                preserve_selected_third_party_models(models, config.selected_models())
-            } else {
-                models
-            };
             if synced {
                 eprintln!(
                     "启动时已从「{}」同步 {} 个上游模型",
@@ -223,7 +292,7 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
                     profile.name
                 );
             }
-            (models, synced)
+            (provider_models, synced)
         }
         Ok(Err(error)) => {
             let (models, synced) = startup_model_sync_models_or_fallback(
@@ -268,7 +337,7 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
         eprintln!("启动时同步模型期间当前线路已变化，忽略旧线路的同步结果");
         return latest;
     }
-    let next = config_with_current_provider_models(&latest, models);
+    let next = config_with_current_provider_model_sync(&latest, models, synced);
     if synced && let Err(error) = state.store.save(&next) {
         eprintln!("保存启动时模型同步结果失败，本次启动仍使用最新模型：{error:#}");
     }
@@ -302,8 +371,16 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
     let models =
         preserve_selected_third_party_models(fetched_models.clone(), latest.selected_models());
     let mut next = latest;
+    let manual_models = selected_models_not_in_upstream(next.selected_models(), &fetched_models);
     next.upstream_models_by_provider
-        .insert(provider_id, models.clone());
+        .insert(provider_id.clone(), models.clone());
+    if manual_models.is_empty() {
+        next.manual_third_party_models_by_provider
+            .remove(&provider_id);
+    } else {
+        next.manual_third_party_models_by_provider
+            .insert(provider_id, manual_models);
+    }
     next = next.normalize();
     let model_state = current_model_state(&next)?;
     let model_catalog_fallback = should_refresh_model_catalog(&model_state)
@@ -326,6 +403,8 @@ pub async fn save_selected_models(
     state: &Arc<AppState>,
     requested_official_models: Vec<String>,
     requested_third_party_models: Vec<String>,
+    requested_manual_third_party_models: Vec<String>,
+    requested_deleted_third_party_models: Vec<String>,
 ) -> Result<Value, String> {
     let _config_write_guard = state.config_write_lock.lock().await;
     let mut config = state.config.read().await.clone();
@@ -342,22 +421,57 @@ pub async fn save_selected_models(
         &requested_official_models,
         &requested_third_party_models,
     )?;
+    let deleted_third_party_model_keys = validate_deleted_third_party_models(
+        &model_catalog::default_official_model_slugs(),
+        &requested_deleted_third_party_models,
+    )?;
+    let selected = selected
+        .into_iter()
+        .filter(|model| !deleted_third_party_model_keys.contains(model.to_lowercase().as_str()))
+        .collect::<Vec<_>>();
     let provider_id = config
         .current_provider_id()
         .ok_or_else(|| "当前线路缺少标识".to_string())?
         .to_string();
-    let supported_models =
-        preserve_selected_third_party_models(supported_official, config.upstream_models());
-    let supported_models = preserve_selected_third_party_models(supported_models, &selected);
+    validate_deleted_models_are_manual(
+        config.manual_third_party_models(),
+        &deleted_third_party_model_keys,
+    )?;
+    let manual_third_party_models = validate_manual_third_party_model_sources(
+        &model_catalog::default_official_model_slugs(),
+        &selected,
+        config.upstream_models(),
+        config.manual_third_party_models(),
+        &requested_manual_third_party_models,
+    )?;
+    let mut supported_models = supported_official;
+    preserve_selected_third_party_models_except(
+        &mut supported_models,
+        config.upstream_models(),
+        &deleted_third_party_model_keys,
+    );
+    preserve_selected_third_party_models_except(&mut supported_models, &selected, &HashSet::new());
     config
         .upstream_models_by_provider
         .insert(provider_id.clone(), supported_models);
     if selected.is_empty() {
         config.selected_models_by_provider.remove(&provider_id);
+        config
+            .manual_third_party_models_by_provider
+            .remove(&provider_id);
     } else {
         config
             .selected_models_by_provider
-            .insert(provider_id, selected);
+            .insert(provider_id.clone(), selected);
+        if manual_third_party_models.is_empty() {
+            config
+                .manual_third_party_models_by_provider
+                .remove(&provider_id);
+        } else {
+            config
+                .manual_third_party_models_by_provider
+                .insert(provider_id, manual_third_party_models);
+        }
     }
     config = config.normalize();
     refresh_model_catalog(&config)?;
@@ -421,6 +535,93 @@ pub(super) fn validate_manual_model_selection(
             Ok(models)
         })?;
     Ok((supported_official, selected_third_party))
+}
+
+pub(super) fn validate_deleted_third_party_models(
+    official_model_ids: &[String],
+    requested_deleted_third_party_models: &[String],
+) -> Result<HashSet<String>, String> {
+    let official_model_keys = official_model_ids
+        .iter()
+        .map(|model| model.to_lowercase())
+        .collect::<HashSet<_>>();
+    requested_deleted_third_party_models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .try_fold(HashSet::<String>::new(), |mut models, model| {
+            let key = model.to_lowercase();
+            if official_model_keys.contains(key.as_str()) {
+                return Err(format!("官方模型 {model} 不能作为其他模型删除"));
+            }
+            models.insert(key);
+            Ok(models)
+        })
+}
+
+fn validate_deleted_models_are_manual(
+    manual_third_party_models: &[String],
+    deleted_model_keys: &HashSet<String>,
+) -> Result<(), String> {
+    let manual_model_keys = manual_third_party_models
+        .iter()
+        .map(|model| model.trim().to_lowercase())
+        .collect::<HashSet<_>>();
+    if let Some(model) = deleted_model_keys
+        .iter()
+        .find(|model| !manual_model_keys.contains(model.as_str()))
+    {
+        return Err(format!("模型 {model} 不是手动添加的其他模型，不能删除"));
+    }
+    Ok(())
+}
+
+fn validate_manual_third_party_model_sources(
+    official_model_ids: &[String],
+    selected_third_party_models: &[String],
+    upstream_models: &[String],
+    existing_manual_third_party_models: &[String],
+    requested_manual_third_party_models: &[String],
+) -> Result<Vec<String>, String> {
+    let official_model_keys = official_model_ids
+        .iter()
+        .map(|model| model.to_lowercase())
+        .collect::<HashSet<_>>();
+    let selected_model_keys = selected_third_party_models
+        .iter()
+        .map(|model| model.trim().to_lowercase())
+        .collect::<HashSet<_>>();
+    let upstream_model_keys = upstream_models
+        .iter()
+        .map(|model| model.trim().to_lowercase())
+        .collect::<HashSet<_>>();
+    let existing_manual_model_keys = existing_manual_third_party_models
+        .iter()
+        .map(|model| model.trim().to_lowercase())
+        .collect::<HashSet<_>>();
+
+    requested_manual_third_party_models
+        .iter()
+        .map(|model| model.trim())
+        .filter(|model| !model.is_empty())
+        .try_fold(Vec::<String>::new(), |mut models, model| {
+            let key = model.to_lowercase();
+            if official_model_keys.contains(key.as_str()) {
+                return Err(format!("官方模型 {model} 不能作为手动添加的其他模型"));
+            }
+            if !selected_model_keys.contains(key.as_str()) {
+                return Ok(models);
+            }
+            if upstream_model_keys.contains(key.as_str())
+                && !existing_manual_model_keys.contains(key.as_str())
+            {
+                return Ok(models);
+            }
+            if !models.iter().any(|existing| existing == model) {
+                models.push(model.to_string());
+            }
+            Ok(models)
+        })
 }
 
 pub async fn save_default_model(
@@ -519,11 +720,12 @@ pub(super) fn current_model_state(
         .iter()
         .find(|profile| profile.id == config.active_profile_id)
         .is_none_or(|profile| profile.cc_switch_read_only);
-    model_catalog::selection_state(
+    model_catalog::selection_state_with_manual_models(
         &codex_home(),
         official,
         config.upstream_models_snapshot(),
         config.selected_models(),
+        config.manual_third_party_models(),
         config.default_model(),
     )
     .map_err(|error| error.to_string())
@@ -625,6 +827,56 @@ mod tests {
         assert_eq!(
             provider_sync_catalog_fallback(Err(anyhow::anyhow!("模型目录写入失败"))).unwrap_err(),
             "模型目录写入失败"
+        );
+    }
+
+    #[test]
+    fn synced_models_are_not_marked_as_manual_sources() {
+        let official = model_catalog::default_official_model_slugs();
+
+        let manual = validate_manual_third_party_model_sources(
+            &official,
+            &["provider-synced".into(), "provider-manual".into()],
+            &["provider-synced".into()],
+            &[],
+            &["provider-synced".into(), "provider-manual".into()],
+        )
+        .unwrap();
+
+        assert_eq!(manual, ["provider-manual"]);
+    }
+
+    #[test]
+    fn deleted_model_must_be_a_saved_manual_source() {
+        let deleted = ["provider-synced".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        let error =
+            validate_deleted_models_are_manual(&["provider-manual".into()], &deleted).unwrap_err();
+
+        assert!(error.contains("不是手动添加的其他模型"));
+    }
+
+    #[test]
+    fn provider_sync_reclassifies_old_selected_models_by_the_raw_upstream_list() {
+        let mut config = CodeyConfig::default();
+        let provider_id = config.current_provider_id().unwrap().to_string();
+        config.selected_models_by_provider.insert(
+            provider_id.clone(),
+            vec!["provider-synced".into(), "provider-manual".into()],
+        );
+
+        let synced =
+            config_with_current_provider_model_sync(&config, vec!["provider-synced".into()], true);
+
+        assert_eq!(
+            synced.manual_third_party_models_by_provider[&provider_id],
+            ["provider-manual"]
+        );
+        assert_eq!(
+            synced.upstream_models_by_provider[&provider_id],
+            ["provider-synced", "provider-manual"]
         );
     }
 }

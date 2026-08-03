@@ -31,6 +31,7 @@ export type Config = {
   codexAppPath: string;
   userScripts: string[];
   selectedModelsByProvider: Record<string, string[]>;
+  manualThirdPartyModelsByProvider: Record<string, string[]>;
   upstreamModelsByProvider: Record<string, string[]>;
   defaultModelByProvider: Record<string, string>;
   disableTraceLogWrites: boolean;
@@ -59,6 +60,7 @@ export type ModelState = {
   officialModels: OfficialModelState[];
   officialModelIds: string[];
   thirdPartyModels: string[];
+  manualThirdPartyModels: string[];
   upstreamModels: string[];
   defaultModel: string;
 };

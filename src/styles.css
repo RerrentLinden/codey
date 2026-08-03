@@ -1169,6 +1169,15 @@ input:focus-visible,
   gap: 6px;
 }
 
+.catalog-model-delete {
+  color: #d70015;
+}
+
+.catalog-model-delete svg {
+  width: 14px;
+  height: 14px;
+}
+
 .readonly-note {
   display: flex;
   align-items: center;
@@ -2487,6 +2496,16 @@ input:focus-visible,
 
 .model-picker-row .codey-tag {
   margin-left: auto;
+}
+
+.model-picker-delete-button {
+  flex: 0 0 auto;
+  color: #d70015;
+}
+
+.model-picker-delete-button svg {
+  width: 14px;
+  height: 14px;
 }
 
 .model-picker-list-heading {

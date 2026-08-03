@@ -65,11 +65,14 @@ export function useModelSelection({
     officialModels: [],
     officialModelIds: [],
     thirdPartyModels: [],
+    manualThirdPartyModels: [],
     upstreamModels: [],
     defaultModel: "",
   });
   const [modelPickerVisible, setModelPickerVisible] = useState(false);
   const [draftModels, setDraftModels] = useState<string[]>([]);
+  const [draftManualThirdPartyModels, setDraftManualThirdPartyModels] = useState<string[]>([]);
+  const [deletedThirdPartyModels, setDeletedThirdPartyModels] = useState<string[]>([]);
   const [customModelInput, setCustomModelInput] = useState("");
   const [modelInputError, setModelInputError] = useState("");
   const [modelSyncWarning, setModelSyncWarning] = useState("");
@@ -83,6 +86,18 @@ export function useModelSelection({
     [modelState.officialModelIds],
   );
   const draftModelSet = useMemo(() => new Set(draftModels), [draftModels]);
+  const draftManualThirdPartyModelKeys = useMemo(
+    () => new Set(draftManualThirdPartyModels.map(modelKey)),
+    [draftManualThirdPartyModels],
+  );
+  const manualThirdPartyModelKeys = useMemo(
+    () => new Set(modelState.manualThirdPartyModels.map(modelKey)),
+    [modelState.manualThirdPartyModels],
+  );
+  const deletedThirdPartyModelKeys = useMemo(
+    () => new Set(deletedThirdPartyModels.map(modelKey)),
+    [deletedThirdPartyModels],
+  );
   const thirdPartyModelOptions = useMemo(
     () => [
       ...modelState.upstreamModels,
@@ -93,6 +108,7 @@ export function useModelSelection({
       if (
         normalized &&
         !officialSlugKeys.has(modelKey(normalized)) &&
+        !deletedThirdPartyModelKeys.has(modelKey(normalized)) &&
         !models.includes(normalized)
       ) {
         models.push(normalized);
@@ -101,6 +117,7 @@ export function useModelSelection({
     }, []),
     [
       draftModels,
+      deletedThirdPartyModelKeys,
       modelState.thirdPartyModels,
       modelState.upstreamModels,
       officialSlugKeys,
@@ -131,6 +148,8 @@ export function useModelSelection({
 
   function openModelPicker(state: ModelState, warning = "") {
     setDraftModels(pickerSelection(state));
+    setDraftManualThirdPartyModels(state.manualThirdPartyModels);
+    setDeletedThirdPartyModels([]);
     setCustomModelInput("");
     setModelInputError("");
     setModelSyncWarning(warning);
@@ -240,6 +259,11 @@ export function useModelSelection({
   }
 
   function toggleDraftModel(model: string, checked: boolean) {
+    if (checked) {
+      setDeletedThirdPartyModels((current) =>
+        current.filter((item) => modelKey(item) !== modelKey(model)),
+      );
+    }
     setDraftModels((current) =>
       checked
         ? current.includes(model)
@@ -247,6 +271,11 @@ export function useModelSelection({
           : [...current, model]
         : current.filter((item) => item !== model),
     );
+    if (!checked) {
+      setDraftManualThirdPartyModels((current) =>
+        current.filter((item) => modelKey(item) !== modelKey(model)),
+      );
+    }
   }
 
   function updateCustomModelInput(value: string) {
@@ -269,11 +298,85 @@ export function useModelSelection({
       );
       return;
     }
+    const existingUpstreamModel = modelState.upstreamModels.find(
+      (upstream) => modelKey(upstream) === modelKey(model),
+    );
     setDraftModels((current) =>
       current.includes(model) ? current : [...current, model],
     );
+    if (!existingUpstreamModel || manualThirdPartyModelKeys.has(modelKey(model))) {
+      setDraftManualThirdPartyModels((current) =>
+        current.some((item) => modelKey(item) === modelKey(model))
+          ? current
+          : [...current, model],
+      );
+    }
+    setDeletedThirdPartyModels((current) =>
+      current.filter((item) => modelKey(item) !== modelKey(model)),
+    );
     setCustomModelInput("");
     setModelInputError("");
+  }
+
+  function deleteDraftThirdPartyModel(model: string) {
+    const normalized = model.trim();
+    if (!normalized) return;
+    const wasManual = draftManualThirdPartyModelKeys.has(modelKey(normalized));
+    if (!wasManual) return;
+    setDraftModels((current) =>
+      current.filter((item) => modelKey(item) !== modelKey(normalized)),
+    );
+    setDraftManualThirdPartyModels((current) =>
+      current.filter((item) => modelKey(item) !== modelKey(normalized)),
+    );
+    setDeletedThirdPartyModels((current) =>
+      !manualThirdPartyModelKeys.has(modelKey(normalized)) ||
+      current.some((item) => modelKey(item) === modelKey(normalized))
+        ? current
+        : [...current, normalized],
+    );
+    setModelInputError("");
+  }
+
+  async function applyModelSelection(
+    officialModels: string[],
+    thirdPartyModels: string[],
+    manualThirdPartyModels: string[],
+    deletedModels: string[],
+    summary: string,
+    closePicker: boolean,
+  ) {
+    const result = await invoke<{
+      config: Config;
+      modelState: ModelState;
+    } & ModelRuntimeUpdate>("save_selected_models", {
+      officialModels,
+      thirdPartyModels,
+      manualThirdPartyModels,
+      deletedThirdPartyModels: deletedModels,
+    });
+    setPersistedConfig(result.config);
+    setModelState(result.modelState);
+    setStatus((current) => ({
+      ...current,
+      restartRequired: result.restartRequired ?? current.restartRequired,
+    }));
+    if (closePicker) {
+      setModelPickerVisible(false);
+    }
+    setDeletedThirdPartyModels([]);
+    const hotReloadFailed = Boolean(result.modelHotReloadError);
+    setNotice({
+      tone:
+        hotReloadFailed || result.restartRequired ? "info" : "success",
+      text: result.modelHotReloaded
+        ? result.restartRequired
+          ? `${summary}；Codex 模型列表已立即更新，其他设置仍需重启`
+          : `${summary}；Codex 模型列表已立即更新`
+        : hotReloadFailed || result.restartRequired
+          ? `${summary}；当前 Codex 模型列表暂未能刷新，重启 Codex 后生效`
+          : summary,
+    });
   }
 
   async function saveModelSelection() {
@@ -284,35 +387,57 @@ export function useModelSelection({
       const thirdPartyModels = draftModels.filter((model) =>
         !officialSlugs.has(model)
       );
-      const result = await invoke<{
-        config: Config;
-        modelState: ModelState;
-      } & ModelRuntimeUpdate>("save_selected_models", {
+      const thirdPartyModelKeys = new Set(thirdPartyModels.map(modelKey));
+      const manualThirdPartyModels = draftManualThirdPartyModels.filter((model) =>
+        thirdPartyModelKeys.has(modelKey(model))
+      );
+      await applyModelSelection(
         officialModels,
         thirdPartyModels,
-      });
-      setPersistedConfig(result.config);
-      setModelState(result.modelState);
-      setStatus((current) => ({
-        ...current,
-        restartRequired: result.restartRequired ?? current.restartRequired,
-      }));
-      setModelPickerVisible(false);
-      const summary =
+        manualThirdPartyModels,
+        deletedThirdPartyModels,
         `已更新模型支持情况：${officialModels.length} 个官方模型、` +
-        `${thirdPartyModels.length} 个其他模型`;
-      const hotReloadFailed = Boolean(result.modelHotReloadError);
+          `${thirdPartyModels.length} 个其他模型`,
+        true,
+      );
+    });
+  }
+
+  async function deleteThirdPartyModel(model: string) {
+    const normalized = model.trim();
+    if (!normalized) return;
+    const deletedKey = modelKey(normalized);
+    if (!manualThirdPartyModelKeys.has(deletedKey)) {
       setNotice({
-        tone:
-          hotReloadFailed || result.restartRequired ? "info" : "success",
-        text: result.modelHotReloaded
-          ? result.restartRequired
-            ? `${summary}；Codex 模型列表已立即更新，其他设置仍需重启`
-            : `${summary}；Codex 模型列表已立即更新`
-          : hotReloadFailed || result.restartRequired
-            ? `${summary}；当前 Codex 模型列表暂未能刷新，重启 Codex 后生效`
-            : summary,
+        tone: "error",
+        text: `${normalized} 不是手动添加的其他模型，不能删除`,
       });
+      return;
+    }
+    await runOperation("delete-model", async () => {
+      const officialModels = modelState.officialModels
+        .filter((candidate) => candidate.supported)
+        .map((candidate) => candidate.slug);
+      const thirdPartyModels = modelState.thirdPartyModels.filter(
+        (candidate) => modelKey(candidate) !== deletedKey,
+      );
+      const manualThirdPartyModels = modelState.manualThirdPartyModels.filter(
+        (candidate) => modelKey(candidate) !== deletedKey,
+      );
+      await applyModelSelection(
+        officialModels,
+        thirdPartyModels,
+        manualThirdPartyModels,
+        [normalized],
+        `已删除其他模型 ${normalized}`,
+        false,
+      );
+      setDraftModels((current) =>
+        current.filter((item) => modelKey(item) !== deletedKey),
+      );
+      setDraftManualThirdPartyModels((current) =>
+        current.filter((item) => modelKey(item) !== deletedKey),
+      );
     });
   }
 
@@ -354,13 +479,17 @@ export function useModelSelection({
     modelInputError,
     modelSyncWarning,
     draftModelSet,
+    draftManualThirdPartyModelKeys,
+    manualThirdPartyModelKeys,
     thirdPartyModelOptions,
     fetchCurrentModels,
     updateSubagentOptimization,
     toggleDraftModel,
+    deleteDraftThirdPartyModel,
     updateCustomModelInput,
     addCustomModel,
     saveModelSelection,
+    deleteThirdPartyModel,
     setDefaultModel,
   };
 }

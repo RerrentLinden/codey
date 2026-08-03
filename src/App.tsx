@@ -180,13 +180,17 @@ export function App({
     modelInputError,
     modelSyncWarning,
     draftModelSet,
+    draftManualThirdPartyModelKeys,
+    manualThirdPartyModelKeys,
     thirdPartyModelOptions,
     fetchCurrentModels,
     updateSubagentOptimization,
     toggleDraftModel,
+    deleteDraftThirdPartyModel,
     updateCustomModelInput,
     addCustomModel,
     saveModelSelection,
+    deleteThirdPartyModel,
     setDefaultModel,
   } = useModelSelection({
     provider,
@@ -621,6 +625,9 @@ export function App({
   const handleSetDefaultModel = useStableEvent(
     (model: string) => void setDefaultModel(model),
   );
+  const handleDeleteThirdPartyModel = useStableEvent(
+    (model: string) => void deleteThirdPartyModel(model),
+  );
   const handleClearTraceLogs = useStableEvent(askClearTraceLogs);
   const handleRefreshTraceLogStats = useStableEvent(
     () => void refreshTraceLogStats(),
@@ -631,6 +638,9 @@ export function App({
   const handleCustomModelInputChange = useStableEvent(updateCustomModelInput);
   const handleAddCustomModel = useStableEvent(addCustomModel);
   const handleToggleDraftModel = useStableEvent(toggleDraftModel);
+  const handleDeleteDraftThirdPartyModel = useStableEvent(
+    deleteDraftThirdPartyModel,
+  );
   const handleSaveModelSelection = useStableEvent(
     () => void saveModelSelection(),
   );
@@ -873,6 +883,8 @@ export function App({
               onSyncCurrentProvider={handleSyncCurrentProvider}
               onFetchCurrentModels={handleFetchCurrentModels}
               onSetDefaultModel={handleSetDefaultModel}
+              onDeleteThirdPartyModel={handleDeleteThirdPartyModel}
+              manualThirdPartyModelKeys={manualThirdPartyModelKeys}
               onShowAccountUsageInHeaderChange={
                 handleShowAccountUsageInHeaderChange
               }
@@ -931,10 +943,12 @@ export function App({
         thirdPartyModelOptions={thirdPartyModelOptions}
         modelState={modelState}
         draftModelSet={draftModelSet}
+        manualThirdPartyModelKeys={draftManualThirdPartyModelKeys}
         onOpenChange={handleModelPickerOpenChange}
         onCustomModelInputChange={handleCustomModelInputChange}
         onAddCustomModel={handleAddCustomModel}
         onToggleDraftModel={handleToggleDraftModel}
+        onDeleteThirdPartyModel={handleDeleteDraftThirdPartyModel}
         onSave={handleSaveModelSelection}
       />
 

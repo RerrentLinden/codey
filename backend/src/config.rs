@@ -26,6 +26,10 @@ pub struct ProviderProfile {
     pub cc_switch_provider_id: Option<String>,
     #[serde(default)]
     pub cc_switch_read_only: bool,
+    /// Preserve the exact Codex provider identity required for remote
+    /// compaction when it was explicitly enabled by the source configuration.
+    #[serde(default)]
+    pub supports_remote_compaction: bool,
 }
 
 impl ProviderProfile {
@@ -38,6 +42,7 @@ impl ProviderProfile {
             protocol: RelayProtocol::Responses,
             cc_switch_provider_id: None,
             cc_switch_read_only: false,
+            supports_remote_compaction: false,
         }
     }
 
@@ -132,6 +137,11 @@ pub struct CodeyConfig {
     /// by cc-switch (or the local Codex configuration).
     #[serde(default)]
     pub selected_models_by_provider: BTreeMap<String, Vec<String>>,
+    /// Third-party model IDs that were explicitly typed by the user. Synced
+    /// provider models are intentionally excluded so only manual entries can be
+    /// deleted from Codey's saved support list.
+    #[serde(default)]
+    pub manual_third_party_models_by_provider: BTreeMap<String, Vec<String>>,
     /// Last synchronized or manually confirmed provider model support. This
     /// keeps unsupported official models disabled between launches and lets
     /// providers without a model-list endpoint retain manual selections.
@@ -204,6 +214,7 @@ impl Default for CodeyConfig {
             codex_app_path: String::new(),
             user_scripts: Vec::new(),
             selected_models_by_provider: BTreeMap::new(),
+            manual_third_party_models_by_provider: BTreeMap::new(),
             upstream_models_by_provider: BTreeMap::new(),
             default_model_by_provider: BTreeMap::new(),
             disable_trace_log_writes: true,
@@ -228,6 +239,11 @@ impl CodeyConfig {
         self.update_manifest_url = default_update_manifest_url();
         self.profiles
             .retain(|profile| !profile.id.trim().is_empty());
+        for profile in &mut self.profiles {
+            if profile.cc_switch_read_only {
+                profile.supports_remote_compaction = true;
+            }
+        }
         if self.profiles.is_empty() {
             let profile = ProviderProfile::new("默认配置");
             self.active_profile_id = profile.id.clone();
@@ -241,6 +257,7 @@ impl CodeyConfig {
             self.active_profile_id = self.profiles[0].id.clone();
         }
         normalize_model_lists(&mut self.selected_models_by_provider);
+        normalize_model_lists(&mut self.manual_third_party_models_by_provider);
         normalize_upstream_model_lists(&mut self.upstream_models_by_provider);
         normalize_model_map(&mut self.default_model_by_provider);
         self.subagent_model = self.subagent_model.trim().to_string();
@@ -278,6 +295,13 @@ impl CodeyConfig {
     pub fn selected_models(&self) -> &[String] {
         self.current_provider_id()
             .and_then(|provider_id| self.selected_models_by_provider.get(provider_id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn manual_third_party_models(&self) -> &[String] {
+        self.current_provider_id()
+            .and_then(|provider_id| self.manual_third_party_models_by_provider.get(provider_id))
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
