@@ -258,11 +258,7 @@ impl RolloutParseState {
             }
             Some("response_item") => match payload.get("type").and_then(Value::as_str) {
                 Some("function_call") => {
-                    let name = payload
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if !matches!(name, "request_permissions" | "request_user_input") {
+                    if !function_call_requires_approval(payload) {
                         return;
                     }
                     let Some(call_id) = payload.get("call_id").and_then(Value::as_str) else {
@@ -718,6 +714,29 @@ fn task_completion_error(payload: &Value) -> Option<String> {
     })
 }
 
+fn function_call_requires_approval(payload: &Value) -> bool {
+    match payload.get("name").and_then(Value::as_str) {
+        Some("request_permissions" | "request_user_input") => true,
+        Some("exec_command") => {
+            let Some(arguments) = payload.get("arguments") else {
+                return false;
+            };
+            match arguments {
+                Value::String(arguments) => serde_json::from_str::<Value>(arguments)
+                    .ok()
+                    .is_some_and(|arguments| exec_command_requires_escalation(&arguments)),
+                Value::Object(_) => exec_command_requires_escalation(arguments),
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+fn exec_command_requires_escalation(arguments: &Value) -> bool {
+    arguments.get("sandbox_permissions").and_then(Value::as_str) == Some("require_escalated")
+}
+
 #[cfg(test)]
 fn started_turns_in_rollout(contents: &str) -> Vec<String> {
     parse_rollout_events(contents)
@@ -772,6 +791,23 @@ mod tests {
         assert_eq!(
             pending_approvals_in_rollout(rollout),
             vec![("turn-1".to_string(), "pending".to_string())]
+        );
+    }
+
+    #[test]
+    fn finds_only_unresolved_escalated_exec_commands() {
+        let rollout = r#"
+{"type":"turn_context","payload":{"turn_id":"turn-exec"}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"sandbox_permissions\":\"use_default\"}","call_id":"default"}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"not-json","call_id":"invalid"}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"sandbox_permissions\":\"require_escalated\"}","call_id":"resolved"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"resolved"}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"sandbox_permissions\":\"require_escalated\"}","call_id":"pending"}}
+"#;
+
+        assert_eq!(
+            pending_approvals_in_rollout(rollout),
+            vec![("turn-exec".to_string(), "pending".to_string())]
         );
     }
 
