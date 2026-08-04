@@ -1671,9 +1671,9 @@ fn codex_runtime_arguments(
 }
 
 async fn prepare_codex_for_launch(app_dir: &std::path::Path) -> Result<()> {
-    // Existing Codex instances must remain untouched. On macOS spawn_codex
-    // uses `open -n`, so Codey gets a fresh debuggable instance while the
-    // user's existing app and app-server continue running.
+    // Startup patches must be applied before the Codex main process starts.
+    // If the configured app is already running, stop its process tree and
+    // relaunch it under Codey instead of leaving the user to quit it manually.
     #[cfg(windows)]
     {
         let executable = codey_runtime_core::app_paths::build_codex_executable(app_dir);
@@ -1685,18 +1685,18 @@ async fn prepare_codex_for_launch(app_dir: &std::path::Path) -> Result<()> {
             .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
             .any(|path| normalized_windows_path(&path) == executable);
         if already_running {
-            anyhow::bail!(
-                "Codex 启动补丁必须在主进程运行前应用。请从系统托盘完全退出 Codex，再重新启动 Codey"
-            );
+            terminate_windows_codex_processes(app_dir, None)
+                .await
+                .context("停止正在运行的 Codex 失败")?;
         }
     }
     #[cfg(not(windows))]
     let _ = app_dir;
     #[cfg(target_os = "macos")]
     if macos_codex_is_running(app_dir).await? {
-        anyhow::bail!(
-            "Codex 启动优化必须在主进程运行前应用。请完全退出已有 Codex，再重新启动 Codey"
-        );
+        terminate_unix_codex_processes(app_dir, None, None, None)
+            .await
+            .context("停止正在运行的 Codex 失败")?;
     }
     Ok(())
 }

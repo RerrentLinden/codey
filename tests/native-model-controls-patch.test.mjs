@@ -648,7 +648,7 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
   }
 });
 
-test("restarting Codex stops the current runtime and relaunches it with Codey", async () => {
+test("starting or restarting Codex replaces the old runtime with one managed by Codey", async () => {
   const [runtimeSource, launcherSource, appSource] = await Promise.all([
     readFile(new URL("../backend/src/commands/runtime.rs", import.meta.url), "utf8")
       .then(normalizeLineEndings),
@@ -659,6 +659,10 @@ test("restarting Codex stops the current runtime and relaunches it with Codey", 
   const restartFlow = runtimeSource.slice(
     runtimeSource.indexOf("pub async fn schedule_restart_codey_runtime"),
     runtimeSource.indexOf("pub async fn stop_codey_runtime"),
+  );
+  const prepareLaunchFlow = launcherSource.slice(
+    launcherSource.indexOf("async fn prepare_codex_for_launch"),
+    launcherSource.indexOf("fn startup_patch_detail"),
   );
 
   assert.match(restartFlow, /runtime_operation\.lock\(\)/);
@@ -680,7 +684,15 @@ test("restarting Codex stops the current runtime and relaunches it with Codey", 
     launcherSource,
     /stop_macos_codex\([\s\S]*?inspector_argument,[\s\S]*?&self\.codex_app_path,[\s\S]*?self\.process_id,[\s\S]*?self\.process_group_id/,
   );
-  assert.match(launcherSource, /macos_codex_is_running\(app_dir\)\.await\?/);
+  assert.match(
+    prepareLaunchFlow,
+    /if already_running \{[\s\S]*?terminate_windows_codex_processes\(app_dir, None\)[\s\S]*?\.await/,
+  );
+  assert.match(
+    prepareLaunchFlow,
+    /if macos_codex_is_running\(app_dir\)\.await\? \{[\s\S]*?terminate_unix_codex_processes\(app_dir, None, None, None\)[\s\S]*?\.await/,
+  );
+  assert.doesNotMatch(prepareLaunchFlow, /anyhow::bail!/);
   assert.match(launcherSource, /build_codex_executable\(app_dir\)/);
   assert.match(launcherSource, /owned_unix_codex_process_ids/);
   assert.match(launcherSource, /libc::SIGKILL/);

@@ -27,7 +27,7 @@ Codey 是 Codex 桌面客户端的增强启动器。打开 Codey 后，它会自
 - 第三方线路是否可用取决于对应服务本身的能力与账号配置。
 - 保留官方账号登录只保留 Codex 的账号状态，不会把已选择的第三方线路切回官方接口。
 - 删除、导入和恢复类会话操作会尽量保留备份，但仍建议谨慎使用。
-- Windows 和 macOS 上的部分运行策略需要先完全退出已有 Codex，再由 Codey 重新启动后生效。
+- Windows 和 macOS 上启动 Codey 时，如果 Codex 已在运行，Codey 会先将其关闭再重新启动；正在运行的任务会被中断，请提前保存重要内容。
 - 部分增强能力依赖当前 Codex 版本和当前线路支持情况，遇到不兼容时请以 Codey 控制台提示为准。
 - mac arm版本因无签名原因会报损坏，运行`xattr -dr com.apple.quarantine /Applications/Codey.app`即可跳过
 
