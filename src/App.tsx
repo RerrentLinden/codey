@@ -30,7 +30,6 @@ import {
 } from "./AppDialogs";
 import {
   AppUpdateCard,
-  ExperimentalFeaturesCard,
   FeaturePolicyCard,
   ModelSection,
   OperationsPanel,
@@ -419,23 +418,6 @@ export function App({
     });
   }
 
-  async function syncOfficialExperimentalFeatures() {
-    if (!config) return;
-    await runOperation("sync-experimental-features", async () => {
-      const result = await invoke<{
-        experimentalFeatures: Config["experimentalFeatures"];
-      }>("sync_official_experimental_features");
-      editConfig({
-        ...config,
-        experimentalFeatures: result.experimentalFeatures,
-      });
-      setNotice({
-        tone: "info",
-        text: "已同步官方试验性功能配置，保存并重启 Codex 后生效",
-      });
-    });
-  }
-
   async function runOperation(name: string, action: () => Promise<void>) {
     if (isBusy) return;
     setBusy(name);
@@ -626,9 +608,6 @@ export function App({
     askInstallDownloadedUpdate,
   );
   const handleConfigChange = useStableEvent(editConfig);
-  const handleSyncOfficialExperimentalFeatures = useStableEvent(
-    () => void syncOfficialExperimentalFeatures(),
-  );
   const handleAddNotificationChannel = useStableEvent(addNotificationChannel);
   const handleNotificationChannelChange = useStableEvent(
     updateNotificationChannel,
@@ -855,9 +834,9 @@ export function App({
             showRestartAction={!embedded}
           />
 
-          {/* 中间区域：分左右两栏 (左侧: 应用更新与试验性功能; 右侧: 消息通知与功能策略) */}
+          {/* 中间区域：分左右两栏 (左侧: 应用更新; 右侧: 消息通知与功能策略) */}
           <div className="upper-dashboard-grid">
-            {/* 左侧栏：上方应用更新，下方试验性功能 */}
+            {/* 左侧栏：应用更新 */}
             <div className="dashboard-column upper-left-column">
               <AppUpdateCard
                 status={status}
@@ -869,15 +848,6 @@ export function App({
                 onCheckUpdates={handleCheckForUpdates}
                 onDownloadUpdate={handleDownloadUpdate}
                 onInstallUpdate={handleInstallDownloadedUpdate}
-              />
-
-              <ExperimentalFeaturesCard
-                config={config}
-                status={status}
-                busy={busy}
-                isBusy={isBusy}
-                onConfigChange={handleConfigChange}
-                onSyncOfficial={handleSyncOfficialExperimentalFeatures}
               />
             </div>
 

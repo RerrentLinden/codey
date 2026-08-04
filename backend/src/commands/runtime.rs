@@ -76,12 +76,6 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
             "injectionScripts".into(),
             serde_json::to_value(injection_statuses.as_ref()).unwrap_or_else(|_| json!([])),
         );
-        let experimental_feature_runtime =
-            runtime.experimental_feature_runtime.read().await.clone();
-        object.insert(
-            "experimentalFeatureRuntime".into(),
-            serde_json::to_value(&experimental_feature_runtime).unwrap_or_else(|_| json!({})),
-        );
     }
     if let Some(object) = status.as_object_mut() {
         object.insert(

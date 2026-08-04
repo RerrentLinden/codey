@@ -47,33 +47,6 @@ pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Valu
     }))
 }
 
-pub async fn sync_official_experimental_features(state: &Arc<AppState>) -> Result<Value, String> {
-    let runtime = state.runtime.lock().await.clone();
-    let Some(runtime) = runtime else {
-        return Err("Codex 当前未运行，无法同步官方试验性功能配置".to_string());
-    };
-    let websocket_url = runtime.renderer_websocket_url().await;
-    let experimental_features = match cdp::read_official_experimental_features(&websocket_url).await
-    {
-        Ok(features) => features,
-        Err(error) => {
-            error_log::record_failure(
-                "patch_verification_failed",
-                "read_official_experimental_features",
-                format!("{error:#}"),
-                json!({
-                    "websocketUrl": websocket_url,
-                }),
-            );
-            return Err(error.to_string());
-        }
-    };
-    Ok(json!({
-        "status": "ok",
-        "experimentalFeatures": experimental_features,
-    }))
-}
-
 pub async fn sync_cc_switch_state(state: &Arc<AppState>) -> cc_switch::CcSwitchStatus {
     let home = codex_home();
     sync_cc_switch_state_with(state, move |config| {

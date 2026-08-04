@@ -16,8 +16,7 @@ async function loadPatchExpression() {
   return template
     .replaceAll("__DISABLE_PET__", "false")
     .replaceAll("__DISABLE_VOICE__", "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "true")
-    .replaceAll("__EXPERIMENTAL_FEATURE_OVERRIDES__", "{}");
+    .replaceAll("__FAST_CODEX_STARTUP__", "true");
 }
 
 test("API and ChatGPT auth share model-aware native service-tier controls", async () => {

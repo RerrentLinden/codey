@@ -2,8 +2,6 @@
 
 use anyhow::Result;
 
-use crate::config::ExperimentalFeaturesConfig;
-
 const PATCH_RESULT: &str = "codey-startup-patch-installed-v20";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,7 +9,6 @@ pub struct PatchOptions {
     pub disable_pet: bool,
     pub disable_voice: bool,
     pub fast_codex_startup: bool,
-    pub experimental_features: ExperimentalFeaturesConfig,
 }
 
 pub fn inspector_argument(port: u16) -> String {
@@ -23,7 +20,6 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
   const disablePet = __DISABLE_PET__;
   const disableVoice = __DISABLE_VOICE__;
   const fastCodexStartup = __FAST_CODEX_STARTUP__;
-  const experimentalFeatureOverrides = __EXPERIMENTAL_FEATURE_OVERRIDES__;
   const codeyErrorLoggerExecutable = "__CODEY_ERROR_LOGGER_EXECUTABLE__";
   const recordCodeyPatchFailure = (operation, error, context = {}) => {
     const unresolvedExecutable =
@@ -90,29 +86,6 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
       } catch {}
     }
   };
-  const codeyExperimentalFeatureKeyMap = {
-    unified_exec: "unifiedExec",
-    shell_snapshot: "shellSnapshot",
-    responses_websockets_v2: "responsesWebsocketsV2",
-    tool_search_always_defer_mcp_tools: "toolSearchAlwaysDeferMcpTools",
-    standalone_web_search: "standaloneWebSearch",
-    enable_request_compression: "enableRequestCompression",
-    remote_compaction_v2: "remoteCompactionV2",
-    apply_patch_streaming_events: "applyPatchStreamingEvents",
-    concurrent_reasoning_summaries: "concurrentReasoningSummaries",
-  };
-  const toCodeyExperimentalFeatures = (values) => {
-    const result = {};
-    for (const [flag, configKey] of Object.entries(codeyExperimentalFeatureKeyMap)) {
-      const value = values?.[flag];
-      if (typeof value === "boolean") result[configKey] = value;
-    }
-    return result;
-  };
-  const codeyExperimentalFeatureConfigured =
-    toCodeyExperimentalFeatures(experimentalFeatureOverrides);
-  const codeyExperimentalFeatureKeyMapLiteral =
-    JSON.stringify(codeyExperimentalFeatureKeyMap);
   const statsigBootstrapTimeoutMs = 1500;
   const statsigStartupRemainingMs =
     `Math.max(0,(globalThis.__CODEY_STATSIG_STARTUP_DEADLINE_MS__??=Date.now()+${statsigBootstrapTimeoutMs})-Date.now())`;
@@ -477,19 +450,6 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
         /ensureHeartbeat\(\)\{this\.heartbeatTimer\?\?=setInterval\(\(\)=>\{let ([$A-Z_a-z][$\w]*)=this\.now\(\),([$A-Z_a-z][$\w]*)=this\.wallNow\(\);for\(let ([$A-Z_a-z][$\w]*) of this\.activeInteractions\.values\(\)\)this\.recordHeartbeat\(\3,\1,\2\)\},([$A-Z_a-z][$\w]*)\)\}/g,
         "ensureHeartbeat(){}",
         "interaction heartbeat",
-      );
-    }
-    if (
-      source.includes("Concurrent reasoning summaries feature override resolved") &&
-      source.includes("feature_overrides") &&
-      source.includes("2508143457")
-    ) {
-      patched = replaceUniqueRendererGate(
-        patched,
-        /(\b([$A-Z_a-z][$\w]*)\s*=\s*\{\.\.\.[$A-Z_a-z][$\w]*,\.\.\.[$A-Z_a-z][$\w]*,\[[$A-Z_a-z][$\w]*\]:[$A-Z_a-z][$\w]*\([$A-Z_a-z][$\w]*,`2380644311`\)\}\s*;\s*)return/g,
-        (_match, assignment, resultName) =>
-          `${assignment}const codeyOfficialFeatures=((values)=>{const map=${codeyExperimentalFeatureKeyMapLiteral},result={};for(const flag of Object.keys(map)){const value=values?.[flag];if(typeof value==="boolean")result[map[flag]]=value}return result})(${resultName});${resultName}={...${resultName},...${JSON.stringify(experimentalFeatureOverrides)}};globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__={status:"effective",updatedAt:Date.now(),configuredFeatures:${JSON.stringify(codeyExperimentalFeatureConfigured)},officialFeatures:codeyOfficialFeatures,effectiveFeatures:((values)=>{const map=${codeyExperimentalFeatureKeyMapLiteral},result={};for(const flag of Object.keys(map)){const value=values?.[flag];if(typeof value==="boolean")result[map[flag]]=value}return result})(${resultName})};return`,
-        "experimental feature overrides",
       );
     }
     return patched;
@@ -1631,9 +1591,6 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
 "#;
 
 fn patch_expression(options: PatchOptions) -> String {
-    let experimental_feature_overrides =
-        serde_json::to_string(&options.experimental_features.codex_feature_overrides())
-            .expect("experimental feature overrides should serialize");
     let error_logger_executable = match std::env::current_exe() {
         Ok(path) => serde_json::to_string(&path.to_string_lossy().to_string())
             .expect("error logger executable path should serialize"),
@@ -1671,10 +1628,6 @@ fn patch_expression(options: PatchOptions) -> String {
             } else {
                 "false"
             },
-        )
-        .replace(
-            "__EXPERIMENTAL_FEATURE_OVERRIDES__",
-            &experimental_feature_overrides,
         )
 }
 
@@ -1882,7 +1835,6 @@ mod tests {
             disable_pet: true,
             disable_voice: false,
             fast_codex_startup: true,
-            experimental_features: Default::default(),
         });
 
         assert!(expression.contains("const disablePet = true"));
@@ -1922,7 +1874,6 @@ mod tests {
             disable_pet: false,
             disable_voice: false,
             fast_codex_startup: true,
-            experimental_features: Default::default(),
         });
 
         assert!(expression.contains("process.platform === \"win32\""));
@@ -1938,7 +1889,6 @@ mod tests {
             disable_pet: false,
             disable_voice: false,
             fast_codex_startup: false,
-            experimental_features: Default::default(),
         });
 
         assert!(expression.contains("const fastCodexStartup = false"));
@@ -1951,7 +1901,6 @@ mod tests {
             disable_pet: false,
             disable_voice: true,
             fast_codex_startup: true,
-            experimental_features: Default::default(),
         });
 
         assert!(expression.contains("const disableVoice = true"));
@@ -1968,7 +1917,6 @@ mod tests {
             disable_pet: false,
             disable_voice: false,
             fast_codex_startup: true,
-            experimental_features: Default::default(),
         });
 
         assert!(expression.contains("__CODEY_TEMP_WEBVIEW_LIFECYCLE__.close"));
@@ -2092,7 +2040,6 @@ mod tests {
             disable_pet: true,
             disable_voice: false,
             fast_codex_startup: true,
-            experimental_features: Default::default(),
         });
         install_over_websocket(&format!("ws://{address}"), &expression)
             .await
@@ -2154,7 +2101,6 @@ mod tests {
             disable_pet: true,
             disable_voice: false,
             fast_codex_startup: true,
-            experimental_features: Default::default(),
         });
         let error = tokio::time::timeout(
             std::time::Duration::from_millis(500),

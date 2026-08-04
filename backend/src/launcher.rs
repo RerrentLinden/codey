@@ -24,7 +24,7 @@ use crate::codex_config::{
     apply_runtime_provider_config_preserving_route, codex_home, ensure_global_model_provider,
     reconcile_runtime_config_overlay, restore_runtime_provider_config,
 };
-use crate::config::{CodeyConfig, ExperimentalFeaturesConfig, GpuLaunchMode};
+use crate::config::{CodeyConfig, GpuLaunchMode};
 use crate::error_log;
 use crate::maintenance_lock;
 use crate::model_catalog;
@@ -129,7 +129,6 @@ pub struct CodeyRuntime {
     applied_model_config: RwLock<RuntimeModelConfig>,
     applied_subagent_config: RwLock<RuntimeSubagentConfig>,
     pub injection_statuses: Arc<RwLock<Arc<[cdp::InjectionScriptStatus]>>>,
-    pub experimental_feature_runtime: Arc<RwLock<cdp::ExperimentalFeatureRuntimeStatus>>,
     injection_scripts: cdp::PreparedInjectionScripts,
     injection_websocket_url: Arc<RwLock<Arc<str>>>,
     child: Arc<Mutex<Option<Child>>>,
@@ -175,22 +174,10 @@ impl CodeyRuntime {
                 self.injection_scripts
                     .statuses_with_error(format!("实时生效自检失败：{error:#}"))
             });
-        let experimental_feature_runtime = cdp::read_experimental_feature_runtime_status(
-            &websocket_url,
-            self.applied_config.experimental_features,
-        )
-        .await
-        .unwrap_or_else(|error| {
-            cdp::ExperimentalFeatureRuntimeStatus::failed(
-                format!("试验性功能运行态自检失败：{error:#}"),
-                self.applied_config.experimental_features,
-            )
-        });
         if self.injection_websocket_url.read().await.as_ref() != websocket_url.as_ref() {
             return self.injection_statuses.read().await.clone();
         }
         *self.injection_statuses.write().await = statuses.clone();
-        *self.experimental_feature_runtime.write().await = experimental_feature_runtime;
         statuses
     }
 
@@ -624,7 +611,6 @@ impl CodeyRuntime {
             config.slim_codex_pet,
             config.slim_codex_voice,
             config.fast_codex_startup,
-            config.experimental_features,
             config.gpu_launch_mode,
         )
         .await
@@ -740,9 +726,6 @@ impl CodeyRuntime {
             };
 
         let injection_statuses = Arc::new(RwLock::new(injected_target.injection_statuses()));
-        let experimental_feature_runtime = Arc::new(RwLock::new(
-            cdp::ExperimentalFeatureRuntimeStatus::pending(config.experimental_features),
-        ));
         let injection_websocket_url = Arc::new(RwLock::new(injected_target.websocket_url_arc()));
         let (route_overlay_shutdown, route_overlay_task) = if preserve_provider_route {
             let (shutdown, task) = spawn_route_overlay_watcher(home.clone());
@@ -755,8 +738,6 @@ impl CodeyRuntime {
         let watchdog_debug_port = debug_port;
         let watchdog_injection_scripts = injection_scripts.clone();
         let watchdog_injection_statuses = injection_statuses.clone();
-        let watchdog_experimental_feature_runtime = experimental_feature_runtime.clone();
-        let watchdog_experimental_features = config.experimental_features;
         let watchdog_injection_websocket_url = injection_websocket_url.clone();
         let watchdog_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(CDP_WATCHDOG_INTERVAL);
@@ -808,10 +789,6 @@ impl CodeyRuntime {
                         let next_websocket_url = reinjected.websocket_url_arc();
                         let previous = std::mem::replace(&mut target, reinjected);
                         *watchdog_injection_statuses.write().await = next_statuses;
-                        *watchdog_experimental_feature_runtime.write().await =
-                            cdp::ExperimentalFeatureRuntimeStatus::pending(
-                                watchdog_experimental_features,
-                            );
                         *watchdog_injection_websocket_url.write().await = next_websocket_url;
                         previous.close().await;
                         consecutive_failures = 0;
@@ -835,11 +812,6 @@ impl CodeyRuntime {
                         );
                         *watchdog_injection_statuses.write().await = watchdog_injection_scripts
                             .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
-                        *watchdog_experimental_feature_runtime.write().await =
-                            cdp::ExperimentalFeatureRuntimeStatus::failed(
-                                format!("脚本重新注入失败：{error_message}"),
-                                watchdog_experimental_features,
-                            );
                         eprintln!("Codey CDP bridge 恢复失败：{error_message}");
                         consecutive_failures = CDP_WATCHDOG_FAILURE_THRESHOLD.saturating_sub(1);
                     }
@@ -862,7 +834,6 @@ impl CodeyRuntime {
                 applied_model_config: RwLock::new(RuntimeModelConfig::from_config(config)),
                 applied_subagent_config: RwLock::new(RuntimeSubagentConfig::from_config(config)),
                 injection_statuses,
-                experimental_feature_runtime,
                 injection_scripts,
                 injection_websocket_url,
                 child,
@@ -1424,7 +1395,6 @@ async fn spawn_codex(
     disable_codex_pet: bool,
     disable_codex_voice: bool,
     fast_codex_startup: bool,
-    experimental_features: ExperimentalFeaturesConfig,
     gpu_launch_mode: GpuLaunchMode,
 ) -> Result<SpawnedCodex> {
     #[cfg(any(windows, target_os = "macos"))]
@@ -1432,10 +1402,9 @@ async fn spawn_codex(
         disable_pet: disable_codex_pet,
         disable_voice: disable_codex_voice,
         fast_codex_startup,
-        experimental_features,
     };
     #[cfg(not(any(windows, target_os = "macos")))]
-    let _ = (fast_codex_startup, experimental_features);
+    let _ = fast_codex_startup;
     let runtime_arguments = codex_runtime_arguments(gpu_launch_mode, !cfg!(target_os = "macos"));
 
     #[cfg(windows)]

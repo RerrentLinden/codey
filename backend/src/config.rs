@@ -60,64 +60,6 @@ pub enum GpuLaunchMode {
     DisableGpuRasterization,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ExperimentalFeaturesConfig {
-    pub unified_exec: bool,
-    pub shell_snapshot: bool,
-    pub responses_websockets_v2: bool,
-    pub tool_search_always_defer_mcp_tools: bool,
-    pub standalone_web_search: bool,
-    pub enable_request_compression: bool,
-    pub remote_compaction_v2: bool,
-    pub apply_patch_streaming_events: bool,
-    pub concurrent_reasoning_summaries: bool,
-}
-
-impl Default for ExperimentalFeaturesConfig {
-    fn default() -> Self {
-        Self {
-            unified_exec: false,
-            shell_snapshot: false,
-            responses_websockets_v2: false,
-            tool_search_always_defer_mcp_tools: false,
-            standalone_web_search: false,
-            enable_request_compression: true,
-            remote_compaction_v2: true,
-            apply_patch_streaming_events: true,
-            concurrent_reasoning_summaries: true,
-        }
-    }
-}
-
-impl ExperimentalFeaturesConfig {
-    pub fn codex_feature_overrides(self) -> BTreeMap<&'static str, bool> {
-        BTreeMap::from([
-            ("unified_exec", self.unified_exec),
-            ("shell_snapshot", self.shell_snapshot),
-            ("responses_websockets_v2", self.responses_websockets_v2),
-            (
-                "tool_search_always_defer_mcp_tools",
-                self.tool_search_always_defer_mcp_tools,
-            ),
-            ("standalone_web_search", self.standalone_web_search),
-            (
-                "enable_request_compression",
-                self.enable_request_compression,
-            ),
-            ("remote_compaction_v2", self.remote_compaction_v2),
-            (
-                "apply_patch_streaming_events",
-                self.apply_patch_streaming_events,
-            ),
-            (
-                "concurrent_reasoning_summaries",
-                self.concurrent_reasoning_summaries,
-            ),
-        ])
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodeyConfig {
@@ -188,11 +130,6 @@ pub struct CodeyConfig {
     /// header. The renderer only activates this for an official login route.
     #[serde(default = "default_true")]
     pub show_account_usage_in_header: bool,
-    /// Codey-owned Codex feature overrides. These values remain stable until
-    /// the user edits them or explicitly synchronizes the current official
-    /// Statsig configuration.
-    #[serde(default)]
-    pub experimental_features: ExperimentalFeaturesConfig,
     /// Public HTTPS endpoint for the version manifest published to Cloudflare R2.
     /// This is build-time configuration, not a user setting.
     #[serde(
@@ -228,7 +165,6 @@ impl Default for CodeyConfig {
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
             hide_full_access_warning: false,
             show_account_usage_in_header: true,
-            experimental_features: ExperimentalFeaturesConfig::default(),
             update_manifest_url: default_update_manifest_url(),
         }
     }
@@ -517,6 +453,28 @@ mod tests {
     }
 
     #[test]
+    fn removed_experimental_features_are_ignored_and_dropped_on_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let store = ConfigStore::new(&path);
+        let mut value = serde_json::to_value(CodeyConfig::default()).unwrap();
+        value.as_object_mut().unwrap().insert(
+            "experimentalFeatures".into(),
+            serde_json::json!({
+                "unifiedExec": true,
+                "remoteCompactionV2": false,
+            }),
+        );
+        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+
+        let config = store.load().unwrap();
+        store.save(&config).unwrap();
+
+        let saved = serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap();
+        assert!(saved.get("experimentalFeatures").is_none());
+    }
+
+    #[test]
     fn normalizes_missing_active_profile() {
         let config = CodeyConfig {
             active_profile_id: "missing".to_string(),
@@ -763,46 +721,5 @@ mod tests {
             .normalize();
 
         assert!(config.show_account_usage_in_header);
-    }
-
-    #[test]
-    fn experimental_features_default_to_a_stable_user_configuration() {
-        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
-            .unwrap()
-            .normalize();
-
-        assert_eq!(
-            config.experimental_features,
-            ExperimentalFeaturesConfig::default()
-        );
-        assert!(!config.experimental_features.unified_exec);
-        assert!(config.experimental_features.enable_request_compression);
-        assert!(config.experimental_features.remote_compaction_v2);
-        assert!(config.experimental_features.apply_patch_streaming_events);
-        assert!(config.experimental_features.concurrent_reasoning_summaries);
-    }
-
-    #[test]
-    fn experimental_features_round_trip_with_camel_case_config_keys() {
-        let mut config = CodeyConfig::default();
-        config.experimental_features.unified_exec = true;
-        config.experimental_features.remote_compaction_v2 = false;
-
-        let serialized = serde_json::to_value(&config).unwrap();
-        let round_trip = serde_json::from_value::<CodeyConfig>(serialized.clone()).unwrap();
-
-        assert_eq!(
-            serialized["experimentalFeatures"]["unifiedExec"],
-            serde_json::json!(true)
-        );
-        assert_eq!(
-            serialized["experimentalFeatures"]["remoteCompactionV2"],
-            serde_json::json!(false)
-        );
-        assert_eq!(
-            round_trip.experimental_features,
-            config.experimental_features
-        );
-        assert!(config.experimental_features.codex_feature_overrides()["unified_exec"]);
     }
 }

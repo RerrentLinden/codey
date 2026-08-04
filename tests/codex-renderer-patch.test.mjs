@@ -4,10 +4,7 @@ import test from "node:test";
 
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
-async function loadStartupPatchExpression(
-  experimentalFeatureOverrides = {},
-  disablePet = true,
-) {
+async function loadStartupPatchExpression(disablePet = true) {
   const source = normalizeLineEndings(
     await readFile(
       new URL("../backend/src/codex_startup_patch.rs", import.meta.url),
@@ -21,11 +18,7 @@ async function loadStartupPatchExpression(
   return template
     .replaceAll("__DISABLE_PET__", disablePet ? "true" : "false")
     .replaceAll("__DISABLE_VOICE__", "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "true")
-    .replaceAll(
-      "__EXPERIMENTAL_FEATURE_OVERRIDES__",
-      JSON.stringify(experimentalFeatureOverrides),
-    );
+    .replaceAll("__FAST_CODEX_STARTUP__", "true");
 }
 
 test("an incompatible optional renderer patch never blocks the Codex module response", async () => {
@@ -56,12 +49,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
 
   try {
     assert.equal(
-      (0, eval)(
-        await loadStartupPatchExpression({
-          unified_exec: true,
-          remote_compaction_v2: false,
-        }),
-      ),
+      (0, eval)(await loadStartupPatchExpression()),
       "codey-startup-patch-installed-v20",
     );
     const electron = Module._load("electron", undefined, false);
@@ -243,65 +231,6 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       patchedInteractionPerformance,
       /function unrelated\(\)\{return beginCpuSampling\(\)\}/,
     );
-
-    const featureSource = [
-      "function Lln(e){",
-      "let t=zln(e),n=Bln(e),r={...t,...n,[Fnn]:mnt(e,`2380644311`)};",
-      "return Hf.info(`Concurrent reasoning summaries feature override resolved`,{}),r}",
-      "const feature_overrides=`feature_overrides`,gate=`2508143457`;",
-    ].join("");
-    delete globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__;
-    electron.protocol.handle("app", async () => new Response(featureSource));
-    const featureResponse = await installedHandler({
-      url: "app://-/assets/app-initial-BHB6SClA.js",
-    });
-    const patchedFeatureSource = await featureResponse.text();
-    const resolveFeatures = Function(
-      "zln",
-      "Bln",
-      "Fnn",
-      "mnt",
-      "Hf",
-      `${patchedFeatureSource};return Lln`,
-    )(
-      () => ({ unified_exec: false, remote_compaction_v2: true }),
-      () => ({ shell_snapshot: true }),
-      "concurrent_reasoning_summaries",
-      () => true,
-      { info() {} },
-    );
-    assert.deepEqual(resolveFeatures({}), {
-      unified_exec: true,
-      remote_compaction_v2: false,
-      shell_snapshot: true,
-      concurrent_reasoning_summaries: true,
-    });
-    assert.deepEqual(
-      globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__.configuredFeatures,
-      {
-        unifiedExec: true,
-        remoteCompactionV2: false,
-      },
-    );
-    assert.deepEqual(
-      globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__.officialFeatures,
-      {
-        unifiedExec: false,
-        remoteCompactionV2: true,
-        shellSnapshot: true,
-        concurrentReasoningSummaries: true,
-      },
-    );
-    assert.deepEqual(
-      globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__.effectiveFeatures,
-      {
-        unifiedExec: true,
-        remoteCompactionV2: false,
-        shellSnapshot: true,
-        concurrentReasoningSummaries: true,
-      },
-    );
-    delete globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__;
 
     let rejectBootstrap;
     const neverCompletesBootstrap = new Promise((_, reject) => {

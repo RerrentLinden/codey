@@ -4,7 +4,6 @@ export const CODEY_API_COMMANDS = [
   "pick_codex_app_directory",
   "set_codex_app_path",
   "sync_current_provider",
-  "sync_official_experimental_features",
   "fetch_current_provider_models",
   "save_selected_models",
   "save_default_model",

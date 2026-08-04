@@ -11,18 +11,6 @@ export type Profile = {
   ccSwitchReadOnly: boolean;
 };
 
-export type ExperimentalFeaturesConfig = {
-  unifiedExec: boolean;
-  shellSnapshot: boolean;
-  responsesWebsocketsV2: boolean;
-  toolSearchAlwaysDeferMcpTools: boolean;
-  standaloneWebSearch: boolean;
-  enableRequestCompression: boolean;
-  remoteCompactionV2: boolean;
-  applyPatchStreamingEvents: boolean;
-  concurrentReasoningSummaries: boolean;
-};
-
 export type Config = {
   settingsRevision: number;
   activeProfileId: string;
@@ -45,7 +33,6 @@ export type Config = {
   subagentReasoningEffort: string;
   hideFullAccessWarning: boolean;
   showAccountUsageInHeader: boolean;
-  experimentalFeatures: ExperimentalFeaturesConfig;
 };
 
 export type OfficialModelState = {
@@ -86,15 +73,6 @@ export type InjectionScriptStatus = {
   error?: string;
 };
 
-export type ExperimentalFeatureRuntimeStatus = {
-  status: "effective" | "mismatch" | "unknown" | "error";
-  detail?: string;
-  updatedAt?: number;
-  effectiveFeatures?: ExperimentalFeaturesConfig;
-  configuredFeatures?: ExperimentalFeaturesConfig;
-  mismatchedFeatures?: string[];
-};
-
 export type RuntimeStatus = {
   running: boolean;
   appVersion?: string;
@@ -107,7 +85,6 @@ export type RuntimeStatus = {
   codexAppPath?: string;
   maintenance?: Maintenance;
   injectionScripts?: InjectionScriptStatus[];
-  experimentalFeatureRuntime?: ExperimentalFeatureRuntimeStatus;
   traceLogStats?: TraceLogStats;
 };
 

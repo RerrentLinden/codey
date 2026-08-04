@@ -85,17 +85,6 @@ if (import.meta.env.DEV) {
       subagentOptimization: false,
       hideFullAccessWarning: false,
       showAccountUsageInHeader: true,
-      experimentalFeatures: {
-        unifiedExec: false,
-        shellSnapshot: false,
-        responsesWebsocketsV2: false,
-        toolSearchAlwaysDeferMcpTools: false,
-        standaloneWebSearch: false,
-        enableRequestCompression: true,
-        remoteCompactionV2: true,
-        applyPatchStreamingEvents: true,
-        concurrentReasoningSummaries: true,
-      },
     };
     const previewCcSwitch = {
       available: true,
@@ -159,13 +148,6 @@ if (import.meta.env.DEV) {
               previewClientPlatform === "windows"
                 ? "Windows 启动补丁已启用：WMI 周期采样、临时 WebView 残留和执行环境泄漏已修复"
                 : "启动补丁已启用：临时 WebView 和执行环境会自动回收",
-          },
-          experimentalFeatureRuntime: {
-            status: "effective",
-            detail: "运行态与当前页面配置一致",
-            updatedAt: Date.now(),
-            configuredFeatures: previewConfig.experimentalFeatures,
-            effectiveFeatures: previewConfig.experimentalFeatures,
           },
           injectionScripts: [
             {
@@ -264,12 +246,6 @@ if (import.meta.env.DEV) {
           modelState: previewModelState,
           ccSwitch: previewCcSwitch,
           restartRequired: false,
-        };
-      }
-      if (command === "sync_official_experimental_features") {
-        return {
-          status: "ok",
-          experimentalFeatures: previewConfig.experimentalFeatures,
         };
       }
       if (command === "clear_codex_trace_logs") {

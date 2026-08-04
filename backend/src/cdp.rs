@@ -10,7 +10,6 @@ use codey_runtime_core::bridge::{
 use codey_runtime_core::cdp::{list_targets, pick_injectable_codex_page_target};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ExperimentalFeaturesConfig;
 use crate::error_log;
 
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
@@ -57,84 +56,6 @@ pub struct InjectionScriptStatus {
     pub detail: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct ExperimentalFeatureRuntimeStatus {
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub updated_at: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_features: Option<ExperimentalFeaturesConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub configured_features: Option<ExperimentalFeaturesConfig>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mismatched_features: Vec<String>,
-}
-
-impl ExperimentalFeatureRuntimeStatus {
-    pub fn pending(configured_features: ExperimentalFeaturesConfig) -> Self {
-        Self {
-            status: "unknown".to_string(),
-            detail: Some("打开配置面板时会读取一次试验性功能运行态".to_string()),
-            updated_at: None,
-            effective_features: None,
-            configured_features: Some(configured_features),
-            mismatched_features: Vec::new(),
-        }
-    }
-
-    pub fn failed(
-        detail: impl Into<String>,
-        configured_features: ExperimentalFeaturesConfig,
-    ) -> Self {
-        Self {
-            status: "error".to_string(),
-            detail: Some(detail.into()),
-            updated_at: None,
-            effective_features: None,
-            configured_features: Some(configured_features),
-            mismatched_features: Vec::new(),
-        }
-    }
-
-    fn reconciled(mut self, configured_features: ExperimentalFeaturesConfig) -> Self {
-        if self.configured_features.is_none() {
-            self.configured_features = Some(configured_features);
-        }
-        if let Some(effective_features) = self.effective_features {
-            self.mismatched_features =
-                experimental_feature_mismatches(configured_features, effective_features);
-            if self.mismatched_features.is_empty() {
-                self.status = "effective".to_string();
-                self.detail
-                    .get_or_insert_with(|| "运行态与已启动配置一致".to_string());
-            } else {
-                self.status = "mismatch".to_string();
-                self.detail
-                    .get_or_insert_with(|| "运行态与已启动配置不一致".to_string());
-            }
-        } else if !matches!(self.status.as_str(), "error" | "unknown") {
-            self.status = "unknown".to_string();
-        }
-        self
-    }
-}
-
-fn experimental_feature_mismatches(
-    configured_features: ExperimentalFeaturesConfig,
-    effective_features: ExperimentalFeaturesConfig,
-) -> Vec<String> {
-    let effective_overrides = effective_features.codex_feature_overrides();
-    configured_features
-        .codex_feature_overrides()
-        .into_iter()
-        .filter(|(flag, expected)| effective_overrides.get(flag).copied() != Some(*expected))
-        .map(|(flag, _)| flag.to_string())
-        .collect()
 }
 
 #[derive(Clone)]
@@ -609,59 +530,6 @@ pub async fn read_injection_statuses(
     }
 }
 
-pub async fn read_experimental_feature_runtime_status(
-    websocket_url: &str,
-    configured_features: ExperimentalFeaturesConfig,
-) -> Result<ExperimentalFeatureRuntimeStatus> {
-    let result: Result<ExperimentalFeatureRuntimeStatus> = async {
-        let response = codey_runtime_core::bridge::evaluate_script(
-            websocket_url,
-            experimental_feature_runtime_status_script(),
-        )
-        .await
-        .context("读取试验性功能运行态失败")?;
-        let payload = runtime_value(&response)
-            .and_then(serde_json::Value::as_str)
-            .context("试验性功能运行态未返回可解析结果")?;
-        let reported = serde_json::from_str::<ExperimentalFeatureRuntimeStatus>(payload)
-            .context("解析试验性功能运行态失败")?;
-        Ok(reported.reconciled(configured_features))
-    }
-    .await;
-
-    match result {
-        Ok(status) => {
-            if matches!(status.status.as_str(), "error" | "mismatch") {
-                error_log::record_failure(
-                    "patch_verification_failed",
-                    "verify_experimental_feature_patches",
-                    status
-                        .detail
-                        .clone()
-                        .unwrap_or_else(|| "试验性功能运行态与配置不一致".to_string()),
-                    serde_json::json!({
-                        "status": status.status.as_str(),
-                        "mismatchedFeatures": &status.mismatched_features,
-                        "websocketUrl": websocket_url,
-                    }),
-                );
-            }
-            Ok(status)
-        }
-        Err(error) => {
-            error_log::record_failure(
-                "patch_verification_failed",
-                "read_experimental_feature_runtime_status",
-                format!("{error:#}"),
-                serde_json::json!({
-                    "websocketUrl": websocket_url,
-                }),
-            );
-            Err(error)
-        }
-    }
-}
-
 fn record_failed_injection_statuses(websocket_url: &str, statuses: &[InjectionScriptStatus]) {
     for status in statuses
         .iter()
@@ -682,21 +550,6 @@ fn record_failed_injection_statuses(websocket_url: &str, statuses: &[InjectionSc
             }),
         );
     }
-}
-
-pub async fn read_official_experimental_features(
-    websocket_url: &str,
-) -> Result<ExperimentalFeaturesConfig> {
-    let response = codey_runtime_core::bridge::evaluate_script(
-        websocket_url,
-        official_experimental_features_script(),
-    )
-    .await
-    .context("读取 Codex 官方试验性功能配置失败")?;
-    let payload = runtime_value(&response)
-        .and_then(serde_json::Value::as_str)
-        .context("Codex Statsig 尚未返回可解析的官方配置")?;
-    serde_json::from_str(payload).context("解析 Codex 官方试验性功能配置失败")
 }
 
 pub async fn refresh_model_whitelist(
@@ -866,75 +719,6 @@ fn verify_model_whitelist_refresh_response(response: &serde_json::Value) -> Resu
         .and_then(serde_json::Value::as_str)
         .unwrap_or("模型白名单刷新结果未通过校验");
     anyhow::bail!("Codex 模型列表热更新失败：{error}")
-}
-
-fn experimental_feature_runtime_status_script() -> &'static str {
-    r#"(() => {
-  const snapshot = globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__;
-  if (!snapshot || typeof snapshot !== "object") {
-    return JSON.stringify({
-      status: "unknown",
-      detail: "Codex renderer 尚未命中试验性功能补丁；保存并重启 Codex 后再打开配置面板自检",
-    });
-  }
-  return JSON.stringify(snapshot);
-})()"#
-}
-
-fn official_experimental_features_script() -> &'static str {
-    r#"(() => {
-  const client = globalThis.__STATSIG__?.firstInstance;
-  const values = client?._store?._valuesForExternalUse;
-  if (!values || typeof values !== "object") {
-    throw new Error("Codex Statsig 尚未初始化完成");
-  }
-  const gates = values.feature_gates ?? values.featureGates;
-  if (!gates || typeof gates !== "object") {
-    throw new Error("Codex Statsig 官方功能门数据不可用");
-  }
-  const runtimeSnapshot = globalThis.__CODEY_EXPERIMENTAL_FEATURE_RUNTIME__;
-  const fallbackFeatures =
-    runtimeSnapshot?.officialFeatures ?? runtimeSnapshot?.configuredFeatures ?? {};
-  const readGate = (id, configKey) => {
-    const value = gates[id]?.value;
-    if (typeof value === "boolean") return value;
-    const fallback = fallbackFeatures[configKey];
-    return typeof fallback === "boolean" ? fallback : false;
-  };
-  const result = {
-    unifiedExec: readGate("1786883712", "unifiedExec"),
-    shellSnapshot: readGate("1615536597", "shellSnapshot"),
-    responsesWebsocketsV2: readGate("2734851136", "responsesWebsocketsV2"),
-    toolSearchAlwaysDeferMcpTools: readGate("2701734443", "toolSearchAlwaysDeferMcpTools"),
-    standaloneWebSearch: readGate("3701003275", "standaloneWebSearch"),
-    enableRequestCompression: readGate("30039772", "enableRequestCompression"),
-    remoteCompactionV2: readGate("321109023", "remoteCompactionV2"),
-    applyPatchStreamingEvents: readGate("358284800", "applyPatchStreamingEvents"),
-    concurrentReasoningSummaries: readGate("2508143457", "concurrentReasoningSummaries"),
-  };
-  const configs = values.dynamic_configs ?? values.dynamicConfigs ?? {};
-  const layers = values.layer_configs ?? values.layerConfigs ?? {};
-  const layer = configs["3902942138"] ?? layers["3902942138"];
-  const layerOverrides = layer?.value?.feature_overrides;
-  const layerKeyMap = {
-    unified_exec: "unifiedExec",
-    shell_snapshot: "shellSnapshot",
-    responses_websockets_v2: "responsesWebsocketsV2",
-    tool_search_always_defer_mcp_tools: "toolSearchAlwaysDeferMcpTools",
-    standalone_web_search: "standaloneWebSearch",
-    enable_request_compression: "enableRequestCompression",
-    remote_compaction_v2: "remoteCompactionV2",
-    apply_patch_streaming_events: "applyPatchStreamingEvents",
-    concurrent_reasoning_summaries: "concurrentReasoningSummaries",
-  };
-  if (layerOverrides && typeof layerOverrides === "object") {
-    for (const [rawKey, value] of Object.entries(layerOverrides)) {
-      const configKey = layerKeyMap[String(rawKey).replaceAll("-", "_")];
-      if (configKey && typeof value === "boolean") result[configKey] = value;
-    }
-  }
-  return JSON.stringify(result);
-})()"#
 }
 
 fn injection_status_snapshot_script(descriptors: &[InjectionScriptDescriptor]) -> String {
@@ -1371,20 +1155,6 @@ mod tests {
         assert!(script.contains(r#"reasoningEffort: "xhigh""#));
         assert!(script.contains("[0, 80, 200, 500]"));
         assert!(script.contains("result?.applied === true"));
-    }
-
-    #[test]
-    fn official_feature_sync_reads_gates_then_applies_the_feature_override_layer() {
-        let script = official_experimental_features_script();
-
-        assert!(script.contains(r#"readGate("1786883712", "unifiedExec")"#));
-        assert!(script.contains("runtimeSnapshot?.officialFeatures"));
-        assert!(script.contains("typeof fallback === \"boolean\" ? fallback : false"));
-        assert!(script.contains(r#""30039772""#));
-        assert!(script.contains(r#"configs["3902942138"] ?? layers["3902942138"]"#));
-        assert!(script.contains("feature_overrides"));
-        assert!(script.contains(r#"remote_compaction_v2: "remoteCompactionV2""#));
-        assert!(script.contains("result[configKey] = value"));
     }
 
     #[test]

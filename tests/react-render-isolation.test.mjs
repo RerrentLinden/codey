@@ -24,7 +24,6 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
         "OperationsPanel.tsx",
         "AppUpdateCard.tsx",
         "ModelSection.tsx",
-        "ExperimentalFeaturesCard.tsx",
         "FeaturePolicyCard.tsx",
       ].map((file) => readFile(new URL(`src/${file}`, root), "utf8")),
     ).then((sources) => sources.join("\n")),
@@ -68,7 +67,6 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     "OperationsPanel",
     "AppUpdateCard",
     "ModelSection",
-    "ExperimentalFeaturesCard",
     "FeaturePolicyCard",
   ]) {
     assert.match(sections, new RegExp(`export const ${component} = memo\\(`));

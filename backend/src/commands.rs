@@ -32,7 +32,7 @@ use models::{
 };
 pub use models::{
     fetch_current_provider_models, save_default_model, save_selected_models, sync_cc_switch_state,
-    sync_current_provider_command, sync_official_experimental_features,
+    sync_current_provider_command,
 };
 use runtime::refresh_injection_status;
 #[cfg(test)]
@@ -469,7 +469,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Err(error) => Err(error),
         },
         "sync_current_provider" => sync_current_provider_command(state).await,
-        "sync_official_experimental_features" => sync_official_experimental_features(state).await,
         "fetch_current_provider_models" => fetch_current_provider_models(state).await,
         "save_selected_models" => match (
             argument::<Vec<String>>(&args, "officialModels"),
@@ -718,7 +717,6 @@ async fn save_codey_config_locked(
     config.subagent_reasoning_effort = config_input.subagent_reasoning_effort;
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
-    config.experimental_features = config_input.experimental_features;
     let mut config = config.normalize();
     let refresh_subagent_defaults = previous.subagent_optimization
         && config.subagent_optimization
@@ -965,7 +963,6 @@ fn config_requires_restart(
         || applied.fast_context_tools != current.fast_context_tools
         || applied.fast_codex_startup != current.fast_codex_startup
         || applied.subagent_optimization != current.subagent_optimization
-        || applied.experimental_features != current.experimental_features
         || applied_models != &RuntimeModelConfig::from_config(current)
         || ((applied.subagent_optimization || current.subagent_optimization)
             && applied_subagent != &RuntimeSubagentConfig::from_config(current))
@@ -1136,19 +1133,6 @@ mod restart_tests {
             &applied_models,
             &applied_subagent,
             &fast_startup_change
-        ));
-
-        let mut experimental_feature_change = applied.clone();
-        experimental_feature_change
-            .experimental_features
-            .unified_exec = !experimental_feature_change
-            .experimental_features
-            .unified_exec;
-        assert!(config_requires_restart(
-            &applied,
-            &applied_models,
-            &applied_subagent,
-            &experimental_feature_change
         ));
 
         let mut disabled_subagent_change = applied.clone();
