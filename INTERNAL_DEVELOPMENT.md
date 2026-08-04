@@ -87,7 +87,7 @@ pnpm run release -- 0.2.1 --include-existing-changes
 
 Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周期和会话扫描优化也已直接合并其中。本地与 CI 构建不需要额外的运行时源码目录或补丁。PR 与桌面发布质量门会分别对根 workspace 和 CodeyRuntime workspace 执行格式检查、完整测试及零警告 Clippy。
 
-运行时只内置不含提示词的 Codex 模型兼容元数据，完整 system/developer prompt 不进入仓库资产或 CodeyRuntime 二进制。Codex 当前要求自定义模型目录的每个条目都保留 `base_instructions`；因此 Codey 只从用户本机已有的官方 `models_cache.json` 派生运行目录，原样保留本机缓存中的必需字段，并把生成文件权限收紧为仅当前用户可读写。缺少兼容的本机缓存时不生成不完整目录，官方线路回退 Codex 内置目录，第三方线路仍可完成上游模型探测与子代理能力校验；这是可恢复的内置目录回退，不记录为补丁失败。这类本机派生内容不得写入日志、测试夹具、发布包或版本库。
+运行时只内置不含提示词的 Codex 模型兼容元数据，完整 system/developer prompt 不进入仓库资产或 CodeyRuntime 二进制。Codex 当前要求自定义模型目录的每个条目都保留 `base_instructions`；因此 Codey 只从用户本机已有的官方 `models_cache.json` 派生运行目录，原样保留本机缓存中的必需字段，并把生成文件权限收紧为仅当前用户可读写。缺少兼容的本机缓存时不生成不完整目录，官方线路回退 Codex 内置目录，第三方线路仍可完成上游模型探测、手动模型选择保存与子代理能力校验；这是可恢复的内置目录回退，不记录为补丁失败。模型选择保存与线路模型同步必须只吞掉该明确的缓存兼容错误，目录读写或解析错误仍应返回给用户。这类本机派生内容不得写入日志、测试夹具、发布包或版本库。
 
 ## 配置与路径
 

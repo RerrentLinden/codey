@@ -51,6 +51,7 @@ type ModelRuntimeUpdate = {
   restartRequired?: boolean;
   modelHotReloaded?: boolean;
   modelHotReloadError?: string;
+  modelCatalogFallback?: boolean;
 };
 
 export function useModelSelection({

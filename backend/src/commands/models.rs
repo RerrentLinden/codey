@@ -474,7 +474,7 @@ pub async fn save_selected_models(
         }
     }
     config = config.normalize();
-    refresh_model_catalog(&config)?;
+    let model_catalog_fallback = refresh_model_catalog_or_fallback(&config)?;
     state
         .store
         .save(&config)
@@ -489,6 +489,7 @@ pub async fn save_selected_models(
         "status":"ok",
         "config":public_config,
         "modelState":model_state,
+        "modelCatalogFallback":model_catalog_fallback,
         "restartRequired":restart_required,
     })))
 }
@@ -794,15 +795,15 @@ pub(super) fn should_refresh_model_catalog(
     !model_state.official_models.is_empty() || !model_state.third_party_models.is_empty()
 }
 
-pub(super) fn refresh_model_catalog(config: &CodeyConfig) -> Result<(), String> {
-    try_refresh_model_catalog(config).map_err(|error| error.to_string())
-}
-
 fn refresh_model_catalog_for_provider_sync(config: &CodeyConfig) -> Result<bool, String> {
-    provider_sync_catalog_fallback(try_refresh_model_catalog(config))
+    refresh_model_catalog_or_fallback(config)
 }
 
-fn provider_sync_catalog_fallback(result: anyhow::Result<()>) -> Result<bool, String> {
+fn refresh_model_catalog_or_fallback(config: &CodeyConfig) -> Result<bool, String> {
+    model_catalog_fallback(try_refresh_model_catalog(config))
+}
+
+fn model_catalog_fallback(result: anyhow::Result<()>) -> Result<bool, String> {
     match result {
         Ok(()) => Ok(false),
         Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => Ok(true),
@@ -830,15 +831,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_sync_accepts_only_the_known_builtin_catalog_fallback() {
+    fn model_changes_accept_only_the_known_builtin_catalog_fallback() {
         let home = tempfile::tempdir().unwrap();
         let missing_cache =
             model_catalog::refresh_for_provider(home.path(), false, Some(&[]), &[]).unwrap_err();
 
-        assert!(provider_sync_catalog_fallback(Err(missing_cache)).unwrap());
-        assert!(!provider_sync_catalog_fallback(Ok(())).unwrap());
+        assert!(model_catalog_fallback(Err(missing_cache)).unwrap());
+        assert!(!model_catalog_fallback(Ok(())).unwrap());
         assert_eq!(
-            provider_sync_catalog_fallback(Err(anyhow::anyhow!("模型目录写入失败"))).unwrap_err(),
+            model_catalog_fallback(Err(anyhow::anyhow!("模型目录写入失败"))).unwrap_err(),
             "模型目录写入失败"
         );
     }
