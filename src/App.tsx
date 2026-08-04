@@ -542,31 +542,44 @@ export function App({
         protectionEnabled: boolean;
       }>("clear_codex_trace_logs");
       const cleanup = result.cleanup;
+      const statsResult = await updateTraceLogStatsSnapshot();
+      setTraceSnapshotStale(statsResult.status === "pending");
+      const statsDetail =
+        statsResult.status === "pending"
+          ? "Trace 日志统计正在更新"
+          : "Trace 日志统计已刷新";
       if (cleanup.databasesFound === 0) {
-        setNotice({ tone: "info", text: "未发现 Codex 日志库，无需清理" });
+        setNotice({
+          tone: "info",
+          text: `未发现 Codex 日志库，无需清理；${statsDetail}`,
+        });
         return;
       }
-      setTraceSnapshotStale(true);
       const protectionDetail = result.protectionEnabled
         ? "Trace 写盘保护保持开启"
         : "Trace 写盘保护保持关闭";
       setNotice({
         tone: "success",
-        text: `已清理 ${cleanup.databasesCleaned} 个日志库、${cleanup.rowsDeleted} 条记录，释放 ${formatBytes(cleanup.bytesReclaimed)}；${protectionDetail}，可手动刷新统计`,
+        text: `已清理 ${cleanup.databasesCleaned} 个日志库、${cleanup.rowsDeleted} 条记录，释放 ${formatBytes(cleanup.bytesReclaimed)}；${protectionDetail}，${statsDetail}`,
       });
     });
   }
 
+  async function updateTraceLogStatsSnapshot() {
+    const result = await invoke<{
+      status: "ok" | "pending";
+      traceLogStats: TraceLogStats;
+    }>("refresh_trace_log_stats");
+    setStatus((current) => ({
+      ...current,
+      traceLogStats: result.traceLogStats,
+    }));
+    return result;
+  }
+
   async function refreshTraceLogStats() {
     await runOperation("refresh-trace-stats", async () => {
-      const result = await invoke<{
-        status: "ok" | "pending";
-        traceLogStats: TraceLogStats;
-      }>("refresh_trace_log_stats");
-      setStatus((current) => ({
-        ...current,
-        traceLogStats: result.traceLogStats,
-      }));
+      const result = await updateTraceLogStatsSnapshot();
       if (result.status === "pending") {
         setNotice({ tone: "info", text: "Trace 日志正在统计，请稍候" });
         return;

@@ -104,6 +104,8 @@ test("trace guard, stats, pet, and voice remain user-configurable", async () => 
   assert.doesNotMatch(traceSource, /SSD 写入寿命粗略估算/);
   assert.doesNotMatch(traceSource, /级别分布|高占用 Targets/);
   assert.match(appSource, /refresh_trace_log_stats/);
+  assert.match(appSource, /async function clearTraceLogs\(\)[\s\S]*?updateTraceLogStatsSnapshot\(\)/);
+  assert.doesNotMatch(appSource, /可手动刷新统计/);
   assert.match(commandsSource, /"refresh_trace_log_stats"/);
   assert.doesNotMatch(launcherSource, /spawn_startup_trace_stats_refresh/);
   assert.match(uiSource, /slimCodexPet/);
