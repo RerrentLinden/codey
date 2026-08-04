@@ -91,7 +91,7 @@ Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周�
 ## 配置与路径
 
 - Codey 配置：由 `directories` 根据系统保存到 Codey 配置目录下的 `config.json`。
-- cc-switch 配置：自动发现 `~/.cc-switch/cc-switch.db`，仅同步 `app_type = codex` 的 provider。官方 ChatGPT 登录 provider 只读展示，Codey 不读取或改写其中的 OAuth token。
+- cc-switch 配置：`CC_SWITCH_DB_PATH` 指定的数据库文件优先级最高；否则读取 cc-switch Tauri Store 中的 `app_config_dir_override` 并跟随其自定义数据目录，未配置覆盖时使用 `~/.cc-switch/cc-switch.db`。Windows 还与 cc-switch 一致：仅在默认数据库不存在时兼容旧版 `HOME/.cc-switch/cc-switch.db`。只同步 `app_type = codex` 的 provider；数据库存在但没有当前 Codex 线路时回退本地 Codex 直登配置。官方 ChatGPT 登录 provider 只读展示，Codey 不读取或改写其中的 OAuth token。
 - Codex 配置：使用 Codex 默认 `CODEX_HOME`（通常是 `~/.codex`）。
 - Trace 写盘防护不设开关：macOS / Windows 使用相同启动时机自动更新 Codex 根目录及旧版 `sqlite/` 目录中现有的 `logs_*.sqlite`，不会创建、清空或压缩日志库。
 - Windows 卡顿补丁不设开关：Codey 在运行时识别 Windows，并在每次启动 Codex 时自动隔离 Micro 设备模块和周期性 WMI 进程采样。启动 Codey 时若目标 Codex 主进程已在运行，会先终止该安装目录下的 Codex 进程树，确认退出后再拉起新主进程，确保补丁能在主进程执行前安装；清理失败会中止启动。macOS 不执行 Windows 专属分支。

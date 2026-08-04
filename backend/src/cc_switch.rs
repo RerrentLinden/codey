@@ -22,6 +22,10 @@ const OFFICIAL_PROVIDER_ID: &str = "codex-official";
 const LOCAL_OFFICIAL_PROVIDER_ID: &str = "local-official";
 const PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
 const PROXY_OFFICIAL_PROVIDER_ID: &str = "cc-switch-official";
+const CC_SWITCH_APP_ID: &str = "com.ccswitch.desktop";
+const CC_SWITCH_PATH_STORE: &str = "app_paths.json";
+const CC_SWITCH_CONFIG_DIR_KEY: &str = "app_config_dir_override";
+const CC_SWITCH_DB_FILE: &str = "cc-switch.db";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -70,12 +74,79 @@ struct ProviderConnection {
 }
 
 pub fn default_db_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("CC_SWITCH_DB_PATH") {
-        return PathBuf::from(path);
+    let explicit_db_path = std::env::var_os("CC_SWITCH_DB_PATH").map(PathBuf::from);
+    let Some(dirs) = BaseDirs::new() else {
+        return explicit_db_path
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| PathBuf::from(".cc-switch/cc-switch.db"));
+    };
+
+    #[cfg(windows)]
+    let legacy_home = std::env::var_os("HOME").map(PathBuf::from);
+    #[cfg(not(windows))]
+    let legacy_home: Option<PathBuf> = None;
+
+    default_db_path_from(
+        explicit_db_path,
+        dirs.home_dir(),
+        dirs.data_dir(),
+        legacy_home.as_deref(),
+    )
+}
+
+fn default_db_path_from(
+    explicit_db_path: Option<PathBuf>,
+    home_dir: &Path,
+    data_dir: &Path,
+    legacy_home: Option<&Path>,
+) -> PathBuf {
+    if let Some(path) = explicit_db_path.filter(|path| !path.as_os_str().is_empty()) {
+        return path;
     }
-    BaseDirs::new()
-        .map(|dirs| dirs.home_dir().join(".cc-switch/cc-switch.db"))
-        .unwrap_or_else(|| PathBuf::from(".cc-switch/cc-switch.db"))
+
+    if let Some(config_dir) = cc_switch_config_dir_override(data_dir, home_dir) {
+        return config_dir.join(CC_SWITCH_DB_FILE);
+    }
+
+    let default_db = home_dir.join(".cc-switch").join(CC_SWITCH_DB_FILE);
+    legacy_cc_switch_db_path(&default_db, legacy_home).unwrap_or(default_db)
+}
+
+fn cc_switch_config_dir_override(data_dir: &Path, home_dir: &Path) -> Option<PathBuf> {
+    let store_path = data_dir.join(CC_SWITCH_APP_ID).join(CC_SWITCH_PATH_STORE);
+    let store = fs::read(store_path).ok()?;
+    let document: Value = serde_json::from_slice(&store).ok()?;
+    let raw_path = document
+        .get(CC_SWITCH_CONFIG_DIR_KEY)
+        .and_then(Value::as_str)?
+        .trim();
+    if raw_path.is_empty() {
+        return None;
+    }
+
+    let path = resolve_cc_switch_store_path(raw_path, home_dir);
+    path.exists().then_some(path)
+}
+
+fn resolve_cc_switch_store_path(raw_path: &str, home_dir: &Path) -> PathBuf {
+    if raw_path == "~" {
+        return home_dir.to_path_buf();
+    }
+    if let Some(path) = raw_path
+        .strip_prefix("~/")
+        .or_else(|| raw_path.strip_prefix("~\\"))
+    {
+        return home_dir.join(path);
+    }
+    PathBuf::from(raw_path)
+}
+
+fn legacy_cc_switch_db_path(default_db: &Path, legacy_home: Option<&Path>) -> Option<PathBuf> {
+    if default_db.is_file() {
+        return None;
+    }
+    let legacy_db = legacy_home?.join(".cc-switch").join(CC_SWITCH_DB_FILE);
+    legacy_db.is_file().then_some(legacy_db)
 }
 
 pub fn route_takeover_state(codex_home: &Path) -> Result<RouteTakeoverState> {
@@ -238,10 +309,12 @@ fn sync_current_provider_from_paths(
     db_path: &Path,
     codex_home: &Path,
 ) -> Result<(CodeyConfig, CcSwitchStatus)> {
-    let (profile, provider, available, message) = if db_path.is_file() {
-        let record = read_current_provider(db_path)?.ok_or_else(|| {
-            anyhow::anyhow!("cc-switch 没有选中的 Codex 配置，请先在 cc-switch 中选择线路")
-        })?;
+    let (profile, provider, available, message) = if let Some(record) = db_path
+        .is_file()
+        .then(|| read_current_provider(db_path))
+        .transpose()?
+        .flatten()
+    {
         let connection = provider_connection(&record)?;
         let provider = CurrentProvider {
             id: record.id.clone(),
@@ -257,12 +330,12 @@ fn sync_current_provider_from_paths(
     } else {
         let (provider, api_key) = local_provider(codex_home)?;
         let profile = profile_from_provider(&provider, api_key, false);
-        (
-            profile,
-            provider,
-            false,
-            Some("未检测到 cc-switch，已读取本地 Codex 直登配置".to_string()),
-        )
+        let message = if db_path.is_file() {
+            "cc-switch 没有选中的 Codex 线路，已读取本地 Codex 直登配置"
+        } else {
+            "未检测到 cc-switch，已读取本地 Codex 直登配置"
+        };
+        (profile, provider, false, Some(message.to_string()))
     };
 
     let previous_provider_id = config.current_provider_id().map(ToString::to_string);
@@ -665,6 +738,69 @@ mod tests {
         (directory, path, home)
     }
 
+    #[test]
+    fn custom_cc_switch_data_directory_is_read_from_tauri_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let data = directory.path().join("data");
+        let custom = directory.path().join("synced").join(".cc-switch");
+        fs::create_dir_all(data.join(CC_SWITCH_APP_ID)).unwrap();
+        fs::create_dir_all(&custom).unwrap();
+        fs::write(
+            data.join(CC_SWITCH_APP_ID).join(CC_SWITCH_PATH_STORE),
+            json!({CC_SWITCH_CONFIG_DIR_KEY: custom}).to_string(),
+        )
+        .unwrap();
+
+        let path = default_db_path_from(None, &home, &data, None);
+
+        assert_eq!(path, custom.join(CC_SWITCH_DB_FILE));
+    }
+
+    #[test]
+    fn explicit_cc_switch_db_path_wins_over_store_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let data = directory.path().join("data");
+        let custom = directory.path().join("custom");
+        let explicit = directory.path().join("explicit.db");
+        fs::create_dir_all(data.join(CC_SWITCH_APP_ID)).unwrap();
+        fs::create_dir_all(&custom).unwrap();
+        fs::write(
+            data.join(CC_SWITCH_APP_ID).join(CC_SWITCH_PATH_STORE),
+            json!({CC_SWITCH_CONFIG_DIR_KEY: custom}).to_string(),
+        )
+        .unwrap();
+
+        let path = default_db_path_from(Some(explicit.clone()), &home, &data, None);
+
+        assert_eq!(path, explicit);
+    }
+
+    #[test]
+    fn legacy_home_database_is_used_only_when_default_database_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let data = directory.path().join("data");
+        let legacy_home = directory.path().join("legacy-home");
+        let legacy_db = legacy_home.join(".cc-switch").join(CC_SWITCH_DB_FILE);
+        fs::create_dir_all(legacy_db.parent().unwrap()).unwrap();
+        fs::write(&legacy_db, b"legacy").unwrap();
+
+        assert_eq!(
+            default_db_path_from(None, &home, &data, Some(&legacy_home)),
+            legacy_db
+        );
+
+        let default_db = home.join(".cc-switch").join(CC_SWITCH_DB_FILE);
+        fs::create_dir_all(default_db.parent().unwrap()).unwrap();
+        fs::write(&default_db, b"default").unwrap();
+        assert_eq!(
+            default_db_path_from(None, &home, &data, Some(&legacy_home)),
+            default_db
+        );
+    }
+
     fn install_proxy_schema(path: &Path) {
         Connection::open(path)
             .unwrap()
@@ -894,6 +1030,30 @@ requires_openai_auth = true
         assert!(status.provider.official);
         assert_eq!(status.provider.source, "local");
         assert!(synced.profiles[0].api_key.is_empty());
+    }
+
+    #[test]
+    fn falls_back_to_local_login_when_cc_switch_has_no_current_codex_route() {
+        let (_directory, path, home) = fixture();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#,
+        )
+        .unwrap();
+
+        let (synced, status) =
+            sync_current_provider_from_paths(&CodeyConfig::default(), &path, &home).unwrap();
+
+        assert!(!status.available);
+        assert!(status.provider.official);
+        assert_eq!(status.provider.source, "local");
+        assert_eq!(synced.profiles[0].name, "OpenAI 官方直登");
+        assert!(
+            status
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("没有选中的 Codex 线路"))
+        );
     }
 
     #[test]
