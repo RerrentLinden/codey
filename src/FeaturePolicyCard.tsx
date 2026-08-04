@@ -196,7 +196,10 @@ function FeaturePolicyCardComponent({
             className={`feature-card ${config.fastContextTools ? "active" : ""}`}
           >
             <div className="feature-card-header">
-              <strong>FastCtx 上下文工具</strong>
+              <div className="feature-card-title">
+                <strong>FastCtx 上下文工具</strong>
+                <Badge variant="secondary">v0.2.4</Badge>
+              </div>
               <Switch
                 checked={config.fastContextTools}
                 onCheckedChange={(checked) =>
