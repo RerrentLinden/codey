@@ -24,7 +24,7 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
   );
   assert.match(
     appSource,
-    /<SemiModal[\s\S]*closeOnEsc[\s\S]*closable[\s\S]*maskClosable[\s\S]*onCancel=\{onCancel\}/,
+    /<SemiModal[\s\S]*closeOnEsc=\{false\}[\s\S]*closable=\{header === undefined\}[\s\S]*maskClosable=\{false\}[\s\S]*onCancel=\{onCancel\}/,
   );
   assert.match(appSource, /onCancel=\{handleCloseSettings\}/);
   assert.match(
@@ -47,6 +47,47 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
   assert.match(overlaySource, /onClose=\{close\}/);
   assert.match(overlaySource, /SETTINGS_OPENED_EVENT \} from "\.\/useRuntimeStatus"/);
   assert.match(overlaySource, /toggle: open/);
+});
+
+test("settings notice toast is scoped to the settings page", async () => {
+  const [appSource, stylesSource] = await Promise.all([
+    readFile(new URL("src/App.tsx", root), "utf8"),
+    readFile(new URL("src/styles.css", root), "utf8"),
+  ]);
+
+  assert.match(appSource, /<main[\s\S]*className=\{`app-shell/);
+  assert.match(appSource, /className=\{`notice-toast \$\{notice\.tone\}`\}/);
+  assert.match(appSource, /const NOTICE_AUTO_DISMISS_MS = 5_000/);
+  assert.match(
+    appSource,
+    /const \[noticeAutoDismissPaused, setNoticeAutoDismissPaused\] = useState\(false\)/,
+  );
+  assert.match(
+    appSource,
+    /if \(!config \|\| !provider \|\| !notice\.text \|\| noticeAutoDismissPaused\)/,
+  );
+  assert.match(
+    appSource,
+    /window\.setTimeout\(\(\) => \{[\s\S]*setNotice\(\(current\) =>[\s\S]*NOTICE_AUTO_DISMISS_MS/,
+  );
+  assert.match(appSource, /window\.clearTimeout\(timeout\)/);
+  assert.match(appSource, /onMouseEnter=\{\(\) => setNoticeAutoDismissPaused\(true\)\}/);
+  assert.match(appSource, /onMouseLeave=\{\(\) => setNoticeAutoDismissPaused\(false\)\}/);
+  assert.match(appSource, /onFocus=\{\(\) => setNoticeAutoDismissPaused\(true\)\}/);
+  assert.match(appSource, /onBlur=\{\(\) => setNoticeAutoDismissPaused\(false\)\}/);
+  assert.match(appSource, /aria-label="关闭提示"/);
+  assert.match(
+    appSource,
+    /onClick=\{\(\) => \{[\s\S]*setNoticeAutoDismissPaused\(false\);[\s\S]*setNotice\(\{ tone: "info", text: "" \}\);[\s\S]*\}\}/,
+  );
+  assert.match(
+    stylesSource,
+    /\.notice-toast \{\s*position: absolute;\s*right: 24px;\s*bottom: 24px;/,
+  );
+  assert.doesNotMatch(
+    stylesSource,
+    /\.notice-toast \{\s*position: fixed;/,
+  );
 });
 
 test("operations tooltips stay inside the settings overlay", async () => {

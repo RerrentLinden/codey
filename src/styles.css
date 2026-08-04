@@ -2609,13 +2609,14 @@ input:focus-visible,
 }
 
 .notice-toast {
-  position: fixed;
-  bottom: 24px;
+  position: absolute;
   right: 24px;
+  bottom: 24px;
   z-index: 90;
   display: flex;
   align-items: center;
   gap: 10px;
+  max-width: min(420px, calc(100% - 48px));
   padding: 12px 16px;
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.92);
@@ -2625,6 +2626,11 @@ input:focus-visible,
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.14);
   font-size: 12px;
   color: #1d1d1f;
+}
+
+.notice-toast span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .notice-toast.success {

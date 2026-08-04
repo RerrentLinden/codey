@@ -57,6 +57,7 @@ import { Badge, Button, Button as SaveButton } from "./components/semi";
 
 const Check = IconCheck;
 const X = IconX;
+const NOTICE_AUTO_DISMISS_MS = 5_000;
 
 function CodeyBrandMark() {
   return (
@@ -105,12 +106,12 @@ function SettingsModalShell({
       afterClose={afterClose}
       centered
       className="codey-settings-modal-layer"
-      closeOnEsc
+      closeOnEsc={false}
       closable={header === undefined}
       footer={null}
       getPopupContainer={container ? () => container : undefined}
       mask
-      maskClosable
+      maskClosable={false}
       modalContentClass="codey-settings-modal-content"
       onCancel={onCancel}
       visible={visible}
@@ -155,6 +156,7 @@ export function App({
     tone: "info",
     text: "正在连接 Codey…",
   });
+  const [noticeAutoDismissPaused, setNoticeAutoDismissPaused] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
@@ -227,6 +229,25 @@ export function App({
   useEffect(() => {
     void load();
   }, []);
+
+  useEffect(() => {
+    if (!notice.text) setNoticeAutoDismissPaused(false);
+  }, [notice.text]);
+
+  useEffect(() => {
+    if (!config || !provider || !notice.text || noticeAutoDismissPaused) {
+      return undefined;
+    }
+    const timeout = window.setTimeout(() => {
+      setNoticeAutoDismissPaused(false);
+      setNotice((current) =>
+        current.text === notice.text && current.tone === notice.tone
+          ? { tone: "info", text: "" }
+          : current,
+      );
+    }, NOTICE_AUTO_DISMISS_MS);
+    return () => window.clearTimeout(timeout);
+  }, [config, provider, notice.text, notice.tone, noticeAutoDismissPaused]);
 
   async function load() {
     try {
@@ -925,6 +946,10 @@ export function App({
           className={`notice-toast ${notice.tone}`}
           role="status"
           aria-live="polite"
+          onMouseEnter={() => setNoticeAutoDismissPaused(true)}
+          onMouseLeave={() => setNoticeAutoDismissPaused(false)}
+          onFocus={() => setNoticeAutoDismissPaused(true)}
+          onBlur={() => setNoticeAutoDismissPaused(false)}
         >
           {notice.tone === "success" ? (
             <CircleCheck size={17} />
@@ -938,7 +963,10 @@ export function App({
             variant="ghost"
             size="icon-sm"
             aria-label="关闭提示"
-            onClick={() => setNotice({ tone: "info", text: "" })}
+            onClick={() => {
+              setNoticeAutoDismissPaused(false);
+              setNotice({ tone: "info", text: "" });
+            }}
           >
             <X aria-hidden="true" />
           </Button>
