@@ -14,9 +14,6 @@ use serde_json::Value;
 const ERROR_LOG_FILE: &str = "codey-errors.log";
 const ERROR_LOG_HELPER_ARGUMENT: &str = "--codey-record-error";
 const MAX_HELPER_INPUT_BYTES: u64 = 1024 * 1024;
-const MAX_DIAGNOSTIC_DURATION_MS: u64 = 24 * 60 * 60 * 1000;
-const MAX_DIAGNOSTIC_ATTEMPTS: u64 = 10_000;
-
 static ERROR_LOG_WRITER: OnceLock<Mutex<ErrorLogWriter>> = OnceLock::new();
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -214,125 +211,6 @@ pub fn record_failure_with_metadata(
     }
 }
 
-pub fn record_renderer_failure(payload: &Value) -> std::result::Result<(), String> {
-    let reported_event = renderer_failure_text(payload, "event", 80)?;
-    let operation = renderer_failure_text(payload, "operation", 160)?;
-    let Some((event, error, stage)) = renderer_failure_descriptor(&operation) else {
-        return Err(format!("Renderer 错误诊断不支持 operation={operation}"));
-    };
-    if reported_event != event {
-        return Err(format!(
-            "Renderer 错误诊断事件不匹配：expected={event}, actual={reported_event}"
-        ));
-    }
-    let bounded_number = |name: &str, maximum: u64| {
-        payload
-            .get(name)
-            .and_then(Value::as_u64)
-            .map(|value| value.min(maximum))
-    };
-
-    record_failure_with_metadata(
-        event,
-        operation,
-        error,
-        FailureMetadata {
-            stage: Some(stage.to_string()),
-            duration_ms: bounded_number("durationMs", MAX_DIAGNOSTIC_DURATION_MS),
-            attempts: bounded_number("attempts", MAX_DIAGNOSTIC_ATTEMPTS),
-            timeout_ms: bounded_number("timeoutMs", MAX_DIAGNOSTIC_DURATION_MS),
-            recoverable: Some(true),
-        },
-        renderer_failure_context(payload),
-    );
-    Ok(())
-}
-
-fn renderer_failure_descriptor(
-    operation: &str,
-) -> Option<(&'static str, &'static str, &'static str)> {
-    match operation {
-        "wait_for_electron_bridge" => Some((
-            "startup_stalled",
-            "Codex Electron bridge did not become ready before the startup deadline",
-            "renderer.electron_bridge",
-        )),
-        "wait_for_codex_host_shell" => Some((
-            "startup_stalled",
-            "Codex host shell did not become ready before the startup deadline",
-            "renderer.host_shell",
-        )),
-        "sync_codex_locale_setting" => Some((
-            "renderer_operation_failed",
-            "Codex locale synchronization failed after all retries",
-            "renderer.settings_sync",
-        )),
-        "load_session_tools" => Some((
-            "renderer_operation_failed",
-            "Codey session tools lazy load failed",
-            "renderer.session_tools",
-        )),
-        _ => None,
-    }
-}
-
-fn renderer_failure_context(payload: &Value) -> Value {
-    let source = payload.get("context").and_then(Value::as_object);
-    let mut context = serde_json::Map::new();
-    for name in ["documentReadyState", "visibilityState", "errorType"] {
-        if let Some(value) = source
-            .and_then(|context| context.get(name))
-            .and_then(Value::as_str)
-        {
-            context.insert(
-                name.to_string(),
-                Value::String(bounded_diagnostic_text(value, 80)),
-            );
-        }
-    }
-    for name in [
-        "hasElectronBridge",
-        "hasCodeyBridge",
-        "sidebarDetected",
-        "rendererCoreLoaded",
-    ] {
-        if let Some(value) = source
-            .and_then(|context| context.get(name))
-            .and_then(Value::as_bool)
-        {
-            context.insert(name.to_string(), Value::Bool(value));
-        }
-    }
-    Value::Object(context)
-}
-
-fn renderer_failure_text(payload: &Value, name: &str, max_chars: usize) -> Result<String, String> {
-    let value = payload
-        .get(name)
-        .and_then(Value::as_str)
-        .map(|value| bounded_diagnostic_text(value, max_chars))
-        .unwrap_or_default();
-    if value.is_empty() {
-        return Err(format!("Renderer 错误诊断缺少 {name}"));
-    }
-    Ok(value)
-}
-
-fn bounded_diagnostic_text(value: &str, max_chars: usize) -> String {
-    value
-        .trim()
-        .chars()
-        .map(|character| {
-            if character.is_control() {
-                ' '
-            } else {
-                character
-            }
-        })
-        .take(max_chars)
-        .collect()
-}
-
 pub fn run_helper_if_requested() -> anyhow::Result<bool> {
     if std::env::args_os()
         .nth(1)
@@ -452,39 +330,6 @@ mod tests {
         assert_eq!(record.attempts, None);
         assert_eq!(record.timeout_ms, None);
         assert_eq!(record.recoverable, None);
-    }
-
-    #[test]
-    fn renderer_failure_payload_is_bounded_and_validated() {
-        let missing = record_renderer_failure(&serde_json::json!({
-            "event": "startup_stalled",
-        }))
-        .unwrap_err();
-        assert!(missing.contains("operation"));
-
-        assert!(renderer_failure_descriptor("unknown_operation").is_none());
-        assert_eq!(
-            renderer_failure_descriptor("wait_for_codex_host_shell"),
-            Some((
-                "startup_stalled",
-                "Codex host shell did not become ready before the startup deadline",
-                "renderer.host_shell",
-            ))
-        );
-
-        let context = renderer_failure_context(&serde_json::json!({
-            "context": {
-                "documentReadyState": "complete",
-                "hasElectronBridge": true,
-                "token": "must-not-be-logged",
-            }
-        }));
-        assert_eq!(context["documentReadyState"], "complete");
-        assert_eq!(context["hasElectronBridge"], true);
-        assert!(context.get("token").is_none());
-
-        let text = bounded_diagnostic_text("  first\nsecond  ", 64);
-        assert_eq!(text, "first second");
     }
 
     #[test]

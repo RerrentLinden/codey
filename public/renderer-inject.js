@@ -20,8 +20,6 @@
   const accountUsageRefreshIntervalMs = 60_000;
   const accountUsageTimeoutMs = 8_000;
   const accountUsageViewportMargin = 24;
-  const electronBridgeWaitTimeoutMs = 5_000;
-  const hostShellReadyTimeoutMs = 20_000;
   const sidebarSelector = [
     "[data-app-action-sidebar-section]",
     "[data-app-action-sidebar-thread-row]",
@@ -52,8 +50,6 @@
   let sessionToolsInteractionArmed = false;
   let bootstrapObserver = null;
   let headerMountDirty = true;
-  let electronBridgeFailureReported = false;
-  let sessionToolsFailureReported = false;
 
   const queryWithin = (root, selector) => {
     const matches = [];
@@ -71,34 +67,6 @@
       return window.__codexSessionDeleteBridge(path, payload);
     }
     return Promise.resolve({ status: "failed", message: "Codey bridge unavailable" });
-  };
-
-  const rendererErrorType = (error) => {
-    if (error instanceof Error) return String(error.name || "Error").slice(0, 80);
-    return typeof error;
-  };
-
-  const reportRendererFailure = ({
-    event,
-    operation,
-    durationMs,
-    attempts,
-    timeoutMs,
-    errorType,
-    context = {},
-  }) => {
-    const payload = {
-      event,
-      operation,
-      durationMs: Math.max(0, Math.round(Number(durationMs) || 0)),
-      attempts: Math.max(1, Math.round(Number(attempts) || 1)),
-      timeoutMs: Math.max(0, Math.round(Number(timeoutMs) || 0)),
-      context: {
-        ...context,
-        ...(errorType ? { errorType: String(errorType).slice(0, 80) } : {}),
-      },
-    };
-    Promise.resolve(callBridge("/diagnostics/error", payload)).catch(() => {});
   };
 
   const addStyle = () => {
@@ -698,8 +666,6 @@
       settingSyncInFlight: false,
       settingSyncAttempts: 0,
       settingSyncError: null,
-      settingSyncErrorType: null,
-      settingSyncFailureReported: false,
       ensureSynced: null,
       snapshot() {
         return {
@@ -715,8 +681,6 @@
           settingSyncInFlight: this.settingSyncInFlight,
           settingSyncAttempts: this.settingSyncAttempts,
           settingSyncError: this.settingSyncError,
-          settingSyncErrorType: this.settingSyncErrorType,
-          settingSyncFailureReported: this.settingSyncFailureReported,
         };
       },
     };
@@ -899,22 +863,7 @@
           resolve(bridge);
           return;
         }
-        if (Date.now() - startedAt >= electronBridgeWaitTimeoutMs) {
-          if (!electronBridgeFailureReported) {
-            electronBridgeFailureReported = true;
-            reportRendererFailure({
-              event: "startup_stalled",
-              operation: "wait_for_electron_bridge",
-              durationMs: Date.now() - startedAt,
-              attempts: 1,
-              timeoutMs: electronBridgeWaitTimeoutMs,
-              context: {
-                documentReadyState: document.readyState || "unknown",
-                visibilityState: document.visibilityState || "unknown",
-                hasCodeyBridge: typeof window.__codexSessionDeleteBridge === "function",
-              },
-            });
-          }
+        if (Date.now() - startedAt >= 5000) {
           resolve(null);
           return;
         }
@@ -990,7 +939,6 @@
       if (response?.value === defaultChineseLocale) {
         state.settingSynced = true;
         state.settingSyncError = null;
-        state.settingSyncErrorType = null;
         clearLocaleReloadMarker();
         return;
       }
@@ -1008,7 +956,6 @@
       }
       state.settingSynced = true;
       state.settingSyncError = null;
-      state.settingSyncErrorType = null;
       reloadAfterLocaleChange();
     };
 
@@ -1016,7 +963,6 @@
       if (state.settingSynced || state.settingSyncInFlight) return;
       state.settingSyncInFlight = true;
       void (async () => {
-        const syncStartedAt = Date.now();
         const retryDelays = [0, 250, 750, 1500, 3000, 5000];
         for (const delay of retryDelays) {
           if (delay > 0) {
@@ -1034,27 +980,12 @@
             return;
           } catch (error) {
             state.settingSyncError = error instanceof Error ? error.message : String(error);
-            state.settingSyncErrorType = rendererErrorType(error);
           }
         }
         console.warn(
           "[Codey] Codex 中文语言设置同步失败，将在窗口重新聚焦时重试",
           state.settingSyncError,
         );
-        if (!state.settingSyncFailureReported) {
-          state.settingSyncFailureReported = true;
-          reportRendererFailure({
-            event: "renderer_operation_failed",
-            operation: "sync_codex_locale_setting",
-            durationMs: Date.now() - syncStartedAt,
-            attempts: retryDelays.length,
-            errorType: state.settingSyncErrorType,
-            context: {
-              hasElectronBridge: typeof window.electronBridge?.sendMessageFromView === "function",
-              hasCodeyBridge: typeof window.__codexSessionDeleteBridge === "function",
-            },
-          });
-        }
       })().finally(() => {
         state.settingSyncInFlight = false;
       });
@@ -1197,7 +1128,6 @@
   const loadSessionTools = () => {
     if (window.__codeySessionToolsInjectLoaded === true) return Promise.resolve(true);
     if (sessionToolsLoadPromise) return sessionToolsLoadPromise;
-    const startedAt = Date.now();
     sessionToolsLoadPromise = Promise.resolve(callBridge(sessionToolsLoadPath, {}))
       .then((result) => {
         if (!result || result.status !== "ok") {
@@ -1214,20 +1144,6 @@
       .catch((error) => {
         sessionToolsLoadPromise = null;
         console.warn("[Codey] session tools lazy load failed", error);
-        if (!sessionToolsFailureReported) {
-          sessionToolsFailureReported = true;
-          reportRendererFailure({
-            event: "renderer_operation_failed",
-            operation: "load_session_tools",
-            durationMs: Date.now() - startedAt,
-            attempts: 1,
-            errorType: rendererErrorType(error),
-            context: {
-              sidebarDetected: sidebarDetected(),
-              hasCodeyBridge: typeof window.__codexSessionDeleteBridge === "function",
-            },
-          });
-        }
         return false;
       });
     return sessionToolsLoadPromise;
@@ -1349,25 +1265,6 @@
   scan();
   scheduleUpdateCheck(0);
   scheduleAccountUsageCheck(250);
-  window.setTimeout?.(() => {
-    const headerReady = !!findHeaderMount();
-    const sidebarReady = sidebarDetected();
-    if (headerReady || sidebarReady) return;
-    reportRendererFailure({
-      event: "startup_stalled",
-      operation: "wait_for_codex_host_shell",
-      durationMs: hostShellReadyTimeoutMs,
-      attempts: 1,
-      timeoutMs: hostShellReadyTimeoutMs,
-      context: {
-        documentReadyState: document.readyState || "unknown",
-        visibilityState: document.visibilityState || "unknown",
-        hasElectronBridge: typeof window.electronBridge?.sendMessageFromView === "function",
-        hasCodeyBridge: typeof window.__codexSessionDeleteBridge === "function",
-        rendererCoreLoaded: window.__codeyRendererCoreLoaded === true,
-      },
-    });
-  }, hostShellReadyTimeoutMs);
 
   bootstrapObserver = new MutationObserver((mutations) => {
     for (const mutation of mutations) {

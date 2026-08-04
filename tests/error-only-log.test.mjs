@@ -25,16 +25,7 @@ test("startup keeps the original loading page without progress tracing", async (
 });
 
 test("error log is failure-only, daily, structured, and cross-process serialized", async () => {
-  const [
-    errorLog,
-    launcher,
-    cdp,
-    commands,
-    runtimeCommands,
-    lib,
-    startupPatch,
-    renderer,
-  ] =
+  const [errorLog, launcher, cdp, commands, runtimeCommands, lib, startupPatch] =
     await Promise.all([
       source("backend/src/error_log.rs"),
       source("backend/src/launcher.rs"),
@@ -43,7 +34,6 @@ test("error log is failure-only, daily, structured, and cross-process serialized
       source("backend/src/commands/runtime.rs"),
       source("backend/src/lib.rs"),
       source("backend/src/codex_startup_patch.rs"),
-      source("public/renderer-inject.js"),
     ]);
 
   assert.match(errorLog, /codey-errors\.log/);
@@ -62,10 +52,6 @@ test("error log is failure-only, daily, structured, and cross-process serialized
   ]) {
     assert.match(errorLog, new RegExp(`${field}: Option`));
   }
-  assert.match(errorLog, /record_renderer_failure/);
-  assert.match(errorLog, /renderer_failure_descriptor/);
-  assert.match(errorLog, /renderer_failure_context/);
-  assert.match(commands, /"\/diagnostics\/error"/);
   assert.match(cdp, /timeout_at\(\s*deadline/);
 
   for (const operation of [
@@ -89,10 +75,4 @@ test("error log is failure-only, daily, structured, and cross-process serialized
   assert.match(startupPatch, /spawnSync/);
   assert.match(startupPatch, /startup\.renderer_asset_patch/);
   assert.match(startupPatch, /electronVersion/);
-  assert.match(renderer, /"startup_stalled"/);
-  assert.match(renderer, /"wait_for_electron_bridge"/);
-  assert.match(renderer, /"wait_for_codex_host_shell"/);
-  assert.match(renderer, /hostShellReadyTimeoutMs = 20_000/);
-  assert.match(renderer, /reportRendererFailure/);
-  assert.doesNotMatch(renderer, /error\.stack/);
 });
