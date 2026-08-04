@@ -114,60 +114,6 @@ function FeaturePolicyCardComponent({
           </div>
 
           <div
-            className={`feature-card gpu-mode-card ${!isMacClient && gpuLaunchMode.value !== "off" ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <div className="feature-card-title">
-                <strong>GPU 渲染模式</strong>
-                <Badge variant={isMacClient ? "secondary" : "warning"}>
-                  {isMacClient ? "macOS 不可用" : "实验性"}
-                </Badge>
-              </div>
-            </div>
-            <div className="feature-card-body gpu-mode-card-body">
-              <fieldset
-                className="gpu-mode-fieldset"
-                disabled={isMacClient}
-                aria-describedby="gpu-launch-mode-description"
-              >
-                <legend className="sr-only">Codex GPU 启动模式</legend>
-                <div className="gpu-mode-slider" style={gpuLaunchModeStyle}>
-                  <span className="gpu-mode-slider-thumb" aria-hidden="true" />
-                  {GPU_LAUNCH_MODES.map((mode) => (
-                    <label
-                      key={mode.value}
-                      className={`gpu-mode-option ${gpuLaunchMode.value === mode.value ? "selected" : ""}`}
-                    >
-                      <input
-                        type="radio"
-                        name="codey-gpu-launch-mode"
-                        value={mode.value}
-                        checked={gpuLaunchMode.value === mode.value}
-                        onChange={() =>
-                          onConfigChange({
-                            ...config,
-                            gpuLaunchMode: mode.value,
-                          })
-                        }
-                      />
-                      <span>{mode.label}</span>
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
-              <small id="gpu-launch-mode-description" aria-live="polite">
-                {isMacClient
-                  ? "macOS 下已禁用，不会向 Codex 传递 GPU 诊断参数"
-                  : gpuLaunchMode.value === "disableGpu"
-                    ? "启动 Codex 时附加 --disable-gpu；可能增加 CPU 占用"
-                    : gpuLaunchMode.value === "disableGpuRasterization"
-                      ? "启动 Codex 时附加 --disable-gpu-rasterization；仅将栅格化移到 CPU"
-                      : "保持 Codex 默认 GPU 渲染，不附加诊断参数"}
-              </small>
-            </div>
-          </div>
-
-          <div
             className={`feature-card ${config.fastCodexStartup ? "active" : ""}`}
           >
             <div className="feature-card-header">
@@ -239,7 +185,83 @@ function FeaturePolicyCardComponent({
           </div>
 
           <div
-            className={`feature-card ${config.subagentOptimization ? "active" : ""}`}
+            className={`feature-card ${config.hideFullAccessWarning ? "active" : ""}`}
+          >
+            <div className="feature-card-header">
+              <strong>屏蔽完全访问安全提示</strong>
+              <Switch
+                checked={config.hideFullAccessWarning}
+                onCheckedChange={(checked) =>
+                  onConfigChange({ ...config, hideFullAccessWarning: checked })
+                }
+                aria-label="屏蔽完全访问安全提示"
+              />
+            </div>
+            <div className="feature-card-body">
+              <small>
+                {config.hideFullAccessWarning
+                  ? "自动隐藏完全访问模式的原生安全提示"
+                  : "保留 Codex 原生安全提示"}
+              </small>
+            </div>
+          </div>
+
+          <div
+            className={`feature-card gpu-mode-card ${!isMacClient && gpuLaunchMode.value !== "off" ? "active" : ""}`}
+          >
+            <div className="feature-card-header">
+              <div className="feature-card-title">
+                <strong>GPU 渲染模式</strong>
+                <Badge variant={isMacClient ? "secondary" : "warning"}>
+                  {isMacClient ? "macOS 不可用" : "实验性"}
+                </Badge>
+              </div>
+            </div>
+            <div className="feature-card-body gpu-mode-card-body">
+              <fieldset
+                className="gpu-mode-fieldset"
+                disabled={isMacClient}
+                aria-describedby="gpu-launch-mode-description"
+              >
+                <legend className="sr-only">Codex GPU 启动模式</legend>
+                <div className="gpu-mode-slider" style={gpuLaunchModeStyle}>
+                  <span className="gpu-mode-slider-thumb" aria-hidden="true" />
+                  {GPU_LAUNCH_MODES.map((mode) => (
+                    <label
+                      key={mode.value}
+                      className={`gpu-mode-option ${gpuLaunchMode.value === mode.value ? "selected" : ""}`}
+                    >
+                      <input
+                        type="radio"
+                        name="codey-gpu-launch-mode"
+                        value={mode.value}
+                        checked={gpuLaunchMode.value === mode.value}
+                        onChange={() =>
+                          onConfigChange({
+                            ...config,
+                            gpuLaunchMode: mode.value,
+                          })
+                        }
+                      />
+                      <span>{mode.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+              <small id="gpu-launch-mode-description" aria-live="polite">
+                {isMacClient
+                  ? "macOS 下已禁用，不会向 Codex 传递 GPU 诊断参数"
+                  : gpuLaunchMode.value === "disableGpu"
+                    ? "启动 Codex 时附加 --disable-gpu；可能增加 CPU 占用"
+                    : gpuLaunchMode.value === "disableGpuRasterization"
+                      ? "启动 Codex 时附加 --disable-gpu-rasterization；仅将栅格化移到 CPU"
+                      : "保持 Codex 默认 GPU 渲染，不附加诊断参数"}
+              </small>
+            </div>
+          </div>
+
+          <div
+            className={`feature-card subagent-policy-card ${config.subagentOptimization ? "active" : ""}`}
           >
             <div className="feature-card-header">
               <div className="feature-card-title">
@@ -331,28 +353,6 @@ function FeaturePolicyCardComponent({
                   : config.subagentOptimization
                     ? "保存后立即用于当前任务后续新启动的子代理，无需重启"
                     : "保持 Codex 默认子代理配置，不注入协作提示词"}
-              </small>
-            </div>
-          </div>
-
-          <div
-            className={`feature-card ${config.hideFullAccessWarning ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <strong>屏蔽完全访问安全提示</strong>
-              <Switch
-                checked={config.hideFullAccessWarning}
-                onCheckedChange={(checked) =>
-                  onConfigChange({ ...config, hideFullAccessWarning: checked })
-                }
-                aria-label="屏蔽完全访问安全提示"
-              />
-            </div>
-            <div className="feature-card-body">
-              <small>
-                {config.hideFullAccessWarning
-                  ? "自动隐藏完全访问模式的原生安全提示"
-                  : "保留 Codex 原生安全提示"}
               </small>
             </div>
           </div>

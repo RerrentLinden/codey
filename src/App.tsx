@@ -851,7 +851,7 @@ export function App({
               />
             </div>
 
-            {/* 右侧栏：上方消息通知，下方 Codey 功能策略 */}
+            {/* 右侧栏：消息通知 */}
             <div className="dashboard-column upper-right-column">
               <NotificationChannelsCard
                 config={config}
@@ -861,17 +861,20 @@ export function App({
                 onChannelChange={handleNotificationChannelChange}
                 onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
               />
-
-              <FeaturePolicyCard
-                config={config}
-                status={status}
-                busy={busy}
-                isBusy={isBusy}
-                subagentModelOptions={subagentModelOptions}
-                onConfigChange={handleConfigChange}
-                onSubagentOptimizationChange={handleSubagentOptimizationChange}
-              />
             </div>
+          </div>
+
+          {/* Codey 功能策略：整行独占排布 */}
+          <div className="full-row-section feature-full-section">
+            <FeaturePolicyCard
+              config={config}
+              status={status}
+              busy={busy}
+              isBusy={isBusy}
+              subagentModelOptions={subagentModelOptions}
+              onConfigChange={handleConfigChange}
+              onSubagentOptimizationChange={handleSubagentOptimizationChange}
+            />
           </div>
 
           {/* 线路与模型：整行独占排布 */}
