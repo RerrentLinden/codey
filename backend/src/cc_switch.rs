@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -26,6 +27,87 @@ const CC_SWITCH_APP_ID: &str = "com.ccswitch.desktop";
 const CC_SWITCH_PATH_STORE: &str = "app_paths.json";
 const CC_SWITCH_CONFIG_DIR_KEY: &str = "app_config_dir_override";
 const CC_SWITCH_DB_FILE: &str = "cc-switch.db";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaVariant {
+    AppScoped,
+    LegacyUnscoped,
+}
+
+impl SchemaVariant {
+    fn from_columns(columns: &HashSet<String>) -> Self {
+        if columns.contains("app_type") {
+            Self::AppScoped
+        } else {
+            Self::LegacyUnscoped
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProviderSchema {
+    variant: SchemaVariant,
+    has_id: bool,
+    has_settings_config: bool,
+    has_meta: bool,
+    has_is_current: bool,
+    has_category: bool,
+}
+
+impl ProviderSchema {
+    fn inspect(connection: &Connection) -> Result<Self> {
+        let columns = table_columns(connection, "providers")?;
+        Ok(Self {
+            variant: SchemaVariant::from_columns(&columns),
+            has_id: columns.contains("id"),
+            has_settings_config: columns.contains("settings_config"),
+            has_meta: columns.contains("meta"),
+            has_is_current: columns.contains("is_current"),
+            has_category: columns.contains("category"),
+        })
+    }
+
+    fn supports_protocol_hint(self) -> bool {
+        self.has_id && self.has_settings_config && self.has_meta && self.has_is_current
+    }
+
+    fn supports_source_api(self) -> bool {
+        self.has_id && self.has_settings_config && self.has_is_current
+    }
+
+    fn category_projection(self) -> &'static str {
+        if self.has_category {
+            "category"
+        } else {
+            "NULL"
+        }
+    }
+
+    fn query_current<T>(
+        self,
+        connection: &Connection,
+        projection: &str,
+        map: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    ) -> Result<Option<T>> {
+        let scoped_query = format!(
+            "SELECT {projection}
+             FROM providers
+             WHERE app_type=?1 AND is_current != 0
+             LIMIT 1"
+        );
+        let legacy_query = format!(
+            "SELECT {projection}
+             FROM providers
+             WHERE is_current != 0
+             LIMIT 1"
+        );
+        let result = match self.variant {
+            SchemaVariant::AppScoped => connection.query_row(&scoped_query, params![APP_TYPE], map),
+            SchemaVariant::LegacyUnscoped => connection.query_row(&legacy_query, [], map),
+        };
+        Ok(result.optional()?)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -211,19 +293,19 @@ fn read_route_takeover_managed(path: &Path) -> Result<bool> {
     connection.busy_timeout(Duration::from_secs(2))?;
 
     let proxy_columns = table_columns(&connection, "proxy_config")?;
+    let proxy_schema = SchemaVariant::from_columns(&proxy_columns);
     let proxy_enabled = if proxy_columns.contains("enabled") {
-        let enabled = if proxy_columns.contains("app_type") {
-            connection.query_row(
+        let enabled = match proxy_schema {
+            SchemaVariant::AppScoped => connection.query_row(
                 "SELECT COALESCE(MAX(enabled), 0) FROM proxy_config WHERE app_type=?1",
                 params![APP_TYPE],
                 |row| row.get::<_, i64>(0),
-            )?
-        } else {
-            connection.query_row(
+            )?,
+            SchemaVariant::LegacyUnscoped => connection.query_row(
                 "SELECT COALESCE(MAX(enabled), 0) FROM proxy_config",
                 [],
                 |row| row.get::<_, i64>(0),
-            )?
+            )?,
         };
         enabled != 0
     } else if proxy_columns.contains("live_takeover_active") {
@@ -237,22 +319,28 @@ fn read_route_takeover_managed(path: &Path) -> Result<bool> {
     };
 
     let backup_columns = table_columns(&connection, "proxy_live_backup")?;
-    let has_live_backup = if backup_columns.contains("app_type") {
-        connection.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM proxy_live_backup WHERE app_type=?1
-             )",
-            params![APP_TYPE],
-            |row| row.get::<_, i64>(0),
-        )? != 0
-    } else if backup_columns.is_empty() {
+    let backup_schema = SchemaVariant::from_columns(&backup_columns);
+    let has_live_backup = if backup_columns.is_empty() {
         false
     } else {
-        connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM proxy_live_backup)",
-            [],
-            |row| row.get::<_, i64>(0),
-        )? != 0
+        match backup_schema {
+            SchemaVariant::AppScoped => {
+                connection.query_row(
+                    "SELECT EXISTS(
+                    SELECT 1 FROM proxy_live_backup WHERE app_type=?1
+                 )",
+                    params![APP_TYPE],
+                    |row| row.get::<_, i64>(0),
+                )? != 0
+            }
+            SchemaVariant::LegacyUnscoped => {
+                connection.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM proxy_live_backup)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )? != 0
+            }
+        }
     };
 
     let settings_columns = table_columns(&connection, "settings")?;
@@ -406,49 +494,18 @@ fn read_cc_switch_protocol_hint(
         .with_context(|| format!("打开 cc-switch 数据库失败：{}", db_path.display()))?;
     connection.busy_timeout(Duration::from_secs(2))?;
 
-    let provider_columns = table_columns(&connection, "providers")?;
-    if !provider_columns.contains("id")
-        || !provider_columns.contains("settings_config")
-        || !provider_columns.contains("meta")
-        || !provider_columns.contains("is_current")
-    {
+    let provider_schema = ProviderSchema::inspect(&connection)?;
+    if !provider_schema.supports_protocol_hint() {
         return Ok(None);
     }
-    let current_provider = if provider_columns.contains("app_type") {
-        connection
-            .query_row(
-                "SELECT id, settings_config, meta
-                 FROM providers
-                 WHERE app_type=?1 AND is_current != 0
-                 LIMIT 1",
-                params![APP_TYPE],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    ))
-                },
-            )
-            .optional()?
-    } else {
-        connection
-            .query_row(
-                "SELECT id, settings_config, meta
-                 FROM providers
-                 WHERE is_current != 0
-                 LIMIT 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    ))
-                },
-            )
-            .optional()?
-    };
+    let current_provider =
+        provider_schema.query_current(&connection, "id, settings_config, meta", |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
     let Some((provider_id, settings_config, meta)) = current_provider else {
         return Ok(None);
     };
@@ -516,28 +573,23 @@ fn cc_switch_provider_endpoints(connection: &Connection, provider_id: &str) -> R
     if !endpoint_columns.contains("provider_id") || !endpoint_columns.contains("url") {
         return Ok(Vec::new());
     }
-    let (query, uses_app_type) = if endpoint_columns.contains("app_type") {
-        (
-            "SELECT url FROM provider_endpoints WHERE provider_id=?1 AND app_type=?2",
-            true,
-        )
-    } else {
-        (
-            "SELECT url FROM provider_endpoints WHERE provider_id=?1",
-            false,
-        )
+    let schema = SchemaVariant::from_columns(&endpoint_columns);
+    let query = match schema {
+        SchemaVariant::AppScoped => {
+            "SELECT url FROM provider_endpoints WHERE provider_id=?1 AND app_type=?2"
+        }
+        SchemaVariant::LegacyUnscoped => "SELECT url FROM provider_endpoints WHERE provider_id=?1",
     };
     let mut statement = connection.prepare(query)?;
-    let endpoints = if uses_app_type {
-        statement
+    let endpoints = match schema {
+        SchemaVariant::AppScoped => statement
             .query_map(params![provider_id, APP_TYPE], |row| {
                 row.get::<_, String>(0)
             })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-    } else {
-        statement
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        SchemaVariant::LegacyUnscoped => statement
             .query_map(params![provider_id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
     };
     Ok(endpoints
         .into_iter()
@@ -555,57 +607,24 @@ fn read_current_cc_switch_source_api(db_path: &Path) -> Result<CcSwitchSourceApi
         .with_context(|| format!("打开 cc-switch 数据库失败：{}", db_path.display()))?;
     connection.busy_timeout(Duration::from_secs(2))?;
 
-    let provider_columns = table_columns(&connection, "providers")?;
-    if !provider_columns.contains("id")
-        || !provider_columns.contains("settings_config")
-        || !provider_columns.contains("is_current")
-    {
+    let provider_schema = ProviderSchema::inspect(&connection)?;
+    if !provider_schema.supports_source_api() {
         bail!("CC Switch 路由已开启，但数据库缺少当前源 API 配置");
     }
-    let category_column = if provider_columns.contains("category") {
-        "category"
-    } else {
-        "NULL"
-    };
-    let current_provider = if provider_columns.contains("app_type") {
-        connection
-            .query_row(
-                &format!(
-                    "SELECT id, settings_config, {category_column}
-                     FROM providers
-                     WHERE app_type=?1 AND is_current != 0
-                     LIMIT 1"
-                ),
-                params![APP_TYPE],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-    } else {
-        connection
-            .query_row(
-                &format!(
-                    "SELECT id, settings_config, {category_column}
-                     FROM providers
-                     WHERE is_current != 0
-                     LIMIT 1"
-                ),
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
-            )
-            .optional()?
-    };
+    let current_provider = provider_schema.query_current(
+        &connection,
+        &format!(
+            "id, settings_config, {}",
+            provider_schema.category_projection()
+        ),
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        },
+    )?;
     let Some((provider_id, settings_config, category)) = current_provider else {
         bail!("CC Switch 路由已开启，但找不到当前 Codex 源线路");
     };
@@ -986,6 +1005,65 @@ mod tests {
             )
             .unwrap();
         (directory, path, home)
+    }
+
+    #[test]
+    fn legacy_unscoped_schema_reads_current_provider_and_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE providers (
+                    id TEXT PRIMARY KEY,
+                    settings_config TEXT NOT NULL,
+                    meta TEXT NOT NULL DEFAULT '{}',
+                    is_current BOOLEAN NOT NULL DEFAULT 0
+                );
+                CREATE TABLE provider_endpoints (
+                    id INTEGER PRIMARY KEY,
+                    provider_id TEXT NOT NULL,
+                    url TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+        let base_url = "https://legacy.example/v1";
+        let settings = json!({
+            "auth": {"OPENAI_API_KEY": "legacy-secret"},
+            "config": format!(
+                "model_provider = \"legacy\"\n\n[model_providers.legacy]\nbase_url = \"{base_url}\"\nwire_api = \"responses\"\n"
+            )
+        })
+        .to_string();
+        connection
+            .execute(
+                "INSERT INTO providers (id, settings_config, meta, is_current)
+                 VALUES (?1, ?2, ?3, 1)",
+                params![
+                    "legacy-provider",
+                    settings,
+                    json!({"apiFormat": "openai_chat"}).to_string()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO provider_endpoints (provider_id, url) VALUES (?1, ?2)",
+                params!["legacy-provider", base_url],
+            )
+            .unwrap();
+        drop(connection);
+
+        let hint = read_cc_switch_protocol_hint(&path, base_url)
+            .unwrap()
+            .unwrap();
+        assert_eq!(hint.provider_id, "legacy-provider");
+        assert_eq!(hint.protocol, RelayProtocol::ChatCompletions);
+
+        let source = read_current_cc_switch_source_api(&path).unwrap();
+        assert_eq!(source.base_url, base_url);
+        assert_eq!(source.api_key, "legacy-secret");
+        assert_eq!(source.protocol, RelayProtocol::Responses);
     }
 
     #[test]

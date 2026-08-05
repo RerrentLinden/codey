@@ -8,6 +8,9 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   const [
     app,
     appUpdates,
+    notice,
+    confirmation,
+    appPathDialog,
     sections,
     dialogs,
     trace,
@@ -19,6 +22,9 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/useAppUpdates.ts", root), "utf8"),
+    readFile(new URL("src/useAppNotice.tsx", root), "utf8"),
+    readFile(new URL("src/useConfirmationDialog.tsx", root), "utf8"),
+    readFile(new URL("src/CodexAppPathDialogHost.tsx", root), "utf8"),
     Promise.all(
       [
         "OperationsPanel.tsx",
@@ -50,6 +56,17 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
 
   assert.match(app, /function useStableEvent</);
   assert.match(app, /useAppUpdates\(\{/);
+  assert.match(app, /useAppNoticeController\(\)/);
+  assert.match(app, /useConfirmationController\(\)/);
+  assert.match(app, /useCodexAppPathDialogController\(\)/);
+  assert.doesNotMatch(app, /useState<Notice>/);
+  assert.doesNotMatch(app, /useState<Confirmation/);
+  assert.match(notice, /useSyncExternalStore\(/);
+  assert.match(notice, /export const NoticeToast = memo\(/);
+  assert.match(confirmation, /useSyncExternalStore\(/);
+  assert.match(confirmation, /export const ConfirmationDialogHost = memo\(/);
+  assert.match(appPathDialog, /useSyncExternalStore\(/);
+  assert.match(appPathDialog, /export const CodexAppPathDialogHost = memo\(/);
   assert.doesNotMatch(app, /async function checkForUpdates\(/);
   assert.match(appUpdates, /export function useAppUpdates/);
   assert.match(appUpdates, /invoke<UpdateCheck>\("check_for_updates"\)/);

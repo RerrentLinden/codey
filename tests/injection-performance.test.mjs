@@ -68,6 +68,9 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(petShield, /if \(!enabled\) \{/);
   assert.match(bridge, /window\.__codeyMutationDispatcher = Object\.freeze/);
   assert.match(bridge, /const createShieldLifecycle = \(\{/);
+  assert.match(bridge, /const controlsWithin = \(root, selector\) =>/);
+  assert.doesNotMatch(petShield, /const controlsWithin = \(root, selector\) =>/);
+  assert.doesNotMatch(voiceShield, /const controlsWithin = \(root, selector\) =>/);
   assert.match(petShield, /__codeyMutationDispatcher\?\.createShieldLifecycle/);
   assert.match(voiceShield, /const block = \(root = document\)/);
   assert.match(voiceShield, /if \(!enabled\) \{/);

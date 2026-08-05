@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -310,11 +311,17 @@ pub fn upstream_stream_header_timeout() -> Duration {
 }
 
 pub fn upstream_http_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-        .user_agent("CodeyRuntime/ProtocolProxy")
-        .build()
-        .context("failed to build upstream HTTP client")
+    static CLIENT: LazyLock<Result<reqwest::Client, String>> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+            .user_agent("CodeyRuntime/ProtocolProxy")
+            .build()
+            .map_err(|error| error.to_string())
+    });
+    match &*CLIENT {
+        Ok(client) => Ok(client.clone()),
+        Err(error) => anyhow::bail!("failed to build upstream HTTP client: {error}"),
+    }
 }
 
 pub async fn send_upstream_request(
@@ -524,12 +531,10 @@ pub async fn open_responses_proxy_request_with_settings_and_user_agent(
         );
         let upstream = match send_upstream_request_for_responses(
             upstream_request_builder(
-                crate::http_client::proxied_client(&effective_user_agent(
-                    &relay.user_agent,
-                    original_user_agent,
-                ))?,
+                upstream_http_client()?,
                 &endpoint,
                 relay.api_key.trim(),
+                &effective_user_agent(&relay.user_agent, original_user_agent),
                 is_stream,
                 &upstream_body,
             ),
@@ -552,7 +557,7 @@ pub async fn open_responses_proxy_request_with_settings_and_user_agent(
                         "candidateCount": relay_count,
                         "headerTimeoutSeconds": header_timeout.as_secs(),
                         "willFailover": has_more_candidates,
-                        "error": error.to_string()
+                        "errorClass": upstream_error_class(&error)
                     }),
                 );
                 crate::relay_rotation::record_relay_request_failure(&settings);
@@ -644,12 +649,13 @@ pub async fn open_models_proxy_request(
         }),
     );
     let upstream = send_upstream_request(
-        crate::http_client::proxied_client(&effective_user_agent(
-            &relay.user_agent,
-            original_user_agent,
-        ))?
-        .get(endpoint)
-        .bearer_auth(relay.api_key.trim()),
+        upstream_http_client()?
+            .get(endpoint)
+            .header(
+                reqwest::header::USER_AGENT,
+                effective_user_agent(&relay.user_agent, original_user_agent),
+            )
+            .bearer_auth(relay.api_key.trim()),
     )
     .await?;
     let status_code = upstream.status().as_u16();
@@ -690,15 +696,18 @@ pub async fn open_chat_completions_proxy_request(
         .get("stream")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let upstream = crate::http_client::proxied_client(&effective_user_agent(
-        &relay.user_agent,
-        original_user_agent,
-    ))?
-    .post(chat_completions_url(&relay.base_url))
-    .bearer_auth(relay.api_key.trim())
-    .header(reqwest::header::CONTENT_TYPE, "application/json")
-    .json(&request_json)
-    .send()
+    let upstream = send_upstream_request_for_responses(
+        upstream_http_client()?
+            .post(chat_completions_url(&relay.base_url))
+            .bearer_auth(relay.api_key.trim())
+            .header(
+                reqwest::header::USER_AGENT,
+                effective_user_agent(&relay.user_agent, original_user_agent),
+            )
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&request_json),
+        is_stream,
+    )
     .await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
@@ -747,12 +756,14 @@ fn upstream_request_builder(
     client: reqwest::Client,
     endpoint: &str,
     api_key: &str,
+    user_agent: &str,
     is_stream: bool,
     upstream_body: &Value,
 ) -> reqwest::RequestBuilder {
     let mut builder = client
         .post(endpoint)
         .bearer_auth(api_key)
+        .header(reqwest::header::USER_AGENT, user_agent)
         .header(reqwest::header::CONTENT_TYPE, "application/json");
     if is_stream {
         builder = builder
@@ -792,8 +803,24 @@ fn effective_user_agent(configured_user_agent: &str, original_user_agent: Option
     original_user_agent
         .map(str::trim)
         .filter(|user_agent| !user_agent.is_empty())
-        .unwrap_or("")
-        .to_string()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("CodeyRuntime/{}", env!("CARGO_PKG_VERSION")))
+}
+
+fn upstream_error_class(error: &anyhow::Error) -> &'static str {
+    let reqwest_error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<reqwest::Error>());
+    match reqwest_error {
+        Some(error) if error.is_timeout() => "timeout",
+        Some(error) if error.is_connect() => "connect",
+        Some(error) if error.is_request() => "request",
+        Some(error) if error.is_body() => "body",
+        Some(error) if error.is_decode() => "decode",
+        Some(_) => "http-client",
+        None if error.to_string().contains("未返回响应头") => "header-timeout",
+        None => "other",
+    }
 }
 
 pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyHttpResponse> {

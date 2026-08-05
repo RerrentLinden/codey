@@ -6,10 +6,7 @@ import {
   useState,
 } from "react";
 import {
-  IconActivity as Activity,
-  IconAlertCircle as CircleAlert,
   IconCheck,
-  IconCircleCheck as CircleCheck,
   IconDeviceFloppy as Save,
   IconGitBranch as GitBranch,
   IconLoader2 as LoaderCircle,
@@ -25,8 +22,6 @@ import {
   type TraceLogStats,
 } from "./TraceLogModule";
 import {
-  CodexAppPathDialog,
-  ConfirmationDialog,
   ModelPickerDialog,
 } from "./AppDialogs";
 import {
@@ -42,15 +37,26 @@ import { useModelSelection } from "./useModelSelection";
 import { useNotifications } from "./useNotifications";
 import { useRuntimeStatus } from "./useRuntimeStatus";
 import { useAppUpdates } from "./useAppUpdates";
+import {
+  NoticeLoadingText,
+  NoticeToast,
+  useAppNoticeController,
+} from "./useAppNotice";
+import {
+  ConfirmationDialogHost,
+  useConfirmationController,
+} from "./useConfirmationDialog";
+import {
+  CodexAppPathDialogHost,
+  useCodexAppPathDialogController,
+} from "./CodexAppPathDialogHost";
 import type {
   AppProps,
   CcSwitchStatus,
   CodexAppDirectorySelection,
   Config,
-  Confirmation,
   CrashpadCleanup,
   ModelState,
-  Notice,
   PluginMarketplaceStatus,
   TraceLogCleanup,
 } from "./App.types";
@@ -59,7 +65,6 @@ import { Badge, Button, Button as SaveButton } from "./components/semi";
 const Check = IconCheck;
 const X = IconX;
 const SETTINGS_OVERLAY_Z_INDEX = 2147483647;
-const NOTICE_AUTO_DISMISS_MS = 5_000;
 
 function CodeyBrandMark() {
   return (
@@ -154,22 +159,17 @@ export function App({
   const [ccSwitchStatus, setCcSwitchStatus] = useState<CcSwitchStatus | null>(
     null,
   );
-  const [notice, setNotice] = useState<Notice>({
-    tone: "info",
-    text: "正在连接 Codey…",
-  });
-  const [noticeAutoDismissPaused, setNoticeAutoDismissPaused] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
-  const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
-  const [codexAppPathDialogVisible, setCodexAppPathDialogVisible] =
-    useState(false);
-  const [selectedCodexAppPath, setSelectedCodexAppPath] = useState("");
-  const [codexAppPathError, setCodexAppPathError] = useState("");
   const [portalContainer, setPortalContainer] = useState<HTMLElement | null>(
     null,
   );
   const [traceSnapshotStale, setTraceSnapshotStale] = useState(false);
+  const noticeController = useAppNoticeController();
+  const confirmationController = useConfirmationController();
+  const codexAppPathDialog = useCodexAppPathDialogController();
+  const setNotice = noticeController.setNotice;
+  const setConfirmation = confirmationController.setConfirmation;
 
   const provider = ccSwitchStatus?.provider;
   const isBusy = busy !== null;
@@ -232,25 +232,6 @@ export function App({
     void load();
   }, []);
 
-  useEffect(() => {
-    if (!notice.text) setNoticeAutoDismissPaused(false);
-  }, [notice.text]);
-
-  useEffect(() => {
-    if (!config || !provider || !notice.text || noticeAutoDismissPaused) {
-      return undefined;
-    }
-    const timeout = window.setTimeout(() => {
-      setNoticeAutoDismissPaused(false);
-      setNotice((current) =>
-        current.text === notice.text && current.tone === notice.tone
-          ? { tone: "info", text: "" }
-          : current,
-      );
-    }, NOTICE_AUTO_DISMISS_MS);
-    return () => window.clearTimeout(timeout);
-  }, [config, provider, notice.text, notice.tone, noticeAutoDismissPaused]);
-
   async function load() {
     try {
       const result = await invoke<{
@@ -268,9 +249,7 @@ export function App({
         refreshPluginMarketplaceStatus(),
       ]);
       const startupError = next.startupError || result.startupError;
-      setCodexAppPathDialogVisible(
-        Boolean(result.codexAppPathSelectionRequired),
-      );
+      codexAppPathDialog.setOpen(Boolean(result.codexAppPathSelectionRequired));
       if (startupError) {
         setNotice({ tone: "error", text: `自动启动失败：${startupError}` });
       } else if (next.restartRequired) {
@@ -353,25 +332,27 @@ export function App({
   async function chooseCodexAppDirectory() {
     if (isBusy) return;
     setBusy("pick-codex-app-directory");
-    setCodexAppPathError("");
+    codexAppPathDialog.setError("");
     try {
       const result = await invoke<CodexAppDirectorySelection>(
         "pick_codex_app_directory",
       );
       if (result.status === "selected" && result.path) {
-        setSelectedCodexAppPath(result.path);
+        codexAppPathDialog.setSelectedPath(result.path);
       }
     } catch (error) {
-      setCodexAppPathError(errorText(error));
+      codexAppPathDialog.setError(errorText(error));
     } finally {
       setBusy(null);
     }
   }
 
   async function confirmCodexAppPath() {
+    const selectedCodexAppPath =
+      codexAppPathDialog.getSnapshot().selectedPath;
     if (!selectedCodexAppPath || isBusy) return;
     setBusy("set-codex-app-path");
-    setCodexAppPathError("");
+    codexAppPathDialog.setError("");
     try {
       const result = await invoke<{
         config: Config;
@@ -383,14 +364,14 @@ export function App({
       if (result.modelState) setModelState(result.modelState);
       await invoke("launch_codey");
       await refreshStatus();
-      setCodexAppPathDialogVisible(false);
-      setSelectedCodexAppPath("");
+      codexAppPathDialog.setOpen(false);
+      codexAppPathDialog.setSelectedPath("");
       setNotice({
         tone: "success",
         text: "Codex 应用路径已校验并保存，客户端已启动",
       });
     } catch (error) {
-      setCodexAppPathError(errorText(error));
+      codexAppPathDialog.setError(errorText(error));
     } finally {
       setBusy(null);
     }
@@ -476,7 +457,7 @@ export function App({
     }
     setDirty(false);
     setModelPickerVisible(false);
-    setConfirmation(null);
+    confirmationController.clear();
     onClose?.();
   }
 
@@ -699,15 +680,8 @@ export function App({
   const handleSaveModelSelection = useStableEvent(
     () => void saveModelSelection(),
   );
-  const handleConfirmationClose = useStableEvent(
-    () => setConfirmation(null),
-  );
-  const handleConfirmationConfirm = useStableEvent((pending: Confirmation) => {
-    setConfirmation(null);
-    pending.run();
-  });
   const handleCodexAppPathOpenChange = useStableEvent((open: boolean) => {
-    if (!isBusy) setCodexAppPathDialogVisible(open);
+    if (!isBusy) codexAppPathDialog.setOpen(open);
   });
   const handleChooseCodexAppDirectory = useStableEvent(
     () => void chooseCodexAppDirectory(),
@@ -724,7 +698,9 @@ export function App({
         </div>
         <div>
           <strong>正在载入 Codey</strong>
-          <p>{notice.text}</p>
+          <p>
+            <NoticeLoadingText controller={noticeController} />
+          </p>
         </div>
         <LoaderCircle
           className="spinner loading-spinner"
@@ -960,37 +936,10 @@ export function App({
         </div>
       </div>
 
-      {notice.text && (
-        <div
-          className={`notice-toast ${notice.tone}`}
-          role="status"
-          aria-live="polite"
-          onMouseEnter={() => setNoticeAutoDismissPaused(true)}
-          onMouseLeave={() => setNoticeAutoDismissPaused(false)}
-          onFocus={() => setNoticeAutoDismissPaused(true)}
-          onBlur={() => setNoticeAutoDismissPaused(false)}
-        >
-          {notice.tone === "success" ? (
-            <CircleCheck size={17} />
-          ) : notice.tone === "error" ? (
-            <CircleAlert size={17} />
-          ) : (
-            <Activity size={17} />
-          )}
-          <span>{notice.text}</span>
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label="关闭提示"
-            onClick={() => {
-              setNoticeAutoDismissPaused(false);
-              setNotice({ tone: "info", text: "" });
-            }}
-          >
-            <X aria-hidden="true" />
-          </Button>
-        </div>
-      )}
+      <NoticeToast
+        autoDismissEnabled={Boolean(config && provider)}
+        controller={noticeController}
+      />
 
       <ModelPickerDialog
         open={modelPickerVisible}
@@ -1012,18 +961,14 @@ export function App({
         onSave={handleSaveModelSelection}
       />
 
-      <ConfirmationDialog
-        confirmation={confirmation}
+      <ConfirmationDialogHost
         container={portalContainer}
-        onClose={handleConfirmationClose}
-        onConfirm={handleConfirmationConfirm}
+        controller={confirmationController}
       />
 
       {status.clientPlatform === "windows" && (
-        <CodexAppPathDialog
-          open={codexAppPathDialogVisible}
-          selectedPath={selectedCodexAppPath}
-          error={codexAppPathError}
+        <CodexAppPathDialogHost
+          controller={codexAppPathDialog}
           isBusy={isBusy}
           busy={busy}
           container={portalContainer}

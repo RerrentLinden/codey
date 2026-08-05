@@ -2,6 +2,7 @@
   if (
     window.__codeyBridgeHelpersInstalled
     && window.__codeyMutationDispatcher?.createShieldLifecycle
+    && window.__codeyMutationDispatcher?.controlsWithin
   ) return;
   window.__codeyBridgeHelpersInstalled = true;
 
@@ -76,6 +77,15 @@
       mutationSubscribers.delete(id);
       syncMutationObserver();
     };
+  };
+
+  const controlsWithin = (root, selector) => {
+    const controls = [];
+    if (root instanceof HTMLElement && root.matches?.(selector)) controls.push(root);
+    if (root && typeof root.querySelectorAll === "function") {
+      controls.push(...root.querySelectorAll(selector));
+    }
+    return controls;
   };
 
   const createShieldLifecycle = ({
@@ -204,6 +214,7 @@
   };
 
   window.__codeyMutationDispatcher = Object.freeze({
+    controlsWithin,
     createShieldLifecycle,
     snapshot: () => Object.freeze({
       observerInstalled: mutationObserver !== null,

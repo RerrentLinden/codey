@@ -1,11 +1,4 @@
-use std::collections::BTreeSet;
 use std::fs;
-#[cfg(unix)]
-use std::fs::OpenOptions;
-#[cfg(unix)]
-use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -15,8 +8,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG, LEGACY_CODEY_FASTCTX_GUIDANCE, SUBAGENT_GUIDANCE,
-    append_subagent_guidance, remove_codey_fastctx_guidance, remove_owned_guidance_block,
-    remove_subagent_guidance,
+    append_subagent_guidance, remove_codey_fastctx_guidance, remove_subagent_guidance,
 };
 use crate::config::{
     DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, ProviderProfile,
@@ -24,6 +16,16 @@ use crate::config::{
 };
 use crate::fs_util::timestamp_millis;
 use crate::provider_lease::CODEY_PROVIDER_ID;
+
+mod fs_io;
+mod toml_restore;
+
+use fs_io::{
+    atomic_write, create_private_dir_all, read_optional, remove_optional, write_private_file,
+};
+use toml_restore::restore_owned_config_changes;
+#[cfg(test)]
+use toml_restore::{items_semantically_equal, tables_semantically_equal};
 
 pub const GLOBAL_PROVIDER_ID: &str = "codey_global";
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
@@ -98,6 +100,37 @@ pub(crate) struct RuntimeProviderConfigOptions<'a> {
     pub protocol_proxy_base_url: Option<&'a str>,
 }
 
+struct ProviderApplyOptions<'a> {
+    use_official_catalog: bool,
+    default_model: Option<&'a str>,
+    fastctx_command: Option<&'a Path>,
+    subagent_optimization: bool,
+    subagent_model: &'a str,
+    subagent_reasoning_effort: &'a str,
+    marker: &'a Path,
+    backup_root: &'a Path,
+    preserve_provider_route: bool,
+    protocol_proxy_base_url: Option<&'a str>,
+}
+
+#[cfg(test)]
+impl<'a> ProviderApplyOptions<'a> {
+    fn for_test(marker: &'a Path, backup_root: &'a Path) -> Self {
+        Self {
+            use_official_catalog: true,
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            marker,
+            backup_root,
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+        }
+    }
+}
+
 pub(crate) fn apply_runtime_provider_config(
     home: &Path,
     profile: &ProviderProfile,
@@ -118,16 +151,18 @@ pub(crate) fn apply_runtime_provider_config(
         home,
         profile,
         provider_id,
-        use_official_catalog,
-        default_model,
-        fastctx_command.as_deref(),
-        options.subagent_optimization,
-        options.subagent_model,
-        options.subagent_reasoning_effort,
-        &marker,
-        &backup_root,
-        options.preserve_provider_route,
-        options.protocol_proxy_base_url,
+        ProviderApplyOptions {
+            use_official_catalog,
+            default_model,
+            fastctx_command: fastctx_command.as_deref(),
+            subagent_optimization: options.subagent_optimization,
+            subagent_model: options.subagent_model,
+            subagent_reasoning_effort: options.subagent_reasoning_effort,
+            marker: &marker,
+            backup_root: &backup_root,
+            preserve_provider_route: options.preserve_provider_route,
+            protocol_proxy_base_url: options.protocol_proxy_base_url,
+        },
     )
 }
 
@@ -171,52 +206,24 @@ fn fastctx_server_command() -> Result<PathBuf> {
         })
 }
 
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-fn apply_runtime_provider_config_at(
-    home: &Path,
-    profile: &ProviderProfile,
-    provider_id: &str,
-    use_official_catalog: bool,
-    default_model: Option<&str>,
-    fastctx_command: Option<&Path>,
-    subagent_optimization: bool,
-    marker: &Path,
-    backup_root: &Path,
-) -> Result<PathBuf> {
-    apply_runtime_provider_config_at_mode(
-        home,
-        profile,
-        provider_id,
-        use_official_catalog,
-        default_model,
-        fastctx_command,
-        subagent_optimization,
-        DEFAULT_SUBAGENT_MODEL,
-        DEFAULT_SUBAGENT_REASONING_EFFORT,
-        marker,
-        backup_root,
-        false,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
 fn apply_runtime_provider_config_at_mode(
     home: &Path,
     profile: &ProviderProfile,
     provider_id: &str,
-    use_official_catalog: bool,
-    default_model: Option<&str>,
-    fastctx_command: Option<&Path>,
-    subagent_optimization: bool,
-    subagent_model: &str,
-    subagent_reasoning_effort: &str,
-    marker: &Path,
-    backup_root: &Path,
-    preserve_provider_route: bool,
-    protocol_proxy_base_url: Option<&str>,
+    options: ProviderApplyOptions<'_>,
 ) -> Result<PathBuf> {
+    let ProviderApplyOptions {
+        use_official_catalog,
+        default_model,
+        fastctx_command,
+        subagent_optimization,
+        subagent_model,
+        subagent_reasoning_effort,
+        marker,
+        backup_root,
+        preserve_provider_route,
+        protocol_proxy_base_url,
+    } = options;
     ensure_supported_provider_protocol(profile.protocol, protocol_proxy_base_url)?;
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
@@ -265,14 +272,16 @@ fn apply_runtime_provider_config_at_mode(
         existing,
         profile,
         &provider_id,
-        model_catalog_path.as_deref(),
-        default_model,
-        fastctx_command,
-        subagent_optimization,
-        subagent_model,
-        subagent_reasoning_effort,
-        preserve_provider_route,
-        protocol_proxy_base_url,
+        ProviderPatchOptions {
+            model_catalog_path: model_catalog_path.as_deref(),
+            default_model,
+            fastctx_command,
+            subagent_optimization,
+            subagent_model,
+            subagent_reasoning_effort,
+            preserve_provider_route,
+            protocol_proxy_base_url,
+        },
     )?;
     let applied_base_url = provider_base_url(&updated, &provider_id);
     if let Err(error) =
@@ -963,219 +972,6 @@ fn ensure_child_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Ta
         .ok_or_else(|| anyhow::anyhow!("{key} 必须是 TOML table"))
 }
 
-fn restore_owned_config_changes(original: &str, applied: &str, current: &str) -> Result<String> {
-    let original = parse_document(original).context("解析 Codex 原配置备份失败")?;
-    let applied = parse_document(applied).context("解析 Codey 已应用配置快照失败")?;
-    let mut current = parse_document(current).context("解析 Codex 当前配置失败")?;
-    restore_table_changes(
-        original.as_table(),
-        applied.as_table(),
-        current.as_table_mut(),
-    );
-    if current.as_table().is_empty() {
-        Ok(String::new())
-    } else {
-        document_string(&current)
-    }
-}
-
-fn restore_table_changes(original: &Table, applied: &Table, current: &mut Table) {
-    let keys = original
-        .iter()
-        .chain(applied.iter())
-        .map(|(key, _)| key.to_string())
-        .collect::<BTreeSet<_>>();
-
-    for key in keys {
-        let original_item = original.get(&key).filter(|item| !item.is_none());
-        let applied_item = applied.get(&key).filter(|item| !item.is_none());
-        if optional_items_semantically_equal(original_item, applied_item) {
-            continue;
-        }
-
-        let current_matches_applied = optional_items_semantically_equal(
-            current.get(&key).filter(|item| !item.is_none()),
-            applied_item,
-        );
-        if current_matches_applied {
-            if let Some(original_item) = original_item {
-                current.insert(&key, original_item.clone());
-            } else {
-                current.remove(&key);
-            }
-            continue;
-        }
-
-        if key == CODEY_FASTCTX_SERVER_ID && original_item.is_none() {
-            let still_codey_owned = applied_item
-                .and_then(Item::as_table)
-                .zip(current.get(&key).and_then(Item::as_table))
-                .is_some_and(|(applied, current)| {
-                    ["command", "args"].iter().all(|field| {
-                        optional_items_semantically_equal(applied.get(field), current.get(field))
-                    })
-                });
-            if still_codey_owned {
-                current.remove(&key);
-            }
-            // A complete replacement under the reserved id belongs to the
-            // concurrent writer; do not strip matching fields out of it.
-            continue;
-        }
-
-        if restore_fastctx_owned_value(&key, original_item, applied_item, current.get_mut(&key)) {
-            continue;
-        }
-
-        let empty_original = Table::new();
-        let original_table = match original_item {
-            Some(item) => item.as_table(),
-            None => Some(&empty_original),
-        };
-        let applied_table = applied_item.and_then(Item::as_table);
-        let mut remove_empty_added_table = false;
-        if let (Some(original_table), Some(applied_table), Some(current_table)) = (
-            original_table,
-            applied_table,
-            current.get_mut(&key).and_then(Item::as_table_mut),
-        ) {
-            restore_table_changes(original_table, applied_table, current_table);
-            remove_empty_added_table = original_item.is_none() && current_table.is_empty();
-        }
-        if remove_empty_added_table {
-            current.remove(&key);
-        }
-    }
-}
-
-fn restore_fastctx_owned_value(
-    key: &str,
-    original: Option<&Item>,
-    applied: Option<&Item>,
-    current: Option<&mut Item>,
-) -> bool {
-    match key {
-        "direct_only_tool_namespaces" => {
-            let original_has_namespace = original.and_then(Item::as_array).is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-            });
-            let applied_has_namespace = applied.and_then(Item::as_array).is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-            });
-            if original_has_namespace || !applied_has_namespace {
-                return false;
-            }
-            let Some(entries) = current.and_then(Item::as_array_mut) else {
-                return false;
-            };
-            let Some(index) = entries
-                .iter()
-                .position(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-            else {
-                return false;
-            };
-            entries.remove(index);
-            true
-        }
-        "developer_instructions" => {
-            let Some(current) = current else {
-                return false;
-            };
-            let Some(text) = current.as_str() else {
-                return false;
-            };
-            let mut restored = text.to_string();
-            let mut changed = false;
-            for guidance in [CODEY_FASTCTX_GUIDANCE, LEGACY_CODEY_FASTCTX_GUIDANCE] {
-                let original_has_guidance = original
-                    .and_then(Item::as_str)
-                    .is_some_and(|text| text.contains(guidance));
-                let applied_has_guidance = applied
-                    .and_then(Item::as_str)
-                    .is_some_and(|text| text.contains(guidance));
-                if original_has_guidance || !applied_has_guidance {
-                    continue;
-                }
-                while let Some(without_guidance) = remove_owned_guidance_block(&restored, guidance)
-                {
-                    restored = without_guidance;
-                    changed = true;
-                }
-            }
-            if changed {
-                *current = value(restored);
-            }
-            changed
-        }
-        _ => false,
-    }
-}
-
-fn optional_items_semantically_equal(left: Option<&Item>, right: Option<&Item>) -> bool {
-    match (left, right) {
-        (None, None) => true,
-        (Some(left), Some(right)) => items_semantically_equal(left, right),
-        _ => false,
-    }
-}
-
-fn items_semantically_equal(left: &Item, right: &Item) -> bool {
-    match (left, right) {
-        (Item::None, Item::None) => true,
-        (Item::Value(left), Item::Value(right)) => values_semantically_equal(left, right),
-        (Item::Table(left), Item::Table(right)) => tables_semantically_equal(left, right),
-        (Item::ArrayOfTables(left), Item::ArrayOfTables(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| tables_semantically_equal(left, right))
-        }
-        _ => false,
-    }
-}
-
-fn tables_semantically_equal(left: &Table, right: &Table) -> bool {
-    left.len() == right.len()
-        && left.iter().all(|(key, left)| {
-            right
-                .get(key)
-                .is_some_and(|right| items_semantically_equal(left, right))
-        })
-}
-
-fn values_semantically_equal(left: &Value, right: &Value) -> bool {
-    match (left, right) {
-        (Value::String(left), Value::String(right)) => left.value() == right.value(),
-        (Value::Integer(left), Value::Integer(right)) => left.value() == right.value(),
-        (Value::Float(left), Value::Float(right)) => {
-            left.value().to_bits() == right.value().to_bits()
-        }
-        (Value::Boolean(left), Value::Boolean(right)) => left.value() == right.value(),
-        (Value::Datetime(left), Value::Datetime(right)) => left.value() == right.value(),
-        (Value::Array(left), Value::Array(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right.iter())
-                    .all(|(left, right)| values_semantically_equal(left, right))
-        }
-        (Value::InlineTable(left), Value::InlineTable(right)) => {
-            left.len() == right.len()
-                && left.iter().all(|(key, left)| {
-                    right
-                        .get(key)
-                        .is_some_and(|right| values_semantically_equal(left, right))
-                })
-        }
-        _ => false,
-    }
-}
-
 /// Reads the provider selected by an external Live-route owner without
 /// normalizing or rewriting the surrounding Codex configuration.
 pub fn active_model_provider(home: &Path) -> Result<String> {
@@ -1274,34 +1070,47 @@ fn patch_config_with_fastctx(
         existing,
         profile,
         provider_id,
-        model_catalog_path,
-        default_model,
-        fastctx_command,
-        subagent_optimization,
-        DEFAULT_SUBAGENT_MODEL,
-        DEFAULT_SUBAGENT_REASONING_EFFORT,
-        false,
+        ProviderPatchOptions {
+            model_catalog_path,
+            default_model,
+            fastctx_command,
+            subagent_optimization,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+        },
     )
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_arguments)]
 fn patch_config_with_fastctx_mode(
     existing: &str,
     profile: &ProviderProfile,
     provider_id: &str,
-    model_catalog_path: Option<&Path>,
-    default_model: Option<&str>,
-    fastctx_command: Option<&Path>,
-    subagent_optimization: bool,
-    subagent_model: &str,
-    subagent_reasoning_effort: &str,
-    preserve_provider_route: bool,
+    options: ProviderPatchOptions<'_>,
 ) -> Result<String> {
-    patch_config_with_fastctx_mode_and_proxy(
-        existing,
-        profile,
-        provider_id,
+    patch_config_with_fastctx_mode_and_proxy(existing, profile, provider_id, options)
+}
+
+struct ProviderPatchOptions<'a> {
+    model_catalog_path: Option<&'a Path>,
+    default_model: Option<&'a str>,
+    fastctx_command: Option<&'a Path>,
+    subagent_optimization: bool,
+    subagent_model: &'a str,
+    subagent_reasoning_effort: &'a str,
+    preserve_provider_route: bool,
+    protocol_proxy_base_url: Option<&'a str>,
+}
+
+fn patch_config_with_fastctx_mode_and_proxy(
+    existing: &str,
+    profile: &ProviderProfile,
+    provider_id: &str,
+    options: ProviderPatchOptions<'_>,
+) -> Result<String> {
+    let ProviderPatchOptions {
         model_catalog_path,
         default_model,
         fastctx_command,
@@ -1309,24 +1118,8 @@ fn patch_config_with_fastctx_mode(
         subagent_model,
         subagent_reasoning_effort,
         preserve_provider_route,
-        None,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn patch_config_with_fastctx_mode_and_proxy(
-    existing: &str,
-    profile: &ProviderProfile,
-    provider_id: &str,
-    model_catalog_path: Option<&Path>,
-    default_model: Option<&str>,
-    fastctx_command: Option<&Path>,
-    subagent_optimization: bool,
-    subagent_model: &str,
-    subagent_reasoning_effort: &str,
-    preserve_provider_route: bool,
-    protocol_proxy_base_url: Option<&str>,
-) -> Result<String> {
+        protocol_proxy_base_url,
+    } = options;
     if !preserve_provider_route {
         ensure_supported_provider_protocol(profile.protocol, protocol_proxy_base_url)?;
     }
@@ -1396,14 +1189,16 @@ fn patch_config_preserving_provider_route(
         existing,
         &profile,
         "",
-        None,
-        None,
-        fastctx_command,
-        subagent_optimization,
-        subagent_model,
-        subagent_reasoning_effort,
-        true,
-        protocol_proxy_base_url,
+        ProviderPatchOptions {
+            model_catalog_path: None,
+            default_model: None,
+            fastctx_command,
+            subagent_optimization,
+            subagent_model,
+            subagent_reasoning_effort,
+            preserve_provider_route: true,
+            protocol_proxy_base_url,
+        },
     )
 }
 
@@ -1892,57 +1687,6 @@ fn backup_global_provider_migration(home: &Path, original: Option<&[u8]>) -> Res
     Ok(())
 }
 
-fn create_private_dir_all(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)?;
-    #[cfg(unix)]
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        file.write_all(bytes)?;
-    }
-    #[cfg(not(unix))]
-    fs::write(path, bytes)?;
-    Ok(())
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("路径没有父目录：{}", path.display()))?;
-    fs::create_dir_all(parent)?;
-    let temp = crate::fs_util::unique_temp_path(path);
-    write_private_file(&temp, bytes)?;
-    crate::fs_util::persist_temp_file(&temp, path)?;
-    Ok(())
-}
-
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("读取文件失败：{}", path.display())),
-    }
-}
-
-fn remove_optional(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("删除文件失败：{}", path.display())),
-    }
-}
-
 const BACKUP_RETENTION_COUNT: usize = 5;
 
 /// Best-effort retention for the launch backup root: keeps the newest few
@@ -2198,14 +1942,16 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
             "model_provider = \"openai\"\n",
             &direct_profile(RelayProtocol::ChatCompletions),
             "openai",
-            None,
-            None,
-            None,
-            false,
-            DEFAULT_SUBAGENT_MODEL,
-            DEFAULT_SUBAGENT_REASONING_EFFORT,
-            false,
-            Some("http://127.0.0.1:43123/v1"),
+            ProviderPatchOptions {
+                model_catalog_path: None,
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                preserve_provider_route: false,
+                protocol_proxy_base_url: Some("http://127.0.0.1:43123/v1"),
+            },
         )
         .unwrap();
 
@@ -2234,13 +1980,16 @@ enabled = true
             existing,
             &direct_profile(RelayProtocol::ChatCompletions),
             GLOBAL_PROVIDER_ID,
-            relative_model_catalog_path(),
-            Some("codey-model"),
-            Some(Path::new("/opt/codey")),
-            true,
-            DEFAULT_SUBAGENT_MODEL,
-            DEFAULT_SUBAGENT_REASONING_EFFORT,
-            true,
+            ProviderPatchOptions {
+                model_catalog_path: relative_model_catalog_path(),
+                default_model: Some("codey-model"),
+                fastctx_command: Some(Path::new("/opt/codey")),
+                subagent_optimization: true,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                preserve_provider_route: true,
+                protocol_proxy_base_url: None,
+            },
         )
         .unwrap();
         let before = parse_document(existing).unwrap();
@@ -2289,13 +2038,16 @@ wire_api = "chat"
             existing,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            None,
-            None,
-            None,
-            false,
-            DEFAULT_SUBAGENT_MODEL,
-            DEFAULT_SUBAGENT_REASONING_EFFORT,
-            true,
+            ProviderPatchOptions {
+                model_catalog_path: None,
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                preserve_provider_route: true,
+                protocol_proxy_base_url: None,
+            },
         )
         .unwrap_err();
 
@@ -2322,14 +2074,16 @@ experimental_bearer_token = "PROXY_MANAGED"
             existing,
             &direct_profile(RelayProtocol::ChatCompletions),
             GLOBAL_PROVIDER_ID,
-            None,
-            None,
-            None,
-            false,
-            DEFAULT_SUBAGENT_MODEL,
-            DEFAULT_SUBAGENT_REASONING_EFFORT,
-            true,
-            Some("http://127.0.0.1:43123/v1"),
+            ProviderPatchOptions {
+                model_catalog_path: None,
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                preserve_provider_route: true,
+                protocol_proxy_base_url: Some("http://127.0.0.1:43123/v1"),
+            },
         )
         .unwrap();
 
@@ -2738,13 +2492,16 @@ custom_setting = "preserved"
             existing,
             &official_profile(),
             GLOBAL_PROVIDER_ID,
-            relative_model_catalog_path(),
-            None,
-            None,
-            true,
-            "gpt-5.6-sol",
-            "high",
-            false,
+            ProviderPatchOptions {
+                model_catalog_path: relative_model_catalog_path(),
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: true,
+                subagent_model: "gpt-5.6-sol",
+                subagent_reasoning_effort: "high",
+                preserve_provider_route: false,
+                protocol_proxy_base_url: None,
+            },
         )
         .unwrap();
         let document = result.parse::<DocumentMut>().unwrap();
@@ -2801,16 +2558,14 @@ custom_setting = "preserved"
         fs::write(home.join("AGENTS.md"), original_agents_md).unwrap();
         fs::write(home.join("agents/default.toml"), original_default_agent).unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            None,
-            true,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions {
+                subagent_optimization: true,
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
         )
         .unwrap();
 
@@ -2869,16 +2624,14 @@ custom_setting = "preserved"
         let original_config = b"model_provider = \"codey_global\"\n\n[agents]\ncustom = \"keep\"\n\n[model_providers.codey_global]\nbase_url = \"https://chatgpt.com/backend-api/codex\"\n";
         fs::write(home.join("config.toml"), original_config).unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            None,
-            true,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions {
+                subagent_optimization: true,
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
         )
         .unwrap();
 
@@ -2932,16 +2685,14 @@ custom_setting = "preserved"
         .unwrap();
         fs::write(home.join("AGENTS.md"), "# Original\n").unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            None,
-            true,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions {
+                subagent_optimization: true,
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
         )
         .unwrap();
         let mut concurrent_agents_md = fs::read_to_string(home.join("AGENTS.md")).unwrap();
@@ -2977,16 +2728,14 @@ custom_setting = "preserved"
         )
         .unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            None,
-            true,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions {
+                subagent_optimization: true,
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
         )
         .unwrap();
         assert!(home.join("AGENTS.md").exists());
@@ -3013,16 +2762,14 @@ custom_setting = "preserved"
         let original_agents_md = b"# Original guidance\n";
         fs::write(home.join("AGENTS.md"), original_agents_md).unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            None,
-            true,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions {
+                subagent_optimization: true,
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
         )
         .unwrap();
         let replacement_config = b"model_provider = \"user-provider\"\n\n[model_providers.user-provider]\nbase_url = \"https://user.example/v1\"\n";
@@ -3051,16 +2798,11 @@ custom_setting = "preserved"
         let original = b"model_provider = \"codey_global\"\n\n[model_providers.codey_global]\nbase_url = \"https://chatgpt.com/backend-api/codex\"\n";
         fs::write(home.join("config.toml"), original).unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            None,
-            false,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions::for_test(&marker, &backup_root),
         )
         .unwrap();
         let temporary = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -3100,16 +2842,18 @@ command = "cc-switch-tool"
             &home,
             &direct_profile(RelayProtocol::Responses),
             "route-a",
-            false,
-            None,
-            Some(Path::new("/opt/codey")),
-            false,
-            DEFAULT_SUBAGENT_MODEL,
-            DEFAULT_SUBAGENT_REASONING_EFFORT,
-            &marker,
-            &backup_root,
-            true,
-            None,
+            ProviderApplyOptions {
+                use_official_catalog: false,
+                default_model: None,
+                fastctx_command: Some(Path::new("/opt/codey")),
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                marker: &marker,
+                backup_root: &backup_root,
+                preserve_provider_route: true,
+                protocol_proxy_base_url: None,
+            },
         )
         .unwrap();
         let applied_a = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -3204,16 +2948,18 @@ experimental_bearer_token = "PROXY_MANAGED"
             &home,
             &direct_profile(RelayProtocol::ChatCompletions),
             "route-a",
-            false,
-            None,
-            None,
-            false,
-            DEFAULT_SUBAGENT_MODEL,
-            DEFAULT_SUBAGENT_REASONING_EFFORT,
-            &marker,
-            &backup_root,
-            true,
-            Some("http://127.0.0.1:43123/v1"),
+            ProviderApplyOptions {
+                use_official_catalog: false,
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                marker: &marker,
+                backup_root: &backup_root,
+                preserve_provider_route: true,
+                protocol_proxy_base_url: Some("http://127.0.0.1:43123/v1"),
+            },
         )
         .unwrap();
         let applied_a = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -3268,16 +3014,14 @@ experimental_bearer_token = "PROXY_MANAGED"
         let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"free-account-token"}}"#;
         fs::write(home.join("auth.json"), auth).unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            false,
-            None,
-            None,
-            false,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions {
+                use_official_catalog: false,
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
         )
         .unwrap();
 
@@ -3322,16 +3066,14 @@ X-Route = "manual"
         profile.id = "manual".to_string();
         profile.base_url = "https://manual.example/v1".to_string();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &profile,
             "manual",
-            false,
-            None,
-            None,
-            false,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions {
+                use_official_catalog: false,
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
         )
         .unwrap();
 
@@ -3618,16 +3360,11 @@ experimental_bearer_token = "sk-temporary"
         )
         .unwrap();
 
-        let backup_dir = apply_runtime_provider_config_at(
+        let backup_dir = apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            None,
-            false,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions::for_test(&marker, &backup_root),
         )
         .unwrap();
 
@@ -3676,16 +3413,14 @@ last_updated = "old"
         )
         .unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            Some(Path::new("/tmp/codey")),
-            false,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions {
+                fastctx_command: Some(Path::new("/tmp/codey")),
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
         )
         .unwrap();
 
@@ -3813,16 +3548,11 @@ note = "user replacement"
         )
         .unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            None,
-            false,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions::for_test(&marker, &backup_root),
         )
         .unwrap();
 
@@ -3851,16 +3581,11 @@ note = "user replacement"
         assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
         let first_restore = fs::read(home.join("config.toml")).unwrap();
 
-        apply_runtime_provider_config_at(
+        apply_runtime_provider_config_at_mode(
             &home,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
-            true,
-            None,
-            None,
-            false,
-            &marker,
-            &backup_root,
+            ProviderApplyOptions::for_test(&marker, &backup_root),
         )
         .unwrap();
         assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());

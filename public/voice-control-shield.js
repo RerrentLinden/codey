@@ -212,14 +212,7 @@
         (value) => gptVoicePromotionIdPrefixes.some((prefix) => value.startsWith(prefix)),
       );
 
-  const controlsWithin = (root, selector) => {
-    const controls = [];
-    if (root instanceof HTMLElement && root.matches?.(selector)) controls.push(root);
-    if (root && typeof root.querySelectorAll === "function") {
-      controls.push(...root.querySelectorAll(selector));
-    }
-    return controls;
-  };
+  const controlsWithin = window.__codeyMutationDispatcher.controlsWithin;
 
   const findGptVoicePromotionRoot = (asset) => {
     let promotion = asset;

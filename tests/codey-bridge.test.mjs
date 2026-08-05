@@ -10,6 +10,7 @@ const source = await readFile(
 
 function createRuntime() {
   const observers = [];
+  class FakeHTMLElement {}
   class FakeMutationObserver {
     constructor(callback) {
       this.callback = callback;
@@ -29,8 +30,13 @@ function createRuntime() {
   const document = { documentElement: {} };
   const window = {};
   window.window = window;
-  vm.runInNewContext(source, { document, MutationObserver: FakeMutationObserver, window });
-  return { observers, window };
+  vm.runInNewContext(source, {
+    document,
+    HTMLElement: FakeHTMLElement,
+    MutationObserver: FakeMutationObserver,
+    window,
+  });
+  return { FakeHTMLElement, observers, window };
 }
 
 test("mutation dispatcher unions subscriptions and tears down only when empty", () => {
@@ -94,4 +100,17 @@ test("mutation dispatcher unions subscriptions and tears down only when empty", 
   assert.equal(finalObserver.disconnects, 1);
   assert.equal(dispatcher.snapshot().observerInstalled, false);
   assert.equal(dispatcher.snapshot().subscriberCount, 0);
+});
+
+test("shared control lookup includes a matching root and its descendants", () => {
+  const runtime = createRuntime();
+  const child = {};
+  const root = new runtime.FakeHTMLElement();
+  root.matches = (selector) => selector === "button";
+  root.querySelectorAll = (selector) => selector === "button" ? [child] : [];
+
+  const controls = runtime.window.__codeyMutationDispatcher.controlsWithin(root, "button");
+  assert.equal(controls.length, 2);
+  assert.equal(controls[0], root);
+  assert.equal(controls[1], child);
 });

@@ -648,13 +648,19 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
 });
 
 test("starting or restarting Codex replaces the old runtime with one managed by Codey", async () => {
-  const [runtimeSource, launcherSource, appSource] = await Promise.all([
+  const [runtimeSource, launcherSource, launcherPlatformSource, appSource] =
+    await Promise.all([
     readFile(new URL("../backend/src/commands/runtime.rs", import.meta.url), "utf8")
       .then(normalizeLineEndings),
     readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8")
       .then(normalizeLineEndings),
+    readFile(
+      new URL("../backend/src/launcher/platform.rs", import.meta.url),
+      "utf8",
+    ).then(normalizeLineEndings),
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
   ]);
+  const launcherModules = `${launcherSource}\n${launcherPlatformSource}`;
   const restartFlow = runtimeSource.slice(
     runtimeSource.indexOf("pub async fn schedule_restart_codey_runtime"),
     runtimeSource.indexOf("pub async fn stop_codey_runtime"),
@@ -680,7 +686,7 @@ test("starting or restarting Codex replaces the old runtime with one managed by 
     /runtime_generation\.load\(Ordering::Acquire\) == runtime_generation/,
   );
   assert.match(
-    launcherSource,
+    launcherModules,
     /stop_macos_codex\([\s\S]*?inspector_argument,[\s\S]*?&self\.codex_app_path,[\s\S]*?self\.process_id,[\s\S]*?self\.process_group_id/,
   );
   assert.match(
@@ -693,8 +699,8 @@ test("starting or restarting Codex replaces the old runtime with one managed by 
   );
   assert.doesNotMatch(prepareLaunchFlow, /anyhow::bail!/);
   assert.match(launcherSource, /build_codex_executable\(app_dir\)/);
-  assert.match(launcherSource, /owned_unix_codex_process_ids/);
-  assert.match(launcherSource, /libc::SIGKILL/);
+  assert.match(launcherModules, /owned_unix_codex_process_ids/);
+  assert.match(launcherModules, /libc::SIGKILL/);
   assert.doesNotMatch(runtimeSource, /"close_codex"/);
   assert.doesNotMatch(runtimeSource, /show_manual_relaunch_prompt/);
   assert.match(appSource, /await invoke\("restart_codey"\)/);

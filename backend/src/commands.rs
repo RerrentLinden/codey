@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex as BlockingMutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
@@ -93,7 +93,7 @@ pub struct AppState {
     restart_task: Mutex<Option<ScheduledRestart>>,
     runtime_generation: AtomicU64,
     session_titles: RwLock<HashMap<String, String>>,
-    session_metadata_cache: Mutex<Option<session_metadata::SessionMetadataCache>>,
+    session_metadata_cache: BlockingMutex<session_metadata::SessionMetadataCache>,
     webhook_notifications: Mutex<WebhookNotificationState>,
     persisted_waiting_notifications: Mutex<WaitingLedgerState>,
     recent_session_event_cache: Mutex<Option<pending_approval::RecentSessionEventCache>>,
@@ -158,9 +158,9 @@ impl Default for AppState {
             restart_task: Mutex::new(None),
             runtime_generation: AtomicU64::new(0),
             session_titles: RwLock::new(HashMap::new()),
-            session_metadata_cache: Mutex::new(Some(
+            session_metadata_cache: BlockingMutex::new(
                 session_metadata::SessionMetadataCache::default(),
-            )),
+            ),
             webhook_notifications: Mutex::new(WebhookNotificationState::from_settled(
                 persisted_waiting_notifications.iter().cloned(),
             )),
@@ -440,23 +440,25 @@ where
     T: Send + 'static,
     F: FnOnce(&mut session_metadata::SessionMetadataCache) -> T + Send + 'static,
 {
-    let mut slot = state.session_metadata_cache.lock().await;
-    let mut cache = slot.take().unwrap_or_default();
-    match tokio::task::spawn_blocking(move || {
-        let value = task(&mut cache);
-        (cache, value)
+    let state = Arc::clone(state);
+    tokio::task::spawn_blocking(move || {
+        let mut cache = state
+            .session_metadata_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        task(&mut cache)
     })
     .await
-    {
-        Ok((cache, value)) => {
-            *slot = Some(cache);
-            Ok(value)
-        }
-        Err(error) => {
-            *slot = Some(session_metadata::SessionMetadataCache::default());
-            Err(format!("{operation}任务异常退出：{error}"))
-        }
-    }
+    .map_err(|error| format!("{operation}任务异常退出：{error}"))
+}
+
+async fn save_config_to_store(state: &AppState, config: &CodeyConfig) -> Result<(), String> {
+    let store = state.store.clone();
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || store.save(&config))
+        .await
+        .map_err(|error| format!("保存 Codey 配置任务异常退出：{error}"))?
+        .map_err(|error| error.to_string())
 }
 
 async fn resolve_session_name_cached(
@@ -670,9 +672,8 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
     let mut config = state.config.read().await.clone();
     config.codex_app_path = app_dir.to_string_lossy().to_string();
     config.settings_revision = config.settings_revision.saturating_add(1);
-    state
-        .store
-        .save(&config)
+    save_config_to_store(state, &config)
+        .await
         .map_err(|error| format!("保存 Codex 桌面应用目录失败：{error}"))?;
     *state.config.write().await = config;
     Ok(())
@@ -764,10 +765,7 @@ async fn save_codey_config_locked(
             return Err(error);
         }
     }
-    state
-        .store
-        .save(&config)
-        .map_err(|error| error.to_string())?;
+    save_config_to_store(state, &config).await?;
     *state.config.write().await = config.clone();
     Ok(SavedCodeyConfig {
         config,
@@ -1899,6 +1897,79 @@ mod tests {
         assert_eq!(bridge_u64(&payload, "offset"), Some(42));
         assert_eq!(bridge_u64(&payload, "missing"), None);
         assert_eq!(bridge_u64(&payload, "wrongOffset"), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_metadata_cache_operations_are_serialized_in_blocking_workers() {
+        let state = Arc::new(AppState::default());
+        let first_started = Arc::new(AtomicBool::new(false));
+        let second_submitted = Arc::new(AtomicBool::new(false));
+        let second_started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        let first = tokio::spawn({
+            let state = Arc::clone(&state);
+            let first_started = Arc::clone(&first_started);
+            let release = Arc::clone(&release);
+            async move {
+                with_session_metadata_cache(&state, "first cache operation", move |_| {
+                    first_started.store(true, Ordering::Release);
+                    let (released, signal) = &*release;
+                    let guard = released
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let guard = signal
+                        .wait_while(guard, |released| !*released)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    drop(guard);
+                    1
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first_started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the first cache operation should start");
+
+        let second = tokio::spawn({
+            let state = Arc::clone(&state);
+            let second_submitted = Arc::clone(&second_submitted);
+            let second_started = Arc::clone(&second_started);
+            async move {
+                second_submitted.store(true, Ordering::Release);
+                with_session_metadata_cache(&state, "second cache operation", move |_| {
+                    second_started.store(true, Ordering::Release);
+                    2
+                })
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !second_submitted.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the second cache operation should be submitted");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second_started.load(Ordering::Acquire),
+            "the second operation must wait for exclusive cache ownership"
+        );
+
+        let (released, signal) = &*release;
+        *released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        signal.notify_all();
+
+        assert_eq!(first.await.unwrap().unwrap(), 1);
+        assert_eq!(second.await.unwrap().unwrap(), 2);
+        assert!(second_started.load(Ordering::Acquire));
     }
 
     #[test]

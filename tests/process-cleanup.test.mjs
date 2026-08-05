@@ -5,12 +5,17 @@ import test from "node:test";
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
 test("every shutdown path reaps Codex and Codey process trees", async () => {
-  const [library, launcher, commands, cleanup, processTree] = await Promise.all([
+  const [library, launcher, launcherPlatform, commands, cleanup, processTree] =
+    await Promise.all([
     readFile(new URL("../backend/src/lib.rs", import.meta.url), "utf8").then(
       normalizeLineEndings,
     ),
     readFile(
       new URL("../backend/src/launcher.rs", import.meta.url),
+      "utf8",
+    ).then(normalizeLineEndings),
+    readFile(
+      new URL("../backend/src/launcher/platform.rs", import.meta.url),
       "utf8",
     ).then(normalizeLineEndings),
     readFile(
@@ -25,7 +30,8 @@ test("every shutdown path reaps Codex and Codey process trees", async () => {
       new URL("../backend/src/process_tree.rs", import.meta.url),
       "utf8",
     ).then(normalizeLineEndings),
-  ]);
+    ]);
+  const launcherModules = `${launcher}\n${launcherPlatform}`;
 
   const finalShutdown = library.slice(
     library.indexOf("let shutdown_reason = tokio::select!"),
@@ -51,11 +57,11 @@ test("every shutdown path reaps Codex and Codey process trees", async () => {
   );
   assert.match(runtimeStop, /terminate_unix_codex_processes/);
   assert.match(runtimeStop, /terminate_windows_codex_processes/);
-  assert.match(launcher, /windows_terminate_process_if_matches/);
+  assert.match(launcherModules, /windows_terminate_process_if_matches/);
   assert.doesNotMatch(runtimeStop, /if !self\.codex_exited/);
-  assert.match(launcher, /child_command\.process_group\(0\)/);
+  assert.match(launcherModules, /child_command\.process_group\(0\)/);
   assert.match(
-    launcher,
+    launcherModules,
     /let poll_delays = \[\s*Duration::from_millis\(100\),\s*Duration::from_millis\(200\),\s*Duration::from_millis\(350\),\s*Duration::from_millis\(550\),\s*Duration::from_millis\(800\),\s*\]/,
   );
   assert.match(cleanup, /process_ids_with_descendants/);

@@ -3,17 +3,22 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 async function loadWindowsStartupSource() {
-  const launcher = (await readFile(
-    new URL("../backend/src/launcher.rs", import.meta.url),
-    "utf8",
-  )).replace(/\r\n/g, "\n");
+  const [launcher, launcherPlatform] = await Promise.all([
+    readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8"),
+    readFile(
+      new URL("../backend/src/launcher/platform.rs", import.meta.url),
+      "utf8",
+    ),
+  ]).then((sources) => sources.map((source) => source.replace(/\r\n/g, "\n")));
   const windowsSpawn = launcher.slice(
     launcher.indexOf("#[cfg(windows)]\n    {", launcher.indexOf("async fn spawn_codex")),
     launcher.indexOf("#[cfg(target_os = \"macos\")]", launcher.indexOf("async fn spawn_codex")),
   );
-  const cleanup = launcher.slice(
-    launcher.indexOf("async fn stop_windows_spawned_codex"),
-    launcher.indexOf("#[cfg(target_os = \"macos\")]\nfn build_fresh_macos_open_command"),
+  const cleanup = launcherPlatform.slice(
+    launcherPlatform.indexOf("async fn stop_windows_spawned_codex"),
+    launcherPlatform.indexOf(
+      "#[cfg(target_os = \"macos\")]\npub(super) fn build_fresh_macos_open_command",
+    ),
   );
   return { cleanup, windowsSpawn };
 }

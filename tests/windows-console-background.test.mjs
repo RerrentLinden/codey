@@ -58,15 +58,17 @@ test("Windows startup failures are visible and terminate the background process"
 });
 
 test("Windows background helpers never create console windows", async () => {
-  const [launcher, processCleanup] = await Promise.all([
-    readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8")
-      .then(normalizeLineEndings),
+  const [launcherPlatform, processCleanup] = await Promise.all([
+    readFile(
+      new URL("../backend/src/launcher/platform.rs", import.meta.url),
+      "utf8",
+    ).then(normalizeLineEndings),
     readFile(new URL("../backend/src/process_cleanup.rs", import.meta.url), "utf8")
       .then(normalizeLineEndings),
   ]);
 
   assert.equal(
-    launcher.match(
+    launcherPlatform.match(
       /creation_flags\(codey_runtime_core::windows_create_no_window\(\)\)/g,
     )?.length,
     2,

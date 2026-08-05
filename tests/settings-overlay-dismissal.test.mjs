@@ -66,35 +66,37 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
 });
 
 test("settings notice toast is scoped to the settings page", async () => {
-  const [appSource, stylesSource] = await Promise.all([
+  const [appSource, noticeSource, stylesSource] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
+    readFile(new URL("src/useAppNotice.tsx", root), "utf8"),
     readFile(new URL("src/styles.css", root), "utf8"),
   ]);
 
   assert.match(appSource, /<main[\s\S]*className=\{`app-shell/);
-  assert.match(appSource, /className=\{`notice-toast \$\{notice\.tone\}`\}/);
-  assert.match(appSource, /const NOTICE_AUTO_DISMISS_MS = 5_000/);
+  assert.match(appSource, /<NoticeToast[\s\S]*controller=\{noticeController\}/);
+  assert.match(noticeSource, /className=\{`notice-toast \$\{notice\.tone\}`\}/);
+  assert.match(noticeSource, /const NOTICE_AUTO_DISMISS_MS = 5_000/);
   assert.match(
-    appSource,
-    /const \[noticeAutoDismissPaused, setNoticeAutoDismissPaused\] = useState\(false\)/,
+    noticeSource,
+    /const \[autoDismissPaused, setAutoDismissPaused\] = useState\(false\)/,
   );
   assert.match(
-    appSource,
-    /if \(!config \|\| !provider \|\| !notice\.text \|\| noticeAutoDismissPaused\)/,
+    noticeSource,
+    /if \(!autoDismissEnabled \|\| !notice\.text \|\| autoDismissPaused\)/,
   );
   assert.match(
-    appSource,
-    /window\.setTimeout\(\(\) => \{[\s\S]*setNotice\(\(current\) =>[\s\S]*NOTICE_AUTO_DISMISS_MS/,
+    noticeSource,
+    /window\.setTimeout\(\(\) => \{[\s\S]*controller\.setNotice\(\(current\) =>[\s\S]*NOTICE_AUTO_DISMISS_MS/,
   );
-  assert.match(appSource, /window\.clearTimeout\(timeout\)/);
-  assert.match(appSource, /onMouseEnter=\{\(\) => setNoticeAutoDismissPaused\(true\)\}/);
-  assert.match(appSource, /onMouseLeave=\{\(\) => setNoticeAutoDismissPaused\(false\)\}/);
-  assert.match(appSource, /onFocus=\{\(\) => setNoticeAutoDismissPaused\(true\)\}/);
-  assert.match(appSource, /onBlur=\{\(\) => setNoticeAutoDismissPaused\(false\)\}/);
-  assert.match(appSource, /aria-label="关闭提示"/);
+  assert.match(noticeSource, /window\.clearTimeout\(timeout\)/);
+  assert.match(noticeSource, /onMouseEnter=\{\(\) => setAutoDismissPaused\(true\)\}/);
+  assert.match(noticeSource, /onMouseLeave=\{\(\) => setAutoDismissPaused\(false\)\}/);
+  assert.match(noticeSource, /onFocus=\{\(\) => setAutoDismissPaused\(true\)\}/);
+  assert.match(noticeSource, /onBlur=\{\(\) => setAutoDismissPaused\(false\)\}/);
+  assert.match(noticeSource, /aria-label="关闭提示"/);
   assert.match(
-    appSource,
-    /onClick=\{\(\) => \{[\s\S]*setNoticeAutoDismissPaused\(false\);[\s\S]*setNotice\(\{ tone: "info", text: "" \}\);[\s\S]*\}\}/,
+    noticeSource,
+    /onClick=\{\(\) => \{[\s\S]*setAutoDismissPaused\(false\);[\s\S]*controller\.setNotice\(\{ tone: "info", text: "" \}\);[\s\S]*\}\}/,
   );
   assert.match(
     stylesSource,

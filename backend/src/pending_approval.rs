@@ -76,29 +76,85 @@ struct RolloutSignature {
 
 #[derive(Debug, Clone, Default)]
 struct ParsedRolloutEvents {
+    #[cfg(test)]
     pending_approvals: Vec<(String, String)>,
     started_turns: Vec<String>,
     aborted_turns: Vec<String>,
     completed_turns: Vec<(String, u128, Option<i64>, Option<String>)>,
     snapshot_replay_turns: HashSet<String>,
     turn_configurations: HashMap<String, TurnConfiguration>,
-    status: SessionLifecycleStatus,
 }
 
 /// Resumable rollout parser. Rollout JSONL is append-only in normal operation,
 /// so a poll that sees a grown file only has to parse the appended bytes
 /// instead of the whole history.
+const ROLLOUT_FINGERPRINT_LEN: usize = 64;
+
+#[derive(Debug, Clone)]
+struct RolloutFingerprint {
+    bytes: [u8; ROLLOUT_FINGERPRINT_LEN],
+    len: usize,
+}
+
+impl Default for RolloutFingerprint {
+    fn default() -> Self {
+        Self {
+            bytes: [0; ROLLOUT_FINGERPRINT_LEN],
+            len: 0,
+        }
+    }
+}
+
+impl RolloutFingerprint {
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn set_prefix(&mut self, source: &[u8]) {
+        self.len = source.len().min(ROLLOUT_FINGERPRINT_LEN);
+        self.bytes[..self.len].copy_from_slice(&source[..self.len]);
+    }
+
+    fn push_tail(&mut self, source: &[u8]) {
+        if source.len() >= ROLLOUT_FINGERPRINT_LEN {
+            self.bytes
+                .copy_from_slice(&source[source.len() - ROLLOUT_FINGERPRINT_LEN..]);
+            self.len = ROLLOUT_FINGERPRINT_LEN;
+            return;
+        }
+        if self.len + source.len() <= ROLLOUT_FINGERPRINT_LEN {
+            let next_len = self.len + source.len();
+            self.bytes[self.len..next_len].copy_from_slice(source);
+            self.len = next_len;
+            return;
+        }
+
+        let retained = ROLLOUT_FINGERPRINT_LEN - source.len();
+        self.bytes.copy_within(self.len - retained..self.len, 0);
+        self.bytes[retained..].copy_from_slice(source);
+        self.len = ROLLOUT_FINGERPRINT_LEN;
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct RolloutParseState {
     consumed_bytes: u64,
     /// Leading bytes of the file. Provider normalisation rewrites the
     /// `session_meta` header in place, which leaves the tail untouched.
-    head_fingerprint: Vec<u8>,
+    head_fingerprint: RolloutFingerprint,
     /// Trailing bytes of the region already consumed. Re-reading just these
     /// detects an in-place rewrite (Codey itself rewrites rollouts when
     /// deleting turns or normalising providers), which must force a full
     /// re-parse instead of appending to stale state.
-    tail_fingerprint: Vec<u8>,
+    tail_fingerprint: RolloutFingerprint,
     is_subagent: bool,
     forked_session_id: Option<String>,
     replaying_fork_history: bool,
@@ -109,8 +165,6 @@ struct RolloutParseState {
     latest_terminal: SessionLifecycleStatus,
     events: ParsedRolloutEvents,
 }
-
-const ROLLOUT_TAIL_FINGERPRINT_LEN: usize = 64;
 
 impl RolloutParseState {
     /// Consumes whole lines from `chunk`, returning how many bytes were taken.
@@ -152,22 +206,10 @@ impl RolloutParseState {
         }
         let taken = &chunk.as_bytes()[..consumed];
         if self.consumed_bytes == 0 {
-            let head_len = taken.len().min(ROLLOUT_TAIL_FINGERPRINT_LEN);
-            self.head_fingerprint = taken[..head_len].to_vec();
+            self.head_fingerprint.set_prefix(taken);
         }
         self.consumed_bytes += consumed as u64;
-        if taken.len() >= ROLLOUT_TAIL_FINGERPRINT_LEN {
-            self.tail_fingerprint = taken[taken.len() - ROLLOUT_TAIL_FINGERPRINT_LEN..].to_vec();
-        } else {
-            self.tail_fingerprint.extend_from_slice(taken);
-            let overflow = self
-                .tail_fingerprint
-                .len()
-                .saturating_sub(ROLLOUT_TAIL_FINGERPRINT_LEN);
-            if overflow > 0 {
-                self.tail_fingerprint.drain(..overflow);
-            }
-        }
+        self.tail_fingerprint.push_tail(taken);
     }
 
     fn apply(&mut self, record: &Value) {
@@ -308,27 +350,36 @@ impl RolloutParseState {
         }
     }
 
-    fn snapshot(&self) -> Option<ParsedRolloutEvents> {
-        if self.is_subagent {
-            return None;
-        }
-        let mut parsed = self.events.clone();
-        parsed.pending_approvals = self
+    fn pending_approvals(&self) -> Vec<(String, String)> {
+        let mut pending_approvals = self
             .waiting_calls
             .iter()
             .filter(|(_, turn_id)| {
                 !turn_id.is_empty() && !self.terminal_turns.contains(turn_id.as_str())
             })
             .map(|(call_id, turn_id)| (turn_id.clone(), call_id.clone()))
-            .collect();
-        parsed.pending_approvals.sort();
-        parsed.status = if !parsed.pending_approvals.is_empty() {
+            .collect::<Vec<_>>();
+        pending_approvals.sort();
+        pending_approvals
+    }
+
+    fn lifecycle_status(&self, pending_approvals: &[(String, String)]) -> SessionLifecycleStatus {
+        if !pending_approvals.is_empty() {
             SessionLifecycleStatus::Waiting
         } else if !self.active_turns.is_empty() {
             SessionLifecycleStatus::Running
         } else {
             self.latest_terminal
-        };
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self) -> Option<ParsedRolloutEvents> {
+        if self.is_subagent {
+            return None;
+        }
+        let mut parsed = self.events.clone();
+        parsed.pending_approvals = self.pending_approvals();
         Some(parsed)
     }
 }
@@ -337,7 +388,6 @@ impl RolloutParseState {
 struct CachedRolloutEvents {
     session_id: String,
     signature: RolloutSignature,
-    parsed: Option<ParsedRolloutEvents>,
     state: RolloutParseState,
 }
 
@@ -463,12 +513,11 @@ impl RecentSessionEventCache {
                 // its consumed prefix is intact; otherwise start from scratch.
                 let resumable = self
                     .rollouts
-                    .get(&rollout_path)
+                    .remove(&rollout_path)
                     .filter(|cached| cached.session_id == session_id)
-                    .map(|cached| cached.state.clone())
+                    .map(|cached| cached.state)
                     .filter(|state| state.consumed_bytes > 0);
                 let Some((mut state, chunk)) = read_rollout_update(&rollout_path, resumable) else {
-                    self.rollouts.remove(&rollout_path);
                     continue;
                 };
                 #[cfg(test)]
@@ -480,25 +529,27 @@ impl RecentSessionEventCache {
                 }
                 let consumed = state.consume(&chunk);
                 state.advance(&chunk, consumed);
-                let parsed = state.snapshot();
                 self.rollouts.insert(
                     rollout_path.clone(),
                     CachedRolloutEvents {
                         session_id: session_id.clone(),
                         signature: signature.clone(),
-                        parsed,
                         state,
                     },
                 );
             }
 
-            let Some(parsed) = self
+            let Some(state) = self
                 .rollouts
                 .get(&rollout_path)
-                .and_then(|cached| cached.parsed.as_ref())
+                .map(|cached| &cached.state)
+                .filter(|state| !state.is_subagent)
             else {
                 continue;
             };
+            let pending_approvals = state.pending_approvals();
+            let status = state.lifecycle_status(&pending_approvals);
+            let parsed = &state.events;
             let rollout_is_snapshot_replay = rollout_path
                 .parent()
                 .and_then(Path::file_name)
@@ -508,17 +559,14 @@ impl RecentSessionEventCache {
                 .and_then(|modified| modified.elapsed().ok())
                 .map(|duration| duration.as_millis())
                 .unwrap_or_default();
-            events
-                .session_statuses
-                .insert(session_id.clone(), parsed.status);
+            events.session_statuses.insert(session_id.clone(), status);
             events
                 .turn_configurations
                 .insert(session_id.clone(), parsed.turn_configurations.clone());
             events
                 .pending_approvals
                 .extend(
-                    parsed
-                        .pending_approvals
+                    pending_approvals
                         .iter()
                         .cloned()
                         .map(|(turn_id, waiting_id)| PendingApproval {
@@ -603,8 +651,11 @@ fn read_rollout_update(
     // Rollout rewrites (provider normalisation) edit the `session_meta` header
     // and leave the tail byte-identical, so the head has to be checked too.
     if !state.head_fingerprint.is_empty() {
-        let mut head = vec![0u8; state.head_fingerprint.len()];
-        if file.read_exact(&mut head).is_err() || head != state.head_fingerprint {
+        let head_len = state.head_fingerprint.len();
+        let mut head = [0u8; ROLLOUT_FINGERPRINT_LEN];
+        if file.read_exact(&mut head[..head_len]).is_err()
+            || head[..head_len] != *state.head_fingerprint.as_slice()
+        {
             return full();
         }
     }
@@ -614,8 +665,11 @@ fn read_rollout_update(
     {
         return full();
     }
-    let mut fingerprint = vec![0u8; state.tail_fingerprint.len()];
-    if file.read_exact(&mut fingerprint).is_err() || fingerprint != state.tail_fingerprint {
+    let tail_len = state.tail_fingerprint.len();
+    let mut fingerprint = [0u8; ROLLOUT_FINGERPRINT_LEN];
+    if file.read_exact(&mut fingerprint[..tail_len]).is_err()
+        || fingerprint[..tail_len] != *state.tail_fingerprint.as_slice()
+    {
         return full();
     }
     let mut appended = String::new();
@@ -692,9 +746,13 @@ fn session_lifecycle_status_in_rollout(
     contents: &str,
     _pending_approvals: &[(String, String)],
 ) -> SessionLifecycleStatus {
-    parse_rollout_events(contents)
-        .map(|parsed| parsed.status)
-        .unwrap_or(SessionLifecycleStatus::Idle)
+    let mut state = RolloutParseState::default();
+    state.consume(contents);
+    if state.is_subagent {
+        return SessionLifecycleStatus::Idle;
+    }
+    let pending_approvals = state.pending_approvals();
+    state.lifecycle_status(&pending_approvals)
 }
 
 fn task_completion_error(payload: &Value) -> Option<String> {

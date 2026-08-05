@@ -5,7 +5,8 @@ use codey_runtime_core::settings::{RelayMode, RelayProfile};
 use serde_json::{Value, json};
 
 use super::{
-    AppState, STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT, redacted_config, runtime_config_requires_restart,
+    AppState, STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT, redacted_config,
+    runtime_config_requires_restart, save_config_to_store,
 };
 use crate::cc_switch;
 use crate::cdp;
@@ -82,7 +83,7 @@ where
                     Some("Codey 设置在同步线路期间已更新，已忽略过期的同步结果".to_string());
                 return current;
             }
-            if let Err(error) = state.store.save(&config) {
+            if let Err(error) = save_config_to_store(state, &config).await {
                 let mut current = cc_switch::status_from_config(&latest);
                 current.message = Some(format!("保存当前线路同步结果失败：{error}"));
                 return current;
@@ -325,7 +326,7 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
         return latest;
     }
     let next = config_with_current_provider_model_sync(&latest, models, synced);
-    if synced && let Err(error) = state.store.save(&next) {
+    if synced && let Err(error) = save_config_to_store(state, &next).await {
         eprintln!("保存启动时模型同步结果失败，本次启动仍使用最新模型：{error:#}");
     }
     *state.config.write().await = next.clone();
@@ -372,7 +373,7 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
     let model_state = current_model_state(&next)?;
     let model_catalog_fallback = should_refresh_model_catalog(&model_state)
         && refresh_model_catalog_for_provider_sync(&next)?;
-    state.store.save(&next).map_err(|error| error.to_string())?;
+    save_config_to_store(state, &next).await?;
     *state.config.write().await = next.clone();
     drop(_config_write_guard);
     let hot_reload = hot_reload_runtime_models(state, &next, &model_state).await;
@@ -539,10 +540,7 @@ pub async fn save_selected_models(
     }
     config = config.normalize();
     let model_catalog_fallback = refresh_model_catalog_or_fallback(&config)?;
-    state
-        .store
-        .save(&config)
-        .map_err(|error| error.to_string())?;
+    save_config_to_store(state, &config).await?;
     *state.config.write().await = config.clone();
     let model_state = current_model_state(&config)?;
     let public_config = redacted_config(&config);
@@ -719,10 +717,7 @@ pub async fn save_default_model(
         .default_model_by_provider
         .insert(provider_id, requested_model.to_string());
     config = config.normalize();
-    state
-        .store
-        .save(&config)
-        .map_err(|error| error.to_string())?;
+    save_config_to_store(state, &config).await?;
     *state.config.write().await = config.clone();
     let model_state = current_model_state(&config)?;
     let public_config = redacted_config(&config);

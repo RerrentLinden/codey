@@ -3,15 +3,15 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::settings::{BackendSettings, SettingsStore, normalize_codex_extra_args};
 use crate::status::{LaunchStatus, StatusStore};
@@ -20,6 +20,11 @@ use crate::status::{LaunchStatus, StatusStore};
 const POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS: &[u64] = &[0, 5, 15, 30, 60, 120, 180, 240, 300];
 #[cfg_attr(not(windows), allow(dead_code))]
 const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
+const PROTOCOL_PROXY_MAX_CONNECTIONS: usize = 64;
+const PROTOCOL_PROXY_MAX_HEADER_BYTES: usize = 64 * 1024;
+const PROTOCOL_PROXY_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const PROTOCOL_PROXY_REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const PROTOCOL_PROXY_REQUEST_DEADLINE: Duration = Duration::from_secs(45);
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
@@ -188,6 +193,7 @@ pub async fn start_protocol_proxy(
         }),
     );
     let settings = Arc::new(settings);
+    let connection_limit = Arc::new(Semaphore::new(PROTOCOL_PROXY_MAX_CONNECTIONS));
     let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
@@ -196,8 +202,13 @@ pub async fn start_protocol_proxy(
                 _ = &mut shutdown_rx => break,
                 accepted = listener.accept() => {
                     if let Ok((stream, addr)) = accepted {
+                        let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
+                            drop(stream);
+                            continue;
+                        };
                         let settings = settings.clone();
                         connections.spawn(async move {
+                            let _permit = permit;
                             let _ = handle_helper_connection_with_settings(
                                 stream,
                                 Some(addr),
@@ -1051,7 +1062,11 @@ async fn handle_helper_connection_with_settings(
     remote_addr: Option<SocketAddr>,
     proxy_settings: Option<Arc<BackendSettings>>,
 ) -> anyhow::Result<()> {
-    let request_bytes = read_http_request(&mut stream).await?;
+    let request_bytes = if proxy_settings.is_some() {
+        read_http_request_with_limits(&mut stream, HttpRequestLimits::protocol_proxy()).await?
+    } else {
+        read_http_request(&mut stream).await?
+    };
     let request = String::from_utf8_lossy(&request_bytes);
     let request_line = request.lines().next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
@@ -1675,6 +1690,94 @@ mod computer_use_tests {
     }
 }
 
+#[cfg(test)]
+mod protocol_proxy_request_limit_tests {
+    use super::{HttpRequestLimits, read_http_request_with_limits};
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    fn limits(max_header_bytes: usize, max_body_bytes: usize) -> HttpRequestLimits {
+        HttpRequestLimits {
+            max_header_bytes,
+            max_body_bytes,
+            idle_timeout: Duration::from_millis(50),
+            deadline: Duration::from_millis(250),
+        }
+    }
+
+    #[tokio::test]
+    async fn limited_reader_waits_for_a_fragmented_complete_body() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(b"POST /responses HTTP/1.1\r\nContent-Length: 7\r\n\r\n{\"a\"")
+                .await
+                .unwrap();
+            tokio::task::yield_now().await;
+            client.write_all(b":1}").await.unwrap();
+        });
+
+        let request = read_http_request_with_limits(&mut server, limits(1024, 1024))
+            .await
+            .unwrap();
+
+        writer.await.unwrap();
+        assert!(request.ends_with(b"\r\n\r\n{\"a\":1}"));
+    }
+
+    #[tokio::test]
+    async fn limited_reader_rejects_an_oversized_declared_body_before_reading_it() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"POST /responses HTTP/1.1\r\nContent-Length: 9\r\n\r\n")
+            .await
+            .unwrap();
+
+        let error = read_http_request_with_limits(&mut server, limits(1024, 8))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("body is too large"));
+    }
+
+    #[tokio::test]
+    async fn limited_reader_rejects_oversized_incomplete_headers() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"GET /models HTTP/1.1\r\nX-Fill: abcdefghijklmnop")
+            .await
+            .unwrap();
+
+        let error = read_http_request_with_limits(&mut server, limits(32, 1024))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("headers are too large"));
+    }
+
+    #[tokio::test]
+    async fn limited_reader_times_out_an_incomplete_request() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"POST /responses HTTP/1.1\r\n")
+            .await
+            .unwrap();
+
+        let error = read_http_request_with_limits(
+            &mut server,
+            HttpRequestLimits {
+                idle_timeout: Duration::from_millis(10),
+                deadline: Duration::from_millis(100),
+                ..limits(1024, 1024)
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("idle timeout"));
+    }
+}
+
 async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<Vec<u8>> {
     let mut buffer = Vec::new();
     let mut chunk = vec![0_u8; 4096];
@@ -1706,6 +1809,96 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result
     Ok(buffer)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HttpRequestLimits {
+    max_header_bytes: usize,
+    max_body_bytes: usize,
+    idle_timeout: Duration,
+    deadline: Duration,
+}
+
+impl HttpRequestLimits {
+    const fn protocol_proxy() -> Self {
+        Self {
+            max_header_bytes: PROTOCOL_PROXY_MAX_HEADER_BYTES,
+            max_body_bytes: PROTOCOL_PROXY_MAX_BODY_BYTES,
+            idle_timeout: PROTOCOL_PROXY_REQUEST_IDLE_TIMEOUT,
+            deadline: PROTOCOL_PROXY_REQUEST_DEADLINE,
+        }
+    }
+}
+
+async fn read_http_request_with_limits<R>(
+    stream: &mut R,
+    limits: HttpRequestLimits,
+) -> anyhow::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + limits.deadline;
+    let mut buffer = Vec::with_capacity(4096);
+    let mut chunk = [0_u8; 4096];
+    let mut target_len = None;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("HTTP request read deadline exceeded");
+        }
+        let read_timeout = limits.idle_timeout.min(remaining);
+        let read = match tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await {
+            Ok(result) => result?,
+            Err(_) if tokio::time::Instant::now() >= deadline => {
+                anyhow::bail!("HTTP request read deadline exceeded");
+            }
+            Err(_) => anyhow::bail!("HTTP request read idle timeout exceeded"),
+        };
+        if read == 0 {
+            if target_len.is_some_and(|target_len| buffer.len() < target_len) {
+                anyhow::bail!("HTTP request body ended before Content-Length bytes arrived");
+            }
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+
+        if target_len.is_none() {
+            if let Some(header_end) = find_header_end(&buffer) {
+                let header_len = header_end
+                    .checked_add(4)
+                    .context("HTTP request header length overflow")?;
+                if header_len > limits.max_header_bytes {
+                    anyhow::bail!("HTTP request headers are too large");
+                }
+                let content_length = strict_content_length_from_headers(
+                    &buffer[..header_end],
+                    limits.max_body_bytes,
+                )?;
+                target_len = Some(
+                    header_len
+                        .checked_add(content_length)
+                        .context("HTTP request length overflow")?,
+                );
+            } else if buffer.len() >= limits.max_header_bytes {
+                anyhow::bail!("HTTP request headers are too large");
+            }
+        }
+
+        if let Some(target_len) = target_len {
+            if buffer.len() > target_len {
+                anyhow::bail!("HTTP request contains bytes beyond its declared Content-Length");
+            }
+            if buffer.len() == target_len {
+                return Ok(buffer);
+            }
+        }
+    }
+
+    if target_len.is_none() {
+        anyhow::bail!("HTTP request ended before its headers were complete");
+    }
+    Ok(buffer)
+}
+
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -1720,6 +1913,45 @@ fn content_length_from_headers(headers: &[u8]) -> Option<usize> {
             None
         }
     })
+}
+
+fn strict_content_length_from_headers(
+    headers: &[u8],
+    max_body_bytes: usize,
+) -> anyhow::Result<usize> {
+    let text = std::str::from_utf8(headers).context("HTTP request headers are not valid UTF-8")?;
+    let method = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_default();
+    let mut content_length = None;
+    for line in text.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            anyhow::bail!("HTTP request contains a malformed header");
+        };
+        if name.trim().eq_ignore_ascii_case("transfer-encoding") && !value.trim().is_empty() {
+            anyhow::bail!("HTTP request Transfer-Encoding is unsupported");
+        }
+        if !name.trim().eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        if content_length.is_some() {
+            anyhow::bail!("HTTP request contains duplicate Content-Length headers");
+        }
+        let parsed = value
+            .trim()
+            .parse::<usize>()
+            .context("HTTP request Content-Length is invalid")?;
+        if parsed > max_body_bytes {
+            anyhow::bail!("HTTP request body is too large");
+        }
+        content_length = Some(parsed);
+    }
+    if method.eq_ignore_ascii_case("POST") && content_length.is_none() {
+        anyhow::bail!("HTTP POST request is missing Content-Length");
+    }
+    Ok(content_length.unwrap_or(0))
 }
 
 fn http_request_body(request: &str) -> &str {

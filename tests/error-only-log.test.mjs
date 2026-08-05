@@ -9,17 +9,22 @@ async function source(path) {
 }
 
 test("startup keeps the original loading page without progress tracing", async () => {
-  const [app, types, main, styles] = await Promise.all([
+  const [app, notice, types, main, styles] = await Promise.all([
     source("src/App.tsx"),
+    source("src/useAppNotice.tsx"),
     source("src/App.types.ts"),
     source("src/main.tsx"),
     source("src/styles.css"),
   ]);
-  const frontend = [app, types, main, styles].join("\n");
+  const frontend = [app, notice, types, main, styles].join("\n");
 
   assert.match(app, /if \(!config \|\| !provider\)/);
   assert.match(app, /正在载入 Codey/);
-  assert.match(app, /<p>\{notice\.text\}<\/p>/);
+  assert.match(
+    app,
+    /<p>\s*<NoticeLoadingText controller=\{noticeController\} \/>\s*<\/p>/,
+  );
+  assert.match(notice, /return <>\{notice\.text\}<\/>/);
   assert.doesNotMatch(frontend, /StartupLoading|startupProgress|startup_progress/);
   await assert.rejects(access(new URL("src/StartupLoading.tsx", root)));
 });
