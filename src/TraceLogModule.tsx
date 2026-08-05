@@ -1,11 +1,13 @@
 import { memo } from "react";
 import {
   IconAlertCircle as CircleAlert,
+  IconArchive as Archive,
   IconDatabase as Database,
   IconFileDescription as FileText,
   IconListDetails as ListDetails,
   IconLoader2 as LoaderCircle,
   IconRefresh as RefreshCw,
+  IconReport as Report,
   IconTrash as Trash2,
 } from "@tabler/icons-react";
 
@@ -24,10 +26,34 @@ export type TraceLogStats = {
   errors: string[];
 };
 
+export type CrashpadPendingStats = {
+  pending: boolean;
+  capturedAt: number;
+  directoriesFound: number;
+  reportsFound: number;
+  completeReports: number;
+  filesFound: number;
+  managedFiles: number;
+  orphanFiles: number;
+  unmanagedFiles: number;
+  pendingBytes: number;
+  managedBytes: number;
+  oldestTimestamp?: number;
+  newestTimestamp?: number;
+  hardLimitBytes: number;
+  targetBytes: number;
+  overLimit: boolean;
+  protectionEnabled: boolean;
+  errors: string[];
+};
+
 type TraceLogModuleProps = {
   stats?: TraceLogStats;
+  crashpadStats?: CrashpadPendingStats;
+  crashpadSupported: boolean;
   snapshotStale: boolean;
-  protectionEnabled: boolean;
+  traceProtectionEnabled: boolean;
+  crashpadProtectionEnabled: boolean;
   clearBusy: boolean;
   refreshing: boolean;
   disabled: boolean;
@@ -66,35 +92,81 @@ function formatSnapshotTime(timestamp: number): string {
   return snapshotTimeFormatter.format(new Date(timestamp * 1000));
 }
 
-function formatRange(stats: TraceLogStats): string {
-  if (!stats.oldestTimestamp || !stats.newestTimestamp) return "暂无日志时间范围";
-  return `${rangeDateFormatter.format(new Date(stats.oldestTimestamp * 1000))} - ${rangeDateFormatter.format(new Date(stats.newestTimestamp * 1000))}`;
+function formatRange(
+  oldestTimestamp?: number,
+  newestTimestamp?: number,
+  fallback = "暂无时间范围",
+): string {
+  if (!oldestTimestamp || !newestTimestamp) return fallback;
+  return `${rangeDateFormatter.format(new Date(oldestTimestamp * 1000))} - ${rangeDateFormatter.format(new Date(newestTimestamp * 1000))}`;
 }
 
 function TraceLogModuleComponent({
   stats,
+  crashpadStats,
+  crashpadSupported,
   snapshotStale,
-  protectionEnabled,
+  traceProtectionEnabled,
+  crashpadProtectionEnabled,
   clearBusy,
   refreshing,
   disabled,
   onClear,
   onRefresh,
 }: TraceLogModuleProps) {
-  const loading = refreshing || Boolean(stats?.pending);
-  const snapshot = stats && stats.capturedAt > 0 && !stats.pending ? stats : undefined;
+  const loading = refreshing || Boolean(stats?.pending || crashpadStats?.pending);
+  const traceSnapshot =
+    stats && stats.capturedAt > 0 && !stats.pending ? stats : undefined;
+  const crashpadSnapshot =
+    crashpadStats && crashpadStats.capturedAt > 0 && !crashpadStats.pending
+      ? crashpadStats
+      : undefined;
+  const hasSnapshot =
+    Boolean(traceSnapshot) &&
+    (!crashpadSupported || Boolean(crashpadSnapshot));
+  const protectionsEnabled =
+    traceProtectionEnabled &&
+    (!crashpadSupported || crashpadProtectionEnabled);
+  const partiallyProtected =
+    traceProtectionEnabled ||
+    (crashpadSupported && crashpadProtectionEnabled);
+  const warningCount =
+    (traceSnapshot?.errors.length ?? 0) +
+    (crashpadSnapshot?.errors.length ?? 0);
+  const capturedAt = Math.max(
+    traceSnapshot?.capturedAt ?? 0,
+    crashpadSnapshot?.capturedAt ?? 0,
+  );
 
   return (
     <section className="trace-section" aria-labelledby="trace-title">
       <div className="section-title compact trace-section-title">
         <div>
           <span className="section-kicker">Diagnostics</span>
-          <h2 id="trace-title">Trace 日志分析</h2>
-          <p>按需快照 · 日志诊断</p>
+          <h2 id="trace-title">诊断存储保护</h2>
+          <p>
+            {crashpadSupported
+              ? "Trace 数据库 · Crashpad 待处理报告"
+              : "Trace 数据库写盘与占用分析"}
+          </p>
         </div>
         <div className="trace-module-actions">
-          <Badge variant={protectionEnabled ? "success" : "secondary"}>
-            {protectionEnabled ? "写盘保护已开启" : "写盘保护关闭"}
+          <Badge
+            variant={
+              protectionsEnabled
+                ? "success"
+                : partiallyProtected
+                  ? "warning"
+                  : "secondary"
+            }
+          >
+            {protectionsEnabled
+              ? crashpadSupported
+                ? "双重保护已开启"
+                : "Trace 保护已开启"
+              : partiallyProtected
+                ? "部分保护已开启"
+                : "存储保护关闭"}
           </Badge>
           <Button
             className="trace-refresh-button"
@@ -116,13 +188,16 @@ function TraceLogModuleComponent({
             {clearBusy
               ? <LoaderCircle className="spinner" aria-hidden="true" />
               : <Trash2 aria-hidden="true" />}
-            清理日志库
+            清理诊断存储
           </Button>
         </div>
       </div>
 
-      <Card className={`trace-card${snapshot ? "" : " trace-card-empty"}`} aria-busy={loading}>
-        {!snapshot ? (
+      <Card
+        className={`trace-card${hasSnapshot ? "" : " trace-card-empty"}`}
+        aria-busy={loading}
+      >
+        {!hasSnapshot ? (
           <div className="trace-empty-container">
             <div className="trace-empty" role="status" aria-live="polite">
               <div className="trace-empty-badge">
@@ -133,11 +208,19 @@ function TraceLogModuleComponent({
                 </span>
               </div>
               <div className="trace-empty-copy">
-                <h3>{loading ? "正在统计 Trace 日志" : "未获取 Diagnostic/Trace 诊断快照"}</h3>
+                <h3>
+                  {loading
+                    ? "正在统计诊断存储"
+                    : "未获取本地诊断存储快照"}
+                </h3>
                 <p>
                   {loading
-                    ? "正在扫描本地 Codex 日志库及数据库索引，请稍候…"
-                    : "一键扫描本地 logs_*.sqlite 日志数据库，统计日志总量、磁盘占用与内容字节。"}
+                    ? crashpadSupported
+                      ? "正在扫描 Trace 数据库与 Crashpad 待处理报告，请稍候…"
+                      : "正在扫描本地 Trace 数据库，请稍候…"
+                    : crashpadSupported
+                      ? "一键统计 logs_*.sqlite 与 Crashpad pending 的数量、时间范围和磁盘占用。"
+                      : "一键统计 logs_*.sqlite 的数量、时间范围和磁盘占用。"}
                 </p>
               </div>
               <div className="trace-empty-action">
@@ -167,24 +250,49 @@ function TraceLogModuleComponent({
           <>
             <div className="trace-snapshot-row">
               <div className="trace-snapshot-info">
-                <span className={`trace-status-dot ${protectionEnabled ? "active" : ""}`} />
-                <strong>{protectionEnabled ? "保护状态正常" : "写盘保护未开启"}</strong>
-                <span>{snapshot.databasesScanned}/{snapshot.databasesFound} 个日志数据库已完成扫描</span>
+                <span
+                  className={`trace-status-dot ${protectionsEnabled ? "active" : ""}`}
+                />
+                <strong>
+                  {protectionsEnabled ? "保护状态正常" : "存在未启用的保护策略"}
+                </strong>
+                <span>
+                  Trace {traceSnapshot?.databasesScanned ?? 0}/
+                  {traceSnapshot?.databasesFound ?? 0} 个数据库
+                  {crashpadSupported
+                    ? ` · Crashpad ${crashpadSnapshot?.completeReports ?? 0} 份完整报告`
+                    : ""}
+                </span>
               </div>
-              <Badge variant={snapshot.errors.length || snapshotStale ? "warning" : "secondary"}>
-                {snapshotStale ? "清理前快照 · " : ""}{formatSnapshotTime(snapshot.capturedAt)}
+              <Badge
+                variant={
+                  warningCount ||
+                  snapshotStale ||
+                  crashpadSnapshot?.overLimit
+                    ? "warning"
+                    : "secondary"
+                }
+              >
+                {snapshotStale ? "清理前快照 · " : ""}
+                {formatSnapshotTime(capturedAt)}
               </Badge>
             </div>
 
-            <div className="trace-metrics-grid">
+            <div className={`trace-metrics-grid ${crashpadSupported ? "has-crashpad" : ""}`}>
               <div className="trace-metric-card trace-metric-card-rows">
                 <span className="trace-metric-icon" aria-hidden="true">
                   <ListDetails size={20} />
                 </span>
                 <div className="trace-metric-content">
                   <span>日志总条数</span>
-                  <strong>{formatCount(snapshot.rowCount)}</strong>
-                  <small>{formatRange(snapshot)}</small>
+                  <strong>{formatCount(traceSnapshot?.rowCount ?? 0)}</strong>
+                  <small>
+                    {formatRange(
+                      traceSnapshot?.oldestTimestamp,
+                      traceSnapshot?.newestTimestamp,
+                      "暂无 Trace 时间范围",
+                    )}
+                  </small>
                 </div>
               </div>
               <div className="trace-metric-card trace-metric-card-storage">
@@ -192,8 +300,10 @@ function TraceLogModuleComponent({
                   <Database size={20} />
                 </span>
                 <div className="trace-metric-content">
-                  <span>磁盘占用空间</span>
-                  <strong>{formatBytes(snapshot.databaseBytes)}</strong>
+                  <span>Trace 磁盘占用</span>
+                  <strong>
+                    {formatBytes(traceSnapshot?.databaseBytes ?? 0)}
+                  </strong>
                   <small>主数据库及 WAL/SHM</small>
                 </div>
               </div>
@@ -203,16 +313,64 @@ function TraceLogModuleComponent({
                 </span>
                 <div className="trace-metric-content">
                   <span>内容字节估算</span>
-                  <strong>{formatBytes(snapshot.estimatedLogBytes)}</strong>
+                  <strong>
+                    {formatBytes(traceSnapshot?.estimatedLogBytes ?? 0)}
+                  </strong>
                   <small>按 estimated_bytes 汇总</small>
                 </div>
               </div>
+              {crashpadSupported && (
+                <>
+                  <div className="trace-metric-card trace-metric-card-crashpad-reports">
+                    <span className="trace-metric-icon" aria-hidden="true">
+                      <Report size={20} />
+                    </span>
+                    <div className="trace-metric-content">
+                      <span>Crashpad 报告</span>
+                      <strong>
+                        {formatCount(crashpadSnapshot?.completeReports ?? 0)}
+                      </strong>
+                      <small>
+                        {formatCount(crashpadSnapshot?.filesFound ?? 0)} 个待处理文件
+                      </small>
+                    </div>
+                  </div>
+                  <div className="trace-metric-card trace-metric-card-crashpad-storage">
+                    <span className="trace-metric-icon" aria-hidden="true">
+                      <Archive size={20} />
+                    </span>
+                    <div className="trace-metric-content">
+                      <span>Crashpad 占用</span>
+                      <strong>
+                        {formatBytes(crashpadSnapshot?.pendingBytes ?? 0)}
+                      </strong>
+                      <small>
+                        上限{" "}
+                        {formatBytes(
+                          crashpadSnapshot?.hardLimitBytes ??
+                            512 * 1024 * 1024,
+                        )}
+                      </small>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
 
-            {snapshot.errors.length > 0 && (
-              <div className="trace-warning" title={snapshot.errors.join("\n")}>
+            {(warningCount > 0 || crashpadSnapshot?.overLimit) && (
+              <div
+                className="trace-warning"
+                title={[
+                  ...(traceSnapshot?.errors ?? []),
+                  ...(crashpadSnapshot?.errors ?? []),
+                ].join("\n")}
+              >
                 <CircleAlert size={15} />
-                <span>{snapshot.errors.length} 个日志库统计异常，已保留其余快照数据</span>
+                <span>
+                  {crashpadSnapshot?.overLimit
+                    ? "Crashpad 占用仍高于安全上限；最近写入的报告已保留，后台会继续收敛"
+                    : `${warningCount} 项诊断存储统计异常，已保留其余快照数据`}
+                </span>
               </div>
             )}
           </>

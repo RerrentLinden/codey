@@ -85,7 +85,10 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
   }, [refreshInjectionStatus]);
 
   useEffect(() => {
-    if (!status.traceLogStats?.pending) return;
+    if (
+      !status.traceLogStats?.pending &&
+      !status.crashpadPendingStats?.pending
+    ) return;
     const delays = [250, 500, 1_000, 2_000, 5_000];
     let cancelled = false;
     let timer = 0;
@@ -99,7 +102,10 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
           const next = await invoke<RuntimeStatus>("runtime_status");
           if (cancelled) return;
           setStatus(next);
-          if (next.traceLogStats?.pending) poll();
+          if (
+            next.traceLogStats?.pending ||
+            next.crashpadPendingStats?.pending
+          ) poll();
         } catch {
           poll();
         }
@@ -110,7 +116,10 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [status.traceLogStats?.pending]);
+  }, [
+    status.crashpadPendingStats?.pending,
+    status.traceLogStats?.pending,
+  ]);
 
   useEffect(() => {
     if (!status.restartInProgress) return;

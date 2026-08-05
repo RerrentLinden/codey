@@ -184,6 +184,32 @@ function FeaturePolicyCardComponent({
             </div>
           </div>
 
+          {isMacClient && (
+            <div
+              className={`feature-card ${config.protectCrashpadPending ? "active" : ""}`}
+            >
+              <div className="feature-card-header">
+                <strong>Crashpad 磁盘保护</strong>
+                <Switch
+                  checked={config.protectCrashpadPending}
+                  onCheckedChange={(checked) =>
+                    onConfigChange({
+                      ...config,
+                      protectCrashpadPending: checked,
+                    })}
+                  aria-label="启用 Codex Crashpad 磁盘保护"
+                />
+              </div>
+              <div className="feature-card-body">
+                <small>
+                  {config.protectCrashpadPending
+                    ? "待处理崩溃报告超过安全上限时自动收敛，并保留最近写入"
+                    : "仅显示占用和提供手动清理，不执行自动容量保护"}
+                </small>
+              </div>
+            </div>
+          )}
+
           <div
             className={`feature-card ${config.hideFullAccessWarning ? "active" : ""}`}
           >

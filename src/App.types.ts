@@ -1,4 +1,7 @@
-import type { TraceLogStats } from "./TraceLogModule";
+import type {
+  CrashpadPendingStats,
+  TraceLogStats,
+} from "./TraceLogModule";
 import type { NotificationChannel } from "./notifications/types";
 
 export type Profile = {
@@ -23,6 +26,7 @@ export type Config = {
   upstreamModelsByProvider: Record<string, string[]>;
   defaultModelByProvider: Record<string, string>;
   disableTraceLogWrites: boolean;
+  protectCrashpadPending: boolean;
   slimCodexPet: boolean;
   slimCodexVoice: boolean;
   gpuLaunchMode: "off" | "disableGpu" | "disableGpuRasterization";
@@ -86,6 +90,7 @@ export type RuntimeStatus = {
   maintenance?: Maintenance;
   injectionScripts?: InjectionScriptStatus[];
   traceLogStats?: TraceLogStats;
+  crashpadPendingStats?: CrashpadPendingStats;
 };
 
 export type PluginMarketplaceStatus = {
@@ -145,6 +150,23 @@ export type TraceLogCleanup = {
   bytesBefore: number;
   bytesAfter: number;
   bytesReclaimed: number;
+};
+
+export type CrashpadCleanup = {
+  directoriesFound: number;
+  reportsFound: number;
+  reportsDeleted: number;
+  filesFound: number;
+  filesDeleted: number;
+  orphanFilesDeleted: number;
+  unmanagedFiles: number;
+  skippedRecentReports: number;
+  bytesBefore: number;
+  bytesAfter: number;
+  bytesReclaimed: number;
+  limitApplied: boolean;
+  stillOverLimit: boolean;
+  errors: string[];
 };
 
 export type UpdateCheck = {

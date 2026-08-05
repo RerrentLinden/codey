@@ -25,6 +25,7 @@ use crate::codex_config::{
     reconcile_runtime_config_overlay, restore_runtime_provider_config,
 };
 use crate::config::{CodeyConfig, GpuLaunchMode};
+use crate::crashpad_pending_guard::{self, CrashpadPendingStatsHandle};
 use crate::error_log;
 use crate::maintenance_lock;
 use crate::model_catalog;
@@ -160,6 +161,9 @@ pub struct CodeyRuntime {
     route_overlay_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     exit_watchdog_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     exit_watchdog_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    crashpad_guard_enabled: Arc<AtomicBool>,
+    crashpad_guard_shutdown: Mutex<Option<oneshot::Sender<()>>>,
+    crashpad_guard_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl CodeyRuntime {
@@ -181,6 +185,11 @@ impl CodeyRuntime {
 
     pub async fn mark_subagent_config_applied(&self, config: &CodeyConfig) {
         *self.applied_subagent_config.write().await = RuntimeSubagentConfig::from_config(config);
+    }
+
+    pub fn set_crashpad_pending_protection(&self, enabled: bool) {
+        self.crashpad_guard_enabled
+            .store(enabled, Ordering::Release);
     }
 
     pub fn injection_statuses_for_display(
@@ -214,6 +223,7 @@ impl CodeyRuntime {
     pub async fn start(
         config: &CodeyConfig,
         handler: codey_runtime_core::bridge::BridgeHandler,
+        crashpad_pending_stats: CrashpadPendingStatsHandle,
     ) -> Result<(Self, oneshot::Receiver<()>)> {
         let home = codex_home();
         let injection_scripts = cdp::prepare_injection_scripts(
@@ -227,6 +237,17 @@ impl CodeyRuntime {
         let disable_trace_log_writes = config.disable_trace_log_writes;
         let initial_trace_guard = tokio::task::spawn_blocking(move || {
             trace_log_guard::configure(&trace_guard_home, disable_trace_log_writes)
+        });
+        let protect_crashpad_pending = config.protect_crashpad_pending;
+        let initial_crashpad_guard = tokio::task::spawn_blocking(move || {
+            if protect_crashpad_pending {
+                crashpad_pending_guard::enforce_system_limit()
+            } else {
+                crashpad_pending_guard::CrashpadGuardRun {
+                    cleanup: crashpad_pending_guard::CrashpadCleanupReport::default(),
+                    snapshot: crashpad_pending_guard::snapshot_system(false),
+                }
+            }
         });
         let route_takeover_home = home.clone();
         let route_takeover = tokio::task::spawn_blocking(move || {
@@ -430,6 +451,46 @@ impl CodeyRuntime {
                     }),
                 );
                 return Err(error);
+            }
+        }
+        match initial_crashpad_guard.await {
+            Ok(run) => {
+                if !run.cleanup.errors.is_empty() || run.cleanup.still_over_limit {
+                    error_log::record_failure(
+                        "cleanup_failed",
+                        "enforce_crashpad_pending_limit_at_startup",
+                        if run.cleanup.still_over_limit {
+                            "Crashpad pending 仍超过安全上限".to_string()
+                        } else {
+                            format!(
+                                "{} 个 Crashpad 待处理文件未能完成收敛",
+                                run.cleanup.errors.len()
+                            )
+                        },
+                        serde_json::json!({
+                            "errorCount": run.cleanup.errors.len(),
+                            "stillOverLimit": run.cleanup.still_over_limit,
+                            "bytesReclaimed": run.cleanup.bytes_reclaimed,
+                        }),
+                    );
+                }
+                crashpad_pending_stats.replace(run.snapshot);
+            }
+            Err(error) => {
+                let error = format!("Crashpad 磁盘保护任务异常退出：{error}");
+                error_log::record_failure(
+                    "cleanup_failed",
+                    "enforce_crashpad_pending_limit_at_startup",
+                    error.clone(),
+                    serde_json::json!({
+                        "taskJoinFailed": true,
+                    }),
+                );
+                let mut snapshot = crashpad_pending_guard::CrashpadPendingStatsSnapshot::idle(
+                    protect_crashpad_pending,
+                );
+                snapshot.errors.push(error);
+                crashpad_pending_stats.replace(snapshot);
             }
         }
 
@@ -850,6 +911,9 @@ impl CodeyRuntime {
             target.close().await;
         });
         let codex_exited = Arc::new(AtomicBool::new(false));
+        let crashpad_guard_enabled = Arc::new(AtomicBool::new(protect_crashpad_pending));
+        let (crashpad_guard_shutdown, crashpad_guard_task) =
+            spawn_crashpad_guard_watcher(crashpad_guard_enabled.clone(), crashpad_pending_stats);
         #[cfg(windows)]
         let (exit_watchdog_shutdown, codex_exit, exit_watchdog_task) =
             spawn_codex_exit_watcher(child.clone(), spawned.process_id, codex_exited.clone());
@@ -878,12 +942,30 @@ impl CodeyRuntime {
                 route_overlay_task: Mutex::new(route_overlay_task),
                 exit_watchdog_shutdown: Mutex::new(Some(exit_watchdog_shutdown)),
                 exit_watchdog_task: Mutex::new(Some(exit_watchdog_task)),
+                crashpad_guard_enabled,
+                crashpad_guard_shutdown: Mutex::new(Some(crashpad_guard_shutdown)),
+                crashpad_guard_task: Mutex::new(Some(crashpad_guard_task)),
             },
             codex_exit,
         ))
     }
 
     pub async fn stop(&self) -> Result<()> {
+        if let Some(sender) = self.crashpad_guard_shutdown.lock().await.take() {
+            let _ = sender.send(());
+        }
+        let crashpad_guard_task = self.crashpad_guard_task.lock().await.take();
+        if let Some(task) = crashpad_guard_task
+            && let Err(error) = task.await
+        {
+            error_log::record_failure(
+                "cleanup_failed",
+                "stop_crashpad_pending_guard",
+                error.to_string(),
+                serde_json::json!({}),
+            );
+            eprintln!("Crashpad 磁盘保护任务关闭失败：{error}");
+        }
         if let Some(sender) = self.route_overlay_shutdown.lock().await.take() {
             let _ = sender.send(());
         }
@@ -997,6 +1079,65 @@ fn preserve_cc_switch_route(state: RouteTakeoverState) -> Result<bool> {
         );
     }
     Ok(state.live)
+}
+
+fn spawn_crashpad_guard_watcher(
+    enabled: Arc<AtomicBool>,
+    stats: CrashpadPendingStatsHandle,
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(crashpad_pending_guard::GUARD_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
+                _ = interval.tick() => {}
+            }
+            if !enabled.load(Ordering::Acquire) {
+                continue;
+            }
+            let result =
+                tokio::task::spawn_blocking(crashpad_pending_guard::enforce_system_limit).await;
+            match result {
+                Ok(run) => {
+                    if !run.cleanup.errors.is_empty() || run.cleanup.still_over_limit {
+                        error_log::record_failure(
+                            "cleanup_failed",
+                            "enforce_crashpad_pending_limit",
+                            if run.cleanup.still_over_limit {
+                                "Crashpad pending 仍超过安全上限".to_string()
+                            } else {
+                                format!(
+                                    "{} 个 Crashpad 待处理文件未能完成收敛",
+                                    run.cleanup.errors.len()
+                                )
+                            },
+                            serde_json::json!({
+                                "errorCount": run.cleanup.errors.len(),
+                                "stillOverLimit": run.cleanup.still_over_limit,
+                                "bytesReclaimed": run.cleanup.bytes_reclaimed,
+                            }),
+                        );
+                    }
+                    let _ = stats.replace_if_idle(run.snapshot);
+                }
+                Err(error) => {
+                    error_log::record_failure(
+                        "cleanup_failed",
+                        "enforce_crashpad_pending_limit",
+                        error.to_string(),
+                        serde_json::json!({
+                            "taskJoinFailed": true,
+                        }),
+                    );
+                }
+            }
+        }
+    });
+    (shutdown_tx, task)
 }
 
 fn spawn_route_overlay_watcher(

@@ -21,6 +21,7 @@ import { invoke } from "./api";
 import {
   formatBytes,
   TraceLogModule,
+  type CrashpadPendingStats,
   type TraceLogStats,
 } from "./TraceLogModule";
 import {
@@ -47,6 +48,7 @@ import type {
   CodexAppDirectorySelection,
   Config,
   Confirmation,
+  CrashpadCleanup,
   ModelState,
   Notice,
   PluginMarketplaceStatus,
@@ -467,9 +469,9 @@ export function App({
   function askClearTraceLogs() {
     setConfirmation({
       action: "clear",
-      title: "清理 Codex 日志库？",
+      title: "清理 Codex 诊断存储？",
       description:
-        "将清空并压缩 logs_*.sqlite，只删除本地诊断/Trace 日志，不影响聊天历史、账号、配置或插件。清理后的诊断记录无法恢复。",
+        "将清空并压缩 logs_*.sqlite，同时删除已稳定写入的 Crashpad 待处理报告。最近写入、未知文件和其他 Crashpad 目录会保留；聊天历史、账号、配置及插件不受影响。清理后的诊断记录无法恢复。",
       confirmLabel: "确认清理",
       run: () => void clearTraceLogs(),
     });
@@ -542,29 +544,49 @@ export function App({
   async function clearTraceLogs() {
     await runOperation("clear-trace-logs", async () => {
       const result = await invoke<{
-        cleanup: TraceLogCleanup;
-        protectionEnabled: boolean;
-      }>("clear_codex_trace_logs");
-      const cleanup = result.cleanup;
-      const statsResult = await updateTraceLogStatsSnapshot();
-      setTraceSnapshotStale(statsResult.status === "pending");
-      const statsDetail =
-        statsResult.status === "pending"
-          ? "Trace 日志统计正在更新"
-          : "Trace 日志统计已刷新";
-      if (cleanup.databasesFound === 0) {
+        status: "ok" | "partial";
+        traceCleanup?: TraceLogCleanup;
+        crashpadCleanup: CrashpadCleanup;
+        traceProtectionEnabled: boolean;
+        crashpadProtectionEnabled: boolean;
+        errors: string[];
+        traceLogStats: TraceLogStats;
+        crashpadPendingStats: CrashpadPendingStats;
+      }>("clear_diagnostic_storage");
+      setStatus((current) => ({
+        ...current,
+        traceLogStats: result.traceLogStats,
+        crashpadPendingStats: result.crashpadPendingStats,
+      }));
+      setTraceSnapshotStale(false);
+      const traceCleanup = result.traceCleanup;
+      const crashpadCleanup = result.crashpadCleanup;
+      if (
+        (traceCleanup?.databasesFound ?? 0) === 0 &&
+        crashpadCleanup.reportsFound === 0
+      ) {
         setNotice({
           tone: "info",
-          text: `未发现 Codex 日志库，无需清理；${statsDetail}`,
+          text: "未发现可清理的 Trace 日志或 Crashpad 待处理报告",
         });
         return;
       }
-      const protectionDetail = result.protectionEnabled
-        ? "Trace 写盘保护保持开启"
-        : "Trace 写盘保护保持关闭";
+      const traceDetail = traceCleanup
+        ? `${traceCleanup.databasesCleaned} 个日志库、${traceCleanup.rowsDeleted} 条记录`
+        : "Trace 日志清理未完成";
+      const crashpadDetail =
+        `${crashpadCleanup.reportsDeleted} 份 Crashpad 报告、` +
+        `${crashpadCleanup.filesDeleted} 个文件`;
+      const reclaimed =
+        (traceCleanup?.bytesReclaimed ?? 0) +
+        crashpadCleanup.bytesReclaimed;
+      const protectionDetail =
+        result.traceProtectionEnabled && result.crashpadProtectionEnabled
+          ? "双重保护保持开启"
+          : "当前仅启用了部分保护";
       setNotice({
-        tone: "success",
-        text: `已清理 ${cleanup.databasesCleaned} 个日志库、${cleanup.rowsDeleted} 条记录，释放 ${formatBytes(cleanup.bytesReclaimed)}；${protectionDetail}，${statsDetail}`,
+        tone: result.errors.length ? "error" : "success",
+        text: `已处理 ${traceDetail}；${crashpadDetail}，释放 ${formatBytes(reclaimed)}；${protectionDetail}${result.errors.length ? `，另有 ${result.errors.length} 项未完成` : ""}`,
       });
     });
   }
@@ -573,10 +595,12 @@ export function App({
     const result = await invoke<{
       status: "ok" | "pending";
       traceLogStats: TraceLogStats;
-    }>("refresh_trace_log_stats");
+      crashpadPendingStats: CrashpadPendingStats;
+    }>("refresh_diagnostic_storage_stats");
     setStatus((current) => ({
       ...current,
       traceLogStats: result.traceLogStats,
+      crashpadPendingStats: result.crashpadPendingStats,
     }));
     return result;
   }
@@ -585,11 +609,11 @@ export function App({
     await runOperation("refresh-trace-stats", async () => {
       const result = await updateTraceLogStatsSnapshot();
       if (result.status === "pending") {
-        setNotice({ tone: "info", text: "Trace 日志正在统计，请稍候" });
+        setNotice({ tone: "info", text: "诊断存储正在统计，请稍候" });
         return;
       }
       setTraceSnapshotStale(false);
-      setNotice({ tone: "success", text: "Trace 日志统计已更新" });
+      setNotice({ tone: "success", text: "诊断存储统计已更新" });
     });
   }
 
@@ -899,12 +923,15 @@ export function App({
             />
           </div>
 
-          {/* Trace 日志分析：整行独占排布 */}
+          {/* 诊断存储保护：整行独占排布 */}
           <div className="full-row-section trace-full-section">
             <TraceLogModule
               stats={status.traceLogStats}
+              crashpadStats={status.crashpadPendingStats}
+              crashpadSupported={status.clientPlatform === "macos"}
               snapshotStale={traceSnapshotStale}
-              protectionEnabled={config.disableTraceLogWrites}
+              traceProtectionEnabled={config.disableTraceLogWrites}
+              crashpadProtectionEnabled={config.protectCrashpadPending}
               clearBusy={busy === "clear-trace-logs"}
               refreshing={busy === "refresh-trace-stats"}
               disabled={isBusy}

@@ -83,6 +83,10 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
             "traceLogStats".into(),
             serde_json::to_value(&state.trace_log_stats).unwrap_or_else(|_| json!({})),
         );
+        object.insert(
+            "crashpadPendingStats".into(),
+            serde_json::to_value(&state.crashpad_pending_stats).unwrap_or_else(|_| json!({})),
+        );
     }
     Ok(status)
 }
@@ -141,13 +145,14 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
         return Err(error);
     }
     let handler = make_bridge_handler(state);
-    let (runtime, codex_exit) = match CodeyRuntime::start(&config, handler).await {
-        Ok(started) => started,
-        Err(error) => {
-            reclaim_initial_session_scan(state, initial_scan_task).await;
-            return Err(error.to_string());
-        }
-    };
+    let (runtime, codex_exit) =
+        match CodeyRuntime::start(&config, handler, state.crashpad_pending_stats.clone()).await {
+            Ok(started) => started,
+            Err(error) => {
+                reclaim_initial_session_scan(state, initial_scan_task).await;
+                return Err(error.to_string());
+            }
+        };
     if state.is_shutting_down() {
         let stop_error = runtime.stop().await.err();
         reclaim_initial_session_scan(state, initial_scan_task).await;

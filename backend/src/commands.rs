@@ -54,6 +54,9 @@ use crate::cc_switch;
 use crate::cdp;
 use crate::codex_config::{codex_home, mark_runtime_subagent_defaults_applied};
 use crate::config::{CodeyConfig, ConfigStore};
+use crate::crashpad_pending_guard::{
+    self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
+};
 use crate::error_log;
 #[cfg(windows)]
 use crate::launcher::{CODEX_APP_NOT_FOUND_ERROR, CODEX_APP_PATH_INVALID_ERROR};
@@ -80,7 +83,9 @@ pub struct AppState {
     pub webhook_http_client: reqwest::Client,
     pub runtime: Mutex<Option<Arc<CodeyRuntime>>>,
     runtime_operation: Mutex<()>,
+    diagnostic_storage_operation: Mutex<()>,
     pub trace_log_stats: TraceLogStatsHandle,
+    pub crashpad_pending_stats: CrashpadPendingStatsHandle,
     pub startup_error: RwLock<Option<String>>,
     restart_in_progress: AtomicBool,
     shutting_down: AtomicBool,
@@ -127,6 +132,7 @@ impl Default for AppState {
     fn default() -> Self {
         let store = ConfigStore::default();
         let config = store.load().unwrap_or_default();
+        let protect_crashpad_pending = config.protect_crashpad_pending;
         let persisted_waiting_notifications = initial_waiting_notifications(&store, &[]);
         let (shutdown_reason, _) = watch::channel(None);
         Self {
@@ -142,7 +148,9 @@ impl Default for AppState {
                 .expect("notification HTTP client should be constructible"),
             runtime: Mutex::new(None),
             runtime_operation: Mutex::new(()),
+            diagnostic_storage_operation: Mutex::new(()),
             trace_log_stats: TraceLogStatsHandle::idle(),
+            crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
             startup_error: RwLock::new(None),
             restart_in_progress: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
@@ -502,9 +510,11 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         },
         "runtime_status" => runtime_status(state).await,
         "refresh_injection_status" => refresh_injection_status(state).await,
+        "refresh_diagnostic_storage_stats" => refresh_diagnostic_storage_stats(state).await,
         "refresh_trace_log_stats" => refresh_trace_log_stats(state).await,
         "launch_codey" => launch_codey_runtime(state).await,
         "restart_codey" => schedule_restart_codey_runtime(state).await,
+        "clear_diagnostic_storage" => clear_diagnostic_storage(state).await,
         "clear_codex_trace_logs" => clear_codex_trace_logs(state).await,
         "test_webhook" => {
             let channel_id = args
@@ -707,6 +717,7 @@ async fn save_codey_config_locked(
     config.codex_app_path = config_input.codex_app_path;
     config.user_scripts = config_input.user_scripts;
     config.disable_trace_log_writes = config_input.disable_trace_log_writes;
+    config.protect_crashpad_pending = config_input.protect_crashpad_pending;
     config.slim_codex_pet = config_input.slim_codex_pet;
     config.slim_codex_voice = config_input.slim_codex_voice;
     config.gpu_launch_mode = config_input.gpu_launch_mode;
@@ -762,6 +773,10 @@ async fn finish_codey_config_save(
     saved: SavedCodeyConfig,
 ) -> Result<Value, String> {
     sync_waiting_webhook_watcher(state).await;
+    if let Some(runtime) = state.runtime.lock().await.clone() {
+        runtime.set_crashpad_pending_protection(saved.config.protect_crashpad_pending);
+    }
+    schedule_crashpad_pending_refresh(state, saved.config.protect_crashpad_pending);
     let mut subagent_defaults_hot_reloaded = false;
     let mut subagent_defaults_hot_reload_error = None;
     if saved.refresh_subagent_defaults
@@ -789,6 +804,60 @@ async fn finish_codey_config_save(
         "subagentDefaultsHotReloaded":subagent_defaults_hot_reloaded,
         "subagentDefaultsHotReloadError":subagent_defaults_hot_reload_error,
     }))
+}
+
+fn schedule_crashpad_pending_refresh(state: &Arc<AppState>, protection_enabled: bool) {
+    if !state
+        .crashpad_pending_stats
+        .begin_refresh(protection_enabled)
+    {
+        return;
+    }
+    let stats = state.crashpad_pending_stats.clone();
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            if protection_enabled {
+                crashpad_pending_guard::enforce_system_limit()
+            } else {
+                crashpad_pending_guard::CrashpadGuardRun {
+                    cleanup: crashpad_pending_guard::CrashpadCleanupReport::default(),
+                    snapshot: crashpad_pending_guard::snapshot_system(false),
+                }
+            }
+        })
+        .await;
+        match result {
+            Ok(run) => {
+                if !run.cleanup.errors.is_empty() || run.cleanup.still_over_limit {
+                    error_log::record_failure(
+                        "cleanup_failed",
+                        "refresh_crashpad_pending_protection",
+                        if run.cleanup.still_over_limit {
+                            "Crashpad pending 仍超过安全上限".to_string()
+                        } else {
+                            format!(
+                                "{} 个 Crashpad 待处理文件未能完成收敛",
+                                run.cleanup.errors.len()
+                            )
+                        },
+                        json!({
+                            "errorCount": run.cleanup.errors.len(),
+                            "stillOverLimit": run.cleanup.still_over_limit,
+                            "bytesReclaimed": run.cleanup.bytes_reclaimed,
+                        }),
+                    );
+                }
+                stats.replace(run.snapshot);
+            }
+            Err(error) => {
+                let mut snapshot = CrashpadPendingStatsSnapshot::idle(protection_enabled);
+                snapshot
+                    .errors
+                    .push(format!("Crashpad 磁盘保护任务异常退出：{error}"));
+                stats.replace(snapshot);
+            }
+        }
+    });
 }
 
 async fn hot_reload_runtime_subagent_defaults(
@@ -847,6 +916,7 @@ async fn hot_reload_runtime_subagent_defaults(
 }
 
 pub async fn clear_codex_trace_logs(state: &Arc<AppState>) -> Result<Value, String> {
+    let _operation = state.diagnostic_storage_operation.lock().await;
     let home = codex_home();
     let disable_writes = state.config.read().await.disable_trace_log_writes;
     let result = tokio::task::spawn_blocking(move || {
@@ -877,7 +947,167 @@ pub async fn clear_codex_trace_logs(state: &Arc<AppState>) -> Result<Value, Stri
     }))
 }
 
+pub async fn clear_diagnostic_storage(state: &Arc<AppState>) -> Result<Value, String> {
+    let _operation = state.diagnostic_storage_operation.lock().await;
+    let config = state.config.read().await;
+    let disable_trace_writes = config.disable_trace_log_writes;
+    let protect_crashpad_pending = config.protect_crashpad_pending;
+    drop(config);
+
+    let trace_home = codex_home();
+    let trace_task = tokio::task::spawn_blocking(move || {
+        let cleanup = trace_log_guard::configure(&trace_home, disable_trace_writes)
+            .and_then(|_| trace_log_guard::clear(&trace_home));
+        let snapshot = trace_log_stats::snapshot(&trace_home);
+        (cleanup, snapshot)
+    });
+    let crashpad_task = tokio::task::spawn_blocking(move || {
+        crashpad_pending_guard::clear_system(protect_crashpad_pending)
+    });
+    let (trace_result, crashpad_result) = tokio::join!(trace_task, crashpad_task);
+
+    let mut errors = Vec::new();
+    let (trace_cleanup, trace_snapshot) = match trace_result {
+        Ok((Ok(cleanup), snapshot)) => (Some(cleanup), snapshot),
+        Ok((Err(error), snapshot)) => {
+            let error = format!("{error:#}");
+            error_log::record_failure(
+                "cleanup_failed",
+                "clear_diagnostic_trace_logs",
+                error.clone(),
+                json!({
+                    "protectionEnabled": disable_trace_writes,
+                }),
+            );
+            errors.push(error);
+            (None, snapshot)
+        }
+        Err(error) => {
+            let error = format!("Trace 日志库清理任务异常退出：{error}");
+            error_log::record_failure(
+                "cleanup_failed",
+                "clear_diagnostic_trace_logs",
+                error.clone(),
+                json!({
+                    "protectionEnabled": disable_trace_writes,
+                    "taskJoinFailed": true,
+                }),
+            );
+            errors.push(error.clone());
+            let mut snapshot = TraceLogStatsSnapshot::idle();
+            snapshot.errors.push(error);
+            (None, snapshot)
+        }
+    };
+    state.trace_log_stats.replace(trace_snapshot);
+
+    let (crashpad_cleanup, crashpad_snapshot) = match crashpad_result {
+        Ok(run) => {
+            if !run.cleanup.errors.is_empty() {
+                let error = format!(
+                    "{} 个 Crashpad 待处理文件未能完成清理",
+                    run.cleanup.errors.len()
+                );
+                error_log::record_failure(
+                    "cleanup_failed",
+                    "clear_crashpad_pending",
+                    error,
+                    json!({
+                        "protectionEnabled": protect_crashpad_pending,
+                        "errorCount": run.cleanup.errors.len(),
+                    }),
+                );
+            }
+            errors.extend(run.cleanup.errors.iter().cloned());
+            (run.cleanup, run.snapshot)
+        }
+        Err(error) => {
+            let error = format!("Crashpad 待处理报告清理任务异常退出：{error}");
+            error_log::record_failure(
+                "cleanup_failed",
+                "clear_crashpad_pending",
+                error.clone(),
+                json!({
+                    "protectionEnabled": protect_crashpad_pending,
+                    "taskJoinFailed": true,
+                }),
+            );
+            errors.push(error.clone());
+            let mut cleanup = crashpad_pending_guard::CrashpadCleanupReport::default();
+            cleanup.errors.push(error.clone());
+            let mut snapshot = CrashpadPendingStatsSnapshot::idle(protect_crashpad_pending);
+            snapshot.errors.push(error);
+            (cleanup, snapshot)
+        }
+    };
+    state.crashpad_pending_stats.replace(crashpad_snapshot);
+
+    Ok(json!({
+        "status": if errors.is_empty() { "ok" } else { "partial" },
+        "traceCleanup": trace_cleanup,
+        "crashpadCleanup": crashpad_cleanup,
+        "traceProtectionEnabled": disable_trace_writes,
+        "crashpadProtectionEnabled": protect_crashpad_pending,
+        "errors": errors,
+        "traceLogStats": &state.trace_log_stats,
+        "crashpadPendingStats": &state.crashpad_pending_stats,
+    }))
+}
+
+pub async fn refresh_diagnostic_storage_stats(state: &Arc<AppState>) -> Result<Value, String> {
+    let _operation = state.diagnostic_storage_operation.lock().await;
+    let protect_crashpad_pending = state.config.read().await.protect_crashpad_pending;
+    if !state.trace_log_stats.begin_refresh() {
+        return Ok(json!({
+            "status": "pending",
+            "traceLogStats": &state.trace_log_stats,
+            "crashpadPendingStats": &state.crashpad_pending_stats,
+        }));
+    }
+    let _ = state
+        .crashpad_pending_stats
+        .begin_refresh(protect_crashpad_pending);
+
+    let trace_home = codex_home();
+    let trace_task = tokio::task::spawn_blocking(move || trace_log_stats::snapshot(&trace_home));
+    let crashpad_task = tokio::task::spawn_blocking(move || {
+        crashpad_pending_guard::snapshot_system(protect_crashpad_pending)
+    });
+    let (trace_result, crashpad_result) = tokio::join!(trace_task, crashpad_task);
+
+    let trace_snapshot = match trace_result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let mut snapshot = TraceLogStatsSnapshot::idle();
+            snapshot
+                .errors
+                .push(format!("Trace 日志统计任务异常退出：{error}"));
+            snapshot
+        }
+    };
+    state.trace_log_stats.replace(trace_snapshot);
+
+    let crashpad_snapshot = match crashpad_result {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            let mut snapshot = CrashpadPendingStatsSnapshot::idle(protect_crashpad_pending);
+            snapshot
+                .errors
+                .push(format!("Crashpad 待处理报告统计任务异常退出：{error}"));
+            snapshot
+        }
+    };
+    state.crashpad_pending_stats.replace(crashpad_snapshot);
+
+    Ok(json!({
+        "status": "ok",
+        "traceLogStats": &state.trace_log_stats,
+        "crashpadPendingStats": &state.crashpad_pending_stats,
+    }))
+}
+
 pub async fn refresh_trace_log_stats(state: &Arc<AppState>) -> Result<Value, String> {
+    let _operation = state.diagnostic_storage_operation.lock().await;
     if !state.trace_log_stats.begin_refresh() {
         return Ok(json!({
             "status": "pending",
@@ -1212,6 +1442,7 @@ mod restart_tests {
             ..NotificationChannelConfig::default()
         });
         current.disable_trace_log_writes = !current.disable_trace_log_writes;
+        current.protect_crashpad_pending = !current.protect_crashpad_pending;
 
         assert!(!config_requires_restart(
             &applied,

@@ -5,6 +5,7 @@ mod codex_config;
 mod codex_startup_patch;
 mod commands;
 mod config;
+mod crashpad_pending_guard;
 mod error_log;
 mod fs_util;
 mod launcher;

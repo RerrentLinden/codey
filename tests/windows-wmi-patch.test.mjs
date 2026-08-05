@@ -90,7 +90,7 @@ test("settings exposes degraded Windows and pet optimization failures", async ()
   assert.match(launcherSource, /pet_status\.status = "failed"/);
 });
 
-test("trace guard, stats, pet, and voice remain user-configurable", async () => {
+test("diagnostic storage guards, pet, and voice remain user-configurable", async () => {
   const [appSource, sectionsSource, configSource, traceSource, launcherSource, commandsSource] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/FeaturePolicyCard.tsx", import.meta.url), "utf8"),
@@ -105,18 +105,26 @@ test("trace guard, stats, pet, and voice remain user-configurable", async () => 
   assert.doesNotMatch(configSource, /pub disable_codex_micro/);
   assert.match(uiSource, /disableTraceLogWrites/);
   assert.match(configSource, /pub disable_trace_log_writes: bool/);
-  assert.match(traceSource, /onProtectionChange|protectionEnabled/);
+  assert.match(uiSource, /protectCrashpadPending/);
+  assert.match(configSource, /pub protect_crashpad_pending: bool/);
+  assert.match(traceSource, /traceProtectionEnabled/);
+  assert.match(traceSource, /crashpadProtectionEnabled/);
   assert.match(traceSource, /刷新统计/);
   assert.match(traceSource, /日志总条数/);
-  assert.match(traceSource, /磁盘占用空间/);
+  assert.match(traceSource, /Trace 磁盘占用/);
   assert.match(traceSource, /内容字节估算/);
+  assert.match(traceSource, /Crashpad 报告/);
+  assert.match(traceSource, /Crashpad 占用/);
   assert.doesNotMatch(traceSource, /近 7 天写入/);
   assert.doesNotMatch(traceSource, /SSD 写入寿命粗略估算/);
   assert.doesNotMatch(traceSource, /级别分布|高占用 Targets/);
-  assert.match(appSource, /refresh_trace_log_stats/);
-  assert.match(appSource, /async function clearTraceLogs\(\)[\s\S]*?updateTraceLogStatsSnapshot\(\)/);
+  assert.match(appSource, /refresh_diagnostic_storage_stats/);
+  assert.match(appSource, /clear_diagnostic_storage/);
+  assert.match(appSource, /crashpadPendingStats: result\.crashpadPendingStats/);
   assert.doesNotMatch(appSource, /可手动刷新统计/);
-  assert.match(commandsSource, /"refresh_trace_log_stats"/);
+  assert.match(commandsSource, /"refresh_diagnostic_storage_stats"/);
+  assert.match(commandsSource, /"clear_diagnostic_storage"/);
+  assert.match(launcherSource, /spawn_crashpad_guard_watcher/);
   assert.doesNotMatch(launcherSource, /spawn_startup_trace_stats_refresh/);
   assert.match(uiSource, /slimCodexPet/);
   assert.match(uiSource, /slimCodexVoice/);

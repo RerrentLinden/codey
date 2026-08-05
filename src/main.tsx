@@ -3,7 +3,10 @@ import ReactDOM from "react-dom/client";
 import "../node_modules/@douyinfe/semi-ui/lib/es/_base/base.css";
 import { App } from "./App";
 import { previewOfficialModels, previewUpstreamModels } from "./previewModels";
-import { previewTraceLogStats } from "./previewTraceLogStats";
+import {
+  previewCrashpadPendingStats,
+  previewTraceLogStats,
+} from "./previewTraceLogStats";
 import "./styles.css";
 
 // 在 Vite 开发模式下，若未通过 Codey Bridge/Token 访问，自动注入 Mock 接口方便 UI 调试
@@ -77,12 +80,15 @@ if (import.meta.env.DEV) {
       upstreamModelsByProvider: { primary: previewUpstreamModels },
       defaultModelByProvider: {},
       disableTraceLogWrites: true,
+      protectCrashpadPending: true,
       slimCodexPet: true,
       slimCodexVoice: false,
       gpuLaunchMode: "off" as const,
       fastContextTools: false,
       fastCodexStartup: true,
       subagentOptimization: false,
+      subagentModel: "gpt-5.6-terra",
+      subagentReasoningEffort: "medium",
       hideFullAccessWarning: false,
       showAccountUsageInHeader: true,
     };
@@ -111,6 +117,9 @@ if (import.meta.env.DEV) {
       defaultModel: "gpt-5.6-sol",
     };
     let previewTraceStats: typeof previewTraceLogStats | undefined;
+    let previewCrashpadStats:
+      | typeof previewCrashpadPendingStats
+      | undefined = previewCrashpadPendingStats;
 
     window.__codeyInvokeApi = async (command, args) => {
       console.log(`[Mock API Call] ${command}`, args);
@@ -210,6 +219,21 @@ if (import.meta.env.DEV) {
             },
           ],
           ...(previewTraceStats ? { traceLogStats: previewTraceStats } : {}),
+          ...(previewCrashpadStats
+            ? { crashpadPendingStats: previewCrashpadStats }
+            : {}),
+        };
+      }
+      if (command === "refresh_diagnostic_storage_stats") {
+        previewTraceStats = previewTraceLogStats;
+        previewCrashpadStats = {
+          ...previewCrashpadPendingStats,
+          protectionEnabled: previewConfig.protectCrashpadPending,
+        };
+        return {
+          status: "ok",
+          traceLogStats: previewTraceStats,
+          crashpadPendingStats: previewCrashpadStats,
         };
       }
       if (command === "refresh_trace_log_stats") {
@@ -260,6 +284,56 @@ if (import.meta.env.DEV) {
             bytesAfter: 49152,
             bytesReclaimed: 406872064,
           },
+        };
+      }
+      if (command === "clear_diagnostic_storage") {
+        previewTraceStats = {
+          ...previewTraceLogStats,
+          databaseBytes: 49152,
+          rowCount: 0,
+          estimatedLogBytes: 0,
+        };
+        previewCrashpadStats = {
+          ...previewCrashpadPendingStats,
+          protectionEnabled: previewConfig.protectCrashpadPending,
+          reportsFound: 0,
+          completeReports: 0,
+          filesFound: 0,
+          managedFiles: 0,
+          pendingBytes: 0,
+          managedBytes: 0,
+        };
+        return {
+          status: "ok",
+          traceProtectionEnabled: previewConfig.disableTraceLogWrites,
+          crashpadProtectionEnabled: previewConfig.protectCrashpadPending,
+          errors: [],
+          traceCleanup: {
+            databasesFound: 1,
+            databasesCleaned: 1,
+            rowsDeleted: 30141,
+            bytesBefore: 406921216,
+            bytesAfter: 49152,
+            bytesReclaimed: 406872064,
+          },
+          crashpadCleanup: {
+            directoriesFound: 2,
+            reportsFound: 13,
+            reportsDeleted: 13,
+            filesFound: 26,
+            filesDeleted: 26,
+            orphanFilesDeleted: 0,
+            unmanagedFiles: 0,
+            skippedRecentReports: 0,
+            bytesBefore: 3448832,
+            bytesAfter: 0,
+            bytesReclaimed: 3448832,
+            limitApplied: false,
+            stillOverLimit: false,
+            errors: [],
+          },
+          traceLogStats: previewTraceStats,
+          crashpadPendingStats: previewCrashpadStats,
         };
       }
       if (command === "fetch_current_provider_models") {

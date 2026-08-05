@@ -95,6 +95,10 @@ pub struct CodeyConfig {
     pub default_model_by_provider: BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub disable_trace_log_writes: bool,
+    /// Keeps Codex/ChatGPT Crashpad pending reports below a bounded disk
+    /// budget. The guard only manages validated report files on macOS.
+    #[serde(default = "default_true")]
+    pub protect_crashpad_pending: bool,
     #[serde(default = "default_true")]
     pub slim_codex_pet: bool,
     #[serde(default)]
@@ -155,6 +159,7 @@ impl Default for CodeyConfig {
             upstream_models_by_provider: BTreeMap::new(),
             default_model_by_provider: BTreeMap::new(),
             disable_trace_log_writes: true,
+            protect_crashpad_pending: true,
             slim_codex_pet: true,
             slim_codex_voice: false,
             gpu_launch_mode: GpuLaunchMode::Off,
@@ -500,17 +505,22 @@ mod tests {
     #[test]
     fn legacy_micro_switch_is_ignored_but_feature_controls_are_preserved() {
         let config = serde_json::from_str::<CodeyConfig>(
-            r#"{"activeProfileId":"","profiles":[],"disableTraceLogWrites":false,"disableCodexMicro":false,"slimCodexPet":false,"slimCodexVoice":false}"#,
+            r#"{"activeProfileId":"","profiles":[],"disableTraceLogWrites":false,"protectCrashpadPending":false,"disableCodexMicro":false,"slimCodexPet":false,"slimCodexVoice":false}"#,
         )
         .unwrap()
         .normalize();
         let serialized = serde_json::to_value(&config).unwrap();
 
         assert!(!config.disable_trace_log_writes);
+        assert!(!config.protect_crashpad_pending);
         assert!(!config.slim_codex_pet);
         assert!(!config.slim_codex_voice);
         assert_eq!(
             serialized.get("disableTraceLogWrites"),
+            Some(&serde_json::json!(false))
+        );
+        assert_eq!(
+            serialized.get("protectCrashpadPending"),
             Some(&serde_json::json!(false))
         );
         assert!(serialized.get("disableCodexMicro").is_none());
@@ -548,6 +558,7 @@ mod tests {
             .normalize();
 
         assert!(config.disable_trace_log_writes);
+        assert!(config.protect_crashpad_pending);
     }
 
     #[test]
