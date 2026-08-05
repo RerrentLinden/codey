@@ -68,7 +68,9 @@ function OperationsPanelComponent({
   const pluginOk = pluginMarketplaceStatus?.status === "ready";
   const pluginStatusError = pluginMarketplaceStatus?.status === "error";
   const pluginRepairing = busy === "repair-plugin-marketplace";
-  const performanceError = maintenance?.performanceStatus === "error";
+  const performanceError =
+    maintenance?.performanceStatus === "error" ||
+    maintenance?.performanceStatus === "degraded";
   const injectionScripts = status.injectionScripts ?? EMPTY_INJECTION_SCRIPTS;
   const {
     effectiveScriptCount,
@@ -520,13 +522,17 @@ function OperationsPanelComponent({
                                 const scriptUnverified =
                                   script.status === "executed";
                                 const scriptFailed =
-                                  !scriptEffective && !scriptUnverified;
+                                  script.status === "failed";
+                                const scriptUnknown =
+                                  script.status === "unknown";
+                                const scriptProblem =
+                                  scriptFailed || scriptUnknown;
                                 const ScriptStatusIcon = scriptEffective
                                   ? Check
                                   : scriptUnverified
                                     ? IconClock
                                     : X;
-                                const stateClass = scriptFailed
+                                const stateClass = scriptProblem
                                   ? " failed"
                                   : scriptUnverified
                                     ? " unverified"
@@ -570,7 +576,9 @@ function OperationsPanelComponent({
                                           ? "生效探针通过"
                                           : scriptUnverified
                                             ? "脚本已执行，但没有生效证据"
-                                            : "脚本异常"
+                                            : scriptFailed
+                                              ? "脚本未生效"
+                                              : "脚本状态异常"
                                       }
                                     >
                                       <ScriptStatusIcon
@@ -581,7 +589,9 @@ function OperationsPanelComponent({
                                         ? "已生效"
                                         : scriptUnverified
                                           ? "未验证"
-                                          : "异常"}
+                                          : scriptFailed
+                                            ? "失败"
+                                            : "异常"}
                                     </span>
                                   </div>
                                 );

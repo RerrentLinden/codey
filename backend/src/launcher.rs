@@ -90,6 +90,23 @@ struct SessionMaintenanceSummary {
     ghost_tasks_pruned: usize,
 }
 
+fn mark_pet_slim_startup_failure(
+    statuses: Arc<[cdp::InjectionScriptStatus]>,
+    detail: &str,
+) -> Arc<[cdp::InjectionScriptStatus]> {
+    let mut statuses = statuses.as_ref().to_vec();
+    let Some(pet_status) = statuses
+        .iter_mut()
+        .find(|status| status.id == "pet-control-shield")
+    else {
+        return Arc::from(statuses);
+    };
+    pet_status.status = "failed".to_string();
+    pet_status.detail = None;
+    pet_status.error = Some(detail.to_string());
+    Arc::from(statuses)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeModelConfig {
     selected_models: Vec<String>,
@@ -166,6 +183,17 @@ impl CodeyRuntime {
         *self.applied_subagent_config.write().await = RuntimeSubagentConfig::from_config(config);
     }
 
+    pub fn injection_statuses_for_display(
+        &self,
+        statuses: Arc<[cdp::InjectionScriptStatus]>,
+    ) -> Arc<[cdp::InjectionScriptStatus]> {
+        if self.applied_config.slim_codex_pet && self.maintenance.performance_status == "degraded" {
+            mark_pet_slim_startup_failure(statuses, &self.maintenance.performance_detail)
+        } else {
+            statuses
+        }
+    }
+
     pub async fn refresh_injection_statuses(&self) -> Arc<[cdp::InjectionScriptStatus]> {
         let websocket_url = self.injection_websocket_url.read().await.clone();
         let statuses = cdp::read_injection_statuses(&websocket_url, &self.injection_scripts)
@@ -175,8 +203,10 @@ impl CodeyRuntime {
                     .statuses_with_error(format!("实时生效自检失败：{error:#}"))
             });
         if self.injection_websocket_url.read().await.as_ref() != websocket_url.as_ref() {
-            return self.injection_statuses.read().await.clone();
+            let statuses = self.injection_statuses.read().await.clone();
+            return self.injection_statuses_for_display(statuses);
         }
+        let statuses = self.injection_statuses_for_display(statuses);
         *self.injection_statuses.write().await = statuses.clone();
         statuses
     }
@@ -1188,6 +1218,40 @@ mod maintenance_status_tests {
                 .contains("修复 3 个")
         );
     }
+
+    #[test]
+    fn pet_slim_startup_failure_overrides_the_renderer_only_probe() {
+        let statuses: Arc<[cdp::InjectionScriptStatus]> = Arc::from(vec![
+            cdp::InjectionScriptStatus {
+                id: "pet-control-shield".to_string(),
+                name: "宠物控制精简".to_string(),
+                source: "builtin".to_string(),
+                status: "effective".to_string(),
+                detail: Some("宠物控制精简已启用".to_string()),
+                error: None,
+            },
+            cdp::InjectionScriptStatus {
+                id: "bridge-helpers".to_string(),
+                name: "桥接辅助".to_string(),
+                source: "builtin".to_string(),
+                status: "effective".to_string(),
+                detail: Some("桥接函数可调用".to_string()),
+                error: None,
+            },
+        ]);
+
+        let statuses =
+            mark_pet_slim_startup_failure(statuses, "宠物精简启动补丁未能确认生效，已使用兼容模式");
+
+        assert_eq!(statuses[0].status, "failed");
+        assert_eq!(statuses[0].detail, None);
+        assert_eq!(
+            statuses[0].error.as_deref(),
+            Some("宠物精简启动补丁未能确认生效，已使用兼容模式")
+        );
+        assert_eq!(statuses[1].status, "effective");
+        assert_eq!(statuses[1].error, None);
+    }
 }
 
 pub fn restore_previous_runtime_state(home: &std::path::Path) -> Result<()> {
@@ -1456,9 +1520,13 @@ async fn spawn_codex(
                 match spawn_windows_codex(app_dir, debug_port, &runtime_arguments).await {
                     Ok(mut fallback) => {
                         fallback.performance_status = "degraded".to_string();
-                        fallback.performance_detail =
+                        fallback.performance_detail = if patch_options.disable_pet {
+                            "宠物精简启动补丁未能确认生效，已自动以兼容模式启动；本次宠物精简失败，可能存在额外 Renderer，下次启动将自动重试"
+                                .to_string()
+                        } else {
                             "启动补丁未能安装，已自动以兼容模式启动；启动优化将在下次启动时重试"
-                                .to_string();
+                                .to_string()
+                        };
                         error_log::record_failure(
                             "patch_degraded",
                             "restart_without_startup_patch",
@@ -1466,6 +1534,7 @@ async fn spawn_codex(
                             serde_json::json!({
                                 "platform": "windows",
                                 "processId": fallback.process_id,
+                                "petSlimRequested": patch_options.disable_pet,
                             }),
                         );
                         Ok(fallback)

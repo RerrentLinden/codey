@@ -72,6 +72,7 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
             serde_json::to_value(&runtime.maintenance).unwrap_or_else(|_| json!({})),
         );
         let injection_statuses = runtime.injection_statuses.read().await.clone();
+        let injection_statuses = runtime.injection_statuses_for_display(injection_statuses);
         object.insert(
             "injectionScripts".into(),
             serde_json::to_value(injection_statuses.as_ref()).unwrap_or_else(|_| json!([])),

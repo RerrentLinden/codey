@@ -3,6 +3,17 @@
 use anyhow::Result;
 
 const PATCH_RESULT: &str = "codey-startup-patch-installed-v20";
+const PET_HARD_DISABLE_STATUS_EXPRESSION: &str = r#"
+globalThis.__CODEY_PET_HARD_DISABLE_STATUS__ ?? { phase: "pending", message: "" }
+"#;
+const CLOSE_INSPECTOR_EXPRESSION: &str = r#"
+(() => {
+  setImmediate(() => {
+    try { process.getBuiltinModule("inspector").close(); } catch {}
+  });
+  return "codey-inspector-close-scheduled";
+})()
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
@@ -20,6 +31,15 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
   const disablePet = __DISABLE_PET__;
   const disableVoice = __DISABLE_VOICE__;
   const fastCodexStartup = __FAST_CODEX_STARTUP__;
+  const petHardDisableStatus = {
+    phase: disablePet ? "pending" : "not_requested",
+    message: "",
+  };
+  Object.defineProperty(globalThis, "__CODEY_PET_HARD_DISABLE_STATUS__", {
+    configurable: false,
+    value: petHardDisableStatus,
+    writable: false,
+  });
   const codeyErrorLoggerExecutable = "__CODEY_ERROR_LOGGER_EXECUTABLE__";
   const recordCodeyPatchFailure = (operation, error, context = {}) => {
     const unresolvedExecutable =
@@ -1281,6 +1301,7 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
       try {
       const fs = process.getBuiltinModule("fs");
       let source = fs.readFileSync(filename, "utf8");
+      let petManagerSourceRemoved = false;
       source = applyOptionalMainBundlePatch(
         "desktopCesAnalytics",
         patchCodexMainDesktopAnalytics,
@@ -1337,7 +1358,7 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
         source.slice(0, valueStart) +
         "globalThis.__CODEY_DISABLED_PET_MANAGER__" +
         source.slice(valueEnd);
-      globalThis.__CODEY_PET_MANAGER_SOURCE_REMOVED__ = true;
+      petManagerSourceRemoved = true;
       }
 
       const presentationCall = source.match(
@@ -1432,7 +1453,17 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
       globalThis.__CODEY_APP_STATE_HEARTBEAT_SOURCE_PATCHED__ =
         !hasOptionalMainBundlePatchFailure("appStateHeartbeat");
       module._compile(source, filename);
+      if (disablePet && petManagerSourceRemoved) {
+        globalThis.__CODEY_PET_MANAGER_SOURCE_REMOVED__ = true;
+        petHardDisableStatus.phase = "removed";
+        petHardDisableStatus.message = "";
+      }
       } catch (error) {
+        if (disablePet) {
+          petHardDisableStatus.phase = "error";
+          petHardDisableStatus.message =
+            error instanceof Error ? error.message : String(error);
+        }
         recordCodeyPatchFailure("patch_codex_main_bundle", error, { filename });
         throw error;
       }
@@ -1467,6 +1498,121 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
 
   let electronProxy = null;
   let electronProtocolProxy = null;
+  let avatarOverlayBlockedWindowCreations = 0;
+  let avatarOverlayBlockedNativeLoads = 0;
+  let avatarOverlayGuardedWindowsObserved = 0;
+  let avatarOverlayActiveGuards = 0;
+  let avatarOverlayUrlMatches = 0;
+  let avatarOverlayDestroyedWindows = 0;
+  let avatarOverlayDestroyErrors = 0;
+  let avatarOverlayLastRoute = "";
+  const avatarOverlayGuardedWindows = new WeakSet();
+  const isAvatarOverlayRoute = (value) => {
+    if (typeof value !== "string" || value.length === 0) return false;
+    try {
+      const url = new URL(value);
+      if (
+        url.protocol !== "app:" ||
+        url.hostname !== "-" ||
+        url.pathname !== "/index.html"
+      ) {
+        return false;
+      }
+      for (const [key, route] of url.searchParams) {
+        if (
+          key.toLowerCase() === "initialroute" &&
+          route.toLowerCase() === "/avatar-overlay"
+        ) {
+          return true;
+        }
+      }
+    } catch {}
+    return false;
+  };
+  const guardAvatarOverlayLifecycle = (window) => {
+    if (
+      !disablePet ||
+      window == null ||
+      avatarOverlayGuardedWindows.has(window)
+    ) {
+      return;
+    }
+    const webContents = window.webContents;
+    if (webContents == null) return;
+
+    avatarOverlayGuardedWindows.add(window);
+    avatarOverlayGuardedWindowsObserved += 1;
+    avatarOverlayActiveGuards += 1;
+    let cleaned = false;
+    let destroyRequested = false;
+    const restoreLoadUrlMethods = [];
+    const onNavigation = (event, url) => {
+      destroyForRoute(url, event);
+    };
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      avatarOverlayActiveGuards = Math.max(0, avatarOverlayActiveGuards - 1);
+      avatarOverlayGuardedWindows.delete(window);
+      try { webContents.removeListener?.("will-navigate", onNavigation); } catch {}
+      try { webContents.removeListener?.("did-start-navigation", onNavigation); } catch {}
+      try { webContents.removeListener?.("destroyed", cleanup); } catch {}
+      try { window.removeListener?.("closed", cleanup); } catch {}
+      for (const restore of restoreLoadUrlMethods.splice(0)) {
+        try { restore(); } catch {}
+      }
+    };
+    const destroyForRoute = (url, event) => {
+      if (!isAvatarOverlayRoute(url)) return false;
+      try { event?.preventDefault?.(); } catch {}
+      if (destroyRequested) return true;
+      destroyRequested = true;
+      avatarOverlayUrlMatches += 1;
+      avatarOverlayLastRoute = "/avatar-overlay";
+      cleanup();
+      try {
+        if (typeof window.destroy !== "function") {
+          throw new Error("avatar overlay BrowserWindow has no destroy method");
+        }
+        if (window.isDestroyed?.() !== true) window.destroy();
+        avatarOverlayDestroyedWindows += 1;
+      } catch (error) {
+        avatarOverlayDestroyErrors += 1;
+        recordCodeyPatchFailure("avatar_overlay_lifecycle_destroy", error, {
+          route: avatarOverlayLastRoute,
+        });
+      }
+      return true;
+    };
+    const installLoadUrlGuard = (target) => {
+      const originalLoadUrl = target?.loadURL;
+      if (typeof originalLoadUrl !== "function") return;
+      const guardedLoadUrl = function codeyAvatarOverlayGuardedLoadURL(url) {
+        if (destroyForRoute(url)) return Promise.resolve();
+        return Reflect.apply(originalLoadUrl, this, arguments);
+      };
+      try {
+        target.loadURL = guardedLoadUrl;
+        if (target.loadURL === guardedLoadUrl) {
+          restoreLoadUrlMethods.push(() => {
+            if (target.loadURL === guardedLoadUrl) target.loadURL = originalLoadUrl;
+          });
+        }
+      } catch (error) {
+        recordCodeyPatchFailure("avatar_overlay_lifecycle_install", error, {
+          method: "loadURL",
+        });
+      }
+    };
+
+    try { webContents.on?.("will-navigate", onNavigation); } catch {}
+    try { webContents.on?.("did-start-navigation", onNavigation); } catch {}
+    try { webContents.once?.("destroyed", cleanup); } catch {}
+    try { window.once?.("closed", cleanup); } catch {}
+    installLoadUrlGuard(window);
+    installLoadUrlGuard(webContents);
+    try { destroyForRoute(webContents.getURL?.()); } catch {}
+  };
   Module._load = function codeyStartupPatchLoader(request, parent, isMain) {
     if (disableMicro && request === "@worklouder/device-kit-oai") return microStub;
     if (
@@ -1474,6 +1620,7 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
       typeof request === "string" &&
       /(?:^|[/\\])avatar(?:-|_)overlay\.node$/i.test(request)
     ) {
+      avatarOverlayBlockedNativeLoads += 1;
       const error = new Error("Codex pet native module disabled by Codey");
       error.code = "CODEY_PET_DISABLED";
       throw error;
@@ -1503,6 +1650,7 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
           options.frame === false &&
           options.skipTaskbar === true;
         if (disablePet && (isPetSurface || isPetOverlay)) {
+          avatarOverlayBlockedWindowCreations += 1;
           const error = new Error("Codex pet window disabled by Codey");
           error.code = "CODEY_PET_DISABLED";
           throw error;
@@ -1514,7 +1662,9 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
           error.code = "CODEY_VOICE_DISABLED";
           throw error;
         }
-        return Reflect.construct(target, argumentsList, target);
+        const window = Reflect.construct(target, argumentsList, target);
+        guardAvatarOverlayLifecycle(window);
+        return window;
       },
       get(target, property) {
         if (property === "__codeyPetBlocked") return disablePet;
@@ -1557,6 +1707,42 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
     disableVoice,
     fastCodexStartup,
     statsigBootstrapTimeoutMs,
+    get petHardDisablePhase() {
+      return petHardDisableStatus.phase;
+    },
+    get petHardDisableMessage() {
+      return petHardDisableStatus.message;
+    },
+    get petManagerSourceRemoved() {
+      return (
+        petHardDisableStatus.phase === "removed" &&
+        globalThis.__CODEY_PET_MANAGER_SOURCE_REMOVED__ === true
+      );
+    },
+    get avatarOverlayBlockedWindowCreations() {
+      return avatarOverlayBlockedWindowCreations;
+    },
+    get avatarOverlayBlockedNativeLoads() {
+      return avatarOverlayBlockedNativeLoads;
+    },
+    get avatarOverlayGuardedWindowsObserved() {
+      return avatarOverlayGuardedWindowsObserved;
+    },
+    get avatarOverlayActiveGuards() {
+      return avatarOverlayActiveGuards;
+    },
+    get avatarOverlayUrlMatches() {
+      return avatarOverlayUrlMatches;
+    },
+    get avatarOverlayDestroyedWindows() {
+      return avatarOverlayDestroyedWindows;
+    },
+    get avatarOverlayDestroyErrors() {
+      return avatarOverlayDestroyErrors;
+    },
+    get avatarOverlayLastRoute() {
+      return avatarOverlayLastRoute;
+    },
     disableAppServerAnalytics: true,
     get disableDesktopCesAnalytics() {
       return !hasOptionalMainBundlePatchFailure("desktopCesAnalytics");
@@ -1583,9 +1769,11 @@ const STARTUP_PATCH_TEMPLATE: &str = r#"
     destroyTemporaryWebViews: true,
     disableWindowsWmiSampler,
   });
-  setImmediate(() => {
-    try { process.getBuiltinModule("inspector").close(); } catch {}
-  });
+  if (!disablePet) {
+    setImmediate(() => {
+      try { process.getBuiltinModule("inspector").close(); } catch {}
+    });
+  }
   return "codey-startup-patch-installed-v20";
 })()
 "#;
@@ -1639,12 +1827,19 @@ pub fn reserve_loopback_port() -> Result<u16> {
 pub async fn install(port: u16, options: PatchOptions) -> Result<()> {
     let websocket_url = wait_for_inspector(port).await?;
     let expression = patch_expression(options);
+    let verify_pet_hard_disable = options.disable_pet;
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        install_over_websocket(&websocket_url, &expression),
+        install_over_websocket(&websocket_url, &expression, verify_pet_hard_disable),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("Codex 启动补丁调试会话超时"))??;
+    .map_err(|_| {
+        if verify_pet_hard_disable {
+            anyhow::anyhow!("Codex 启动补丁已注入，但等待宠物 manager 硬禁用生效超时")
+        } else {
+            anyhow::anyhow!("Codex 启动补丁调试会话超时")
+        }
+    })??;
     Ok(())
 }
 
@@ -1688,7 +1883,11 @@ async fn wait_for_inspector(port: u16) -> Result<String> {
     anyhow::bail!("等待 Codex 启动补丁超时：{last_error}")
 }
 
-async fn install_over_websocket(websocket_url: &str, expression: &str) -> Result<()> {
+async fn install_over_websocket(
+    websocket_url: &str,
+    expression: &str,
+    verify_pet_hard_disable: bool,
+) -> Result<()> {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -1700,6 +1899,9 @@ async fn install_over_websocket(websocket_url: &str, expression: &str) -> Result
     let mut debugger_enabled = false;
     let mut continued = false;
     let mut evaluation_sent = false;
+    let mut next_command_id = 6_u64;
+    let mut pet_status_command_id = None;
+    let mut close_inspector_command_id = None;
 
     while let Some(message) = socket.next().await {
         let message = message?;
@@ -1708,6 +1910,7 @@ async fn install_over_websocket(websocket_url: &str, expression: &str) -> Result
             Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {
                 continue;
             }
+            Message::Close(_) if close_inspector_command_id.is_some() => return Ok(()),
             Message::Close(_) => anyhow::bail!("Codex 启动补丁调试连接提前关闭"),
         };
         let payload: serde_json::Value = serde_json::from_str(text.as_ref())?;
@@ -1742,6 +1945,96 @@ async fn install_over_websocket(websocket_url: &str, expression: &str) -> Result
             }
             Some(5) => {
                 ensure_protocol_success(&payload, "Debugger.resume")?;
+                if verify_pet_hard_disable {
+                    let command_id = next_command_id;
+                    next_command_id += 1;
+                    pet_status_command_id = Some(command_id);
+                    send_command(
+                        &mut socket,
+                        command_id,
+                        "Runtime.evaluate",
+                        serde_json::json!({
+                            "expression": PET_HARD_DISABLE_STATUS_EXPRESSION,
+                            "returnByValue": true,
+                            "silent": false,
+                        }),
+                    )
+                    .await?;
+                    continue;
+                }
+                let _ = socket.close(None).await;
+                return Ok(());
+            }
+            Some(command_id) if pet_status_command_id == Some(command_id) => {
+                ensure_protocol_success(&payload, "Runtime.evaluate pet hard-disable status")?;
+                if let Some(exception) = payload
+                    .get("result")
+                    .and_then(|result| result.get("exceptionDetails"))
+                {
+                    anyhow::bail!("读取 Codex 宠物硬禁用状态异常：{exception}");
+                }
+                let status = payload
+                    .pointer("/result/result/value")
+                    .and_then(serde_json::Value::as_object)
+                    .ok_or_else(|| anyhow::anyhow!("Codex 宠物硬禁用状态返回格式无效"))?;
+                let phase = status
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Codex 宠物硬禁用状态缺少 phase"))?;
+                match phase {
+                    "removed" => {
+                        pet_status_command_id = None;
+                        let command_id = next_command_id;
+                        close_inspector_command_id = Some(command_id);
+                        send_command(
+                            &mut socket,
+                            command_id,
+                            "Runtime.evaluate",
+                            serde_json::json!({
+                                "expression": CLOSE_INSPECTOR_EXPRESSION,
+                                "returnByValue": true,
+                                "silent": true,
+                            }),
+                        )
+                        .await?;
+                    }
+                    "error" => {
+                        let message = status
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("unknown Codex main bundle patch error");
+                        anyhow::bail!("Codex 宠物 manager 硬禁用失败：{message}");
+                    }
+                    "pending" => {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        let command_id = next_command_id;
+                        next_command_id += 1;
+                        pet_status_command_id = Some(command_id);
+                        send_command(
+                            &mut socket,
+                            command_id,
+                            "Runtime.evaluate",
+                            serde_json::json!({
+                                "expression": PET_HARD_DISABLE_STATUS_EXPRESSION,
+                                "returnByValue": true,
+                                "silent": false,
+                            }),
+                        )
+                        .await?;
+                    }
+                    other => {
+                        anyhow::bail!("Codex 宠物硬禁用状态不可识别：{other}");
+                    }
+                }
+            }
+            Some(command_id) if close_inspector_command_id == Some(command_id) => {
+                ensure_protocol_success(&payload, "Runtime.evaluate close inspector")?;
+                if let Some(exception) = payload
+                    .get("result")
+                    .and_then(|result| result.get("exceptionDetails"))
+                {
+                    anyhow::bail!("关闭 Codex 启动 Inspector 异常：{exception}");
+                }
                 let _ = socket.close(None).await;
                 return Ok(());
             }
@@ -1850,6 +2143,19 @@ mod tests {
         assert!(expression.contains("avatar(?:-|_)overlay"));
         assert!(expression.contains("__CODEY_DISABLED_PET_MANAGER__"));
         assert!(expression.contains("getVisibleNativePetWebContents"));
+        assert!(expression.contains("__CODEY_PET_HARD_DISABLE_STATUS__"));
+        assert!(expression.contains("petHardDisableStatus.phase = \"removed\""));
+        assert!(expression.contains("guardAvatarOverlayLifecycle"));
+        assert!(expression.contains("initialroute"));
+        assert!(expression.contains("avatarOverlayDestroyedWindows"));
+        assert!(expression.contains("if (!disablePet)"));
+        let compile_position = expression
+            .find("module._compile(source, filename);")
+            .expect("main bundle compile call");
+        let removal_confirmation_position = expression
+            .find("globalThis.__CODEY_PET_MANAGER_SOURCE_REMOVED__ = true;")
+            .expect("pet manager removal confirmation");
+        assert!(compile_position < removal_confirmation_position);
         assert!(expression.contains("disableAppServerAnalytics: true"));
         assert!(expression.contains("get disableDesktopCesAnalytics()"));
         assert!(expression.contains("analytics.enabled=false"));
@@ -2034,6 +2340,60 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+
+            for (expected_id, phase) in [(6_u64, "pending"), (7_u64, "removed")] {
+                let message = socket.next().await.unwrap().unwrap();
+                let Message::Text(text) = message else {
+                    panic!("expected pet hard-disable status query");
+                };
+                let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+                assert_eq!(command["id"], expected_id);
+                assert_eq!(command["method"], "Runtime.evaluate");
+                assert!(
+                    command["params"]["expression"]
+                        .as_str()
+                        .unwrap()
+                        .contains("__CODEY_PET_HARD_DISABLE_STATUS__")
+                );
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "id": expected_id,
+                            "result": {
+                                "result": {
+                                    "type": "object",
+                                    "value": { "phase": phase, "message": "" }
+                                }
+                            }
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            let message = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = message else {
+                panic!("expected inspector close command");
+            };
+            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+            assert_eq!(command["id"], 8);
+            assert_eq!(command["method"], "Runtime.evaluate");
+            assert!(
+                command["params"]["expression"]
+                    .as_str()
+                    .unwrap()
+                    .contains("inspector\").close")
+            );
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id": 8, "result": {"result": {"value": "ok"}}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
         });
 
         let expression = patch_expression(PatchOptions {
@@ -2041,7 +2401,7 @@ mod tests {
             disable_voice: false,
             fast_codex_startup: true,
         });
-        install_over_websocket(&format!("ws://{address}"), &expression)
+        install_over_websocket(&format!("ws://{address}"), &expression, true)
             .await
             .unwrap();
         server.await.unwrap();
@@ -2104,7 +2464,7 @@ mod tests {
         });
         let error = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            install_over_websocket(&format!("ws://{address}"), &expression),
+            install_over_websocket(&format!("ws://{address}"), &expression, true),
         )
         .await
         .expect("protocol error should not wait for the outer startup timeout")

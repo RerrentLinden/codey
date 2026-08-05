@@ -62,21 +62,32 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
   });
 });
 
-test("settings exposes the Windows optimization patch status only on Windows clients", async () => {
-  const [sectionsSource, typesSource, commandsSource] = await Promise.all([
+test("settings exposes degraded Windows and pet optimization failures", async () => {
+  const [sectionsSource, typesSource, commandsSource, launcherSource] = await Promise.all([
     readFile(new URL("../src/OperationsPanel.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/App.types.ts", import.meta.url), "utf8"),
     readFile(new URL("../backend/src/commands/runtime.rs", import.meta.url), "utf8"),
+    readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8"),
   ]);
 
   assert.match(commandsSource, /"clientPlatform": current_update_platform\(\)/);
+  assert.match(commandsSource, /injection_statuses_for_display/);
   assert.match(typesSource, /clientPlatform\?: string/);
   assert.match(sectionsSource, /status\.clientPlatform === "windows"/);
   assert.match(sectionsSource, /\{isWindowsClient && \(/);
   assert.match(sectionsSource, /Windows 优化补丁/);
   assert.match(sectionsSource, /maintenance\?\.performanceStatus === "ready"/);
+  assert.match(
+    sectionsSource,
+    /performanceStatus === "error" \|\|[\s\S]*?performanceStatus === "degraded"/,
+  );
   assert.match(sectionsSource, /windowsPatchReady[\s\S]*?"已启用"/);
   assert.match(sectionsSource, /windowsPatchFailed[\s\S]*?"未生效"/);
+  assert.match(sectionsSource, /script\.status === "failed"/);
+  assert.match(sectionsSource, /scriptFailed[\s\S]*?\? "失败"/);
+  assert.match(launcherSource, /fn mark_pet_slim_startup_failure/);
+  assert.match(launcherSource, /status\.id == "pet-control-shield"/);
+  assert.match(launcherSource, /pet_status\.status = "failed"/);
 });
 
 test("trace guard, stats, pet, and voice remain user-configurable", async () => {
