@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use codey_runtime_core::settings::RelayProtocol;
 use directories::BaseDirs;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
@@ -18,7 +18,6 @@ use crate::model_catalog;
 use crate::sqlite_util::table_columns;
 
 const APP_TYPE: &str = "codex";
-const OFFICIAL_PROVIDER_ID: &str = "codex-official";
 const LOCAL_OFFICIAL_PROVIDER_ID: &str = "local-official";
 const PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
 const PROXY_OFFICIAL_PROVIDER_ID: &str = "cc-switch-official";
@@ -54,23 +53,6 @@ pub struct CcSwitchStatus {
 pub struct RouteTakeoverState {
     pub managed: bool,
     pub live: bool,
-}
-
-#[derive(Debug, Clone)]
-struct ProviderRecord {
-    id: String,
-    name: String,
-    settings_config: String,
-    category: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ProviderConnection {
-    base_url: String,
-    api_key: String,
-    protocol: RelayProtocol,
-    official: bool,
-    supports_remote_compaction: bool,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -326,42 +308,8 @@ pub fn sync_current_provider(
     config: &CodeyConfig,
     codex_home: &Path,
 ) -> Result<(CodeyConfig, CcSwitchStatus)> {
-    sync_current_provider_from_paths(config, &default_db_path(), codex_home)
-}
-
-fn sync_current_provider_from_paths(
-    config: &CodeyConfig,
-    db_path: &Path,
-    codex_home: &Path,
-) -> Result<(CodeyConfig, CcSwitchStatus)> {
-    let (profile, provider, available, message) = if let Some(record) = db_path
-        .is_file()
-        .then(|| read_current_provider(db_path))
-        .transpose()?
-        .flatten()
-    {
-        let connection = provider_connection(&record)?;
-        let provider = CurrentProvider {
-            id: record.id.clone(),
-            name: record.name.clone(),
-            official: connection.official,
-            supports_remote_compaction: connection.supports_remote_compaction,
-            base_url: connection.base_url.clone(),
-            protocol: connection.protocol,
-            source: "cc-switch".to_string(),
-        };
-        let profile = profile_from_provider(&provider, connection.api_key, true);
-        (profile, provider, true, None)
-    } else {
-        let (provider, api_key) = local_provider(codex_home)?;
-        let profile = profile_from_provider(&provider, api_key, false);
-        let message = if db_path.is_file() {
-            "cc-switch 没有选中的 Codex 线路，已读取本地 Codex 直登配置"
-        } else {
-            "未检测到 cc-switch，已读取本地 Codex 直登配置"
-        };
-        (profile, provider, false, Some(message.to_string()))
-    };
+    let (provider, api_key) = local_provider(codex_home)?;
+    let profile = profile_from_provider(&provider, api_key);
 
     let previous_provider_id = config.current_provider_id().map(ToString::to_string);
     let mut next = config.clone();
@@ -373,10 +321,10 @@ fn sync_current_provider_from_paths(
     next = next.normalize();
     let changed = &next != config;
     let status = CcSwitchStatus {
-        available,
-        path: db_path.to_string_lossy().to_string(),
+        available: false,
+        path: codex_home.join("config.toml").to_string_lossy().to_string(),
         changed,
-        message,
+        message: Some("已直接读取本地 Codex 登录与 API 配置".to_string()),
         provider,
     };
     Ok((next, status))
@@ -462,21 +410,15 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
         .iter()
         .find(|profile| profile.id == config.active_profile_id)
         .or_else(|| config.profiles.first());
-    let available = profile
-        .and_then(|profile| profile.cc_switch_provider_id.as_ref())
-        .is_some();
     let provider = profile
         .map(|profile| CurrentProvider {
-            id: profile
-                .cc_switch_provider_id
-                .clone()
-                .unwrap_or_else(|| profile.id.clone()),
+            id: profile.id.clone(),
             name: profile.name.clone(),
             official: profile.cc_switch_read_only,
             supports_remote_compaction: profile.supports_remote_compaction,
             base_url: profile.base_url.clone(),
             protocol: profile.protocol,
-            source: if available { "cc-switch" } else { "local" }.to_string(),
+            source: "local".to_string(),
         })
         .unwrap_or_else(|| CurrentProvider {
             id: LOCAL_OFFICIAL_PROVIDER_ID.to_string(),
@@ -488,123 +430,28 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
             source: "local".to_string(),
         });
     CcSwitchStatus {
-        available,
-        path: default_db_path().to_string_lossy().to_string(),
+        available: false,
+        path: crate::codex_config::codex_home()
+            .join("config.toml")
+            .to_string_lossy()
+            .to_string(),
         changed: false,
-        message: (!available).then(|| "当前使用本地 Codex 直登配置".to_string()),
+        message: Some("当前使用本地 Codex 登录与 API 配置".to_string()),
         provider,
     }
 }
 
-fn profile_from_provider(
-    provider: &CurrentProvider,
-    api_key: String,
-    cc_switch_managed: bool,
-) -> ProviderProfile {
+fn profile_from_provider(provider: &CurrentProvider, api_key: String) -> ProviderProfile {
     ProviderProfile {
         id: provider.id.clone(),
         name: provider.name.clone(),
         base_url: provider.base_url.clone(),
         api_key,
         protocol: provider.protocol,
-        cc_switch_provider_id: cc_switch_managed.then(|| provider.id.clone()),
+        cc_switch_provider_id: None,
         cc_switch_read_only: provider.official,
         supports_remote_compaction: provider.supports_remote_compaction,
     }
-}
-
-fn read_current_provider(path: &Path) -> Result<Option<ProviderRecord>> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("打开 cc-switch 数据库失败：{}", path.display()))?;
-    connection.busy_timeout(Duration::from_secs(2))?;
-    connection
-        .query_row(
-            "SELECT id, name, settings_config, category
-             FROM providers
-             WHERE app_type=?1 AND is_current=1
-             ORDER BY CASE WHEN sort_index IS NULL THEN 1 ELSE 0 END, sort_index, created_at, name
-             LIMIT 1",
-            params![APP_TYPE],
-            |row| {
-                Ok(ProviderRecord {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    settings_config: row.get(2)?,
-                    category: row.get(3)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(Into::into)
-}
-
-fn provider_connection(record: &ProviderRecord) -> Result<ProviderConnection> {
-    let settings = serde_json::from_str::<Value>(&record.settings_config)
-        .context("解析 cc-switch 当前线路失败")?;
-    let config_text = settings
-        .get("config")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let document = DocumentMut::from_str(config_text).unwrap_or_default();
-    let provider_key = document
-        .get("model_provider")
-        .and_then(Item::as_str)
-        .unwrap_or_default();
-    let provider_table = document
-        .get("model_providers")
-        .and_then(Item::as_table_like)
-        .and_then(|providers| providers.get(provider_key))
-        .and_then(Item::as_table_like);
-    let base_url = provider_table
-        .and_then(|table| table.get("base_url"))
-        .and_then(Item::as_str)
-        .unwrap_or_default()
-        .trim()
-        .trim_end_matches('/')
-        .to_string();
-    let wire_api = provider_table
-        .and_then(|table| table.get("wire_api"))
-        .and_then(Item::as_str)
-        .unwrap_or("responses");
-    let provider_name = provider_table
-        .and_then(|table| table.get("name"))
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-    let auth = settings.get("auth").and_then(Value::as_object);
-    let auth_api_key = auth
-        .and_then(|auth| auth.get("OPENAI_API_KEY"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let config_api_key = provider_config_api_key(&document, provider_table);
-    // CC Switch keeps the canonical provider key in auth.OPENAI_API_KEY, but
-    // its "keep official login" compatibility mode may leave ChatGPT OAuth in
-    // auth.json and put the active third-party token in config.toml instead.
-    let api_key = auth_api_key
-        .map(ToString::to_string)
-        .or(config_api_key)
-        .unwrap_or_default();
-    let auth_mode = auth
-        .and_then(|auth| auth.get("auth_mode"))
-        .and_then(Value::as_str);
-    let official_auth_route =
-        auth_mode == Some("chatgpt") && is_official_base_url(&base_url) && api_key.is_empty();
-    let official = record.id == OFFICIAL_PROVIDER_ID
-        || record.category.as_deref() == Some("official")
-        || provider_key.is_empty()
-        || base_url.is_empty()
-        || official_auth_route;
-    if !(official || base_url.starts_with("http://") || base_url.starts_with("https://")) {
-        bail!("cc-switch 当前第三方线路缺少有效的 API 地址");
-    }
-    Ok(ProviderConnection {
-        base_url,
-        api_key: if official { String::new() } else { api_key },
-        protocol: protocol_from_wire_api(wire_api),
-        official,
-        supports_remote_compaction: official || provider_name == "OpenAI",
-    })
 }
 
 fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
@@ -660,8 +507,8 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let config_api_key = provider_config_api_key(&document, table);
-    // The provider-scoped token describes the active live route and must win
-    // over a long-lived auth.json login retained by CC Switch.
+    // The provider-scoped token describes the active route and must win over
+    // any long-lived auth.json login retained alongside it.
     let api_key = config_api_key
         .or_else(|| auth_api_key.map(ToString::to_string))
         .unwrap_or_default();
@@ -892,54 +739,72 @@ mod tests {
     }
 
     #[test]
-    fn imports_only_the_current_cc_switch_provider() {
+    fn codex_config_wins_when_cc_switch_database_has_a_current_provider() {
         let (_directory, path, home) = fixture();
-        insert_provider(&path, "route-a", "线路 A", "https://a.example/v1", false);
-        insert_provider(&path, "route-b", "线路 B", "https://b.example/v1", true);
+        insert_provider(
+            &path,
+            "cc-switch-route",
+            "CC Switch 线路",
+            "https://cc-switch.example/v1",
+            true,
+        );
+        fs::write(
+            home.join("config.toml"),
+            r#"
+model_provider = "codex-local"
 
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &path, &home).unwrap();
+[model_providers.codex-local]
+name = "Codex Local"
+base_url = "https://codex-local.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-codex-local"
+"#,
+        )
+        .unwrap();
 
-        assert!(status.available);
-        assert_eq!(status.provider.id, "route-b");
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
+
+        assert!(!status.available);
+        assert_eq!(status.provider.id, "codex-local");
+        assert_eq!(status.provider.source, "local");
+        assert_eq!(
+            status.path,
+            home.join("config.toml").to_string_lossy().to_string()
+        );
         assert_eq!(synced.profiles.len(), 1);
-        assert_eq!(synced.profiles[0].base_url, "https://b.example/v1");
-        assert_eq!(synced.profiles[0].api_key, "route-b-secret");
+        assert_eq!(
+            synced.profiles[0].base_url,
+            "https://codex-local.example/v1"
+        );
+        assert_eq!(synced.profiles[0].api_key, "sk-codex-local");
+        assert!(synced.profiles[0].cc_switch_provider_id.is_none());
     }
 
     #[test]
     fn official_tokens_are_never_copied_into_a_provider_profile() {
-        let (_directory, path, home) = fixture();
-        let settings = json!({
-            "auth": {"auth_mode": "chatgpt", "tokens": {"access_token": "secret"}},
-            "config": ""
-        });
-        Connection::open(&path)
-            .unwrap()
-            .execute(
-                "INSERT INTO providers
-                 (id, app_type, name, settings_config, category, sort_index, is_current)
-                 VALUES ('codex-official', 'codex', 'OpenAI Official', ?1, 'official', 0, 1)",
-                [settings.to_string()],
-            )
-            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#,
+        )
+        .unwrap();
 
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &path, &home).unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
         assert!(status.provider.official);
         assert!(synced.profiles[0].api_key.is_empty());
     }
 
     #[test]
-    fn preserved_chatgpt_login_does_not_replace_a_cc_switch_api_route() {
-        let (_directory, path, home) = fixture();
-        let settings = json!({
-            "auth": {
-                "auth_mode": "chatgpt",
-                "tokens": {"access_token": "free-account-token"}
-            },
-            "config": r#"
+    fn preserved_chatgpt_login_does_not_replace_the_codex_api_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"
 model_provider = "custom"
 
 [model_providers.custom]
@@ -948,22 +813,13 @@ base_url = "https://relay.example/v1"
 wire_api = "responses"
 requires_openai_auth = true
 experimental_bearer_token = "sk-relay"
-"#
-        });
-        Connection::open(&path)
-            .unwrap()
-            .execute(
-                "INSERT INTO providers
-                 (id, app_type, name, settings_config, sort_index, is_current)
-                 VALUES ('route-a', 'codex', '线路 A', ?1, 0, 1)",
-                [settings.to_string()],
-            )
-            .unwrap();
+"#,
+        )
+        .unwrap();
         let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"free-account-token"}}"#;
         fs::write(home.join("auth.json"), auth).unwrap();
 
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &path, &home).unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
         assert!(!status.provider.official);
         assert_eq!(status.provider.base_url, "https://relay.example/v1");
@@ -983,11 +839,13 @@ experimental_bearer_token = "sk-relay"
     }
 
     #[test]
-    fn remote_compaction_identity_survives_cc_switch_import_and_runtime_patch() {
-        let (_directory, path, home) = fixture();
-        let settings = json!({
-            "auth": {"OPENAI_API_KEY": "sk-relay"},
-            "config": r#"
+    fn remote_compaction_identity_survives_local_config_read_and_runtime_patch() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"
 model_provider = "custom"
 
 [model_providers.custom]
@@ -995,20 +853,12 @@ name = "OpenAI"
 base_url = "https://relay.example/v1"
 wire_api = "responses"
 requires_openai_auth = true
-"#
-        });
-        Connection::open(&path)
-            .unwrap()
-            .execute(
-                "INSERT INTO providers
-                 (id, app_type, name, settings_config, sort_index, is_current)
-                 VALUES ('remote-compact', 'codex', '远程压缩线路', ?1, 0, 1)",
-                [settings.to_string()],
-            )
-            .unwrap();
+experimental_bearer_token = "sk-relay"
+"#,
+        )
+        .unwrap();
 
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &path, &home).unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
         assert!(!status.provider.official);
         assert!(status.provider.supports_remote_compaction);
@@ -1034,7 +884,7 @@ requires_openai_auth = true
     }
 
     #[test]
-    fn falls_back_to_local_official_login_without_cc_switch() {
+    fn reads_local_official_login() {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
@@ -1044,12 +894,7 @@ requires_openai_auth = true
         )
         .unwrap();
 
-        let (synced, status) = sync_current_provider_from_paths(
-            &CodeyConfig::default(),
-            &directory.path().join("missing.db"),
-            &home,
-        )
-        .unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
         assert!(!status.available);
         assert!(status.provider.official);
@@ -1058,27 +903,17 @@ requires_openai_auth = true
     }
 
     #[test]
-    fn falls_back_to_local_login_when_cc_switch_has_no_current_codex_route() {
-        let (_directory, path, home) = fixture();
-        fs::write(
-            home.join("auth.json"),
-            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#,
-        )
-        .unwrap();
-
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &path, &home).unwrap();
+    fn saved_cc_switch_metadata_is_not_reported_as_the_config_source() {
+        let config = CodeyConfig {
+            active_profile_id: "route-a".into(),
+            profiles: vec![saved_route_profile("route-a")],
+            ..CodeyConfig::default()
+        };
+        let status = status_from_config(&config);
 
         assert!(!status.available);
-        assert!(status.provider.official);
         assert_eq!(status.provider.source, "local");
-        assert_eq!(synced.profiles[0].name, "OpenAI 官方直登");
-        assert!(
-            status
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("没有选中的 Codex 线路"))
-        );
+        assert_eq!(status.provider.id, "route-a");
     }
 
     #[test]
@@ -1103,12 +938,7 @@ experimental_bearer_token = "sk-provider"
         let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"free-account-token"}}"#;
         fs::write(home.join("auth.json"), auth).unwrap();
 
-        let (synced, status) = sync_current_provider_from_paths(
-            &CodeyConfig::default(),
-            &directory.path().join("missing.db"),
-            &home,
-        )
-        .unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
         assert!(!status.available);
         assert!(!status.provider.official);
@@ -1128,7 +958,7 @@ experimental_bearer_token = "sk-provider"
     }
 
     #[test]
-    fn manual_api_route_reads_auth_json_api_key_without_cc_switch() {
+    fn manual_api_route_reads_auth_json_api_key() {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
@@ -1148,12 +978,7 @@ requires_openai_auth = true
         let auth = br#"{"OPENAI_API_KEY":"sk-manual"}"#;
         fs::write(home.join("auth.json"), auth).unwrap();
 
-        let (synced, status) = sync_current_provider_from_paths(
-            &CodeyConfig::default(),
-            &directory.path().join("missing.db"),
-            &home,
-        )
-        .unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
         assert!(!status.available);
         assert!(!status.provider.official);
@@ -1175,27 +1000,31 @@ requires_openai_auth = true
 
     #[test]
     fn model_selections_survive_provider_synchronization() {
-        let (_directory, path, home) = fixture();
-        insert_provider(&path, "route-a", "线路 A", "https://a.example/v1", true);
+        let (_directory, _path, home) = fixture();
+        write_live_route(
+            &home,
+            "route-a",
+            "https://route-a.example/v1",
+            "route-a-secret",
+        );
         let mut config = CodeyConfig::default();
         config
             .selected_models_by_provider
             .insert("route-a".into(), vec!["custom-model".into()]);
 
-        let (synced, _) = sync_current_provider_from_paths(&config, &path, &home).unwrap();
+        let (synced, _) = sync_current_provider(&config, &home).unwrap();
 
         assert_eq!(synced.selected_models(), &["custom-model"]);
     }
 
     #[test]
     fn provider_switch_resets_subagent_defaults_when_default_model_is_supported() {
-        let (_directory, path, home) = fixture();
-        insert_provider(
-            &path,
+        let (_directory, _path, home) = fixture();
+        write_live_route(
+            &home,
             "route-b",
-            "线路 B",
             "https://route-b.example/v1",
-            true,
+            "route-b-secret",
         );
         let mut config = CodeyConfig {
             active_profile_id: "route-a".into(),
@@ -1208,7 +1037,7 @@ requires_openai_auth = true
             .upstream_models_by_provider
             .insert("route-b".into(), vec![DEFAULT_SUBAGENT_MODEL.into()]);
 
-        let (synced, status) = sync_current_provider_from_paths(&config, &path, &home).unwrap();
+        let (synced, status) = sync_current_provider(&config, &home).unwrap();
 
         assert_eq!(status.provider.id, "route-b");
         assert_eq!(synced.subagent_model, DEFAULT_SUBAGENT_MODEL);
@@ -1220,13 +1049,12 @@ requires_openai_auth = true
 
     #[test]
     fn provider_switch_uses_available_subagent_model_when_default_is_unsupported() {
-        let (_directory, path, home) = fixture();
-        insert_provider(
-            &path,
+        let (_directory, _path, home) = fixture();
+        write_live_route(
+            &home,
             "route-b",
-            "线路 B",
             "https://route-b.example/v1",
-            true,
+            "route-b-secret",
         );
         let mut config = CodeyConfig {
             active_profile_id: "route-a".into(),
@@ -1239,7 +1067,7 @@ requires_openai_auth = true
             .upstream_models_by_provider
             .insert("route-b".into(), vec!["gpt-5.6-sol".into()]);
 
-        let (synced, status) = sync_current_provider_from_paths(&config, &path, &home).unwrap();
+        let (synced, status) = sync_current_provider(&config, &home).unwrap();
 
         assert_eq!(status.provider.id, "route-b");
         assert_eq!(synced.subagent_model, "gpt-5.6-sol");
@@ -1251,13 +1079,12 @@ requires_openai_auth = true
 
     #[test]
     fn provider_sync_preserves_subagent_defaults_when_provider_is_unchanged() {
-        let (_directory, path, home) = fixture();
-        insert_provider(
-            &path,
+        let (_directory, _path, home) = fixture();
+        write_live_route(
+            &home,
             "route-a",
-            "线路 route-a",
             "https://route-a.example/v1",
-            true,
+            "route-a-secret",
         );
         let config = CodeyConfig {
             active_profile_id: "route-a".into(),
@@ -1267,7 +1094,7 @@ requires_openai_auth = true
             ..CodeyConfig::default()
         };
 
-        let (synced, status) = sync_current_provider_from_paths(&config, &path, &home).unwrap();
+        let (synced, status) = sync_current_provider(&config, &home).unwrap();
 
         assert_eq!(status.provider.id, "route-a");
         assert_eq!(synced.subagent_model, "provider-custom-model");

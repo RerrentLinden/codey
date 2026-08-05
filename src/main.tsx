@@ -93,8 +93,8 @@ if (import.meta.env.DEV) {
       showAccountUsageInHeader: true,
     };
     const previewCcSwitch = {
-      available: true,
-      path: "~/.cc-switch/cc-switch.db",
+      available: false,
+      path: "~/.codex/config.toml",
       changed: false,
       provider: {
         id: "primary",
@@ -102,7 +102,7 @@ if (import.meta.env.DEV) {
         official: false,
         baseUrl: previewEndpoints.primary,
         protocol: "responses" as const,
-        source: "cc-switch" as const,
+        source: "local" as const,
       },
     };
     let previewModelState = {

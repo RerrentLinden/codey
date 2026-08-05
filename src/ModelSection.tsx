@@ -30,7 +30,6 @@ type ModelSectionProps = {
 };
 
 function ModelSectionComponent({
-  ccSwitchStatus,
   provider,
   modelState,
   dirty,
@@ -50,11 +49,7 @@ function ModelSectionComponent({
       <div className="section-title">
         <div>
           <h2 id="route-title">线路与模型</h2>
-          <p>
-            {ccSwitchStatus.available
-              ? "cc-switch 当前配置"
-              : "本地 Codex 直登配置"}
-          </p>
+          <p>Codex 当前配置</p>
         </div>
         <div className="route-heading-actions">
           {provider.official && (
@@ -80,7 +75,7 @@ function ModelSectionComponent({
               className={busy === "sync-provider" ? "spinner" : ""}
               aria-hidden="true"
             />
-            同步当前线路
+            重新读取 Codex 配置
           </Button>
         </div>
       </div>
@@ -308,11 +303,7 @@ function ModelSectionComponent({
 
         <div className="readonly-note">
           <Server size={14} />
-          <span>
-            {ccSwitchStatus.available
-              ? "线路配置由 cc-switch 管理，Codey 仅在启动时读取当前线路"
-              : "未安装 cc-switch，Codey 读取本地 Codex 登录与 API 配置"}
-          </span>
+          <span>Codey 直接读取本地 Codex 登录与 API 配置</span>
           <Badge variant="secondary">只读</Badge>
         </div>
       </Card>
