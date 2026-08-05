@@ -56,6 +56,7 @@ import { Badge, Button, Button as SaveButton } from "./components/semi";
 
 const Check = IconCheck;
 const X = IconX;
+const SETTINGS_OVERLAY_Z_INDEX = 2147483647;
 const NOTICE_AUTO_DISMISS_MS = 5_000;
 
 function CodeyBrandMark() {
@@ -115,7 +116,7 @@ function SettingsModalShell({
       onCancel={onCancel}
       visible={visible}
       width={1040}
-      zIndex={2147483646}
+      zIndex={SETTINGS_OVERLAY_Z_INDEX}
     >
       {children}
     </SemiModal>

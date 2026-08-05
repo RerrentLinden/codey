@@ -1,6 +1,9 @@
 :host {
   all: initial;
   color-scheme: light;
+  inset: 0 !important;
+  position: fixed !important;
+  z-index: 2147483647 !important;
 }
 
 #codey-overlay-root,

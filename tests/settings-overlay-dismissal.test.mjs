@@ -5,9 +5,10 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 
 test("settings Semi modal dismissal restores unsaved config", async () => {
-  const [appSource, overlaySource] = await Promise.all([
+  const [appSource, overlaySource, overlayStyles] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/overlay.tsx", root), "utf8"),
+    readFile(new URL("src/overlay.css", root), "utf8"),
   ]);
 
   assert.match(
@@ -47,6 +48,21 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
   assert.match(overlaySource, /onClose=\{close\}/);
   assert.match(overlaySource, /SETTINGS_OPENED_EVENT \} from "\.\/useRuntimeStatus"/);
   assert.match(overlaySource, /toggle: open/);
+  assert.match(appSource, /const SETTINGS_OVERLAY_Z_INDEX = 2147483647/);
+  assert.match(appSource, /zIndex=\{SETTINGS_OVERLAY_Z_INDEX\}/);
+  assert.match(overlaySource, /const SETTINGS_OVERLAY_Z_INDEX = "2147483647"/);
+  assert.match(
+    overlaySource,
+    /host\.style\.setProperty\("z-index", SETTINGS_OVERLAY_Z_INDEX, "important"\)/,
+  );
+  assert.match(
+    overlaySource,
+    /document\.documentElement\.appendChild\(host\);[\s\S]*host\.style\.display = "block"/,
+  );
+  assert.match(
+    overlayStyles,
+    /:host \{[\s\S]*z-index:\s*2147483647 !important;/,
+  );
 });
 
 test("settings notice toast is scoped to the settings page", async () => {

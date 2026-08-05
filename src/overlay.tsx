@@ -6,6 +6,8 @@ import overlayStyles from "./overlay.css?inline";
 import { codeyApiPath } from "./api";
 import { SETTINGS_OPENED_EVENT } from "./useRuntimeStatus";
 
+const SETTINGS_OVERLAY_Z_INDEX = "2147483647";
+
 type OverlayController = {
   open: () => void;
   close: () => void;
@@ -37,6 +39,9 @@ if (!window.__codeySettingsOverlay) {
   const host = document.createElement("div");
   host.id = "codey-settings-overlay-host";
   host.style.display = "none";
+  host.style.setProperty("inset", "0", "important");
+  host.style.setProperty("position", "fixed", "important");
+  host.style.setProperty("z-index", SETTINGS_OVERLAY_Z_INDEX, "important");
   host.setAttribute("aria-hidden", "true");
   const shadow = host.attachShadow({ mode: "open" });
   const style = document.createElement("style");
@@ -75,6 +80,7 @@ if (!window.__codeySettingsOverlay) {
   const open = () => {
     window.clearTimeout(hideTimer);
     hideTimer = undefined;
+    document.documentElement.appendChild(host);
     host.style.display = "block";
     host.setAttribute("aria-hidden", "false");
     render(true);
