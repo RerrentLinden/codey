@@ -19,6 +19,8 @@ const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(15);
 const FAST_STARTUP_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/fast-startup-shield.js");
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
+const GIT_REQUEST_GUARD_SCRIPT: &str =
+    include_str!("../../dist-overlay/inject/git-request-guard.js");
 const MODEL_WHITELIST_INJECT_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/model-whitelist-inject.js");
 const RENDERER_INJECT_SCRIPT: &str = include_str!("../../dist-overlay/inject/renderer-inject.js");
@@ -159,6 +161,23 @@ pub fn prepare_injection_scripts(
                 .to_string(),
         ),
         (
+            "git-request-guard",
+            "Windows Git 请求保护",
+            GIT_REQUEST_GUARD_SCRIPT,
+            r#"(() => {
+              const guard = window.__codeyGitRequestGuard;
+              if (!guard || typeof guard.snapshot !== "function") return "";
+              const snapshot = guard.snapshot();
+              if (snapshot.enabled === false && snapshot.installed === true) {
+                return "Git 请求保护已就绪，当前平台无需启用";
+              }
+              return snapshot.enabled === true && snapshot.bridgePatched === true
+                ? `Windows Git 请求限流已接管（持续速率 ${Math.round(60000 / snapshot.tokenRefillMs)} 次/分钟）`
+                : "";
+            })()"#
+                .to_string(),
+        ),
+        (
             "model-whitelist",
             "模型白名单",
             MODEL_WHITELIST_INJECT_SCRIPT,
@@ -261,6 +280,7 @@ pub fn prepare_injection_scripts(
     let mut core_bundle = String::with_capacity(
         FAST_STARTUP_SHIELD_SCRIPT.len()
             + CODEY_BRIDGE_SCRIPT.len()
+            + GIT_REQUEST_GUARD_SCRIPT.len()
             + MODEL_WHITELIST_INJECT_SCRIPT.len()
             + RENDERER_INJECT_SCRIPT.len()
             + PET_CONTROL_SHIELD_SCRIPT.len()
@@ -1190,6 +1210,7 @@ mod tests {
         assert!(core.contains("window.__codeyFastStartupShield"));
         assert!(core.contains(r#"const enabled = "true" === "true""#));
         assert!(core.contains("window.__codeyBridgeHelpersInstalled"));
+        assert!(core.contains("__codeyGitRequestGuard"));
         assert!(core.contains("window.__codeyModelWhitelistPatch"));
         assert!(core.contains("/codex-model-catalog"));
         assert!(core.contains("window.__codeyRendererCoreLoaded"));
@@ -1206,11 +1227,12 @@ mod tests {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 10);
-        assert_eq!(prepared.descriptors[9].id, "user-script-1");
-        assert_eq!(prepared.descriptors[9].source, "user");
+        assert_eq!(prepared.descriptors.len(), 11);
+        assert_eq!(prepared.descriptors[10].id, "user-script-1");
+        assert_eq!(prepared.descriptors[10].source, "user");
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
+        assert!(snapshot_script.contains("Windows Git 请求限流已接管"));
         assert!(snapshot_script.contains("模型目录已加载"));
         assert!(snapshot_script.contains("插件市场桥接已接管"));
         assert!(snapshot_script.contains("for (const delay of [50, 200])"));
@@ -1263,8 +1285,10 @@ mod tests {
         assert_eq!(statuses[1].id, "bridge-helpers");
         assert_eq!(statuses[1].status, "effective");
         assert_eq!(statuses[1].detail.as_deref(), Some("桥接函数可调用"));
-        assert_eq!(statuses[2].id, "model-whitelist");
+        assert_eq!(statuses[2].id, "git-request-guard");
         assert_eq!(statuses[2].status, "unknown");
+        assert_eq!(statuses[3].id, "model-whitelist");
+        assert_eq!(statuses[3].status, "unknown");
         assert_eq!(
             statuses.last().map(|status| status.id.as_str()),
             Some("user-script-1")

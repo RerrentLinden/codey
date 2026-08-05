@@ -1,0 +1,506 @@
+(() => {
+  "use strict";
+
+  const guardKey = "__codeyGitRequestGuard";
+  const scriptId = "git-request-guard";
+  const version = 1;
+  const targetMethods = new Set([
+    "git-origins",
+    "status-summary",
+    "review-summary",
+    "branch-diff-stats",
+  ]);
+  const tokenCapacity = 3;
+  const tokenRefillMs = 1_000;
+  const perKeyIntervalMs = 2_000;
+  const maximumQueueSize = 48;
+  const maximumPerKeyQueueSize = 6;
+  const maximumQueueWaitMs = 15_000;
+  const maximumFailureBackoffMs = 15_000;
+
+  const existing = window[guardKey];
+  if (existing && typeof existing.ensureInstalled === "function") {
+    existing.ensureInstalled();
+    return;
+  }
+
+  const platformText = [
+    window.navigator?.userAgentData?.platform,
+    window.navigator?.platform,
+    window.navigator?.userAgent,
+  ]
+    .filter((value) => typeof value === "string")
+    .join(" ");
+  const enabled = /\bwin(?:32|64|dows)?\b/i.test(platformText);
+  const queue = [];
+  const queuedByRequestId = new Map();
+  const sentKeyByRequestId = new Map();
+  const lastSentAtByKey = new Map();
+  const failureCountByKey = new Map();
+  const cooldownUntilByKey = new Map();
+  const counters = {
+    matched: 0,
+    sent: 0,
+    queued: 0,
+    cancelledBeforeSend: 0,
+    rejected: 0,
+    transportFailures: 0,
+    observedFailures: 0,
+  };
+
+  let availableTokens = tokenCapacity;
+  let tokenUpdatedAt = Date.now();
+  let drainTimer = 0;
+  let drainTimerAt = Number.POSITIVE_INFINITY;
+  let bridgePatched = false;
+  let responseObserverPatched = false;
+  let observedGitSubscriptions = 0;
+  let lastMethod = "";
+  let bridgeRetryTimer = 0;
+  let bridgeRetryDelay = 50;
+  let bridgeRetryDeadline = Date.now() + 30_000;
+
+  const now = () => {
+    const value = Number(Date.now());
+    return Number.isFinite(value) ? value : 0;
+  };
+
+  const hashText = (value) => {
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < value.length; index += 1) {
+      hash ^= value.charCodeAt(index);
+      hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(16).padStart(8, "0");
+  };
+
+  const stringPart = (value) =>
+    typeof value === "string" ? value.slice(0, 2_048) : "";
+
+  const requestInfo = (workerId, message) => {
+    if (
+      workerId !== "git" ||
+      !message ||
+      typeof message !== "object" ||
+      message.type !== "worker-request" ||
+      message.workerId !== "git"
+    ) {
+      return null;
+    }
+    const request = message.request;
+    if (!request || typeof request !== "object" || typeof request.method !== "string") {
+      return null;
+    }
+
+    const workerMethod = request.method;
+    const outerParams =
+      request.params && typeof request.params === "object" ? request.params : {};
+    const query =
+      workerMethod === "subscribe-live-query" &&
+      outerParams.query &&
+      typeof outerParams.query === "object"
+        ? outerParams.query
+        : null;
+    const method = query && typeof query.method === "string" ? query.method : workerMethod;
+    if (!targetMethods.has(method)) return null;
+
+    const params =
+      query?.params && typeof query.params === "object" ? query.params : outerParams;
+    const operationSource = stringPart(
+      params.operationSource ?? outerParams.operationSource,
+    );
+    const repositoryScope =
+      method === "git-origins"
+        ? "all-origins"
+        : stringPart(
+            params.cwd ??
+              params.root ??
+              params.commonDir ??
+              outerParams.cwd ??
+              outerParams.root ??
+              outerParams.commonDir,
+          );
+    const keyMaterial = [
+      workerMethod,
+      method,
+      operationSource,
+      repositoryScope,
+      stringPart(params.baseBranch),
+      params.includeUntrackedFiles === true ? "untracked" : "",
+      params.hideWhitespace === true ? "hide-whitespace" : "",
+    ].join("\0");
+
+    return {
+      id: request.id,
+      key: `${method}:${hashText(keyMaterial)}`,
+      method,
+    };
+  };
+
+  const refillTokens = (at) => {
+    if (at < tokenUpdatedAt) {
+      availableTokens = tokenCapacity;
+      tokenUpdatedAt = at;
+      return;
+    }
+    const elapsed = at - tokenUpdatedAt;
+    if (elapsed <= 0) return;
+    availableTokens = Math.min(
+      tokenCapacity,
+      availableTokens + elapsed / tokenRefillMs,
+    );
+    tokenUpdatedAt = at;
+  };
+
+  const nextEligibleAt = (info, at) => {
+    refillTokens(at);
+    const tokenReadyAt =
+      availableTokens >= 1
+        ? at
+        : at + Math.ceil((1 - availableTokens) * tokenRefillMs);
+    const keyReadyAt = Math.max(
+      at,
+      (lastSentAtByKey.get(info.key) ?? Number.NEGATIVE_INFINITY) +
+        perKeyIntervalMs,
+    );
+    const cooldownReadyAt = Math.max(at, cooldownUntilByKey.get(info.key) ?? 0);
+    return Math.max(tokenReadyAt, keyReadyAt, cooldownReadyAt);
+  };
+
+  const markEffective = () => {
+    const entry = window.__codeyInjectionStatus?.[scriptId];
+    if (!entry) return;
+    const changed =
+      entry.status !== "effective" ||
+      entry.detail !==
+        (enabled
+          ? "Windows Git 请求限流已接管"
+          : "Git 请求保护已就绪，当前平台无需启用");
+    entry.status = "effective";
+    entry.detail = enabled
+      ? "Windows Git 请求限流已接管"
+      : "Git 请求保护已就绪，当前平台无需启用";
+    entry.error = null;
+    if (changed && typeof window.dispatchEvent === "function") {
+      window.dispatchEvent(
+        new CustomEvent("codey-injection-status-changed", {
+          detail: { id: scriptId, status: "effective" },
+        }),
+      );
+    }
+  };
+
+  const makeGuardError = (reason, info) => {
+    const error = new Error(`Codey Git request guard: ${reason}`);
+    error.name = "CodeyGitRequestGuardError";
+    error.code = "CODEY_GIT_REQUEST_THROTTLED";
+    error.method = info?.method ?? "";
+    return error;
+  };
+
+  const recordFailure = (info, at, observed) => {
+    const failureCount = Math.min((failureCountByKey.get(info.key) ?? 0) + 1, 5);
+    failureCountByKey.set(info.key, failureCount);
+    const backoff = Math.min(
+      1_000 * 2 ** (failureCount - 1),
+      maximumFailureBackoffMs,
+    );
+    cooldownUntilByKey.set(info.key, at + backoff);
+    if (observed) counters.observedFailures += 1;
+    else counters.transportFailures += 1;
+  };
+
+  const responseFailed = (message) => {
+    const result = message?.response?.result;
+    const value = result?.value;
+    return (
+      result?.type === "error" ||
+      value?.type === "error" ||
+      value?.status === "error" ||
+      value?.status === "command-error" ||
+      value?.success === false
+    );
+  };
+
+  const observeWorkerMessage = (workerId, message) => {
+    if (workerId !== "git" || message?.type !== "worker-response") return;
+    const requestId = message?.response?.id;
+    const info = sentKeyByRequestId.get(requestId);
+    if (!info) return;
+    sentKeyByRequestId.delete(requestId);
+    if (responseFailed(message)) {
+      recordFailure(info, now(), true);
+    } else {
+      failureCountByKey.delete(info.key);
+      cooldownUntilByKey.delete(info.key);
+    }
+    scheduleDrain();
+  };
+
+  const removeQueuedEntry = (entry) => {
+    const index = queue.indexOf(entry);
+    if (index >= 0) queue.splice(index, 1);
+    if (entry.info.id !== undefined) queuedByRequestId.delete(entry.info.id);
+  };
+
+  const rejectEntry = (entry, reason) => {
+    removeQueuedEntry(entry);
+    counters.rejected += 1;
+    entry.reject(makeGuardError(reason, entry.info));
+  };
+
+  const dispatch = (entry, at) => {
+    refillTokens(at);
+    availableTokens = Math.max(0, availableTokens - 1);
+    lastSentAtByKey.set(entry.info.key, at);
+    if (observedGitSubscriptions > 0 && entry.info.id !== undefined) {
+      sentKeyByRequestId.set(entry.info.id, entry.info);
+    }
+    lastMethod = entry.info.method;
+    counters.sent += 1;
+
+    let result;
+    try {
+      result = Reflect.apply(entry.original, entry.thisValue, entry.args);
+    } catch (error) {
+      recordFailure(entry.info, at, false);
+      entry.reject(error);
+      scheduleDrain();
+      return;
+    }
+    Promise.resolve(result).then(
+      (value) => {
+        entry.resolve(value);
+        scheduleDrain();
+      },
+      (error) => {
+        recordFailure(entry.info, now(), false);
+        entry.reject(error);
+        scheduleDrain();
+      },
+    );
+  };
+
+  const scheduleDrain = () => {
+    if (!enabled || queue.length === 0 || typeof window.setTimeout !== "function") {
+      return;
+    }
+    const at = now();
+    let earliest = Number.POSITIVE_INFINITY;
+    for (const entry of queue) {
+      earliest = Math.min(
+        earliest,
+        nextEligibleAt(entry.info, at),
+        entry.enqueuedAt + maximumQueueWaitMs,
+      );
+    }
+    if (!Number.isFinite(earliest)) return;
+    if (drainTimer && drainTimerAt <= earliest) return;
+    if (drainTimer) window.clearTimeout(drainTimer);
+    drainTimerAt = earliest;
+    drainTimer = window.setTimeout(drain, Math.max(0, earliest - at));
+  };
+
+  const drain = () => {
+    drainTimer = 0;
+    drainTimerAt = Number.POSITIVE_INFINITY;
+    let at = now();
+
+    for (const entry of [...queue]) {
+      if (at - entry.enqueuedAt >= maximumQueueWaitMs) {
+        rejectEntry(entry, "queue timeout");
+      }
+    }
+
+    while (queue.length > 0) {
+      at = now();
+      let selected = null;
+      for (const entry of queue) {
+        if (nextEligibleAt(entry.info, at) <= at) {
+          selected = entry;
+          break;
+        }
+      }
+      if (!selected) break;
+      removeQueuedEntry(selected);
+      dispatch(selected, at);
+    }
+    scheduleDrain();
+  };
+
+  const enqueue = (original, thisValue, args, info) => {
+    const sameKeyQueued = queue.reduce(
+      (count, entry) => count + (entry.info.key === info.key ? 1 : 0),
+      0,
+    );
+    if (
+      queue.length >= maximumQueueSize ||
+      sameKeyQueued >= maximumPerKeyQueueSize
+    ) {
+      counters.rejected += 1;
+      return Promise.reject(makeGuardError("queue capacity exceeded", info));
+    }
+    counters.queued += 1;
+    return new Promise((resolve, reject) => {
+      const entry = {
+        original,
+        thisValue,
+        args,
+        info,
+        enqueuedAt: now(),
+        resolve,
+        reject,
+      };
+      queue.push(entry);
+      if (info.id !== undefined) queuedByRequestId.set(info.id, entry);
+      scheduleDrain();
+    });
+  };
+
+  const sendGuarded = (original, thisValue, args, info) => {
+    counters.matched += 1;
+    const at = now();
+    if (queue.length === 0 && nextEligibleAt(info, at) <= at) {
+      return new Promise((resolve, reject) => {
+        dispatch({ original, thisValue, args, info, resolve, reject }, at);
+      });
+    }
+    return enqueue(original, thisValue, args, info);
+  };
+
+  const patchSendWorkerMessage = (bridge) => {
+    const current = bridge?.sendWorkerMessageFromView;
+    if (typeof current !== "function") return false;
+    if (current.__codeyGitRequestGuardOwner === api) return true;
+
+    const original = current;
+    const wrapped = function (...args) {
+      const [workerId, message] = args;
+      if (
+        enabled &&
+        workerId === "git" &&
+        message?.type === "worker-request-cancel"
+      ) {
+        const queued = queuedByRequestId.get(message.id);
+        if (queued) {
+          removeQueuedEntry(queued);
+          counters.cancelledBeforeSend += 1;
+          queued.resolve(undefined);
+          scheduleDrain();
+          return Promise.resolve(undefined);
+        }
+        sentKeyByRequestId.delete(message.id);
+      }
+
+      const info = enabled ? requestInfo(workerId, message) : null;
+      if (!info) return Reflect.apply(original, this, args);
+      return sendGuarded(original, this, args, info);
+    };
+    Object.defineProperties(wrapped, {
+      __codeyGitRequestGuardOwner: { value: api },
+      __codeyGitRequestGuardOriginal: { value: original },
+    });
+    try {
+      bridge.sendWorkerMessageFromView = wrapped;
+    } catch {
+      return false;
+    }
+    return bridge.sendWorkerMessageFromView === wrapped;
+  };
+
+  const patchWorkerMessageSubscription = (bridge) => {
+    const current = bridge?.subscribeToWorkerMessages;
+    if (typeof current !== "function") return false;
+    if (current.__codeyGitRequestGuardOwner === api) return true;
+
+    const original = current;
+    const wrapped = function (workerId, listener, ...rest) {
+      if (workerId !== "git" || typeof listener !== "function") {
+        return Reflect.apply(original, this, [workerId, listener, ...rest]);
+      }
+      observedGitSubscriptions += 1;
+      const observed = function (...listenerArgs) {
+        try {
+          observeWorkerMessage(workerId, listenerArgs[0]);
+        } catch {}
+        return Reflect.apply(listener, this, listenerArgs);
+      };
+      return Reflect.apply(original, this, [workerId, observed, ...rest]);
+    };
+    Object.defineProperties(wrapped, {
+      __codeyGitRequestGuardOwner: { value: api },
+      __codeyGitRequestGuardOriginal: { value: original },
+    });
+    try {
+      bridge.subscribeToWorkerMessages = wrapped;
+    } catch {
+      return false;
+    }
+    return bridge.subscribeToWorkerMessages === wrapped;
+  };
+
+  const ensureInstalled = () => {
+    if (!enabled) {
+      bridgePatched = false;
+      responseObserverPatched = false;
+      markEffective();
+      return true;
+    }
+    const bridge = window.electronBridge;
+    bridgePatched = patchSendWorkerMessage(bridge);
+    responseObserverPatched = patchWorkerMessageSubscription(bridge);
+    if (bridgePatched) {
+      if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
+      bridgeRetryTimer = 0;
+      markEffective();
+      return true;
+    }
+    return false;
+  };
+
+  const snapshot = () => ({
+    version,
+    enabled,
+    installed: enabled ? bridgePatched : true,
+    bridgePatched,
+    responseObserverPatched,
+    observedGitSubscriptions,
+    queued: queue.length,
+    matched: counters.matched,
+    sent: counters.sent,
+    queuedTotal: counters.queued,
+    cancelledBeforeSend: counters.cancelledBeforeSend,
+    rejected: counters.rejected,
+    transportFailures: counters.transportFailures,
+    observedFailures: counters.observedFailures,
+    lastMethod,
+    targetMethods: [...targetMethods],
+    tokenCapacity,
+    tokenRefillMs,
+    perKeyIntervalMs,
+  });
+
+  const api = Object.freeze({
+    version,
+    enabled,
+    ensureInstalled,
+    snapshot,
+  });
+  Object.defineProperty(window, guardKey, {
+    configurable: false,
+    value: api,
+    writable: false,
+  });
+
+  const retryInstall = () => {
+    bridgeRetryTimer = 0;
+    if (ensureInstalled()) return;
+    const fastRetry = now() < bridgeRetryDeadline;
+    bridgeRetryDelay = fastRetry ? Math.min(bridgeRetryDelay * 2, 2_000) : 30_000;
+    bridgeRetryTimer = window.setTimeout(retryInstall, bridgeRetryDelay);
+  };
+
+  if (!ensureInstalled() && typeof window.setTimeout === "function") {
+    bridgeRetryTimer = window.setTimeout(retryInstall, bridgeRetryDelay);
+  }
+})();
