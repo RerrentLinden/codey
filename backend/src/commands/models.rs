@@ -10,7 +10,7 @@ use super::{
 use crate::cc_switch;
 use crate::cdp;
 use crate::codex_config::codex_home;
-use crate::config::CodeyConfig;
+use crate::config::{CodeyConfig, ProviderProfile};
 use crate::error_log;
 use crate::model_catalog;
 use crate::provider_models;
@@ -228,6 +228,19 @@ pub(super) fn preserve_selected_third_party_models_except(
     }
 }
 
+async fn fetch_provider_models(
+    profile: ProviderProfile,
+    http_client: &reqwest::Client,
+) -> anyhow::Result<Vec<String>> {
+    let home = codex_home();
+    let fetch_profile = tokio::task::spawn_blocking(move || {
+        cc_switch::provider_model_fetch_profile(&profile, &home)
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("解析模型源 API 配置任务异常退出：{error}"))??;
+    provider_models::fetch(&fetch_profile, http_client).await
+}
+
 pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> CodeyConfig {
     let config = state.config.read().await.clone();
     let Some(profile) = config.active_profile() else {
@@ -242,7 +255,7 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
 
     let (models, synced) = match tokio::time::timeout(
         STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT,
-        provider_models::fetch(&profile, &state.http_client),
+        fetch_provider_models(profile.clone(), &state.http_client),
     )
     .await
     {
@@ -334,7 +347,7 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
         .current_provider_id()
         .ok_or_else(|| "当前线路缺少标识".to_string())?
         .to_string();
-    let fetched_models = provider_models::fetch(&profile, &state.http_client)
+    let fetched_models = fetch_provider_models(profile, &state.http_client)
         .await
         .map_err(|error| error.to_string())?;
     let _config_write_guard = state.config_write_lock.lock().await;

@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use codey_runtime_core::settings::RelayProtocol;
 use directories::BaseDirs;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
@@ -18,6 +18,7 @@ use crate::model_catalog;
 use crate::sqlite_util::table_columns;
 
 const APP_TYPE: &str = "codex";
+const OFFICIAL_PROVIDER_ID: &str = "codex-official";
 const LOCAL_OFFICIAL_PROVIDER_ID: &str = "local-official";
 const PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
 const PROXY_OFFICIAL_PROVIDER_ID: &str = "cc-switch-official";
@@ -53,6 +54,19 @@ pub struct CcSwitchStatus {
 pub struct RouteTakeoverState {
     pub managed: bool,
     pub live: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CcSwitchProtocolHint {
+    provider_id: String,
+    protocol: RelayProtocol,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CcSwitchSourceApi {
+    base_url: String,
+    api_key: String,
+    protocol: RelayProtocol,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -133,6 +147,31 @@ fn legacy_cc_switch_db_path(default_db: &Path, legacy_home: Option<&Path>) -> Op
 
 pub fn route_takeover_state(codex_home: &Path) -> Result<RouteTakeoverState> {
     route_takeover_state_from_paths(&default_db_path(), codex_home)
+}
+
+pub fn provider_model_fetch_profile(
+    profile: &ProviderProfile,
+    codex_home: &Path,
+) -> Result<ProviderProfile> {
+    provider_model_fetch_profile_from_paths(profile, codex_home, &default_db_path())
+}
+
+fn provider_model_fetch_profile_from_paths(
+    profile: &ProviderProfile,
+    codex_home: &Path,
+    db_path: &Path,
+) -> Result<ProviderProfile> {
+    let takeover = route_takeover_state_from_paths(db_path, codex_home)?;
+    if !(takeover.managed && takeover.live) {
+        return Ok(profile.clone());
+    }
+
+    let source = read_current_cc_switch_source_api(db_path)?;
+    let mut fetch_profile = profile.clone();
+    fetch_profile.base_url = source.base_url;
+    fetch_profile.api_key = source.api_key;
+    fetch_profile.protocol = source.protocol;
+    Ok(fetch_profile)
 }
 
 fn route_takeover_state_from_paths(
@@ -308,8 +347,21 @@ pub fn sync_current_provider(
     config: &CodeyConfig,
     codex_home: &Path,
 ) -> Result<(CodeyConfig, CcSwitchStatus)> {
-    let (provider, api_key) = local_provider(codex_home)?;
-    let profile = profile_from_provider(&provider, api_key);
+    sync_current_provider_from_paths(config, codex_home, &default_db_path())
+}
+
+fn sync_current_provider_from_paths(
+    config: &CodeyConfig,
+    codex_home: &Path,
+    db_path: &Path,
+) -> Result<(CodeyConfig, CcSwitchStatus)> {
+    let (mut provider, api_key) = local_provider(codex_home)?;
+    let protocol_hint = cc_switch_protocol_hint(db_path, &provider);
+    if let Some(hint) = protocol_hint.as_ref() {
+        provider.protocol = hint.protocol;
+    }
+    let mut profile = profile_from_provider(&provider, api_key);
+    profile.cc_switch_provider_id = protocol_hint.map(|hint| hint.provider_id);
 
     let previous_provider_id = config.current_provider_id().map(ToString::to_string);
     let mut next = config.clone();
@@ -328,6 +380,325 @@ pub fn sync_current_provider(
         provider,
     };
     Ok((next, status))
+}
+
+fn cc_switch_protocol_hint(
+    db_path: &Path,
+    provider: &CurrentProvider,
+) -> Option<CcSwitchProtocolHint> {
+    if provider.official
+        || provider.base_url.trim().is_empty()
+        || is_loopback_url(&provider.base_url)
+        || !db_path.is_file()
+    {
+        return None;
+    }
+    read_cc_switch_protocol_hint(db_path, &provider.base_url)
+        .ok()
+        .flatten()
+}
+
+fn read_cc_switch_protocol_hint(
+    db_path: &Path,
+    provider_base_url: &str,
+) -> Result<Option<CcSwitchProtocolHint>> {
+    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("打开 cc-switch 数据库失败：{}", db_path.display()))?;
+    connection.busy_timeout(Duration::from_secs(2))?;
+
+    let provider_columns = table_columns(&connection, "providers")?;
+    if !provider_columns.contains("id")
+        || !provider_columns.contains("settings_config")
+        || !provider_columns.contains("meta")
+        || !provider_columns.contains("is_current")
+    {
+        return Ok(None);
+    }
+    let current_provider = if provider_columns.contains("app_type") {
+        connection
+            .query_row(
+                "SELECT id, settings_config, meta
+                 FROM providers
+                 WHERE app_type=?1 AND is_current != 0
+                 LIMIT 1",
+                params![APP_TYPE],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()?
+    } else {
+        connection
+            .query_row(
+                "SELECT id, settings_config, meta
+                 FROM providers
+                 WHERE is_current != 0
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    ))
+                },
+            )
+            .optional()?
+    };
+    let Some((provider_id, settings_config, meta)) = current_provider else {
+        return Ok(None);
+    };
+    let Some(protocol) = protocol_from_cc_switch_meta(&meta) else {
+        return Ok(None);
+    };
+
+    let mut candidate_base_urls = cc_switch_config_base_url(&settings_config)
+        .into_iter()
+        .collect::<Vec<_>>();
+    candidate_base_urls.extend(cc_switch_provider_endpoints(&connection, &provider_id)?);
+    if !candidate_base_urls
+        .iter()
+        .any(|candidate| provider_base_urls_match(candidate, provider_base_url))
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(CcSwitchProtocolHint {
+        provider_id,
+        protocol,
+    }))
+}
+
+fn protocol_from_cc_switch_meta(meta: &str) -> Option<RelayProtocol> {
+    let meta = serde_json::from_str::<Value>(meta).ok()?;
+    match meta
+        .get("apiFormat")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("openai_chat" | "openai_chat_completions" | "chat_completions") => {
+            Some(RelayProtocol::ChatCompletions)
+        }
+        Some("openai_responses" | "responses") => Some(RelayProtocol::Responses),
+        _ => None,
+    }
+}
+
+fn cc_switch_config_base_url(settings_config: &str) -> Option<String> {
+    let settings = serde_json::from_str::<Value>(settings_config).ok()?;
+    let config = settings.get("config").and_then(Value::as_str)?;
+    let document = DocumentMut::from_str(config).ok()?;
+    let provider_id = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())?;
+    document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table_like)
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+        .map(ToString::to_string)
+}
+
+fn cc_switch_provider_endpoints(connection: &Connection, provider_id: &str) -> Result<Vec<String>> {
+    let endpoint_columns = table_columns(connection, "provider_endpoints")?;
+    if !endpoint_columns.contains("provider_id") || !endpoint_columns.contains("url") {
+        return Ok(Vec::new());
+    }
+    let (query, uses_app_type) = if endpoint_columns.contains("app_type") {
+        (
+            "SELECT url FROM provider_endpoints WHERE provider_id=?1 AND app_type=?2",
+            true,
+        )
+    } else {
+        (
+            "SELECT url FROM provider_endpoints WHERE provider_id=?1",
+            false,
+        )
+    };
+    let mut statement = connection.prepare(query)?;
+    let endpoints = if uses_app_type {
+        statement
+            .query_map(params![provider_id, APP_TYPE], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        statement
+            .query_map(params![provider_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(endpoints
+        .into_iter()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .collect())
+}
+
+fn provider_base_urls_match(left: &str, right: &str) -> bool {
+    left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/')
+}
+
+fn read_current_cc_switch_source_api(db_path: &Path) -> Result<CcSwitchSourceApi> {
+    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("打开 cc-switch 数据库失败：{}", db_path.display()))?;
+    connection.busy_timeout(Duration::from_secs(2))?;
+
+    let provider_columns = table_columns(&connection, "providers")?;
+    if !provider_columns.contains("id")
+        || !provider_columns.contains("settings_config")
+        || !provider_columns.contains("is_current")
+    {
+        bail!("CC Switch 路由已开启，但数据库缺少当前源 API 配置");
+    }
+    let category_column = if provider_columns.contains("category") {
+        "category"
+    } else {
+        "NULL"
+    };
+    let current_provider = if provider_columns.contains("app_type") {
+        connection
+            .query_row(
+                &format!(
+                    "SELECT id, settings_config, {category_column}
+                     FROM providers
+                     WHERE app_type=?1 AND is_current != 0
+                     LIMIT 1"
+                ),
+                params![APP_TYPE],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+    } else {
+        connection
+            .query_row(
+                &format!(
+                    "SELECT id, settings_config, {category_column}
+                     FROM providers
+                     WHERE is_current != 0
+                     LIMIT 1"
+                ),
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+    };
+    let Some((provider_id, settings_config, category)) = current_provider else {
+        bail!("CC Switch 路由已开启，但找不到当前 Codex 源线路");
+    };
+
+    cc_switch_source_api(&provider_id, category.as_deref(), &settings_config)
+}
+
+fn cc_switch_source_api(
+    provider_id: &str,
+    category: Option<&str>,
+    settings_config: &str,
+) -> Result<CcSwitchSourceApi> {
+    if provider_id == OFFICIAL_PROVIDER_ID
+        || category.is_some_and(|value| value.eq_ignore_ascii_case("official"))
+    {
+        bail!("CC Switch 当前为官方线路，无需从第三方源 API 同步模型");
+    }
+
+    let settings =
+        serde_json::from_str::<Value>(settings_config).context("解析 CC Switch 当前源线路失败")?;
+    let config_text = settings
+        .get("config")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let document =
+        DocumentMut::from_str(config_text).context("解析 CC Switch 当前源 API 配置失败")?;
+    let source_provider_id = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("CC Switch 当前源线路缺少 model_provider")?;
+    let provider = document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(source_provider_id))
+        .and_then(Item::as_table_like)
+        .context("CC Switch 当前源线路缺少 provider 配置")?;
+    let base_url = provider
+        .get("base_url")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .context("CC Switch 当前源线路缺少 API 地址")?;
+    if !is_safe_source_api_url(&base_url) {
+        bail!("CC Switch 当前源线路缺少有效的非回环 HTTP(S) API 地址");
+    }
+
+    let auth = settings.get("auth").and_then(Value::as_object);
+    let auth_api_key = auth
+        .and_then(|auth| auth.get("OPENAI_API_KEY"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let config_api_key = provider_config_api_key(&document, Some(provider));
+    let proxy_marker_present = auth_api_key.as_deref() == Some(PROXY_MANAGED_TOKEN)
+        || config_api_key.as_deref() == Some(PROXY_MANAGED_TOKEN);
+    let api_key = [auth_api_key, config_api_key]
+        .into_iter()
+        .flatten()
+        .find(|value| value != PROXY_MANAGED_TOKEN)
+        .unwrap_or_default();
+    if api_key.is_empty() && proxy_marker_present {
+        bail!("CC Switch 当前源线路仅包含路由占位凭据，无法安全同步模型");
+    }
+
+    let wire_api = provider
+        .get("wire_api")
+        .and_then(Item::as_str)
+        .unwrap_or("responses");
+    Ok(CcSwitchSourceApi {
+        base_url,
+        api_key,
+        protocol: protocol_from_wire_api(wire_api),
+    })
+}
+
+fn is_safe_source_api_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    !host.eq_ignore_ascii_case("localhost")
+        && !host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn reset_subagent_defaults_for_current_provider(
@@ -599,11 +970,18 @@ mod tests {
                     app_type TEXT NOT NULL,
                     name TEXT NOT NULL,
                     settings_config TEXT NOT NULL,
+                    meta TEXT NOT NULL DEFAULT '{}',
                     category TEXT,
                     created_at INTEGER,
                     sort_index INTEGER,
                     is_current BOOLEAN NOT NULL DEFAULT 0,
                     PRIMARY KEY (id, app_type)
+                );
+                CREATE TABLE provider_endpoints (
+                    id INTEGER PRIMARY KEY,
+                    provider_id TEXT NOT NULL,
+                    app_type TEXT NOT NULL,
+                    url TEXT NOT NULL
                 );",
             )
             .unwrap();
@@ -707,20 +1085,41 @@ mod tests {
         .unwrap();
     }
 
-    fn insert_provider(path: &Path, id: &str, name: &str, url: &str, current: bool) {
+    fn insert_provider_with_api_format(
+        path: &Path,
+        id: &str,
+        name: &str,
+        url: &str,
+        current: bool,
+        api_format: Option<&str>,
+    ) {
         let settings = json!({
             "auth": {"OPENAI_API_KEY": format!("{id}-secret")},
             "config": format!(
                 "model_provider = \"custom\"\n\n[model_providers.custom]\nname = \"custom\"\nbase_url = \"{url}\"\nwire_api = \"responses\"\n"
             )
         });
+        let meta = api_format
+            .map(|api_format| json!({"apiFormat": api_format}))
+            .unwrap_or_else(|| json!({}));
         Connection::open(path)
             .unwrap()
             .execute(
                 "INSERT INTO providers
-                 (id, app_type, name, settings_config, sort_index, is_current)
-                 VALUES (?1, 'codex', ?2, ?3, 0, ?4)",
-                params![id, name, settings.to_string(), current],
+                 (id, app_type, name, settings_config, meta, sort_index, is_current)
+                 VALUES (?1, 'codex', ?2, ?3, ?4, 0, ?5)",
+                params![id, name, settings.to_string(), meta.to_string(), current],
+            )
+            .unwrap();
+    }
+
+    fn insert_provider_endpoint(path: &Path, provider_id: &str, url: &str) {
+        Connection::open(path)
+            .unwrap()
+            .execute(
+                "INSERT INTO provider_endpoints (provider_id, app_type, url)
+                 VALUES (?1, 'codex', ?2)",
+                params![provider_id, url],
             )
             .unwrap();
     }
@@ -741,12 +1140,13 @@ mod tests {
     #[test]
     fn codex_config_wins_when_cc_switch_database_has_a_current_provider() {
         let (_directory, path, home) = fixture();
-        insert_provider(
+        insert_provider_with_api_format(
             &path,
             "cc-switch-route",
             "CC Switch 线路",
             "https://cc-switch.example/v1",
             true,
+            Some("openai_chat"),
         );
         fs::write(
             home.join("config.toml"),
@@ -762,7 +1162,8 @@ experimental_bearer_token = "sk-codex-local"
         )
         .unwrap();
 
-        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
+        let (synced, status) =
+            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
 
         assert!(!status.available);
         assert_eq!(status.provider.id, "codex-local");
@@ -777,6 +1178,156 @@ experimental_bearer_token = "sk-codex-local"
             "https://codex-local.example/v1"
         );
         assert_eq!(synced.profiles[0].api_key, "sk-codex-local");
+        assert_eq!(synced.profiles[0].protocol, RelayProtocol::Responses);
+        assert!(synced.profiles[0].cc_switch_provider_id.is_none());
+    }
+
+    #[test]
+    fn matching_cc_switch_chat_format_drives_the_codey_protocol_proxy() {
+        let (_directory, path, home) = fixture();
+        insert_provider_with_api_format(
+            &path,
+            "chat-route",
+            "Chat 线路",
+            "https://chat.example/v1",
+            true,
+            Some("openai_chat"),
+        );
+        fs::write(
+            home.join("config.toml"),
+            r#"
+model_provider = "custom"
+
+[model_providers.custom]
+name = "custom"
+base_url = "https://chat.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-chat"
+"#,
+        )
+        .unwrap();
+
+        let (synced, status) =
+            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+
+        assert_eq!(status.provider.protocol, RelayProtocol::ChatCompletions);
+        assert_eq!(synced.profiles[0].protocol, RelayProtocol::ChatCompletions);
+        assert_eq!(
+            synced.profiles[0].cc_switch_provider_id.as_deref(),
+            Some("chat-route")
+        );
+        assert_eq!(synced.profiles[0].base_url, "https://chat.example/v1");
+        assert_eq!(synced.profiles[0].api_key, "sk-chat");
+    }
+
+    #[test]
+    fn matching_cc_switch_responses_format_stays_native() {
+        let (_directory, path, home) = fixture();
+        insert_provider_with_api_format(
+            &path,
+            "responses-route",
+            "Responses 线路",
+            "https://responses.example/v1",
+            true,
+            Some("openai_responses"),
+        );
+        write_live_route(
+            &home,
+            "custom",
+            "https://responses.example/v1",
+            "sk-responses",
+        );
+
+        let (synced, status) =
+            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+
+        assert_eq!(status.provider.protocol, RelayProtocol::Responses);
+        assert_eq!(synced.profiles[0].protocol, RelayProtocol::Responses);
+        assert_eq!(
+            synced.profiles[0].cc_switch_provider_id.as_deref(),
+            Some("responses-route")
+        );
+    }
+
+    #[test]
+    fn selected_cc_switch_endpoint_can_supply_the_chat_format_hint() {
+        let (_directory, path, home) = fixture();
+        insert_provider_with_api_format(
+            &path,
+            "chat-route",
+            "Chat 线路",
+            "https://default-chat.example/v1",
+            true,
+            Some("openai_chat"),
+        );
+        insert_provider_endpoint(&path, "chat-route", "https://selected-chat.example/v1/");
+        write_live_route(
+            &home,
+            "custom",
+            "https://selected-chat.example/v1",
+            "sk-chat",
+        );
+
+        let (synced, _) =
+            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+
+        assert_eq!(synced.profiles[0].protocol, RelayProtocol::ChatCompletions);
+        assert_eq!(
+            synced.profiles[0].cc_switch_provider_id.as_deref(),
+            Some("chat-route")
+        );
+    }
+
+    #[test]
+    fn cc_switch_loopback_route_never_enables_a_second_codey_proxy() {
+        let (_directory, path, home) = fixture();
+        insert_provider_with_api_format(
+            &path,
+            "chat-route",
+            "Chat 线路",
+            "https://chat.example/v1",
+            true,
+            Some("openai_chat"),
+        );
+        write_live_route(
+            &home,
+            PROXY_OFFICIAL_PROVIDER_ID,
+            "http://127.0.0.1:15721/v1",
+            PROXY_MANAGED_TOKEN,
+        );
+
+        let (synced, status) =
+            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+
+        assert_eq!(status.provider.protocol, RelayProtocol::Responses);
+        assert_eq!(synced.profiles[0].protocol, RelayProtocol::Responses);
+        assert!(synced.profiles[0].cc_switch_provider_id.is_none());
+    }
+
+    #[test]
+    fn old_cc_switch_schema_does_not_block_local_provider_sync() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cc-switch.db");
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE providers (
+                    id TEXT NOT NULL,
+                    app_type TEXT NOT NULL,
+                    settings_config TEXT NOT NULL,
+                    is_current BOOLEAN NOT NULL DEFAULT 0
+                );",
+            )
+            .unwrap();
+        write_live_route(&home, "manual", "https://manual.example/v1", "sk-manual");
+
+        let (synced, status) =
+            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+
+        assert_eq!(status.provider.protocol, RelayProtocol::Responses);
+        assert_eq!(synced.profiles[0].base_url, "https://manual.example/v1");
         assert!(synced.profiles[0].cc_switch_provider_id.is_none());
     }
 
@@ -1099,6 +1650,114 @@ requires_openai_auth = true
         assert_eq!(status.provider.id, "route-a");
         assert_eq!(synced.subagent_model, "provider-custom-model");
         assert_eq!(synced.subagent_reasoning_effort, "high");
+    }
+
+    #[test]
+    fn model_fetch_uses_the_cc_switch_source_api_during_live_route_takeover() {
+        let (_directory, path, home) = fixture();
+        install_proxy_schema(&path);
+        insert_provider_with_api_format(
+            &path,
+            "source-route",
+            "源线路",
+            "https://source.example/v1",
+            true,
+            Some("openai_responses"),
+        );
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO proxy_config (app_type, enabled) VALUES ('codex', 1)",
+                [],
+            )
+            .unwrap();
+        write_live_route(
+            &home,
+            "relay",
+            "http://127.0.0.1:15721/v1",
+            PROXY_MANAGED_TOKEN,
+        );
+        let live_profile = ProviderProfile {
+            id: "relay".into(),
+            name: "CC Switch 路由".into(),
+            base_url: "http://127.0.0.1:15721/v1".into(),
+            api_key: PROXY_MANAGED_TOKEN.into(),
+            protocol: RelayProtocol::Responses,
+            cc_switch_provider_id: None,
+            cc_switch_read_only: false,
+            supports_remote_compaction: false,
+        };
+
+        let fetch_profile =
+            provider_model_fetch_profile_from_paths(&live_profile, &home, &path).unwrap();
+
+        assert_eq!(fetch_profile.id, live_profile.id);
+        assert_eq!(fetch_profile.name, live_profile.name);
+        assert_eq!(fetch_profile.base_url, "https://source.example/v1");
+        assert_eq!(fetch_profile.api_key, "source-route-secret");
+        assert_eq!(fetch_profile.protocol, RelayProtocol::Responses);
+        assert_eq!(live_profile.api_key, PROXY_MANAGED_TOKEN);
+    }
+
+    #[test]
+    fn model_fetch_keeps_the_codex_profile_when_route_takeover_is_not_live() {
+        let (_directory, path, home) = fixture();
+        let profile = saved_route_profile("direct");
+
+        let fetch_profile =
+            provider_model_fetch_profile_from_paths(&profile, &home, &path).unwrap();
+
+        assert_eq!(fetch_profile, profile);
+    }
+
+    #[test]
+    fn model_fetch_never_forwards_the_cc_switch_proxy_marker_to_a_source_api() {
+        let (_directory, path, home) = fixture();
+        install_proxy_schema(&path);
+        let settings = json!({
+            "auth": {"OPENAI_API_KEY": PROXY_MANAGED_TOKEN},
+            "config": r#"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://source.example/v1"
+wire_api = "responses"
+"#
+        });
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO providers
+                 (id, app_type, name, settings_config, sort_index, is_current)
+                 VALUES ('source-route', 'codex', '源线路', ?1, 0, 1)",
+                [settings.to_string()],
+            )
+            .unwrap();
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO proxy_config (app_type, enabled) VALUES ('codex', 1)",
+                [],
+            )
+            .unwrap();
+        write_live_route(
+            &home,
+            "relay",
+            "http://127.0.0.1:15721/v1",
+            PROXY_MANAGED_TOKEN,
+        );
+        let live_profile = ProviderProfile {
+            base_url: "http://127.0.0.1:15721/v1".into(),
+            api_key: PROXY_MANAGED_TOKEN.into(),
+            ..saved_route_profile("relay")
+        };
+
+        let error = provider_model_fetch_profile_from_paths(&live_profile, &home, &path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("路由占位凭据"));
+        assert!(!error.contains(PROXY_MANAGED_TOKEN));
     }
 
     #[test]
