@@ -1,3 +1,4 @@
+use codey_runtime_core::launcher::start_protocol_proxy;
 use codey_runtime_core::protocol_proxy::{
     ChatSseToResponsesConverter, chat_completion_to_response,
     chat_completion_to_response_with_request, chat_completions_url, chat_sse_to_responses_sse,
@@ -10,7 +11,7 @@ use codey_runtime_core::protocol_proxy::{
 };
 use codey_runtime_core::settings::{
     AggregateRelayMember, AggregateRelayProfile, AggregateRelayStrategy, BackendSettings,
-    RelayMode, RelayProfile,
+    RelayMode, RelayProfile, RelayProtocol,
 };
 use serde_json::json;
 use std::io::{Read, Write};
@@ -20,7 +21,7 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, oneshot};
 
 #[test]
 fn responses_request_converts_to_chat_completions() {
@@ -1586,6 +1587,120 @@ async fn responses_proxy_passes_through_original_user_agent_when_unconfigured() 
 }
 
 #[tokio::test]
+async fn explicit_protocol_proxy_bridges_responses_to_a_chat_upstream() {
+    let server = spawn_chat_server();
+    let relay = RelayProfile {
+        id: "chat".to_string(),
+        name: "Chat".to_string(),
+        base_url: server.base_url.clone(),
+        upstream_base_url: server.base_url.clone(),
+        api_key: "sk-explicit".to_string(),
+        protocol: RelayProtocol::ChatCompletions,
+        relay_mode: RelayMode::PureApi,
+        ..RelayProfile::default()
+    };
+    let settings = BackendSettings {
+        active_relay_id: relay.id.clone(),
+        relay_profiles: vec![relay],
+        enhancements_enabled: false,
+        ..BackendSettings::default()
+    };
+    let proxy = start_protocol_proxy(settings).await.unwrap();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", proxy.base_url()))
+        .json(&json!({
+            "model": "deepseek-reasoner",
+            "input": "hello",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response_json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(response_json["object"], "response");
+
+    proxy.shutdown().await.unwrap();
+    let request = server.finish();
+    assert!(
+        request
+            .request_line
+            .starts_with("POST /v1/chat/completions ")
+    );
+    assert_eq!(request.authorization, "Bearer sk-explicit");
+    let upstream_body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(upstream_body["model"], "deepseek-reasoner");
+    assert_eq!(upstream_body["messages"][0]["content"], "hello");
+}
+
+#[tokio::test]
+async fn protocol_proxy_shutdown_aborts_inflight_streams() {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let upstream_base_url = format!("http://{}", listener.local_addr().unwrap());
+    let (request_seen, request_seen_rx) = oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 4096];
+        let request_bytes = stream.read(&mut request).await.unwrap();
+        assert!(request_bytes > 0);
+        let _ = request_seen.send(());
+
+        let mut trailing = [0_u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), stream.read(&mut trailing))
+            .await
+            .expect("proxy shutdown should close the upstream connection")
+            .unwrap()
+    });
+    let relay = RelayProfile {
+        id: "chat".to_string(),
+        name: "Chat".to_string(),
+        base_url: upstream_base_url.clone(),
+        upstream_base_url,
+        api_key: "sk-explicit".to_string(),
+        protocol: RelayProtocol::ChatCompletions,
+        relay_mode: RelayMode::PureApi,
+        ..RelayProfile::default()
+    };
+    let settings = BackendSettings {
+        active_relay_id: relay.id.clone(),
+        relay_profiles: vec![relay],
+        enhancements_enabled: false,
+        ..BackendSettings::default()
+    };
+    let proxy = start_protocol_proxy(settings).await.unwrap();
+    let client = tokio::spawn(
+        reqwest::Client::new()
+            .post(format!("{}/responses", proxy.base_url()))
+            .json(&json!({
+                "model": "deepseek-reasoner",
+                "input": "hello",
+                "stream": true
+            }))
+            .send(),
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), request_seen_rx)
+        .await
+        .expect("proxy should start the upstream request")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), proxy.shutdown())
+        .await
+        .expect("proxy shutdown should not wait for the upstream stream")
+        .unwrap();
+
+    let client_result = tokio::time::timeout(Duration::from_secs(2), client)
+        .await
+        .expect("proxy client should observe the closed connection")
+        .unwrap();
+    assert!(client_result.is_err());
+    let trailing_bytes = upstream_task.await.unwrap();
+    assert_eq!(trailing_bytes, 0);
+}
+
+#[tokio::test]
 async fn models_proxy_passes_through_original_user_agent_when_unconfigured() {
     let _lock = settings_path_test_lock().lock().await;
     let temp = tempfile::tempdir().unwrap();
@@ -1658,6 +1773,9 @@ impl ChatServer {
 
 struct ChatRequest {
     user_agent: String,
+    authorization: String,
+    request_line: String,
+    body: String,
 }
 
 fn spawn_chat_server() -> ChatServer {
@@ -1701,14 +1819,33 @@ fn spawn_chat_server() -> ChatServer {
                 })
             })
             .unwrap_or_default();
-        let body = r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[]}"#;
+        let authorization = request
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("authorization")
+                        .then(|| value.trim().to_string())
+                })
+            })
+            .unwrap_or_default();
+        let request_line = request.lines().next().unwrap_or_default().to_string();
+        let request_body = request
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body.to_string())
+            .unwrap_or_default();
+        let body = r#"{"id":"chatcmpl-test","object":"chat.completion","model":"deepseek-reasoner","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         );
         stream.write_all(response.as_bytes()).unwrap();
-        ChatRequest { user_agent }
+        ChatRequest {
+            user_agent,
+            authorization,
+            request_line,
+            body: request_body,
+        }
     });
     ChatServer { base_url, handle }
 }

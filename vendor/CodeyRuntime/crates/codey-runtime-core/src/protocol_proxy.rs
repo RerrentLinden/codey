@@ -477,12 +477,18 @@ pub async fn open_responses_proxy_request_with_settings(
     open_responses_proxy_request_with_settings_and_user_agent(body, settings, None).await
 }
 
-async fn open_responses_proxy_request_with_settings_and_user_agent(
+pub async fn open_responses_proxy_request_with_settings_and_user_agent(
     body: &str,
     settings: crate::settings::BackendSettings,
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let request_json: Value = serde_json::from_str(body)?;
+    let model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
     let is_stream = request_json
         .get("stream")
         .and_then(Value::as_bool)
@@ -509,6 +515,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "relayName": relay.name,
                 "endpoint": endpoint,
                 "wireApi": wire_api,
+                "model": model,
                 "stream": is_stream,
                 "attempt": attempt + 1,
                 "candidateCount": relay_count,
@@ -539,6 +546,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                         "relayName": relay.name,
                         "endpoint": endpoint,
                         "wireApi": wire_api,
+                        "model": model,
                         "stream": is_stream,
                         "attempt": attempt + 1,
                         "candidateCount": relay_count,
@@ -567,6 +575,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "relayName": relay.name,
                 "endpoint": endpoint,
                 "wireApi": wire_api,
+                "model": model,
                 "stream": is_stream,
                 "statusCode": status_code,
                 "attempt": attempt + 1,
@@ -605,6 +614,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "relayName": relay.name,
                 "endpoint": endpoint,
                 "wireApi": wire_api,
+                "model": model,
                 "stream": is_stream,
                 "statusCode": status_code,
                 "attempt": attempt + 1,

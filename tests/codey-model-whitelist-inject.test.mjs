@@ -63,6 +63,12 @@ async function loadPatch(
     clearTimeout(id) {
       timers.delete(id);
     },
+    dispatchEvent(event) {
+      for (const listener of windowListeners.get(event?.type) || []) {
+        listener(event);
+      }
+      return true;
+    },
   };
   if (bridgeReady) window.__codexSessionDeleteBridge = bridge;
   Function("window", "document", "globalThis", "console", source)(
@@ -79,9 +85,7 @@ async function loadPatch(
       window.__codexSessionDeleteBridge = bridge;
     },
     dispatchWindowEvent(name, event) {
-      for (const listener of windowListeners.get(name) || []) {
-        listener(event);
-      }
+      window.dispatchEvent({ ...event, type: name });
     },
     async runNextTimer() {
       const next = timers.entries().next().value;
@@ -280,7 +284,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "4");
+  assert.equal(patch.version, "5");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -341,6 +345,134 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
     ["gpt-5.6-sol", "provider-hot-pushed"],
   );
   patch.dispose();
+});
+
+test("stale thread and turn models are repaired before app-server dispatch", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "gpt-5.6-terra"],
+    default_model: "gpt-5.6-sol",
+  }, [statsigClient()]);
+
+  for (const method of ["thread/start", "thread/resume", "turn/start"]) {
+    const event = {
+      detail: {
+        type: "mcp-request",
+        request: {
+          id: method,
+          method,
+          params: {
+            threadId: "stale-thread",
+            model: "claude-opus-4-8",
+          },
+        },
+      },
+    };
+    runtime.dispatchWindowEvent("codex-message-from-view", event);
+    assert.equal(event.detail.request.params.model, "gpt-5.6-sol");
+  }
+  runtime.patch.dispose();
+});
+
+test("configured third-party models survive direct and wrapped requests", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["claude-opus-4-8", "deepseek-reasoner"],
+    default_model: "claude-opus-4-8",
+  }, [statsigClient()]);
+  const direct = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        method: "turn/start",
+        params: { threadId: "valid-thread", model: "deepseek-reasoner" },
+      },
+    },
+  };
+  const wrapped = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        method: "send-cli-request-for-host",
+        params: {
+          hostId: "local",
+          method: "turn/start",
+          params: { threadId: "valid-thread", model: "deepseek-reasoner" },
+        },
+      },
+    },
+  };
+
+  runtime.dispatchWindowEvent("codex-message-from-view", direct);
+  runtime.dispatchWindowEvent("codex-message-from-view", wrapped);
+
+  assert.equal(direct.detail.request.params.model, "deepseek-reasoner");
+  assert.equal(
+    wrapped.detail.request.params.params.model,
+    "deepseek-reasoner",
+  );
+  runtime.patch.dispose();
+});
+
+test("valid current-route models survive direct and wrapped requests", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "gpt-5.6-terra"],
+    default_model: "gpt-5.6-sol",
+  }, [statsigClient()]);
+  const direct = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        method: "turn/start",
+        params: { threadId: "valid-thread", model: "gpt-5.6-terra" },
+      },
+    },
+  };
+  const wrapped = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        method: "send-cli-request-for-host",
+        params: {
+          hostId: "local",
+          method: "turn/start",
+          params: { threadId: "stale-thread", model: "claude-opus-4-8" },
+        },
+      },
+    },
+  };
+
+  runtime.dispatchWindowEvent("codex-message-from-view", direct);
+  runtime.dispatchWindowEvent("codex-message-from-view", wrapped);
+
+  assert.equal(direct.detail.request.params.model, "gpt-5.6-terra");
+  assert.equal(
+    wrapped.detail.request.params.params.model,
+    "gpt-5.6-sol",
+  );
+  runtime.patch.dispose();
+});
+
+test("missing turn model receives the current route default", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["provider-current"],
+    default_model: "provider-current",
+  }, [statsigClient()]);
+  const event = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        method: "turn/start",
+        params: { threadId: "legacy-thread" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", event);
+
+  assert.equal(event.detail.request.params.model, "provider-current");
+  runtime.patch.dispose();
 });
 
 test("an unchanged model list repairs missing reasoning effort options", async () => {

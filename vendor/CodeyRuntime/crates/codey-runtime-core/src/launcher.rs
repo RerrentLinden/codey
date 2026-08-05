@@ -122,6 +122,107 @@ impl LaunchHandle {
     }
 }
 
+pub struct ProtocolProxyHandle {
+    port: u16,
+    base_url: String,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl std::fmt::Debug for ProtocolProxyHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProtocolProxyHandle")
+            .field("port", &self.port)
+            .field("base_url", &self.base_url)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProtocolProxyHandle {
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.await.context("protocol proxy task failed")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ProtocolProxyHandle {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+pub async fn start_protocol_proxy(
+    settings: BackendSettings,
+) -> anyhow::Result<ProtocolProxyHandle> {
+    let bind_host = "127.0.0.1";
+    let listener = tokio::net::TcpListener::bind((bind_host, 0))
+        .await
+        .context("failed to bind protocol proxy")?;
+    let port = listener.local_addr()?.port();
+    let base_url = crate::protocol_proxy::local_responses_proxy_base_url(port);
+    let _ = crate::diagnostic_log::append_diagnostic_log(
+        "protocol_proxy.listening",
+        serde_json::json!({
+            "port": port,
+            "bindHost": bind_host,
+            "baseUrl": base_url,
+        }),
+    );
+    let settings = Arc::new(settings);
+    let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    if let Ok((stream, addr)) = accepted {
+                        let settings = settings.clone();
+                        connections.spawn(async move {
+                            let _ = handle_helper_connection_with_settings(
+                                stream,
+                                Some(addr),
+                                Some(settings),
+                            )
+                            .await;
+                        });
+                    }
+                }
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    let _ = joined;
+                }
+            }
+        }
+        connections.abort_all();
+        while connections.join_next().await.is_some() {}
+    });
+    Ok(ProtocolProxyHandle {
+        port,
+        base_url,
+        shutdown: Some(shutdown),
+        task: Some(task),
+    })
+}
+
 #[async_trait(?Send)]
 pub trait LaunchHooks: Send + Sync {
     fn resolve_app_dir(
@@ -939,8 +1040,16 @@ impl LaunchHooks for DefaultLaunchHooks {
 }
 
 async fn handle_helper_connection(
+    stream: tokio::net::TcpStream,
+    remote_addr: Option<SocketAddr>,
+) -> anyhow::Result<()> {
+    handle_helper_connection_with_settings(stream, remote_addr, None).await
+}
+
+async fn handle_helper_connection_with_settings(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
+    proxy_settings: Option<Arc<BackendSettings>>,
 ) -> anyhow::Result<()> {
     let request_bytes = read_http_request(&mut stream).await?;
     let request = String::from_utf8_lossy(&request_bytes);
@@ -972,6 +1081,7 @@ async fn handle_helper_connection(
             method,
             path,
             remote_addr_text,
+            proxy_settings.as_deref(),
         )
         .await;
     }
@@ -1229,14 +1339,20 @@ async fn handle_protocol_proxy_connection(
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
+    proxy_settings: Option<&BackendSettings>,
 ) -> anyhow::Result<()> {
     let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let upstream = match crate::protocol_proxy::open_responses_proxy_request(
-        request_body,
-        request_user_agent,
-    )
-    .await
-    {
+    let upstream_result = if let Some(settings) = proxy_settings {
+        crate::protocol_proxy::open_responses_proxy_request_with_settings_and_user_agent(
+            request_body,
+            settings.clone(),
+            request_user_agent,
+        )
+        .await
+    } else {
+        crate::protocol_proxy::open_responses_proxy_request(request_body, request_user_agent).await
+    };
+    let upstream = match upstream_result {
         Ok(upstream) => upstream,
         Err(error) => {
             let body = serde_json::to_vec(
@@ -1268,6 +1384,24 @@ async fn handle_protocol_proxy_connection(
             upstream.status_code,
             &upstream_content_type,
             &upstream_body,
+        );
+        let model = request_json
+            .as_ref()
+            .and_then(|request| request.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            "protocol_proxy.upstream_error",
+            serde_json::json!({
+                "model": model,
+                "wireApi": upstream.wire_api,
+                "statusCode": upstream.status_code,
+                "upstreamBodyBytes": upstream_body.len(),
+                "structuredError": error.get("error").is_some(),
+                "errorTypePresent": error.pointer("/error/type").is_some(),
+                "errorCodePresent": error.pointer("/error/code").is_some(),
+            }),
         );
         let body = serde_json::to_vec(&error)?;
         write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;

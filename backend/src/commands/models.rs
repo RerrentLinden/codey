@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use codey_runtime_core::settings::{RelayMode, RelayProfile};
 use serde_json::{Value, json};
 
 use super::{
@@ -372,6 +373,83 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
     })))
 }
 
+pub async fn test_current_provider(state: &Arc<AppState>) -> Result<Value, String> {
+    let config = state.config.read().await.clone();
+    let profile = config
+        .active_profile()
+        .ok_or_else(|| "找不到当前线路".to_string())?;
+    if profile.cc_switch_read_only {
+        return Err("官方线路无需执行第三方 API 对话测试".to_string());
+    }
+    let model = config
+        .default_model()
+        .or_else(|| config.selected_models().first().map(String::as_str))
+        .or_else(|| config.upstream_models().first().map(String::as_str))
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| "请先同步模型并设置默认模型".to_string())?
+        .to_string();
+    let base_url = profile.normalized_base_url();
+    let relay = RelayProfile {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        model: model.clone(),
+        base_url: base_url.clone(),
+        upstream_base_url: base_url,
+        api_key: profile.api_key.clone(),
+        protocol: profile.protocol,
+        relay_mode: RelayMode::PureApi,
+        ..RelayProfile::default()
+    };
+    let result = codey_runtime_core::relay_config::test_relay_profile(&relay, &model)
+        .await
+        .map_err(|error| {
+            error_log::record_failure(
+                "provider_test_failed",
+                "test_current_provider",
+                "无法完成第三方模型对话测试",
+                json!({
+                    "provider": profile.id,
+                    "model": model,
+                    "protocol": profile.protocol,
+                    "errorKind": "request_failed",
+                }),
+            );
+            error.to_string()
+        })?;
+    if !(200..300).contains(&result.http_status) {
+        error_log::record_failure(
+            "provider_test_failed",
+            "test_current_provider",
+            format!("上游返回 HTTP {}", result.http_status),
+            json!({
+                "provider": profile.id,
+                "model": model,
+                "protocol": profile.protocol,
+                "httpStatus": result.http_status,
+                "responseBytes": result.response_preview.len(),
+            }),
+        );
+        return Err(format!(
+            "模型「{model}」对话测试失败：HTTP {}{}",
+            result.http_status,
+            if result.response_preview.trim().is_empty() {
+                String::new()
+            } else {
+                format!("，{}", result.response_preview.trim())
+            }
+        ));
+    }
+    Ok(json!({
+        "status": "ok",
+        "model": model,
+        "protocol": profile.protocol,
+        "httpStatus": result.http_status,
+        "endpoint": result.endpoint,
+        "responsePreview": result.response_preview,
+    }))
+}
+
 pub async fn save_selected_models(
     state: &Arc<AppState>,
     requested_official_models: Vec<String>,
@@ -655,6 +733,9 @@ async fn hot_reload_runtime_models(
     let Some(runtime) = runtime else {
         return ModelHotReloadOutcome::default();
     };
+    if provider_route_requires_restart(&runtime.applied_config, config) {
+        return ModelHotReloadOutcome::default();
+    }
     let expected_models = renderer_model_ids(model_state);
     let websocket_url = runtime.renderer_websocket_url().await;
     match cdp::refresh_model_whitelist(&websocket_url, &expected_models, &model_state.default_model)
@@ -708,6 +789,13 @@ pub(super) fn current_model_state(
 pub(super) fn current_renderer_model_catalog(config: &CodeyConfig) -> Result<Value, String> {
     let model_state = current_model_state(config)?;
     Ok(renderer_model_catalog_value(config, &model_state))
+}
+
+pub(super) fn provider_route_requires_restart(
+    applied: &CodeyConfig,
+    current: &CodeyConfig,
+) -> bool {
+    applied.active_profile() != current.active_profile()
 }
 
 pub(super) fn renderer_model_catalog_value(
@@ -865,5 +953,26 @@ mod tests {
             synced.upstream_models_by_provider[&provider_id],
             ["provider-synced", "provider-manual"]
         );
+    }
+
+    #[test]
+    fn provider_route_restart_detection_ignores_model_only_changes() {
+        let applied = CodeyConfig::default();
+        let mut current = applied.clone();
+        let provider_id = current.current_provider_id().unwrap().to_string();
+        current
+            .default_model_by_provider
+            .insert(provider_id, "provider-default".into());
+
+        assert!(!provider_route_requires_restart(&applied, &current));
+    }
+
+    #[test]
+    fn provider_route_restart_detection_catches_profile_changes() {
+        let applied = CodeyConfig::default();
+        let mut current = applied.clone();
+        current.profiles[0].base_url = "https://api.example.test/v1".into();
+
+        assert!(provider_route_requires_restart(&applied, &current));
     }
 }

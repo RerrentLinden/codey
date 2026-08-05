@@ -421,6 +421,20 @@ export function App({
     });
   }
 
+  async function testCurrentProvider() {
+    await runOperation("test-provider", async () => {
+      const result = await invoke<{
+        model: string;
+        protocol: string;
+        httpStatus: number;
+      }>("test_current_provider");
+      setNotice({
+        tone: "success",
+        text: `模型「${result.model}」对话测试通过（HTTP ${result.httpStatus}）`,
+      });
+    });
+  }
+
   async function runOperation(name: string, action: () => Promise<void>) {
     if (isBusy) return;
     setBusy(name);
@@ -659,6 +673,9 @@ export function App({
   );
   const handleFetchCurrentModels = useStableEvent(
     () => void fetchCurrentModels(),
+  );
+  const handleTestCurrentProvider = useStableEvent(
+    () => void testCurrentProvider(),
   );
   const handleSetDefaultModel = useStableEvent(
     (model: string) => void setDefaultModel(model),
@@ -914,6 +931,7 @@ export function App({
               showAccountUsageInHeader={config.showAccountUsageInHeader}
               onSyncCurrentProvider={handleSyncCurrentProvider}
               onFetchCurrentModels={handleFetchCurrentModels}
+              onTestCurrentProvider={handleTestCurrentProvider}
               onSetDefaultModel={handleSetDefaultModel}
               onDeleteThirdPartyModel={handleDeleteThirdPartyModel}
               manualThirdPartyModelKeys={manualThirdPartyModelKeys}

@@ -55,6 +55,8 @@ struct RuntimeConfigLease {
     #[serde(default)]
     preserve_provider_route: bool,
     #[serde(default)]
+    protocol_proxy_base_url: Option<String>,
+    #[serde(default)]
     fastctx_command: Option<PathBuf>,
     #[serde(default)]
     subagent_optimization_applied: bool,
@@ -85,24 +87,33 @@ fn lease_marker_path() -> PathBuf {
         .join("codex-lease.json")
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn apply_runtime_provider_config(
+pub(crate) struct RuntimeProviderConfigOptions<'a> {
+    pub use_official_catalog: bool,
+    pub default_model: Option<&'a str>,
+    pub fast_context_tools: bool,
+    pub subagent_optimization: bool,
+    pub subagent_model: &'a str,
+    pub subagent_reasoning_effort: &'a str,
+    pub preserve_provider_route: bool,
+    pub protocol_proxy_base_url: Option<&'a str>,
+}
+
+pub(crate) fn apply_runtime_provider_config(
     home: &Path,
     profile: &ProviderProfile,
     provider_id: &str,
-    use_official_catalog: bool,
-    default_model: Option<&str>,
-    fast_context_tools: bool,
-    subagent_optimization: bool,
-    subagent_model: &str,
-    subagent_reasoning_effort: &str,
+    options: RuntimeProviderConfigOptions<'_>,
 ) -> Result<PathBuf> {
     let marker = lease_marker_path();
     let backup_root = marker
         .parent()
         .unwrap_or_else(|| Path::new(".codey"))
         .join("codex-backups");
-    let fastctx_command = resolve_fastctx_command(fast_context_tools);
+    let fastctx_command = resolve_fastctx_command(options.fast_context_tools);
+    let use_official_catalog = !options.preserve_provider_route && options.use_official_catalog;
+    let default_model = (!options.preserve_provider_route)
+        .then_some(options.default_model)
+        .flatten();
     apply_runtime_provider_config_at_mode(
         home,
         profile,
@@ -110,43 +121,13 @@ pub fn apply_runtime_provider_config(
         use_official_catalog,
         default_model,
         fastctx_command.as_deref(),
-        subagent_optimization,
-        subagent_model,
-        subagent_reasoning_effort,
+        options.subagent_optimization,
+        options.subagent_model,
+        options.subagent_reasoning_effort,
         &marker,
         &backup_root,
-        false,
-    )
-}
-
-pub fn apply_runtime_provider_config_preserving_route(
-    home: &Path,
-    profile: &ProviderProfile,
-    provider_id: &str,
-    fast_context_tools: bool,
-    subagent_optimization: bool,
-    subagent_model: &str,
-    subagent_reasoning_effort: &str,
-) -> Result<PathBuf> {
-    let marker = lease_marker_path();
-    let backup_root = marker
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join("codex-backups");
-    let fastctx_command = resolve_fastctx_command(fast_context_tools);
-    apply_runtime_provider_config_at_mode(
-        home,
-        profile,
-        provider_id,
-        false,
-        None,
-        fastctx_command.as_deref(),
-        subagent_optimization,
-        subagent_model,
-        subagent_reasoning_effort,
-        &marker,
-        &backup_root,
-        true,
+        options.preserve_provider_route,
+        options.protocol_proxy_base_url,
     )
 }
 
@@ -216,6 +197,7 @@ fn apply_runtime_provider_config_at(
         marker,
         backup_root,
         false,
+        None,
     )
 }
 
@@ -233,10 +215,9 @@ fn apply_runtime_provider_config_at_mode(
     marker: &Path,
     backup_root: &Path,
     preserve_provider_route: bool,
+    protocol_proxy_base_url: Option<&str>,
 ) -> Result<PathBuf> {
-    if !preserve_provider_route {
-        ensure_supported_provider_protocol(profile.protocol)?;
-    }
+    ensure_supported_provider_protocol(profile.protocol, protocol_proxy_base_url)?;
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let agents_md_path = home.join("AGENTS.md");
@@ -280,7 +261,7 @@ fn apply_runtime_provider_config_at_mode(
     // `/` for the packaged macOS app, rather than from CODEX_HOME.
     let model_catalog_path =
         use_official_catalog.then(|| home.join(crate::model_catalog::relative_path()));
-    let updated = patch_config_with_fastctx_mode(
+    let updated = patch_config_with_fastctx_mode_and_proxy(
         existing,
         profile,
         &provider_id,
@@ -291,6 +272,7 @@ fn apply_runtime_provider_config_at_mode(
         subagent_model,
         subagent_reasoning_effort,
         preserve_provider_route,
+        protocol_proxy_base_url,
     )?;
     let applied_base_url = provider_base_url(&updated, &provider_id);
     if let Err(error) =
@@ -324,6 +306,7 @@ fn apply_runtime_provider_config_at_mode(
         config_snapshot_dir: None,
         original_config_exists: original_config.is_some(),
         preserve_provider_route,
+        protocol_proxy_base_url: protocol_proxy_base_url.map(str::to_string),
         fastctx_command: fastctx_command.map(Path::to_path_buf),
         subagent_optimization_applied: subagent_optimization,
         subagent_model: subagent_model.to_string(),
@@ -553,6 +536,7 @@ fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Opt
         } else {
             state.subagent_reasoning_effort.as_str()
         },
+        state.protocol_proxy_base_url.as_deref(),
     )
     .context("重新应用 Codey 运行时增强失败")?;
 
@@ -1300,6 +1284,7 @@ fn patch_config_with_fastctx(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn patch_config_with_fastctx_mode(
     existing: &str,
@@ -1313,12 +1298,41 @@ fn patch_config_with_fastctx_mode(
     subagent_reasoning_effort: &str,
     preserve_provider_route: bool,
 ) -> Result<String> {
+    patch_config_with_fastctx_mode_and_proxy(
+        existing,
+        profile,
+        provider_id,
+        model_catalog_path,
+        default_model,
+        fastctx_command,
+        subagent_optimization,
+        subagent_model,
+        subagent_reasoning_effort,
+        preserve_provider_route,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn patch_config_with_fastctx_mode_and_proxy(
+    existing: &str,
+    profile: &ProviderProfile,
+    provider_id: &str,
+    model_catalog_path: Option<&Path>,
+    default_model: Option<&str>,
+    fastctx_command: Option<&Path>,
+    subagent_optimization: bool,
+    subagent_model: &str,
+    subagent_reasoning_effort: &str,
+    preserve_provider_route: bool,
+    protocol_proxy_base_url: Option<&str>,
+) -> Result<String> {
     if !preserve_provider_route {
-        ensure_supported_provider_protocol(profile.protocol)?;
+        ensure_supported_provider_protocol(profile.protocol, protocol_proxy_base_url)?;
     }
     let mut doc = parse_document(existing)?;
     if preserve_provider_route {
-        ensure_active_provider_uses_responses(&doc)?;
+        apply_preserved_provider_route(&mut doc, protocol_proxy_base_url)?;
     }
     // CC Switch owns all routing and model-selection fields while Live
     // takeover is active. Codey only layers its independent runtime
@@ -1340,7 +1354,7 @@ fn patch_config_with_fastctx_mode(
         let provider = if profile.cc_switch_read_only {
             official_provider_table()
         } else {
-            direct_provider_table(profile, existing_local_provider)?
+            direct_provider_table(profile, existing_local_provider, protocol_proxy_base_url)?
         };
         doc["model_providers"]
             .as_table_mut()
@@ -1372,10 +1386,15 @@ fn patch_config_preserving_provider_route(
     subagent_optimization: bool,
     subagent_model: &str,
     subagent_reasoning_effort: &str,
+    protocol_proxy_base_url: Option<&str>,
 ) -> Result<String> {
-    patch_config_with_fastctx_mode(
+    let mut profile = ProviderProfile::new("route-preserve");
+    if protocol_proxy_base_url.is_some() {
+        profile.protocol = RelayProtocol::ChatCompletions;
+    }
+    patch_config_with_fastctx_mode_and_proxy(
         existing,
-        &ProviderProfile::new("route-preserve"),
+        &profile,
         "",
         None,
         None,
@@ -1384,6 +1403,7 @@ fn patch_config_preserving_provider_route(
         subagent_model,
         subagent_reasoning_effort,
         true,
+        protocol_proxy_base_url,
     )
 }
 
@@ -1601,8 +1621,16 @@ fn mentions_fastctx(value: &str) -> bool {
 fn direct_provider_table(
     profile: &ProviderProfile,
     existing_local_provider: Option<Table>,
+    protocol_proxy_base_url: Option<&str>,
 ) -> Result<Table> {
-    let base_url = profile.normalized_base_url();
+    let base_url = match profile.protocol {
+        RelayProtocol::Responses => profile.normalized_base_url(),
+        RelayProtocol::ChatCompletions => protocol_proxy_base_url
+            .map(str::trim)
+            .filter(|base_url| !base_url.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Chat Completions 线路的本地协议代理尚未启动"))?,
+    };
     if base_url.is_empty() {
         anyhow::bail!("第三方线路缺少 API 地址");
     }
@@ -1624,13 +1652,51 @@ fn direct_provider_table(
     Ok(provider)
 }
 
-fn ensure_supported_provider_protocol(protocol: RelayProtocol) -> Result<()> {
+fn ensure_supported_provider_protocol(
+    protocol: RelayProtocol,
+    protocol_proxy_base_url: Option<&str>,
+) -> Result<()> {
     match protocol {
         RelayProtocol::Responses => Ok(()),
-        RelayProtocol::ChatCompletions => anyhow::bail!(
-            "当前 Codex 已移除 wire_api = \"chat\"；请将第三方线路改为 Responses API 后重试"
-        ),
+        RelayProtocol::ChatCompletions
+            if protocol_proxy_base_url
+                .map(str::trim)
+                .is_some_and(|base_url| !base_url.is_empty()) =>
+        {
+            Ok(())
+        }
+        RelayProtocol::ChatCompletions => {
+            anyhow::bail!("Chat Completions 线路的本地 Responses 协议代理尚未启动")
+        }
     }
+}
+
+fn apply_preserved_provider_route(
+    doc: &mut DocumentMut,
+    protocol_proxy_base_url: Option<&str>,
+) -> Result<()> {
+    let Some(protocol_proxy_base_url) = protocol_proxy_base_url
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+    else {
+        return ensure_active_provider_uses_responses(doc);
+    };
+    let provider_id = doc
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|provider_id| !provider_id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("CC Switch Live 配置缺少活动 model_provider"))?
+        .to_string();
+    let provider = doc
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .and_then(|providers| providers.get_mut(&provider_id))
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| anyhow::anyhow!("CC Switch Live 配置缺少活动 Provider「{provider_id}」"))?;
+    provider["base_url"] = value(protocol_proxy_base_url);
+    provider["wire_api"] = value("responses");
+    Ok(())
 }
 
 fn ensure_active_provider_uses_responses(doc: &DocumentMut) -> Result<()> {
@@ -1989,6 +2055,7 @@ mod tests {
                 config_snapshot_dir: None,
                 original_config_exists: original.is_some(),
                 preserve_provider_route: false,
+                protocol_proxy_base_url: None,
                 fastctx_command: None,
                 subagent_optimization_applied: false,
                 subagent_model: String::new(),
@@ -2109,7 +2176,7 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
     }
 
     #[test]
-    fn direct_patch_rejects_the_removed_chat_wire_api() {
+    fn direct_chat_patch_requires_the_local_protocol_proxy() {
         let error = patch_config(
             "model_provider = \"openai\"\n",
             &direct_profile(RelayProtocol::ChatCompletions),
@@ -2121,8 +2188,30 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
         assert!(
             error
                 .to_string()
-                .contains("当前 Codex 已移除 wire_api = \"chat\"")
+                .contains("本地 Responses 协议代理尚未启动")
         );
+    }
+
+    #[test]
+    fn direct_chat_patch_routes_codex_through_the_local_responses_proxy() {
+        let result = patch_config_with_fastctx_mode_and_proxy(
+            "model_provider = \"openai\"\n",
+            &direct_profile(RelayProtocol::ChatCompletions),
+            "openai",
+            None,
+            None,
+            None,
+            false,
+            DEFAULT_SUBAGENT_MODEL,
+            DEFAULT_SUBAGENT_REASONING_EFFORT,
+            false,
+            Some("http://127.0.0.1:43123/v1"),
+        )
+        .unwrap();
+
+        assert!(result.contains("base_url = \"http://127.0.0.1:43123/v1\""));
+        assert!(result.contains("wire_api = \"responses\""));
+        assert!(result.contains("experimental_bearer_token = \"sk-direct\""));
     }
 
     #[test]
@@ -2187,7 +2276,7 @@ enabled = true
     }
 
     #[test]
-    fn route_preserving_patch_rejects_a_live_chat_wire_api() {
+    fn route_preserving_chat_patch_requires_the_local_protocol_proxy() {
         let existing = r#"
 model_provider = "cc-switch-live"
 
@@ -2215,6 +2304,49 @@ wire_api = "chat"
                 .to_string()
                 .contains("请将 CC Switch Live 线路改为 Responses API")
         );
+    }
+
+    #[test]
+    fn route_preserving_chat_patch_overlays_only_the_runtime_endpoint() {
+        let existing = r#"
+model_provider = "cc-switch-live"
+model = "deepseek-reasoner"
+
+[model_providers.cc-switch-live]
+name = "CC Switch Live"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "chat"
+experimental_bearer_token = "PROXY_MANAGED"
+"#;
+        let result = patch_config_with_fastctx_mode_and_proxy(
+            existing,
+            &direct_profile(RelayProtocol::ChatCompletions),
+            GLOBAL_PROVIDER_ID,
+            None,
+            None,
+            None,
+            false,
+            DEFAULT_SUBAGENT_MODEL,
+            DEFAULT_SUBAGENT_REASONING_EFFORT,
+            true,
+            Some("http://127.0.0.1:43123/v1"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            root_key_string(&result, "model_provider").as_deref(),
+            Some("cc-switch-live")
+        );
+        assert_eq!(
+            root_key_string(&result, "model").as_deref(),
+            Some("deepseek-reasoner")
+        );
+        assert_eq!(
+            provider_base_url(&result, "cc-switch-live").as_deref(),
+            Some("http://127.0.0.1:43123/v1")
+        );
+        assert!(result.contains("wire_api = \"responses\""));
+        assert!(result.contains("experimental_bearer_token = \"PROXY_MANAGED\""));
     }
 
     #[test]
@@ -2977,6 +3109,7 @@ command = "cc-switch-tool"
             &marker,
             &backup_root,
             true,
+            None,
         )
         .unwrap();
         let applied_a = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -3046,6 +3179,83 @@ command = "cc-switch-tool-v2"
             actual.as_table()
         ));
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn chat_route_lease_reapplies_the_protocol_proxy_after_a_live_hot_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        let route_a = r#"
+model_provider = "route-a"
+model = "deepseek-chat"
+
+[model_providers.route-a]
+name = "Route A"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "chat"
+experimental_bearer_token = "PROXY_MANAGED"
+"#;
+        fs::write(home.join("config.toml"), route_a).unwrap();
+
+        apply_runtime_provider_config_at_mode(
+            &home,
+            &direct_profile(RelayProtocol::ChatCompletions),
+            "route-a",
+            false,
+            None,
+            None,
+            false,
+            DEFAULT_SUBAGENT_MODEL,
+            DEFAULT_SUBAGENT_REASONING_EFFORT,
+            &marker,
+            &backup_root,
+            true,
+            Some("http://127.0.0.1:43123/v1"),
+        )
+        .unwrap();
+        let applied_a = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(
+            provider_base_url(&applied_a, "route-a").as_deref(),
+            Some("http://127.0.0.1:43123/v1")
+        );
+        assert!(applied_a.contains("wire_api = \"responses\""));
+
+        let route_b = r#"
+model_provider = "route-b"
+model = "qwen-coder"
+
+[model_providers.route-b]
+name = "Route B"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "chat"
+experimental_bearer_token = "PROXY_MANAGED"
+"#;
+        fs::write(home.join("config.toml"), route_b).unwrap();
+        let reconciled = reconcile_runtime_config_overlay_at(&home, &marker)
+            .unwrap()
+            .unwrap();
+        let applied_b = String::from_utf8(reconciled).unwrap();
+        assert_eq!(
+            root_key_string(&applied_b, "model_provider").as_deref(),
+            Some("route-b")
+        );
+        assert_eq!(
+            provider_base_url(&applied_b, "route-b").as_deref(),
+            Some("http://127.0.0.1:43123/v1")
+        );
+        assert!(applied_b.contains("wire_api = \"responses\""));
+
+        assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+        let restored =
+            parse_document(&fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+        let expected = parse_document(route_b).unwrap();
+        assert!(tables_semantically_equal(
+            expected.as_table(),
+            restored.as_table()
+        ));
     }
 
     #[test]

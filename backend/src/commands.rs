@@ -28,11 +28,12 @@ use models::{
     validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
-    current_model_state, current_renderer_model_catalog, sync_provider_models_for_launch,
+    current_model_state, current_renderer_model_catalog, provider_route_requires_restart,
+    sync_provider_models_for_launch,
 };
 pub use models::{
     fetch_current_provider_models, save_default_model, save_selected_models, sync_cc_switch_state,
-    sync_current_provider_command,
+    sync_current_provider_command, test_current_provider,
 };
 use runtime::refresh_injection_status;
 #[cfg(test)]
@@ -236,8 +237,14 @@ impl AppState {
                     .unwrap_or_else(|_| json!({"status":"failed"}))
             }
             "/codex-model-catalog" => {
-                let config = self.config.read().await.clone();
-                current_renderer_model_catalog(&config).unwrap_or_else(api_error_message)
+                let current_config = self.config.read().await.clone();
+                let runtime = self.runtime.lock().await.clone();
+                let catalog_config = model_catalog_config_for_runtime(
+                    &current_config,
+                    runtime.as_ref().map(|runtime| &runtime.applied_config),
+                )
+                .clone();
+                current_renderer_model_catalog(&catalog_config).unwrap_or_else(api_error_message)
             }
             "/backend/status" => {
                 let mut value = runtime_status(self).await.unwrap_or_else(api_error_message);
@@ -478,6 +485,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         },
         "sync_current_provider" => sync_current_provider_command(state).await,
         "fetch_current_provider_models" => fetch_current_provider_models(state).await,
+        "test_current_provider" => test_current_provider(state).await,
         "save_selected_models" => match (
             argument::<Vec<String>>(&args, "officialModels"),
             argument::<Vec<String>>(&args, "thirdPartyModels"),
@@ -1198,6 +1206,15 @@ fn config_requires_restart(
             && applied_subagent != &RuntimeSubagentConfig::from_config(current))
 }
 
+fn model_catalog_config_for_runtime<'a>(
+    current: &'a CodeyConfig,
+    runtime_applied: Option<&'a CodeyConfig>,
+) -> &'a CodeyConfig {
+    runtime_applied
+        .filter(|applied| provider_route_requires_restart(applied, current))
+        .unwrap_or(current)
+}
+
 async fn runtime_config_requires_restart(state: &Arc<AppState>, current: &CodeyConfig) -> bool {
     let runtime = state.runtime.lock().await.clone();
     let Some(runtime) = runtime else {
@@ -1282,6 +1299,36 @@ mod restart_tests {
             })
         );
         assert_eq!(catalog["model_metadata"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn renderer_catalog_uses_applied_route_while_provider_restart_is_pending() {
+        let applied = CodeyConfig::default();
+        let mut current = applied.clone();
+        let mut third_party = crate::config::ProviderProfile::new("第三方线路");
+        third_party.base_url = "https://api.example.test/v1".into();
+        current.active_profile_id = third_party.id.clone();
+        current.profiles.push(third_party);
+
+        assert!(std::ptr::eq(
+            model_catalog_config_for_runtime(&current, Some(&applied)),
+            &applied
+        ));
+    }
+
+    #[test]
+    fn renderer_catalog_uses_current_config_for_model_only_changes() {
+        let applied = CodeyConfig::default();
+        let mut current = applied.clone();
+        let provider_id = current.current_provider_id().unwrap().to_string();
+        current
+            .default_model_by_provider
+            .insert(provider_id, "provider-default".into());
+
+        assert!(std::ptr::eq(
+            model_catalog_config_for_runtime(&current, Some(&applied)),
+            &current
+        ));
     }
 
     #[test]

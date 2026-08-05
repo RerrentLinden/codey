@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "4";
+  const patchVersion = "5";
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion) {
     void existingPatch.refresh();
@@ -14,6 +14,11 @@
   const modelQueryKey = ["models", "list"];
   const modelResponseEvent = "message";
   const modelRequestEvent = "codex-message-from-view";
+  const modelBoundRequestMethods = new Set([
+    "thread/start",
+    "thread/resume",
+    "turn/start",
+  ]);
   let catalog = {
     loaded: false,
     models: [],
@@ -28,6 +33,8 @@
   let disposed = false;
   const modelListRequestIds = new Set();
   const knownModelQueryClients = new Set();
+  let originalDispatchEvent = null;
+  let patchedDispatchEvent = null;
   let deliveryState = {
     revision: 0,
     statsigClients: 0,
@@ -773,15 +780,79 @@
     });
   };
 
-  const handleModelRequest = (event) => {
-    const detail = event?.detail;
+  const patchedRequestParams = (method, params) => {
+    if (
+      !catalog.loaded
+      || !catalog.defaultModel
+      || !modelBoundRequestMethods.has(method)
+    ) {
+      return params;
+    }
+    const source = params && typeof params === "object" ? params : {};
+    const requestedModel = typeof source.model === "string"
+      ? source.model.trim()
+      : "";
+    if (requestedModel && catalog.models.includes(requestedModel)) {
+      return params;
+    }
+    return {
+      ...source,
+      model: catalog.defaultModel,
+    };
+  };
+
+  const patchOutgoingModelRequest = (detail) => {
     const request = detail?.request;
     if (
       detail?.type !== "mcp-request"
-      || request?.method !== "model/list"
-      || request?.id == null
-    ) return;
-    modelListRequestIds.add(String(request.id));
+      || !request
+      || typeof request !== "object"
+    ) return false;
+    if (request.method === "model/list" && request.id != null) {
+      modelListRequestIds.add(String(request.id));
+    }
+
+    const wrappedMethod = request.method === "send-cli-request-for-host"
+      && typeof request.params?.method === "string"
+      ? request.params.method
+      : "";
+    const method = wrappedMethod || String(request.method || "");
+    const params = wrappedMethod ? request.params?.params : request.params;
+    const nextParams = patchedRequestParams(method, params);
+    if (nextParams === params) return false;
+    if (wrappedMethod) {
+      request.params = {
+        ...(request.params || {}),
+        params: nextParams,
+      };
+    } else {
+      request.params = nextParams;
+    }
+    return true;
+  };
+
+  const handleModelRequest = (event) => {
+    patchOutgoingModelRequest(event?.detail);
+  };
+
+  const installModelRequestDispatchPatch = () => {
+    if (typeof window.dispatchEvent !== "function") return;
+    if (window.dispatchEvent.__codeyModelRequestPatchVersion === patchVersion) return;
+    originalDispatchEvent = window.dispatchEvent;
+    patchedDispatchEvent = function codeyModelRequestDispatchEvent(event) {
+      try {
+        if (event?.type === modelRequestEvent) {
+          patchOutgoingModelRequest(event.detail);
+        }
+      } catch (error) {
+        console.warn("[Codey] model request repair failed", error);
+      }
+      return originalDispatchEvent.call(this, event);
+    };
+    Object.defineProperty(patchedDispatchEvent, "__codeyModelRequestPatchVersion", {
+      value: patchVersion,
+    });
+    window.dispatchEvent = patchedDispatchEvent;
   };
 
   const handleModelResponse = (event) => {
@@ -825,6 +896,7 @@
     document.addEventListener(eventName, handleInteraction, true);
   });
   window.addEventListener?.("focus", handleFocus);
+  installModelRequestDispatchPatch();
   if (typeof window.addEventListener === "function") {
     window.addEventListener(modelRequestEvent, handleModelRequest, true);
     window.addEventListener(modelResponseEvent, handleModelResponse, true);
@@ -852,6 +924,11 @@
       window.removeEventListener?.("focus", handleFocus);
       window.removeEventListener?.(modelRequestEvent, handleModelRequest, true);
       window.removeEventListener?.(modelResponseEvent, handleModelResponse, true);
+      if (patchedDispatchEvent && window.dispatchEvent === patchedDispatchEvent) {
+        window.dispatchEvent = originalDispatchEvent;
+      }
+      originalDispatchEvent = null;
+      patchedDispatchEvent = null;
       knownModelQueryClients.clear();
       modelListRequestIds.clear();
     },

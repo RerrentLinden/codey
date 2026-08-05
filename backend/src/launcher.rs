@@ -11,7 +11,10 @@ use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
 use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved;
-use codey_runtime_core::launcher::build_codex_command;
+use codey_runtime_core::launcher::{
+    ProtocolProxyHandle, build_codex_command, start_protocol_proxy,
+};
+use codey_runtime_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
 use serde::Serialize;
 use tokio::process::{Child, Command};
@@ -20,9 +23,9 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use crate::cc_switch::{self, RouteTakeoverState};
 use crate::cdp;
 use crate::codex_config::{
-    active_model_provider, apply_runtime_provider_config,
-    apply_runtime_provider_config_preserving_route, codex_home, ensure_global_model_provider,
-    reconcile_runtime_config_overlay, restore_runtime_provider_config,
+    RuntimeProviderConfigOptions, active_model_provider, apply_runtime_provider_config, codex_home,
+    ensure_global_model_provider, reconcile_runtime_config_overlay,
+    restore_runtime_provider_config,
 };
 use crate::config::{CodeyConfig, GpuLaunchMode};
 use crate::crashpad_pending_guard::{self, CrashpadPendingStatsHandle};
@@ -164,6 +167,42 @@ pub struct CodeyRuntime {
     crashpad_guard_enabled: Arc<AtomicBool>,
     crashpad_guard_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     crashpad_guard_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    protocol_proxy: Mutex<Option<ProtocolProxyHandle>>,
+}
+
+fn protocol_proxy_settings(config: &CodeyConfig) -> Option<BackendSettings> {
+    let profile = config.active_profile()?;
+    if profile.cc_switch_read_only || profile.protocol != RelayProtocol::ChatCompletions {
+        return None;
+    }
+    let base_url = profile.normalized_base_url();
+    let relay = RelayProfile {
+        id: profile.id.clone(),
+        name: profile.name.clone(),
+        model: config.default_model().unwrap_or_default().to_string(),
+        base_url: base_url.clone(),
+        upstream_base_url: base_url,
+        api_key: profile.api_key.clone(),
+        protocol: RelayProtocol::ChatCompletions,
+        relay_mode: RelayMode::PureApi,
+        ..RelayProfile::default()
+    };
+    Some(BackendSettings {
+        active_relay_id: relay.id.clone(),
+        relay_profiles: vec![relay],
+        enhancements_enabled: false,
+        ..BackendSettings::default()
+    })
+}
+
+async fn start_runtime_protocol_proxy(config: &CodeyConfig) -> Result<Option<ProtocolProxyHandle>> {
+    let Some(settings) = protocol_proxy_settings(config) else {
+        return Ok(None);
+    };
+    start_protocol_proxy(settings)
+        .await
+        .map(Some)
+        .context("启动 Chat Completions 本地协议代理失败")
 }
 
 async fn resolve_startup_provider(
@@ -336,6 +375,7 @@ async fn prepare_codex_startup_state(
     home: &std::path::Path,
     original_provider: &str,
     preserve_provider_route: bool,
+    protocol_proxy_base_url: Option<&str>,
 ) -> Result<PathBuf> {
     let current_profile = config
         .active_profile()
@@ -474,30 +514,24 @@ async fn prepare_codex_startup_state(
     let subagent_optimization = config.subagent_optimization;
     let subagent_model = config.subagent_model.clone();
     let subagent_reasoning_effort = config.subagent_reasoning_effort.clone();
+    let protocol_proxy_base_url = protocol_proxy_base_url.map(str::to_string);
+    let protocol_proxy_enabled = protocol_proxy_base_url.is_some();
     let runtime_config = tokio::task::spawn_blocking(move || {
-        if preserve_provider_route {
-            apply_runtime_provider_config_preserving_route(
-                &runtime_config_home,
-                &runtime_config_profile,
-                &runtime_config_provider,
-                fast_context_tools,
-                subagent_optimization,
-                &subagent_model,
-                &subagent_reasoning_effort,
-            )
-        } else {
-            apply_runtime_provider_config(
-                &runtime_config_home,
-                &runtime_config_profile,
-                &runtime_config_provider,
+        apply_runtime_provider_config(
+            &runtime_config_home,
+            &runtime_config_profile,
+            &runtime_config_provider,
+            RuntimeProviderConfigOptions {
                 use_official_catalog,
-                runtime_default_model.as_deref(),
+                default_model: runtime_default_model.as_deref(),
                 fast_context_tools,
                 subagent_optimization,
-                &subagent_model,
-                &subagent_reasoning_effort,
-            )
-        }
+                subagent_model: &subagent_model,
+                subagent_reasoning_effort: &subagent_reasoning_effort,
+                preserve_provider_route,
+                protocol_proxy_base_url: protocol_proxy_base_url.as_deref(),
+            },
+        )
     })
     .await
     .map_err(|error| {
@@ -512,6 +546,7 @@ async fn prepare_codex_startup_state(
                 "fastContextTools": config.fast_context_tools,
                 "subagentOptimization": config.subagent_optimization,
                 "preserveProviderRoute": preserve_provider_route,
+                "protocolProxyEnabled": protocol_proxy_enabled,
                 "taskJoinFailed": true,
             }),
         );
@@ -528,6 +563,7 @@ async fn prepare_codex_startup_state(
                 "fastContextTools": config.fast_context_tools,
                 "subagentOptimization": config.subagent_optimization,
                 "preserveProviderRoute": preserve_provider_route,
+                "protocolProxyEnabled": protocol_proxy_enabled,
             }),
         );
         error
@@ -735,9 +771,31 @@ impl CodeyRuntime {
             }
         }
 
-        let app_dir =
-            prepare_codex_startup_state(config, &home, &original_provider, preserve_provider_route)
-                .await?;
+        let protocol_proxy = start_runtime_protocol_proxy(config)
+            .await
+            .map_err(|error| {
+                error_log::record_failure(
+                    "protocol_proxy_start_failed",
+                    "start_chat_completions_protocol_proxy",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "provider": config.current_provider_id(),
+                        "protocol": config.active_profile().map(|profile| profile.protocol),
+                    }),
+                );
+                error
+            })?;
+        let protocol_proxy_base_url = protocol_proxy
+            .as_ref()
+            .map(|proxy| proxy.base_url().to_string());
+        let app_dir = prepare_codex_startup_state(
+            config,
+            &home,
+            &original_provider,
+            preserve_provider_route,
+            protocol_proxy_base_url.as_deref(),
+        )
+        .await?;
 
         let marketplace_home = home.clone();
         let marketplace_task = tokio::task::spawn_blocking(move || {
@@ -1060,6 +1118,7 @@ impl CodeyRuntime {
                 crashpad_guard_enabled,
                 crashpad_guard_shutdown: Mutex::new(Some(crashpad_guard_shutdown)),
                 crashpad_guard_task: Mutex::new(Some(crashpad_guard_task)),
+                protocol_proxy: Mutex::new(protocol_proxy),
             },
             codex_exit,
         ))
@@ -1163,6 +1222,11 @@ impl CodeyRuntime {
         if let Some(child) = self.child.lock().await.take() {
             reap_child_after_cleanup(child, "reap_child_during_runtime_stop").await;
         }
+        let protocol_proxy_stop = if let Some(proxy) = self.protocol_proxy.lock().await.take() {
+            proxy.shutdown().await
+        } else {
+            Ok(())
+        };
         let config_restore = restore_runtime_config(&codex_home());
         if let Err(error) = &process_stop {
             error_log::record_failure(
@@ -1175,13 +1239,28 @@ impl CodeyRuntime {
                 }),
             );
         }
-        match (process_stop, config_restore) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(process_error), Ok(())) => Err(process_error),
-            (Ok(()), Err(config_error)) => Err(config_error),
-            (Err(process_error), Err(config_error)) => anyhow::bail!(
-                "清理 Codex 遗留进程失败：{process_error:#}；恢复 Codex 配置也失败：{config_error:#}"
-            ),
+        if let Err(error) = &protocol_proxy_stop {
+            error_log::record_failure(
+                "cleanup_failed",
+                "stop_chat_completions_protocol_proxy",
+                format!("{error:#}"),
+                serde_json::json!({}),
+            );
+        }
+        let mut failures = Vec::new();
+        if let Err(error) = process_stop {
+            failures.push(format!("清理 Codex 遗留进程失败：{error:#}"));
+        }
+        if let Err(error) = protocol_proxy_stop {
+            failures.push(format!("关闭本地协议代理失败：{error:#}"));
+        }
+        if let Err(error) = config_restore {
+            failures.push(format!("恢复 Codex 配置失败：{error:#}"));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(failures.join("；"))
         }
     }
 }
@@ -2444,6 +2523,40 @@ mod gpu_launch_argument_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_provider_builds_an_explicit_protocol_proxy_snapshot() {
+        let mut config = CodeyConfig::default();
+        let mut profile = crate::config::ProviderProfile::new("DeepSeek");
+        profile.base_url = "https://relay.example/v1".to_string();
+        profile.api_key = "sk-test".to_string();
+        profile.protocol = RelayProtocol::ChatCompletions;
+        config.active_profile_id = profile.id.clone();
+        config.profiles = vec![profile.clone()];
+        config
+            .default_model_by_provider
+            .insert(profile.id.clone(), "deepseek-reasoner".to_string());
+
+        let settings = protocol_proxy_settings(&config).unwrap();
+        let relay = settings.active_relay_profile();
+        assert_eq!(settings.active_relay_id, profile.id);
+        assert_eq!(relay.base_url, "https://relay.example/v1");
+        assert_eq!(relay.api_key, "sk-test");
+        assert_eq!(relay.model, "deepseek-reasoner");
+        assert_eq!(relay.protocol, RelayProtocol::ChatCompletions);
+        assert_eq!(relay.relay_mode, RelayMode::PureApi);
+    }
+
+    #[test]
+    fn responses_provider_does_not_start_a_protocol_proxy() {
+        let mut config = CodeyConfig::default();
+        let mut profile = crate::config::ProviderProfile::new("Responses");
+        profile.base_url = "https://relay.example/v1".to_string();
+        config.active_profile_id = profile.id.clone();
+        config.profiles = vec![profile];
+
+        assert!(protocol_proxy_settings(&config).is_none());
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
