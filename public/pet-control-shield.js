@@ -1,7 +1,7 @@
 (() => {
   window.__codeyPetControlShieldCleanup?.();
 
-  const enabled = "__CODEY_SLIM_PET__" === "true";
+  const enabled = ["__CODEY_SLIM_PET__"][0] === "true";
   const petControlIds = new Set([
     "settings.appearance.pets",
     "settings.personalization.pets",
@@ -104,13 +104,6 @@
     return blocked;
   };
 
-  const blockBeforePaint = (root) => {
-    if (!(root instanceof HTMLElement) || root.isConnected === false) return 0;
-    const hasControlCandidate =
-      root.matches?.(controlSelector) || root.querySelector?.(controlSelector);
-    return hasControlCandidate ? block(root) : 0;
-  };
-
   if (!enabled) {
     window.__codeyBlockNativePetControls = () => 0;
     window.__codeyPetControlShield = Object.freeze({ enabled, block: () => 0, isPetControl });
@@ -122,121 +115,16 @@
     return;
   }
 
-  let controlObserver = null;
-  let flushTimer = 0;
-  let cancelPendingFlush = null;
-  const pendingRoots = new Set();
-  const pendingRootLimit = 64;
-
-  const addPendingRoot = (root) => {
-    if (!(root instanceof HTMLElement) || pendingRoots.has(root)) return;
-    if (pendingRoots.has(document.documentElement)) return;
-    if (pendingRoots.size >= pendingRootLimit) {
-      // Collapse instead of tracking an unbounded root set during heavy
-      // streaming; one document sweep is cheaper than hundreds of subtrees.
-      pendingRoots.clear();
-      pendingRoots.add(document.documentElement);
-      return;
-    }
-    for (const pending of pendingRoots) {
-      if (pending.contains?.(root)) return;
-    }
-    for (const pending of [...pendingRoots]) {
-      if (root.contains?.(pending)) pendingRoots.delete(pending);
-    }
-    pendingRoots.add(root);
-  };
-
-  const flushPendingRoots = () => {
-    flushTimer = 0;
-    cancelPendingFlush = null;
-    if (!pendingRoots.size) return;
-    const roots = [...pendingRoots];
-    pendingRoots.clear();
-    for (const root of roots) {
-      if (root.isConnected === false) continue;
-      block(root);
-    }
-  };
-
-  const queueMutationRoot = (root) => {
-    if (!(root instanceof HTMLElement)) return;
-    if (blockBeforePaint(root) > 0) return;
-    addPendingRoot(root);
-  };
-
-  const schedulePendingFlush = () => {
-    // Deliberately non-resetting: a sustained mutation stream must not be able
-    // to starve the flush indefinitely. Prefer rAF so menu controls inserted
-    // during a click are blocked before the next paint instead of flashing.
-    if (flushTimer) return;
-    if (typeof window.requestAnimationFrame === "function") {
-      flushTimer = window.requestAnimationFrame(flushPendingRoots);
-      cancelPendingFlush = () => window.cancelAnimationFrame?.(flushTimer);
-      return;
-    }
-    if (typeof window.setTimeout !== "function") {
-      flushPendingRoots();
-      return;
-    }
-    flushTimer = window.setTimeout(flushPendingRoots, 0);
-    cancelPendingFlush = () => window.clearTimeout?.(flushTimer);
-  };
-
-  if (typeof MutationObserver === "function" && document.documentElement) {
-    const mutationRoot = (node) => {
-      if (node instanceof HTMLElement) return node;
-      return node?.parentElement instanceof HTMLElement ? node.parentElement : null;
-    };
-    controlObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        const target = mutationRoot(mutation.target);
-        if (mutation.type === "attributes") {
-          const containingControl = target?.closest?.(controlSelector);
-          if (containingControl) queueMutationRoot(containingControl);
-          continue;
-        }
-        const containingControl = target?.closest?.(controlSelector);
-        if (containingControl) queueMutationRoot(containingControl);
-        for (const node of mutation.addedNodes || []) {
-          queueMutationRoot(mutationRoot(node));
-        }
-      }
-      if (pendingRoots.size) schedulePendingFlush();
-    });
-    controlObserver.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["aria-label", "role", "title"],
-      childList: true,
-      subtree: true,
-    });
-  }
-
-  const stopPetControlEvent = (event) => {
-    const control = event.target instanceof Element
-      ? event.target.closest(controlSelector)
-      : null;
-    if (!isPetControl(control)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation?.();
-  };
-
-  const eventNames = ["pointerdown", "click", "keydown"];
-  eventNames.forEach((eventName) => {
-    document.addEventListener(eventName, stopPetControlEvent, true);
+  const shieldLifecycle = window.__codeyMutationDispatcher?.createShieldLifecycle({
+    attributeFilter: ["aria-label", "role", "title"],
+    block,
+    eventSelector: controlSelector,
+    isControl: isPetControl,
   });
   window.__codeyBlockNativePetControls = block;
   window.__codeyPetControlShield = Object.freeze({ enabled, block, isPetControl });
   window.__codeyPetControlShieldCleanup = () => {
-    controlObserver?.disconnect();
-    if (flushTimer) cancelPendingFlush?.();
-    flushTimer = 0;
-    cancelPendingFlush = null;
-    pendingRoots.clear();
-    eventNames.forEach((eventName) => {
-      document.removeEventListener(eventName, stopPetControlEvent, true);
-    });
+    shieldLifecycle?.cleanup();
     delete window.__codeyBlockNativePetControls;
     delete window.__codeyPetControlShield;
     delete window.__codeyPetControlShieldCleanup;

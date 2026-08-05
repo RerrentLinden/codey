@@ -4,7 +4,10 @@ import test from "node:test";
 import vm from "node:vm";
 
 const root = new URL("../", import.meta.url);
-const source = await readFile(new URL("public/security-warning-shield.js", root), "utf8");
+const [bridgeSource, source] = await Promise.all([
+  readFile(new URL("public/codey-bridge.js", root), "utf8"),
+  readFile(new URL("public/security-warning-shield.js", root), "utf8"),
+]);
 
 class FakeElement {
   constructor(tagName = "div", text = "") {
@@ -88,7 +91,7 @@ function createRuntime(config) {
     },
   };
   window.window = window;
-  vm.runInNewContext(source, {
+  const sandbox = {
     document,
     Element: FakeElement,
     MutationObserver: class {
@@ -97,9 +100,13 @@ function createRuntime(config) {
       }
 
       observe() {}
+
+      disconnect() {}
     },
     window,
-  });
+  };
+  vm.runInNewContext(bridgeSource, sandbox);
+  vm.runInNewContext(source, sandbox);
   return {
     body,
     listeners,

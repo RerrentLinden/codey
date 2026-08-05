@@ -7,6 +7,10 @@ const template = readFileSync(
   new URL("../public/pet-control-shield.js", import.meta.url),
   "utf8",
 );
+const bridgeTemplate = readFileSync(
+  new URL("../public/codey-bridge.js", import.meta.url),
+  "utf8",
+);
 
 class FakeElement {
   constructor(text = "", isControl = true, children = []) {
@@ -148,16 +152,18 @@ function loadShield(enabled) {
     pendingTimers.clear();
     callbacks.forEach((callback) => callback());
   };
+  const sandbox = {
+    document,
+    Element: FakeElement,
+    HTMLElement: FakeElement,
+    MutationObserver: FakeMutationObserver,
+    WeakMap,
+    window,
+  };
+  vm.runInNewContext(bridgeTemplate, sandbox);
   vm.runInNewContext(
     template.replace("__CODEY_SLIM_PET__", enabled ? "true" : "false"),
-    {
-      document,
-      Element: FakeElement,
-      HTMLElement: FakeElement,
-      MutationObserver: FakeMutationObserver,
-      WeakMap,
-      window,
-    },
+    sandbox,
   );
   return {
     documentElement,

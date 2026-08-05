@@ -2,6 +2,7 @@ mod account_usage;
 mod cc_switch;
 mod cdp;
 mod codex_config;
+mod codex_config_guidance;
 mod codex_startup_patch;
 mod commands;
 mod config;

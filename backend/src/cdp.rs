@@ -15,7 +15,7 @@ use crate::error_log;
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const FAST_STARTUP_STATSIG_TIMEOUT_MS: u64 = 1500;
-const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(15);
+const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const FAST_STARTUP_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/fast-startup-shield.js");
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
@@ -412,8 +412,10 @@ pub async fn retry_inject_with_scripts(
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
 ) -> std::result::Result<InjectedTarget, InjectionRetryFailure> {
-    // 与原 30x500ms 相同的 ~15 秒总预算，指数退避减少 Codex 尚未就绪时的
-    // 无效尝试。
+    // Renderer asset preparation on newer Windows Codex builds can consume
+    // more than ten seconds before the first injectable page appears. Keep
+    // enough budget for the bridge commands after discovery while retaining a
+    // hard startup deadline.
     let started_at = tokio::time::Instant::now();
     let deadline = started_at + CDP_INJECTION_TIMEOUT;
     let mut delay = Duration::from_millis(100);
@@ -1109,6 +1111,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn injection_deadline_leaves_time_for_slow_windows_renderer_startup() {
+        assert_eq!(CDP_INJECTION_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
     fn overlay_wrapper_records_runtime_errors() {
         let wrapped = wrap_settings_overlay("throw new Error('boom');");
         assert!(wrapped.contains("window.__codeyOverlayError = message"));
@@ -1182,8 +1189,8 @@ mod tests {
         let enabled = PET_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_PET__", "true");
         let disabled = PET_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_PET__", "false");
 
-        assert!(enabled.contains(r#"const enabled = "true" === "true""#));
-        assert!(disabled.contains(r#"const enabled = "false" === "true""#));
+        assert!(enabled.contains(r#"["true"][0]==="true""#));
+        assert!(disabled.contains(r#"["false"][0]==="true""#));
     }
 
     #[test]
@@ -1191,8 +1198,8 @@ mod tests {
         let enabled = VOICE_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_VOICE__", "true");
         let disabled = VOICE_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_VOICE__", "false");
 
-        assert!(enabled.contains(r#"const enabled = "true" === "true""#));
-        assert!(disabled.contains(r#"const enabled = "false" === "true""#));
+        assert!(enabled.contains(r#"["true"][0]==="true""#));
+        assert!(disabled.contains(r#"["false"][0]==="true""#));
     }
 
     #[test]
@@ -1208,14 +1215,14 @@ mod tests {
         assert_eq!(prepared.scripts.len(), 2);
         let core = &prepared.scripts[0];
         assert!(core.contains("window.__codeyFastStartupShield"));
-        assert!(core.contains(r#"const enabled = "true" === "true""#));
+        assert!(core.contains(r#"["true"][0]==="true""#));
         assert!(core.contains("window.__codeyBridgeHelpersInstalled"));
         assert!(core.contains("__codeyGitRequestGuard"));
         assert!(core.contains("window.__codeyModelWhitelistPatch"));
         assert!(core.contains("/codex-model-catalog"));
         assert!(core.contains("window.__codeyRendererCoreLoaded"));
-        assert!(core.contains(r#"const enabled = "true" === "true""#));
-        assert!(core.contains(r#"const enabled = "false" === "true""#));
+        assert!(core.contains(r#"["true"][0]==="true""#));
+        assert!(core.contains(r#"["false"][0]==="true""#));
         assert!(core.contains(SETTINGS_OVERLAY_LOAD_PATH));
         assert!(core.contains(SESSION_TOOLS_LOAD_PATH));
         assert!(core.contains("__codeyLazyLoader"));

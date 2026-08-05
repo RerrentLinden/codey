@@ -101,6 +101,58 @@ input:focus-visible,
   padding: 0;
 }
 
+.codey-tag {
+  box-sizing: border-box;
+  display: inline-flex;
+  height: 20px;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border-radius: var(--semi-border-radius-full);
+  padding: 2px 8px;
+  font-size: 12px;
+  line-height: 16px;
+  user-select: none;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+
+.codey-tag-neutral {
+  background: rgba(var(--semi-grey-5), 0.15);
+  color: rgba(var(--semi-grey-8), 1);
+}
+
+.codey-tag-destructive {
+  background: rgba(var(--semi-red-5), 0.15);
+  color: rgba(var(--semi-red-8), 1);
+}
+
+.codey-tag-outline {
+  border: 1px solid rgba(var(--semi-grey-4), 1);
+  background: transparent;
+  color: rgba(var(--semi-grey-5), 1);
+}
+
+.codey-tag-success {
+  background: rgba(var(--semi-green-5), 0.15);
+  color: rgba(var(--semi-green-8), 1);
+}
+
+.codey-tag-warning {
+  background: rgba(var(--semi-orange-5), 0.15);
+  color: rgba(var(--semi-orange-8), 1);
+}
+
+.codey-tag-info {
+  background: rgba(var(--semi-light-blue-5), 0.15);
+  color: rgba(var(--semi-light-blue-8), 1);
+}
+
+.codey-tag-brand {
+  background: rgba(var(--semi-blue-5), 0.15);
+  color: rgba(var(--semi-blue-8), 1);
+}
+
 .skip-link {
   position: fixed;
   z-index: 100;
@@ -1999,15 +2051,17 @@ input:focus-visible,
 }
 
 .trace-status-dot {
-  width: 7px;
-  height: 7px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: #8e8e93;
   flex-shrink: 0;
+  transition: all 0.3s ease;
 }
 
 .trace-status-dot.active {
   background: #34c759;
+  box-shadow: 0 0 0 3px rgba(52, 199, 89, 0.2);
 }
 
 .trace-snapshot-info strong {
@@ -2023,30 +2077,57 @@ input:focus-visible,
 
 .trace-metrics-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(6, 1fr);
   gap: 12px;
 }
 
 .trace-metric-card {
   position: relative;
   display: flex;
+  grid-column: span 2;
   min-width: 0;
-  min-height: 104px;
+  min-height: 98px;
   align-items: flex-start;
-  gap: 12px;
+  gap: 10px;
   overflow: hidden;
   border: 1px solid rgba(0, 0, 0, 0.07);
-  border-radius: 10px;
-  background: #fbfbfd;
-  padding: 14px 16px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.02);
-  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 14px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+  transition: border-color 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              background-color 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.trace-metrics-grid.has-crashpad .trace-metric-card-crashpad-reports,
+.trace-metrics-grid.has-crashpad .trace-metric-card-crashpad-storage {
+  grid-column: span 3;
+}
+
+@media (max-width: 840px) {
+  .trace-metrics-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .trace-metric-card,
+  .trace-metrics-grid.has-crashpad .trace-metric-card-crashpad-reports,
+  .trace-metrics-grid.has-crashpad .trace-metric-card-crashpad-storage {
+    grid-column: span 1;
+  }
+}
+
+@media (max-width: 580px) {
+  .trace-metrics-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .trace-metric-card:hover {
-  border-color: rgba(0, 0, 0, 0.14);
+  transform: translateY(-2px);
   background: #ffffff;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+  border-color: rgba(0, 0, 0, 0.12);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.06);
 }
 
 .trace-metric-card::after {
@@ -2055,26 +2136,66 @@ input:focus-visible,
 
 .trace-metric-icon {
   display: grid;
-  width: 34px;
-  height: 34px;
+  width: 36px;
+  height: 36px;
   flex: 0 0 auto;
   place-items: center;
-  border-radius: 8px;
+  border-radius: 10px;
   background: rgba(0, 0, 0, 0.04);
   color: #48484a;
-  transition: background-color 0.15s ease, color 0.15s ease;
+  transition: all 0.2s ease;
 }
 
-.trace-metric-card:hover .trace-metric-icon {
-  background: rgba(0, 0, 0, 0.06);
-  color: #1d1d1f;
+.trace-metric-card-rows .trace-metric-icon {
+  background: rgba(0, 122, 255, 0.09);
+  color: #007aff;
+}
+.trace-metric-card-rows:hover {
+  border-color: rgba(0, 122, 255, 0.3);
+  box-shadow: 0 6px 16px rgba(0, 122, 255, 0.08);
+}
+
+.trace-metric-card-storage .trace-metric-icon {
+  background: rgba(88, 86, 214, 0.09);
+  color: #5856d6;
+}
+.trace-metric-card-storage:hover {
+  border-color: rgba(88, 86, 214, 0.3);
+  box-shadow: 0 6px 16px rgba(88, 86, 214, 0.08);
+}
+
+.trace-metric-card-content .trace-metric-icon {
+  background: rgba(48, 176, 199, 0.09);
+  color: #30b0c7;
+}
+.trace-metric-card-content:hover {
+  border-color: rgba(48, 176, 199, 0.3);
+  box-shadow: 0 6px 16px rgba(48, 176, 199, 0.08);
+}
+
+.trace-metric-card-crashpad-reports .trace-metric-icon {
+  background: rgba(255, 149, 0, 0.09);
+  color: #ff9500;
+}
+.trace-metric-card-crashpad-reports:hover {
+  border-color: rgba(255, 149, 0, 0.3);
+  box-shadow: 0 6px 16px rgba(255, 149, 0, 0.08);
+}
+
+.trace-metric-card-crashpad-storage .trace-metric-icon {
+  background: rgba(255, 45, 85, 0.09);
+  color: #ff2d55;
+}
+.trace-metric-card-crashpad-storage:hover {
+  border-color: rgba(255, 45, 85, 0.3);
+  box-shadow: 0 6px 16px rgba(255, 45, 85, 0.08);
 }
 
 .trace-metric-content {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  gap: 2px;
+  gap: 3px;
 }
 
 .trace-metric-content span {
@@ -2089,10 +2210,10 @@ input:focus-visible,
 .trace-metric-content strong {
   display: block;
   color: #1d1d1f;
-  font-size: 22px;
-  font-weight: 600;
+  font-size: 20px;
+  font-weight: 700;
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.025em;
+  letter-spacing: -0.03em;
   line-height: 1.15;
 }
 
@@ -2100,7 +2221,9 @@ input:focus-visible,
   display: block;
   color: #8e8e93;
   font-size: 11px;
-  line-height: 1.3;
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
 }
 
 .trace-empty-container {
@@ -2721,6 +2844,10 @@ input:focus-visible,
 
   .trace-metrics-grid {
     grid-template-columns: 1fr;
+  }
+
+  .trace-metric-card {
+    grid-column: span 1 !important;
   }
 
   .windows-patch-status {

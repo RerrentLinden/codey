@@ -6,11 +6,13 @@ import vm from "node:vm";
 const root = new URL("../", import.meta.url);
 
 test("renderer core waits for sidebar interaction before loading session tools", async () => {
-  const [inject, sessionTools, petShield, voiceShield] = await Promise.all([
+  const [inject, sessionTools, bridge, petShield, voiceShield, securityShield] = await Promise.all([
     readFile(new URL("public/renderer-inject.js", root), "utf8"),
     readFile(new URL("public/codey-inject.js", root), "utf8"),
+    readFile(new URL("public/codey-bridge.js", root), "utf8"),
     readFile(new URL("public/pet-control-shield.js", root), "utf8"),
     readFile(new URL("public/voice-control-shield.js", root), "utf8"),
+    readFile(new URL("public/security-warning-shield.js", root), "utf8"),
   ]);
 
   assert.match(inject, /const queryWithin = \(root, selector\)/);
@@ -64,9 +66,16 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.doesNotMatch(inject, /__codeyBlockNativePetControls/);
   assert.match(petShield, /const block = \(root = document\)/);
   assert.match(petShield, /if \(!enabled\) \{/);
-  assert.match(petShield, /controlObserver = new MutationObserver/);
+  assert.match(bridge, /window\.__codeyMutationDispatcher = Object\.freeze/);
+  assert.match(bridge, /const createShieldLifecycle = \(\{/);
+  assert.match(petShield, /__codeyMutationDispatcher\?\.createShieldLifecycle/);
   assert.match(voiceShield, /const block = \(root = document\)/);
   assert.match(voiceShield, /if \(!enabled\) \{/);
+  assert.match(voiceShield, /__codeyMutationDispatcher\?\.createShieldLifecycle/);
+  assert.match(securityShield, /__codeyMutationDispatcher\.subscribe/);
+  assert.doesNotMatch(petShield, /new MutationObserver/);
+  assert.doesNotMatch(voiceShield, /new MutationObserver/);
+  assert.doesNotMatch(securityShield, /new MutationObserver/);
 });
 
 test("renderer core defaults Codex locale to Chinese before remote config settles", async () => {

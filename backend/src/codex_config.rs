@@ -13,6 +13,11 @@ use codey_runtime_core::settings::RelayProtocol;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
+use crate::codex_config_guidance::{
+    CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG, LEGACY_CODEY_FASTCTX_GUIDANCE, SUBAGENT_GUIDANCE,
+    append_subagent_guidance, remove_codey_fastctx_guidance, remove_owned_guidance_block,
+    remove_subagent_guidance,
+};
 use crate::config::{
     DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, ProviderProfile,
     SUBAGENT_REASONING_EFFORTS, default_config_path,
@@ -31,85 +36,6 @@ const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 15;
 const APPLIED_CONFIG_FILE: &str = "applied-config.toml";
 const APPLIED_AGENTS_MD_FILE: &str = "applied-AGENTS.md";
 const APPLIED_DEFAULT_AGENT_FILE: &str = "agents/applied-default.toml";
-const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
-
-子代理在我们的工作里用于探索，他是你的探子。
-把子代理当成你手边最顺手的、用于「宽而重」读取的工具。工作的任何时候，只要你觉得需要就可以派。只有在它能减少主线程上下文污染、提高并行度或者提供独立核验的时候才使用。
-必须遵守：你需要更激进和更频繁地调用子代理，在任何需要的情况下，而不仅仅只是在对话的开头。我们需要更频繁的子代理调用来避免上下文腐烂，你承担子代理编排者的角色。
-
-### 何时直接处理
-
-直接读取以及处理以下内容，不派子代理：
-
-- 已知位置的小文件、少量代码或者单一事实；
-- 即将修改的具体代码；
-- 派发、等待以及复核的成本不低于自己读取的任务。
-- 奠基性文档，无论多长都自己读：架构文档、设计文档、交接备忘录（在别的工作流里可能是别的名字）等用来让你建立全局视角、充当后续判断地基的文件——它们的价值全在细节与脉络，一经子代理转译即失真，长度不构成外包的理由。
-
-### 何时适合派发
-
-适合交给子代理的：
-
-- 巨型大文件（奠基性文档除外，见上）、跨文件或者跨目录的检索；
-- 相互独立、可以并行的探索或者核验；
-- 长任务当中需要重新确认模块现状的；
-- 会产生大量日志、搜索结果或者外围材料的阅读。
-
-多个独立的任务应当并发派发。
-
-### 委派与验证
-
-给子代理的任务必须是自包含的，说明检索范围、具体问题以及期望的输出。精度重要的时候，要求返回 `file:line`、符号名以及必要的关键原文——这些出处就是你之后廉价复核的抓手。
-
-子代理的结果只是线索，可能遗漏或者出错。但复核不是把它读过的东西重读一遍，那样这次派发就白费了——你买的是「压缩」，重读会把压缩当场退光。复核 = 顺着它给的 `file:line` 以及关键原文来。抽查真的需要主代理亲自阅读的那几小部分，别去重新通读整份材料；既然把「读」外包了出去，就靠它压缩之后的结论来干活，只在结论要紧或者可疑的时候回去点验出处。
-
-唯二需要你亲自完整读原文的是：① 即将修改的确切代码，② 奠基性文档——这两类本就不外包（见「何时直接处理」）。对它们，子代理至多帮你定位，读由你亲自来：定位与阅读是分工，并非重复劳动。
-
-子代理默认只做探索、检索以及核验。代码修改、方案取舍以及最终验证由主代理来负责。
-
-### 派发机制
-
-- 是否派、派几个由主代理自主决定，无需用户明确要求；较重的探索应当拆成多个独立的轻任务来并发派发。
-- 我们系统允许最大并行7个会话进程。所以你最多可以并行分派 6 个子代理；子代理模型的成本较低，无需去顾虑并行派发的成本，只要任务需要就积极使用。
-- 子代理一律使用默认配置：工具支持角色参数的时候显式指定 `agent_role = "default"` 或者 `agent_type = "default"`；不支持的时候省略角色、由泛型派生加载 `default.toml`。禁用 `explorer`、`worker` 或者其他角色。
-- 派生的时候**必须**显式 `fork_turns = "none"`，不复制主代理的历史，让每个探子都保持干净、快、不背主代理正在腐烂的上下文（代价即上文「任务必须自包含」）。
-- 需要多个子代理的时候在同一轮并发派发；派发之后主代理立即 `wait_agent`，停止其余的分析、检索、命令执行以及文件修改，直至全部返回。
-- 收到某个子代理结果之后，如果提供了 `close_agent` 就必须立即关闭；每个子代理只用一轮，不复用、不追派。
-- 特别注意：子代理自派生起累计运行 10 分钟仍未完成：视为异常，主代理必须介入、不得继续盲等；检查代理状态或运行记录，已有可用 MESSAGE 时采用其部分结果，然后停止这个子代理。并自行判断是否需要再派生或拆分更小任务重新分派。"#;
-const DEFAULT_AGENT_CONFIG: &str = r#####"name = "default"
-
-description = "General-purpose exploration subagent using the configured default model and reasoning effort."
-
-developer_instructions = """
-你是通用子代理，是主代理派出去的探子。你只做探索、检索、核验：不改动任何东西，不做方案取舍或者最终判断——那些是主代理的事。
-不要派生、调用或者请求新的子代理；任务若是需要进一步拆分，把拆分的建议返回给主代理。
-
-你交回给主代理的东西：
-- 你的产出直接喂给主代理、是它据以行动的数据，并非给人看的。密而不水，不寒暄、不复述过程、不下客套结论。
-- 给证据，不给包装：关键处附上 `file:line`、符号名、必要的逐字原文。主代理会靠这些出处来抽查你、省去重读原文，所以出处必须准、且足以让它核验。
-- 把「看到的事实」以及「你的推断」分开，存疑的明确标注——别把猜测写成事实。
-- 压缩体量，但承重的精确信息（确切的名字、签名、取值、路径）一字不改地留住，别在转述里磨没了。
-
-你怎么工作：
-- 你只有一轮、任务是自包含的：没有追问的机会，别反问；用这一轮把任务范围查到位、尽力答全。
-- 答不全就如实交代「查到了什么、还有什么没覆盖、哪里存疑或者矛盾」。宁可显式报「没查到 / 没覆盖」，也别用含糊的话糊弄过去——你悄悄漏掉的，主代理无从复核。
-"""
-
-[features]
-image_generation = false
-"#####;
-const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. For local file \
-reading, content search, and file discovery, always use `mcp__codey_fastctx__read`, \
-`mcp__codey_fastctx__grep`, and `mcp__codey_fastctx__glob` before exec or shell commands. \
-Do not use cat, sed, rg, grep, find, or recursive ls when a FastCtx tool covers the operation. \
-Use exec only for builds, tests, Git, package managers, or when the FastCtx tool is unavailable \
-or fails. Use `mcp__codey_fastctx__replace` only for deterministic mechanical replacements, \
-and follow every Complete or Partial continuation exactly.";
-const LEGACY_CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Prefer \
-`mcp__codey_fastctx__read`, `mcp__codey_fastctx__grep`, and \
-`mcp__codey_fastctx__glob` over shell commands for local file inspection. Use \
-`mcp__codey_fastctx__replace` only for deterministic batch replacements, and \
-follow every Complete or Partial pagination note exactly.";
 const RESERVED_PROVIDER_IDS: [&str; 6] = [
     "amazon-bedrock",
     "openai",
@@ -458,19 +384,6 @@ fn apply_runtime_provider_config_at_mode(
     Ok(backup_dir)
 }
 
-fn append_subagent_guidance(existing: &str) -> String {
-    if existing.contains(SUBAGENT_GUIDANCE) {
-        return existing.to_string();
-    }
-    let mut updated = existing.trim_end().to_string();
-    if !updated.is_empty() {
-        updated.push_str("\n\n");
-    }
-    updated.push_str(SUBAGENT_GUIDANCE);
-    updated.push('\n');
-    updated
-}
-
 fn restore_optional_bytes(path: &Path, original: Option<&[u8]>) -> Result<()> {
     match original {
         Some(bytes) => atomic_write(path, bytes),
@@ -814,21 +727,6 @@ fn restore_agents_md(path: &Path, original: Option<&[u8]>, applied: &[u8]) -> Re
     } else {
         atomic_write(path, restored.as_bytes())
     }
-}
-
-fn remove_subagent_guidance(current: &str) -> Option<String> {
-    let guidance_start = current.find(SUBAGENT_GUIDANCE)?;
-    let mut owned_start = guidance_start;
-    if current[..owned_start].ends_with("\n\n") {
-        owned_start -= 2;
-    }
-    let mut owned_end = guidance_start + SUBAGENT_GUIDANCE.len();
-    if current[owned_end..].starts_with('\n') {
-        owned_end += 1;
-    }
-    let mut restored = current[..owned_start].to_string();
-    restored.push_str(&current[owned_end..]);
-    Some(restored)
 }
 
 fn restore_if_still_applied(path: &Path, original: Option<&[u8]>, applied: &[u8]) -> Result<()> {
@@ -1698,49 +1596,6 @@ fn mentions_fastctx(value: &str) -> bool {
     value
         .split(|character: char| !character.is_ascii_alphanumeric())
         .any(|part| part.eq_ignore_ascii_case("fastctx"))
-}
-
-fn remove_codey_fastctx_guidance(current: &str) -> Option<String> {
-    let mut restored = current.to_string();
-    let mut changed = false;
-    for guidance in [CODEY_FASTCTX_GUIDANCE, LEGACY_CODEY_FASTCTX_GUIDANCE] {
-        while let Some(without_guidance) = remove_guidance_paragraph(&restored, guidance) {
-            restored = without_guidance;
-            changed = true;
-        }
-    }
-    changed.then_some(restored)
-}
-
-fn remove_owned_guidance_block(current: &str, guidance: &str) -> Option<String> {
-    let guidance_start = current.find(guidance)?;
-    Some(remove_guidance_at(current, guidance_start, guidance.len()))
-}
-
-fn remove_guidance_paragraph(current: &str, guidance: &str) -> Option<String> {
-    let guidance_start = current.match_indices(guidance).find_map(|(start, _)| {
-        let end = start + guidance.len();
-        let starts_paragraph = start == 0 || current[..start].ends_with("\n\n");
-        let ends_paragraph = end == current.len() || current[end..].starts_with("\n\n");
-        (starts_paragraph && ends_paragraph).then_some(start)
-    })?;
-    Some(remove_guidance_at(current, guidance_start, guidance.len()))
-}
-
-fn remove_guidance_at(current: &str, guidance_start: usize, guidance_len: usize) -> String {
-    let guidance_end = guidance_start + guidance_len;
-    let (owned_start, owned_end) = if current[..guidance_start].ends_with("\n\n") {
-        (guidance_start - 2, guidance_end)
-    } else if current[guidance_end..].starts_with("\n\n") {
-        (guidance_start, guidance_end + 2)
-    } else if current[..guidance_start].ends_with('\n') {
-        (guidance_start - 1, guidance_end)
-    } else if current[guidance_end..].starts_with('\n') {
-        (guidance_start, guidance_end + 1)
-    } else {
-        (guidance_start, guidance_end)
-    };
-    format!("{}{}", &current[..owned_start], &current[owned_end..])
 }
 
 fn direct_provider_table(

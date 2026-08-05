@@ -1,5 +1,5 @@
 (() => {
-  const enabled = "__CODEY_FAST_CODEX_STARTUP__" === "true";
+  const enabled = ["__CODEY_FAST_CODEX_STARTUP__"][0] === "true";
   const timeoutMs = Math.max(
     250,
     Math.min(Number("__CODEY_STATSIG_TIMEOUT_MS__") || 1500, 5000),

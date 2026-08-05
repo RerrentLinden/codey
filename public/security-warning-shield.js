@@ -24,7 +24,7 @@
   ];
   let enabled = false;
   let scanTimer = 0;
-  let observer = null;
+  let unsubscribeMutations = null;
 
   // innerText forces a layout flush; the action labels this shield matches are
   // plain text nodes, so textContent is both sufficient and layout-free.
@@ -93,8 +93,8 @@
         scanTimer = 0;
       }
       pendingRoots.clear();
-      observer?.disconnect?.();
-      observer = null;
+      unsubscribeMutations?.();
+      unsubscribeMutations = null;
     }
     return enabled;
   };
@@ -145,8 +145,14 @@
   };
 
   const ensureObserver = () => {
-    if (observer || typeof MutationObserver !== "function" || !document.documentElement) return;
-    observer = new MutationObserver((mutations) => {
+    if (
+      unsubscribeMutations
+      || !window.__codeyMutationDispatcher
+      || !document.documentElement
+    ) {
+      return;
+    }
+    unsubscribeMutations = window.__codeyMutationDispatcher.subscribe((mutations) => {
       if (!enabled) return;
       let added = false;
       for (const mutation of mutations) {
@@ -164,8 +170,7 @@
         if (target) addPendingRoot(target.closest?.("button, [role=button]") || target);
       }
       if (added) scheduleScan();
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    }, { childList: true });
   };
 
   window.addEventListener?.(configEventName, (event) => {

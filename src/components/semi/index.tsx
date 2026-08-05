@@ -6,7 +6,6 @@ import SemiCheckbox from "@douyinfe/semi-ui/lib/es/checkbox";
 import SemiInput from "@douyinfe/semi-ui/lib/es/input";
 import Modal from "@douyinfe/semi-ui/lib/es/modal";
 import SemiSwitch from "@douyinfe/semi-ui/lib/es/switch";
-import Tag from "@douyinfe/semi-ui/lib/es/tag";
 import Tooltip from "@douyinfe/semi-ui/lib/es/tooltip";
 
 export { Tooltip };
@@ -77,22 +76,19 @@ type BadgeVariant =
   | "info"
   | "brand";
 
-export interface BadgeProps {
-  children?: React.ReactNode;
-  className?: string;
-  style?: React.CSSProperties;
+export interface BadgeProps extends React.HTMLAttributes<HTMLSpanElement> {
   variant?: BadgeVariant;
 }
 
 const badgeAppearance = {
-  default: { color: "grey", type: "light" },
-  secondary: { color: "grey", type: "light" },
-  destructive: { color: "red", type: "light" },
-  outline: { color: "grey", type: "ghost" },
-  success: { color: "green", type: "light" },
-  warning: { color: "orange", type: "light" },
-  info: { color: "light-blue", type: "light" },
-  brand: { color: "blue", type: "light" },
+  default: "neutral",
+  secondary: "neutral",
+  destructive: "destructive",
+  outline: "outline",
+  success: "success",
+  warning: "warning",
+  info: "info",
+  brand: "brand",
 } as const;
 
 export function Badge({
@@ -102,13 +98,9 @@ export function Badge({
 }: BadgeProps) {
   const appearance = badgeAppearance[variant];
   return (
-    <Tag
+    <span
       {...props}
-      className={classNames("codey-tag", className)}
-      color={appearance.color}
-      shape="circle"
-      size="small"
-      type={appearance.type}
+      className={classNames("codey-tag", `codey-tag-${appearance}`, className)}
     />
   );
 }

@@ -166,6 +166,375 @@ pub struct CodeyRuntime {
     crashpad_guard_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+async fn resolve_startup_provider(
+    home: &std::path::Path,
+    preserve_provider_route: bool,
+) -> Result<String> {
+    let provider_home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        if preserve_provider_route {
+            active_model_provider(&provider_home)
+        } else {
+            ensure_global_model_provider(&provider_home)
+        }
+    })
+    .await
+    .map_err(|error| {
+        let error = anyhow::Error::new(error).context("准备全局模型 Provider 任务异常退出");
+        error_log::record_failure(
+            "patch_failed",
+            if preserve_provider_route {
+                "read_cc_switch_live_provider"
+            } else {
+                "ensure_global_model_provider"
+            },
+            format!("{error:#}"),
+            serde_json::json!({
+                "codexHome": home,
+                "preserveProviderRoute": preserve_provider_route,
+                "taskJoinFailed": true,
+            }),
+        );
+        error
+    })?
+    .map_err(|error| {
+        error_log::record_failure(
+            "patch_failed",
+            if preserve_provider_route {
+                "read_cc_switch_live_provider"
+            } else {
+                "ensure_global_model_provider"
+            },
+            format!("{error:#}"),
+            serde_json::json!({
+                "codexHome": home,
+                "preserveProviderRoute": preserve_provider_route,
+            }),
+        );
+        error
+    })
+}
+
+async fn run_startup_session_maintenance(
+    home: &std::path::Path,
+    provider: &str,
+) -> Result<SessionMaintenanceSummary> {
+    let maintenance_home = home.to_path_buf();
+    let maintenance_provider = provider.to_string();
+    let maintenance_result = tokio::task::spawn_blocking(move || {
+        let stale_lock_recovery = maintenance_lock::recover_stale_locks(&maintenance_home);
+        let provider_sync =
+            match startup_maintenance::provider_sync_plan(&maintenance_home, &maintenance_provider)
+            {
+                Ok(ProviderSyncPlan::Cached) => {
+                    startup_maintenance::cached_provider_sync_result(&maintenance_provider)
+                }
+                Ok(ProviderSyncPlan::Full) | Err(_) => {
+                    let result = codey_runtime_data::run_provider_sync_with_target(
+                        Some(&maintenance_home),
+                        Some(&maintenance_provider),
+                    );
+                    if result.status == ProviderSyncStatus::Synced
+                        && result.skipped_locked_rollout_files.is_empty()
+                        && let Err(error) = startup_maintenance::record_provider_sync_success(
+                            &maintenance_home,
+                            &maintenance_provider,
+                        )
+                    {
+                        error_log::record_failure(
+                            "patch_failed",
+                            "record_provider_sync_success",
+                            format!("{error:#}"),
+                            serde_json::json!({
+                                "provider": maintenance_provider,
+                            }),
+                        );
+                        eprintln!("保存 Provider 同步状态失败：{error:#}");
+                    }
+                    result
+                }
+            };
+        // `session_index.jsonl` is also cleaned before spawn, while its
+        // source snapshot is stable. The original file is backed up.
+        let index_cleanup = session_index_cleanup::cleanup(&maintenance_home);
+        (stale_lock_recovery, provider_sync, index_cleanup)
+    })
+    .await;
+    let (stale_lock_recovery, provider_sync, index_cleanup) = match maintenance_result {
+        Ok(result) => result,
+        Err(error) => {
+            let error = anyhow::Error::new(error).context("启动前会话修复任务异常退出");
+            error_log::record_failure(
+                "patch_failed",
+                "run_startup_session_repairs",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "codexHome": home,
+                }),
+            );
+            return Err(error);
+        }
+    };
+    match stale_lock_recovery {
+        Ok(recovered) => {
+            for path in recovered {
+                eprintln!("已清理陈旧维护锁：{}", path.display());
+            }
+        }
+        Err(error) => {
+            error_log::record_failure(
+                "patch_failed",
+                "recover_stale_maintenance_locks",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "codexHome": home,
+                }),
+            );
+            eprintln!("清理陈旧维护锁失败：{error:#}");
+        }
+    }
+    if provider_sync.status != ProviderSyncStatus::Synced {
+        error_log::record_failure(
+            "patch_failed",
+            "sync_session_providers",
+            provider_sync.message.clone(),
+            serde_json::json!({
+                "status": format!("{:?}", provider_sync.status),
+                "targetProvider": provider_sync.target_provider,
+                "skippedLockedFiles": provider_sync.skipped_locked_rollout_files.len(),
+            }),
+        );
+    } else if !provider_sync.skipped_locked_rollout_files.is_empty() {
+        error_log::record_failure(
+            "patch_failed",
+            "sync_session_providers",
+            format!(
+                "跳过 {} 个被占用的会话文件",
+                provider_sync.skipped_locked_rollout_files.len()
+            ),
+            serde_json::json!({
+                "targetProvider": provider_sync.target_provider,
+                "skippedLockedFiles": provider_sync.skipped_locked_rollout_files,
+            }),
+        );
+    }
+    if let Err(error) = &index_cleanup {
+        error_log::record_failure(
+            "patch_failed",
+            "cleanup_session_index",
+            format!("{error:#}"),
+            serde_json::json!({
+                "codexHome": home,
+            }),
+        );
+    }
+    Ok(session_maintenance_summary(&provider_sync, &index_cleanup))
+}
+
+async fn prepare_codex_startup_state(
+    config: &CodeyConfig,
+    home: &std::path::Path,
+    original_provider: &str,
+    preserve_provider_route: bool,
+) -> Result<PathBuf> {
+    let current_profile = config
+        .active_profile()
+        .ok_or_else(|| anyhow::anyhow!("找不到当前 Codex 线路"))?;
+    let configured_app_path = config.codex_app_path.trim();
+    let configured_app_path_is_empty = configured_app_path.is_empty();
+    let configured_app_path =
+        (!configured_app_path_is_empty).then(|| PathBuf::from(configured_app_path));
+    let app_dir_task = tokio::task::spawn_blocking(move || {
+        resolve_codex_app_dir_with_saved(configured_app_path.as_deref(), None)
+    });
+    let catalog_task = if preserve_provider_route {
+        None
+    } else {
+        let catalog_home = home.to_path_buf();
+        let official_provider = current_profile.cc_switch_read_only;
+        let upstream_models = config.upstream_models_snapshot().map(<[String]>::to_vec);
+        let selected_models = config.selected_models().to_vec();
+        let manual_models = config.manual_third_party_models().to_vec();
+        let requested_default_model = config.default_model().map(str::to_owned);
+        Some(tokio::task::spawn_blocking(move || {
+            let refresh = model_catalog::refresh_for_provider(
+                &catalog_home,
+                official_provider,
+                upstream_models.as_deref(),
+                &selected_models,
+            );
+            let catalog_available = refresh.is_err() && model_catalog::is_available(&catalog_home);
+            let selection = model_catalog::selection_state_with_manual_models(
+                &catalog_home,
+                official_provider,
+                upstream_models.as_deref(),
+                &selected_models,
+                &manual_models,
+                requested_default_model.as_deref(),
+            );
+            (refresh, catalog_available, selection)
+        }))
+    };
+    let app_dir = app_dir_task
+        .await
+        .map_err(|error| anyhow::Error::new(error).context("定位 Codex App 任务异常退出"))?
+        .ok_or_else(|| {
+            if configured_app_path_is_empty {
+                anyhow::anyhow!(CODEX_APP_NOT_FOUND_ERROR)
+            } else {
+                anyhow::anyhow!(CODEX_APP_PATH_INVALID_ERROR)
+            }
+        })?;
+    let (prepare_result, catalog_result) = if let Some(catalog_task) = catalog_task {
+        let (prepare_result, catalog_result) =
+            tokio::join!(prepare_codex_for_launch(&app_dir), catalog_task);
+        (prepare_result, Some(catalog_result))
+    } else {
+        (prepare_codex_for_launch(&app_dir).await, None)
+    };
+    prepare_result?;
+    let (use_official_catalog, default_model) = if preserve_provider_route {
+        (false, String::new())
+    } else {
+        let official_provider = current_profile.cc_switch_read_only;
+        let (refresh_result, catalog_available, selection_result) = catalog_result
+            .expect("catalog task exists for managed provider routes")
+            .map_err(|error| {
+                let error = anyhow::Error::new(error).context("准备模型目录任务异常退出");
+                error_log::record_failure(
+                    "patch_failed",
+                    "prepare_model_catalog",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "officialProvider": official_provider,
+                        "taskJoinFailed": true,
+                    }),
+                );
+                error
+            })?;
+        let use_official_catalog = match refresh_result {
+            Ok(_) => true,
+            Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => {
+                if catalog_available {
+                    eprintln!("本机官方模型缓存暂不含自定义目录必需字段，沿用上一份合法镜像");
+                } else {
+                    eprintln!("本机官方模型缓存暂不含自定义目录必需字段，使用 Codex 内置模型目录");
+                }
+                catalog_available
+            }
+            Err(error) if catalog_available => {
+                error_log::record_failure(
+                    "patch_failed",
+                    "refresh_model_catalog",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "fallback": "last_valid_catalog",
+                        "officialProvider": official_provider,
+                    }),
+                );
+                eprintln!("刷新官方账号模型目录失败，沿用上一份合法镜像：{error:#}");
+                true
+            }
+            Err(error) => {
+                error_log::record_failure(
+                    "patch_failed",
+                    "refresh_model_catalog",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "fallback": "codex_builtin_catalog",
+                        "officialProvider": official_provider,
+                    }),
+                );
+                eprintln!("刷新官方账号模型目录失败，临时使用 Codex 内置目录：{error:#}");
+                false
+            }
+        };
+        let default_model = match selection_result {
+            Ok(state) => state.default_model,
+            Err(error) => {
+                error_log::record_failure(
+                    "patch_failed",
+                    "read_model_catalog_selection",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "fallback": "empty_default_model",
+                        "officialProvider": official_provider,
+                    }),
+                );
+                String::new()
+            }
+        };
+        (use_official_catalog, default_model)
+    };
+    let runtime_config_home = home.to_path_buf();
+    let runtime_config_profile = current_profile.clone();
+    let runtime_config_provider = original_provider.to_string();
+    let runtime_default_model = (!default_model.is_empty()).then_some(default_model);
+    let fast_context_tools = config.fast_context_tools;
+    let subagent_optimization = config.subagent_optimization;
+    let subagent_model = config.subagent_model.clone();
+    let subagent_reasoning_effort = config.subagent_reasoning_effort.clone();
+    let runtime_config = tokio::task::spawn_blocking(move || {
+        if preserve_provider_route {
+            apply_runtime_provider_config_preserving_route(
+                &runtime_config_home,
+                &runtime_config_profile,
+                &runtime_config_provider,
+                fast_context_tools,
+                subagent_optimization,
+                &subagent_model,
+                &subagent_reasoning_effort,
+            )
+        } else {
+            apply_runtime_provider_config(
+                &runtime_config_home,
+                &runtime_config_profile,
+                &runtime_config_provider,
+                use_official_catalog,
+                runtime_default_model.as_deref(),
+                fast_context_tools,
+                subagent_optimization,
+                &subagent_model,
+                &subagent_reasoning_effort,
+            )
+        }
+    })
+    .await
+    .map_err(|error| {
+        let error = anyhow::Error::new(error).context("应用运行时 Provider 配置任务异常退出");
+        error_log::record_failure(
+            "patch_failed",
+            "apply_runtime_provider_config",
+            format!("{error:#}"),
+            serde_json::json!({
+                "profile": current_profile.name,
+                "provider": original_provider,
+                "fastContextTools": config.fast_context_tools,
+                "subagentOptimization": config.subagent_optimization,
+                "preserveProviderRoute": preserve_provider_route,
+                "taskJoinFailed": true,
+            }),
+        );
+        error
+    })?;
+    runtime_config.map_err(|error| {
+        error_log::record_failure(
+            "patch_failed",
+            "apply_runtime_provider_config",
+            format!("{error:#}"),
+            serde_json::json!({
+                "profile": current_profile.name,
+                "provider": original_provider,
+                "fastContextTools": config.fast_context_tools,
+                "subagentOptimization": config.subagent_optimization,
+                "preserveProviderRoute": preserve_provider_route,
+            }),
+        );
+        error
+    })?;
+    Ok(app_dir)
+}
+
 impl CodeyRuntime {
     pub async fn renderer_websocket_url(&self) -> Arc<str> {
         self.injection_websocket_url.read().await.clone()
@@ -291,142 +660,14 @@ impl CodeyRuntime {
                 );
                 error
             })?;
-        let original_provider = if preserve_provider_route {
-            active_model_provider(&home)
-        } else {
-            ensure_global_model_provider(&home)
-        }
-        .map_err(|error| {
-            error_log::record_failure(
-                "patch_failed",
-                if preserve_provider_route {
-                    "read_cc_switch_live_provider"
-                } else {
-                    "ensure_global_model_provider"
-                },
-                format!("{error:#}"),
-                serde_json::json!({
-                    "codexHome": home,
-                    "preserveProviderRoute": preserve_provider_route,
-                }),
-            );
-            error
-        })?;
+        let original_provider = resolve_startup_provider(&home, preserve_provider_route).await?;
 
         // Permanent maintenance runs before Codey creates the temporary
         // direct-provider lease. A lightweight header/SQLite validation normally
         // reuses the last successful provider sync; provider changes still
         // fall back to the complete rollout and SQLite repair.
-        let maintenance_home = home.clone();
-        match maintenance_lock::recover_stale_locks(&maintenance_home) {
-            Ok(recovered) => {
-                for path in recovered {
-                    eprintln!("已清理陈旧维护锁：{}", path.display());
-                }
-            }
-            Err(error) => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "recover_stale_maintenance_locks",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "codexHome": maintenance_home,
-                    }),
-                );
-                eprintln!("清理陈旧维护锁失败：{error:#}");
-            }
-        }
-        let maintenance_provider = original_provider.clone();
-        let maintenance_result = tokio::task::spawn_blocking(move || {
-            let provider_sync = match startup_maintenance::provider_sync_plan(
-                &maintenance_home,
-                &maintenance_provider,
-            ) {
-                Ok(ProviderSyncPlan::Cached) => {
-                    startup_maintenance::cached_provider_sync_result(&maintenance_provider)
-                }
-                Ok(ProviderSyncPlan::Full) | Err(_) => {
-                    let result = codey_runtime_data::run_provider_sync_with_target(
-                        Some(&maintenance_home),
-                        Some(&maintenance_provider),
-                    );
-                    if result.status == ProviderSyncStatus::Synced
-                        && result.skipped_locked_rollout_files.is_empty()
-                        && let Err(error) = startup_maintenance::record_provider_sync_success(
-                            &maintenance_home,
-                            &maintenance_provider,
-                        )
-                    {
-                        error_log::record_failure(
-                            "patch_failed",
-                            "record_provider_sync_success",
-                            format!("{error:#}"),
-                            serde_json::json!({
-                                "provider": maintenance_provider,
-                            }),
-                        );
-                        eprintln!("保存 Provider 同步状态失败：{error:#}");
-                    }
-                    result
-                }
-            };
-            // `session_index.jsonl` is also cleaned before spawn, while its
-            // source snapshot is stable. The original file is backed up.
-            let index_cleanup = session_index_cleanup::cleanup(&maintenance_home);
-            (provider_sync, index_cleanup)
-        })
-        .await;
-        let (provider_sync, index_cleanup) = match maintenance_result {
-            Ok(result) => result,
-            Err(error) => {
-                let error = anyhow::Error::new(error).context("启动前会话修复任务异常退出");
-                error_log::record_failure(
-                    "patch_failed",
-                    "run_startup_session_repairs",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "codexHome": home,
-                    }),
-                );
-                return Err(error);
-            }
-        };
-        if provider_sync.status != ProviderSyncStatus::Synced {
-            error_log::record_failure(
-                "patch_failed",
-                "sync_session_providers",
-                provider_sync.message.clone(),
-                serde_json::json!({
-                    "status": format!("{:?}", provider_sync.status),
-                    "targetProvider": provider_sync.target_provider,
-                    "skippedLockedFiles": provider_sync.skipped_locked_rollout_files.len(),
-                }),
-            );
-        } else if !provider_sync.skipped_locked_rollout_files.is_empty() {
-            error_log::record_failure(
-                "patch_failed",
-                "sync_session_providers",
-                format!(
-                    "跳过 {} 个被占用的会话文件",
-                    provider_sync.skipped_locked_rollout_files.len()
-                ),
-                serde_json::json!({
-                    "targetProvider": provider_sync.target_provider,
-                    "skippedLockedFiles": provider_sync.skipped_locked_rollout_files,
-                }),
-            );
-        }
-        if let Err(error) = &index_cleanup {
-            error_log::record_failure(
-                "patch_failed",
-                "cleanup_session_index",
-                format!("{error:#}"),
-                serde_json::json!({
-                    "codexHome": home,
-                }),
-            );
-        }
-        let session_maintenance = session_maintenance_summary(&provider_sync, &index_cleanup);
+        let session_maintenance =
+            run_startup_session_maintenance(&home, &original_provider).await?;
         match initial_trace_guard.await {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -494,135 +735,9 @@ impl CodeyRuntime {
             }
         }
 
-        let configured_app_path = config.codex_app_path.trim();
-        let app_dir = resolve_codex_app_dir_with_saved(
-            (!configured_app_path.is_empty())
-                .then(|| PathBuf::from(configured_app_path))
-                .as_deref(),
-            None,
-        )
-        .ok_or_else(|| {
-            if configured_app_path.is_empty() {
-                anyhow::anyhow!(CODEX_APP_NOT_FOUND_ERROR)
-            } else {
-                anyhow::anyhow!(CODEX_APP_PATH_INVALID_ERROR)
-            }
-        })?;
-        prepare_codex_for_launch(&app_dir).await?;
-        let current_profile = config
-            .active_profile()
-            .ok_or_else(|| anyhow::anyhow!("找不到当前 Codex 线路"))?;
-        let (use_official_catalog, default_model) = if preserve_provider_route {
-            (false, String::new())
-        } else {
-            let official_provider = current_profile.cc_switch_read_only;
-            let use_official_catalog = match model_catalog::refresh_for_provider(
-                &home,
-                official_provider,
-                config.upstream_models_snapshot(),
-                config.selected_models(),
-            ) {
-                Ok(_) => true,
-                Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => {
-                    let use_last_valid_catalog = model_catalog::is_available(&home);
-                    if use_last_valid_catalog {
-                        eprintln!("本机官方模型缓存暂不含自定义目录必需字段，沿用上一份合法镜像");
-                    } else {
-                        eprintln!(
-                            "本机官方模型缓存暂不含自定义目录必需字段，使用 Codex 内置模型目录"
-                        );
-                    }
-                    use_last_valid_catalog
-                }
-                Err(error) if model_catalog::is_available(&home) => {
-                    error_log::record_failure(
-                        "patch_failed",
-                        "refresh_model_catalog",
-                        format!("{error:#}"),
-                        serde_json::json!({
-                            "fallback": "last_valid_catalog",
-                            "officialProvider": official_provider,
-                        }),
-                    );
-                    eprintln!("刷新官方账号模型目录失败，沿用上一份合法镜像：{error:#}");
-                    true
-                }
-                Err(error) => {
-                    error_log::record_failure(
-                        "patch_failed",
-                        "refresh_model_catalog",
-                        format!("{error:#}"),
-                        serde_json::json!({
-                            "fallback": "codex_builtin_catalog",
-                            "officialProvider": official_provider,
-                        }),
-                    );
-                    eprintln!("刷新官方账号模型目录失败，临时使用 Codex 内置目录：{error:#}");
-                    false
-                }
-            };
-            let default_model = match model_catalog::selection_state_with_manual_models(
-                &home,
-                official_provider,
-                config.upstream_models_snapshot(),
-                config.selected_models(),
-                config.manual_third_party_models(),
-                config.default_model(),
-            ) {
-                Ok(state) => state.default_model,
-                Err(error) => {
-                    error_log::record_failure(
-                        "patch_failed",
-                        "read_model_catalog_selection",
-                        format!("{error:#}"),
-                        serde_json::json!({
-                            "fallback": "empty_default_model",
-                            "officialProvider": official_provider,
-                        }),
-                    );
-                    String::new()
-                }
-            };
-            (use_official_catalog, default_model)
-        };
-        let runtime_config = if preserve_provider_route {
-            apply_runtime_provider_config_preserving_route(
-                &home,
-                &current_profile,
-                &original_provider,
-                config.fast_context_tools,
-                config.subagent_optimization,
-                &config.subagent_model,
-                &config.subagent_reasoning_effort,
-            )
-        } else {
-            apply_runtime_provider_config(
-                &home,
-                &current_profile,
-                &original_provider,
-                use_official_catalog,
-                (!default_model.is_empty()).then_some(default_model.as_str()),
-                config.fast_context_tools,
-                config.subagent_optimization,
-                &config.subagent_model,
-                &config.subagent_reasoning_effort,
-            )
-        };
-        runtime_config.map_err(|error| {
-            error_log::record_failure(
-                "patch_failed",
-                "apply_runtime_provider_config",
-                format!("{error:#}"),
-                serde_json::json!({
-                    "profile": current_profile.name,
-                    "provider": original_provider,
-                    "fastContextTools": config.fast_context_tools,
-                    "subagentOptimization": config.subagent_optimization,
-                    "preserveProviderRoute": preserve_provider_route,
-                }),
-            );
-            error
-        })?;
+        let app_dir =
+            prepare_codex_startup_state(config, &home, &original_provider, preserve_provider_route)
+                .await?;
 
         let marketplace_home = home.clone();
         let marketplace_task = tokio::task::spawn_blocking(move || {

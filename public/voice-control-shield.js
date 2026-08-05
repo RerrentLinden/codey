@@ -1,5 +1,5 @@
 (() => {
-  const enabled = "__CODEY_SLIM_VOICE__" === "true";
+  const enabled = ["__CODEY_SLIM_VOICE__"][0] === "true";
   const preserveBlockedControls = enabled && window.__codeyVoiceControlShield?.enabled === true;
   window.__codeyVoiceControlShieldCleanup?.({ restoreControls: !preserveBlockedControls });
 
@@ -375,130 +375,23 @@
     return;
   }
 
-  let controlObserver = null;
-  let flushTimer = 0;
-  let cancelPendingFlush = null;
-  const pendingRoots = new Set();
-  const pendingRootLimit = 64;
-
-  const addPendingRoot = (root) => {
-    if (!(root instanceof HTMLElement) || pendingRoots.has(root)) return;
-    const documentRoot = document.documentElement || document.body;
-    if (documentRoot && pendingRoots.has(documentRoot)) return;
-    if (pendingRoots.size >= pendingRootLimit && documentRoot) {
-      pendingRoots.clear();
-      pendingRoots.add(documentRoot);
-      return;
-    }
-    for (const pending of pendingRoots) {
-      if (pending.contains?.(root)) return;
-    }
-    for (const pending of [...pendingRoots]) {
-      if (root.contains?.(pending)) pendingRoots.delete(pending);
-    }
-    pendingRoots.add(root);
-  };
-
-  const flushPendingRoots = () => {
-    flushTimer = 0;
-    cancelPendingFlush = null;
-    if (!pendingRoots.size) return;
-    const roots = [...pendingRoots];
-    pendingRoots.clear();
-    for (const root of roots) {
-      if (root.isConnected === false) continue;
-      block(root);
-    }
-  };
-
-  const blockBeforePaint = (root) => {
-    if (!(root instanceof HTMLElement) || root.isConnected === false) return 0;
-    const hasControlCandidate =
-      root.matches?.(mutationCandidateSelector) || root.querySelector?.(mutationCandidateSelector);
-    return hasControlCandidate ? block(root) : 0;
-  };
-
-  const queueMutationRoot = (root) => {
-    if (!(root instanceof HTMLElement)) return;
-    if (blockBeforePaint(root) > 0) return;
-    addPendingRoot(root);
-  };
-
-  const schedulePendingFlush = () => {
-    if (flushTimer) return;
-    if (typeof window.requestAnimationFrame === "function") {
-      flushTimer = window.requestAnimationFrame(flushPendingRoots);
-      cancelPendingFlush = () => window.cancelAnimationFrame?.(flushTimer);
-      return;
-    }
-    if (typeof window.setTimeout !== "function") {
-      flushPendingRoots();
-      return;
-    }
-    flushTimer = window.setTimeout(flushPendingRoots, 0);
-    cancelPendingFlush = () => window.clearTimeout?.(flushTimer);
-  };
-
-  if (typeof MutationObserver === "function" && document.documentElement) {
-    const mutationRoot = (node) => {
-      if (node instanceof HTMLElement) return node;
-      return node?.parentElement instanceof HTMLElement ? node.parentElement : null;
-    };
-    controlObserver = new MutationObserver((mutations) => {
-      for (const mutation of mutations) {
-        const target = mutationRoot(mutation.target);
-        if (mutation.type === "attributes") {
-          const containingControl = target?.closest?.(mutationCandidateSelector);
-          if (containingControl) queueMutationRoot(containingControl);
-          continue;
-        }
-        const containingControl = target?.closest?.(mutationCandidateSelector);
-        if (containingControl) queueMutationRoot(containingControl);
-        for (const node of mutation.addedNodes || []) {
-          queueMutationRoot(mutationRoot(node));
-        }
-      }
-      if (pendingRoots.size) schedulePendingFlush();
-    });
-    controlObserver.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["aria-label", "role", "title", "src"],
-      childList: true,
-      subtree: true,
-    });
-  }
-
-  const stopVoiceControlEvent = (event) => {
-    const control = event.target instanceof Element
-      ? event.target.closest(voiceControlSelector)
-      : null;
-    if (!isVoiceControl(control)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.stopImmediatePropagation?.();
-  };
-
-  const eventNames = ["pointerdown", "click", "keydown"];
-  eventNames.forEach((eventName) => {
-    document.addEventListener(eventName, stopVoiceControlEvent, true);
+  const shieldLifecycle = window.__codeyMutationDispatcher?.createShieldLifecycle({
+    attributeFilter: ["aria-label", "role", "title", "src"],
+    block,
+    eventSelector: voiceControlSelector,
+    isControl: isVoiceControl,
+    mutationSelector: mutationCandidateSelector,
   });
   window.__codeyBlockNativeVoiceControls = block;
   window.__codeyVoiceControlShield = Object.freeze({
     enabled,
     block,
     isVoiceControl,
-    observerInstalled: controlObserver !== null,
+    observerInstalled: shieldLifecycle?.observerInstalled === true,
     resourceGuardsInstalled: restoreResourceGuards.length,
   });
   window.__codeyVoiceControlShieldCleanup = (options = {}) => {
-    controlObserver?.disconnect();
-    if (flushTimer) cancelPendingFlush?.();
-    flushTimer = 0;
-    cancelPendingFlush = null;
-    pendingRoots.clear();
-    eventNames.forEach((eventName) => {
-      document.removeEventListener(eventName, stopVoiceControlEvent, true);
-    });
+    shieldLifecycle?.cleanup();
     restoreResourceGuards.splice(0).reverse().forEach((restore) => restore());
     if (options?.restoreControls !== false) restoreBlockedElements();
     delete window.__codeyBlockNativeVoiceControls;

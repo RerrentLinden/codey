@@ -166,6 +166,24 @@ fn route_takeover_state_from_paths(
     Ok(RouteTakeoverState { managed, live })
 }
 
+fn live_auth_uses_proxy_route(codex_home: &Path) -> Result<bool> {
+    let auth_path = codex_home.join("auth.json");
+    let auth = match fs::read(&auth_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 Codex Live 认证失败：{}", auth_path.display()));
+        }
+    };
+    let document = serde_json::from_slice::<Value>(&auth)
+        .with_context(|| format!("解析 Codex Live 认证失败：{}", auth_path.display()))?;
+    Ok(document
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .is_some_and(|token| token.trim() == PROXY_MANAGED_TOKEN))
+}
+
 fn read_route_takeover_managed(path: &Path) -> Result<bool> {
     let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("打开 cc-switch 数据库失败：{}", path.display()))?;
@@ -236,6 +254,13 @@ fn read_route_takeover_managed(path: &Path) -> Result<bool> {
 }
 
 fn live_config_uses_proxy_route(codex_home: &Path) -> Result<bool> {
+    // CC Switch keeps the placeholder in auth.json unless its optional
+    // "preserve Codex official auth" mode is enabled. In that default mode
+    // config.toml can point at a third-party loopback provider without carrying
+    // its own experimental_bearer_token, so auth.json is the ownership marker.
+    if live_auth_uses_proxy_route(codex_home)? {
+        return Ok(true);
+    }
     let config_path = codex_home.join("config.toml");
     let config = match fs::read_to_string(&config_path) {
         Ok(contents) => contents,
@@ -1273,6 +1298,48 @@ requires_openai_auth = true
                 managed: true,
                 live: true,
             }
+        );
+    }
+
+    #[test]
+    fn route_takeover_recognizes_the_auth_placeholder_used_by_default_cc_switch_mode() {
+        let (_directory, path, home) = fixture();
+        install_proxy_schema(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO proxy_config (app_type, enabled) VALUES ('codex', 1)",
+                [],
+            )
+            .unwrap();
+        write_live_route(&home, "deepseek", "http://127.0.0.1:15721/v1", "");
+        fs::write(
+            home.join("auth.json"),
+            br#"{"OPENAI_API_KEY":"PROXY_MANAGED"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            route_takeover_state_from_paths(&path, &home).unwrap(),
+            RouteTakeoverState {
+                managed: true,
+                live: true,
+            }
+        );
+    }
+
+    #[test]
+    fn ordinary_auth_api_key_does_not_claim_cc_switch_takeover() {
+        let (_directory, path, home) = fixture();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"OPENAI_API_KEY":"sk-user-route"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            route_takeover_state_from_paths(&path, &home).unwrap(),
+            RouteTakeoverState::default()
         );
     }
 

@@ -7,6 +7,10 @@ const template = readFileSync(
   new URL("../public/voice-control-shield.js", import.meta.url),
   "utf8",
 );
+const bridgeTemplate = readFileSync(
+  new URL("../public/codey-bridge.js", import.meta.url),
+  "utf8",
+);
 
 class FakeElement {
   constructor(text = "", isControl = true, children = [], isImage = false) {
@@ -288,6 +292,7 @@ function loadShield(enabled) {
     pendingTimers.clear();
     callbacks.forEach((callback) => callback());
   };
+  vm.runInNewContext(bridgeTemplate, sandbox);
   inject(enabled);
   return {
     documentElement,

@@ -52,7 +52,11 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
 });
 
 test("subagent optimization owns the requested V2 and default-agent settings", async () => {
-  const source = await readFile(new URL("backend/src/codex_config.rs", root), "utf8");
+  const [configSource, guidanceSource] = await Promise.all([
+    readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
+    readFile(new URL("backend/src/codex_config_guidance.rs", root), "utf8"),
+  ]);
+  const source = `${configSource}\n${guidanceSource}`;
 
   assert.match(source, /multi_agent\["enabled"\] = value\(true\)/);
   assert.match(source, /multi_agent\["hide_spawn_agent_metadata"\] = value\(true\)/);
