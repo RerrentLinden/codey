@@ -24,6 +24,8 @@ struct WaitingNotificationLedger {
 }
 
 const WEBHOOK_NOTIFICATION_HISTORY_LIMIT: usize = 2048;
+const WEBHOOK_TURN_HISTORY_LIMIT: usize =
+    pending_approval::MAX_RECENT_SESSIONS * pending_approval::MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT;
 
 #[derive(Debug, Default)]
 pub(super) struct WebhookNotificationState {
@@ -193,6 +195,7 @@ fn terminal_turn_key(session_id: &str, turn_id: &str) -> String {
 struct WebhookTurnTracker {
     running: HashSet<String>,
     settled: HashSet<String>,
+    settled_order: VecDeque<String>,
     ignore_completed_before: i64,
 }
 
@@ -345,7 +348,7 @@ impl WebhookTurnTracker {
                 candidates.push(completed.clone());
             } else {
                 // A terminal event without a running edge belongs to snapshot history.
-                self.settled.insert(key);
+                self.remember_terminal_key(key);
             }
         }
         candidates
@@ -358,7 +361,18 @@ impl WebhookTurnTracker {
     fn mark_terminal(&mut self, session_id: &str, turn_id: &str) {
         let key = terminal_turn_key(session_id, turn_id);
         self.running.remove(&key);
-        self.settled.insert(key);
+        self.remember_terminal_key(key);
+    }
+
+    fn remember_terminal_key(&mut self, key: String) {
+        if self.settled.insert(key.clone()) {
+            self.settled_order.push_back(key);
+        }
+        while self.settled_order.len() > WEBHOOK_TURN_HISTORY_LIMIT {
+            if let Some(oldest) = self.settled_order.pop_front() {
+                self.settled.remove(&oldest);
+            }
+        }
     }
 }
 
@@ -1776,6 +1790,23 @@ mod tests {
 
         tracker.mark_settled(&first[0]);
         assert!(tracker.completion_candidates(&events).is_empty());
+    }
+
+    #[test]
+    fn webhook_turn_tracker_bounds_terminal_deduplication_history() {
+        let mut tracker = WebhookTurnTracker::default();
+        for index in 0..=WEBHOOK_TURN_HISTORY_LIMIT {
+            tracker.mark_terminal("session-1", &format!("turn-{index}"));
+        }
+
+        assert_eq!(tracker.settled.len(), WEBHOOK_TURN_HISTORY_LIMIT);
+        assert_eq!(tracker.settled_order.len(), WEBHOOK_TURN_HISTORY_LIMIT);
+        assert!(!tracker.settled.contains("session-1:turn-0"));
+        assert!(
+            tracker
+                .settled
+                .contains(&format!("session-1:turn-{WEBHOOK_TURN_HISTORY_LIMIT}"))
+        );
     }
 
     #[test]

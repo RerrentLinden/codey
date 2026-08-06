@@ -374,23 +374,35 @@ async fn run_startup_session_maintenance(
     Ok(session_maintenance_summary(&provider_sync, &index_cleanup))
 }
 
+async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBuf> {
+    let configured_app_path = config.codex_app_path.trim();
+    let configured_app_path_is_empty = configured_app_path.is_empty();
+    let configured_app_path =
+        (!configured_app_path_is_empty).then(|| PathBuf::from(configured_app_path));
+    tokio::task::spawn_blocking(move || {
+        resolve_codex_app_dir_with_saved(configured_app_path.as_deref(), None)
+    })
+    .await
+    .map_err(|error| anyhow::Error::new(error).context("定位 Codex App 任务异常退出"))?
+    .ok_or_else(|| {
+        if configured_app_path_is_empty {
+            anyhow::anyhow!(CODEX_APP_NOT_FOUND_ERROR)
+        } else {
+            anyhow::anyhow!(CODEX_APP_PATH_INVALID_ERROR)
+        }
+    })
+}
+
 async fn prepare_codex_startup_state(
     config: &CodeyConfig,
     home: &std::path::Path,
     original_provider: &str,
     preserve_provider_route: bool,
     protocol_proxy_base_url: Option<&str>,
-) -> Result<PathBuf> {
+) -> Result<()> {
     let current_profile = config
         .active_profile()
         .ok_or_else(|| anyhow::anyhow!("找不到当前 Codex 线路"))?;
-    let configured_app_path = config.codex_app_path.trim();
-    let configured_app_path_is_empty = configured_app_path.is_empty();
-    let configured_app_path =
-        (!configured_app_path_is_empty).then(|| PathBuf::from(configured_app_path));
-    let app_dir_task = tokio::task::spawn_blocking(move || {
-        resolve_codex_app_dir_with_saved(configured_app_path.as_deref(), None)
-    });
     let catalog_task = if preserve_provider_route {
         None
     } else {
@@ -419,24 +431,11 @@ async fn prepare_codex_startup_state(
             (refresh, catalog_available, selection)
         }))
     };
-    let app_dir = app_dir_task
-        .await
-        .map_err(|error| anyhow::Error::new(error).context("定位 Codex App 任务异常退出"))?
-        .ok_or_else(|| {
-            if configured_app_path_is_empty {
-                anyhow::anyhow!(CODEX_APP_NOT_FOUND_ERROR)
-            } else {
-                anyhow::anyhow!(CODEX_APP_PATH_INVALID_ERROR)
-            }
-        })?;
-    let (prepare_result, catalog_result) = if let Some(catalog_task) = catalog_task {
-        let (prepare_result, catalog_result) =
-            tokio::join!(prepare_codex_for_launch(&app_dir), catalog_task);
-        (prepare_result, Some(catalog_result))
+    let catalog_result = if let Some(catalog_task) = catalog_task {
+        Some(catalog_task.await)
     } else {
-        (prepare_codex_for_launch(&app_dir).await, None)
+        None
     };
-    prepare_result?;
     let (use_official_catalog, default_model) = if preserve_provider_route {
         (false, String::new())
     } else {
@@ -572,7 +571,7 @@ async fn prepare_codex_startup_state(
         );
         error
     })?;
-    Ok(app_dir)
+    Ok(())
 }
 
 impl CodeyRuntime {
@@ -701,6 +700,11 @@ impl CodeyRuntime {
                 error
             })?;
         let original_provider = resolve_startup_provider(&home, preserve_provider_route).await?;
+        let app_dir = resolve_configured_codex_app_dir(config).await?;
+        // Session repair must never race a live Codex writer. Stopping the old
+        // runtime first also gives SQLite and rollout buffers a chance to flush
+        // before any permanent maintenance is applied.
+        prepare_codex_for_launch(&app_dir).await?;
 
         // Permanent maintenance runs before Codey creates the temporary
         // direct-provider lease. A lightweight header/SQLite validation normally
@@ -792,7 +796,7 @@ impl CodeyRuntime {
         let protocol_proxy_base_url = protocol_proxy
             .as_ref()
             .map(|proxy| proxy.base_url().to_string());
-        let app_dir = prepare_codex_startup_state(
+        prepare_codex_startup_state(
             config,
             &home,
             &original_provider,

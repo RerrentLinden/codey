@@ -79,3 +79,33 @@ test("every shutdown path reaps Codex and Codey process trees", async () => {
   assert.match(stopCommand, /\*state\.runtime\.lock\(\)\.await = Some\(runtime\)/);
   assert.match(stopCommand, /runtime_operation\.lock\(\)\.await/);
 });
+
+test("startup stops the old Codex before permanent session maintenance", async () => {
+  const launcher = await readFile(
+    new URL("../backend/src/launcher.rs", import.meta.url),
+    "utf8",
+  ).then(normalizeLineEndings);
+  const startup = launcher.slice(
+    launcher.indexOf("pub async fn start("),
+    launcher.indexOf("fn startup_patch_detail"),
+  );
+  const stopOldCodex = startup.indexOf(
+    "prepare_codex_for_launch(&app_dir).await?",
+  );
+  const permanentMaintenance = startup.indexOf(
+    "run_startup_session_maintenance",
+  );
+  const protocolProxy = startup.indexOf("start_runtime_protocol_proxy");
+
+  assert.notEqual(stopOldCodex, -1);
+  assert.notEqual(permanentMaintenance, -1);
+  assert.notEqual(protocolProxy, -1);
+  assert.ok(
+    stopOldCodex < permanentMaintenance,
+    "the old Codex writer must stop before session files are maintained",
+  );
+  assert.ok(
+    permanentMaintenance < protocolProxy,
+    "the temporary runtime must not start before permanent maintenance finishes",
+  );
+});

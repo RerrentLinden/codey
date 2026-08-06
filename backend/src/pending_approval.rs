@@ -1,6 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -10,7 +10,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 const RECENT_SESSION_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
-const MAX_RECENT_SESSIONS: usize = 64;
+pub(crate) const MAX_RECENT_SESSIONS: usize = 64;
+pub(crate) const MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT: usize = 256;
+const MAX_CACHED_TURN_CONFIGURATIONS_PER_ROLLOUT: usize = MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT * 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApproval {
@@ -161,7 +163,9 @@ struct RolloutParseState {
     current_turn_id: String,
     waiting_calls: HashMap<String, String>,
     terminal_turns: HashSet<String>,
+    terminal_turn_order: VecDeque<String>,
     active_turns: HashSet<String>,
+    turn_configuration_order: VecDeque<String>,
     latest_terminal: SessionLifecycleStatus,
     events: ParsedRolloutEvents,
 }
@@ -241,7 +245,7 @@ impl RolloutParseState {
                         .trim()
                         .to_string();
                     if !model.is_empty() || !reasoning_effort.is_empty() {
-                        self.events.turn_configurations.insert(
+                        self.remember_turn_configuration(
                             turn_id.to_string(),
                             TurnConfiguration {
                                 model,
@@ -262,38 +266,41 @@ impl RolloutParseState {
                 };
                 match payload.get("type").and_then(Value::as_str) {
                     Some("task_started") => {
-                        self.active_turns.insert(turn_id.to_string());
-                        self.events.started_turns.push(turn_id.to_string());
+                        if self.active_turns.insert(turn_id.to_string()) {
+                            self.events.started_turns.push(turn_id.to_string());
+                        }
                     }
                     Some("task_complete") => {
-                        self.terminal_turns.insert(turn_id.to_string());
-                        self.active_turns.remove(turn_id);
-                        if self.replaying_fork_history {
-                            self.events
-                                .snapshot_replay_turns
-                                .insert(turn_id.to_string());
-                        }
                         let error = task_completion_error(payload);
                         self.latest_terminal = if error.is_some() {
                             SessionLifecycleStatus::Error
                         } else {
                             SessionLifecycleStatus::Idle
                         };
-                        self.events.completed_turns.push((
-                            turn_id.to_string(),
-                            payload
-                                .get("duration_ms")
-                                .and_then(Value::as_u64)
-                                .unwrap_or_default() as u128,
-                            payload.get("completed_at").and_then(Value::as_i64),
-                            error,
-                        ));
+                        if self.finish_turn(turn_id) {
+                            if self.replaying_fork_history {
+                                self.events
+                                    .snapshot_replay_turns
+                                    .insert(turn_id.to_string());
+                            }
+                            self.events.completed_turns.push((
+                                turn_id.to_string(),
+                                payload
+                                    .get("duration_ms")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or_default() as u128,
+                                payload.get("completed_at").and_then(Value::as_i64),
+                                error,
+                            ));
+                            self.remember_terminal_turn(turn_id);
+                        }
                     }
                     Some("turn_aborted") => {
-                        self.terminal_turns.insert(turn_id.to_string());
-                        self.active_turns.remove(turn_id);
                         self.latest_terminal = SessionLifecycleStatus::Idle;
-                        self.events.aborted_turns.push(turn_id.to_string());
+                        if self.finish_turn(turn_id) {
+                            self.events.aborted_turns.push(turn_id.to_string());
+                            self.remember_terminal_turn(turn_id);
+                        }
                     }
                     _ => {}
                 }
@@ -322,6 +329,62 @@ impl RolloutParseState {
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    fn finish_turn(&mut self, turn_id: &str) -> bool {
+        self.active_turns.remove(turn_id);
+        self.waiting_calls
+            .retain(|_, waiting_turn_id| waiting_turn_id != turn_id);
+        self.terminal_turns.insert(turn_id.to_string())
+    }
+
+    fn remember_terminal_turn(&mut self, turn_id: &str) {
+        self.terminal_turn_order.push_back(turn_id.to_string());
+        while self.terminal_turn_order.len() > MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT {
+            let Some(oldest) = self.terminal_turn_order.pop_front() else {
+                break;
+            };
+            self.terminal_turns.remove(&oldest);
+            self.events
+                .started_turns
+                .retain(|candidate| candidate != &oldest);
+            self.events
+                .completed_turns
+                .retain(|(candidate, _, _, _)| candidate != &oldest);
+            self.events
+                .aborted_turns
+                .retain(|candidate| candidate != &oldest);
+            self.events.snapshot_replay_turns.remove(&oldest);
+            self.events.turn_configurations.remove(&oldest);
+            self.turn_configuration_order
+                .retain(|candidate| candidate != &oldest);
+        }
+    }
+
+    fn remember_turn_configuration(&mut self, turn_id: String, configuration: TurnConfiguration) {
+        let is_new = !self.events.turn_configurations.contains_key(&turn_id);
+        self.events
+            .turn_configurations
+            .insert(turn_id.clone(), configuration);
+        if is_new {
+            self.turn_configuration_order.push_back(turn_id);
+        }
+        while self.turn_configuration_order.len() > MAX_CACHED_TURN_CONFIGURATIONS_PER_ROLLOUT {
+            let removable_index = self
+                .turn_configuration_order
+                .iter()
+                .position(|candidate| {
+                    !self.active_turns.contains(candidate)
+                        && !self
+                            .waiting_calls
+                            .values()
+                            .any(|waiting_turn_id| waiting_turn_id == candidate)
+                })
+                .unwrap_or(0);
+            if let Some(oldest) = self.turn_configuration_order.remove(removable_index) {
+                self.events.turn_configurations.remove(&oldest);
+            }
         }
     }
 
@@ -517,18 +580,17 @@ impl RecentSessionEventCache {
                     .filter(|cached| cached.session_id == session_id)
                     .map(|cached| cached.state)
                     .filter(|state| state.consumed_bytes > 0);
-                let Some((mut state, chunk)) = read_rollout_update(&rollout_path, resumable) else {
+                let Some((state, _was_incremental)) = read_rollout_update(&rollout_path, resumable)
+                else {
                     continue;
                 };
                 #[cfg(test)]
                 {
                     self.parse_count += 1;
-                    if state.consumed_bytes > 0 {
+                    if _was_incremental {
                         self.incremental_parse_count += 1;
                     }
                 }
-                let consumed = state.consume(&chunk);
-                state.advance(&chunk, consumed);
                 self.rollouts.insert(
                     rollout_path.clone(),
                     CachedRolloutEvents {
@@ -619,21 +681,25 @@ impl RecentSessionEventCache {
     }
 }
 
-/// Returns the parser state to continue from plus the text still to consume.
+/// Returns an updated parser state plus whether the previous state was resumed.
 /// Falls back to a fresh state and the whole file whenever the previously
 /// consumed prefix cannot be confirmed byte-for-byte.
 fn read_rollout_update(
     path: &Path,
     resumable: Option<RolloutParseState>,
-) -> Option<(RolloutParseState, String)> {
+) -> Option<(RolloutParseState, bool)> {
     let full = || {
-        fs::read_to_string(path)
-            .ok()
-            .map(|contents| (RolloutParseState::default(), contents))
+        let file = fs::File::open(path).ok()?;
+        let mut state = RolloutParseState::default();
+        consume_rollout_reader(BufReader::new(file), &mut state)?;
+        Some((state, false))
     };
-    let Some(state) = resumable else {
+    let Some(mut state) = resumable else {
         return full();
     };
+    if state.is_subagent {
+        return Some((state, true));
+    }
     let fingerprint_len = state.tail_fingerprint.len() as u64;
     if fingerprint_len == 0 || fingerprint_len > state.consumed_bytes {
         return full();
@@ -672,11 +738,24 @@ fn read_rollout_update(
     {
         return full();
     }
-    let mut appended = String::new();
-    if file.read_to_string(&mut appended).is_err() {
-        return full();
+    consume_rollout_reader(BufReader::new(file), &mut state)?;
+    Some((state, true))
+}
+
+fn consume_rollout_reader(mut reader: impl BufRead, state: &mut RolloutParseState) -> Option<()> {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line).ok()?;
+        if read == 0 {
+            return Some(());
+        }
+        let consumed = state.consume(&line);
+        state.advance(&line, consumed);
+        if state.is_subagent {
+            return Some(());
+        }
     }
-    Some((state, appended))
 }
 
 #[cfg(test)]
@@ -925,6 +1004,80 @@ mod tests {
     }
 
     #[test]
+    fn rollout_cache_keeps_only_recent_terminal_turn_history() {
+        let mut rollout = String::new();
+        for index in 0..=MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT {
+            rollout.push_str(&format!(
+                "{{\"type\":\"turn_context\",\"payload\":{{\"turn_id\":\"turn-{index}\",\"model\":\"model-{index}\"}}}}\n"
+            ));
+            rollout.push_str(&format!(
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"turn-{index}\"}}}}\n"
+            ));
+            rollout.push_str(&format!(
+                "{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"turn-{index}\",\"completed_at\":{index}}}}}\n"
+            ));
+        }
+
+        let mut state = RolloutParseState::default();
+        state.consume(&rollout);
+        let parsed = state.snapshot().unwrap();
+        let latest_turn = format!("turn-{MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT}");
+
+        assert_eq!(
+            state.terminal_turn_order.len(),
+            MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT
+        );
+        assert_eq!(
+            state.terminal_turns.len(),
+            MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT
+        );
+        assert_eq!(
+            parsed.started_turns.len(),
+            MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT
+        );
+        assert_eq!(
+            parsed.completed_turns.len(),
+            MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT
+        );
+        assert_eq!(
+            parsed.turn_configurations.len(),
+            MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT
+        );
+        assert!(!state.terminal_turns.contains("turn-0"));
+        assert!(!parsed.started_turns.iter().any(|turn| turn == "turn-0"));
+        assert!(
+            !parsed
+                .completed_turns
+                .iter()
+                .any(|(turn, _, _, _)| turn == "turn-0")
+        );
+        assert!(!parsed.turn_configurations.contains_key("turn-0"));
+        assert_eq!(
+            parsed.started_turns.first().map(String::as_str),
+            Some("turn-1")
+        );
+        assert_eq!(
+            parsed.started_turns.last().map(String::as_str),
+            Some(latest_turn.as_str())
+        );
+    }
+
+    #[test]
+    fn terminal_turns_release_waiting_approval_state() {
+        let rollout = r#"
+{"type":"turn_context","payload":{"turn_id":"turn-1"}}
+{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"approval-1"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}
+"#;
+        let mut state = RolloutParseState::default();
+
+        state.consume(rollout);
+
+        assert!(state.waiting_calls.is_empty());
+        assert!(state.pending_approvals().is_empty());
+    }
+
+    #[test]
     fn derives_authoritative_session_lifecycle_status() {
         let running = r#"
 {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
@@ -1098,6 +1251,47 @@ mod tests {
         assert_eq!(updated.started_turns.len(), 1, "history must not be lost");
         assert_eq!(updated.completed_turns.len(), 1);
         assert_eq!(updated.turn_configurations["thread-1"].len(), 40);
+    }
+
+    #[test]
+    fn a_partial_jsonl_tail_is_resumed_after_the_writer_finishes_the_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout_path = temp.path().join("rollout-thread-1.jsonl");
+        fs::write(
+            &rollout_path,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"thread-1\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"turn"
+            ),
+        )
+        .unwrap();
+        let rollouts = || vec![("thread-1".to_string(), rollout_path.clone())];
+        let mut cache = RecentSessionEventCache::default();
+
+        let first = cache.refresh_rollouts(rollouts());
+        assert!(first.started_turns.is_empty());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&rollout_path)
+            .unwrap()
+            .write_all(b"-1\"}}\n")
+            .unwrap();
+        let updated = cache.refresh_rollouts(rollouts());
+
+        assert_eq!(cache.incremental_parse_count, 1);
+        assert_eq!(
+            updated
+                .started_turns
+                .iter()
+                .map(|turn| turn.turn_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-1"]
+        );
+        assert_eq!(
+            updated.session_statuses.get("thread-1"),
+            Some(&SessionLifecycleStatus::Running)
+        );
     }
 
     #[test]
