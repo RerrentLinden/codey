@@ -22,23 +22,8 @@ const windowsInstallerScript = fs.readFileSync(
 function assertRustQualityGates(job) {
   assert.match(job, /components: rustfmt, clippy/);
   assert.match(job, /cargo fmt --all -- --check/);
-  assert.match(
-    job,
-    /cargo fmt --manifest-path vendor\/CodeyRuntime\/Cargo\.toml --all -- --check/,
-  );
   assert.match(job, /cargo test --workspace --locked/);
-  assert.match(
-    job,
-    /cargo test --manifest-path vendor\/CodeyRuntime\/Cargo\.toml --workspace --locked/,
-  );
-  assert.match(
-    job,
-    /cargo clippy --workspace --all-targets --locked -- -D warnings/,
-  );
-  assert.match(
-    job,
-    /cargo clippy --manifest-path vendor\/CodeyRuntime\/Cargo\.toml --workspace --all-targets --locked -- -D warnings/,
-  );
+  assert.match(job, /cargo clippy --workspace --all-targets --locked -- -D warnings/);
 }
 
 function workflowStep(from, to) {
@@ -49,19 +34,7 @@ function workflowStep(from, to) {
   return workflow.slice(fromIndex, toIndex);
 }
 
-test("every desktop release build enforces the Rust quality gates", () => {
-  assert.match(workflow, /^\s*RUSTFLAGS: -D warnings$/m);
-  const jobs = [
-    workflow.slice(workflow.indexOf("\n  macos:"), workflow.indexOf("\n  windows:")),
-    workflow.slice(workflow.indexOf("\n  windows:"), workflow.indexOf("\n  publish:")),
-  ];
-
-  for (const job of jobs) {
-    assertRustQualityGates(job);
-  }
-});
-
-test("pull requests enforce Rust quality gates for both workspaces", () => {
+test("pull requests enforce the unified Rust quality gate", () => {
   assert.match(ciWorkflow, /^\s*RUSTFLAGS: -D warnings$/m);
   assertRustQualityGates(ciWorkflow);
   const windowsJob = ciWorkflow.slice(ciWorkflow.indexOf("\n  windows-rust:"));
@@ -70,16 +43,29 @@ test("pull requests enforce Rust quality gates for both workspaces", () => {
   assert.match(windowsJob, /cargo test --workspace --locked/);
   assert.match(
     windowsJob,
-    /cargo test --manifest-path vendor\/CodeyRuntime\/Cargo\.toml --workspace --locked/,
-  );
-  assert.match(
-    windowsJob,
     /cargo clippy --workspace --all-targets --locked -- -D warnings/,
   );
-  assert.match(
-    windowsJob,
-    /cargo clippy --manifest-path vendor\/CodeyRuntime\/Cargo\.toml --workspace --all-targets --locked -- -D warnings/,
+});
+
+test("desktop release builds keep macOS Rust coverage and lean on the CI gate for Windows", () => {
+  assert.match(workflow, /^\s*RUSTFLAGS: -D warnings$/m);
+  const macosJob = workflow.slice(
+    workflow.indexOf("\n  macos:"),
+    workflow.indexOf("\n  windows:"),
   );
+  const windowsJob = workflow.slice(
+    workflow.indexOf("\n  windows:"),
+    workflow.indexOf("\n  publish:"),
+  );
+  // macOS has no dedicated CI job, so the release build keeps its Rust tests;
+  // formatting and clippy are covered by the Linux/Windows CI gate.
+  assert.match(macosJob, /cargo test --workspace --locked/);
+  assert.doesNotMatch(macosJob, /cargo fmt/);
+  assert.doesNotMatch(macosJob, /cargo clippy/);
+  // Windows Rust coverage lives in ci.yml's windows-rust job, so the release
+  // build skips Rust checks and only builds the package.
+  assert.doesNotMatch(windowsJob, /cargo test/);
+  assert.doesNotMatch(windowsJob, /cargo clippy/);
 });
 
 test("desktop packages include FastCtx license and notice files", () => {

@@ -60,19 +60,13 @@ jobs:
         run: pnpm run vite:build
 
       - name: Rust formatting
-        run: |
-          cargo fmt --all -- --check
-          cargo fmt --manifest-path vendor/CodeyRuntime/Cargo.toml --all -- --check
+        run: cargo fmt --all -- --check
 
       - name: Rust tests
-        run: |
-          cargo test --workspace --locked
-          cargo test --manifest-path vendor/CodeyRuntime/Cargo.toml --workspace --locked
+        run: cargo test --workspace --locked
 
       - name: Rust lint
-        run: |
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo clippy --manifest-path vendor/CodeyRuntime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   windows-rust:
     name: Windows Rust
@@ -106,12 +100,8 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Test Windows workspaces
-        run: |
-          cargo test --workspace --locked
-          cargo test --manifest-path vendor/CodeyRuntime/Cargo.toml --workspace --locked
+      - name: Test Windows workspace
+        run: cargo test --workspace --locked
 
-      - name: Lint Windows workspaces
-        run: |
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo clippy --manifest-path vendor/CodeyRuntime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+      - name: Lint Windows workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

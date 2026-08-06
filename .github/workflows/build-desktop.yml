@@ -61,20 +61,8 @@ jobs:
       - name: JavaScript tests
         run: pnpm run test:js
 
-      - name: Rust formatting
-        run: |
-          cargo fmt --all -- --check
-          cargo fmt --manifest-path vendor/CodeyRuntime/Cargo.toml --all -- --check
-
       - name: Rust tests
-        run: |
-          cargo test --workspace --locked
-          cargo test --manifest-path vendor/CodeyRuntime/Cargo.toml --workspace --locked
-
-      - name: Rust lint
-        run: |
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo clippy --manifest-path vendor/CodeyRuntime/Cargo.toml --workspace --all-targets --locked -- -D warnings
+        run: cargo test --workspace --locked
 
       - name: Build unsigned macOS app
         env:
@@ -182,21 +170,6 @@ jobs:
 
       - name: JavaScript tests
         run: pnpm run test:js
-
-      - name: Rust formatting
-        run: |
-          cargo fmt --all -- --check
-          cargo fmt --manifest-path vendor/CodeyRuntime/Cargo.toml --all -- --check
-
-      - name: Rust tests
-        run: |
-          cargo test --workspace --locked
-          cargo test --manifest-path vendor/CodeyRuntime/Cargo.toml --workspace --locked
-
-      - name: Rust lint
-        run: |
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo clippy --manifest-path vendor/CodeyRuntime/Cargo.toml --workspace --all-targets --locked -- -D warnings
 
       - name: Build Windows executable
         env:

@@ -383,7 +383,7 @@ dependencies = [
 
 [[package]]
 name = "codey-runtime-core"
-version = "0.4.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -396,6 +396,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
@@ -408,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "codey-runtime-data"
-version = "0.4.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -418,6 +419,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "uuid",
 ]

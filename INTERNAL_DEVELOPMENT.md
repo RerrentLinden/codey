@@ -90,7 +90,7 @@ pnpm run release -- 0.2.1 --include-existing-changes
 
 未配置上述 variable 或 secret 时，现有 GitHub Release 发布不受影响，R2 同步会被跳过。默认构建使用项目公开的 R2 更新源；设置 `CODEY_UPDATE_BASE_URL` 可以在编译时覆盖该地址。配置页面不允许用户改写更新源。检查更新会经 HTTPS 拉取清单，校验版本、下载地址和 SHA-256 格式后显示是否有新版本。当前 macOS 包仍是未签名包，Windows 包也尚未进行代码签名，因此检查更新不会自动下载或静默安装。
 
-Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周期、会话扫描优化以及显式配置的独立协议代理句柄也已直接合并其中。主程序只复用该句柄和既有 Responses↔Chat 转换器，不接管 vendor 的整套启动器或全局设置。后端启动编排与 macOS/Windows/Unix 进程适配分层维护，运行时 TOML 三方恢复算法和私有原子文件 I/O 基元也已与 provider 应用/租约编排分离。本地与 CI 构建不需要额外的运行时源码目录或补丁。PR 与桌面发布质量门会分别对根 workspace 和 CodeyRuntime workspace 执行格式检查、完整测试及零警告 Clippy。
+Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周期、会话扫描优化以及显式配置的独立协议代理句柄也已直接合并其中。主程序只复用该句柄和既有 Responses↔Chat 转换器，不接管 vendor 的整套启动器或全局设置。后端启动编排与 macOS/Windows/Unix 进程适配分层维护，运行时 TOML 三方恢复算法和私有原子文件 I/O 基元也已与 provider 应用/租约编排分离。本地与 CI 构建不需要额外的运行时源码目录或补丁。这些 crate 与后端同属根 Cargo workspace，`cargo test --workspace` 一条命令覆盖全部；统一依赖解析与特性合并消除了两个独立 workspace 的重复编译。PR 质量门在 Linux 上执行格式检查、完整测试及零警告 Clippy，Windows CI 补充该平台测试与 Clippy；桌面发布构建只保留 macOS 的 Rust 测试（macOS 无独立 CI 任务），Windows 的 Rust 检查由 CI 门保证，打包流程不再重复编译。
 
 运行时只内置不含提示词的 Codex 模型兼容元数据，完整 system/developer prompt 不进入仓库资产或 CodeyRuntime 二进制。Codex 当前要求自定义模型目录的每个条目都保留 `base_instructions`；因此 Codey 只从用户本机已有的官方 `models_cache.json` 派生运行目录，原样保留本机缓存中的必需字段，并把生成文件权限收紧为仅当前用户可读写。缺少兼容的本机缓存时不生成不完整目录，官方线路回退 Codex 内置目录，第三方线路仍可完成上游模型探测、手动模型选择保存与子代理能力校验；这是可恢复的内置目录回退，不记录为补丁失败。模型选择保存与线路模型同步必须只吞掉该明确的缓存兼容错误，目录读写或解析错误仍应返回给用户。这类本机派生内容不得写入日志、测试夹具、发布包或版本库。
 
