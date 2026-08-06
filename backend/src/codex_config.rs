@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use codey_runtime_core::settings::RelayProtocol;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
@@ -420,8 +420,8 @@ fn mark_runtime_subagent_defaults_applied_at(
     reasoning_effort: &str,
 ) -> Result<()> {
     let model = model.trim();
-    let reasoning_effort = reasoning_effort.trim().to_ascii_lowercase();
     anyhow::ensure!(!model.is_empty(), "子代理模型不能为空");
+    let reasoning_effort = reasoning_effort.trim().to_ascii_lowercase();
     anyhow::ensure!(
         SUBAGENT_REASONING_EFFORTS.contains(&reasoning_effort.as_str()),
         "子代理思考深度无效：{reasoning_effort}"
@@ -517,7 +517,26 @@ fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Opt
     let applied_path = snapshot_dir.join(APPLIED_CONFIG_FILE);
     let applied_bytes = fs::read(&applied_path)
         .with_context(|| format!("读取 Codey 已应用配置快照失败：{}", applied_path.display()))?;
-    if current_bytes == applied_bytes {
+    let normalized_subagent_model = {
+        let model = state.subagent_model.trim();
+        if model.is_empty() {
+            DEFAULT_SUBAGENT_MODEL.to_string()
+        } else {
+            model.to_string()
+        }
+    };
+    let normalized_subagent_reasoning_effort = {
+        let effort = state.subagent_reasoning_effort.trim().to_ascii_lowercase();
+        if SUBAGENT_REASONING_EFFORTS.contains(&effort.as_str()) {
+            effort
+        } else {
+            DEFAULT_SUBAGENT_REASONING_EFFORT.to_string()
+        }
+    };
+    let subagent_defaults_changed = state.subagent_optimization_applied
+        && (state.subagent_model != normalized_subagent_model
+            || state.subagent_reasoning_effort != normalized_subagent_reasoning_effort);
+    if current_bytes == applied_bytes && !subagent_defaults_changed {
         return Ok(Some(current_bytes));
     }
 
@@ -535,16 +554,8 @@ fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Opt
         &baseline,
         state.fastctx_command.as_deref(),
         state.subagent_optimization_applied,
-        if state.subagent_model.trim().is_empty() {
-            DEFAULT_SUBAGENT_MODEL
-        } else {
-            state.subagent_model.as_str()
-        },
-        if state.subagent_reasoning_effort.trim().is_empty() {
-            DEFAULT_SUBAGENT_REASONING_EFFORT
-        } else {
-            state.subagent_reasoning_effort.as_str()
-        },
+        &normalized_subagent_model,
+        &normalized_subagent_reasoning_effort,
         state.protocol_proxy_base_url.as_deref(),
     )
     .context("重新应用 Codey 运行时增强失败")?;
@@ -571,6 +582,10 @@ fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Opt
         .provider_id
         .as_deref()
         .and_then(|provider_id| provider_base_url(&updated, provider_id));
+    if state.subagent_optimization_applied {
+        state.subagent_model = normalized_subagent_model;
+        state.subagent_reasoning_effort = normalized_subagent_reasoning_effort;
+    }
     write_lease(marker, &state)?;
     if read_optional(&config_path)?.as_deref() != Some(current_bytes.as_slice()) {
         anyhow::bail!("Codex Live 配置在 Codey 保存增强快照后再次变化");
@@ -1207,11 +1222,18 @@ fn enable_subagent_optimization(
     subagent_model: &str,
     subagent_reasoning_effort: &str,
 ) -> Result<()> {
+    let subagent_model = subagent_model.trim();
+    if subagent_model.is_empty() {
+        bail!("子代理模型不能为空");
+    }
+    let subagent_reasoning_effort = subagent_reasoning_effort.trim().to_ascii_lowercase();
+    if !SUBAGENT_REASONING_EFFORTS.contains(&subagent_reasoning_effort.as_str()) {
+        bail!("子代理思考深度无效：{subagent_reasoning_effort}");
+    }
     doc.as_table_mut().remove("agents");
     let agents = ensure_root_table(doc, "agents")?;
-    agents["default_subagent_model"] = value(subagent_model.trim());
-    agents["default_subagent_reasoning_effort"] =
-        value(subagent_reasoning_effort.trim().to_ascii_lowercase());
+    agents["default_subagent_model"] = value(subagent_model);
+    agents["default_subagent_reasoning_effort"] = value(subagent_reasoning_effort);
     let features = ensure_root_table(doc, "features")?;
     if features.get("multi_agent_v2").is_none() {
         features["multi_agent_v2"] = Item::Table(Table::new());
@@ -2545,6 +2567,49 @@ custom_setting = "preserved"
     }
 
     #[test]
+    fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
+        let patched = patch_config_with_fastctx_mode(
+            "",
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            ProviderPatchOptions {
+                model_catalog_path: relative_model_catalog_path(),
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: true,
+                subagent_model: "gpt-5.6-luna",
+                subagent_reasoning_effort: "high",
+                preserve_provider_route: false,
+                protocol_proxy_base_url: None,
+            },
+        )
+        .unwrap();
+        let document = patched.parse::<DocumentMut>().unwrap();
+        assert_eq!(
+            document["agents"]["default_subagent_model"].as_str(),
+            Some("gpt-5.6-luna")
+        );
+
+        let error = patch_config_with_fastctx_mode(
+            "",
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            ProviderPatchOptions {
+                model_catalog_path: relative_model_catalog_path(),
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: true,
+                subagent_model: "   ",
+                subagent_reasoning_effort: "high",
+                preserve_provider_route: false,
+                protocol_proxy_base_url: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("子代理模型不能为空"));
+    }
+
+    #[test]
     fn subagent_lease_applies_and_restores_all_owned_files() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
@@ -2639,16 +2704,17 @@ custom_setting = "preserved"
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
-        current["agents"]["default_subagent_model"] = value("gpt-5.6-sol");
+        current["agents"]["default_subagent_model"] = value("provider-coder");
         current["agents"]["default_subagent_reasoning_effort"] = value("high");
         fs::write(home.join("config.toml"), document_string(&current).unwrap()).unwrap();
 
-        mark_runtime_subagent_defaults_applied_at(&home, &marker, "gpt-5.6-sol", "high").unwrap();
+        mark_runtime_subagent_defaults_applied_at(&home, &marker, "provider-coder", "high")
+            .unwrap();
 
         let state =
             serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap())
                 .unwrap();
-        assert_eq!(state.subagent_model, "gpt-5.6-sol");
+        assert_eq!(state.subagent_model, "provider-coder");
         assert_eq!(state.subagent_reasoning_effort, "high");
         let snapshot_dir = state
             .config_snapshot_dir
@@ -2660,7 +2726,7 @@ custom_setting = "preserved"
             .unwrap();
         assert_eq!(
             applied["agents"]["default_subagent_model"].as_str(),
-            Some("gpt-5.6-sol")
+            Some("provider-coder")
         );
         assert_eq!(
             applied["agents"]["default_subagent_reasoning_effort"].as_str(),
@@ -2923,6 +2989,69 @@ command = "cc-switch-tool-v2"
             actual.as_table()
         ));
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn route_lease_preserves_dynamic_subagent_defaults() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        let route = r#"
+model_provider = "route-a"
+model = "model-a"
+
+[model_providers.route-a]
+name = "Route A"
+base_url = "http://127.0.0.1:15721/v1"
+wire_api = "responses"
+experimental_bearer_token = "PROXY_MANAGED"
+"#;
+        fs::write(home.join("config.toml"), route).unwrap();
+
+        apply_runtime_provider_config_at_mode(
+            &home,
+            &direct_profile(RelayProtocol::Responses),
+            "route-a",
+            ProviderApplyOptions {
+                use_official_catalog: false,
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: true,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                marker: &marker,
+                backup_root: &backup_root,
+                preserve_provider_route: true,
+                protocol_proxy_base_url: None,
+            },
+        )
+        .unwrap();
+
+        let mut lease =
+            serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap())
+                .unwrap();
+        let legacy_applied = fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .replace(DEFAULT_SUBAGENT_MODEL, "gpt-5.6-luna");
+        fs::write(home.join("config.toml"), &legacy_applied).unwrap();
+        fs::write(lease.backup_dir.join(APPLIED_CONFIG_FILE), &legacy_applied).unwrap();
+        lease.subagent_model = "gpt-5.6-luna".into();
+        write_lease(&marker, &lease).unwrap();
+
+        let reconciled = reconcile_runtime_config_overlay_at(&home, &marker)
+            .unwrap()
+            .unwrap();
+        let document = parse_document(std::str::from_utf8(&reconciled).unwrap()).unwrap();
+        assert_eq!(
+            document["agents"]["default_subagent_model"].as_str(),
+            Some("gpt-5.6-luna")
+        );
+        let reconciled_lease =
+            serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap())
+                .unwrap();
+        assert_eq!(reconciled_lease.subagent_model, "gpt-5.6-luna");
     }
 
     #[test]

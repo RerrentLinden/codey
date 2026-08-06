@@ -4,10 +4,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use semver::Version;
 use serde::Serialize;
 use serde_json::{Value, json};
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
+// First published Codex tag containing openai/codex#36892, which allows
+// Multi-Agent V2 parents to spawn non-disabled leaf models.
+const LEAF_SUBAGENT_MIN_CLIENT_VERSION: &str = "0.147.0-alpha.8";
 const ALLOWED_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
@@ -56,10 +60,41 @@ pub struct OfficialModelAvailability {
 pub struct ModelSelectionState {
     pub official_models: Vec<OfficialModelAvailability>,
     pub official_model_ids: Vec<String>,
+    pub subagent_model_ids: Vec<String>,
     pub third_party_models: Vec<String>,
     pub manual_third_party_models: Vec<String>,
     pub upstream_models: Vec<String>,
     pub default_model: String,
+}
+
+impl ModelSelectionState {
+    pub fn available_subagent_model(&self, requested: &str) -> Option<&str> {
+        let requested = requested.trim();
+        if requested.is_empty()
+            || !self
+                .subagent_model_ids
+                .iter()
+                .any(|model| model.eq_ignore_ascii_case(requested))
+        {
+            return None;
+        }
+        self.official_models
+            .iter()
+            .find(|model| model.supported && model.slug.eq_ignore_ascii_case(requested))
+            .map(|model| model.slug.as_str())
+            .or_else(|| {
+                self.third_party_models
+                    .iter()
+                    .find(|model| model.eq_ignore_ascii_case(requested))
+                    .map(String::as_str)
+            })
+    }
+
+    pub fn first_available_subagent_model(&self) -> Option<&str> {
+        self.subagent_model_ids
+            .iter()
+            .find_map(|model| self.available_subagent_model(model))
+    }
 }
 
 pub fn relative_path() -> &'static str {
@@ -220,6 +255,20 @@ pub fn selection_state_with_manual_models(
                 models
             })
     };
+    let subagent_policy = subagent_model_policy(home);
+    let mut subagent_model_ids = official_entries
+        .iter()
+        .filter(|model| model_supports_subagent_policy(model, subagent_policy))
+        .filter_map(|model| {
+            model
+                .get("slug")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect::<Vec<_>>();
+    if subagent_policy == SubagentModelPolicy::LeafModels {
+        subagent_model_ids.extend(third_party_models.iter().cloned());
+    }
     let manual_model_keys = manual_third_party_models
         .iter()
         .map(|model| model.trim().to_lowercase())
@@ -241,6 +290,7 @@ pub fn selection_state_with_manual_models(
     Ok(ModelSelectionState {
         official_models,
         official_model_ids,
+        subagent_model_ids,
         third_party_models,
         manual_third_party_models,
         upstream_models: if official_provider {
@@ -250,6 +300,45 @@ pub fn selection_state_with_manual_models(
         },
         default_model,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentModelPolicy {
+    V2Only,
+    LeafModels,
+}
+
+fn subagent_model_policy(home: &Path) -> SubagentModelPolicy {
+    let client_version = read_catalog_value(&home.join("models_cache.json")).and_then(|value| {
+        value
+            .get("client_version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .map(|version| version.trim_start_matches('v'))
+            .and_then(|version| Version::parse(version).ok())
+    });
+    let leaf_minimum = Version::parse(LEAF_SUBAGENT_MIN_CLIENT_VERSION)
+        .expect("leaf-subagent minimum is a valid semantic version");
+    if client_version.is_some_and(|version| version >= leaf_minimum) {
+        SubagentModelPolicy::LeafModels
+    } else {
+        SubagentModelPolicy::V2Only
+    }
+}
+
+fn model_supports_subagent_policy(model: &Value, policy: SubagentModelPolicy) -> bool {
+    let multi_agent_version = model
+        .get("multi_agent_version")
+        .and_then(Value::as_str)
+        .map(str::trim);
+    match policy {
+        SubagentModelPolicy::V2Only => {
+            multi_agent_version.is_some_and(|version| version.eq_ignore_ascii_case("v2"))
+        }
+        SubagentModelPolicy::LeafModels => {
+            !multi_agent_version.is_some_and(|version| version.eq_ignore_ascii_case("disabled"))
+        }
+    }
 }
 
 fn effective_default_model(
@@ -397,6 +486,21 @@ fn normalize_official_model(model: &mut Value, slug: &str, display_name: &str, p
     model["visibility"] = json!("list");
     model["priority"] = json!(priority);
     model["supported_in_api"] = json!(true);
+    if model
+        .get("multi_agent_version")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        match slug {
+            "gpt-5.6-sol" | "gpt-5.6-terra" => {
+                model["multi_agent_version"] = json!("v2");
+            }
+            "gpt-5.6-luna" => {
+                model["multi_agent_version"] = json!("v1");
+            }
+            _ => {}
+        }
+    }
     if let Some(object) = model.as_object_mut() {
         object.remove("availability_nux");
         object.remove("upgrade");
@@ -624,6 +728,10 @@ fn synthetic_model(template: &Value, model_id: &str, index: usize) -> Value {
         object.remove("availability_nux");
         object.remove("upgrade");
         object.remove("default_service_tier");
+        // A provider-defined model may be used as a leaf worker by newer
+        // runtimes, but it must not inherit the official template's ability to
+        // spawn further agents.
+        object.remove("multi_agent_version");
     }
     model["service_tiers"] = json!([]);
     model["additional_speed_tiers"] = json!([]);
@@ -690,6 +798,7 @@ mod tests {
 
     fn official_cache() -> Value {
         let mut cache = json!({
+            "client_version": LEAF_SUBAGENT_MIN_CLIENT_VERSION,
             "models": [
                 {
                     "slug": "gpt-5.6-sol",
@@ -764,7 +873,21 @@ mod tests {
             cache["models"].as_array_mut().unwrap().push(model);
         }
         for model in cache["models"].as_array_mut().unwrap() {
-            let slug = model["slug"].as_str().unwrap_or("test-model");
+            let slug = model["slug"].as_str().unwrap_or("test-model").to_string();
+            match slug.as_str() {
+                "gpt-5.6-sol" | "gpt-5.6-terra" => {
+                    model["multi_agent_version"] = json!("v2");
+                }
+                "gpt-5.6-luna" => {
+                    model["multi_agent_version"] = json!("v1");
+                }
+                "gpt-5.4" => {
+                    model["multi_agent_version"] = json!("disabled");
+                }
+                _ => {
+                    model.as_object_mut().unwrap().remove("multi_agent_version");
+                }
+            }
             model["base_instructions"] = json!(format!("test-only instructions for {slug}"));
             model["model_messages"] = json!({
                 "instructions_template": "test-only template"
@@ -864,6 +987,7 @@ mod tests {
             .iter()
             .find(|model| model["slug"] == "gpt-5.6-sol")
             .unwrap();
+        assert_eq!(sol["multi_agent_version"], "v2");
         let efforts = sol["supported_reasoning_levels"]
             .as_array()
             .unwrap()
@@ -878,6 +1002,17 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.5")
             .unwrap();
         assert_eq!(gpt_55["service_tiers"][0]["id"], "priority");
+        assert!(gpt_55.get("multi_agent_version").is_none());
+        let luna = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(luna["multi_agent_version"], "v1");
+        let gpt_54 = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.4")
+            .unwrap();
+        assert_eq!(gpt_54["multi_agent_version"], "disabled");
         let spark = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.3-codex-spark")
@@ -1040,6 +1175,7 @@ mod tests {
         let custom = models.last().unwrap();
         assert_eq!(custom["slug"], "claude-sonnet");
         assert_eq!(custom["codey_source"], "third_party");
+        assert!(custom.get("multi_agent_version").is_none());
         assert_eq!(
             custom["supported_reasoning_levels"]
                 .as_array()
@@ -1294,7 +1430,11 @@ mod tests {
     fn selection_state_uses_requested_default_when_available() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
-        let upstream = vec!["gpt-5.6-sol".into(), "third-model".into()];
+        let upstream = vec![
+            "gpt-5.6-sol".into(),
+            "gpt-5.6-luna".into(),
+            "third-model".into(),
+        ];
         let state = selection_state(
             home.path(),
             false,
@@ -1305,6 +1445,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.default_model, "third-model");
+        assert_eq!(
+            state.subagent_model_ids,
+            [
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+                "third-model",
+            ]
+        );
+        assert_eq!(
+            state.available_subagent_model(" GPT-5.6-LUNA "),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            state.available_subagent_model("third-model"),
+            Some("third-model")
+        );
+        assert_eq!(state.available_subagent_model("gpt-5.4"), None);
         let sol = state
             .official_models
             .iter()
@@ -1332,5 +1493,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.default_model, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn legacy_client_only_exposes_models_explicitly_marked_v2() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cache = official_cache();
+        cache["client_version"] = json!("0.146.1");
+        fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+        let upstream = vec![
+            "gpt-5.6-sol".into(),
+            "gpt-5.6-terra".into(),
+            "gpt-5.6-luna".into(),
+            "third-model".into(),
+        ];
+
+        let state = selection_state(
+            home.path(),
+            false,
+            Some(&upstream),
+            &["third-model".into()],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(state.subagent_model_ids, ["gpt-5.6-sol", "gpt-5.6-terra"]);
+        assert_eq!(state.available_subagent_model("gpt-5.6-luna"), None);
+        assert_eq!(state.available_subagent_model("third-model"), None);
     }
 }

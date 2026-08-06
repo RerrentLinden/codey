@@ -302,7 +302,7 @@ fn default_true() -> bool {
     true
 }
 
-pub const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-luna";
+pub const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-terra";
 pub const DEFAULT_SUBAGENT_REASONING_EFFORT: &str = "low";
 pub const SUBAGENT_REASONING_EFFORTS: [&str; 6] =
     ["low", "medium", "high", "xhigh", "max", "ultra"];
@@ -702,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_defaults_are_trimmed_and_invalid_effort_falls_back() {
+    fn subagent_defaults_preserve_models_and_invalid_effort_falls_back() {
         let config = serde_json::from_str::<CodeyConfig>(
             r#"{"activeProfileId":"","profiles":[],"subagentModel":"  provider-coder  ","subagentReasoningEffort":"unsupported"}"#,
         )
@@ -714,6 +714,15 @@ mod tests {
             config.subagent_reasoning_effort,
             DEFAULT_SUBAGENT_REASONING_EFFORT
         );
+
+        let empty = serde_json::from_str::<CodeyConfig>(
+            r#"{"activeProfileId":"","profiles":[],"subagentModel":"   ","subagentReasoningEffort":"high"}"#,
+        )
+        .unwrap()
+        .normalize();
+
+        assert_eq!(empty.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(empty.subagent_reasoning_effort, "high");
     }
 
     #[test]

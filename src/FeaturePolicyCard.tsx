@@ -52,7 +52,9 @@ function FeaturePolicyCardComponent({
     "--gpu-mode-offset": `${gpuLaunchModeIndex * 100}%`,
   } as CSSProperties;
   const selectedSubagentModel = subagentModelOptions.find(
-    (option) => option.value === config.subagentModel,
+    (option) =>
+      option.value.trim().toLowerCase() ===
+      config.subagentModel.trim().toLowerCase(),
   );
   const subagentReasoningEfforts =
     selectedSubagentModel?.supportedReasoningEfforts ?? [];
@@ -334,7 +336,11 @@ function FeaturePolicyCardComponent({
                     }}
                   >
                     {!selectedSubagentModel && (
-                      <option value="">请选择已启用的模型</option>
+                      <option value="">
+                        {subagentModelOptions.length === 0
+                          ? "当前线路无兼容模型"
+                          : "请选择兼容模型"}
+                      </option>
                     )}
                     {subagentModelOptions.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -376,6 +382,8 @@ function FeaturePolicyCardComponent({
               <small>
                 {busy === "check-subagent-model"
                   ? `正在校验当前线路是否支持 ${config.subagentModel}`
+                  : subagentModelOptions.length === 0
+                    ? "当前 Codex 版本或线路没有可用于子代理的模型"
                   : config.subagentOptimization
                     ? "保存后立即用于当前任务后续新启动的子代理，无需重启"
                     : "保持 Codex 默认子代理配置，不注入协作提示词"}

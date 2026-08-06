@@ -5,13 +5,14 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 
 test("subagent optimization is opt-in and exposed through the settings switch", async () => {
-  const [appSource, modelHookSource, sectionsSource, configSource, commandSource, launcherSource] = await Promise.all([
+  const [appSource, modelHookSource, sectionsSource, configSource, commandSource, launcherSource, catalogSource] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/useModelSelection.ts", root), "utf8"),
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
     readFile(new URL("backend/src/config.rs", root), "utf8"),
     readFile(new URL("backend/src/commands.rs", root), "utf8"),
     readFile(new URL("backend/src/launcher.rs", root), "utf8"),
+    readFile(new URL("backend/src/model_catalog.rs", root), "utf8"),
   ]);
   const uiSource = `${appSource}\n${sectionsSource}`;
   const modelSource = `${appSource}\n${modelHookSource}`;
@@ -22,6 +23,16 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
   assert.match(launcherSource, /config\.subagent_optimization/);
   assert.match(configSource, /pub subagent_model: String/);
   assert.match(configSource, /pub subagent_reasoning_effort: String/);
+  assert.match(
+    configSource,
+    /pub const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5\.6-terra"/,
+  );
+  assert.doesNotMatch(configSource, /pub const SUBAGENT_MODELS/);
+  assert.doesNotMatch(configSource, /canonical_subagent_model/);
+  assert.match(catalogSource, /LEAF_SUBAGENT_MIN_CLIENT_VERSION/);
+  assert.match(catalogSource, /SubagentModelPolicy::V2Only/);
+  assert.match(catalogSource, /SubagentModelPolicy::LeafModels/);
+  assert.match(catalogSource, /version\.eq_ignore_ascii_case\("disabled"\)/);
   assert.match(uiSource, /checked=\{config\.subagentOptimization\}/);
   assert.match(
     uiSource,
@@ -43,6 +54,11 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
     /subagentPolicyControlsDisabled \|\|\s*subagentReasoningEfforts\.length === 0/,
   );
   assert.match(uiSource, /subagentModelOptions/);
+  assert.match(modelHookSource, /modelState\.subagentModelIds/);
+  assert.match(modelHookSource, /subagentModelKeys\.has\(modelKey\(model\.slug\)\)/);
+  assert.match(modelHookSource, /当前线路没有 Codex 子代理工具可用的模型/);
+  assert.match(uiSource, /当前 Codex 版本或线路没有可用于子代理的模型/);
+  assert.doesNotMatch(uiSource, /仅接受 Sol \/ Terra/);
   assert.match(modelSource, /invoke\("fetch_current_provider_models"\)/);
   assert.match(modelSource, /supportsModel\(result\.models, subagentModel\)/);
   assert.match(modelSource, /provider\.official \? "官方账号" : "第三方 API"/);
@@ -64,7 +80,9 @@ test("subagent optimization owns the requested V2 and default-agent settings", a
   assert.match(source, /multi_agent\["max_concurrent_threads_per_session"\] = value\(7\)/);
   assert.match(source, /multi_agent\["max_wait_timeout_ms"\] = value\(120_000\)/);
   assert.match(source, /doc\.as_table_mut\(\)\.remove\("agents"\)/);
-  assert.match(source, /agents\["default_subagent_model"\] = value\(subagent_model\.trim\(\)\)/);
+  assert.match(source, /let subagent_model = subagent_model\.trim\(\)/);
+  assert.match(source, /子代理模型不能为空/);
+  assert.match(source, /agents\["default_subagent_model"\] = value\(subagent_model\)/);
   assert.match(source, /agents\["default_subagent_reasoning_effort"\]/);
   assert.doesNotMatch(source, /\nmodel = "gpt-5\.6-luna"/);
   assert.match(source, /image_generation = false/);
