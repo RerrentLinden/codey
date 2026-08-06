@@ -15,7 +15,9 @@ use codey_runtime_core::launcher::{
 use codey_runtime_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
 use serde::Serialize;
-use tokio::process::{Child, Command};
+use tokio::process::Child;
+#[cfg(not(windows))]
+use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock, oneshot};
 
 use crate::cc_switch::{self, RouteTakeoverState};
