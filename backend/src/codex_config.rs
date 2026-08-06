@@ -10,10 +10,9 @@ use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG, LEGACY_CODEY_FASTCTX_GUIDANCE, SUBAGENT_GUIDANCE,
     append_subagent_guidance, remove_codey_fastctx_guidance, remove_subagent_guidance,
 };
-use crate::config::{
-    DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, ProviderProfile,
-    SUBAGENT_REASONING_EFFORTS, default_config_path,
-};
+#[cfg(test)]
+use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
+use crate::config::{ProviderProfile, SUBAGENT_REASONING_EFFORTS, default_config_path};
 use crate::fs_util::timestamp_millis;
 use crate::provider_lease::CODEY_PROVIDER_ID;
 
@@ -27,10 +26,9 @@ use toml_restore::restore_owned_config_changes;
 #[cfg(test)]
 use toml_restore::{items_semantically_equal, tables_semantically_equal};
 
-pub const GLOBAL_PROVIDER_ID: &str = "codey_global";
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
-const LEGACY_CODEY_GLOBAL_PROVIDER_NAME: &str = "OpenAI (Codey Global)";
 const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
 const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_TOKEN_BUDGET: &str = "8500";
@@ -98,6 +96,11 @@ pub(crate) struct RuntimeProviderConfigOptions<'a> {
     pub subagent_reasoning_effort: &'a str,
     pub preserve_provider_route: bool,
     pub protocol_proxy_base_url: Option<&'a str>,
+    pub expected_config: Option<&'a [u8]>,
+}
+
+pub(crate) struct AppliedRuntimeProviderConfig {
+    pub config_contents: Vec<u8>,
 }
 
 struct ProviderApplyOptions<'a> {
@@ -111,6 +114,7 @@ struct ProviderApplyOptions<'a> {
     backup_root: &'a Path,
     preserve_provider_route: bool,
     protocol_proxy_base_url: Option<&'a str>,
+    expected_config: Option<&'a [u8]>,
 }
 
 #[cfg(test)]
@@ -127,6 +131,7 @@ impl<'a> ProviderApplyOptions<'a> {
             backup_root,
             preserve_provider_route: false,
             protocol_proxy_base_url: None,
+            expected_config: None,
         }
     }
 }
@@ -136,7 +141,7 @@ pub(crate) fn apply_runtime_provider_config(
     profile: &ProviderProfile,
     provider_id: &str,
     options: RuntimeProviderConfigOptions<'_>,
-) -> Result<PathBuf> {
+) -> Result<AppliedRuntimeProviderConfig> {
     let marker = lease_marker_path();
     let backup_root = marker
         .parent()
@@ -147,7 +152,7 @@ pub(crate) fn apply_runtime_provider_config(
     let default_model = (!options.preserve_provider_route)
         .then_some(options.default_model)
         .flatten();
-    apply_runtime_provider_config_at_mode(
+    let backup_dir = apply_runtime_provider_config_at_mode(
         home,
         profile,
         provider_id,
@@ -162,8 +167,12 @@ pub(crate) fn apply_runtime_provider_config(
             backup_root: &backup_root,
             preserve_provider_route: options.preserve_provider_route,
             protocol_proxy_base_url: options.protocol_proxy_base_url,
+            expected_config: options.expected_config,
         },
-    )
+    )?;
+    let config_contents =
+        fs::read(backup_dir.join(APPLIED_CONFIG_FILE)).context("读取 Codey 已应用配置快照失败")?;
+    Ok(AppliedRuntimeProviderConfig { config_contents })
 }
 
 const FASTCTX_SERVER_BINARY: &str = if cfg!(windows) {
@@ -223,6 +232,7 @@ fn apply_runtime_provider_config_at_mode(
         backup_root,
         preserve_provider_route,
         protocol_proxy_base_url,
+        expected_config,
     } = options;
     ensure_supported_provider_protocol(profile.protocol, protocol_proxy_base_url)?;
     fs::create_dir_all(home)?;
@@ -231,6 +241,11 @@ fn apply_runtime_provider_config_at_mode(
     let agents_dir = home.join("agents");
     let default_agent_path = agents_dir.join("default.toml");
     let original_config = read_optional(&config_path)?;
+    if let Some(expected_config) = expected_config
+        && original_config.as_deref() != Some(expected_config)
+    {
+        bail!("CC Switch Live 配置在启动准备期间发生变化；已取消本次启动以避免混用线路");
+    }
     let original_agents_md = if subagent_optimization {
         read_optional(&agents_md_path)?
     } else {
@@ -259,11 +274,7 @@ fn apply_runtime_provider_config_at_mode(
     } else {
         None
     };
-    let provider_id = if preserve_provider_route {
-        provider_id.trim().to_string()
-    } else {
-        normalized_provider_id(provider_id)
-    };
+    let provider_id = validated_provider_id(provider_id)?;
     // Codex resolves this path from the app-server working directory, which is
     // `/` for the packaged macOS app, rather than from CODEX_HOME.
     let model_catalog_path =
@@ -487,10 +498,7 @@ fn mark_runtime_subagent_defaults_applied_at(
     write_lease(marker, &state)
 }
 
-pub fn reconcile_runtime_config_overlay(home: &Path) -> Result<Option<Vec<u8>>> {
-    reconcile_runtime_config_overlay_at(home, &lease_marker_path())
-}
-
+#[cfg(test)]
 fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Option<Vec<u8>>> {
     let mut state = match fs::read_to_string(marker) {
         Ok(contents) => serde_json::from_str::<RuntimeConfigLease>(&contents)
@@ -987,68 +995,21 @@ fn ensure_child_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Ta
         .ok_or_else(|| anyhow::anyhow!("{key} 必须是 TOML table"))
 }
 
-/// Reads the provider selected by an external Live-route owner without
-/// normalizing or rewriting the surrounding Codex configuration.
-pub fn active_model_provider(home: &Path) -> Result<String> {
-    let config_path = home.join("config.toml");
-    let contents = fs::read_to_string(&config_path)
-        .with_context(|| format!("读取 Codex 配置失败：{}", config_path.display()))?;
-    root_key_string(&contents, "model_provider")
-        .filter(|provider| !provider.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("CC Switch 路由配置缺少活动 model_provider"))
-}
-
-/// Installs a stable non-reserved provider for the official account flow.
-/// Direct third-party profiles temporarily reuse this provider id while Codey
-/// runs, then the exact original configuration is restored.
-pub fn ensure_global_model_provider(home: &Path) -> Result<String> {
-    fs::create_dir_all(home)?;
+/// Reads the provider bucket selected by the current Codex configuration.
+/// Codex defaults to its built-in `openai` provider when the root key is absent.
+pub fn current_model_provider(home: &Path) -> Result<String> {
     let config_path = home.join("config.toml");
     let original = read_optional(&config_path)?;
-    let existing = String::from_utf8(original.clone().unwrap_or_default())
-        .context("Codex config.toml 不是 UTF-8")?;
-    let mut doc = parse_document(&existing)?;
-
-    let current_provider = doc
+    let existing =
+        String::from_utf8(original.unwrap_or_default()).context("Codex config.toml 不是 UTF-8")?;
+    let doc = parse_document(&existing)?;
+    Ok(doc
         .get("model_provider")
         .and_then(Item::as_str)
         .map(str::trim)
         .filter(|provider| !provider.is_empty())
-        .map(ToString::to_string);
-    let current_provider_config = current_provider
-        .as_deref()
-        .and_then(|provider| {
-            doc.get("model_providers")
-                .and_then(Item::as_table)
-                .and_then(|providers| providers.get(provider))
-        })
-        .filter(|provider| provider.as_table_like().is_some())
-        .cloned();
-
-    if let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut) {
-        for provider in RESERVED_PROVIDER_IDS {
-            providers.remove(provider);
-        }
-    }
-    if let Some(provider) = current_provider.as_deref()
-        && !is_reserved_provider(provider)
-        && provider != CODEY_PROVIDER_ID
-        && provider != GLOBAL_PROVIDER_ID
-    {
-        write_global_provider_migration_if_changed(home, &config_path, &existing, &doc, original)?;
-        return Ok(provider.to_string());
-    }
-
-    ensure_provider_table(&mut doc)?;
-    let mut global_provider =
-        current_provider_config.unwrap_or_else(|| Item::Table(official_provider_table()));
-    migrate_legacy_official_provider_name(&mut global_provider);
-    doc["model_providers"]
-        .as_table_mut()
-        .expect("model_providers was initialized")[GLOBAL_PROVIDER_ID] = global_provider;
-    doc["model_provider"] = value(GLOBAL_PROVIDER_ID);
-    write_global_provider_migration_if_changed(home, &config_path, &existing, &doc, original)?;
-    Ok(GLOBAL_PROVIDER_ID.to_string())
+        .unwrap_or(BUILTIN_OPENAI_PROVIDER_ID)
+        .to_string())
 }
 
 #[cfg(test)]
@@ -1146,28 +1107,41 @@ fn patch_config_with_fastctx_mode_and_proxy(
     // takeover is active. Codey only layers its independent runtime
     // enhancements onto the current Live document.
     if !preserve_provider_route {
-        ensure_provider_table(&mut doc)?;
-        let provider_id = normalized_provider_id(provider_id);
-        let existing_local_provider = profile
-            .cc_switch_provider_id
-            .is_none()
-            .then(|| {
-                doc.get("model_providers")
-                    .and_then(Item::as_table)
-                    .and_then(|providers| providers.get(&provider_id))
-                    .and_then(Item::as_table)
-                    .cloned()
-            })
-            .flatten();
-        let provider = if profile.cc_switch_read_only {
-            official_provider_table()
+        let provider_id = validated_provider_id(provider_id)?;
+        let uses_builtin_provider =
+            profile.cc_switch_read_only && is_reserved_provider_id(&provider_id);
+        if uses_builtin_provider {
+            // Keep built-in providers built-in. Current Codex ignores most
+            // configured overrides for reserved provider ids, and these routes
+            // already obtain their endpoint and authentication internally.
         } else {
-            direct_provider_table(profile, existing_local_provider, protocol_proxy_base_url)?
-        };
-        doc["model_providers"]
-            .as_table_mut()
-            .expect("model_providers was initialized")[&provider_id] = Item::Table(provider);
-        doc["model_provider"] = value(provider_id);
+            if is_reserved_provider_id(&provider_id) {
+                anyhow::bail!(
+                    "当前第三方线路使用了 Codex 保留 Provider ID「{provider_id}」；请改用非保留的自定义 ID 后重试"
+                );
+            }
+            ensure_provider_table(&mut doc)?;
+            let existing_local_provider = profile
+                .cc_switch_provider_id
+                .is_none()
+                .then(|| {
+                    doc.get("model_providers")
+                        .and_then(Item::as_table)
+                        .and_then(|providers| providers.get(&provider_id))
+                        .and_then(Item::as_table)
+                        .cloned()
+                })
+                .flatten();
+            let provider = if profile.cc_switch_read_only {
+                official_provider_table()
+            } else {
+                direct_provider_table(profile, existing_local_provider, protocol_proxy_base_url)?
+            };
+            doc["model_providers"]
+                .as_table_mut()
+                .expect("model_providers was initialized")[&provider_id] = Item::Table(provider);
+        }
+        doc["model_provider"] = value(&provider_id);
         if let Some(model_catalog_path) = model_catalog_path {
             doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().into_owned());
         } else {
@@ -1188,6 +1162,7 @@ fn patch_config_with_fastctx_mode_and_proxy(
     document_string(&doc)
 }
 
+#[cfg(test)]
 fn patch_config_preserving_provider_route(
     existing: &str,
     fastctx_command: Option<&Path>,
@@ -1550,21 +1525,6 @@ fn official_provider_table() -> Table {
     provider
 }
 
-fn migrate_legacy_official_provider_name(provider: &mut Item) {
-    let is_legacy_official_provider = provider.as_table_like().is_some_and(|provider| {
-        provider.get("name").and_then(Item::as_str) == Some(LEGACY_CODEY_GLOBAL_PROVIDER_NAME)
-            && provider
-                .get("base_url")
-                .and_then(Item::as_str)
-                .is_some_and(|base_url| {
-                    base_url.trim().trim_end_matches('/') == CHATGPT_CODEX_BASE_URL
-                })
-    });
-    if is_legacy_official_provider && let Some(provider) = provider.as_table_like_mut() {
-        provider.insert("name", value(OPENAI_PROVIDER_NAME));
-    }
-}
-
 fn parse_document(existing: &str) -> Result<DocumentMut> {
     if existing.trim().is_empty() {
         Ok(DocumentMut::new())
@@ -1596,21 +1556,6 @@ fn ensure_root_table<'a>(doc: &'a mut DocumentMut, key: &str) -> Result<&'a mut 
     doc[key]
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("{key} 必须是 TOML table"))
-}
-
-fn write_global_provider_migration_if_changed(
-    home: &Path,
-    config_path: &Path,
-    existing: &str,
-    doc: &DocumentMut,
-    original: Option<Vec<u8>>,
-) -> Result<()> {
-    let updated = document_string(doc)?;
-    if updated != existing {
-        backup_global_provider_migration(home, original.as_deref())?;
-        atomic_write(config_path, updated.as_bytes())?;
-    }
-    Ok(())
 }
 
 fn document_string(doc: &DocumentMut) -> Result<String> {
@@ -1681,32 +1626,16 @@ fn provider_base_url(contents: &str, provider_id: &str) -> Option<String> {
         .map(|value| value.trim_end_matches('/').to_string())
 }
 
-fn normalized_provider_id(provider_id: &str) -> String {
+fn validated_provider_id(provider_id: &str) -> Result<String> {
     let provider_id = provider_id.trim();
-    if provider_id.is_empty()
-        || provider_id == CODEY_PROVIDER_ID
-        || is_reserved_provider(provider_id)
-    {
-        GLOBAL_PROVIDER_ID.to_string()
-    } else {
-        provider_id.to_string()
+    if provider_id.is_empty() {
+        anyhow::bail!("Codex 活动 model_provider 不能为空");
     }
+    Ok(provider_id.to_string())
 }
 
-fn is_reserved_provider(provider_id: &str) -> bool {
+pub(crate) fn is_reserved_provider_id(provider_id: &str) -> bool {
     RESERVED_PROVIDER_IDS.contains(&provider_id)
-}
-
-fn backup_global_provider_migration(home: &Path, original: Option<&[u8]>) -> Result<()> {
-    let Some(original) = original else {
-        return Ok(());
-    };
-    let backup_root = home.join("backups_state/codey-global-provider");
-    create_private_dir_all(&backup_root)?;
-    let backup_dir = backup_root.join(format!("{}-{}", timestamp_millis(), std::process::id()));
-    create_private_dir_all(&backup_dir)?;
-    write_private_file(&backup_dir.join("config.toml"), original)?;
-    Ok(())
 }
 
 const BACKUP_RETENTION_COUNT: usize = 5;
@@ -1757,6 +1686,8 @@ fn prune_stale_backup_dirs(backup_root: &Path, marker: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const GLOBAL_PROVIDER_ID: &str = "codey_global";
 
     #[test]
     fn stale_backup_dirs_are_pruned_beyond_retention() {
@@ -1867,6 +1798,53 @@ mod tests {
     }
 
     #[test]
+    fn official_patch_keeps_builtin_openai_without_a_configured_provider_table() {
+        let result = patch_config(
+            "model_provider = \"openai\"\n",
+            &official_profile(),
+            BUILTIN_OPENAI_PROVIDER_ID,
+            true,
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+
+        assert_eq!(
+            document["model_provider"].as_str(),
+            Some(BUILTIN_OPENAI_PROVIDER_ID)
+        );
+        assert!(
+            document
+                .get("model_providers")
+                .and_then(Item::as_table)
+                .is_none_or(|providers| providers.get(BUILTIN_OPENAI_PROVIDER_ID).is_none())
+        );
+        assert_eq!(
+            document["model_catalog_json"].as_str(),
+            Some("model-catalogs/codey-official.json")
+        );
+    }
+
+    #[test]
+    fn official_patch_keeps_other_builtin_providers_without_overrides() {
+        let result = patch_config(
+            "model_provider = \"ollama\"\n",
+            &official_profile(),
+            "ollama",
+            false,
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+
+        assert_eq!(document["model_provider"].as_str(), Some("ollama"));
+        assert!(
+            document
+                .get("model_providers")
+                .and_then(Item::as_table)
+                .is_none_or(|providers| providers.get("ollama").is_none())
+        );
+    }
+
+    #[test]
     fn provider_patch_enables_all_desktop_reasoning_efforts() {
         let existing = r#"
 [desktop]
@@ -1925,9 +1903,9 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
     #[test]
     fn direct_patch_configures_a_responses_provider_without_a_loopback_endpoint() {
         let result = patch_config(
-            "model_provider = \"openai\"\n",
+            "model_provider = \"relay\"\n",
             &direct_profile(RelayProtocol::Responses),
-            "openai",
+            "relay",
             false,
         )
         .unwrap();
@@ -1937,8 +1915,21 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
         assert!(!result.contains("127.0.0.1"));
         assert_eq!(
             root_key_string(&result, "model_provider").as_deref(),
-            Some(GLOBAL_PROVIDER_ID)
+            Some("relay")
         );
+    }
+
+    #[test]
+    fn direct_patch_rejects_a_reserved_provider_id_instead_of_silently_renaming_it() {
+        let error = patch_config(
+            "model_provider = \"openai\"\n",
+            &direct_profile(RelayProtocol::Responses),
+            BUILTIN_OPENAI_PROVIDER_ID,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("Codex 保留 Provider ID"));
     }
 
     #[test]
@@ -1961,9 +1952,9 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
     #[test]
     fn direct_chat_patch_routes_codex_through_the_local_responses_proxy() {
         let result = patch_config_with_fastctx_mode_and_proxy(
-            "model_provider = \"openai\"\n",
+            "model_provider = \"relay\"\n",
             &direct_profile(RelayProtocol::ChatCompletions),
-            "openai",
+            "relay",
             ProviderPatchOptions {
                 model_catalog_path: None,
                 default_model: None,
@@ -2882,6 +2873,35 @@ custom_setting = "preserved"
     }
 
     #[test]
+    fn route_apply_rejects_a_config_changed_after_live_snapshot_validation() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        let expected = b"model_provider = \"route-a\"\n";
+        let current = b"model_provider = \"route-b\"\n";
+        fs::write(home.join("config.toml"), current).unwrap();
+
+        let error = apply_runtime_provider_config_at_mode(
+            &home,
+            &direct_profile(RelayProtocol::Responses),
+            "route-a",
+            ProviderApplyOptions {
+                preserve_provider_route: true,
+                expected_config: Some(expected),
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("启动准备期间发生变化"));
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), current);
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn route_lease_rebases_after_cc_switch_hot_swap_and_restores_latest_route() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
@@ -2919,6 +2939,7 @@ command = "cc-switch-tool"
                 backup_root: &backup_root,
                 preserve_provider_route: true,
                 protocol_proxy_base_url: None,
+                expected_config: None,
             },
         )
         .unwrap();
@@ -3025,6 +3046,7 @@ experimental_bearer_token = "PROXY_MANAGED"
                 backup_root: &backup_root,
                 preserve_provider_route: true,
                 protocol_proxy_base_url: None,
+                expected_config: None,
             },
         )
         .unwrap();
@@ -3088,6 +3110,7 @@ experimental_bearer_token = "PROXY_MANAGED"
                 backup_root: &backup_root,
                 preserve_provider_route: true,
                 protocol_proxy_base_url: Some("http://127.0.0.1:43123/v1"),
+                expected_config: None,
             },
         )
         .unwrap();
@@ -3739,34 +3762,38 @@ note = "user replacement"
     }
 
     #[test]
-    fn installs_a_non_reserved_global_provider_for_builtin_openai() {
+    fn current_provider_defaults_to_builtin_openai_without_creating_config() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
-        fs::write(
-            home.join("config.toml"),
-            "model_provider = \"openai\"\nmodel = \"gpt-5\"\n",
-        )
-        .unwrap();
+
         assert_eq!(
-            ensure_global_model_provider(&home).unwrap(),
-            GLOBAL_PROVIDER_ID
+            current_model_provider(&home).unwrap(),
+            BUILTIN_OPENAI_PROVIDER_ID
         );
-        let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        assert_eq!(
-            provider_base_url(&config, GLOBAL_PROVIDER_ID).as_deref(),
-            Some(CHATGPT_CODEX_BASE_URL)
-        );
-        let document = config.parse::<DocumentMut>().unwrap();
-        assert_eq!(
-            document["model_providers"][GLOBAL_PROVIDER_ID]["name"].as_str(),
-            Some("OpenAI")
-        );
-        assert!(!config.contains("[model_providers.openai]"));
+        assert!(!home.join("config.toml").exists());
     }
 
     #[test]
-    fn migrates_the_legacy_codey_name_for_the_official_provider() {
+    fn preserves_the_builtin_openai_provider_without_adding_a_global_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let original = "model_provider = \"openai\"\nmodel = \"gpt-5\"\n";
+        fs::write(home.join("config.toml"), original).unwrap();
+
+        assert_eq!(
+            current_model_provider(&home).unwrap(),
+            BUILTIN_OPENAI_PROVIDER_ID
+        );
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn preserves_the_current_legacy_global_official_provider() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
@@ -3783,34 +3810,20 @@ requires_openai_auth = true
         )
         .unwrap();
 
+        let original = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(current_model_provider(&home).unwrap(), GLOBAL_PROVIDER_ID);
         assert_eq!(
-            ensure_global_model_provider(&home).unwrap(),
-            GLOBAL_PROVIDER_ID
-        );
-        let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        let document = config.parse::<DocumentMut>().unwrap();
-        let provider = document["model_providers"][GLOBAL_PROVIDER_ID]
-            .as_table_like()
-            .unwrap();
-
-        assert_eq!(
-            provider.get("name").and_then(Item::as_str),
-            Some(OPENAI_PROVIDER_NAME)
-        );
-        assert_eq!(
-            provider.get("base_url").and_then(Item::as_str),
-            Some("https://chatgpt.com/backend-api/codex/")
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            original
         );
     }
 
     #[test]
-    fn migrates_a_reserved_custom_provider_without_changing_its_api_address() {
+    fn preserves_a_reserved_current_provider_without_rewriting_its_config() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         fs::create_dir_all(&home).unwrap();
-        fs::write(
-            home.join("config.toml"),
-            r#"model_provider = "openai"
+        let original = r#"model_provider = "openai"
 
 [model_providers.openai]
 name = "Private Relay"
@@ -3818,44 +3831,16 @@ base_url = "https://relay.example/v1"
 wire_api = "chat"
 requires_openai_auth = true
 experimental_bearer_token = "sk-existing"
-"#,
-        )
-        .unwrap();
+"#;
+        fs::write(home.join("config.toml"), original).unwrap();
 
         assert_eq!(
-            ensure_global_model_provider(&home).unwrap(),
-            GLOBAL_PROVIDER_ID
-        );
-        let config = fs::read_to_string(home.join("config.toml")).unwrap();
-        let document = config.parse::<DocumentMut>().unwrap();
-        let provider = document["model_providers"][GLOBAL_PROVIDER_ID]
-            .as_table_like()
-            .unwrap();
-
-        assert_eq!(
-            provider.get("name").and_then(Item::as_str),
-            Some("Private Relay")
+            current_model_provider(&home).unwrap(),
+            BUILTIN_OPENAI_PROVIDER_ID
         );
         assert_eq!(
-            provider.get("base_url").and_then(Item::as_str),
-            Some("https://relay.example/v1")
-        );
-        assert_eq!(
-            provider.get("wire_api").and_then(Item::as_str),
-            Some("chat")
-        );
-        assert_eq!(
-            provider
-                .get("experimental_bearer_token")
-                .and_then(Item::as_str),
-            Some("sk-existing")
-        );
-        assert!(
-            document["model_providers"]
-                .as_table()
-                .unwrap()
-                .get("openai")
-                .is_none()
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            original
         );
     }
 
@@ -3875,10 +3860,30 @@ experimental_bearer_token = "sk-existing"
 "#;
         fs::write(home.join("config.toml"), original).unwrap();
 
+        assert_eq!(current_model_provider(&home).unwrap(), GLOBAL_PROVIDER_ID);
         assert_eq!(
-            ensure_global_model_provider(&home).unwrap(),
-            GLOBAL_PROVIDER_ID
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            original
         );
+    }
+
+    #[test]
+    fn preserves_a_legacy_official_global_provider_with_extra_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        let original = r#"model_provider = "codey_global"
+
+[model_providers.codey_global]
+name = "OpenAI (Codey Global)"
+base_url = "https://chatgpt.com/backend-api/codex/"
+wire_api = "responses"
+requires_openai_auth = true
+experimental_bearer_token = "must-not-be-removed"
+"#;
+        fs::write(home.join("config.toml"), original).unwrap();
+
+        assert_eq!(current_model_provider(&home).unwrap(), GLOBAL_PROVIDER_ID);
         assert_eq!(
             fs::read_to_string(home.join("config.toml")).unwrap(),
             original
@@ -3893,7 +3898,7 @@ experimental_bearer_token = "sk-existing"
         let original = "model_provider = \"company\"\n\n[model_providers.company]\nname = \"Company\"\nbase_url = \"https://example.com/v1\"\n";
         fs::write(home.join("config.toml"), original).unwrap();
         assert_eq!(
-            ensure_global_model_provider(&home).unwrap(),
+            current_model_provider(&home).unwrap(),
             "company".to_string()
         );
         assert_eq!(

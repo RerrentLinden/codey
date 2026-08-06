@@ -151,6 +151,24 @@ async fn reclaim_initial_session_scan(
     }
 }
 
+fn spawn_route_change_restart(state: Arc<AppState>, route_changed: oneshot::Receiver<()>) {
+    tokio::spawn(async move {
+        if route_changed.await.is_err() || state.is_shutting_down() {
+            return;
+        }
+        eprintln!("检测到 CC Switch Live 路由变化，正在安全重启 Codex");
+        if let Err(error) = schedule_restart_codey_runtime(&state).await {
+            error_log::record_failure(
+                "runtime_restart_failed",
+                "restart_after_cc_switch_route_change",
+                error.clone(),
+                json!({}),
+            );
+            eprintln!("CC Switch 路由变化后的自动重启失败：{error}");
+        }
+    });
+}
+
 async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, String> {
     ensure_runtime_can_start(state)?;
     if state.runtime.lock().await.is_some() {
@@ -161,6 +179,9 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     stop_waiting_webhook_watcher(state).await;
     restore_previous_runtime_state(&codex_home())
         .map_err(|error| format!("恢复上次 Codey 临时 Codex 配置失败：{error}"))?;
+    super::sync_cc_switch_state(state)
+        .await
+        .map_err(|error| format!("重新读取当前 Codex 线路失败：{error}"))?;
     let config = sync_provider_models_for_launch(state).await;
     let initial_scan_task = if webhook_watcher_should_run(&config) {
         let initial_event_cache = state
@@ -178,7 +199,7 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
         return Err(error);
     }
     let handler = make_bridge_handler(state);
-    let (runtime, codex_exit) =
+    let (runtime, codex_exit, route_changed) =
         match CodeyRuntime::start(&config, handler, state.crashpad_pending_stats.clone()).await {
             Ok(started) => started,
             Err(error) => {
@@ -198,6 +219,9 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     let runtime_generation = state.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1;
     if let Some(initial_scan_task) = initial_scan_task {
         start_waiting_webhook_watcher(state, initial_scan_task).await;
+    }
+    if let Some(route_changed) = route_changed {
+        spawn_route_change_restart(Arc::clone(state), route_changed);
     }
     let exit_state = Arc::clone(state);
     tokio::spawn(async move {

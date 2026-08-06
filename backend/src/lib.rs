@@ -76,16 +76,6 @@ pub async fn run() -> Result<()> {
         );
         eprintln!("Codey 启动前恢复上次临时配置失败：{error:#}");
     }
-    if let Err(error) = commands::sync_cc_switch_state(&state).await {
-        error_log::record_failure(
-            "provider_sync_failed",
-            "sync_current_provider_at_startup",
-            error.clone(),
-            serde_json::json!({}),
-        );
-        eprintln!("Codey 启动时读取当前 Codex 线路失败：{error}");
-    }
-
     if let Err(error) = commands::launch_codey_runtime(&state).await {
         eprintln!("Codey 自动启动 Codex 失败：{error:#}");
         let cleanup = stop_runtime_with_retry(&state).await;

@@ -23,11 +23,10 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use crate::cc_switch::{self, RouteTakeoverState};
 use crate::cdp;
 use crate::codex_config::{
-    RuntimeProviderConfigOptions, active_model_provider, apply_runtime_provider_config, codex_home,
-    ensure_global_model_provider, reconcile_runtime_config_overlay,
-    restore_runtime_provider_config,
+    RuntimeProviderConfigOptions, apply_runtime_provider_config, codex_home,
+    current_model_provider, restore_runtime_provider_config,
 };
-use crate::config::{CodeyConfig, GpuLaunchMode};
+use crate::config::{CodeyConfig, GpuLaunchMode, ProviderProfile};
 use crate::crashpad_pending_guard::{self, CrashpadPendingStatsHandle};
 use crate::error_log;
 use crate::maintenance_lock;
@@ -174,8 +173,10 @@ pub struct CodeyRuntime {
     protocol_proxy: Mutex<Option<ProtocolProxyHandle>>,
 }
 
-fn protocol_proxy_settings(config: &CodeyConfig) -> Option<BackendSettings> {
-    let profile = config.active_profile()?;
+fn protocol_proxy_settings(
+    profile: &ProviderProfile,
+    default_model: Option<&str>,
+) -> Option<BackendSettings> {
     if profile.cc_switch_read_only || profile.protocol != RelayProtocol::ChatCompletions {
         return None;
     }
@@ -183,7 +184,7 @@ fn protocol_proxy_settings(config: &CodeyConfig) -> Option<BackendSettings> {
     let relay = RelayProfile {
         id: profile.id.clone(),
         name: profile.name.clone(),
-        model: config.default_model().unwrap_or_default().to_string(),
+        model: default_model.unwrap_or_default().to_string(),
         base_url: base_url.clone(),
         upstream_base_url: base_url,
         api_key: profile.api_key.clone(),
@@ -199,8 +200,11 @@ fn protocol_proxy_settings(config: &CodeyConfig) -> Option<BackendSettings> {
     })
 }
 
-async fn start_runtime_protocol_proxy(config: &CodeyConfig) -> Result<Option<ProtocolProxyHandle>> {
-    let Some(settings) = protocol_proxy_settings(config) else {
+async fn start_runtime_protocol_proxy(
+    profile: &ProviderProfile,
+    default_model: Option<&str>,
+) -> Result<Option<ProtocolProxyHandle>> {
+    let Some(settings) = protocol_proxy_settings(profile, default_model) else {
         return Ok(None);
     };
     start_protocol_proxy(settings)
@@ -209,53 +213,34 @@ async fn start_runtime_protocol_proxy(config: &CodeyConfig) -> Result<Option<Pro
         .context("启动 Chat Completions 本地协议代理失败")
 }
 
-async fn resolve_startup_provider(
-    home: &std::path::Path,
-    preserve_provider_route: bool,
-) -> Result<String> {
+async fn resolve_startup_provider(home: &std::path::Path) -> Result<String> {
     let provider_home = home.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        if preserve_provider_route {
-            active_model_provider(&provider_home)
-        } else {
-            ensure_global_model_provider(&provider_home)
-        }
-    })
-    .await
-    .map_err(|error| {
-        let error = anyhow::Error::new(error).context("准备全局模型 Provider 任务异常退出");
-        error_log::record_failure(
-            "patch_failed",
-            if preserve_provider_route {
-                "read_cc_switch_live_provider"
-            } else {
-                "ensure_global_model_provider"
-            },
-            format!("{error:#}"),
-            serde_json::json!({
-                "codexHome": home,
-                "preserveProviderRoute": preserve_provider_route,
-                "taskJoinFailed": true,
-            }),
-        );
-        error
-    })?
-    .map_err(|error| {
-        error_log::record_failure(
-            "patch_failed",
-            if preserve_provider_route {
-                "read_cc_switch_live_provider"
-            } else {
-                "ensure_global_model_provider"
-            },
-            format!("{error:#}"),
-            serde_json::json!({
-                "codexHome": home,
-                "preserveProviderRoute": preserve_provider_route,
-            }),
-        );
-        error
-    })
+    tokio::task::spawn_blocking(move || current_model_provider(&provider_home))
+        .await
+        .map_err(|error| {
+            let error = anyhow::Error::new(error).context("读取当前模型 Provider 任务异常退出");
+            error_log::record_failure(
+                "patch_failed",
+                "read_current_model_provider",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "codexHome": home,
+                    "taskJoinFailed": true,
+                }),
+            );
+            error
+        })?
+        .map_err(|error| {
+            error_log::record_failure(
+                "patch_failed",
+                "read_current_model_provider",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "codexHome": home,
+                }),
+            );
+            error
+        })
 }
 
 async fn run_startup_session_maintenance(
@@ -393,17 +378,26 @@ async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBu
     })
 }
 
+struct CodexStartupStateOptions<'a> {
+    original_provider: &'a str,
+    preserve_provider_route: bool,
+    protocol_proxy_base_url: Option<&'a str>,
+    expected_config: Option<&'a [u8]>,
+}
+
 async fn prepare_codex_startup_state(
     config: &CodeyConfig,
+    current_profile: &ProviderProfile,
     app_dir: &std::path::Path,
     home: &std::path::Path,
-    original_provider: &str,
-    preserve_provider_route: bool,
-    protocol_proxy_base_url: Option<&str>,
-) -> Result<()> {
-    let current_profile = config
-        .active_profile()
-        .ok_or_else(|| anyhow::anyhow!("找不到当前 Codex 线路"))?;
+    options: CodexStartupStateOptions<'_>,
+) -> Result<Vec<u8>> {
+    let CodexStartupStateOptions {
+        original_provider,
+        preserve_provider_route,
+        protocol_proxy_base_url,
+        expected_config,
+    } = options;
     let catalog_task = if preserve_provider_route {
         None
     } else {
@@ -525,6 +519,7 @@ async fn prepare_codex_startup_state(
     let subagent_reasoning_effort = config.subagent_reasoning_effort.clone();
     let protocol_proxy_base_url = protocol_proxy_base_url.map(str::to_string);
     let protocol_proxy_enabled = protocol_proxy_base_url.is_some();
+    let expected_config = expected_config.map(<[u8]>::to_vec);
     let runtime_config = tokio::task::spawn_blocking(move || {
         apply_runtime_provider_config(
             &runtime_config_home,
@@ -539,6 +534,7 @@ async fn prepare_codex_startup_state(
                 subagent_reasoning_effort: &subagent_reasoning_effort,
                 preserve_provider_route,
                 protocol_proxy_base_url: protocol_proxy_base_url.as_deref(),
+                expected_config: expected_config.as_deref(),
             },
         )
     })
@@ -561,7 +557,7 @@ async fn prepare_codex_startup_state(
         );
         error
     })?;
-    runtime_config.map_err(|error| {
+    let applied = runtime_config.map_err(|error| {
         error_log::record_failure(
             "patch_failed",
             "apply_runtime_provider_config",
@@ -577,7 +573,7 @@ async fn prepare_codex_startup_state(
         );
         error
     })?;
-    Ok(())
+    Ok(applied.config_contents)
 }
 
 impl CodeyRuntime {
@@ -638,7 +634,7 @@ impl CodeyRuntime {
         config: &CodeyConfig,
         handler: codey_runtime_core::bridge::BridgeHandler,
         crashpad_pending_stats: CrashpadPendingStatsHandle,
-    ) -> Result<(Self, oneshot::Receiver<()>)> {
+    ) -> Result<(Self, oneshot::Receiver<()>, Option<oneshot::Receiver<()>>)> {
         let home = codex_home();
         let injection_scripts = cdp::prepare_injection_scripts(
             config.fast_codex_startup,
@@ -663,9 +659,9 @@ impl CodeyRuntime {
                 }
             }
         });
-        let route_takeover_home = home.clone();
-        let route_takeover = tokio::task::spawn_blocking(move || {
-            cc_switch::route_takeover_state(&route_takeover_home)
+        let startup_route_home = home.clone();
+        let startup_route = tokio::task::spawn_blocking(move || {
+            cc_switch::startup_route_state(&startup_route_home)
         })
         .await
         .map_err(|error| {
@@ -693,19 +689,38 @@ impl CodeyRuntime {
             error
         })?;
         let preserve_provider_route =
-            preserve_cc_switch_route(route_takeover).map_err(|error| {
+            preserve_cc_switch_route(startup_route.takeover).map_err(|error| {
                 error_log::record_failure(
                     "patch_failed",
                     "validate_cc_switch_route_takeover",
                     format!("{error:#}"),
                     serde_json::json!({
-                        "managed": route_takeover.managed,
-                        "live": route_takeover.live,
+                        "managed": startup_route.takeover.managed,
+                        "live": startup_route.takeover.live,
                     }),
                 );
                 error
             })?;
-        let original_provider = resolve_startup_provider(&home, preserve_provider_route).await?;
+        let live_route =
+            if preserve_provider_route {
+                Some(startup_route.live_route.ok_or_else(|| {
+                    anyhow::anyhow!("CC Switch Live 路由缺少已验证的 Provider 快照")
+                })?)
+            } else {
+                None
+            };
+        let original_provider = if let Some(live_route) = live_route.as_ref() {
+            live_route.provider_id().to_string()
+        } else {
+            resolve_startup_provider(&home).await?
+        };
+        let current_profile = if let Some(live_route) = live_route.as_ref() {
+            live_route.profile().clone()
+        } else {
+            config
+                .active_profile()
+                .ok_or_else(|| anyhow::anyhow!("找不到当前 Codex 线路"))?
+        };
         let app_dir = resolve_configured_codex_app_dir(config).await?;
         // Session repair must never race a live Codex writer. Stopping the old
         // runtime first also gives SQLite and rollout buffers a chance to flush
@@ -785,7 +800,7 @@ impl CodeyRuntime {
             }
         }
 
-        let protocol_proxy = start_runtime_protocol_proxy(config)
+        let protocol_proxy = start_runtime_protocol_proxy(&current_profile, config.default_model())
             .await
             .map_err(|error| {
                 error_log::record_failure(
@@ -793,8 +808,8 @@ impl CodeyRuntime {
                     "start_chat_completions_protocol_proxy",
                     format!("{error:#}"),
                     serde_json::json!({
-                        "provider": config.current_provider_id(),
-                        "protocol": config.active_profile().map(|profile| profile.protocol),
+                        "provider": original_provider,
+                        "protocol": current_profile.protocol,
                     }),
                 );
                 error
@@ -802,15 +817,31 @@ impl CodeyRuntime {
         let protocol_proxy_base_url = protocol_proxy
             .as_ref()
             .map(|proxy| proxy.base_url().to_string());
-        prepare_codex_startup_state(
+        let applied_config = prepare_codex_startup_state(
             config,
+            &current_profile,
             &app_dir,
             &home,
-            &original_provider,
-            preserve_provider_route,
-            protocol_proxy_base_url.as_deref(),
+            CodexStartupStateOptions {
+                original_provider: &original_provider,
+                preserve_provider_route,
+                protocol_proxy_base_url: protocol_proxy_base_url.as_deref(),
+                expected_config: live_route.as_ref().map(|route| route.config_contents()),
+            },
         )
         .await?;
+        let applied_route_files = live_route.as_ref().map(|live_route| RouteFilesSnapshot {
+            config: applied_config,
+            auth: live_route.auth_contents().map(<[u8]>::to_vec),
+        });
+        let (route_overlay_shutdown, route_overlay_task, route_changed) =
+            if let Some(applied_route_files) = applied_route_files.as_ref() {
+                let (shutdown, task, changed) =
+                    spawn_route_overlay_watcher(home.clone(), applied_route_files.clone());
+                (Some(shutdown), Some(task), Some(changed))
+            } else {
+                (None, None, None)
+            };
 
         let marketplace_home = home.clone();
         let marketplace_task = tokio::task::spawn_blocking(move || {
@@ -852,6 +883,17 @@ impl CodeyRuntime {
             }
         };
         let debug_port = codey_runtime_core::ports::select_packaged_codex_debug_port(9229);
+        if let Some(applied_route_files) = applied_route_files.as_ref() {
+            let current_route_files = read_route_files(&home)
+                .await
+                .with_context(|| "启动 Codex 前复核 CC Switch Live 路由失败")?;
+            if current_route_files.as_ref() != Some(applied_route_files) {
+                return Err(restore_runtime_config_after_error(
+                    &home,
+                    anyhow::anyhow!("CC Switch Live 路由在 Codex 启动前发生变化；已取消旧线路启动"),
+                ));
+            }
+        }
         match pet_result {
             Ok(Ok(_)) => {}
             Ok(Err(error)) => {
@@ -1006,12 +1048,6 @@ impl CodeyRuntime {
 
         let injection_statuses = Arc::new(RwLock::new(injected_target.injection_statuses()));
         let injection_websocket_url = Arc::new(RwLock::new(injected_target.websocket_url_arc()));
-        let (route_overlay_shutdown, route_overlay_task) = if preserve_provider_route {
-            let (shutdown, task) = spawn_route_overlay_watcher(home.clone());
-            (Some(shutdown), Some(task))
-        } else {
-            (None, None)
-        };
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let watchdog_handler = handler.clone();
         let watchdog_debug_port = debug_port;
@@ -1136,6 +1172,7 @@ impl CodeyRuntime {
                 protocol_proxy: Mutex::new(protocol_proxy),
             },
             codex_exit,
+            route_changed,
         ))
     }
 
@@ -1351,15 +1388,20 @@ fn spawn_crashpad_guard_watcher(
 
 fn spawn_route_overlay_watcher(
     home: PathBuf,
-) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    applied: RouteFilesSnapshot,
+) -> (
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+    oneshot::Receiver<()>,
+) {
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+    let (route_changed_tx, route_changed_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
-        let config_path = home.join("config.toml");
         let mut interval = tokio::time::interval(ROUTE_OVERLAY_WATCH_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
-        let mut last_applied: Option<Vec<u8>> = None;
-        let mut pending_external: Option<Vec<u8>> = None;
+        let mut pending_external: Option<RouteFilesSnapshot> = None;
+        let mut route_changed_tx = Some(route_changed_tx);
 
         loop {
             tokio::select! {
@@ -1367,72 +1409,64 @@ fn spawn_route_overlay_watcher(
                 _ = &mut shutdown_rx => break,
                 _ = interval.tick() => {}
             }
-            let current = match tokio::fs::read(&config_path).await {
-                Ok(contents) => contents,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let current = match read_route_files(&home).await {
+                Ok(Some(current)) => current,
+                Ok(None) => {
                     pending_external = None;
                     continue;
                 }
                 Err(error) => {
                     error_log::record_failure(
                         "route_overlay_watch_failed",
-                        "read_cc_switch_live_config",
+                        "read_cc_switch_live_route",
                         error.to_string(),
                         serde_json::json!({
-                            "configPath": config_path,
+                            "codexHome": home,
                         }),
                     );
                     continue;
                 }
             };
-            if last_applied.as_deref() == Some(current.as_slice()) {
+            if !route_files_changed(&applied, &current) {
                 pending_external = None;
                 continue;
             }
-            if pending_external.as_deref() != Some(current.as_slice()) {
+            if pending_external.as_ref() != Some(&current) {
                 pending_external = Some(current);
                 continue;
             }
 
-            let reconcile_home = home.clone();
-            match tokio::task::spawn_blocking(move || {
-                reconcile_runtime_config_overlay(&reconcile_home)
-            })
-            .await
-            {
-                Ok(Ok(Some(applied))) => {
-                    last_applied = Some(applied);
-                    pending_external = None;
-                }
-                Ok(Ok(None)) => {
-                    pending_external = None;
-                }
-                Ok(Err(error)) => {
-                    error_log::record_failure(
-                        "route_overlay_watch_failed",
-                        "reapply_cc_switch_route_overlay",
-                        format!("{error:#}"),
-                        serde_json::json!({
-                            "codexHome": home,
-                        }),
-                    );
-                    eprintln!("重新应用 Codey 路由增强失败，将自动重试：{error:#}");
-                }
-                Err(error) => {
-                    error_log::record_failure(
-                        "route_overlay_watch_failed",
-                        "join_cc_switch_route_overlay_reapply",
-                        error.to_string(),
-                        serde_json::json!({
-                            "codexHome": home,
-                        }),
-                    );
-                    eprintln!("Codey 路由增强任务异常退出，将自动重试：{error}");
-                }
+            if let Some(sender) = route_changed_tx.take() {
+                let _ = sender.send(());
             }
+            break;
         }
     });
-    (shutdown_tx, task)
+    (shutdown_tx, task, route_changed_rx)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RouteFilesSnapshot {
+    config: Vec<u8>,
+    auth: Option<Vec<u8>>,
+}
+
+async fn read_route_files(home: &std::path::Path) -> std::io::Result<Option<RouteFilesSnapshot>> {
+    let config = match tokio::fs::read(home.join("config.toml")).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let auth = match tokio::fs::read(home.join("auth.json")).await {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    Ok(Some(RouteFilesSnapshot { config, auth }))
+}
+
+fn route_files_changed(applied: &RouteFilesSnapshot, current: &RouteFilesSnapshot) -> bool {
+    applied != current
 }
 
 fn watchdog_should_reinject(consecutive_failures: &mut u8, healthy: bool) -> bool {
@@ -1514,6 +1548,30 @@ mod route_takeover_tests {
             .unwrap()
         );
         assert!(!preserve_cc_switch_route(RouteTakeoverState::default()).unwrap());
+    }
+
+    #[test]
+    fn route_watcher_restarts_for_config_or_auth_changes() {
+        let applied = RouteFilesSnapshot {
+            config: b"model_provider = \"route-a\"\n".to_vec(),
+            auth: Some(br#"{"OPENAI_API_KEY":"PROXY_MANAGED"}"#.to_vec()),
+        };
+        let same = RouteFilesSnapshot {
+            config: applied.config.clone(),
+            auth: applied.auth.clone(),
+        };
+        let changed_config = RouteFilesSnapshot {
+            config: b"model_provider = \"route-b\"\n".to_vec(),
+            auth: applied.auth.clone(),
+        };
+        let changed_auth = RouteFilesSnapshot {
+            config: applied.config.clone(),
+            auth: Some(br#"{"OPENAI_API_KEY":"new-key"}"#.to_vec()),
+        };
+
+        assert!(!route_files_changed(&applied, &same));
+        assert!(route_files_changed(&applied, &changed_config));
+        assert!(route_files_changed(&applied, &changed_auth));
     }
 }
 
@@ -2178,7 +2236,7 @@ mod tests {
             .default_model_by_provider
             .insert(profile.id.clone(), "deepseek-reasoner".to_string());
 
-        let settings = protocol_proxy_settings(&config).unwrap();
+        let settings = protocol_proxy_settings(&profile, config.default_model()).unwrap();
         let relay = settings.active_relay_profile();
         assert_eq!(settings.active_relay_id, profile.id);
         assert_eq!(relay.base_url, "https://relay.example/v1");
@@ -2194,9 +2252,9 @@ mod tests {
         let mut profile = crate::config::ProviderProfile::new("Responses");
         profile.base_url = "https://relay.example/v1".to_string();
         config.active_profile_id = profile.id.clone();
-        config.profiles = vec![profile];
+        config.profiles = vec![profile.clone()];
 
-        assert!(protocol_proxy_settings(&config).is_none());
+        assert!(protocol_proxy_settings(&profile, config.default_model()).is_none());
     }
 
     #[cfg(target_os = "macos")]

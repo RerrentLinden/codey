@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::codex_config::ensure_global_model_provider;
+use crate::codex_config::current_model_provider;
 use crate::fs_util::timestamp_millis;
 use crate::sqlite_util::table_columns;
 
@@ -381,7 +381,7 @@ fn import_session_bundle(
         project_path
     };
     let project = canonical_project_path(project_path)?;
-    let provider_id = ensure_global_model_provider(home)?;
+    let provider_id = current_model_provider(home)?;
 
     let original_id = bundle
         .thread
@@ -1144,13 +1144,17 @@ mod tests {
             imported_project.path().canonicalize().unwrap()
         );
         assert_eq!(row.1, "可移植会话");
-        assert_eq!(row.2, crate::codex_config::GLOBAL_PROVIDER_ID);
+        assert_eq!(row.2, "openai");
         assert!(row.4 > 20);
         let rollout = fs::read_to_string(row.3).unwrap();
         let session_meta: Value = serde_json::from_str(rollout.lines().next().unwrap()).unwrap();
         assert_eq!(
             PathBuf::from(session_meta["payload"]["cwd"].as_str().unwrap()),
             imported_project.path().canonicalize().unwrap()
+        );
+        assert_eq!(
+            session_meta["payload"]["model_provider"].as_str(),
+            Some("openai")
         );
         assert!(rollout.contains(source_id));
     }

@@ -12,6 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
 
+use crate::codex_config::is_reserved_provider_id;
 use crate::config::{
     CodeyConfig, DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, ProviderProfile,
 };
@@ -133,6 +134,36 @@ pub struct RouteTakeoverState {
     pub live: bool,
 }
 
+pub struct LiveRouteSnapshot {
+    provider: CurrentProvider,
+    profile: ProviderProfile,
+    config_contents: Vec<u8>,
+    auth_contents: Option<Vec<u8>>,
+}
+
+impl LiveRouteSnapshot {
+    pub fn provider_id(&self) -> &str {
+        &self.provider.id
+    }
+
+    pub fn profile(&self) -> &ProviderProfile {
+        &self.profile
+    }
+
+    pub fn config_contents(&self) -> &[u8] {
+        &self.config_contents
+    }
+
+    pub fn auth_contents(&self) -> Option<&[u8]> {
+        self.auth_contents.as_deref()
+    }
+}
+
+pub struct StartupRouteState {
+    pub takeover: RouteTakeoverState,
+    pub live_route: Option<LiveRouteSnapshot>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CcSwitchProtocolHint {
     provider_id: String,
@@ -221,8 +252,8 @@ fn legacy_cc_switch_db_path(default_db: &Path, legacy_home: Option<&Path>) -> Op
     legacy_db.is_file().then_some(legacy_db)
 }
 
-pub fn route_takeover_state(codex_home: &Path) -> Result<RouteTakeoverState> {
-    route_takeover_state_from_paths(&default_db_path(), codex_home)
+pub fn startup_route_state(codex_home: &Path) -> Result<StartupRouteState> {
+    startup_route_state_from_paths(&default_db_path(), codex_home)
 }
 
 pub fn provider_model_fetch_profile(
@@ -262,6 +293,77 @@ fn route_takeover_state_from_paths(
     Ok(RouteTakeoverState { managed, live })
 }
 
+fn startup_route_state_from_paths(db_path: &Path, codex_home: &Path) -> Result<StartupRouteState> {
+    let managed = if db_path.is_file() {
+        read_route_takeover_managed(db_path)?
+    } else {
+        false
+    };
+    let auth_path = codex_home.join("auth.json");
+    let auth_contents = match fs::read(&auth_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 Codex Live 认证失败：{}", auth_path.display()));
+        }
+    };
+    let auth = auth_contents
+        .as_deref()
+        .map(|contents| {
+            serde_json::from_slice::<Value>(contents)
+                .with_context(|| format!("解析 Codex Live 认证失败：{}", auth_path.display()))
+        })
+        .transpose()?;
+    let auth_managed = auth.as_ref().is_some_and(auth_uses_proxy_route);
+
+    let config_path = codex_home.join("config.toml");
+    let config_contents = match fs::read(&config_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 Codex Live 配置失败：{}", config_path.display()));
+        }
+    };
+    let document = config_contents
+        .as_deref()
+        .map(|contents| {
+            let contents = std::str::from_utf8(contents)
+                .with_context(|| format!("Codex Live 配置不是 UTF-8：{}", config_path.display()))?;
+            DocumentMut::from_str(contents)
+                .with_context(|| format!("解析 Codex Live 配置失败：{}", config_path.display()))
+        })
+        .transpose()?;
+    let config_managed = document.as_ref().is_some_and(document_uses_proxy_route);
+    let live = auth_managed || config_managed;
+    let takeover = RouteTakeoverState { managed, live };
+    if !live {
+        return Ok(StartupRouteState {
+            takeover,
+            live_route: None,
+        });
+    }
+
+    let document = document.ok_or_else(|| {
+        anyhow::anyhow!(
+            "CC Switch 路由已标记为 Live，但 Codex config.toml 不存在；请在 CC Switch 中关闭并重新开启 Codex 路由后重试"
+        )
+    })?;
+    let config_contents = config_contents.expect("parsed Live config has source bytes");
+    let live_route = validated_live_route_snapshot(
+        db_path,
+        document,
+        config_contents,
+        auth_contents,
+        auth.as_ref(),
+    )?;
+    Ok(StartupRouteState {
+        takeover,
+        live_route: Some(live_route),
+    })
+}
+
 fn live_auth_uses_proxy_route(codex_home: &Path) -> Result<bool> {
     let auth_path = codex_home.join("auth.json");
     let auth = match fs::read(&auth_path) {
@@ -274,10 +376,14 @@ fn live_auth_uses_proxy_route(codex_home: &Path) -> Result<bool> {
     };
     let document = serde_json::from_slice::<Value>(&auth)
         .with_context(|| format!("解析 Codex Live 认证失败：{}", auth_path.display()))?;
-    Ok(document
+    Ok(auth_uses_proxy_route(&document))
+}
+
+fn auth_uses_proxy_route(document: &Value) -> bool {
+    document
         .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
-        .is_some_and(|token| token.trim() == PROXY_MANAGED_TOKEN))
+        .is_some_and(|token| token.trim() == PROXY_MANAGED_TOKEN)
 }
 
 fn read_route_takeover_managed(path: &Path) -> Result<bool> {
@@ -374,13 +480,17 @@ fn live_config_uses_proxy_route(codex_home: &Path) -> Result<bool> {
     };
     let document = DocumentMut::from_str(&config)
         .with_context(|| format!("解析 Codex Live 配置失败：{}", config_path.display()))?;
-    let provider_id = document
+    Ok(document_uses_proxy_route(&document))
+}
+
+fn document_uses_proxy_route(document: &DocumentMut) -> bool {
+    let Some(provider_id) = document
         .get("model_provider")
         .and_then(Item::as_str)
         .map(str::trim)
-        .filter(|provider| !provider.is_empty());
-    let Some(provider_id) = provider_id else {
-        return Ok(false);
+        .filter(|provider| !provider.is_empty())
+    else {
+        return false;
     };
     let provider = document
         .get("model_providers")
@@ -401,7 +511,7 @@ fn live_config_uses_proxy_route(codex_home: &Path) -> Result<bool> {
             .and_then(|provider| provider.get("base_url"))
             .and_then(Item::as_str)
             .is_some_and(is_loopback_url);
-    Ok(managed_token || official_loopback)
+    managed_token || official_loopback
 }
 
 fn is_loopback_url(url: &str) -> bool {
@@ -856,6 +966,109 @@ fn profile_from_provider(provider: &CurrentProvider, api_key: String) -> Provide
         cc_switch_read_only: provider.official,
         supports_remote_compaction: provider.supports_remote_compaction,
     }
+}
+
+fn validated_live_route_snapshot(
+    db_path: &Path,
+    document: DocumentMut,
+    config_contents: Vec<u8>,
+    auth_contents: Option<Vec<u8>>,
+    auth: Option<&Value>,
+) -> Result<LiveRouteSnapshot> {
+    let provider_id = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CC Switch Live 配置缺少活动 model_provider；请关闭并重新开启 Codex 路由后重试"
+            )
+        })?;
+    let table = document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table_like)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CC Switch Live 配置中的活动 Provider「{provider_id}」不存在；已停止启动以避免损坏会话或把密钥发往错误地址，请关闭并重新开启 Codex 路由后重试"
+            )
+        })?;
+    let base_url = table
+        .get("base_url")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CC Switch Live Provider「{provider_id}」缺少 API 地址；已停止启动以避免把密钥发往错误地址"
+            )
+        })?;
+    let parsed_base_url = reqwest::Url::parse(&base_url)
+        .with_context(|| format!("CC Switch Live Provider「{provider_id}」的 API 地址无效"))?;
+    if !matches!(parsed_base_url.scheme(), "http" | "https") || parsed_base_url.host_str().is_none()
+    {
+        bail!("CC Switch Live Provider「{provider_id}」的 API 地址必须是有效的 HTTP(S) 地址");
+    }
+
+    let name = table
+        .get("name")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(provider_id);
+    let wire_api = table
+        .get("wire_api")
+        .and_then(Item::as_str)
+        .unwrap_or("responses");
+    let auth_mode = auth
+        .and_then(|auth| auth.get("auth_mode"))
+        .and_then(Value::as_str);
+    let auth_api_key = auth
+        .and_then(|auth| auth.get("OPENAI_API_KEY"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let config_api_key = provider_config_api_key(&document, Some(table));
+    let api_key = config_api_key
+        .or_else(|| auth_api_key.map(ToString::to_string))
+        .unwrap_or_default();
+    let official_endpoint = is_official_base_url(&base_url);
+    let official = official_endpoint && (auth_mode == Some("chatgpt") || api_key.is_empty());
+    if !official && is_reserved_provider_id(provider_id) {
+        bail!(
+            "CC Switch Live 第三方线路使用了 Codex 保留 Provider ID「{provider_id}」；Codex 可能忽略自定义地址并把密钥发往内置服务，已停止启动。请在 CC Switch 中改用非保留的自定义 Provider ID"
+        );
+    }
+
+    let mut provider = CurrentProvider {
+        id: provider_id.to_string(),
+        name: if official {
+            "OpenAI 官方直登".to_string()
+        } else {
+            name.to_string()
+        },
+        official,
+        supports_remote_compaction: official || name == "OpenAI",
+        base_url,
+        protocol: protocol_from_wire_api(wire_api),
+    };
+    let protocol_hint = cc_switch_protocol_hint(db_path, &provider);
+    if let Some(hint) = protocol_hint.as_ref() {
+        provider.protocol = hint.protocol;
+    }
+    let mut profile =
+        profile_from_provider(&provider, if official { String::new() } else { api_key });
+    profile.cc_switch_provider_id = protocol_hint.map(|hint| hint.provider_id);
+
+    Ok(LiveRouteSnapshot {
+        provider,
+        profile,
+        config_contents,
+        auth_contents,
+    })
 }
 
 fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
@@ -2036,6 +2249,98 @@ wire_api = "responses"
                 live: true,
             }
         );
+    }
+
+    #[test]
+    fn startup_route_snapshot_keeps_provider_endpoint_key_and_protocol_together() {
+        let (_directory, path, home) = fixture();
+        install_proxy_schema(&path);
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO proxy_config (app_type, enabled) VALUES ('codex', 1)",
+                [],
+            )
+            .unwrap();
+        let config = br#"model_provider = "relay"
+
+[model_providers.relay]
+name = "Live Relay"
+base_url = "https://relay.example/v1"
+wire_api = "chat"
+experimental_bearer_token = "sk-live"
+"#;
+        let auth = br#"{"OPENAI_API_KEY":"PROXY_MANAGED"}"#;
+        fs::write(home.join("config.toml"), config).unwrap();
+        fs::write(home.join("auth.json"), auth).unwrap();
+
+        let state = startup_route_state_from_paths(&path, &home).unwrap();
+        let snapshot = state.live_route.unwrap();
+        let profile = snapshot.profile();
+
+        assert_eq!(
+            state.takeover,
+            RouteTakeoverState {
+                managed: true,
+                live: true,
+            }
+        );
+        assert_eq!(snapshot.provider_id(), "relay");
+        assert_eq!(snapshot.config_contents(), config);
+        assert_eq!(snapshot.auth_contents(), Some(auth.as_slice()));
+        assert_eq!(profile.id, "relay");
+        assert_eq!(profile.base_url, "https://relay.example/v1");
+        assert_eq!(profile.api_key, "sk-live");
+        assert_eq!(profile.protocol, RelayProtocol::ChatCompletions);
+    }
+
+    #[test]
+    fn startup_route_snapshot_rejects_a_dangling_provider_before_session_repair() {
+        let (_directory, path, home) = fixture();
+        install_proxy_schema(&path);
+        fs::write(
+            home.join("config.toml"),
+            "model_provider = \"codey_global\"\n",
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"OPENAI_API_KEY":"PROXY_MANAGED"}"#,
+        )
+        .unwrap();
+
+        let error = startup_route_state_from_paths(&path, &home)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("Provider「codey_global」不存在"));
+        assert!(error.contains("避免损坏会话"));
+    }
+
+    #[test]
+    fn startup_route_snapshot_rejects_a_third_party_reserved_provider_id() {
+        let (_directory, path, home) = fixture();
+        install_proxy_schema(&path);
+        write_live_route(
+            &home,
+            "openai",
+            "https://third-party.example/v1",
+            "sk-third-party",
+        );
+        fs::write(
+            home.join("auth.json"),
+            br#"{"OPENAI_API_KEY":"PROXY_MANAGED"}"#,
+        )
+        .unwrap();
+
+        let error = startup_route_state_from_paths(&path, &home)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(error.contains("Codex 保留 Provider ID「openai」"));
+        assert!(error.contains("把密钥发往内置服务"));
     }
 
     #[test]
