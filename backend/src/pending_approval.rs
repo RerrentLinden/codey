@@ -64,11 +64,11 @@ pub enum SessionLifecycleStatus {
 #[derive(Debug, Clone, Default)]
 pub struct RecentSessionEvents {
     pub pending_approvals: Vec<PendingApproval>,
-    pub started_turns: Vec<StartedTurn>,
-    pub aborted_turns: Vec<AbortedTurn>,
-    pub completed_turns: Vec<CompletedTurn>,
-    pub session_statuses: HashMap<String, SessionLifecycleStatus>,
-    pub turn_configurations: HashMap<String, HashMap<String, TurnConfiguration>>,
+    pub started_turns: Arc<Vec<StartedTurn>>,
+    pub aborted_turns: Arc<Vec<AbortedTurn>>,
+    pub completed_turns: Arc<Vec<CompletedTurn>>,
+    pub session_statuses: Arc<HashMap<String, SessionLifecycleStatus>>,
+    pub turn_configurations: Arc<HashMap<String, HashMap<String, TurnConfiguration>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,16 +611,28 @@ impl RecentSessionEventCache {
             }
         }
 
-        if !snapshot_changed
-            && let Some(snapshot) = self
-                .last_snapshot
-                .as_ref()
-                .filter(|snapshot| snapshot.pending_approvals.is_empty())
-        {
-            return Arc::clone(snapshot);
+        if !snapshot_changed && let Some(snapshot) = self.last_snapshot.as_ref() {
+            if snapshot.pending_approvals.is_empty() {
+                return Arc::clone(snapshot);
+            }
+            let snapshot = Arc::new(RecentSessionEvents {
+                pending_approvals: self.refresh_pending_approvals(&rollouts),
+                started_turns: Arc::clone(&snapshot.started_turns),
+                aborted_turns: Arc::clone(&snapshot.aborted_turns),
+                completed_turns: Arc::clone(&snapshot.completed_turns),
+                session_statuses: Arc::clone(&snapshot.session_statuses),
+                turn_configurations: Arc::clone(&snapshot.turn_configurations),
+            });
+            self.last_snapshot = Some(Arc::clone(&snapshot));
+            return snapshot;
         }
 
-        let mut events = RecentSessionEvents::default();
+        let mut pending_approvals = Vec::new();
+        let mut started_turns = Vec::new();
+        let mut aborted_turns = Vec::new();
+        let mut completed_turns = Vec::new();
+        let mut session_statuses = HashMap::new();
+        let mut turn_configurations = HashMap::new();
         for (session_id, rollout_path) in rollouts {
             let Some(cached) = self
                 .rollouts
@@ -631,8 +643,8 @@ impl RecentSessionEventCache {
             };
             let state = &cached.state;
             let signature = &cached.signature;
-            let pending_approvals = state.pending_approvals();
-            let status = state.lifecycle_status(&pending_approvals);
+            let waiting_approvals = state.pending_approvals();
+            let status = state.lifecycle_status(&waiting_approvals);
             let parsed = &state.events;
             let rollout_is_snapshot_replay = rollout_path
                 .parent()
@@ -643,62 +655,87 @@ impl RecentSessionEventCache {
                 .and_then(|modified| modified.elapsed().ok())
                 .map(|duration| duration.as_millis())
                 .unwrap_or_default();
-            events.session_statuses.insert(session_id.clone(), status);
-            events
-                .turn_configurations
-                .insert(session_id.clone(), parsed.turn_configurations.clone());
-            events
-                .pending_approvals
-                .extend(pending_approvals.into_iter().map(|(turn_id, waiting_id)| {
-                    PendingApproval {
+            session_statuses.insert(session_id.clone(), status);
+            turn_configurations.insert(session_id.clone(), parsed.turn_configurations.clone());
+            pending_approvals.extend(waiting_approvals.into_iter().map(|(turn_id, waiting_id)| {
+                PendingApproval {
+                    session_id: session_id.clone(),
+                    turn_id,
+                    waiting_id,
+                    duration_ms,
+                }
+            }));
+            started_turns.extend(
+                parsed
+                    .started_turns
+                    .iter()
+                    .cloned()
+                    .map(|turn_id| StartedTurn {
                         session_id: session_id.clone(),
                         turn_id,
-                        waiting_id,
-                        duration_ms,
-                    }
-                }));
-            events
-                .started_turns
-                .extend(
-                    parsed
-                        .started_turns
-                        .iter()
-                        .cloned()
-                        .map(|turn_id| StartedTurn {
-                            session_id: session_id.clone(),
-                            turn_id,
-                        }),
-                );
-            events
-                .completed_turns
-                .extend(parsed.completed_turns.iter().cloned().map(
-                    |(turn_id, duration_ms, completed_at, error)| CompletedTurn {
-                        is_snapshot_replay: rollout_is_snapshot_replay
-                            || parsed.snapshot_replay_turns.contains(&turn_id),
+                    }),
+            );
+            completed_turns.extend(parsed.completed_turns.iter().cloned().map(
+                |(turn_id, duration_ms, completed_at, error)| CompletedTurn {
+                    is_snapshot_replay: rollout_is_snapshot_replay
+                        || parsed.snapshot_replay_turns.contains(&turn_id),
+                    session_id: session_id.clone(),
+                    turn_id,
+                    duration_ms,
+                    completed_at,
+                    error,
+                },
+            ));
+            aborted_turns.extend(
+                parsed
+                    .aborted_turns
+                    .iter()
+                    .cloned()
+                    .map(|turn_id| AbortedTurn {
                         session_id: session_id.clone(),
                         turn_id,
-                        duration_ms,
-                        completed_at,
-                        error,
-                    },
-                ));
-            events
-                .aborted_turns
-                .extend(
-                    parsed
-                        .aborted_turns
-                        .iter()
-                        .cloned()
-                        .map(|turn_id| AbortedTurn {
-                            session_id: session_id.clone(),
-                            turn_id,
-                        }),
-                );
+                    }),
+            );
         }
 
-        let snapshot = Arc::new(events);
+        let snapshot = Arc::new(RecentSessionEvents {
+            pending_approvals,
+            started_turns: Arc::new(started_turns),
+            aborted_turns: Arc::new(aborted_turns),
+            completed_turns: Arc::new(completed_turns),
+            session_statuses: Arc::new(session_statuses),
+            turn_configurations: Arc::new(turn_configurations),
+        });
         self.last_snapshot = Some(Arc::clone(&snapshot));
         snapshot
+    }
+
+    fn refresh_pending_approvals(&self, rollouts: &[(String, PathBuf)]) -> Vec<PendingApproval> {
+        let mut pending_approvals = Vec::new();
+        for (session_id, rollout_path) in rollouts {
+            let Some(cached) = self
+                .rollouts
+                .get(rollout_path)
+                .filter(|cached| cached.session_id == *session_id && !cached.state.is_subagent)
+            else {
+                continue;
+            };
+            let duration_ms = cached
+                .signature
+                .modified
+                .and_then(|modified| modified.elapsed().ok())
+                .map(|duration| duration.as_millis())
+                .unwrap_or_default();
+            pending_approvals.extend(cached.state.pending_approvals().into_iter().map(
+                |(turn_id, waiting_id)| PendingApproval {
+                    session_id: session_id.clone(),
+                    turn_id,
+                    waiting_id,
+                    duration_ms,
+                },
+            ));
+        }
+        pending_approvals
     }
 }
 
@@ -1244,6 +1281,17 @@ mod tests {
         assert_eq!(first.pending_approvals.len(), 1);
         assert_eq!(second.pending_approvals.len(), 1);
         assert!(!Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first.started_turns, &second.started_turns));
+        assert!(Arc::ptr_eq(&first.aborted_turns, &second.aborted_turns));
+        assert!(Arc::ptr_eq(&first.completed_turns, &second.completed_turns));
+        assert!(Arc::ptr_eq(
+            &first.session_statuses,
+            &second.session_statuses
+        ));
+        assert!(Arc::ptr_eq(
+            &first.turn_configurations,
+            &second.turn_configurations
+        ));
     }
 
     #[test]

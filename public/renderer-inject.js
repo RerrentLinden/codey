@@ -747,30 +747,7 @@
       return dynamicConfig;
     };
 
-    const statsigClients = () => {
-      const clients = [];
-      for (const root of [window.__STATSIG__, globalThis.__STATSIG__]) {
-        if (!root || typeof root !== "object") continue;
-        try {
-          clients.push(root.firstInstance);
-        } catch {
-        }
-        try {
-          if (typeof root.instance === "function") clients.push(root.instance());
-        } catch {
-        }
-        try {
-          if (root.instances && typeof root.instances === "object") {
-            clients.push(...Object.values(root.instances));
-          }
-        } catch {
-        }
-      }
-      return clients.filter(
-        (client, index, array) =>
-          client && typeof client === "object" && array.indexOf(client) === index,
-      );
-    };
+    const statsigClients = window.__codeySharedRuntime.statsigClients;
 
     const patchStatsigClient = (client) => {
       if (!client || typeof client !== "object") return;

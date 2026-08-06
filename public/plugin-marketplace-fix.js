@@ -298,9 +298,9 @@
     bridgeRetryTimer = window.setTimeout(retryPatchElectronBridge, bridgeRetryDelay);
   };
 
-  const originalFetch = window.fetch;
-  if (typeof originalFetch === "function") {
-    window.fetch = (...args) => {
+  const registerFetchInterceptor = window.__codeySharedRuntime?.registerFetchInterceptor;
+  if (typeof registerFetchInterceptor === "function") {
+    registerFetchInterceptor("plugin-marketplace", (next, ...args) => {
       const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
       const body = args[1]?.body;
       const patchesPluginResponse = /plugin|marketplace/i.test(url);
@@ -313,7 +313,7 @@
         !urlRequestsPluginList &&
         !bodyMayRequestPluginList
       ) {
-        return originalFetch(...args);
+        return next(...args);
       }
 
       let isPluginListRequest = urlRequestsPluginList;
@@ -325,7 +325,7 @@
         } catch {}
       }
 
-      const responsePromise = originalFetch(...args);
+      const responsePromise = next(...args);
       const ready = isPluginListRequest
         ? Promise.all([responsePromise, waitForLocalPlugins()]).then(([response]) => response)
         : responsePromise;
@@ -341,7 +341,7 @@
           return response;
         }
       });
-    };
+    }, 30);
   }
   const bridgePatched = patchElectronBridge();
   if (!bridgePatched) {

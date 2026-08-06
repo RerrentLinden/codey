@@ -404,27 +404,7 @@
     return changed;
   };
 
-  const statsigClients = () => {
-    const root = window.__STATSIG__ || globalThis.__STATSIG__;
-    if (!root || typeof root !== "object") return [];
-    let currentInstance = null;
-    try {
-      currentInstance = typeof root.instance === "function" ? root.instance() : null;
-    } catch {
-      currentInstance = null;
-    }
-    return [
-      root.firstInstance,
-      currentInstance,
-      ...(root.instances && typeof root.instances === "object"
-        ? Object.values(root.instances)
-        : []),
-    ].filter((client, index, clients) => (
-      client
-      && typeof client === "object"
-      && clients.indexOf(client) === index
-    ));
-  };
+  const statsigClients = window.__codeySharedRuntime.statsigClients;
 
   const notifyStatsigClients = () => {
     let notified = 0;

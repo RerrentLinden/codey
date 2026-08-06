@@ -38,7 +38,7 @@ test("script injection diagnostics report runtime evidence without continuous po
     launcher,
     /injection_statuses:\s*Arc<RwLock<Arc<\[cdp::InjectionScriptStatus\]>>>/,
   );
-  assert.match(launcher, /watchdog_injection_statuses\.write\(\)\.await/);
+  assert.match(launcher, /watchdog_statuses\.write\(\)\.await/);
   assert.match(
     runtimeCommands,
     /runtime\.injection_statuses\.read\(\)\.await\.clone\(\)/,

@@ -26,23 +26,18 @@
     "settings.pets.",
   ];
   const fallbackLabelPattern = /^(?:pet|pets|wake pet|show pet|tuck away pet|hide pet|refresh custom pets|create your own pet|open custom pets folder|宠物|唤醒宠物|显示宠物|收起宠物|隐藏宠物|刷新自定义宠物|创建自己的宠物|打开自定义宠物文件夹|寵物|喚醒寵物|顯示寵物|收起寵物|隱藏寵物|重新整理自訂寵物|建立自己的寵物|開啟自訂寵物資料夾)$/i;
-  const reactInternalKeyPattern = /^__(?:reactProps|reactFiber|reactInternalInstance)\$.*/;
   const controlSelector = "button, [role=button], [role=menuitem], [role=option], [role=tab]";
+  const reactTraversalKeys = new Set(["return", "child", "sibling", "stateNode", "_owner"]);
 
   const isPetControlId = (value) =>
     petControlIds.has(value)
       || petControlIdPrefixes.some((prefix) => value.startsWith(prefix));
 
-  const containsPetControlId = (value, depth = 0, seen = new WeakSet()) => {
-    if (typeof value === "string") return isPetControlId(value);
-    if (!value || typeof value !== "object" || depth > 7 || seen.has(value)) return false;
-    seen.add(value);
-    for (const [key, child] of Object.entries(value)) {
-      if (["return", "child", "sibling", "stateNode", "_owner"].includes(key)) continue;
-      if (containsPetControlId(child, depth + 1, seen)) return true;
-    }
-    return false;
-  };
+  const containsPetControlId = (value) =>
+    window.__codeySharedRuntime.objectGraphIncludes(value, isPetControlId, {
+      ignoredKeys: reactTraversalKeys,
+      maxDepth: 7,
+    });
 
   const isPetControl = (control) => {
     if (!(control instanceof HTMLElement)) return false;
@@ -55,11 +50,9 @@
     // At ~3 µs per control the walk is not worth a fail-open cache on a shield
     // that has to fail closed; the observer throttling above is what keeps this
     // off the streaming hot path.
-    return Object.keys(control)
-      .filter((key) => reactInternalKeyPattern.test(key))
-      .some((key) => {
+    return window.__codeySharedRuntime.reactInternals(control)
+      .some((internal) => {
         try {
-          const internal = control[key];
           return containsPetControlId(internal?.memoizedProps ?? internal);
         } catch {
           return false;

@@ -732,6 +732,235 @@ async fn stop_runtime_watcher(
     }
 }
 
+async fn stop_codex_processes(
+    app_dir: &std::path::Path,
+    process_id: Option<u32>,
+    #[cfg(unix)] process_group_id: Option<u32>,
+    #[cfg(target_os = "macos")] inspector_argument: Option<&str>,
+) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(inspector_argument) = inspector_argument {
+            return stop_macos_codex(inspector_argument, app_dir, process_id, process_group_id)
+                .await;
+        }
+        terminate_unix_codex_processes(app_dir, process_id, process_group_id, None)
+            .await
+            .map(|_| ())
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        terminate_unix_codex_processes(app_dir, process_id, process_group_id, None)
+            .await
+            .map(|_| ())
+    }
+    #[cfg(windows)]
+    {
+        terminate_windows_codex_processes(app_dir, process_id).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (app_dir, process_id);
+        Ok(())
+    }
+}
+
+fn injection_failure_cleanup_operation() -> &'static str {
+    #[cfg(windows)]
+    {
+        "cleanup_windows_after_injection_failure"
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "cleanup_macos_after_injection_failure"
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        "cleanup_unix_after_injection_failure"
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        "cleanup_after_injection_failure"
+    }
+}
+
+async fn inject_initial_renderer(
+    debug_port: u16,
+    handler: codey_runtime_core::bridge::BridgeHandler,
+    injection_scripts: &cdp::PreparedInjectionScripts,
+    app_dir: &std::path::Path,
+    home: &std::path::Path,
+    spawned: &SpawnedCodex,
+    child: &Arc<Mutex<Option<Child>>>,
+) -> Result<cdp::InjectedTarget> {
+    let failure = match cdp::retry_inject_with_scripts(debug_port, handler, injection_scripts).await
+    {
+        Ok(target) => return Ok(target),
+        Err(failure) => failure,
+    };
+    let error_message = format!("{failure:#}");
+    let failure_metadata = error_log::FailureMetadata {
+        stage: Some("startup.renderer_injection".to_string()),
+        duration_ms: Some(failure.duration_ms()),
+        attempts: Some(failure.attempts()),
+        timeout_ms: Some(failure.timeout_ms()),
+        recoverable: Some(false),
+    };
+    let error = failure.into_error();
+    error_log::record_failure_with_metadata(
+        "injection_failed",
+        "inject_cdp_bridge",
+        error_message,
+        failure_metadata,
+        serde_json::json!({
+            "appPath": app_dir,
+            "debugPort": debug_port,
+            "processId": spawned.process_id,
+        }),
+    );
+
+    if let Err(stop_error) = stop_codex_processes(
+        app_dir,
+        spawned.process_id,
+        #[cfg(unix)]
+        spawned.process_group_id,
+        #[cfg(target_os = "macos")]
+        spawned.inspector_argument.as_deref(),
+    )
+    .await
+    {
+        let mut context = serde_json::json!({
+            "appPath": app_dir,
+            "processId": spawned.process_id,
+        });
+        #[cfg(unix)]
+        if let Some(context) = context.as_object_mut() {
+            context.insert(
+                "processGroupId".to_string(),
+                serde_json::json!(spawned.process_group_id),
+            );
+        }
+        error_log::record_failure(
+            "cleanup_failed",
+            injection_failure_cleanup_operation(),
+            format!("{stop_error:#}"),
+            context,
+        );
+        eprintln!("Codex 注入失败后的进程清理失败：{stop_error:#}");
+    }
+    if let Some(child) = child.lock().await.take() {
+        reap_child_after_cleanup(child, "reap_child_after_injection_failure").await;
+    }
+    Err(restore_runtime_config_after_error(home, error).await)
+}
+
+struct InjectionWatchdog {
+    statuses: Arc<RwLock<Arc<[cdp::InjectionScriptStatus]>>>,
+    websocket_url: Arc<RwLock<Arc<str>>>,
+    shutdown: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn spawn_injection_watchdog(
+    injected_target: cdp::InjectedTarget,
+    debug_port: u16,
+    handler: codey_runtime_core::bridge::BridgeHandler,
+    injection_scripts: cdp::PreparedInjectionScripts,
+) -> InjectionWatchdog {
+    let statuses = Arc::new(RwLock::new(injected_target.injection_statuses()));
+    let websocket_url = Arc::new(RwLock::new(injected_target.websocket_url_arc()));
+    let (shutdown, mut shutdown_rx) = oneshot::channel();
+    let watchdog_statuses = statuses.clone();
+    let watchdog_websocket_url = websocket_url.clone();
+    let watchdog_scripts = injection_scripts.clone();
+    let task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CDP_WATCHDOG_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let mut target = injected_target;
+        let mut consecutive_failures = 0u8;
+        'watchdog: loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break,
+                _ = interval.tick() => {}
+            }
+            let healthy = tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break 'watchdog,
+                result = cdp::is_target_healthy(target.websocket_url()) => {
+                    match result {
+                        Ok(healthy) => healthy,
+                        Err(error) => {
+                            error_log::record_failure(
+                                "injection_health_check_failed",
+                                "check_cdp_bridge_health",
+                                format!("{error:#}"),
+                                serde_json::json!({
+                                    "websocketUrl": target.websocket_url(),
+                                }),
+                            );
+                            false
+                        }
+                    }
+                }
+            };
+            if !watchdog_should_reinject(&mut consecutive_failures, healthy) {
+                continue;
+            }
+            let reinjection = tokio::select! {
+                biased;
+                _ = &mut shutdown_rx => break 'watchdog,
+                result = cdp::retry_inject_with_scripts(
+                    debug_port,
+                    handler.clone(),
+                    &watchdog_scripts,
+                ) => result,
+            };
+            match reinjection {
+                Ok(reinjected) => {
+                    let next_statuses = reinjected.injection_statuses();
+                    let next_websocket_url = reinjected.websocket_url_arc();
+                    let previous = std::mem::replace(&mut target, reinjected);
+                    *watchdog_statuses.write().await = next_statuses;
+                    *watchdog_websocket_url.write().await = next_websocket_url;
+                    previous.close().await;
+                    consecutive_failures = 0;
+                }
+                Err(error) => {
+                    let error_message = format!("{error:#}");
+                    error_log::record_failure_with_metadata(
+                        "injection_failed",
+                        "reinject_cdp_bridge",
+                        error_message.clone(),
+                        error_log::FailureMetadata {
+                            stage: Some("runtime.renderer_reinjection".to_string()),
+                            duration_ms: Some(error.duration_ms()),
+                            attempts: Some(error.attempts()),
+                            timeout_ms: Some(error.timeout_ms()),
+                            recoverable: Some(true),
+                        },
+                        serde_json::json!({
+                            "debugPort": debug_port,
+                        }),
+                    );
+                    *watchdog_statuses.write().await = watchdog_scripts
+                        .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
+                    eprintln!("Codey CDP bridge 恢复失败：{error_message}");
+                    consecutive_failures = CDP_WATCHDOG_FAILURE_THRESHOLD.saturating_sub(1);
+                }
+            }
+        }
+        target.close().await;
+    });
+    InjectionWatchdog {
+        statuses,
+        websocket_url,
+        shutdown,
+        task,
+    }
+}
+
 impl CodeyRuntime {
     pub async fn renderer_websocket_url(&self) -> Arc<str> {
         self.injection_websocket_url.read().await.clone()
@@ -991,7 +1220,7 @@ impl CodeyRuntime {
                 .await);
             }
         };
-        let spawned = match spawn_codex(
+        let mut spawned = match spawn_codex(
             &app_dir,
             debug_port,
             config.slim_codex_pet,
@@ -1019,186 +1248,28 @@ impl CodeyRuntime {
         };
         #[cfg(target_os = "macos")]
         let inspector_argument = spawned.inspector_argument.clone();
-        let child = Arc::new(Mutex::new(spawned.child));
-        let injected_target =
-            match cdp::retry_inject_with_scripts(debug_port, handler.clone(), &injection_scripts)
-                .await
-            {
-                Ok(target) => target,
-                Err(error) => {
-                    let error_message = format!("{error:#}");
-                    let failure_metadata = error_log::FailureMetadata {
-                        stage: Some("startup.renderer_injection".to_string()),
-                        duration_ms: Some(error.duration_ms()),
-                        attempts: Some(error.attempts()),
-                        timeout_ms: Some(error.timeout_ms()),
-                        recoverable: Some(false),
-                    };
-                    let error = error.into_error();
-                    error_log::record_failure_with_metadata(
-                        "injection_failed",
-                        "inject_cdp_bridge",
-                        error_message,
-                        failure_metadata,
-                        serde_json::json!({
-                            "appPath": app_dir,
-                            "debugPort": debug_port,
-                            "processId": spawned.process_id,
-                        }),
-                    );
-                    #[cfg(windows)]
-                    if let Err(stop_error) =
-                        terminate_windows_codex_processes(&app_dir, spawned.process_id).await
-                    {
-                        error_log::record_failure(
-                            "cleanup_failed",
-                            "cleanup_windows_after_injection_failure",
-                            format!("{stop_error:#}"),
-                            serde_json::json!({
-                                "appPath": app_dir,
-                                "processId": spawned.process_id,
-                            }),
-                        );
-                        eprintln!("Codex 注入失败后的进程清理失败：{stop_error:#}");
-                    }
-                    #[cfg(target_os = "macos")]
-                    if let Some(inspector_argument) = spawned.inspector_argument.as_deref()
-                        && let Err(stop_error) = stop_macos_codex(
-                            inspector_argument,
-                            &app_dir,
-                            spawned.process_id,
-                            spawned.process_group_id,
-                        )
-                        .await
-                    {
-                        error_log::record_failure(
-                            "cleanup_failed",
-                            "cleanup_macos_after_injection_failure",
-                            format!("{stop_error:#}"),
-                            serde_json::json!({
-                                "appPath": app_dir,
-                                "processId": spawned.process_id,
-                                "processGroupId": spawned.process_group_id,
-                            }),
-                        );
-                        eprintln!("Codex 注入失败后的进程清理失败：{stop_error:#}");
-                    }
-                    #[cfg(all(unix, not(target_os = "macos")))]
-                    if let Err(stop_error) = terminate_unix_codex_processes(
-                        &app_dir,
-                        spawned.process_id,
-                        spawned.process_group_id,
-                        None,
-                    )
-                    .await
-                    {
-                        error_log::record_failure(
-                            "cleanup_failed",
-                            "cleanup_unix_after_injection_failure",
-                            format!("{stop_error:#}"),
-                            serde_json::json!({
-                                "appPath": app_dir,
-                                "processId": spawned.process_id,
-                                "processGroupId": spawned.process_group_id,
-                            }),
-                        );
-                        eprintln!("Codex 注入失败后的进程清理失败：{stop_error:#}");
-                    }
-                    if let Some(child) = child.lock().await.take() {
-                        reap_child_after_cleanup(child, "reap_child_after_injection_failure").await;
-                    }
-                    return Err(restore_runtime_config_after_error(&home, error).await);
-                }
-            };
-
-        let injection_statuses = Arc::new(RwLock::new(injected_target.injection_statuses()));
-        let injection_websocket_url = Arc::new(RwLock::new(injected_target.websocket_url_arc()));
-        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
-        let watchdog_handler = handler.clone();
-        let watchdog_debug_port = debug_port;
-        let watchdog_injection_scripts = injection_scripts.clone();
-        let watchdog_injection_statuses = injection_statuses.clone();
-        let watchdog_injection_websocket_url = injection_websocket_url.clone();
-        let watchdog_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(CDP_WATCHDOG_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await;
-            let mut target = injected_target;
-            let mut consecutive_failures = 0u8;
-            'watchdog: loop {
-                tokio::select! {
-                    biased;
-                    _ = &mut shutdown_rx => break,
-                    _ = interval.tick() => {}
-                }
-                let healthy = tokio::select! {
-                    biased;
-                    _ = &mut shutdown_rx => break 'watchdog,
-                    result = cdp::is_target_healthy(target.websocket_url()) => {
-                        match result {
-                            Ok(healthy) => healthy,
-                            Err(error) => {
-                                error_log::record_failure(
-                                    "injection_health_check_failed",
-                                    "check_cdp_bridge_health",
-                                    format!("{error:#}"),
-                                    serde_json::json!({
-                                        "websocketUrl": target.websocket_url(),
-                                    }),
-                                );
-                                false
-                            }
-                        }
-                    }
-                };
-                if !watchdog_should_reinject(&mut consecutive_failures, healthy) {
-                    continue;
-                }
-                let reinjection = tokio::select! {
-                    biased;
-                    _ = &mut shutdown_rx => break 'watchdog,
-                    result = cdp::retry_inject_with_scripts(
-                        watchdog_debug_port,
-                        watchdog_handler.clone(),
-                        &watchdog_injection_scripts,
-                    ) => result,
-                };
-                match reinjection {
-                    Ok(reinjected) => {
-                        let next_statuses = reinjected.injection_statuses();
-                        let next_websocket_url = reinjected.websocket_url_arc();
-                        let previous = std::mem::replace(&mut target, reinjected);
-                        *watchdog_injection_statuses.write().await = next_statuses;
-                        *watchdog_injection_websocket_url.write().await = next_websocket_url;
-                        previous.close().await;
-                        consecutive_failures = 0;
-                    }
-                    Err(error) => {
-                        let error_message = format!("{error:#}");
-                        error_log::record_failure_with_metadata(
-                            "injection_failed",
-                            "reinject_cdp_bridge",
-                            error_message.clone(),
-                            error_log::FailureMetadata {
-                                stage: Some("runtime.renderer_reinjection".to_string()),
-                                duration_ms: Some(error.duration_ms()),
-                                attempts: Some(error.attempts()),
-                                timeout_ms: Some(error.timeout_ms()),
-                                recoverable: Some(true),
-                            },
-                            serde_json::json!({
-                                "debugPort": watchdog_debug_port,
-                            }),
-                        );
-                        *watchdog_injection_statuses.write().await = watchdog_injection_scripts
-                            .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
-                        eprintln!("Codey CDP bridge 恢复失败：{error_message}");
-                        consecutive_failures = CDP_WATCHDOG_FAILURE_THRESHOLD.saturating_sub(1);
-                    }
-                }
-            }
-            target.close().await;
-        });
+        let child = Arc::new(Mutex::new(spawned.child.take()));
+        let injected_target = inject_initial_renderer(
+            debug_port,
+            handler.clone(),
+            &injection_scripts,
+            &app_dir,
+            &home,
+            &spawned,
+            &child,
+        )
+        .await?;
+        let InjectionWatchdog {
+            statuses: injection_statuses,
+            websocket_url: injection_websocket_url,
+            shutdown: watchdog_shutdown,
+            task: watchdog_task,
+        } = spawn_injection_watchdog(
+            injected_target,
+            debug_port,
+            handler,
+            injection_scripts.clone(),
+        );
         let codex_exited = Arc::new(AtomicBool::new(false));
         let crashpad_guard_enabled = Arc::new(AtomicBool::new(protect_crashpad_pending));
         let (crashpad_guard_shutdown, crashpad_guard_task) =
@@ -1225,7 +1296,7 @@ impl CodeyRuntime {
                 process_group_id: spawned.process_group_id,
                 #[cfg(target_os = "macos")]
                 inspector_argument,
-                watchdog_shutdown: Mutex::new(Some(shutdown_tx)),
+                watchdog_shutdown: Mutex::new(Some(watchdog_shutdown)),
                 watchdog_task: Mutex::new(Some(watchdog_task)),
                 route_overlay_shutdown: Mutex::new(route_overlay_shutdown),
                 route_overlay_task: Mutex::new(route_overlay_task),
@@ -1274,39 +1345,15 @@ impl CodeyRuntime {
             "Codex 退出监听器关闭失败",
         )
         .await;
-        #[cfg(target_os = "macos")]
-        let process_stop = if let Some(inspector_argument) = self.inspector_argument.as_deref() {
-            stop_macos_codex(
-                inspector_argument,
-                &self.codex_app_path,
-                self.process_id,
-                self.process_group_id,
-            )
-            .await
-        } else {
-            terminate_unix_codex_processes(
-                &self.codex_app_path,
-                self.process_id,
-                self.process_group_id,
-                None,
-            )
-            .await
-            .map(|_| ())
-        };
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let process_stop = terminate_unix_codex_processes(
+        let process_stop = stop_codex_processes(
             &self.codex_app_path,
             self.process_id,
+            #[cfg(unix)]
             self.process_group_id,
-            None,
+            #[cfg(target_os = "macos")]
+            self.inspector_argument.as_deref(),
         )
-        .await
-        .map(|_| ());
-        #[cfg(windows)]
-        let process_stop =
-            terminate_windows_codex_processes(&self.codex_app_path, self.process_id).await;
-        #[cfg(not(any(unix, windows)))]
-        let process_stop: Result<()> = Ok(());
+        .await;
 
         if let Some(child) = self.child.lock().await.take() {
             reap_child_after_cleanup(child, "reap_child_during_runtime_stop").await;
@@ -1387,7 +1434,7 @@ fn spawn_crashpad_guard_watcher(
             match result {
                 Ok(run) => {
                     if !run.cleanup.errors.is_empty() || run.cleanup.still_over_limit {
-                        error_log::record_failure(
+                        error_log::record_failure_async(
                             "cleanup_failed",
                             "enforce_crashpad_pending_limit",
                             if run.cleanup.still_over_limit {
@@ -1403,19 +1450,21 @@ fn spawn_crashpad_guard_watcher(
                                 "stillOverLimit": run.cleanup.still_over_limit,
                                 "bytesReclaimed": run.cleanup.bytes_reclaimed,
                             }),
-                        );
+                        )
+                        .await;
                     }
                     let _ = stats.replace_if_idle(run.snapshot);
                 }
                 Err(error) => {
-                    error_log::record_failure(
+                    error_log::record_failure_async(
                         "cleanup_failed",
                         "enforce_crashpad_pending_limit",
                         error.to_string(),
                         serde_json::json!({
                             "taskJoinFailed": true,
                         }),
-                    );
+                    )
+                    .await;
                 }
             }
         }
@@ -1453,14 +1502,15 @@ fn spawn_route_overlay_watcher(
                     continue;
                 }
                 Err(error) => {
-                    error_log::record_failure(
+                    error_log::record_failure_async(
                         "route_overlay_watch_failed",
                         "read_cc_switch_live_route",
                         error.to_string(),
                         serde_json::json!({
                             "codexHome": home,
                         }),
-                    );
+                    )
+                    .await;
                     continue;
                 }
             };

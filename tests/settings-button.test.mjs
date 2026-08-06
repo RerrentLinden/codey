@@ -4,6 +4,13 @@ import test from "node:test";
 import vm from "node:vm";
 
 const source = readFileSync(new URL("../public/renderer-inject.js", import.meta.url), "utf8");
+const bridgeSource = readFileSync(new URL("../public/codey-bridge.js", import.meta.url), "utf8");
+
+const runRenderer = (sandbox) => {
+  const context = vm.createContext(sandbox);
+  vm.runInContext(bridgeSource, context);
+  vm.runInContext(source, context);
+};
 
 class FakeElement {
   constructor(tagName = "div", { visible = true, right = 100, width = right, height = 46, top = 0 } = {}) {
@@ -179,7 +186,7 @@ test("moves the Codey button beside the visible header's trailing action region"
   };
   window.window = window;
 
-  vm.runInNewContext(source, {
+  runRenderer({
     console,
     document,
     HTMLElement: FakeElement,
@@ -300,7 +307,7 @@ test("renders official account usage as a draggable floating card", async () => 
   };
   window.window = window;
 
-  vm.runInNewContext(source, {
+  runRenderer({
     console,
     document,
     HTMLElement: FakeElement,
@@ -503,7 +510,7 @@ test("marks the Codey button when a silent update check finds a new version", as
   };
   window.window = window;
 
-  vm.runInNewContext(source, {
+  runRenderer({
     console,
     CustomEvent: class {
       constructor(type, init = {}) {
@@ -578,7 +585,7 @@ test("ignores sidebar nav and main content until top chrome is available", () =>
   };
   window.window = window;
 
-  vm.runInNewContext(source, {
+  runRenderer({
     console,
     document,
     HTMLElement: FakeElement,
@@ -639,7 +646,7 @@ test("repeated scans fast-path an already mounted button without layout reads", 
   window.window = window;
   let observerCallback = null;
 
-  vm.runInNewContext(source, {
+  runRenderer({
     console,
     document,
     HTMLElement: FakeElement,

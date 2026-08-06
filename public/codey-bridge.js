@@ -4,8 +4,145 @@
     && window.__codeyMutationDispatcher?.createShieldLifecycle
     && window.__codeyMutationDispatcher?.controlDescriptor
     && window.__codeyMutationDispatcher?.controlsWithin
+    && window.__codeySharedRuntime?.registerFetchInterceptor
+    && window.__codeySharedRuntime?.statsigClients
   ) return;
   window.__codeyBridgeHelpersInstalled = true;
+
+  const statsigClients = () => {
+    const clients = [];
+    const roots = [window.__STATSIG__, globalThis.__STATSIG__]
+      .filter((root, index, values) => root && values.indexOf(root) === index);
+    for (const root of roots) {
+      if (typeof root !== "object") continue;
+      try {
+        clients.push(root.firstInstance);
+      } catch {
+      }
+      try {
+        if (typeof root.instance === "function") clients.push(root.instance());
+      } catch {
+      }
+      try {
+        if (root.instances && typeof root.instances === "object") {
+          clients.push(...Object.values(root.instances));
+        }
+      } catch {
+      }
+    }
+    return clients.filter(
+      (client, index, values) =>
+        client && typeof client === "object" && values.indexOf(client) === index,
+    );
+  };
+
+  const reactInternalKeyPattern = /^__(?:reactProps|reactFiber|reactInternalInstance)\$.*/;
+  const reactInternals = (element) => {
+    if (!element || (typeof element !== "object" && typeof element !== "function")) return [];
+    try {
+      return Object.keys(element)
+        .filter((key) => reactInternalKeyPattern.test(key))
+        .flatMap((key) => {
+          try {
+            return [element[key]];
+          } catch {
+            return [];
+          }
+        });
+    } catch {
+      return [];
+    }
+  };
+
+  const objectGraphIncludes = (value, predicate, options = {}) => {
+    const ignoredKeys = options.ignoredKeys instanceof Set
+      ? options.ignoredKeys
+      : new Set(options.ignoredKeys || []);
+    const maxDepth = Number.isFinite(options.maxDepth) ? options.maxDepth : 7;
+    const seen = new WeakSet();
+    const visit = (current, depth) => {
+      if (typeof current === "string") return predicate(current);
+      if (
+        !current
+        || typeof current !== "object"
+        || depth > maxDepth
+        || seen.has(current)
+      ) return false;
+      seen.add(current);
+      let entries;
+      try {
+        entries = Object.entries(current);
+      } catch {
+        return false;
+      }
+      for (const [key, child] of entries) {
+        if (ignoredKeys.has(key)) continue;
+        if (visit(child, depth + 1)) return true;
+      }
+      return false;
+    };
+    return visit(value, 0);
+  };
+
+  const fetchInterceptors = new Map();
+  let fetchBase = typeof window.fetch === "function" ? window.fetch : null;
+  const dispatchFetch = function dispatchCodeyFetch(...args) {
+    const receiver = this;
+    const interceptors = [...fetchInterceptors.values()]
+      .sort((left, right) => right.priority - left.priority);
+    const invoke = (index, currentArgs) => {
+      const entry = interceptors[index];
+      if (!entry) {
+        return Reflect.apply(fetchBase, receiver, currentArgs);
+      }
+      const next = (...nextArgs) => invoke(
+        index + 1,
+        nextArgs.length ? nextArgs : currentArgs,
+      );
+      return entry.interceptor(next, ...currentArgs);
+    };
+    return invoke(0, args);
+  };
+
+  const syncFetchDispatcher = () => {
+    if (typeof window.fetch !== "function") return;
+    if (fetchInterceptors.size === 0) {
+      if (window.fetch === dispatchFetch && fetchBase) window.fetch = fetchBase;
+      return;
+    }
+    if (window.fetch !== dispatchFetch) {
+      fetchBase = window.fetch;
+      window.fetch = dispatchFetch;
+    }
+  };
+
+  const registerFetchInterceptor = (id, interceptor, priority = 0) => {
+    if (typeof interceptor !== "function" || typeof window.fetch !== "function") {
+      return () => {};
+    }
+    const key = String(id);
+    const entry = { interceptor, priority: Number(priority) || 0 };
+    fetchInterceptors.set(key, entry);
+    syncFetchDispatcher();
+    let registered = true;
+    return () => {
+      if (!registered) return;
+      registered = false;
+      if (fetchInterceptors.get(key) === entry) fetchInterceptors.delete(key);
+      syncFetchDispatcher();
+    };
+  };
+
+  window.__codeySharedRuntime = Object.freeze({
+    fetchSnapshot: () => Object.freeze({
+      installed: window.fetch === dispatchFetch,
+      interceptorCount: fetchInterceptors.size,
+    }),
+    objectGraphIncludes,
+    reactInternals,
+    registerFetchInterceptor,
+    statsigClients,
+  });
 
   const mutationSubscribers = new Map();
   let mutationObserver = null;

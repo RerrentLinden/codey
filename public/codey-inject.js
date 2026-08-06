@@ -1941,10 +1941,7 @@
       if (mutation.type === "attributes") {
         if (target && !isCodeyOwned(target)) {
           const threadRow = target.closest?.(sidebarThreadRowSelector) || null;
-          if (
-            threadRow
-            || (mutation.attributeName !== "class" && mutation.attributeName !== "style")
-          ) {
+          if (threadRow || mutation.attributeName !== "class") {
             addPendingScanRoot(threadRow || nearestScanRoot(target));
           }
         }
@@ -2008,7 +2005,6 @@
       "data-testid",
       "disabled",
       "class",
-      "style",
     ],
     childList: true,
     subtree: true,

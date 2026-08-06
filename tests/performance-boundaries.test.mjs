@@ -83,5 +83,6 @@ test("hot paths keep bounded work and avoid duplicate whole-payload processing",
 
   assert.match(rendererInject, /let accountUsagePollingEnabled = true/);
   assert.match(rendererInject, /if \(!accountUsagePollingEnabled/);
-  assert.match(pluginFix, /return originalFetch\(\.\.\.args\)/);
+  assert.match(pluginFix, /registerFetchInterceptor\("plugin-marketplace"/);
+  assert.match(pluginFix, /return next\(\.\.\.args\)/);
 });

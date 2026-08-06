@@ -59,6 +59,11 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(sessionTools, /window\.__codeyRendererInvalidateHeaderMount\?\.\(root\)/);
   assert.doesNotMatch(sessionTools, /headerMountDirty/);
   assert.match(sessionTools, /const threadUpdatedAtRows = new Set\(\)/);
+  const sessionObserverFilter = sessionTools.match(
+    /attributeFilter:\s*\[([\s\S]*?)\],\s*childList:\s*true/,
+  )?.[1] ?? "";
+  assert.match(sessionObserverFilter, /"class"/);
+  assert.doesNotMatch(sessionObserverFilter, /"style"/);
   assert.doesNotMatch(
     sessionTools,
     /flushThreadUpdatedAtFetch[\s\S]*queryWithin\(document, "\[data-app-action-sidebar-thread-row\]"\)/,
@@ -244,7 +249,10 @@ test("plugin bridge fast-paths unrelated IPC payloads without a DOM observer", a
 });
 
 test("plugin fetch wrapper returns unrelated native requests without promise or header work", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const [bridgeSource, source] = await Promise.all([
+    readFile(new URL("public/codey-bridge.js", root), "utf8"),
+    readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8"),
+  ]);
   const nativeResponse = {
     headers: {
       get() {
@@ -271,11 +279,15 @@ test("plugin fetch wrapper returns unrelated native requests without promise or 
     },
   };
   window.window = window;
-  vm.runInNewContext(source, {
+  const sandbox = {
     CustomEvent: class {},
     console,
+    globalThis: window,
     window,
-  });
+  };
+  vm.runInNewContext(bridgeSource, sandbox);
+  vm.runInNewContext(source, sandbox);
+  assert.equal(window.__codeySharedRuntime.fetchSnapshot().interceptorCount, 1);
 
   const result = window.fetch("https://api.example/conversation", {
     body: JSON.stringify({ message: "hello" }),

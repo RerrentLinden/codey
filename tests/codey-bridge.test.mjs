@@ -8,7 +8,7 @@ const source = await readFile(
   "utf8",
 );
 
-function createRuntime() {
+function createRuntime({ fetch = undefined, statsig = undefined } = {}) {
   const observers = [];
   class FakeHTMLElement {}
   class FakeMutationObserver {
@@ -28,7 +28,7 @@ function createRuntime() {
     }
   }
   const document = { documentElement: {} };
-  const window = {};
+  const window = { __STATSIG__: statsig, fetch };
   window.window = window;
   vm.runInNewContext(source, {
     document,
@@ -128,4 +128,72 @@ test("shared control descriptor normalizes accessible labels and text", () => {
     runtime.window.__codeyMutationDispatcher.controlDescriptor(control),
     "Voice Start now please",
   );
+});
+
+test("shared helpers deduplicate Statsig clients and inspect React values", () => {
+  const first = {};
+  const second = {};
+  const runtime = createRuntime({
+    statsig: {
+      firstInstance: first,
+      instance: () => first,
+      instances: { first, second },
+    },
+  });
+  const control = new runtime.FakeHTMLElement();
+  control.__reactProps$test = {
+    children: { props: { id: "settings.personalization.pets" } },
+  };
+  const shared = runtime.window.__codeySharedRuntime;
+
+  assert.deepEqual([...shared.statsigClients()], [first, second]);
+  assert.equal(shared.reactInternals(control).length, 1);
+  assert.equal(
+    shared.objectGraphIncludes(
+      shared.reactInternals(control)[0],
+      (value) => value === "settings.personalization.pets",
+      { ignoredKeys: new Set(["return"]), maxDepth: 7 },
+    ),
+    true,
+  );
+});
+
+test("fetch interceptors share one stable wrapper and unregister independently", async () => {
+  const nativeCalls = [];
+  const nativeFetch = async (input) => {
+    nativeCalls.push(input);
+    return input;
+  };
+  const runtime = createRuntime({ fetch: nativeFetch });
+  const shared = runtime.window.__codeySharedRuntime;
+  const order = [];
+  const unregisterInner = shared.registerFetchInterceptor(
+    "inner",
+    (next, input) => {
+      order.push("inner");
+      return next(`${input}:inner`);
+    },
+    10,
+  );
+  const wrapper = runtime.window.fetch;
+  const unregisterOuter = shared.registerFetchInterceptor(
+    "outer",
+    (next, input) => {
+      order.push("outer");
+      return next(`${input}:outer`);
+    },
+    20,
+  );
+
+  assert.equal(runtime.window.fetch, wrapper);
+  assert.equal(await runtime.window.fetch("request"), "request:outer:inner");
+  assert.deepEqual(order, ["outer", "inner"]);
+  assert.deepEqual(nativeCalls, ["request:outer:inner"]);
+  assert.equal(shared.fetchSnapshot().interceptorCount, 2);
+
+  unregisterOuter();
+  assert.equal(runtime.window.fetch, wrapper);
+  unregisterInner();
+  assert.equal(runtime.window.fetch, nativeFetch);
+  assert.equal(shared.fetchSnapshot().installed, false);
 });

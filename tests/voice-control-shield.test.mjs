@@ -417,6 +417,7 @@ test("voice slim mode blocks inserted voice controls before a deferred flush", (
 test("voice slim mode preserves hidden controls across enabled reinjection", () => {
   const runtime = loadShield(true);
   const styleRestoresAfterFirstInject = runtime.semantic.removedStyleProperties.length;
+  const fetchWrapper = runtime.window.fetch;
 
   runtime.inject(true);
 
@@ -426,6 +427,8 @@ test("voice slim mode preserves hidden controls across enabled reinjection", () 
   assert.equal(runtime.semantic.removedStyleProperties.length, styleRestoresAfterFirstInject);
   assert.equal(runtime.observerDisconnects, 1);
   assert.equal(runtime.window.__codeyVoiceControlShield.enabled, true);
+  assert.equal(runtime.window.fetch, fetchWrapper);
+  assert.equal(runtime.window.__codeySharedRuntime.fetchSnapshot().interceptorCount, 1);
 
   runtime.inject(false);
 

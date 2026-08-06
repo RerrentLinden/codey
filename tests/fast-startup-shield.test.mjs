@@ -8,6 +8,10 @@ const shieldSource = await readFile(
   new URL("public/fast-startup-shield.js", root),
   "utf8",
 );
+const bridgeSource = await readFile(
+  new URL("public/codey-bridge.js", root),
+  "utf8",
+);
 
 function preparedShield({ enabled = true, timeoutMs = 20 } = {}) {
   return shieldSource
@@ -42,6 +46,7 @@ function runShield(window, options = {}) {
     Set,
     globalThis: window,
   });
+  vm.runInContext(bridgeSource, context);
   vm.runInContext(preparedShield(options), context);
   return window.__codeyFastStartupShield;
 }

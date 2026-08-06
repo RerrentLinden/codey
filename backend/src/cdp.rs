@@ -136,6 +136,15 @@ pub fn prepare_injection_scripts(
 ) -> PreparedInjectionScripts {
     let builtin_scripts = [
         (
+            "bridge-helpers",
+            "桥接辅助",
+            CODEY_BRIDGE_SCRIPT,
+            r#"typeof window.__codexSessionDeleteBridge === "function"
+              && typeof window.__codeyCall === "function"
+              ? "桥接函数可调用" : """#
+                .to_string(),
+        ),
+        (
             "fast-startup-shield",
             "Codex 快速启动保护",
             FAST_STARTUP_SHIELD_SCRIPT,
@@ -150,15 +159,6 @@ pub fn prepare_injection_scripts(
                     : "慢请求保护已关闭";
                 }})()"#
             ),
-        ),
-        (
-            "bridge-helpers",
-            "桥接辅助",
-            CODEY_BRIDGE_SCRIPT,
-            r#"typeof window.__codexSessionDeleteBridge === "function"
-              && typeof window.__codeyCall === "function"
-              ? "桥接函数可调用" : """#
-                .to_string(),
         ),
         (
             "git-request-guard",
@@ -1287,11 +1287,11 @@ mod tests {
         let statuses = reconcile_injection_statuses(&prepared.descriptors, reported);
 
         assert_eq!(statuses.len(), prepared.descriptors.len());
-        assert_eq!(statuses[0].id, "fast-startup-shield");
-        assert_eq!(statuses[0].status, "unknown");
-        assert_eq!(statuses[1].id, "bridge-helpers");
-        assert_eq!(statuses[1].status, "effective");
-        assert_eq!(statuses[1].detail.as_deref(), Some("桥接函数可调用"));
+        assert_eq!(statuses[0].id, "bridge-helpers");
+        assert_eq!(statuses[0].status, "effective");
+        assert_eq!(statuses[0].detail.as_deref(), Some("桥接函数可调用"));
+        assert_eq!(statuses[1].id, "fast-startup-shield");
+        assert_eq!(statuses[1].status, "unknown");
         assert_eq!(statuses[2].id, "git-request-guard");
         assert_eq!(statuses[2].status, "unknown");
         assert_eq!(statuses[3].id, "model-whitelist");

@@ -55,8 +55,10 @@ test("every shutdown path reaps Codex and Codey process trees", async () => {
     launcher.indexOf("pub async fn stop(&self)"),
     launcher.indexOf("fn watchdog_should_reinject"),
   );
-  assert.match(runtimeStop, /terminate_unix_codex_processes/);
-  assert.match(runtimeStop, /terminate_windows_codex_processes/);
+  assert.match(runtimeStop, /stop_codex_processes/);
+  assert.match(launcher, /async fn stop_codex_processes/);
+  assert.match(launcher, /terminate_unix_codex_processes/);
+  assert.match(launcher, /terminate_windows_codex_processes/);
   assert.match(launcherModules, /windows_terminate_process_if_matches/);
   assert.doesNotMatch(runtimeStop, /if !self\.codex_exited/);
   assert.match(launcherModules, /child_command\.process_group\(0\)/);

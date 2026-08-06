@@ -9,10 +9,10 @@ async function loadPatch(
   clients,
   { bridgeReady = true, queryClient = null } = {},
 ) {
-  const source = await readFile(
-    new URL("../public/model-whitelist-inject.js", import.meta.url),
-    "utf8",
-  );
+  const [bridgeSource, source] = await Promise.all([
+    readFile(new URL("../public/codey-bridge.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/model-whitelist-inject.js", import.meta.url), "utf8"),
+  ]);
   let nextTimer = 0;
   const timers = new Map();
   const windowListeners = new Map();
@@ -71,6 +71,12 @@ async function loadPatch(
     },
   };
   if (bridgeReady) window.__codexSessionDeleteBridge = bridge;
+  Function("window", "document", "globalThis", "console", bridgeSource)(
+    window,
+    document,
+    window,
+    { warn() {} },
+  );
   Function("window", "document", "globalThis", "console", source)(
     window,
     document,

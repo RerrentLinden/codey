@@ -494,6 +494,7 @@ test("injects time styles that coexist with native statuses and yield to sidebar
   assert.match(source, /font-variant-numeric: tabular-nums/);
   assert.match(source, /placeThreadUpdatedAt\(row, label\)/);
   assert.match(source, /mount\.insertBefore\(label, before\)/);
-  assert.match(source, /"class",\s*"style",/);
+  assert.match(source, /"disabled",\s*"class",/);
+  assert.doesNotMatch(source, /"class",\s*"style",/);
   assert.match(source, /sidebar-thread-row\]:hover \[\$\{threadUpdatedAtAttribute\}\].*opacity: 0/s);
 });

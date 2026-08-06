@@ -51,7 +51,6 @@
   const fallbackLabelPattern = /^(?:try (?:chatgpt|codex) voice|voice|voice chat|voice chat hotkey|voice mode|start (?:new )?voice(?: chat| mode)?|stop voice chat|end voice chat|cancel voice chat|open the voice (?:chat )?control window|start or stop voice (?:chat|mode)|mute (?:your microphone|voice chat)|unmute (?:your microphone|voice chat)|dictate|dictation|start dictation|stop dictation|transcribing|dismiss dictation|retry dictation|click to dictate or hold|hold(?:-| )to(?:-| )dictate|toggle dictation|global dictation|体验\s*(?:chatgpt|codex)?\s*语音|试试\s*(?:chatgpt|codex)?\s*语音|语音|语音聊天|开始(?:新(?:的)?\s*)?语音(?:聊天|模式)?|停止语音聊天|结束语音聊天|打开语音控制窗口|听写|开始听写|停止听写|正在转录|关闭听写|重试听写|全局听写|按住听写|切换听写|體驗\s*(?:chatgpt|codex)?\s*語音|試試\s*(?:chatgpt|codex)?\s*語音|語音|語音聊天|開始(?:新(?:的)?\s*)?語音(?:聊天|模式)?|停止語音聊天|結束語音聊天|開啟語音控制視窗|聽寫|開始聽寫|停止聽寫|正在轉錄|關閉聽寫|重試聽寫|全域聽寫)(?:\s*[(:（].*)?$/i;
   const preservedComposerActionPattern =
     /^(?:send|send message|submit|stop|发送|发送消息|提交|停止|傳送|傳送訊息|提交|停止)$/i;
-  const reactInternalKeyPattern = /^__(?:reactProps|reactFiber|reactInternalInstance)\$.*/;
   const dictationRequestPattern = /(?:\/codex\/dictation-stream-connect-info|\/dictation\/stream)(?:[/?#]|$)/i;
   const gptVoicePromotionAssetPattern = /(?:^|\/)[^/?#]*(?:bidi[^/?#]*banner|voice[^/?#]*banner)[^/?#]*\.(?:avif|gif|jpe?g|png|webp)(?:[?#]|$)/i;
   const voiceControlSelector =
@@ -103,19 +102,21 @@
       } catch {}
     }
 
-    const nativeFetch = window.fetch;
-    if (typeof nativeFetch === "function") {
-      const guardedFetch = function guardedFetch(input) {
-        const url = typeof input === "string" || input instanceof URL
-          ? String(input)
-          : String(input?.url ?? "");
-        if (dictationRequestPattern.test(url)) return Promise.reject(disabledVoiceError());
-        return Reflect.apply(nativeFetch, this, arguments);
-      };
-      window.fetch = guardedFetch;
-      restoreResourceGuards.push(() => {
-        if (window.fetch === guardedFetch) window.fetch = nativeFetch;
-      });
+    const registerFetchInterceptor = window.__codeySharedRuntime?.registerFetchInterceptor;
+    if (typeof registerFetchInterceptor === "function") {
+      const unregisterFetchInterceptor = registerFetchInterceptor(
+        "voice-control-shield",
+        (next, ...args) => {
+          const input = args[0];
+          const url = typeof input === "string" || input instanceof URL
+            ? String(input)
+            : String(input?.url ?? "");
+          if (dictationRequestPattern.test(url)) return Promise.reject(disabledVoiceError());
+          return next(...args);
+        },
+        20,
+      );
+      restoreResourceGuards.push(unregisterFetchInterceptor);
     }
 
     const NativeWebSocket = window.WebSocket;
@@ -141,30 +142,17 @@
 
   const reactTraversalKeys = new Set(["return", "child", "sibling", "stateNode", "_owner"]);
   const reactAncestorTraversalKeys = new Set([...reactTraversalKeys, "children"]);
-
-  const containsMatchingValue = (
-    value,
-    predicate,
-    depth = 0,
-    seen = new WeakSet(),
-    ignoredKeys = reactTraversalKeys,
-  ) => {
-    if (typeof value === "string") return predicate(value);
-    if (!value || typeof value !== "object" || depth > 7 || seen.has(value)) return false;
-    seen.add(value);
-    for (const [key, child] of Object.entries(value)) {
-      if (ignoredKeys.has(key)) continue;
-      if (containsMatchingValue(child, predicate, depth + 1, seen, ignoredKeys)) return true;
-    }
-    return false;
-  };
+  const reactInternals = window.__codeySharedRuntime.reactInternals;
+  const containsMatchingValue = (value, predicate, ignoredKeys = reactTraversalKeys) =>
+    window.__codeySharedRuntime.objectGraphIncludes(value, predicate, {
+      ignoredKeys,
+      maxDepth: 7,
+    });
 
   const hasMatchingReactValue = (control, predicate) =>
-    Object.keys(control)
-      .filter((key) => reactInternalKeyPattern.test(key))
-      .some((key) => {
+    reactInternals(control)
+      .some((internal) => {
         try {
-          const internal = control[key];
           if (containsMatchingValue(internal?.memoizedProps ?? internal, predicate)) return true;
 
           let ancestor = internal?.memoizedProps ? internal.return : null;
@@ -173,8 +161,6 @@
               containsMatchingValue(
                 ancestor.memoizedProps,
                 predicate,
-                0,
-                new WeakSet(),
                 reactAncestorTraversalKeys,
               )
             ) {

@@ -268,7 +268,7 @@ fn session_event_state_changed(
         || previous
             .started_turns
             .iter()
-            .zip(&current.started_turns)
+            .zip(current.started_turns.iter())
             .any(|(left, right)| {
                 left.session_id != right.session_id || left.turn_id != right.turn_id
             })
@@ -276,7 +276,7 @@ fn session_event_state_changed(
         || previous
             .aborted_turns
             .iter()
-            .zip(&current.aborted_turns)
+            .zip(current.aborted_turns.iter())
             .any(|(left, right)| {
                 left.session_id != right.session_id || left.turn_id != right.turn_id
             })
@@ -284,7 +284,7 @@ fn session_event_state_changed(
         || previous
             .completed_turns
             .iter()
-            .zip(&current.completed_turns)
+            .zip(current.completed_turns.iter())
             .any(|(left, right)| {
                 left.session_id != right.session_id
                     || left.turn_id != right.turn_id
@@ -304,34 +304,34 @@ impl WebhookTurnTracker {
             ignore_completed_before: observed_at,
             ..Self::default()
         };
-        for started in &events.started_turns {
+        for started in events.started_turns.iter() {
             tracker
                 .running
                 .insert(terminal_turn_key(&started.session_id, &started.turn_id));
         }
-        for completed in &events.completed_turns {
+        for completed in events.completed_turns.iter() {
             tracker.mark_settled(completed);
         }
-        for aborted in &events.aborted_turns {
+        for aborted in events.aborted_turns.iter() {
             tracker.mark_terminal(&aborted.session_id, &aborted.turn_id);
         }
         tracker
     }
 
     fn completion_candidates(&mut self, events: &RecentSessionEvents) -> Vec<CompletedTurn> {
-        for started in &events.started_turns {
+        for started in events.started_turns.iter() {
             let key = terminal_turn_key(&started.session_id, &started.turn_id);
             if !self.settled.contains(&key) {
                 self.running.insert(key);
             }
         }
-        for aborted in &events.aborted_turns {
+        for aborted in events.aborted_turns.iter() {
             self.mark_terminal(&aborted.session_id, &aborted.turn_id);
         }
 
         let mut candidates = Vec::new();
         let mut candidate_keys = HashSet::new();
-        for completed in &events.completed_turns {
+        for completed in events.completed_turns.iter() {
             let key = terminal_turn_key(&completed.session_id, &completed.turn_id);
             if self.settled.contains(&key) || !candidate_keys.insert(key.clone()) {
                 continue;
@@ -1206,24 +1206,28 @@ mod tests {
 
     fn lifecycle(started: &[(&str, &str)], completed: &[(&str, &str)]) -> RecentSessionEvents {
         RecentSessionEvents {
-            started_turns: started
-                .iter()
-                .map(|(session_id, turn_id)| StartedTurn {
-                    session_id: (*session_id).to_string(),
-                    turn_id: (*turn_id).to_string(),
-                })
-                .collect(),
-            completed_turns: completed
-                .iter()
-                .map(|(session_id, turn_id)| CompletedTurn {
-                    session_id: (*session_id).to_string(),
-                    turn_id: (*turn_id).to_string(),
-                    duration_ms: 123,
-                    completed_at: None,
-                    error: None,
-                    is_snapshot_replay: false,
-                })
-                .collect(),
+            started_turns: Arc::new(
+                started
+                    .iter()
+                    .map(|(session_id, turn_id)| StartedTurn {
+                        session_id: (*session_id).to_string(),
+                        turn_id: (*turn_id).to_string(),
+                    })
+                    .collect(),
+            ),
+            completed_turns: Arc::new(
+                completed
+                    .iter()
+                    .map(|(session_id, turn_id)| CompletedTurn {
+                        session_id: (*session_id).to_string(),
+                        turn_id: (*turn_id).to_string(),
+                        duration_ms: 123,
+                        completed_at: None,
+                        error: None,
+                        is_snapshot_replay: false,
+                    })
+                    .collect(),
+            ),
             ..RecentSessionEvents::default()
         }
     }
@@ -1231,7 +1235,7 @@ mod tests {
     #[test]
     fn webhook_notifications_use_the_matching_turn_configuration() {
         let events = RecentSessionEvents {
-            turn_configurations: HashMap::from([(
+            turn_configurations: Arc::new(HashMap::from([(
                 "session-1".to_string(),
                 HashMap::from([(
                     "turn-1".to_string(),
@@ -1240,7 +1244,7 @@ mod tests {
                         reasoning_effort: "xhigh".to_string(),
                     },
                 )]),
-            )]),
+            )])),
             ..RecentSessionEvents::default()
         };
 
@@ -1301,10 +1305,10 @@ mod tests {
     fn active_or_changed_sessions_keep_the_fast_scan_period() {
         let idle = RecentSessionEvents::default();
         let running = RecentSessionEvents {
-            session_statuses: HashMap::from([(
+            session_statuses: Arc::new(HashMap::from([(
                 "session-1".to_string(),
                 SessionLifecycleStatus::Running,
-            )]),
+            )])),
             ..RecentSessionEvents::default()
         };
         let mut schedule = SessionScanSchedule::default();
@@ -1813,14 +1817,14 @@ mod tests {
     fn webhook_turn_tracker_fences_an_aborted_turn_from_late_completion() {
         let mut tracker = WebhookTurnTracker::default();
         let terminal = RecentSessionEvents {
-            started_turns: vec![StartedTurn {
+            started_turns: Arc::new(vec![StartedTurn {
                 session_id: "session-1".to_string(),
                 turn_id: "turn-1".to_string(),
-            }],
-            aborted_turns: vec![AbortedTurn {
+            }]),
+            aborted_turns: Arc::new(vec![AbortedTurn {
                 session_id: "session-1".to_string(),
                 turn_id: "turn-1".to_string(),
-            }],
+            }]),
             ..RecentSessionEvents::default()
         };
 
@@ -1840,7 +1844,7 @@ mod tests {
             &[("session-imported", "turn-old")],
             &[("session-imported", "turn-old")],
         );
-        imported.completed_turns[0].completed_at = Some(100);
+        Arc::make_mut(&mut imported.completed_turns)[0].completed_at = Some(100);
 
         assert!(tracker.completion_candidates(&imported).is_empty());
     }
@@ -1853,7 +1857,7 @@ mod tests {
             &[("session-live", "turn-new")],
             &[("session-live", "turn-new")],
         );
-        live.completed_turns[0].completed_at = Some(200);
+        Arc::make_mut(&mut live.completed_turns)[0].completed_at = Some(200);
 
         assert_eq!(tracker.completion_candidates(&live).len(), 1);
     }
@@ -1866,8 +1870,8 @@ mod tests {
             &[("session-imported", "turn-new")],
             &[("session-imported", "turn-new")],
         );
-        imported.completed_turns[0].completed_at = Some(300);
-        imported.completed_turns[0].is_snapshot_replay = true;
+        Arc::make_mut(&mut imported.completed_turns)[0].completed_at = Some(300);
+        Arc::make_mut(&mut imported.completed_turns)[0].is_snapshot_replay = true;
 
         assert!(tracker.completion_candidates(&imported).is_empty());
     }
@@ -1886,9 +1890,9 @@ mod tests {
                 ("session-fork", "turn-live"),
             ],
         );
-        forked.completed_turns[0].completed_at = Some(300);
-        forked.completed_turns[0].is_snapshot_replay = true;
-        forked.completed_turns[1].completed_at = Some(301);
+        Arc::make_mut(&mut forked.completed_turns)[0].completed_at = Some(300);
+        Arc::make_mut(&mut forked.completed_turns)[0].is_snapshot_replay = true;
+        Arc::make_mut(&mut forked.completed_turns)[1].completed_at = Some(301);
 
         let candidates = tracker.completion_candidates(&forked);
 

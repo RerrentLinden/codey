@@ -211,6 +211,45 @@ pub fn record_failure_with_metadata(
     }
 }
 
+pub async fn record_failure_async<C>(
+    event: impl Into<String>,
+    operation: impl Into<String>,
+    error: impl Into<String>,
+    context: C,
+) where
+    C: Serialize + Send + 'static,
+{
+    record_failure_with_metadata_async(
+        event,
+        operation,
+        error,
+        FailureMetadata::default(),
+        context,
+    )
+    .await;
+}
+
+pub async fn record_failure_with_metadata_async<C>(
+    event: impl Into<String>,
+    operation: impl Into<String>,
+    error: impl Into<String>,
+    metadata: FailureMetadata,
+    context: C,
+) where
+    C: Serialize + Send + 'static,
+{
+    let event = event.into();
+    let operation = operation.into();
+    let error = error.into();
+    if let Err(join_error) = tokio::task::spawn_blocking(move || {
+        record_failure_with_metadata(event, operation, error, metadata, context);
+    })
+    .await
+    {
+        eprintln!("Codey 错误日志写入任务异常退出：{join_error}");
+    }
+}
+
 pub fn run_helper_if_requested() -> anyhow::Result<bool> {
     if std::env::args_os()
         .nth(1)

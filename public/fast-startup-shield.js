@@ -34,7 +34,11 @@
     },
   };
   window.__codeyFastStartupShield = state;
-  if (!enabled || typeof window.fetch !== "function") return;
+  if (
+    !enabled
+    || typeof window.fetch !== "function"
+    || typeof window.__codeySharedRuntime?.registerFetchInterceptor !== "function"
+  ) return;
 
   const statsigHosts = new Set([
     "ab.chatgpt.com",
@@ -55,31 +59,7 @@
     }
   };
 
-  const statsigClients = () => {
-    const clients = [];
-    const roots = [window.__STATSIG__, globalThis.__STATSIG__];
-    for (const root of roots) {
-      if (!root || typeof root !== "object") continue;
-      try {
-        clients.push(root.firstInstance);
-      } catch {
-      }
-      try {
-        if (typeof root.instance === "function") clients.push(root.instance());
-      } catch {
-      }
-      try {
-        if (root.instances && typeof root.instances === "object") {
-          clients.push(...Object.values(root.instances));
-        }
-      } catch {
-      }
-    }
-    return clients.filter(
-      (client, index, array) =>
-        client && typeof client === "object" && array.indexOf(client) === index,
-    );
-  };
+  const statsigClients = window.__codeySharedRuntime.statsigClients;
 
   const markClientReady = (client) => {
     try {
@@ -145,41 +125,42 @@
     }
   };
 
-  const originalFetch = window.fetch;
-  const patchedFetch = (input, init = undefined) => {
-    if (!state.active || !isStatsigRequest(input)) {
-      return originalFetch.call(window, input, init);
-    }
-    state.statsigFetches += 1;
+  const unregisterFetchInterceptor = window.__codeySharedRuntime.registerFetchInterceptor(
+    "fast-startup",
+    (next, input, init = undefined) => {
+      if (!state.active || !isStatsigRequest(input)) {
+        return next(input, init);
+      }
+      state.statsigFetches += 1;
 
-    const controller = new AbortController();
-    const upstreamSignal = init?.signal || (
-      input && typeof input === "object" ? input.signal : undefined
-    );
-    const propagateAbort = () => controller.abort();
-    if (upstreamSignal) {
-      if (upstreamSignal.aborted) propagateAbort();
-      else upstreamSignal.addEventListener("abort", propagateAbort, { once: true });
-    }
-    const timer = window.setTimeout(() => {
-      state.statsigTimeouts += 1;
-      releaseStatsigClients();
-      controller.abort();
-    }, timeoutMs);
-    const cleanup = () => {
-      window.clearTimeout(timer);
-      upstreamSignal?.removeEventListener?.("abort", propagateAbort);
-    };
-    const nextInit = { ...(init || {}), signal: controller.signal };
-    try {
-      return Promise.resolve(originalFetch.call(window, input, nextInit)).finally(cleanup);
-    } catch (error) {
-      cleanup();
-      throw error;
-    }
-  };
-  patchedFetch.__codeyFastStartupPatched = true;
-  window.fetch = patchedFetch;
+      const controller = new AbortController();
+      const upstreamSignal = init?.signal || (
+        input && typeof input === "object" ? input.signal : undefined
+      );
+      const propagateAbort = () => controller.abort();
+      if (upstreamSignal) {
+        if (upstreamSignal.aborted) propagateAbort();
+        else upstreamSignal.addEventListener("abort", propagateAbort, { once: true });
+      }
+      const timer = window.setTimeout(() => {
+        state.statsigTimeouts += 1;
+        releaseStatsigClients();
+        controller.abort();
+      }, timeoutMs);
+      const cleanup = () => {
+        window.clearTimeout(timer);
+        upstreamSignal?.removeEventListener?.("abort", propagateAbort);
+      };
+      const nextInit = { ...(init || {}), signal: controller.signal };
+      try {
+        return Promise.resolve(next(input, nextInit)).finally(cleanup);
+      } catch (error) {
+        cleanup();
+        throw error;
+      }
+    },
+    10,
+  );
   state.installed = true;
   state.active = true;
 
@@ -209,6 +190,6 @@
   clientScanTimer = window.setInterval(scanForStatsigClients, fastScanIntervalMs);
   window.setTimeout(() => {
     state.active = false;
-    if (window.fetch === patchedFetch) window.fetch = originalFetch;
+    unregisterFetchInterceptor();
   }, state.protectionWindowMs);
 })();
