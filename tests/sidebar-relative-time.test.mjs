@@ -15,6 +15,12 @@ class FakeElement {
     this.textContent = "";
     this.title = "";
     this.attributeWrites = 0;
+    const styleValues = new Map();
+    this.style = {
+      getPropertyValue: (name) => styleValues.get(name) || "",
+      removeProperty: (name) => styleValues.delete(name),
+      setProperty: (name, value) => styleValues.set(name, String(value)),
+    };
   }
 
   appendChild(child) {
@@ -134,13 +140,17 @@ function loadInjection({ rows = [], bridgeHandler } = {}) {
   return { document, window };
 }
 
-function sidebarThreadEntry({ running = false, statusState = null } = {}) {
+function sidebarThreadEntry({ running = false, sessionId = "" } = {}) {
   const list = new FakeElement();
   list.setAttribute("role", "list");
   const item = new FakeElement();
   item.setAttribute("role", "listitem");
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
+  if (sessionId) {
+    row.setAttribute("data-app-action-sidebar-thread-id", sessionId);
+    row.setAttribute("data-app-action-sidebar-thread-title", sessionId);
+  }
   const content = new FakeElement();
   content.className = "flex h-full w-full items-center";
   const titleRegion = new FakeElement();
@@ -155,12 +165,6 @@ function sidebarThreadEntry({ running = false, statusState = null } = {}) {
   row.appendChild(content);
   item.appendChild(row);
   list.appendChild(item);
-  if (statusState) {
-    row.__reactFiber$test = {
-      memoizedProps: {},
-      return: { memoizedProps: { statusState }, return: null },
-    };
-  }
   return {
     content,
     item,
@@ -189,6 +193,7 @@ test("formats compact relative times for the sidebar", () => {
 test("normalizes Codex timestamp payload variants to milliseconds", () => {
   const { window } = loadInjection();
   const timestampFrom = window.__codeyThreadTimestampMsFromPayload;
+  const sortTimestampFrom = window.__codeyThreadSortTimestampMsFromPayload;
 
   assert.equal(timestampFrom({ recency_at_ms: 222_333, updated_at_ms: 123_456 }), 222_333);
   assert.equal(timestampFrom({ recency_at: 123, updated_at_ms: 456_789 }), 123_000);
@@ -198,6 +203,11 @@ test("normalizes Codex timestamp payload variants to milliseconds", () => {
     1_784_903_687_076,
   );
   assert.equal(timestampFrom({ updated_at: 123 }), 123_000);
+  assert.equal(
+    sortTimestampFrom({ recency_at_ms: 999_000, updated_at_ms: 123_000 }),
+    123_000,
+  );
+  assert.equal(sortTimestampFrom({ recency_at_ms: 999_000 }), 999_000);
 });
 
 test("renders an accessible time element in the thread row content", () => {
@@ -306,40 +316,88 @@ test("hides thread time from Codex React loading and unread status state", () =>
   assert.equal(content.querySelector("[data-codey-thread-updated-at]")?.textContent, "6 分");
 });
 
-test("marks running sidebar items for visual priority and clears the mark on completion", () => {
-  const idle = sidebarThreadEntry();
-  const running = sidebarThreadEntry({ running: true });
-  const list = idle.list;
-  list.appendChild(running.item);
-  const { window } = loadInjection({ rows: [idle.row, running.row] });
+test("sorts sidebar items by updated_at without moving React-owned rows", async () => {
+  const olderIdle = sidebarThreadEntry({
+    sessionId: "thread-older",
+  });
+  const newerIdle = sidebarThreadEntry({ sessionId: "thread-newer" });
+  const list = olderIdle.list;
+  list.appendChild(newerIdle.item);
+  loadInjection({
+    rows: [olderIdle.row, newerIdle.row],
+    bridgeHandler: async () => ({
+      status: "ok",
+      sort_keys: [
+        {
+          session_id: "thread-older",
+          recency_at_ms: 9 * 60_000,
+          updated_at_ms: 60_000,
+        },
+        {
+          session_id: "thread-newer",
+          recency_at_ms: 2 * 60_000,
+          updated_at_ms: 3 * 60_000,
+        },
+      ],
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(idle.item.getAttribute("data-codey-thread-running"), null);
-  assert.equal(running.item.getAttribute("data-codey-thread-running"), "true");
-  assert.deepEqual(list.children, [idle.item, running.item]);
-
-  running.spinner.remove();
-  window.__codeySyncSidebarThreadRunningOrder(running.row);
-
-  assert.equal(running.item.getAttribute("data-codey-thread-running"), null);
-  assert.deepEqual(list.children, [idle.item, running.item]);
+  assert.equal(
+    olderIdle.item.style.getPropertyValue("--codey-thread-sort-order"),
+    "-1",
+  );
+  assert.equal(
+    newerIdle.item.style.getPropertyValue("--codey-thread-sort-order"),
+    "-3",
+  );
+  assert.equal(olderIdle.item.getAttribute("data-codey-thread-sort-order"), "true");
+  assert.equal(newerIdle.item.getAttribute("data-codey-thread-sort-order"), "true");
+  assert.deepEqual(list.children, [olderIdle.item, newerIdle.item]);
 });
 
-test("prioritizes active React status without treating unread as running", () => {
-  const entry = sidebarThreadEntry({
-    statusState: { type: undefined, unread: true },
+test("keeps a newly running thread at the top until its updated_at catches up", async () => {
+  const running = sidebarThreadEntry({
+    running: true,
+    sessionId: "thread-running",
   });
-  const { window } = loadInjection({ rows: [entry.row] });
-  const statusFiber = entry.row.__reactFiber$test.return;
+  let resolveBridge;
+  let bridgeCalls = 0;
+  const bridgeResult = new Promise((resolve) => {
+    resolveBridge = resolve;
+  });
+  const { window } = loadInjection({
+    rows: [running.row],
+    bridgeHandler: async () => {
+      bridgeCalls += 1;
+      return bridgeResult;
+    },
+  });
 
-  assert.equal(entry.item.getAttribute("data-codey-thread-running"), null);
+  const optimisticOrder = running.item.style.getPropertyValue("--codey-thread-sort-order");
+  assert.equal(running.item.getAttribute("data-codey-thread-sort-order"), "true");
+  assert.ok(Number(optimisticOrder) < -1);
 
-  statusFiber.memoizedProps.statusState = { type: "processing", unread: false };
-  window.__codeySyncSidebarThreadRunningOrder(entry.row);
-  assert.equal(entry.item.getAttribute("data-codey-thread-running"), "true");
+  resolveBridge({
+    status: "ok",
+    sort_keys: [{
+      session_id: "thread-running",
+      updated_at_ms: 60_000,
+    }],
+  });
+  await new Promise((resolve) => setImmediate(resolve));
 
-  statusFiber.memoizedProps.statusState = { type: undefined, unread: false };
-  window.__codeySyncSidebarThreadRunningOrder(entry.row);
-  assert.equal(entry.item.getAttribute("data-codey-thread-running"), null);
+  assert.equal(
+    running.item.style.getPropertyValue("--codey-thread-sort-order"),
+    optimisticOrder,
+  );
+
+  running.spinner.remove();
+  window.__codeyInstallThreadUpdatedTimes(running.row);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(bridgeCalls, 2);
+  assert.equal(running.item.style.getPropertyValue("--codey-thread-sort-order"), "-1");
 });
 
 test("keeps an existing thread time when a native completion marker appears", async () => {
@@ -489,8 +547,15 @@ test("batches visible thread timestamps through the bridge and renders the resul
 
 test("injects time styles that coexist with native statuses and yield to sidebar actions", () => {
   assert.match(source, /threadUpdatedAtAttribute = "data-codey-thread-updated-at"/);
-  assert.match(source, /threadRunningAttribute = "data-codey-thread-running"/);
-  assert.match(source, /\[\$\{threadRunningAttribute\}="true"\] \{ order: -1 !important; \}/);
+  assert.match(source, /threadSortOrderAttribute = "data-codey-thread-sort-order"/);
+  assert.match(
+    source,
+    /\[\$\{threadSortOrderAttribute\}="true"\] \{ order: var\(--codey-thread-sort-order\) !important; \}/,
+  );
+  assert.doesNotMatch(source, /data-codey-thread-running/);
+  assert.match(source, /activeThreadSortRefreshIntervalMs = 3_000/);
+  assert.match(source, /idleThreadSortRefreshIntervalMs = 30_000/);
+  assert.match(source, /workInProgress[\s\S]*activeThreadSortRefreshIntervalMs/);
   assert.match(source, /font-variant-numeric: tabular-nums/);
   assert.match(source, /placeThreadUpdatedAt\(row, label\)/);
   assert.match(source, /mount\.insertBefore\(label, before\)/);

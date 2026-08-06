@@ -4,7 +4,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};

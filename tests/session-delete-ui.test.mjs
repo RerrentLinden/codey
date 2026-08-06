@@ -417,6 +417,7 @@ test("matches native sidebar actions and deletes after popover confirmation", as
   assert.match(popover.textContent + popover.children.map((child) => child.textContent).join(""), /待删除会话/);
 
   popover.querySelector("[data-codey-session-delete-confirm]").click();
+  assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "pending");
   await new Promise((resolve) => setImmediate(resolve));
 
   const deletion = runtime.bridgeCalls.find((call) => call.path === "/session/delete");
@@ -454,6 +455,39 @@ test("matches native sidebar actions and deletes after popover confirmation", as
     "已删除会话“待删除会话”",
   );
   assert.equal(runtime.thread.parentElement, runtime.document.body);
+  assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
+});
+
+test("restores an optimistically hidden sidebar session when deletion fails", async () => {
+  let finishDelete;
+  const runtime = loadInjection({
+    bridge: async (path) => {
+      if (path !== "/session/delete") return { status: "ok" };
+      return new Promise((resolve) => {
+        finishDelete = resolve;
+      });
+    },
+    dispatcher: async () => {},
+  });
+
+  runtime.thread.querySelector("[data-codey-session-delete]").click();
+  runtime.document.body
+    .querySelector("[data-codey-session-delete-confirm]")
+    .click();
+
+  assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "pending");
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(typeof finishDelete, "function");
+
+  finishDelete({ status: "failed", deleted: false, message: "database is locked" });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), null);
+  assert.equal(runtime.thread.parentElement, runtime.document.body);
+  assert.equal(
+    runtime.document.getElementById("codey-runtime-toast")?.textContent,
+    "删除失败：database is locked",
+  );
 });
 
 test("deletes a newly created sidebar session by its canonical conversation id", async () => {
@@ -483,6 +517,7 @@ test("deletes a newly created sidebar session by its canonical conversation id",
     title: "待删除会话",
   });
   assert.equal(runtime.thread.parentElement, runtime.document.body);
+  assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
 });
 
 test("treats an already missing local thread as deleted without detaching virtualized rows", async () => {
@@ -516,8 +551,10 @@ test("treats an already missing local thread as deleted without detaching virtua
     ],
   );
   assert.equal(runtime.thread.parentElement, runtime.document.body);
+  assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
 
   runtime.document.body.appendChild(runtime.thread);
   assert.equal(runtime.window.__codeyPruneDeletedSidebarSessions(runtime.thread), true);
   assert.equal(runtime.thread.parentElement, runtime.document.body);
+  assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
 });

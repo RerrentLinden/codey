@@ -14,11 +14,12 @@
   const tasksImportAttribute = "data-codey-tasks-import";
   const projectImportAttribute = "data-codey-project-import";
   const sessionDeleteAttribute = "data-codey-session-delete";
+  const sessionDeleteStateAttribute = "data-codey-session-delete-state";
   const sessionDeletePopoverId = "codey-session-delete-popover";
   const sidebarActionTooltipId = "codey-sidebar-action-tooltip";
   const threadUpdatedAtAttribute = "data-codey-thread-updated-at";
   const threadUpdatedAtMsAttribute = "data-codey-thread-updated-at-ms";
-  const threadRunningAttribute = "data-codey-thread-running";
+  const threadSortOrderAttribute = "data-codey-thread-sort-order";
   const sessionExportIcon = `
     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -56,10 +57,14 @@
   let threadUpdatedAtFetchTimer = 0;
   let threadUpdatedAtFetchInFlight = false;
   const threadUpdatedAtCache = new Map();
+  const threadSortAtCache = new Map();
+  const threadOptimisticSortAtCache = new Map();
+  const threadOptimisticSortSessionByRow = new WeakMap();
   const threadUpdatedAtRequestedAt = new Map();
   const pendingThreadUpdatedAtRefs = new Map();
   const threadUpdatedAtRows = new Set();
   const deletedSidebarSessionIds = new Map();
+  const pendingSidebarSessionDeleteIds = new Set();
   const hardDeletedMessageKeys = new Set();
   const messageSelectButtons = typeof WeakMap === "function" ? new WeakMap() : null;
   const conversationTurnSelector = [
@@ -78,6 +83,8 @@
   const sidebarThreadRowSelector = "[data-app-action-sidebar-thread-row]";
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
   const deletedSidebarSessionTtlMs = 10 * 60 * 1000;
+  const activeThreadSortRefreshIntervalMs = 3_000;
+  const idleThreadSortRefreshIntervalMs = 30_000;
   const fallbackSessionExportMaxBytes = 64 * 1024 * 1024;
   const queryWithin = (root, selector) => {
     const matches = [];
@@ -225,7 +232,8 @@
       [data-app-action-sidebar-thread-row] [${threadUpdatedAtAttribute}] { display: block; flex: 0 0 auto; min-width: 26px; margin-inline-start: auto; color: inherit; font: 400 12px/16px system-ui, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: end; opacity: .52; pointer-events: none; white-space: nowrap; }
       [data-app-action-sidebar-thread-row]:hover [${threadUpdatedAtAttribute}],
       [data-app-action-sidebar-thread-row]:has(:focus-visible) [${threadUpdatedAtAttribute}] { opacity: 0; }
-      [${threadRunningAttribute}="true"] { order: -1 !important; }
+      [${threadSortOrderAttribute}="true"] { order: var(--codey-thread-sort-order) !important; }
+      [${sessionDeleteStateAttribute}] { display: none !important; }
       [${sessionExportAttribute}], [${tasksImportAttribute}], [${sessionDeleteAttribute}] { -webkit-app-region: no-drag !important; flex: 0 0 auto; pointer-events: auto !important; }
       [${projectImportAttribute}] { -webkit-app-region: no-drag !important; position: absolute; top: 50%; right: 62px; z-index: 35; flex: 0 0 auto; transform: translateY(-50%); opacity: 0; pointer-events: auto !important; transition: opacity .15s ease; }
       [data-app-action-sidebar-project-row][data-app-action-sidebar-project-id]:hover > [${projectImportAttribute}],
@@ -662,12 +670,15 @@
   const rememberDeletedSidebarSession = (sessionId) => {
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return "";
+    pendingSidebarSessionDeleteIds.delete(normalizedSessionId);
     deletedSidebarSessionIds.set(
       normalizedSessionId,
       Date.now() + deletedSidebarSessionTtlMs,
     );
     sidebarTitleCache.delete(normalizedSessionId);
     threadUpdatedAtCache.delete(normalizedSessionId);
+    threadSortAtCache.delete(normalizedSessionId);
+    threadOptimisticSortAtCache.delete(normalizedSessionId);
     threadUpdatedAtRequestedAt.delete(normalizedSessionId);
     pendingThreadUpdatedAtRefs.delete(normalizedSessionId);
     return normalizedSessionId;
@@ -686,8 +697,44 @@
 
   const isDeletedSidebarThread = (row) => {
     const identity = threadIdentityNode(row);
-    return identity instanceof HTMLElement
-      && isDeletedSidebarSession(threadSessionIdFromRow(identity));
+    if (!(identity instanceof HTMLElement)) return false;
+    const sessionId = normalizeThreadSessionId(threadSessionIdFromRow(identity));
+    const pending = pendingSidebarSessionDeleteIds.has(sessionId);
+    const deleted = isDeletedSidebarSession(sessionId);
+    const item = sidebarThreadListItem(row);
+    if (item instanceof HTMLElement) {
+      if (pending || deleted) {
+        item.setAttribute(sessionDeleteStateAttribute, pending ? "pending" : "deleted");
+      } else {
+        item.removeAttribute?.(sessionDeleteStateAttribute);
+      }
+    }
+    return pending || deleted;
+  };
+
+  const beginSidebarSessionDelete = (row, sessionId) => {
+    const normalizedSessionId = normalizeThreadSessionId(sessionId);
+    if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return "";
+    pendingSidebarSessionDeleteIds.add(normalizedSessionId);
+    isDeletedSidebarThread(row);
+    return normalizedSessionId;
+  };
+
+  const rollbackSidebarSessionDelete = (row, sessionId) => {
+    const normalizedSessionId = normalizeThreadSessionId(sessionId);
+    pendingSidebarSessionDeleteIds.delete(normalizedSessionId);
+    isDeletedSidebarThread(row);
+    queryWithin(
+      document,
+      "[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-title]",
+    ).forEach((candidate) => {
+      if (
+        candidate instanceof HTMLElement
+        && normalizeThreadSessionId(threadSessionIdFromRow(candidate)) === normalizedSessionId
+      ) {
+        isDeletedSidebarThread(candidate);
+      }
+    });
   };
 
   // Codex owns and virtualizes sidebar rows. Removing one behind React's back
@@ -722,6 +769,12 @@
     || uuidV7ThreadTimestampMs(payload?.session_id ?? payload?.sessionId)
     || numericThreadTimestamp(payload?.updated_at_ms ?? payload?.updatedAtMs)
     || threadTimestampValueToMs(payload?.updated_at ?? payload?.updatedAt)
+  );
+
+  const threadSortTimestampMsFromPayload = (payload) => (
+    numericThreadTimestamp(payload?.updated_at_ms ?? payload?.updatedAtMs)
+    || threadTimestampValueToMs(payload?.updated_at ?? payload?.updatedAt)
+    || threadTimestampMsFromPayload(payload)
   );
 
   const formatRelativeThreadTime = (timestampMs, nowMs = Date.now()) => {
@@ -819,7 +872,7 @@
     return [...(element.children || [])].some((child) => nativeElementLooksLikeThreadStatus(child));
   };
 
-  const nativeThreadRunning = (row) => {
+  const nativeThreadWorkInProgress = (row) => {
     const statusState = nativeReactThreadStatusState(row);
     if (/^(?:loading|processing|running|working)$/i.test(String(statusState?.type || ""))) {
       return true;
@@ -846,18 +899,86 @@
     return row instanceof HTMLElement ? row : null;
   };
 
-  const syncSidebarThreadRunningRow = (row) => {
+  const syncSidebarThreadTimeOrder = (row, sessionId = "") => {
     if (!(row instanceof HTMLElement)) return;
     const item = sidebarThreadListItem(row);
     if (!(item instanceof HTMLElement)) return;
-    const running = nativeThreadRunning(row);
-    const marked = item.getAttribute(threadRunningAttribute) === "true";
-    if (running && !marked) item.setAttribute(threadRunningAttribute, "true");
-    if (!running && marked) item.removeAttribute(threadRunningAttribute);
+    const identity = threadIdentityNode(row);
+    const normalizedSessionId = normalizeThreadSessionId(
+      sessionId || (
+        identity instanceof HTMLElement
+          ? threadSessionIdFromRow(identity)
+          : ""
+      ),
+    );
+    const timestamp = threadSortAtCache.get(normalizedSessionId) || 0;
+    if (!timestamp) {
+      if (item.getAttribute(threadSortOrderAttribute) === "true") {
+        item.removeAttribute(threadSortOrderAttribute);
+        item.style?.removeProperty?.("--codey-thread-sort-order");
+      }
+      return;
+    }
+    const order = String(-Math.floor(timestamp / 60_000));
+    if (
+      item.getAttribute(threadSortOrderAttribute) === "true"
+      && item.style?.getPropertyValue?.("--codey-thread-sort-order") === order
+    ) return;
+    item.setAttribute(threadSortOrderAttribute, "true");
+    item.style?.setProperty?.("--codey-thread-sort-order", order);
   };
 
-  const syncSidebarThreadRunningOrder = (root = document) => {
-    queryWithin(root, sidebarThreadRowSelector).forEach(syncSidebarThreadRunningRow);
+  const syncOptimisticThreadSortTime = (
+    row,
+    sessionId,
+    workInProgress,
+    now = Date.now(),
+  ) => {
+    if (!(row instanceof HTMLElement)) return;
+    const normalizedSessionId = normalizeThreadSessionId(sessionId);
+    if (!normalizedSessionId) return;
+    const previousSessionId = threadOptimisticSortSessionByRow.get(row) || "";
+    const shouldSeed = workInProgress || normalizedSessionId.startsWith("client-new-thread:");
+    if (!shouldSeed) {
+      const hadOptimisticSort = Boolean(
+        previousSessionId || threadOptimisticSortAtCache.has(normalizedSessionId),
+      );
+      if (previousSessionId) {
+        threadOptimisticSortAtCache.delete(previousSessionId);
+        threadOptimisticSortSessionByRow.delete(row);
+      }
+      threadOptimisticSortAtCache.delete(normalizedSessionId);
+      if (hadOptimisticSort) threadUpdatedAtRequestedAt.delete(normalizedSessionId);
+      return;
+    }
+    if (
+      previousSessionId === normalizedSessionId
+      && threadOptimisticSortAtCache.has(normalizedSessionId)
+    ) return;
+    const timestamp = threadOptimisticSortAtCache.get(normalizedSessionId)
+      || threadOptimisticSortAtCache.get(previousSessionId)
+      || now;
+    if (previousSessionId && previousSessionId !== normalizedSessionId) {
+      threadOptimisticSortAtCache.delete(previousSessionId);
+      threadSortAtCache.delete(previousSessionId);
+    }
+    threadOptimisticSortSessionByRow.set(row, normalizedSessionId);
+    threadOptimisticSortAtCache.set(normalizedSessionId, timestamp);
+    threadSortAtCache.set(
+      normalizedSessionId,
+      Math.max(threadSortAtCache.get(normalizedSessionId) || 0, timestamp),
+    );
+  };
+
+  const syncSidebarThreadTimeState = (row, now = Date.now()) => {
+    const identity = threadIdentityNode(row);
+    if (!(identity instanceof HTMLElement)) return { sessionId: "", workInProgress: false };
+    const sessionId = threadSessionIdFromRow(identity);
+    if (!sessionId) return { sessionId: "", workInProgress: false };
+    const workInProgress = nativeThreadWorkInProgress(row);
+    syncOptimisticThreadSortTime(row, sessionId, workInProgress, now);
+    syncSidebarThreadTimeOrder(row, sessionId);
+    return { sessionId, workInProgress };
   };
 
   const placeThreadUpdatedAt = (row, label) => {
@@ -921,6 +1042,7 @@
     const sessionId = threadSessionIdFromRow(identity);
     if (!sessionId) return "";
     threadUpdatedAtRows.add(row);
+    syncSidebarThreadTimeOrder(row, sessionId);
     const timestamp = threadUpdatedAtCache.get(sessionId);
     updateThreadUpdatedAt(row, timestamp || 0);
     return sessionId;
@@ -951,13 +1073,21 @@
       result.sort_keys.forEach((item) => {
         const sessionId = normalizeThreadSessionId(item?.session_id);
         const timestamp = threadTimestampMsFromPayload(item);
+        const sortTimestamp = threadSortTimestampMsFromPayload(item);
+        const optimisticSortTimestamp = threadOptimisticSortAtCache.get(sessionId) || 0;
         if (!sessionId) return;
         returnedSessionIds.add(sessionId);
         if (timestamp) threadUpdatedAtCache.set(sessionId, timestamp);
         else threadUpdatedAtCache.delete(sessionId);
+        if (sortTimestamp || optimisticSortTimestamp) {
+          threadSortAtCache.set(sessionId, Math.max(sortTimestamp, optimisticSortTimestamp));
+        }
+        else threadSortAtCache.delete(sessionId);
       });
       refs.forEach(({ session_id: sessionId }) => {
-        if (!returnedSessionIds.has(sessionId)) threadUpdatedAtCache.delete(sessionId);
+        if (returnedSessionIds.has(sessionId)) return;
+        threadUpdatedAtCache.delete(sessionId);
+        if (!threadOptimisticSortAtCache.has(sessionId)) threadSortAtCache.delete(sessionId);
       });
       const refreshedSessionIds = new Set(refs.map(({ session_id: sessionId }) => sessionId));
       forEachTrackedThreadRow((row) => {
@@ -990,10 +1120,16 @@
     const now = Date.now();
     queryWithin(root, "[data-app-action-sidebar-thread-row]").forEach((row) => {
       if (!(row instanceof HTMLElement) || isDeletedSidebarThread(row)) return;
-      syncSidebarThreadRunningRow(row);
-      const sessionId = renderCachedThreadUpdatedAt(row);
+      const { sessionId, workInProgress } = syncSidebarThreadTimeState(row, now);
+      renderCachedThreadUpdatedAt(row);
       if (!sessionId || sessionId.startsWith("client-new-thread:")) return;
-      if (!forceRefresh && now - (threadUpdatedAtRequestedAt.get(sessionId) || 0) < 30_000) return;
+      const refreshIntervalMs = workInProgress
+        ? activeThreadSortRefreshIntervalMs
+        : idleThreadSortRefreshIntervalMs;
+      if (
+        !forceRefresh
+        && now - (threadUpdatedAtRequestedAt.get(sessionId) || 0) < refreshIntervalMs
+      ) return;
       const identity = threadIdentityNode(row);
       pendingThreadUpdatedAtRefs.set(sessionId, {
         session_id: sessionId,
@@ -1044,13 +1180,19 @@
     if (typeof window.__codeyCodexSignalDispatcher === "function") {
       return window.__codeyCodexSignalDispatcher;
     }
-    const urls = codexAppAssetUrls().sort((left, right) => (
-      Number(right.includes("app-server-manager-signals-"))
-      - Number(left.includes("app-server-manager-signals-"))
-    ));
+    const signalAssetPriority = (url) => (
+      url.includes("app-server-manager-signals-")
+        ? 2
+        : Number(url.includes("app-initial-"))
+    );
+    const urls = codexAppAssetUrls().sort((
+      left,
+      right,
+    ) => signalAssetPriority(right) - signalAssetPriority(left));
     for (const url of urls) {
       const namedSignalAsset = url.includes("app-server-manager-signals-");
-      if (!namedSignalAsset) {
+      const appInitialAsset = url.includes("app-initial-");
+      if (!namedSignalAsset && !appInitialAsset) {
         let source = "";
         try {
           source = await fetch(url).then((response) => (response.ok ? response.text() : ""));
@@ -1439,6 +1581,7 @@
     nativeDeletionNotified,
   ) => {
     const normalizedSessionId = rememberDeletedSidebarSession(sessionId) || sessionId;
+    isDeletedSidebarThread(thread);
     closeSessionDeletePopover();
     if (isActive) {
       const navigated = navigateAwayFromDeletedThread(thread);
@@ -1479,6 +1622,8 @@
     confirmButton.disabled = true;
     confirmButton.textContent = "删除中…";
     anchor.setAttribute("aria-busy", "true");
+    beginSidebarSessionDelete(thread, sessionId);
+    closeSessionDeletePopover();
     try {
       await unsubscribeNativeSidebarSession(sessionId);
       const result = await callBridge("/session/delete", { sessionId, title });
@@ -1511,6 +1656,7 @@
         );
         return;
       }
+      rollbackSidebarSessionDelete(thread, sessionId);
       confirmButton.disabled = false;
       confirmButton.textContent = "删除";
       showRuntimeToast(
@@ -1832,10 +1978,11 @@
   window.__codeyProjectPathFromRow = projectPathFromRow;
   window.__codeyFormatRelativeThreadTime = formatRelativeThreadTime;
   window.__codeyThreadTimestampMsFromPayload = threadTimestampMsFromPayload;
+  window.__codeyThreadSortTimestampMsFromPayload = threadSortTimestampMsFromPayload;
   window.__codeyUpdateThreadUpdatedAt = updateThreadUpdatedAt;
   window.__codeyInstallThreadUpdatedTimes = installThreadUpdatedTimes;
   window.__codeyHasNativeThreadStatus = hasNativeThreadStatus;
-  window.__codeySyncSidebarThreadRunningOrder = syncSidebarThreadRunningOrder;
+  window.__codeySyncSidebarThreadTimeOrder = syncSidebarThreadTimeOrder;
   window.__codeyRefreshRecentLocalSessions = refreshRecentLocalSessions;
   window.__codeyExportSession = exportSession;
   window.__codeyImportSessionFile = importSessionFile;
@@ -1941,6 +2088,7 @@
       if (mutation.type === "attributes") {
         if (target && !isCodeyOwned(target)) {
           const threadRow = target.closest?.(sidebarThreadRowSelector) || null;
+          if (threadRow) syncSidebarThreadTimeState(threadRow);
           if (threadRow || mutation.attributeName !== "class") {
             addPendingScanRoot(threadRow || nearestScanRoot(target));
           }
@@ -1971,6 +2119,7 @@
           || target?.closest?.(sidebarThreadRowSelector)
           || null;
         if (threadRow) {
+          syncSidebarThreadTimeState(threadRow);
           addPendingScanRoot(threadRow);
           continue;
         }
@@ -1982,6 +2131,7 @@
         if (!element) continue;
         const threadRow = target?.closest?.(sidebarThreadRowSelector) || null;
         if (threadRow && !isCodeyOwned(target)) {
+          syncSidebarThreadTimeState(threadRow);
           addPendingScanRoot(threadRow);
           continue;
         }
