@@ -81,6 +81,7 @@ export type InjectionScriptStatus = {
 export type RuntimeStatus = {
   running: boolean;
   appVersion?: string;
+  codexAppVersion?: string;
   clientPlatform?: string;
   restartRequired?: boolean;
   restartInProgress?: boolean;

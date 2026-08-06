@@ -140,6 +140,7 @@ if (import.meta.env.DEV) {
         return {
           running: true,
           appVersion: "0.2.0",
+          codexAppVersion: "26.601.21317",
           clientPlatform: previewClientPlatform,
           restartRequired: false,
           restartInProgress: false,

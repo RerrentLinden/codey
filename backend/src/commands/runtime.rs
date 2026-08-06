@@ -1,6 +1,8 @@
+use std::path::PathBuf;
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 
+use codey_runtime_core::app_paths::{codex_app_version, resolve_codex_app_dir_with_saved};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
@@ -32,6 +34,10 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
     };
     let config = state.config.read().await;
     let profile = config.active_profile();
+    let configured_codex_app_path = config.codex_app_path.clone();
+    let runtime_codex_app_path = runtime
+        .as_ref()
+        .map(|runtime| runtime.codex_app_path.clone());
     let restart_required = match (
         runtime.as_ref(),
         applied_models.as_ref(),
@@ -55,6 +61,11 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
         "restartInProgress": state.restart_in_progress.load(Ordering::Acquire),
     });
     drop(config);
+    let codex_app_version =
+        codex_app_version_for_status(runtime_codex_app_path, configured_codex_app_path).await;
+    if let Some(object) = status.as_object_mut() {
+        object.insert("codexAppVersion".into(), Value::String(codex_app_version));
+    }
     if let Some(error) = state.startup_error.read().await.clone()
         && let Some(object) = status.as_object_mut()
     {
@@ -89,6 +100,28 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
         );
     }
     Ok(status)
+}
+
+async fn codex_app_version_for_status(
+    runtime_app_path: Option<PathBuf>,
+    configured_app_path: String,
+) -> String {
+    tokio::task::spawn_blocking(move || {
+        let configured_app_path = configured_app_path.trim();
+        let configured_app_path =
+            (!configured_app_path.is_empty()).then(|| PathBuf::from(configured_app_path));
+        let app_dir = runtime_app_path.or_else(|| {
+            configured_app_path
+                .as_deref()
+                .and_then(|path| resolve_codex_app_dir_with_saved(Some(path), None))
+        });
+        app_dir
+            .as_deref()
+            .and_then(codex_app_version)
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
 }
 
 pub(super) async fn refresh_injection_status(state: &Arc<AppState>) -> Result<Value, String> {

@@ -120,6 +120,10 @@ function OperationsPanelComponent({
         : "将在 Codex 启动时自动安装并校验 Windows 优化补丁。";
   const resolvedCodexPath = status.codexAppPath || "/Applications/ChatGPT.app";
   const restartPending = Boolean(status.restartRequired);
+  const codexVersion = status.codexAppVersion?.trim();
+  const codexVersionLabel = codexVersion
+    ? `Codex v${codexVersion}`
+    : "Codex 版本未知";
 
   type MetricItem = {
     id: string;
@@ -362,8 +366,11 @@ function OperationsPanelComponent({
             <span className="operations-heading-icon">
               <Activity size={18} aria-hidden="true" />
             </span>
-            <div>
-              <h1 id="operations-title">Codex 运行状态</h1>
+            <div className="operations-heading-copy">
+              <div className="operations-title-row">
+                <h1 id="operations-title">Codex 运行状态</h1>
+                <span className="codex-version-tag">{codexVersionLabel}</span>
+              </div>
               <div
                 className="path-display header-path-display"
                 aria-label="Codex 应用路径"
