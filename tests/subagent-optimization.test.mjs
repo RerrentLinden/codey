@@ -41,6 +41,22 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
   assert.match(uiSource, /aria-label="启用子代理协作优化"/);
   assert.match(uiSource, /aria-label="选择子代理模型"/);
   assert.match(uiSource, /aria-label="选择子代理思考深度"/);
+  const featureGridIndex = sectionsSource.indexOf(
+    '<div className="feature-grid">',
+  );
+  const gpuCardIndex = sectionsSource.indexOf(
+    "<strong>GPU 渲染模式</strong>",
+  );
+  const subagentCardIndex = sectionsSource.indexOf(
+    "<strong>子代理协作优化</strong>",
+  );
+  const petCardIndex = sectionsSource.indexOf(
+    "<strong>精简 Codex 宠物模块</strong>",
+  );
+  assert.ok(featureGridIndex >= 0);
+  assert.ok(gpuCardIndex > featureGridIndex);
+  assert.ok(subagentCardIndex > gpuCardIndex);
+  assert.ok(petCardIndex > subagentCardIndex);
   assert.match(
     uiSource,
     /const subagentPolicyControlsDisabled =\s*isBusy \|\| !config\.subagentOptimization/,

@@ -72,6 +72,163 @@ function FeaturePolicyCardComponent({
       <Card className="secondary-card runtime-card">
         <div className="feature-grid">
           <div
+            className={`feature-card gpu-mode-card ${!isMacClient && gpuLaunchMode.value !== "off" ? "active" : ""}`}
+          >
+            <div className="feature-card-header">
+              <div className="feature-card-title">
+                <strong>GPU 渲染模式</strong>
+                <Badge variant={isMacClient ? "secondary" : "warning"}>
+                  {isMacClient ? "macOS 不可用" : "实验性"}
+                </Badge>
+              </div>
+            </div>
+            <div className="feature-card-body gpu-mode-card-body">
+              <fieldset
+                className="gpu-mode-fieldset"
+                disabled={isMacClient}
+                aria-describedby="gpu-launch-mode-description"
+              >
+                <legend className="sr-only">Codex GPU 启动模式</legend>
+                <div className="gpu-mode-slider" style={gpuLaunchModeStyle}>
+                  <span className="gpu-mode-slider-thumb" aria-hidden="true" />
+                  {GPU_LAUNCH_MODES.map((mode) => (
+                    <label
+                      key={mode.value}
+                      className={`gpu-mode-option ${gpuLaunchMode.value === mode.value ? "selected" : ""}`}
+                    >
+                      <input
+                        type="radio"
+                        name="codey-gpu-launch-mode"
+                        value={mode.value}
+                        checked={gpuLaunchMode.value === mode.value}
+                        onChange={() =>
+                          onConfigChange({
+                            ...config,
+                            gpuLaunchMode: mode.value,
+                          })
+                        }
+                      />
+                      <span>{mode.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </fieldset>
+              <small id="gpu-launch-mode-description" aria-live="polite">
+                {isMacClient
+                  ? "macOS 下已禁用，不会向 Codex 传递 GPU 诊断参数"
+                  : gpuLaunchMode.value === "disableGpu"
+                    ? "启动 Codex 时附加 --disable-gpu；可能增加 CPU 占用"
+                    : gpuLaunchMode.value === "disableGpuRasterization"
+                      ? "启动 Codex 时附加 --disable-gpu-rasterization；仅将栅格化移到 CPU"
+                      : "保持 Codex 默认 GPU 渲染，不附加诊断参数"}
+              </small>
+            </div>
+          </div>
+
+          <div
+            className={`feature-card subagent-policy-card ${config.subagentOptimization ? "active" : ""}`}
+          >
+            <div className="feature-card-header">
+              <div className="feature-card-title">
+                <strong>子代理协作优化</strong>
+                <Badge variant="warning">模型与深度可配置</Badge>
+              </div>
+              <Switch
+                checked={config.subagentOptimization}
+                disabled={isBusy}
+                aria-busy={busy === "check-subagent-model"}
+                onCheckedChange={(checked) =>
+                  onSubagentOptimizationChange(checked)
+                }
+                aria-label="启用子代理协作优化"
+              />
+            </div>
+            <div className="feature-card-body subagent-policy-body">
+              <div className="subagent-policy-controls">
+                <label>
+                  <span>子代理模型</span>
+                  <select
+                    aria-label="选择子代理模型"
+                    value={selectedSubagentModel?.value ?? ""}
+                    disabled={
+                      subagentPolicyControlsDisabled ||
+                      subagentModelOptions.length === 0
+                    }
+                    onChange={(event) => {
+                      const option = subagentModelOptions.find(
+                        (candidate) => candidate.value === event.target.value,
+                      );
+                      if (!option) return;
+                      const reasoningEffort =
+                        option.supportedReasoningEfforts.includes(
+                          config.subagentReasoningEffort,
+                        )
+                          ? config.subagentReasoningEffort
+                          : option.defaultReasoningEffort;
+                      onConfigChange({
+                        ...config,
+                        subagentModel: option.value,
+                        subagentReasoningEffort: reasoningEffort,
+                      });
+                    }}
+                  >
+                    {!selectedSubagentModel && (
+                      <option value="">
+                        {subagentModelOptions.length === 0
+                          ? "当前线路无兼容模型"
+                          : "请选择兼容模型"}
+                      </option>
+                    )}
+                    {subagentModelOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  <span>思考深度</span>
+                  <select
+                    aria-label="选择子代理思考深度"
+                    value={
+                      subagentReasoningEfforts.includes(
+                        config.subagentReasoningEffort,
+                      )
+                        ? config.subagentReasoningEffort
+                        : ""
+                    }
+                    disabled={
+                      subagentPolicyControlsDisabled ||
+                      subagentReasoningEfforts.length === 0
+                    }
+                    onChange={(event) =>
+                      onConfigChange({
+                        ...config,
+                        subagentReasoningEffort: event.target.value,
+                      })
+                    }
+                  >
+                    {subagentReasoningEfforts.map((effort) => (
+                      <option key={effort} value={effort}>
+                        {REASONING_EFFORT_LABELS[effort] ?? effort}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+              <small>
+                {busy === "check-subagent-model"
+                  ? `正在校验当前线路是否支持 ${config.subagentModel}`
+                  : subagentModelOptions.length === 0
+                    ? "当前 Codex 版本或线路没有可用于子代理的模型"
+                  : config.subagentOptimization
+                    ? "保存后立即用于当前任务后续新启动的子代理，无需重启"
+                    : "保持 Codex 默认子代理配置，不注入协作提示词"}
+              </small>
+            </div>
+          </div>
+
+          <div
             className={`feature-card ${config.slimCodexPet ? "active" : ""}`}
           >
             <div className="feature-card-header">
@@ -230,163 +387,6 @@ function FeaturePolicyCardComponent({
                 {config.hideFullAccessWarning
                   ? "自动隐藏完全访问模式的原生安全提示"
                   : "保留 Codex 原生安全提示"}
-              </small>
-            </div>
-          </div>
-
-          <div
-            className={`feature-card gpu-mode-card ${!isMacClient && gpuLaunchMode.value !== "off" ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <div className="feature-card-title">
-                <strong>GPU 渲染模式</strong>
-                <Badge variant={isMacClient ? "secondary" : "warning"}>
-                  {isMacClient ? "macOS 不可用" : "实验性"}
-                </Badge>
-              </div>
-            </div>
-            <div className="feature-card-body gpu-mode-card-body">
-              <fieldset
-                className="gpu-mode-fieldset"
-                disabled={isMacClient}
-                aria-describedby="gpu-launch-mode-description"
-              >
-                <legend className="sr-only">Codex GPU 启动模式</legend>
-                <div className="gpu-mode-slider" style={gpuLaunchModeStyle}>
-                  <span className="gpu-mode-slider-thumb" aria-hidden="true" />
-                  {GPU_LAUNCH_MODES.map((mode) => (
-                    <label
-                      key={mode.value}
-                      className={`gpu-mode-option ${gpuLaunchMode.value === mode.value ? "selected" : ""}`}
-                    >
-                      <input
-                        type="radio"
-                        name="codey-gpu-launch-mode"
-                        value={mode.value}
-                        checked={gpuLaunchMode.value === mode.value}
-                        onChange={() =>
-                          onConfigChange({
-                            ...config,
-                            gpuLaunchMode: mode.value,
-                          })
-                        }
-                      />
-                      <span>{mode.label}</span>
-                    </label>
-                  ))}
-                </div>
-              </fieldset>
-              <small id="gpu-launch-mode-description" aria-live="polite">
-                {isMacClient
-                  ? "macOS 下已禁用，不会向 Codex 传递 GPU 诊断参数"
-                  : gpuLaunchMode.value === "disableGpu"
-                    ? "启动 Codex 时附加 --disable-gpu；可能增加 CPU 占用"
-                    : gpuLaunchMode.value === "disableGpuRasterization"
-                      ? "启动 Codex 时附加 --disable-gpu-rasterization；仅将栅格化移到 CPU"
-                      : "保持 Codex 默认 GPU 渲染，不附加诊断参数"}
-              </small>
-            </div>
-          </div>
-
-          <div
-            className={`feature-card subagent-policy-card ${config.subagentOptimization ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <div className="feature-card-title">
-                <strong>子代理协作优化</strong>
-                <Badge variant="warning">模型与深度可配置</Badge>
-              </div>
-              <Switch
-                checked={config.subagentOptimization}
-                disabled={isBusy}
-                aria-busy={busy === "check-subagent-model"}
-                onCheckedChange={(checked) =>
-                  onSubagentOptimizationChange(checked)
-                }
-                aria-label="启用子代理协作优化"
-              />
-            </div>
-            <div className="feature-card-body subagent-policy-body">
-              <div className="subagent-policy-controls">
-                <label>
-                  <span>子代理模型</span>
-                  <select
-                    aria-label="选择子代理模型"
-                    value={selectedSubagentModel?.value ?? ""}
-                    disabled={
-                      subagentPolicyControlsDisabled ||
-                      subagentModelOptions.length === 0
-                    }
-                    onChange={(event) => {
-                      const option = subagentModelOptions.find(
-                        (candidate) => candidate.value === event.target.value,
-                      );
-                      if (!option) return;
-                      const reasoningEffort =
-                        option.supportedReasoningEfforts.includes(
-                          config.subagentReasoningEffort,
-                        )
-                          ? config.subagentReasoningEffort
-                          : option.defaultReasoningEffort;
-                      onConfigChange({
-                        ...config,
-                        subagentModel: option.value,
-                        subagentReasoningEffort: reasoningEffort,
-                      });
-                    }}
-                  >
-                    {!selectedSubagentModel && (
-                      <option value="">
-                        {subagentModelOptions.length === 0
-                          ? "当前线路无兼容模型"
-                          : "请选择兼容模型"}
-                      </option>
-                    )}
-                    {subagentModelOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label>
-                  <span>思考深度</span>
-                  <select
-                    aria-label="选择子代理思考深度"
-                    value={
-                      subagentReasoningEfforts.includes(
-                        config.subagentReasoningEffort,
-                      )
-                        ? config.subagentReasoningEffort
-                        : ""
-                    }
-                    disabled={
-                      subagentPolicyControlsDisabled ||
-                      subagentReasoningEfforts.length === 0
-                    }
-                    onChange={(event) =>
-                      onConfigChange({
-                        ...config,
-                        subagentReasoningEffort: event.target.value,
-                      })
-                    }
-                  >
-                    {subagentReasoningEfforts.map((effort) => (
-                      <option key={effort} value={effort}>
-                        {REASONING_EFFORT_LABELS[effort] ?? effort}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
-              <small>
-                {busy === "check-subagent-model"
-                  ? `正在校验当前线路是否支持 ${config.subagentModel}`
-                  : subagentModelOptions.length === 0
-                    ? "当前 Codex 版本或线路没有可用于子代理的模型"
-                  : config.subagentOptimization
-                    ? "保存后立即用于当前任务后续新启动的子代理，无需重启"
-                    : "保持 Codex 默认子代理配置，不注入协作提示词"}
               </small>
             </div>
           </div>
