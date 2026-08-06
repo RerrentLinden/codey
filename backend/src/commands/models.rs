@@ -901,11 +901,14 @@ fn try_refresh_model_catalog(config: &CodeyConfig) -> anyhow::Result<()> {
         .iter()
         .find(|profile| profile.id == config.active_profile_id)
         .is_none_or(|profile| profile.cc_switch_read_only);
+    let codex_runtime_version =
+        model_catalog::desktop_runtime_version(None, &config.codex_app_path);
     model_catalog::refresh_for_provider(
         &codex_home(),
         official,
         config.upstream_models_snapshot(),
         config.selected_models(),
+        codex_runtime_version.as_deref(),
     )
     .map(|_| ())
 }
@@ -955,7 +958,8 @@ mod tests {
     fn model_changes_accept_only_the_known_builtin_catalog_fallback() {
         let home = tempfile::tempdir().unwrap();
         let missing_cache =
-            model_catalog::refresh_for_provider(home.path(), false, Some(&[]), &[]).unwrap_err();
+            model_catalog::refresh_for_provider(home.path(), false, Some(&[]), &[], None)
+                .unwrap_err();
 
         assert!(model_catalog_fallback(Err(missing_cache)).unwrap());
         assert!(!model_catalog_fallback(Ok(())).unwrap());

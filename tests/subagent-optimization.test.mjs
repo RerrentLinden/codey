@@ -5,7 +5,7 @@ import test from "node:test";
 const root = new URL("../", import.meta.url);
 
 test("subagent optimization is opt-in and exposed through the settings switch", async () => {
-  const [appSource, modelHookSource, sectionsSource, configSource, commandSource, launcherSource, catalogSource] = await Promise.all([
+  const [appSource, modelHookSource, sectionsSource, configSource, commandSource, launcherSource, catalogSource, appPathsSource] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/useModelSelection.ts", root), "utf8"),
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
@@ -13,6 +13,7 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
     readFile(new URL("backend/src/commands.rs", root), "utf8"),
     readFile(new URL("backend/src/launcher.rs", root), "utf8"),
     readFile(new URL("backend/src/model_catalog.rs", root), "utf8"),
+    readFile(new URL("vendor/CodeyRuntime/crates/codey-runtime-core/src/app_paths.rs", root), "utf8"),
   ]);
   const uiSource = `${appSource}\n${sectionsSource}`;
   const modelSource = `${appSource}\n${modelHookSource}`;
@@ -30,9 +31,14 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
   assert.doesNotMatch(configSource, /pub const SUBAGENT_MODELS/);
   assert.doesNotMatch(configSource, /canonical_subagent_model/);
   assert.match(catalogSource, /LEAF_SUBAGENT_MIN_CLIENT_VERSION/);
-  assert.match(catalogSource, /SubagentModelPolicy::V2Only/);
-  assert.match(catalogSource, /SubagentModelPolicy::LeafModels/);
+  assert.match(catalogSource, /apply_legacy_v2_catalog_compatibility/);
+  assert.match(catalogSource, /model_is_subagent_eligible/);
+  assert.match(catalogSource, /model\["multi_agent_version"\] = json!\("v2"\)/);
+  assert.doesNotMatch(catalogSource, /SubagentModelPolicy/);
   assert.match(catalogSource, /version\.eq_ignore_ascii_case\("disabled"\)/);
+  assert.match(appPathsSource, /pub fn codex_runtime_version\(app_dir: &Path\)/);
+  assert.match(appPathsSource, /\.arg\("--version"\)/);
+  assert.match(appPathsSource, /join\("Contents"\)\.join\("Resources"\)\.join\("codex"\)/);
   assert.match(uiSource, /checked=\{config\.subagentOptimization\}/);
   assert.match(
     uiSource,

@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use codey_runtime_core::app_paths::{
-    build_codex_executable, codex_app_version, find_latest_codex_app_dir,
-    find_latest_codex_app_dir_from_roots, find_macos_codex_app,
+    build_codex_executable, codex_app_version, codex_runtime_executable, codex_runtime_version,
+    find_latest_codex_app_dir, find_latest_codex_app_dir_from_roots, find_macos_codex_app,
     latest_appx_install_location_from_output, normalize_codex_app_path, packaged_app_user_model_id,
-    resolve_codex_app_dir_with_saved, user_data_candidates_from,
+    resolve_codex_app_dir_with_saved, resolve_codex_runtime_version, user_data_candidates_from,
 };
 use codey_runtime_core::launcher::{
     CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
@@ -209,6 +209,91 @@ fn app_paths_extracts_codex_version_from_macos_bundle_plist() {
     .unwrap();
 
     assert_eq!(codex_app_version(&app).as_deref(), Some("26.513.3673"));
+}
+
+#[test]
+fn app_paths_finds_the_runtime_bundled_with_each_desktop_layout() {
+    let temp = tempfile::tempdir().unwrap();
+    let macos_app = temp.path().join("Codex.app");
+    let macos_runtime = macos_app.join("Contents/Resources/codex");
+    std::fs::create_dir_all(macos_runtime.parent().unwrap()).unwrap();
+    std::fs::write(&macos_runtime, "").unwrap();
+
+    let windows_app = temp.path().join("windows-app");
+    let windows_runtime = windows_app.join("resources/codex.exe");
+    std::fs::create_dir_all(windows_runtime.parent().unwrap()).unwrap();
+    std::fs::write(&windows_runtime, "").unwrap();
+
+    let windows_uppercase_app = temp.path().join("windows-uppercase-app");
+    let windows_uppercase_runtime = windows_uppercase_app.join("Resources/codex.exe");
+    std::fs::create_dir_all(windows_uppercase_runtime.parent().unwrap()).unwrap();
+    std::fs::write(&windows_uppercase_runtime, "").unwrap();
+
+    assert_eq!(
+        codex_runtime_executable(&macos_app).as_deref(),
+        Some(macos_runtime.as_path())
+    );
+    assert_eq!(
+        codex_runtime_executable(&windows_app).as_deref(),
+        Some(windows_runtime.as_path())
+    );
+    let detected_uppercase_runtime =
+        codex_runtime_executable(&windows_uppercase_app).expect("uppercase Resources runtime");
+    assert_eq!(
+        std::fs::canonicalize(detected_uppercase_runtime).unwrap(),
+        std::fs::canonicalize(windows_uppercase_runtime).unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn app_paths_reads_the_runtime_version_from_the_desktop_bundle() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let app = temp.path().join("Codex.app");
+    let runtime = app.join("Contents/Resources/codex");
+    std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+    std::fs::write(
+        &runtime,
+        "#!/bin/sh\nprintf 'codex-cli 0.147.0-alpha.8\\n'\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&runtime, permissions).unwrap();
+
+    assert_eq!(
+        codex_runtime_version(&app).as_deref(),
+        Some("0.147.0-alpha.8")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn app_paths_runtime_version_prefers_the_actual_app_over_the_saved_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let actual_app = temp.path().join("Actual Codex.app");
+    let saved_app = temp.path().join("Saved Codex.app");
+    for (app, version) in [(&actual_app, "0.147.0-alpha.8"), (&saved_app, "0.146.1")] {
+        let runtime = app.join("Contents/Resources/codex");
+        std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+        std::fs::write(
+            &runtime,
+            format!("#!/bin/sh\nprintf 'codex-cli {version}\\n'\n"),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(runtime, permissions).unwrap();
+    }
+
+    assert_eq!(
+        resolve_codex_runtime_version(Some(&actual_app), saved_app.to_str()).as_deref(),
+        Some("0.147.0-alpha.8")
+    );
 }
 
 #[test]

@@ -1175,9 +1175,9 @@ mod tests {
         .unwrap();
     }
 
-    fn write_leaf_capable_model_cache(home: &Path) {
+    fn write_stale_model_cache(home: &Path) {
         let mut cache = codey_runtime_core::model_suffix::bundled_model_catalog().unwrap();
-        cache["client_version"] = json!("0.147.0-alpha.8");
+        cache["client_version"] = json!("0.146.1");
         fs::write(
             home.join("models_cache.json"),
             serde_json::to_vec(&cache).unwrap(),
@@ -1752,9 +1752,9 @@ requires_openai_auth = true
     }
 
     #[test]
-    fn provider_switch_accepts_a_leaf_model_on_newer_codex() {
-        let (_directory, _path, home) = fixture();
-        write_leaf_capable_model_cache(&home);
+    fn provider_switch_accepts_a_non_disabled_leaf_model() {
+        let (_directory, path, home) = fixture();
+        write_stale_model_cache(&home);
         write_live_route(
             &home,
             "route-b",
@@ -1773,7 +1773,7 @@ requires_openai_auth = true
             .upstream_models_by_provider
             .insert("route-b".into(), vec!["gpt-5.6-luna".into()]);
 
-        let (synced, status) = sync_current_provider(&config, &home).unwrap();
+        let (synced, status) = sync_current_provider_from_paths(&config, &home, &path).unwrap();
 
         assert_eq!(status.provider.id, "route-b");
         assert!(synced.subagent_optimization);
@@ -1785,9 +1785,9 @@ requires_openai_auth = true
     }
 
     #[test]
-    fn provider_switch_accepts_a_selected_third_party_leaf_model_on_newer_codex() {
-        let (_directory, _path, home) = fixture();
-        write_leaf_capable_model_cache(&home);
+    fn provider_switch_accepts_a_selected_third_party_leaf_model() {
+        let (_directory, path, home) = fixture();
+        write_stale_model_cache(&home);
         write_live_route(
             &home,
             "route-b",
@@ -1809,7 +1809,7 @@ requires_openai_auth = true
             .upstream_models_by_provider
             .insert("route-b".into(), vec!["provider-custom-model".into()]);
 
-        let (synced, status) = sync_current_provider(&config, &home).unwrap();
+        let (synced, status) = sync_current_provider_from_paths(&config, &home, &path).unwrap();
 
         assert_eq!(status.provider.id, "route-b");
         assert!(synced.subagent_optimization);

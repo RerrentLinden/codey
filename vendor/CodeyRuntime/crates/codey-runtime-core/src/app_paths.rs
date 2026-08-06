@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, Copy)]
 struct AppPackageSpec {
@@ -13,6 +15,21 @@ struct AppPackageSpec {
 
 const CODEX_PACKAGE_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
 const STANDALONE_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct RuntimeExecutableSignature {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone)]
+struct RuntimeVersionCacheEntry {
+    signature: RuntimeExecutableSignature,
+    version: Option<String>,
+}
+
+static RUNTIME_VERSION_CACHE: OnceLock<Mutex<HashMap<PathBuf, RuntimeVersionCacheEntry>>> =
+    OnceLock::new();
 
 const APP_PACKAGE_SPECS: &[AppPackageSpec] = &[
     AppPackageSpec {
@@ -290,6 +307,75 @@ pub fn codex_app_version(app_dir: &Path) -> Option<String> {
         .or_else(|| codex_directory_version(app_dir))
         .or_else(|| codex_version_file(package_dir))
         .or_else(|| codex_version_file(app_dir))
+}
+
+pub fn codex_runtime_executable(app_dir: &Path) -> Option<PathBuf> {
+    let candidates = if app_dir.extension() == Some(OsStr::new("app")) {
+        vec![app_dir.join("Contents").join("Resources").join("codex")]
+    } else {
+        vec![
+            app_dir.join("resources").join("codex.exe"),
+            app_dir.join("Resources").join("codex.exe"),
+        ]
+    };
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+pub fn codex_runtime_version(app_dir: &Path) -> Option<String> {
+    let executable = codex_runtime_executable(app_dir)?;
+    let metadata = std::fs::metadata(&executable).ok()?;
+    let signature = RuntimeExecutableSignature {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    };
+    let cache = RUNTIME_VERSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(cache) = cache.lock()
+        && let Some(entry) = cache.get(&executable)
+        && entry.signature == signature
+    {
+        return entry.version.clone();
+    }
+
+    let version = Command::new(&executable)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            parse_codex_runtime_version(&String::from_utf8_lossy(&output.stdout))
+                .or_else(|| parse_codex_runtime_version(&String::from_utf8_lossy(&output.stderr)))
+        });
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(
+            executable,
+            RuntimeVersionCacheEntry {
+                signature,
+                version: version.clone(),
+            },
+        );
+    }
+    version
+}
+
+pub fn resolve_codex_runtime_version(
+    app_dir: Option<&Path>,
+    saved_app_path: Option<&str>,
+) -> Option<String> {
+    let app_dir = resolve_codex_app_dir_with_saved(app_dir, saved_app_path)?;
+    codex_runtime_version(&app_dir)
+}
+
+fn parse_codex_runtime_version(output: &str) -> Option<String> {
+    let mut parts = output.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part.eq_ignore_ascii_case("codex-cli") {
+            return parts
+                .next()
+                .map(|version| version.trim_start_matches('v').to_string())
+                .filter(|version| !version.is_empty());
+        }
+    }
+    None
 }
 
 pub fn packaged_app_user_model_id(app_dir: &Path) -> Option<String> {

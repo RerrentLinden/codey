@@ -395,6 +395,7 @@ async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBu
 
 async fn prepare_codex_startup_state(
     config: &CodeyConfig,
+    app_dir: &std::path::Path,
     home: &std::path::Path,
     original_provider: &str,
     preserve_provider_route: bool,
@@ -412,12 +413,17 @@ async fn prepare_codex_startup_state(
         let selected_models = config.selected_models().to_vec();
         let manual_models = config.manual_third_party_models().to_vec();
         let requested_default_model = config.default_model().map(str::to_owned);
+        let app_dir = app_dir.to_path_buf();
+        let configured_app_path = config.codex_app_path.clone();
         Some(tokio::task::spawn_blocking(move || {
+            let codex_runtime_version =
+                model_catalog::desktop_runtime_version(Some(&app_dir), &configured_app_path);
             let refresh = model_catalog::refresh_for_provider(
                 &catalog_home,
                 official_provider,
                 upstream_models.as_deref(),
                 &selected_models,
+                codex_runtime_version.as_deref(),
             );
             let catalog_available = refresh.is_err() && model_catalog::is_available(&catalog_home);
             let selection = model_catalog::selection_state_with_manual_models(
@@ -798,6 +804,7 @@ impl CodeyRuntime {
             .map(|proxy| proxy.base_url().to_string());
         prepare_codex_startup_state(
             config,
+            &app_dir,
             &home,
             &original_provider,
             preserve_provider_route,

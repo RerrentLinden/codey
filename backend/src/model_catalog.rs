@@ -4,13 +4,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use codey_runtime_core::app_paths::resolve_codex_runtime_version;
 use semver::Version;
 use serde::Serialize;
 use serde_json::{Value, json};
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
-// First published Codex tag containing openai/codex#36892, which allows
-// Multi-Agent V2 parents to spawn non-disabled leaf models.
+// First published Codex tag containing openai/codex#36892. Older runtimes
+// require an explicit `v2` marker, so Codey backports the newer
+// "anything except disabled" catalog semantics for them.
 const LEAF_SUBAGENT_MIN_CLIENT_VERSION: &str = "0.147.0-alpha.8";
 const ALLOWED_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 const FAST_SERVICE_TIER_ID: &str = "priority";
@@ -101,6 +103,17 @@ pub fn relative_path() -> &'static str {
     MODEL_CATALOG_RELATIVE_PATH
 }
 
+pub fn desktop_runtime_version(
+    app_dir: Option<&Path>,
+    configured_app_path: &str,
+) -> Option<String> {
+    let configured_app_path = configured_app_path.trim();
+    resolve_codex_runtime_version(
+        app_dir,
+        (!configured_app_path.is_empty()).then_some(configured_app_path),
+    )
+}
+
 pub fn default_official_model_slugs() -> Vec<String> {
     OFFICIAL_MODELS
         .iter()
@@ -113,6 +126,7 @@ pub fn refresh_for_provider(
     official_provider: bool,
     upstream_models: Option<&[String]>,
     selected_models: &[String],
+    codex_runtime_version: Option<&str>,
 ) -> Result<usize> {
     let official_models = read_official_entries(home)?;
     ensure_runtime_compatible_models(&official_models)?;
@@ -171,6 +185,7 @@ pub fn refresh_for_provider(
             catalog_models.push(synthetic_model(&template, model_id, index));
         }
     }
+    apply_legacy_v2_catalog_compatibility(&mut catalog_models, codex_runtime_version);
 
     write_catalog(home, &catalog_models)?;
     Ok(catalog_models.len())
@@ -255,10 +270,9 @@ pub fn selection_state_with_manual_models(
                 models
             })
     };
-    let subagent_policy = subagent_model_policy(home);
     let mut subagent_model_ids = official_entries
         .iter()
-        .filter(|model| model_supports_subagent_policy(model, subagent_policy))
+        .filter(|model| model_is_subagent_eligible(model))
         .filter_map(|model| {
             model
                 .get("slug")
@@ -266,9 +280,7 @@ pub fn selection_state_with_manual_models(
                 .map(ToString::to_string)
         })
         .collect::<Vec<_>>();
-    if subagent_policy == SubagentModelPolicy::LeafModels {
-        subagent_model_ids.extend(third_party_models.iter().cloned());
-    }
+    subagent_model_ids.extend(third_party_models.iter().cloned());
     let manual_model_keys = manual_third_party_models
         .iter()
         .map(|model| model.trim().to_lowercase())
@@ -302,43 +314,38 @@ pub fn selection_state_with_manual_models(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SubagentModelPolicy {
-    V2Only,
-    LeafModels,
-}
-
-fn subagent_model_policy(home: &Path) -> SubagentModelPolicy {
-    let client_version = read_catalog_value(&home.join("models_cache.json")).and_then(|value| {
-        value
-            .get("client_version")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .map(|version| version.trim_start_matches('v'))
-            .and_then(|version| Version::parse(version).ok())
-    });
+fn legacy_v2_catalog_compatibility_required(codex_runtime_version: Option<&str>) -> bool {
+    let client_version = codex_runtime_version
+        .map(str::trim)
+        .map(|version| version.trim_start_matches('v'))
+        .and_then(|version| Version::parse(version).ok());
     let leaf_minimum = Version::parse(LEAF_SUBAGENT_MIN_CLIENT_VERSION)
         .expect("leaf-subagent minimum is a valid semantic version");
-    if client_version.is_some_and(|version| version >= leaf_minimum) {
-        SubagentModelPolicy::LeafModels
-    } else {
-        SubagentModelPolicy::V2Only
+    client_version.is_none_or(|version| version < leaf_minimum)
+}
+
+fn apply_legacy_v2_catalog_compatibility(
+    models: &mut [Value],
+    codex_runtime_version: Option<&str>,
+) {
+    if !legacy_v2_catalog_compatibility_required(codex_runtime_version) {
+        return;
+    }
+    for model in models {
+        if model.get("visibility").and_then(Value::as_str) == Some("list")
+            && model_is_subagent_eligible(model)
+        {
+            model["multi_agent_version"] = json!("v2");
+        }
     }
 }
 
-fn model_supports_subagent_policy(model: &Value, policy: SubagentModelPolicy) -> bool {
+fn model_is_subagent_eligible(model: &Value) -> bool {
     let multi_agent_version = model
         .get("multi_agent_version")
         .and_then(Value::as_str)
         .map(str::trim);
-    match policy {
-        SubagentModelPolicy::V2Only => {
-            multi_agent_version.is_some_and(|version| version.eq_ignore_ascii_case("v2"))
-        }
-        SubagentModelPolicy::LeafModels => {
-            !multi_agent_version.is_some_and(|version| version.eq_ignore_ascii_case("disabled"))
-        }
-    }
+    !multi_agent_version.is_some_and(|version| version.eq_ignore_ascii_case("disabled"))
 }
 
 fn effective_default_model(
@@ -728,9 +735,10 @@ fn synthetic_model(template: &Value, model_id: &str, index: usize) -> Value {
         object.remove("availability_nux");
         object.remove("upgrade");
         object.remove("default_service_tier");
-        // A provider-defined model may be used as a leaf worker by newer
-        // runtimes, but it must not inherit the official template's ability to
-        // spawn further agents.
+        // Provider-defined models must not inherit the template model's
+        // capability marker. The runtime-version compatibility pass below
+        // decides whether this concrete catalog entry needs an explicit V2
+        // marker.
         object.remove("multi_agent_version");
     }
     model["service_tiers"] = json!([]);
@@ -964,7 +972,14 @@ mod tests {
         write_cache(home.path());
 
         assert_eq!(
-            refresh_for_provider(home.path(), true, None, &[]).unwrap(),
+            refresh_for_provider(
+                home.path(),
+                true,
+                None,
+                &[],
+                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+            )
+            .unwrap(),
             OFFICIAL_MODELS.len()
         );
         let catalog: Value = serde_json::from_slice(
@@ -1042,11 +1057,77 @@ mod tests {
     }
 
     #[test]
+    fn legacy_runtime_promotes_every_visible_non_disabled_official_model_to_v2() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+
+        refresh_for_provider(home.path(), true, None, &[], Some("0.147.0-alpha.1.2")).unwrap();
+
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        for model in catalog["models"].as_array().unwrap() {
+            if model["slug"] == "gpt-5.4" {
+                assert_eq!(model["multi_agent_version"], "disabled");
+            } else {
+                assert_eq!(
+                    model["multi_agent_version"], "v2",
+                    "{} was not promoted",
+                    model["slug"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_runtime_promotes_selected_third_party_models_to_v2() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let upstream = vec![
+            "gpt-5.6-luna".into(),
+            "gpt-5.4".into(),
+            "provider-custom-model".into(),
+        ];
+
+        refresh_for_provider(
+            home.path(),
+            false,
+            Some(&upstream),
+            &upstream,
+            Some("0.146.1"),
+        )
+        .unwrap();
+
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        for slug in ["gpt-5.6-luna", "provider-custom-model"] {
+            let model = models.iter().find(|model| model["slug"] == slug).unwrap();
+            assert_eq!(model["multi_agent_version"], "v2");
+        }
+        let disabled = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.4")
+            .unwrap();
+        assert_eq!(disabled["multi_agent_version"], "disabled");
+    }
+
+    #[test]
     fn generated_catalog_preserves_required_fields_from_the_local_native_cache() {
         let home = tempfile::tempdir().unwrap();
         write_cache_with_prompt_fields(home.path());
 
-        refresh_for_provider(home.path(), true, None, &[]).unwrap();
+        refresh_for_provider(
+            home.path(),
+            true,
+            None,
+            &[],
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+        )
+        .unwrap();
 
         let catalog: Value = serde_json::from_slice(
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
@@ -1076,7 +1157,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
 
-        refresh_for_provider(home.path(), true, None, &[]).unwrap();
+        refresh_for_provider(
+            home.path(),
+            true,
+            None,
+            &[],
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+        )
+        .unwrap();
 
         let mode = fs::metadata(home.path().join(MODEL_CATALOG_RELATIVE_PATH))
             .unwrap()
@@ -1091,7 +1179,14 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cache_without_fast_metadata(home.path());
 
-        refresh_for_provider(home.path(), true, None, &[]).unwrap();
+        refresh_for_provider(
+            home.path(),
+            true,
+            None,
+            &[],
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+        )
+        .unwrap();
 
         let catalog: Value = serde_json::from_slice(
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
@@ -1131,7 +1226,14 @@ mod tests {
         let selected = upstream.clone();
 
         assert_eq!(
-            refresh_for_provider(home.path(), false, Some(&upstream), &selected).unwrap(),
+            refresh_for_provider(
+                home.path(),
+                false,
+                Some(&upstream),
+                &selected,
+                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+            )
+            .unwrap(),
             4
         );
         let catalog: Value = serde_json::from_slice(
@@ -1208,7 +1310,14 @@ mod tests {
         let selected = vec!["provider-fast-coder".into()];
 
         assert_eq!(
-            refresh_for_provider(home.path(), false, None, &selected).unwrap(),
+            refresh_for_provider(
+                home.path(),
+                false,
+                None,
+                &selected,
+                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+            )
+            .unwrap(),
             OFFICIAL_MODELS.len() + 1
         );
         let catalog: Value = serde_json::from_slice(
@@ -1234,7 +1343,14 @@ mod tests {
     fn prompt_free_cold_start_falls_back_instead_of_writing_an_invalid_catalog() {
         let home = tempfile::tempdir().unwrap();
 
-        let error = refresh_for_provider(home.path(), true, None, &[]).unwrap_err();
+        let error = refresh_for_provider(
+            home.path(),
+            true,
+            None,
+            &[],
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("模型缓存缺少运行时必需字段"));
         assert!(is_runtime_model_cache_unavailable(&error));
@@ -1270,7 +1386,14 @@ mod tests {
         fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
         fs::write(&catalog_path, serde_json::to_vec(&stale_catalog).unwrap()).unwrap();
 
-        refresh_for_provider(home.path(), true, None, &[]).unwrap();
+        refresh_for_provider(
+            home.path(),
+            true,
+            None,
+            &[],
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+        )
+        .unwrap();
 
         let catalog: Value = serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
         for slug in ["gpt-5.4-mini", "gpt-5.3-codex-spark"] {
@@ -1290,7 +1413,14 @@ mod tests {
         write_cache(home.path());
         let upstream = Vec::<String>::new();
         assert_eq!(
-            refresh_for_provider(home.path(), false, Some(&upstream), &[]).unwrap(),
+            refresh_for_provider(
+                home.path(),
+                false,
+                Some(&upstream),
+                &[],
+                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+            )
+            .unwrap(),
             0
         );
         let catalog: Value = serde_json::from_slice(
@@ -1496,13 +1626,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_client_only_exposes_models_explicitly_marked_v2() {
+    fn selection_exposes_all_non_disabled_models_independently_of_cache_client_version() {
         let home = tempfile::tempdir().unwrap();
-        let mut cache = official_cache();
-        cache["client_version"] = json!("0.146.1");
         fs::write(
             home.path().join("models_cache.json"),
-            serde_json::to_vec(&cache).unwrap(),
+            serde_json::to_vec(&official_cache()).unwrap(),
         )
         .unwrap();
         let upstream = vec![
@@ -1521,8 +1649,60 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.subagent_model_ids, ["gpt-5.6-sol", "gpt-5.6-terra"]);
-        assert_eq!(state.available_subagent_model("gpt-5.6-luna"), None);
-        assert_eq!(state.available_subagent_model("third-model"), None);
+        assert_eq!(
+            state.subagent_model_ids,
+            [
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+                "third-model",
+            ]
+        );
+        assert_eq!(
+            state.available_subagent_model("gpt-5.6-luna"),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            state.available_subagent_model("third-model"),
+            Some("third-model")
+        );
+    }
+
+    #[test]
+    fn selection_ignores_a_stale_shared_cache_client_version() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cache = official_cache();
+        cache["client_version"] = json!("0.146.1");
+        fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+        let upstream = vec![
+            "gpt-5.6-sol".into(),
+            "gpt-5.6-luna".into(),
+            "third-model".into(),
+        ];
+
+        let state = selection_state(
+            home.path(),
+            false,
+            Some(&upstream),
+            &["third-model".into()],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.available_subagent_model("gpt-5.6-luna"),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            state.available_subagent_model("third-model"),
+            Some("third-model")
+        );
     }
 }
