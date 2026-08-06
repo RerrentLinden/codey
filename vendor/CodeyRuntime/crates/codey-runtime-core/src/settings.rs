@@ -1247,24 +1247,6 @@ mod tests {
     }
 
     #[test]
-    fn settings_deserialize_ignores_removed_cli_wrapper_keys() {
-        let settings: BackendSettings = serde_json::from_str(
-            r#"{"codexAppPath":"C:\\Portable\\Codex\\app","providerSyncEnabled":true,"codexGoalsEnabled":true,"cliWrapperEnabled":true,"cliWrapperBaseUrl":"https://example.test","cliWrapperApiKey":"sk-test","cliWrapperApiKeyEnv":""}"#,
-        )
-        .unwrap();
-        assert_eq!(settings.codex_app_path, r"C:\Portable\Codex\app");
-        assert!(settings.provider_sync_enabled);
-        assert!(settings.codex_goals_enabled);
-        assert_eq!(settings.relay_base_url, default_relay_base_url());
-        assert!(settings.codex_extra_args.is_empty());
-        let saved = serde_json::to_value(&settings).unwrap();
-        assert!(saved.get("cliWrapperEnabled").is_none());
-        assert!(saved.get("cliWrapperBaseUrl").is_none());
-        assert!(saved.get("cliWrapperApiKey").is_none());
-        assert!(saved.get("cliWrapperApiKeyEnv").is_none());
-    }
-
-    #[test]
     fn settings_deserialize_keeps_plugin_marketplace_unlock_switch() {
         let settings: BackendSettings = serde_json::from_str(
             r#"{

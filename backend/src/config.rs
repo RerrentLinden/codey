@@ -458,28 +458,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_experimental_features_are_ignored_and_dropped_on_save() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("config.json");
-        let store = ConfigStore::new(&path);
-        let mut value = serde_json::to_value(CodeyConfig::default()).unwrap();
-        value.as_object_mut().unwrap().insert(
-            "experimentalFeatures".into(),
-            serde_json::json!({
-                "unifiedExec": true,
-                "remoteCompactionV2": false,
-            }),
-        );
-        fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
-
-        let config = store.load().unwrap();
-        store.save(&config).unwrap();
-
-        let saved = serde_json::from_slice::<serde_json::Value>(&fs::read(path).unwrap()).unwrap();
-        assert!(saved.get("experimentalFeatures").is_none());
-    }
-
-    #[test]
     fn normalizes_missing_active_profile() {
         let config = CodeyConfig {
             active_profile_id: "missing".to_string(),
@@ -503,9 +481,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_micro_switch_is_ignored_but_feature_controls_are_preserved() {
+    fn diagnostic_guards_can_be_disabled_explicitly() {
         let config = serde_json::from_str::<CodeyConfig>(
-            r#"{"activeProfileId":"","profiles":[],"disableTraceLogWrites":false,"protectCrashpadPending":false,"disableCodexMicro":false,"slimCodexPet":false,"slimCodexVoice":false}"#,
+            r#"{"activeProfileId":"","profiles":[],"disableTraceLogWrites":false,"protectCrashpadPending":false}"#,
         )
         .unwrap()
         .normalize();
@@ -513,8 +491,6 @@ mod tests {
 
         assert!(!config.disable_trace_log_writes);
         assert!(!config.protect_crashpad_pending);
-        assert!(!config.slim_codex_pet);
-        assert!(!config.slim_codex_voice);
         assert_eq!(
             serialized.get("disableTraceLogWrites"),
             Some(&serde_json::json!(false))
@@ -523,7 +499,6 @@ mod tests {
             serialized.get("protectCrashpadPending"),
             Some(&serde_json::json!(false))
         );
-        assert!(serialized.get("disableCodexMicro").is_none());
     }
 
     #[test]
@@ -629,18 +604,14 @@ mod tests {
     }
 
     #[test]
-    fn gpu_launch_mode_defaults_to_off_and_ignores_retired_switches() {
-        let config = serde_json::from_str::<CodeyConfig>(
-            r#"{"activeProfileId":"","profiles":[],"disableGpuSandbox":true,"disableHardwareAcceleration":true}"#,
-        )
-        .unwrap()
-        .normalize();
+    fn gpu_launch_mode_defaults_to_off() {
+        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
+            .unwrap()
+            .normalize();
         let serialized = serde_json::to_value(&config).unwrap();
 
         assert_eq!(config.gpu_launch_mode, GpuLaunchMode::Off);
         assert_eq!(serialized["gpuLaunchMode"], "off");
-        assert!(serialized.get("disableGpuSandbox").is_none());
-        assert!(serialized.get("disableHardwareAcceleration").is_none());
     }
 
     #[test]

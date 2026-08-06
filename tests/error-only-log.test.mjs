@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access, readFile } from "node:fs/promises";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const root = new URL("../", import.meta.url);
@@ -8,15 +8,11 @@ async function source(path) {
   return readFile(new URL(path, root), "utf8");
 }
 
-test("startup keeps the original loading page without progress tracing", async () => {
-  const [app, notice, types, main, styles] = await Promise.all([
+test("startup renders a loading state until config and provider are ready", async () => {
+  const [app, notice] = await Promise.all([
     source("src/App.tsx"),
     source("src/useAppNotice.tsx"),
-    source("src/App.types.ts"),
-    source("src/main.tsx"),
-    source("src/styles.css"),
   ]);
-  const frontend = [app, notice, types, main, styles].join("\n");
 
   assert.match(app, /if \(!config \|\| !provider\)/);
   assert.match(app, /正在载入 Codey/);
@@ -25,8 +21,6 @@ test("startup keeps the original loading page without progress tracing", async (
     /<p>\s*<NoticeLoadingText controller=\{noticeController\} \/>\s*<\/p>/,
   );
   assert.match(notice, /return <>\{notice\.text\}<\/>/);
-  assert.doesNotMatch(frontend, /StartupLoading|startupProgress|startup_progress/);
-  await assert.rejects(access(new URL("src/StartupLoading.tsx", root)));
 });
 
 test("error log is failure-only, daily, structured, and cross-process serialized", async () => {

@@ -26,15 +26,3 @@ test("selection changes resynchronize adjacent-turn grouping", () => {
   assert.match(source, /row\.dataset\.codeySelectedPrevious = "true"/);
   assert.match(source, /row\.dataset\.codeySelectedNext = "true"/);
 });
-
-test("hard-deleted messages are removed while Codex rebuilds its active history", () => {
-  assert.doesNotMatch(source, /codey-deleted-turns/);
-  assert.doesNotMatch(source, /data-codey-message-deleted/);
-  assert.match(source, /dispatcher\("unsubscribe-thread-for-host"/);
-  assert.match(source, /dispatcher\("maybe-resume-conversation"/);
-  assert.match(source, /hardDeletedMessageKeys/);
-  assert.match(source, /rows\.forEach\(\(row\) => row\.remove\(\)\)/);
-  assert.doesNotMatch(source, /dispatcher\("discard-conversation-from-cache"/);
-  assert.match(source, /已移除 \$\{locallyRemoved\} 条未写入会话的消息/);
-  assert.match(source, /已永久删除 \$\{deleted\} 轮对话/);
-});

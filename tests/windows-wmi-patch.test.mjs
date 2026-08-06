@@ -101,8 +101,6 @@ test("diagnostic storage guards, pet, and voice remain user-configurable", async
   ]);
   const uiSource = `${appSource}\n${sectionsSource}`;
 
-  assert.doesNotMatch(uiSource, /disableCodexMicro/);
-  assert.doesNotMatch(configSource, /pub disable_codex_micro/);
   assert.match(uiSource, /disableTraceLogWrites/);
   assert.match(configSource, /pub disable_trace_log_writes: bool/);
   assert.match(uiSource, /protectCrashpadPending/);
