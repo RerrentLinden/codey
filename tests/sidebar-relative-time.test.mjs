@@ -269,7 +269,7 @@ test("hides thread time from Codex React loading and unread status state", () =>
   assert.equal(content.querySelector("[data-codey-thread-updated-at]")?.textContent, "6 分");
 });
 
-test("removes an existing thread time when a native status appears later", async () => {
+test("keeps an existing thread time when a native completion marker appears", async () => {
   const timestamp = Date.now() - 2 * 60_000;
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
@@ -301,10 +301,21 @@ test("removes an existing thread time when a native status appears later", async
 
   const completedStatus = new FakeElement();
   completedStatus.className = "rounded-full bg-blue-500";
+  completedStatus.setAttribute("aria-label", "Completed");
   nativeStatusRail.appendChild(completedStatus);
   window.__codeyInstallThreadUpdatedTimes(row);
 
+  assert.equal(content.querySelector("[data-codey-thread-updated-at]")?.textContent, "2 分");
+
+  const runningStatus = new FakeElement();
+  runningStatus.className = "animate-spin rounded-full";
+  nativeStatusRail.appendChild(runningStatus);
+  window.__codeyInstallThreadUpdatedTimes(row);
   assert.equal(content.querySelector("[data-codey-thread-updated-at]"), null);
+
+  runningStatus.remove();
+  window.__codeyInstallThreadUpdatedTimes(row);
+  assert.equal(content.querySelector("[data-codey-thread-updated-at]")?.textContent, "2 分");
 });
 
 test("does not treat trailing action icons as native thread status", () => {

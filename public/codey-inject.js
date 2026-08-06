@@ -772,15 +772,7 @@
       && child !== label
       && !child.hasAttribute?.(threadUpdatedAtAttribute)
     ));
-    for (const [index, candidate] of candidates.entries()) {
-      if (
-        index === 0
-        && [...(candidate.children || [])].some((child) => (
-          child instanceof HTMLElement
-          && child !== label
-          && !child.hasAttribute?.(threadUpdatedAtAttribute)
-        ))
-      ) return true;
+    for (const candidate of candidates) {
       if (nativeElementLooksLikeThreadStatus(candidate)) return true;
     }
     return false;
@@ -804,16 +796,18 @@
   const nativeElementLooksLikeThreadStatus = (element) => {
     if (!(element instanceof HTMLElement)) return false;
     if (element.matches?.("button, [role=button], [role=menuitem]")) return false;
-    if (String(element.textContent || "").trim()) return true;
     const statusText = [
+      element.textContent || "",
       element.getAttribute?.("aria-label") || "",
       element.getAttribute?.("role") || "",
       element.getAttribute?.("title") || "",
       element.title || "",
     ].join(" ");
-    if (/(running|completed|complete|done|status|运行|进行|完成|状态)/i.test(statusText)) return true;
+    // A completed marker can remain on the active row until another thread is
+    // selected. Only active work should temporarily displace the timestamp.
+    if (/(running|processing|working|loading|streaming|generating|in progress|运行中|进行中|处理中|加载中|生成中)/i.test(statusText)) return true;
     const className = String(element.className || "");
-    if (/\b(?:animate-|rounded-full|bg-blue|text-blue|circle|spinner)\b/i.test(className)) return true;
+    if (/\b(?:animate-|spinner)\b/i.test(className)) return true;
     return [...(element.children || [])].some((child) => nativeElementLooksLikeThreadStatus(child));
   };
 
