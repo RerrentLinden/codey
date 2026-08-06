@@ -59,7 +59,8 @@ pub async fn run() -> Result<()> {
     error_log::initialize();
     let state = Arc::new(AppState::default());
     let restore_started_at = std::time::Instant::now();
-    if let Err(error) = launcher::restore_previous_runtime_state(&codex_config::codex_home()) {
+    if let Err(error) = launcher::restore_previous_runtime_state(&codex_config::codex_home()).await
+    {
         error_log::record_failure_with_metadata(
             "restore_failed",
             "restore_previous_runtime_state_at_startup",

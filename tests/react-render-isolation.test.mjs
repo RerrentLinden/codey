@@ -118,3 +118,31 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   assert.match(channelRegistry, /feishu:\s*\{/);
   assert.match(channelRegistry, /telegram:\s*\{/);
 });
+
+test("runtime polling preserves stable slices and narrows panel props", async () => {
+  const [app, runtimeHook, runtimeSnapshot, updateCard, featureCard, operations] =
+    await Promise.all([
+      readFile(new URL("src/App.tsx", root), "utf8"),
+      readFile(new URL("src/useRuntimeStatus.ts", root), "utf8"),
+      readFile(new URL("src/runtimeStatusSnapshot.ts", root), "utf8"),
+      readFile(new URL("src/AppUpdateCard.tsx", root), "utf8"),
+      readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
+      readFile(new URL("src/OperationsPanel.tsx", root), "utf8"),
+    ]);
+
+  assert.match(runtimeHook, /reconcileRuntimeStatus/);
+  assert.equal(
+    runtimeHook.match(/reconcileRuntimeStatus\(current, next\)/g)?.length,
+    4,
+  );
+  assert.match(runtimeSnapshot, /if \(valuesEqual\(current, next\)\) return current/);
+  assert.match(runtimeSnapshot, /current\.traceLogStats/);
+  assert.match(runtimeSnapshot, /current\.injectionScripts/);
+  assert.match(app, /const operationsStatus = useMemo\(/);
+  assert.match(app, /status=\{operationsStatus\}/);
+  assert.match(app, /appVersion=\{status\.appVersion\}/);
+  assert.match(app, /isMacClient=\{status\.clientPlatform === "macos"\}/);
+  assert.doesNotMatch(updateCard, /RuntimeStatus/);
+  assert.doesNotMatch(featureCard, /RuntimeStatus/);
+  assert.match(operations, /type OperationsRuntimeStatus = Pick</);
+});

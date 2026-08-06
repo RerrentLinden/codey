@@ -2,6 +2,7 @@
   if (
     window.__codeyBridgeHelpersInstalled
     && window.__codeyMutationDispatcher?.createShieldLifecycle
+    && window.__codeyMutationDispatcher?.controlDescriptor
     && window.__codeyMutationDispatcher?.controlsWithin
   ) return;
   window.__codeyBridgeHelpersInstalled = true;
@@ -87,6 +88,12 @@
     }
     return controls;
   };
+
+  const controlDescriptor = (control) => [
+    control?.getAttribute?.("aria-label"),
+    control?.getAttribute?.("title"),
+    control?.textContent,
+  ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
 
   const createShieldLifecycle = ({
     attributeFilter,
@@ -214,6 +221,7 @@
   };
 
   window.__codeyMutationDispatcher = Object.freeze({
+    controlDescriptor,
     controlsWithin,
     createShieldLifecycle,
     snapshot: () => Object.freeze({

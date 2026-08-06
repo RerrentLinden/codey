@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import { invoke } from "./api";
 import type { RuntimeStatus } from "./App.types";
+import { reconcileRuntimeStatus } from "./runtimeStatusSnapshot";
 
 const INJECTION_STATUS_CHANGED_EVENT = "codey-injection-status-changed";
 export const SETTINGS_OPENED_EVENT = "codey-settings-opened";
@@ -27,7 +28,7 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
 
   const refreshStatus = useCallback(async () => {
     const next = await requestRuntimeStatus(false);
-    setStatus(next);
+    setStatus((current) => reconcileRuntimeStatus(current, next));
     return next;
   }, [requestRuntimeStatus]);
 
@@ -37,7 +38,7 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
     }
     const refresh = requestRuntimeStatus(true)
       .then((next) => {
-        setStatus(next);
+        setStatus((current) => reconcileRuntimeStatus(current, next));
         return next;
       })
       .finally(() => {
@@ -101,7 +102,7 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
         try {
           const next = await invoke<RuntimeStatus>("runtime_status");
           if (cancelled) return;
-          setStatus(next);
+          setStatus((current) => reconcileRuntimeStatus(current, next));
           if (
             next.traceLogStats?.pending ||
             next.crashpadPendingStats?.pending
@@ -130,7 +131,7 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
         try {
           const next = await invoke<RuntimeStatus>("runtime_status");
           if (cancelled) return;
-          setStatus(next);
+          setStatus((current) => reconcileRuntimeStatus(current, next));
           if (next.restartInProgress) poll();
         } catch {
           if (!cancelled) poll();

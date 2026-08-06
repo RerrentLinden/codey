@@ -6,11 +6,11 @@ import {
   IconRefresh as RefreshCw,
 } from "@tabler/icons-react";
 
-import type { InlineResult, RuntimeStatus, UpdateCheck, UpdateDownload } from "./App.types";
+import type { InlineResult, UpdateCheck, UpdateDownload } from "./App.types";
 import { Badge, Button, Card } from "./components/semi";
 
 type AppUpdateCardProps = {
-  status: RuntimeStatus;
+  appVersion?: string;
   updateResult: InlineResult;
   updateCheck: UpdateCheck | null;
   downloadedUpdate: UpdateDownload | null;
@@ -22,7 +22,7 @@ type AppUpdateCardProps = {
 };
 
 function AppUpdateCardComponent({
-  status,
+  appVersion,
   updateResult,
   updateCheck,
   downloadedUpdate,
@@ -61,7 +61,7 @@ function AppUpdateCardComponent({
               <strong>应用更新</strong>
               <small>
                 当前版本{" "}
-                {status.appVersion ? `v${status.appVersion}` : "读取中"}
+                {appVersion ? `v${appVersion}` : "读取中"}
               </small>
             </div>
           </div>

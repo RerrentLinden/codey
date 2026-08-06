@@ -31,9 +31,22 @@ const EMPTY_INJECTION_SCRIPTS: NonNullable<
   RuntimeStatus["injectionScripts"]
 > = [];
 
+type OperationsRuntimeStatus = Pick<
+  RuntimeStatus,
+  | "running"
+  | "codexAppVersion"
+  | "clientPlatform"
+  | "restartRequired"
+  | "restartInProgress"
+  | "startupError"
+  | "codexAppPath"
+  | "maintenance"
+  | "injectionScripts"
+>;
+
 type OperationsPanelProps = {
   config: Config;
-  status: RuntimeStatus;
+  status: OperationsRuntimeStatus;
   busy: string | null;
   isBusy: boolean;
   pluginMarketplaceStatus: PluginMarketplaceStatus | null;

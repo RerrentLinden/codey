@@ -201,7 +201,7 @@ struct WebhookTurnTracker {
 
 type RecentSessionScanResult = (
     pending_approval::RecentSessionEventCache,
-    RecentSessionEvents,
+    Arc<RecentSessionEvents>,
 );
 pub(super) type RecentSessionScanTask = tokio::task::JoinHandle<RecentSessionScanResult>;
 
@@ -690,7 +690,7 @@ pub(super) async fn await_recent_session_scan(
             eprintln!("Codey 会话状态扫描任务异常退出：{error}");
             (
                 pending_approval::RecentSessionEventCache::default(),
-                RecentSessionEvents::default(),
+                Arc::new(RecentSessionEvents::default()),
             )
         }
     }
@@ -1676,7 +1676,7 @@ mod tests {
             let _ = release_scan_rx.await;
             (
                 pending_approval::RecentSessionEventCache::default(),
-                RecentSessionEvents::default(),
+                Arc::new(RecentSessionEvents::default()),
             )
         });
 

@@ -194,11 +194,7 @@
   // no cheap identity token covers what the verdict actually depends on.
   const isVoiceControl = (control) => {
     if (!(control instanceof HTMLElement)) return false;
-    const descriptor = [
-      control.getAttribute("aria-label"),
-      control.getAttribute("title"),
-      control.textContent,
-    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+    const descriptor = window.__codeyMutationDispatcher.controlDescriptor(control);
     if (preservedComposerActionPattern.test(descriptor)) return false;
     if (fallbackLabelPattern.test(descriptor)) return true;
 

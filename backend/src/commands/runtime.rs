@@ -178,6 +178,7 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     ensure_windows_codex_app_path(state).await?;
     stop_waiting_webhook_watcher(state).await;
     restore_previous_runtime_state(&codex_home())
+        .await
         .map_err(|error| format!("恢复上次 Codey 临时 Codex 配置失败：{error}"))?;
     super::sync_cc_switch_state(state)
         .await
@@ -355,7 +356,9 @@ async fn stop_codey_runtime_locked(state: &Arc<AppState>) -> Result<Value, Strin
             return Err(error.to_string());
         }
     } else {
-        restore_runtime_config(&codex_home()).map_err(|error| error.to_string())?;
+        restore_runtime_config(&codex_home())
+            .await
+            .map_err(|error| error.to_string())?;
     }
     *state.startup_error.write().await = None;
     Ok(json!({"status":"stopped"}))

@@ -114,3 +114,18 @@ test("shared control lookup includes a matching root and its descendants", () =>
   assert.equal(controls[0], root);
   assert.equal(controls[1], child);
 });
+
+test("shared control descriptor normalizes accessible labels and text", () => {
+  const runtime = createRuntime();
+  const control = {
+    getAttribute(name) {
+      return name === "aria-label" ? "  Voice " : name === "title" ? "Start" : null;
+    },
+    textContent: " now\nplease ",
+  };
+
+  assert.equal(
+    runtime.window.__codeyMutationDispatcher.controlDescriptor(control),
+    "Voice Start now please",
+  );
+});

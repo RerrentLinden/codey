@@ -66,7 +66,7 @@ test("three-position GPU slider is accessible and disabled on macOS", async () =
     readFile(new URL("src/main.tsx", root), "utf8"),
   ]);
 
-  assert.match(sectionsSource, /const isMacClient = status\.clientPlatform === "macos"/);
+  assert.match(sectionsSource, /isMacClient: boolean/);
   assert.match(sectionsSource, /\{ value: "off", label: "关闭" \}/);
   assert.match(sectionsSource, /\{ value: "disableGpu", label: "禁用 GPU" \}/);
   assert.match(
@@ -83,7 +83,10 @@ test("three-position GPU slider is accessible and disabled on macOS", async () =
   assert.match(stylesSource, /\.gpu-mode-slider-thumb/);
   assert.match(stylesSource, /transform: translateX\(var\(--gpu-mode-offset\)\)/);
   assert.match(stylesSource, /@media \(prefers-reduced-motion: reduce\)/);
-  assert.match(appSource, /<FeaturePolicyCard[\s\S]{0,200}status=\{status\}/);
+  assert.match(
+    appSource,
+    /<FeaturePolicyCard[\s\S]{0,200}isMacClient=\{status\.clientPlatform === "macos"\}/,
+  );
   assert.match(
     launcherSource,
     /gpu_launch_arguments\(GpuLaunchMode::DisableGpu, false\)\.is_empty\(\)/,

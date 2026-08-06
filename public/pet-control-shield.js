@@ -46,11 +46,7 @@
 
   const isPetControl = (control) => {
     if (!(control instanceof HTMLElement)) return false;
-    const descriptor = [
-      control.getAttribute("aria-label"),
-      control.getAttribute("title"),
-      control.textContent,
-    ].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+    const descriptor = window.__codeyMutationDispatcher.controlDescriptor(control);
     if (fallbackLabelPattern.test(descriptor)) return true;
 
     // Deliberately not memoised. React reuses host elements and swaps both

@@ -385,31 +385,27 @@ struct CodexStartupStateOptions<'a> {
     expected_config: Option<&'a [u8]>,
 }
 
-async fn prepare_codex_startup_state(
+async fn prepare_startup_model_catalog(
     config: &CodeyConfig,
     current_profile: &ProviderProfile,
     app_dir: &std::path::Path,
     home: &std::path::Path,
-    options: CodexStartupStateOptions<'_>,
-) -> Result<Vec<u8>> {
-    let CodexStartupStateOptions {
-        original_provider,
-        preserve_provider_route,
-        protocol_proxy_base_url,
-        expected_config,
-    } = options;
-    let catalog_task = if preserve_provider_route {
-        None
-    } else {
-        let catalog_home = home.to_path_buf();
-        let official_provider = current_profile.cc_switch_read_only;
-        let upstream_models = config.upstream_models_snapshot().map(<[String]>::to_vec);
-        let selected_models = config.selected_models().to_vec();
-        let manual_models = config.manual_third_party_models().to_vec();
-        let requested_default_model = config.default_model().map(str::to_owned);
-        let app_dir = app_dir.to_path_buf();
-        let configured_app_path = config.codex_app_path.clone();
-        Some(tokio::task::spawn_blocking(move || {
+    preserve_provider_route: bool,
+) -> Result<(bool, String)> {
+    if preserve_provider_route {
+        return Ok((false, String::new()));
+    }
+
+    let catalog_home = home.to_path_buf();
+    let official_provider = current_profile.cc_switch_read_only;
+    let upstream_models = config.upstream_models_snapshot().map(<[String]>::to_vec);
+    let selected_models = config.selected_models().to_vec();
+    let manual_models = config.manual_third_party_models().to_vec();
+    let requested_default_model = config.default_model().map(str::to_owned);
+    let app_dir = app_dir.to_path_buf();
+    let configured_app_path = config.codex_app_path.clone();
+    let (refresh_result, catalog_available, selection_result) =
+        tokio::task::spawn_blocking(move || {
             let codex_runtime_version =
                 model_catalog::desktop_runtime_version(Some(&app_dir), &configured_app_path);
             let refresh = model_catalog::refresh_for_provider(
@@ -429,86 +425,98 @@ async fn prepare_codex_startup_state(
                 requested_default_model.as_deref(),
             );
             (refresh, catalog_available, selection)
-        }))
+        })
+        .await
+        .map_err(|error| {
+            let error = anyhow::Error::new(error).context("准备模型目录任务异常退出");
+            error_log::record_failure(
+                "patch_failed",
+                "prepare_model_catalog",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "officialProvider": official_provider,
+                    "taskJoinFailed": true,
+                }),
+            );
+            error
+        })?;
+
+    let use_official_catalog = match refresh_result {
+        Ok(_) => true,
+        Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => {
+            if catalog_available {
+                eprintln!("本机官方模型缓存暂不含自定义目录必需字段，沿用上一份合法镜像");
+            } else {
+                eprintln!("本机官方模型缓存暂不含自定义目录必需字段，使用 Codex 内置模型目录");
+            }
+            catalog_available
+        }
+        Err(error) if catalog_available => {
+            error_log::record_failure(
+                "patch_failed",
+                "refresh_model_catalog",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "fallback": "last_valid_catalog",
+                    "officialProvider": official_provider,
+                }),
+            );
+            eprintln!("刷新官方账号模型目录失败，沿用上一份合法镜像：{error:#}");
+            true
+        }
+        Err(error) => {
+            error_log::record_failure(
+                "patch_failed",
+                "refresh_model_catalog",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "fallback": "codex_builtin_catalog",
+                    "officialProvider": official_provider,
+                }),
+            );
+            eprintln!("刷新官方账号模型目录失败，临时使用 Codex 内置目录：{error:#}");
+            false
+        }
     };
-    let catalog_result = if let Some(catalog_task) = catalog_task {
-        Some(catalog_task.await)
-    } else {
-        None
+    let default_model = match selection_result {
+        Ok(state) => state.default_model,
+        Err(error) => {
+            error_log::record_failure(
+                "patch_failed",
+                "read_model_catalog_selection",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "fallback": "empty_default_model",
+                    "officialProvider": official_provider,
+                }),
+            );
+            String::new()
+        }
     };
-    let (use_official_catalog, default_model) = if preserve_provider_route {
-        (false, String::new())
-    } else {
-        let official_provider = current_profile.cc_switch_read_only;
-        let (refresh_result, catalog_available, selection_result) = catalog_result
-            .expect("catalog task exists for managed provider routes")
-            .map_err(|error| {
-                let error = anyhow::Error::new(error).context("准备模型目录任务异常退出");
-                error_log::record_failure(
-                    "patch_failed",
-                    "prepare_model_catalog",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "officialProvider": official_provider,
-                        "taskJoinFailed": true,
-                    }),
-                );
-                error
-            })?;
-        let use_official_catalog = match refresh_result {
-            Ok(_) => true,
-            Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => {
-                if catalog_available {
-                    eprintln!("本机官方模型缓存暂不含自定义目录必需字段，沿用上一份合法镜像");
-                } else {
-                    eprintln!("本机官方模型缓存暂不含自定义目录必需字段，使用 Codex 内置模型目录");
-                }
-                catalog_available
-            }
-            Err(error) if catalog_available => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "refresh_model_catalog",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "fallback": "last_valid_catalog",
-                        "officialProvider": official_provider,
-                    }),
-                );
-                eprintln!("刷新官方账号模型目录失败，沿用上一份合法镜像：{error:#}");
-                true
-            }
-            Err(error) => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "refresh_model_catalog",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "fallback": "codex_builtin_catalog",
-                        "officialProvider": official_provider,
-                    }),
-                );
-                eprintln!("刷新官方账号模型目录失败，临时使用 Codex 内置目录：{error:#}");
-                false
-            }
-        };
-        let default_model = match selection_result {
-            Ok(state) => state.default_model,
-            Err(error) => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "read_model_catalog_selection",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "fallback": "empty_default_model",
-                        "officialProvider": official_provider,
-                    }),
-                );
-                String::new()
-            }
-        };
-        (use_official_catalog, default_model)
-    };
+    Ok((use_official_catalog, default_model))
+}
+
+async fn prepare_codex_startup_state(
+    config: &CodeyConfig,
+    current_profile: &ProviderProfile,
+    app_dir: &std::path::Path,
+    home: &std::path::Path,
+    options: CodexStartupStateOptions<'_>,
+) -> Result<Vec<u8>> {
+    let CodexStartupStateOptions {
+        original_provider,
+        preserve_provider_route,
+        protocol_proxy_base_url,
+        expected_config,
+    } = options;
+    let (use_official_catalog, default_model) = prepare_startup_model_catalog(
+        config,
+        current_profile,
+        app_dir,
+        home,
+        preserve_provider_route,
+    )
+    .await?;
     let runtime_config_home = home.to_path_buf();
     let runtime_config_profile = current_profile.clone();
     let runtime_config_provider = original_provider.to_string();
@@ -574,6 +582,154 @@ async fn prepare_codex_startup_state(
         error
     })?;
     Ok(applied.config_contents)
+}
+
+async fn await_initial_storage_guards(
+    initial_trace_guard: tokio::task::JoinHandle<Result<trace_log_guard::TraceLogGuardReport>>,
+    disable_trace_log_writes: bool,
+    initial_crashpad_guard: tokio::task::JoinHandle<crashpad_pending_guard::CrashpadGuardRun>,
+    protect_crashpad_pending: bool,
+    crashpad_pending_stats: &CrashpadPendingStatsHandle,
+) -> Result<()> {
+    match initial_trace_guard.await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            error_log::record_failure(
+                "patch_failed",
+                "configure_trace_log_guard",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "disabled": disable_trace_log_writes,
+                }),
+            );
+            return Err(error);
+        }
+        Err(error) => {
+            let error = anyhow::Error::new(error).context("Trace 日志保护切换任务异常退出");
+            error_log::record_failure(
+                "patch_failed",
+                "configure_trace_log_guard",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "disabled": disable_trace_log_writes,
+                }),
+            );
+            return Err(error);
+        }
+    }
+
+    match initial_crashpad_guard.await {
+        Ok(run) => {
+            if !run.cleanup.errors.is_empty() || run.cleanup.still_over_limit {
+                error_log::record_failure(
+                    "cleanup_failed",
+                    "enforce_crashpad_pending_limit_at_startup",
+                    if run.cleanup.still_over_limit {
+                        "Crashpad pending 仍超过安全上限".to_string()
+                    } else {
+                        format!(
+                            "{} 个 Crashpad 待处理文件未能完成收敛",
+                            run.cleanup.errors.len()
+                        )
+                    },
+                    serde_json::json!({
+                        "errorCount": run.cleanup.errors.len(),
+                        "stillOverLimit": run.cleanup.still_over_limit,
+                        "bytesReclaimed": run.cleanup.bytes_reclaimed,
+                    }),
+                );
+            }
+            crashpad_pending_stats.replace(run.snapshot);
+        }
+        Err(error) => {
+            let error = format!("Crashpad 磁盘保护任务异常退出：{error}");
+            error_log::record_failure(
+                "cleanup_failed",
+                "enforce_crashpad_pending_limit_at_startup",
+                error.clone(),
+                serde_json::json!({
+                    "taskJoinFailed": true,
+                }),
+            );
+            let mut snapshot = crashpad_pending_guard::CrashpadPendingStatsSnapshot::idle(
+                protect_crashpad_pending,
+            );
+            snapshot.errors.push(error);
+            crashpad_pending_stats.replace(snapshot);
+        }
+    }
+    Ok(())
+}
+
+type PetSlimTaskResult =
+    std::result::Result<Result<pet_slim_patch::PetSlimReport>, tokio::task::JoinError>;
+
+async fn read_startup_patch_status(
+    home: &std::path::Path,
+    slim_codex_pet: bool,
+) -> (String, String, PetSlimTaskResult) {
+    let marketplace_home = home.to_path_buf();
+    let marketplace_task = tokio::task::spawn_blocking(move || {
+        plugin_marketplace::marketplaces_status(&marketplace_home)
+    });
+    let pet_home = home.to_path_buf();
+    let pet_task =
+        tokio::task::spawn_blocking(move || pet_slim_patch::configure(&pet_home, slim_codex_pet));
+    let (marketplace_result, pet_result) = tokio::join!(marketplace_task, pet_task);
+    let (plugin_status, plugin_detail) = match marketplace_result {
+        Ok(status)
+            if !status
+                .get("needsRepair")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true) =>
+        {
+            (
+                "ready".to_string(),
+                "插件市场状态正常；启动时未执行修复".to_string(),
+            )
+        }
+        Ok(_) => (
+            "needs_repair".to_string(),
+            "插件市场需要修复；可在 Codey 配置页手动处理".to_string(),
+        ),
+        Err(error) => {
+            error_log::record_failure(
+                "patch_status_failed",
+                "read_plugin_marketplace_status",
+                error.to_string(),
+                serde_json::json!({}),
+            );
+            (
+                "error".to_string(),
+                format!("插件市场状态任务异常退出：{error}"),
+            )
+        }
+    };
+    (plugin_status, plugin_detail, pet_result)
+}
+
+async fn stop_runtime_watcher(
+    shutdown: &Mutex<Option<oneshot::Sender<()>>>,
+    task: &Mutex<Option<tokio::task::JoinHandle<()>>>,
+    failure_event: &'static str,
+    failure_operation: &'static str,
+    failure_message: &'static str,
+) {
+    if let Some(sender) = shutdown.lock().await.take() {
+        let _ = sender.send(());
+    }
+    let task = task.lock().await.take();
+    if let Some(task) = task
+        && let Err(error) = task.await
+    {
+        error_log::record_failure(
+            failure_event,
+            failure_operation,
+            error.to_string(),
+            serde_json::json!({}),
+        );
+        eprintln!("{failure_message}：{error}");
+    }
 }
 
 impl CodeyRuntime {
@@ -733,72 +889,14 @@ impl CodeyRuntime {
         // fall back to the complete rollout and SQLite repair.
         let session_maintenance =
             run_startup_session_maintenance(&home, &original_provider).await?;
-        match initial_trace_guard.await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "configure_trace_log_guard",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "disabled": disable_trace_log_writes,
-                    }),
-                );
-                return Err(error);
-            }
-            Err(error) => {
-                let error = anyhow::Error::new(error).context("Trace 日志保护切换任务异常退出");
-                error_log::record_failure(
-                    "patch_failed",
-                    "configure_trace_log_guard",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "disabled": disable_trace_log_writes,
-                    }),
-                );
-                return Err(error);
-            }
-        }
-        match initial_crashpad_guard.await {
-            Ok(run) => {
-                if !run.cleanup.errors.is_empty() || run.cleanup.still_over_limit {
-                    error_log::record_failure(
-                        "cleanup_failed",
-                        "enforce_crashpad_pending_limit_at_startup",
-                        if run.cleanup.still_over_limit {
-                            "Crashpad pending 仍超过安全上限".to_string()
-                        } else {
-                            format!(
-                                "{} 个 Crashpad 待处理文件未能完成收敛",
-                                run.cleanup.errors.len()
-                            )
-                        },
-                        serde_json::json!({
-                            "errorCount": run.cleanup.errors.len(),
-                            "stillOverLimit": run.cleanup.still_over_limit,
-                            "bytesReclaimed": run.cleanup.bytes_reclaimed,
-                        }),
-                    );
-                }
-                crashpad_pending_stats.replace(run.snapshot);
-            }
-            Err(error) => {
-                let error = format!("Crashpad 磁盘保护任务异常退出：{error}");
-                error_log::record_failure(
-                    "cleanup_failed",
-                    "enforce_crashpad_pending_limit_at_startup",
-                    error.clone(),
-                    serde_json::json!({
-                        "taskJoinFailed": true,
-                    }),
-                );
-                let mut snapshot = crashpad_pending_guard::CrashpadPendingStatsSnapshot::idle(
-                    protect_crashpad_pending,
-                );
-                snapshot.errors.push(error);
-                crashpad_pending_stats.replace(snapshot);
-            }
-        }
+        await_initial_storage_guards(
+            initial_trace_guard,
+            disable_trace_log_writes,
+            initial_crashpad_guard,
+            protect_crashpad_pending,
+            &crashpad_pending_stats,
+        )
+        .await?;
 
         let protocol_proxy = start_runtime_protocol_proxy(&current_profile, config.default_model())
             .await
@@ -843,45 +941,9 @@ impl CodeyRuntime {
                 (None, None, None)
             };
 
-        let marketplace_home = home.clone();
-        let marketplace_task = tokio::task::spawn_blocking(move || {
-            plugin_marketplace::marketplaces_status(&marketplace_home)
-        });
-        let pet_home = home.clone();
         let slim_codex_pet = config.slim_codex_pet;
-        let pet_task = tokio::task::spawn_blocking(move || {
-            pet_slim_patch::configure(&pet_home, slim_codex_pet)
-        });
-        let (marketplace_result, pet_result) = tokio::join!(marketplace_task, pet_task);
-        let (plugin_status, plugin_detail) = match marketplace_result {
-            Ok(status)
-                if !status
-                    .get("needsRepair")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true) =>
-            {
-                (
-                    "ready".to_string(),
-                    "插件市场状态正常；启动时未执行修复".to_string(),
-                )
-            }
-            Ok(_) => (
-                "needs_repair".to_string(),
-                "插件市场需要修复；可在 Codey 配置页手动处理".to_string(),
-            ),
-            Err(error) => {
-                error_log::record_failure(
-                    "patch_status_failed",
-                    "read_plugin_marketplace_status",
-                    error.to_string(),
-                    serde_json::json!({}),
-                );
-                (
-                    "error".to_string(),
-                    format!("插件市场状态任务异常退出：{error}"),
-                )
-            }
-        };
+        let (plugin_status, plugin_detail, pet_result) =
+            read_startup_patch_status(&home, slim_codex_pet).await;
         let debug_port = codey_runtime_core::ports::select_packaged_codex_debug_port(9229);
         if let Some(applied_route_files) = applied_route_files.as_ref() {
             let current_route_files = read_route_files(&home)
@@ -891,7 +953,8 @@ impl CodeyRuntime {
                 return Err(restore_runtime_config_after_error(
                     &home,
                     anyhow::anyhow!("CC Switch Live 路由在 Codex 启动前发生变化；已取消旧线路启动"),
-                ));
+                )
+                .await);
             }
         }
         match pet_result {
@@ -908,7 +971,8 @@ impl CodeyRuntime {
                 return Err(restore_runtime_config_after_error(
                     &home,
                     error.context("应用 Codex 宠物精简设置失败"),
-                ));
+                )
+                .await);
             }
             Err(error) => {
                 error_log::record_failure(
@@ -923,7 +987,8 @@ impl CodeyRuntime {
                 return Err(restore_runtime_config_after_error(
                     &home,
                     anyhow::Error::new(error).context("Codex 宠物精简设置任务异常退出"),
-                ));
+                )
+                .await);
             }
         };
         let spawned = match spawn_codex(
@@ -938,7 +1003,7 @@ impl CodeyRuntime {
         {
             Ok(spawned) => spawned,
             Err(error) => {
-                return Err(restore_runtime_config_after_error(&home, error));
+                return Err(restore_runtime_config_after_error(&home, error).await);
             }
         };
         let maintenance = MaintenanceStatus {
@@ -1042,7 +1107,7 @@ impl CodeyRuntime {
                     if let Some(child) = child.lock().await.take() {
                         reap_child_after_cleanup(child, "reap_child_after_injection_failure").await;
                     }
-                    return Err(restore_runtime_config_after_error(&home, error));
+                    return Err(restore_runtime_config_after_error(&home, error).await);
                 }
             };
 
@@ -1177,66 +1242,38 @@ impl CodeyRuntime {
     }
 
     pub async fn stop(&self) -> Result<()> {
-        if let Some(sender) = self.crashpad_guard_shutdown.lock().await.take() {
-            let _ = sender.send(());
-        }
-        let crashpad_guard_task = self.crashpad_guard_task.lock().await.take();
-        if let Some(task) = crashpad_guard_task
-            && let Err(error) = task.await
-        {
-            error_log::record_failure(
-                "cleanup_failed",
-                "stop_crashpad_pending_guard",
-                error.to_string(),
-                serde_json::json!({}),
-            );
-            eprintln!("Crashpad 磁盘保护任务关闭失败：{error}");
-        }
-        if let Some(sender) = self.route_overlay_shutdown.lock().await.take() {
-            let _ = sender.send(());
-        }
-        let route_overlay_task = self.route_overlay_task.lock().await.take();
-        if let Some(task) = route_overlay_task
-            && let Err(error) = task.await
-        {
-            error_log::record_failure(
-                "route_overlay_watch_failed",
-                "stop_cc_switch_route_overlay_watcher",
-                error.to_string(),
-                serde_json::json!({}),
-            );
-            eprintln!("CC Switch 路由配置监听器关闭失败：{error}");
-        }
-        if let Some(sender) = self.watchdog_shutdown.lock().await.take() {
-            let _ = sender.send(());
-        }
-        let watchdog_task = self.watchdog_task.lock().await.take();
-        if let Some(task) = watchdog_task
-            && let Err(error) = task.await
-        {
-            error_log::record_failure(
-                "injection_watchdog_failed",
-                "stop_cdp_watchdog",
-                error.to_string(),
-                serde_json::json!({}),
-            );
-            eprintln!("Codey CDP watchdog 关闭失败：{error}");
-        }
-        if let Some(sender) = self.exit_watchdog_shutdown.lock().await.take() {
-            let _ = sender.send(());
-        }
-        let exit_watchdog_task = self.exit_watchdog_task.lock().await.take();
-        if let Some(task) = exit_watchdog_task
-            && let Err(error) = task.await
-        {
-            error_log::record_failure(
-                "process_watch_failed",
-                "stop_codex_exit_watcher",
-                error.to_string(),
-                serde_json::json!({}),
-            );
-            eprintln!("Codex 退出监听器关闭失败：{error}");
-        }
+        stop_runtime_watcher(
+            &self.crashpad_guard_shutdown,
+            &self.crashpad_guard_task,
+            "cleanup_failed",
+            "stop_crashpad_pending_guard",
+            "Crashpad 磁盘保护任务关闭失败",
+        )
+        .await;
+        stop_runtime_watcher(
+            &self.route_overlay_shutdown,
+            &self.route_overlay_task,
+            "route_overlay_watch_failed",
+            "stop_cc_switch_route_overlay_watcher",
+            "CC Switch 路由配置监听器关闭失败",
+        )
+        .await;
+        stop_runtime_watcher(
+            &self.watchdog_shutdown,
+            &self.watchdog_task,
+            "injection_watchdog_failed",
+            "stop_cdp_watchdog",
+            "Codey CDP watchdog 关闭失败",
+        )
+        .await;
+        stop_runtime_watcher(
+            &self.exit_watchdog_shutdown,
+            &self.exit_watchdog_task,
+            "process_watch_failed",
+            "stop_codex_exit_watcher",
+            "Codex 退出监听器关闭失败",
+        )
+        .await;
         #[cfg(target_os = "macos")]
         let process_stop = if let Some(inspector_argument) = self.inspector_argument.as_deref() {
             stop_macos_codex(
@@ -1279,7 +1316,7 @@ impl CodeyRuntime {
         } else {
             Ok(())
         };
-        let config_restore = restore_runtime_config(&codex_home());
+        let config_restore = restore_runtime_config(&codex_home()).await;
         if let Err(error) = &process_stop {
             error_log::record_failure(
                 "cleanup_failed",
@@ -1662,7 +1699,14 @@ mod maintenance_status_tests {
     }
 }
 
-pub fn restore_previous_runtime_state(home: &std::path::Path) -> Result<()> {
+pub async fn restore_previous_runtime_state(home: &std::path::Path) -> Result<()> {
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || restore_previous_runtime_state_blocking(&home))
+        .await
+        .context("恢复上次 Codey 运行状态任务异常退出")?
+}
+
+fn restore_previous_runtime_state_blocking(home: &std::path::Path) -> Result<()> {
     let provider_result = provider_lease::restore_legacy();
     let config_result = restore_runtime_provider_config(home);
     if let Err(error) = &provider_result {
@@ -1693,7 +1737,14 @@ pub fn restore_previous_runtime_state(home: &std::path::Path) -> Result<()> {
     }
 }
 
-pub fn restore_runtime_config(home: &std::path::Path) -> Result<()> {
+pub async fn restore_runtime_config(home: &std::path::Path) -> Result<()> {
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || restore_runtime_config_blocking(&home))
+        .await
+        .context("恢复 Codey 运行时配置任务异常退出")?
+}
+
+fn restore_runtime_config_blocking(home: &std::path::Path) -> Result<()> {
     let result = restore_runtime_provider_config(home)
         .map(|_| ())
         .context("恢复 Codex 配置失败");
@@ -1710,11 +1761,11 @@ pub fn restore_runtime_config(home: &std::path::Path) -> Result<()> {
     result
 }
 
-fn restore_runtime_config_after_error(
+async fn restore_runtime_config_after_error(
     home: &std::path::Path,
     error: anyhow::Error,
 ) -> anyhow::Error {
-    match restore_runtime_config(home) {
+    match restore_runtime_config(home).await {
         Ok(()) => error,
         Err(restore_error) => {
             anyhow::anyhow!("{error:#}；启动失败后恢复临时 Codex 配置也失败：{restore_error:#}")

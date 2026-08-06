@@ -34,6 +34,7 @@ struct CleanupCandidate {
     id: String,
     thread_name: String,
     updated_at: String,
+    source_line_index: usize,
 }
 
 #[derive(Debug)]
@@ -185,12 +186,12 @@ fn apply_cleanup_plan(
         });
     }
 
-    let selected_ids = plan
+    let selected_line_indexes = plan
         .candidates
         .iter()
-        .map(|candidate| candidate.id.clone())
+        .map(|candidate| candidate.source_line_index)
         .collect::<HashSet<_>>();
-    let (next_text, pruned_entries) = filtered_index_text(&plan, &selected_ids);
+    let (next_text, pruned_entries) = filtered_index_text(&plan, &selected_line_indexes);
     let backup_dir = backup_original
         .then(|| create_backup(home, &plan, pruned_entries))
         .transpose()?;
@@ -472,9 +473,9 @@ fn plan_cleanup_matching(
         .with_context(|| format!("会话索引不是 UTF-8：{}", path.display()))?;
     let mut candidates = Vec::new();
     let mut scanned_entries = 0;
-    for segment in original_text.split_inclusive('\n') {
+    for (source_line_index, segment) in original_text.split_inclusive('\n').enumerate() {
         let (line, _) = split_line_ending(segment);
-        if let Some(candidate) = known_candidate(line) {
+        if let Some(candidate) = known_candidate(line, source_line_index) {
             scanned_entries += 1;
             if should_remove(&candidate) {
                 candidates.push(candidate);
@@ -491,7 +492,7 @@ fn plan_cleanup_matching(
     }))
 }
 
-fn known_candidate(line: &str) -> Option<CleanupCandidate> {
+fn known_candidate(line: &str, source_line_index: usize) -> Option<CleanupCandidate> {
     let record = serde_json::from_str::<Value>(line).ok()?;
     let object = record.as_object()?;
     if object.len() != 3
@@ -511,15 +512,19 @@ fn known_candidate(line: &str) -> Option<CleanupCandidate> {
         id: id.to_string(),
         thread_name: thread_name.to_string(),
         updated_at: updated_at.to_string(),
+        source_line_index,
     })
 }
 
-fn filtered_index_text(plan: &CleanupPlan, selected_ids: &HashSet<String>) -> (String, usize) {
+fn filtered_index_text(
+    plan: &CleanupPlan,
+    selected_line_indexes: &HashSet<usize>,
+) -> (String, usize) {
     let mut next = String::with_capacity(plan.original_text.len());
     let mut removed = 0;
-    for segment in plan.original_text.split_inclusive('\n') {
+    for (source_line_index, segment) in plan.original_text.split_inclusive('\n').enumerate() {
         let (line, line_ending) = split_line_ending(segment);
-        if known_candidate(line).is_some_and(|candidate| selected_ids.contains(&candidate.id)) {
+        if selected_line_indexes.contains(&source_line_index) {
             removed += 1;
         } else {
             next.push_str(line);
@@ -724,6 +729,60 @@ mod tests {
         assert!(updated.contains("\"id\":\"kept-thread\""));
         assert!(report.backup_dir.is_none());
         assert!(!home.join("backups_state").exists());
+    }
+
+    #[test]
+    fn filtering_uses_planned_line_identity_and_preserves_original_endings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session_index.jsonl");
+        let removable = index_line("same-id", "remove");
+        let retained = index_line("same-id", "keep");
+        let unknown_shape = serde_json::to_string(&json!({
+            "id": "same-id",
+            "thread_name": "unknown",
+            "updated_at": "2026-07-20T00:00:00Z",
+            "source": "cloud",
+        }))
+        .unwrap();
+        let original = format!("{removable}\r\n{retained}\n{unknown_shape}\nnot-json");
+        fs::write(&path, &original).unwrap();
+
+        let plan = plan_cleanup_matching(&path, |candidate| candidate.thread_name == "remove")
+            .unwrap()
+            .unwrap();
+        let selected_line_indexes = plan
+            .candidates
+            .iter()
+            .map(|candidate| candidate.source_line_index)
+            .collect::<HashSet<_>>();
+        let (filtered, removed) = filtered_index_text(&plan, &selected_line_indexes);
+
+        assert_eq!(removed, 1);
+        assert_eq!(filtered, format!("{retained}\n{unknown_shape}\nnot-json"));
+    }
+
+    #[test]
+    fn cleanup_prunes_all_exact_duplicate_orphans() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        fs::write(
+            home.join("session_index.jsonl"),
+            format!(
+                "{}\n{}\n",
+                index_line("duplicate-orphan", "first"),
+                index_line("duplicate-orphan", "second")
+            ),
+        )
+        .unwrap();
+
+        let report = cleanup(home).unwrap();
+
+        assert_eq!(report.pruned_entries, 2);
+        assert!(
+            fs::read_to_string(home.join("session_index.jsonl"))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

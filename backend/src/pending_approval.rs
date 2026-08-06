@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home;
@@ -464,6 +465,7 @@ struct CachedDatabaseConnection {
 pub struct RecentSessionEventCache {
     rollouts: HashMap<PathBuf, CachedRolloutEvents>,
     database_connections: HashMap<PathBuf, CachedDatabaseConnection>,
+    last_snapshot: Option<Arc<RecentSessionEvents>>,
     #[cfg(test)]
     parse_count: usize,
     #[cfg(test)]
@@ -475,7 +477,7 @@ pub struct RecentSessionEventCache {
 impl RecentSessionEventCache {
     /// Finds recent session lifecycle events from rollout data. Unchanged
     /// rollouts reuse their compact parsed event set across polling cycles.
-    pub fn refresh(&mut self, home: &Path) -> RecentSessionEvents {
+    pub fn refresh(&mut self, home: &Path) -> Arc<RecentSessionEvents> {
         let recent_after = SystemTime::now()
             .checked_sub(RECENT_SESSION_WINDOW)
             .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
@@ -551,36 +553,43 @@ impl RecentSessionEventCache {
         rollouts
     }
 
-    fn refresh_rollouts(&mut self, rollouts: Vec<(String, PathBuf)>) -> RecentSessionEvents {
-        let mut events = RecentSessionEvents::default();
+    fn refresh_rollouts(&mut self, rollouts: Vec<(String, PathBuf)>) -> Arc<RecentSessionEvents> {
         let active_paths = rollouts
             .iter()
             .map(|(_, path)| path.clone())
             .collect::<HashSet<_>>();
+        let mut snapshot_changed = self.last_snapshot.is_none()
+            || self.rollouts.len() != active_paths.len()
+            || self
+                .rollouts
+                .keys()
+                .any(|path| !active_paths.contains(path));
         self.rollouts.retain(|path, _| active_paths.contains(path));
 
-        for (session_id, rollout_path) in rollouts {
-            let Ok(metadata) = fs::metadata(&rollout_path) else {
-                self.rollouts.remove(&rollout_path);
+        for (session_id, rollout_path) in &rollouts {
+            let Ok(metadata) = fs::metadata(rollout_path) else {
+                snapshot_changed = true;
+                self.rollouts.remove(rollout_path);
                 continue;
             };
             let signature = RolloutSignature {
                 len: metadata.len(),
                 modified: metadata.modified().ok(),
             };
-            let cache_is_current = self.rollouts.get(&rollout_path).is_some_and(|cached| {
-                cached.session_id == session_id && cached.signature == signature
+            let cache_is_current = self.rollouts.get(rollout_path).is_some_and(|cached| {
+                cached.session_id == *session_id && cached.signature == signature
             });
             if !cache_is_current {
+                snapshot_changed = true;
                 // Reuse the resumable parser state when the file only grew and
                 // its consumed prefix is intact; otherwise start from scratch.
                 let resumable = self
                     .rollouts
-                    .remove(&rollout_path)
-                    .filter(|cached| cached.session_id == session_id)
+                    .remove(rollout_path)
+                    .filter(|cached| cached.session_id == *session_id)
                     .map(|cached| cached.state)
                     .filter(|state| state.consumed_bytes > 0);
-                let Some((state, _was_incremental)) = read_rollout_update(&rollout_path, resumable)
+                let Some((state, _was_incremental)) = read_rollout_update(rollout_path, resumable)
                 else {
                     continue;
                 };
@@ -600,15 +609,28 @@ impl RecentSessionEventCache {
                     },
                 );
             }
+        }
 
-            let Some(state) = self
+        if !snapshot_changed
+            && let Some(snapshot) = self
+                .last_snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.pending_approvals.is_empty())
+        {
+            return Arc::clone(snapshot);
+        }
+
+        let mut events = RecentSessionEvents::default();
+        for (session_id, rollout_path) in rollouts {
+            let Some(cached) = self
                 .rollouts
                 .get(&rollout_path)
-                .map(|cached| &cached.state)
-                .filter(|state| !state.is_subagent)
+                .filter(|cached| cached.session_id == session_id && !cached.state.is_subagent)
             else {
                 continue;
             };
+            let state = &cached.state;
+            let signature = &cached.signature;
             let pending_approvals = state.pending_approvals();
             let status = state.lifecycle_status(&pending_approvals);
             let parsed = &state.events;
@@ -627,17 +649,14 @@ impl RecentSessionEventCache {
                 .insert(session_id.clone(), parsed.turn_configurations.clone());
             events
                 .pending_approvals
-                .extend(
-                    pending_approvals
-                        .iter()
-                        .cloned()
-                        .map(|(turn_id, waiting_id)| PendingApproval {
-                            session_id: session_id.clone(),
-                            turn_id,
-                            waiting_id,
-                            duration_ms,
-                        }),
-                );
+                .extend(pending_approvals.into_iter().map(|(turn_id, waiting_id)| {
+                    PendingApproval {
+                        session_id: session_id.clone(),
+                        turn_id,
+                        waiting_id,
+                        duration_ms,
+                    }
+                }));
             events
                 .started_turns
                 .extend(
@@ -677,7 +696,9 @@ impl RecentSessionEventCache {
                 );
         }
 
-        events
+        let snapshot = Arc::new(events);
+        self.last_snapshot = Some(Arc::clone(&snapshot));
+        snapshot
     }
 }
 
@@ -1183,6 +1204,7 @@ mod tests {
             first.session_statuses.get("thread-1"),
             Some(&SessionLifecycleStatus::Running)
         );
+        assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(second.started_turns, first.started_turns);
 
         writeln!(
@@ -1200,6 +1222,28 @@ mod tests {
             updated.session_statuses.get("thread-1"),
             Some(&SessionLifecycleStatus::Idle)
         );
+    }
+
+    #[test]
+    fn pending_approval_snapshots_are_rebuilt_for_fresh_wait_durations() {
+        let temp = tempfile::tempdir().unwrap();
+        let rollout_path = temp.path().join("rollout-waiting.jsonl");
+        fs::write(
+            &rollout_path,
+            r#"{"type":"turn_context","payload":{"turn_id":"turn-1"}}
+{"type":"response_item","payload":{"type":"function_call","name":"request_permissions","call_id":"pending"}}
+"#,
+        )
+        .unwrap();
+        let rollouts = || vec![("waiting".to_string(), rollout_path.clone())];
+        let mut cache = RecentSessionEventCache::default();
+
+        let first = cache.refresh_rollouts(rollouts());
+        let second = cache.refresh_rollouts(rollouts());
+
+        assert_eq!(first.pending_approvals.len(), 1);
+        assert_eq!(second.pending_approvals.len(), 1);
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     #[test]

@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -174,6 +175,30 @@ export function App({
   const provider = ccSwitchStatus?.provider;
   const isBusy = busy !== null;
   const configLoaded = config !== null;
+  const operationsStatus = useMemo(
+    () => ({
+      running: status.running,
+      codexAppVersion: status.codexAppVersion,
+      clientPlatform: status.clientPlatform,
+      restartRequired: status.restartRequired,
+      restartInProgress: status.restartInProgress,
+      startupError: status.startupError,
+      codexAppPath: status.codexAppPath,
+      maintenance: status.maintenance,
+      injectionScripts: status.injectionScripts,
+    }),
+    [
+      status.running,
+      status.codexAppVersion,
+      status.clientPlatform,
+      status.restartRequired,
+      status.restartInProgress,
+      status.startupError,
+      status.codexAppPath,
+      status.maintenance,
+      status.injectionScripts,
+    ],
+  );
   const {
     subagentModelOptions,
     modelState,
@@ -843,7 +868,7 @@ export function App({
           {/* 最上方：运行状态 (Codex 运行与维护，含 Codex 应用路径) */}
           <OperationsPanel
             config={config}
-            status={status}
+            status={operationsStatus}
             busy={busy}
             isBusy={isBusy}
             pluginMarketplaceStatus={pluginMarketplaceStatus}
@@ -857,7 +882,7 @@ export function App({
             {/* 左侧栏：应用更新 */}
             <div className="dashboard-column upper-left-column">
               <AppUpdateCard
-                status={status}
+                appVersion={status.appVersion}
                 updateResult={updateResult}
                 updateCheck={updateCheck}
                 downloadedUpdate={downloadedUpdate}
@@ -886,7 +911,7 @@ export function App({
           <div className="full-row-section feature-full-section">
             <FeaturePolicyCard
               config={config}
-              status={status}
+              isMacClient={status.clientPlatform === "macos"}
               busy={busy}
               isBusy={isBusy}
               subagentModelOptions={subagentModelOptions}

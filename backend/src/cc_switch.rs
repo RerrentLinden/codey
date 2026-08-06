@@ -957,7 +957,8 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
                 .with_context(|| format!("读取本地 Codex 配置失败：{}", config_path.display()));
         }
     };
-    let document = DocumentMut::from_str(&config).unwrap_or_default();
+    let document = DocumentMut::from_str(&config)
+        .with_context(|| format!("解析本地 Codex 配置失败：{}", config_path.display()))?;
     let provider_id = document
         .get("model_provider")
         .and_then(Item::as_str)
@@ -986,9 +987,18 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         .and_then(|provider| provider.get("wire_api"))
         .and_then(Item::as_str)
         .unwrap_or("responses");
-    let auth = fs::read(codex_home.join("auth.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let auth_path = codex_home.join("auth.json");
+    let auth = match fs::read(&auth_path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<Value>(&bytes)
+                .with_context(|| format!("解析本地 Codex 认证失败：{}", auth_path.display()))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取本地 Codex 认证失败：{}", auth_path.display()));
+        }
+    };
     let auth_mode = auth
         .as_ref()
         .and_then(|auth| auth.get("auth_mode"))
@@ -1107,6 +1117,44 @@ mod tests {
             )
             .unwrap();
         (directory, path, home)
+    }
+
+    #[test]
+    fn local_provider_rejects_malformed_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        fs::write(home.join("config.toml"), "model_provider = [").unwrap();
+
+        let error = local_provider(home).unwrap_err();
+
+        assert!(format!("{error:#}").contains("解析本地 Codex 配置失败"));
+        assert!(format!("{error:#}").contains("config.toml"));
+    }
+
+    #[test]
+    fn local_provider_rejects_malformed_auth() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        write_live_route(home, "third-party", "https://third-party.example/v1", "");
+        fs::write(home.join("auth.json"), "{").unwrap();
+
+        let error = local_provider(home).unwrap_err();
+
+        assert!(format!("{error:#}").contains("解析本地 Codex 认证失败"));
+        assert!(format!("{error:#}").contains("auth.json"));
+    }
+
+    #[test]
+    fn local_provider_propagates_non_not_found_auth_read_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        write_live_route(home, "third-party", "https://third-party.example/v1", "");
+        fs::create_dir(home.join("auth.json")).unwrap();
+
+        let error = local_provider(home).unwrap_err();
+
+        assert!(format!("{error:#}").contains("读取本地 Codex 认证失败"));
+        assert!(format!("{error:#}").contains("auth.json"));
     }
 
     #[test]

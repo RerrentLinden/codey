@@ -1,6 +1,6 @@
 import { memo, type CSSProperties } from "react";
 
-import type { Config, RuntimeStatus } from "./App.types";
+import type { Config } from "./App.types";
 import { Badge, Card, Switch } from "./components/semi";
 import type { SubagentModelOption } from "./useModelSelection";
 
@@ -23,7 +23,7 @@ const REASONING_EFFORT_LABELS: Record<string, string> = {
 
 type FeaturePolicyCardProps = {
   config: Config;
-  status: RuntimeStatus;
+  isMacClient: boolean;
   busy: string | null;
   isBusy: boolean;
   subagentModelOptions: SubagentModelOption[];
@@ -33,14 +33,13 @@ type FeaturePolicyCardProps = {
 
 function FeaturePolicyCardComponent({
   config,
-  status,
+  isMacClient,
   busy,
   isBusy,
   subagentModelOptions,
   onConfigChange,
   onSubagentOptimizationChange,
 }: FeaturePolicyCardProps) {
-  const isMacClient = status.clientPlatform === "macos";
   const configuredGpuLaunchModeIndex = GPU_LAUNCH_MODES.findIndex(
     ({ value }) => value === config.gpuLaunchMode,
   );
