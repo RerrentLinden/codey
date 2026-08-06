@@ -134,6 +134,43 @@ function loadInjection({ rows = [], bridgeHandler } = {}) {
   return { document, window };
 }
 
+function sidebarThreadEntry({ running = false, statusState = null } = {}) {
+  const list = new FakeElement();
+  list.setAttribute("role", "list");
+  const item = new FakeElement();
+  item.setAttribute("role", "listitem");
+  const row = new FakeElement();
+  row.setAttribute("data-app-action-sidebar-thread-row", "");
+  const content = new FakeElement();
+  content.className = "flex h-full w-full items-center";
+  const titleRegion = new FakeElement();
+  titleRegion.className = "flex min-w-0 flex-1 items-center gap-2";
+  const nativeStatusRail = new FakeElement();
+  nativeStatusRail.className = "ml-[3px] flex items-center justify-end gap-1";
+  const spinner = new FakeElement();
+  spinner.className = "animate-spin rounded-full";
+  if (running) nativeStatusRail.appendChild(spinner);
+  content.appendChild(titleRegion);
+  content.appendChild(nativeStatusRail);
+  row.appendChild(content);
+  item.appendChild(row);
+  list.appendChild(item);
+  if (statusState) {
+    row.__reactFiber$test = {
+      memoizedProps: {},
+      return: { memoizedProps: { statusState }, return: null },
+    };
+  }
+  return {
+    content,
+    item,
+    list,
+    nativeStatusRail,
+    row,
+    spinner,
+  };
+}
+
 test("formats compact relative times for the sidebar", () => {
   const { window } = loadInjection();
   const now = Date.UTC(2026, 6, 21, 12);
@@ -267,6 +304,42 @@ test("hides thread time from Codex React loading and unread status state", () =>
   statusFiber.memoizedProps.statusState = { type: undefined, unread: false };
   window.__codeyUpdateThreadUpdatedAt(row, timestamp);
   assert.equal(content.querySelector("[data-codey-thread-updated-at]")?.textContent, "6 分");
+});
+
+test("marks running sidebar items for visual priority and clears the mark on completion", () => {
+  const idle = sidebarThreadEntry();
+  const running = sidebarThreadEntry({ running: true });
+  const list = idle.list;
+  list.appendChild(running.item);
+  const { window } = loadInjection({ rows: [idle.row, running.row] });
+
+  assert.equal(idle.item.getAttribute("data-codey-thread-running"), null);
+  assert.equal(running.item.getAttribute("data-codey-thread-running"), "true");
+  assert.deepEqual(list.children, [idle.item, running.item]);
+
+  running.spinner.remove();
+  window.__codeySyncSidebarThreadRunningOrder(running.row);
+
+  assert.equal(running.item.getAttribute("data-codey-thread-running"), null);
+  assert.deepEqual(list.children, [idle.item, running.item]);
+});
+
+test("prioritizes active React status without treating unread as running", () => {
+  const entry = sidebarThreadEntry({
+    statusState: { type: undefined, unread: true },
+  });
+  const { window } = loadInjection({ rows: [entry.row] });
+  const statusFiber = entry.row.__reactFiber$test.return;
+
+  assert.equal(entry.item.getAttribute("data-codey-thread-running"), null);
+
+  statusFiber.memoizedProps.statusState = { type: "processing", unread: false };
+  window.__codeySyncSidebarThreadRunningOrder(entry.row);
+  assert.equal(entry.item.getAttribute("data-codey-thread-running"), "true");
+
+  statusFiber.memoizedProps.statusState = { type: undefined, unread: false };
+  window.__codeySyncSidebarThreadRunningOrder(entry.row);
+  assert.equal(entry.item.getAttribute("data-codey-thread-running"), null);
 });
 
 test("keeps an existing thread time when a native completion marker appears", async () => {
@@ -416,6 +489,8 @@ test("batches visible thread timestamps through the bridge and renders the resul
 
 test("injects time styles that coexist with native statuses and yield to sidebar actions", () => {
   assert.match(source, /threadUpdatedAtAttribute = "data-codey-thread-updated-at"/);
+  assert.match(source, /threadRunningAttribute = "data-codey-thread-running"/);
+  assert.match(source, /\[\$\{threadRunningAttribute\}="true"\] \{ order: -1 !important; \}/);
   assert.match(source, /font-variant-numeric: tabular-nums/);
   assert.match(source, /placeThreadUpdatedAt\(row, label\)/);
   assert.match(source, /mount\.insertBefore\(label, before\)/);

@@ -18,6 +18,7 @@
   const sidebarActionTooltipId = "codey-sidebar-action-tooltip";
   const threadUpdatedAtAttribute = "data-codey-thread-updated-at";
   const threadUpdatedAtMsAttribute = "data-codey-thread-updated-at-ms";
+  const threadRunningAttribute = "data-codey-thread-running";
   const sessionExportIcon = `
     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -224,6 +225,7 @@
       [data-app-action-sidebar-thread-row] [${threadUpdatedAtAttribute}] { display: block; flex: 0 0 auto; min-width: 26px; margin-inline-start: auto; color: inherit; font: 400 12px/16px system-ui, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: end; opacity: .52; pointer-events: none; white-space: nowrap; }
       [data-app-action-sidebar-thread-row]:hover [${threadUpdatedAtAttribute}],
       [data-app-action-sidebar-thread-row]:has(:focus-visible) [${threadUpdatedAtAttribute}] { opacity: 0; }
+      [${threadRunningAttribute}="true"] { order: -1 !important; }
       [${sessionExportAttribute}], [${tasksImportAttribute}], [${sessionDeleteAttribute}] { -webkit-app-region: no-drag !important; flex: 0 0 auto; pointer-events: auto !important; }
       [${projectImportAttribute}] { -webkit-app-region: no-drag !important; position: absolute; top: 50%; right: 62px; z-index: 35; flex: 0 0 auto; transform: translateY(-50%); opacity: 0; pointer-events: auto !important; transition: opacity .15s ease; }
       [data-app-action-sidebar-project-row][data-app-action-sidebar-project-id]:hover > [${projectImportAttribute}],
@@ -778,8 +780,8 @@
     return false;
   };
 
-  const nativeReactThreadStatusVisible = (row) => {
-    if (!(row instanceof HTMLElement)) return false;
+  const nativeReactThreadStatusState = (row) => {
+    if (!(row instanceof HTMLElement)) return null;
     // Codex owns the canonical loading/unread flags even when its status icon
     // is moved or updated without adding a new element to the trailing rail.
     const fiberKey = Object.keys(row).find((key) => key.startsWith("__reactFiber$"));
@@ -787,10 +789,16 @@
     for (let depth = 0; fiber && depth < 12; depth += 1, fiber = fiber.return) {
       const statusState = fiber.memoizedProps?.statusState || fiber.pendingProps?.statusState;
       if (!statusState || typeof statusState !== "object") continue;
-      const type = String(statusState.type || "");
-      return statusState.unread === true || /^(?:loading|processing|running|working)$/i.test(type);
+      return statusState;
     }
-    return false;
+    return null;
+  };
+
+  const nativeReactThreadStatusVisible = (row) => {
+    const statusState = nativeReactThreadStatusState(row);
+    if (!statusState) return false;
+    const type = String(statusState.type || "");
+    return statusState.unread === true || /^(?:loading|processing|running|working)$/i.test(type);
   };
 
   const nativeElementLooksLikeThreadStatus = (element) => {
@@ -809,6 +817,47 @@
     const className = String(element.className || "");
     if (/\b(?:animate-|spinner)\b/i.test(className)) return true;
     return [...(element.children || [])].some((child) => nativeElementLooksLikeThreadStatus(child));
+  };
+
+  const nativeThreadRunning = (row) => {
+    const statusState = nativeReactThreadStatusState(row);
+    if (/^(?:loading|processing|running|working)$/i.test(String(statusState?.type || ""))) {
+      return true;
+    }
+    const { trailing } = threadUpdatedAtPlacement(row);
+    return (trailing || []).some((candidate) => nativeElementLooksLikeThreadStatus(candidate));
+  };
+
+  const sidebarThreadListItem = (row) => {
+    let current = threadIdentityNode(row) || row;
+    while (current instanceof HTMLElement) {
+      if (
+        current.getAttribute?.("role") === "listitem"
+        && !current.querySelector?.("[data-app-action-sidebar-project-row]")
+      ) return current;
+      const parent = current.parentElement;
+      if (!(parent instanceof HTMLElement)) break;
+      if (
+        parent.getAttribute?.("role") === "list"
+        || parent.hasAttribute?.("data-app-action-sidebar-project-list-id")
+      ) return current;
+      current = parent;
+    }
+    return row instanceof HTMLElement ? row : null;
+  };
+
+  const syncSidebarThreadRunningRow = (row) => {
+    if (!(row instanceof HTMLElement)) return;
+    const item = sidebarThreadListItem(row);
+    if (!(item instanceof HTMLElement)) return;
+    const running = nativeThreadRunning(row);
+    const marked = item.getAttribute(threadRunningAttribute) === "true";
+    if (running && !marked) item.setAttribute(threadRunningAttribute, "true");
+    if (!running && marked) item.removeAttribute(threadRunningAttribute);
+  };
+
+  const syncSidebarThreadRunningOrder = (root = document) => {
+    queryWithin(root, sidebarThreadRowSelector).forEach(syncSidebarThreadRunningRow);
   };
 
   const placeThreadUpdatedAt = (row, label) => {
@@ -941,6 +990,7 @@
     const now = Date.now();
     queryWithin(root, "[data-app-action-sidebar-thread-row]").forEach((row) => {
       if (!(row instanceof HTMLElement) || isDeletedSidebarThread(row)) return;
+      syncSidebarThreadRunningRow(row);
       const sessionId = renderCachedThreadUpdatedAt(row);
       if (!sessionId || sessionId.startsWith("client-new-thread:")) return;
       if (!forceRefresh && now - (threadUpdatedAtRequestedAt.get(sessionId) || 0) < 30_000) return;
@@ -1785,6 +1835,7 @@
   window.__codeyUpdateThreadUpdatedAt = updateThreadUpdatedAt;
   window.__codeyInstallThreadUpdatedTimes = installThreadUpdatedTimes;
   window.__codeyHasNativeThreadStatus = hasNativeThreadStatus;
+  window.__codeySyncSidebarThreadRunningOrder = syncSidebarThreadRunningOrder;
   window.__codeyRefreshRecentLocalSessions = refreshRecentLocalSessions;
   window.__codeyExportSession = exportSession;
   window.__codeyImportSessionFile = importSessionFile;
