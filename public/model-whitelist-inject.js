@@ -429,19 +429,8 @@
     return changed;
   };
 
-  const reactFiberKeys = (element) => {
-    if (!element || (typeof element !== "object" && typeof element !== "function")) return [];
-    try {
-      return Object.keys(element).filter((key) => (
-        key.startsWith("__reactFiber")
-        || key.startsWith("__reactInternalInstance")
-        || key.startsWith("__reactProps")
-        || key.startsWith("__reactContainer")
-      ));
-    } catch {
-      return [];
-    }
-  };
+  const reactFiberKeys = (element) =>
+    window.__codeySharedRuntime.reactInternalKeys(element, { includeContainer: true });
 
   const reactModelStateNodes = (forceScan = false) => {
     const nodes = [

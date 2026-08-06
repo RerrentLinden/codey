@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useMemo,
   useState,
   type Dispatch,
@@ -169,7 +170,7 @@ export function useModelSelection({
     ],
   );
 
-  function openModelPicker(state: ModelState, warning = "") {
+  const openModelPicker = useCallback((state: ModelState, warning = "") => {
     setDraftModels(pickerSelection(state));
     setDraftManualThirdPartyModels(state.manualThirdPartyModels);
     setDeletedThirdPartyModels([]);
@@ -177,9 +178,9 @@ export function useModelSelection({
     setModelInputError("");
     setModelSyncWarning(warning);
     setModelPickerVisible(true);
-  }
+  }, []);
 
-  async function fetchCurrentModels() {
+  const fetchCurrentModels = useCallback(async () => {
     if (!provider || provider.official) return;
     await runOperation("fetch-models", async () => {
       try {
@@ -209,12 +210,19 @@ export function useModelSelection({
         });
       }
     });
-  }
+  }, [
+    modelState,
+    openModelPicker,
+    provider,
+    runOperation,
+    setNotice,
+    setStatus,
+  ]);
 
-  async function updateSubagentOptimization(
+  const updateSubagentOptimization = useCallback(async (
     checked: boolean,
     selectedModel: string,
-  ) {
+  ) => {
     if (!checked) {
       setSubagentOptimization(false);
       return;
@@ -290,9 +298,17 @@ export function useModelSelection({
         text: `已确认当前线路支持 ${subagentModel}，保存并重启 Codex 后生效`,
       });
     });
-  }
+  }, [
+    modelState.officialModels,
+    provider,
+    runOperation,
+    setNotice,
+    setStatus,
+    setSubagentOptimization,
+    subagentModelOptions,
+  ]);
 
-  function toggleDraftModel(model: string, checked: boolean) {
+  const toggleDraftModel = useCallback((model: string, checked: boolean) => {
     if (checked) {
       setDeletedThirdPartyModels((current) =>
         current.filter((item) => modelKey(item) !== modelKey(model)),
@@ -310,14 +326,14 @@ export function useModelSelection({
         current.filter((item) => modelKey(item) !== modelKey(model)),
       );
     }
-  }
+  }, []);
 
-  function updateCustomModelInput(value: string) {
+  const updateCustomModelInput = useCallback((value: string) => {
     setCustomModelInput(value);
     if (modelInputError) setModelInputError("");
-  }
+  }, [modelInputError]);
 
-  function addCustomModel() {
+  const addCustomModel = useCallback(() => {
     const model = customModelInput.trim();
     if (!model) {
       setModelInputError("请输入要添加的模型 ID");
@@ -361,9 +377,15 @@ export function useModelSelection({
     );
     setCustomModelInput("");
     setModelInputError("");
-  }
+  }, [
+    customModelInput,
+    draftModels,
+    manualThirdPartyModelKeys,
+    modelState.officialModelIds,
+    modelState.upstreamModels,
+  ]);
 
-  function deleteDraftThirdPartyModel(model: string) {
+  const deleteDraftThirdPartyModel = useCallback((model: string) => {
     const normalized = model.trim();
     if (!normalized) return;
     const wasManual = draftManualThirdPartyModelKeys.has(modelKey(normalized));
@@ -381,16 +403,19 @@ export function useModelSelection({
         : [...current, normalized],
     );
     setModelInputError("");
-  }
+  }, [
+    draftManualThirdPartyModelKeys,
+    manualThirdPartyModelKeys,
+  ]);
 
-  async function applyModelSelection(
+  const applyModelSelection = useCallback(async (
     officialModels: string[],
     thirdPartyModels: string[],
     manualThirdPartyModels: string[],
     deletedModels: string[],
     summary: string,
     closePicker: boolean,
-  ) {
+  ) => {
     const result = await invoke<{
       config: Config;
       modelState: ModelState;
@@ -422,9 +447,13 @@ export function useModelSelection({
           ? `${summary}；当前 Codex 模型列表暂未能刷新，重启 Codex 后生效`
           : summary,
     });
-  }
+  }, [
+    setNotice,
+    setPersistedConfig,
+    setStatus,
+  ]);
 
-  async function saveModelSelection() {
+  const saveModelSelection = useCallback(async () => {
     await runOperation("save-models", async () => {
       const officialModels = draftModels.filter((model) =>
         officialSlugs.has(model)
@@ -446,9 +475,16 @@ export function useModelSelection({
         true,
       );
     });
-  }
+  }, [
+    applyModelSelection,
+    deletedThirdPartyModels,
+    draftManualThirdPartyModels,
+    draftModels,
+    officialSlugs,
+    runOperation,
+  ]);
 
-  async function deleteThirdPartyModel(model: string) {
+  const deleteThirdPartyModel = useCallback(async (model: string) => {
     const normalized = model.trim();
     if (!normalized) return;
     const deletedKey = modelKey(normalized);
@@ -484,9 +520,17 @@ export function useModelSelection({
         current.filter((item) => modelKey(item) !== deletedKey),
       );
     });
-  }
+  }, [
+    applyModelSelection,
+    manualThirdPartyModelKeys,
+    modelState.manualThirdPartyModels,
+    modelState.officialModels,
+    modelState.thirdPartyModels,
+    runOperation,
+    setNotice,
+  ]);
 
-  async function setDefaultModel(model: string) {
+  const setDefaultModel = useCallback(async (model: string) => {
     await runOperation("save-default-model", async () => {
       const result = await invoke<{
         config: Config;
@@ -512,7 +556,12 @@ export function useModelSelection({
             : summary,
       });
     });
-  }
+  }, [
+    runOperation,
+    setNotice,
+    setPersistedConfig,
+    setStatus,
+  ]);
 
   return {
     subagentModelOptions,

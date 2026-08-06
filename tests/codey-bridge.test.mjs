@@ -156,6 +156,72 @@ test("shared helpers deduplicate Statsig clients and inspect React values", () =
     ),
     true,
   );
+  assert.equal(
+    shared.reactInternalGraphIncludes(
+      control,
+      (value) => value === "settings.personalization.pets",
+    ),
+    true,
+  );
+});
+
+test("shared React graph walking preserves direct, ancestor, and container semantics", () => {
+  const runtime = createRuntime();
+  const shared = runtime.window.__codeySharedRuntime;
+  const control = new runtime.FakeHTMLElement();
+  control.__reactFiber$direct = {
+    memoizedProps: { children: { commandId: "composer.startDictation" } },
+    return: null,
+  };
+  control.__reactContainer$root = { current: {} };
+  assert.deepEqual(
+    [...shared.reactInternalKeys(control, { includeContainer: true })],
+    ["__reactFiber$direct", "__reactContainer$root"],
+  );
+  assert.equal(
+    shared.reactInternalGraphIncludes(
+      control,
+      (value) => value === "composer.startDictation",
+    ),
+    true,
+  );
+
+  const ancestorControl = new runtime.FakeHTMLElement();
+  ancestorControl.__reactFiber$ancestor = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: { commandId: "settings.general.realtimeVoice" },
+      return: null,
+    },
+  };
+  assert.equal(
+    shared.reactInternalGraphIncludes(
+      ancestorControl,
+      (value) => value === "settings.general.realtimeVoice",
+      {
+        ancestorDepth: 8,
+        ancestorIgnoredKeys:
+          new Set(["return", "child", "sibling", "stateNode", "_owner", "children"]),
+      },
+    ),
+    true,
+  );
+
+  ancestorControl.__reactFiber$ancestor.return.memoizedProps = {
+    children: { commandId: "settings.general.realtimeVoice" },
+  };
+  assert.equal(
+    shared.reactInternalGraphIncludes(
+      ancestorControl,
+      (value) => value === "settings.general.realtimeVoice",
+      {
+        ancestorDepth: 8,
+        ancestorIgnoredKeys:
+          new Set(["return", "child", "sibling", "stateNode", "_owner", "children"]),
+      },
+    ),
+    false,
+  );
 });
 
 test("fetch interceptors share one stable wrapper and unregister independently", async () => {

@@ -89,15 +89,25 @@ test("startup stops the old Codex before permanent session maintenance", async (
   ).then(normalizeLineEndings);
   const startup = launcher.slice(
     launcher.indexOf("pub async fn start("),
-    launcher.indexOf("fn startup_patch_detail"),
+    launcher.indexOf("pub async fn stop(&self)"),
   );
-  const stopOldCodex = startup.indexOf(
+  const storagePreparation = launcher.slice(
+    launcher.indexOf("async fn prepare_startup_storage("),
+    launcher.indexOf("async fn prepare_runtime_provider_state("),
+  );
+  const providerPreparation = launcher.slice(
+    launcher.indexOf("async fn prepare_runtime_provider_state("),
+    launcher.indexOf("async fn prepare_startup_patches_and_overlay("),
+  );
+  const stopOldCodex = storagePreparation.indexOf(
     "prepare_codex_for_launch(&app_dir).await?",
   );
-  const permanentMaintenance = startup.indexOf(
+  const permanentMaintenance = storagePreparation.indexOf(
     "run_startup_session_maintenance",
   );
-  const protocolProxy = startup.indexOf("start_runtime_protocol_proxy");
+  const storagePhase = startup.indexOf("prepare_startup_storage");
+  const providerPhase = startup.indexOf("prepare_runtime_provider_state");
+  const protocolProxy = providerPreparation.indexOf("start_runtime_protocol_proxy");
 
   assert.notEqual(stopOldCodex, -1);
   assert.notEqual(permanentMaintenance, -1);
@@ -107,7 +117,7 @@ test("startup stops the old Codex before permanent session maintenance", async (
     "the old Codex writer must stop before session files are maintained",
   );
   assert.ok(
-    permanentMaintenance < protocolProxy,
+    storagePhase < providerPhase,
     "the temporary runtime must not start before permanent maintenance finishes",
   );
 });

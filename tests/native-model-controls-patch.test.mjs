@@ -5,13 +5,10 @@ import test from "node:test";
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
 async function loadPatchExpression() {
-  const source = normalizeLineEndings(await readFile(
-    new URL("../backend/src/codex_startup_patch.rs", import.meta.url),
+  const template = normalizeLineEndings(await readFile(
+    new URL("../backend/src/codex_startup_patch.js", import.meta.url),
     "utf8",
   ));
-  const template = source.match(
-    /const STARTUP_PATCH_TEMPLATE: &str = r#"\n([\s\S]*?)\n"#;/,
-  )?.[1];
   assert.ok(template, "startup patch template should be readable");
   return template
     .replaceAll("__DISABLE_PET__", "false")

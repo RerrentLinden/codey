@@ -4,6 +4,8 @@
     && window.__codeyMutationDispatcher?.createShieldLifecycle
     && window.__codeyMutationDispatcher?.controlDescriptor
     && window.__codeyMutationDispatcher?.controlsWithin
+    && window.__codeySharedRuntime?.reactInternalGraphIncludes
+    && window.__codeySharedRuntime?.reactInternalKeys
     && window.__codeySharedRuntime?.registerFetchInterceptor
     && window.__codeySharedRuntime?.statsigClients
   ) return;
@@ -37,22 +39,30 @@
   };
 
   const reactInternalKeyPattern = /^__(?:reactProps|reactFiber|reactInternalInstance)\$.*/;
-  const reactInternals = (element) => {
+  const reactInspectableKeyPattern = /^__(?:reactProps|reactFiber|reactInternalInstance)/;
+  const reactContainerKeyPattern = /^__reactContainer/;
+  const reactInternalKeys = (element, options = {}) => {
     if (!element || (typeof element !== "object" && typeof element !== "function")) return [];
     try {
       return Object.keys(element)
-        .filter((key) => reactInternalKeyPattern.test(key))
-        .flatMap((key) => {
-          try {
-            return [element[key]];
-          } catch {
-            return [];
-          }
-        });
+        .filter((key) => (
+          (options.includeContainer === true
+            ? reactInspectableKeyPattern.test(key)
+            : reactInternalKeyPattern.test(key))
+          || (options.includeContainer === true && reactContainerKeyPattern.test(key))
+        ));
     } catch {
       return [];
     }
   };
+  const reactInternals = (element, options = {}) =>
+    reactInternalKeys(element, options).flatMap((key) => {
+      try {
+        return [element[key]];
+      } catch {
+        return [];
+      }
+    });
 
   const objectGraphIncludes = (value, predicate, options = {}) => {
     const ignoredKeys = options.ignoredKeys instanceof Set
@@ -82,6 +92,42 @@
       return false;
     };
     return visit(value, 0);
+  };
+
+  const defaultReactTraversalIgnoredKeys =
+    new Set(["return", "child", "sibling", "stateNode", "_owner"]);
+  const reactInternalGraphIncludes = (element, predicate, options = {}) => {
+    const ignoredKeys = options.ignoredKeys ?? defaultReactTraversalIgnoredKeys;
+    const ancestorIgnoredKeys = options.ancestorIgnoredKeys ?? ignoredKeys;
+    const maxDepth = Number.isFinite(options.maxDepth) ? options.maxDepth : 7;
+    const ancestorDepth = Number.isFinite(options.ancestorDepth)
+      ? Math.max(0, options.ancestorDepth)
+      : 0;
+    return reactInternals(element).some((internal) => {
+      try {
+        if (objectGraphIncludes(internal?.memoizedProps ?? internal, predicate, {
+          ignoredKeys,
+          maxDepth,
+        })) {
+          return true;
+        }
+        let ancestor = internal?.memoizedProps && ancestorDepth > 0
+          ? internal.return
+          : null;
+        for (let depth = 0; ancestor && depth < ancestorDepth; depth += 1) {
+          if (objectGraphIncludes(ancestor.memoizedProps, predicate, {
+            ignoredKeys: ancestorIgnoredKeys,
+            maxDepth,
+          })) {
+            return true;
+          }
+          ancestor = ancestor.return;
+        }
+        return false;
+      } catch {
+        return false;
+      }
+    });
   };
 
   const fetchInterceptors = new Map();
@@ -139,6 +185,8 @@
       interceptorCount: fetchInterceptors.size,
     }),
     objectGraphIncludes,
+    reactInternalGraphIncludes,
+    reactInternalKeys,
     reactInternals,
     registerFetchInterceptor,
     statsigClients,

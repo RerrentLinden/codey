@@ -19,6 +19,7 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     feishuEditor,
     telegramEditor,
     channelRegistry,
+    modelSelection,
   ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/useAppUpdates.ts", root), "utf8"),
@@ -52,6 +53,7 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
       "utf8",
     ),
     readFile(new URL("src/notifications/channelRegistry.tsx", root), "utf8"),
+    readFile(new URL("src/useModelSelection.ts", root), "utf8"),
   ]);
 
   assert.match(app, /function useStableEvent</);
@@ -74,7 +76,28 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   assert.match(appUpdates, /invoke\("install_downloaded_update"/);
   assert.match(app, /onRepairPluginMarketplace=\{handleRepairPluginMarketplace\}/);
   assert.match(app, /onRefresh=\{handleRefreshTraceLogStats\}/);
-  assert.match(app, /onToggleDraftModel=\{handleToggleDraftModel\}/);
+  assert.match(app, /onToggleDraftModel=\{toggleDraftModel\}/);
+  assert.match(app, /onFetchCurrentModels=\{fetchCurrentModels\}/);
+  assert.match(app, /onSetDefaultModel=\{setDefaultModel\}/);
+  assert.match(app, /onSave=\{saveModelSelection\}/);
+  assert.doesNotMatch(app, /handleFetchCurrentModels|handleSetDefaultModel/);
+  for (const callback of [
+    "fetchCurrentModels",
+    "updateSubagentOptimization",
+    "toggleDraftModel",
+    "updateCustomModelInput",
+    "addCustomModel",
+    "deleteDraftThirdPartyModel",
+    "applyModelSelection",
+    "saveModelSelection",
+    "deleteThirdPartyModel",
+    "setDefaultModel",
+  ]) {
+    assert.match(
+      modelSelection,
+      new RegExp(`const ${callback} = useCallback\\(`),
+    );
+  }
   assert.doesNotMatch(
     app,
     /onRepairPluginMarketplace=\{\(\) => void repairPluginMarketplace\(\)\}/,

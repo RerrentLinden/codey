@@ -7,15 +7,12 @@ import test from "node:test";
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
 async function loadStartupPatchExpression(disablePet = true) {
-  const source = normalizeLineEndings(
+  const template = normalizeLineEndings(
     await readFile(
-      new URL("../backend/src/codex_startup_patch.rs", import.meta.url),
+      new URL("../backend/src/codex_startup_patch.js", import.meta.url),
       "utf8",
     ),
   );
-  const template = source.match(
-    /const STARTUP_PATCH_TEMPLATE: &str = r#"\n([\s\S]*?)\n"#;/,
-  )?.[1];
   assert.ok(template);
   return template
     .replaceAll("__DISABLE_PET__", disablePet ? "true" : "false")

@@ -961,6 +961,423 @@ fn spawn_injection_watchdog(
     }
 }
 
+struct InitialStorageGuards {
+    trace: tokio::task::JoinHandle<Result<trace_log_guard::TraceLogGuardReport>>,
+    crashpad: tokio::task::JoinHandle<crashpad_pending_guard::CrashpadGuardRun>,
+}
+
+struct StartupRouteContext {
+    preserve_provider_route: bool,
+    live_route: Option<cc_switch::LiveRouteSnapshot>,
+    original_provider: String,
+    current_profile: ProviderProfile,
+}
+
+struct StartupStorageState {
+    app_dir: PathBuf,
+    session_maintenance: SessionMaintenanceSummary,
+}
+
+struct PreparedProviderState {
+    protocol_proxy: Option<ProtocolProxyHandle>,
+    applied_route_files: Option<RouteFilesSnapshot>,
+}
+
+struct StartupPatchState {
+    plugin_status: String,
+    plugin_detail: String,
+    debug_port: u16,
+    route_overlay_shutdown: Option<oneshot::Sender<()>>,
+    route_overlay_task: Option<tokio::task::JoinHandle<()>>,
+    route_changed: Option<oneshot::Receiver<()>>,
+}
+
+struct SpawnedRenderer {
+    app_dir: PathBuf,
+    spawned: SpawnedCodex,
+    child: Arc<Mutex<Option<Child>>>,
+    maintenance: MaintenanceStatus,
+    injected_target: cdp::InjectedTarget,
+}
+
+struct RuntimeWatchers {
+    injection_statuses: Arc<RwLock<Arc<[cdp::InjectionScriptStatus]>>>,
+    injection_websocket_url: Arc<RwLock<Arc<str>>>,
+    watchdog_shutdown: oneshot::Sender<()>,
+    watchdog_task: tokio::task::JoinHandle<()>,
+    crashpad_guard_enabled: Arc<AtomicBool>,
+    crashpad_guard_shutdown: oneshot::Sender<()>,
+    crashpad_guard_task: tokio::task::JoinHandle<()>,
+    exit_watchdog_shutdown: oneshot::Sender<()>,
+    exit_watchdog_task: tokio::task::JoinHandle<()>,
+    codex_exit: oneshot::Receiver<()>,
+}
+
+struct RuntimeWatcherInputs {
+    injected_target: cdp::InjectedTarget,
+    debug_port: u16,
+    handler: codey_runtime_core::bridge::BridgeHandler,
+    injection_scripts: cdp::PreparedInjectionScripts,
+    child: Arc<Mutex<Option<Child>>>,
+    process_id: Option<u32>,
+    protect_crashpad_pending: bool,
+    crashpad_pending_stats: CrashpadPendingStatsHandle,
+}
+
+fn spawn_initial_storage_guards(
+    home: &std::path::Path,
+    config: &CodeyConfig,
+) -> InitialStorageGuards {
+    let trace_guard_home = home.to_path_buf();
+    let disable_trace_log_writes = config.disable_trace_log_writes;
+    let trace = tokio::task::spawn_blocking(move || {
+        trace_log_guard::configure(&trace_guard_home, disable_trace_log_writes)
+    });
+    let protect_crashpad_pending = config.protect_crashpad_pending;
+    let crashpad = tokio::task::spawn_blocking(move || {
+        if protect_crashpad_pending {
+            crashpad_pending_guard::enforce_system_limit()
+        } else {
+            crashpad_pending_guard::CrashpadGuardRun {
+                cleanup: crashpad_pending_guard::CrashpadCleanupReport::default(),
+                snapshot: crashpad_pending_guard::snapshot_system(false),
+            }
+        }
+    });
+    InitialStorageGuards { trace, crashpad }
+}
+
+async fn resolve_startup_route_context(
+    home: &std::path::Path,
+    config: &CodeyConfig,
+) -> Result<StartupRouteContext> {
+    let startup_route_home = home.to_path_buf();
+    let startup_route =
+        tokio::task::spawn_blocking(move || cc_switch::startup_route_state(&startup_route_home))
+            .await
+            .map_err(|error| {
+                let error =
+                    anyhow::Error::new(error).context("检测 CC Switch 路由接管任务异常退出");
+                error_log::record_failure(
+                    "patch_failed",
+                    "detect_cc_switch_route_takeover",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "codexHome": home,
+                        "taskJoinFailed": true,
+                    }),
+                );
+                error
+            })?
+            .map_err(|error| {
+                error_log::record_failure(
+                    "patch_failed",
+                    "detect_cc_switch_route_takeover",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "codexHome": home,
+                    }),
+                );
+                error
+            })?;
+    let preserve_provider_route =
+        preserve_cc_switch_route(startup_route.takeover).map_err(|error| {
+            error_log::record_failure(
+                "patch_failed",
+                "validate_cc_switch_route_takeover",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "managed": startup_route.takeover.managed,
+                    "live": startup_route.takeover.live,
+                }),
+            );
+            error
+        })?;
+    let live_route = if preserve_provider_route {
+        Some(
+            startup_route
+                .live_route
+                .ok_or_else(|| anyhow::anyhow!("CC Switch Live 路由缺少已验证的 Provider 快照"))?,
+        )
+    } else {
+        None
+    };
+    let original_provider = if let Some(live_route) = live_route.as_ref() {
+        live_route.provider_id().to_string()
+    } else {
+        resolve_startup_provider(home).await?
+    };
+    let current_profile = if let Some(live_route) = live_route.as_ref() {
+        live_route.profile().clone()
+    } else {
+        config
+            .active_profile()
+            .ok_or_else(|| anyhow::anyhow!("找不到当前 Codex 线路"))?
+    };
+    Ok(StartupRouteContext {
+        preserve_provider_route,
+        live_route,
+        original_provider,
+        current_profile,
+    })
+}
+
+async fn prepare_startup_storage(
+    home: &std::path::Path,
+    config: &CodeyConfig,
+    original_provider: &str,
+    guards: InitialStorageGuards,
+    crashpad_pending_stats: &CrashpadPendingStatsHandle,
+) -> Result<StartupStorageState> {
+    let app_dir = resolve_configured_codex_app_dir(config).await?;
+    // Session repair must never race a live Codex writer. Stopping the old
+    // runtime first also gives SQLite and rollout buffers a chance to flush
+    // before any permanent maintenance is applied.
+    prepare_codex_for_launch(&app_dir).await?;
+
+    // Permanent maintenance runs before Codey creates the temporary
+    // direct-provider lease. A lightweight header/SQLite validation normally
+    // reuses the last successful provider sync; provider changes still
+    // fall back to the complete rollout and SQLite repair.
+    let session_maintenance = run_startup_session_maintenance(home, original_provider).await?;
+    await_initial_storage_guards(
+        guards.trace,
+        config.disable_trace_log_writes,
+        guards.crashpad,
+        config.protect_crashpad_pending,
+        crashpad_pending_stats,
+    )
+    .await?;
+    Ok(StartupStorageState {
+        app_dir,
+        session_maintenance,
+    })
+}
+
+async fn prepare_runtime_provider_state(
+    home: &std::path::Path,
+    config: &CodeyConfig,
+    route: &StartupRouteContext,
+    app_dir: &std::path::Path,
+) -> Result<PreparedProviderState> {
+    let protocol_proxy =
+        start_runtime_protocol_proxy(&route.current_profile, config.default_model())
+            .await
+            .map_err(|error| {
+                error_log::record_failure(
+                    "protocol_proxy_start_failed",
+                    "start_chat_completions_protocol_proxy",
+                    format!("{error:#}"),
+                    serde_json::json!({
+                        "provider": route.original_provider,
+                        "protocol": route.current_profile.protocol,
+                    }),
+                );
+                error
+            })?;
+    let protocol_proxy_base_url = protocol_proxy
+        .as_ref()
+        .map(|proxy| proxy.base_url().to_string());
+    let applied_config = prepare_codex_startup_state(
+        config,
+        &route.current_profile,
+        app_dir,
+        home,
+        CodexStartupStateOptions {
+            original_provider: &route.original_provider,
+            preserve_provider_route: route.preserve_provider_route,
+            protocol_proxy_base_url: protocol_proxy_base_url.as_deref(),
+            expected_config: route
+                .live_route
+                .as_ref()
+                .map(|route| route.config_contents()),
+        },
+    )
+    .await?;
+    let applied_route_files = route
+        .live_route
+        .as_ref()
+        .map(|live_route| RouteFilesSnapshot {
+            config: applied_config,
+            auth: live_route.auth_contents().map(<[u8]>::to_vec),
+        });
+    Ok(PreparedProviderState {
+        protocol_proxy,
+        applied_route_files,
+    })
+}
+
+async fn prepare_startup_patches_and_overlay(
+    home: &std::path::Path,
+    config: &CodeyConfig,
+    applied_route_files: Option<&RouteFilesSnapshot>,
+) -> Result<StartupPatchState> {
+    let (route_overlay_shutdown, route_overlay_task, route_changed) =
+        if let Some(applied_route_files) = applied_route_files {
+            let (shutdown, task, changed) =
+                spawn_route_overlay_watcher(home.to_path_buf(), applied_route_files.clone());
+            (Some(shutdown), Some(task), Some(changed))
+        } else {
+            (None, None, None)
+        };
+
+    let slim_codex_pet = config.slim_codex_pet;
+    let (plugin_status, plugin_detail, pet_result) =
+        read_startup_patch_status(home, slim_codex_pet).await;
+    let debug_port = codey_runtime_core::ports::select_packaged_codex_debug_port(9229);
+    if let Some(applied_route_files) = applied_route_files {
+        let current_route_files = read_route_files(home)
+            .await
+            .with_context(|| "启动 Codex 前复核 CC Switch Live 路由失败")?;
+        if current_route_files.as_ref() != Some(applied_route_files) {
+            return Err(restore_runtime_config_after_error(
+                home,
+                anyhow::anyhow!("CC Switch Live 路由在 Codex 启动前发生变化；已取消旧线路启动"),
+            )
+            .await);
+        }
+    }
+    match pet_result {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            error_log::record_failure(
+                "patch_failed",
+                "configure_codex_pet_slim",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "enabled": slim_codex_pet,
+                }),
+            );
+            return Err(restore_runtime_config_after_error(
+                home,
+                error.context("应用 Codex 宠物精简设置失败"),
+            )
+            .await);
+        }
+        Err(error) => {
+            error_log::record_failure(
+                "patch_failed",
+                "configure_codex_pet_slim",
+                error.to_string(),
+                serde_json::json!({
+                    "enabled": slim_codex_pet,
+                    "taskJoinFailed": true,
+                }),
+            );
+            return Err(restore_runtime_config_after_error(
+                home,
+                anyhow::Error::new(error).context("Codex 宠物精简设置任务异常退出"),
+            )
+            .await);
+        }
+    };
+    Ok(StartupPatchState {
+        plugin_status,
+        plugin_detail,
+        debug_port,
+        route_overlay_shutdown,
+        route_overlay_task,
+        route_changed,
+    })
+}
+
+async fn spawn_and_inject_runtime(
+    home: &std::path::Path,
+    config: &CodeyConfig,
+    handler: &codey_runtime_core::bridge::BridgeHandler,
+    injection_scripts: &cdp::PreparedInjectionScripts,
+    storage: StartupStorageState,
+    patch: &StartupPatchState,
+) -> Result<SpawnedRenderer> {
+    let mut spawned = match spawn_codex(
+        &storage.app_dir,
+        patch.debug_port,
+        config.slim_codex_pet,
+        config.slim_codex_voice,
+        config.fast_codex_startup,
+        config.gpu_launch_mode,
+    )
+    .await
+    {
+        Ok(spawned) => spawned,
+        Err(error) => {
+            return Err(restore_runtime_config_after_error(home, error).await);
+        }
+    };
+    let maintenance = MaintenanceStatus {
+        session_status: storage.session_maintenance.status,
+        session_detail: storage.session_maintenance.detail,
+        session_files_fixed: storage.session_maintenance.files_fixed,
+        sqlite_rows_updated: storage.session_maintenance.sqlite_rows_updated,
+        ghost_tasks_pruned: storage.session_maintenance.ghost_tasks_pruned,
+        plugin_status: patch.plugin_status.clone(),
+        plugin_detail: patch.plugin_detail.clone(),
+        performance_status: spawned.performance_status.clone(),
+        performance_detail: spawned.performance_detail.clone(),
+    };
+    let child = Arc::new(Mutex::new(spawned.child.take()));
+    let injected_target = inject_initial_renderer(
+        patch.debug_port,
+        handler.clone(),
+        injection_scripts,
+        &storage.app_dir,
+        home,
+        &spawned,
+        &child,
+    )
+    .await?;
+    Ok(SpawnedRenderer {
+        app_dir: storage.app_dir,
+        spawned,
+        child,
+        maintenance,
+        injected_target,
+    })
+}
+
+fn spawn_runtime_watchers(inputs: RuntimeWatcherInputs) -> RuntimeWatchers {
+    let RuntimeWatcherInputs {
+        injected_target,
+        debug_port,
+        handler,
+        injection_scripts,
+        child,
+        process_id,
+        protect_crashpad_pending,
+        crashpad_pending_stats,
+    } = inputs;
+    #[cfg(not(windows))]
+    let _ = process_id;
+    let InjectionWatchdog {
+        statuses: injection_statuses,
+        websocket_url: injection_websocket_url,
+        shutdown: watchdog_shutdown,
+        task: watchdog_task,
+    } = spawn_injection_watchdog(injected_target, debug_port, handler, injection_scripts);
+    let codex_exited = Arc::new(AtomicBool::new(false));
+    let crashpad_guard_enabled = Arc::new(AtomicBool::new(protect_crashpad_pending));
+    let (crashpad_guard_shutdown, crashpad_guard_task) =
+        spawn_crashpad_guard_watcher(crashpad_guard_enabled.clone(), crashpad_pending_stats);
+    #[cfg(windows)]
+    let (exit_watchdog_shutdown, codex_exit, exit_watchdog_task) =
+        spawn_codex_exit_watcher(child, process_id, codex_exited);
+    #[cfg(not(windows))]
+    let (exit_watchdog_shutdown, codex_exit, exit_watchdog_task) =
+        spawn_codex_exit_watcher(child, codex_exited);
+    RuntimeWatchers {
+        injection_statuses,
+        injection_websocket_url,
+        watchdog_shutdown,
+        watchdog_task,
+        crashpad_guard_enabled,
+        crashpad_guard_shutdown,
+        crashpad_guard_task,
+        exit_watchdog_shutdown,
+        exit_watchdog_task,
+        codex_exit,
+    }
+}
+
 impl CodeyRuntime {
     pub async fn renderer_websocket_url(&self) -> Arc<str> {
         self.injection_websocket_url.read().await.clone()
@@ -1028,258 +1445,55 @@ impl CodeyRuntime {
             config.hide_full_access_warning,
             &config.user_scripts,
         );
-        let trace_guard_home = home.clone();
-        let disable_trace_log_writes = config.disable_trace_log_writes;
-        let initial_trace_guard = tokio::task::spawn_blocking(move || {
-            trace_log_guard::configure(&trace_guard_home, disable_trace_log_writes)
-        });
-        let protect_crashpad_pending = config.protect_crashpad_pending;
-        let initial_crashpad_guard = tokio::task::spawn_blocking(move || {
-            if protect_crashpad_pending {
-                crashpad_pending_guard::enforce_system_limit()
-            } else {
-                crashpad_pending_guard::CrashpadGuardRun {
-                    cleanup: crashpad_pending_guard::CrashpadCleanupReport::default(),
-                    snapshot: crashpad_pending_guard::snapshot_system(false),
-                }
-            }
-        });
-        let startup_route_home = home.clone();
-        let startup_route = tokio::task::spawn_blocking(move || {
-            cc_switch::startup_route_state(&startup_route_home)
-        })
-        .await
-        .map_err(|error| {
-            let error = anyhow::Error::new(error).context("检测 CC Switch 路由接管任务异常退出");
-            error_log::record_failure(
-                "patch_failed",
-                "detect_cc_switch_route_takeover",
-                format!("{error:#}"),
-                serde_json::json!({
-                    "codexHome": home,
-                    "taskJoinFailed": true,
-                }),
-            );
-            error
-        })?
-        .map_err(|error| {
-            error_log::record_failure(
-                "patch_failed",
-                "detect_cc_switch_route_takeover",
-                format!("{error:#}"),
-                serde_json::json!({
-                    "codexHome": home,
-                }),
-            );
-            error
-        })?;
-        let preserve_provider_route =
-            preserve_cc_switch_route(startup_route.takeover).map_err(|error| {
-                error_log::record_failure(
-                    "patch_failed",
-                    "validate_cc_switch_route_takeover",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "managed": startup_route.takeover.managed,
-                        "live": startup_route.takeover.live,
-                    }),
-                );
-                error
-            })?;
-        let live_route =
-            if preserve_provider_route {
-                Some(startup_route.live_route.ok_or_else(|| {
-                    anyhow::anyhow!("CC Switch Live 路由缺少已验证的 Provider 快照")
-                })?)
-            } else {
-                None
-            };
-        let original_provider = if let Some(live_route) = live_route.as_ref() {
-            live_route.provider_id().to_string()
-        } else {
-            resolve_startup_provider(&home).await?
-        };
-        let current_profile = if let Some(live_route) = live_route.as_ref() {
-            live_route.profile().clone()
-        } else {
-            config
-                .active_profile()
-                .ok_or_else(|| anyhow::anyhow!("找不到当前 Codex 线路"))?
-        };
-        let app_dir = resolve_configured_codex_app_dir(config).await?;
-        // Session repair must never race a live Codex writer. Stopping the old
-        // runtime first also gives SQLite and rollout buffers a chance to flush
-        // before any permanent maintenance is applied.
-        prepare_codex_for_launch(&app_dir).await?;
-
-        // Permanent maintenance runs before Codey creates the temporary
-        // direct-provider lease. A lightweight header/SQLite validation normally
-        // reuses the last successful provider sync; provider changes still
-        // fall back to the complete rollout and SQLite repair.
-        let session_maintenance =
-            run_startup_session_maintenance(&home, &original_provider).await?;
-        await_initial_storage_guards(
-            initial_trace_guard,
-            disable_trace_log_writes,
-            initial_crashpad_guard,
-            protect_crashpad_pending,
+        let initial_storage_guards = spawn_initial_storage_guards(&home, config);
+        let route = resolve_startup_route_context(&home, config).await?;
+        let storage = prepare_startup_storage(
+            &home,
+            config,
+            &route.original_provider,
+            initial_storage_guards,
             &crashpad_pending_stats,
         )
         .await?;
-
-        let protocol_proxy = start_runtime_protocol_proxy(&current_profile, config.default_model())
-            .await
-            .map_err(|error| {
-                error_log::record_failure(
-                    "protocol_proxy_start_failed",
-                    "start_chat_completions_protocol_proxy",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "provider": original_provider,
-                        "protocol": current_profile.protocol,
-                    }),
-                );
-                error
-            })?;
-        let protocol_proxy_base_url = protocol_proxy
-            .as_ref()
-            .map(|proxy| proxy.base_url().to_string());
-        let applied_config = prepare_codex_startup_state(
-            config,
-            &current_profile,
-            &app_dir,
-            &home,
-            CodexStartupStateOptions {
-                original_provider: &original_provider,
-                preserve_provider_route,
-                protocol_proxy_base_url: protocol_proxy_base_url.as_deref(),
-                expected_config: live_route.as_ref().map(|route| route.config_contents()),
-            },
-        )
-        .await?;
-        let applied_route_files = live_route.as_ref().map(|live_route| RouteFilesSnapshot {
-            config: applied_config,
-            auth: live_route.auth_contents().map(<[u8]>::to_vec),
-        });
-        let (route_overlay_shutdown, route_overlay_task, route_changed) =
-            if let Some(applied_route_files) = applied_route_files.as_ref() {
-                let (shutdown, task, changed) =
-                    spawn_route_overlay_watcher(home.clone(), applied_route_files.clone());
-                (Some(shutdown), Some(task), Some(changed))
-            } else {
-                (None, None, None)
-            };
-
-        let slim_codex_pet = config.slim_codex_pet;
-        let (plugin_status, plugin_detail, pet_result) =
-            read_startup_patch_status(&home, slim_codex_pet).await;
-        let debug_port = codey_runtime_core::ports::select_packaged_codex_debug_port(9229);
-        if let Some(applied_route_files) = applied_route_files.as_ref() {
-            let current_route_files = read_route_files(&home)
-                .await
-                .with_context(|| "启动 Codex 前复核 CC Switch Live 路由失败")?;
-            if current_route_files.as_ref() != Some(applied_route_files) {
-                return Err(restore_runtime_config_after_error(
-                    &home,
-                    anyhow::anyhow!("CC Switch Live 路由在 Codex 启动前发生变化；已取消旧线路启动"),
-                )
-                .await);
-            }
-        }
-        match pet_result {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "configure_codex_pet_slim",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "enabled": slim_codex_pet,
-                    }),
-                );
-                return Err(restore_runtime_config_after_error(
-                    &home,
-                    error.context("应用 Codex 宠物精简设置失败"),
-                )
-                .await);
-            }
-            Err(error) => {
-                error_log::record_failure(
-                    "patch_failed",
-                    "configure_codex_pet_slim",
-                    error.to_string(),
-                    serde_json::json!({
-                        "enabled": slim_codex_pet,
-                        "taskJoinFailed": true,
-                    }),
-                );
-                return Err(restore_runtime_config_after_error(
-                    &home,
-                    anyhow::Error::new(error).context("Codex 宠物精简设置任务异常退出"),
-                )
-                .await);
-            }
-        };
-        let mut spawned = match spawn_codex(
-            &app_dir,
-            debug_port,
-            config.slim_codex_pet,
-            config.slim_codex_voice,
-            config.fast_codex_startup,
-            config.gpu_launch_mode,
-        )
-        .await
-        {
-            Ok(spawned) => spawned,
-            Err(error) => {
-                return Err(restore_runtime_config_after_error(&home, error).await);
-            }
-        };
-        let maintenance = MaintenanceStatus {
-            session_status: session_maintenance.status,
-            session_detail: session_maintenance.detail,
-            session_files_fixed: session_maintenance.files_fixed,
-            sqlite_rows_updated: session_maintenance.sqlite_rows_updated,
-            ghost_tasks_pruned: session_maintenance.ghost_tasks_pruned,
-            plugin_status,
-            plugin_detail,
-            performance_status: spawned.performance_status.clone(),
-            performance_detail: spawned.performance_detail.clone(),
-        };
+        let PreparedProviderState {
+            protocol_proxy,
+            applied_route_files,
+        } = prepare_runtime_provider_state(&home, config, &route, &storage.app_dir).await?;
+        let patch =
+            prepare_startup_patches_and_overlay(&home, config, applied_route_files.as_ref())
+                .await?;
+        let SpawnedRenderer {
+            app_dir,
+            spawned,
+            child,
+            maintenance,
+            injected_target,
+        } = spawn_and_inject_runtime(&home, config, &handler, &injection_scripts, storage, &patch)
+            .await?;
         #[cfg(target_os = "macos")]
         let inspector_argument = spawned.inspector_argument.clone();
-        let child = Arc::new(Mutex::new(spawned.child.take()));
-        let injected_target = inject_initial_renderer(
-            debug_port,
-            handler.clone(),
-            &injection_scripts,
-            &app_dir,
-            &home,
-            &spawned,
-            &child,
-        )
-        .await?;
-        let InjectionWatchdog {
-            statuses: injection_statuses,
-            websocket_url: injection_websocket_url,
-            shutdown: watchdog_shutdown,
-            task: watchdog_task,
-        } = spawn_injection_watchdog(
+        let process_id = spawned.process_id;
+        let RuntimeWatchers {
+            injection_statuses,
+            injection_websocket_url,
+            watchdog_shutdown,
+            watchdog_task,
+            crashpad_guard_enabled,
+            crashpad_guard_shutdown,
+            crashpad_guard_task,
+            exit_watchdog_shutdown,
+            exit_watchdog_task,
+            codex_exit,
+        } = spawn_runtime_watchers(RuntimeWatcherInputs {
             injected_target,
-            debug_port,
+            debug_port: patch.debug_port,
             handler,
-            injection_scripts.clone(),
-        );
-        let codex_exited = Arc::new(AtomicBool::new(false));
-        let crashpad_guard_enabled = Arc::new(AtomicBool::new(protect_crashpad_pending));
-        let (crashpad_guard_shutdown, crashpad_guard_task) =
-            spawn_crashpad_guard_watcher(crashpad_guard_enabled.clone(), crashpad_pending_stats);
-        #[cfg(windows)]
-        let (exit_watchdog_shutdown, codex_exit, exit_watchdog_task) =
-            spawn_codex_exit_watcher(child.clone(), spawned.process_id, codex_exited.clone());
-        #[cfg(not(windows))]
-        let (exit_watchdog_shutdown, codex_exit, exit_watchdog_task) =
-            spawn_codex_exit_watcher(child.clone(), codex_exited.clone());
+            injection_scripts: injection_scripts.clone(),
+            child: child.clone(),
+            process_id,
+            protect_crashpad_pending: config.protect_crashpad_pending,
+            crashpad_pending_stats,
+        });
         Ok((
             Self {
                 codex_app_path: app_dir,
@@ -1291,15 +1505,15 @@ impl CodeyRuntime {
                 injection_scripts,
                 injection_websocket_url,
                 child,
-                process_id: spawned.process_id,
+                process_id,
                 #[cfg(unix)]
                 process_group_id: spawned.process_group_id,
                 #[cfg(target_os = "macos")]
                 inspector_argument,
                 watchdog_shutdown: Mutex::new(Some(watchdog_shutdown)),
                 watchdog_task: Mutex::new(Some(watchdog_task)),
-                route_overlay_shutdown: Mutex::new(route_overlay_shutdown),
-                route_overlay_task: Mutex::new(route_overlay_task),
+                route_overlay_shutdown: Mutex::new(patch.route_overlay_shutdown),
+                route_overlay_task: Mutex::new(patch.route_overlay_task),
                 exit_watchdog_shutdown: Mutex::new(Some(exit_watchdog_shutdown)),
                 exit_watchdog_task: Mutex::new(Some(exit_watchdog_task)),
                 crashpad_guard_enabled,
@@ -1308,7 +1522,7 @@ impl CodeyRuntime {
                 protocol_proxy: Mutex::new(protocol_proxy),
             },
             codex_exit,
-            route_changed,
+            patch.route_changed,
         ))
     }
 

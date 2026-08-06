@@ -24,7 +24,7 @@ test("startup renders a loading state until config and provider are ready", asyn
 });
 
 test("error log is failure-only, daily, structured, and cross-process serialized", async () => {
-  const [errorLog, launcher, cdp, commands, runtimeCommands, lib, startupPatch] =
+  const [errorLog, launcher, cdp, commands, runtimeCommands, lib, startupPatch, startupPatchLoader] =
     await Promise.all([
       source("backend/src/error_log.rs"),
       source("backend/src/launcher.rs"),
@@ -32,6 +32,7 @@ test("error log is failure-only, daily, structured, and cross-process serialized
       source("backend/src/commands.rs"),
       source("backend/src/commands/runtime.rs"),
       source("backend/src/lib.rs"),
+      source("backend/src/codex_startup_patch.js"),
       source("backend/src/codex_startup_patch.rs"),
     ]);
 
@@ -74,4 +75,5 @@ test("error log is failure-only, daily, structured, and cross-process serialized
   assert.match(startupPatch, /spawnSync/);
   assert.match(startupPatch, /startup\.renderer_asset_patch/);
   assert.match(startupPatch, /electronVersion/);
+  assert.match(startupPatchLoader, /include_str!\("codex_startup_patch\.js"\)/);
 });

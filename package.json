@@ -8,7 +8,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "node scripts/build.mjs",
-    "check": "tsc --noEmit",
+    "check": "node --check backend/src/codex_startup_patch.js && tsc --noEmit",
     "release": "node scripts/release.mjs",
     "test:js": "node --test tests/*.test.mjs",
     "vite:dev": "vite --host 127.0.0.1 --port 1421",

@@ -175,6 +175,30 @@ export function App({
   const provider = ccSwitchStatus?.provider;
   const isBusy = busy !== null;
   const configLoaded = config !== null;
+  const setPersistedConfig = useCallback((next: Config) => {
+    persistedConfigRef.current = next;
+    setConfig(next);
+  }, []);
+  const setSubagentOptimization = useCallback((enabled: boolean) => {
+    setConfig((current) =>
+      current ? { ...current, subagentOptimization: enabled } : current,
+    );
+    setDirty(true);
+  }, []);
+  const runOperation = useCallback(
+    async (name: string, action: () => Promise<void>) => {
+      if (isBusy) return;
+      setBusy(name);
+      try {
+        await action();
+      } catch (error) {
+        setNotice({ tone: "error", text: errorText(error) });
+      } finally {
+        setBusy(null);
+      }
+    },
+    [isBusy, setNotice],
+  );
   const operationsStatus = useMemo(
     () => ({
       running: status.running,
@@ -310,20 +334,8 @@ export function App({
     }
   }
 
-  function setPersistedConfig(next: Config) {
-    persistedConfigRef.current = next;
-    setConfig(next);
-  }
-
   function editConfig(next: Config) {
     setConfig(next);
-    setDirty(true);
-  }
-
-  function setSubagentOptimization(enabled: boolean) {
-    setConfig((current) =>
-      current ? { ...current, subagentOptimization: enabled } : current,
-    );
     setDirty(true);
   }
 
@@ -439,18 +451,6 @@ export function App({
         text: `模型「${result.model}」对话测试通过（HTTP ${result.httpStatus}）`,
       });
     });
-  }
-
-  async function runOperation(name: string, action: () => Promise<void>) {
-    if (isBusy) return;
-    setBusy(name);
-    try {
-      await action();
-    } catch (error) {
-      setNotice({ tone: "error", text: errorText(error) });
-    } finally {
-      setBusy(null);
-    }
   }
 
   async function saveCurrent() {
@@ -660,12 +660,14 @@ export function App({
   const handleRequestRemoveNotificationChannel = useStableEvent(
     askRemoveNotificationChannel,
   );
-  const handleSubagentOptimizationChange = useStableEvent(
-    (checked: boolean) =>
+  const handleSubagentOptimizationChange = useCallback(
+    (checked: boolean) => {
       void updateSubagentOptimization(
         checked,
         config?.subagentModel ?? "",
-      ),
+      );
+    },
+    [config?.subagentModel, updateSubagentOptimization],
   );
   const handleSyncCurrentProvider = useStableEvent(
     () => void syncCurrentProvider(),
@@ -677,17 +679,8 @@ export function App({
       }
     },
   );
-  const handleFetchCurrentModels = useStableEvent(
-    () => void fetchCurrentModels(),
-  );
   const handleTestCurrentProvider = useStableEvent(
     () => void testCurrentProvider(),
-  );
-  const handleSetDefaultModel = useStableEvent(
-    (model: string) => void setDefaultModel(model),
-  );
-  const handleDeleteThirdPartyModel = useStableEvent(
-    (model: string) => void deleteThirdPartyModel(model),
   );
   const handleClearTraceLogs = useStableEvent(askClearTraceLogs);
   const handleRefreshTraceLogStats = useStableEvent(
@@ -696,15 +689,6 @@ export function App({
   const handleModelPickerOpenChange = useStableEvent((open: boolean) => {
     if (!isBusy || open) setModelPickerVisible(open);
   });
-  const handleCustomModelInputChange = useStableEvent(updateCustomModelInput);
-  const handleAddCustomModel = useStableEvent(addCustomModel);
-  const handleToggleDraftModel = useStableEvent(toggleDraftModel);
-  const handleDeleteDraftThirdPartyModel = useStableEvent(
-    deleteDraftThirdPartyModel,
-  );
-  const handleSaveModelSelection = useStableEvent(
-    () => void saveModelSelection(),
-  );
   const handleCodexAppPathOpenChange = useStableEvent((open: boolean) => {
     if (!isBusy) codexAppPathDialog.setOpen(open);
   });
@@ -930,10 +914,10 @@ export function App({
               busy={busy}
               showAccountUsageInHeader={config.showAccountUsageInHeader}
               onSyncCurrentProvider={handleSyncCurrentProvider}
-              onFetchCurrentModels={handleFetchCurrentModels}
+              onFetchCurrentModels={fetchCurrentModels}
               onTestCurrentProvider={handleTestCurrentProvider}
-              onSetDefaultModel={handleSetDefaultModel}
-              onDeleteThirdPartyModel={handleDeleteThirdPartyModel}
+              onSetDefaultModel={setDefaultModel}
+              onDeleteThirdPartyModel={deleteThirdPartyModel}
               manualThirdPartyModelKeys={manualThirdPartyModelKeys}
               onShowAccountUsageInHeaderChange={
                 handleShowAccountUsageInHeaderChange
@@ -978,11 +962,11 @@ export function App({
         draftModelSet={draftModelSet}
         manualThirdPartyModelKeys={draftManualThirdPartyModelKeys}
         onOpenChange={handleModelPickerOpenChange}
-        onCustomModelInputChange={handleCustomModelInputChange}
-        onAddCustomModel={handleAddCustomModel}
-        onToggleDraftModel={handleToggleDraftModel}
-        onDeleteThirdPartyModel={handleDeleteDraftThirdPartyModel}
-        onSave={handleSaveModelSelection}
+        onCustomModelInputChange={updateCustomModelInput}
+        onAddCustomModel={addCustomModel}
+        onToggleDraftModel={toggleDraftModel}
+        onDeleteThirdPartyModel={deleteDraftThirdPartyModel}
+        onSave={saveModelSelection}
       />
 
       <ConfirmationDialogHost

@@ -140,42 +140,17 @@
     voiceControlIds.has(value) ||
     voiceControlIdPrefixes.some((prefix) => value.startsWith(prefix));
 
-  const reactTraversalKeys = new Set(["return", "child", "sibling", "stateNode", "_owner"]);
-  const reactAncestorTraversalKeys = new Set([...reactTraversalKeys, "children"]);
-  const reactInternals = window.__codeySharedRuntime.reactInternals;
-  const containsMatchingValue = (value, predicate, ignoredKeys = reactTraversalKeys) =>
-    window.__codeySharedRuntime.objectGraphIncludes(value, predicate, {
-      ignoredKeys,
-      maxDepth: 7,
-    });
+  const reactAncestorTraversalKeys =
+    new Set(["return", "child", "sibling", "stateNode", "_owner", "children"]);
 
   const hasMatchingReactValue = (control, predicate) =>
-    reactInternals(control)
-      .some((internal) => {
-        try {
-          if (containsMatchingValue(internal?.memoizedProps ?? internal, predicate)) return true;
-
-          let ancestor = internal?.memoizedProps ? internal.return : null;
-          for (let depth = 0; ancestor && depth < 8; depth += 1) {
-            if (
-              containsMatchingValue(
-                ancestor.memoizedProps,
-                predicate,
-                reactAncestorTraversalKeys,
-              )
-            ) {
-              return true;
-            }
-            ancestor = ancestor.return;
-          }
-          return false;
-        } catch {
-          return false;
-        }
-      });
+    window.__codeySharedRuntime.reactInternalGraphIncludes(control, predicate, {
+      ancestorDepth: 8,
+      ancestorIgnoredKeys: reactAncestorTraversalKeys,
+    });
 
   // Verdicts are deliberately not memoised. `restoreRepurposedVoiceControls`
-  // depends on seeing a control stop being a voice control, and the walk above
+  // depends on seeing a control stop being a voice control, and the shared walk
   // reads every __reactProps$/__reactFiber$ key plus eight ancestor fibers, so
   // no cheap identity token covers what the verdict actually depends on.
   const isVoiceControl = (control) => {
