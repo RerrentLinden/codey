@@ -16,6 +16,9 @@ import type {
 import { errorText, withTimeout } from "./appUtils";
 
 const THIRD_PARTY_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
+const MAX_MODEL_ID_BYTES = 512;
+const MAX_MODEL_COUNT = 10_000;
+const modelIdEncoder = new TextEncoder();
 
 const supportsModel = (models: string[], expected: string) =>
   models.some(
@@ -65,6 +68,7 @@ export function useModelSelection({
   const [modelState, setModelState] = useState<ModelState>({
     officialModels: [],
     officialModelIds: [],
+    subagentModelIds: [],
     thirdPartyModels: [],
     manualThirdPartyModels: [],
     upstreamModels: [],
@@ -99,23 +103,32 @@ export function useModelSelection({
     () => new Set(deletedThirdPartyModels.map(modelKey)),
     [deletedThirdPartyModels],
   );
+  const subagentModelKeys = useMemo(
+    () => new Set(modelState.subagentModelIds.map(modelKey)),
+    [modelState.subagentModelIds],
+  );
   const thirdPartyModelOptions = useMemo(
-    () => [
-      ...modelState.upstreamModels,
-      ...modelState.thirdPartyModels,
-      ...draftModels,
-    ].reduce<string[]>((models, model) => {
-      const normalized = model.trim();
-      if (
-        normalized &&
-        !officialSlugKeys.has(modelKey(normalized)) &&
-        !deletedThirdPartyModelKeys.has(modelKey(normalized)) &&
-        !models.includes(normalized)
-      ) {
-        models.push(normalized);
-      }
-      return models;
-    }, []),
+    () => {
+      const seenKeys = new Set<string>();
+      return [
+        ...modelState.upstreamModels,
+        ...modelState.thirdPartyModels,
+        ...draftModels,
+      ].reduce<string[]>((models, model) => {
+        const normalized = model.trim();
+        const key = modelKey(normalized);
+        if (
+          normalized &&
+          !officialSlugKeys.has(key) &&
+          !deletedThirdPartyModelKeys.has(key) &&
+          !seenKeys.has(key)
+        ) {
+          seenKeys.add(key);
+          models.push(normalized);
+        }
+        return models;
+      }, []);
+    },
     [
       draftModels,
       deletedThirdPartyModelKeys,
@@ -127,7 +140,10 @@ export function useModelSelection({
   const subagentModelOptions = useMemo<SubagentModelOption[]>(
     () => [
       ...modelState.officialModels
-        .filter((model) => model.supported)
+        .filter(
+          (model) =>
+            model.supported && subagentModelKeys.has(modelKey(model.slug)),
+        )
         .map((model) => ({
           value: model.slug,
           label: model.displayName,
@@ -137,14 +153,20 @@ export function useModelSelection({
               : ["low"],
           defaultReasoningEffort: model.defaultReasoningEffort || "low",
         })),
-      ...modelState.thirdPartyModels.map((model) => ({
-        value: model,
-        label: model,
-        supportedReasoningEfforts: THIRD_PARTY_REASONING_EFFORTS,
-        defaultReasoningEffort: "low",
-      })),
+      ...modelState.thirdPartyModels
+        .filter((model) => subagentModelKeys.has(modelKey(model)))
+        .map((model) => ({
+          value: model,
+          label: model,
+          supportedReasoningEfforts: THIRD_PARTY_REASONING_EFFORTS,
+          defaultReasoningEffort: "low",
+        })),
     ],
-    [modelState.officialModels, modelState.thirdPartyModels],
+    [
+      modelState.officialModels,
+      modelState.thirdPartyModels,
+      subagentModelKeys,
+    ],
   );
 
   function openModelPicker(state: ModelState, warning = "") {
@@ -204,11 +226,21 @@ export function useModelSelection({
       });
       return;
     }
-    const subagentModel = selectedModel.trim();
-    if (!subagentModel || !subagentModelOptions.some((option) => option.value === subagentModel)) {
+    const selectedSubagentModelKey = modelKey(selectedModel);
+    if (subagentModelOptions.length === 0) {
       setNotice({
         tone: "error",
-        text: "请先从当前已选模型列表中选择子代理模型",
+        text: "当前线路没有 Codex 子代理工具可用的模型，无法开启子代理协作优化",
+      });
+      return;
+    }
+    const subagentModel = subagentModelOptions.find(
+      (option) => modelKey(option.value) === selectedSubagentModelKey,
+    )?.value;
+    if (!subagentModel) {
+      setNotice({
+        tone: "error",
+        text: "请先选择 Codex 子代理工具支持的模型",
       });
       return;
     }
@@ -216,7 +248,8 @@ export function useModelSelection({
       let supported = false;
       if (provider.official) {
         supported = modelState.officialModels.some(
-          (model) => model.slug === subagentModel && model.supported,
+          (model) =>
+            modelKey(model.slug) === modelKey(subagentModel) && model.supported,
         );
       } else {
         let result: {
@@ -288,6 +321,17 @@ export function useModelSelection({
     const model = customModelInput.trim();
     if (!model) {
       setModelInputError("请输入要添加的模型 ID");
+      return;
+    }
+    if (modelIdEncoder.encode(model).byteLength > MAX_MODEL_ID_BYTES) {
+      setModelInputError(`模型 ID 不能超过 ${MAX_MODEL_ID_BYTES} 字节`);
+      return;
+    }
+    if (
+      draftModels.length >= MAX_MODEL_COUNT &&
+      !draftModels.some((item) => modelKey(item) === modelKey(model))
+    ) {
+      setModelInputError(`模型数量不能超过 ${MAX_MODEL_COUNT} 个`);
       return;
     }
     const officialModel = modelState.officialModelIds.find(

@@ -1152,6 +1152,7 @@ async fn handle_helper_connection_with_settings(
                 .unwrap_or_else(|| "event".to_string());
             let _ =
                 crate::diagnostic_log::append_diagnostic_log(&format!("renderer.{event}"), detail);
+            let _ = crate::diagnostic_log::flush_diagnostic_log();
         }
         (
             "200 OK".to_string(),
@@ -1356,16 +1357,27 @@ async fn handle_protocol_proxy_connection(
     remote_addr_text: Option<String>,
     proxy_settings: Option<&BackendSettings>,
 ) -> anyhow::Result<()> {
-    let request_json = serde_json::from_str::<serde_json::Value>(request_body).ok();
-    let upstream_result = if let Some(settings) = proxy_settings {
-        crate::protocol_proxy::open_responses_proxy_request_with_settings_and_user_agent(
-            request_body,
-            settings.clone(),
-            request_user_agent,
-        )
-        .await
-    } else {
-        crate::protocol_proxy::open_responses_proxy_request(request_body, request_user_agent).await
+    let (request_json, upstream_result) = match serde_json::from_str::<serde_json::Value>(
+        request_body,
+    ) {
+        Ok(request_json) => {
+            let upstream_result = if let Some(settings) = proxy_settings {
+                crate::protocol_proxy::open_responses_proxy_request_value_with_settings_and_user_agent(
+                        &request_json,
+                        settings.clone(),
+                        request_user_agent,
+                    )
+                    .await
+            } else {
+                crate::protocol_proxy::open_responses_proxy_request_value(
+                    &request_json,
+                    request_user_agent,
+                )
+                .await
+            };
+            (Some(request_json), upstream_result)
+        }
+        Err(error) => (None, Err(error.into())),
     };
     let upstream = match upstream_result {
         Ok(upstream) => upstream,
@@ -1391,6 +1403,8 @@ async fn handle_protocol_proxy_connection(
             return Ok(());
         }
     };
+    let request_json =
+        request_json.expect("a successful protocol proxy request must contain valid JSON");
     if !upstream.is_success() {
         let status = upstream.status();
         let upstream_content_type = upstream.content_type.clone();
@@ -1401,8 +1415,7 @@ async fn handle_protocol_proxy_connection(
             &upstream_body,
         );
         let model = request_json
-            .as_ref()
-            .and_then(|request| request.get("model"))
+            .get("model")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .unwrap_or_default();
@@ -1451,10 +1464,8 @@ async fn handle_protocol_proxy_connection(
             stream.shutdown().await?;
             return Ok(());
         }
-        let mut converter = request_json
-            .as_ref()
-            .map(crate::protocol_proxy::ChatSseToResponsesConverter::with_request)
-            .unwrap_or_default();
+        let mut converter =
+            crate::protocol_proxy::ChatSseToResponsesConverter::with_owned_request(request_json);
         let mut bytes_stream = upstream.response.bytes_stream();
         let mut stream_failed = false;
         while let Some(chunk) = bytes_stream.next().await {
@@ -1518,11 +1529,8 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
     let chat_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
-    let response_json = if let Some(request_json) = request_json.as_ref() {
-        crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, request_json)?
-    } else {
-        crate::protocol_proxy::chat_completion_to_response(chat_json)?
-    };
+    let response_json =
+        crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, &request_json)?;
     let body = serde_json::to_vec(&response_json)?;
     write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
     log_helper_response(

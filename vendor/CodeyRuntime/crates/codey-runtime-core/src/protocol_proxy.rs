@@ -2,6 +2,7 @@
 //!
 //! Codex Chat 与 Responses 协议之间的转换实现。
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::LazyLock;
@@ -364,6 +365,13 @@ impl ChatSseToResponsesConverter {
         }
     }
 
+    pub fn with_owned_request(original_request: Value) -> Self {
+        Self {
+            state: ChatSseState::with_owned_request(original_request),
+            ..Self::default()
+        }
+    }
+
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Vec<u8> {
         append_utf8_safe(&mut self.buffer, &mut self.utf8_remainder, bytes);
         let mut output = String::new();
@@ -472,9 +480,21 @@ pub async fn open_responses_proxy_request(
     body: &str,
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    let request_json: Value = serde_json::from_str(body)?;
+    open_responses_proxy_request_value(&request_json, original_user_agent).await
+}
+
+pub(crate) async fn open_responses_proxy_request_value(
+    request_json: &Value,
+    original_user_agent: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    open_responses_proxy_request_with_settings_and_user_agent(body, settings, original_user_agent)
-        .await
+    open_responses_proxy_request_value_with_settings_and_user_agent(
+        request_json,
+        settings,
+        original_user_agent,
+    )
+    .await
 }
 
 pub async fn open_responses_proxy_request_with_settings(
@@ -490,6 +510,19 @@ pub async fn open_responses_proxy_request_with_settings_and_user_agent(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let request_json: Value = serde_json::from_str(body)?;
+    open_responses_proxy_request_value_with_settings_and_user_agent(
+        &request_json,
+        settings,
+        original_user_agent,
+    )
+    .await
+}
+
+pub(crate) async fn open_responses_proxy_request_value_with_settings_and_user_agent(
+    request_json: &Value,
+    settings: crate::settings::BackendSettings,
+    original_user_agent: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let model = request_json
         .get("model")
         .and_then(Value::as_str)
@@ -501,7 +534,7 @@ pub async fn open_responses_proxy_request_with_settings_and_user_agent(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let context = RotationContext {
-        conversation_id: conversation_id_from_responses_request(&request_json),
+        conversation_id: conversation_id_from_responses_request(request_json),
     };
     let relay = crate::relay_rotation::select_relay_for_request(&settings, context)?;
     let mut relays = vec![relay.clone()];
@@ -511,8 +544,7 @@ pub async fn open_responses_proxy_request_with_settings_and_user_agent(
     let relay_count = relays.len();
     for (attempt, relay) in relays.into_iter().enumerate() {
         validate_upstream(&relay)?;
-        let (endpoint, upstream_body, wire_api) =
-            upstream_request_parts(&relay, request_json.clone())?;
+        let (endpoint, upstream_body, wire_api) = upstream_request_parts(&relay, request_json)?;
         let has_more_candidates = attempt + 1 < relay_count;
         let header_timeout = response_header_timeout(is_stream);
         let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -536,7 +568,7 @@ pub async fn open_responses_proxy_request_with_settings_and_user_agent(
                 relay.api_key.trim(),
                 &effective_user_agent(&relay.user_agent, original_user_agent),
                 is_stream,
-                &upstream_body,
+                upstream_body.as_ref(),
             ),
             is_stream,
         )
@@ -734,19 +766,19 @@ fn response_header_timeout(is_stream: bool) -> Duration {
     }
 }
 
-fn upstream_request_parts(
+fn upstream_request_parts<'a>(
     relay: &crate::settings::RelayProfile,
-    request_json: Value,
-) -> anyhow::Result<(String, Value, UpstreamWireApi)> {
+    request_json: &'a Value,
+) -> anyhow::Result<(String, Cow<'a, Value>, UpstreamWireApi)> {
     match relay.protocol {
         RelayProtocol::Responses => Ok((
             responses_url(&relay.base_url),
-            request_json,
+            Cow::Borrowed(request_json),
             UpstreamWireApi::Responses,
         )),
         RelayProtocol::ChatCompletions => Ok((
             chat_completions_url(&relay.base_url),
-            responses_to_chat_completions(request_json)?,
+            Cow::Owned(responses_to_chat_completions(request_json.clone())?),
             UpstreamWireApi::ChatCompletions,
         )),
     }
@@ -1064,9 +1096,14 @@ impl Default for ChatSseState {
 
 impl ChatSseState {
     fn with_request(original_request: &Value) -> Self {
+        Self::with_owned_request(original_request.clone())
+    }
+
+    fn with_owned_request(original_request: Value) -> Self {
+        let tool_context = build_codex_tool_context(original_request.get("tools"));
         Self {
-            tool_context: build_codex_tool_context(original_request.get("tools")),
-            original_request: Some(original_request.clone()),
+            tool_context,
+            original_request: Some(original_request),
             ..Self::default()
         }
     }

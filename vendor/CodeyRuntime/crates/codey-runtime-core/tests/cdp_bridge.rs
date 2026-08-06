@@ -1852,6 +1852,71 @@ async fn install_bridge_does_not_wait_for_resolve_runtime_evaluate_ack() {
     pump.close().await;
 }
 
+#[tokio::test]
+async fn bridge_read_routes_bypass_a_slow_serial_handler() {
+    let release_slow_handler = Arc::new(tokio::sync::Notify::new());
+    let server_release = Arc::clone(&release_slow_handler);
+    let (url, request_rx) = spawn_cdp_server(move |mut socket| async move {
+        for expected_id in 1..=5 {
+            let command = recv_json(&mut socket).await;
+            assert_eq!(command["id"], expected_id);
+            send_json(&mut socket, json!({ "id": expected_id, "result": {} })).await;
+        }
+
+        for (id, path) in [
+            ("slow", "/api/fetch_current_provider_models"),
+            ("fast", "/backend/status"),
+        ] {
+            send_json(
+                &mut socket,
+                json!({
+                    "method": "Runtime.bindingCalled",
+                    "params": {
+                        "payload": serde_json::to_string(&json!({
+                            "id": id,
+                            "path": path,
+                            "payload": {},
+                        })).unwrap(),
+                    },
+                }),
+            )
+            .await;
+        }
+
+        let first = tokio::time::timeout(Duration::from_secs(1), async {
+            recv_json(&mut socket).await
+        })
+        .await
+        .expect("read-only bridge request should not wait for the serial handler");
+        assert_expression_contains_request(&first, "fast");
+        server_release.notify_one();
+
+        let second = recv_json(&mut socket).await;
+        assert_expression_contains_request(&second, "slow");
+        close_socket(&mut socket).await;
+    })
+    .await;
+
+    let handler_release = Arc::clone(&release_slow_handler);
+    let handler = Arc::new(move |path: String, _payload: serde_json::Value| {
+        let handler_release = Arc::clone(&handler_release);
+        Box::pin(async move {
+            if path == "/api/fetch_current_provider_models" {
+                handler_release.notified().await;
+            }
+            Ok(json!({ "status": "ok", "path": path }))
+        }) as Pin<Box<dyn Future<Output = anyhow::Result<serde_json::Value>> + Send>>
+    });
+
+    let pump = bridge::install_bridge(&url, BRIDGE_BINDING_NAME, handler, &[])
+        .await
+        .expect("bridge should install");
+    request_rx
+        .await
+        .expect("server task should finish without panicking");
+    pump.close().await;
+}
+
 type TestSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
 async fn accept_installed_bridge(listener: &TcpListener) -> (TestSocket, String) {

@@ -659,6 +659,7 @@ fn diagnostic_log_value(payload: Value) -> anyhow::Result<Value> {
         .map(sanitize_diagnostic_event)
         .unwrap_or_else(|| "event".to_string());
     crate::diagnostic_log::append_diagnostic_log(&format!("renderer.{event}"), payload)?;
+    crate::diagnostic_log::flush_diagnostic_log()?;
     Ok(json!({
         "status": "ok",
         "message": "日志已记录"

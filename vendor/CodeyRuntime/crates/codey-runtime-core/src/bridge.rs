@@ -3,18 +3,23 @@ use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, bail};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::stream::FuturesUnordered;
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 pub const BRIDGE_BINDING_NAME: &str = "codexSessionDeleteV2";
 const CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const CDP_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const BRIDGE_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const BRIDGE_MAX_CONCURRENT_READ_HANDLERS: usize = 8;
+const BRIDGE_MAX_PENDING_CALLS: usize = 256;
 
 pub type BridgeHandler = Arc<
     dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = anyhow::Result<Value>> + Send>>
@@ -26,6 +31,8 @@ pub type BridgeHandler = Arc<
 #[derive(Debug)]
 pub struct BridgePumpHandle {
     task: Option<tokio::task::JoinHandle<()>>,
+    closing: Arc<AtomicBool>,
+    shutdown: Arc<Notify>,
 }
 
 impl BridgePumpHandle {
@@ -36,7 +43,13 @@ impl BridgePumpHandle {
     }
 
     pub async fn close(mut self) {
-        if let Some(task) = self.task.take() {
+        self.closing.store(true, Ordering::Release);
+        self.shutdown.notify_one();
+        if let Some(mut task) = self.task.take()
+            && tokio::time::timeout(BRIDGE_CLOSE_TIMEOUT, &mut task)
+                .await
+                .is_err()
+        {
             task.abort();
             let _ = task.await;
         }
@@ -50,6 +63,8 @@ impl BridgePumpHandle {
 impl Drop for BridgePumpHandle {
     fn drop(&mut self) {
         if let Some(task) = self.task.take() {
+            self.closing.store(true, Ordering::Release);
+            self.shutdown.notify_one();
             task.abort();
         }
     }
@@ -230,20 +245,24 @@ pub async fn install_bridge(
             .await?;
     }
 
-    session.drain_binding_queue().await?;
+    let closing = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(Notify::new());
+    let task_closing = Arc::clone(&closing);
+    let task_shutdown = Arc::clone(&shutdown);
     let task = tokio::spawn(async move {
-        loop {
-            if session.drain_binding_queue().await.is_err() {
-                break;
-            }
-            match session.next_message().await {
-                Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
-            }
+        if let Err(error) = run_bridge_pump(session, task_closing, task_shutdown).await {
+            let _ = crate::diagnostic_log::append_diagnostic_log(
+                "bridge.pump_failed",
+                json!({ "message": error.to_string() }),
+            );
         }
     });
 
-    Ok(BridgePumpHandle { task: Some(task) })
+    Ok(BridgePumpHandle {
+        task: Some(task),
+        closing,
+        shutdown,
+    })
 }
 
 pub fn runtime_evaluate_params(script: &str) -> Value {
@@ -274,11 +293,10 @@ pub fn reject_bridge_expression(request_id: &str, message: &str) -> anyhow::Resu
     ))
 }
 
-async fn connect_cdp_websocket(
-    websocket_url: &str,
-) -> anyhow::Result<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-> {
+type ConnectedCdpSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_cdp_websocket(websocket_url: &str) -> anyhow::Result<ConnectedCdpSocket> {
     let (socket, _) = tokio::time::timeout(CDP_CONNECT_TIMEOUT, connect_async(websocket_url))
         .await
         .with_context(|| {
@@ -290,6 +308,265 @@ async fn connect_cdp_websocket(
         .context("failed to connect CDP websocket")?;
 
     Ok(socket)
+}
+
+struct BridgeCall {
+    request_id: String,
+    path: String,
+    payload: Value,
+}
+
+enum BridgeCompletion {
+    Resolve { request_id: String, result: Value },
+    Reject { request_id: String, message: String },
+}
+
+enum ParsedBridgeDispatch {
+    Call(BridgeCall),
+    Completion(BridgeCompletion),
+}
+
+type BridgeCallFuture = Pin<Box<dyn Future<Output = BridgeCompletion> + Send>>;
+
+async fn run_bridge_pump(
+    session: CdpSession<ConnectedCdpSocket>,
+    closing: Arc<AtomicBool>,
+    shutdown: Arc<Notify>,
+) -> anyhow::Result<()> {
+    let CdpSession {
+        socket,
+        mut binding_calls,
+        handler,
+        binding_session,
+        ..
+    } = session;
+    let Some(handler) = handler else {
+        return Ok(());
+    };
+    let (mut writer, mut reader) = socket.split();
+    let mut pending_concurrent = VecDeque::<BridgeCall>::new();
+    let mut pending_serial = VecDeque::<BridgeCall>::new();
+    let mut ready = VecDeque::<BridgeCompletion>::new();
+    let mut concurrent = FuturesUnordered::<BridgeCallFuture>::new();
+    let mut serial = FuturesUnordered::<BridgeCallFuture>::new();
+    let mut stream_open = true;
+
+    while let Some(message) = binding_calls.pop_front() {
+        queue_bridge_dispatch(
+            parse_bridge_binding_call(message, binding_session.as_deref()),
+            &mut pending_concurrent,
+            &mut pending_serial,
+            &mut ready,
+        );
+    }
+
+    loop {
+        while concurrent.len() < BRIDGE_MAX_CONCURRENT_READ_HANDLERS {
+            let Some(call) = pending_concurrent.pop_front() else {
+                break;
+            };
+            concurrent.push(execute_bridge_call(Arc::clone(&handler), call));
+        }
+        if serial.is_empty()
+            && let Some(call) = pending_serial.pop_front()
+        {
+            serial.push(execute_bridge_call(Arc::clone(&handler), call));
+        }
+
+        if let Some(completion) = ready.pop_front() {
+            send_bridge_completion(&mut writer, completion).await?;
+            continue;
+        }
+        if closing.load(Ordering::Acquire) {
+            break;
+        }
+        if !stream_open
+            && concurrent.is_empty()
+            && serial.is_empty()
+            && pending_concurrent.is_empty()
+            && pending_serial.is_empty()
+        {
+            break;
+        }
+
+        let pending_count = pending_concurrent
+            .len()
+            .saturating_add(pending_serial.len());
+        let can_read = stream_open && pending_count < BRIDGE_MAX_PENDING_CALLS;
+        tokio::select! {
+            _ = shutdown.notified() => {
+                if closing.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            completion = concurrent.next(), if !concurrent.is_empty() => {
+                if let Some(completion) = completion {
+                    ready.push_back(completion);
+                }
+            }
+            completion = serial.next(), if !serial.is_empty() => {
+                if let Some(completion) = completion {
+                    ready.push_back(completion);
+                }
+            }
+            message = reader.next(), if can_read => {
+                match message {
+                    Some(Ok(Message::Text(text))) => {
+                        let value = serde_json::from_str::<Value>(&text)
+                            .context("failed to parse CDP message")?;
+                        if value.get("method").and_then(Value::as_str)
+                            == Some("Runtime.bindingCalled")
+                        {
+                            queue_bridge_dispatch(
+                                parse_bridge_binding_call(value, binding_session.as_deref()),
+                                &mut pending_concurrent,
+                                &mut pending_serial,
+                                &mut ready,
+                            );
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        stream_open = false;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        return Err(error).context("failed to read CDP websocket message");
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = writer.close().await;
+    Ok(())
+}
+
+fn parse_bridge_binding_call(
+    message: Value,
+    binding_session: Option<&str>,
+) -> Option<ParsedBridgeDispatch> {
+    let payload_text = message
+        .get("params")
+        .and_then(|params| params.get("payload"))
+        .and_then(Value::as_str)?;
+    let parsed: Value = match serde_json::from_str(payload_text) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let request_id = extract_string_field(payload_text, "id")?;
+            return Some(ParsedBridgeDispatch::Completion(BridgeCompletion::Reject {
+                request_id,
+                message: format!("failed to parse bridge payload: {error}"),
+            }));
+        }
+    };
+    if let (Some(expected), Some(actual)) = (
+        binding_session,
+        parsed.get("bridgeSession").and_then(Value::as_str),
+    ) && actual != expected
+    {
+        return None;
+    }
+    let request_id = parsed.get("id").and_then(Value::as_str)?.to_string();
+    let path = parsed
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let payload = parsed.get("payload").cloned().unwrap_or_else(|| json!({}));
+    Some(ParsedBridgeDispatch::Call(BridgeCall {
+        request_id,
+        path,
+        payload,
+    }))
+}
+
+fn queue_bridge_dispatch(
+    dispatch: Option<ParsedBridgeDispatch>,
+    pending_concurrent: &mut VecDeque<BridgeCall>,
+    pending_serial: &mut VecDeque<BridgeCall>,
+    ready: &mut VecDeque<BridgeCompletion>,
+) {
+    match dispatch {
+        Some(ParsedBridgeDispatch::Call(call)) if bridge_path_can_run_concurrently(&call.path) => {
+            pending_concurrent.push_back(call);
+        }
+        Some(ParsedBridgeDispatch::Call(call)) => pending_serial.push_back(call),
+        Some(ParsedBridgeDispatch::Completion(completion)) => ready.push_back(completion),
+        None => {}
+    }
+}
+
+fn bridge_path_can_run_concurrently(path: &str) -> bool {
+    matches!(
+        path,
+        "/settings/get"
+            | "/codex-model-catalog"
+            | "/backend/status"
+            | "/account/usage"
+            | "/session/wake-watcher"
+            | "/plugins/list"
+    )
+}
+
+fn execute_bridge_call(handler: BridgeHandler, call: BridgeCall) -> BridgeCallFuture {
+    Box::pin(async move {
+        match handler(call.path, call.payload).await {
+            Ok(result) => BridgeCompletion::Resolve {
+                request_id: call.request_id,
+                result,
+            },
+            Err(error) => BridgeCompletion::Reject {
+                request_id: call.request_id,
+                message: error.to_string(),
+            },
+        }
+    })
+}
+
+async fn send_bridge_completion<S>(
+    writer: &mut S,
+    completion: BridgeCompletion,
+) -> anyhow::Result<()>
+where
+    S: Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    let (request_id, expression, failure_event) = match completion {
+        BridgeCompletion::Resolve { request_id, result } => {
+            let expression = resolve_bridge_expression(&request_id, &result)?;
+            (request_id, expression, "bridge.resolve_failed")
+        }
+        BridgeCompletion::Reject {
+            request_id,
+            message,
+        } => {
+            let expression = reject_bridge_expression(&request_id, &message)?;
+            (request_id, expression, "bridge.reject_failed")
+        }
+    };
+    let message_id = next_message_id();
+    let sent = writer
+        .send(Message::Text(
+            json!({
+                "id": message_id,
+                "method": "Runtime.evaluate",
+                "params": runtime_evaluate_params(&expression),
+            })
+            .to_string()
+            .into(),
+        ))
+        .await;
+    if let Err(error) = &sent {
+        let _ = crate::diagnostic_log::append_diagnostic_log(
+            failure_event,
+            json!({
+                "request_id": request_id,
+                "message_id": message_id,
+                "message": error.to_string(),
+            }),
+        );
+    }
+    sent.with_context(|| format!("failed to send bridge response for request {request_id}"))
 }
 
 struct CdpSession<S> {
@@ -360,27 +637,6 @@ where
         })?
     }
 
-    async fn send_command_without_wait(
-        &mut self,
-        message_id: u64,
-        method: &str,
-        params: Value,
-    ) -> anyhow::Result<()> {
-        self.socket
-            .send(Message::Text(
-                json!({
-                    "id": message_id,
-                    "method": method,
-                    "params": params,
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .with_context(|| format!("failed to send CDP command {method} id {message_id}"))?;
-        Ok(())
-    }
-
     async fn wait_for_id(&mut self, message_id: u64, method: String) -> anyhow::Result<Value> {
         loop {
             if let Some(response) = self.responses.remove(&message_id) {
@@ -411,140 +667,11 @@ where
         let value: Value = serde_json::from_str(&text).context("failed to parse CDP message")?;
 
         if value.get("method").and_then(Value::as_str) == Some("Runtime.bindingCalled") {
-            self.binding_calls.push_back(value.clone());
+            self.binding_calls.push_back(value);
+            return Ok(Some(json!({})));
         }
 
         Ok(Some(value))
-    }
-
-    async fn drain_binding_queue(&mut self) -> anyhow::Result<()> {
-        while let Some(message) = self.binding_calls.pop_front() {
-            self.route_binding_call(message).await?;
-        }
-        Ok(())
-    }
-
-    fn route_binding_call(
-        &mut self,
-        message: Value,
-    ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + '_>> {
-        Box::pin(async move {
-            let Some(handler) = self.handler.clone() else {
-                return Ok(());
-            };
-
-            let Some(payload_text) = message
-                .get("params")
-                .and_then(|params| params.get("payload"))
-                .and_then(Value::as_str)
-            else {
-                return Ok(());
-            };
-
-            let parsed: Value = match serde_json::from_str(payload_text) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    if let Some(request_id) = extract_string_field(payload_text, "id") {
-                        self.reject_bridge_request(
-                            &request_id,
-                            &format!("failed to parse bridge payload: {error}"),
-                        )
-                        .await?;
-                    }
-                    return Ok(());
-                }
-            };
-            if let (Some(expected), Some(actual)) = (
-                self.binding_session.as_deref(),
-                parsed.get("bridgeSession").and_then(Value::as_str),
-            ) && actual != expected
-            {
-                return Ok(());
-            }
-            self.route_parsed_binding_call(&handler, parsed).await
-        })
-    }
-
-    async fn route_parsed_binding_call(
-        &mut self,
-        handler: &BridgeHandler,
-        parsed: Value,
-    ) -> anyhow::Result<()> {
-        let Some(request_id) = parsed.get("id").and_then(Value::as_str) else {
-            return Ok(());
-        };
-        let path = parsed
-            .get("path")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let payload = parsed.get("payload").cloned().unwrap_or_else(|| json!({}));
-
-        match handler(path, payload).await {
-            Ok(result) => {
-                self.resolve_bridge_request(request_id, &result).await?;
-            }
-            Err(error) => {
-                self.reject_bridge_request(request_id, &error.to_string())
-                    .await?;
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn resolve_bridge_request(
-        &mut self,
-        request_id: &str,
-        result: &Value,
-    ) -> anyhow::Result<()> {
-        let expression = resolve_bridge_expression(request_id, result)?;
-        let message_id = next_message_id();
-        let sent = self
-            .send_command_without_wait(
-                message_id,
-                "Runtime.evaluate",
-                runtime_evaluate_params(&expression),
-            )
-            .await;
-        if let Err(error) = &sent {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "bridge.resolve_failed",
-                json!({
-                    "request_id": request_id,
-                    "message_id": message_id,
-                    "message": error.to_string()
-                }),
-            );
-        }
-        sent.map(|_| ())
-    }
-
-    async fn reject_bridge_request(
-        &mut self,
-        request_id: &str,
-        message: &str,
-    ) -> anyhow::Result<()> {
-        let expression = reject_bridge_expression(request_id, message)?;
-        let message_id = next_message_id();
-        let sent = self
-            .send_command_without_wait(
-                message_id,
-                "Runtime.evaluate",
-                runtime_evaluate_params(&expression),
-            )
-            .await;
-        if let Err(error) = &sent {
-            let _ = crate::diagnostic_log::append_diagnostic_log(
-                "bridge.reject_failed",
-                json!({
-                    "request_id": request_id,
-                    "message_id": message_id,
-                    "error": error.to_string()
-                }),
-            );
-        }
-        sent.map(|_| ())
     }
 }
 

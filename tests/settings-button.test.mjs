@@ -271,9 +271,12 @@ test("renders official account usage as a draggable floating card", async () => 
       resetsAt: Math.floor(tomorrowResetAt.getTime() / 1000),
     },
   };
+  let accountUsageCalls = 0;
+  const scheduledDelays = [];
   const window = {
     __codexSessionDeleteBridge: async (path) => {
       assert.equal(path, "/account/usage");
+      accountUsageCalls += 1;
       return accountUsageResult;
     },
     addEventListener: addWindowListener,
@@ -290,7 +293,10 @@ test("renders official account usage as a draggable floating card", async () => 
       setItem: (key, value) => storedItems.set(key, String(value)),
     },
     removeEventListener: removeWindowListener,
-    setTimeout: () => 1,
+    setTimeout: (_callback, delay) => {
+      scheduledDelays.push(delay);
+      return scheduledDelays.length;
+    },
   };
   window.window = window;
 
@@ -395,9 +401,16 @@ test("renders official account usage as a draggable floating card", async () => 
   assert.match(usage.innerHTML, /class="codey-usage-plan" data-plan="free">Free/);
 
   accountUsageResult = { status: "unavailable", reason: "third_party" };
+  const refreshSchedulesBeforeUnavailable = scheduledDelays.filter(
+    (delay) => delay === 60_000,
+  ).length;
   await window.__codeyRefreshAccountUsage();
   assert.equal(findById("codey-account-usage"), null);
   assert.equal(visibleHeader.getAttribute("data-codey-usage-host"), null);
+  assert.equal(
+    scheduledDelays.filter((delay) => delay === 60_000).length,
+    refreshSchedulesBeforeUnavailable,
+  );
 
   accountUsageResult = {
     status: "ok",
@@ -411,6 +424,7 @@ test("renders official account usage as a draggable floating card", async () => 
   await window.__codeyRefreshAccountUsage();
   const remountedUsage = findById("codey-account-usage");
   assert.ok(remountedUsage);
+  assert.equal(accountUsageCalls, 6);
   assert.equal(remountedUsage.parentElement, document.body);
   assert.equal(remountedUsage.style.left, "794px");
   assert.equal(remountedUsage.style.top, "430px");

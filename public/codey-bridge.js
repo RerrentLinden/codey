@@ -171,7 +171,7 @@
           if (containingControl) queueMutationRoot(containingControl);
           if (mutation.type === "attributes") continue;
           for (const node of mutation.addedNodes || []) {
-            queueMutationRoot(mutationRoot(node));
+            if (node instanceof HTMLElement) queueMutationRoot(node);
           }
         }
         if (pendingRoots.size) schedulePendingFlush();

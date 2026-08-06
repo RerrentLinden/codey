@@ -243,6 +243,57 @@ test("plugin bridge fast-paths unrelated IPC payloads without a DOM observer", a
   assert.equal(replacementCalls[0][0].options.includeHidden, true);
 });
 
+test("plugin fetch wrapper returns unrelated native requests without promise or header work", async () => {
+  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const nativeResponse = {
+    headers: {
+      get() {
+        throw new Error("unrelated response headers must not be inspected");
+      },
+    },
+  };
+  const nativePromise = Promise.resolve(nativeResponse);
+  const fetchCalls = [];
+  const window = {
+    clearTimeout() {},
+    dispatchEvent() {},
+    electronBridge: {
+      sendMessageFromView() {
+        return Promise.resolve({ status: "ok" });
+      },
+    },
+    fetch(...args) {
+      fetchCalls.push(args);
+      return nativePromise;
+    },
+    setTimeout() {
+      return 1;
+    },
+  };
+  window.window = window;
+  vm.runInNewContext(source, {
+    CustomEvent: class {},
+    console,
+    window,
+  });
+
+  const result = window.fetch("https://api.example/conversation", {
+    body: JSON.stringify({ message: "hello" }),
+    method: "POST",
+  });
+
+  assert.equal(result, nativePromise);
+  assert.equal(await result, nativeResponse);
+
+  const objectBodyResult = window.fetch("https://api.example/upload", {
+    body: new URLSearchParams({ message: "hello" }),
+    method: "POST",
+  });
+  assert.equal(objectBodyResult, nativePromise);
+  assert.equal(await objectBodyResult, nativeResponse);
+  assert.equal(fetchCalls.length, 2);
+});
+
 test("plugin bridge reports effective only after the runtime method is patched", async () => {
   const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
   const events = [];

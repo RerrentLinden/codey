@@ -898,7 +898,6 @@ export function App({
           {/* 线路与模型：整行独占排布 */}
           <div className="full-row-section model-full-section">
             <ModelSection
-              ccSwitchStatus={ccSwitchStatus}
               provider={provider}
               modelState={modelState}
               dirty={dirty}

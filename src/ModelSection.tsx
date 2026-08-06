@@ -14,7 +14,6 @@ import type { CcSwitchStatus, ModelState } from "./App.types";
 import { Badge, Button, Card, Switch } from "./components/semi";
 
 type ModelSectionProps = {
-  ccSwitchStatus: CcSwitchStatus;
   provider: CcSwitchStatus["provider"];
   modelState: ModelState;
   dirty: boolean;
@@ -46,6 +45,10 @@ function ModelSectionComponent({
   onShowAccountUsageInHeaderChange,
 }: ModelSectionProps) {
   const defaultModel = modelState.defaultModel;
+  const supportedOfficialModelCount = modelState.officialModels.reduce(
+    (count, model) => count + Number(model.supported),
+    0,
+  );
   return (
     <section className="route-section" aria-labelledby="route-title">
       <div className="section-title">
@@ -124,8 +127,7 @@ function ModelSectionComponent({
                   {provider.official
                     ? "官方目录"
                     : `已确认 ${
-                        modelState.officialModels.filter((model) => model.supported).length +
-                        modelState.thirdPartyModels.length
+                        supportedOfficialModelCount + modelState.thirdPartyModels.length
                       } 个可用模型`}
                 </small>
               </div>
@@ -166,11 +168,7 @@ function ModelSectionComponent({
                 <div>
                   <strong>官方模型</strong>
                   <small>
-                    {
-                      modelState.officialModels.filter(
-                        (model) => model.supported,
-                      ).length
-                    }{" "}
+                    {supportedOfficialModelCount}{" "}
                     / {modelState.officialModels.length}
                   </small>
                 </div>

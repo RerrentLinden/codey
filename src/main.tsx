@@ -93,8 +93,6 @@ if (import.meta.env.DEV) {
       showAccountUsageInHeader: true,
     };
     const previewCcSwitch = {
-      available: false,
-      path: "~/.codex/config.toml",
       changed: false,
       provider: {
         id: "primary",
@@ -102,7 +100,6 @@ if (import.meta.env.DEV) {
         official: false,
         baseUrl: previewEndpoints.primary,
         protocol: "responses" as const,
-        source: "local" as const,
       },
     };
     let previewModelState = {
@@ -111,6 +108,11 @@ if (import.meta.env.DEV) {
         supported: previewUpstreamModels.includes(model.slug),
       })),
       officialModelIds: previewOfficialModels.map((model) => model.slug),
+      subagentModelIds: [
+        ...previewOfficialModels.map((model) => model.slug),
+        "provider-fast-coder",
+        "claude-sonnet-4-5",
+      ],
       thirdPartyModels: ["provider-fast-coder", "claude-sonnet-4-5"],
       manualThirdPartyModels: ["provider-fast-coder"],
       upstreamModels: previewUpstreamModels,

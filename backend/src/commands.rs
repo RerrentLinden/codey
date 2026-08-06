@@ -63,7 +63,6 @@ use crate::error_log;
 use crate::launcher::{CODEX_APP_NOT_FOUND_ERROR, CODEX_APP_PATH_INVALID_ERROR};
 use crate::launcher::{CodeyRuntime, RuntimeModelConfig, RuntimeSubagentConfig};
 use crate::message_delete::delete_messages;
-#[cfg(test)]
 use crate::model_catalog;
 use crate::notifications::NotificationChannelConfig;
 use crate::pending_approval;
@@ -738,9 +737,14 @@ async fn save_codey_config_locked(
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     let mut config = config.normalize();
+    let subagent_model_changed = previous.subagent_model != config.subagent_model;
+    if config.subagent_optimization && (!previous.subagent_optimization || subagent_model_changed) {
+        let model_state = current_model_state(&config)?;
+        validate_subagent_model_selection(&config.subagent_model, &model_state)?;
+    }
     let refresh_subagent_defaults = previous.subagent_optimization
         && config.subagent_optimization
-        && (previous.subagent_model != config.subagent_model
+        && (subagent_model_changed
             || previous.subagent_reasoning_effort != config.subagent_reasoning_effort);
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let restart_required = runtime_config_requires_restart(state, &config).await;
@@ -772,6 +776,19 @@ async fn save_codey_config_locked(
         restart_required,
         refresh_subagent_defaults,
     })
+}
+
+fn validate_subagent_model_selection(
+    model: &str,
+    state: &model_catalog::ModelSelectionState,
+) -> Result<(), String> {
+    if state.available_subagent_model(model).is_some() {
+        return Ok(());
+    }
+    if state.first_available_subagent_model().is_none() {
+        return Err("当前 Codex 版本或线路没有可用于子代理的模型".to_string());
+    }
+    Err(format!("模型 {} 当前不能用于子代理", model.trim()))
 }
 
 async fn finish_codey_config_save(
@@ -1233,6 +1250,30 @@ mod restart_tests {
     use super::*;
 
     #[test]
+    fn subagent_selection_validation_uses_dynamic_model_state() {
+        let state = model_catalog::ModelSelectionState {
+            subagent_model_ids: vec!["gpt-5.6-luna".into(), "provider-coder".into()],
+            third_party_models: vec!["provider-coder".into()],
+            official_models: vec![model_catalog::OfficialModelAvailability {
+                slug: "gpt-5.6-luna".into(),
+                display_name: "GPT-5.6-Luna".into(),
+                supported: true,
+                supported_reasoning_efforts: vec!["low".into(), "high".into()],
+                default_reasoning_effort: "low".into(),
+            }],
+            ..model_catalog::ModelSelectionState::default()
+        };
+
+        assert!(validate_subagent_model_selection("GPT-5.6-LUNA", &state).is_ok());
+        assert!(validate_subagent_model_selection("provider-coder", &state).is_ok());
+        assert!(
+            validate_subagent_model_selection("gpt-5.6-sol", &state)
+                .unwrap_err()
+                .contains("当前不能用于子代理")
+        );
+    }
+
+    #[test]
     fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         let mut config = CodeyConfig::default();
         config.profiles[0].cc_switch_provider_id = Some("cc-switch-provider".into());
@@ -1266,6 +1307,7 @@ mod restart_tests {
                 .iter()
                 .map(|model| model.slug.clone())
                 .collect(),
+            subagent_model_ids: vec!["gpt-5.6-sol".into()],
             official_models,
             third_party_models: vec!["provider-fast-coder".into()],
             manual_third_party_models: vec!["provider-fast-coder".into()],
@@ -2205,13 +2247,8 @@ mod tests {
         .unwrap();
         release_tx.send(()).unwrap();
 
-        let status = sync_task.await.unwrap();
-        assert!(
-            status
-                .message
-                .as_deref()
-                .is_some_and(|message| message.contains("已忽略过期"))
-        );
+        let error = sync_task.await.unwrap().unwrap_err();
+        assert!(error.contains("已忽略过期"));
         let memory = state.config.read().await.clone();
         let disk = state.store.load().unwrap();
         assert_eq!(disk, memory);

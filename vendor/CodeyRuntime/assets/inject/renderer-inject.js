@@ -401,8 +401,6 @@
   const projectMoveProjectionTtlMs = 24 * 60 * 60 * 1000;
   const projectMoveProjectionSettleMs = 5 * 60 * 1000;
   const projectMoveRefreshDelaysMs = [50, 250, 750, 1500];
-  const chatsSortRefreshIntervalMs = 1500;
-  const chatsSortDbRefreshIntervalMs = 5000;
   const styleId = "codex-delete-style";
   const codexDeleteStyleVersion = "14";
   const codeyMenuId = "codey-menu";
@@ -3700,9 +3698,6 @@
   }
 
   let codexStateApiPromise = null;
-  let chatsSortInFlight = false;
-  let chatsSortSignature = "";
-  let chatsSortLastFetchAt = 0;
 
   async function codexStateApi() {
     codexStateApiPromise = codexStateApiPromise || loadCodexAppModule("vscode-api-");
@@ -5090,115 +5085,12 @@
   }
 
   function refreshAfterProjectMove() {
-    const refreshVisibleSidebar = () => {
-      applyProjectMoveProjection();
-      scheduleChatsSortCorrection(0);
-    };
-    refreshVisibleSidebar();
-    refreshRecentConversationsForHost().finally(() => {
-      projectMoveRefreshDelaysMs.forEach((delay) => setTimeout(refreshVisibleSidebar, delay));
-    });
-  }
-
-  function visibleChatsRows() {
-    const list = chatsThreadList();
-    if (!list) return [];
-    return Array.from(list.children).map(threadRowFromListItem).filter(Boolean).filter((row) => rowIsInChats(row));
-  }
-
-  function chatsSortNeedsCorrection(rows) {
-    let previousPinned = true;
-    let previousSortMs = Infinity;
-    let previousKey = "\uffff";
-    for (const row of rows) {
-      const pinned = rowPinned(row);
-      const ref = sessionRefFromRow(row);
-      const sortMs = rowSortMs(row, ref);
-      const key = projectMoveSessionKey(ref.session_id);
-      if (previousPinned && !pinned) {
-        previousPinned = false;
-        previousSortMs = sortMs;
-        previousKey = key;
-        continue;
-      }
-      if (!previousPinned && pinned) return true;
-      if (sortMs > previousSortMs || (sortMs === previousSortMs && key > previousKey)) return true;
-      previousSortMs = sortMs;
-      previousKey = key;
-    }
-    return false;
-  }
-
-  function reorderChatsRows(rows) {
-    const list = chatsThreadList();
-    if (!list || rows.length < 2) return;
-    const rowItems = new Set(rows.map(rowListItem));
-    const firstNonThreadItem = Array.from(list.children).find((child) => !rowItems.has(child) && !threadRowFromListItem(child));
-    const orderedRows = [...rows].sort((left, right) => {
-      const leftPinned = rowPinned(left);
-      const rightPinned = rowPinned(right);
-      if (leftPinned !== rightPinned) return leftPinned ? -1 : 1;
-      const leftRef = sessionRefFromRow(left);
-      const rightRef = sessionRefFromRow(right);
-      const leftSortMs = rowSortMs(left, leftRef);
-      const rightSortMs = rowSortMs(right, rightRef);
-      if (leftSortMs !== rightSortMs) return rightSortMs - leftSortMs;
-      return projectMoveSessionKey(rightRef.session_id).localeCompare(projectMoveSessionKey(leftRef.session_id));
-    });
-    orderedRows.forEach((row) => list.insertBefore(rowListItem(row), firstNonThreadItem || null));
-    cachedSessionRowsAt = 0;
-  }
-
-  async function applyChatsSortCorrection() {
-    if (!codeySettings().projectMove || chatsSortInFlight) return;
-    const rows = visibleChatsRows();
-    if (rows.length < 2) return;
-    const refs = rows.map(sessionRefFromRow).filter((ref) => ref.session_id);
-    const signature = refs.map((ref) => projectMoveSessionKey(ref.session_id)).join("|");
-    const allRowsHaveSortMs = rows.every((row) => numericTimestamp(row.dataset.codexProjectMoveSortMs || rowListItem(row).dataset.codexProjectMoveSortMs));
-    const shouldRefreshSortKeys = signature !== chatsSortSignature || !allRowsHaveSortMs || Date.now() - chatsSortLastFetchAt > chatsSortDbRefreshIntervalMs;
-    if (!shouldRefreshSortKeys && !chatsSortNeedsCorrection(rows)) return;
-    chatsSortInFlight = true;
-    try {
-      if (shouldRefreshSortKeys) {
-        const result = await postJson("/thread-sort-keys", { sessions: refs }).catch(() => ({ status: "failed", sort_keys: [] }));
-        chatsSortLastFetchAt = Date.now();
-        const byId = new Map();
-        if (result?.status === "ok" && Array.isArray(result?.sort_keys)) {
-          result.sort_keys.forEach((item) => {
-            const key = projectMoveSessionKey(String(item?.session_id || ""));
-            if (key) byId.set(key, item);
-          });
-        }
-        rows.forEach((row) => {
-          const ref = sessionRefFromRow(row);
-          const payload = byId.get(projectMoveSessionKey(ref.session_id));
-          const trustedSortMs = timestampMsFromPayload(payload);
-          const sortMs = trustedSortMs || sortMsForSession(ref.session_id, row.dataset.codexProjectMoveSortMs || rowListItem(row).dataset.codexProjectMoveSortMs);
-          row.dataset.codexProjectMoveSortMs = String(sortMs || 0);
-          rowListItem(row).dataset.codexProjectMoveSortMs = String(sortMs || 0);
-          if (trustedSortMs) updateRowTimeLabel(row, trustedSortMs);
-        });
-      }
-      if (chatsSortNeedsCorrection(rows)) reorderChatsRows(rows);
-      chatsSortSignature = visibleChatsRows().map((row) => projectMoveSessionKey(sessionRefFromRow(row).session_id)).join("|");
-    } finally {
-      chatsSortInFlight = false;
-    }
-  }
-
-  function scheduleChatsSortCorrection(delay = chatsSortRefreshIntervalMs) {
-    if (!codeySettings().projectMove || window.__codexProjectMoveChatsSortTimer) return;
-    window.__codexProjectMoveChatsSortTimer = setTimeout(() => {
-      if (window.__codexProjectMoveRuntimeId !== codexProjectMoveRuntimeId) return;
-      window.__codexProjectMoveChatsSortTimer = null;
-      applyChatsSortCorrection().catch((error) => {
-        window.__codexProjectMoveSortFailures = window.__codexProjectMoveSortFailures || [];
-        window.__codexProjectMoveSortFailures.push(String(error?.stack || error));
-      }).finally(() => {
-        if (codeySettings().projectMove) scheduleChatsSortCorrection();
+    applyProjectMoveProjection();
+    void refreshRecentConversationsForHost().finally(() => {
+      projectMoveRefreshDelaysMs.forEach((delay) => {
+        setTimeout(applyProjectMoveProjection, delay);
       });
-    }, delay);
+    });
   }
 
   async function setProjectlessThreadIds(ref, mode) {
@@ -7820,7 +7712,6 @@
     sessionRows().forEach(tryAttachButton);
     updateDeleteButtonOffsets();
     scheduleProjectMoveProjection();
-    scheduleChatsSortCorrection();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
     scheduleThreadScrollSync();
@@ -7924,7 +7815,6 @@
   window.__codexProjectMoveApplyProjection = applyProjectMoveProjection;
   window.__codexProjectMoveReadProjection = readProjectMoveProjection;
   window.__codexProjectMoveTargets = projectMoveTargets;
-  window.__codexProjectMoveSortChats = applyChatsSortCorrection;
   window.removeEventListener("resize", window.__codeyResizeHandler);
   let codeyResizeRafId = 0;
   window.__codeyResizeHandler = () => {

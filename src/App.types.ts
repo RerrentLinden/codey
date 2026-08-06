@@ -50,6 +50,7 @@ export type OfficialModelState = {
 export type ModelState = {
   officialModels: OfficialModelState[];
   officialModelIds: string[];
+  subagentModelIds: string[];
   thirdPartyModels: string[];
   manualThirdPartyModels: string[];
   upstreamModels: string[];
@@ -115,17 +116,13 @@ export type CodexAppDirectorySelection = {
 };
 
 export type CcSwitchStatus = {
-  available: boolean;
-  path: string;
   changed: boolean;
-  message?: string;
   provider: {
     id: string;
     name: string;
     official: boolean;
     baseUrl: string;
     protocol: "responses" | "chatCompletions";
-    source: "cc-switch" | "local";
   };
 };
 

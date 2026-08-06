@@ -2598,6 +2598,20 @@ input:focus-visible,
   line-height: 1.35;
 }
 
+.model-picker-search {
+  padding: 4px 8px 6px;
+}
+
+.model-picker-search .semi-input-wrapper {
+  width: 100%;
+}
+
+.model-picker-load-more {
+  display: flex;
+  justify-content: center;
+  padding: 6px 8px 4px;
+}
+
 .model-picker-warning {
   display: flex;
   align-items: flex-start;

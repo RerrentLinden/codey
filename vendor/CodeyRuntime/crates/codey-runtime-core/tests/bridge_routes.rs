@@ -766,6 +766,7 @@ async fn bridge_backend_status_writes_diagnostic_log() {
     let result = handle_bridge_request(ctx, "/backend/status", json!({})).await;
 
     assert_eq!(result["status"], "ok");
+    codey_runtime_core::diagnostic_log::flush_diagnostic_log().unwrap();
     let contents = std::fs::read_to_string(&log_path).unwrap();
     assert!(contents.contains("bridge.request"));
     assert!(contents.contains("bridge.backend_status_ok"));

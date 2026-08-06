@@ -225,7 +225,10 @@ fn validate_rollout_headers_at(
         .iter()
         .filter(|file| {
             file.signature.modified_ns.is_none()
-                || cached.get(&file.cache_key) != Some(&file.signature)
+                || cached
+                    .as_ref()
+                    .and_then(|entries| entries.get(&file.cache_key))
+                    != Some(&file.signature)
         })
         .map(|file| file.path.clone())
         .collect::<Vec<_>>();
@@ -236,21 +239,30 @@ fn validate_rollout_headers_at(
         });
     }
 
+    let entries = files
+        .into_iter()
+        .map(|file| RolloutHeaderCacheEntry {
+            path: file.cache_key,
+            signature: file.signature,
+        })
+        .collect::<Vec<_>>();
+    let cache_matches = cached.as_ref().is_some_and(|cached| {
+        cached.len() == entries.len()
+            && entries
+                .iter()
+                .all(|entry| cached.get(&entry.path) == Some(&entry.signature))
+    });
     let cache = RolloutHeaderCache {
         version: ROLLOUT_HEADER_CACHE_VERSION,
         target_provider: target_provider.to_string(),
-        entries: files
-            .into_iter()
-            .map(|file| RolloutHeaderCacheEntry {
-                path: file.cache_key,
-                signature: file.signature,
-            })
-            .collect(),
+        entries,
         validated_at_ms: timestamp_millis(),
     };
     // This cache only avoids repeat reads. Failing to persist it must not turn
     // a correct provider validation into a failed startup.
-    let _ = write_rollout_header_cache(cache_path, &cache);
+    if !cache_matches {
+        let _ = write_rollout_header_cache(cache_path, &cache);
+    }
     Ok(RolloutHeaderValidation {
         matches: true,
         headers_read: changed.len(),
@@ -370,21 +382,23 @@ fn rollout_header_matches(path: &Path, target_provider: &str) -> Result<bool> {
 fn read_rollout_header_cache(
     path: &Path,
     target_provider: &str,
-) -> BTreeMap<PathBuf, RolloutHeaderSignature> {
+) -> Option<BTreeMap<PathBuf, RolloutHeaderSignature>> {
     let Ok(bytes) = fs::read(path) else {
-        return BTreeMap::new();
+        return None;
     };
     let Ok(cache) = serde_json::from_slice::<RolloutHeaderCache>(&bytes) else {
-        return BTreeMap::new();
+        return None;
     };
     if cache.version != ROLLOUT_HEADER_CACHE_VERSION || cache.target_provider != target_provider {
-        return BTreeMap::new();
+        return None;
     }
-    cache
-        .entries
-        .into_iter()
-        .map(|entry| (entry.path, entry.signature))
-        .collect()
+    Some(
+        cache
+            .entries
+            .into_iter()
+            .map(|entry| (entry.path, entry.signature))
+            .collect(),
+    )
 }
 
 fn write_rollout_header_cache(path: &Path, cache: &RolloutHeaderCache) -> Result<()> {
@@ -556,7 +570,9 @@ mod tests {
         let cache = temp.path().join("codey/rollout-headers.json");
 
         let first = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+        let first_cache = fs::read(&cache).unwrap();
         let second = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+        let second_cache = fs::read(&cache).unwrap();
 
         assert_eq!(
             first,
@@ -572,6 +588,27 @@ mod tests {
                 headers_read: 0
             }
         );
+        assert_eq!(second_cache, first_cache);
+    }
+
+    #[test]
+    fn removed_rollouts_update_the_metadata_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        write_rollout(temp.path(), "rollout-thread-1.jsonl", "codey_global");
+        write_rollout(temp.path(), "rollout-thread-2.jsonl", "codey_global");
+        let cache = temp.path().join("codey/rollout-headers.json");
+        validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+
+        fs::remove_file(
+            temp.path()
+                .join("sessions/2026/07/20/rollout-thread-2.jsonl"),
+        )
+        .unwrap();
+        let validation = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+        let entries = read_rollout_header_cache(&cache, "codey_global").unwrap();
+
+        assert_eq!(validation.headers_read, 0);
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]

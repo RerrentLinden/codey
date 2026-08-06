@@ -126,6 +126,15 @@
   const mayContainMethod = (text, method) => (
     typeof text === "string" && text.toLowerCase().includes(method.toLowerCase())
   );
+  const isStructuredRequestBody = (value) => {
+    if (!value || typeof value !== "object") return false;
+    if (Array.isArray(value)) return true;
+    try {
+      return Object.prototype.toString.call(value) === "[object Object]";
+    } catch {
+      return true;
+    }
+  };
   const requestValueMatchesMethod = (value, method) => {
     if (typeof value !== "string") return false;
     const normalized = value.trim().toLowerCase().split(/[?#]/, 1)[0];
@@ -291,31 +300,47 @@
 
   const originalFetch = window.fetch;
   if (typeof originalFetch === "function") {
-    window.fetch = async (...args) => {
+    window.fetch = (...args) => {
       const url = typeof args[0] === "string" ? args[0] : args[0]?.url || "";
       const body = args[1]?.body;
-      let isPluginListRequest = requestValueMatchesMethod(url, "list-plugins");
-      if (!isPluginListRequest && body && typeof body === "object") {
+      const patchesPluginResponse = /plugin|marketplace/i.test(url);
+      const urlRequestsPluginList = requestValueMatchesMethod(url, "list-plugins");
+      const bodyIsStructuredRequest = isStructuredRequestBody(body);
+      const bodyMayRequestPluginList =
+        bodyIsStructuredRequest || mayContainMethod(body, "list-plugins");
+      if (
+        !patchesPluginResponse &&
+        !urlRequestsPluginList &&
+        !bodyMayRequestPluginList
+      ) {
+        return originalFetch(...args);
+      }
+
+      let isPluginListRequest = urlRequestsPluginList;
+      if (!isPluginListRequest && bodyIsStructuredRequest) {
         isPluginListRequest = requestHasMethod(body, "list-plugins");
       } else if (!isPluginListRequest && mayContainMethod(body, "list-plugins")) {
         try {
           isPluginListRequest = requestHasMethod(JSON.parse(body), "list-plugins");
         } catch {}
       }
-      const [response] = await Promise.all([
-        originalFetch(...args),
-        isPluginListRequest ? waitForLocalPlugins() : Promise.resolve(),
-      ]);
-      const contentType = response.headers.get("content-type") || "";
-      if (!/plugin|marketplace/i.test(url) || !contentType.includes("application/json")) return response;
-      try {
-        const patched = patchResponse(await response.clone().json());
-        const headers = new Headers(response.headers);
-        headers.delete("content-length");
-        return new Response(JSON.stringify(patched), { status: response.status, statusText: response.statusText, headers });
-      } catch {
-        return response;
-      }
+
+      const responsePromise = originalFetch(...args);
+      const ready = isPluginListRequest
+        ? Promise.all([responsePromise, waitForLocalPlugins()]).then(([response]) => response)
+        : responsePromise;
+      return ready.then(async (response) => {
+        const contentType = response.headers.get("content-type") || "";
+        if (!patchesPluginResponse || !contentType.includes("application/json")) return response;
+        try {
+          const patched = patchResponse(await response.clone().json());
+          const headers = new Headers(response.headers);
+          headers.delete("content-length");
+          return new Response(JSON.stringify(patched), { status: response.status, statusText: response.statusText, headers });
+        } catch {
+          return response;
+        }
+      });
     };
   }
   const bridgePatched = patchElectronBridge();

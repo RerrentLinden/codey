@@ -118,17 +118,12 @@ pub struct CurrentProvider {
     pub supports_remote_compaction: bool,
     pub base_url: String,
     pub protocol: RelayProtocol,
-    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CcSwitchStatus {
-    pub available: bool,
-    pub path: String,
     pub changed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
     pub provider: CurrentProvider,
 }
 
@@ -148,7 +143,6 @@ struct CcSwitchProtocolHint {
 struct CcSwitchSourceApi {
     base_url: String,
     api_key: String,
-    protocol: RelayProtocol,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -252,7 +246,6 @@ fn provider_model_fetch_profile_from_paths(
     let mut fetch_profile = profile.clone();
     fetch_profile.base_url = source.base_url;
     fetch_profile.api_key = source.api_key;
-    fetch_profile.protocol = source.protocol;
     Ok(fetch_profile)
 }
 
@@ -455,18 +448,15 @@ fn sync_current_provider_from_paths(
     let mut next = config.clone();
     next.active_profile_id = profile.id.clone();
     next.profiles = vec![profile];
-    if previous_provider_id.as_deref() != Some(provider.id.as_str()) {
+    let provider_changed = previous_provider_id.as_deref() != Some(provider.id.as_str());
+    if provider_changed {
         reset_subagent_defaults_for_current_provider(&mut next, codex_home, provider.official);
+    } else {
+        reconcile_subagent_defaults_for_current_provider(&mut next, codex_home, provider.official);
     }
     next = next.normalize();
     let changed = &next != config;
-    let status = CcSwitchStatus {
-        available: false,
-        path: codex_home.join("config.toml").to_string_lossy().to_string(),
-        changed,
-        message: Some("已直接读取本地 Codex 登录与 API 配置".to_string()),
-        provider,
-    };
+    let status = CcSwitchStatus { changed, provider };
     Ok((next, status))
 }
 
@@ -693,15 +683,7 @@ fn cc_switch_source_api(
         bail!("CC Switch 当前源线路仅包含路由占位凭据，无法安全同步模型");
     }
 
-    let wire_api = provider
-        .get("wire_api")
-        .and_then(Item::as_str)
-        .unwrap_or("responses");
-    Ok(CcSwitchSourceApi {
-        base_url,
-        api_key,
-        protocol: protocol_from_wire_api(wire_api),
-    })
+    Ok(CcSwitchSourceApi { base_url, api_key })
 }
 
 fn is_safe_source_api_url(base_url: &str) -> bool {
@@ -725,17 +707,36 @@ fn reset_subagent_defaults_for_current_provider(
     codex_home: &Path,
     official_provider: bool,
 ) {
-    let (model, reasoning_effort) =
+    let (model, reasoning_effort, compatible_model_available) =
         subagent_defaults_for_current_provider(config, codex_home, official_provider);
     config.subagent_model = model;
     config.subagent_reasoning_effort = reasoning_effort;
+    if !compatible_model_available {
+        config.subagent_optimization = false;
+    }
+}
+
+pub(crate) fn reconcile_subagent_defaults_for_current_provider(
+    config: &mut CodeyConfig,
+    codex_home: &Path,
+    official_provider: bool,
+) {
+    if config.subagent_optimization
+        && !selected_subagent_model_available_for_current_provider(
+            config,
+            codex_home,
+            official_provider,
+        )
+    {
+        reset_subagent_defaults_for_current_provider(config, codex_home, official_provider);
+    }
 }
 
 fn subagent_defaults_for_current_provider(
     config: &CodeyConfig,
     codex_home: &Path,
     official_provider: bool,
-) -> (String, String) {
+) -> (String, String, bool) {
     let Ok(state) = model_catalog::selection_state_with_manual_models(
         codex_home,
         official_provider,
@@ -747,28 +748,49 @@ fn subagent_defaults_for_current_provider(
         return (
             DEFAULT_SUBAGENT_MODEL.to_string(),
             DEFAULT_SUBAGENT_REASONING_EFFORT.to_string(),
+            official_provider,
         );
     };
-    let model = if subagent_model_available(&state, DEFAULT_SUBAGENT_MODEL) {
-        DEFAULT_SUBAGENT_MODEL.to_string()
-    } else if !state.default_model.trim().is_empty() {
-        state.default_model.clone()
-    } else {
-        DEFAULT_SUBAGENT_MODEL.to_string()
+    let Some(model) = state
+        .available_subagent_model(DEFAULT_SUBAGENT_MODEL)
+        .or_else(|| state.available_subagent_model(&state.default_model))
+        .or_else(|| state.first_available_subagent_model())
+    else {
+        return (
+            DEFAULT_SUBAGENT_MODEL.to_string(),
+            DEFAULT_SUBAGENT_REASONING_EFFORT.to_string(),
+            false,
+        );
     };
+    let model = model.to_string();
     let reasoning_effort = subagent_reasoning_effort_for_model(&state, &model);
-    (model, reasoning_effort)
+    (model, reasoning_effort, true)
 }
 
 fn subagent_model_available(state: &model_catalog::ModelSelectionState, model: &str) -> bool {
-    state
-        .official_models
-        .iter()
-        .any(|candidate| candidate.supported && candidate.slug == model)
-        || state
-            .third_party_models
-            .iter()
-            .any(|candidate| candidate == model)
+    state.available_subagent_model(model).is_some()
+}
+
+fn selected_subagent_model_available_for_current_provider(
+    config: &CodeyConfig,
+    codex_home: &Path,
+    official_provider: bool,
+) -> bool {
+    let model = config.subagent_model.trim();
+    if model.is_empty() {
+        return false;
+    }
+    let Ok(state) = model_catalog::selection_state_with_manual_models(
+        codex_home,
+        official_provider,
+        config.upstream_models_snapshot(),
+        config.selected_models(),
+        config.manual_third_party_models(),
+        Some(DEFAULT_SUBAGENT_MODEL),
+    ) else {
+        return true;
+    };
+    subagent_model_available(&state, model)
 }
 
 fn subagent_reasoning_effort_for_model(
@@ -808,7 +830,6 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
             supports_remote_compaction: profile.supports_remote_compaction,
             base_url: profile.base_url.clone(),
             protocol: profile.protocol,
-            source: "local".to_string(),
         })
         .unwrap_or_else(|| CurrentProvider {
             id: LOCAL_OFFICIAL_PROVIDER_ID.to_string(),
@@ -817,16 +838,9 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
             supports_remote_compaction: true,
             base_url: String::new(),
             protocol: RelayProtocol::Responses,
-            source: "local".to_string(),
         });
     CcSwitchStatus {
-        available: false,
-        path: crate::codex_config::codex_home()
-            .join("config.toml")
-            .to_string_lossy()
-            .to_string(),
         changed: false,
-        message: Some("当前使用本地 Codex 登录与 API 配置".to_string()),
         provider,
     }
 }
@@ -924,7 +938,6 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         supports_remote_compaction: official || name == "OpenAI",
         base_url,
         protocol: protocol_from_wire_api(wire_api),
-        source: "local".to_string(),
     };
     Ok((provider, if official { String::new() } else { api_key }))
 }
@@ -1063,7 +1076,6 @@ mod tests {
         let source = read_current_cc_switch_source_api(&path).unwrap();
         assert_eq!(source.base_url, base_url);
         assert_eq!(source.api_key, "legacy-secret");
-        assert_eq!(source.protocol, RelayProtocol::Responses);
     }
 
     #[test]
@@ -1163,6 +1175,16 @@ mod tests {
         .unwrap();
     }
 
+    fn write_leaf_capable_model_cache(home: &Path) {
+        let mut cache = codey_runtime_core::model_suffix::bundled_model_catalog().unwrap();
+        cache["client_version"] = json!("0.147.0-alpha.8");
+        fs::write(
+            home.join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn insert_provider_with_api_format(
         path: &Path,
         id: &str,
@@ -1243,13 +1265,7 @@ experimental_bearer_token = "sk-codex-local"
         let (synced, status) =
             sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
 
-        assert!(!status.available);
         assert_eq!(status.provider.id, "codex-local");
-        assert_eq!(status.provider.source, "local");
-        assert_eq!(
-            status.path,
-            home.join("config.toml").to_string_lossy().to_string()
-        );
         assert_eq!(synced.profiles.len(), 1);
         assert_eq!(
             synced.profiles[0].base_url,
@@ -1525,14 +1541,12 @@ experimental_bearer_token = "sk-relay"
 
         let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
-        assert!(!status.available);
         assert!(status.provider.official);
-        assert_eq!(status.provider.source, "local");
         assert!(synced.profiles[0].api_key.is_empty());
     }
 
     #[test]
-    fn saved_cc_switch_metadata_is_not_reported_as_the_config_source() {
+    fn status_from_config_keeps_the_saved_provider_identity() {
         let config = CodeyConfig {
             active_profile_id: "route-a".into(),
             profiles: vec![saved_route_profile("route-a")],
@@ -1540,8 +1554,6 @@ experimental_bearer_token = "sk-relay"
         };
         let status = status_from_config(&config);
 
-        assert!(!status.available);
-        assert_eq!(status.provider.source, "local");
         assert_eq!(status.provider.id, "route-a");
     }
 
@@ -1569,7 +1581,6 @@ experimental_bearer_token = "sk-provider"
 
         let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
-        assert!(!status.available);
         assert!(!status.provider.official);
         assert_eq!(status.provider.base_url, "https://relay.example/v1");
         assert_eq!(synced.profiles[0].api_key, "sk-provider");
@@ -1609,9 +1620,7 @@ requires_openai_auth = true
 
         let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
-        assert!(!status.available);
         assert!(!status.provider.official);
-        assert_eq!(status.provider.source, "local");
         assert_eq!(status.provider.base_url, "https://manual.example/v1");
         assert_eq!(synced.profiles[0].api_key, "sk-manual");
         let patched = crate::codex_config::patch_config(
@@ -1658,6 +1667,7 @@ requires_openai_auth = true
         let mut config = CodeyConfig {
             active_profile_id: "route-a".into(),
             profiles: vec![saved_route_profile("route-a")],
+            subagent_optimization: true,
             subagent_model: "provider-old-model".into(),
             subagent_reasoning_effort: "xhigh".into(),
             ..CodeyConfig::default()
@@ -1669,6 +1679,7 @@ requires_openai_auth = true
         let (synced, status) = sync_current_provider(&config, &home).unwrap();
 
         assert_eq!(status.provider.id, "route-b");
+        assert!(synced.subagent_optimization);
         assert_eq!(synced.subagent_model, DEFAULT_SUBAGENT_MODEL);
         assert_eq!(
             synced.subagent_reasoning_effort,
@@ -1688,6 +1699,7 @@ requires_openai_auth = true
         let mut config = CodeyConfig {
             active_profile_id: "route-a".into(),
             profiles: vec![saved_route_profile("route-a")],
+            subagent_optimization: true,
             subagent_model: "provider-old-model".into(),
             subagent_reasoning_effort: "xhigh".into(),
             ..CodeyConfig::default()
@@ -1699,7 +1711,109 @@ requires_openai_auth = true
         let (synced, status) = sync_current_provider(&config, &home).unwrap();
 
         assert_eq!(status.provider.id, "route-b");
+        assert!(synced.subagent_optimization);
         assert_eq!(synced.subagent_model, "gpt-5.6-sol");
+        assert_eq!(
+            synced.subagent_reasoning_effort,
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        );
+    }
+
+    #[test]
+    fn provider_switch_disables_subagent_optimization_without_a_selected_compatible_model() {
+        let (_directory, _path, home) = fixture();
+        write_live_route(
+            &home,
+            "route-b",
+            "https://route-b.example/v1",
+            "route-b-secret",
+        );
+        let mut config = CodeyConfig {
+            active_profile_id: "route-a".into(),
+            profiles: vec![saved_route_profile("route-a")],
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol".into(),
+            subagent_reasoning_effort: "high".into(),
+            ..CodeyConfig::default()
+        };
+        config
+            .upstream_models_by_provider
+            .insert("route-b".into(), vec!["provider-custom-model".into()]);
+
+        let (synced, status) = sync_current_provider(&config, &home).unwrap();
+
+        assert_eq!(status.provider.id, "route-b");
+        assert!(!synced.subagent_optimization);
+        assert_eq!(synced.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(
+            synced.subagent_reasoning_effort,
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        );
+    }
+
+    #[test]
+    fn provider_switch_accepts_a_leaf_model_on_newer_codex() {
+        let (_directory, _path, home) = fixture();
+        write_leaf_capable_model_cache(&home);
+        write_live_route(
+            &home,
+            "route-b",
+            "https://route-b.example/v1",
+            "route-b-secret",
+        );
+        let mut config = CodeyConfig {
+            active_profile_id: "route-a".into(),
+            profiles: vec![saved_route_profile("route-a")],
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol".into(),
+            subagent_reasoning_effort: "high".into(),
+            ..CodeyConfig::default()
+        };
+        config
+            .upstream_models_by_provider
+            .insert("route-b".into(), vec!["gpt-5.6-luna".into()]);
+
+        let (synced, status) = sync_current_provider(&config, &home).unwrap();
+
+        assert_eq!(status.provider.id, "route-b");
+        assert!(synced.subagent_optimization);
+        assert_eq!(synced.subagent_model, "gpt-5.6-luna");
+        assert_eq!(
+            synced.subagent_reasoning_effort,
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        );
+    }
+
+    #[test]
+    fn provider_switch_accepts_a_selected_third_party_leaf_model_on_newer_codex() {
+        let (_directory, _path, home) = fixture();
+        write_leaf_capable_model_cache(&home);
+        write_live_route(
+            &home,
+            "route-b",
+            "https://route-b.example/v1",
+            "route-b-secret",
+        );
+        let mut config = CodeyConfig {
+            active_profile_id: "route-a".into(),
+            profiles: vec![saved_route_profile("route-a")],
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol".into(),
+            subagent_reasoning_effort: "high".into(),
+            ..CodeyConfig::default()
+        };
+        config
+            .selected_models_by_provider
+            .insert("route-b".into(), vec!["provider-custom-model".into()]);
+        config
+            .upstream_models_by_provider
+            .insert("route-b".into(), vec!["provider-custom-model".into()]);
+
+        let (synced, status) = sync_current_provider(&config, &home).unwrap();
+
+        assert_eq!(status.provider.id, "route-b");
+        assert!(synced.subagent_optimization);
+        assert_eq!(synced.subagent_model, "provider-custom-model");
         assert_eq!(
             synced.subagent_reasoning_effort,
             DEFAULT_SUBAGENT_REASONING_EFFORT
@@ -1718,7 +1832,8 @@ requires_openai_auth = true
         let config = CodeyConfig {
             active_profile_id: "route-a".into(),
             profiles: vec![saved_route_profile("route-a")],
-            subagent_model: "provider-custom-model".into(),
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol".into(),
             subagent_reasoning_effort: "high".into(),
             ..CodeyConfig::default()
         };
@@ -1726,8 +1841,40 @@ requires_openai_auth = true
         let (synced, status) = sync_current_provider(&config, &home).unwrap();
 
         assert_eq!(status.provider.id, "route-a");
-        assert_eq!(synced.subagent_model, "provider-custom-model");
+        assert_eq!(synced.subagent_model, "gpt-5.6-sol");
         assert_eq!(synced.subagent_reasoning_effort, "high");
+    }
+
+    #[test]
+    fn provider_sync_disables_subagent_optimization_when_current_route_loses_compatible_models() {
+        let (_directory, _path, home) = fixture();
+        write_live_route(
+            &home,
+            "route-a",
+            "https://route-a.example/v1",
+            "route-a-secret",
+        );
+        let mut config = CodeyConfig {
+            active_profile_id: "route-a".into(),
+            profiles: vec![saved_route_profile("route-a")],
+            subagent_optimization: true,
+            subagent_model: DEFAULT_SUBAGENT_MODEL.into(),
+            subagent_reasoning_effort: "high".into(),
+            ..CodeyConfig::default()
+        };
+        config
+            .upstream_models_by_provider
+            .insert("route-a".into(), vec!["provider-custom-model".into()]);
+
+        let (synced, status) = sync_current_provider(&config, &home).unwrap();
+
+        assert_eq!(status.provider.id, "route-a");
+        assert!(!synced.subagent_optimization);
+        assert_eq!(synced.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(
+            synced.subagent_reasoning_effort,
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        );
     }
 
     #[test]
@@ -1773,7 +1920,6 @@ requires_openai_auth = true
         assert_eq!(fetch_profile.name, live_profile.name);
         assert_eq!(fetch_profile.base_url, "https://source.example/v1");
         assert_eq!(fetch_profile.api_key, "source-route-secret");
-        assert_eq!(fetch_profile.protocol, RelayProtocol::Responses);
         assert_eq!(live_profile.api_key, PROXY_MANAGED_TOKEN);
     }
 

@@ -45,6 +45,7 @@
   let updateCheckInFlight = false;
   let accountUsageTimer = 0;
   let accountUsageCheckInFlight = false;
+  let accountUsagePollingEnabled = true;
   let accountUsageLastResult = null;
   let accountUsageDragState = null;
   let sessionToolsInteractionArmed = false;
@@ -535,10 +536,14 @@
 
   const renderAccountUsage = (result) => {
     if (!result || result.status === "disabled" || result.status === "unavailable") {
+      accountUsagePollingEnabled = false;
+      window.clearTimeout(accountUsageTimer);
+      accountUsageTimer = 0;
       accountUsageLastResult = null;
       removeAccountUsage();
       return;
     }
+    accountUsagePollingEnabled = true;
     if (result.status === "error") {
       const usage = accountUsageMount();
       if (!usage) return;
@@ -600,6 +605,8 @@
 
   const scheduleAccountUsageCheck = (delayMs = accountUsageRefreshIntervalMs) => {
     window.clearTimeout(accountUsageTimer);
+    accountUsageTimer = 0;
+    if (!accountUsagePollingEnabled || document.visibilityState === "hidden") return;
     accountUsageTimer = window.setTimeout(() => {
       accountUsageTimer = 0;
       void checkAccountUsage();
@@ -607,10 +614,7 @@
   };
 
   const checkAccountUsage = async () => {
-    if (accountUsageCheckInFlight || document.visibilityState === "hidden") {
-      scheduleAccountUsageCheck();
-      return null;
-    }
+    if (accountUsageCheckInFlight || document.visibilityState === "hidden") return null;
     accountUsageCheckInFlight = true;
     try {
       const result = await withTimeout(
@@ -627,7 +631,7 @@
       return null;
     } finally {
       accountUsageCheckInFlight = false;
-      scheduleAccountUsageCheck();
+      if (accountUsagePollingEnabled) scheduleAccountUsageCheck();
     }
   };
 
@@ -1260,11 +1264,25 @@
     if (!hasDetectedUpdate()) scheduleUpdateCheck();
   });
   window.addEventListener?.(configChangedEvent, () => {
+    accountUsagePollingEnabled = true;
     scheduleAccountUsageCheck(0);
   });
   scan();
   scheduleUpdateCheck(0);
   scheduleAccountUsageCheck(250);
+
+  const headerNodesChanged = (nodes) => {
+    for (const node of nodes || []) {
+      if (
+        node instanceof HTMLElement
+        && node.id !== buttonId
+        && node.id !== accountUsageId
+      ) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   bootstrapObserver = new MutationObserver((mutations) => {
     for (const mutation of mutations) {
@@ -1288,14 +1306,10 @@
       const targetHeader = target?.matches?.(headerSelector)
         ? target
         : target?.closest?.(headerSelector);
-      const headerChildrenChanged = targetHeader && [
-        ...(mutation.addedNodes || []),
-        ...(mutation.removedNodes || []),
-      ].some((node) => (
-        node instanceof HTMLElement
-        && node.id !== buttonId
-        && node.id !== accountUsageId
-      ));
+      const headerChildrenChanged = targetHeader && (
+        headerNodesChanged(mutation.addedNodes)
+        || headerNodesChanged(mutation.removedNodes)
+      );
       if (headerChildrenChanged) {
         headerMountDirty = true;
         scheduleScan(targetHeader);
@@ -1340,6 +1354,9 @@
 
   window.addEventListener?.("focus", () => {
     scan();
+    scheduleAccountUsageCheck(0);
+  });
+  document.addEventListener?.("visibilitychange", () => {
     scheduleAccountUsageCheck(0);
   });
   window.addEventListener?.("pageshow", () => scan());

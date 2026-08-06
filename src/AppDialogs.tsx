@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   IconAlertTriangle as AlertTriangle,
   IconCheck as Check,
@@ -43,6 +43,8 @@ type ModelPickerDialogProps = {
   onSave: () => void;
 };
 
+const MODEL_PICKER_PAGE_SIZE = 200;
+
 function ModelPickerDialogComponent({
   open,
   isBusy,
@@ -62,9 +64,38 @@ function ModelPickerDialogComponent({
   onDeleteThirdPartyModel,
   onSave,
 }: ModelPickerDialogProps) {
+  const [modelQuery, setModelQuery] = useState("");
+  const [visibleThirdPartyCount, setVisibleThirdPartyCount] = useState(
+    MODEL_PICKER_PAGE_SIZE,
+  );
+  useEffect(() => {
+    if (!open) return;
+    setModelQuery("");
+    setVisibleThirdPartyCount(MODEL_PICKER_PAGE_SIZE);
+  }, [open]);
+  const filteredThirdPartyModels = useMemo(() => {
+    if (!open) return [];
+    const query = modelQuery.trim().toLowerCase();
+    if (!query) return thirdPartyModelOptions;
+    return thirdPartyModelOptions.filter((model) =>
+      model.toLowerCase().includes(query)
+    );
+  }, [modelQuery, open, thirdPartyModelOptions]);
+  const visibleThirdPartyModels = filteredThirdPartyModels.slice(
+    0,
+    visibleThirdPartyCount,
+  );
+  const selectedThirdPartyModelKeys = useMemo(
+    () =>
+      open
+        ? new Set(modelState.thirdPartyModels.map((model) => model.trim().toLowerCase()))
+        : new Set<string>(),
+    [modelState.thirdPartyModels, open],
+  );
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent
+      {open && <DialogContent
         className="model-picker-dialog"
         container={container}
         onEscapeKeyDown={(event) => {
@@ -146,11 +177,31 @@ function ModelPickerDialogComponent({
               <strong>其他模型</strong>
               <small>可选择同步发现的模型，也可在上方手动输入</small>
             </div>
-            <Badge variant="secondary">{thirdPartyModelOptions.length} 个</Badge>
+            <Badge variant="secondary">
+              {filteredThirdPartyModels.length === thirdPartyModelOptions.length
+                ? `${thirdPartyModelOptions.length} 个`
+                : `${filteredThirdPartyModels.length} / ${thirdPartyModelOptions.length} 个`}
+            </Badge>
           </div>
-          {thirdPartyModelOptions.map((model) => {
+          {thirdPartyModelOptions.length > 0 && (
+            <div className="model-picker-search">
+              <Input
+                value={modelQuery}
+                onChange={(event) => {
+                  setModelQuery(event.target.value);
+                  setVisibleThirdPartyCount(MODEL_PICKER_PAGE_SIZE);
+                }}
+                placeholder="搜索其他模型"
+                spellCheck={false}
+                aria-label="搜索其他模型"
+                disabled={isBusy}
+              />
+            </div>
+          )}
+          {visibleThirdPartyModels.map((model) => {
             const added =
-              draftModelSet.has(model) || modelState.thirdPartyModels.includes(model);
+              draftModelSet.has(model) ||
+              selectedThirdPartyModelKeys.has(model.trim().toLowerCase());
             const manual = manualThirdPartyModelKeys.has(model.trim().toLowerCase());
             return (
               <div className="model-picker-row" key={model}>
@@ -177,8 +228,35 @@ function ModelPickerDialogComponent({
               </div>
             );
           })}
-          {thirdPartyModelOptions.length === 0 && (
-            <div className="empty-state">尚无其他模型，可在上方输入模型 ID 添加</div>
+          {visibleThirdPartyModels.length < filteredThirdPartyModels.length && (
+            <div className="model-picker-load-more">
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={isBusy}
+                onClick={() =>
+                  setVisibleThirdPartyCount((count) =>
+                    Math.min(
+                      count + MODEL_PICKER_PAGE_SIZE,
+                      filteredThirdPartyModels.length,
+                    )
+                  )}
+              >
+                再显示{" "}
+                {Math.min(
+                  MODEL_PICKER_PAGE_SIZE,
+                  filteredThirdPartyModels.length - visibleThirdPartyModels.length,
+                )}{" "}
+                个
+              </Button>
+            </div>
+          )}
+          {filteredThirdPartyModels.length === 0 && (
+            <div className="empty-state">
+              {thirdPartyModelOptions.length === 0
+                ? "尚无其他模型，可在上方输入模型 ID 添加"
+                : "没有匹配的其他模型"}
+            </div>
           )}
         </div>
         <DialogFooter>
@@ -195,7 +273,7 @@ function ModelPickerDialogComponent({
             保存模型支持情况
           </Button>
         </DialogFooter>
-      </DialogContent>
+      </DialogContent>}
     </Dialog>
   );
 }

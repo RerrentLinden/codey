@@ -35,7 +35,7 @@ impl ModelHotReloadOutcome {
 }
 
 pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Value, String> {
-    let cc_switch = sync_cc_switch_state(state).await;
+    let cc_switch = sync_cc_switch_state(state).await?;
     let config = state.config.read().await.clone();
     let restart_required = runtime_config_requires_restart(state, &config).await;
     let model_state = current_model_state(&config)?;
@@ -49,7 +49,9 @@ pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Valu
     }))
 }
 
-pub async fn sync_cc_switch_state(state: &Arc<AppState>) -> cc_switch::CcSwitchStatus {
+pub async fn sync_cc_switch_state(
+    state: &Arc<AppState>,
+) -> Result<cc_switch::CcSwitchStatus, String> {
     let home = codex_home();
     sync_cc_switch_state_with(state, move |config| {
         cc_switch::sync_current_provider(&config, &home).map_err(|error| error.to_string())
@@ -60,7 +62,7 @@ pub async fn sync_cc_switch_state(state: &Arc<AppState>) -> cc_switch::CcSwitchS
 pub(super) async fn sync_cc_switch_state_with<F>(
     state: &Arc<AppState>,
     sync: F,
-) -> cc_switch::CcSwitchStatus
+) -> Result<cc_switch::CcSwitchStatus, String>
 where
     F: FnOnce(CodeyConfig) -> Result<(CodeyConfig, cc_switch::CcSwitchStatus), String>
         + Send
@@ -72,37 +74,22 @@ where
     match sync_result {
         Ok(Ok((config, status))) => {
             if !status.changed {
-                return status;
+                return Ok(status);
             }
 
             let _config_write_guard = state.config_write_lock.lock().await;
             let latest = state.config.read().await.clone();
             if latest != previous {
-                let mut current = cc_switch::status_from_config(&latest);
-                current.message =
-                    Some("Codey 设置在同步线路期间已更新，已忽略过期的同步结果".to_string());
-                return current;
+                return Err("Codey 设置在同步线路期间已更新，已忽略过期的同步结果".to_string());
             }
-            if let Err(error) = save_config_to_store(state, &config).await {
-                let mut current = cc_switch::status_from_config(&latest);
-                current.message = Some(format!("保存当前线路同步结果失败：{error}"));
-                return current;
-            }
+            save_config_to_store(state, &config)
+                .await
+                .map_err(|error| format!("保存当前线路同步结果失败：{error}"))?;
             *state.config.write().await = config;
-            status
+            Ok(status)
         }
-        Ok(Err(error)) => {
-            let current = state.config.read().await.clone();
-            let mut status = cc_switch::status_from_config(&current);
-            status.message = Some(error);
-            status
-        }
-        Err(error) => {
-            let current = state.config.read().await.clone();
-            let mut status = cc_switch::status_from_config(&current);
-            status.message = Some(format!("同步当前线路任务异常退出：{error}"));
-            status
-        }
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(format!("同步当前线路任务异常退出：{error}")),
     }
 }
 
@@ -151,6 +138,7 @@ fn config_with_current_provider_model_sync(
     config: &CodeyConfig,
     provider_models: Vec<String>,
     synced: bool,
+    codex_home: &std::path::Path,
 ) -> CodeyConfig {
     let Some(provider_id) = config.current_provider_id().map(ToString::to_string) else {
         return config.clone();
@@ -175,7 +163,9 @@ fn config_with_current_provider_model_sync(
         next.manual_third_party_models_by_provider
             .insert(provider_id, manual_models);
     }
-    next.normalize()
+    next = next.normalize();
+    cc_switch::reconcile_subagent_defaults_for_current_provider(&mut next, codex_home, false);
+    next
 }
 
 pub(super) fn startup_model_sync_models_or_fallback(
@@ -325,7 +315,7 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
         eprintln!("启动时同步模型期间当前线路已变化，忽略旧线路的同步结果");
         return latest;
     }
-    let next = config_with_current_provider_model_sync(&latest, models, synced);
+    let next = config_with_current_provider_model_sync(&latest, models, synced, &codex_home());
     if synced && let Err(error) = save_config_to_store(state, &next).await {
         eprintln!("保存启动时模型同步结果失败，本次启动仍使用最新模型：{error:#}");
     }
@@ -356,20 +346,12 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
     if latest.current_provider_id() != Some(provider_id.as_str()) {
         return Err("同步模型期间当前线路已变化，请重试".to_string());
     }
-    let models =
-        preserve_selected_third_party_models(fetched_models.clone(), latest.selected_models());
-    let mut next = latest;
-    let manual_models = selected_models_not_in_upstream(next.selected_models(), &fetched_models);
-    next.upstream_models_by_provider
-        .insert(provider_id.clone(), models.clone());
-    if manual_models.is_empty() {
-        next.manual_third_party_models_by_provider
-            .remove(&provider_id);
-    } else {
-        next.manual_third_party_models_by_provider
-            .insert(provider_id, manual_models);
-    }
-    next = next.normalize();
+    let next = config_with_current_provider_model_sync(
+        &latest,
+        fetched_models.clone(),
+        true,
+        &codex_home(),
+    );
     let model_state = current_model_state(&next)?;
     let model_catalog_fallback = should_refresh_model_catalog(&model_state)
         && refresh_model_catalog_for_provider_sync(&next)?;
@@ -471,6 +453,16 @@ pub async fn save_selected_models(
     requested_manual_third_party_models: Vec<String>,
     requested_deleted_third_party_models: Vec<String>,
 ) -> Result<Value, String> {
+    validate_requested_model_list_bounds("官方模型", &requested_official_models)?;
+    validate_requested_model_list_bounds("其他模型", &requested_third_party_models)?;
+    validate_requested_model_list_bounds(
+        "手动添加的其他模型",
+        &requested_manual_third_party_models,
+    )?;
+    validate_requested_model_list_bounds(
+        "待删除的其他模型",
+        &requested_deleted_third_party_models,
+    )?;
     let _config_write_guard = state.config_write_lock.lock().await;
     let mut config = state.config.read().await.clone();
     let profile = config
@@ -556,6 +548,26 @@ pub async fn save_selected_models(
     })))
 }
 
+fn validate_requested_model_list_bounds(label: &str, models: &[String]) -> Result<(), String> {
+    if models.len() > provider_models::MAX_PROVIDER_MODELS {
+        return Err(format!(
+            "{label}数量超过安全上限 {}",
+            provider_models::MAX_PROVIDER_MODELS
+        ));
+    }
+    if models
+        .iter()
+        .map(|model| model.trim())
+        .any(|model| model.len() > provider_models::MAX_PROVIDER_MODEL_ID_BYTES)
+    {
+        return Err(format!(
+            "{label} ID 超过安全上限 {} 字节",
+            provider_models::MAX_PROVIDER_MODEL_ID_BYTES
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn validate_manual_model_selection(
     official_model_ids: &[String],
     requested_official_models: &[String],
@@ -582,21 +594,22 @@ pub(super) fn validate_manual_model_selection(
         .filter(|model| requested_official.contains(model.to_lowercase().as_str()))
         .cloned()
         .collect::<Vec<_>>();
-    let selected_third_party = requested_third_party_models
+    let mut selected_third_party = Vec::with_capacity(requested_third_party_models.len());
+    let mut seen_third_party = HashSet::<&str>::with_capacity(requested_third_party_models.len());
+    for model in requested_third_party_models
         .iter()
         .map(|model| model.trim())
         .filter(|model| !model.is_empty())
-        .try_fold(Vec::<String>::new(), |mut models, model| {
-            if official_by_key.contains_key(model.to_lowercase().as_str()) {
-                return Err(format!(
-                    "模型 {model} 已在官方模型列表中，请直接勾选，不可作为其他模型手动添加"
-                ));
-            }
-            if !models.iter().any(|existing| existing == model) {
-                models.push(model.to_string());
-            }
-            Ok(models)
-        })?;
+    {
+        if official_by_key.contains_key(model.to_lowercase().as_str()) {
+            return Err(format!(
+                "模型 {model} 已在官方模型列表中，请直接勾选，不可作为其他模型手动添加"
+            ));
+        }
+        if seen_third_party.insert(model) {
+            selected_third_party.push(model.to_string());
+        }
+    }
     Ok((supported_official, selected_third_party))
 }
 
@@ -663,28 +676,30 @@ fn validate_manual_third_party_model_sources(
         .map(|model| model.trim().to_lowercase())
         .collect::<HashSet<_>>();
 
-    requested_manual_third_party_models
+    let mut models = Vec::with_capacity(requested_manual_third_party_models.len());
+    let mut seen = HashSet::<&str>::with_capacity(requested_manual_third_party_models.len());
+    for model in requested_manual_third_party_models
         .iter()
         .map(|model| model.trim())
         .filter(|model| !model.is_empty())
-        .try_fold(Vec::<String>::new(), |mut models, model| {
-            let key = model.to_lowercase();
-            if official_model_keys.contains(key.as_str()) {
-                return Err(format!("官方模型 {model} 不能作为手动添加的其他模型"));
-            }
-            if !selected_model_keys.contains(key.as_str()) {
-                return Ok(models);
-            }
-            if upstream_model_keys.contains(key.as_str())
-                && !existing_manual_model_keys.contains(key.as_str())
-            {
-                return Ok(models);
-            }
-            if !models.iter().any(|existing| existing == model) {
-                models.push(model.to_string());
-            }
-            Ok(models)
-        })
+    {
+        let key = model.to_lowercase();
+        if official_model_keys.contains(key.as_str()) {
+            return Err(format!("官方模型 {model} 不能作为手动添加的其他模型"));
+        }
+        if !selected_model_keys.contains(key.as_str()) {
+            continue;
+        }
+        if upstream_model_keys.contains(key.as_str())
+            && !existing_manual_model_keys.contains(key.as_str())
+        {
+            continue;
+        }
+        if seen.insert(model) {
+            models.push(model.to_string());
+        }
+    }
+    Ok(models)
 }
 
 pub async fn save_default_model(
@@ -900,6 +915,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requested_model_lists_enforce_count_and_id_limits() {
+        let too_many = (0..=provider_models::MAX_PROVIDER_MODELS)
+            .map(|index| format!("model-{index}"))
+            .collect::<Vec<_>>();
+        assert!(
+            validate_requested_model_list_bounds("其他模型", &too_many)
+                .unwrap_err()
+                .contains("数量超过安全上限")
+        );
+
+        let too_long = vec!["m".repeat(provider_models::MAX_PROVIDER_MODEL_ID_BYTES + 1)];
+        assert!(
+            validate_requested_model_list_bounds("其他模型", &too_long)
+                .unwrap_err()
+                .contains("ID 超过安全上限")
+        );
+    }
+
+    #[test]
+    fn manual_model_selection_keeps_first_exact_duplicate_in_linear_time() {
+        let official = model_catalog::default_official_model_slugs();
+        let (_, selected) = validate_manual_model_selection(
+            &official,
+            &[],
+            &[
+                "provider-a".into(),
+                "provider-a".into(),
+                "Provider-A".into(),
+                "provider-b".into(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(selected, ["provider-a", "Provider-A", "provider-b"]);
+    }
+
+    #[test]
     fn model_changes_accept_only_the_known_builtin_catalog_fallback() {
         let home = tempfile::tempdir().unwrap();
         let missing_cache =
@@ -943,6 +995,7 @@ mod tests {
 
     #[test]
     fn provider_sync_reclassifies_old_selected_models_by_the_raw_upstream_list() {
+        let home = tempfile::tempdir().unwrap();
         let mut config = CodeyConfig::default();
         let provider_id = config.current_provider_id().unwrap().to_string();
         config.selected_models_by_provider.insert(
@@ -950,8 +1003,12 @@ mod tests {
             vec!["provider-synced".into(), "provider-manual".into()],
         );
 
-        let synced =
-            config_with_current_provider_model_sync(&config, vec!["provider-synced".into()], true);
+        let synced = config_with_current_provider_model_sync(
+            &config,
+            vec!["provider-synced".into()],
+            true,
+            home.path(),
+        );
 
         assert_eq!(
             synced.manual_third_party_models_by_provider[&provider_id],
@@ -960,6 +1017,35 @@ mod tests {
         assert_eq!(
             synced.upstream_models_by_provider[&provider_id],
             ["provider-synced", "provider-manual"]
+        );
+    }
+
+    #[test]
+    fn provider_model_refresh_disables_subagent_optimization_after_selected_model_disappears() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = CodeyConfig {
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol".into(),
+            subagent_reasoning_effort: "high".into(),
+            ..CodeyConfig::default()
+        };
+        let provider_id = config.current_provider_id().unwrap().to_string();
+        config
+            .upstream_models_by_provider
+            .insert(provider_id, vec!["gpt-5.6-sol".into()]);
+
+        let synced = config_with_current_provider_model_sync(
+            &config,
+            vec!["provider-custom-model".into()],
+            true,
+            home.path(),
+        );
+
+        assert!(!synced.subagent_optimization);
+        assert_eq!(synced.subagent_model, crate::config::DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(
+            synced.subagent_reasoning_effort,
+            crate::config::DEFAULT_SUBAGENT_REASONING_EFFORT
         );
     }
 
