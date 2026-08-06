@@ -27,6 +27,7 @@ mod session_metadata;
 mod session_transfer;
 mod sqlite_util;
 mod startup_maintenance;
+mod subagent_policy;
 mod trace_log_guard;
 mod trace_log_stats;
 mod update_helper;

@@ -15,6 +15,7 @@ use crate::config::{CodeyConfig, ProviderProfile};
 use crate::error_log;
 use crate::model_catalog;
 use crate::provider_models;
+use crate::subagent_policy;
 
 #[derive(Default)]
 struct ModelHotReloadOutcome {
@@ -54,7 +55,19 @@ pub async fn sync_cc_switch_state(
 ) -> Result<cc_switch::CcSwitchStatus, String> {
     let home = codex_home();
     sync_cc_switch_state_with(state, move |config| {
-        cc_switch::sync_current_provider(&config, &home).map_err(|error| error.to_string())
+        let previous_provider_id = config.current_provider_id().map(ToString::to_string);
+        let (mut next, mut status) =
+            cc_switch::sync_current_provider(&config, &home).map_err(|error| error.to_string())?;
+        subagent_policy::apply_after_provider_sync(
+            previous_provider_id.as_deref(),
+            &status.provider.id,
+            &mut next,
+            &home,
+            status.provider.official,
+        );
+        next = next.normalize();
+        status.changed = next != config;
+        Ok((next, status))
     })
     .await
 }
@@ -164,7 +177,7 @@ fn config_with_current_provider_model_sync(
             .insert(provider_id, manual_models);
     }
     next = next.normalize();
-    cc_switch::reconcile_subagent_defaults_for_current_provider(&mut next, codex_home, false);
+    subagent_policy::reconcile_for_current_provider(&mut next, codex_home, false);
     next
 }
 
