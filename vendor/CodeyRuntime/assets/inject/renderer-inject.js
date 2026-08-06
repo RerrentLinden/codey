@@ -4880,45 +4880,58 @@
     return item.querySelector?.("[data-app-action-sidebar-thread-id]") || null;
   }
 
-  function rowPinned(row) {
-    return row?.getAttribute?.("data-app-action-sidebar-thread-pinned") === "true" || rowListItem(row)?.getAttribute?.("data-app-action-sidebar-thread-pinned") === "true";
+  function rowHasRunningStatus(row) {
+    if (!(row instanceof HTMLElement)) return false;
+    if (row.querySelector?.(".animate-spin")) return true;
+    const fiberKey = Object.keys(row).find((key) => key.startsWith("__reactFiber$"));
+    let fiber = fiberKey ? row[fiberKey] : null;
+    for (let depth = 0; fiber && depth < 12; depth += 1, fiber = fiber.return) {
+      const statusState = fiber.memoizedProps?.statusState || fiber.pendingProps?.statusState;
+      if (!statusState || typeof statusState !== "object") continue;
+      return /^(?:loading|processing|running|working)$/i.test(String(statusState.type || ""));
+    }
+    return false;
   }
 
-  function insertRowItemByTime(list, item, row, target) {
+  function prioritizeRunningRowsInList(list) {
+    if (!(list instanceof HTMLElement)) return;
+    const children = Array.from(list.children);
+    const entries = children.map((item) => ({
+      item,
+      row: threadRowFromListItem(item),
+    })).filter(({ row }) => row instanceof HTMLElement);
+    if (entries.length < 2) return;
+    const running = entries.filter(({ row }) => rowHasRunningStatus(row));
+    if (running.length === 0 || running.length === entries.length) return;
+    const idle = entries.filter(({ row }) => !rowHasRunningStatus(row));
+    const ordered = [...running, ...idle];
+    if (ordered.every(({ item }, index) => item === entries[index].item)) return;
+    const firstNonThreadItem = children.find((child) => !threadRowFromListItem(child)) || null;
+    ordered.forEach(({ item }) => list.insertBefore(item, firstNonThreadItem));
+    cachedSessionRowsAt = 0;
+  }
+
+  function prioritizeRunningProjectRows() {
+    const lists = new Set();
+    sessionRows(true).forEach((row) => {
+      if (!row.closest?.('[data-app-action-sidebar-section-heading="Projects"]')) return;
+      const item = rowListItem(row);
+      if (item?.parentElement) lists.add(item.parentElement);
+    });
+    lists.forEach(prioritizeRunningRowsInList);
+  }
+
+  function insertProjectedRowItem(list, item, row, target) {
     const ref = sessionRefFromRow(row);
     const sortMs = rowSortMs(row, ref, target);
     item.dataset.codexProjectMoveSortMs = String(sortMs || 0);
     row.dataset.codexProjectMoveSortMs = String(sortMs || 0);
     if (target?.sortMsTrusted) updateRowTimeLabel(row, sortMs);
-    const pinned = rowPinned(row);
-    const sessionKey = projectMoveSessionKey(ref.session_id);
-    const existingItems = Array.from(list.children).filter((child) => child !== item);
-    let firstNonThreadItem = null;
-    for (const child of existingItems) {
-      const childRow = threadRowFromListItem(child);
-      if (!childRow) {
-        firstNonThreadItem = firstNonThreadItem || child;
-        continue;
-      }
-      const childPinned = rowPinned(childRow);
-      if (childPinned && !pinned) continue;
-      if (!childPinned && pinned) {
-        list.insertBefore(item, child);
-        return;
-      }
-      const childRef = sessionRefFromRow(childRow);
-      const childSortMs = rowSortMs(childRow, childRef);
-      const childKey = projectMoveSessionKey(childRef.session_id);
-      if (sortMs > childSortMs || (sortMs === childSortMs && sessionKey > childKey)) {
-        list.insertBefore(item, child);
-        return;
-      }
-    }
-    if (firstNonThreadItem) {
+    if (item.parentElement !== list) {
+      const firstNonThreadItem = Array.from(list.children).find((child) => !threadRowFromListItem(child)) || null;
       list.insertBefore(item, firstNonThreadItem);
-      return;
     }
-    list.appendChild(item);
+    prioritizeRunningRowsInList(list);
   }
 
   function projectMoveInjectedList(projectItem) {
@@ -4986,7 +4999,7 @@
     const list = projectThreadList(projectItem, target);
     const item = rowListItem(row);
     if (!list) return false;
-    insertRowItemByTime(list, item, row, target);
+    insertProjectedRowItem(list, item, row, target);
     cachedSessionRowsAt = 0;
     item.dataset.codexProjectMoveTargetKind = "project";
     item.dataset.codexProjectMoveTargetCwd = targetPath(target);
@@ -5000,7 +5013,7 @@
     const list = chatsThreadList();
     if (!list) return false;
     const item = rowListItem(row);
-    insertRowItemByTime(list, item, row, target);
+    insertProjectedRowItem(list, item, row, target);
     cachedSessionRowsAt = 0;
     item.dataset.codexProjectMoveTargetKind = "projectless";
     row.dataset.codexProjectMoveTargetKind = "projectless";
@@ -5063,6 +5076,7 @@
     });
     settledRefs.forEach(clearProjectMoveProjection);
     updateProjectMoveEmptyStates();
+    prioritizeRunningProjectRows();
   }
 
   function scheduleProjectMoveProjection() {
@@ -5085,10 +5099,14 @@
   }
 
   function refreshAfterProjectMove() {
-    applyProjectMoveProjection();
+    const refreshVisibleSidebar = () => {
+      applyProjectMoveProjection();
+      prioritizeRunningProjectRows();
+    };
+    refreshVisibleSidebar();
     void refreshRecentConversationsForHost().finally(() => {
       projectMoveRefreshDelaysMs.forEach((delay) => {
-        setTimeout(applyProjectMoveProjection, delay);
+        setTimeout(refreshVisibleSidebar, delay);
       });
     });
   }
@@ -7712,6 +7730,7 @@
     sessionRows().forEach(tryAttachButton);
     updateDeleteButtonOffsets();
     scheduleProjectMoveProjection();
+    prioritizeRunningProjectRows();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
     scheduleThreadScrollSync();
@@ -7815,6 +7834,7 @@
   window.__codexProjectMoveApplyProjection = applyProjectMoveProjection;
   window.__codexProjectMoveReadProjection = readProjectMoveProjection;
   window.__codexProjectMoveTargets = projectMoveTargets;
+  window.__codexProjectMovePrioritizeRunning = prioritizeRunningProjectRows;
   window.removeEventListener("resize", window.__codeyResizeHandler);
   let codeyResizeRafId = 0;
   window.__codeyResizeHandler = () => {
