@@ -829,17 +829,21 @@ async fn inject_initial_renderer(
     )
     .await
     {
-        let mut context = serde_json::json!({
+        let context = serde_json::json!({
             "appPath": app_dir,
             "processId": spawned.process_id,
         });
         #[cfg(unix)]
-        if let Some(context) = context.as_object_mut() {
-            context.insert(
-                "processGroupId".to_string(),
-                serde_json::json!(spawned.process_group_id),
-            );
-        }
+        let context = {
+            let mut context = context;
+            if let Some(context) = context.as_object_mut() {
+                context.insert(
+                    "processGroupId".to_string(),
+                    serde_json::json!(spawned.process_group_id),
+                );
+            }
+            context
+        };
         error_log::record_failure(
             "cleanup_failed",
             injection_failure_cleanup_operation(),
