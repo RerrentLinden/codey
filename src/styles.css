@@ -1274,8 +1274,18 @@ input:focus-visible,
   color: #6e6e73;
 }
 
-.readonly-note span {
+.readonly-note-text {
   flex: 1;
+}
+
+.readonly-note-tag {
+  flex: 0 0 auto;
+  height: 18px;
+  padding: 1px 7px;
+  font-size: 11px;
+  line-height: 14px;
+  background: rgba(0, 122, 255, 0.14);
+  color: #0066d6;
 }
 
 /* ==========================================================================

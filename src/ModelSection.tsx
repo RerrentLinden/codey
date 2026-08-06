@@ -317,8 +317,12 @@ function ModelSectionComponent({
 
         <div className="readonly-note">
           <Server size={14} />
-          <span>Codey 直接读取本地 Codex 登录与 API 配置</span>
-          <Badge variant="secondary">只读</Badge>
+          <span className="readonly-note-text">
+            Codey 直接读取本地 Codex 登录与 API 配置
+          </span>
+          <Badge variant="brand" className="readonly-note-tag">
+            只读
+          </Badge>
         </div>
       </Card>
     </section>

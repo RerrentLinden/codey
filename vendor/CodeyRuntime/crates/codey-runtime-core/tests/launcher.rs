@@ -2,11 +2,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use codey_runtime_core::app_paths::{
-    build_codex_executable, codex_app_version, codex_runtime_executable, codex_runtime_version,
-    find_latest_codex_app_dir, find_latest_codex_app_dir_from_roots, find_macos_codex_app,
+    build_codex_executable, codex_app_version, codex_runtime_executable, find_latest_codex_app_dir,
+    find_latest_codex_app_dir_from_roots, find_macos_codex_app,
     latest_appx_install_location_from_output, normalize_codex_app_path, packaged_app_user_model_id,
-    resolve_codex_app_dir_with_saved, resolve_codex_runtime_version, user_data_candidates_from,
+    resolve_codex_app_dir_with_saved, user_data_candidates_from,
 };
+#[cfg(unix)]
+use codey_runtime_core::app_paths::{codex_runtime_version, resolve_codex_runtime_version};
 use codey_runtime_core::launcher::{
     CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
     build_codex_arguments, build_codex_arguments_for_settings,
