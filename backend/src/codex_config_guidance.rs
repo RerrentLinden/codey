@@ -67,19 +67,36 @@ developer_instructions = """
 image_generation = false
 "#####;
 
-pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. For local file \
-reading, content search, and file discovery, always use `mcp__codey_fastctx__read`, \
-`mcp__codey_fastctx__grep`, and `mcp__codey_fastctx__glob` before exec or shell commands. \
-Do not use cat, sed, rg, grep, find, or recursive ls when a FastCtx tool covers the operation. \
-Use exec only for builds, tests, Git, package managers, or when the FastCtx tool is unavailable \
-or fails. Use `mcp__codey_fastctx__replace` only for deterministic mechanical replacements, \
-and follow every Complete or Partial continuation exactly.";
+pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Local files \
+have exactly one read route: call `mcp__codey_fastctx__read` directly, including when the input is a \
+URI-shaped local reference. Set `file_path` to a plain absolute filesystem path (never a URI); on \
+Windows, convert the reference to a drive-letter path such as `E:/repo/file.ts` before the call. For \
+content search and file discovery, always use `mcp__codey_fastctx__grep` and \
+`mcp__codey_fastctx__glob` before exec or shell commands. Do not use cat, sed, rg, grep, find, or \
+recursive ls when a FastCtx tool covers the operation. Use exec only for builds, tests, Git, package \
+managers, or when the FastCtx tool is unavailable or fails. Use `mcp__codey_fastctx__replace` only \
+for deterministic mechanical replacements, and follow every Complete or Partial continuation \
+exactly.";
+
+pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. \
+For local file reading, content search, and file discovery, always use \
+`mcp__codey_fastctx__read`, `mcp__codey_fastctx__grep`, and `mcp__codey_fastctx__glob` before exec \
+or shell commands. Do not use cat, sed, rg, grep, find, or recursive ls when a FastCtx tool covers \
+the operation. Use exec only for builds, tests, Git, package managers, or when the FastCtx tool is \
+unavailable or fails. Use `mcp__codey_fastctx__replace` only for deterministic mechanical \
+replacements, and follow every Complete or Partial continuation exactly.";
 
 pub(crate) const LEGACY_CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Prefer \
 `mcp__codey_fastctx__read`, `mcp__codey_fastctx__grep`, and \
 `mcp__codey_fastctx__glob` over shell commands for local file inspection. Use \
 `mcp__codey_fastctx__replace` only for deterministic batch replacements, and \
 follow every Complete or Partial pagination note exactly.";
+
+pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
+    CODEY_FASTCTX_GUIDANCE,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE,
+    LEGACY_CODEY_FASTCTX_GUIDANCE,
+];
 
 pub(crate) fn append_subagent_guidance(existing: &str) -> String {
     if existing.contains(SUBAGENT_GUIDANCE) {
@@ -112,7 +129,7 @@ pub(crate) fn remove_subagent_guidance(current: &str) -> Option<String> {
 pub(crate) fn remove_codey_fastctx_guidance(current: &str) -> Option<String> {
     let mut restored = current.to_string();
     let mut changed = false;
-    for guidance in [CODEY_FASTCTX_GUIDANCE, LEGACY_CODEY_FASTCTX_GUIDANCE] {
+    for &guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
         while let Some(without_guidance) = remove_guidance_paragraph(&restored, guidance) {
             restored = without_guidance;
             changed = true;
@@ -150,4 +167,36 @@ fn remove_guidance_at(current: &str, guidance_start: usize, guidance_len: usize)
         (guidance_start, guidance_end)
     };
     format!("{}{}", &current[..owned_start], &current[owned_end..])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fastctx_guidance_routes_uri_shaped_local_files_through_the_read_tool() {
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Local files have exactly one read route"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("`mcp__codey_fastctx__read` directly"));
+        assert!(
+            CODEY_FASTCTX_GUIDANCE
+                .contains("`file_path` to a plain absolute filesystem path (never a URI)")
+        );
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("drive-letter path such as `E:/repo/file.ts`"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("resources/read"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("read_mcp_resource"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("file:///"));
+    }
+
+    #[test]
+    fn fastctx_guidance_cleanup_removes_every_codey_owned_version() {
+        let configured = format!(
+            "User guidance.\n\n{}\n\nConcurrent guidance.",
+            CODEY_FASTCTX_GUIDANCE_VERSIONS.join("\n\n")
+        );
+
+        assert_eq!(
+            remove_codey_fastctx_guidance(&configured).as_deref(),
+            Some("User guidance.\n\nConcurrent guidance.")
+        );
+    }
 }

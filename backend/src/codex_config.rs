@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG, LEGACY_CODEY_FASTCTX_GUIDANCE, SUBAGENT_GUIDANCE,
-    append_subagent_guidance, remove_codey_fastctx_guidance, remove_subagent_guidance,
+    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, DEFAULT_AGENT_CONFIG,
+    SUBAGENT_GUIDANCE, append_subagent_guidance, remove_codey_fastctx_guidance,
+    remove_subagent_guidance,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -891,7 +892,7 @@ fn restore_legacy_owned_config_changes(
         .unwrap_or_default();
     let mut applied_guidance = original_guidance.to_string();
     let mut fastctx_guidance_was_applied = false;
-    for guidance in [CODEY_FASTCTX_GUIDANCE, LEGACY_CODEY_FASTCTX_GUIDANCE] {
+    for &guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
         if original_guidance.contains(guidance) || !current_guidance.contains(guidance) {
             continue;
         }
@@ -2331,8 +2332,10 @@ direct_only_tool_namespaces = ["mcp__existing"]
         .unwrap();
         let mut stale = enabled.parse::<DocumentMut>().unwrap();
         let guidance = stale["developer_instructions"].as_str().unwrap();
+        let previous_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[1];
+        let legacy_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[2];
         stale["developer_instructions"] = value(format!(
-            "{guidance}\n\n{LEGACY_CODEY_FASTCTX_GUIDANCE}\n\nConcurrent guidance."
+            "{guidance}\n\n{previous_guidance}\n\n{legacy_guidance}\n\nConcurrent guidance."
         ));
 
         let disabled = patch_config_with_fastctx(
@@ -2474,6 +2477,11 @@ direct_only_tool_namespaces = ["mcp__codey_fastctx", "mcp__user"]
         assert_eq!(first, second);
         assert_eq!(first.matches(CODEY_FASTCTX_GUIDANCE).count(), 1);
         let document = first.parse::<DocumentMut>().unwrap();
+        let guidance = document["developer_instructions"].as_str().unwrap();
+        assert!(guidance.contains("Local files have exactly one read route"));
+        assert!(guidance.contains("drive-letter path such as `E:/repo/file.ts`"));
+        assert!(!guidance.contains(CODEY_FASTCTX_GUIDANCE_VERSIONS[1]));
+        assert!(!guidance.contains(CODEY_FASTCTX_GUIDANCE_VERSIONS[2]));
         assert_eq!(
             document["features"]["code_mode"]["direct_only_tool_namespaces"]
                 .as_array()
@@ -3283,11 +3291,13 @@ custom_original = "restore"
 [features.code_mode]
 direct_only_tool_namespaces = ["mcp__existing"]
 "#;
+        let previous_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[1];
+        let legacy_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[2];
         let current = format!(
             r#"model_provider = "codey_global"
 model_catalog_json = "model-catalogs/codey-official.json"
 profile = "work"
-developer_instructions = "Original guidance\n\n{LEGACY_CODEY_FASTCTX_GUIDANCE}\n\n{CODEY_FASTCTX_GUIDANCE}\n\nConcurrent guidance"
+developer_instructions = "Original guidance\n\n{legacy_guidance}\n\n{previous_guidance}\n\n{CODEY_FASTCTX_GUIDANCE}\n\nConcurrent guidance"
 tool_output_token_limit = 10000
 approval_policy = "never"
 service_tier = "fast"

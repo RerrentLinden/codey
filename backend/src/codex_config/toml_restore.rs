@@ -4,8 +4,8 @@ use anyhow::{Context, Result};
 use toml_edit::{Item, Table, Value, value};
 
 use super::{
-    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID,
-    LEGACY_CODEY_FASTCTX_GUIDANCE, document_string, parse_document,
+    CODEY_FASTCTX_GUIDANCE_VERSIONS, CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID,
+    document_string, parse_document,
 };
 use crate::codex_config_guidance::remove_owned_guidance_block;
 
@@ -140,7 +140,7 @@ fn restore_fastctx_owned_value(
             };
             let mut restored = text.to_string();
             let mut changed = false;
-            for guidance in [CODEY_FASTCTX_GUIDANCE, LEGACY_CODEY_FASTCTX_GUIDANCE] {
+            for &guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
                 let original_has_guidance = original
                     .and_then(Item::as_str)
                     .is_some_and(|text| text.contains(guidance));
