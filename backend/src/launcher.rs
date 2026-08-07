@@ -16,11 +16,11 @@ use codey_runtime_core::launcher::{
 use codey_runtime_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
 use serde::Serialize;
-use toml_edit::{DocumentMut, Item};
 use tokio::process::Child;
 #[cfg(not(windows))]
 use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock, oneshot};
+use toml_edit::{DocumentMut, Item};
 
 use crate::cc_switch::{self, RouteTakeoverState};
 use crate::cdp;
@@ -1818,10 +1818,12 @@ struct RouteConfigSignature {
 fn route_auth_changed(applied: Option<&[u8]>, current: Option<&[u8]>) -> bool {
     match (applied, current) {
         (None, None) => false,
-        (Some(applied), Some(current)) => match (auth_signature(applied), auth_signature(current)) {
-            (Some(applied_sig), Some(current_sig)) => applied_sig != current_sig,
-            _ => applied != current,
-        },
+        (Some(applied), Some(current)) => {
+            match (auth_signature(applied), auth_signature(current)) {
+                (Some(applied_sig), Some(current_sig)) => applied_sig != current_sig,
+                _ => applied != current,
+            }
+        }
         // Auth appeared or disappeared: treat as a route change.
         _ => true,
     }
