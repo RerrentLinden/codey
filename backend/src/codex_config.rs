@@ -1436,9 +1436,7 @@ fn configured_fastctx_tool_namespace(doc: &DocumentMut) -> Option<String> {
 }
 
 fn configured_fastctx_server_id(doc: &DocumentMut) -> Option<String> {
-    let Some(mcp_servers) = doc.get("mcp_servers").and_then(Item::as_table) else {
-        return None;
-    };
+    let mcp_servers = doc.get("mcp_servers").and_then(Item::as_table)?;
 
     mcp_servers.iter().find_map(|(server_id, server)| {
         mcp_server_mentions_fastctx(server_id, server).then(|| server_id.to_string())
