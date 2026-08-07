@@ -1324,8 +1324,17 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()
         })
         .transpose()?
         .unwrap_or_default();
-    if !existing_guidance.contains(CODEY_FASTCTX_GUIDANCE) {
-        let guidance = if existing_guidance.trim().is_empty() {
+    let (existing_guidance, fastctx_guidance_was_cleaned) =
+        if let Some(cleaned_guidance) = remove_codey_fastctx_guidance(existing_guidance) {
+            (cleaned_guidance, true)
+        } else {
+            (existing_guidance.to_string(), false)
+        };
+    let fastctx_guidance_needs_append = !existing_guidance.contains(CODEY_FASTCTX_GUIDANCE);
+    if fastctx_guidance_was_cleaned || fastctx_guidance_needs_append {
+        let guidance = if !fastctx_guidance_needs_append {
+            existing_guidance
+        } else if existing_guidance.trim().is_empty() {
             CODEY_FASTCTX_GUIDANCE.to_string()
         } else {
             format!("{existing_guidance}\n\n{CODEY_FASTCTX_GUIDANCE}")
@@ -2478,6 +2487,44 @@ direct_only_tool_namespaces = ["mcp__codey_fastctx", "mcp__user"]
         let embedded = format!("User prefix {CODEY_FASTCTX_GUIDANCE} user suffix");
 
         assert_eq!(remove_codey_fastctx_guidance(&embedded), None);
+    }
+
+    #[test]
+    fn enabling_fast_context_tools_replaces_stale_guidance_versions() {
+        let previous_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[1];
+        let legacy_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[2];
+        let existing = format!(
+            r#"
+developer_instructions = "User guidance.\n\n{previous_guidance}\n\n{CODEY_FASTCTX_GUIDANCE}\n\n{legacy_guidance}"
+"#
+        );
+
+        let result = patch_config_with_fastctx(
+            &existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            Some(Path::new("/tmp/codey")),
+            false,
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+        let guidance = document["developer_instructions"].as_str().unwrap();
+
+        assert_eq!(
+            guidance
+                .matches("Codey FastCtx context tools are enabled")
+                .count(),
+            1
+        );
+        assert!(guidance.contains(CODEY_FASTCTX_GUIDANCE));
+        assert!(!guidance.contains(previous_guidance));
+        assert!(!guidance.contains(legacy_guidance));
+        assert_eq!(
+            guidance,
+            format!("User guidance.\n\n{CODEY_FASTCTX_GUIDANCE}")
+        );
     }
 
     #[test]
