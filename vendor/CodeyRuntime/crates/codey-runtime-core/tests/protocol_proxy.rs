@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::Mutex;
 
 #[test]
 fn responses_request_converts_to_chat_completions() {
@@ -1473,6 +1473,35 @@ async fn respond_once(listener: tokio::net::TcpListener, response: &'static str)
     stream.write_all(response.as_bytes()).await.unwrap();
 }
 
+async fn read_complete_http_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut request = Vec::new();
+    loop {
+        let mut chunk = [0_u8; 4096];
+        let chunk_bytes = stream.read(&mut chunk).await.unwrap();
+        assert!(
+            chunk_bytes > 0,
+            "upstream connection closed before the request was complete"
+        );
+        request.extend_from_slice(&chunk[..chunk_bytes]);
+
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or_default();
+        if request.len() >= header_end + 4 + content_length {
+            return request;
+        }
+    }
+}
+
 fn aggregate_proxy_settings(
     id_suffix: &str,
     first_base_url: String,
@@ -1638,13 +1667,16 @@ async fn protocol_proxy_shutdown_aborts_inflight_streams() {
         .await
         .unwrap();
     let upstream_base_url = format!("http://{}", listener.local_addr().unwrap());
-    let (request_seen, request_seen_rx) = oneshot::channel();
     let upstream_task = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
-        let mut request = [0_u8; 4096];
-        let request_bytes = stream.read(&mut request).await.unwrap();
-        assert!(request_bytes > 0);
-        let _ = request_seen.send(());
+        let request = read_complete_http_request(&mut stream).await;
+        assert!(!request.is_empty());
+        stream
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
 
         let mut trailing = [0_u8; 1];
         tokio::time::timeout(Duration::from_secs(2), stream.read(&mut trailing))
@@ -1680,20 +1712,20 @@ async fn protocol_proxy_shutdown_aborts_inflight_streams() {
             .send(),
     );
 
-    tokio::time::timeout(Duration::from_secs(2), request_seen_rx)
+    let response = tokio::time::timeout(Duration::from_secs(2), client)
         .await
-        .expect("proxy should start the upstream request")
-        .unwrap();
+        .expect("proxy should start the downstream response")
+        .unwrap()
+        .expect("proxy should return the upstream response headers");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     tokio::time::timeout(Duration::from_secs(2), proxy.shutdown())
         .await
         .expect("proxy shutdown should not wait for the upstream stream")
         .unwrap();
 
-    let client_result = tokio::time::timeout(Duration::from_secs(2), client)
+    let _ = tokio::time::timeout(Duration::from_secs(2), response.bytes())
         .await
-        .expect("proxy client should observe the closed connection")
-        .unwrap();
-    assert!(client_result.is_err());
+        .expect("proxy client should observe the closed response body");
     let trailing_bytes = upstream_task.await.unwrap();
     assert_eq!(trailing_bytes, 0);
 }
