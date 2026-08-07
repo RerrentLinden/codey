@@ -301,7 +301,11 @@
     sidebarActionTooltipAnchor = button;
     sidebarActionTooltipTimer = window.setTimeout(() => {
       sidebarActionTooltipTimer = 0;
-      if (sidebarActionTooltipAnchor !== button || button.getClientRects().length === 0) return;
+      if (sidebarActionTooltipAnchor !== button) return;
+      if (button.isConnected === false || button.getClientRects().length === 0) {
+        hideSidebarActionTooltip();
+        return;
+      }
       const tooltip = document.createElement("div");
       tooltip.setAttribute("id", sidebarActionTooltipId);
       tooltip.setAttribute("role", "tooltip");
@@ -724,6 +728,8 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     pendingSidebarSessionDeleteIds.delete(normalizedSessionId);
     isDeletedSidebarThread(row);
+    syncSidebarThreadTimeState(row);
+    renderCachedThreadUpdatedAt(row);
     queryWithin(
       document,
       "[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-title]",
@@ -733,6 +739,10 @@
         && normalizeThreadSessionId(threadSessionIdFromRow(candidate)) === normalizedSessionId
       ) {
         isDeletedSidebarThread(candidate);
+        if (candidate !== row) {
+          syncSidebarThreadTimeState(candidate);
+          renderCachedThreadUpdatedAt(candidate);
+        }
       }
     });
   };
@@ -1118,6 +1128,10 @@
 
   const installThreadUpdatedTimes = (root = document, forceRefresh = false) => {
     const now = Date.now();
+    // Virtualized sidebar rows can be replaced without another metadata
+    // response. Release detached rows on every sidebar scan instead of waiting
+    // for the one-minute relative-time repaint.
+    forEachTrackedThreadRow(() => {});
     queryWithin(root, "[data-app-action-sidebar-thread-row]").forEach((row) => {
       if (!(row instanceof HTMLElement) || isDeletedSidebarThread(row)) return;
       const { sessionId, workInProgress } = syncSidebarThreadTimeState(row, now);
@@ -1890,7 +1904,16 @@
 
   const installMessageSelection = (root = document) => {
     mountToolbar();
-    const currentTurnRows = queryWithin(root, "[data-turn-key]");
+    if (lastSelectedRow?.isConnected === false) lastSelectedRow = null;
+    // Incremental scans already hand us the nearest turn boundary. Avoid
+    // enumerating that entire subtree again when the boundary itself carries
+    // Codex's canonical turn key; document/container scans retain the fallback.
+    const currentTurnRows = (
+      root instanceof HTMLElement
+      && root.matches?.("[data-turn-key]")
+    )
+      ? [root]
+      : queryWithin(root, "[data-turn-key]");
     const rows = currentTurnRows.length
       ? currentTurnRows
       : queryWithin(root, "[data-message-author-role], [data-testid=conversation-turn], [data-message-id]");
@@ -2087,7 +2110,6 @@
       if (mutation.type === "attributes") {
         if (target && !isCodeyOwned(target)) {
           const threadRow = target.closest?.(sidebarThreadRowSelector) || null;
-          if (threadRow) syncSidebarThreadTimeState(threadRow);
           if (threadRow || mutation.attributeName !== "class") {
             addPendingScanRoot(threadRow || nearestScanRoot(target));
           }
@@ -2118,7 +2140,6 @@
           || target?.closest?.(sidebarThreadRowSelector)
           || null;
         if (threadRow) {
-          syncSidebarThreadTimeState(threadRow);
           addPendingScanRoot(threadRow);
           continue;
         }
@@ -2130,7 +2151,6 @@
         if (!element) continue;
         const threadRow = target?.closest?.(sidebarThreadRowSelector) || null;
         if (threadRow && !isCodeyOwned(target)) {
-          syncSidebarThreadTimeState(threadRow);
           addPendingScanRoot(threadRow);
           continue;
         }

@@ -68,6 +68,9 @@
     }
   };
   const statsigBootstrapTimeoutMs = 1500;
+  const threadOwnerDiscoveryTimeoutMs = 150;
+  const threadOwnerCacheTtlMs = 5000;
+  const threadOwnerCacheMaxEntries = 64;
   const statsigStartupRemainingMs =
     `Math.max(0,(globalThis.__CODEY_STATSIG_STARTUP_DEADLINE_MS__??=Date.now()+${statsigBootstrapTimeoutMs})-Date.now())`;
   const disableWindowsOptimizations = process.platform === "win32";
@@ -149,6 +152,45 @@
       .join("");
     return `const ${firstBinding}=(()=>{const target=function(){return null};return new Proxy(target,{get(target,property,receiver){if(property===Symbol.iterator)return function*(){};if(property===\`map\`||property===\`filter\`||property===\`flatMap\`||property===\`slice\`)return()=>[];if(property===\`then\`)return void 0;return Reflect.get(target,property,receiver)},construct(){return{}}})})()${aliasDeclarations};`;
   };
+  const threadOwnerDiscoveryExpression = (
+    coordinationName,
+    hostIdName,
+    conversationIdName,
+  ) =>
+    [
+      "await (globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__??=(()=>{",
+      "const states=new WeakMap;",
+      "const remember=(state,key,owner,now)=>{",
+      `if(state.cache.size>=${threadOwnerCacheMaxEntries})state.cache.delete(state.cache.keys().next().value);`,
+      `state.cache.set(key,{owner,expiresAt:now+${threadOwnerCacheTtlMs}})`,
+      "};",
+      "return{find(client,hostId,conversationId){",
+      "let state=states.get(client);",
+      "if(state==null){state={cache:new Map,inflight:new Map};states.set(client,state)}",
+      "const key=String(hostId)+String.fromCharCode(0)+String(conversationId),now=Date.now(),cached=state.cache.get(key);",
+      "if(cached!=null){if(cached.expiresAt>now)return Promise.resolve(cached.owner);state.cache.delete(key)}",
+      "const existing=state.inflight.get(key);",
+      "if(existing!=null)return existing;",
+      "let settled=false,timer;",
+      "const lookup=Promise.resolve().then(()=>client.findThreadOwner({hostId,conversationId}));",
+      "const request=new Promise((resolve,reject)=>{",
+      `timer=globalThis.setTimeout(()=>{if(settled)return;settled=true;resolve(null)},${threadOwnerDiscoveryTimeoutMs});`,
+      "lookup.then(owner=>{",
+      "if(settled)return;",
+      "settled=true;globalThis.clearTimeout(timer);",
+      "if(owner!=null)remember(state,key,owner,Date.now());",
+      "resolve(owner)",
+      "},error=>{",
+      "if(settled)return;",
+      "settled=true;globalThis.clearTimeout(timer);reject(error)",
+      "})",
+      "}).finally(()=>{if(state.inflight.get(key)===request)state.inflight.delete(key)});",
+      "state.inflight.set(key,request);",
+      "return request",
+      "}}",
+      "})()).find(",
+      `${coordinationName}.clientCoordination,${hostIdName},${conversationIdName})`,
+    ].join("");
   const patchCodexRendererAsset = (source) => {
     let patched = source;
     if (
@@ -192,6 +234,28 @@
         ) =>
           `let ${i18nEnabledName}=(globalThis.__CODEY_DEFAULT_CHINESE_LOCALE_RENDERER_PATCH__=!0),${localeSourceName}=\`SYSTEM\`,${localeOverrideName}=\`zh-CN\``,
         "default Chinese locale",
+      );
+    }
+    if (
+      source.includes("maybe_resume_owner_discovery_failed")
+      && source.includes("followExistingOwner")
+      && source.includes(".clientCoordination.findThreadOwner")
+    ) {
+      // Owner discovery is an optimization for reusing a stream already owned
+      // by another window. Cache only positive, recent answers within the same
+      // coordination client and merge duplicate in-flight lookups. Cache hits
+      // have no timer or IPC wait; misses retain a short safety window before
+      // local hydration. Null, rejected and timed-out lookups are never cached.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /await\s+([$A-Z_a-z][$\w]*)\.clientCoordination\.findThreadOwner\(\{\s*hostId\s*:\s*([$A-Z_a-z][$\w]*)\s*,\s*conversationId\s*:\s*([$A-Z_a-z][$\w]*)\s*\}\)/g,
+        (_match, coordinationName, hostIdName, conversationIdName) =>
+          threadOwnerDiscoveryExpression(
+            coordinationName,
+            hostIdName,
+            conversationIdName,
+          ),
+        "thread owner discovery cache",
       );
     }
     if (

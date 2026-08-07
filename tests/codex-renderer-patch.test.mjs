@@ -306,6 +306,191 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     );
     delete globalThis.__CODEY_DEFAULT_CHINESE_LOCALE_RENDERER_PATCH__;
 
+    const ownerDiscoverySource = [
+      "async function maybeResume(Bm,f,n,t){",
+      "if(t.followExistingOwner===!0&&f===`local`&&Bm?.clientCoordination!=null){",
+      "let owner=null;",
+      "try{owner=await Bm.clientCoordination.findThreadOwner({hostId:f,conversationId:n})}",
+      "catch(error){console.warn(`maybe_resume_owner_discovery_failed`,error)}",
+      "return owner}",
+      "return null}",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(ownerDiscoverySource),
+    );
+    const ownerDiscoveryResponse = await installedHandler({
+      url: "app://-/assets/app-initial-BHB6SClA.js",
+    });
+    const patchedOwnerDiscoverySource = await ownerDiscoveryResponse.text();
+    assert.match(
+      patchedOwnerDiscoverySource,
+      /__CODEY_THREAD_OWNER_DISCOVERY_V1__/,
+    );
+    assert.match(
+      patchedOwnerDiscoverySource,
+      /setTimeout\(\(\)=>\{if\(settled\)return;settled=true;resolve\(null\)\},150\)/,
+    );
+    assert.match(patchedOwnerDiscoverySource, /expiresAt:now\+5000/);
+    assert.match(patchedOwnerDiscoverySource, /state\.cache\.size>=64/);
+    assert.doesNotMatch(
+      patchedOwnerDiscoverySource,
+      /owner=await Bm\.clientCoordination\.findThreadOwner/,
+    );
+    delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__;
+    const maybeResume = Function(
+      `${patchedOwnerDiscoverySource};return maybeResume`,
+    )();
+    const ownerNativeSetTimeout = globalThis.setTimeout;
+    const ownerNativeClearTimeout = globalThis.clearTimeout;
+    let scheduledOwnerTimers = 0;
+    globalThis.setTimeout = (callback, delay, ...args) => {
+      scheduledOwnerTimers += 1;
+      return ownerNativeSetTimeout(callback, delay, ...args);
+    };
+    globalThis.clearTimeout = (timer) => ownerNativeClearTimeout(timer);
+    let ownerLookupCalls = 0;
+    const primaryCoordination = {
+      async findThreadOwner() {
+        ownerLookupCalls += 1;
+        return "existing-owner";
+      },
+    };
+    try {
+      assert.equal(
+        await maybeResume(
+          { clientCoordination: primaryCoordination },
+          "local",
+          "thread-1",
+          { followExistingOwner: true },
+        ),
+        "existing-owner",
+      );
+      assert.equal(ownerLookupCalls, 1);
+      assert.equal(scheduledOwnerTimers, 1);
+
+      // A positive answer in the same renderer/coordination generation is a
+      // cache hit: no IPC lookup and no fallback timer.
+      assert.equal(
+        await maybeResume(
+          { clientCoordination: primaryCoordination },
+          "local",
+          "thread-1",
+          { followExistingOwner: true },
+        ),
+        "existing-owner",
+      );
+      assert.equal(ownerLookupCalls, 1);
+      assert.equal(scheduledOwnerTimers, 1);
+
+      // A separate window/client never shares the positive owner cache.
+      let overlayLookupCalls = 0;
+      assert.equal(
+        await maybeResume(
+          {
+            clientCoordination: {
+              async findThreadOwner() {
+                overlayLookupCalls += 1;
+                return "overlay-owner";
+              },
+            },
+          },
+          "local",
+          "thread-1",
+          { followExistingOwner: true },
+        ),
+        "overlay-owner",
+      );
+      assert.equal(overlayLookupCalls, 1);
+      assert.equal(scheduledOwnerTimers, 2);
+    } finally {
+      globalThis.setTimeout = ownerNativeSetTimeout;
+      globalThis.clearTimeout = ownerNativeClearTimeout;
+      delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__;
+    }
+
+    // Concurrent hydration attempts in the same renderer share one discovery.
+    let resolveSharedOwner;
+    let sharedLookupCalls = 0;
+    const sharedOwner = new Promise((resolve) => {
+      resolveSharedOwner = resolve;
+    });
+    const sharedCoordination = {
+      findThreadOwner() {
+        sharedLookupCalls += 1;
+        return sharedOwner;
+      },
+    };
+    const sharedOwnerFirst = maybeResume(
+      { clientCoordination: sharedCoordination },
+      "local",
+      "thread-shared",
+      { followExistingOwner: true },
+    );
+    const sharedOwnerSecond = maybeResume(
+      { clientCoordination: sharedCoordination },
+      "local",
+      "thread-shared",
+      { followExistingOwner: true },
+    );
+    await Promise.resolve();
+    assert.equal(sharedLookupCalls, 1);
+    resolveSharedOwner("shared-owner");
+    assert.deepEqual(
+      await Promise.all([sharedOwnerFirst, sharedOwnerSecond]),
+      ["shared-owner", "shared-owner"],
+    );
+    delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__;
+
+    // A timeout is uncertainty, not a negative cache entry. The next attempt
+    // must retry discovery and can immediately observe a newly available owner.
+    const timeoutCallbacks = [];
+    let timeoutLookupCalls = 0;
+    globalThis.setTimeout = (callback, delay) => {
+      const timer = { callback, delay, cleared: false };
+      timeoutCallbacks.push(timer);
+      return timer;
+    };
+    globalThis.clearTimeout = (timer) => {
+      timer.cleared = true;
+    };
+    const timeoutCoordination = {
+      findThreadOwner() {
+        timeoutLookupCalls += 1;
+        if (timeoutLookupCalls === 1) return new Promise(() => {});
+        return Promise.resolve("owner-after-timeout");
+      },
+    };
+    try {
+      const timedOutOwner = maybeResume(
+        { clientCoordination: timeoutCoordination },
+        "local",
+        "thread-timeout",
+        { followExistingOwner: true },
+      );
+      assert.equal(timeoutCallbacks.length, 1);
+      assert.equal(timeoutCallbacks[0].delay, 150);
+      timeoutCallbacks[0].callback();
+      assert.equal(await timedOutOwner, null);
+
+      assert.equal(
+        await maybeResume(
+          { clientCoordination: timeoutCoordination },
+          "local",
+          "thread-timeout",
+          { followExistingOwner: true },
+        ),
+        "owner-after-timeout",
+      );
+      assert.equal(timeoutLookupCalls, 2);
+      assert.equal(timeoutCallbacks.length, 2);
+      assert.equal(timeoutCallbacks[1].cleared, true);
+    } finally {
+      globalThis.setTimeout = ownerNativeSetTimeout;
+      globalThis.clearTimeout = ownerNativeClearTimeout;
+      delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__;
+    }
+
     const interactionPerformanceSource = [
       "Hcn=class{activeInteractions=new Map;beginCpuSampling;",
       "start(e,n,u){let d={activeKey:e,",

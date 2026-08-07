@@ -80,6 +80,16 @@ class FakeElement {
     return matches;
   }
 
+  closest(selector) {
+    const selectors = selector.split(",").map((candidate) => candidate.trim());
+    let current = this;
+    while (current) {
+      if (selectors.some((candidate) => current.matches(candidate))) return current;
+      current = current.parentElement;
+    }
+    return null;
+  }
+
   remove() {
     if (!this.parentElement) return;
     this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
@@ -98,6 +108,7 @@ class FakeElement {
 
 function loadInjection({ rows = [], bridgeHandler } = {}) {
   const placeholder = new FakeElement();
+  let mutationCallback = null;
   const document = {
     body: new FakeElement("body"),
     documentElement: new FakeElement("html"),
@@ -132,12 +143,19 @@ function loadInjection({ rows = [], bridgeHandler } = {}) {
     HTMLElement: FakeElement,
     location: { pathname: "/", search: "" },
     MutationObserver: class {
+      constructor(callback) {
+        mutationCallback = callback;
+      }
       observe() {}
     },
     URLSearchParams,
     window,
   });
-  return { document, window };
+  return {
+    document,
+    notifyMutations: (mutations) => mutationCallback?.(mutations),
+    window,
+  };
 }
 
 function sidebarThreadEntry({ running = false, sessionId = "" } = {}) {
@@ -398,6 +416,58 @@ test("keeps a newly running thread at the top until its updated_at catches up", 
 
   assert.equal(bridgeCalls, 2);
   assert.equal(running.item.style.getPropertyValue("--codey-thread-sort-order"), "-1");
+});
+
+test("coalesces sidebar mutations before recomputing React status and sort order", async () => {
+  const entry = sidebarThreadEntry({ sessionId: "thread-1" });
+  let fiberReads = 0;
+  Object.defineProperty(entry.row, "__reactFiber$test", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      fiberReads += 1;
+      return { memoizedProps: {}, return: null };
+    },
+  });
+  const { notifyMutations } = loadInjection({
+    rows: [entry.row],
+    bridgeHandler: async (path) => (
+      path === "/thread-sort-keys"
+        ? {
+          status: "ok",
+          sort_keys: [{ session_id: "thread-1", updated_at_ms: 60_000 }],
+        }
+        : { status: "ok" }
+    ),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(entry.item.style.getPropertyValue("--codey-thread-sort-order"), "-1");
+  fiberReads = 0;
+
+  entry.nativeStatusRail.appendChild(entry.spinner);
+  notifyMutations(Array.from({ length: 100 }, () => ({
+    type: "childList",
+    target: entry.nativeStatusRail,
+    addedNodes: [entry.spinner],
+    removedNodes: [],
+  })));
+
+  assert.equal(
+    entry.item.style.getPropertyValue("--codey-thread-sort-order"),
+    "-1",
+    "the MutationObserver callback must not synchronously walk React state",
+  );
+  assert.equal(fiberReads, 0);
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(
+    Number(entry.item.style.getPropertyValue("--codey-thread-sort-order")) < -1,
+    "the existing deferred scan must still converge the running-thread order",
+  );
+  assert.ok(
+    fiberReads <= 2,
+    `100 mutations should converge in one scan, observed ${fiberReads} React fiber reads`,
+  );
 });
 
 test("keeps an existing thread time when a native completion marker appears", async () => {

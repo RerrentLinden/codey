@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "5";
+  const patchVersion = "7";
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion) {
     void existingPatch.refresh();
@@ -31,6 +31,10 @@
   let catalogLoadPromise = null;
   let catalogRevision = 0;
   let disposed = false;
+  const fullReactDiscoveryIntervalMs = 10_000;
+  const maxTrackedModelListRequests = 256;
+  const maxKnownModelQueryClients = 8;
+  let nextFullReactDiscoveryAt = 0;
   const modelListRequestIds = new Set();
   const knownModelQueryClients = new Set();
   let originalDispatchEvent = null;
@@ -43,6 +47,14 @@
     queryEntries: 0,
     reactContainers: 0,
     responsePatchInstalled: false,
+  };
+
+  const rememberBounded = (set, value, limit) => {
+    set.delete(value);
+    set.add(value);
+    while (set.size > limit) {
+      set.delete(set.values().next().value);
+    }
   };
 
   const uniqueModelNames = (values) => Array.from(new Set(
@@ -187,6 +199,13 @@
       )
     );
   });
+
+  const sameCatalog = (left, right) => (
+    left.loaded
+    && sameModelNames(left.models, right.models)
+    && left.defaultModel === right.defaultModel
+    && sameModelMetadata(left.modelMetadata, right.modelMetadata, right.models)
+  );
 
   const modelArrayLooksPatchable = (value, allowEmpty = false) => (
     Array.isArray(value)
@@ -477,7 +496,11 @@
           && typeof value.invalidateQueries === "function"
         ) {
           queryClients.add(value);
-          knownModelQueryClients.add(value);
+          rememberBounded(
+            knownModelQueryClients,
+            value,
+            maxKnownModelQueryClients,
+          );
         }
       } catch {
         // Ignore proxy-backed values that reject capability probes.
@@ -534,11 +557,26 @@
     return { queryClients: [...queryClients], reactContainers };
   };
 
+  const scanReactObjectGraphWhenDue = (forceScan = false) => {
+    let runFullScan = forceScan;
+    if (!runFullScan && knownModelQueryClients.size === 0) {
+      const now = Date.now();
+      if (now < nextFullReactDiscoveryAt) {
+        return { queryClients: [], reactContainers: 0 };
+      }
+      runFullScan = true;
+    }
+    if (runFullScan) {
+      nextFullReactDiscoveryAt = Date.now() + fullReactDiscoveryIntervalMs;
+    }
+    return scanReactObjectGraph(runFullScan);
+  };
+
   const patchModelQueryClients = async ({
     forceScan = false,
     invalidate = false,
   } = {}) => {
-    const scan = scanReactObjectGraph(forceScan);
+    const scan = scanReactObjectGraphWhenDue(forceScan);
     let queryEntries = 0;
     let changedEntries = 0;
     const invalidations = [];
@@ -548,6 +586,7 @@
       try {
         entries = client.getQueriesData({ queryKey: modelQueryKey }) || [];
       } catch {
+        knownModelQueryClients.delete(client);
         continue;
       }
       queryEntries += entries.length;
@@ -635,7 +674,7 @@
     if (!catalog.loaded || disposed) return false;
     const statsigChanged = applyModelWhitelist();
     const firstPass = await patchModelQueryClients({
-      forceScan: invalidate || knownModelQueryClients.size === 0,
+      forceScan: invalidate,
       invalidate,
     });
     const shouldNotify = (
@@ -706,14 +745,7 @@
           return false;
         }
         if (requestedRevision !== catalogRevision) return false;
-        const unchanged = catalog.loaded
-          && sameModelNames(catalog.models, nextCatalog.models)
-          && catalog.defaultModel === nextCatalog.defaultModel
-          && sameModelMetadata(
-            catalog.modelMetadata,
-            nextCatalog.modelMetadata,
-            nextCatalog.models,
-          );
+        const unchanged = sameCatalog(catalog, nextCatalog);
         if (unchanged) {
           // Window-focus reloads land here when nothing changed upstream:
           // skip the invalidating re-delivery (full client scan plus query
@@ -741,6 +773,10 @@
     if (disposed) return false;
     const nextCatalog = normalizedCatalog(value);
     if (!nextCatalog) return false;
+    if (sameCatalog(catalog, nextCatalog)) {
+      scheduleRefresh(1000);
+      return Promise.resolve(true);
+    }
     catalogRevision += 1;
     catalog = nextCatalog;
     return deliverModelCatalog().then((delivered) => {
@@ -778,7 +814,11 @@
       || typeof request !== "object"
     ) return false;
     if (request.method === "model/list" && request.id != null) {
-      modelListRequestIds.add(String(request.id));
+      rememberBounded(
+        modelListRequestIds,
+        String(request.id),
+        maxTrackedModelListRequests,
+      );
     }
 
     const wrappedMethod = request.method === "send-cli-request-for-host"

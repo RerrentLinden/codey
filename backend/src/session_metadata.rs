@@ -7,7 +7,9 @@ use anyhow::Result;
 use base64::Engine;
 use codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home;
 use codey_runtime_core::models::SessionRef;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::ValueRef};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, params, params_from_iter, types::ValueRef,
+};
 use serde_json::{Map, Value, json};
 
 use crate::sqlite_util::table_columns;
@@ -264,51 +266,68 @@ fn thread_sort_keys_from_connection(
     if !columns.contains("id") {
         return Ok(Vec::new());
     }
-    let mut selected_columns = vec!["id"];
-    selected_columns.extend(
-        THREAD_TIMESTAMP_COLUMNS
-            .iter()
-            .copied()
-            .filter(|column| columns.contains(*column)),
-    );
+
+    let mut seen = HashSet::new();
+    let thread_ids = sessions
+        .iter()
+        .filter_map(|session| {
+            let thread_id = normalize_session_id(&session.session_id);
+            if thread_id.is_empty() || !seen.insert(thread_id.to_string()) {
+                return None;
+            }
+            Some(thread_id.to_string())
+        })
+        .collect::<Vec<_>>();
+    if thread_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let selected_columns = THREAD_TIMESTAMP_COLUMNS
+        .iter()
+        .copied()
+        .filter(|column| columns.contains(*column))
+        .collect::<Vec<_>>();
+    let requested_rows = thread_ids
+        .iter()
+        .enumerate()
+        .map(|(index, _)| format!("(?{}, {index})", index + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let selected_thread_columns = selected_columns
+        .iter()
+        .map(|column| format!("threads.{column}"))
+        .collect::<Vec<_>>();
+    let selected_thread_columns = if selected_thread_columns.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", selected_thread_columns.join(", "))
+    };
     let sql = format!(
-        "SELECT {} FROM threads WHERE id = ?1",
-        selected_columns.join(", ")
+        "WITH requested(requested_id, ordinal) AS (VALUES {requested_rows})
+         SELECT requested.requested_id{selected_thread_columns}
+         FROM requested
+         JOIN threads ON threads.id = requested.requested_id
+         ORDER BY requested.ordinal"
     );
     let mut statement = connection.prepare(&sql)?;
-    let mut seen = HashSet::new();
+    let mut rows = statement.query(params_from_iter(thread_ids.iter()))?;
     let mut sort_keys = Vec::new();
-    for session in sessions {
-        let thread_id = normalize_session_id(&session.session_id);
-        if thread_id.is_empty() || !seen.insert(thread_id.to_string()) {
-            continue;
-        }
-        let row = statement
-            .query_row([thread_id], |row| {
-                let mut values = Map::new();
-                for (index, column) in selected_columns.iter().enumerate() {
-                    values.insert(
-                        (*column).to_string(),
-                        sql_value_to_json(row.get_ref(index)?),
-                    );
-                }
-                Ok(values)
-            })
-            .optional()?;
-        let Some(row) = row else {
-            continue;
-        };
+    while let Some(row) = rows.next()? {
+        let thread_id = row.get::<_, String>(0)?;
         let mut payload = Map::new();
-        for column in THREAD_TIMESTAMP_COLUMNS {
+        for (index, column) in selected_columns.iter().enumerate() {
             payload.insert(
-                column.to_string(),
-                row.get(column).cloned().unwrap_or(Value::Null),
+                (*column).to_string(),
+                sql_value_to_json(row.get_ref(index + 1)?),
             );
         }
-        payload.insert(
-            "session_id".to_string(),
-            Value::String(thread_id.to_string()),
-        );
+        for column in THREAD_TIMESTAMP_COLUMNS {
+            if payload.contains_key(column) {
+                continue;
+            }
+            payload.insert(column.to_string(), Value::Null);
+        }
+        payload.insert("session_id".to_string(), Value::String(thread_id));
         sort_keys.push(Value::Object(payload));
     }
     Ok(sort_keys)
@@ -504,6 +523,89 @@ mod tests {
                     }
                 ]
             })
+        );
+    }
+
+    #[test]
+    fn batches_the_full_sort_key_request_and_preserves_input_order() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("state_5.sqlite");
+        let mut connection = Connection::open(path).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    updated_at_ms INTEGER
+                )",
+                [],
+            )
+            .unwrap();
+        let thread_ids = (0..MAX_THREAD_SORT_KEYS)
+            .map(|index| {
+                if index == 37 {
+                    "thread-'?-037".to_string()
+                } else {
+                    format!("thread-{index:03}")
+                }
+            })
+            .collect::<Vec<_>>();
+        let transaction = connection.transaction().unwrap();
+        for (index, thread_id) in thread_ids.iter().enumerate().rev() {
+            transaction
+                .execute(
+                    "INSERT INTO threads (id, updated_at_ms) VALUES (?1, ?2)",
+                    params![thread_id, (index as i64 + 1) * 1_000],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let requested_ids = thread_ids.iter().rev().cloned().collect::<Vec<_>>();
+        let sessions = requested_ids
+            .iter()
+            .map(|thread_id| SessionRef::new(thread_id, thread_id).unwrap())
+            .collect::<Vec<_>>();
+        let result = thread_sort_keys(home.path(), &sessions);
+        let returned_ids = result["sort_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["session_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(returned_ids, requested_ids);
+        assert_eq!(returned_ids.len(), MAX_THREAD_SORT_KEYS);
+        assert_eq!(
+            result["sort_keys"][MAX_THREAD_SORT_KEYS - 1]["updated_at_ms"],
+            1_000
+        );
+    }
+
+    #[test]
+    fn batch_sort_keys_normalizes_and_deduplicates_session_ids() {
+        let home = tempdir().unwrap();
+        create_thread_database(
+            &home.path().join("state_5.sqlite"),
+            "updated_at_ms",
+            &[("thread-1", 1_000), ("thread-2", 2_000)],
+        );
+        let sessions = vec![
+            SessionRef::new(" local:thread-2 ", "Two").unwrap(),
+            SessionRef::new("thread-1", "One").unwrap(),
+            SessionRef::new("thread-2", "Duplicate").unwrap(),
+            SessionRef::new("local:   ", "Empty after normalization").unwrap(),
+        ];
+        let result = thread_sort_keys(home.path(), &sessions);
+
+        assert_eq!(
+            result["sort_keys"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["session_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["thread-2", "thread-1"]
         );
     }
 

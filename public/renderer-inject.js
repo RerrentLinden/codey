@@ -1104,8 +1104,6 @@
     headerMountDirty = false;
   };
 
-  const sidebarDetected = (root = document) => queryWithin(root, sidebarSelector).length > 0;
-
   const loadSessionTools = () => {
     if (window.__codeySessionToolsInjectLoaded === true) return Promise.resolve(true);
     if (sessionToolsLoadPromise) return sessionToolsLoadPromise;
@@ -1188,7 +1186,8 @@
 
   const armSessionToolsInteraction = () => {
     if (
-      sessionToolsInteractionArmed
+      typeof document.addEventListener !== "function"
+      || sessionToolsInteractionArmed
       || sessionToolsLoadPromise
       || window.__codeySessionToolsInjectLoaded === true
     ) return;
@@ -1215,7 +1214,6 @@
   const scan = (root = document) => {
     mountButton();
     syncAccountUsageMount();
-    if (sidebarDetected(root)) armSessionToolsInteraction();
   };
 
   const scheduleScan = (root = document) => {
@@ -1244,6 +1242,10 @@
     accountUsagePollingEnabled = true;
     scheduleAccountUsageCheck(0);
   });
+  // Arm before React mounts the sidebar. The handler itself filters to sidebar
+  // targets, so this closes the observer/debounce race without moving the heavy
+  // session-tools evaluation into startup.
+  armSessionToolsInteraction();
   scan();
   scheduleUpdateCheck(0);
   scheduleAccountUsageCheck(250);

@@ -14,6 +14,7 @@ class FakeElement {
     this.parentElement = null;
     this.removed = false;
     this.textContent = "";
+    this.querySelectorAllCalls = [];
     const classes = new Set();
     this.classList = {
       add: (className) => classes.add(className),
@@ -43,11 +44,16 @@ class FakeElement {
     return null;
   }
 
-  querySelectorAll() {
+  querySelectorAll(selector) {
+    this.querySelectorAllCalls.push(selector);
     if (this.getAttribute("data-terminal-error") === "true") {
       return [new FakeElement({ "data-status": "failed" })];
     }
     return [];
+  }
+
+  matches(selector) {
+    return selector === "[data-turn-key]" && this.hasAttribute("data-turn-key");
   }
 
   closest() {
@@ -190,6 +196,7 @@ function loadInjection({
     },
     bridgeCalls,
     getReloadCount: () => reloadCount,
+    getTurnRow: (index = 0) => rows[index] || null,
     getVisibleTurnIds: () => rows
       .filter((row) => !row.removed)
       .map((row) => row.getAttribute("data-turn-key")),
@@ -310,6 +317,16 @@ test("removes a failed message that was never written to the session", async () 
   runtime.appendTurn("failed-turn");
   runtime.window.__codeyInstallMessageSelection();
   assert.deepEqual(runtime.getVisibleTurnIds(), []);
+});
+
+test("rescans a direct turn boundary without enumerating its subtree", () => {
+  const runtime = loadInjection({ turnIds: ["turn-direct"] });
+  const row = runtime.getTurnRow();
+  row.querySelectorAllCalls.length = 0;
+
+  runtime.window.__codeyInstallMessageSelection(row);
+
+  assert.equal(row.querySelectorAllCalls.includes("[data-turn-key]"), false);
 });
 
 test("syncs Codex sidebar titles to the notification backend", async () => {

@@ -18,7 +18,11 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(inject, /const sessionToolsLoadPath = "\/internal\/codey\/session-tools\/load"/);
   assert.match(inject, /const sidebarSelector = \[/);
   assert.match(inject, /const loadSessionTools = \(\) =>/);
-  assert.match(inject, /sidebarDetected\(root\)\) armSessionToolsInteraction\(\)/);
+  assert.doesNotMatch(inject, /const sidebarDetected =/);
+  assert.match(
+    inject,
+    /armSessionToolsInteraction\(\);\s*scan\(\);\s*scheduleUpdateCheck\(0\)/,
+  );
   assert.match(inject, /document\.addEventListener\("pointerover", loadSessionToolsFromInteraction/);
   assert.match(inject, /document\.addEventListener\("focusin", loadSessionToolsFromInteraction/);
   assert.match(inject, /bootstrapObserver\?\.disconnect\(\)/);
@@ -67,6 +71,18 @@ test("renderer core waits for sidebar interaction before loading session tools",
     sessionTools,
     /flushThreadUpdatedAtFetch[\s\S]*queryWithin\(document, "\[data-app-action-sidebar-thread-row\]"\)/,
   );
+  const sessionObserverBody = sessionTools.match(
+    /new MutationObserver\(\(mutations\) => \{([\s\S]*?)\}\)\.observe\(document\.documentElement/,
+  )?.[1] ?? "";
+  assert.match(sessionObserverBody, /addPendingScanRoot\(threadRow\)/);
+  assert.doesNotMatch(sessionObserverBody, /syncSidebarThreadTimeState\(threadRow\)/);
+  const modelWhitelist = await readFile(
+    new URL("public/model-whitelist-inject.js", root),
+    "utf8",
+  );
+  assert.match(modelWhitelist, /const maxTrackedModelListRequests = 256/);
+  assert.match(modelWhitelist, /const maxKnownModelQueryClients = 8/);
+  assert.match(modelWhitelist, /knownModelQueryClients\.delete\(client\)/);
   assert.doesNotMatch(inject, /__codeyBlockNativePetControls/);
   assert.match(petShield, /const block = \(root = document\)/);
   assert.match(petShield, /if \(!enabled\) \{/);

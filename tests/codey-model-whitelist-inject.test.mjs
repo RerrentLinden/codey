@@ -16,6 +16,8 @@ async function loadPatch(
   let nextTimer = 0;
   const timers = new Map();
   const windowListeners = new Map();
+  const documentListeners = new Map();
+  let wildcardScanCount = 0;
   const body = {};
   if (queryClient) {
     body.__reactFiber$codeyTest = {
@@ -30,11 +32,18 @@ async function loadPatch(
     getElementById() {
       return null;
     },
-    querySelectorAll() {
+    querySelectorAll(selector) {
+      if (selector === "*") wildcardScanCount += 1;
       return [];
     },
-    addEventListener() {},
-    removeEventListener() {},
+    addEventListener(name, listener) {
+      const listeners = documentListeners.get(name) || new Set();
+      listeners.add(listener);
+      documentListeners.set(name, listeners);
+    },
+    removeEventListener(name, listener) {
+      documentListeners.get(name)?.delete(listener);
+    },
   };
   const bridge = async (path) => {
     assert.equal(path, "/codex-model-catalog");
@@ -92,6 +101,14 @@ async function loadPatch(
     },
     dispatchWindowEvent(name, event) {
       window.dispatchEvent({ ...event, type: name });
+    },
+    dispatchDocumentEvent(name, event = {}) {
+      for (const listener of documentListeners.get(name) || []) {
+        listener({ ...event, type: name });
+      }
+    },
+    wildcardScanCount() {
+      return wildcardScanCount;
     },
     async runNextTimer() {
       const next = timers.entries().next().value;
@@ -290,7 +307,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "5");
+  assert.equal(patch.version, "7");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -377,6 +394,37 @@ test("stale thread and turn models are repaired before app-server dispatch", asy
     runtime.dispatchWindowEvent("codex-message-from-view", event);
     assert.equal(event.detail.request.params.model, "gpt-5.6-sol");
   }
+  runtime.patch.dispose();
+});
+
+test("unchanged catalog retries and interactions do not repeat full React discovery", async () => {
+  const catalog = {
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+  };
+  const runtime = await loadPatch(catalog, [statsigClient()]);
+
+  assert.equal(runtime.wildcardScanCount(), 1);
+  runtime.dispatchDocumentEvent("pointerdown");
+  runtime.dispatchDocumentEvent("focusin");
+  await Promise.resolve();
+  assert.equal(runtime.wildcardScanCount(), 1);
+
+  await runtime.patch.setCatalog(catalog);
+  assert.equal(runtime.wildcardScanCount(), 1);
+  assert.equal(runtime.patch.delivery().revision, 1);
+
+  await runtime.runNextTimer();
+  await runtime.runNextTimer();
+  assert.equal(runtime.wildcardScanCount(), 1);
+
+  await runtime.patch.setCatalog({
+    ...catalog,
+    models: ["gpt-5.6-sol", "provider-new"],
+  });
+  assert.equal(runtime.wildcardScanCount(), 2);
+  assert.equal(runtime.patch.delivery().revision, 2);
   runtime.patch.dispose();
 });
 
