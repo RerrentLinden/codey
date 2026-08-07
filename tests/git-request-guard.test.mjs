@@ -18,7 +18,7 @@ const gitRequest = (id, method, params = {}) => ({
   request: { id, method, params },
 });
 
-function createRuntime({ platform = "Win32", send } = {}) {
+function createRuntime({ platform = "Win32", send, bridgeReady = true } = {}) {
   let currentTime = 10_000;
   let nextTimerId = 0;
   const timers = new Map();
@@ -56,17 +56,18 @@ function createRuntime({ platform = "Win32", send } = {}) {
       events.push(event);
       return true;
     },
-    electronBridge: {
-      sendWorkerMessageFromView(workerId, message, ...rest) {
-        nativeCalls.push({ workerId, message, rest });
-        return sendImpl(workerId, message, ...rest);
-      },
-      subscribeToWorkerMessages(workerId, listener) {
-        subscriptions.set(workerId, listener);
-        return () => subscriptions.delete(workerId);
-      },
+  };
+  const electronBridge = {
+    sendWorkerMessageFromView(workerId, message, ...rest) {
+      nativeCalls.push({ workerId, message, rest });
+      return sendImpl(workerId, message, ...rest);
+    },
+    subscribeToWorkerMessages(workerId, listener) {
+      subscriptions.set(workerId, listener);
+      return () => subscriptions.delete(workerId);
     },
   };
+  if (bridgeReady) window.electronBridge = electronBridge;
   window.window = window;
   const context = {
     CustomEvent: class CustomEvent {
@@ -105,6 +106,9 @@ function createRuntime({ platform = "Win32", send } = {}) {
   return {
     advance,
     context,
+    connectBridge() {
+      window.electronBridge = electronBridge;
+    },
     emit(workerId, message) {
       subscriptions.get(workerId)?.(message);
     },
@@ -261,6 +265,44 @@ test("Git request guard allows a small burst and caps the sustained global rate"
   await Promise.all(deliveries);
   assert.equal(runtime.nativeCalls.length, 4);
   assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().queued, 0);
+});
+
+test("Git request guard probe can finish installation after the bridge appears", async () => {
+  const runtime = createRuntime({ bridgeReady: false });
+
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().bridgePatched, false);
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["git-request-guard"].status,
+    "pending",
+  );
+  runtime.connectBridge();
+
+  assert.equal(runtime.window.__codeyGitRequestGuard.ensureInstalled(), true);
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().bridgePatched, true);
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["git-request-guard"].status,
+    "effective",
+  );
+});
+
+test("Git request guard can patch configurable bridge methods", async () => {
+  const runtime = createRuntime({ bridgeReady: false });
+  let send = runtime.context.window.electronBridge?.sendWorkerMessageFromView;
+  runtime.connectBridge();
+  send = runtime.window.electronBridge.sendWorkerMessageFromView;
+  Object.defineProperty(runtime.window.electronBridge, "sendWorkerMessageFromView", {
+    configurable: true,
+    get: () => send,
+    set: () => {},
+  });
+
+  assert.equal(runtime.window.__codeyGitRequestGuard.ensureInstalled(), true);
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().bridgePatched, true);
+  await runtime.window.electronBridge.sendWorkerMessageFromView(
+    "git",
+    gitRequest("status-accessor", "status-summary", { cwd: "C:\\repo" }),
+  );
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().matched, 1);
 });
 
 test("Git request guard observes worker failures and remains idempotent", async () => {

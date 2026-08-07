@@ -73,5 +73,6 @@ test("script injection diagnostics report runtime evidence without continuous po
   assert.doesNotMatch(sections, /setInterval/);
   assert.match(styles, /text-wrap:\s*balance/);
   assert.match(styles, /word-break:\s*normal/);
-  assert.match(cdp, /for \(const delay of \[50, 200\]\)/);
+  assert.match(cdp, /guard\.ensureInstalled\?\.\(\)/);
+  assert.match(cdp, /for \(const delay of \[50, 200, 750\]\)/);
 });

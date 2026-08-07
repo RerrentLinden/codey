@@ -167,6 +167,7 @@ pub fn prepare_injection_scripts(
             r#"(() => {
               const guard = window.__codeyGitRequestGuard;
               if (!guard || typeof guard.snapshot !== "function") return "";
+              guard.ensureInstalled?.();
               const snapshot = guard.snapshot();
               if (snapshot.enabled === false && snapshot.installed === true) {
                 return "Git 请求保护已就绪，当前平台无需启用";
@@ -780,7 +781,7 @@ fn injection_status_snapshot_script(descriptors: &[InjectionScriptDescriptor]) -
   const hasPendingProbe = () => Object.keys(probes)
     .some((id) => registry[id]?.status === "executed");
   verify();
-  for (const delay of [50, 200]) {{
+  for (const delay of [50, 200, 750]) {{
     if (!hasPendingProbe()) break;
     await new Promise((resolve) => setTimeout(resolve, delay));
     verify();
@@ -1240,9 +1241,10 @@ mod tests {
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
         assert!(snapshot_script.contains("Windows Git 请求限流已接管"));
+        assert!(snapshot_script.contains("guard.ensureInstalled?.()"));
         assert!(snapshot_script.contains("模型目录已加载"));
         assert!(snapshot_script.contains("插件市场桥接已接管"));
-        assert!(snapshot_script.contains("for (const delay of [50, 200])"));
+        assert!(snapshot_script.contains("for (const delay of [50, 200, 750])"));
         assert!(!snapshot_script.contains("user-script-1\": () =>"));
         let overlay_load_script = prepared_settings_overlay_load_script();
         assert!(overlay_load_script.contains("codey-settings-overlay-host"));

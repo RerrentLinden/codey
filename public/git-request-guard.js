@@ -237,6 +237,21 @@
     scheduleDrain();
   };
 
+  const replaceBridgeMethod = (bridge, method, wrapped) => {
+    try {
+      bridge[method] = wrapped;
+    } catch {}
+    if (bridge?.[method] === wrapped) return true;
+    try {
+      Object.defineProperty(bridge, method, {
+        configurable: true,
+        value: wrapped,
+        writable: true,
+      });
+    } catch {}
+    return bridge?.[method] === wrapped;
+  };
+
   const removeQueuedEntry = (entry) => {
     const index = queue.indexOf(entry);
     if (index >= 0) queue.splice(index, 1);
@@ -400,12 +415,7 @@
       __codeyGitRequestGuardOwner: { value: api },
       __codeyGitRequestGuardOriginal: { value: original },
     });
-    try {
-      bridge.sendWorkerMessageFromView = wrapped;
-    } catch {
-      return false;
-    }
-    return bridge.sendWorkerMessageFromView === wrapped;
+    return replaceBridgeMethod(bridge, "sendWorkerMessageFromView", wrapped);
   };
 
   const patchWorkerMessageSubscription = (bridge) => {
@@ -431,12 +441,7 @@
       __codeyGitRequestGuardOwner: { value: api },
       __codeyGitRequestGuardOriginal: { value: original },
     });
-    try {
-      bridge.subscribeToWorkerMessages = wrapped;
-    } catch {
-      return false;
-    }
-    return bridge.subscribeToWorkerMessages === wrapped;
+    return replaceBridgeMethod(bridge, "subscribeToWorkerMessages", wrapped);
   };
 
   const ensureInstalled = () => {

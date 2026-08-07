@@ -79,6 +79,15 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
     assert.equal(modelGate("chatgpt"), true);
     assert.equal(modelGate("apikey"), false);
 
+    const nestedAuthModelSource = [
+      "function Ue({authMethod:e,includeUltraReasoningEffort:i,useHiddenModels:o}){",
+      "let s=[],c=null,l=(o)&&e!==\"amazonBedrock\",u=i;",
+      "return {gate:l,models:s,defaultModel:c,useHiddenModels:o}}",
+    ].join("");
+    const patchedNestedAuthModel = await patchAsset(nestedAuthModelSource);
+    assert.match(patchedNestedAuthModel, /l=\(o\)&&e=== `chatgpt`/);
+    assert.doesNotMatch(patchedNestedAuthModel, /amazonBedrock/);
+
     const modelListFilterSource = [
       "function filter({authMethod:e,availableModels:n,includeUltraReasoningEffort:a,models:o,useHiddenModels:s}){",
       "let c=[],l=null,u=s&&e!==`amazonBedrock`;",
@@ -132,6 +141,23 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
       }).models,
       ["gpt-5.6-sol", "gpt-5.3-codex-spark"],
     );
+
+    const strictHiddenModelListFilterSource = [
+      "function filterStrict({authMethod:e,availableModels:n,",
+      "includeUltraReasoningEffort:a,models:o,useHiddenModels:s}){",
+      "let c=[],u=(s)&&e!==\"amazonBedrock\";",
+      "o.forEach(r=>{if((u?n.has(r.model):r.hidden!==!0)){c.push(r.model)}});",
+      "return {models:c,includeUltraReasoningEffort:a}}",
+    ].join("");
+    const patchedStrictHiddenModelListFilter = await patchAsset(
+      strictHiddenModelListFilterSource,
+      "app://-/assets/model-list-filter-strict-hidden.js",
+    );
+    assert.match(
+      patchedStrictHiddenModelListFilter,
+      /if\(u\?\(n\.has\(r\.model\)\|\|!r\.hidden\):!r\.hidden\)/,
+    );
+    assert.match(patchedStrictHiddenModelListFilter, /u=\(s\)&&e=== `chatgpt`/);
 
     const consolidatedModelListFilterSource = [
       "function filterV2({additionalAvailableModels:e,authMethod:t,availableModels:n,",

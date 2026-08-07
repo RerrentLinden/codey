@@ -94,15 +94,24 @@
   // where one unrelated anchor moved: an exception here aborted every gate on
   // the asset. Log and return the source unchanged so the rest still apply.
   const replaceUniqueRendererGate = (source, pattern, replacement, name) => {
-    let count = 0;
-    const patched = source.replace(pattern, (...args) => {
-      count += 1;
-      return typeof replacement === "function" ? replacement(...args) : replacement;
-    });
-    if (count !== 1) {
+    const gates = Array.isArray(pattern) ? pattern : [{ pattern, replacement }];
+    let matchCount = 0;
+    let patched = source;
+    for (const gate of gates) {
+      let gateCount = 0;
+      const candidate = source.replace(gate.pattern, (...args) => {
+        gateCount += 1;
+        return typeof gate.replacement === "function"
+          ? gate.replacement(...args)
+          : gate.replacement;
+      });
+      if (gateCount > 0 && matchCount === 0) patched = candidate;
+      matchCount += gateCount;
+    }
+    if (matchCount !== 1) {
       const message =
-        `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${count} times`;
-      recordCodeyPatchFailure(`renderer_patch:${name}`, message, { matchCount: count });
+        `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${matchCount} times`;
+      recordCodeyPatchFailure(`renderer_patch:${name}`, message, { matchCount });
       try {
         console.error(message);
       } catch {}
@@ -202,7 +211,7 @@
     ) {
       patched = replaceUniqueRendererGate(
         patched,
-        /if\s*\(\s*(?:[$A-Z_a-z][$\w]*\?\.\s*has\(\s*[$A-Z_a-z][$\w]*\.model\s*\)\s*===\s*!0\s*\|\|\s*)?\(?\s*([$A-Z_a-z][$\w]*)\s*\?\s*([$A-Z_a-z][$\w]*)\.has\(\s*([$A-Z_a-z][$\w]*)\.model\s*\)\s*:\s*!\s*\3\.hidden\s*\)?\s*\)/g,
+        /if\s*\(\s*\(*\s*(?:[$A-Z_a-z][$\w]*\s*(?:\?\.|\.)\s*has\(\s*[$A-Z_a-z][$\w]*\.model\s*\)\s*(?:===\s*!0)?\s*\|\|\s*)?\(?\s*([$A-Z_a-z][$\w]*)\s*\?\s*([$A-Z_a-z][$\w]*)\.has\(\s*([$A-Z_a-z][$\w]*)\.model\s*\)\s*:\s*(?:!\s*\3\.hidden|\3\.hidden\s*!==\s*!0|\3\.hidden\s*===\s*!1)\s*\)?\s*\)*\s*\)/g,
         (_match, useAllowlistName, allowlistName, modelName) =>
           `if(${useAllowlistName}?(${allowlistName}.has(${modelName}.model)||!${modelName}.hidden):!${modelName}.hidden)`,
         "model allowlist",
@@ -215,9 +224,9 @@
     ) {
       patched = replaceUniqueRendererGate(
         patched,
-        /(\b[$A-Z_a-z][$\w]*\s*=\s*[$A-Z_a-z][$\w]*\s*&&\s*[$A-Z_a-z][$\w]*\s*)!==\s*`amazonBedrock`/g,
-        (_match, visibilityExpression) =>
-          `${visibilityExpression}=== \`chatgpt\``,
+        /(\b[$A-Z_a-z][$\w]*\s*=\s*\(?\s*[$A-Z_a-z][$\w]*(?:\s*(?:\?\.|\.)\s*[$A-Z_a-z][$\w]*)?\s*\)?\s*&&\s*)\(?\s*([$A-Z_a-z][$\w]*(?:\s*(?:\?\.|\.)\s*[$A-Z_a-z][$\w]*)?)\s*(?:!==|!=)\s*(["'`])amazonBedrock\3\s*\)?/g,
+        (_match, visibilityPrefix, authMethodExpression) =>
+          `${visibilityPrefix}${authMethodExpression}=== \`chatgpt\``,
         "model visibility",
       );
     }
