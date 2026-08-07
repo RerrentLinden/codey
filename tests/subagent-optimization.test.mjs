@@ -65,7 +65,7 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
   assert.ok(petCardIndex > subagentCardIndex);
   assert.match(
     uiSource,
-    /const subagentPolicyControlsDisabled =\s*isBusy \|\| !config\.subagentOptimization/,
+    /const subagentPolicyControlsDisabled =\s*isBusy/,
   );
   assert.match(
     uiSource,
@@ -87,6 +87,7 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
   assert.match(modelSource, /不支持 \$\{subagentModel\}，无法开启子代理协作优化/);
   assert.match(uiSource, /无需重启/);
   assert.doesNotMatch(uiSource, /下次启动启用 V2 并行配置，退出时自动恢复原文件/);
+  assert.match(uiSource, /可先选择子代理模型与思考深度，开启后保存即生效/);
 });
 
 test("subagent optimization owns the requested V2 and default-agent settings", async () => {
@@ -98,6 +99,7 @@ test("subagent optimization owns the requested V2 and default-agent settings", a
 
   assert.match(source, /multi_agent\["enabled"\] = value\(true\)/);
   assert.match(source, /multi_agent\["hide_spawn_agent_metadata"\] = value\(true\)/);
+  assert.match(source, /multi_agent\["expose_spawn_agent_model_overrides"\] = value\(false\)/);
   assert.match(source, /multi_agent\["tool_namespace"\] = value\("agents"\)/);
   assert.match(source, /multi_agent\["max_concurrent_threads_per_session"\] = value\(7\)/);
   assert.match(source, /multi_agent\["max_wait_timeout_ms"\] = value\(120_000\)/);

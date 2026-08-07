@@ -58,7 +58,7 @@ function FeaturePolicyCardComponent({
   const subagentReasoningEfforts =
     selectedSubagentModel?.supportedReasoningEfforts ?? [];
   const subagentPolicyControlsDisabled =
-    isBusy || !config.subagentOptimization;
+    isBusy;
 
   return (
     <section className="secondary-section" aria-labelledby="runtime-title">
@@ -222,7 +222,7 @@ function FeaturePolicyCardComponent({
                     ? "当前 Codex 版本或线路没有可用于子代理的模型"
                   : config.subagentOptimization
                     ? "保存后立即用于当前任务后续新启动的子代理，无需重启"
-                    : "保持 Codex 默认子代理配置，不注入协作提示词"}
+                    : "可先选择子代理模型与思考深度，开启后保存即生效"}
               </small>
             </div>
           </div>

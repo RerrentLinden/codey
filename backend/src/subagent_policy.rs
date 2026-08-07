@@ -63,7 +63,8 @@ fn defaults_for_current_provider(
         );
     };
     let Some(model) = state
-        .available_subagent_model(DEFAULT_SUBAGENT_MODEL)
+        .available_subagent_model(config.subagent_model.trim())
+        .or_else(|| state.available_subagent_model(DEFAULT_SUBAGENT_MODEL))
         .or_else(|| state.available_subagent_model(&state.default_model))
         .or_else(|| state.first_available_subagent_model())
     else {
@@ -243,6 +244,24 @@ mod tests {
 
         assert!(config.subagent_optimization);
         assert_eq!(config.subagent_model, "provider-custom-model");
+        assert_eq!(config.subagent_reasoning_effort, "high");
+    }
+
+    #[test]
+    fn provider_change_preserves_a_saved_compatible_subagent_model() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = route_config("route-b");
+        config.subagent_model = "gpt-5.6-sol".into();
+        config.subagent_reasoning_effort = "high".into();
+        config.upstream_models_by_provider.insert(
+            "route-b".into(),
+            vec![DEFAULT_SUBAGENT_MODEL.into(), "gpt-5.6-sol".into()],
+        );
+
+        apply_after_provider_sync(Some("route-a"), "route-b", &mut config, home.path(), false);
+
+        assert!(config.subagent_optimization);
+        assert_eq!(config.subagent_model, "gpt-5.6-sol");
         assert_eq!(config.subagent_reasoning_effort, "high");
     }
 

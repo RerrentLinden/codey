@@ -1,5 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use codey_runtime_core::settings::RelayProtocol;
@@ -34,6 +36,8 @@ const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
 const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_TOKEN_BUDGET: &str = "8500";
 const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 15;
+const SUBAGENT_DEFAULTS_VERIFY_TIMEOUT_MS: u64 = 1_500;
+const SUBAGENT_DEFAULTS_VERIFY_POLL_MS: u64 = 75;
 const APPLIED_CONFIG_FILE: &str = "applied-config.toml";
 const APPLIED_AGENTS_MD_FILE: &str = "applied-AGENTS.md";
 const APPLIED_DEFAULT_AGENT_FILE: &str = "agents/applied-default.toml";
@@ -451,28 +455,8 @@ fn mark_runtime_subagent_defaults_applied_at(
     );
 
     let config_path = home.join("config.toml");
-    let current_bytes = fs::read(&config_path)
-        .with_context(|| format!("读取 Codex 配置失败：{}", config_path.display()))?;
-    let current =
-        String::from_utf8(current_bytes.clone()).context("Codex config.toml 不是 UTF-8")?;
-    let current_doc = current
-        .parse::<DocumentMut>()
-        .context("解析 Codex config.toml 失败")?;
-    let current_agents = current_doc
-        .get("agents")
-        .and_then(Item::as_table)
-        .context("Codex config.toml 缺少 [agents] 配置")?;
-    anyhow::ensure!(
-        current_agents
-            .get("default_subagent_model")
-            .and_then(Item::as_str)
-            == Some(model)
-            && current_agents
-                .get("default_subagent_reasoning_effort")
-                .and_then(Item::as_str)
-                == Some(reasoning_effort.as_str()),
-        "Codex config.toml 尚未写入新的子代理默认配置"
-    );
+    let current_bytes =
+        wait_for_subagent_defaults_in_config(&config_path, model, &reasoning_effort)?;
 
     let snapshot_dir = state
         .config_snapshot_dir
@@ -497,6 +481,49 @@ fn mark_runtime_subagent_defaults_applied_at(
     state.subagent_model = model.to_string();
     state.subagent_reasoning_effort = reasoning_effort;
     write_lease(marker, &state)
+}
+
+fn wait_for_subagent_defaults_in_config(
+    config_path: &Path,
+    model: &str,
+    reasoning_effort: &str,
+) -> Result<Vec<u8>> {
+    let deadline = Instant::now() + Duration::from_millis(SUBAGENT_DEFAULTS_VERIFY_TIMEOUT_MS);
+    loop {
+        let error = match read_subagent_defaults_config(config_path, model, reasoning_effort) {
+            Ok(Some(bytes)) => return Ok(bytes),
+            Ok(None) => "Codex config.toml 尚未写入新的子代理默认配置".to_string(),
+            Err(error) => format!("{error:#}"),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!("{error}");
+        }
+        thread::sleep(Duration::from_millis(SUBAGENT_DEFAULTS_VERIFY_POLL_MS));
+    }
+}
+
+fn read_subagent_defaults_config(
+    config_path: &Path,
+    model: &str,
+    reasoning_effort: &str,
+) -> Result<Option<Vec<u8>>> {
+    let bytes = fs::read(config_path)
+        .with_context(|| format!("读取 Codex 配置失败：{}", config_path.display()))?;
+    let current = String::from_utf8(bytes.clone()).context("Codex config.toml 不是 UTF-8")?;
+    let document = current
+        .parse::<DocumentMut>()
+        .context("解析 Codex config.toml 失败")?;
+    let agents = document
+        .get("agents")
+        .and_then(Item::as_table)
+        .context("Codex config.toml 缺少 [agents] 配置")?;
+    let matches_defaults = agents.get("default_subagent_model").and_then(Item::as_str)
+        == Some(model)
+        && agents
+            .get("default_subagent_reasoning_effort")
+            .and_then(Item::as_str)
+            == Some(reasoning_effort);
+    Ok(matches_defaults.then_some(bytes))
 }
 
 #[cfg(test)]
@@ -1219,6 +1246,7 @@ fn enable_subagent_optimization(
         .ok_or_else(|| anyhow::anyhow!("features.multi_agent_v2 必须是 TOML table"))?;
     multi_agent["enabled"] = value(true);
     multi_agent["hide_spawn_agent_metadata"] = value(true);
+    multi_agent["expose_spawn_agent_model_overrides"] = value(false);
     multi_agent["tool_namespace"] = value("agents");
     multi_agent["max_concurrent_threads_per_session"] = value(7);
     multi_agent["min_wait_timeout_ms"] = value(10_000);
@@ -2544,6 +2572,10 @@ custom_setting = "preserved"
         assert_eq!(
             multi_agent["hide_spawn_agent_metadata"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            multi_agent["expose_spawn_agent_model_overrides"].as_bool(),
+            Some(false)
         );
         assert_eq!(multi_agent["tool_namespace"].as_str(), Some("agents"));
         assert_eq!(
