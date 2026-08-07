@@ -39,7 +39,6 @@ const MENU_LABEL_TRANSLATIONS: &[(&str, &str)] = &[
     ("Open in New Window", "在新窗口中打开"),
     ("Archive chat", "归档对话"),
     ("Pin/unpin chat", "固定/取消固定对话"),
-    ("Dictation", "听写"),
     ("Wake Pet", "唤醒助手"),
     ("Previous Chat", "上一个对话"),
     ("Next Chat", "下一个对话"),

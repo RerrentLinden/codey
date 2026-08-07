@@ -14,9 +14,6 @@
     "codex.profileFooter.hidePet",
     "codex.command.openPetOverlay",
     "codex.command.tuckAwayPetOverlay",
-    "openAvatarOverlay",
-    "tuckAwayAvatarOverlay",
-    "avatar-overlay-open",
   ]);
   const petControlIdPrefixes = [
     "settings.appearance.pets.",

@@ -1948,7 +1948,6 @@
   };
 
   const scan = (root = document, syncTitles = true) => {
-    window.__codeyBlockNativeVoiceControls?.(root);
     if (shouldIgnoreDeletedSidebarSessionRoot(root)) return;
     // Streaming output makes conversation turns by far the most frequent scan
     // root. Sidebar controls can never live inside a turn, so running their

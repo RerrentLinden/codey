@@ -55,8 +55,8 @@ test("mutation dispatcher unions subscriptions and tears down only when empty", 
     (mutations) => calls.push(["security", ...mutations]),
     { childList: true },
   );
-  const unsubscribeVoice = dispatcher.subscribe(
-    (mutations) => calls.push(["voice", ...mutations]),
+  const unsubscribeAssets = dispatcher.subscribe(
+    (mutations) => calls.push(["assets", ...mutations]),
     {
       attributes: true,
       attributeFilter: ["aria-label", "role", "title", "src"],
@@ -79,11 +79,11 @@ test("mutation dispatcher unions subscriptions and tears down only when empty", 
   assert.deepEqual(calls, [
     ["pet", "mutation"],
     ["security", "mutation"],
-    ["voice", "mutation"],
+    ["assets", "mutation"],
   ]);
 
-  unsubscribeVoice();
-  unsubscribeVoice();
+  unsubscribeAssets();
+  unsubscribeAssets();
   assert.deepEqual(
     [...runtime.observers.at(-1).options.attributeFilter],
     ["aria-label", "role", "title"],
@@ -119,14 +119,14 @@ test("shared control descriptor normalizes accessible labels and text", () => {
   const runtime = createRuntime();
   const control = {
     getAttribute(name) {
-      return name === "aria-label" ? "  Voice " : name === "title" ? "Start" : null;
+      return name === "aria-label" ? "  Open " : name === "title" ? "Settings" : null;
     },
     textContent: " now\nplease ",
   };
 
   assert.equal(
     runtime.window.__codeyMutationDispatcher.controlDescriptor(control),
-    "Voice Start now please",
+    "Open Settings now please",
   );
 });
 
@@ -170,7 +170,7 @@ test("shared React graph walking preserves direct, ancestor, and container seman
   const shared = runtime.window.__codeySharedRuntime;
   const control = new runtime.FakeHTMLElement();
   control.__reactFiber$direct = {
-    memoizedProps: { children: { commandId: "composer.startDictation" } },
+    memoizedProps: { children: { commandId: "composer.openCommandMenu" } },
     return: null,
   };
   control.__reactContainer$root = { current: {} };
@@ -181,7 +181,7 @@ test("shared React graph walking preserves direct, ancestor, and container seman
   assert.equal(
     shared.reactInternalGraphIncludes(
       control,
-      (value) => value === "composer.startDictation",
+      (value) => value === "composer.openCommandMenu",
     ),
     true,
   );
@@ -190,14 +190,14 @@ test("shared React graph walking preserves direct, ancestor, and container seman
   ancestorControl.__reactFiber$ancestor = {
     memoizedProps: {},
     return: {
-      memoizedProps: { commandId: "settings.general.realtimeVoice" },
+      memoizedProps: { commandId: "settings.general.appearance" },
       return: null,
     },
   };
   assert.equal(
     shared.reactInternalGraphIncludes(
       ancestorControl,
-      (value) => value === "settings.general.realtimeVoice",
+      (value) => value === "settings.general.appearance",
       {
         ancestorDepth: 8,
         ancestorIgnoredKeys:
@@ -208,12 +208,12 @@ test("shared React graph walking preserves direct, ancestor, and container seman
   );
 
   ancestorControl.__reactFiber$ancestor.return.memoizedProps = {
-    children: { commandId: "settings.general.realtimeVoice" },
+    children: { commandId: "settings.general.appearance" },
   };
   assert.equal(
     shared.reactInternalGraphIncludes(
       ancestorControl,
-      (value) => value === "settings.general.realtimeVoice",
+      (value) => value === "settings.general.appearance",
       {
         ancestorDepth: 8,
         ancestorIgnoredKeys:

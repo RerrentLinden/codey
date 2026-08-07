@@ -1,7 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
@@ -16,7 +14,6 @@ async function loadStartupPatchExpression(disablePet = true) {
   assert.ok(template);
   return template
     .replaceAll("__DISABLE_PET__", disablePet ? "true" : "false")
-    .replaceAll("__DISABLE_VOICE__", "false")
     .replaceAll("__FAST_CODEX_STARTUP__", "true");
 }
 
@@ -24,7 +21,6 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
   const Module = process.getBuiltinModule("module");
   const nativeLoad = Module._load;
   const nativeJsExtension = Module._extensions[".js"];
-  const fixtureRoot = await mkdtemp(join(tmpdir(), "codey-main-bundle-"));
   let installedHandler = null;
   class FakeEmitter {
     constructor() {
@@ -117,8 +113,12 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       },
     },
   };
+  const fakeAvatarOverlayNative = { createController: () => ({}) };
   Module._load = function testElectronLoader(request) {
     if (request === "electron") return fakeElectron;
+    if (request === "C:\\Codex\\avatar_overlay.node") {
+      return fakeAvatarOverlayNative;
+    }
     return Reflect.apply(nativeLoad, this, arguments);
   };
 
@@ -133,151 +133,36 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       (0, eval)(await loadStartupPatchExpression()),
       "codey-startup-patch-installed-v20",
     );
-    const fixtureBuildDir = join(fixtureRoot, ".vite", "build");
-    await mkdir(fixtureBuildDir, { recursive: true });
-    const incompatibleMainBundle = join(
-      fixtureBuildDir,
-      "main-incompatible-fixture.js",
-    );
-    await writeFile(incompatibleMainBundle, "const incompatible=true;", "utf8");
-    assert.equal(
-      globalThis.__CODEY_PET_HARD_DISABLE_STATUS__.phase,
-      "pending",
-    );
-    assert.throws(
-      () => Module._extensions[".js"](
-        { _compile: () => assert.fail("incompatible bundle must not compile") },
-        incompatibleMainBundle,
-      ),
-      /pet hard-disable anchors not found/,
-    );
-    assert.equal(
-      globalThis.__CODEY_PET_HARD_DISABLE_STATUS__.phase,
-      "error",
-    );
-
-    const compatibleMainBundle = join(
-      fixtureBuildDir,
-      "main-compatible-fixture.js",
-    );
-    const compatibleMainSource = [
-      "const petState=`electron-avatar-overlay-open`;",
-      "const petPreload=`avatar-overlay-composition-surface-preload.js`;",
-      ";petManager=new NativePetManager();",
-      "const petApi={getVisibleNativePetWebContents:()=>petManager.getVisibleWebContents()};",
-      "function present(owner,{partition:part,url:target}){if(target==null){return}return target}",
-      "function attach({getAuthToken:token,owner:attachOwner}){",
-      "const before=`will-attach-webview`,after=`did-attach-webview`;",
-      "let entry=queue.shift();if(entry==null)return;",
-      "const attached={webContents:guest};",
-      "}",
-      "switch(event){case`checkout-webview-presentation-changed`:present(ownerArg,payloadArg);break}",
-      "disposer.add(makeOwner({appServerConnection:createConnection(),closeActiveTurn:turn.closeActiveTurn}));",
-      "new ProcessManager(registry.getBrowserSessionRegistry());",
-    ].join("");
-    await writeFile(compatibleMainBundle, compatibleMainSource, "utf8");
-    let compiledMainSource = "";
-    assert.equal(globalThis.__CODEY_PET_HARD_DISABLE_STATUS__.phase, "error");
-    Module._extensions[".js"](
-      {
-        _compile(source) {
-          assert.equal(
-            globalThis.__CODEY_PET_HARD_DISABLE_STATUS__.phase,
-            "error",
-            "manager removal must not be confirmed before _compile returns",
-          );
-          compiledMainSource = source;
-        },
-      },
-      compatibleMainBundle,
-    );
-    assert.match(
-      compiledMainSource,
-      /petManager=globalThis\.__CODEY_DISABLED_PET_MANAGER__/,
-    );
-    assert.doesNotMatch(compiledMainSource, /petManager=new NativePetManager/);
-    assert.equal(
-      globalThis.__CODEY_PET_HARD_DISABLE_STATUS__.phase,
-      "removed",
-    );
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.petManagerSourceRemoved,
-      true,
-    );
-
     const electron = Module._load("electron", undefined, false);
-    assert.throws(
-      () => new electron.BrowserWindow({ title: "Pet Surface test" }),
-      (error) => error?.code === "CODEY_PET_DISABLED",
+    const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
+    assert.equal(petSurface.destroyed, false);
+    const avatarOverlayWindow = new electron.BrowserWindow({
+      width: 356,
+      height: 320,
+      alwaysOnTop: true,
+      transparent: true,
+      focusable: false,
+      show: false,
+      frame: false,
+      skipTaskbar: true,
+    });
+    assert.equal(avatarOverlayWindow.destroyed, false);
+    assert.equal(
+      Module._load("C:\\Codex\\avatar_overlay.node", undefined, false),
+      fakeAvatarOverlayNative,
     );
-    assert.throws(
-      () => new electron.BrowserWindow({
-        width: 356,
-        height: 320,
-        alwaysOnTop: true,
-        transparent: true,
-        focusable: false,
-        show: false,
-        frame: false,
-        skipTaskbar: true,
-      }),
-      (error) => error?.code === "CODEY_PET_DISABLED",
-    );
-    assert.throws(
-      () => Module._load("C:\\Codex\\avatar_overlay.node", undefined, false),
-      (error) => error?.code === "CODEY_PET_DISABLED",
-    );
-
-    const normalWindow = new electron.BrowserWindow({ title: "Settings" });
-    await normalWindow.loadURL("app://-/index.html?initialRoute=%2Fchat");
-    assert.equal(normalWindow.destroyed, false);
     const routeWindow = new electron.BrowserWindow({ title: "Codex" });
     await routeWindow.webContents.loadURL(
       "app://-/index.html?initialRoute=%2Favatar-overlay",
     );
-    assert.equal(routeWindow.destroyCalls, 1);
-    assert.deepEqual(routeWindow.webContents.loadedUrls, []);
-    const eventWindow = new electron.BrowserWindow({ title: "Codex" });
-    let navigationPrevented = false;
-    eventWindow.webContents.emit(
-      "did-start-navigation",
-      { preventDefault: () => { navigationPrevented = true; } },
-      "app://-/index.html?initialRoute=/avatar-overlay",
-    );
-    assert.equal(navigationPrevented, true);
-    assert.equal(eventWindow.destroyCalls, 1);
+    assert.equal(routeWindow.destroyed, false);
+    assert.deepEqual(routeWindow.webContents.loadedUrls, [
+      "app://-/index.html?initialRoute=%2Favatar-overlay",
+    ]);
+    assert.equal(globalThis.__CODEY_CODEX_STARTUP_PATCH__.disablePet, true);
     assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.avatarOverlayBlockedWindowCreations,
-      2,
-    );
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.avatarOverlayBlockedNativeLoads,
-      1,
-    );
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.avatarOverlayUrlMatches,
-      2,
-    );
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.avatarOverlayDestroyedWindows,
-      2,
-    );
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.avatarOverlayDestroyErrors,
-      0,
-    );
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.avatarOverlayLastRoute,
-      "/avatar-overlay",
-    );
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.avatarOverlayActiveGuards,
-      1,
-    );
-    normalWindow.destroy();
-    assert.equal(
-      globalThis.__CODEY_CODEX_STARTUP_PATCH__.avatarOverlayActiveGuards,
-      0,
+      Object.hasOwn(globalThis.__CODEY_CODEX_STARTUP_PATCH__, "petManagerSourceRemoved"),
+      false,
     );
     const upstreamHandler = async () =>
       new Response(
@@ -581,7 +466,6 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     // interaction bundles patched cleanly, so no further skips were logged.
     assert.equal(patchErrors.length, 2);
   } finally {
-    await rm(fixtureRoot, { force: true, recursive: true });
     console.error = nativeConsoleError;
     Module._load = nativeLoad;
     Module._extensions[".js"] = nativeJsExtension;

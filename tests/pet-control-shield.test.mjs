@@ -82,6 +82,10 @@ function loadShield(enabled) {
   };
   const localizedSettingsMenu = new FakeElement("宠物");
   const localized = new FakeElement("唤醒宠物");
+  const sharedAvatarControl = new FakeElement();
+  sharedAvatarControl.__reactProps$test = {
+    children: { props: { id: "openAvatarOverlay" } },
+  };
   const unrelated = new FakeElement("打开设置");
   const controls = [
     semantic,
@@ -89,6 +93,7 @@ function loadShield(enabled) {
     nestedSettingsMenu,
     localizedSettingsMenu,
     localized,
+    sharedAvatarControl,
     unrelated,
   ];
   const listeners = new Map();
@@ -191,6 +196,7 @@ function loadShield(enabled) {
       return scheduledFlushes;
     },
     semantic,
+    sharedAvatarControl,
     settingsMenu,
     unrelated,
     window,
@@ -213,6 +219,10 @@ test("pet slim mode blocks semantic and localized native pet controls", () => {
   assert.equal(runtime.localized.getAttribute("data-codey-pet-control-blocked"), "true");
   assert.equal(runtime.semantic.disabled, true);
   assert.equal(runtime.semantic.style.display, "none:important");
+  assert.equal(
+    runtime.sharedAvatarControl.getAttribute("data-codey-pet-control-blocked"),
+    null,
+  );
   assert.equal(runtime.unrelated.getAttribute("data-codey-pet-control-blocked"), null);
 
   let prevented = false;

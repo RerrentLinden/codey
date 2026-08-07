@@ -7,7 +7,6 @@ const root = new URL("../", import.meta.url);
 const fixtures = [
   ["fast-startup-shield.js", "__CODEY_FAST_CODEX_STARTUP__"],
   ["pet-control-shield.js", "__CODEY_SLIM_PET__"],
-  ["voice-control-shield.js", "__CODEY_SLIM_VOICE__"],
 ];
 
 test("boolean injection markers survive esbuild minification", async () => {

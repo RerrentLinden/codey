@@ -16,7 +16,7 @@ async function waitFor(predicate, timeoutMs = 5000) {
   }
 }
 
-async function loadVoicePatchExpression() {
+async function loadStartupPatchExpression() {
   const template = normalizeLineEndings(await readFile(
     new URL("../backend/src/codex_startup_patch.js", import.meta.url),
     "utf8",
@@ -24,11 +24,10 @@ async function loadVoicePatchExpression() {
   assert.ok(template);
   return template
     .replaceAll("__DISABLE_PET__", "false")
-    .replaceAll("__DISABLE_VOICE__", "true")
     .replaceAll("__FAST_CODEX_STARTUP__", "true");
 }
 
-test("voice startup patch blocks native listeners and Dictation windows", async () => {
+test("startup patch preserves native child processes and ordinary BrowserWindows", async () => {
   const Module = process.getBuiltinModule("module");
   const nativeLoad = Module._load;
   const nativeJsExtension = Module._extensions[".js"];
@@ -55,7 +54,10 @@ test("voice startup patch blocks native listeners and Dictation windows", async 
   };
 
   try {
-    assert.equal((0, eval)(await loadVoicePatchExpression()), "codey-startup-patch-installed-v20");
+    assert.equal(
+      (0, eval)(await loadStartupPatchExpression()),
+      "codey-startup-patch-installed-v20",
+    );
 
     const childProcess = Module._load("node:child_process", undefined, false);
     const bareMonitor = childProcess.spawn(
@@ -73,12 +75,7 @@ test("voice startup patch blocks native listeners and Dictation windows", async 
     assert.equal(nativeChildSpawns.length, 2);
 
     const electron = Module._load("electron", undefined, false);
-    assert.throws(
-      () => new electron.BrowserWindow({ appearance: "globalDictation", title: "Dictation" }),
-      (error) => error?.code === "CODEY_VOICE_DISABLED",
-    );
     assert.ok(new electron.BrowserWindow({ title: "Settings" }) instanceof FakeBrowserWindow);
-    assert.equal(globalThis.__CODEY_DISABLED_VOICE_MANAGER__, undefined);
   } finally {
     Module._load = nativeLoad;
     Module._extensions[".js"] = nativeJsExtension;

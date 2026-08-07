@@ -727,7 +727,6 @@ async fn save_codey_config_locked(
     config.disable_trace_log_writes = config_input.disable_trace_log_writes;
     config.protect_crashpad_pending = config_input.protect_crashpad_pending;
     config.slim_codex_pet = config_input.slim_codex_pet;
-    config.slim_codex_voice = config_input.slim_codex_voice;
     config.gpu_launch_mode = config_input.gpu_launch_mode;
     config.fast_context_tools = config_input.fast_context_tools;
     config.fast_codex_startup = config_input.fast_codex_startup;
@@ -1211,7 +1210,6 @@ fn config_requires_restart(
         || applied.codex_app_path != current.codex_app_path
         || applied.user_scripts != current.user_scripts
         || applied.slim_codex_pet != current.slim_codex_pet
-        || applied.slim_codex_voice != current.slim_codex_voice
         || applied.gpu_launch_mode != current.gpu_launch_mode
         || applied.fast_context_tools != current.fast_context_tools
         || applied.fast_codex_startup != current.fast_codex_startup
@@ -1414,15 +1412,6 @@ mod restart_tests {
             &RuntimeModelConfig::from_config(&default_model_change),
             &applied_subagent,
             &default_model_change
-        ));
-
-        let mut startup_change = applied.clone();
-        startup_change.slim_codex_voice = !startup_change.slim_codex_voice;
-        assert!(config_requires_restart(
-            &applied,
-            &applied_models,
-            &applied_subagent,
-            &startup_change
         ));
 
         let mut gpu_mode_change = applied.clone();

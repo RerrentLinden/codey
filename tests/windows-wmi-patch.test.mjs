@@ -13,7 +13,6 @@ async function loadPatchExpression() {
   assert.ok(template, "startup patch template should be readable by the regression test");
   return template
     .replaceAll("__DISABLE_PET__", "false")
-    .replaceAll("__DISABLE_VOICE__", "false")
     .replaceAll("__FAST_CODEX_STARTUP__", "true");
 }
 
@@ -59,7 +58,7 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
   });
 });
 
-test("settings exposes degraded Windows and pet optimization failures", async () => {
+test("settings exposes degraded Windows optimization failures", async () => {
   const [sectionsSource, typesSource, commandsSource, launcherSource] = await Promise.all([
     readFile(new URL("../src/OperationsPanel.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/App.types.ts", import.meta.url), "utf8"),
@@ -82,12 +81,11 @@ test("settings exposes degraded Windows and pet optimization failures", async ()
   assert.match(sectionsSource, /windowsPatchFailed[\s\S]*?"未生效"/);
   assert.match(sectionsSource, /script\.status === "failed"/);
   assert.match(sectionsSource, /scriptFailed[\s\S]*?\? "失败"/);
-  assert.match(launcherSource, /fn mark_pet_slim_startup_failure/);
-  assert.match(launcherSource, /status\.id == "pet-control-shield"/);
-  assert.match(launcherSource, /pet_status\.status = "failed"/);
+  assert.doesNotMatch(launcherSource, /fn mark_pet_slim_startup_failure/);
+  assert.doesNotMatch(launcherSource, /pet_status\.status = "failed"/);
 });
 
-test("diagnostic storage guards, pet, and voice remain user-configurable", async () => {
+test("diagnostic storage guards and pet remain user-configurable", async () => {
   const [appSource, sectionsSource, configSource, traceSource, launcherSource, commandsSource] = await Promise.all([
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/FeaturePolicyCard.tsx", import.meta.url), "utf8"),
@@ -122,6 +120,4 @@ test("diagnostic storage guards, pet, and voice remain user-configurable", async
   assert.match(launcherSource, /spawn_crashpad_guard_watcher/);
   assert.doesNotMatch(launcherSource, /spawn_startup_trace_stats_refresh/);
   assert.match(uiSource, /slimCodexPet/);
-  assert.match(uiSource, /slimCodexVoice/);
-  assert.match(configSource, /pub slim_codex_voice: bool/);
 });

@@ -1,16 +1,6 @@
 (() => {
   const disablePet = __DISABLE_PET__;
-  const disableVoice = __DISABLE_VOICE__;
   const fastCodexStartup = __FAST_CODEX_STARTUP__;
-  const petHardDisableStatus = {
-    phase: disablePet ? "pending" : "not_requested",
-    message: "",
-  };
-  Object.defineProperty(globalThis, "__CODEY_PET_HARD_DISABLE_STATUS__", {
-    configurable: false,
-    value: petHardDisableStatus,
-    writable: false,
-  });
   const codeyErrorLoggerExecutable = "__CODEY_ERROR_LOGGER_EXECUTABLE__";
   const recordCodeyPatchFailure = (operation, error, context = {}) => {
     const unresolvedExecutable =
@@ -171,7 +161,8 @@
       // controls after React mounts is too late: that import has already pulled
       // the avatar renderer and every bundled spritesheet into the main window.
       // Replace only that settings-side dependency with inert callable/iterable
-      // bindings. The real overlay route is blocked independently below.
+      // bindings. The shared avatar overlay host stays intact because current
+      // Codex builds also use it for voice controls.
       patched = replaceUniqueRendererGate(
         patched,
         /import(?:\s*([^;"']+?)\s*from)?\s*["']\.\/codex-avatar(?:[~-][^/"']*)?\.js["'];?/g,
@@ -911,38 +902,6 @@
     workerThreads.Worker = CodeyNoInspectWorker;
   }
 
-  const petNoop = () => undefined;
-  const petAsyncNoop = async () => undefined;
-  const disabledPetManager = new Proxy(
-    {
-      close: petNoop,
-      getCompositionSurfaceHost: () => null,
-      getFeedbackLogEntries: () => [],
-      getVisibleWebContents: () => null,
-      handleRendererReady: petNoop,
-      hide: petNoop,
-      isOpen: () => false,
-      open: petAsyncNoop,
-      reconcileRemoteHostedPIPContentHost: petNoop,
-      restoreOpenState: petAsyncNoop,
-      setFeedbackDiagnosticsEnabled: petNoop,
-      toggle: petAsyncNoop,
-      wake: petAsyncNoop,
-    },
-    {
-      get(target, property, receiver) {
-        return Reflect.has(target, property)
-          ? Reflect.get(target, property, receiver)
-          : petNoop;
-      },
-    },
-  );
-  Object.defineProperty(globalThis, "__CODEY_DISABLED_PET_MANAGER__", {
-    configurable: false,
-    value: disabledPetManager,
-    writable: false,
-  });
-
   const temporaryWebViews = new WeakMap();
   const temporaryWebViewLifecycle = Object.freeze({
     close(owner, partition) {
@@ -1262,13 +1221,10 @@
     },
   );
 
-  // The pet manager and macOS native composition bridge live inside the
-  // monolithic main bundle. Replace the pet manager construction before V8
-  // compiles that bundle so the feature owns no timers, windows, native
-  // bridge, or lifecycle subscriptions. Voice remains initialized because
-  // Codex's settings preload gate awaits responses from its lifecycle
-  // manager; the renderer and BrowserWindow guards below disable its UI and
-  // resources without deadlocking startup.
+  // Install the main-bundle lifecycle and telemetry patches before V8 compiles
+  // the monolithic bundle. Pet slimming deliberately stays renderer-only here:
+  // the avatar overlay manager and native composition bridge are also used by
+  // the official voice controller in current Codex builds.
   {
     const originalJsExtension = Module._extensions[".js"];
     Module._extensions[".js"] = function codeyMainBundleCompileHook(module, filename) {
@@ -1281,7 +1237,6 @@
       try {
       const fs = process.getBuiltinModule("fs");
       let source = fs.readFileSync(filename, "utf8");
-      let petManagerSourceRemoved = false;
       source = applyOptionalMainBundlePatch(
         "desktopCesAnalytics",
         patchCodexMainDesktopAnalytics,
@@ -1297,50 +1252,6 @@
         patchCodexMainAppStateHeartbeat,
         source,
       );
-      if (disablePet) {
-      if (
-        !source.includes("electron-avatar-overlay-open") ||
-        !source.includes("avatar-overlay-composition-surface-preload.js")
-      ) {
-        throw new Error("Codey pet hard-disable anchors not found in Codex main bundle");
-      }
-      const managerReference = source.match(
-        /getVisibleNativePetWebContents:\(\)=>([$A-Z_a-z][$\w]*)\.getVisibleWebContents\(\)/,
-      );
-      if (!managerReference) {
-        throw new Error("Codey could not identify the Codex pet manager");
-      }
-      const managerName = managerReference[1];
-      const escapedManagerName = managerName.replace(/[$]/g, "\\$&");
-      const assignmentPattern = new RegExp(
-        "(?:^|[,;])" + escapedManagerName + "=new [$A-Z_a-z][$\\w]*\\(",
-      );
-      const assignment = assignmentPattern.exec(source);
-      if (!assignment) {
-        throw new Error("Codey could not locate the Codex pet manager constructor");
-      }
-      const newOffset = assignment[0].indexOf("new ");
-      const valueStart = assignment.index + newOffset;
-      const openParen = assignment.index + assignment[0].length - 1;
-      let depth = 0;
-      let valueEnd = -1;
-      for (let index = openParen; index < source.length; index += 1) {
-        if (source[index] === "(") depth += 1;
-        else if (source[index] === ")" && --depth === 0) {
-          valueEnd = index + 1;
-          break;
-        }
-      }
-      if (valueEnd < 0) {
-        throw new Error("Codey could not bound the Codex pet manager constructor");
-      }
-      source =
-        source.slice(0, valueStart) +
-        "globalThis.__CODEY_DISABLED_PET_MANAGER__" +
-        source.slice(valueEnd);
-      petManagerSourceRemoved = true;
-      }
-
       const presentationCall = source.match(
         /case`checkout-webview-presentation-changed`:([$A-Z_a-z][$\w]*)\(([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*)\);break/,
       );
@@ -1433,17 +1344,7 @@
       globalThis.__CODEY_APP_STATE_HEARTBEAT_SOURCE_PATCHED__ =
         !hasOptionalMainBundlePatchFailure("appStateHeartbeat");
       module._compile(source, filename);
-      if (disablePet && petManagerSourceRemoved) {
-        globalThis.__CODEY_PET_MANAGER_SOURCE_REMOVED__ = true;
-        petHardDisableStatus.phase = "removed";
-        petHardDisableStatus.message = "";
-      }
       } catch (error) {
-        if (disablePet) {
-          petHardDisableStatus.phase = "error";
-          petHardDisableStatus.message =
-            error instanceof Error ? error.message : String(error);
-        }
         recordCodeyPatchFailure("patch_codex_main_bundle", error, { filename });
         throw error;
       }
@@ -1478,181 +1379,13 @@
 
   let electronProxy = null;
   let electronProtocolProxy = null;
-  let avatarOverlayBlockedWindowCreations = 0;
-  let avatarOverlayBlockedNativeLoads = 0;
-  let avatarOverlayGuardedWindowsObserved = 0;
-  let avatarOverlayActiveGuards = 0;
-  let avatarOverlayUrlMatches = 0;
-  let avatarOverlayDestroyedWindows = 0;
-  let avatarOverlayDestroyErrors = 0;
-  let avatarOverlayLastRoute = "";
-  const avatarOverlayGuardedWindows = new WeakSet();
-  const isAvatarOverlayRoute = (value) => {
-    if (typeof value !== "string" || value.length === 0) return false;
-    try {
-      const url = new URL(value);
-      if (
-        url.protocol !== "app:" ||
-        url.hostname !== "-" ||
-        url.pathname !== "/index.html"
-      ) {
-        return false;
-      }
-      for (const [key, route] of url.searchParams) {
-        if (
-          key.toLowerCase() === "initialroute" &&
-          route.toLowerCase() === "/avatar-overlay"
-        ) {
-          return true;
-        }
-      }
-    } catch {}
-    return false;
-  };
-  const guardAvatarOverlayLifecycle = (window) => {
-    if (
-      !disablePet ||
-      window == null ||
-      avatarOverlayGuardedWindows.has(window)
-    ) {
-      return;
-    }
-    const webContents = window.webContents;
-    if (webContents == null) return;
-
-    avatarOverlayGuardedWindows.add(window);
-    avatarOverlayGuardedWindowsObserved += 1;
-    avatarOverlayActiveGuards += 1;
-    let cleaned = false;
-    let destroyRequested = false;
-    const restoreLoadUrlMethods = [];
-    const onNavigation = (event, url) => {
-      destroyForRoute(url, event);
-    };
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      avatarOverlayActiveGuards = Math.max(0, avatarOverlayActiveGuards - 1);
-      avatarOverlayGuardedWindows.delete(window);
-      try { webContents.removeListener?.("will-navigate", onNavigation); } catch {}
-      try { webContents.removeListener?.("did-start-navigation", onNavigation); } catch {}
-      try { webContents.removeListener?.("destroyed", cleanup); } catch {}
-      try { window.removeListener?.("closed", cleanup); } catch {}
-      for (const restore of restoreLoadUrlMethods.splice(0)) {
-        try { restore(); } catch {}
-      }
-    };
-    const destroyForRoute = (url, event) => {
-      if (!isAvatarOverlayRoute(url)) return false;
-      try { event?.preventDefault?.(); } catch {}
-      if (destroyRequested) return true;
-      destroyRequested = true;
-      avatarOverlayUrlMatches += 1;
-      avatarOverlayLastRoute = "/avatar-overlay";
-      cleanup();
-      try {
-        if (typeof window.destroy !== "function") {
-          throw new Error("avatar overlay BrowserWindow has no destroy method");
-        }
-        if (window.isDestroyed?.() !== true) window.destroy();
-        avatarOverlayDestroyedWindows += 1;
-      } catch (error) {
-        avatarOverlayDestroyErrors += 1;
-        recordCodeyPatchFailure("avatar_overlay_lifecycle_destroy", error, {
-          route: avatarOverlayLastRoute,
-        });
-      }
-      return true;
-    };
-    const installLoadUrlGuard = (target) => {
-      const originalLoadUrl = target?.loadURL;
-      if (typeof originalLoadUrl !== "function") return;
-      const guardedLoadUrl = function codeyAvatarOverlayGuardedLoadURL(url) {
-        if (destroyForRoute(url)) return Promise.resolve();
-        return Reflect.apply(originalLoadUrl, this, arguments);
-      };
-      try {
-        target.loadURL = guardedLoadUrl;
-        if (target.loadURL === guardedLoadUrl) {
-          restoreLoadUrlMethods.push(() => {
-            if (target.loadURL === guardedLoadUrl) target.loadURL = originalLoadUrl;
-          });
-        }
-      } catch (error) {
-        recordCodeyPatchFailure("avatar_overlay_lifecycle_install", error, {
-          method: "loadURL",
-        });
-      }
-    };
-
-    try { webContents.on?.("will-navigate", onNavigation); } catch {}
-    try { webContents.on?.("did-start-navigation", onNavigation); } catch {}
-    try { webContents.once?.("destroyed", cleanup); } catch {}
-    try { window.once?.("closed", cleanup); } catch {}
-    installLoadUrlGuard(window);
-    installLoadUrlGuard(webContents);
-    try { destroyForRoute(webContents.getURL?.()); } catch {}
-  };
   Module._load = function codeyStartupPatchLoader(request, parent, isMain) {
     if (disableMicro && request === "@worklouder/device-kit-oai") return microStub;
-    if (
-      disablePet &&
-      typeof request === "string" &&
-      /(?:^|[/\\])avatar(?:-|_)overlay\.node$/i.test(request)
-    ) {
-      avatarOverlayBlockedNativeLoads += 1;
-      const error = new Error("Codex pet native module disabled by Codey");
-      error.code = "CODEY_PET_DISABLED";
-      throw error;
-    }
 
     const loaded = Reflect.apply(originalLoad, this, arguments);
     if (request !== "electron" || !loaded?.BrowserWindow) return loaded;
     if (electronProxy) return electronProxy;
 
-    const NativeBrowserWindow = loaded.BrowserWindow;
-    const CodeyPetBlockedBrowserWindow = new Proxy(NativeBrowserWindow, {
-      construct(target, argumentsList) {
-        const options = argumentsList[0] ?? {};
-        const title = typeof options.title === "string" ? options.title : "";
-        const preload = options.webPreferences?.preload;
-        const isPetSurface =
-          title.startsWith("Pet Surface ") ||
-          (typeof preload === "string" &&
-            /avatar-overlay-composition-surface-preload\.js$/i.test(preload));
-        const isPetOverlay =
-          options.width === 356 &&
-          options.height === 320 &&
-          options.alwaysOnTop === true &&
-          options.transparent === true &&
-          options.focusable === false &&
-          options.show === false &&
-          options.frame === false &&
-          options.skipTaskbar === true;
-        if (disablePet && (isPetSurface || isPetOverlay)) {
-          avatarOverlayBlockedWindowCreations += 1;
-          const error = new Error("Codex pet window disabled by Codey");
-          error.code = "CODEY_PET_DISABLED";
-          throw error;
-        }
-        const isVoiceWindow =
-          options.appearance === "globalDictation" || /^Dictation$/i.test(title);
-        if (disableVoice && isVoiceWindow) {
-          const error = new Error("Codex voice window disabled by Codey");
-          error.code = "CODEY_VOICE_DISABLED";
-          throw error;
-        }
-        const window = Reflect.construct(target, argumentsList, target);
-        guardAvatarOverlayLifecycle(window);
-        return window;
-      },
-      get(target, property) {
-        if (property === "__codeyPetBlocked") return disablePet;
-        if (property === "__codeyVoiceBlocked") return disableVoice;
-        const value = Reflect.get(target, property, target);
-        return typeof value === "function" ? value.bind(target) : value;
-      },
-    });
     if (loaded.protocol) {
       electronProtocolProxy = new Proxy(loaded.protocol, {
         get(target, property, receiver) {
@@ -1673,7 +1406,6 @@
     }
     electronProxy = new Proxy(loaded, {
       get(target, property, receiver) {
-        if (property === "BrowserWindow") return CodeyPetBlockedBrowserWindow;
         if (property === "protocol" && electronProtocolProxy) return electronProtocolProxy;
         return Reflect.get(target, property, receiver);
       },
@@ -1684,45 +1416,8 @@
     disableWindowsOptimizations,
     disableMicro,
     disablePet,
-    disableVoice,
     fastCodexStartup,
     statsigBootstrapTimeoutMs,
-    get petHardDisablePhase() {
-      return petHardDisableStatus.phase;
-    },
-    get petHardDisableMessage() {
-      return petHardDisableStatus.message;
-    },
-    get petManagerSourceRemoved() {
-      return (
-        petHardDisableStatus.phase === "removed" &&
-        globalThis.__CODEY_PET_MANAGER_SOURCE_REMOVED__ === true
-      );
-    },
-    get avatarOverlayBlockedWindowCreations() {
-      return avatarOverlayBlockedWindowCreations;
-    },
-    get avatarOverlayBlockedNativeLoads() {
-      return avatarOverlayBlockedNativeLoads;
-    },
-    get avatarOverlayGuardedWindowsObserved() {
-      return avatarOverlayGuardedWindowsObserved;
-    },
-    get avatarOverlayActiveGuards() {
-      return avatarOverlayActiveGuards;
-    },
-    get avatarOverlayUrlMatches() {
-      return avatarOverlayUrlMatches;
-    },
-    get avatarOverlayDestroyedWindows() {
-      return avatarOverlayDestroyedWindows;
-    },
-    get avatarOverlayDestroyErrors() {
-      return avatarOverlayDestroyErrors;
-    },
-    get avatarOverlayLastRoute() {
-      return avatarOverlayLastRoute;
-    },
     disableAppServerAnalytics: true,
     get disableDesktopCesAnalytics() {
       return !hasOptionalMainBundlePatchFailure("desktopCesAnalytics");
@@ -1749,10 +1444,8 @@
     destroyTemporaryWebViews: true,
     disableWindowsWmiSampler,
   });
-  if (!disablePet) {
-    setImmediate(() => {
-      try { process.getBuiltinModule("inspector").close(); } catch {}
-    });
-  }
+  setImmediate(() => {
+    try { process.getBuiltinModule("inspector").close(); } catch {}
+  });
   return "codey-startup-patch-installed-v20";
 })()

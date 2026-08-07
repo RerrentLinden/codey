@@ -243,30 +243,8 @@ function FeaturePolicyCardComponent({
             <div className="feature-card-body">
               <small>
                 {config.slimCodexPet
-                  ? "已停止宠物窗口和相关运行时模块"
+                  ? "已收起宠物并精简宠物入口与设置资源"
                   : "保留 Codex 宠物的完整功能"}
-              </small>
-            </div>
-          </div>
-
-          <div
-            className={`feature-card ${config.slimCodexVoice ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <strong>精简 Codex 语音模块</strong>
-              <Switch
-                checked={config.slimCodexVoice}
-                onCheckedChange={(checked) =>
-                  onConfigChange({ ...config, slimCodexVoice: checked })
-                }
-                aria-label="精简 Codex 语音模块"
-              />
-            </div>
-            <div className="feature-card-body">
-              <small>
-                {config.slimCodexVoice
-                  ? "已停止听写、GPT Voice、快捷键与音频初始化"
-                  : "保留 Codex 语音的完整功能"}
               </small>
             </div>
           </div>

@@ -12,7 +12,6 @@ async function loadPatchExpression() {
   assert.ok(template, "startup patch template should be readable by the regression test");
   return template
     .replaceAll("__DISABLE_PET__", "false")
-    .replaceAll("__DISABLE_VOICE__", "false")
     .replaceAll("__FAST_CODEX_STARTUP__", "true");
 }
 

@@ -101,8 +101,6 @@ pub struct CodeyConfig {
     pub protect_crashpad_pending: bool,
     #[serde(default = "default_true")]
     pub slim_codex_pet: bool,
-    #[serde(default)]
-    pub slim_codex_voice: bool,
     /// Selects at most one Chromium GPU diagnostic argument for the next
     /// Codey-managed Codex launch. Disabled by default and ignored on macOS.
     #[serde(default)]
@@ -161,7 +159,6 @@ impl Default for CodeyConfig {
             disable_trace_log_writes: true,
             protect_crashpad_pending: true,
             slim_codex_pet: true,
-            slim_codex_voice: false,
             gpu_launch_mode: GpuLaunchMode::Off,
             fast_context_tools: false,
             fast_codex_startup: true,
@@ -579,28 +576,6 @@ mod tests {
         .normalize();
 
         assert!(!config.slim_codex_pet);
-    }
-
-    #[test]
-    fn voice_slim_mode_defaults_to_disabled_for_existing_configs() {
-        assert!(!CodeyConfig::default().slim_codex_voice);
-
-        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
-            .unwrap()
-            .normalize();
-
-        assert!(!config.slim_codex_voice);
-    }
-
-    #[test]
-    fn voice_slim_mode_can_be_enabled_explicitly() {
-        let config = serde_json::from_str::<CodeyConfig>(
-            r#"{"activeProfileId":"","profiles":[],"slimCodexVoice":true}"#,
-        )
-        .unwrap()
-        .normalize();
-
-        assert!(config.slim_codex_voice);
     }
 
     #[test]

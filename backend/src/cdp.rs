@@ -27,8 +27,6 @@ const RENDERER_INJECT_SCRIPT: &str = include_str!("../../dist-overlay/inject/ren
 const CODEY_SESSION_TOOLS_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-inject.js");
 const PET_CONTROL_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/pet-control-shield.js");
-const VOICE_CONTROL_SHIELD_SCRIPT: &str =
-    include_str!("../../dist-overlay/inject/voice-control-shield.js");
 const SECURITY_WARNING_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/security-warning-shield.js");
 const SETTINGS_OVERLAY_SCRIPT: &str = include_str!("../../dist-overlay/codey-overlay.js");
@@ -130,7 +128,6 @@ impl InjectedTarget {
 pub fn prepare_injection_scripts(
     fast_codex_startup: bool,
     slim_codex_pet: bool,
-    slim_codex_voice: bool,
     hide_full_access_warning: bool,
     user_scripts: &[String],
 ) -> PreparedInjectionScripts {
@@ -209,23 +206,6 @@ pub fn prepare_injection_scripts(
             ),
         ),
         (
-            "voice-control-shield",
-            "语音控制精简",
-            VOICE_CONTROL_SHIELD_SCRIPT,
-            if slim_codex_voice {
-                r#"window.__codeyVoiceControlShield?.enabled === true
-                  && typeof window.__codeyVoiceControlShield?.block === "function"
-                  && window.__codeyVoiceControlShield.resourceGuardsInstalled >= 2
-                  ? "语音 UI 与资源拦截已启用" : """#
-                    .to_string()
-            } else {
-                r#"window.__codeyVoiceControlShield?.enabled === false
-                  && typeof window.__codeyVoiceControlShield?.block === "function"
-                  ? "控制器已就绪，当前精简策略关闭" : """#
-                    .to_string()
-            },
-        ),
-        (
             "security-warning-shield",
             "安全提示控制",
             SECURITY_WARNING_SHIELD_SCRIPT,
@@ -285,7 +265,6 @@ pub fn prepare_injection_scripts(
             + MODEL_WHITELIST_INJECT_SCRIPT.len()
             + RENDERER_INJECT_SCRIPT.len()
             + PET_CONTROL_SHIELD_SCRIPT.len()
-            + VOICE_CONTROL_SHIELD_SCRIPT.len()
             + SECURITY_WARNING_SHIELD_SCRIPT.len()
             + PLUGIN_MARKETPLACE_FIX_SCRIPT.len()
             + 4096,
@@ -298,7 +277,7 @@ pub fn prepare_injection_scripts(
             source: "builtin",
             probe: Some(probe),
         };
-        let prepared = prepare_script(script, fast_codex_startup, slim_codex_pet, slim_codex_voice);
+        let prepared = prepare_script(script, fast_codex_startup, slim_codex_pet);
         append_guarded_script(&mut core_bundle, &descriptor, prepared.as_ref());
         descriptors.push(descriptor);
     }
@@ -327,16 +306,10 @@ pub fn prepare_injection_scripts(
     }
 }
 
-fn prepare_script(
-    script: &str,
-    fast_codex_startup: bool,
-    slim_codex_pet: bool,
-    slim_codex_voice: bool,
-) -> Cow<'_, str> {
+fn prepare_script(script: &str, fast_codex_startup: bool, slim_codex_pet: bool) -> Cow<'_, str> {
     if !script.contains("__CODEY_FAST_CODEX_STARTUP__")
         && !script.contains("__CODEY_STATSIG_TIMEOUT_MS__")
         && !script.contains("__CODEY_SLIM_PET__")
-        && !script.contains("__CODEY_SLIM_VOICE__")
     {
         return Cow::Borrowed(script);
     }
@@ -353,10 +326,6 @@ fn prepare_script(
             .replace(
                 "__CODEY_SLIM_PET__",
                 if slim_codex_pet { "true" } else { "false" },
-            )
-            .replace(
-                "__CODEY_SLIM_VOICE__",
-                if slim_codex_voice { "true" } else { "false" },
             ),
     )
 }
@@ -1195,19 +1164,9 @@ mod tests {
     }
 
     #[test]
-    fn voice_control_shield_receives_the_launch_setting() {
-        let enabled = VOICE_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_VOICE__", "true");
-        let disabled = VOICE_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_VOICE__", "false");
-
-        assert!(enabled.contains(r#"["true"][0]==="true""#));
-        assert!(disabled.contains(r#"["false"][0]==="true""#));
-    }
-
-    #[test]
     fn core_scripts_share_one_cdp_document_script_and_user_scripts_stay_isolated() {
         let prepared = prepare_injection_scripts(
             true,
-            false,
             false,
             false,
             &["".to_string(), "window.userScriptRan = true;".to_string()],
@@ -1235,9 +1194,9 @@ mod tests {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 11);
-        assert_eq!(prepared.descriptors[10].id, "user-script-1");
-        assert_eq!(prepared.descriptors[10].source, "user");
+        assert_eq!(prepared.descriptors.len(), 10);
+        assert_eq!(prepared.descriptors[9].id, "user-script-1");
+        assert_eq!(prepared.descriptors[9].source, "user");
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
         assert!(snapshot_script.contains("Windows Git 请求限流已接管"));
@@ -1265,7 +1224,6 @@ mod tests {
     #[test]
     fn injection_statuses_preserve_script_order_and_report_missing_entries() {
         let prepared = prepare_injection_scripts(
-            false,
             false,
             false,
             false,

@@ -82,7 +82,6 @@ if (import.meta.env.DEV) {
       disableTraceLogWrites: true,
       protectCrashpadPending: true,
       slimCodexPet: true,
-      slimCodexVoice: false,
       gpuLaunchMode: "off" as const,
       fastContextTools: false,
       fastCodexStartup: true,
@@ -182,15 +181,6 @@ if (import.meta.env.DEV) {
               source: "builtin",
               status: "effective",
               detail: "宠物控制精简已启用",
-            },
-            {
-              id: "voice-control-shield",
-              name: "语音控制精简",
-              source: "builtin",
-              status: "effective",
-              detail: previewConfig.slimCodexVoice
-                ? "语音 UI 与资源拦截已启用"
-                : "控制器已就绪，当前精简策略关闭",
             },
             {
               id: "security-warning-shield",

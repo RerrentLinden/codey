@@ -188,11 +188,10 @@ function OperationsPanelComponent({
       {
         id: "opt-slim",
         icon: IconAdjustmentsHorizontal,
-        tooltip:
-          config.slimCodexPet || config.slimCodexVoice
-            ? `客户端精简：已开启${config.slimCodexPet ? "宠物" : ""}${config.slimCodexVoice ? "/语音" : ""}精简`
-            : "客户端精简：保留完整功能",
-        tone: config.slimCodexPet || config.slimCodexVoice ? "success" : "info",
+        tooltip: config.slimCodexPet
+          ? "客户端精简：已开启宠物精简"
+          : "客户端精简：保留完整宠物功能",
+        tone: config.slimCodexPet ? "success" : "info",
       },
       {
         id: "opt-patch",
@@ -224,7 +223,6 @@ function OperationsPanelComponent({
     [
       config.fastContextTools,
       config.slimCodexPet,
-      config.slimCodexVoice,
       effectiveScriptCount,
       failedInjectionScriptCount,
       injectionError,

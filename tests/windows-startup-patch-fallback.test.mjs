@@ -23,7 +23,7 @@ async function loadWindowsStartupSource() {
   return { cleanup, windowsSpawn };
 }
 
-test("Windows pet slim mode degrades to compatible startup after safely cleaning its paused process", async () => {
+test("Windows startup patch failure cleans the paused process before compatible restart", async () => {
   const { cleanup, windowsSpawn } = await loadWindowsStartupSource();
   const cleanupCall = windowsSpawn.indexOf(
     "stop_windows_spawned_codex(&mut spawned, app_dir).await",
@@ -34,24 +34,13 @@ test("Windows pet slim mode degrades to compatible startup after safely cleaning
 
   assert.ok(cleanupCall >= 0);
   assert.ok(compatibleRestart > cleanupCall);
-  assert.doesNotMatch(windowsSpawn, /宠物精简依赖启动硬补丁/);
-  assert.doesNotMatch(windowsSpawn, /未以兼容模式重启/);
+  assert.match(windowsSpawn, /fallback\.performance_status = "degraded"/);
   assert.match(
     windowsSpawn,
-    /if patch_options\.disable_pet \{[\s\S]*宠物精简启动补丁未能确认生效/,
+    /启动补丁未能安装，已自动以兼容模式启动；启动优化将在下次启动时重试/,
   );
-  assert.match(windowsSpawn, /fallback\.performance_status = "degraded"/);
-  assert.match(windowsSpawn, /本次宠物精简失败，可能存在额外 Renderer/);
-  assert.match(windowsSpawn, /"petSlimRequested": patch_options\.disable_pet/);
+  assert.doesNotMatch(windowsSpawn, /宠物精简启动补丁未能确认生效/);
+  assert.doesNotMatch(windowsSpawn, /petSlimRequested/);
   assert.match(cleanup, /terminate_windows_codex_processes\(app_dir, process_id\)\.await/);
   assert.match(cleanup, /-> Result<\(\)>/);
-});
-
-test("Windows keeps generic degraded detail when pet slim mode is not required", async () => {
-  const { windowsSpawn } = await loadWindowsStartupSource();
-
-  assert.match(windowsSpawn, /if patch_options\.disable_pet/);
-  assert.match(windowsSpawn, /spawn_windows_codex\(app_dir, debug_port, &runtime_arguments\)\.await/);
-  assert.match(windowsSpawn, /fallback\.performance_status = "degraded"/);
-  assert.match(windowsSpawn, /启动补丁未能确认生效，已自动以兼容模式启动/);
 });
