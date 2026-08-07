@@ -76,6 +76,20 @@ test("startup patch preserves native child processes and ordinary BrowserWindows
 
     const electron = Module._load("electron", undefined, false);
     assert.ok(new electron.BrowserWindow({ title: "Settings" }) instanceof FakeBrowserWindow);
+    const nativeAvatarManagerSource = [
+      "class AvatarOverlayManager{",
+      "async prewarm(e){",
+      "if(this.window!=null||this.openingWindowPromise!=null||this.isAppQuitting)return;",
+      "let t=this.windowVisibilitySequence,n=await this.ensureWindow(t);",
+      "n==null||t!==this.windowVisibilitySequence}",
+      "}",
+    ].join("");
+    assert.equal(
+      globalThis.__CODEY_PATCH_CODEX_AVATAR_OVERLAY_PREWARM__(
+        nativeAvatarManagerSource,
+      ),
+      nativeAvatarManagerSource,
+    );
   } finally {
     Module._load = nativeLoad;
     Module._extensions[".js"] = nativeJsExtension;

@@ -243,7 +243,7 @@ function FeaturePolicyCardComponent({
             <div className="feature-card-body">
               <small>
                 {config.slimCodexPet
-                  ? "已收起宠物并精简宠物入口与设置资源"
+                  ? "已收起宠物并取消隐藏窗口预热；语音功能仍按需启用"
                   : "保留 Codex 宠物的完整功能"}
               </small>
             </div>

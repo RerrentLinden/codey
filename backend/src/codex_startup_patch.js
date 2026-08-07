@@ -911,6 +911,36 @@
     },
   );
 
+  // Codex prewarms the shared avatar/voice overlay at startup by creating a
+  // hidden BrowserWindow. In slim-pet mode the pet entry points are already
+  // unavailable, so keep the manager and voice path intact but make prewarm a
+  // no-op. Voice can still create the overlay on demand through the manager's
+  // regular presentation path.
+  const patchCodexAvatarOverlayPrewarm = (source) => {
+    if (!disablePet) return source;
+    let count = 0;
+    const patched = source.replace(
+      /async prewarm\(([$A-Z_a-z][$\w]*)\)\{if\(this\.window!=null\|\|this\.openingWindowPromise!=null\|\|this\.isAppQuitting\)return;let ([$A-Z_a-z][$\w]*)=this\.windowVisibilitySequence,([$A-Z_a-z][$\w]*)=await this\.ensureWindow\(\2\);/g,
+      (match) => {
+        count += 1;
+        return match.replace("{", "{return;");
+      },
+    );
+    if (count !== 1) {
+      throw new Error(`Codey avatar overlay prewarm matches ${count}`);
+    }
+    return patched;
+  };
+  Object.defineProperty(
+    globalThis,
+    "__CODEY_PATCH_CODEX_AVATAR_OVERLAY_PREWARM__",
+    {
+      configurable: false,
+      value: patchCodexAvatarOverlayPrewarm,
+      writable: false,
+    },
+  );
+
   const workerThreads = process.getBuiltinModule("worker_threads");
   const NativeWorker = workerThreads.Worker;
   if (!NativeWorker.__codeyNoInspectWrapper) {
@@ -1286,9 +1316,9 @@
   );
 
   // Install the main-bundle lifecycle and telemetry patches before V8 compiles
-  // the monolithic bundle. Pet slimming deliberately stays renderer-only here:
-  // the avatar overlay manager and native composition bridge are also used by
-  // the official voice controller in current Codex builds.
+  // the monolithic bundle. Slim-pet mode skips only the eager hidden overlay
+  // prewarm; the manager and native composition bridge stay available for
+  // explicit voice use.
   {
     const originalJsExtension = Module._extensions[".js"];
     Module._extensions[".js"] = function codeyMainBundleCompileHook(module, filename) {
@@ -1316,6 +1346,13 @@
         patchCodexMainAppStateHeartbeat,
         source,
       );
+      if (disablePet) {
+        source = applyOptionalMainBundlePatch(
+          "avatarOverlayPrewarm",
+          patchCodexAvatarOverlayPrewarm,
+          source,
+        );
+      }
       const presentationCall = source.match(
         /case`checkout-webview-presentation-changed`:([$A-Z_a-z][$\w]*)\(([$A-Z_a-z][$\w]*),([$A-Z_a-z][$\w]*)\);break/,
       );

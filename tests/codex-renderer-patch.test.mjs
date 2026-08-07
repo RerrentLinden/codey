@@ -159,6 +159,39 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     assert.deepEqual(routeWindow.webContents.loadedUrls, [
       "app://-/index.html?initialRoute=%2Favatar-overlay",
     ]);
+    const nativeAvatarManagerSource = [
+      "const avatarStateKey=`electron-avatar-overlay-open`;",
+      "class AvatarOverlayManager{",
+      "constructor(){this.window=null;this.openingWindowPromise=null;",
+      "this.isAppQuitting=false;this.windowVisibilitySequence=1;",
+      "this.ensureWindowCalls=0;",
+      "this.compositionHost={tuck(){}}}",
+      "async ensureWindow(){this.ensureWindowCalls+=1;return {}}",
+      "positionWindow(){}",
+      "async prewarm(e){",
+      "if(this.window!=null||this.openingWindowPromise!=null||this.isAppQuitting)return;",
+      "let t=this.windowVisibilitySequence,n=await this.ensureWindow(t);",
+      "n==null||t!==this.windowVisibilitySequence||",
+      "(this.compositionHost.tuck(),this.positionWindow(n,e))}",
+      "async prepareRealtimePresentation(){return this.ensureWindow()}",
+      "}",
+    ].join("");
+    const patchedAvatarManagerSource =
+      globalThis.__CODEY_PATCH_CODEX_AVATAR_OVERLAY_PREWARM__(
+        nativeAvatarManagerSource,
+      );
+    assert.match(
+      patchedAvatarManagerSource,
+      /async prewarm\(e\)\{return;if\(this\.window!=null/,
+    );
+    const AvatarOverlayManager = Function(
+      `${patchedAvatarManagerSource};return AvatarOverlayManager`,
+    )();
+    const avatarOverlayManager = new AvatarOverlayManager();
+    await avatarOverlayManager.prewarm({ x: 0, y: 0 });
+    assert.equal(avatarOverlayManager.ensureWindowCalls, 0);
+    await avatarOverlayManager.prepareRealtimePresentation();
+    assert.equal(avatarOverlayManager.ensureWindowCalls, 1);
     assert.equal(globalThis.__CODEY_CODEX_STARTUP_PATCH__.disablePet, true);
     assert.equal(
       Object.hasOwn(globalThis.__CODEY_CODEX_STARTUP_PATCH__, "petManagerSourceRemoved"),

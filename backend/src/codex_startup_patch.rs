@@ -248,7 +248,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_expression_keeps_pet_slimming_renderer_only() {
+    fn patch_expression_keeps_pet_slimming_voice_compatible() {
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
             fast_codex_startup: true,
@@ -262,6 +262,8 @@ mod tests {
         assert!(expression.contains("const disableMicro = disableWindowsOptimizations"));
         assert!(expression.contains("patchCodexRendererResponse"));
         assert!(expression.contains("pet settings avatar resources"));
+        assert!(expression.contains("avatarOverlayPrewarm"));
+        assert!(expression.contains("__CODEY_PATCH_CODEX_AVATAR_OVERLAY_PREWARM__"));
         assert!(expression.contains("restoreNativeModelAndSpeedControls: true"));
         assert!(!expression.contains("CodeyPetBlockedBrowserWindow"));
         assert!(!expression.contains("__CODEY_DISABLED_PET_MANAGER__"));
