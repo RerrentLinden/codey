@@ -20,6 +20,36 @@ use crate::codex_config::codex_home;
 use crate::error_log;
 use crate::launcher::{CodeyRuntime, restore_previous_runtime_state, restore_runtime_config};
 
+pub(crate) const CC_SWITCH_ROUTE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+pub(crate) const CC_SWITCH_ROUTE_RECOVERY_STABLE_READS: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RestartTrigger {
+    Manual,
+    RouteChange,
+}
+
+pub(crate) fn is_cc_switch_route_recovery_error(error: &str) -> bool {
+    error.contains("CC Switch") || error.contains("Codex Live")
+}
+
+fn observe_route_recovery_readiness(ready_streak: &mut u8, ready: bool) -> bool {
+    if ready {
+        *ready_streak = ready_streak.saturating_add(1);
+    } else {
+        *ready_streak = 0;
+    }
+    *ready_streak >= CC_SWITCH_ROUTE_RECOVERY_STABLE_READS
+}
+
+pub(crate) async fn cc_switch_route_ready_for_recovery() -> bool {
+    let home = codex_home();
+    matches!(
+        tokio::task::spawn_blocking(move || crate::cc_switch::startup_route_state(&home)).await,
+        Ok(Ok(route)) if !route.takeover.managed || route.takeover.live
+    )
+}
+
 pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
     let runtime = state.runtime.lock().await.clone();
     // 先在无锁状态取运行时模型基线，再持配置读锁做同步比较：读守卫跨
@@ -157,7 +187,9 @@ fn spawn_route_change_restart(state: Arc<AppState>, route_changed: oneshot::Rece
             return;
         }
         eprintln!("检测到 CC Switch Live 路由变化，正在安全重启 Codex");
-        if let Err(error) = schedule_restart_codey_runtime(&state).await {
+        if let Err(error) =
+            schedule_restart_codey_runtime_with_trigger(&state, RestartTrigger::RouteChange).await
+        {
             error_log::record_failure(
                 "runtime_restart_failed",
                 "restart_after_cc_switch_route_change",
@@ -256,6 +288,7 @@ pub async fn launch_codey_runtime(state: &Arc<AppState>) -> Result<Value, String
     let result = launch_codey_inner(state).await;
     *state.startup_error.write().await = result.as_ref().err().cloned();
     if let Err(error) = &result {
+        let waiting_for_route_recovery = is_cc_switch_route_recovery_error(error);
         error_log::record_failure_with_metadata(
             "runtime_start_failed",
             "launch_codey_runtime",
@@ -267,10 +300,11 @@ pub async fn launch_codey_runtime(state: &Arc<AppState>) -> Result<Value, String
                 ),
                 attempts: Some(1),
                 timeout_ms: None,
-                recoverable: Some(false),
+                recoverable: Some(waiting_for_route_recovery),
             },
             json!({
                 "restart": false,
+                "waitingForRouteRecovery": waiting_for_route_recovery,
             }),
         );
     }
@@ -278,6 +312,13 @@ pub async fn launch_codey_runtime(state: &Arc<AppState>) -> Result<Value, String
 }
 
 pub async fn schedule_restart_codey_runtime(state: &Arc<AppState>) -> Result<Value, String> {
+    schedule_restart_codey_runtime_with_trigger(state, RestartTrigger::Manual).await
+}
+
+async fn schedule_restart_codey_runtime_with_trigger(
+    state: &Arc<AppState>,
+    trigger: RestartTrigger,
+) -> Result<Value, String> {
     let mut restart_task = state.restart_task.lock().await;
     ensure_runtime_can_start(state)?;
     if state.restart_in_progress.swap(true, Ordering::AcqRel) {
@@ -290,14 +331,38 @@ pub async fn schedule_restart_codey_runtime(state: &Arc<AppState>) -> Result<Val
         let _restart_guard = RestartInProgressGuard {
             state: Arc::clone(&restart_state),
         };
-        run_scheduled_restart(restart_state, cancel_rx).await;
+        run_scheduled_restart(restart_state, cancel_rx, trigger).await;
     });
     *restart_task = Some(ScheduledRestart { cancel, task });
 
     Ok(json!({"status":"restarting"}))
 }
 
-async fn run_scheduled_restart(restart_state: Arc<AppState>, mut cancel: oneshot::Receiver<()>) {
+async fn wait_for_cc_switch_route_recovery(
+    state: &AppState,
+    cancel: &mut oneshot::Receiver<()>,
+) -> bool {
+    let mut ready_streak = 0;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(CC_SWITCH_ROUTE_RECOVERY_INTERVAL) => {}
+            _ = &mut *cancel => return false,
+        }
+        if state.is_shutting_down() {
+            return false;
+        }
+        let ready = cc_switch_route_ready_for_recovery().await;
+        if observe_route_recovery_readiness(&mut ready_streak, ready) {
+            return true;
+        }
+    }
+}
+
+async fn run_scheduled_restart(
+    restart_state: Arc<AppState>,
+    mut cancel: oneshot::Receiver<()>,
+    trigger: RestartTrigger,
+) {
     tokio::select! {
         // The request originates inside the Codex renderer. Let the bridge
         // deliver its response before stopping the renderer that owns it.
@@ -333,17 +398,31 @@ async fn run_scheduled_restart(restart_state: Arc<AppState>, mut cancel: oneshot
         return;
     }
 
-    let launch = launch_codey_inner_locked(&restart_state).await;
-    *restart_state.startup_error.write().await = launch.as_ref().err().cloned();
-    if let Err(error) = launch {
+    loop {
+        let launch = launch_codey_inner_locked(&restart_state).await;
+        *restart_state.startup_error.write().await = launch.as_ref().err().cloned();
+        let Err(error) = launch else {
+            return;
+        };
         error_log::record_failure(
             "runtime_restart_failed",
             "launch_runtime_after_restart",
             error.clone(),
-            json!({}),
+            json!({
+                "routeChange": trigger == RestartTrigger::RouteChange,
+                "waitingForRouteRecovery": is_cc_switch_route_recovery_error(&error),
+            }),
         );
         eprintln!("Codey 自动重启 Codex 失败：{error}");
-        restart_state.request_shutdown();
+        if !is_cc_switch_route_recovery_error(&error) {
+            restart_state.request_shutdown();
+            return;
+        }
+        eprintln!("CC Switch 路由尚未稳定；Codey 将保持运行并等待路由恢复");
+        if !wait_for_cc_switch_route_recovery(&restart_state, &mut cancel).await {
+            return;
+        }
+        eprintln!("CC Switch 路由已稳定，正在重新启动 Codex");
     }
 }
 
@@ -385,4 +464,36 @@ pub async fn begin_shutdown(state: &Arc<AppState>) {
         }
     }
     state.restart_in_progress.store(false, Ordering::Release);
+}
+
+#[cfg(test)]
+mod route_recovery_tests {
+    use super::{
+        CC_SWITCH_ROUTE_RECOVERY_STABLE_READS, is_cc_switch_route_recovery_error,
+        observe_route_recovery_readiness,
+    };
+
+    #[test]
+    fn classifies_cc_switch_route_startup_errors_as_recoverable() {
+        assert!(is_cc_switch_route_recovery_error(
+            "检测到 CC Switch 已开启 Codex 路由，但当前 Live 配置未处于接管状态"
+        ));
+        assert!(is_cc_switch_route_recovery_error(
+            "解析 Codex Live 配置失败"
+        ));
+        assert!(!is_cc_switch_route_recovery_error(
+            "连接 Codex Renderer 失败"
+        ));
+    }
+
+    #[test]
+    fn route_recovery_requires_consecutive_ready_observations() {
+        let mut ready_streak = 0;
+        for _ in 1..CC_SWITCH_ROUTE_RECOVERY_STABLE_READS {
+            assert!(!observe_route_recovery_readiness(&mut ready_streak, true));
+        }
+        assert!(observe_route_recovery_readiness(&mut ready_streak, true));
+        assert!(!observe_route_recovery_readiness(&mut ready_streak, false));
+        assert_eq!(ready_streak, 0);
+    }
 }

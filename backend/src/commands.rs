@@ -36,6 +36,10 @@ pub use models::{
     sync_current_provider_command, test_current_provider,
 };
 use runtime::refresh_injection_status;
+pub(crate) use runtime::{
+    CC_SWITCH_ROUTE_RECOVERY_INTERVAL, CC_SWITCH_ROUTE_RECOVERY_STABLE_READS,
+    cc_switch_route_ready_for_recovery, is_cc_switch_route_recovery_error,
+};
 #[cfg(test)]
 use runtime::{begin_shutdown, launch_codey_inner};
 pub use runtime::{

@@ -22,20 +22,29 @@ test("Windows builds Codey as a GUI process without a console window", async () 
   assert.doesNotMatch(manifest, /Win32_System_Console|Win32_UI_WindowsAndMessaging/);
 });
 
-test("Windows startup failures are visible and terminate the background process", async () => {
+test("Windows keeps route transitions resident but shows fatal startup failures", async () => {
   const library = normalizeLineEndings(
     await readFile(new URL("../backend/src/lib.rs", import.meta.url), "utf8"),
   );
-  const failureStart = library.indexOf(
-    "if let Err(error) = commands::launch_codey_runtime(&state).await",
+  const failureStart = library.indexOf("let shutdown_reason = 'runtime: loop");
+  const fatalCleanup = library.indexOf(
+    "let cleanup = stop_runtime_with_retry(&state).await;",
+    failureStart,
   );
-  const shutdownWait = library.indexOf("let shutdown_reason = tokio::select!");
+  const shutdownCleanup = library.indexOf(
+    "let cleanup = stop_runtime_with_retry(&state).await;",
+    fatalCleanup + 1,
+  );
 
   assert.notEqual(failureStart, -1);
-  assert.notEqual(shutdownWait, -1);
-  assert.ok(failureStart < shutdownWait);
+  assert.notEqual(fatalCleanup, -1);
+  assert.notEqual(shutdownCleanup, -1);
 
-  const failureBranch = library.slice(failureStart, shutdownWait);
+  const failureBranch = library.slice(failureStart, shutdownCleanup);
+  assert.match(failureBranch, /commands::launch_codey_runtime\(&state\)\.await/);
+  assert.match(failureBranch, /is_cc_switch_route_recovery_error\(&error\)/);
+  assert.match(failureBranch, /cc_switch_route_ready_for_recovery\(\)\.await/);
+  assert.match(failureBranch, /CC_SWITCH_ROUTE_RECOVERY_STABLE_READS/);
   assert.match(failureBranch, /stop_runtime_with_retry\(&state\)\.await/);
   assert.match(failureBranch, /show_initial_startup_failure\(&error\)\.await/);
   assert.match(failureBranch, /return Err\(/);

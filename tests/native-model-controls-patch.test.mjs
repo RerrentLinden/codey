@@ -699,6 +699,12 @@ test("starting or restarting Codex replaces the old runtime with one managed by 
   assert.match(restartFlow, /restart_task/);
   assert.match(restartFlow, /oneshot::channel\(\)/);
   assert.match(restartFlow, /is_shutting_down\(\)/);
+  assert.match(restartFlow, /RestartTrigger::RouteChange/);
+  assert.match(restartFlow, /wait_for_cc_switch_route_recovery/);
+  assert.match(
+    restartFlow,
+    /if !is_cc_switch_route_recovery_error\(&error\) \{[\s\S]*?request_shutdown\(\)/,
+  );
   assert.match(
     runtimeSource,
     /pub async fn begin_shutdown[\s\S]*?cancel\.send\(\(\)\)[\s\S]*?task\.await/,

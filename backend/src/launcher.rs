@@ -99,23 +99,6 @@ struct SessionMaintenanceSummary {
     ghost_tasks_pruned: usize,
 }
 
-fn mark_pet_slim_startup_failure(
-    statuses: Arc<[cdp::InjectionScriptStatus]>,
-    detail: &str,
-) -> Arc<[cdp::InjectionScriptStatus]> {
-    let mut statuses = statuses.as_ref().to_vec();
-    let Some(pet_status) = statuses
-        .iter_mut()
-        .find(|status| status.id == "pet-control-shield")
-    else {
-        return Arc::from(statuses);
-    };
-    pet_status.status = "failed".to_string();
-    pet_status.detail = None;
-    pet_status.error = Some(detail.to_string());
-    Arc::from(statuses)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeModelConfig {
     selected_models: Vec<String>,
@@ -1299,7 +1282,6 @@ async fn spawn_and_inject_runtime(
         &storage.app_dir,
         patch.debug_port,
         config.slim_codex_pet,
-        config.slim_codex_voice,
         config.fast_codex_startup,
         config.gpu_launch_mode,
     )
@@ -1414,11 +1396,7 @@ impl CodeyRuntime {
         &self,
         statuses: Arc<[cdp::InjectionScriptStatus]>,
     ) -> Arc<[cdp::InjectionScriptStatus]> {
-        if self.applied_config.slim_codex_pet && self.maintenance.performance_status == "degraded" {
-            mark_pet_slim_startup_failure(statuses, &self.maintenance.performance_detail)
-        } else {
-            statuses
-        }
+        statuses
     }
 
     pub async fn refresh_injection_statuses(&self) -> Arc<[cdp::InjectionScriptStatus]> {
@@ -1447,7 +1425,6 @@ impl CodeyRuntime {
         let injection_scripts = cdp::prepare_injection_scripts(
             config.fast_codex_startup,
             config.slim_codex_pet,
-            config.slim_codex_voice,
             config.hide_full_access_warning,
             &config.user_scripts,
         );
@@ -2056,40 +2033,6 @@ mod maintenance_status_tests {
                 .contains("修复 3 个")
         );
     }
-
-    #[test]
-    fn pet_slim_startup_failure_overrides_the_renderer_only_probe() {
-        let statuses: Arc<[cdp::InjectionScriptStatus]> = Arc::from(vec![
-            cdp::InjectionScriptStatus {
-                id: "pet-control-shield".to_string(),
-                name: "宠物控制精简".to_string(),
-                source: "builtin".to_string(),
-                status: "effective".to_string(),
-                detail: Some("宠物控制精简已启用".to_string()),
-                error: None,
-            },
-            cdp::InjectionScriptStatus {
-                id: "bridge-helpers".to_string(),
-                name: "桥接辅助".to_string(),
-                source: "builtin".to_string(),
-                status: "effective".to_string(),
-                detail: Some("桥接函数可调用".to_string()),
-                error: None,
-            },
-        ]);
-
-        let statuses =
-            mark_pet_slim_startup_failure(statuses, "宠物精简启动补丁未能确认生效，已使用兼容模式");
-
-        assert_eq!(statuses[0].status, "failed");
-        assert_eq!(statuses[0].detail, None);
-        assert_eq!(
-            statuses[0].error.as_deref(),
-            Some("宠物精简启动补丁未能确认生效，已使用兼容模式")
-        );
-        assert_eq!(statuses[1].status, "effective");
-        assert_eq!(statuses[1].error, None);
-    }
 }
 
 pub async fn restore_previous_runtime_state(home: &std::path::Path) -> Result<()> {
@@ -2309,18 +2252,16 @@ async fn spawn_codex(
     app_dir: &std::path::Path,
     debug_port: u16,
     disable_codex_pet: bool,
-    disable_codex_voice: bool,
     fast_codex_startup: bool,
     gpu_launch_mode: GpuLaunchMode,
 ) -> Result<SpawnedCodex> {
     #[cfg(any(windows, target_os = "macos"))]
     let patch_options = crate::codex_startup_patch::PatchOptions {
         disable_pet: disable_codex_pet,
-        disable_voice: disable_codex_voice,
         fast_codex_startup,
     };
     #[cfg(not(any(windows, target_os = "macos")))]
-    let _ = fast_codex_startup;
+    let _ = (disable_codex_pet, fast_codex_startup);
     let runtime_arguments = codex_runtime_arguments(gpu_launch_mode, !cfg!(target_os = "macos"));
 
     #[cfg(windows)]
@@ -2359,7 +2300,6 @@ async fn spawn_codex(
                         "inspectorPort": inspector_port,
                         "processId": spawned.process_id,
                         "disablePet": patch_options.disable_pet,
-                        "disableVoice": patch_options.disable_voice,
                         "fastCodexStartup": patch_options.fast_codex_startup,
                     }),
                 );
@@ -2372,13 +2312,9 @@ async fn spawn_codex(
                 match spawn_windows_codex(app_dir, debug_port, &runtime_arguments).await {
                     Ok(mut fallback) => {
                         fallback.performance_status = "degraded".to_string();
-                        fallback.performance_detail = if patch_options.disable_pet {
-                            "宠物精简启动补丁未能确认生效，已自动以兼容模式启动；本次宠物精简失败，可能存在额外 Renderer，下次启动将自动重试"
-                                .to_string()
-                        } else {
+                        fallback.performance_detail =
                             "启动补丁未能安装，已自动以兼容模式启动；启动优化将在下次启动时重试"
-                                .to_string()
-                        };
+                                .to_string();
                         error_log::record_failure(
                             "patch_degraded",
                             "restart_without_startup_patch",
@@ -2386,7 +2322,6 @@ async fn spawn_codex(
                             serde_json::json!({
                                 "platform": "windows",
                                 "processId": fallback.process_id,
-                                "petSlimRequested": patch_options.disable_pet,
                             }),
                         );
                         Ok(fallback)
@@ -2441,7 +2376,6 @@ async fn spawn_codex(
                         "processId": spawned.process_id,
                         "processGroupId": spawned.process_group_id,
                         "disablePet": patch_options.disable_pet,
-                        "disableVoice": patch_options.disable_voice,
                         "fastCodexStartup": patch_options.fast_codex_startup,
                     }),
                 );
@@ -2468,7 +2402,7 @@ async fn spawn_codex(
                 if let Some(child) = spawned.child.take() {
                     reap_child_after_cleanup(child, "reap_child_after_startup_patch_failure").await;
                 }
-                Err(error).context("Codex 启动硬补丁未能安装；已停止 Codex，未降级为仅隐藏 UI")
+                Err(error).context("Codex 启动补丁未能安装；已停止 Codex")
             }
         }
     }
@@ -2478,13 +2412,7 @@ async fn spawn_codex(
         let command = build_codex_command(app_dir, debug_port, &runtime_arguments);
         let mut spawned = spawn_command(command)?;
         spawned.performance_status = "ready".to_string();
-        spawned.performance_detail = if disable_codex_pet {
-            "当前平台不支持宠物硬屏蔽启动补丁".to_string()
-        } else if disable_codex_voice {
-            "当前平台不支持语音硬屏蔽启动补丁".to_string()
-        } else {
-            "当前平台无需 macOS / Windows 启动补丁".to_string()
-        };
+        spawned.performance_detail = "当前平台无需 macOS / Windows 启动补丁".to_string();
         Ok(spawned)
     }
 }
