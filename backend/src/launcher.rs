@@ -20,7 +20,7 @@ use tokio::process::Child;
 #[cfg(not(windows))]
 use tokio::process::Command;
 use tokio::sync::{Mutex, RwLock, oneshot};
-use toml_edit::{DocumentMut, Item};
+use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::cc_switch::{self, RouteTakeoverState};
 use crate::cdp;
@@ -47,6 +47,7 @@ use platform::*;
 const CDP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const CDP_WATCHDOG_FAILURE_THRESHOLD: u8 = 2;
 const ROUTE_OVERLAY_WATCH_INTERVAL: Duration = Duration::from_secs(1);
+const ROUTE_OVERLAY_STABLE_READS: u8 = 2;
 pub const CODEX_APP_NOT_FOUND_ERROR: &str = "找不到 Codex App，请在 Codey 配置中填写路径";
 pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效或指向了 Codex CLI；请选择 Codex 桌面 App，不要选择 codex.exe 命令行程序";
 const DISABLE_GPU_ARGUMENT: &str = "--disable-gpu";
@@ -1683,7 +1684,8 @@ fn spawn_route_overlay_watcher(
         let mut interval = tokio::time::interval(ROUTE_OVERLAY_WATCH_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
-        let mut pending_external: Option<RouteFilesSnapshot> = None;
+        let mut pending_external: Option<RouteChangeFingerprint> = None;
+        let mut missing_config_streak = 0_u8;
         let mut route_changed_tx = Some(route_changed_tx);
 
         loop {
@@ -1693,12 +1695,22 @@ fn spawn_route_overlay_watcher(
                 _ = interval.tick() => {}
             }
             let current = match read_route_files(&home).await {
-                Ok(Some(current)) => current,
+                Ok(Some(current)) => {
+                    missing_config_streak = 0;
+                    current
+                }
                 Ok(None) => {
                     pending_external = None;
-                    continue;
+                    if !observe_missing_route_config(&mut missing_config_streak) {
+                        continue;
+                    }
+                    if let Some(sender) = route_changed_tx.take() {
+                        let _ = sender.send(());
+                    }
+                    break;
                 }
                 Err(error) => {
+                    missing_config_streak = 0;
                     error_log::record_failure_async(
                         "route_overlay_watch_failed",
                         "read_cc_switch_live_route",
@@ -1715,8 +1727,9 @@ fn spawn_route_overlay_watcher(
                 pending_external = None;
                 continue;
             }
-            if pending_external.as_ref() != Some(&current) {
-                pending_external = Some(current);
+            let current_fingerprint = route_change_fingerprint(&current);
+            if pending_external.as_ref() != Some(&current_fingerprint) {
+                pending_external = Some(current_fingerprint);
                 continue;
             }
 
@@ -1727,6 +1740,11 @@ fn spawn_route_overlay_watcher(
         }
     });
     (shutdown_tx, task, route_changed_rx)
+}
+
+fn observe_missing_route_config(missing_streak: &mut u8) -> bool {
+    *missing_streak = missing_streak.saturating_add(1);
+    *missing_streak >= ROUTE_OVERLAY_STABLE_READS
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1750,30 +1768,45 @@ async fn read_route_files(home: &std::path::Path) -> std::io::Result<Option<Rout
 }
 
 fn route_files_changed(applied: &RouteFilesSnapshot, current: &RouteFilesSnapshot) -> bool {
-    route_config_changed(&applied.config, &current.config)
-        || route_auth_changed(applied.auth.as_deref(), current.auth.as_deref())
+    route_change_fingerprint(applied) != route_change_fingerprint(current)
+}
+
+fn route_change_fingerprint(snapshot: &RouteFilesSnapshot) -> RouteChangeFingerprint {
+    match (
+        route_config_signature(&snapshot.config),
+        route_auth_signature(snapshot.auth.as_deref()),
+    ) {
+        (Some(config), Some(auth)) => RouteChangeFingerprint::Semantic(RouteFilesSignature {
+            provider_id: config.provider_id,
+            base_url: config.base_url.clone(),
+            wire_api: config.wire_api,
+            api_key: config.api_key.or(auth.api_key.clone()),
+            auth_uses_proxy_route: auth.api_key.as_deref() == Some("PROXY_MANAGED"),
+            official_auth_mode: route_base_url_is_official(&config.base_url)
+                .then_some(auth.auth_mode.as_deref() == Some("chatgpt")),
+        }),
+        _ => RouteChangeFingerprint::Raw(snapshot.clone()),
+    }
+}
+
+#[cfg(test)]
+fn route_config_changed(applied: &[u8], current: &[u8]) -> bool {
+    match (
+        route_config_signature(applied),
+        route_config_signature(current),
+    ) {
+        (Some(applied), Some(current)) => applied != current,
+        _ => applied != current,
+    }
 }
 
 /// The overlay watcher must restart Codex only when the user actually switches
 /// the CC Switch route, not when Codex rewrites `config.toml` while starting
 /// up. Newer Codex builds normalise that file on launch (whitespace, field
 /// order, default values), so a byte-level comparison treats the self-rewrite
-/// as a route switch and restarts Codex in a loop. Compare only the fields that
-/// identify a route — the active `model_provider` and its endpoint — and fall
-/// back to raw bytes when either side cannot be parsed, so a genuine change is
-/// never hidden by a parse failure.
-fn route_config_changed(applied: &[u8], current: &[u8]) -> bool {
-    match (
-        route_config_signature(applied),
-        route_config_signature(current),
-    ) {
-        (Some(applied_sig), Some(current_sig)) => applied_sig != current_sig,
-        // Unparseable on either side: keep the conservative raw-byte behaviour
-        // so a malformed rewrite is still detected instead of silently ignored.
-        _ => applied != current,
-    }
-}
-
+/// as a route switch and restarts Codex in a loop. Compare only the active
+/// provider, canonical endpoint, effective wire protocol, and route credential.
+/// Unparseable snapshots fall back to raw bytes so malformed writes stay visible.
 fn route_config_signature(config: &[u8]) -> Option<RouteConfigSignature> {
     let text = std::str::from_utf8(config).ok()?;
     let document = DocumentMut::from_str(text).ok()?;
@@ -1786,51 +1819,119 @@ fn route_config_signature(config: &[u8]) -> Option<RouteConfigSignature> {
         .get("model_providers")
         .and_then(Item::as_table_like)
         .and_then(|providers| providers.get(provider_id))
-        .and_then(Item::as_table_like);
+        .and_then(Item::as_table_like)?;
     let base_url = provider
-        .and_then(|provider| provider.get("base_url"))
+        .get("base_url")
         .and_then(Item::as_str)
         .map(str::trim)
-        .unwrap_or_default();
+        .filter(|value| !value.is_empty())?
+        .trim_end_matches('/');
     let wire_api = provider
-        .and_then(|provider| provider.get("wire_api"))
+        .get("wire_api")
         .and_then(Item::as_str)
         .map(str::trim)
-        .unwrap_or_default();
+        .filter(|value| !value.is_empty())
+        .unwrap_or("responses");
+    let wire_api = if wire_api.eq_ignore_ascii_case("responses") {
+        "responses".to_string()
+    } else if wire_api.to_ascii_lowercase().contains("chat") {
+        "chat".to_string()
+    } else {
+        wire_api.to_ascii_lowercase()
+    };
     Some(RouteConfigSignature {
         provider_id: provider_id.to_owned(),
         base_url: base_url.to_owned(),
-        wire_api: wire_api.to_owned(),
+        wire_api,
+        api_key: route_config_api_key(&document, provider),
     })
 }
 
-#[derive(PartialEq, Eq)]
+fn route_config_api_key(document: &DocumentMut, provider: &dyn TableLike) -> Option<String> {
+    const PROVIDER_KEYS: &[&str] = &[
+        "experimental_bearer_token",
+        "api_key",
+        "apikey",
+        "bearer_token",
+        "token",
+    ];
+    PROVIDER_KEYS
+        .iter()
+        .find_map(|key| provider.get(key).and_then(Item::as_str))
+        .or_else(|| {
+            document
+                .get("experimental_bearer_token")
+                .and_then(Item::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct RouteConfigSignature {
     provider_id: String,
     base_url: String,
     wire_api: String,
+    api_key: Option<String>,
 }
 
-/// Parse `auth.json` before comparing so key order and whitespace do not look
-/// like a credential change. A real change (a different API key) still produces
-/// a different JSON value and restarts Codex. Fall back to raw bytes when
-/// either side is not valid JSON.
+fn route_base_url_is_official(base_url: &str) -> bool {
+    let base_url = base_url.to_ascii_lowercase();
+    base_url.contains("chatgpt.com/backend-api/codex") || base_url.contains("api.openai.com")
+}
+
+/// Only fields consumed by Live route resolution belong in the route signature.
+/// ChatGPT token refreshes and unrelated account metadata must not restart Codex.
+fn route_auth_signature(auth: Option<&[u8]>) -> Option<RouteAuthSignature> {
+    let Some(auth) = auth else {
+        return Some(RouteAuthSignature::default());
+    };
+    let auth: serde_json::Value = serde_json::from_slice(auth).ok()?;
+    if !auth.is_object() {
+        return None;
+    }
+    let auth_mode = auth
+        .get("auth_mode")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    let api_key = auth
+        .get("OPENAI_API_KEY")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    Some(RouteAuthSignature { auth_mode, api_key })
+}
+
+#[cfg(test)]
 fn route_auth_changed(applied: Option<&[u8]>, current: Option<&[u8]>) -> bool {
-    match (applied, current) {
-        (None, None) => false,
-        (Some(applied), Some(current)) => {
-            match (auth_signature(applied), auth_signature(current)) {
-                (Some(applied_sig), Some(current_sig)) => applied_sig != current_sig,
-                _ => applied != current,
-            }
-        }
-        // Auth appeared or disappeared: treat as a route change.
-        _ => true,
+    match (route_auth_signature(applied), route_auth_signature(current)) {
+        (Some(applied), Some(current)) => applied != current,
+        _ => applied != current,
     }
 }
 
-fn auth_signature(auth: &[u8]) -> Option<serde_json::Value> {
-    serde_json::from_slice(auth).ok()
+#[derive(Clone, Default, PartialEq, Eq)]
+struct RouteAuthSignature {
+    auth_mode: Option<String>,
+    api_key: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct RouteFilesSignature {
+    provider_id: String,
+    base_url: String,
+    wire_api: String,
+    api_key: Option<String>,
+    auth_uses_proxy_route: bool,
+    official_auth_mode: Option<bool>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum RouteChangeFingerprint {
+    Semantic(RouteFilesSignature),
+    Raw(RouteFilesSnapshot),
 }
 
 fn watchdog_should_reinject(consecutive_failures: &mut u8, healthy: bool) -> bool {
@@ -1950,14 +2051,13 @@ wire_api = \"responses\"\n"
                 .to_vec(),
             auth: Some(br#"{"OPENAI_API_KEY":"sk-custom"}"#.to_vec()),
         };
-        // Codex rewrote config.toml on startup — reordered the provider table,
-        // added a default field, changed whitespace — but the route (provider +
-        // endpoint + protocol) is unchanged. This must NOT restart Codex.
+        // Codex rewrote config.toml on startup: reordered the provider table,
+        // added a default field, removed the default `wire_api = "responses"`,
+        // and added a trailing slash. The effective route is unchanged.
         let normalized = RouteFilesSnapshot {
             config: b"model_provider = \"custom\"\n\n\
 [model_providers.custom]\n\
-wire_api = \"responses\"\n\
-base_url = \"https://api.example.com/v1\"\n\
+base_url = \"https://api.example.com/v1/\"\n\
 name = \"custom\"\n\
 env_key = \"OPENAI_API_KEY\"\n"
                 .to_vec(),
@@ -1972,15 +2072,145 @@ wire_api = \"responses\"\n"
                 .to_vec(),
             auth: applied.auth.clone(),
         };
-        // Reformatting auth.json (whitespace / key order) is also not a switch.
+        // Reformatting auth.json and refreshing unrelated ChatGPT account tokens
+        // must not restart a third-party route.
         let reformatted_auth = RouteFilesSnapshot {
             config: applied.config.clone(),
-            auth: Some(b"{\n  \"OPENAI_API_KEY\": \"sk-custom\"\n}\n".to_vec()),
+            auth: Some(
+                b"{\n  \"tokens\": {\"access_token\": \"refreshed\"},\n  \
+\"OPENAI_API_KEY\": \"sk-custom\",\n  \"account_id\": \"account-b\"\n}\n"
+                    .to_vec(),
+            ),
+        };
+        let rerouted_format_variant = RouteFilesSnapshot {
+            config: b"model_provider=\"custom\"\n\
+[model_providers.custom]\n\
+wire_api=\"RESPONSES\"\n\
+base_url=\"https://api.other.com/v1/\"\n"
+                .to_vec(),
+            auth: applied.auth.clone(),
         };
 
         assert!(!route_files_changed(&applied, &normalized));
         assert!(!route_files_changed(&applied, &reformatted_auth));
         assert!(route_files_changed(&applied, &rerouted));
+        assert!(!route_config_changed(&applied.config, &normalized.config));
+        assert!(!route_auth_changed(
+            applied.auth.as_deref(),
+            reformatted_auth.auth.as_deref()
+        ));
+        assert!(
+            route_change_fingerprint(&rerouted)
+                == route_change_fingerprint(&rerouted_format_variant)
+        );
+    }
+
+    #[test]
+    fn route_watcher_restarts_for_effective_credential_changes() {
+        let config_with_key = |key: &str| {
+            format!(
+                "model_provider = \"custom\"\n\
+[model_providers.custom]\n\
+base_url = \"https://api.example.com/v1\"\n\
+wire_api = \"responses\"\n\
+experimental_bearer_token = \"{key}\"\n"
+            )
+            .into_bytes()
+        };
+        let applied = RouteFilesSnapshot {
+            config: config_with_key("sk-old"),
+            auth: Some(
+                br#"{"OPENAI_API_KEY":"PROXY_MANAGED","tokens":{"access_token":"old"}}"#.to_vec(),
+            ),
+        };
+        let rotated_config_key = RouteFilesSnapshot {
+            config: config_with_key("sk-new"),
+            auth: applied.auth.clone(),
+        };
+        let rotated_auth_marker = RouteFilesSnapshot {
+            config: applied.config.clone(),
+            auth: Some(br#"{"OPENAI_API_KEY":"sk-direct"}"#.to_vec()),
+        };
+        let refreshed_account_token = RouteFilesSnapshot {
+            config: applied.config.clone(),
+            auth: Some(
+                br#"{"OPENAI_API_KEY":"PROXY_MANAGED","tokens":{"access_token":"new"}}"#.to_vec(),
+            ),
+        };
+        let redundant_auth_key = RouteFilesSnapshot {
+            config: applied.config.clone(),
+            auth: Some(br#"{"OPENAI_API_KEY":"sk-unused"}"#.to_vec()),
+        };
+        let redundant_auth_key_rotated = RouteFilesSnapshot {
+            config: applied.config.clone(),
+            auth: Some(br#"{"OPENAI_API_KEY":"sk-still-unused"}"#.to_vec()),
+        };
+        let auth_fallback_old = RouteFilesSnapshot {
+            config: b"model_provider = \"custom\"\n\
+[model_providers.custom]\n\
+base_url = \"https://api.example.com/v1\"\n"
+                .to_vec(),
+            auth: Some(br#"{"OPENAI_API_KEY":"sk-old"}"#.to_vec()),
+        };
+        let auth_fallback_new = RouteFilesSnapshot {
+            config: auth_fallback_old.config.clone(),
+            auth: Some(br#"{"OPENAI_API_KEY":"sk-new"}"#.to_vec()),
+        };
+
+        assert!(route_files_changed(&applied, &rotated_config_key));
+        assert!(route_files_changed(&applied, &rotated_auth_marker));
+        assert!(!route_files_changed(&applied, &refreshed_account_token));
+        assert!(!route_files_changed(
+            &redundant_auth_key,
+            &redundant_auth_key_rotated
+        ));
+        assert!(route_files_changed(&auth_fallback_old, &auth_fallback_new));
+    }
+
+    #[test]
+    fn route_watcher_ignores_an_auth_file_without_route_fields() {
+        let config = b"model_provider = \"custom\"\n\
+[model_providers.custom]\n\
+base_url = \"https://api.example.com/v1\"\n\
+wire_api = \"responses\"\n\
+experimental_bearer_token = \"sk-custom\"\n"
+            .to_vec();
+        let without_auth = RouteFilesSnapshot {
+            config: config.clone(),
+            auth: None,
+        };
+        let account_only_auth = RouteFilesSnapshot {
+            config,
+            auth: Some(br#"{"tokens":{"access_token":"oauth"},"account_id":"account-a"}"#.to_vec()),
+        };
+
+        assert!(!route_files_changed(&without_auth, &account_only_auth));
+    }
+
+    #[test]
+    fn route_watcher_uses_raw_fallback_for_invalid_auth_shapes() {
+        let config = b"model_provider = \"custom\"\n\
+[model_providers.custom]\n\
+base_url = \"https://api.example.com/v1\"\n"
+            .to_vec();
+        let array_auth = RouteFilesSnapshot {
+            config: config.clone(),
+            auth: Some(br#"["not","an","auth-object"]"#.to_vec()),
+        };
+        let numeric_auth = RouteFilesSnapshot {
+            config,
+            auth: Some(b"42".to_vec()),
+        };
+
+        assert!(route_files_changed(&array_auth, &numeric_auth));
+    }
+
+    #[test]
+    fn route_watcher_requires_a_stably_missing_config() {
+        let mut missing_streak = 0;
+
+        assert!(!observe_missing_route_config(&mut missing_streak));
+        assert!(observe_missing_route_config(&mut missing_streak));
     }
 }
 
