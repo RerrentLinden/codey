@@ -372,10 +372,39 @@ fn effective_default_model(
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 pub fn is_available(home: &Path) -> bool {
     read_catalog_value(&home.join(relative_path())).is_some_and(|value| {
         let models = catalog_models_from_value(&value);
         runtime_compatible_models(&models)
+    })
+}
+
+pub fn is_available_for_runtime(home: &Path, codex_runtime_version: Option<&str>) -> bool {
+    read_catalog_value(&home.join(relative_path())).is_some_and(|value| {
+        let models = catalog_models_from_value(&value);
+        runtime_compatible_models(&models)
+            && catalog_matches_runtime_subagent_compatibility(&models, codex_runtime_version)
+    })
+}
+
+fn catalog_matches_runtime_subagent_compatibility(
+    models: &[Value],
+    codex_runtime_version: Option<&str>,
+) -> bool {
+    if !legacy_v2_catalog_compatibility_required(codex_runtime_version) {
+        return true;
+    }
+    models.iter().all(|model| {
+        if model.get("visibility").and_then(Value::as_str) == Some("list")
+            && model_is_subagent_eligible(model)
+        {
+            return model
+                .get("multi_agent_version")
+                .and_then(Value::as_str)
+                .is_some_and(|version| version.trim().eq_ignore_ascii_case("v2"));
+        }
+        true
     })
 }
 
@@ -1373,6 +1402,41 @@ mod tests {
         .unwrap();
 
         assert!(!is_available(home.path()));
+    }
+
+    #[test]
+    fn legacy_runtime_rejects_a_previous_catalog_without_v2_markers() {
+        let home = tempfile::tempdir().unwrap();
+        let mut catalog = official_cache();
+        for model in catalog["models"].as_array_mut().unwrap() {
+            model.as_object_mut().unwrap().remove("multi_agent_version");
+        }
+        let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+
+        assert!(is_available(home.path()));
+        assert!(!is_available_for_runtime(
+            home.path(),
+            Some("0.147.0-alpha.6.5")
+        ));
+        assert!(is_available_for_runtime(
+            home.path(),
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION)
+        ));
+    }
+
+    #[test]
+    fn legacy_runtime_accepts_a_previous_catalog_with_v2_markers() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+
+        refresh_for_provider(home.path(), true, None, &[], Some("0.147.0-alpha.6.5")).unwrap();
+
+        assert!(is_available_for_runtime(
+            home.path(),
+            Some("0.147.0-alpha.6.5")
+        ));
     }
 
     #[test]

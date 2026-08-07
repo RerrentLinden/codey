@@ -897,31 +897,45 @@ fn refresh_model_catalog_for_provider_sync(config: &CodeyConfig) -> Result<bool,
 }
 
 fn refresh_model_catalog_or_fallback(config: &CodeyConfig) -> Result<bool, String> {
-    model_catalog_fallback(try_refresh_model_catalog(config))
+    let codex_runtime_version =
+        model_catalog::desktop_runtime_version(None, &config.codex_app_path);
+    let home = codex_home();
+    model_catalog_fallback(
+        try_refresh_model_catalog(config, codex_runtime_version.as_deref()),
+        &home,
+        codex_runtime_version.as_deref(),
+    )
 }
 
-fn model_catalog_fallback(result: anyhow::Result<()>) -> Result<bool, String> {
+fn model_catalog_fallback(
+    result: anyhow::Result<()>,
+    home: &std::path::Path,
+    codex_runtime_version: Option<&str>,
+) -> Result<bool, String> {
     match result {
         Ok(()) => Ok(false),
-        Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => Ok(true),
+        Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => Ok(
+            !model_catalog::is_available_for_runtime(home, codex_runtime_version),
+        ),
         Err(error) => Err(error.to_string()),
     }
 }
 
-fn try_refresh_model_catalog(config: &CodeyConfig) -> anyhow::Result<()> {
+fn try_refresh_model_catalog(
+    config: &CodeyConfig,
+    codex_runtime_version: Option<&str>,
+) -> anyhow::Result<()> {
     let official = config
         .profiles
         .iter()
         .find(|profile| profile.id == config.active_profile_id)
         .is_none_or(|profile| profile.cc_switch_read_only);
-    let codex_runtime_version =
-        model_catalog::desktop_runtime_version(None, &config.codex_app_path);
     model_catalog::refresh_for_provider(
         &codex_home(),
         official,
         config.upstream_models_snapshot(),
         config.selected_models(),
-        codex_runtime_version.as_deref(),
+        codex_runtime_version,
     )
     .map(|_| ())
 }
@@ -974,10 +988,11 @@ mod tests {
             model_catalog::refresh_for_provider(home.path(), false, Some(&[]), &[], None)
                 .unwrap_err();
 
-        assert!(model_catalog_fallback(Err(missing_cache)).unwrap());
-        assert!(!model_catalog_fallback(Ok(())).unwrap());
+        assert!(model_catalog_fallback(Err(missing_cache), home.path(), None).unwrap());
+        assert!(!model_catalog_fallback(Ok(()), home.path(), None).unwrap());
         assert_eq!(
-            model_catalog_fallback(Err(anyhow::anyhow!("模型目录写入失败"))).unwrap_err(),
+            model_catalog_fallback(Err(anyhow::anyhow!("模型目录写入失败")), home.path(), None)
+                .unwrap_err(),
             "模型目录写入失败"
         );
     }

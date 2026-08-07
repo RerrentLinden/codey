@@ -401,7 +401,11 @@ async fn prepare_startup_model_catalog(
                 &selected_models,
                 codex_runtime_version.as_deref(),
             );
-            let catalog_available = refresh.is_err() && model_catalog::is_available(&catalog_home);
+            let catalog_available = refresh.is_err()
+                && model_catalog::is_available_for_runtime(
+                    &catalog_home,
+                    codex_runtime_version.as_deref(),
+                );
             let selection = model_catalog::selection_state_with_manual_models(
                 &catalog_home,
                 official_provider,
