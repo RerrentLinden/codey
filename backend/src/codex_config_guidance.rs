@@ -98,6 +98,69 @@ pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     LEGACY_CODEY_FASTCTX_GUIDANCE,
 ];
 
+const CODEY_FASTCTX_GUIDANCE_PREFIX: &str =
+    "Codey FastCtx context tools are enabled. Local files have exactly one read route: call `";
+const CODEY_FASTCTX_GUIDANCE_READ_SUFFIX: &str = "__read` directly, including when the input is a URI-shaped local reference. Set `file_path` to \
+a plain absolute filesystem path (never a URI); on Windows, convert the reference to a drive-letter \
+path such as `E:/repo/file.ts` before the call. For content search and file discovery, always use `";
+const CODEY_FASTCTX_GUIDANCE_GREP_SUFFIX: &str = "__grep` and `";
+const CODEY_FASTCTX_GUIDANCE_GLOB_SUFFIX: &str = "__glob` before exec or shell commands. Do not use \
+cat, sed, rg, grep, find, or recursive ls when a FastCtx tool covers the operation. Use exec only \
+for builds, tests, Git, package managers, or when the FastCtx tool is unavailable or fails. Use `";
+const CODEY_FASTCTX_GUIDANCE_REPLACE_SUFFIX: &str = "__replace` only for deterministic mechanical \
+replacements, and follow every Complete or Partial continuation exactly.";
+
+pub(crate) fn codey_fastctx_guidance_for_namespace(namespace: &str) -> String {
+    format!(
+        "{CODEY_FASTCTX_GUIDANCE_PREFIX}{namespace}{CODEY_FASTCTX_GUIDANCE_READ_SUFFIX}{namespace}{CODEY_FASTCTX_GUIDANCE_GREP_SUFFIX}{namespace}{CODEY_FASTCTX_GUIDANCE_GLOB_SUFFIX}{namespace}{CODEY_FASTCTX_GUIDANCE_REPLACE_SUFFIX}"
+    )
+}
+
+pub(crate) fn default_agent_config_with_fastctx_guidance(namespace: Option<&str>) -> String {
+    let Some(namespace) = namespace else {
+        return DEFAULT_AGENT_CONFIG.to_string();
+    };
+    let guidance = codey_fastctx_guidance_for_namespace(namespace);
+    let marker = "\n\"\"\"\n\n[features]\n";
+    let replacement = format!("\n\n{guidance}\n\"\"\"\n\n[features]\n");
+    DEFAULT_AGENT_CONFIG.replacen(marker, &replacement, 1)
+}
+
+pub(crate) fn codey_fastctx_guidance_blocks(current: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    for guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
+        if current.contains(guidance) {
+            blocks.push((*guidance).to_string());
+        }
+    }
+
+    for (start, _) in current.match_indices(CODEY_FASTCTX_GUIDANCE_PREFIX) {
+        let Some(guidance) = dynamic_codey_fastctx_guidance_at(current, start) else {
+            continue;
+        };
+        if !blocks.iter().any(|block| block == &guidance) {
+            blocks.push(guidance);
+        }
+    }
+    blocks
+}
+
+fn dynamic_codey_fastctx_guidance_at(current: &str, start: usize) -> Option<String> {
+    let after_prefix = current.get(start + CODEY_FASTCTX_GUIDANCE_PREFIX.len()..)?;
+    let namespace_end = after_prefix.find(CODEY_FASTCTX_GUIDANCE_READ_SUFFIX)?;
+    let namespace = &after_prefix[..namespace_end];
+    if namespace.is_empty()
+        || namespace.contains('`')
+        || namespace.contains('\n')
+        || namespace.contains('\r')
+        || !namespace.starts_with("mcp__")
+    {
+        return None;
+    }
+    let guidance = codey_fastctx_guidance_for_namespace(namespace);
+    current[start..].starts_with(&guidance).then_some(guidance)
+}
+
 pub(crate) fn append_subagent_guidance(existing: &str) -> String {
     if existing.contains(SUBAGENT_GUIDANCE) {
         return existing.to_string();
@@ -129,8 +192,8 @@ pub(crate) fn remove_subagent_guidance(current: &str) -> Option<String> {
 pub(crate) fn remove_codey_fastctx_guidance(current: &str) -> Option<String> {
     let mut restored = current.to_string();
     let mut changed = false;
-    for &guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
-        while let Some(without_guidance) = remove_guidance_paragraph(&restored, guidance) {
+    for guidance in codey_fastctx_guidance_blocks(current) {
+        while let Some(without_guidance) = remove_guidance_paragraph(&restored, &guidance) {
             restored = without_guidance;
             changed = true;
         }
@@ -175,6 +238,10 @@ mod tests {
 
     #[test]
     fn fastctx_guidance_routes_uri_shaped_local_files_through_the_read_tool() {
+        assert_eq!(
+            codey_fastctx_guidance_for_namespace("mcp__codey_fastctx"),
+            CODEY_FASTCTX_GUIDANCE
+        );
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Local files have exactly one read route"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("`mcp__codey_fastctx__read` directly"));
         assert!(
@@ -188,15 +255,37 @@ mod tests {
     }
 
     #[test]
+    fn default_agent_config_can_include_the_fastctx_namespace_guidance() {
+        let config = default_agent_config_with_fastctx_guidance(Some("mcp__fastctx"));
+
+        assert!(config.contains("`mcp__fastctx__read` directly"));
+        assert!(!config.contains("mcp__codey_fastctx"));
+        assert!(config.contains("[features]"));
+        assert!(config.ends_with("image_generation = false\n"));
+    }
+
+    #[test]
     fn fastctx_guidance_cleanup_removes_every_codey_owned_version() {
+        let user_server_guidance = codey_fastctx_guidance_for_namespace("mcp__fastctx");
         let configured = format!(
-            "User guidance.\n\n{}\n\nConcurrent guidance.",
-            CODEY_FASTCTX_GUIDANCE_VERSIONS.join("\n\n")
+            "User guidance.\n\n{}\n\n{user_server_guidance}\n\nConcurrent guidance.",
+            CODEY_FASTCTX_GUIDANCE_VERSIONS.join("\n\n"),
         );
 
         assert_eq!(
             remove_codey_fastctx_guidance(&configured).as_deref(),
             Some("User guidance.\n\nConcurrent guidance.")
+        );
+    }
+
+    #[test]
+    fn fastctx_guidance_blocks_detect_user_fastctx_namespaces() {
+        let user_server_guidance = codey_fastctx_guidance_for_namespace("mcp__context_tools");
+        let configured = format!("Prefix\n\n{user_server_guidance}\n\nSuffix");
+
+        assert_eq!(
+            codey_fastctx_guidance_blocks(&configured),
+            vec![user_server_guidance]
         );
     }
 }

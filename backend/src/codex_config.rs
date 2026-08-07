@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, DEFAULT_AGENT_CONFIG,
-    SUBAGENT_GUIDANCE, append_subagent_guidance, remove_codey_fastctx_guidance,
-    remove_subagent_guidance,
+    CODEY_FASTCTX_GUIDANCE_VERSIONS, SUBAGENT_GUIDANCE, append_subagent_guidance,
+    codey_fastctx_guidance_for_namespace, default_agent_config_with_fastctx_guidance,
+    remove_codey_fastctx_guidance, remove_subagent_guidance,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -300,6 +300,20 @@ fn apply_runtime_provider_config_at_mode(
         },
     )?;
     let applied_base_url = provider_base_url(&updated, &provider_id);
+    let updated_default_agent = if subagent_optimization {
+        let fastctx_namespace = if fastctx_command.is_some() {
+            let updated_document =
+                parse_document(&updated).context("解析已应用 Codex 临时配置失败")?;
+            configured_fastctx_tool_namespace(&updated_document)
+        } else {
+            None
+        };
+        Some(default_agent_config_with_fastctx_guidance(
+            fastctx_namespace.as_deref(),
+        ))
+    } else {
+        None
+    };
     if let Err(error) =
         write_private_file(&backup_dir.join(APPLIED_CONFIG_FILE), updated.as_bytes())
     {
@@ -323,7 +337,10 @@ fn apply_runtime_provider_config_at_mode(
         )?;
         write_private_file(
             &backup_dir.join(APPLIED_DEFAULT_AGENT_FILE),
-            DEFAULT_AGENT_CONFIG.as_bytes(),
+            updated_default_agent
+                .as_deref()
+                .expect("default agent config was prepared")
+                .as_bytes(),
         )?;
     }
     let state = RuntimeConfigLease {
@@ -352,7 +369,13 @@ fn apply_runtime_provider_config_at_mode(
         if let Some(updated_agents_md) = updated_agents_md.as_deref() {
             atomic_write(&agents_md_path, updated_agents_md.as_bytes())?;
             create_private_dir_all(&agents_dir)?;
-            atomic_write(&default_agent_path, DEFAULT_AGENT_CONFIG.as_bytes())?;
+            atomic_write(
+                &default_agent_path,
+                updated_default_agent
+                    .as_deref()
+                    .expect("default agent config was prepared")
+                    .as_bytes(),
+            )?;
         }
         Ok(())
     })();
@@ -1262,7 +1285,9 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()
         .and_then(|servers| servers.get(CODEY_FASTCTX_SERVER_ID))
         .and_then(Item::as_table)
         .is_some_and(legacy_fastctx_server_is_codey_owned);
-    if has_configured_fastctx_server(doc) && !codey_owned_server {
+    if let Some(namespace) = configured_fastctx_tool_namespace(doc).filter(|_| !codey_owned_server)
+    {
+        apply_fastctx_guidance(doc, &namespace)?;
         return Ok(());
     }
 
@@ -1316,6 +1341,12 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()
     if doc.get("tool_output_token_limit").is_none() {
         doc["tool_output_token_limit"] = value(10_000);
     }
+    apply_fastctx_guidance(doc, CODEY_FASTCTX_NAMESPACE)?;
+    Ok(())
+}
+
+fn apply_fastctx_guidance(doc: &mut DocumentMut, namespace: &str) -> Result<()> {
+    let desired_guidance = codey_fastctx_guidance_for_namespace(namespace);
     let existing_guidance = doc
         .get("developer_instructions")
         .map(|item| {
@@ -1330,14 +1361,14 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()
         } else {
             (existing_guidance.to_string(), false)
         };
-    let fastctx_guidance_needs_append = !existing_guidance.contains(CODEY_FASTCTX_GUIDANCE);
+    let fastctx_guidance_needs_append = !existing_guidance.contains(&desired_guidance);
     if fastctx_guidance_was_cleaned || fastctx_guidance_needs_append {
         let guidance = if !fastctx_guidance_needs_append {
             existing_guidance
         } else if existing_guidance.trim().is_empty() {
-            CODEY_FASTCTX_GUIDANCE.to_string()
+            desired_guidance
         } else {
-            format!("{existing_guidance}\n\n{CODEY_FASTCTX_GUIDANCE}")
+            format!("{existing_guidance}\n\n{desired_guidance}")
         };
         doc["developer_instructions"] = value(guidance);
     }
@@ -1400,46 +1431,54 @@ fn disable_fast_context_tools(doc: &mut DocumentMut) {
     }
 }
 
-fn has_configured_fastctx_server(doc: &DocumentMut) -> bool {
+fn configured_fastctx_tool_namespace(doc: &DocumentMut) -> Option<String> {
+    configured_fastctx_server_id(doc).map(|server_id| format!("mcp__{server_id}"))
+}
+
+fn configured_fastctx_server_id(doc: &DocumentMut) -> Option<String> {
     let Some(mcp_servers) = doc.get("mcp_servers").and_then(Item::as_table) else {
-        return false;
+        return None;
     };
 
-    mcp_servers.iter().any(|(server_id, server)| {
-        mentions_fastctx(server_id)
-            || server.as_table().is_some_and(|server| {
-                server
+    mcp_servers.iter().find_map(|(server_id, server)| {
+        mcp_server_mentions_fastctx(server_id, server).then(|| server_id.to_string())
+    })
+}
+
+fn mcp_server_mentions_fastctx(server_id: &str, server: &Item) -> bool {
+    mentions_fastctx(server_id)
+        || server.as_table().is_some_and(|server| {
+            server
+                .get("command")
+                .and_then(Item::as_str)
+                .is_some_and(mentions_fastctx)
+                || server
+                    .get("args")
+                    .and_then(Item::as_array)
+                    .is_some_and(|arguments| {
+                        arguments
+                            .iter()
+                            .filter_map(toml_edit::Value::as_str)
+                            .any(mentions_fastctx)
+                    })
+        })
+        || matches!(
+            server,
+            Item::Value(Value::InlineTable(server))
+                if server
                     .get("command")
-                    .and_then(Item::as_str)
+                    .and_then(Value::as_str)
                     .is_some_and(mentions_fastctx)
                     || server
                         .get("args")
-                        .and_then(Item::as_array)
+                        .and_then(Value::as_array)
                         .is_some_and(|arguments| {
                             arguments
                                 .iter()
-                                .filter_map(toml_edit::Value::as_str)
+                                .filter_map(Value::as_str)
                                 .any(mentions_fastctx)
                         })
-            })
-            || matches!(
-                server,
-                Item::Value(Value::InlineTable(server))
-                    if server
-                        .get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(mentions_fastctx)
-                        || server
-                            .get("args")
-                            .and_then(Value::as_array)
-                            .is_some_and(|arguments| {
-                                arguments
-                                    .iter()
-                                    .filter_map(Value::as_str)
-                                    .any(mentions_fastctx)
-                            })
-            )
-    })
+        )
 }
 
 fn mentions_fastctx(value: &str) -> bool {
@@ -1724,6 +1763,7 @@ fn prune_stale_backup_dirs(backup_root: &Path, marker: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_config_guidance::{CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG};
 
     const GLOBAL_PROVIDER_ID: &str = "codey_global";
 
@@ -2208,8 +2248,16 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__fastctx"]
                 .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE))
         );
         let guidance = document["developer_instructions"].as_str().unwrap();
-        assert_eq!(guidance, "Keep my guidance.");
-        assert!(!guidance.contains(CODEY_FASTCTX_GUIDANCE));
+        assert_eq!(
+            guidance,
+            format!(
+                "Keep my guidance.\n\n{}",
+                codey_fastctx_guidance_for_namespace("mcp__fastctx")
+            )
+        );
+        assert!(guidance.contains("`mcp__fastctx__read` directly"));
+        assert!(!guidance.contains("mcp__codey_fastctx"));
+        assert!(!guidance.contains("resources/read"));
     }
 
     #[test]
@@ -2290,7 +2338,11 @@ args = ["fastctx", "--stdio"]
                 .get(CODEY_FASTCTX_SERVER_ID)
                 .is_none()
         );
-        assert!(document.get("developer_instructions").is_none());
+        let guidance = document["developer_instructions"].as_str().unwrap();
+        assert!(guidance.contains("`mcp__context_tools__read` directly"));
+        assert!(guidance.contains("`mcp__context_tools__grep`"));
+        assert!(!guidance.contains("mcp__codey_fastctx"));
+        assert!(!guidance.contains("resources/read"));
         assert!(document.get("tool_output_token_limit").is_none());
     }
 
@@ -2410,6 +2462,52 @@ direct_only_tool_namespaces = ["mcp__existing"]
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>(),
             vec!["mcp__existing"]
+        );
+    }
+
+    #[test]
+    fn disabling_fast_context_tools_removes_user_fastctx_guidance_only() {
+        let user_fastctx_guidance = codey_fastctx_guidance_for_namespace("mcp__fastctx");
+        let existing = format!(
+            r#"
+developer_instructions = "User guidance.\n\n{user_fastctx_guidance}"
+
+[mcp_servers.fastctx]
+command = "/custom/fastctx"
+args = ["serve"]
+
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__fastctx"]
+"#
+        );
+
+        let result = patch_config_with_fastctx(
+            &existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+
+        assert_eq!(
+            document["mcp_servers"]["fastctx"]["command"].as_str(),
+            Some("/custom/fastctx")
+        );
+        assert_eq!(
+            document["developer_instructions"].as_str(),
+            Some("User guidance.")
+        );
+        let namespaces = document["features"]["code_mode"]["direct_only_tool_namespaces"]
+            .as_array()
+            .unwrap();
+        assert!(
+            namespaces
+                .iter()
+                .any(|entry| entry.as_str() == Some("mcp__fastctx"))
         );
     }
 
@@ -2755,6 +2853,59 @@ custom_setting = "preserved"
             original_default_agent
         );
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn subagent_default_agent_uses_the_configured_fastctx_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        let original_config = r#"model_provider = "codey_global"
+
+[model_providers.codey_global]
+base_url = "https://chatgpt.com/backend-api/codex"
+
+[mcp_servers.fastctx]
+command = "/custom/fastctx"
+args = ["serve"]
+"#;
+        fs::write(home.join("config.toml"), original_config).unwrap();
+
+        apply_runtime_provider_config_at_mode(
+            &home,
+            &direct_profile(RelayProtocol::Responses),
+            GLOBAL_PROVIDER_ID,
+            ProviderApplyOptions {
+                fastctx_command: Some(Path::new("/tmp/codey-fastctx")),
+                subagent_optimization: true,
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
+        )
+        .unwrap();
+
+        let temporary_config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let document = temporary_config.parse::<DocumentMut>().unwrap();
+        assert!(
+            document["mcp_servers"]
+                .as_table()
+                .unwrap()
+                .get(CODEY_FASTCTX_SERVER_ID)
+                .is_none()
+        );
+        let default_agent = fs::read_to_string(home.join("agents/default.toml")).unwrap();
+        assert!(default_agent.contains("`mcp__fastctx__read` directly"));
+        assert!(default_agent.contains("`mcp__fastctx__grep`"));
+        assert!(!default_agent.contains("mcp__codey_fastctx"));
+        assert!(!default_agent.contains("resources/read"));
+
+        assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+        assert_eq!(
+            fs::read_to_string(home.join("config.toml")).unwrap(),
+            original_config
+        );
+        assert!(!home.join("agents/default.toml").exists());
     }
 
     #[test]
@@ -3773,6 +3924,27 @@ note = "user replacement"
         assert_eq!(
             restored["mcp_servers"][CODEY_FASTCTX_SERVER_ID]["note"].as_str(),
             Some("user replacement")
+        );
+    }
+
+    #[test]
+    fn restore_removes_dynamic_user_fastctx_guidance_after_concurrent_edits() {
+        let user_fastctx_guidance = codey_fastctx_guidance_for_namespace("mcp__fastctx");
+        let original = r#"developer_instructions = "User guidance""#;
+        let applied =
+            format!(r#"developer_instructions = "User guidance\n\n{user_fastctx_guidance}""#);
+        let current = format!(
+            r#"developer_instructions = "User guidance\n\n{user_fastctx_guidance}\n\nConcurrent guidance""#
+        );
+
+        let restored = restore_owned_config_changes(original, &applied, &current)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+
+        assert_eq!(
+            restored["developer_instructions"].as_str(),
+            Some("User guidance\n\nConcurrent guidance")
         );
     }
 

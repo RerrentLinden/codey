@@ -3,11 +3,8 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 use toml_edit::{Item, Table, Value, value};
 
-use super::{
-    CODEY_FASTCTX_GUIDANCE_VERSIONS, CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID,
-    document_string, parse_document,
-};
-use crate::codex_config_guidance::remove_owned_guidance_block;
+use super::{CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID, document_string, parse_document};
+use crate::codex_config_guidance::{codey_fastctx_guidance_blocks, remove_owned_guidance_block};
 
 pub(super) fn restore_owned_config_changes(
     original: &str,
@@ -140,17 +137,16 @@ fn restore_fastctx_owned_value(
             };
             let mut restored = text.to_string();
             let mut changed = false;
-            for &guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
-                let original_has_guidance = original
-                    .and_then(Item::as_str)
-                    .is_some_and(|text| text.contains(guidance));
-                let applied_has_guidance = applied
-                    .and_then(Item::as_str)
-                    .is_some_and(|text| text.contains(guidance));
-                if original_has_guidance || !applied_has_guidance {
+            let original_text = original.and_then(Item::as_str);
+            let applied_blocks = applied
+                .and_then(Item::as_str)
+                .map(codey_fastctx_guidance_blocks)
+                .unwrap_or_default();
+            for guidance in applied_blocks {
+                if original_text.is_some_and(|text| text.contains(&guidance)) {
                     continue;
                 }
-                while let Some(without_guidance) = remove_owned_guidance_block(&restored, guidance)
+                while let Some(without_guidance) = remove_owned_guidance_block(&restored, &guidance)
                 {
                     restored = without_guidance;
                     changed = true;
