@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -15,6 +16,7 @@ use codey_runtime_core::launcher::{
 use codey_runtime_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
 use serde::Serialize;
+use toml_edit::{DocumentMut, Item};
 use tokio::process::Child;
 #[cfg(not(windows))]
 use tokio::process::Command;
@@ -1771,7 +1773,85 @@ async fn read_route_files(home: &std::path::Path) -> std::io::Result<Option<Rout
 }
 
 fn route_files_changed(applied: &RouteFilesSnapshot, current: &RouteFilesSnapshot) -> bool {
-    applied != current
+    route_config_changed(&applied.config, &current.config)
+        || route_auth_changed(applied.auth.as_deref(), current.auth.as_deref())
+}
+
+/// The overlay watcher must restart Codex only when the user actually switches
+/// the CC Switch route, not when Codex rewrites `config.toml` while starting
+/// up. Newer Codex builds normalise that file on launch (whitespace, field
+/// order, default values), so a byte-level comparison treats the self-rewrite
+/// as a route switch and restarts Codex in a loop. Compare only the fields that
+/// identify a route — the active `model_provider` and its endpoint — and fall
+/// back to raw bytes when either side cannot be parsed, so a genuine change is
+/// never hidden by a parse failure.
+fn route_config_changed(applied: &[u8], current: &[u8]) -> bool {
+    match (
+        route_config_signature(applied),
+        route_config_signature(current),
+    ) {
+        (Some(applied_sig), Some(current_sig)) => applied_sig != current_sig,
+        // Unparseable on either side: keep the conservative raw-byte behaviour
+        // so a malformed rewrite is still detected instead of silently ignored.
+        _ => applied != current,
+    }
+}
+
+fn route_config_signature(config: &[u8]) -> Option<RouteConfigSignature> {
+    let text = std::str::from_utf8(config).ok()?;
+    let document = DocumentMut::from_str(text).ok()?;
+    let provider_id = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())?;
+    let provider = document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table_like);
+    let base_url = provider
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let wire_api = provider
+        .and_then(|provider| provider.get("wire_api"))
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    Some(RouteConfigSignature {
+        provider_id: provider_id.to_owned(),
+        base_url: base_url.to_owned(),
+        wire_api: wire_api.to_owned(),
+    })
+}
+
+#[derive(PartialEq, Eq)]
+struct RouteConfigSignature {
+    provider_id: String,
+    base_url: String,
+    wire_api: String,
+}
+
+/// Parse `auth.json` before comparing so key order and whitespace do not look
+/// like a credential change. A real change (a different API key) still produces
+/// a different JSON value and restarts Codex. Fall back to raw bytes when
+/// either side is not valid JSON.
+fn route_auth_changed(applied: Option<&[u8]>, current: Option<&[u8]>) -> bool {
+    match (applied, current) {
+        (None, None) => false,
+        (Some(applied), Some(current)) => match (auth_signature(applied), auth_signature(current)) {
+            (Some(applied_sig), Some(current_sig)) => applied_sig != current_sig,
+            _ => applied != current,
+        },
+        // Auth appeared or disappeared: treat as a route change.
+        _ => true,
+    }
+}
+
+fn auth_signature(auth: &[u8]) -> Option<serde_json::Value> {
+    serde_json::from_slice(auth).ok()
 }
 
 fn watchdog_should_reinject(consecutive_failures: &mut u8, healthy: bool) -> bool {
@@ -1877,6 +1957,51 @@ mod route_takeover_tests {
         assert!(!route_files_changed(&applied, &same));
         assert!(route_files_changed(&applied, &changed_config));
         assert!(route_files_changed(&applied, &changed_auth));
+    }
+
+    #[test]
+    fn route_watcher_ignores_codex_config_normalization() {
+        // Codey applies a compact route for provider "custom".
+        let applied = RouteFilesSnapshot {
+            config: b"model_provider = \"custom\"\n\
+[model_providers.custom]\n\
+name = \"custom\"\n\
+base_url = \"https://api.example.com/v1\"\n\
+wire_api = \"responses\"\n"
+                .to_vec(),
+            auth: Some(br#"{"OPENAI_API_KEY":"sk-custom"}"#.to_vec()),
+        };
+        // Codex rewrote config.toml on startup — reordered the provider table,
+        // added a default field, changed whitespace — but the route (provider +
+        // endpoint + protocol) is unchanged. This must NOT restart Codex.
+        let normalized = RouteFilesSnapshot {
+            config: b"model_provider = \"custom\"\n\n\
+[model_providers.custom]\n\
+wire_api = \"responses\"\n\
+base_url = \"https://api.example.com/v1\"\n\
+name = \"custom\"\n\
+env_key = \"OPENAI_API_KEY\"\n"
+                .to_vec(),
+            auth: applied.auth.clone(),
+        };
+        // A real route switch (different endpoint) still restarts Codex.
+        let rerouted = RouteFilesSnapshot {
+            config: b"model_provider = \"custom\"\n\
+[model_providers.custom]\n\
+base_url = \"https://api.other.com/v1\"\n\
+wire_api = \"responses\"\n"
+                .to_vec(),
+            auth: applied.auth.clone(),
+        };
+        // Reformatting auth.json (whitespace / key order) is also not a switch.
+        let reformatted_auth = RouteFilesSnapshot {
+            config: applied.config.clone(),
+            auth: Some(b"{\n  \"OPENAI_API_KEY\": \"sk-custom\"\n}\n".to_vec()),
+        };
+
+        assert!(!route_files_changed(&applied, &normalized));
+        assert!(!route_files_changed(&applied, &reformatted_auth));
+        assert!(route_files_changed(&applied, &rerouted));
     }
 }
 
