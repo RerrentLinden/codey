@@ -437,7 +437,7 @@ test("renders official account usage as a draggable floating card", async () => 
   assert.equal(remountedUsage.style.top, "430px");
 });
 
-test("marks the Codey button when a silent update check finds a new version", async () => {
+const createStartupUpdateFixture = (bridge) => {
   const visibleHeader = new FakeElement("header", { right: 1200 });
   const documentElement = new FakeElement("html");
   const elementsById = new Map();
@@ -468,27 +468,21 @@ test("marks the Codey button when a silent update check finds a new version", as
       };
       return element;
     },
-    getElementById: (id) =>
-      id === "codey-settings-button"
+    getElementById: (id) => {
+      const element = id === "codey-settings-button"
         ? visibleButton()
-        : elementsById.get(id) || null,
+        : elementsById.get(id);
+      return element?.isConnected ? element : null;
+    },
     querySelector: () => null,
     querySelectorAll: (selector) =>
       selector === "header" ? [visibleHeader] : [],
   };
   const window = {
-    __codexSessionDeleteBridge: async (path) => {
-      assert.equal(path, "/api/check_for_updates");
-      return {
-        currentVersion: "0.3.9",
-        latestVersion: "0.4.0",
-        updateAvailable: true,
-        selectedAsset: { fileName: "Codey-0.4.0.zip" },
-      };
-    },
+    __codexSessionDeleteBridge: bridge,
     addEventListener() {},
     alert() {
-      throw new Error("silent update check must not alert");
+      throw new Error("startup update check must use page UI, not alert");
     },
     clearTimeout(id) {
       const timer = timers.find((entry) => entry.id === id);
@@ -528,21 +522,114 @@ test("marks the Codey button when a silent update check finds a new version", as
     window,
   });
 
-  const initialTimer = activeTimers().find((timer) => timer.delay === 0);
+  return {
+    activeTimers,
+    document,
+    elementsById,
+    events,
+    timers,
+    window,
+  };
+};
+
+test("shows startup update progress and asks before installing a detected update", async () => {
+  const bridgeCalls = [];
+  const fixture = createStartupUpdateFixture(async (path, payload) => {
+    bridgeCalls.push({ path, payload });
+    if (path === "/api/check_for_updates") {
+      return {
+        currentVersion: "0.3.9",
+        latestVersion: "0.4.0",
+        updateAvailable: true,
+        selectedAsset: { fileName: "Codey-0.4.0.zip" },
+      };
+    }
+    if (path === "/api/download_update") {
+      return {
+        fileName: "Codey-0.4.0.zip",
+        filePath: "/tmp/codey-updates/Codey-0.4.0.zip",
+      };
+    }
+    if (path === "/api/install_downloaded_update") {
+      assert.equal(payload.filePath, "/tmp/codey-updates/Codey-0.4.0.zip");
+      return { status: "installing" };
+    }
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+
+  assert.ok(fixture.document.getElementById("codey-update-check-status"));
+  const initialTimer = fixture.activeTimers().find((timer) => timer.delay === 0);
   assert.equal(initialTimer?.delay, 0);
   initialTimer.cleared = true;
   initialTimer.callback();
   await new Promise((resolve) => setImmediate(resolve));
-  const button = visibleButton();
+
+  const button = fixture.document.getElementById("codey-settings-button");
   assert.ok(button);
   assert.equal(button.getAttribute("data-codey-update-available"), "true");
   assert.equal(button.getAttribute("aria-label"), "打开 Codey 配置，有可用更新");
-  assert.equal(window.__codeyUpdateAvailability.latestVersion, "0.4.0");
-  assert.equal(events.length, 1);
-  assert.equal(events[0].type, "codey-update-availability-changed");
+  assert.equal(fixture.window.__codeyUpdateAvailability.latestVersion, "0.4.0");
+  assert.equal(fixture.events.length, 1);
+  assert.equal(fixture.events[0].type, "codey-update-availability-changed");
+  assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
+  assert.match(
+    fixture.document.getElementById("codey-update-dialog-title").textContent,
+    /v0\.4\.0/,
+  );
+  assert.match(
+    fixture.document.getElementById("codey-update-dialog-description").textContent,
+    /下载、校验并安装更新/,
+  );
   assert.equal(
-    activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
+    fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
     false,
+  );
+
+  fixture.document
+    .getElementById("codey-update-dialog-confirm")
+    .dispatchEvent({ type: "click" });
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    bridgeCalls.map(({ path }) => path),
+    [
+      "/api/check_for_updates",
+      "/api/download_update",
+      "/api/install_downloaded_update",
+    ],
+  );
+  assert.match(
+    fixture.document.getElementById("codey-update-dialog-description").textContent,
+    /安装完成后将尝试启动新版/,
+  );
+});
+
+test("skips startup update flow after ten seconds when the update source hangs", async () => {
+  const fixture = createStartupUpdateFixture(
+    async () => new Promise(() => {}),
+  );
+
+  assert.ok(fixture.document.getElementById("codey-update-check-status"));
+  const initialTimer = fixture.activeTimers().find((timer) => timer.delay === 0);
+  assert.equal(initialTimer?.delay, 0);
+  initialTimer.cleared = true;
+  initialTimer.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const timeoutTimer = fixture.activeTimers().find(
+    (timer) => timer.delay === 10_000,
+  );
+  assert.ok(timeoutTimer);
+  timeoutTimer.cleared = true;
+  timeoutTimer.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
+  assert.equal(fixture.document.getElementById("codey-update-dialog"), null);
+  assert.equal(fixture.window.__codeyUpdateAvailability, undefined);
+  assert.equal(
+    fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
+    true,
   );
 });
 

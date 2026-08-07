@@ -21,7 +21,7 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.doesNotMatch(inject, /const sidebarDetected =/);
   assert.match(
     inject,
-    /armSessionToolsInteraction\(\);\s*scan\(\);\s*scheduleUpdateCheck\(0\)/,
+    /armSessionToolsInteraction\(\);\s*scan\(\);\s*scheduleUpdateCheck\(0,\s*\{\s*startup:\s*true\s*\}\)/,
   );
   assert.match(inject, /document\.addEventListener\("pointerover", loadSessionToolsFromInteraction/);
   assert.match(inject, /document\.addEventListener\("focusin", loadSessionToolsFromInteraction/);

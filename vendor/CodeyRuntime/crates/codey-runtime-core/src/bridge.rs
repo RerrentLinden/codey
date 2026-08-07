@@ -516,6 +516,7 @@ fn bridge_path_can_run_concurrently(path: &str) -> bool {
             | "/codex-model-catalog"
             | "/backend/status"
             | "/account/usage"
+            | "/api/check_for_updates"
             | "/session/wake-watcher"
             | "/plugins/list"
     )
@@ -795,5 +796,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["delete-1", "delete-2", "sort", "settings"]
         );
+    }
+
+    #[test]
+    fn update_checks_use_the_concurrent_read_lane() {
+        let mut pending_concurrent = VecDeque::new();
+        let mut pending_serial = VecDeque::new();
+        let mut ready = VecDeque::new();
+        for (request_id, path) in [
+            ("update-check", "/api/check_for_updates"),
+            ("settings", "/settings/set"),
+        ] {
+            queue_bridge_dispatch(
+                Some(bridge_call(request_id, path)),
+                &mut pending_concurrent,
+                &mut pending_serial,
+                &mut ready,
+            );
+        }
+
+        assert_eq!(
+            pending_concurrent
+                .iter()
+                .map(|call| call.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["update-check"]
+        );
+        assert_eq!(
+            pending_serial
+                .iter()
+                .map(|call| call.request_id.as_str())
+                .collect::<Vec<_>>(),
+            ["settings"]
+        );
+        assert!(ready.is_empty());
     }
 }

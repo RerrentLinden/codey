@@ -19,7 +19,7 @@ import { formatBytes } from "./TraceLogModule";
 
 const UPDATE_AVAILABLE_EVENT = "codey-update-availability-changed";
 const AUTO_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
-const AUTO_UPDATE_CHECK_TIMEOUT_MS = 12_000;
+const UPDATE_CHECK_TIMEOUT_MS = 10_000;
 
 declare global {
   interface Window {
@@ -135,10 +135,11 @@ export function useAppUpdates({
       if (cancelled || shouldPause() || autoUpdateCheckInFlightRef.current)
         return;
       autoUpdateCheckInFlightRef.current = true;
+      setUpdateResult({ tone: "pending", text: "正在检查更新…" });
       try {
         const result = await withTimeout(
           invoke<UpdateCheck>("check_for_updates"),
-          AUTO_UPDATE_CHECK_TIMEOUT_MS,
+          UPDATE_CHECK_TIMEOUT_MS,
           "检查更新超时",
         );
         if (cancelled) return;
@@ -152,8 +153,13 @@ export function useAppUpdates({
           publishUpdateAvailability(result);
           return;
         }
+        setUpdateResult({
+          tone: "success",
+          text: updateCheckText(result),
+        });
       } catch {
-        // 后台更新检测保持静默；手动检查仍会展示具体错误。
+        if (!cancelled) setUpdateResult({ tone: "idle", text: "" });
+        // 更新地址不可达或检查超时时直接跳过；手动检查仍会展示具体错误。
       } finally {
         autoUpdateCheckInFlightRef.current = false;
         if (!cancelled && !shouldPause()) schedule();
@@ -176,7 +182,7 @@ export function useAppUpdates({
     try {
       const result = await withTimeout(
         invoke<UpdateCheck>("check_for_updates"),
-        12_000,
+        UPDATE_CHECK_TIMEOUT_MS,
         "检查更新超时，请检查网络",
       );
       setUpdateCheck(result);
