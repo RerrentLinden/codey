@@ -316,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_lifecycle_patch_destroys_webviews_and_reclaims_execution_helpers() {
+    fn automatic_lifecycle_patch_preserves_mcp_and_reclaims_execution_helpers() {
         let expression = patch_expression(PatchOptions {
             disable_pet: false,
             fast_codex_startup: true,
@@ -333,7 +333,9 @@ mod tests {
         assert!(expression.contains("waitForReclaimBarrier"));
         assert!(!expression.contains("evictStaleTurns"));
         assert!(expression.contains("turnStateVersion"));
-        assert!(expression.contains("codegraph\\.js\\s+serve"));
+        assert!(!expression.contains("processInfo?.kind === \"mcp\""));
+        assert!(!expression.contains("codegraph\\.js\\s+serve"));
+        assert!(!expression.contains("mcp[/\\\\]server"));
         assert!(expression.contains("node_repl"));
         assert!(expression.contains("handlers[\"child-process-kill\"]"));
     }

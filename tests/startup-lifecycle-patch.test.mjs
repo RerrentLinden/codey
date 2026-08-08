@@ -96,7 +96,7 @@ test("startup patch preserves native child processes and ordinary BrowserWindows
   }
 });
 
-test("startup lifecycle patch closes temporary WebViews and waits for all turns before cleanup", async () => {
+test("startup lifecycle patch preserves MCP servers and waits for all turns before cleanup", async () => {
   const lifecycle = globalThis.__CODEY_TEMP_WEBVIEW_LIFECYCLE__;
   const owner = {};
   let destroyedListener = null;
@@ -124,9 +124,11 @@ test("startup lifecycle patch closes temporary WebViews and waits for all turns 
     },
     kill: async (pid) => { killed.push(pid); },
     snapshot: async () => [
-      { command: "node ./mcp/server.mjs", depth: 2, kind: "mcp", pid: 41 },
+      { command: "git-mcp-server --stdio", depth: 2, kind: "mcp", pid: 41 },
       { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 2, pid: 42 },
       { command: "npm run vite:dev", depth: 2, kind: "other", pid: 43 },
+      { command: "node ./mcp/server.mjs", depth: 2, pid: 44 },
+      { command: "node codegraph.js serve --mcp", depth: 2, pid: 45 },
     ],
     completionGraceMs: 10,
   });
@@ -136,8 +138,8 @@ test("startup lifecycle patch closes temporary WebViews and waits for all turns 
   await delay(20);
   assert.deepEqual(killed, []);
   notificationHandler({ method: "turn/completed", params: { threadId: "b", turn: { id: "2" } } });
-  await waitFor(() => killed.length === 2);
-  assert.deepEqual(killed, [41, 42]);
+  await waitFor(() => killed.length === 1);
+  assert.deepEqual(killed, [42]);
   dispose();
 });
 
@@ -314,7 +316,7 @@ test("execution reaper never evicts a silent long-running turn", async () => {
     },
     kill: async (pid) => { killed.push(pid); },
     snapshot: async () => [
-      { command: "node ./mcp/server.mjs", depth: 1, kind: "mcp", pid: 53 },
+      { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 53 },
     ],
     completionGraceMs: 5,
   });
@@ -515,7 +517,7 @@ test("disposing execution reaper cancels pending cleanup", async () => {
       firstSnapshotSeen = true;
       return new Promise((resolve) => {
         releaseSnapshot = () => resolve([
-          { command: "node ./mcp/server.mjs", depth: 1, kind: "mcp", pid: 57 },
+          { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 57 },
         ]);
       });
     },

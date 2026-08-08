@@ -1062,12 +1062,10 @@
 
     const isReclaimable = (processInfo) => {
       const command = String(processInfo?.command ?? "");
-      return (
-        processInfo?.kind === "mcp" ||
-        /(?:^|[/\\])node_repl(?:\.exe)?(?:\s|$)/i.test(command) ||
-        /(?:^|[/\\])codegraph\.js\s+serve\b[^\r\n]*--mcp\b/i.test(command) ||
-        /(?:^|\s|[/\\])mcp[/\\]server\.mjs(?:\s|$)/i.test(command)
-      );
+      // Configured MCP servers belong to the app-server session, not to one
+      // turn. Killing them here forces Codex to reconnect and repeat capability
+      // discovery (including resources/list) after every completed turn.
+      return /(?:^|[/\\])node_repl(?:\.exe)?(?:\s|$)/i.test(command);
     };
 
     const clearReclaimTimer = () => {
