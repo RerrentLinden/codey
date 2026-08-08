@@ -61,17 +61,29 @@ developer_instructions = """
 你怎么工作：
 - 你只有一轮、任务是自包含的：没有追问的机会，别反问；用这一轮把任务范围查到位、尽力答全。
 - 答不全就如实交代「查到了什么、还有什么没覆盖、哪里存疑或者矛盾」。宁可显式报「没查到 / 没覆盖」，也别用含糊的话糊弄过去——你悄悄漏掉的，主代理无从复核。
-- 终端只运行任务实际需要的命令。不得把 `Write-Output`、`Write-Error`、`echo`、`printf`、`exit`、`sleep` 等命令当作进度播报、道歉、自我提醒或纠错标记；发现工具用错时直接改用正确工具。
+- 每次工具调用都必须推进任务本身。进度、道歉、自我提醒和纠错写在回复中；发现工具用错时直接改用正确工具，不要为此额外执行诊断或播报命令。
 """
 
 [features]
 image_generation = false
 "#####;
 
-pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Local files \
-have exactly one read route: call `mcp__codey_fastctx__read` directly, including when the input is a \
-URI-shaped local reference. `mcp__codey_fastctx` is a direct tool namespace, not an MCP Resources \
-server name. Never call `list_mcp_resources`, `list_mcp_resource_templates`, or \
+pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Use \
+`mcp__codey_fastctx__read`, `mcp__codey_fastctx__grep`, `mcp__codey_fastctx__glob`, and \
+`mcp__codey_fastctx__replace` for local workspace files. Call them directly when visible. When these \
+functions are available inside a code-mode program, use the same names on the `tools` object, for example \
+`await tools.mcp__codey_fastctx__read({ file_path: absolutePath })`. Keep local file reading, \
+content search, discovery, and deterministic replacement on these FastCtx functions; no separate \
+tool discovery is needed. Set `file_path` to a plain absolute filesystem path (never a URI); on \
+Windows, convert the reference to a drive-letter path such as `E:/repo/file.ts` before the call. Use \
+terminal commands only for builds, tests, Git, package managers, or after a FastCtx function actually \
+fails. Every tool call must advance the requested task; put progress and corrections in commentary. \
+Follow every Complete or Partial continuation exactly.";
+
+pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. \
+Local files have exactly one read route: call `mcp__codey_fastctx__read` directly, including when the \
+input is a URI-shaped local reference. `mcp__codey_fastctx` is a direct tool namespace, not an MCP \
+Resources server name. Never call `list_mcp_resources`, `list_mcp_resource_templates`, or \
 `read_mcp_resource` during local workspace work, including discovery or probe calls with placeholder \
 server names; never pass `mcp__codey_fastctx` to a `resources/*` method. Never use exec or shell \
 commands such as `Write-Output`, `Write-Error`, `echo`, `printf`, `exit`, or `sleep` to narrate \
@@ -85,7 +97,7 @@ managers, or when the FastCtx tool is unavailable or fails. Use `mcp__codey_fast
 for deterministic mechanical replacements, and follow every Complete or Partial continuation \
 exactly.";
 
-pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. \
+pub(crate) const OLDER_CODEY_FASTCTX_GUIDANCE_V2: &str = "Codey FastCtx context tools are enabled. \
 Local files have exactly one read route: call `mcp__codey_fastctx__read` directly, including when the \
 input is a URI-shaped local reference. Set `file_path` to a plain absolute filesystem path (never a \
 URI); on Windows, convert the reference to a drive-letter path such as `E:/repo/file.ts` before the \
@@ -113,6 +125,7 @@ follow every Complete or Partial pagination note exactly.";
 pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     CODEY_FASTCTX_GUIDANCE,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE,
+    OLDER_CODEY_FASTCTX_GUIDANCE_V2,
     OLDER_CODEY_FASTCTX_GUIDANCE,
     LEGACY_CODEY_FASTCTX_GUIDANCE,
 ];
@@ -260,23 +273,19 @@ mod tests {
             codey_fastctx_guidance_for_namespace("mcp__codey_fastctx"),
             CODEY_FASTCTX_GUIDANCE
         );
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("Local files have exactly one read route"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("`mcp__codey_fastctx__read` directly"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Call them directly when visible"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("tools.mcp__codey_fastctx__read"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("available inside a code-mode program"));
         assert!(
             CODEY_FASTCTX_GUIDANCE
                 .contains("`file_path` to a plain absolute filesystem path (never a URI)")
         );
         assert!(CODEY_FASTCTX_GUIDANCE.contains("drive-letter path such as `E:/repo/file.ts`"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("is a direct tool namespace"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("not an MCP Resources server name"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("Never call `list_mcp_resources`"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("`list_mcp_resource_templates`"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("`read_mcp_resource`"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("probe calls with placeholder server names"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("`resources/*` method"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("Never use exec or shell commands"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("`Write-Output`"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("record self-reminders"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("no separate tool discovery is needed"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Every tool call must advance the requested task"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("list_mcp_resources"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("read_mcp_resource"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("Write-Output"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("file:///"));
     }
 
@@ -284,12 +293,13 @@ mod tests {
     fn default_agent_config_can_include_the_fastctx_namespace_guidance() {
         let config = default_agent_config_with_fastctx_guidance(Some("mcp__fastctx"));
 
-        assert!(config.contains("`mcp__fastctx__read` directly"));
-        assert!(config.contains("`mcp__fastctx` is a direct tool namespace"));
-        assert!(config.contains("Never call `list_mcp_resources`"));
-        assert!(config.contains("`read_mcp_resource`"));
-        assert!(config.contains("`Write-Output`"));
-        assert!(config.contains("continue directly with the correct tool"));
+        assert!(config.contains("tools.mcp__fastctx__read"));
+        assert!(config.contains("Call them directly when visible"));
+        assert!(config.contains("no separate tool discovery is needed"));
+        assert!(config.contains("put progress and corrections in commentary"));
+        assert!(!config.contains("list_mcp_resources"));
+        assert!(!config.contains("read_mcp_resource"));
+        assert!(!config.contains("Write-Output"));
         assert!(!config.contains("mcp__codey_fastctx"));
         assert!(config.contains("[features]"));
         assert!(config.ends_with("image_generation = false\n"));
@@ -297,10 +307,11 @@ mod tests {
 
     #[test]
     fn default_agent_never_uses_terminal_commands_as_narration() {
-        assert!(DEFAULT_AGENT_CONFIG.contains("终端只运行任务实际需要的命令"));
-        assert!(DEFAULT_AGENT_CONFIG.contains("`Write-Output`"));
-        assert!(DEFAULT_AGENT_CONFIG.contains("进度播报、道歉、自我提醒或纠错标记"));
+        assert!(DEFAULT_AGENT_CONFIG.contains("每次工具调用都必须推进任务本身"));
+        assert!(DEFAULT_AGENT_CONFIG.contains("进度、道歉、自我提醒和纠错写在回复中"));
         assert!(DEFAULT_AGENT_CONFIG.contains("直接改用正确工具"));
+        assert!(!DEFAULT_AGENT_CONFIG.contains("Write-Output"));
+        assert!(!DEFAULT_AGENT_CONFIG.contains("Write-Error"));
     }
 
     #[test]

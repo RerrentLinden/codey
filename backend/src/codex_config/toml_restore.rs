@@ -113,20 +113,30 @@ fn restore_fastctx_owned_value(
                     .iter()
                     .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
             });
-            if original_has_namespace || !applied_has_namespace {
+            if original_has_namespace == applied_has_namespace {
                 return false;
             }
             let Some(entries) = current.and_then(Item::as_array_mut) else {
                 return false;
             };
-            let Some(index) = entries
+            if applied_has_namespace {
+                let Some(index) = entries
+                    .iter()
+                    .position(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
+                else {
+                    return false;
+                };
+                entries.remove(index);
+                true
+            } else if entries
                 .iter()
-                .position(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-            else {
-                return false;
-            };
-            entries.remove(index);
-            true
+                .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE))
+            {
+                entries.push(CODEY_FASTCTX_NAMESPACE);
+                true
+            } else {
+                false
+            }
         }
         "developer_instructions" | "subagent_developer_instructions" => {
             let Some(current) = current else {

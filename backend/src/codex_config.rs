@@ -1342,28 +1342,11 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<St
     env["FASTCTX_TOKEN_BUDGET"] = value(CODEY_FASTCTX_TOKEN_BUDGET);
     server["env"] = Item::Table(env);
 
-    let features = ensure_root_table(doc, "features")?;
-    if features.get("code_mode").is_none() {
-        features["code_mode"] = Item::Table(Table::new());
-    }
-    let code_mode = features["code_mode"]
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("features.code_mode 必须是 TOML table"))?;
-    if code_mode.get("direct_only_tool_namespaces").is_none() {
-        code_mode["direct_only_tool_namespaces"] =
-            Item::Value(toml_edit::Value::Array(Array::new()));
-    }
-    let namespaces = code_mode["direct_only_tool_namespaces"]
-        .as_array_mut()
-        .ok_or_else(|| {
-            anyhow::anyhow!("features.code_mode.direct_only_tool_namespaces 必须是数组")
-        })?;
-    if !namespaces
-        .iter()
-        .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-    {
-        namespaces.push(CODEY_FASTCTX_NAMESPACE);
-    }
+    // Direct-only namespaces disappear from the nested `tools` object used by
+    // code mode. FastCtx must be available there as well as through direct
+    // calls, otherwise code-mode turns fall back to Codex's generic MCP
+    // Resources helpers and can pass the tool namespace as an invalid server id.
+    remove_direct_only_tool_namespace(doc, CODEY_FASTCTX_NAMESPACE);
 
     if doc.get("tool_output_token_limit").is_none() {
         doc["tool_output_token_limit"] = value(10_000);
@@ -1448,24 +1431,25 @@ fn disable_fast_context_tools(doc: &mut DocumentMut) {
         .is_some_and(|mcp_servers| mcp_servers.contains_key(CODEY_FASTCTX_SERVER_ID));
     if (codey_owned_server_removed || codey_guidance_removed || subagent_guidance_removed)
         && !reserved_server_remains
-        && let Some(namespaces) = doc
-            .get_mut("features")
-            .and_then(Item::as_table_mut)
-            .and_then(|features| features.get_mut("code_mode"))
-            .and_then(Item::as_table_mut)
-            .and_then(|code_mode| code_mode.get_mut("direct_only_tool_namespaces"))
-            .and_then(Item::as_array_mut)
     {
-        loop {
-            let index = namespaces
-                .iter()
-                .position(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE));
-            let Some(index) = index else {
-                break;
-            };
-            namespaces.remove(index);
-        }
+        remove_direct_only_tool_namespace(doc, CODEY_FASTCTX_NAMESPACE);
     }
+}
+
+fn remove_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> bool {
+    let Some(namespaces) = doc
+        .get_mut("features")
+        .and_then(Item::as_table_mut)
+        .and_then(|features| features.get_mut("code_mode"))
+        .and_then(Item::as_table_mut)
+        .and_then(|code_mode| code_mode.get_mut("direct_only_tool_namespaces"))
+        .and_then(Item::as_array_mut)
+    else {
+        return false;
+    };
+    let original_len = namespaces.len();
+    namespaces.retain(|entry| entry.as_str() != Some(namespace));
+    namespaces.len() != original_len
 }
 
 fn remove_fastctx_guidance_from_table(table: &mut Table, key: &str) -> bool {
@@ -2306,10 +2290,11 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__fastctx"]
                 codey_fastctx_guidance_for_namespace("mcp__fastctx")
             )
         );
-        assert!(guidance.contains("`mcp__fastctx__read` directly"));
-        assert!(guidance.contains("`mcp__fastctx` is a direct tool namespace"));
-        assert!(guidance.contains("Never call `list_mcp_resources`"));
-        assert!(guidance.contains("`read_mcp_resource`"));
+        assert!(guidance.contains("tools.mcp__fastctx__read"));
+        assert!(guidance.contains("Call them directly when visible"));
+        assert!(guidance.contains("no separate tool discovery is needed"));
+        assert!(!guidance.contains("list_mcp_resources"));
+        assert!(!guidance.contains("read_mcp_resource"));
         assert!(!guidance.contains("mcp__codey_fastctx"));
         assert!(!guidance.contains("resources/read"));
     }
@@ -2393,10 +2378,11 @@ args = ["fastctx", "--stdio"]
                 .is_none()
         );
         let guidance = document["developer_instructions"].as_str().unwrap();
-        assert!(guidance.contains("`mcp__context_tools__read` directly"));
+        assert!(guidance.contains("tools.mcp__context_tools__read"));
         assert!(guidance.contains("`mcp__context_tools__grep`"));
-        assert!(guidance.contains("Never call `list_mcp_resources`"));
-        assert!(guidance.contains("`read_mcp_resource`"));
+        assert!(guidance.contains("no separate tool discovery is needed"));
+        assert!(!guidance.contains("list_mcp_resources"));
+        assert!(!guidance.contains("read_mcp_resource"));
         assert!(!guidance.contains("mcp__codey_fastctx"));
         assert!(!guidance.contains("resources/read"));
         assert!(document.get("tool_output_token_limit").is_none());
@@ -2694,8 +2680,12 @@ developer_instructions = "User guidance.\n\n{stale_guidance}\n\n{CODEY_FASTCTX_G
 
     #[test]
     fn fast_context_tools_are_idempotent_and_default_the_host_output_limit() {
+        let existing = r#"
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__codey_fastctx"]
+"#;
         let first = patch_config_with_fastctx(
-            "",
+            existing,
             &official_profile(),
             GLOBAL_PROVIDER_ID,
             relative_model_catalog_path(),
@@ -2718,10 +2708,12 @@ developer_instructions = "User guidance.\n\n{stale_guidance}\n\n{CODEY_FASTCTX_G
         assert_eq!(first.matches(CODEY_FASTCTX_GUIDANCE).count(), 1);
         let document = first.parse::<DocumentMut>().unwrap();
         let guidance = document["developer_instructions"].as_str().unwrap();
-        assert!(guidance.contains("Local files have exactly one read route"));
+        assert!(guidance.contains("tools.mcp__codey_fastctx__read"));
+        assert!(guidance.contains("available inside a code-mode program"));
         assert!(guidance.contains("drive-letter path such as `E:/repo/file.ts`"));
-        assert!(guidance.contains("Never call `list_mcp_resources`"));
-        assert!(guidance.contains("`read_mcp_resource`"));
+        assert!(!guidance.contains("list_mcp_resources"));
+        assert!(!guidance.contains("read_mcp_resource"));
+        assert!(!guidance.contains("Write-Output"));
         for stale_guidance in &CODEY_FASTCTX_GUIDANCE_VERSIONS[1..] {
             assert!(!guidance.contains(stale_guidance));
         }
@@ -2730,9 +2722,9 @@ developer_instructions = "User guidance.\n\n{stale_guidance}\n\n{CODEY_FASTCTX_G
                 .as_array()
                 .unwrap()
                 .iter()
-                .filter(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-                .count(),
-            1
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["mcp__existing"]
         );
         assert_eq!(
             document["tool_output_token_limit"].as_integer(),
@@ -2970,13 +2962,14 @@ args = ["serve"]
                 .is_none()
         );
         let default_agent = fs::read_to_string(home.join("agents/default.toml")).unwrap();
-        assert!(default_agent.contains("`mcp__fastctx__read` directly"));
+        assert!(default_agent.contains("tools.mcp__fastctx__read"));
         assert!(default_agent.contains("`mcp__fastctx__grep`"));
-        assert!(default_agent.contains("`mcp__fastctx` is a direct tool namespace"));
-        assert!(default_agent.contains("Never call `list_mcp_resources`"));
-        assert!(default_agent.contains("`read_mcp_resource`"));
-        assert!(default_agent.contains("`Write-Output`"));
-        assert!(default_agent.contains("直接改用正确工具"));
+        assert!(default_agent.contains("Call them directly when visible"));
+        assert!(default_agent.contains("no separate tool discovery is needed"));
+        assert!(default_agent.contains("每次工具调用都必须推进任务本身"));
+        assert!(!default_agent.contains("list_mcp_resources"));
+        assert!(!default_agent.contains("read_mcp_resource"));
+        assert!(!default_agent.contains("Write-Output"));
         assert!(!default_agent.contains("mcp__codey_fastctx"));
         assert!(!default_agent.contains("resources/read"));
         let root_guidance = document["developer_instructions"].as_str().unwrap();
@@ -2985,11 +2978,12 @@ args = ["serve"]
                 .as_str()
                 .unwrap();
         assert_eq!(subagent_guidance, root_guidance);
-        assert!(subagent_guidance.contains("`mcp__fastctx__read` directly"));
-        assert!(subagent_guidance.contains("Never call `list_mcp_resources`"));
-        assert!(subagent_guidance.contains("`read_mcp_resource`"));
-        assert!(subagent_guidance.contains("`Write-Output`"));
-        assert!(subagent_guidance.contains("record self-reminders"));
+        assert!(subagent_guidance.contains("tools.mcp__fastctx__read"));
+        assert!(subagent_guidance.contains("no separate tool discovery is needed"));
+        assert!(subagent_guidance.contains("put progress and corrections in commentary"));
+        assert!(!subagent_guidance.contains("list_mcp_resources"));
+        assert!(!subagent_guidance.contains("read_mcp_resource"));
+        assert!(!subagent_guidance.contains("Write-Output"));
         assert!(!subagent_guidance.contains("mcp__codey_fastctx"));
 
         assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
@@ -3892,6 +3886,9 @@ base_url = "https://chatgpt.com/backend-api/codex"
 
 [marketplaces.openai-bundled]
 last_updated = "old"
+
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx"]
 "#,
         )
         .unwrap();
@@ -3911,6 +3908,19 @@ last_updated = "old"
             .unwrap()
             .parse::<DocumentMut>()
             .unwrap();
+        let applied_namespaces = current["features"]["code_mode"]["direct_only_tool_namespaces"]
+            .as_array()
+            .unwrap();
+        assert!(
+            applied_namespaces
+                .iter()
+                .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE))
+        );
+        assert!(
+            applied_namespaces
+                .iter()
+                .any(|entry| entry.as_str() == Some("mcp__existing"))
+        );
         current["model"] = value("gpt-new");
         current["service_tier"] = value("fast");
         current["developer_instructions"] = value(format!(
@@ -3954,7 +3964,12 @@ last_updated = "old"
         assert!(
             namespaces
                 .iter()
-                .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE))
+                .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
+        );
+        assert!(
+            namespaces
+                .iter()
+                .any(|entry| entry.as_str() == Some("mcp__existing"))
         );
         assert!(
             namespaces
