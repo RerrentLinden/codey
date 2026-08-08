@@ -500,12 +500,16 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
         .iter()
         .enumerate()
         .map(|(priority, (slug, display_name))| {
-            let mut model = catalogs
+            let mut matching_models = catalogs
                 .iter()
                 .flat_map(|models| models.iter())
-                .find(|model| model.get("slug").and_then(Value::as_str) == Some(*slug))
+                .filter(|model| model.get("slug").and_then(Value::as_str) == Some(*slug));
+            let mut model = matching_models
+                .next()
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("Codex 模型模板缺少固定官方模型 {slug}"))?;
+            let fallbacks = matching_models.collect::<Vec<_>>();
+            complete_reasoning_metadata(&mut model, &fallbacks);
             normalize_official_model(&mut model, slug, display_name, priority);
             remove_fast_speed_controls(&mut model);
             if bundled_fast_model_slugs.contains(*slug) {
@@ -514,6 +518,58 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
             Ok(model)
         })
         .collect()
+}
+
+fn complete_reasoning_metadata(model: &mut Value, fallbacks: &[&Value]) {
+    let current_efforts = reasoning_efforts_from_value(model);
+    // Older Codex caches can omit this capability list or reduce it to the
+    // default `low` entry. Preserve richer local lists, but repair these two
+    // incomplete shapes from the best later catalog.
+    let current_is_incomplete =
+        current_efforts.is_empty() || (current_efforts.len() == 1 && current_efforts[0] == "low");
+    if current_is_incomplete {
+        let mut best_effort_count = current_efforts.len();
+        let mut best_levels = None;
+        for fallback in fallbacks {
+            let fallback_efforts = reasoning_efforts_from_value(fallback);
+            if fallback_efforts.len() > best_effort_count
+                && let Some(levels) = fallback
+                    .get("supported_reasoning_levels")
+                    .and_then(Value::as_array)
+            {
+                best_effort_count = fallback_efforts.len();
+                best_levels = Some(levels.clone());
+            }
+        }
+        if let Some(levels) = best_levels {
+            model["supported_reasoning_levels"] = Value::Array(levels);
+        }
+    }
+
+    let supported = reasoning_efforts_from_value(model);
+    let configured_default_is_valid = model
+        .get("default_reasoning_level")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|effort| supported.iter().any(|candidate| candidate == effort));
+    if configured_default_is_valid {
+        return;
+    }
+
+    let fallback_default = fallbacks.iter().find_map(|fallback| {
+        fallback
+            .get("default_reasoning_level")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|effort| supported.iter().any(|candidate| candidate == effort))
+            .map(ToString::to_string)
+    });
+    if let Some(object) = model.as_object_mut() {
+        object.remove("default_reasoning_level");
+        if let Some(default) = fallback_default {
+            object.insert("default_reasoning_level".to_string(), json!(default));
+        }
+    }
 }
 
 fn normalize_official_model(model: &mut Value, slug: &str, display_name: &str, priority: usize) {
@@ -978,6 +1034,42 @@ mod tests {
         .unwrap();
     }
 
+    fn write_cache_with_sol_reasoning_metadata(
+        home: &Path,
+        supported_reasoning_levels: Option<Value>,
+        default_reasoning_level: Option<&str>,
+    ) {
+        let mut cache = official_cache();
+        let sol = cache["models"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        let object = sol.as_object_mut().unwrap();
+        match supported_reasoning_levels {
+            Some(levels) => {
+                object.insert("supported_reasoning_levels".to_string(), levels);
+            }
+            None => {
+                object.remove("supported_reasoning_levels");
+            }
+        }
+        match default_reasoning_level {
+            Some(default) => {
+                object.insert("default_reasoning_level".to_string(), json!(default));
+            }
+            None => {
+                object.remove("default_reasoning_level");
+            }
+        }
+        fs::write(
+            home.join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn assert_native_fast(model: &Value) {
         assert!(
             model["service_tiers"]
@@ -1176,6 +1268,94 @@ mod tests {
             "runtime-cache-only nested variable"
         );
         assert!(is_available(home.path()));
+    }
+
+    #[test]
+    fn incomplete_local_reasoning_metadata_is_completed_from_fallback_catalog() {
+        let cases = [
+            (None, None, "low"),
+            (None, Some("xhigh"), "xhigh"),
+            (
+                Some(json!([{"effort": "low", "description": "local low"}])),
+                Some("low"),
+                "low",
+            ),
+        ];
+
+        for (supported_reasoning_levels, default_reasoning_level, expected_default) in cases {
+            let home = tempfile::tempdir().unwrap();
+            write_cache_with_sol_reasoning_metadata(
+                home.path(),
+                supported_reasoning_levels,
+                default_reasoning_level,
+            );
+
+            let state = selection_state(home.path(), true, None, &[], None).unwrap();
+            let sol_state = state
+                .official_models
+                .iter()
+                .find(|model| model.slug == "gpt-5.6-sol")
+                .unwrap();
+            assert_eq!(
+                sol_state.supported_reasoning_efforts,
+                ["low", "medium", "high", "xhigh", "max", "ultra"]
+            );
+            assert_eq!(sol_state.default_reasoning_effort, expected_default);
+
+            refresh_for_provider(
+                home.path(),
+                true,
+                None,
+                &[],
+                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+            )
+            .unwrap();
+            let catalog: Value = serde_json::from_slice(
+                &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+            )
+            .unwrap();
+            let sol = catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["slug"] == "gpt-5.6-sol")
+                .unwrap();
+            assert_eq!(
+                reasoning_efforts_from_value(sol),
+                ["low", "medium", "high", "xhigh", "max", "ultra"]
+            );
+            assert_eq!(sol["default_reasoning_level"], expected_default);
+            assert_eq!(
+                sol["base_instructions"],
+                "test-only instructions for gpt-5.6-sol"
+            );
+            assert_eq!(
+                sol["model_messages"]["instructions_template"],
+                "test-only template"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_nontrivial_local_reasoning_metadata_remains_authoritative() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache_with_sol_reasoning_metadata(
+            home.path(),
+            Some(json!([
+                {"effort": "low", "description": "local low"},
+                {"effort": "xhigh", "description": "local xhigh"}
+            ])),
+            Some("xhigh"),
+        );
+
+        let state = selection_state(home.path(), true, None, &[], None).unwrap();
+        let sol = state
+            .official_models
+            .iter()
+            .find(|model| model.slug == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol.supported_reasoning_efforts, ["low", "xhigh"]);
+        assert_eq!(sol.default_reasoning_effort, "xhigh");
     }
 
     #[cfg(unix)]
