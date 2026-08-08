@@ -18,12 +18,19 @@ const gitRequest = (id, method, params = {}) => ({
   request: { id, method, params },
 });
 
-function createRuntime({ platform = "Win32", send, bridgeReady = true } = {}) {
+function createRuntime({
+  platform = "Win32",
+  send,
+  bridgeReady = true,
+  freezeBridge = false,
+  mainGuardReady = null,
+} = {}) {
   let currentTime = 10_000;
   let nextTimerId = 0;
   const timers = new Map();
   const nativeCalls = [];
   const events = [];
+  const statusRequests = [];
   const subscriptions = new Map();
   const sendImpl =
     send ??
@@ -67,6 +74,31 @@ function createRuntime({ platform = "Win32", send, bridgeReady = true } = {}) {
       return () => subscriptions.delete(workerId);
     },
   };
+  if (mainGuardReady !== null) {
+    electronBridge.sendMessageFromView = (message) => {
+      statusRequests.push(message);
+      if (!mainGuardReady) {
+        return Promise.resolve({
+          status: "ok",
+          guard: {
+            enabled: true,
+            gitHandlerPatched: false,
+          },
+        });
+      }
+      return Promise.resolve({
+        status: "ok",
+        guard: {
+          enabled: true,
+          gitHandlerPatched: true,
+          statusHandlerPatched: true,
+          strategy: "main-process-ipc",
+          tokenRefillMs: 1_000,
+        },
+      });
+    };
+  }
+  if (freezeBridge) Object.freeze(electronBridge);
   if (bridgeReady) window.electronBridge = electronBridge;
   window.window = window;
   const context = {
@@ -119,6 +151,7 @@ function createRuntime({ platform = "Win32", send, bridgeReady = true } = {}) {
     flush,
     nativeCalls,
     run,
+    statusRequests,
     timers,
     window,
   };
@@ -134,7 +167,7 @@ test("Git request guard is registered as an independently probed CDP script", ()
     /"git-request-guard",\s*"Windows Git 请求保护",\s*GIT_REQUEST_GUARD_SCRIPT/,
   );
   assert.match(cdpSource, /window\.__codeyGitRequestGuard/);
-  assert.match(cdpSource, /Windows Git 请求限流已接管/);
+  assert.match(cdpSource, /Windows Git 请求限流已由主进程接管/);
 });
 
 test("Git request guard leaves unknown and mutating worker requests untouched", async () => {
@@ -308,6 +341,41 @@ test("Git request guard can patch configurable bridge methods", async () => {
   assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().matched, 1);
 });
 
+test("Git request guard accepts main-process protection when contextBridge is frozen", async () => {
+  const runtime = createRuntime({
+    freezeBridge: true,
+    mainGuardReady: true,
+  });
+  await runtime.flush();
+
+  const snapshot = runtime.window.__codeyGitRequestGuard.snapshot();
+  assert.equal(snapshot.version, 3);
+  assert.equal(snapshot.bridgePatched, false);
+  assert.equal(snapshot.mainProcessProtected, true);
+  assert.equal(snapshot.installed, true);
+  assert.equal(snapshot.strategy, "main-process-ipc");
+  assert.equal(runtime.statusRequests.length, 1);
+  assert.equal(
+    runtime.statusRequests[0].type,
+    "codey-git-request-guard-status",
+  );
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["git-request-guard"].status,
+    "effective",
+  );
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["git-request-guard"].detail,
+    "Windows Git 请求限流已由主进程接管",
+  );
+
+  await runtime.window.electronBridge.sendWorkerMessageFromView(
+    "git",
+    gitRequest("main-process-status", "status-summary", { cwd: "C:\\repo" }),
+  );
+  assert.equal(runtime.nativeCalls.length, 1);
+  assert.equal(snapshot.matched, 0);
+});
+
 test("Git request guard re-arms bridge retries when an existing guard is re-injected", async () => {
   const runtime = createRuntime();
   const entry = runtime.window.__codeyInjectionStatus["git-request-guard"];
@@ -363,7 +431,7 @@ test("Git request guard observes worker failures and remains idempotent", async 
   assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().observedFailures, 1);
   runtime.run();
   assert.equal(runtime.window.electronBridge.sendWorkerMessageFromView, wrapper);
-  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().version, 2);
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().version, 3);
   assert.equal(
     runtime.window.__codeyInjectionStatus["git-request-guard"].status,
     "effective",

@@ -78,6 +78,351 @@
   const disableWindowsWmiSampler = disableWindowsOptimizations;
   const Module = process.getBuiltinModule("module");
   const originalLoad = Module._load;
+  const mainGitGuardWorkerChannel = "codex_desktop:worker:git:from-view";
+  const mainGitGuardStatusChannel = "codex_desktop:message-from-view";
+  const mainGitGuardStatusRequestType = "codey-git-request-guard-status";
+  const createMainGitRequestGuard = ({
+    enabled = false,
+    clock = () => Date.now(),
+    scheduleTimeout = (callback, delay) => setTimeout(callback, delay),
+    cancelTimeout = (timer) => clearTimeout(timer),
+    limits = {},
+  } = {}) => {
+    const targetMethods = new Set([
+      "git-origins",
+      "status-summary",
+      "review-summary",
+      "branch-diff-stats",
+    ]);
+    const tokenCapacity = limits.tokenCapacity ?? 3;
+    const tokenRefillMs = limits.tokenRefillMs ?? 1000;
+    const perKeyIntervalMs = limits.perKeyIntervalMs ?? 2000;
+    const maximumQueueSize = limits.maximumQueueSize ?? 48;
+    const maximumPerKeyQueueSize = limits.maximumPerKeyQueueSize ?? 6;
+    const maximumQueueWaitMs = limits.maximumQueueWaitMs ?? 15000;
+    const queue = [];
+    const queuedByRequestId = new Map();
+    const lastSentAtByKey = new Map();
+    const counters = {
+      matched: 0,
+      sent: 0,
+      queued: 0,
+      cancelledBeforeSend: 0,
+      rejected: 0,
+    };
+    let availableTokens = tokenCapacity;
+    let tokenUpdatedAt = Number(clock()) || 0;
+    let drainTimer = null;
+    let drainTimerAt = Number.POSITIVE_INFINITY;
+    let gitHandlerPatched = false;
+    let statusHandlerPatched = false;
+    let lastMethod = "";
+
+    const now = () => {
+      const value = Number(clock());
+      return Number.isFinite(value) ? value : 0;
+    };
+    const hashText = (value) => {
+      let hash = 0x811c9dc5;
+      for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193);
+      }
+      return (hash >>> 0).toString(16).padStart(8, "0");
+    };
+    const stringPart = (value) =>
+      typeof value === "string" ? value.slice(0, 2048) : "";
+    const requestInfo = (message) => {
+      if (
+        !message ||
+        typeof message !== "object" ||
+        message.type !== "worker-request" ||
+        message.workerId !== "git"
+      ) {
+        return null;
+      }
+      const request = message.request;
+      if (
+        !request ||
+        typeof request !== "object" ||
+        typeof request.method !== "string"
+      ) {
+        return null;
+      }
+      const workerMethod = request.method;
+      const outerParams =
+        request.params && typeof request.params === "object"
+          ? request.params
+          : {};
+      const query =
+        workerMethod === "subscribe-live-query" &&
+        outerParams.query &&
+        typeof outerParams.query === "object"
+          ? outerParams.query
+          : null;
+      const method =
+        query && typeof query.method === "string"
+          ? query.method
+          : workerMethod;
+      if (!targetMethods.has(method)) return null;
+      const params =
+        query?.params && typeof query.params === "object"
+          ? query.params
+          : outerParams;
+      const keyMaterial = [
+        workerMethod,
+        method,
+        stringPart(params.operationSource ?? outerParams.operationSource),
+        method === "git-origins"
+          ? "all-origins"
+          : stringPart(
+              params.cwd ??
+                params.root ??
+                params.commonDir ??
+                outerParams.cwd ??
+                outerParams.root ??
+                outerParams.commonDir,
+            ),
+        stringPart(params.baseBranch),
+        params.includeUntrackedFiles === true ? "untracked" : "",
+        params.hideWhitespace === true ? "hide-whitespace" : "",
+      ].join("\0");
+      return {
+        id: request.id,
+        key: `${method}:${hashText(keyMaterial)}`,
+        method,
+      };
+    };
+    const refillTokens = (at) => {
+      if (at < tokenUpdatedAt) {
+        availableTokens = tokenCapacity;
+        tokenUpdatedAt = at;
+        return;
+      }
+      const elapsed = at - tokenUpdatedAt;
+      if (elapsed <= 0) return;
+      availableTokens = Math.min(
+        tokenCapacity,
+        availableTokens + elapsed / tokenRefillMs,
+      );
+      tokenUpdatedAt = at;
+    };
+    const nextEligibleAt = (info, at) => {
+      refillTokens(at);
+      const tokenReadyAt =
+        availableTokens >= 1
+          ? at
+          : at + Math.ceil((1 - availableTokens) * tokenRefillMs);
+      const keyReadyAt = Math.max(
+        at,
+        (lastSentAtByKey.get(info.key) ?? Number.NEGATIVE_INFINITY) +
+          perKeyIntervalMs,
+      );
+      return Math.max(tokenReadyAt, keyReadyAt);
+    };
+    const makeGuardError = (reason, info) => {
+      const error = new Error(`Codey Git request guard: ${reason}`);
+      error.name = "CodeyGitRequestGuardError";
+      error.code = "CODEY_GIT_REQUEST_THROTTLED";
+      error.method = info?.method ?? "";
+      return error;
+    };
+    const removeQueuedEntry = (entry) => {
+      const index = queue.indexOf(entry);
+      if (index >= 0) queue.splice(index, 1);
+      if (entry.info.id !== undefined) {
+        queuedByRequestId.delete(entry.info.id);
+      }
+    };
+    const rejectEntry = (entry, reason) => {
+      removeQueuedEntry(entry);
+      counters.rejected += 1;
+      entry.reject(makeGuardError(reason, entry.info));
+    };
+    const dispatch = (entry, at) => {
+      refillTokens(at);
+      availableTokens = Math.max(0, availableTokens - 1);
+      lastSentAtByKey.set(entry.info.key, at);
+      lastMethod = entry.info.method;
+      counters.sent += 1;
+      let result;
+      try {
+        result = Reflect.apply(entry.handler, entry.thisValue, entry.args);
+      } catch (error) {
+        entry.reject(error);
+        scheduleDrain();
+        return;
+      }
+      Promise.resolve(result).then(entry.resolve, entry.reject).finally(scheduleDrain);
+    };
+    const scheduleDrain = () => {
+      if (!enabled || queue.length === 0) return;
+      const at = now();
+      let earliest = Number.POSITIVE_INFINITY;
+      for (const entry of queue) {
+        earliest = Math.min(
+          earliest,
+          nextEligibleAt(entry.info, at),
+          entry.enqueuedAt + maximumQueueWaitMs,
+        );
+      }
+      if (!Number.isFinite(earliest)) return;
+      if (drainTimer !== null && drainTimerAt <= earliest) return;
+      if (drainTimer !== null) cancelTimeout(drainTimer);
+      drainTimerAt = earliest;
+      drainTimer = scheduleTimeout(drain, Math.max(0, earliest - at));
+      drainTimer?.unref?.();
+    };
+    const drain = () => {
+      drainTimer = null;
+      drainTimerAt = Number.POSITIVE_INFINITY;
+      let at = now();
+      for (const entry of [...queue]) {
+        if (at - entry.enqueuedAt >= maximumQueueWaitMs) {
+          rejectEntry(entry, "queue timeout");
+        }
+      }
+      while (queue.length > 0) {
+        at = now();
+        const selected = queue.find(
+          (entry) => nextEligibleAt(entry.info, at) <= at,
+        );
+        if (!selected) break;
+        removeQueuedEntry(selected);
+        dispatch(selected, at);
+      }
+      scheduleDrain();
+    };
+    const enqueue = (handler, thisValue, args, info) => {
+      const sameKeyQueued = queue.reduce(
+        (count, entry) => count + (entry.info.key === info.key ? 1 : 0),
+        0,
+      );
+      if (
+        queue.length >= maximumQueueSize ||
+        sameKeyQueued >= maximumPerKeyQueueSize
+      ) {
+        counters.rejected += 1;
+        return Promise.reject(
+          makeGuardError("queue capacity exceeded", info),
+        );
+      }
+      counters.queued += 1;
+      return new Promise((resolve, reject) => {
+        const entry = {
+          handler,
+          thisValue,
+          args,
+          info,
+          enqueuedAt: now(),
+          resolve,
+          reject,
+        };
+        queue.push(entry);
+        if (info.id !== undefined) queuedByRequestId.set(info.id, entry);
+        scheduleDrain();
+      });
+    };
+    const sendGuarded = (handler, thisValue, args, info) => {
+      counters.matched += 1;
+      const at = now();
+      if (queue.length === 0 && nextEligibleAt(info, at) <= at) {
+        return new Promise((resolve, reject) => {
+          dispatch({ handler, thisValue, args, info, resolve, reject }, at);
+        });
+      }
+      return enqueue(handler, thisValue, args, info);
+    };
+    const snapshot = () => ({
+      version: 1,
+      enabled,
+      installed: enabled ? gitHandlerPatched : true,
+      strategy: enabled ? "main-process-ipc" : "not-required",
+      gitHandlerPatched,
+      statusHandlerPatched,
+      queued: queue.length,
+      matched: counters.matched,
+      sent: counters.sent,
+      queuedTotal: counters.queued,
+      cancelledBeforeSend: counters.cancelledBeforeSend,
+      rejected: counters.rejected,
+      lastMethod,
+      targetMethods: [...targetMethods],
+      tokenCapacity,
+      tokenRefillMs,
+      perKeyIntervalMs,
+    });
+    const wrapGitHandler = (handler) => {
+      if (typeof handler !== "function") return handler;
+      if (handler.__codeyMainGitRequestGuardOwner === api) {
+        gitHandlerPatched = true;
+        return handler;
+      }
+      gitHandlerPatched = true;
+      const wrapped = function (...args) {
+        if (!enabled) return Reflect.apply(handler, this, args);
+        const message = args[1];
+        if (
+          message?.type === "worker-request-cancel" &&
+          message.workerId === "git"
+        ) {
+          const queued = queuedByRequestId.get(message.id);
+          if (queued) {
+            removeQueuedEntry(queued);
+            counters.cancelledBeforeSend += 1;
+            queued.resolve(undefined);
+            scheduleDrain();
+            return Promise.resolve(undefined);
+          }
+        }
+        const info = requestInfo(message);
+        if (!info) return Reflect.apply(handler, this, args);
+        return sendGuarded(handler, this, args, info);
+      };
+      Object.defineProperty(wrapped, "__codeyMainGitRequestGuardOwner", {
+        value: api,
+      });
+      return wrapped;
+    };
+    const wrapStatusHandler = (handler) => {
+      if (typeof handler !== "function") return handler;
+      if (handler.__codeyMainGitRequestGuardStatusOwner === api) {
+        statusHandlerPatched = true;
+        return handler;
+      }
+      statusHandlerPatched = true;
+      const wrapped = function (...args) {
+        if (args[1]?.type === mainGitGuardStatusRequestType) {
+          return { status: "ok", guard: snapshot() };
+        }
+        return Reflect.apply(handler, this, args);
+      };
+      Object.defineProperty(wrapped, "__codeyMainGitRequestGuardStatusOwner", {
+        value: api,
+      });
+      return wrapped;
+    };
+    const api = Object.freeze({
+      enabled,
+      snapshot,
+      wrapGitHandler,
+      wrapStatusHandler,
+    });
+    return api;
+  };
+  const mainGitRequestGuard = createMainGitRequestGuard({
+    enabled: disableWindowsOptimizations,
+  });
+  Object.defineProperty(globalThis, "__CODEY_CREATE_MAIN_GIT_REQUEST_GUARD__", {
+    configurable: false,
+    value: createMainGitRequestGuard,
+    writable: false,
+  });
+  Object.defineProperty(globalThis, "__CODEY_MAIN_GIT_REQUEST_GUARD__", {
+    configurable: false,
+    value: mainGitRequestGuard,
+    writable: false,
+  });
   const isInspectorArgument = (argument) =>
     typeof argument === "string" && /^--inspect(?:-brk)?(?:=|$)/.test(argument);
   // Each renderer gate is optional and independent. Codex bundles are minified
@@ -1478,6 +1823,7 @@
 
   let electronProxy = null;
   let electronProtocolProxy = null;
+  let electronIpcMainProxy = null;
   Module._load = function codeyStartupPatchLoader(request, parent, isMain) {
     if (disableMicro && request === "@worklouder/device-kit-oai") return microStub;
 
@@ -1503,9 +1849,36 @@
         },
       });
     }
+    if (loaded.ipcMain) {
+      electronIpcMainProxy = new Proxy(loaded.ipcMain, {
+        get(target, property, receiver) {
+          if (
+            (property === "handle" || property === "handleOnce") &&
+            typeof target[property] === "function"
+          ) {
+            return (channel, handler, ...rest) => {
+              const effectiveHandler =
+                channel === mainGitGuardWorkerChannel
+                  ? mainGitRequestGuard.wrapGitHandler(handler)
+                  : channel === mainGitGuardStatusChannel
+                    ? mainGitRequestGuard.wrapStatusHandler(handler)
+                    : handler;
+              return Reflect.apply(target[property], target, [
+                channel,
+                effectiveHandler,
+                ...rest,
+              ]);
+            };
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    }
     electronProxy = new Proxy(loaded, {
       get(target, property, receiver) {
         if (property === "protocol" && electronProtocolProxy) return electronProtocolProxy;
+        if (property === "ipcMain" && electronIpcMainProxy) return electronIpcMainProxy;
         return Reflect.get(target, property, receiver);
       },
     });
@@ -1542,9 +1915,12 @@
     restoreNativeModelAndSpeedControls: true,
     destroyTemporaryWebViews: true,
     disableWindowsWmiSampler,
+    get mainGitRequestGuard() {
+      return mainGitRequestGuard.snapshot();
+    },
   });
   setImmediate(() => {
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v20";
+  return "codey-startup-patch-installed-v21";
 })()

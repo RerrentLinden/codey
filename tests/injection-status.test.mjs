@@ -64,6 +64,9 @@ test("script injection diagnostics report runtime evidence without continuous po
     /const STATUS_POLL_MAX_CONSECUTIVE_ERRORS = 5/,
   );
   assert.match(runtimeHook, /STATUS_POLL_MAX_DURATION_MS/);
+  assert.match(runtimeHook, /GIT_GUARD_PROBE_MAX_DURATION_MS = 30_000/);
+  assert.match(runtimeHook, /gitGuardStatus !== "executed"/);
+  assert.match(runtimeHook, /const next = await refreshInjectionStatus\(\)/);
   assert.match(cdp, /completedEntry\.status === \\"pending\\"/);
   assert.match(pluginFix, /markPluginBridgeEffective/);
   assert.match(pluginFix, /entry\.status = "effective"/);
@@ -81,5 +84,7 @@ test("script injection diagnostics report runtime evidence without continuous po
   assert.match(styles, /text-wrap:\s*balance/);
   assert.match(styles, /word-break:\s*normal/);
   assert.match(cdp, /guard\.ensureInstalled\?\.\(\)/);
+  assert.match(cdp, /snapshot\.mainProcessProtected === true/);
+  assert.match(cdp, /Object\.prototype\.hasOwnProperty\.call/);
   assert.match(cdp, /for \(const delay of \[50, 200, 750\]\)/);
 });

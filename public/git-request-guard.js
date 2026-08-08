@@ -3,7 +3,8 @@
 
   const guardKey = "__codeyGitRequestGuard";
   const scriptId = "git-request-guard";
-  const version = 2;
+  const version = 3;
+  const mainProcessStatusRequestType = "codey-git-request-guard-status";
   const targetMethods = new Set([
     "git-origins",
     "status-summary",
@@ -63,6 +64,11 @@
   let bridgeRetryTimer = 0;
   let bridgeRetryDelay = 50;
   let bridgeRetryDeadline = Date.now() + 30_000;
+  let mainProcessProtected = false;
+  let mainProcessProbePending = null;
+  let mainProcessProbeAttempts = 0;
+  let mainProcessProbeError = "";
+  let mainProcessSnapshot = null;
 
   const now = () => {
     const value = Number(Date.now());
@@ -174,16 +180,16 @@
   const markEffective = () => {
     const entry = window.__codeyInjectionStatus?.[scriptId];
     if (!entry) return;
+    const detail = enabled
+      ? mainProcessProtected
+        ? "Windows Git 请求限流已由主进程接管"
+        : "Windows Git 请求限流已由 Renderer 接管"
+      : "Git 请求保护已就绪，当前平台无需启用";
     const changed =
       entry.status !== "effective" ||
-      entry.detail !==
-        (enabled
-          ? "Windows Git 请求限流已接管"
-          : "Git 请求保护已就绪，当前平台无需启用");
+      entry.detail !== detail;
     entry.status = "effective";
-    entry.detail = enabled
-      ? "Windows Git 请求限流已接管"
-      : "Git 请求保护已就绪，当前平台无需启用";
+    entry.detail = detail;
     entry.error = null;
     if (changed && typeof window.dispatchEvent === "function") {
       window.dispatchEvent(
@@ -411,7 +417,8 @@
         sentKeyByRequestId.delete(message.id);
       }
 
-      const info = enabled ? requestInfo(workerId, message) : null;
+      const info =
+        enabled && !mainProcessProtected ? requestInfo(workerId, message) : null;
       if (!info) return Reflect.apply(original, this, args);
       return sendGuarded(original, this, args, info);
     };
@@ -448,6 +455,57 @@
     return replaceBridgeMethod(bridge, "subscribeToWorkerMessages", wrapped);
   };
 
+  const probeMainProcessProtection = () => {
+    if (!enabled || mainProcessProtected || mainProcessProbePending) {
+      return mainProcessProbePending;
+    }
+    const bridge = window.electronBridge;
+    const sendStatusRequest = bridge?.sendMessageFromView;
+    if (typeof sendStatusRequest !== "function") {
+      mainProcessProbeError = "主进程状态通道不可用";
+      return null;
+    }
+    mainProcessProbeAttempts += 1;
+    const request = Promise.resolve()
+      .then(() =>
+        Reflect.apply(sendStatusRequest, bridge, [
+          { type: mainProcessStatusRequestType, version },
+        ]),
+      )
+      .then((result) => {
+        const guard = result?.guard;
+        if (
+          result?.status === "ok" &&
+          guard?.enabled === true &&
+          guard?.gitHandlerPatched === true
+        ) {
+          mainProcessProtected = true;
+          mainProcessSnapshot = guard;
+          mainProcessProbeError = "";
+          if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
+          bridgeRetryTimer = 0;
+          markEffective();
+          return;
+        }
+        mainProcessProbeError =
+          result?.status === "ok"
+            ? "主进程 Git handler 尚未注册"
+            : "主进程未返回保护状态";
+      })
+      .catch((error) => {
+        mainProcessProbeError = String(
+          error instanceof Error ? error.message : error || "主进程状态查询失败",
+        ).slice(0, 160);
+      })
+      .finally(() => {
+        if (mainProcessProbePending === request) {
+          mainProcessProbePending = null;
+        }
+      });
+    mainProcessProbePending = request;
+    return request;
+  };
+
   const ensureInstalled = () => {
     if (!enabled) {
       bridgePatched = false;
@@ -455,10 +513,11 @@
       markEffective();
       return true;
     }
+    probeMainProcessProtection();
     const bridge = window.electronBridge;
     bridgePatched = patchSendWorkerMessage(bridge);
     responseObserverPatched = patchWorkerMessageSubscription(bridge);
-    if (bridgePatched) {
+    if (mainProcessProtected || bridgePatched) {
       if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
       bridgeRetryTimer = 0;
       markEffective();
@@ -471,7 +530,16 @@
   const snapshot = () => ({
     version,
     enabled,
-    installed: enabled ? bridgePatched : true,
+    installed: enabled ? mainProcessProtected || bridgePatched : true,
+    strategy: mainProcessProtected
+      ? "main-process-ipc"
+      : bridgePatched
+        ? "renderer-bridge"
+        : "pending",
+    mainProcessProtected,
+    mainProcessProbeAttempts,
+    mainProcessProbeError,
+    mainProcessSnapshot,
     bridgePatched,
     responseObserverPatched,
     observedGitSubscriptions,

@@ -24,6 +24,19 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
   const originalSpawn = childProcess.spawn;
   const NativeWorker = workerThreads.Worker;
   const spawnCalls = [];
+  const ipcHandlers = new Map();
+  const fakeElectron = {
+    BrowserWindow: class BrowserWindow {},
+    ipcMain: {
+      handle(channel, handler) {
+        ipcHandlers.set(channel, handler);
+      },
+    },
+  };
+  Module._load = function testElectronLoader(request) {
+    if (request === "electron") return fakeElectron;
+    return Reflect.apply(originalLoad, this, arguments);
+  };
   childProcess.spawn = (...args) => {
     spawnCalls.push(args);
     return { pid: 42 };
@@ -31,7 +44,96 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
 
   try {
     const expression = await loadPatchExpression();
-    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v20");
+    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v21");
+
+    const patchedElectron = Module._load("electron");
+    const passthroughGitHandler = () => "git-handler";
+    const passthroughMessageHandler = () => "message-handler";
+    patchedElectron.ipcMain.handle(
+      "codex_desktop:worker:git:from-view",
+      passthroughGitHandler,
+    );
+    patchedElectron.ipcMain.handle(
+      "codex_desktop:message-from-view",
+      passthroughMessageHandler,
+    );
+    assert.notEqual(
+      ipcHandlers.get("codex_desktop:worker:git:from-view"),
+      passthroughGitHandler,
+    );
+    assert.notEqual(
+      ipcHandlers.get("codex_desktop:message-from-view"),
+      passthroughMessageHandler,
+    );
+    const startupGitGuardStatus = ipcHandlers.get(
+      "codex_desktop:message-from-view",
+    )(null, { type: "codey-git-request-guard-status" });
+    assert.equal(startupGitGuardStatus.status, "ok");
+    assert.equal(startupGitGuardStatus.guard.gitHandlerPatched, true);
+    assert.equal(startupGitGuardStatus.guard.statusHandlerPatched, true);
+
+    let gitGuardTime = 10_000;
+    let nextGitGuardTimer = 0;
+    const gitGuardTimers = new Map();
+    const mainGitGuard =
+      globalThis.__CODEY_CREATE_MAIN_GIT_REQUEST_GUARD__({
+        enabled: true,
+        clock: () => gitGuardTime,
+        scheduleTimeout(callback, delay) {
+          const id = ++nextGitGuardTimer;
+          gitGuardTimers.set(id, {
+            callback,
+            dueAt: gitGuardTime + delay,
+          });
+          return id;
+        },
+        cancelTimeout(id) {
+          gitGuardTimers.delete(id);
+        },
+        limits: {
+          perKeyIntervalMs: 20,
+          tokenRefillMs: 10,
+        },
+      });
+    const handledGitRequests = [];
+    const nativeGitHandler = (_event, message) => {
+      handledGitRequests.push(message);
+      return { accepted: message.request?.id };
+    };
+    const guardedGitHandler = mainGitGuard.wrapGitHandler(nativeGitHandler);
+    const gitRequest = (id) => ({
+      type: "worker-request",
+      workerId: "git",
+      request: {
+        id,
+        method: "status-summary",
+        params: { cwd: "C:\\repo" },
+      },
+    });
+    const firstGitRequest = guardedGitHandler(null, gitRequest("status-1"));
+    const secondGitRequest = guardedGitHandler(null, gitRequest("status-2"));
+    assert.equal(handledGitRequests.length, 1);
+    assert.equal(mainGitGuard.snapshot().queued, 1);
+    await firstGitRequest;
+    gitGuardTime += 20;
+    for (const [id, timer] of [...gitGuardTimers]) {
+      if (timer.dueAt > gitGuardTime) continue;
+      gitGuardTimers.delete(id);
+      timer.callback();
+      await Promise.resolve();
+    }
+    assert.deepEqual(await secondGitRequest, { accepted: "status-2" });
+    assert.equal(handledGitRequests.length, 2);
+    const guardedStatusHandler = mainGitGuard.wrapStatusHandler(() => {
+      throw new Error("Codey status messages must not reach Codex");
+    });
+    const mainGitGuardStatus = guardedStatusHandler(null, {
+      type: "codey-git-request-guard-status",
+    });
+    assert.equal(mainGitGuardStatus.status, "ok");
+    assert.equal(mainGitGuardStatus.guard.gitHandlerPatched, true);
+    assert.equal(mainGitGuardStatus.guard.statusHandlerPatched, true);
+    assert.equal(mainGitGuardStatus.guard.strategy, "main-process-ipc");
 
     const directArgs = [
       "-c",

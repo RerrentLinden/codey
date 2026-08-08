@@ -169,9 +169,20 @@ pub fn prepare_injection_scripts(
               if (snapshot.enabled === false && snapshot.installed === true) {
                 return "Git 请求保护已就绪，当前平台无需启用";
               }
-              return snapshot.enabled === true && snapshot.bridgePatched === true
-                ? `Windows Git 请求限流已接管（持续速率 ${Math.round(60000 / snapshot.tokenRefillMs)} 次/分钟）`
-                : "";
+              if (snapshot.enabled === true && snapshot.mainProcessProtected === true) {
+                return `Windows Git 请求限流已由主进程接管（持续速率 ${Math.round(60000 / snapshot.mainProcessSnapshot.tokenRefillMs)} 次/分钟）`;
+              }
+              if (snapshot.enabled === true && snapshot.bridgePatched === true) {
+                return `Windows Git 请求限流已由 Renderer 接管（持续速率 ${Math.round(60000 / snapshot.tokenRefillMs)} 次/分钟）`;
+              }
+              const bridge = window.electronBridge;
+              const workerMethod = typeof bridge?.sendWorkerMessageFromView;
+              const statusMethod = typeof bridge?.sendMessageFromView;
+              const reason = snapshot.mainProcessProbeError || "等待主进程保护注册";
+              return {
+                effective: false,
+                detail: `Git 保护待确认：${reason}（workerBridge=${workerMethod}，statusBridge=${statusMethod}）`,
+              };
             })()"#
                 .to_string(),
         ),
@@ -734,11 +745,15 @@ fn injection_status_snapshot_script(descriptors: &[InjectionScriptDescriptor]) -
       const entry = registry[id];
       if (!entry || entry.status !== "executed") continue;
       try {{
-        const detail = probe();
-        if (detail) {{
+        const evidence = probe();
+        const structured = evidence && typeof evidence === "object"
+          && Object.prototype.hasOwnProperty.call(evidence, "effective");
+        const effective = structured ? evidence.effective === true : Boolean(evidence);
+        const detail = structured ? evidence.detail : evidence;
+        if (effective) {{
           entry.status = "effective";
-          entry.detail = String(detail);
         }}
+        if (detail) entry.detail = String(detail);
       }} catch (error) {{
         entry.status = "failed";
         entry.error = String(error instanceof Error
@@ -1199,8 +1214,11 @@ mod tests {
         assert_eq!(prepared.descriptors[9].source, "user");
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
-        assert!(snapshot_script.contains("Windows Git 请求限流已接管"));
+        assert!(snapshot_script.contains("Windows Git 请求限流已由主进程接管"));
         assert!(snapshot_script.contains("guard.ensureInstalled?.()"));
+        assert!(snapshot_script.contains("snapshot.mainProcessProtected === true"));
+        assert!(snapshot_script.contains("effective: false"));
+        assert!(snapshot_script.contains("Object.prototype.hasOwnProperty.call"));
         assert!(snapshot_script.contains("模型目录已加载"));
         assert!(snapshot_script.contains("插件市场桥接已接管"));
         assert!(snapshot_script.contains("for (const delay of [50, 200, 750])"));

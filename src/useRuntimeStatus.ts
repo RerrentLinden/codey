@@ -14,6 +14,8 @@ type UseRuntimeStatusOptions = {
 
 const STATUS_POLL_MAX_DURATION_MS = 5 * 60 * 1_000;
 const STATUS_POLL_MAX_CONSECUTIVE_ERRORS = 5;
+const GIT_GUARD_PROBE_DELAYS_MS = [500, 1_000, 2_000, 5_000];
+const GIT_GUARD_PROBE_MAX_DURATION_MS = 30_000;
 
 export function useRuntimeStatus({
   active,
@@ -94,6 +96,46 @@ export function useRuntimeStatus({
       window.removeEventListener(SETTINGS_OPENED_EVENT, handleSettingsOpened);
     };
   }, [refreshInjectionStatus]);
+
+  const gitGuardStatus = status.injectionScripts?.find(
+    (script) => script.id === "git-request-guard",
+  )?.status;
+
+  useEffect(() => {
+    if (!active || gitGuardStatus !== "executed") return;
+    let cancelled = false;
+    let timer = 0;
+    let delayIndex = 0;
+    let consecutiveErrors = 0;
+    const deadline = Date.now() + GIT_GUARD_PROBE_MAX_DURATION_MS;
+    const poll = () => {
+      if (cancelled || Date.now() >= deadline) return;
+      const delay =
+        GIT_GUARD_PROBE_DELAYS_MS[
+          Math.min(delayIndex, GIT_GUARD_PROBE_DELAYS_MS.length - 1)
+        ];
+      delayIndex += 1;
+      timer = window.setTimeout(async () => {
+        try {
+          const next = await refreshInjectionStatus();
+          if (cancelled) return;
+          consecutiveErrors = 0;
+          const nextGitGuardStatus = next.injectionScripts?.find(
+            (script) => script.id === "git-request-guard",
+          )?.status;
+          if (nextGitGuardStatus === "executed") poll();
+        } catch {
+          consecutiveErrors += 1;
+          if (consecutiveErrors < STATUS_POLL_MAX_CONSECUTIVE_ERRORS) poll();
+        }
+      }, delay);
+    };
+    poll();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [active, gitGuardStatus, refreshInjectionStatus]);
 
   useEffect(() => {
     if (

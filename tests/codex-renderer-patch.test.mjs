@@ -131,7 +131,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
   try {
     assert.equal(
       (0, eval)(await loadStartupPatchExpression()),
-      "codey-startup-patch-installed-v20",
+      "codey-startup-patch-installed-v21",
     );
     const electron = Module._load("electron", undefined, false);
     const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
