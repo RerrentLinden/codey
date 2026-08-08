@@ -15,18 +15,16 @@ import type {
   RuntimeStatus,
 } from "./App.types";
 import { errorText, withTimeout } from "./appUtils";
+import {
+  includesModelId,
+  modelKey,
+  uniqueModelIds,
+} from "./modelIds";
 
 const THIRD_PARTY_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
 const MAX_MODEL_ID_BYTES = 512;
 const MAX_MODEL_COUNT = 10_000;
 const modelIdEncoder = new TextEncoder();
-
-const supportsModel = (models: string[], expected: string) =>
-  models.some(
-    (model) => model.trim().toLowerCase() === expected.trim().toLowerCase(),
-  );
-
-const modelKey = (model: string) => model.trim().toLowerCase();
 
 const pickerSelection = (state: ModelState) => [
   ...state.officialModels
@@ -83,15 +81,14 @@ export function useModelSelection({
   const [modelInputError, setModelInputError] = useState("");
   const [modelSyncWarning, setModelSyncWarning] = useState("");
 
-  const officialSlugs = useMemo(
-    () => new Set(modelState.officialModelIds),
-    [modelState.officialModelIds],
-  );
   const officialSlugKeys = useMemo(
     () => new Set(modelState.officialModelIds.map(modelKey)),
     [modelState.officialModelIds],
   );
-  const draftModelSet = useMemo(() => new Set(draftModels), [draftModels]);
+  const draftModelSet = useMemo(
+    () => new Set(draftModels.map(modelKey)),
+    [draftModels],
+  );
   const draftManualThirdPartyModelKeys = useMemo(
     () => new Set(draftManualThirdPartyModels.map(modelKey)),
     [draftManualThirdPartyModels],
@@ -282,7 +279,7 @@ export function useModelSelection({
             restartRequired: result.restartRequired,
           }));
         }
-        supported = supportsModel(result.models, subagentModel);
+        supported = includesModelId(result.models, subagentModel);
       }
 
       if (!supported) {
@@ -316,10 +313,10 @@ export function useModelSelection({
     }
     setDraftModels((current) =>
       checked
-        ? current.includes(model)
+        ? includesModelId(current, model)
           ? current
           : [...current, model]
-        : current.filter((item) => item !== model),
+        : current.filter((item) => modelKey(item) !== modelKey(model)),
     );
     if (!checked) {
       setDraftManualThirdPartyModels((current) =>
@@ -363,7 +360,7 @@ export function useModelSelection({
       (upstream) => modelKey(upstream) === modelKey(model),
     );
     setDraftModels((current) =>
-      current.includes(model) ? current : [...current, model],
+      includesModelId(current, model) ? current : [...current, model],
     );
     if (!existingUpstreamModel || manualThirdPartyModelKeys.has(modelKey(model))) {
       setDraftManualThirdPartyModels((current) =>
@@ -455,11 +452,12 @@ export function useModelSelection({
 
   const saveModelSelection = useCallback(async () => {
     await runOperation("save-models", async () => {
-      const officialModels = draftModels.filter((model) =>
-        officialSlugs.has(model)
+      const normalizedDraftModels = uniqueModelIds(draftModels);
+      const officialModels = normalizedDraftModels.filter((model) =>
+        officialSlugKeys.has(modelKey(model))
       );
-      const thirdPartyModels = draftModels.filter((model) =>
-        !officialSlugs.has(model)
+      const thirdPartyModels = normalizedDraftModels.filter((model) =>
+        !officialSlugKeys.has(modelKey(model))
       );
       const thirdPartyModelKeys = new Set(thirdPartyModels.map(modelKey));
       const manualThirdPartyModels = draftManualThirdPartyModels.filter((model) =>
@@ -480,7 +478,7 @@ export function useModelSelection({
     deletedThirdPartyModels,
     draftManualThirdPartyModels,
     draftModels,
-    officialSlugs,
+    officialSlugKeys,
     runOperation,
   ]);
 

@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "7";
+  const patchVersion = "8";
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion) {
     void existingPatch.refresh();
@@ -57,12 +57,23 @@
     }
   };
 
-  const uniqueModelNames = (values) => Array.from(new Set(
-    (Array.isArray(values) ? values : [])
-      .filter((value) => typeof value === "string")
-      .map((value) => value.trim())
-      .filter(Boolean),
-  ));
+  const modelKey = (value) => String(value || "").trim().toLowerCase();
+  const uniqueModelNames = (values) => {
+    const seen = new Set();
+    return (Array.isArray(values) ? values : []).reduce((models, value) => {
+      if (typeof value !== "string") return models;
+      const model = value.trim();
+      const key = modelKey(model);
+      if (!key || seen.has(key)) return models;
+      seen.add(key);
+      models.push(model);
+      return models;
+    }, []);
+  };
+  const canonicalModelName = (models, value) => {
+    const key = modelKey(value);
+    return key ? models.find((model) => modelKey(model) === key) || "" : "";
+  };
 
   const sameModelNames = (left, right) => (
     Array.isArray(left)
@@ -80,16 +91,19 @@
     }
     const models = uniqueModelNames(value.models);
     const requestedDefault = [value.default_model, value.model]
-      .find((model) => typeof model === "string" && models.includes(model.trim()));
+      .map((model) => canonicalModelName(models, model))
+      .find(Boolean);
     const modelMetadata = Object.fromEntries(
       (Array.isArray(value.model_metadata) ? value.model_metadata : [])
-        .filter((metadata) => (
-          metadata
-          && typeof metadata === "object"
-          && typeof metadata.model === "string"
-          && models.includes(metadata.model.trim())
-        ))
-        .map((metadata) => [metadata.model.trim(), metadata]),
+        .flatMap((metadata) => {
+          if (
+            !metadata
+            || typeof metadata !== "object"
+            || typeof metadata.model !== "string"
+          ) return [];
+          const model = canonicalModelName(models, metadata.model);
+          return model ? [[model, metadata]] : [];
+        }),
     );
     return {
       loaded: true,
@@ -219,9 +233,9 @@
 
   const patchedModelArray = (models, allowEmpty = false) => {
     if (!catalog.loaded || !modelArrayLooksPatchable(models, allowEmpty)) return null;
-    const existing = new Map(models.map((item) => [item.model, item]));
+    const existing = new Map(models.map((item) => [modelKey(item.model), item]));
     const nextModels = catalog.models.map((modelName) => (
-      modelDescriptor(modelName, existing.get(modelName))
+      modelDescriptor(modelName, existing.get(modelKey(modelName)))
     ));
     const unchanged = (
       models.length === nextModels.length
@@ -797,8 +811,11 @@
     const requestedModel = typeof source.model === "string"
       ? source.model.trim()
       : "";
-    if (requestedModel && catalog.models.includes(requestedModel)) {
-      return params;
+    const canonicalRequestedModel = canonicalModelName(catalog.models, requestedModel);
+    if (canonicalRequestedModel) {
+      return requestedModel === canonicalRequestedModel
+        ? params
+        : { ...source, model: canonicalRequestedModel };
     }
     return {
       ...source,

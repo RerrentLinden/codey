@@ -86,6 +86,28 @@
   const activeThreadSortRefreshIntervalMs = 3_000;
   const idleThreadSortRefreshIntervalMs = 30_000;
   const fallbackSessionExportMaxBytes = 64 * 1024 * 1024;
+  const maxSessionCacheEntries = 2_048;
+  const maxHardDeletedMessageKeys = 10_000;
+  const maxPendingScanRoots = 64;
+  const rememberBoundedMapValue = (cache, key, value, limit = maxSessionCacheEntries) => {
+    cache.delete(key);
+    cache.set(key, value);
+    while (cache.size > limit) {
+      cache.delete(cache.keys().next().value);
+    }
+  };
+  const rememberBoundedSetValue = (set, value, limit) => {
+    set.delete(value);
+    set.add(value);
+    while (set.size > limit) {
+      set.delete(set.values().next().value);
+    }
+  };
+  const pruneExpiredDeletedSidebarSessions = (now = Date.now()) => {
+    deletedSidebarSessionIds.forEach((expiresAt, sessionId) => {
+      if (expiresAt <= now) deletedSidebarSessionIds.delete(sessionId);
+    });
+  };
   const queryWithin = (root, selector) => {
     const matches = [];
     if (root instanceof HTMLElement && typeof root.matches === "function" && root.matches(selector)) {
@@ -147,21 +169,23 @@
     const previousTitles = titles.map(({ sessionId }) => (
       [sessionId, sidebarTitleCache.get(sessionId)]
     ));
-    titles.forEach(({ sessionId, title }) => sidebarTitleCache.set(sessionId, title));
+    titles.forEach(({ sessionId, title }) => (
+      rememberBoundedMapValue(sidebarTitleCache, sessionId, title)
+    ));
     void callBridge("/session/titles", { titles })
       .then((result) => {
         if (result?.status !== "failed") return;
         previousTitles.forEach(([sessionId, previousTitle], index) => {
           if (sidebarTitleCache.get(sessionId) !== titles[index].title) return;
           if (previousTitle === undefined) sidebarTitleCache.delete(sessionId);
-          else sidebarTitleCache.set(sessionId, previousTitle);
+          else rememberBoundedMapValue(sidebarTitleCache, sessionId, previousTitle);
         });
       })
       .catch(() => {
         previousTitles.forEach(([sessionId, previousTitle], index) => {
           if (sidebarTitleCache.get(sessionId) !== titles[index].title) return;
           if (previousTitle === undefined) sidebarTitleCache.delete(sessionId);
-          else sidebarTitleCache.set(sessionId, previousTitle);
+          else rememberBoundedMapValue(sidebarTitleCache, sessionId, previousTitle);
         });
       });
   };
@@ -197,7 +221,13 @@
   const rememberHardDeletedMessages = (sessionId, messageIds) => {
     messageIds.forEach((messageId) => {
       const key = hardDeletedMessageKey(sessionId, messageId);
-      if (key) hardDeletedMessageKeys.add(key);
+      if (key) {
+        rememberBoundedSetValue(
+          hardDeletedMessageKeys,
+          key,
+          maxHardDeletedMessageKeys,
+        );
+      }
     });
   };
 
@@ -675,7 +705,8 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return "";
     pendingSidebarSessionDeleteIds.delete(normalizedSessionId);
-    deletedSidebarSessionIds.set(
+    rememberBoundedMapValue(
+      deletedSidebarSessionIds,
       normalizedSessionId,
       Date.now() + deletedSidebarSessionTtlMs,
     );
@@ -973,8 +1004,13 @@
       threadSortAtCache.delete(previousSessionId);
     }
     threadOptimisticSortSessionByRow.set(row, normalizedSessionId);
-    threadOptimisticSortAtCache.set(normalizedSessionId, timestamp);
-    threadSortAtCache.set(
+    rememberBoundedMapValue(
+      threadOptimisticSortAtCache,
+      normalizedSessionId,
+      timestamp,
+    );
+    rememberBoundedMapValue(
+      threadSortAtCache,
       normalizedSessionId,
       Math.max(threadSortAtCache.get(normalizedSessionId) || 0, timestamp),
     );
@@ -1087,10 +1123,16 @@
         const optimisticSortTimestamp = threadOptimisticSortAtCache.get(sessionId) || 0;
         if (!sessionId) return;
         returnedSessionIds.add(sessionId);
-        if (timestamp) threadUpdatedAtCache.set(sessionId, timestamp);
+        if (timestamp) {
+          rememberBoundedMapValue(threadUpdatedAtCache, sessionId, timestamp);
+        }
         else threadUpdatedAtCache.delete(sessionId);
         if (sortTimestamp || optimisticSortTimestamp) {
-          threadSortAtCache.set(sessionId, Math.max(sortTimestamp, optimisticSortTimestamp));
+          rememberBoundedMapValue(
+            threadSortAtCache,
+            sessionId,
+            Math.max(sortTimestamp, optimisticSortTimestamp),
+          );
         }
         else threadSortAtCache.delete(sessionId);
       });
@@ -1151,7 +1193,7 @@
           identity?.getAttribute("data-app-action-sidebar-thread-title") || "",
         ).trim(),
       });
-      threadUpdatedAtRequestedAt.set(sessionId, now);
+      rememberBoundedMapValue(threadUpdatedAtRequestedAt, sessionId, now);
     });
     scheduleThreadUpdatedAtFetch();
   };
@@ -1971,6 +2013,7 @@
   };
 
   const scan = (root = document, syncTitles = true) => {
+    pruneExpiredDeletedSidebarSessions();
     if (shouldIgnoreDeletedSidebarSessionRoot(root)) return;
     // Streaming output makes conversation turns by far the most frequent scan
     // root. Sidebar controls can never live inside a turn, so running their
@@ -2070,6 +2113,14 @@
   };
   const addPendingScanRoot = (root) => {
     if (!(root instanceof HTMLElement)) return;
+    if (
+      pendingScanRoots.size >= maxPendingScanRoots
+      && document.documentElement instanceof HTMLElement
+    ) {
+      pendingScanRoots.clear();
+      pendingScanRoots.add(document.documentElement);
+      return;
+    }
     if (root.matches?.("header, nav")) {
       window.__codeyRendererInvalidateHeaderMount?.(root);
     }

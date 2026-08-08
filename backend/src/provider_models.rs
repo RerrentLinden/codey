@@ -7,6 +7,7 @@ use reqwest::{Client, header::ACCEPT};
 use serde_json::Value;
 
 use crate::config::ProviderProfile;
+use crate::model_id;
 
 const PROVIDER_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_PROVIDER_MODEL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -156,7 +157,7 @@ fn model_ids_with_limits(
         .ok_or(ModelListError::UnsupportedFormat)?;
     let capacity = items.len().min(max_models);
     let mut models = Vec::with_capacity(capacity);
-    let mut seen = HashSet::<&str>::with_capacity(capacity);
+    let mut seen = HashSet::<String>::with_capacity(capacity);
     for item in items {
         let Some(model) = item.as_str().or_else(|| {
             item.get("id")
@@ -168,7 +169,7 @@ fn model_ids_with_limits(
             continue;
         };
         let model = model.trim();
-        if model.is_empty() || !seen.insert(model) {
+        if model.is_empty() || !seen.insert(model_id::key(model)) {
             continue;
         }
         if model.len() > max_model_id_bytes {
@@ -207,8 +208,10 @@ mod tests {
 
     #[test]
     fn parses_common_model_list_shapes() {
-        let models = model_ids(br#"{"data":[{"id":"a"},{"name":"b"},{"id":"a"}]}"#).unwrap();
-        assert_eq!(models, vec!["a", "b"]);
+        let models =
+            model_ids(br#"{"data":[{"id":"Provider-A"},{"name":"b"},{"id":"provider-a"}]}"#)
+                .unwrap();
+        assert_eq!(models, vec!["Provider-A", "b"]);
     }
 
     #[test]

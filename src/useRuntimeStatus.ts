@@ -8,13 +8,22 @@ const INJECTION_STATUS_CHANGED_EVENT = "codey-injection-status-changed";
 export const SETTINGS_OPENED_EVENT = "codey-settings-opened";
 
 type UseRuntimeStatusOptions = {
+  active: boolean;
   embedded: boolean;
 };
 
-export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
+const STATUS_POLL_MAX_DURATION_MS = 5 * 60 * 1_000;
+const STATUS_POLL_MAX_CONSECUTIVE_ERRORS = 5;
+
+export function useRuntimeStatus({
+  active,
+  embedded,
+}: UseRuntimeStatusOptions) {
   const [status, setStatus] = useState<RuntimeStatus>({ running: false });
   const injectionStatusRefreshRef = useRef<Promise<RuntimeStatus> | null>(null);
   const settingsOpenRefreshRequestedRef = useRef(false);
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   const requestRuntimeStatus = useCallback(
     async (shouldRefreshInjectionStatus: boolean) => {
@@ -60,6 +69,7 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
 
   useEffect(() => {
     const handleInjectionStatusChanged = () => {
+      if (!activeRef.current) return;
       void refreshInjectionStatus().catch(() => {});
     };
     window.addEventListener(
@@ -87,6 +97,7 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
 
   useEffect(() => {
     if (
+      !active ||
       !status.traceLogStats?.pending &&
       !status.crashpadPendingStats?.pending
     ) return;
@@ -94,21 +105,25 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
     let cancelled = false;
     let timer = 0;
     let delayIndex = 0;
+    let consecutiveErrors = 0;
+    const deadline = Date.now() + STATUS_POLL_MAX_DURATION_MS;
     const poll = () => {
-      if (cancelled) return;
+      if (cancelled || Date.now() >= deadline) return;
       const delay = delays[delayIndex];
       delayIndex = Math.min(delayIndex + 1, delays.length - 1);
       timer = window.setTimeout(async () => {
         try {
           const next = await invoke<RuntimeStatus>("runtime_status");
           if (cancelled) return;
+          consecutiveErrors = 0;
           setStatus((current) => reconcileRuntimeStatus(current, next));
           if (
             next.traceLogStats?.pending ||
             next.crashpadPendingStats?.pending
           ) poll();
         } catch {
-          poll();
+          consecutiveErrors += 1;
+          if (consecutiveErrors < STATUS_POLL_MAX_CONSECUTIVE_ERRORS) poll();
         }
       }, delay);
     };
@@ -118,32 +133,43 @@ export function useRuntimeStatus({ embedded }: UseRuntimeStatusOptions) {
       window.clearTimeout(timer);
     };
   }, [
+    active,
     status.crashpadPendingStats?.pending,
     status.traceLogStats?.pending,
   ]);
 
   useEffect(() => {
-    if (!status.restartInProgress) return;
+    if (!active || !status.restartInProgress) return;
     let cancelled = false;
     let timer = 0;
-    const poll = () => {
+    let consecutiveErrors = 0;
+    const deadline = Date.now() + STATUS_POLL_MAX_DURATION_MS;
+    const poll = (delay = 500) => {
+      if (cancelled || Date.now() >= deadline) return;
       timer = window.setTimeout(async () => {
         try {
           const next = await invoke<RuntimeStatus>("runtime_status");
           if (cancelled) return;
+          consecutiveErrors = 0;
           setStatus((current) => reconcileRuntimeStatus(current, next));
           if (next.restartInProgress) poll();
         } catch {
-          if (!cancelled) poll();
+          consecutiveErrors += 1;
+          if (
+            !cancelled &&
+            consecutiveErrors < STATUS_POLL_MAX_CONSECUTIVE_ERRORS
+          ) {
+            poll(Math.min(500 * 2 ** consecutiveErrors, 5_000));
+          }
         }
-      }, 500);
+      }, delay);
     };
     poll();
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [status.restartInProgress]);
+  }, [active, status.restartInProgress]);
 
   return {
     status,

@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useEffect, useMemo, useState } from "react";
 import {
   IconCheck as Check,
   IconGitBranch as GitBranch,
@@ -12,6 +12,9 @@ import {
 
 import type { CcSwitchStatus, ModelState } from "./App.types";
 import { Badge, Button, Card, Switch } from "./components/semi";
+import { modelIdsEqual, modelKey } from "./modelIds";
+
+const MODEL_SECTION_PAGE_SIZE = 200;
 
 type ModelSectionProps = {
   provider: CcSwitchStatus["provider"];
@@ -48,6 +51,16 @@ function ModelSectionComponent({
   const supportedOfficialModelCount = modelState.officialModels.reduce(
     (count, model) => count + Number(model.supported),
     0,
+  );
+  const [visibleThirdPartyCount, setVisibleThirdPartyCount] = useState(
+    MODEL_SECTION_PAGE_SIZE,
+  );
+  useEffect(() => {
+    setVisibleThirdPartyCount(MODEL_SECTION_PAGE_SIZE);
+  }, [provider.id, modelState.thirdPartyModels]);
+  const visibleThirdPartyModels = useMemo(
+    () => modelState.thirdPartyModels.slice(0, visibleThirdPartyCount),
+    [modelState.thirdPartyModels, visibleThirdPartyCount],
   );
   return (
     <section className="route-section" aria-labelledby="route-title">
@@ -176,7 +189,7 @@ function ModelSectionComponent({
               </div>
               <div className="catalog-model-list">
                 {modelState.officialModels.map((model) => {
-                  const isDefault = defaultModel === model.slug;
+                  const isDefault = modelIdsEqual(defaultModel, model.slug);
                   return (
                     <div
                       className={`catalog-model-row${model.supported ? "" : " unsupported"}${isDefault ? " default-model" : ""}`}
@@ -232,8 +245,8 @@ function ModelSectionComponent({
                       : "catalog-model-list"
                   }
                 >
-                  {modelState.thirdPartyModels.map((model) => {
-                    const isDefault = defaultModel === model;
+                  {visibleThirdPartyModels.map((model) => {
+                    const isDefault = modelIdsEqual(defaultModel, model);
                     return (
                       <div
                         className={`catalog-model-row third-party${isDefault ? " default-model" : ""}`}
@@ -258,7 +271,7 @@ function ModelSectionComponent({
                               设为默认
                             </Button>
                           )}
-                          {manualThirdPartyModelKeys.has(model.toLowerCase()) && (
+                          {manualThirdPartyModelKeys.has(modelKey(model)) && (
                             <Button
                               variant="ghost"
                               size="xs"
@@ -275,6 +288,32 @@ function ModelSectionComponent({
                       </div>
                     );
                   })}
+                  {visibleThirdPartyModels.length <
+                    modelState.thirdPartyModels.length && (
+                    <div className="model-picker-load-more">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={isBusy}
+                        onClick={() =>
+                          setVisibleThirdPartyCount((count) =>
+                            Math.min(
+                              count + MODEL_SECTION_PAGE_SIZE,
+                              modelState.thirdPartyModels.length,
+                            ),
+                          )
+                        }
+                      >
+                        再显示{" "}
+                        {Math.min(
+                          MODEL_SECTION_PAGE_SIZE,
+                          modelState.thirdPartyModels.length -
+                            visibleThirdPartyModels.length,
+                        )}{" "}
+                        个
+                      </Button>
+                    </div>
+                  )}
                   {modelState.thirdPartyModels.length === 0 && (
                     <div
                       className="catalog-empty-state"

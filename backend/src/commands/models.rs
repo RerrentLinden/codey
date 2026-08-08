@@ -14,6 +14,7 @@ use crate::codex_config::codex_home;
 use crate::config::{CodeyConfig, ProviderProfile};
 use crate::error_log;
 use crate::model_catalog;
+use crate::model_id;
 use crate::provider_models;
 use crate::subagent_policy;
 
@@ -125,26 +126,24 @@ fn selected_models_not_in_upstream(
 ) -> Vec<String> {
     let official_model_keys = model_catalog::default_official_model_slugs()
         .into_iter()
-        .map(|model| model.to_lowercase())
+        .map(|model| model_id::key(&model))
         .collect::<HashSet<_>>();
     let upstream_model_keys = upstream_models
         .iter()
-        .map(|model| model.trim().to_lowercase())
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
     selected_models
         .iter()
         .map(|model| model.trim())
         .filter(|model| {
             !model.is_empty()
-                && !official_model_keys.contains(model.to_lowercase().as_str())
-                && !upstream_model_keys.contains(model.to_lowercase().as_str())
+                && !official_model_keys.contains(&model_id::key(model))
+                && !upstream_model_keys.contains(&model_id::key(model))
+                && seen.insert(model_id::key(model))
         })
-        .fold(Vec::<String>::new(), |mut models, model| {
-            if !models.iter().any(|existing| existing == model) {
-                models.push(model.to_string());
-            }
-            models
-        })
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn config_with_current_provider_model_sync(
@@ -216,15 +215,17 @@ pub(super) fn preserve_selected_third_party_models_except(
 ) {
     let official_model_keys = model_catalog::default_official_model_slugs()
         .into_iter()
-        .map(|model| model.to_lowercase())
+        .map(|model| model_id::key(&model))
         .collect::<HashSet<_>>();
     for model in selected_models {
         let model = model.trim();
-        let key = model.to_lowercase();
+        let key = model_id::key(model);
         if model.is_empty()
             || official_model_keys.contains(key.as_str())
             || deleted_model_keys.contains(key.as_str())
-            || upstream_models.iter().any(|existing| existing == model)
+            || upstream_models
+                .iter()
+                .any(|existing| model_id::equal(existing, model))
         {
             continue;
         }
@@ -497,7 +498,7 @@ pub async fn save_selected_models(
     )?;
     let selected = selected
         .into_iter()
-        .filter(|model| !deleted_third_party_model_keys.contains(model.to_lowercase().as_str()))
+        .filter(|model| !deleted_third_party_model_keys.contains(&model_id::key(model)))
         .collect::<Vec<_>>();
     let provider_id = config
         .current_provider_id()
@@ -588,13 +589,13 @@ pub(super) fn validate_manual_model_selection(
 ) -> Result<(Vec<String>, Vec<String>), String> {
     let official_by_key = official_model_ids
         .iter()
-        .map(|model| (model.to_lowercase(), model.as_str()))
+        .map(|model| (model_id::key(model), model.as_str()))
         .collect::<std::collections::HashMap<_, _>>();
     let requested_official = requested_official_models
         .iter()
         .map(|model| model.trim())
         .filter(|model| !model.is_empty())
-        .map(|model| model.to_lowercase())
+        .map(model_id::key)
         .collect::<HashSet<_>>();
     if let Some(model) = requested_official
         .iter()
@@ -604,22 +605,23 @@ pub(super) fn validate_manual_model_selection(
     }
     let supported_official = official_model_ids
         .iter()
-        .filter(|model| requested_official.contains(model.to_lowercase().as_str()))
+        .filter(|model| requested_official.contains(&model_id::key(model)))
         .cloned()
         .collect::<Vec<_>>();
     let mut selected_third_party = Vec::with_capacity(requested_third_party_models.len());
-    let mut seen_third_party = HashSet::<&str>::with_capacity(requested_third_party_models.len());
+    let mut seen_third_party = HashSet::<String>::with_capacity(requested_third_party_models.len());
     for model in requested_third_party_models
         .iter()
         .map(|model| model.trim())
         .filter(|model| !model.is_empty())
     {
-        if official_by_key.contains_key(model.to_lowercase().as_str()) {
+        let key = model_id::key(model);
+        if official_by_key.contains_key(&key) {
             return Err(format!(
                 "模型 {model} 已在官方模型列表中，请直接勾选，不可作为其他模型手动添加"
             ));
         }
-        if seen_third_party.insert(model) {
+        if seen_third_party.insert(key) {
             selected_third_party.push(model.to_string());
         }
     }
@@ -632,14 +634,14 @@ pub(super) fn validate_deleted_third_party_models(
 ) -> Result<HashSet<String>, String> {
     let official_model_keys = official_model_ids
         .iter()
-        .map(|model| model.to_lowercase())
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
     requested_deleted_third_party_models
         .iter()
         .map(|model| model.trim())
         .filter(|model| !model.is_empty())
         .try_fold(HashSet::<String>::new(), |mut models, model| {
-            let key = model.to_lowercase();
+            let key = model_id::key(model);
             if official_model_keys.contains(key.as_str()) {
                 return Err(format!("官方模型 {model} 不能作为其他模型删除"));
             }
@@ -654,7 +656,7 @@ fn validate_deleted_models_are_manual(
 ) -> Result<(), String> {
     let manual_model_keys = manual_third_party_models
         .iter()
-        .map(|model| model.trim().to_lowercase())
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
     if let Some(model) = deleted_model_keys
         .iter()
@@ -674,29 +676,29 @@ fn validate_manual_third_party_model_sources(
 ) -> Result<Vec<String>, String> {
     let official_model_keys = official_model_ids
         .iter()
-        .map(|model| model.to_lowercase())
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
     let selected_model_keys = selected_third_party_models
         .iter()
-        .map(|model| model.trim().to_lowercase())
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
     let upstream_model_keys = upstream_models
         .iter()
-        .map(|model| model.trim().to_lowercase())
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
     let existing_manual_model_keys = existing_manual_third_party_models
         .iter()
-        .map(|model| model.trim().to_lowercase())
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
 
     let mut models = Vec::with_capacity(requested_manual_third_party_models.len());
-    let mut seen = HashSet::<&str>::with_capacity(requested_manual_third_party_models.len());
+    let mut seen = HashSet::<String>::with_capacity(requested_manual_third_party_models.len());
     for model in requested_manual_third_party_models
         .iter()
         .map(|model| model.trim())
         .filter(|model| !model.is_empty())
     {
-        let key = model.to_lowercase();
+        let key = model_id::key(model);
         if official_model_keys.contains(key.as_str()) {
             return Err(format!("官方模型 {model} 不能作为手动添加的其他模型"));
         }
@@ -708,7 +710,7 @@ fn validate_manual_third_party_model_sources(
         {
             continue;
         }
-        if seen.insert(model) {
+        if seen.insert(key) {
             models.push(model.to_string());
         }
     }
@@ -726,24 +728,27 @@ pub async fn save_default_model(
         return Err("默认模型不能为空".to_string());
     }
     let model_state = current_model_state(&config)?;
-    let supported = model_state
+    let canonical_model = model_state
         .official_models
         .iter()
-        .any(|model| model.supported && model.slug == requested_model)
-        || model_state
-            .third_party_models
-            .iter()
-            .any(|model| model == requested_model);
-    if !supported {
-        return Err(format!("模型 {requested_model} 当前不可用，无法设为默认"));
-    }
+        .find(|model| model.supported && model_id::equal(&model.slug, requested_model))
+        .map(|model| model.slug.as_str())
+        .or_else(|| {
+            model_state
+                .third_party_models
+                .iter()
+                .find(|model| model_id::equal(model, requested_model))
+                .map(String::as_str)
+        })
+        .ok_or_else(|| format!("模型 {requested_model} 当前不可用，无法设为默认"))?
+        .to_string();
     let provider_id = config
         .current_provider_id()
         .ok_or_else(|| "当前线路缺少标识".to_string())?
         .to_string();
     config
         .default_model_by_provider
-        .insert(provider_id, requested_model.to_string());
+        .insert(provider_id, canonical_model);
     config = config.normalize();
     save_config_to_store(state, &config).await?;
     *state.config.write().await = config.clone();
@@ -964,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_model_selection_keeps_first_exact_duplicate_in_linear_time() {
+    fn manual_model_selection_keeps_first_case_insensitive_duplicate() {
         let official = model_catalog::default_official_model_slugs();
         let (_, selected) = validate_manual_model_selection(
             &official,
@@ -978,7 +983,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selected, ["provider-a", "Provider-A", "provider-b"]);
+        assert_eq!(selected, ["provider-a", "provider-b"]);
     }
 
     #[test]

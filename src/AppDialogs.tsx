@@ -10,6 +10,7 @@ import {
 } from "@tabler/icons-react";
 
 import type { Confirmation, ModelState } from "./App.types";
+import { modelKey } from "./modelIds";
 import {
   Badge,
   Button,
@@ -88,7 +89,7 @@ function ModelPickerDialogComponent({
   const selectedThirdPartyModelKeys = useMemo(
     () =>
       open
-        ? new Set(modelState.thirdPartyModels.map((model) => model.trim().toLowerCase()))
+        ? new Set(modelState.thirdPartyModels.map(modelKey))
         : new Set<string>(),
     [modelState.thirdPartyModels, open],
   );
@@ -159,7 +160,7 @@ function ModelPickerDialogComponent({
           {modelState.officialModels.map((model) => (
             <div className="model-picker-row official" key={model.slug}>
               <Checkbox
-                checked={draftModelSet.has(model.slug)}
+                checked={draftModelSet.has(modelKey(model.slug))}
                 disabled={isBusy}
                 onCheckedChange={(checked) =>
                   onToggleDraftModel(model.slug, checked === true)}
@@ -200,13 +201,13 @@ function ModelPickerDialogComponent({
           )}
           {visibleThirdPartyModels.map((model) => {
             const added =
-              draftModelSet.has(model) ||
-              selectedThirdPartyModelKeys.has(model.trim().toLowerCase());
-            const manual = manualThirdPartyModelKeys.has(model.trim().toLowerCase());
+              draftModelSet.has(modelKey(model)) ||
+              selectedThirdPartyModelKeys.has(modelKey(model));
+            const manual = manualThirdPartyModelKeys.has(modelKey(model));
             return (
               <div className="model-picker-row" key={model}>
                 <Checkbox
-                  checked={draftModelSet.has(model)}
+                  checked={draftModelSet.has(modelKey(model))}
                   disabled={isBusy}
                   onCheckedChange={(checked) => onToggleDraftModel(model, checked === true)}
                   aria-label={`当前线路支持 ${model}`}

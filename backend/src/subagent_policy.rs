@@ -2,6 +2,7 @@ use std::path::Path;
 
 use crate::config::{CodeyConfig, DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
 use crate::model_catalog;
+use crate::model_id;
 
 pub(crate) fn apply_after_provider_sync(
     previous_provider_id: Option<&str>,
@@ -36,11 +37,26 @@ pub(crate) fn reconcile_for_current_provider(
     codex_home: &Path,
     official_provider: bool,
 ) {
-    if config.subagent_optimization
-        && !selected_model_available_for_current_provider(config, codex_home, official_provider)
-    {
-        reset_for_current_provider(config, codex_home, official_provider);
+    if !config.subagent_optimization {
+        return;
     }
+    let Ok(state) = model_catalog::selection_state_with_manual_models(
+        codex_home,
+        official_provider,
+        config.upstream_models_snapshot(),
+        config.selected_models(),
+        config.manual_third_party_models(),
+        Some(DEFAULT_SUBAGENT_MODEL),
+    ) else {
+        return;
+    };
+    let model = config.subagent_model.trim().to_string();
+    if state.available_subagent_model(&model).is_none() {
+        reset_for_current_provider(config, codex_home, official_provider);
+        return;
+    }
+    config.subagent_reasoning_effort =
+        reasoning_effort_for_model(&state, &model, &config.subagent_reasoning_effort);
 }
 
 fn defaults_for_current_provider(
@@ -80,29 +96,7 @@ fn defaults_for_current_provider(
     (model, reasoning_effort, true)
 }
 
-fn selected_model_available_for_current_provider(
-    config: &CodeyConfig,
-    codex_home: &Path,
-    official_provider: bool,
-) -> bool {
-    let model = config.subagent_model.trim();
-    if model.is_empty() {
-        return false;
-    }
-    let Ok(state) = model_catalog::selection_state_with_manual_models(
-        codex_home,
-        official_provider,
-        config.upstream_models_snapshot(),
-        config.selected_models(),
-        config.manual_third_party_models(),
-        Some(DEFAULT_SUBAGENT_MODEL),
-    ) else {
-        return true;
-    };
-    state.available_subagent_model(model).is_some()
-}
-
-fn reasoning_effort_for_model(
+pub(crate) fn reasoning_effort_for_model(
     state: &model_catalog::ModelSelectionState,
     model: &str,
     preferred_reasoning_effort: &str,
@@ -111,7 +105,7 @@ fn reasoning_effort_for_model(
     if let Some(official_model) = state
         .official_models
         .iter()
-        .find(|candidate| candidate.supported && candidate.slug == model)
+        .find(|candidate| candidate.supported && model_id::equal(&candidate.slug, model))
     {
         if official_model
             .supported_reasoning_efforts
@@ -134,7 +128,7 @@ fn reasoning_effort_for_model(
     if state
         .third_party_models
         .iter()
-        .any(|candidate| candidate.eq_ignore_ascii_case(model))
+        .any(|candidate| model_id::equal(candidate, model))
         && matches!(
             preferred_reasoning_effort.as_str(),
             "low" | "medium" | "high" | "xhigh"
@@ -306,5 +300,38 @@ mod tests {
             unavailable.subagent_reasoning_effort,
             DEFAULT_SUBAGENT_REASONING_EFFORT
         );
+    }
+
+    #[test]
+    fn unchanged_provider_reconciles_an_unsupported_reasoning_effort() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "display_name": "GPT-5.6-Sol",
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [
+                        {"effort": "medium"},
+                        {"effort": "high"}
+                    ]
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut config = route_config("route-a");
+        config.subagent_model = "gpt-5.6-sol".into();
+        config.subagent_reasoning_effort = "low".into();
+        config
+            .upstream_models_by_provider
+            .insert("route-a".into(), vec!["gpt-5.6-sol".into()]);
+
+        apply_after_provider_sync(Some("route-a"), "route-a", &mut config, home.path(), false);
+
+        assert!(config.subagent_optimization);
+        assert_eq!(config.subagent_model, "gpt-5.6-sol");
+        assert_eq!(config.subagent_reasoning_effort, "medium");
     }
 }

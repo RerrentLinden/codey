@@ -182,11 +182,12 @@ pub async fn read_codex_model_catalog_from_home(
     if model.is_empty() {
         model = string_value(effective.get("default_model"));
     }
-    let default_model = if models.iter().any(|item| item == &model) {
-        model.clone()
-    } else {
-        models.first().cloned().unwrap_or_default()
-    };
+    let default_model = models
+        .iter()
+        .find(|item| item.trim().eq_ignore_ascii_case(model.trim()))
+        .cloned()
+        .or_else(|| models.first().cloned())
+        .unwrap_or_default();
     let status = if !models.is_empty() {
         "ok"
     } else if !source_statuses.is_empty()
@@ -721,7 +722,7 @@ fn unique_strings(values: Vec<String>) -> Vec<String> {
     let mut result = Vec::new();
     for value in values {
         let value = value.trim();
-        if value.is_empty() || !seen.insert(value.to_string()) {
+        if value.is_empty() || !seen.insert(value.to_ascii_lowercase()) {
             continue;
         }
         result.push(value.to_string());

@@ -84,7 +84,7 @@ function FeaturePolicyCardComponent({
             <div className="feature-card-body gpu-mode-card-body">
               <fieldset
                 className="gpu-mode-fieldset"
-                disabled={isMacClient}
+                disabled={isMacClient || isBusy}
                 aria-describedby="gpu-launch-mode-description"
               >
                 <legend className="sr-only">Codex GPU 启动模式</legend>
@@ -234,6 +234,7 @@ function FeaturePolicyCardComponent({
               <strong>精简 Codex 宠物模块</strong>
               <Switch
                 checked={config.slimCodexPet}
+                disabled={isBusy}
                 onCheckedChange={(checked) =>
                   onConfigChange({ ...config, slimCodexPet: checked })
                 }
@@ -256,6 +257,7 @@ function FeaturePolicyCardComponent({
               <strong>Codex 慢启动保护</strong>
               <Switch
                 checked={config.fastCodexStartup}
+                disabled={isBusy}
                 onCheckedChange={(checked) =>
                   onConfigChange({
                     ...config,
@@ -284,6 +286,7 @@ function FeaturePolicyCardComponent({
               </div>
               <Switch
                 checked={config.fastContextTools}
+                disabled={isBusy}
                 onCheckedChange={(checked) =>
                   onConfigChange({ ...config, fastContextTools: checked })
                 }
@@ -306,6 +309,7 @@ function FeaturePolicyCardComponent({
               <strong>Trace 日志写盘保护</strong>
               <Switch
                 checked={config.disableTraceLogWrites}
+                disabled={isBusy}
                 onCheckedChange={(checked) =>
                   onConfigChange({
                     ...config,
@@ -328,6 +332,7 @@ function FeaturePolicyCardComponent({
                 <strong>Crashpad 磁盘保护</strong>
                 <Switch
                   checked={config.protectCrashpadPending}
+                  disabled={isBusy}
                   onCheckedChange={(checked) =>
                     onConfigChange({
                       ...config,
@@ -353,6 +358,7 @@ function FeaturePolicyCardComponent({
               <strong>屏蔽完全访问安全提示</strong>
               <Switch
                 checked={config.hideFullAccessWarning}
+                disabled={isBusy}
                 onCheckedChange={(checked) =>
                   onConfigChange({ ...config, hideFullAccessWarning: checked })
                 }

@@ -2,6 +2,12 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "../node_modules/@douyinfe/semi-ui/lib/es/_base/base.css";
 import { App } from "./App";
+import {
+  includesModelId,
+  modelIdsEqual,
+  modelKey,
+  uniqueModelIds,
+} from "./modelIds";
 import { previewOfficialModels, previewUpstreamModels } from "./previewModels";
 import {
   previewCrashpadPendingStats,
@@ -104,7 +110,7 @@ if (import.meta.env.DEV) {
     let previewModelState = {
       officialModels: previewOfficialModels.map((model) => ({
         ...model,
-        supported: previewUpstreamModels.includes(model.slug),
+        supported: includesModelId(previewUpstreamModels, model.slug),
       })),
       officialModelIds: previewOfficialModels.map((model) => model.slug),
       subagentModelIds: [
@@ -334,13 +340,13 @@ if (import.meta.env.DEV) {
           ...previewModelState,
           officialModels: previewOfficialModels.map((model) => ({
             ...model,
-            supported: previewUpstreamModels.includes(model.slug),
+            supported: includesModelId(previewUpstreamModels, model.slug),
           })),
           thirdPartyModels: previewModelState.thirdPartyModels.filter((model) =>
-            previewUpstreamModels.includes(model)
+            includesModelId(previewUpstreamModels, model)
           ),
           manualThirdPartyModels: previewModelState.manualThirdPartyModels.filter((model) =>
-            !previewUpstreamModels.includes(model)
+            !includesModelId(previewUpstreamModels, model)
           ),
           upstreamModels: previewUpstreamModels,
         };
@@ -356,8 +362,11 @@ if (import.meta.env.DEV) {
         const officialModels = (args.officialModels as string[]) || [];
         const thirdPartyModels = (args.thirdPartyModels as string[]) || [];
         const manualThirdPartyModels = (args.manualThirdPartyModels as string[]) || [];
-        const requestedOfficial = new Set(officialModels);
-        const supportedModels = [...officialModels, ...thirdPartyModels];
+        const requestedOfficial = new Set(officialModels.map(modelKey));
+        const supportedModels = uniqueModelIds([
+          ...officialModels,
+          ...thirdPartyModels,
+        ]);
         previewConfig = {
           ...previewConfig,
           selectedModelsByProvider: {
@@ -373,18 +382,20 @@ if (import.meta.env.DEV) {
             primary: supportedModels,
           },
         };
-        const defaultModel = supportedModels.includes(previewModelState.defaultModel)
-          ? previewModelState.defaultModel
-          : supportedModels[0] || "";
+        const defaultModel = supportedModels.find((model) =>
+          modelIdsEqual(model, previewModelState.defaultModel)
+        )
+          ?? supportedModels[0]
+          ?? "";
         previewModelState = {
           ...previewModelState,
           officialModels: previewOfficialModels.map((model) => ({
             ...model,
-            supported: requestedOfficial.has(model.slug),
+            supported: requestedOfficial.has(modelKey(model.slug)),
           })),
           thirdPartyModels,
           manualThirdPartyModels: manualThirdPartyModels.filter((model) =>
-            thirdPartyModels.includes(model)
+            includesModelId(thirdPartyModels, model)
           ),
           upstreamModels: supportedModels,
           defaultModel,

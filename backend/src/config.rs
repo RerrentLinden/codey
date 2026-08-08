@@ -9,6 +9,7 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::model_id;
 pub use crate::notifications::WebhookConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -276,16 +277,7 @@ fn normalize_upstream_model_lists(lists: &mut BTreeMap<String, Vec<String>>) {
 }
 
 fn normalize_model_list(models: &mut Vec<String>) {
-    *models = models
-        .iter()
-        .map(|model| model.trim())
-        .filter(|model| !model.is_empty())
-        .fold(Vec::<String>::new(), |mut unique, model| {
-            if !unique.iter().any(|existing| existing == model) {
-                unique.push(model.to_string());
-            }
-            unique
-        });
+    *models = model_id::dedupe_preserving_first(models.iter().map(String::as_str));
 }
 
 fn normalize_model_map(models_by_provider: &mut BTreeMap<String, String>) {
@@ -475,6 +467,35 @@ mod tests {
         let normalized = config.normalize();
 
         assert_eq!(normalized.upstream_models_snapshot(), Some([].as_slice()));
+    }
+
+    #[test]
+    fn model_lists_trim_and_dedupe_case_insensitively() {
+        let mut config = CodeyConfig::default();
+        let provider_id = config.current_provider_id().unwrap().to_string();
+        config.selected_models_by_provider.insert(
+            provider_id.clone(),
+            vec![
+                " Provider-A ".to_string(),
+                "provider-a".to_string(),
+                "Provider-B".to_string(),
+            ],
+        );
+        config.upstream_models_by_provider.insert(
+            provider_id.clone(),
+            vec!["UPSTREAM-A".to_string(), "upstream-a".to_string()],
+        );
+
+        let normalized = config.normalize();
+
+        assert_eq!(
+            normalized.selected_models_by_provider[&provider_id],
+            ["Provider-A", "Provider-B"]
+        );
+        assert_eq!(
+            normalized.upstream_models_by_provider[&provider_id],
+            ["UPSTREAM-A"]
+        );
     }
 
     #[test]

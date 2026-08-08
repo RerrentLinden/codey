@@ -395,14 +395,12 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-tungstenite",
  "toml 0.8.23",
  "toml_edit",
- "uuid",
  "windows 0.58.0",
  "zip",
 ]
@@ -420,7 +418,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror",
  "uuid",
 ]
 

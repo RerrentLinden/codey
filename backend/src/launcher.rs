@@ -4,7 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 #[cfg(all(test, unix))]
 use std::{collections::HashSet, path::Path};
 
@@ -38,6 +38,7 @@ use crate::plugin_marketplace;
 use crate::provider_lease;
 use crate::session_index_cleanup::{self, SessionIndexCleanupReport};
 use crate::startup_maintenance::{self, ProviderSyncPlan};
+use crate::subagent_policy;
 use crate::trace_log_guard;
 
 mod platform;
@@ -48,6 +49,8 @@ const CDP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const CDP_WATCHDOG_FAILURE_THRESHOLD: u8 = 2;
 const ROUTE_OVERLAY_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const ROUTE_OVERLAY_STABLE_READS: u8 = 2;
+const ROUTE_OVERLAY_ERROR_LOG_INITIAL_INTERVAL: Duration = Duration::from_secs(2);
+const ROUTE_OVERLAY_ERROR_LOG_MAX_INTERVAL: Duration = Duration::from_secs(30);
 pub const CODEX_APP_NOT_FOUND_ERROR: &str = "找不到 Codex App，请在 Codey 配置中填写路径";
 pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效或指向了 Codex CLI；请选择 Codex 桌面 App，不要选择 codex.exe 命令行程序";
 const DISABLE_GPU_ARGUMENT: &str = "--disable-gpu";
@@ -512,9 +515,15 @@ async fn prepare_codex_startup_state(
     let runtime_config_provider = original_provider.to_string();
     let runtime_default_model = (!default_model.is_empty()).then_some(default_model);
     let fast_context_tools = config.fast_context_tools;
-    let subagent_optimization = config.subagent_optimization;
-    let subagent_model = config.subagent_model.clone();
-    let subagent_reasoning_effort = config.subagent_reasoning_effort.clone();
+    let mut runtime_subagent_config = config.clone();
+    subagent_policy::reconcile_for_current_provider(
+        &mut runtime_subagent_config,
+        home,
+        current_profile.cc_switch_read_only,
+    );
+    let subagent_optimization = runtime_subagent_config.subagent_optimization;
+    let subagent_model = runtime_subagent_config.subagent_model;
+    let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort;
     let protocol_proxy_base_url = protocol_proxy_base_url.map(str::to_string);
     let protocol_proxy_enabled = protocol_proxy_base_url.is_some();
     let expected_config = expected_config.map(<[u8]>::to_vec);
@@ -1688,9 +1697,11 @@ fn spawn_route_overlay_watcher(
         let mut interval = tokio::time::interval(ROUTE_OVERLAY_WATCH_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         interval.tick().await;
+        let applied_fingerprint = route_change_fingerprint(&applied);
         let mut pending_external: Option<RouteChangeFingerprint> = None;
         let mut missing_config_streak = 0_u8;
         let mut route_changed_tx = Some(route_changed_tx);
+        let mut error_limiter = RouteWatchErrorLimiter::new(Instant::now());
 
         loop {
             tokio::select! {
@@ -1700,10 +1711,12 @@ fn spawn_route_overlay_watcher(
             }
             let current = match read_route_files(&home).await {
                 Ok(Some(current)) => {
+                    error_limiter.reset();
                     missing_config_streak = 0;
                     current
                 }
                 Ok(None) => {
+                    error_limiter.reset();
                     pending_external = None;
                     if !observe_missing_route_config(&mut missing_config_streak) {
                         continue;
@@ -1715,23 +1728,30 @@ fn spawn_route_overlay_watcher(
                 }
                 Err(error) => {
                     missing_config_streak = 0;
-                    error_log::record_failure_async(
-                        "route_overlay_watch_failed",
-                        "read_cc_switch_live_route",
-                        error.to_string(),
-                        serde_json::json!({
-                            "codexHome": home,
-                        }),
-                    )
-                    .await;
+                    let message = error.to_string();
+                    let error_key = format!("{:?}:{message}", error.kind());
+                    if let Some(suppressed_count) =
+                        error_limiter.should_log(&error_key, Instant::now())
+                    {
+                        error_log::record_failure_async(
+                            "route_overlay_watch_failed",
+                            "read_cc_switch_live_route",
+                            message,
+                            serde_json::json!({
+                                "codexHome": home,
+                                "suppressedCount": suppressed_count,
+                            }),
+                        )
+                        .await;
+                    }
                     continue;
                 }
             };
-            if !route_files_changed(&applied, &current) {
+            let current_fingerprint = route_change_fingerprint(&current);
+            if applied_fingerprint == current_fingerprint {
                 pending_external = None;
                 continue;
             }
-            let current_fingerprint = route_change_fingerprint(&current);
             if pending_external.as_ref() != Some(&current_fingerprint) {
                 pending_external = Some(current_fingerprint);
                 continue;
@@ -1744,6 +1764,51 @@ fn spawn_route_overlay_watcher(
         }
     });
     (shutdown_tx, task, route_changed_rx)
+}
+
+struct RouteWatchErrorLimiter {
+    error_key: Option<String>,
+    interval: Duration,
+    next_log_at: Instant,
+    suppressed_count: u64,
+}
+
+impl RouteWatchErrorLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            error_key: None,
+            interval: ROUTE_OVERLAY_ERROR_LOG_INITIAL_INTERVAL,
+            next_log_at: now,
+            suppressed_count: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.error_key = None;
+        self.interval = ROUTE_OVERLAY_ERROR_LOG_INITIAL_INTERVAL;
+        self.suppressed_count = 0;
+    }
+
+    fn should_log(&mut self, error_key: &str, now: Instant) -> Option<u64> {
+        if self.error_key.as_deref() != Some(error_key) {
+            self.error_key = Some(error_key.to_string());
+            self.interval = ROUTE_OVERLAY_ERROR_LOG_INITIAL_INTERVAL;
+            self.next_log_at = now + self.interval;
+            self.suppressed_count = 0;
+            return Some(0);
+        }
+        if now < self.next_log_at {
+            self.suppressed_count = self.suppressed_count.saturating_add(1);
+            return None;
+        }
+        let suppressed_count = std::mem::take(&mut self.suppressed_count);
+        self.next_log_at = now + self.interval;
+        self.interval = self
+            .interval
+            .saturating_mul(2)
+            .min(ROUTE_OVERLAY_ERROR_LOG_MAX_INTERVAL);
+        Some(suppressed_count)
+    }
 }
 
 fn observe_missing_route_config(missing_streak: &mut u8) -> bool {
@@ -1771,6 +1836,7 @@ async fn read_route_files(home: &std::path::Path) -> std::io::Result<Option<Rout
     Ok(Some(RouteFilesSnapshot { config, auth }))
 }
 
+#[cfg(test)]
 fn route_files_changed(applied: &RouteFilesSnapshot, current: &RouteFilesSnapshot) -> bool {
     route_change_fingerprint(applied) != route_change_fingerprint(current)
 }
@@ -2215,6 +2281,32 @@ base_url = \"https://api.example.com/v1\"\n"
 
         assert!(!observe_missing_route_config(&mut missing_streak));
         assert!(observe_missing_route_config(&mut missing_streak));
+    }
+
+    #[test]
+    fn route_watcher_rate_limits_repeated_read_errors() {
+        let started_at = Instant::now();
+        let mut limiter = RouteWatchErrorLimiter::new(started_at);
+
+        assert_eq!(limiter.should_log("permission-denied", started_at), Some(0));
+        assert_eq!(
+            limiter.should_log("permission-denied", started_at + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(
+            limiter.should_log("permission-denied", started_at + Duration::from_secs(2)),
+            Some(1)
+        );
+        assert_eq!(
+            limiter.should_log("different-error", started_at + Duration::from_secs(2)),
+            Some(0)
+        );
+
+        limiter.reset();
+        assert_eq!(
+            limiter.should_log("permission-denied", started_at + Duration::from_secs(3)),
+            Some(0)
+        );
     }
 }
 

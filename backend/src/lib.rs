@@ -13,6 +13,7 @@ mod launcher;
 mod maintenance_lock;
 mod message_delete;
 mod model_catalog;
+mod model_id;
 mod notifications;
 mod pending_approval;
 mod pet_slim_patch;

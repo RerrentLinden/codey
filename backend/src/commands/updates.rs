@@ -303,45 +303,51 @@ async fn download_update_asset(
         return Err("安装包地址重定向到了非 HTTPS 地址".to_string());
     }
 
-    let mut file = tokio::fs::File::create(&temporary)
-        .await
-        .map_err(|error| format!("创建更新缓存文件失败：{error}"))?;
-    let mut stream = response.bytes_stream();
-    let mut hasher = Sha256::new();
-    let mut bytes_written = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|error| format!("读取更新下载数据失败：{error}"))?;
-        bytes_written += chunk.len() as u64;
-        if bytes_written > asset.size {
-            let _ = tokio::fs::remove_file(&temporary).await;
-            return Err("下载的安装包大小超过更新清单声明".to_string());
-        }
-        hasher.update(&chunk);
-        file.write_all(&chunk)
+    let verified_download = async {
+        let mut file = tokio::fs::File::create(&temporary)
             .await
-            .map_err(|error| format!("写入更新缓存文件失败：{error}"))?;
-    }
-    file.flush()
-        .await
-        .map_err(|error| format!("刷新更新缓存文件失败：{error}"))?;
-    drop(file);
+            .map_err(|error| format!("创建更新缓存文件失败：{error}"))?;
+        let mut stream = response.bytes_stream();
+        let mut hasher = Sha256::new();
+        let mut bytes_written = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| format!("读取更新下载数据失败：{error}"))?;
+            bytes_written += chunk.len() as u64;
+            if bytes_written > asset.size {
+                return Err("下载的安装包大小超过更新清单声明".to_string());
+            }
+            hasher.update(&chunk);
+            file.write_all(&chunk)
+                .await
+                .map_err(|error| format!("写入更新缓存文件失败：{error}"))?;
+        }
+        file.flush()
+            .await
+            .map_err(|error| format!("刷新更新缓存文件失败：{error}"))?;
+        drop(file);
 
-    if bytes_written != asset.size {
-        let _ = tokio::fs::remove_file(&temporary).await;
-        return Err(format!(
-            "安装包大小不一致：期望 {} 字节，实际 {} 字节",
-            asset.size, bytes_written
-        ));
+        if bytes_written != asset.size {
+            return Err(format!(
+                "安装包大小不一致：期望 {} 字节，实际 {} 字节",
+                asset.size, bytes_written
+            ));
+        }
+        let actual_sha256 = format!("{:x}", hasher.finalize());
+        if !actual_sha256.eq_ignore_ascii_case(&asset.sha256) {
+            return Err("安装包 SHA-256 校验失败".to_string());
+        }
+        Ok(())
     }
-    let actual_sha256 = format!("{:x}", hasher.finalize());
-    if !actual_sha256.eq_ignore_ascii_case(&asset.sha256) {
+    .await;
+    if let Err(error) = verified_download {
         let _ = tokio::fs::remove_file(&temporary).await;
-        return Err("安装包 SHA-256 校验失败".to_string());
+        return Err(error);
     }
     let _ = tokio::fs::remove_file(&destination).await;
-    tokio::fs::rename(&temporary, &destination)
-        .await
-        .map_err(|error| format!("保存更新安装包失败：{error}"))?;
+    if let Err(error) = tokio::fs::rename(&temporary, &destination).await {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return Err(format!("保存更新安装包失败：{error}"));
+    }
     Ok(destination)
 }
 
@@ -361,6 +367,9 @@ fn validate_downloaded_update_path(
         .map_err(|error| format!("读取更新安装包失败：{error}"))?;
     if !canonical.starts_with(&root) {
         return Err("只能安装 Codey 下载缓存中的更新包".to_string());
+    }
+    if !canonical.is_file() {
+        return Err("更新安装包路径必须指向文件".to_string());
     }
     Ok(canonical)
 }
@@ -435,4 +444,133 @@ fn current_macos_app_bundle() -> Option<PathBuf> {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn spawn_update_installer(_update_path: &Path) -> Result<(), String> {
     Err("当前平台暂不支持自动安装更新".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_asset() -> UpdateManifestAsset {
+        UpdateManifestAsset {
+            platform: current_update_platform().to_string(),
+            arch: current_update_arch().to_string(),
+            package_type: if cfg!(target_os = "windows") {
+                "nsis"
+            } else if cfg!(target_os = "macos") {
+                "app-zip"
+            } else {
+                "unsupported"
+            }
+            .to_string(),
+            file_name: "codey-update.pkg".to_string(),
+            url: "https://updates.example.test/codey-update.pkg".to_string(),
+            sha256: "a".repeat(64),
+            size: 42,
+        }
+    }
+
+    fn valid_manifest(version: &str) -> UpdateManifest {
+        UpdateManifest {
+            schema_version: 1,
+            version: version.to_string(),
+            tag: format!("v{version}"),
+            assets: vec![valid_asset()],
+        }
+    }
+
+    #[test]
+    fn update_manifest_validation_rejects_invalid_security_fields() {
+        let mut manifest = valid_manifest("2.0.0");
+        assert!(
+            assess_update_manifest("1.0.0", &manifest)
+                .unwrap()
+                .update_available
+        );
+
+        manifest.tag = "v1.0.0".to_string();
+        assert!(
+            assess_update_manifest("1.0.0", &manifest)
+                .unwrap_err()
+                .contains("版本和标签不一致")
+        );
+
+        manifest = valid_manifest("2.0.0");
+        manifest.assets[0].sha256 = "not-a-sha".to_string();
+        assert!(
+            assess_update_manifest("1.0.0", &manifest)
+                .unwrap_err()
+                .contains("SHA-256")
+        );
+
+        manifest = valid_manifest("2.0.0");
+        manifest.assets[0].file_name = "../escape.pkg".to_string();
+        assert!(
+            assess_update_manifest("1.0.0", &manifest)
+                .unwrap_err()
+                .contains("文件名无效")
+        );
+    }
+
+    #[test]
+    fn update_manifest_equal_version_is_not_available() {
+        let check = assess_update_manifest("2.0.0", &valid_manifest("2.0.0")).unwrap();
+
+        assert!(!check.update_available);
+        assert_eq!(check.current_version, "2.0.0");
+        assert_eq!(check.latest_version, "2.0.0");
+    }
+
+    #[test]
+    fn downloaded_update_path_must_be_a_file_inside_the_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let update_root = directory.path().join("updates");
+        let version_dir = update_root.join("v2.0.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let update = version_dir.join("codey-update.pkg");
+        std::fs::write(&update, b"verified").unwrap();
+        let outside = directory.path().join("outside.pkg");
+        std::fs::write(&outside, b"outside").unwrap();
+
+        assert_eq!(
+            validate_downloaded_update_path(&store, update.to_str().unwrap()).unwrap(),
+            update.canonicalize().unwrap()
+        );
+        assert!(
+            validate_downloaded_update_path(&store, "relative.pkg")
+                .unwrap_err()
+                .contains("绝对路径")
+        );
+        assert!(
+            validate_downloaded_update_path(&store, outside.to_str().unwrap())
+                .unwrap_err()
+                .contains("下载缓存")
+        );
+        assert!(
+            validate_downloaded_update_path(&store, version_dir.to_str().unwrap())
+                .unwrap_err()
+                .contains("必须指向文件")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn downloaded_update_path_rejects_symlinks_that_escape_the_cache() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let update_root = directory.path().join("updates");
+        std::fs::create_dir_all(&update_root).unwrap();
+        let outside = directory.path().join("outside.pkg");
+        std::fs::write(&outside, b"outside").unwrap();
+        let link = update_root.join("linked.pkg");
+        symlink(&outside, &link).unwrap();
+
+        assert!(
+            validate_downloaded_update_path(&store, link.to_str().unwrap())
+                .unwrap_err()
+                .contains("下载缓存")
+        );
+    }
 }

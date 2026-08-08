@@ -65,6 +65,33 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
   );
 });
 
+test("all editable feature controls are locked while an operation is active", async () => {
+  const source = await readFile(
+    new URL("src/FeaturePolicyCard.tsx", root),
+    "utf8",
+  );
+
+  assert.match(
+    source,
+    /className="gpu-mode-fieldset"\s*disabled=\{isMacClient \|\| isBusy\}/,
+  );
+  for (const setting of [
+    "slimCodexPet",
+    "fastCodexStartup",
+    "fastContextTools",
+    "disableTraceLogWrites",
+    "protectCrashpadPending",
+    "hideFullAccessWarning",
+  ]) {
+    assert.match(
+      source,
+      new RegExp(
+        `checked=\\{config\\.${setting}\\}[\\s\\S]{0,80}disabled=\\{isBusy\\}`,
+      ),
+    );
+  }
+});
+
 test("settings notice toast is scoped to the settings page", async () => {
   const [appSource, noticeSource, stylesSource] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),

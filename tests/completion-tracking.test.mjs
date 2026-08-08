@@ -346,6 +346,30 @@ test("syncs Codex sidebar titles to the notification backend", async () => {
   );
 });
 
+test("bounds long-lived sidebar title cache entries", () => {
+  const runtime = loadInjection();
+  const rows = Array.from({ length: 2_049 }, (_, index) => new FakeElement({
+    "data-app-action-sidebar-thread-id": `cache-session-${index}`,
+    "data-app-action-sidebar-thread-title": `Cache title ${index}`,
+  }));
+  const root = {
+    querySelectorAll(selector) {
+      return selector ===
+        "[data-app-action-sidebar-thread-id][data-app-action-sidebar-thread-title]"
+        ? rows
+        : [];
+    },
+  };
+
+  runtime.window.__codeySyncSidebarTitles(root);
+
+  assert.equal(runtime.window.__codeyGetSessionTitle("cache-session-0"), "");
+  assert.equal(
+    runtime.window.__codeyGetSessionTitle("cache-session-2048"),
+    "Cache title 2048",
+  );
+});
+
 test("resolves a local project path from the current opaque project row id", () => {
   const runtime = loadInjection();
   const project = new FakeElement({

@@ -57,6 +57,13 @@ test("script injection diagnostics report runtime evidence without continuous po
     /window\.dispatchEvent\(new CustomEvent\(SETTINGS_OPENED_EVENT\)\)/,
   );
   assert.match(runtimeHook, /injectionStatusRefreshRef/);
+  assert.match(app, /active: !embedded \|\| modalVisible/);
+  assert.match(runtimeHook, /if \(!activeRef\.current\) return/);
+  assert.match(
+    runtimeHook,
+    /const STATUS_POLL_MAX_CONSECUTIVE_ERRORS = 5/,
+  );
+  assert.match(runtimeHook, /STATUS_POLL_MAX_DURATION_MS/);
   assert.match(cdp, /completedEntry\.status === \\"pending\\"/);
   assert.match(pluginFix, /markPluginBridgeEffective/);
   assert.match(pluginFix, /entry\.status = "effective"/);

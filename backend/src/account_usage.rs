@@ -57,7 +57,10 @@ pub async fn fetch_official_account_usage(
     client: &Client,
     codex_home: &Path,
 ) -> Result<AccountUsageSnapshot> {
-    let auth = read_official_auth(&codex_home.join("auth.json"))?;
+    let auth_path = codex_home.join("auth.json");
+    let auth = tokio::task::spawn_blocking(move || read_official_auth(&auth_path))
+        .await
+        .context("读取 Codex 官方登录信息任务异常退出")??;
     let mut last_error = None;
 
     // 从上次成功的端点开始轮询，失败仍会回退到完整列表，结果不变但稳定

@@ -82,7 +82,7 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
   assert.match(uiSource, /当前 Codex 版本或线路没有可用于子代理的模型/);
   assert.doesNotMatch(uiSource, /仅接受 Sol \/ Terra/);
   assert.match(modelSource, /invoke\("fetch_current_provider_models"\)/);
-  assert.match(modelSource, /supportsModel\(result\.models, subagentModel\)/);
+  assert.match(modelSource, /includesModelId\(result\.models, subagentModel\)/);
   assert.match(modelSource, /provider\.official \? "官方账号" : "第三方 API"/);
   assert.match(modelSource, /不支持 \$\{subagentModel\}，无法开启子代理协作优化/);
   assert.match(uiSource, /无需重启/);

@@ -9,6 +9,8 @@ use semver::Version;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::model_id;
+
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 // First published Codex tag containing openai/codex#36892. Older runtimes
 // require an explicit `v2` marker, so Codey backports the newer
@@ -133,13 +135,13 @@ pub fn refresh_for_provider(
     let official_slugs = official_models
         .iter()
         .filter_map(|model| model.get("slug").and_then(Value::as_str))
-        .map(ToString::to_string)
+        .map(model_id::key)
         .collect::<HashSet<_>>();
     let provider_models_synced = official_provider || upstream_models.is_some();
     let upstream = upstream_models
         .unwrap_or_default()
         .iter()
-        .map(String::as_str)
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
     let mut catalog_models = official_models
         .iter()
@@ -149,7 +151,7 @@ pub fn refresh_for_provider(
                 || model
                     .get("slug")
                     .and_then(Value::as_str)
-                    .is_some_and(|slug| upstream.contains(slug))
+                    .is_some_and(|slug| upstream.contains(&model_id::key(slug)))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -175,10 +177,11 @@ pub fn refresh_for_provider(
         let mut seen = HashSet::new();
         for (index, model_id) in selected_models.iter().enumerate() {
             let model_id = model_id.trim();
+            let model_key = model_id::key(model_id);
             if model_id.is_empty()
-                || official_slugs.contains(model_id)
-                || (provider_models_synced && !upstream.contains(model_id))
-                || !seen.insert(model_id.to_string())
+                || official_slugs.contains(&model_key)
+                || (provider_models_synced && !upstream.contains(&model_key))
+                || !seen.insert(model_key)
             {
                 continue;
             }
@@ -225,13 +228,13 @@ pub fn selection_state_with_manual_models(
         .collect::<Vec<_>>();
     let official_slugs = official_model_ids
         .iter()
-        .map(String::as_str)
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
     let provider_models_synced = official_provider || upstream_models.is_some();
     let upstream_models = upstream_models.unwrap_or_default();
     let upstream = upstream_models
         .iter()
-        .map(String::as_str)
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
     let official_models: Vec<OfficialModelAvailability> = official_entries
         .iter()
@@ -242,7 +245,7 @@ pub fn selection_state_with_manual_models(
             let model = official_model_from_value(model)?;
             let supported = official_provider
                 || !provider_models_synced
-                || upstream.contains(model.slug.as_str());
+                || upstream.contains(&model_id::key(&model.slug));
             Some(OfficialModelAvailability {
                 slug: model.slug,
                 display_name: model.display_name,
@@ -255,20 +258,22 @@ pub fn selection_state_with_manual_models(
     let third_party_models = if official_provider {
         Vec::new()
     } else {
+        let mut seen = HashSet::new();
         selected_models
             .iter()
-            .map(|model| model.trim())
-            .filter(|model| {
-                !model.is_empty()
-                    && !official_slugs.contains(*model)
-                    && (!provider_models_synced || upstream.contains(*model))
-            })
-            .fold(Vec::<String>::new(), |mut models, model| {
-                if !models.iter().any(|existing| existing == model) {
-                    models.push(model.to_string());
+            .filter_map(|model| {
+                let model = model.trim();
+                let key = model_id::key(model);
+                if key.is_empty()
+                    || official_slugs.contains(&key)
+                    || (provider_models_synced && !upstream.contains(&key))
+                    || !seen.insert(key)
+                {
+                    return None;
                 }
-                models
+                Some(model.to_string())
             })
+            .collect()
     };
     let mut subagent_model_ids = official_entries
         .iter()
@@ -283,14 +288,14 @@ pub fn selection_state_with_manual_models(
     subagent_model_ids.extend(third_party_models.iter().cloned());
     let manual_model_keys = manual_third_party_models
         .iter()
-        .map(|model| model.trim().to_lowercase())
+        .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
     let manual_third_party_models = if official_provider {
         Vec::new()
     } else {
         third_party_models
             .iter()
-            .filter(|model| manual_model_keys.contains(model.to_lowercase().as_str()))
+            .filter(|model| manual_model_keys.contains(&model_id::key(model)))
             .cloned()
             .collect()
     };
@@ -356,13 +361,19 @@ fn effective_default_model(
     let requested = requested_default_model
         .map(str::trim)
         .filter(|model| !model.is_empty());
-    if let Some(requested) = requested
-        && (official_models
+    if let Some(requested) = requested {
+        if let Some(model) = official_models
             .iter()
-            .any(|model| model.supported && model.slug == requested)
-            || third_party_models.iter().any(|model| model == requested))
-    {
-        return requested.to_string();
+            .find(|model| model.supported && model_id::equal(&model.slug, requested))
+        {
+            return model.slug.clone();
+        }
+        if let Some(model) = third_party_models
+            .iter()
+            .find(|model| model_id::equal(model, requested))
+        {
+            return model.clone();
+        }
     }
     official_models
         .iter()
@@ -672,7 +683,7 @@ fn catalog_models_from_value(value: &Value) -> Vec<Value> {
         .iter()
         .filter_map(|model| {
             let slug = model.get("slug")?.as_str()?.trim();
-            if slug.is_empty() || !model.is_object() || !seen.insert(slug.to_string()) {
+            if slug.is_empty() || !model.is_object() || !seen.insert(model_id::key(slug)) {
                 return None;
             }
             let mut model = model.clone();
@@ -1805,16 +1816,16 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
         let upstream = vec![
-            "gpt-5.6-sol".into(),
+            "GPT-5.6-SOL".into(),
             "gpt-5.6-luna".into(),
-            "third-model".into(),
+            "Third-Model".into(),
         ];
         let state = selection_state(
             home.path(),
             false,
             Some(&upstream),
-            &["third-model".into()],
-            Some("third-model"),
+            &["third-model".into(), "THIRD-MODEL".into()],
+            Some("THIRD-MODEL"),
         )
         .unwrap();
 

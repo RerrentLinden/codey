@@ -74,6 +74,7 @@ use crate::plugin_marketplace;
 use crate::session_delete;
 use crate::session_metadata;
 use crate::session_transfer;
+use crate::subagent_policy;
 use crate::trace_log_guard;
 use crate::trace_log_stats::{self, TraceLogStatsHandle, TraceLogStatsSnapshot};
 
@@ -741,9 +742,16 @@ async fn save_codey_config_locked(
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     let mut config = config.normalize();
     let subagent_model_changed = previous.subagent_model != config.subagent_model;
-    if config.subagent_optimization && (!previous.subagent_optimization || subagent_model_changed) {
+    if config.subagent_optimization {
         let model_state = current_model_state(&config)?;
-        validate_subagent_model_selection(&config.subagent_model, &model_state)?;
+        if !previous.subagent_optimization || subagent_model_changed {
+            validate_subagent_model_selection(&config.subagent_model, &model_state)?;
+        }
+        config.subagent_reasoning_effort = subagent_policy::reasoning_effort_for_model(
+            &model_state,
+            &config.subagent_model,
+            &config.subagent_reasoning_effort,
+        );
     }
     let refresh_subagent_defaults = previous.subagent_optimization
         && config.subagent_optimization

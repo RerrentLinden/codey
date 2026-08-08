@@ -307,7 +307,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "7");
+  assert.equal(patch.version, "8");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -394,6 +394,33 @@ test("stale thread and turn models are repaired before app-server dispatch", asy
     runtime.dispatchWindowEvent("codex-message-from-view", event);
     assert.equal(event.detail.request.params.model, "gpt-5.6-sol");
   }
+  runtime.patch.dispose();
+});
+
+test("model IDs dedupe and match without case drift", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["Provider-Coder", " provider-coder ", "Provider-Reasoner"],
+    default_model: "provider-coder",
+  }, [statsigClient()]);
+
+  assert.deepEqual(runtime.patch.snapshot(), {
+    loaded: true,
+    models: ["Provider-Coder", "Provider-Reasoner"],
+    defaultModel: "Provider-Coder",
+  });
+  const event = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "case-insensitive-model",
+        method: "turn/start",
+        params: { model: "PROVIDER-REASONER" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", event);
+  assert.equal(event.detail.request.params.model, "Provider-Reasoner");
   runtime.patch.dispose();
 });
 

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 default-run = "codey"
 
+[package.metadata.cargo-machete]
+ignored = ["winres"]
+
 [lib]
 name = "codey_lib"
 crate-type = ["rlib"]

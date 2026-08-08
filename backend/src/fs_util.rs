@@ -56,4 +56,32 @@ mod tests {
         assert_eq!(first.parent(), destination.parent());
         assert_eq!(second.parent(), destination.parent());
     }
+
+    #[test]
+    fn persisted_temp_file_replaces_destination_and_removes_temp() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("state.json");
+        let temp = unique_temp_path(&destination);
+        fs::write(&destination, b"old").unwrap();
+        fs::write(&temp, b"new").unwrap();
+
+        persist_temp_file(&temp, &destination).unwrap();
+
+        assert_eq!(fs::read(&destination).unwrap(), b"new");
+        assert!(!temp.exists());
+    }
+
+    #[test]
+    fn failed_persist_removes_the_temporary_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let temp = directory.path().join("state.tmp");
+        let destination = directory.path().join("missing").join("state.json");
+        fs::write(&temp, b"temporary").unwrap();
+
+        let error = persist_temp_file(&temp, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!temp.exists());
+        assert!(!destination.exists());
+    }
 }

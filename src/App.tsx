@@ -154,7 +154,10 @@ export function App({
   const [config, setConfig] = useState<Config | null>(null);
   const persistedConfigRef = useRef<Config | null>(null);
   const { status, setStatus, refreshStatus, refreshStatusForLoad } =
-    useRuntimeStatus({ embedded });
+    useRuntimeStatus({
+      active: !embedded || modalVisible,
+      embedded,
+    });
   const [pluginMarketplaceStatus, setPluginMarketplaceStatus] =
     useState<PluginMarketplaceStatus | null>(null);
   const [ccSwitchStatus, setCcSwitchStatus] = useState<CcSwitchStatus | null>(
