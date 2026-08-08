@@ -8,8 +8,10 @@ use codey_runtime_core::settings::RelayProtocol;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
+#[cfg(test)]
+use crate::codex_config_guidance::CODEY_FASTCTX_GUIDANCE_VERSIONS;
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE_VERSIONS, SUBAGENT_GUIDANCE, append_subagent_guidance,
+    SUBAGENT_GUIDANCE, append_subagent_guidance, codey_fastctx_guidance_blocks,
     codey_fastctx_guidance_for_namespace, default_agent_config_with_fastctx_guidance,
     remove_codey_fastctx_guidance, remove_subagent_guidance,
 };
@@ -942,15 +944,15 @@ fn restore_legacy_owned_config_changes(
         .unwrap_or_default();
     let mut applied_guidance = original_guidance.to_string();
     let mut fastctx_guidance_was_applied = false;
-    for &guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
-        if original_guidance.contains(guidance) || !current_guidance.contains(guidance) {
+    for guidance in codey_fastctx_guidance_blocks(current_guidance) {
+        if original_guidance.contains(&guidance) {
             continue;
         }
         if applied_guidance.trim().is_empty() {
-            applied_guidance = guidance.to_string();
+            applied_guidance = guidance;
         } else {
             applied_guidance.push_str("\n\n");
-            applied_guidance.push_str(guidance);
+            applied_guidance.push_str(&guidance);
         }
         fastctx_guidance_was_applied = true;
     }
@@ -1202,13 +1204,19 @@ fn patch_config_with_fastctx_mode_and_proxy(
     }
     enable_desktop_reasoning_efforts(&mut doc)?;
     ensure_default_service_tier(&mut doc);
-    if let Some(command) = fastctx_command {
-        enable_fast_context_tools(&mut doc, command)?;
+    let fastctx_namespace = if let Some(command) = fastctx_command {
+        Some(enable_fast_context_tools(&mut doc, command)?)
     } else {
         disable_fast_context_tools(&mut doc);
-    }
+        None
+    };
     if subagent_optimization {
-        enable_subagent_optimization(&mut doc, subagent_model, subagent_reasoning_effort)?;
+        enable_subagent_optimization(
+            &mut doc,
+            subagent_model,
+            subagent_reasoning_effort,
+            fastctx_namespace.as_deref(),
+        )?;
     }
     document_string(&doc)
 }
@@ -1247,6 +1255,7 @@ fn enable_subagent_optimization(
     doc: &mut DocumentMut,
     subagent_model: &str,
     subagent_reasoning_effort: &str,
+    fastctx_namespace: Option<&str>,
 ) -> Result<()> {
     let subagent_model = subagent_model.trim();
     if subagent_model.is_empty() {
@@ -1256,6 +1265,12 @@ fn enable_subagent_optimization(
     if !SUBAGENT_REASONING_EFFORTS.contains(&subagent_reasoning_effort.as_str()) {
         bail!("子代理思考深度无效：{subagent_reasoning_effort}");
     }
+    let inherited_developer_instructions = fastctx_namespace.map(|_| {
+        doc.get("developer_instructions")
+            .and_then(Item::as_str)
+            .unwrap_or_default()
+            .to_string()
+    });
     doc.as_table_mut().remove("agents");
     let agents = ensure_root_table(doc, "agents")?;
     agents["default_subagent_model"] = value(subagent_model);
@@ -1275,10 +1290,22 @@ fn enable_subagent_optimization(
     multi_agent["min_wait_timeout_ms"] = value(10_000);
     multi_agent["default_wait_timeout_ms"] = value(30_000);
     multi_agent["max_wait_timeout_ms"] = value(120_000);
+    if let Some(namespace) = fastctx_namespace {
+        if multi_agent.get("subagent_developer_instructions").is_none() {
+            multi_agent["subagent_developer_instructions"] =
+                value(inherited_developer_instructions.unwrap_or_default());
+        }
+        apply_fastctx_guidance_to_table(
+            multi_agent,
+            "subagent_developer_instructions",
+            namespace,
+            "features.multi_agent_v2.subagent_developer_instructions",
+        )?;
+    }
     Ok(())
 }
 
-fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()> {
+fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<String> {
     let codey_owned_server = doc
         .get("mcp_servers")
         .and_then(Item::as_table)
@@ -1288,7 +1315,7 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()
     if let Some(namespace) = configured_fastctx_tool_namespace(doc).filter(|_| !codey_owned_server)
     {
         apply_fastctx_guidance(doc, &namespace)?;
-        return Ok(());
+        return Ok(namespace);
     }
 
     let mcp_servers = ensure_root_table(doc, "mcp_servers")?;
@@ -1342,16 +1369,30 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<()
         doc["tool_output_token_limit"] = value(10_000);
     }
     apply_fastctx_guidance(doc, CODEY_FASTCTX_NAMESPACE)?;
-    Ok(())
+    Ok(CODEY_FASTCTX_NAMESPACE.to_string())
 }
 
 fn apply_fastctx_guidance(doc: &mut DocumentMut, namespace: &str) -> Result<()> {
+    apply_fastctx_guidance_to_table(
+        doc.as_table_mut(),
+        "developer_instructions",
+        namespace,
+        "developer_instructions",
+    )
+}
+
+fn apply_fastctx_guidance_to_table(
+    table: &mut Table,
+    key: &str,
+    namespace: &str,
+    qualified_key: &str,
+) -> Result<()> {
     let desired_guidance = codey_fastctx_guidance_for_namespace(namespace);
-    let existing_guidance = doc
-        .get("developer_instructions")
+    let existing_guidance = table
+        .get(key)
         .map(|item| {
             item.as_str()
-                .ok_or_else(|| anyhow::anyhow!("developer_instructions 必须是字符串"))
+                .ok_or_else(|| anyhow::anyhow!("{qualified_key} 必须是字符串"))
         })
         .transpose()?
         .unwrap_or_default();
@@ -1370,7 +1411,7 @@ fn apply_fastctx_guidance(doc: &mut DocumentMut, namespace: &str) -> Result<()> 
         } else {
             format!("{existing_guidance}\n\n{desired_guidance}")
         };
-        doc["developer_instructions"] = value(guidance);
+        table[key] = value(guidance);
     }
     Ok(())
 }
@@ -1390,26 +1431,22 @@ fn disable_fast_context_tools(doc: &mut DocumentMut) {
             false
         };
 
-    let existing_guidance = doc
-        .get("developer_instructions")
-        .and_then(Item::as_str)
-        .map(ToString::to_string);
-    let restored_guidance =
-        existing_guidance.and_then(|guidance| remove_codey_fastctx_guidance(&guidance));
-    let codey_guidance_removed = restored_guidance.is_some();
-    if let Some(restored_guidance) = restored_guidance {
-        if restored_guidance.trim().is_empty() {
-            doc.as_table_mut().remove("developer_instructions");
-        } else {
-            doc["developer_instructions"] = value(restored_guidance);
-        }
-    }
+    let codey_guidance_removed =
+        remove_fastctx_guidance_from_table(doc.as_table_mut(), "developer_instructions");
+    let subagent_guidance_removed = doc
+        .get_mut("features")
+        .and_then(Item::as_table_mut)
+        .and_then(|features| features.get_mut("multi_agent_v2"))
+        .and_then(Item::as_table_mut)
+        .is_some_and(|multi_agent| {
+            remove_fastctx_guidance_from_table(multi_agent, "subagent_developer_instructions")
+        });
 
     let reserved_server_remains = doc
         .get("mcp_servers")
         .and_then(Item::as_table)
         .is_some_and(|mcp_servers| mcp_servers.contains_key(CODEY_FASTCTX_SERVER_ID));
-    if (codey_owned_server_removed || codey_guidance_removed)
+    if (codey_owned_server_removed || codey_guidance_removed || subagent_guidance_removed)
         && !reserved_server_remains
         && let Some(namespaces) = doc
             .get_mut("features")
@@ -1429,6 +1466,22 @@ fn disable_fast_context_tools(doc: &mut DocumentMut) {
             namespaces.remove(index);
         }
     }
+}
+
+fn remove_fastctx_guidance_from_table(table: &mut Table, key: &str) -> bool {
+    let restored_guidance = table
+        .get(key)
+        .and_then(Item::as_str)
+        .and_then(remove_codey_fastctx_guidance);
+    let Some(restored_guidance) = restored_guidance else {
+        return false;
+    };
+    if restored_guidance.trim().is_empty() {
+        table.remove(key);
+    } else {
+        table[key] = value(restored_guidance);
+    }
+    true
 }
 
 fn configured_fastctx_tool_namespace(doc: &DocumentMut) -> Option<String> {
@@ -2254,6 +2307,9 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__fastctx"]
             )
         );
         assert!(guidance.contains("`mcp__fastctx__read` directly"));
+        assert!(guidance.contains("`mcp__fastctx` is a direct tool namespace"));
+        assert!(guidance.contains("Never call `list_mcp_resources`"));
+        assert!(guidance.contains("`read_mcp_resource`"));
         assert!(!guidance.contains("mcp__codey_fastctx"));
         assert!(!guidance.contains("resources/read"));
     }
@@ -2339,6 +2395,8 @@ args = ["fastctx", "--stdio"]
         let guidance = document["developer_instructions"].as_str().unwrap();
         assert!(guidance.contains("`mcp__context_tools__read` directly"));
         assert!(guidance.contains("`mcp__context_tools__grep`"));
+        assert!(guidance.contains("Never call `list_mcp_resources`"));
+        assert!(guidance.contains("`read_mcp_resource`"));
         assert!(!guidance.contains("mcp__codey_fastctx"));
         assert!(!guidance.contains("resources/read"));
         assert!(document.get("tool_output_token_limit").is_none());
@@ -2418,11 +2476,18 @@ direct_only_tool_namespaces = ["mcp__existing"]
         )
         .unwrap();
         let mut stale = enabled.parse::<DocumentMut>().unwrap();
-        let guidance = stale["developer_instructions"].as_str().unwrap();
-        let previous_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[1];
-        let legacy_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[2];
+        let guidance = stale["developer_instructions"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let stale_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[1..].join("\n\n");
         stale["developer_instructions"] = value(format!(
-            "{guidance}\n\n{previous_guidance}\n\n{legacy_guidance}\n\nConcurrent guidance."
+            "{guidance}\n\n{stale_guidance}\n\nConcurrent guidance."
+        ));
+        let features = ensure_root_table(&mut stale, "features").unwrap();
+        let multi_agent = ensure_child_table(features, "multi_agent_v2").unwrap();
+        multi_agent["subagent_developer_instructions"] = value(format!(
+            "Subagent guidance.\n\n{guidance}\n\n{stale_guidance}"
         ));
 
         let disabled = patch_config_with_fastctx(
@@ -2446,6 +2511,10 @@ direct_only_tool_namespaces = ["mcp__existing"]
         assert_eq!(
             document["developer_instructions"].as_str(),
             Some("User guidance.\n\nConcurrent guidance.")
+        );
+        assert_eq!(
+            document["features"]["multi_agent_v2"]["subagent_developer_instructions"].as_str(),
+            Some("Subagent guidance.\n\nUser guidance.")
         );
         assert_eq!(
             document["tool_output_token_limit"].as_integer(),
@@ -2587,11 +2656,10 @@ direct_only_tool_namespaces = ["mcp__codey_fastctx", "mcp__user"]
 
     #[test]
     fn enabling_fast_context_tools_replaces_stale_guidance_versions() {
-        let previous_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[1];
-        let legacy_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[2];
+        let stale_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[1..].join("\\n\\n");
         let existing = format!(
             r#"
-developer_instructions = "User guidance.\n\n{previous_guidance}\n\n{CODEY_FASTCTX_GUIDANCE}\n\n{legacy_guidance}"
+developer_instructions = "User guidance.\n\n{stale_guidance}\n\n{CODEY_FASTCTX_GUIDANCE}"
 "#
         );
 
@@ -2615,8 +2683,9 @@ developer_instructions = "User guidance.\n\n{previous_guidance}\n\n{CODEY_FASTCT
             1
         );
         assert!(guidance.contains(CODEY_FASTCTX_GUIDANCE));
-        assert!(!guidance.contains(previous_guidance));
-        assert!(!guidance.contains(legacy_guidance));
+        for stale_guidance in &CODEY_FASTCTX_GUIDANCE_VERSIONS[1..] {
+            assert!(!guidance.contains(stale_guidance));
+        }
         assert_eq!(
             guidance,
             format!("User guidance.\n\n{CODEY_FASTCTX_GUIDANCE}")
@@ -2651,8 +2720,11 @@ developer_instructions = "User guidance.\n\n{previous_guidance}\n\n{CODEY_FASTCT
         let guidance = document["developer_instructions"].as_str().unwrap();
         assert!(guidance.contains("Local files have exactly one read route"));
         assert!(guidance.contains("drive-letter path such as `E:/repo/file.ts`"));
-        assert!(!guidance.contains(CODEY_FASTCTX_GUIDANCE_VERSIONS[1]));
-        assert!(!guidance.contains(CODEY_FASTCTX_GUIDANCE_VERSIONS[2]));
+        assert!(guidance.contains("Never call `list_mcp_resources`"));
+        assert!(guidance.contains("`read_mcp_resource`"));
+        for stale_guidance in &CODEY_FASTCTX_GUIDANCE_VERSIONS[1..] {
+            assert!(!guidance.contains(stale_guidance));
+        }
         assert_eq!(
             document["features"]["code_mode"]["direct_only_tool_namespaces"]
                 .as_array()
@@ -2679,6 +2751,7 @@ interrupt_message = true
 [features.multi_agent_v2]
 enabled = false
 custom_setting = "preserved"
+subagent_developer_instructions = "Preserve my subagent guidance."
 "#;
         let result = patch_config_with_fastctx_mode(
             existing,
@@ -2738,6 +2811,10 @@ custom_setting = "preserved"
             Some(120_000)
         );
         assert_eq!(multi_agent["custom_setting"].as_str(), Some("preserved"));
+        assert_eq!(
+            multi_agent["subagent_developer_instructions"].as_str(),
+            Some("Preserve my subagent guidance.")
+        );
     }
 
     #[test]
@@ -2895,8 +2972,25 @@ args = ["serve"]
         let default_agent = fs::read_to_string(home.join("agents/default.toml")).unwrap();
         assert!(default_agent.contains("`mcp__fastctx__read` directly"));
         assert!(default_agent.contains("`mcp__fastctx__grep`"));
+        assert!(default_agent.contains("`mcp__fastctx` is a direct tool namespace"));
+        assert!(default_agent.contains("Never call `list_mcp_resources`"));
+        assert!(default_agent.contains("`read_mcp_resource`"));
+        assert!(default_agent.contains("`Write-Output`"));
+        assert!(default_agent.contains("直接改用正确工具"));
         assert!(!default_agent.contains("mcp__codey_fastctx"));
         assert!(!default_agent.contains("resources/read"));
+        let root_guidance = document["developer_instructions"].as_str().unwrap();
+        let subagent_guidance =
+            document["features"]["multi_agent_v2"]["subagent_developer_instructions"]
+                .as_str()
+                .unwrap();
+        assert_eq!(subagent_guidance, root_guidance);
+        assert!(subagent_guidance.contains("`mcp__fastctx__read` directly"));
+        assert!(subagent_guidance.contains("Never call `list_mcp_resources`"));
+        assert!(subagent_guidance.contains("`read_mcp_resource`"));
+        assert!(subagent_guidance.contains("`Write-Output`"));
+        assert!(subagent_guidance.contains("record self-reminders"));
+        assert!(!subagent_guidance.contains("mcp__codey_fastctx"));
 
         assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
         assert_eq!(
@@ -3519,13 +3613,12 @@ custom_original = "restore"
 [features.code_mode]
 direct_only_tool_namespaces = ["mcp__existing"]
 "#;
-        let previous_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[1];
-        let legacy_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[2];
+        let stale_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS[1..].join("\\n\\n");
         let current = format!(
             r#"model_provider = "codey_global"
 model_catalog_json = "model-catalogs/codey-official.json"
 profile = "work"
-developer_instructions = "Original guidance\n\n{legacy_guidance}\n\n{previous_guidance}\n\n{CODEY_FASTCTX_GUIDANCE}\n\nConcurrent guidance"
+developer_instructions = "Original guidance\n\n{stale_guidance}\n\n{CODEY_FASTCTX_GUIDANCE}\n\nConcurrent guidance"
 tool_output_token_limit = 10000
 approval_policy = "never"
 service_tier = "fast"

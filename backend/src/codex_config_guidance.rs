@@ -61,6 +61,7 @@ developer_instructions = """
 你怎么工作：
 - 你只有一轮、任务是自包含的：没有追问的机会，别反问；用这一轮把任务范围查到位、尽力答全。
 - 答不全就如实交代「查到了什么、还有什么没覆盖、哪里存疑或者矛盾」。宁可显式报「没查到 / 没覆盖」，也别用含糊的话糊弄过去——你悄悄漏掉的，主代理无从复核。
+- 终端只运行任务实际需要的命令。不得把 `Write-Output`、`Write-Error`、`echo`、`printf`、`exit`、`sleep` 等命令当作进度播报、道歉、自我提醒或纠错标记；发现工具用错时直接改用正确工具。
 """
 
 [features]
@@ -69,9 +70,15 @@ image_generation = false
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Local files \
 have exactly one read route: call `mcp__codey_fastctx__read` directly, including when the input is a \
-URI-shaped local reference. Set `file_path` to a plain absolute filesystem path (never a URI); on \
-Windows, convert the reference to a drive-letter path such as `E:/repo/file.ts` before the call. For \
-content search and file discovery, always use `mcp__codey_fastctx__grep` and \
+URI-shaped local reference. `mcp__codey_fastctx` is a direct tool namespace, not an MCP Resources \
+server name. Never call `list_mcp_resources`, `list_mcp_resource_templates`, or \
+`read_mcp_resource` during local workspace work, including discovery or probe calls with placeholder \
+server names; never pass `mcp__codey_fastctx` to a `resources/*` method. Never use exec or shell \
+commands such as `Write-Output`, `Write-Error`, `echo`, `printf`, `exit`, or `sleep` to narrate \
+progress, apologize, or record self-reminders; continue directly with the correct tool instead. Set \
+`file_path` to a plain absolute filesystem path (never a URI); on Windows, convert the reference to \
+a drive-letter path such as `E:/repo/file.ts` before the call. For content search and file discovery, \
+always use `mcp__codey_fastctx__grep` and \
 `mcp__codey_fastctx__glob` before exec or shell commands. Do not use cat, sed, rg, grep, find, or \
 recursive ls when a FastCtx tool covers the operation. Use exec only for builds, tests, Git, package \
 managers, or when the FastCtx tool is unavailable or fails. Use `mcp__codey_fastctx__replace` only \
@@ -79,6 +86,17 @@ for deterministic mechanical replacements, and follow every Complete or Partial 
 exactly.";
 
 pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. \
+Local files have exactly one read route: call `mcp__codey_fastctx__read` directly, including when the \
+input is a URI-shaped local reference. Set `file_path` to a plain absolute filesystem path (never a \
+URI); on Windows, convert the reference to a drive-letter path such as `E:/repo/file.ts` before the \
+call. For content search and file discovery, always use `mcp__codey_fastctx__grep` and \
+`mcp__codey_fastctx__glob` before exec or shell commands. Do not use cat, sed, rg, grep, find, or \
+recursive ls when a FastCtx tool covers the operation. Use exec only for builds, tests, Git, package \
+managers, or when the FastCtx tool is unavailable or fails. Use `mcp__codey_fastctx__replace` only \
+for deterministic mechanical replacements, and follow every Complete or Partial continuation \
+exactly.";
+
+pub(crate) const OLDER_CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. \
 For local file reading, content search, and file discovery, always use \
 `mcp__codey_fastctx__read`, `mcp__codey_fastctx__grep`, and `mcp__codey_fastctx__glob` before exec \
 or shell commands. Do not use cat, sed, rg, grep, find, or recursive ls when a FastCtx tool covers \
@@ -95,25 +113,14 @@ follow every Complete or Partial pagination note exactly.";
 pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     CODEY_FASTCTX_GUIDANCE,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE,
+    OLDER_CODEY_FASTCTX_GUIDANCE,
     LEGACY_CODEY_FASTCTX_GUIDANCE,
 ];
 
-const CODEY_FASTCTX_GUIDANCE_PREFIX: &str =
-    "Codey FastCtx context tools are enabled. Local files have exactly one read route: call `";
-const CODEY_FASTCTX_GUIDANCE_READ_SUFFIX: &str = "__read` directly, including when the input is a URI-shaped local reference. Set `file_path` to \
-a plain absolute filesystem path (never a URI); on Windows, convert the reference to a drive-letter \
-path such as `E:/repo/file.ts` before the call. For content search and file discovery, always use `";
-const CODEY_FASTCTX_GUIDANCE_GREP_SUFFIX: &str = "__grep` and `";
-const CODEY_FASTCTX_GUIDANCE_GLOB_SUFFIX: &str = "__glob` before exec or shell commands. Do not use \
-cat, sed, rg, grep, find, or recursive ls when a FastCtx tool covers the operation. Use exec only \
-for builds, tests, Git, package managers, or when the FastCtx tool is unavailable or fails. Use `";
-const CODEY_FASTCTX_GUIDANCE_REPLACE_SUFFIX: &str = "__replace` only for deterministic mechanical \
-replacements, and follow every Complete or Partial continuation exactly.";
+const DEFAULT_FASTCTX_TOOL_NAMESPACE: &str = "mcp__codey_fastctx";
 
 pub(crate) fn codey_fastctx_guidance_for_namespace(namespace: &str) -> String {
-    format!(
-        "{CODEY_FASTCTX_GUIDANCE_PREFIX}{namespace}{CODEY_FASTCTX_GUIDANCE_READ_SUFFIX}{namespace}{CODEY_FASTCTX_GUIDANCE_GREP_SUFFIX}{namespace}{CODEY_FASTCTX_GUIDANCE_GLOB_SUFFIX}{namespace}{CODEY_FASTCTX_GUIDANCE_REPLACE_SUFFIX}"
-    )
+    CODEY_FASTCTX_GUIDANCE.replace(DEFAULT_FASTCTX_TOOL_NAMESPACE, namespace)
 }
 
 pub(crate) fn default_agent_config_with_fastctx_guidance(namespace: Option<&str>) -> String {
@@ -128,26 +135,37 @@ pub(crate) fn default_agent_config_with_fastctx_guidance(namespace: Option<&str>
 
 pub(crate) fn codey_fastctx_guidance_blocks(current: &str) -> Vec<String> {
     let mut blocks = Vec::new();
-    for guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
+    for &guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
         if current.contains(guidance) {
-            blocks.push((*guidance).to_string());
+            blocks.push(guidance.to_string());
         }
-    }
 
-    for (start, _) in current.match_indices(CODEY_FASTCTX_GUIDANCE_PREFIX) {
-        let Some(guidance) = dynamic_codey_fastctx_guidance_at(current, start) else {
+        let Some(prefix_end) = guidance.find(DEFAULT_FASTCTX_TOOL_NAMESPACE) else {
             continue;
         };
-        if !blocks.iter().any(|block| block == &guidance) {
-            blocks.push(guidance);
+        let prefix = &guidance[..prefix_end];
+        for (start, _) in current.match_indices(prefix) {
+            let Some(dynamic_guidance) =
+                dynamic_codey_fastctx_guidance_at(current, start, guidance)
+            else {
+                continue;
+            };
+            if !blocks.iter().any(|block| block == &dynamic_guidance) {
+                blocks.push(dynamic_guidance);
+            }
         }
     }
     blocks
 }
 
-fn dynamic_codey_fastctx_guidance_at(current: &str, start: usize) -> Option<String> {
-    let after_prefix = current.get(start + CODEY_FASTCTX_GUIDANCE_PREFIX.len()..)?;
-    let namespace_end = after_prefix.find(CODEY_FASTCTX_GUIDANCE_READ_SUFFIX)?;
+fn dynamic_codey_fastctx_guidance_at(
+    current: &str,
+    start: usize,
+    guidance_template: &str,
+) -> Option<String> {
+    let prefix_end = guidance_template.find(DEFAULT_FASTCTX_TOOL_NAMESPACE)?;
+    let after_prefix = current.get(start + prefix_end..)?;
+    let namespace_end = after_prefix.find("__read`")?;
     let namespace = &after_prefix[..namespace_end];
     if namespace.is_empty()
         || namespace.contains('`')
@@ -157,7 +175,7 @@ fn dynamic_codey_fastctx_guidance_at(current: &str, start: usize) -> Option<Stri
     {
         return None;
     }
-    let guidance = codey_fastctx_guidance_for_namespace(namespace);
+    let guidance = guidance_template.replace(DEFAULT_FASTCTX_TOOL_NAMESPACE, namespace);
     current[start..].starts_with(&guidance).then_some(guidance)
 }
 
@@ -249,8 +267,16 @@ mod tests {
                 .contains("`file_path` to a plain absolute filesystem path (never a URI)")
         );
         assert!(CODEY_FASTCTX_GUIDANCE.contains("drive-letter path such as `E:/repo/file.ts`"));
-        assert!(!CODEY_FASTCTX_GUIDANCE.contains("resources/read"));
-        assert!(!CODEY_FASTCTX_GUIDANCE.contains("read_mcp_resource"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("is a direct tool namespace"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("not an MCP Resources server name"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Never call `list_mcp_resources`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("`list_mcp_resource_templates`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("`read_mcp_resource`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("probe calls with placeholder server names"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("`resources/*` method"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Never use exec or shell commands"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("`Write-Output`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("record self-reminders"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("file:///"));
     }
 
@@ -259,14 +285,31 @@ mod tests {
         let config = default_agent_config_with_fastctx_guidance(Some("mcp__fastctx"));
 
         assert!(config.contains("`mcp__fastctx__read` directly"));
+        assert!(config.contains("`mcp__fastctx` is a direct tool namespace"));
+        assert!(config.contains("Never call `list_mcp_resources`"));
+        assert!(config.contains("`read_mcp_resource`"));
+        assert!(config.contains("`Write-Output`"));
+        assert!(config.contains("continue directly with the correct tool"));
         assert!(!config.contains("mcp__codey_fastctx"));
         assert!(config.contains("[features]"));
         assert!(config.ends_with("image_generation = false\n"));
     }
 
     #[test]
+    fn default_agent_never_uses_terminal_commands_as_narration() {
+        assert!(DEFAULT_AGENT_CONFIG.contains("终端只运行任务实际需要的命令"));
+        assert!(DEFAULT_AGENT_CONFIG.contains("`Write-Output`"));
+        assert!(DEFAULT_AGENT_CONFIG.contains("进度播报、道歉、自我提醒或纠错标记"));
+        assert!(DEFAULT_AGENT_CONFIG.contains("直接改用正确工具"));
+    }
+
+    #[test]
     fn fastctx_guidance_cleanup_removes_every_codey_owned_version() {
-        let user_server_guidance = codey_fastctx_guidance_for_namespace("mcp__fastctx");
+        let user_server_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS
+            .iter()
+            .map(|guidance| guidance.replace(DEFAULT_FASTCTX_TOOL_NAMESPACE, "mcp__fastctx"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
         let configured = format!(
             "User guidance.\n\n{}\n\n{user_server_guidance}\n\nConcurrent guidance.",
             CODEY_FASTCTX_GUIDANCE_VERSIONS.join("\n\n"),
@@ -280,12 +323,15 @@ mod tests {
 
     #[test]
     fn fastctx_guidance_blocks_detect_user_fastctx_namespaces() {
-        let user_server_guidance = codey_fastctx_guidance_for_namespace("mcp__context_tools");
-        let configured = format!("Prefix\n\n{user_server_guidance}\n\nSuffix");
+        let user_server_guidance = CODEY_FASTCTX_GUIDANCE_VERSIONS
+            .iter()
+            .map(|guidance| guidance.replace(DEFAULT_FASTCTX_TOOL_NAMESPACE, "mcp__context_tools"))
+            .collect::<Vec<_>>();
+        let configured = format!("Prefix\n\n{}\n\nSuffix", user_server_guidance.join("\n\n"));
 
         assert_eq!(
             codey_fastctx_guidance_blocks(&configured),
-            vec![user_server_guidance]
+            user_server_guidance
         );
     }
 }

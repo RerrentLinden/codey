@@ -128,13 +128,21 @@ fn restore_fastctx_owned_value(
             entries.remove(index);
             true
         }
-        "developer_instructions" => {
+        "developer_instructions" | "subagent_developer_instructions" => {
             let Some(current) = current else {
                 return false;
             };
             let Some(text) = current.as_str() else {
                 return false;
             };
+            if key == "subagent_developer_instructions"
+                && original.is_none()
+                && let Some(applied_text) = applied.and_then(Item::as_str)
+                && let Some(without_applied) = remove_owned_guidance_block(text, applied_text)
+            {
+                *current = value(without_applied);
+                return true;
+            }
             let mut restored = text.to_string();
             let mut changed = false;
             let original_text = original.and_then(Item::as_str);
