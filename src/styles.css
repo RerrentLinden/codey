@@ -2892,3 +2892,59 @@ input:focus-visible,
     padding: 12px 16px;
   }
 }
+
+/* 提示词优化卡片 */
+.prompt-optimization-fields {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(0, 0, 0, 0.08);
+}
+
+.prompt-optimization-fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.prompt-optimization-fields label > span {
+  font-size: 11px;
+  font-weight: 600;
+  color: #6e6e73;
+}
+
+.prompt-optimization-instruction {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.03);
+  color: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  resize: vertical;
+  outline: none;
+}
+
+.prompt-optimization-instruction:focus {
+  border-color: #4c9ffe;
+}
+
+.prompt-optimization-test-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+/* 提示词优化：云端模型列表行 */
+.prompt-optimization-model-row .codey-autocomplete {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.prompt-optimization-model-row .codey-button {
+  flex: 0 0 auto;
+}

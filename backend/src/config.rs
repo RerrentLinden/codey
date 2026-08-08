@@ -52,6 +52,68 @@ impl ProviderProfile {
     }
 }
 
+/// Standalone OpenAI-compatible Chat Completions settings used by the
+/// prompt-optimization feature. Kept independent of the active provider so
+/// the feature works on the official login route as well. The API key follows
+/// the notification-channel credential pattern: redacted to the renderer,
+/// restored on save, cleared only on explicit request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptOptimizationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_key_configured: bool,
+    #[serde(default, skip_serializing)]
+    pub clear_api_key: bool,
+    #[serde(default)]
+    pub model: String,
+    /// Optional custom optimizer instructions. When empty the built-in
+    /// default system prompt is used.
+    #[serde(default)]
+    pub instruction: String,
+}
+
+impl PromptOptimizationConfig {
+    pub(crate) fn normalize(&mut self) {
+        self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
+        self.api_key = self.api_key.trim().to_string();
+        self.api_key_configured = !self.api_key.is_empty();
+        self.clear_api_key = false;
+        self.model = self.model.trim().to_string();
+        self.instruction = self.instruction.trim().to_string();
+    }
+
+    pub fn merge_redacted_secrets(&mut self, previous: &Self) {
+        if self.clear_api_key {
+            self.api_key.clear();
+            self.api_key_configured = false;
+            return;
+        }
+        if !self.api_key.trim().is_empty() || !self.api_key_configured {
+            return;
+        }
+        self.api_key = previous.api_key.clone();
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let base_url = self.base_url.trim();
+        if base_url.is_empty() {
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(base_url)
+            .map_err(|_| "提示词优化 API 地址不是有效的 HTTP(S) 地址".to_string())?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err("提示词优化 API 地址必须是有效的 HTTP(S) 地址".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum GpuLaunchMode {
@@ -72,6 +134,8 @@ pub struct CodeyConfig {
     pub profiles: Vec<ProviderProfile>,
     #[serde(default)]
     pub webhook: WebhookConfig,
+    #[serde(default)]
+    pub prompt_optimization: PromptOptimizationConfig,
     #[serde(default)]
     pub codex_app_path: String,
     #[serde(default)]
@@ -151,6 +215,7 @@ impl Default for CodeyConfig {
             active_profile_id: profile.id.clone(),
             profiles: vec![profile],
             webhook: WebhookConfig::default(),
+            prompt_optimization: PromptOptimizationConfig::default(),
             codex_app_path: String::new(),
             user_scripts: Vec::new(),
             selected_models_by_provider: BTreeMap::new(),
@@ -208,6 +273,7 @@ impl CodeyConfig {
             self.subagent_reasoning_effort = default_subagent_reasoning_effort();
         }
         self.webhook.normalize();
+        self.prompt_optimization.normalize();
         self
     }
 
@@ -708,5 +774,81 @@ mod tests {
             .normalize();
 
         assert!(config.show_account_usage_in_header);
+    }
+
+    #[test]
+    fn prompt_optimization_defaults_to_disabled_for_existing_configs() {
+        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
+            .unwrap()
+            .normalize();
+
+        assert!(!config.prompt_optimization.enabled);
+        assert!(config.prompt_optimization.api_key.is_empty());
+    }
+
+    #[test]
+    fn prompt_optimization_round_trips_without_persisting_clear_flag() {
+        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[],"promptOptimization":{"enabled":true,"baseUrl":" https://api.example.com/v1/ ","apiKey":"sk-secret","model":" gpt-x ","instruction":" 保持简洁 "}}"#)
+            .unwrap()
+            .normalize();
+        let serialized = serde_json::to_value(&config).unwrap();
+
+        assert!(config.prompt_optimization.enabled);
+        assert_eq!(
+            config.prompt_optimization.base_url,
+            "https://api.example.com/v1"
+        );
+        assert_eq!(config.prompt_optimization.api_key, "sk-secret");
+        assert!(config.prompt_optimization.api_key_configured);
+        assert_eq!(config.prompt_optimization.model, "gpt-x");
+        assert_eq!(config.prompt_optimization.instruction, "保持简洁");
+        assert!(
+            serialized["promptOptimization"]
+                .get("clearApiKey")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn redacted_prompt_optimization_key_is_restored_when_other_settings_are_saved() {
+        let previous = CodeyConfig {
+            prompt_optimization: PromptOptimizationConfig {
+                enabled: true,
+                base_url: "https://api.example.com/v1".to_string(),
+                api_key: "sk-secret".to_string(),
+                api_key_configured: true,
+                model: "gpt-x".to_string(),
+                ..PromptOptimizationConfig::default()
+            },
+            ..CodeyConfig::default()
+        };
+        let mut incoming = previous.clone();
+        incoming.prompt_optimization.api_key.clear();
+        incoming
+            .prompt_optimization
+            .merge_redacted_secrets(&previous.prompt_optimization);
+
+        assert_eq!(incoming.prompt_optimization.api_key, "sk-secret");
+    }
+
+    #[test]
+    fn explicit_prompt_optimization_key_clear_does_not_restore_the_previous_secret() {
+        let previous = CodeyConfig {
+            prompt_optimization: PromptOptimizationConfig {
+                api_key: "sk-secret".to_string(),
+                api_key_configured: true,
+                ..PromptOptimizationConfig::default()
+            },
+            ..CodeyConfig::default()
+        };
+        let mut incoming = previous.clone();
+        incoming.prompt_optimization.api_key.clear();
+        incoming.prompt_optimization.clear_api_key = true;
+        incoming
+            .prompt_optimization
+            .merge_redacted_secrets(&previous.prompt_optimization);
+
+        assert!(incoming.prompt_optimization.api_key.is_empty());
+        assert!(!incoming.prompt_optimization.api_key_configured);
     }
 }

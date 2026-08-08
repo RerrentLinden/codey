@@ -2073,6 +2073,7 @@
     `[${sessionDeleteAttribute}]`,
     `[${threadUpdatedAtAttribute}]`,
     "[data-codey-message-select]",
+    "[data-codey-prompt-optimize]",
   ].join(", ");
   const scanBoundarySelector = [
     sidebarScanRootSelector,

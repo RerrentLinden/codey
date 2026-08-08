@@ -33,6 +33,7 @@ const SETTINGS_OVERLAY_SCRIPT: &str = include_str!("../../dist-overlay/codey-ove
 const SETTINGS_OVERLAY_STYLES: &str = include_str!("../../dist-overlay/codey.css");
 const PLUGIN_MARKETPLACE_FIX_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/plugin-marketplace-fix.js");
+const PROMPT_OPTIMIZE_SCRIPT: &str = include_str!("../../dist-overlay/inject/prompt-optimize.js");
 const MAX_INJECTION_ERROR_CHARS: usize = 500;
 static SETTINGS_OVERLAY_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
 static SESSION_TOOLS_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
@@ -268,6 +269,20 @@ pub fn prepare_injection_scripts(
               ? "插件市场桥接已接管" : """#
                 .to_string(),
         ),
+        (
+            "prompt-optimize",
+            "提示词优化",
+            PROMPT_OPTIMIZE_SCRIPT,
+            r#"(() => {
+              const optimizer = window.__codeyPromptOptimize;
+              if (!optimizer || typeof optimizer.snapshot !== "function") return "";
+              const snapshot = optimizer.snapshot();
+              return snapshot.ready === true
+                ? (snapshot.enabled === true ? "提示词优化按钮已就绪" : "提示词优化已关闭")
+                : "";
+            })()"#
+                .to_string(),
+        ),
     ];
     let mut core_bundle = String::with_capacity(
         FAST_STARTUP_SHIELD_SCRIPT.len()
@@ -278,6 +293,7 @@ pub fn prepare_injection_scripts(
             + PET_CONTROL_SHIELD_SCRIPT.len()
             + SECURITY_WARNING_SHIELD_SCRIPT.len()
             + PLUGIN_MARKETPLACE_FIX_SCRIPT.len()
+            + PROMPT_OPTIMIZE_SCRIPT.len()
             + 4096,
     );
     let mut descriptors = Vec::with_capacity(builtin_scripts.len() + user_scripts.len());
@@ -1209,9 +1225,9 @@ mod tests {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 10);
-        assert_eq!(prepared.descriptors[9].id, "user-script-1");
-        assert_eq!(prepared.descriptors[9].source, "user");
+        assert_eq!(prepared.descriptors.len(), 11);
+        assert_eq!(prepared.descriptors[10].id, "user-script-1");
+        assert_eq!(prepared.descriptors[10].source, "user");
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
         assert!(snapshot_script.contains("Windows Git 请求限流已由主进程接管"));
