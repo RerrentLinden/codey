@@ -3,7 +3,7 @@
 
   const guardKey = "__codeyGitRequestGuard";
   const scriptId = "git-request-guard";
-  const version = 1;
+  const version = 2;
   const targetMethods = new Set([
     "git-origins",
     "status-summary",
@@ -20,7 +20,11 @@
 
   const existing = window[guardKey];
   if (existing && typeof existing.ensureInstalled === "function") {
-    existing.ensureInstalled();
+    if (typeof existing.requestInstall === "function") {
+      existing.requestInstall();
+    } else {
+      existing.ensureInstalled();
+    }
     return;
   }
 
@@ -460,6 +464,7 @@
       markEffective();
       return true;
     }
+    scheduleBridgeRetry();
     return false;
   };
 
@@ -485,10 +490,32 @@
     perKeyIntervalMs,
   });
 
+  const scheduleBridgeRetry = () => {
+    if (bridgeRetryTimer || typeof window.setTimeout !== "function") return;
+    const delay = now() < bridgeRetryDeadline ? bridgeRetryDelay : 30_000;
+    bridgeRetryTimer = window.setTimeout(retryInstall, delay);
+  };
+
+  const retryInstall = () => {
+    bridgeRetryTimer = 0;
+    const fastRetry = now() < bridgeRetryDeadline;
+    bridgeRetryDelay = fastRetry ? Math.min(bridgeRetryDelay * 2, 2_000) : 30_000;
+    ensureInstalled();
+  };
+
+  const requestInstall = () => {
+    bridgeRetryDeadline = now() + 30_000;
+    bridgeRetryDelay = 50;
+    if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
+    bridgeRetryTimer = 0;
+    return ensureInstalled();
+  };
+
   const api = Object.freeze({
     version,
     enabled,
     ensureInstalled,
+    requestInstall,
     snapshot,
   });
   Object.defineProperty(window, guardKey, {
@@ -497,15 +524,5 @@
     writable: false,
   });
 
-  const retryInstall = () => {
-    bridgeRetryTimer = 0;
-    if (ensureInstalled()) return;
-    const fastRetry = now() < bridgeRetryDeadline;
-    bridgeRetryDelay = fastRetry ? Math.min(bridgeRetryDelay * 2, 2_000) : 30_000;
-    bridgeRetryTimer = window.setTimeout(retryInstall, bridgeRetryDelay);
-  };
-
-  if (!ensureInstalled() && typeof window.setTimeout === "function") {
-    bridgeRetryTimer = window.setTimeout(retryInstall, bridgeRetryDelay);
-  }
+  requestInstall();
 })();

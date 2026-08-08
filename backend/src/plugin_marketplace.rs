@@ -51,10 +51,12 @@ pub fn marketplaces_status(home: &Path) -> Value {
         codey_runtime_core::plugin_marketplace::openai_curated_remote_marketplace_status(home);
     let official_marketplace = official.marketplace_root.is_some();
     let remote_marketplace = remote.marketplace_root.is_some();
+    // The remote snapshot is an optional cache populated outside Codey. When
+    // present it must be registered, but its absence is not repairable here
+    // and does not prevent the online marketplace from working.
     let needs_repair = !official_marketplace
         || !official.config_registered
-        || !remote_marketplace
-        || !remote.config_registered;
+        || (remote_marketplace && !remote.config_registered);
     json!({
         "officialMarketplace": official_marketplace,
         "officialRegistered": official.config_registered,
@@ -227,6 +229,23 @@ fn installed_plugins(home: &Path) -> Result<HashSet<String>> {
 mod tests {
     use super::*;
 
+    fn write_marketplace(home: &Path, directory: &str, name: &str, plugin: &str) {
+        let root = home.join(".tmp").join(directory);
+        fs::create_dir_all(root.join(".agents").join("plugins")).unwrap();
+        fs::create_dir_all(root.join("plugins").join(plugin)).unwrap();
+        fs::write(
+            root.join(".agents")
+                .join("plugins")
+                .join("marketplace.json"),
+            serde_json::to_vec(&json!({
+                "name": name,
+                "plugins": [{"name": plugin, "path": format!("./plugins/{plugin}")}],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn marketplace_status_is_read_only_when_repair_is_needed() {
         let temp = tempfile::tempdir().unwrap();
@@ -242,5 +261,48 @@ mod tests {
         assert_eq!(status["remoteMarketplace"], false);
         assert_eq!(fs::read(&config_path).unwrap(), original);
         assert!(!home.join(".tmp").exists());
+    }
+
+    #[test]
+    fn marketplace_status_does_not_require_optional_remote_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        write_marketplace(home, "plugins", "openai-curated", "gmail");
+
+        let repair = ensure_marketplaces(home).unwrap();
+        let status = marketplaces_status(home);
+
+        assert_eq!(repair["initializedRemote"], false);
+        assert_eq!(status["officialMarketplace"], true);
+        assert_eq!(status["officialRegistered"], true);
+        assert_eq!(status["remoteMarketplace"], false);
+        assert_eq!(status["remoteRegistered"], false);
+        assert_eq!(status["needsRepair"], false);
+    }
+
+    #[test]
+    fn marketplace_status_repairs_cached_remote_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        write_marketplace(home, "plugins", "openai-curated", "gmail");
+        ensure_marketplaces(home).unwrap();
+        write_marketplace(
+            home,
+            "plugins-remote",
+            "openai-curated-remote",
+            "product-design",
+        );
+
+        let before = marketplaces_status(home);
+        let repair = ensure_marketplaces(home).unwrap();
+        let after = marketplaces_status(home);
+
+        assert_eq!(before["officialRegistered"], true);
+        assert_eq!(before["remoteMarketplace"], true);
+        assert_eq!(before["remoteRegistered"], false);
+        assert_eq!(before["needsRepair"], true);
+        assert_eq!(repair["configuredRemote"], true);
+        assert_eq!(after["remoteRegistered"], true);
+        assert_eq!(after["needsRepair"], false);
     }
 }

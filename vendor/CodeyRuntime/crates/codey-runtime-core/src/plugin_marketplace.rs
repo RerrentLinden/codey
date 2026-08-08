@@ -85,24 +85,11 @@ pub fn preserve_openai_curated_remote_marketplace_config(
 
 pub fn openai_curated_marketplace_status(home: &Path) -> MarketplaceStatus {
     let marketplace_root = local_openai_curated_marketplace_root(home).ok().flatten();
-    let remote_marketplace_root = local_openai_curated_remote_marketplace_root(home)
-        .ok()
-        .flatten();
     let config_registered = marketplace_root
         .as_deref()
         .map(|root| {
             marketplace_config_points_to_root(home, OPENAI_CURATED_MARKETPLACE, root)
                 && marketplace_config_points_to_root(home, OPENAI_API_CURATED_MARKETPLACE, root)
-                && remote_marketplace_root
-                    .as_deref()
-                    .map(|remote_root| {
-                        marketplace_config_points_to_root(
-                            home,
-                            OPENAI_CURATED_REMOTE_MARKETPLACE,
-                            remote_root,
-                        )
-                    })
-                    .unwrap_or(true)
         })
         .unwrap_or(false);
     MarketplaceStatus {
@@ -836,6 +823,31 @@ mod tests {
         assert!(status.marketplace_root.is_some());
         assert!(!status.config_registered);
         assert!(status.needs_repair());
+    }
+
+    #[test]
+    fn openai_curated_marketplace_status_is_independent_from_remote_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let root = home.join(".tmp").join("plugins");
+        write_marketplace(home);
+        write_remote_marketplace(home);
+        ensure_marketplace_configs(
+            home,
+            &[OPENAI_CURATED_MARKETPLACE, OPENAI_API_CURATED_MARKETPLACE],
+            &root,
+        )
+        .unwrap();
+
+        let official = openai_curated_marketplace_status(home);
+        let remote = openai_curated_remote_marketplace_status(home);
+
+        assert!(official.marketplace_root.is_some());
+        assert!(official.config_registered);
+        assert!(!official.needs_repair());
+        assert!(remote.marketplace_root.is_some());
+        assert!(!remote.config_registered);
+        assert!(remote.needs_repair());
     }
 
     #[test]

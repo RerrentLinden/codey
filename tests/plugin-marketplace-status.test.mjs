@@ -43,6 +43,9 @@ test("plugin marketplace repair is explicit and status checks stay read-only", a
     /invoke<PluginMarketplaceStatus>\(\s*"repair_plugin_marketplace"\s*,?\s*\)/,
   );
   assert.match(sectionsSource, /仅检查当前状态，不会在打开配置页时自动修复/);
+  assert.match(sectionsSource, /远程市场：未缓存本地快照，无需修复/);
+  assert.match(sectionsSource, /remoteMarketplaceCached/);
+  assert.match(sectionsSource, /remoteRegistered/);
   assert.match(sectionsSource, /onRepairPluginMarketplace/);
   assert.match(sectionsSource, /手动修复/);
 });

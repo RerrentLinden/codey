@@ -81,6 +81,17 @@ function OperationsPanelComponent({
   const pluginOk = pluginMarketplaceStatus?.status === "ready";
   const pluginStatusError = pluginMarketplaceStatus?.status === "error";
   const pluginRepairing = busy === "repair-plugin-marketplace";
+  const pluginStatusKnown = Boolean(
+    pluginMarketplaceStatus && !pluginStatusError,
+  );
+  const officialMarketplaceReady =
+    pluginMarketplaceStatus?.officialMarketplace === true &&
+    pluginMarketplaceStatus.officialRegistered === true;
+  const remoteMarketplaceCached =
+    pluginMarketplaceStatus?.remoteMarketplace === true;
+  const remoteMarketplaceReady =
+    remoteMarketplaceCached &&
+    pluginMarketplaceStatus?.remoteRegistered === true;
   const performanceError =
     maintenance?.performanceStatus === "error" ||
     maintenance?.performanceStatus === "degraded";
@@ -239,26 +250,35 @@ function OperationsPanelComponent({
       {
         id: "plugin-official",
         icon: IconShoppingBag,
-        tooltip:
-          pluginMarketplaceStatus?.officialMarketplace !== false
+        tooltip: !pluginStatusKnown
+          ? "官方市场：正在检查"
+          : officialMarketplaceReady
             ? "官方市场：快照与注册完整"
-            : "官方市场：快照缺失或尚未注册",
-        tone:
-          pluginMarketplaceStatus?.officialMarketplace !== false
+            : pluginMarketplaceStatus?.officialMarketplace !== true
+              ? "官方市场：快照缺失"
+              : "官方市场：快照存在但尚未注册",
+        tone: !pluginStatusKnown
+          ? "info"
+          : officialMarketplaceReady
             ? "success"
             : "warning",
       },
       {
         id: "plugin-remote",
         icon: IconCloudCheck,
-        tooltip:
-          pluginMarketplaceStatus?.remoteMarketplace !== false
-            ? "远程市场：快照与注册完整"
-            : "远程市场：快照缺失或尚未注册",
+        tooltip: !pluginStatusKnown
+          ? "远程市场：正在检查本地缓存"
+          : !remoteMarketplaceCached
+            ? "远程市场：未缓存本地快照，无需修复"
+            : remoteMarketplaceReady
+              ? "远程市场：缓存与注册完整"
+              : "远程市场：已缓存但尚未注册",
         tone:
-          pluginMarketplaceStatus?.remoteMarketplace !== false
-            ? "success"
-            : "warning",
+          !pluginStatusKnown || !remoteMarketplaceCached
+            ? "info"
+            : remoteMarketplaceReady
+              ? "success"
+              : "warning",
       },
       {
         id: "plugin-host",
@@ -270,9 +290,12 @@ function OperationsPanelComponent({
       },
     ],
     [
+      officialMarketplaceReady,
       pluginMarketplaceStatus?.officialMarketplace,
-      pluginMarketplaceStatus?.remoteMarketplace,
       pluginOk,
+      pluginStatusKnown,
+      remoteMarketplaceCached,
+      remoteMarketplaceReady,
     ],
   );
 

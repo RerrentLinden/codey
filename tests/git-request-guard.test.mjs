@@ -109,6 +109,9 @@ function createRuntime({ platform = "Win32", send, bridgeReady = true } = {}) {
     connectBridge() {
       window.electronBridge = electronBridge;
     },
+    disconnectBridge() {
+      delete window.electronBridge;
+    },
     emit(workerId, message) {
       subscriptions.get(workerId)?.(message);
     },
@@ -305,6 +308,37 @@ test("Git request guard can patch configurable bridge methods", async () => {
   assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().matched, 1);
 });
 
+test("Git request guard re-arms bridge retries when an existing guard is re-injected", async () => {
+  const runtime = createRuntime();
+  const entry = runtime.window.__codeyInjectionStatus["git-request-guard"];
+  await runtime.advance(31_000);
+  runtime.events.length = 0;
+  runtime.disconnectBridge();
+  entry.status = "pending";
+  entry.detail = null;
+  entry.error = null;
+
+  runtime.run();
+  entry.status = "executed";
+
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().bridgePatched, false);
+  assert.equal(runtime.timers.size, 1);
+  await runtime.advance(1_000);
+  runtime.connectBridge();
+  await runtime.advance(100);
+
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().bridgePatched, true);
+  assert.equal(entry.status, "effective");
+  assert.equal(runtime.timers.size, 0);
+  assert.ok(
+    runtime.events.some(
+      (event) =>
+        event.type === "codey-injection-status-changed" &&
+        event.detail?.id === "git-request-guard",
+    ),
+  );
+});
+
 test("Git request guard observes worker failures and remains idempotent", async () => {
   const runtime = createRuntime();
   const wrapper = runtime.window.electronBridge.sendWorkerMessageFromView;
@@ -329,7 +363,7 @@ test("Git request guard observes worker failures and remains idempotent", async 
   assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().observedFailures, 1);
   runtime.run();
   assert.equal(runtime.window.electronBridge.sendWorkerMessageFromView, wrapper);
-  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().version, 1);
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().version, 2);
   assert.equal(
     runtime.window.__codeyInjectionStatus["git-request-guard"].status,
     "effective",
