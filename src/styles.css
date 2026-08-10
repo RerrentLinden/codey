@@ -328,6 +328,94 @@ input:focus-visible,
   gap: 8px;
 }
 
+.config-header-feedback {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+}
+
+.feedback-group-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgba(0, 0, 0, 0.09) !important;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.035) !important;
+  color: #4b4b50 !important;
+  font-weight: 600;
+  white-space: nowrap;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
+}
+
+.feedback-group-trigger:hover,
+.feedback-group-trigger:focus-visible {
+  border-color: rgba(0, 122, 255, 0.25) !important;
+  background: rgba(0, 122, 255, 0.08) !important;
+  color: #0068d9 !important;
+  box-shadow: 0 2px 8px rgba(0, 122, 255, 0.12);
+}
+
+.feedback-group-trigger svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
+.feedback-qr-popover {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 10px);
+  left: 50%;
+  display: grid;
+  width: 176px;
+  justify-items: center;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, 0.18);
+  color: #4b4b50;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  opacity: 0;
+  pointer-events: none;
+  transform: translate(-50%, -4px);
+  visibility: hidden;
+  transition: opacity 150ms ease, transform 150ms ease, visibility 150ms ease;
+}
+
+.feedback-qr-popover::before {
+  position: absolute;
+  top: -5px;
+  left: 50%;
+  width: 9px;
+  height: 9px;
+  border-top: 1px solid rgba(0, 0, 0, 0.1);
+  border-left: 1px solid rgba(0, 0, 0, 0.1);
+  background: #ffffff;
+  content: "";
+  transform: translateX(-50%) rotate(45deg);
+}
+
+.feedback-qr-popover img {
+  display: block;
+  width: 156px;
+  height: 156px;
+  border-radius: 7px;
+  object-fit: cover;
+}
+
+.config-header-feedback:hover .feedback-qr-popover,
+.config-header-feedback:focus-within .feedback-qr-popover {
+  opacity: 1;
+  transform: translate(-50%, 0);
+  visibility: visible;
+}
+
 .unsaved-badge {
   background: rgba(255, 149, 0, 0.12) !important;
   color: #c26d00 !important;

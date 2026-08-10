@@ -89,7 +89,7 @@ pnpm run release -- 0.2.1 --include-existing-changes
 
 可选参数：`--skip-checks` 跳过本地检查，`--no-push` 只创建本地提交和 tag，`--remote <name>` 指定推送远端。
 
-未配置上述 variable 或 secret 时，现有 GitHub Release 发布不受影响，R2 同步会被跳过。默认构建使用项目公开的 R2 更新源；设置 `CODEY_UPDATE_BASE_URL` 可以在编译时覆盖该地址。配置页面不允许用户改写更新源。检查更新会经 HTTPS 拉取清单，校验版本、下载地址和 SHA-256 格式后显示是否有新版本。renderer 轻量注入脚本会在启动时立即显示非阻塞的页面检查提示，并通过 bridge 发起检查；前后端检查上限均为 10 秒，更新地址不可达、响应异常或超时时移除提示并继续正常页面流程。发现当前平台可安装的新版本时，注入脚本显示确认对话框；只有用户确认后才依次调用下载、校验与安装命令，安装阶段沿用正常的更新退出与重启流程。当前 macOS 包仍是未签名包，Windows 包也尚未进行代码签名，因此不会静默下载或安装。
+未配置上述 variable 或 secret 时，现有 GitHub Release 发布不受影响，R2 同步会被跳过。默认构建使用项目公开的 R2 更新源；设置 `CODEY_UPDATE_BASE_URL` 可以在编译时覆盖该地址。配置页面不允许用户改写更新源。检查更新会经 HTTPS 拉取清单，校验版本、下载地址和 SHA-256 格式后显示是否有新版本。Codey 在恢复旧租约后、启动 Codex 前执行一次更新 preflight：检查超过 300 毫秒才显示无按钮的原生状态窗，10 秒硬超时、网络错误或清单错误均关闭提示并继续启动。Windows 状态窗运行在独立 Win32 消息线程；macOS 主线程运行 AppKit 事件循环，Tokio runtime 移到工作线程，状态窗使用不激活 Dock 图标的 `NSPanel`。发现当前平台可安装的新版本时使用原生自定义按钮询问；选择稍后会把本次结果保存在 `AppState`，renderer 从 `/backend/status` 恢复 Codey 图标红点，本次运行不再强弹，后续每 30 分钟只静默刷新红点。确认更新后复用同一次检查已验证的资产信息，显示下载校验状态，最长等待 300 秒；安装器成功拉起后直接退出 preflight，不进入 Codex 启动循环。下载、校验或安装器启动失败时提示错误并继续启动 Codex。当前 macOS 包仍是未签名包，Windows 包也尚未进行代码签名，因此不会静默下载或安装。
 
 Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周期、会话扫描优化以及显式配置的独立协议代理句柄也已直接合并其中。主程序只复用该句柄和既有 Responses↔Chat 转换器，不接管 vendor 的整套启动器或全局设置。后端启动编排与 macOS/Windows/Unix 进程适配分层维护，运行时 TOML 三方恢复算法和私有原子文件 I/O 基元也已与 provider 应用/租约编排分离。本地与 CI 构建不需要额外的运行时源码目录或补丁。这些 crate 与后端同属根 Cargo workspace，`cargo test --workspace` 一条命令覆盖全部；统一依赖解析与特性合并消除了两个独立 workspace 的重复编译。PR 质量门在 Linux 上执行格式检查、完整测试及零警告 Clippy，Windows CI 补充该平台测试与 Clippy；桌面发布构建只保留 macOS 的 Rust 测试（macOS 无独立 CI 任务），Windows 的 Rust 检查由 CI 门保证，打包流程不再重复编译。
 

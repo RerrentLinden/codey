@@ -27,10 +27,25 @@ fn main() {
 
 #[cfg(windows)]
 fn embed_windows_icon() {
-    winres::WindowsResource::new()
-        .set_icon("icons/Codey.ico")
-        .compile()
-        .expect("无法嵌入 Codey Windows 图标");
+    let mut resource = winres::WindowsResource::new();
+    resource.set_icon("icons/Codey.ico").set_manifest(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>"#,
+    );
+    resource.compile().expect("无法嵌入 Codey Windows 图标");
 }
 
 #[cfg(not(windows))]

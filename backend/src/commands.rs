@@ -47,6 +47,12 @@ pub use runtime::{
 };
 use updates::current_update_platform;
 #[cfg(test)]
+pub(crate) use updates::{UpdateAssetInfo, UpdateCheck};
+pub(crate) use updates::{
+    UpdateCandidate, UpdateDownload, check_for_update_candidate, download_update_candidate,
+    start_downloaded_update,
+};
+#[cfg(test)]
 use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 pub use updates::{check_for_updates, download_update, install_downloaded_update};
 use webhooks::{
@@ -92,6 +98,7 @@ pub struct AppState {
     pub trace_log_stats: TraceLogStatsHandle,
     pub crashpad_pending_stats: CrashpadPendingStatsHandle,
     pub startup_error: RwLock<Option<String>>,
+    available_update: RwLock<Option<updates::UpdateCheck>>,
     restart_in_progress: AtomicBool,
     shutting_down: AtomicBool,
     restart_task: Mutex<Option<ScheduledRestart>>,
@@ -157,6 +164,7 @@ impl Default for AppState {
             trace_log_stats: TraceLogStatsHandle::idle(),
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
             startup_error: RwLock::new(None),
+            available_update: RwLock::new(None),
             restart_in_progress: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             restart_task: Mutex::new(None),
@@ -1592,6 +1600,23 @@ mod restart_tests {
             .unwrap();
 
         assert_eq!(status["running"], false);
+    }
+
+    #[tokio::test]
+    async fn runtime_status_exposes_cached_available_update() {
+        let state = Arc::new(AppState::default());
+        *state.available_update.write().await = Some(UpdateCheck {
+            current_version: "1.0.0".to_string(),
+            latest_version: "2.0.0".to_string(),
+            update_available: true,
+            selected_asset: None,
+        });
+
+        let status = runtime_status(&state).await.unwrap();
+
+        assert_eq!(status["availableUpdate"]["currentVersion"], "1.0.0");
+        assert_eq!(status["availableUpdate"]["latestVersion"], "2.0.0");
+        assert_eq!(status["availableUpdate"]["updateAvailable"], true);
     }
 
     #[test]

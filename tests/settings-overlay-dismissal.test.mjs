@@ -35,6 +35,15 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
   assert.match(appSource, /aria-label="关闭配置"/);
   assert.match(appSource, /className="title-restart-button"/);
   assert.match(appSource, /onClick=\{handleRestartCodex\}/);
+  assert.match(
+    appSource,
+    /aria-label="问题反馈群，悬浮或聚焦查看二维码"/,
+  );
+  assert.match(appSource, /className="feedback-qr-popover" role="tooltip"/);
+  assert.match(
+    appSource,
+    /https:\/\/pub-2d17a6a8bc22426a92e297a59f55ccc3\.r2\.dev\/qr\.jpg/,
+  );
   assert.match(appSource, /showRestartAction=\{!embedded\}/);
   assert.match(
     appSource,
@@ -62,6 +71,10 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
   assert.match(
     overlayStyles,
     /:host \{[\s\S]*z-index:\s*2147483647 !important;/,
+  );
+  assert.match(
+    overlayStyles,
+    /\.codey-settings-modal-header \.config-header-inner \{[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\) auto minmax\(0, 1fr\)/,
   );
 });
 

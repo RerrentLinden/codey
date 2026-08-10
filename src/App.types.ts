@@ -80,6 +80,7 @@ export type InjectionScriptStatus = {
 export type RuntimeStatus = {
   running: boolean;
   appVersion?: string;
+  availableUpdate?: UpdateCheck;
   codexAppVersion?: string;
   clientPlatform?: string;
   restartRequired?: boolean;

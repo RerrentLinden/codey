@@ -53,11 +53,30 @@
 
 .codey-settings-modal-header {
   align-items: center;
+  position: relative;
+  z-index: 2;
+  overflow: visible;
 }
 
 .codey-settings-modal-header .config-header-inner {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   width: 100%;
   min-width: 0;
+}
+
+.codey-settings-modal-header .config-brand {
+  min-width: 0;
+  justify-self: start;
+}
+
+.codey-settings-modal-header .config-header-feedback {
+  justify-self: center;
+}
+
+.codey-settings-modal-header .config-header-right {
+  min-width: 0;
+  justify-self: end;
 }
 
 .codey-settings-modal-close {
@@ -79,7 +98,6 @@
   }
 
   .codey-settings-modal-header .config-header-inner {
-    flex-direction: row;
     align-items: center;
     gap: 10px;
   }
@@ -107,6 +125,15 @@
 @media (max-width: 520px) {
   .codey-settings-modal-header .title-action-label {
     display: none;
+  }
+
+  .codey-settings-modal-header .feedback-group-label {
+    display: none;
+  }
+
+  .codey-settings-modal-header .feedback-group-trigger {
+    width: 32px;
+    padding: 0;
   }
 
   .codey-settings-modal-header .title-restart-button,

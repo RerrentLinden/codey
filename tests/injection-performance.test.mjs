@@ -21,8 +21,10 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.doesNotMatch(inject, /const sidebarDetected =/);
   assert.match(
     inject,
-    /armSessionToolsInteraction\(\);\s*scan\(\);\s*scheduleUpdateCheck\(0,\s*\{\s*startup:\s*true\s*\}\)/,
+    /armSessionToolsInteraction\(\);\s*scan\(\);\s*void hydrateUpdateAvailability\(\)/,
   );
+  assert.match(inject, /const backendStatusPath = "\/backend\/status"/);
+  assert.doesNotMatch(inject, /showUpdateDialog|codey-update-check-status/);
   assert.match(inject, /document\.addEventListener\("pointerover", loadSessionToolsFromInteraction/);
   assert.match(inject, /document\.addEventListener\("focusin", loadSessionToolsFromInteraction/);
   assert.match(inject, /bootstrapObserver\?\.disconnect\(\)/);

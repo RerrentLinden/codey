@@ -19,7 +19,8 @@ test("Windows builds Codey as a GUI process without a console window", async () 
     /^#!\[cfg_attr\(target_os = "windows", windows_subsystem = "windows"\)\]/,
   );
   assert.doesNotMatch(library, /hide_exclusive_windows_console|ShowWindow|GetConsoleWindow/);
-  assert.doesNotMatch(manifest, /Win32_System_Console|Win32_UI_WindowsAndMessaging/);
+  assert.doesNotMatch(manifest, /Win32_System_Console/);
+  assert.match(manifest, /Win32_UI_WindowsAndMessaging/);
 });
 
 test("Windows keeps route transitions resident but shows fatal startup failures", async () => {
@@ -135,7 +136,7 @@ test("Windows updates survive shutdown through the native helper", async () => {
 
   assert.match(
     main,
-    /run_update_helper_if_requested\(\)\?[\s\S]*Builder::new_multi_thread/,
+    /run_update_helper_if_requested\(\)\?[\s\S]*run_desktop_application\(\)/,
   );
   assert.match(
     updates,

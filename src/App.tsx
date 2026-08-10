@@ -11,6 +11,7 @@ import {
   IconDeviceFloppy as Save,
   IconGitBranch as GitBranch,
   IconLoader2 as LoaderCircle,
+  IconMessageCircleQuestion,
   IconRefresh as RefreshCw,
   IconX,
 } from "@tabler/icons-react";
@@ -66,6 +67,8 @@ import { Badge, Button, Button as SaveButton } from "./components/semi";
 const Check = IconCheck;
 const X = IconX;
 const SETTINGS_OVERLAY_Z_INDEX = 2147483647;
+const FEEDBACK_GROUP_QR_URL =
+  "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev/qr.jpg";
 
 function CodeyBrandMark() {
   return (
@@ -753,6 +756,27 @@ export function App({
           <p>管理 Codex 线路、模型服务、运行策略与诊断日志</p>
         </div>
       </div>
+
+      {embedded && (
+        <div className="config-header-feedback">
+          <Button
+            aria-describedby="codey-feedback-qr-description"
+            aria-label="问题反馈群，悬浮或聚焦查看二维码"
+            className="feedback-group-trigger"
+            size="sm"
+            variant="ghost"
+          >
+            <IconMessageCircleQuestion aria-hidden="true" />
+            <span className="feedback-group-label">问题反馈群</span>
+          </Button>
+          <div className="feedback-qr-popover" role="tooltip">
+            <img src={FEEDBACK_GROUP_QR_URL} alt="问题反馈群二维码" />
+            <span id="codey-feedback-qr-description">
+              扫码加入问题反馈群
+            </span>
+          </div>
+        </div>
+      )}
 
       <div className="config-header-right">
         <div className="config-header-actions">

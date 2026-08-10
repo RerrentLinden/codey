@@ -34,71 +34,100 @@ struct UpdateManifestAsset {
     size: u64,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct UpdateCheck {
-    pub(super) current_version: String,
-    pub(super) latest_version: String,
-    pub(super) update_available: bool,
-    pub(super) selected_asset: Option<UpdateAssetInfo>,
+pub(crate) struct UpdateCheck {
+    pub(crate) current_version: String,
+    pub(crate) latest_version: String,
+    pub(crate) update_available: bool,
+    pub(crate) selected_asset: Option<UpdateAssetInfo>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct UpdateAssetInfo {
-    pub(super) platform: String,
-    pub(super) arch: String,
-    pub(super) package_type: String,
-    pub(super) file_name: String,
-    pub(super) url: String,
-    pub(super) sha256: String,
-    pub(super) size: u64,
+pub(crate) struct UpdateAssetInfo {
+    pub(crate) platform: String,
+    pub(crate) arch: String,
+    pub(crate) package_type: String,
+    pub(crate) file_name: String,
+    pub(crate) url: String,
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
 }
 
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct UpdateDownload {
-    latest_version: String,
-    file_path: String,
-    file_name: String,
-    size: u64,
-    sha256: String,
-    asset: UpdateAssetInfo,
+pub(crate) struct UpdateDownload {
+    pub(crate) latest_version: String,
+    pub(crate) file_path: String,
+    pub(crate) file_name: String,
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
+    pub(crate) asset: UpdateAssetInfo,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UpdateCandidate {
+    pub(crate) check: UpdateCheck,
 }
 
 pub async fn check_for_updates(state: &Arc<AppState>) -> Result<Value, String> {
-    let manifest = fetch_configured_update_manifest(state).await?;
-    let check = assess_update_manifest(env!("CARGO_PKG_VERSION"), &manifest)?;
-    serde_json::to_value(check).map_err(|error| error.to_string())
+    let candidate = check_for_update_candidate(state).await?;
+    serde_json::to_value(candidate.check).map_err(|error| error.to_string())
 }
 
 pub async fn download_update(state: &Arc<AppState>) -> Result<Value, String> {
+    let candidate = check_for_update_candidate(state).await?;
+    let download = download_update_candidate(state, &candidate).await?;
+    serde_json::to_value(download).map_err(|error| error.to_string())
+}
+
+pub(crate) async fn check_for_update_candidate(
+    state: &Arc<AppState>,
+) -> Result<UpdateCandidate, String> {
     let manifest = fetch_configured_update_manifest(state).await?;
     let check = assess_update_manifest(env!("CARGO_PKG_VERSION"), &manifest)?;
-    if !check.update_available {
-        return Err(format!("当前已是最新版本 v{}", check.current_version));
+    *state.available_update.write().await = check.update_available.then(|| check.clone());
+    Ok(UpdateCandidate { check })
+}
+
+pub(crate) async fn download_update_candidate(
+    state: &Arc<AppState>,
+    candidate: &UpdateCandidate,
+) -> Result<UpdateDownload, String> {
+    if !candidate.check.update_available {
+        return Err(format!(
+            "当前已是最新版本 v{}",
+            candidate.check.current_version
+        ));
     }
-    let asset = selected_update_asset(&manifest.assets)
+    let asset = candidate
+        .check
+        .selected_asset
+        .as_ref()
         .ok_or_else(|| "没有适用于当前系统的可安装更新包".to_string())?;
-    let file_path =
-        download_update_asset(&state.http_client, &state.store, &manifest.version, &asset).await?;
-    let download = UpdateDownload {
-        latest_version: manifest.version,
+    let file_path = download_update_asset(
+        &state.http_client,
+        &state.store,
+        &candidate.check.latest_version,
+        asset,
+    )
+    .await?;
+    Ok(UpdateDownload {
+        latest_version: candidate.check.latest_version.clone(),
         file_path: file_path.to_string_lossy().to_string(),
         file_name: asset.file_name.clone(),
         size: asset.size,
         sha256: asset.sha256.clone(),
-        asset: asset_info(&asset),
-    };
-    serde_json::to_value(download).map_err(|error| error.to_string())
+        asset: asset.clone(),
+    })
 }
 
 pub async fn install_downloaded_update(
     state: &Arc<AppState>,
     file_path: String,
 ) -> Result<Value, String> {
-    let update_path = validate_downloaded_update_path(&state.store, &file_path)?;
-    spawn_update_installer(&update_path)?;
+    start_downloaded_update(state, &file_path)?;
     let shutdown_state = Arc::clone(state);
     tokio::spawn(async move {
         // Let the bridge deliver the response before Codex/Codey starts
@@ -107,6 +136,11 @@ pub async fn install_downloaded_update(
         shutdown_state.request_update_shutdown();
     });
     Ok(json!({"status":"installing"}))
+}
+
+pub(crate) fn start_downloaded_update(state: &AppState, file_path: &str) -> Result<(), String> {
+    let update_path = validate_downloaded_update_path(&state.store, &file_path)?;
+    spawn_update_installer(&update_path)
 }
 
 async fn fetch_configured_update_manifest(state: &Arc<AppState>) -> Result<UpdateManifest, String> {
@@ -274,9 +308,9 @@ async fn download_update_asset(
     client: &reqwest::Client,
     store: &ConfigStore,
     version: &str,
-    asset: &UpdateManifestAsset,
+    asset: &UpdateAssetInfo,
 ) -> Result<PathBuf, String> {
-    validate_update_asset(asset)?;
+    validate_update_asset_info(asset)?;
     let url = reqwest::Url::parse(&asset.url)
         .map_err(|_| format!("安装包地址无效：{}", asset.file_name))?;
     let directory = update_download_dir(store)?.join(format!("v{version}"));
@@ -349,6 +383,31 @@ async fn download_update_asset(
         return Err(format!("保存更新安装包失败：{error}"));
     }
     Ok(destination)
+}
+
+fn validate_update_asset_info(asset: &UpdateAssetInfo) -> Result<(), String> {
+    if asset.platform.trim().is_empty()
+        || asset.arch.trim().is_empty()
+        || asset.package_type.trim().is_empty()
+        || asset.file_name.trim().is_empty()
+        || asset.size == 0
+    {
+        return Err("更新清单包含不完整的安装包信息".to_string());
+    }
+    if asset.file_name.contains(['/', '\\'])
+        || Path::new(&asset.file_name).components().count() != 1
+    {
+        return Err(format!("安装包文件名无效：{}", asset.file_name));
+    }
+    let url = reqwest::Url::parse(&asset.url)
+        .map_err(|_| format!("安装包地址无效：{}", asset.file_name))?;
+    if url.scheme() != "https" {
+        return Err(format!("安装包地址必须使用 HTTPS：{}", asset.file_name));
+    }
+    if asset.sha256.len() != 64 || !asset.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("安装包 SHA-256 无效：{}", asset.file_name));
+    }
+    Ok(())
 }
 
 fn validate_downloaded_update_path(

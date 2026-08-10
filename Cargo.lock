@@ -357,15 +357,20 @@ name = "codey"
 version = "0.6.5"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "chrono",
  "codey-runtime-core",
  "codey-runtime-data",
  "directories",
+ "dispatch2",
  "fastctx",
  "fs2",
  "futures-util",
  "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "reqwest",
  "rfd",
  "rusqlite",
@@ -378,6 +383,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml_edit",
  "uuid",
+ "windows 0.58.0",
  "winres",
 ]
 

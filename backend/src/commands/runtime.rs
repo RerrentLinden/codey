@@ -101,6 +101,14 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
     {
         object.insert("startupError".into(), Value::String(error));
     };
+    if let Some(update) = state.available_update.read().await.clone()
+        && let Some(object) = status.as_object_mut()
+    {
+        object.insert(
+            "availableUpdate".into(),
+            serde_json::to_value(update).unwrap_or(Value::Null),
+        );
+    }
     if let Some(runtime) = runtime.as_ref()
         && let Some(object) = status.as_object_mut()
     {

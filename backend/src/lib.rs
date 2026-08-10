@@ -14,6 +14,7 @@ mod maintenance_lock;
 mod message_delete;
 mod model_catalog;
 mod model_id;
+mod native_update_ui;
 mod notifications;
 mod pending_approval;
 mod pet_slim_patch;
@@ -28,6 +29,7 @@ mod session_metadata;
 mod session_transfer;
 mod sqlite_util;
 mod startup_maintenance;
+mod startup_update;
 mod subagent_policy;
 mod trace_log_guard;
 mod trace_log_stats;
@@ -40,6 +42,7 @@ use anyhow::Context;
 use anyhow::Result;
 
 use commands::{AppShutdownReason, AppState};
+use native_update_ui::NativeUpdateUi;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShutdownReason {
@@ -56,7 +59,33 @@ pub fn run_error_log_helper_if_requested() -> Result<bool> {
     error_log::run_helper_if_requested()
 }
 
-pub async fn run() -> Result<()> {
+pub fn run_desktop_application() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        return native_update_ui::run_macos_application(|ui| {
+            build_async_runtime()?.block_on(run(ui))
+        });
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let ui = NativeUpdateUi::start();
+        let result = build_async_runtime()?.block_on(run(ui.clone()));
+        ui.shutdown();
+        result
+    }
+}
+
+fn build_async_runtime() -> Result<tokio::runtime::Runtime> {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    // Codey is an I/O coordinator. Blocking filesystem/SQLite work already
+    // runs on Tokio's blocking pool, so two async workers avoid creating a
+    // CPU-count-sized thread team for every helper instance.
+    builder.worker_threads(2);
+    builder.enable_all().build().map_err(anyhow::Error::from)
+}
+
+async fn run(ui: NativeUpdateUi) -> Result<()> {
     error_log::initialize();
     let state = Arc::new(AppState::default());
     let restore_started_at = std::time::Instant::now();
@@ -80,6 +109,15 @@ pub async fn run() -> Result<()> {
         eprintln!("Codey 启动前恢复上次临时配置失败：{error:#}");
     }
     let mut shutdown = Box::pin(shutdown_signal());
+    let startup_update = startup_update::run(&state, &ui);
+    tokio::pin!(startup_update);
+    let startup_update_outcome = tokio::select! {
+        outcome = &mut startup_update => outcome,
+        _ = &mut shutdown => return Ok(()),
+    };
+    if startup_update_outcome == startup_update::StartupUpdateOutcome::InstallScheduled {
+        return Ok(());
+    }
     let shutdown_reason = 'runtime: loop {
         match commands::launch_codey_runtime(&state).await {
             Ok(_) => {

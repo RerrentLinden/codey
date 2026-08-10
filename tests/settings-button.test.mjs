@@ -532,36 +532,24 @@ const createStartupUpdateFixture = (bridge) => {
   };
 };
 
-test("shows startup update progress and asks before installing a detected update", async () => {
+test("hydrates the passive update badge from startup backend state", async () => {
   const bridgeCalls = [];
   const fixture = createStartupUpdateFixture(async (path, payload) => {
     bridgeCalls.push({ path, payload });
-    if (path === "/api/check_for_updates") {
+    if (path === "/backend/status") {
       return {
-        currentVersion: "0.3.9",
-        latestVersion: "0.4.0",
-        updateAvailable: true,
-        selectedAsset: { fileName: "Codey-0.4.0.zip" },
+        status: "ok",
+        availableUpdate: {
+          currentVersion: "0.3.9",
+          latestVersion: "0.4.0",
+          updateAvailable: true,
+          selectedAsset: { fileName: "Codey-0.4.0.zip" },
+        },
       };
-    }
-    if (path === "/api/download_update") {
-      return {
-        fileName: "Codey-0.4.0.zip",
-        filePath: "/tmp/codey-updates/Codey-0.4.0.zip",
-      };
-    }
-    if (path === "/api/install_downloaded_update") {
-      assert.equal(payload.filePath, "/tmp/codey-updates/Codey-0.4.0.zip");
-      return { status: "installing" };
     }
     throw new Error(`unexpected bridge path: ${path}`);
   });
 
-  assert.ok(fixture.document.getElementById("codey-update-check-status"));
-  const initialTimer = fixture.activeTimers().find((timer) => timer.delay === 0);
-  assert.equal(initialTimer?.delay, 0);
-  initialTimer.cleared = true;
-  initialTimer.callback();
   await new Promise((resolve) => setImmediate(resolve));
 
   const button = fixture.document.getElementById("codey-settings-button");
@@ -572,49 +560,21 @@ test("shows startup update progress and asks before installing a detected update
   assert.equal(fixture.events.length, 1);
   assert.equal(fixture.events[0].type, "codey-update-availability-changed");
   assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
-  assert.match(
-    fixture.document.getElementById("codey-update-dialog-title").textContent,
-    /v0\.4\.0/,
-  );
-  assert.match(
-    fixture.document.getElementById("codey-update-dialog-description").textContent,
-    /下载、校验并安装更新/,
-  );
+  assert.equal(fixture.document.getElementById("codey-update-dialog"), null);
   assert.equal(
     fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
     false,
   );
-
-  fixture.document
-    .getElementById("codey-update-dialog-confirm")
-    .dispatchEvent({ type: "click" });
-  await new Promise((resolve) => setImmediate(resolve));
-  await new Promise((resolve) => setImmediate(resolve));
   assert.deepEqual(
     bridgeCalls.map(({ path }) => path),
-    [
-      "/api/check_for_updates",
-      "/api/download_update",
-      "/api/install_downloaded_update",
-    ],
-  );
-  assert.match(
-    fixture.document.getElementById("codey-update-dialog-description").textContent,
-    /安装完成后将尝试启动新版/,
+    ["/backend/status"],
   );
 });
 
-test("skips startup update flow after ten seconds when the update source hangs", async () => {
+test("falls back to a passive periodic check when backend update state hangs", async () => {
   const fixture = createStartupUpdateFixture(
     async () => new Promise(() => {}),
   );
-
-  assert.ok(fixture.document.getElementById("codey-update-check-status"));
-  const initialTimer = fixture.activeTimers().find((timer) => timer.delay === 0);
-  assert.equal(initialTimer?.delay, 0);
-  initialTimer.cleared = true;
-  initialTimer.callback();
-  await new Promise((resolve) => setImmediate(resolve));
 
   const timeoutTimer = fixture.activeTimers().find(
     (timer) => timer.delay === 10_000,
@@ -626,7 +586,7 @@ test("skips startup update flow after ten seconds when the update source hangs",
 
   assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
   assert.equal(fixture.document.getElementById("codey-update-dialog"), null);
-  assert.equal(fixture.window.__codeyUpdateAvailability, undefined);
+  assert.equal(fixture.window.__codeyUpdateAvailability, null);
   assert.equal(
     fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
     true,

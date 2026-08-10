@@ -8,24 +8,16 @@
 
   const sessionToolsLoadPath = "/internal/codey/session-tools/load";
   const updateCheckPath = "/api/check_for_updates";
-  const updateDownloadPath = "/api/download_update";
-  const updateInstallPath = "/api/install_downloaded_update";
+  const backendStatusPath = "/backend/status";
   const accountUsagePath = "/account/usage";
   const buttonId = "codey-settings-button";
   const accountUsageId = "codey-account-usage";
   const accountUsagePositionStorageKey = "codey.accountUsage.position.v1";
   const styleId = "codey-core-injected-style";
-  const updateCheckStatusId = "codey-update-check-status";
-  const updateDialogId = "codey-update-dialog";
-  const updateDialogTitleId = "codey-update-dialog-title";
-  const updateDialogDescriptionId = "codey-update-dialog-description";
-  const updateDialogCancelId = "codey-update-dialog-cancel";
-  const updateDialogConfirmId = "codey-update-dialog-confirm";
   const updateAvailableEvent = "codey-update-availability-changed";
   const configChangedEvent = "codey:config-changed";
   const updateCheckIntervalMs = 30 * 60 * 1000;
   const updateCheckTimeoutMs = 10_000;
-  const updateDownloadTimeoutMs = 5 * 60 * 1000;
   const accountUsageRefreshIntervalMs = 60_000;
   const accountUsageTimeoutMs = 8_000;
   const accountUsageViewportMargin = 24;
@@ -94,20 +86,6 @@
       #${buttonId}::after { content: ""; position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 999px; background: #ff3b30; box-shadow: 0 0 0 2px Canvas; opacity: 0; transform: scale(.7); transition: opacity .15s ease, transform .15s ease; pointer-events: none; }
       #${buttonId}[data-codey-update-available="true"]::after { opacity: 1; transform: scale(1); }
       #${buttonId}[data-codey-header-actions="true"]::after { top: 4px; right: 4px; }
-      #${updateCheckStatusId} { -webkit-app-region: no-drag !important; pointer-events: none !important; position: fixed; top: 16px; left: 50%; z-index: 2147483646; display: flex; align-items: center; gap: 9px; max-width: calc(100vw - 32px); border: 1px solid color-mix(in srgb, CanvasText 12%, transparent); border-radius: 10px; padding: 9px 13px; background: color-mix(in srgb, Canvas 94%, transparent); box-shadow: 0 10px 30px color-mix(in srgb, CanvasText 14%, transparent); color: CanvasText; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; font-size: 13px; font-weight: 600; line-height: 1.3; transform: translateX(-50%); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); }
-      #${updateCheckStatusId} .codey-update-check-spinner { width: 14px; height: 14px; flex: 0 0 auto; border: 2px solid color-mix(in srgb, CanvasText 18%, transparent); border-top-color: #0a84ff; border-radius: 999px; animation: codey-update-check-spin .8s linear infinite; }
-      #${updateDialogId} { -webkit-app-region: no-drag !important; pointer-events: auto !important; position: fixed; inset: 0; z-index: 2147483647; display: grid; place-items: center; padding: 24px; background: color-mix(in srgb, #000 34%, transparent); font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; }
-      #${updateDialogId} .codey-update-dialog-card { width: min(430px, calc(100vw - 48px)); border: 1px solid color-mix(in srgb, CanvasText 12%, transparent); border-radius: 14px; padding: 22px; background: Canvas; box-shadow: 0 24px 70px rgba(0, 0, 0, .28); color: CanvasText; }
-      #${updateDialogId} .codey-update-dialog-title { margin: 0; font-size: 18px; font-weight: 720; line-height: 1.35; }
-      #${updateDialogId} .codey-update-dialog-description { margin: 9px 0 0; color: color-mix(in srgb, CanvasText 68%, transparent); font-size: 13px; line-height: 1.65; }
-      #${updateDialogId} .codey-update-dialog-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 20px; }
-      #${updateDialogId} button { min-height: 34px; border: 1px solid color-mix(in srgb, CanvasText 14%, transparent); border-radius: 8px; padding: 0 14px; background: color-mix(in srgb, CanvasText 5%, Canvas); color: CanvasText; cursor: pointer; font: inherit; font-size: 13px; font-weight: 650; }
-      #${updateDialogId} button:hover:not(:disabled) { background: color-mix(in srgb, CanvasText 9%, Canvas); }
-      #${updateDialogId} button:focus-visible { outline: 2px solid rgba(10, 132, 255, .72); outline-offset: 2px; }
-      #${updateDialogId} button:disabled { cursor: default; opacity: .58; }
-      #${updateDialogId} .codey-update-dialog-confirm { border-color: #0a84ff; background: #0a84ff; color: #fff; }
-      #${updateDialogId} .codey-update-dialog-confirm:hover:not(:disabled) { background: #0077ed; }
-      @keyframes codey-update-check-spin { to { transform: rotate(360deg); } }
       #${accountUsageId} { -webkit-app-region: no-drag !important; pointer-events: auto !important; position: fixed; right: ${accountUsageViewportMargin}px; bottom: ${accountUsageViewportMargin}px; z-index: 2147483640; display: flex; width: 176px; max-width: calc(100vw - ${accountUsageViewportMargin * 2}px); max-height: calc(100vh - ${accountUsageViewportMargin * 2}px); flex-direction: column; gap: 6px; overflow: hidden; border: 1px solid color-mix(in srgb, CanvasText 9%, transparent); border-radius: 8px; padding: 8px; background: color-mix(in srgb, Canvas 58%, transparent); box-shadow: 0 7px 20px color-mix(in srgb, CanvasText 9%, transparent), 0 1px 5px color-mix(in srgb, CanvasText 7%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 44%, transparent); color: CanvasText; cursor: grab; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; font-size: 11px; line-height: 1.12; opacity: .66; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); touch-action: none; transition: background .16s ease, border-color .16s ease, box-shadow .16s ease, opacity .16s ease; user-select: none; }
       #${accountUsageId}:hover { border-color: color-mix(in srgb, CanvasText 13%, transparent); background: color-mix(in srgb, Canvas 93%, transparent); box-shadow: 0 10px 28px color-mix(in srgb, CanvasText 14%, transparent), 0 2px 8px color-mix(in srgb, CanvasText 10%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 74%, transparent); opacity: .98; }
       #${accountUsageId}[data-state="stale"] { opacity: .5; }
@@ -133,7 +111,7 @@
         #${accountUsageId} { right: 16px; bottom: 16px; width: 164px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); }
       }
       @media (prefers-reduced-motion: reduce) {
-        #${accountUsageId}, #${accountUsageId} *, #${updateCheckStatusId} *, #${updateDialogId}, #${updateDialogId} * { animation: none !important; transition: none !important; }
+        #${accountUsageId}, #${accountUsageId} * { animation: none !important; transition: none !important; }
       }
     `;
     document.documentElement.appendChild(style);
@@ -163,148 +141,6 @@
     button.removeAttribute?.("data-codey-update-available");
     button.setAttribute("aria-label", "打开 Codey 配置");
     button.title = "打开 Codey 配置";
-  };
-
-  const updateUiRoot = () => document.body || document.documentElement;
-
-  const removeUpdateCheckStatus = () => {
-    document.getElementById(updateCheckStatusId)?.remove();
-  };
-
-  const showUpdateCheckStatus = () => {
-    if (document.getElementById(updateCheckStatusId)) return;
-    const root = updateUiRoot();
-    if (!root) return;
-    const status = document.createElement("div");
-    status.id = updateCheckStatusId;
-    status.setAttribute("role", "status");
-    status.setAttribute("aria-live", "polite");
-    const spinner = document.createElement("span");
-    spinner.className = "codey-update-check-spinner";
-    spinner.setAttribute("aria-hidden", "true");
-    const label = document.createElement("span");
-    label.textContent = "正在检查 Codey 更新…";
-    status.appendChild(spinner);
-    status.appendChild(label);
-    root.appendChild(status);
-  };
-
-  const bridgeResultOrThrow = (result, fallbackMessage) => {
-    if (result?.status === "failed") {
-      throw new Error(result.message || fallbackMessage);
-    }
-    return result;
-  };
-
-  const showUpdateDialog = (result) => {
-    if (
-      !result?.selectedAsset
-      || document.getElementById(updateDialogId)
-    ) return;
-    const root = updateUiRoot();
-    if (!root) return;
-
-    const dialog = document.createElement("div");
-    dialog.id = updateDialogId;
-    dialog.setAttribute("role", "dialog");
-    dialog.setAttribute("aria-modal", "true");
-    dialog.setAttribute("aria-labelledby", updateDialogTitleId);
-    dialog.setAttribute("aria-describedby", updateDialogDescriptionId);
-
-    const card = document.createElement("div");
-    card.className = "codey-update-dialog-card";
-    const title = document.createElement("h2");
-    title.id = updateDialogTitleId;
-    title.className = "codey-update-dialog-title";
-    title.textContent = `发现 Codey v${String(result.latestVersion || "").trim()} 更新`;
-    const description = document.createElement("p");
-    description.id = updateDialogDescriptionId;
-    description.className = "codey-update-dialog-description";
-    description.textContent =
-      `当前版本为 v${String(result.currentVersion || "").trim()}。是否现在下载、校验并安装更新？安装时 Codey 会退出，并尝试启动新版。`;
-    const actions = document.createElement("div");
-    actions.className = "codey-update-dialog-actions";
-    const cancelButton = document.createElement("button");
-    cancelButton.id = updateDialogCancelId;
-    cancelButton.type = "button";
-    cancelButton.textContent = "稍后";
-    const confirmButton = document.createElement("button");
-    confirmButton.id = updateDialogConfirmId;
-    confirmButton.type = "button";
-    confirmButton.className = "codey-update-dialog-confirm";
-    confirmButton.textContent = "更新并重启";
-    actions.appendChild(cancelButton);
-    actions.appendChild(confirmButton);
-    card.appendChild(title);
-    card.appendChild(description);
-    card.appendChild(actions);
-    dialog.appendChild(card);
-    root.appendChild(dialog);
-
-    const previouslyFocused = document.activeElement instanceof HTMLElement
-      ? document.activeElement
-      : null;
-    const closeDialog = () => {
-      dialog.remove();
-      if (previouslyFocused?.isConnected) previouslyFocused.focus?.();
-    };
-    let working = false;
-    cancelButton.addEventListener("click", () => {
-      if (!working) closeDialog();
-    });
-    dialog.addEventListener("keydown", (event) => {
-      if (event.key === "Escape" && !working) {
-        closeDialog();
-        return;
-      }
-      if (event.key !== "Tab") return;
-      if (event.shiftKey && document.activeElement === cancelButton) {
-        event.preventDefault();
-        confirmButton.focus?.();
-      } else if (!event.shiftKey && document.activeElement === confirmButton) {
-        event.preventDefault();
-        cancelButton.focus?.();
-      }
-    });
-    confirmButton.addEventListener("click", async () => {
-      if (working) return;
-      working = true;
-      cancelButton.disabled = true;
-      confirmButton.disabled = true;
-      confirmButton.textContent = "更新中…";
-      title.textContent = "正在下载 Codey 更新";
-      description.textContent = "正在下载并校验安装包，请不要关闭 Codey。";
-      try {
-        const downloaded = bridgeResultOrThrow(
-          await withTimeout(
-            callBridge(updateDownloadPath, {}),
-            updateDownloadTimeoutMs,
-            "下载更新超时，请稍后重试",
-          ),
-          "下载更新失败",
-        );
-        if (!downloaded?.filePath) throw new Error("下载结果缺少安装包路径");
-        title.textContent = "正在启动更新安装器";
-        description.textContent = "安装包校验完成，Codey 即将退出并安装新版。";
-        bridgeResultOrThrow(
-          await callBridge(updateInstallPath, { filePath: downloaded.filePath }),
-          "启动更新安装器失败",
-        );
-        title.textContent = "正在安装 Codey 更新";
-        description.textContent = "Codey 正在退出；安装完成后将尝试启动新版。";
-      } catch (error) {
-        working = false;
-        cancelButton.disabled = false;
-        confirmButton.disabled = false;
-        cancelButton.textContent = "关闭";
-        confirmButton.textContent = "重试";
-        title.textContent = "更新失败";
-        description.textContent = error instanceof Error
-          ? error.message
-          : String(error || "更新失败，请稍后重试");
-      }
-    });
-    confirmButton.focus?.();
   };
 
   const setUpdateAvailability = (result, { dispatch = true } = {}) => {
@@ -340,27 +176,17 @@
     );
   });
 
-  const scheduleUpdateCheck = (
-    delayMs = updateCheckIntervalMs,
-    { startup = false } = {},
-  ) => {
-    if (hasDetectedUpdate()) {
-      if (startup) removeUpdateCheckStatus();
-      return;
-    }
+  const scheduleUpdateCheck = (delayMs = updateCheckIntervalMs) => {
+    if (hasDetectedUpdate()) return;
     window.clearTimeout(updateCheckTimer);
-    if (startup) showUpdateCheckStatus();
     updateCheckTimer = window.setTimeout(() => {
       updateCheckTimer = 0;
-      void checkForUpdatesSilently({ startup });
+      void checkForUpdatesSilently();
     }, delayMs);
   };
 
-  const checkForUpdatesSilently = async ({ startup = false } = {}) => {
-    if (updateCheckInFlight || hasDetectedUpdate()) {
-      if (startup) removeUpdateCheckStatus();
-      return;
-    }
+  const checkForUpdatesSilently = async () => {
+    if (updateCheckInFlight || hasDetectedUpdate()) return;
     updateCheckInFlight = true;
     try {
       const result = await withTimeout(
@@ -369,14 +195,27 @@
       );
       if (result?.status !== "failed" && result?.updateAvailable === true) {
         setUpdateAvailability(result);
-        if (startup) showUpdateDialog(result);
         return;
       }
     } catch {
       // 更新地址不可达或检查超时时直接跳过，不阻塞 Codex 页面。
     } finally {
-      if (startup) removeUpdateCheckStatus();
       updateCheckInFlight = false;
+      if (!hasDetectedUpdate()) scheduleUpdateCheck();
+    }
+  };
+
+  const hydrateUpdateAvailability = async () => {
+    try {
+      const status = await withTimeout(
+        callBridge(backendStatusPath, {}),
+        updateCheckTimeoutMs,
+        "读取更新状态超时",
+      );
+      setUpdateAvailability(status?.availableUpdate || null);
+    } catch {
+      setUpdateAvailability(null);
+    } finally {
       if (!hasDetectedUpdate()) scheduleUpdateCheck();
     }
   };
@@ -1428,7 +1267,7 @@
   // session-tools evaluation into startup.
   armSessionToolsInteraction();
   scan();
-  scheduleUpdateCheck(0, { startup: true });
+  void hydrateUpdateAvailability();
   scheduleAccountUsageCheck(250);
 
   const headerNodesChanged = (nodes) => {
