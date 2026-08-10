@@ -44,6 +44,26 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 收到某个子代理结果之后，如果提供了 `close_agent` 就必须立即关闭；每个子代理只用一轮，不复用、不追派。
 - 特别注意：子代理自派生起累计运行 10 分钟仍未完成：视为异常，主代理必须介入、不得继续盲等；检查代理状态或运行记录，已有可用 MESSAGE 时采用其部分结果，然后停止这个子代理。并自行判断是否需要再派生或拆分更小任务重新分派。"#;
 
+pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
+commentary tools. Call them only through their declared direct tool schemas. After spawning agents, \
+call `agents.wait_agent` directly before any other work. Use `timeout_ms <= 120000`; a returned mailbox \
+update is not completion. If it reports `MESSAGE`, process that update and call `agents.wait_agent` \
+again. Treat an agent as done only after its `FINAL_ANSWER` or `task_complete` notification, and \
+continue until every spawned agent is done. The `functions.exec` tool world is a separate route and \
+does not contain collaboration tools.";
+
+pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
+commentary tools. Call them only through their declared direct tool schemas. After spawning agents, \
+call `agents.wait_agent` directly before any other work. The `functions.exec` tool world is a separate \
+route and does not contain collaboration tools.";
+
+pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
+    ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
+];
+
 pub(crate) const DEFAULT_AGENT_CONFIG: &str = r#####"name = "default"
 
 description = "General-purpose exploration subagent using the configured default model and reasoning effort."
@@ -205,6 +225,37 @@ pub(crate) fn append_subagent_guidance(existing: &str) -> String {
     updated
 }
 
+pub(crate) fn append_root_agent_collaboration_usage_hint(existing: &str) -> String {
+    let current_is_present =
+        guidance_paragraph_start(existing, ROOT_AGENT_COLLABORATION_USAGE_HINT).is_some();
+    let mut updated = existing.to_string();
+    for &guidance in ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS {
+        if current_is_present && guidance == ROOT_AGENT_COLLABORATION_USAGE_HINT {
+            continue;
+        }
+        while let Some(without_guidance) = remove_owned_guidance_paragraph(&updated, guidance) {
+            updated = without_guidance;
+        }
+    }
+    if current_is_present {
+        return updated;
+    }
+    let mut updated = updated.trim_end().to_string();
+    if !updated.is_empty() {
+        updated.push_str("\n\n");
+    }
+    updated.push_str(ROOT_AGENT_COLLABORATION_USAGE_HINT);
+    updated
+}
+
+pub(crate) fn root_agent_collaboration_usage_hint_blocks(current: &str) -> Vec<&'static str> {
+    ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS
+        .iter()
+        .copied()
+        .filter(|guidance| guidance_paragraph_start(current, guidance).is_some())
+        .collect()
+}
+
 pub(crate) fn remove_subagent_guidance(current: &str) -> Option<String> {
     let guidance_start = current.find(SUBAGENT_GUIDANCE)?;
     let mut owned_start = guidance_start;
@@ -224,7 +275,7 @@ pub(crate) fn remove_codey_fastctx_guidance(current: &str) -> Option<String> {
     let mut restored = current.to_string();
     let mut changed = false;
     for guidance in codey_fastctx_guidance_blocks(current) {
-        while let Some(without_guidance) = remove_guidance_paragraph(&restored, &guidance) {
+        while let Some(without_guidance) = remove_owned_guidance_paragraph(&restored, &guidance) {
             restored = without_guidance;
             changed = true;
         }
@@ -237,14 +288,18 @@ pub(crate) fn remove_owned_guidance_block(current: &str, guidance: &str) -> Opti
     Some(remove_guidance_at(current, guidance_start, guidance.len()))
 }
 
-fn remove_guidance_paragraph(current: &str, guidance: &str) -> Option<String> {
-    let guidance_start = current.match_indices(guidance).find_map(|(start, _)| {
+pub(crate) fn remove_owned_guidance_paragraph(current: &str, guidance: &str) -> Option<String> {
+    let guidance_start = guidance_paragraph_start(current, guidance)?;
+    Some(remove_guidance_at(current, guidance_start, guidance.len()))
+}
+
+fn guidance_paragraph_start(current: &str, guidance: &str) -> Option<usize> {
+    current.match_indices(guidance).find_map(|(start, _)| {
         let end = start + guidance.len();
         let starts_paragraph = start == 0 || current[..start].ends_with("\n\n");
         let ends_paragraph = end == current.len() || current[end..].starts_with("\n\n");
         (starts_paragraph && ends_paragraph).then_some(start)
-    })?;
-    Some(remove_guidance_at(current, guidance_start, guidance.len()))
+    })
 }
 
 fn remove_guidance_at(current: &str, guidance_start: usize, guidance_len: usize) -> String {
@@ -312,6 +367,57 @@ mod tests {
         assert!(DEFAULT_AGENT_CONFIG.contains("直接改用正确工具"));
         assert!(!DEFAULT_AGENT_CONFIG.contains("Write-Output"));
         assert!(!DEFAULT_AGENT_CONFIG.contains("Write-Error"));
+    }
+
+    #[test]
+    fn root_agent_usage_hint_routes_collaboration_tools_directly() {
+        let custom = "Preserve my root usage hint.";
+        let combined = append_root_agent_collaboration_usage_hint(custom);
+
+        assert!(combined.contains(custom));
+        assert!(combined.contains("`agents.spawn_agent`"));
+        assert!(combined.contains("`agents.wait_agent` directly"));
+        assert!(combined.contains("direct commentary tools"));
+        assert!(combined.contains("`timeout_ms <= 120000`"));
+        assert!(combined.contains("mailbox update is not completion"));
+        assert!(combined.contains("`MESSAGE`"));
+        assert!(combined.contains("`FINAL_ANSWER`"));
+        assert!(combined.contains("`task_complete`"));
+        assert!(combined.contains("`functions.exec` tool world is a separate route"));
+        assert!(!combined.contains("Write-Output"));
+        assert!(!combined.contains("Write-Error"));
+        assert_eq!(
+            append_root_agent_collaboration_usage_hint(&combined),
+            combined
+        );
+        let current_before_user =
+            format!("{ROOT_AGENT_COLLABORATION_USAGE_HINT}\n\nPreserve this position.");
+        assert_eq!(
+            append_root_agent_collaboration_usage_hint(&current_before_user),
+            current_before_user
+        );
+    }
+
+    #[test]
+    fn root_agent_usage_hint_migrates_only_complete_owned_paragraphs() {
+        let configured = format!(
+            "User hint.\n\n{PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT}\n\nConcurrent hint."
+        );
+        let migrated = append_root_agent_collaboration_usage_hint(&configured);
+
+        assert_eq!(
+            migrated,
+            format!("User hint.\n\nConcurrent hint.\n\n{ROOT_AGENT_COLLABORATION_USAGE_HINT}")
+        );
+        assert_eq!(
+            root_agent_collaboration_usage_hint_blocks(&migrated),
+            vec![ROOT_AGENT_COLLABORATION_USAGE_HINT]
+        );
+
+        let inline = format!("Keep inline: {PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT} end.");
+        let with_current = append_root_agent_collaboration_usage_hint(&inline);
+        assert!(with_current.starts_with(&inline));
+        assert!(with_current.ends_with(ROOT_AGENT_COLLABORATION_USAGE_HINT));
     }
 
     #[test]

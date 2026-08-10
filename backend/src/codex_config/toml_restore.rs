@@ -4,7 +4,10 @@ use anyhow::{Context, Result};
 use toml_edit::{Item, Table, Value, value};
 
 use super::{CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID, document_string, parse_document};
-use crate::codex_config_guidance::{codey_fastctx_guidance_blocks, remove_owned_guidance_block};
+use crate::codex_config_guidance::{
+    codey_fastctx_guidance_blocks, remove_owned_guidance_block, remove_owned_guidance_paragraph,
+    root_agent_collaboration_usage_hint_blocks,
+};
 
 pub(super) fn restore_owned_config_changes(
     original: &str,
@@ -70,7 +73,16 @@ fn restore_table_changes(original: &Table, applied: &Table, current: &mut Table)
             continue;
         }
 
-        if restore_fastctx_owned_value(&key, original_item, applied_item, current.get_mut(&key)) {
+        if restore_owned_value(&key, original_item, applied_item, current.get_mut(&key)) {
+            if key == "root_agent_usage_hint_text"
+                && original_item.is_none()
+                && current
+                    .get(&key)
+                    .and_then(Item::as_str)
+                    .is_some_and(|text| text.trim().is_empty())
+            {
+                current.remove(&key);
+            }
             continue;
         }
 
@@ -95,7 +107,7 @@ fn restore_table_changes(original: &Table, applied: &Table, current: &mut Table)
     }
 }
 
-fn restore_fastctx_owned_value(
+fn restore_owned_value(
     key: &str,
     original: Option<&Item>,
     applied: Option<&Item>,
@@ -165,6 +177,39 @@ fn restore_fastctx_owned_value(
                     continue;
                 }
                 while let Some(without_guidance) = remove_owned_guidance_block(&restored, &guidance)
+                {
+                    restored = without_guidance;
+                    changed = true;
+                }
+            }
+            if changed {
+                *current = value(restored);
+            }
+            changed
+        }
+        "root_agent_usage_hint_text" => {
+            let Some(current) = current else {
+                return false;
+            };
+            let Some(text) = current.as_str() else {
+                return false;
+            };
+            let mut restored = text.to_string();
+            let mut changed = false;
+            let original_blocks = original
+                .and_then(Item::as_str)
+                .map(root_agent_collaboration_usage_hint_blocks)
+                .unwrap_or_default();
+            let applied_blocks = applied
+                .and_then(Item::as_str)
+                .map(root_agent_collaboration_usage_hint_blocks)
+                .unwrap_or_default();
+            for guidance in applied_blocks {
+                if original_blocks.contains(&guidance) {
+                    continue;
+                }
+                while let Some(without_guidance) =
+                    remove_owned_guidance_paragraph(&restored, guidance)
                 {
                     restored = without_guidance;
                     changed = true;

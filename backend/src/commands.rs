@@ -894,11 +894,29 @@ fn schedule_crashpad_pending_refresh(state: &Arc<AppState>, protection_enabled: 
     });
 }
 
+fn subagent_hot_reload_commit_is_current(
+    shutting_down: bool,
+    restart_in_progress: bool,
+    captured_generation: u64,
+    current_generation: u64,
+    same_runtime: bool,
+    config_matches: bool,
+    has_startup_error: bool,
+) -> bool {
+    !shutting_down
+        && !restart_in_progress
+        && captured_generation == current_generation
+        && same_runtime
+        && config_matches
+        && !has_startup_error
+}
+
 async fn hot_reload_runtime_subagent_defaults(
     state: &Arc<AppState>,
     config: &CodeyConfig,
 ) -> Option<Result<(), String>> {
     let runtime = state.runtime.lock().await.clone()?;
+    let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
     let websocket_url = runtime.renderer_websocket_url().await;
     let result = cdp::refresh_subagent_defaults(
         &websocket_url,
@@ -908,6 +926,36 @@ async fn hot_reload_runtime_subagent_defaults(
     .await;
     match result {
         Ok(()) => {
+            // CDP may wait for the renderer. Acquire the lifecycle lock only
+            // for the final lease commit so stop/restart stays responsive while
+            // the request is in flight, but cannot restore the lease in parallel
+            // with the commit below.
+            let _runtime_operation = state.runtime_operation.lock().await;
+            let current_runtime = state.runtime.lock().await.clone();
+            let same_runtime = current_runtime
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &runtime));
+            let current_generation = state.runtime_generation.load(Ordering::Acquire);
+            let current_config = state.config.read().await;
+            let config_matches = current_config.subagent_optimization
+                && current_config.subagent_model == config.subagent_model
+                && current_config.subagent_reasoning_effort == config.subagent_reasoning_effort;
+            drop(current_config);
+            let has_startup_error = state.startup_error.read().await.is_some();
+            if !subagent_hot_reload_commit_is_current(
+                state.is_shutting_down(),
+                state.restart_in_progress.load(Ordering::Acquire),
+                runtime_generation,
+                current_generation,
+                same_runtime,
+                config_matches,
+                has_startup_error,
+            ) {
+                return Some(Err(
+                    "Codex 运行时在子代理默认配置热更新期间发生变化；已跳过过期租约提交"
+                        .to_string(),
+                ));
+            }
             let home = codex_home();
             let model = config.subagent_model.clone();
             let reasoning_effort = config.subagent_reasoning_effort.clone();
@@ -945,6 +993,30 @@ async fn hot_reload_runtime_subagent_defaults(
                 }),
             );
             Some(Err(error))
+        }
+    }
+}
+
+#[cfg(test)]
+mod subagent_hot_reload_commit_tests {
+    use super::subagent_hot_reload_commit_is_current;
+
+    #[test]
+    fn commits_only_to_the_same_live_runtime_and_current_config() {
+        assert!(subagent_hot_reload_commit_is_current(
+            false, false, 7, 7, true, true, false
+        ));
+        for stale in [
+            (true, false, 7, 7, true, true, false),
+            (false, true, 7, 7, true, true, false),
+            (false, false, 7, 8, true, true, false),
+            (false, false, 7, 7, false, true, false),
+            (false, false, 7, 7, true, false, false),
+            (false, false, 7, 7, true, true, true),
+        ] {
+            assert!(!subagent_hot_reload_commit_is_current(
+                stale.0, stale.1, stale.2, stale.3, stale.4, stale.5, stale.6,
+            ));
         }
     }
 }

@@ -98,12 +98,19 @@ test("subagent optimization owns the requested V2 and default-agent settings", a
   const source = `${configSource}\n${guidanceSource}`;
 
   assert.match(source, /multi_agent\["enabled"\] = value\(true\)/);
+  assert.match(source, /multi_agent\["wait_agent_enabled"\] = value\(true\)/);
   assert.match(source, /multi_agent\["hide_spawn_agent_metadata"\] = value\(true\)/);
   assert.match(source, /multi_agent\["expose_spawn_agent_model_overrides"\] = value\(false\)/);
   assert.match(source, /multi_agent\["tool_namespace"\] = value\("agents"\)/);
   assert.match(source, /multi_agent\["max_concurrent_threads_per_session"\] = value\(7\)/);
   assert.match(source, /multi_agent\["max_wait_timeout_ms"\] = value\(120_000\)/);
-  assert.match(source, /doc\.as_table_mut\(\)\.remove\("agents"\)/);
+  assert.match(source, /multi_agent\["root_agent_usage_hint_text"\] = value\(/);
+  assert.match(source, /const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str/);
+  assert.match(source, /`agents\.wait_agent` directly before any other work/);
+  assert.match(source, /mailbox update is not completion/);
+  assert.match(source, /`FINAL_ANSWER` or `task_complete`/);
+  assert.doesNotMatch(source, /doc\.as_table_mut\(\)\.remove\("agents"\)/);
+  assert.match(source, /"max_threads", "max_depth", "interrupt_message"/);
   assert.match(source, /let subagent_model = subagent_model\.trim\(\)/);
   assert.match(source, /子代理模型不能为空/);
   assert.match(source, /agents\["default_subagent_model"\] = value\(subagent_model\)/);
@@ -123,6 +130,26 @@ test("subagent defaults are hot-reloaded through the packaged app-server bridge"
 
   assert.match(commandSource, /hot_reload_runtime_subagent_defaults/);
   assert.match(commandSource, /mark_runtime_subagent_defaults_applied/);
+  assert.match(commandSource, /subagent_hot_reload_commit_is_current/);
+  const hotReloadIndex = commandSource.indexOf(
+    "async fn hot_reload_runtime_subagent_defaults",
+  );
+  const cdpRefreshIndex = commandSource.indexOf(
+    "cdp::refresh_subagent_defaults",
+    hotReloadIndex,
+  );
+  const lifecycleLockIndex = commandSource.indexOf(
+    "state.runtime_operation.lock().await",
+    cdpRefreshIndex,
+  );
+  const leaseCommitIndex = commandSource.indexOf(
+    "mark_runtime_subagent_defaults_applied",
+    lifecycleLockIndex,
+  );
+  assert.ok(hotReloadIndex >= 0);
+  assert.ok(cdpRefreshIndex > hotReloadIndex);
+  assert.ok(lifecycleLockIndex > cdpRefreshIndex);
+  assert.ok(leaseCommitIndex > lifecycleLockIndex);
   assert.match(cdpSource, /window\.__codeyApplySubagentDefaults/);
   assert.match(rendererSource, /window\.__codeyApplySubagentDefaults/);
   assert.match(rendererSource, /method: "config\/batchWrite"/);

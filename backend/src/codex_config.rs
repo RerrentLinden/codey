@@ -9,11 +9,15 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 
 #[cfg(test)]
-use crate::codex_config_guidance::CODEY_FASTCTX_GUIDANCE_VERSIONS;
 use crate::codex_config_guidance::{
-    SUBAGENT_GUIDANCE, append_subagent_guidance, codey_fastctx_guidance_blocks,
-    codey_fastctx_guidance_for_namespace, default_agent_config_with_fastctx_guidance,
-    remove_codey_fastctx_guidance, remove_subagent_guidance,
+    CODEY_FASTCTX_GUIDANCE_VERSIONS, PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    ROOT_AGENT_COLLABORATION_USAGE_HINT,
+};
+use crate::codex_config_guidance::{
+    SUBAGENT_GUIDANCE, append_root_agent_collaboration_usage_hint, append_subagent_guidance,
+    codey_fastctx_guidance_blocks, codey_fastctx_guidance_for_namespace,
+    default_agent_config_with_fastctx_guidance, remove_codey_fastctx_guidance,
+    remove_subagent_guidance,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -1271,8 +1275,10 @@ fn enable_subagent_optimization(
             .unwrap_or_default()
             .to_string()
     });
-    doc.as_table_mut().remove("agents");
     let agents = ensure_root_table(doc, "agents")?;
+    for legacy_key in ["max_threads", "max_depth", "interrupt_message"] {
+        agents.remove(legacy_key);
+    }
     agents["default_subagent_model"] = value(subagent_model);
     agents["default_subagent_reasoning_effort"] = value(subagent_reasoning_effort);
     let features = ensure_root_table(doc, "features")?;
@@ -1283,6 +1289,7 @@ fn enable_subagent_optimization(
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("features.multi_agent_v2 必须是 TOML table"))?;
     multi_agent["enabled"] = value(true);
+    multi_agent["wait_agent_enabled"] = value(true);
     multi_agent["hide_spawn_agent_metadata"] = value(true);
     multi_agent["expose_spawn_agent_model_overrides"] = value(false);
     multi_agent["tool_namespace"] = value("agents");
@@ -1290,6 +1297,18 @@ fn enable_subagent_optimization(
     multi_agent["min_wait_timeout_ms"] = value(10_000);
     multi_agent["default_wait_timeout_ms"] = value(30_000);
     multi_agent["max_wait_timeout_ms"] = value(120_000);
+    let existing_root_usage_hint = multi_agent
+        .get("root_agent_usage_hint_text")
+        .map(|item| {
+            item.as_str().ok_or_else(|| {
+                anyhow::anyhow!("features.multi_agent_v2.root_agent_usage_hint_text 必须是字符串")
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    multi_agent["root_agent_usage_hint_text"] = value(append_root_agent_collaboration_usage_hint(
+        existing_root_usage_hint,
+    ));
     if let Some(namespace) = fastctx_namespace {
         if multi_agent.get("subagent_developer_instructions").is_none() {
             multi_agent["subagent_developer_instructions"] =
@@ -2739,11 +2758,13 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
 max_threads = 6
 max_depth = 1
 interrupt_message = true
+custom_setting = "preserved"
 
 [features.multi_agent_v2]
 enabled = false
 custom_setting = "preserved"
 subagent_developer_instructions = "Preserve my subagent guidance."
+root_agent_usage_hint_text = "Preserve my root usage hint."
 "#;
         let result = patch_config_with_fastctx_mode(
             existing,
@@ -2768,6 +2789,7 @@ subagent_developer_instructions = "Preserve my subagent guidance."
         assert!(agents.get("max_threads").is_none());
         assert!(agents.get("max_depth").is_none());
         assert!(agents.get("interrupt_message").is_none());
+        assert_eq!(agents["custom_setting"].as_str(), Some("preserved"));
         assert_eq!(
             agents["default_subagent_model"].as_str(),
             Some("gpt-5.6-sol")
@@ -2777,6 +2799,7 @@ subagent_developer_instructions = "Preserve my subagent guidance."
             Some("high")
         );
         assert_eq!(multi_agent["enabled"].as_bool(), Some(true));
+        assert_eq!(multi_agent["wait_agent_enabled"].as_bool(), Some(true));
         assert_eq!(
             multi_agent["hide_spawn_agent_metadata"].as_bool(),
             Some(true)
@@ -2807,6 +2830,9 @@ subagent_developer_instructions = "Preserve my subagent guidance."
             multi_agent["subagent_developer_instructions"].as_str(),
             Some("Preserve my subagent guidance.")
         );
+        let root_usage_hint = multi_agent["root_agent_usage_hint_text"].as_str().unwrap();
+        assert!(root_usage_hint.contains("Preserve my root usage hint."));
+        assert!(root_usage_hint.contains(ROOT_AGENT_COLLABORATION_USAGE_HINT));
     }
 
     #[test]
@@ -2898,6 +2924,14 @@ subagent_developer_instructions = "Preserve my subagent guidance."
         assert_eq!(
             document["features"]["multi_agent_v2"]["tool_namespace"].as_str(),
             Some("agents")
+        );
+        assert_eq!(
+            document["features"]["multi_agent_v2"]["wait_agent_enabled"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            document["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
+            Some(ROOT_AGENT_COLLABORATION_USAGE_HINT)
         );
         assert!(
             fs::read_to_string(home.join("AGENTS.md"))
@@ -4051,6 +4085,58 @@ note = "user replacement"
         assert_eq!(
             restored["developer_instructions"].as_str(),
             Some("User guidance\n\nConcurrent guidance")
+        );
+    }
+
+    #[test]
+    fn restore_removes_root_agent_hint_after_concurrent_user_edits() {
+        let config_with_hint = |hint: &str| {
+            format!(
+                "[features.multi_agent_v2]\nroot_agent_usage_hint_text = {}\n",
+                Value::from(hint)
+            )
+        };
+        let original_hint = "User root hint.";
+        let applied_hint = format!("{original_hint}\n\n{ROOT_AGENT_COLLABORATION_USAGE_HINT}");
+        let current_hint = format!("{applied_hint}\n\nConcurrent root hint.");
+
+        let restored = restore_owned_config_changes(
+            &config_with_hint(original_hint),
+            &config_with_hint(&applied_hint),
+            &config_with_hint(&current_hint),
+        )
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+        assert_eq!(
+            restored["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
+            Some("User root hint.\n\nConcurrent root hint.")
+        );
+
+        let applied = config_with_hint(ROOT_AGENT_COLLABORATION_USAGE_HINT);
+        let current = config_with_hint(&format!(
+            "{ROOT_AGENT_COLLABORATION_USAGE_HINT}\n\nConcurrent root hint."
+        ));
+        let restored = restore_owned_config_changes("", &applied, &current)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            restored["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
+            Some("Concurrent root hint.")
+        );
+
+        let applied = config_with_hint(PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT);
+        let current = config_with_hint(&format!(
+            "{PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT}\n\nConcurrent root hint."
+        ));
+        let restored = restore_owned_config_changes("", &applied, &current)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            restored["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
+            Some("Concurrent root hint.")
         );
     }
 
