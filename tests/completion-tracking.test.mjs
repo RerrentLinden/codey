@@ -246,7 +246,7 @@ test("unloads Codex memory without discarding the active conversation", async ()
     },
   }, {
     signal: "refresh-recent-conversations-for-host",
-    payload: { hostId: "local", sortKey: "updated_at" },
+    payload: { hostId: "local" },
   }]);
   assert.equal(
     dispatcherCalls.some(({ signal }) => signal === "discard-conversation-from-cache"),
@@ -498,7 +498,7 @@ test("refreshes Codex recent sessions after importing instead of reloading", asy
 
   assert.deepEqual(JSON.parse(JSON.stringify(signalCalls)), [{
     name: "refresh-recent-conversations-for-host",
-    payload: { hostId: "local", sortKey: "updated_at" },
+    payload: { hostId: "local" },
   }]);
   const chunkCall = runtime.bridgeCalls.find((call) => call.path === "/session/import/chunk");
   assert.equal(Buffer.from(chunkCall?.payload.data, "base64").toString("utf8"), "{\"format\":\"codey.session\"}");

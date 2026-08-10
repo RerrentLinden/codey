@@ -1158,7 +1158,6 @@
                 cursor,
                 limit: threadTimestampListPageSize,
                 modelProviders: null,
-                sortKey: "updated_at",
                 useStateDbOnly: true,
               },
               priority: "background",
@@ -1479,7 +1478,6 @@
       const dispatcher = await getCodexSignalDispatcher();
       await dispatcher("refresh-recent-conversations-for-host", {
         hostId: "local",
-        sortKey: "updated_at",
       });
       return true;
     } catch {
@@ -1552,7 +1550,6 @@
     });
     await dispatcher("refresh-recent-conversations-for-host", {
       hostId: "local",
-      sortKey: "updated_at",
     });
   };
 

@@ -442,7 +442,7 @@ test("matches native sidebar actions and deletes after popover confirmation", as
     },
   }, {
     signal: "refresh-recent-conversations-for-host",
-    payload: { hostId: "local", sortKey: "updated_at" },
+    payload: { hostId: "local" },
   }]);
   assert.deepEqual(events, [
     "signal:unsubscribe-thread-for-host",

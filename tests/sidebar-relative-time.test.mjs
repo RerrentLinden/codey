@@ -627,7 +627,6 @@ test("loads visible thread timestamps through the official app-server list", asy
       cursor: null,
       limit: 100,
       modelProviders: null,
-      sortKey: "updated_at",
       useStateDbOnly: true,
     },
     priority: "background",
@@ -1025,6 +1024,7 @@ test("injects time styles that coexist with native statuses and yield to sidebar
   assert.doesNotMatch(source, /threadSortOrderAttribute|data-codey-thread-sort-order/);
   assert.doesNotMatch(source, /--codey-thread-sort-order|thread-sort-keys/);
   assert.doesNotMatch(source, /data-codey-thread-running/);
+  assert.doesNotMatch(source, /sortKey:\s*"updated_at"/);
   assert.match(source, /threadTimestampRefreshIntervalMs = 60_000/);
   assert.match(source, /threadTimestampReadBatchSize = 32/);
   assert.match(source, /dispatcher\("send-cli-request-for-host"/);
@@ -1053,7 +1053,11 @@ test("vendor project moves preserve Codex-owned thread ordering", () => {
     vendorSource,
     /const ordered = \[\.\.\.running, \.\.\.idle\]/,
   );
-  assert.match(vendorSource, /function insertProjectedRowItem\(list, item, row, target\)/);
+  assert.doesNotMatch(
+    vendorSource,
+    /codexProjectMoveTimestampMs|timestampTrusted|timestampStateFromMoveResult/,
+  );
+  assert.match(vendorSource, /function insertProjectedRowItem\(list, item\)/);
   assert.match(vendorSource, /item\.parentElement !== list/);
   assert.match(vendorSource, /list\.insertBefore\(item, firstNonThreadItem\)/);
 });
