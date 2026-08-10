@@ -14,7 +14,7 @@ import type {
   Notice,
   RuntimeStatus,
 } from "./App.types";
-import { errorText, withTimeout } from "./appUtils";
+import { errorText } from "./appUtils";
 import {
   includesModelId,
   modelKey,
@@ -181,12 +181,10 @@ export function useModelSelection({
     if (!provider || provider.official) return;
     await runOperation("fetch-models", async () => {
       try {
-        const result = await withTimeout(
-          invoke<{ modelState: ModelState } & ModelRuntimeUpdate>(
-            "fetch_current_provider_models",
-          ),
-          15_000,
-          "获取上游模型超时，请检查当前线路",
+        const result = await invoke<
+          { modelState: ModelState } & ModelRuntimeUpdate
+        >(
+          "fetch_current_provider_models",
         );
         setModelState(result.modelState);
         if (typeof result.restartRequired === "boolean") {
@@ -262,11 +260,7 @@ export function useModelSelection({
           modelState: ModelState;
         } & ModelRuntimeUpdate;
         try {
-          result = await withTimeout(
-            invoke("fetch_current_provider_models"),
-            15_000,
-            "获取上游模型超时，请检查当前线路",
-          );
+          result = await invoke("fetch_current_provider_models");
         } catch (error) {
           throw new Error(
             `无法确认当前第三方 API 是否支持 ${subagentModel}：${errorText(error)}`,

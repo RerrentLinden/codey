@@ -330,14 +330,25 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
         return latest;
     }
     let next = config_with_current_provider_model_sync(&latest, models, synced, &codex_home());
+    commit_startup_model_sync(state, latest, next, synced).await
+}
+
+async fn commit_startup_model_sync(
+    state: &Arc<AppState>,
+    latest: CodeyConfig,
+    next: CodeyConfig,
+    synced: bool,
+) -> CodeyConfig {
     if synced && let Err(error) = save_config_to_store(state, &next).await {
-        eprintln!("保存启动时模型同步结果失败，本次启动仍使用最新模型：{error:#}");
+        eprintln!("保存启动时模型同步结果失败，本次启动沿用已持久化模型：{error:#}");
+        return latest;
     }
     *state.config.write().await = next.clone();
     next
 }
 
 pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Value, String> {
+    let _provider_model_sync_guard = state.provider_model_sync_lock.lock().await;
     let config = state.config.read().await.clone();
     let profile = config
         .profiles
@@ -367,9 +378,18 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
         &codex_home(),
     );
     let model_state = current_model_state(&next)?;
-    let model_catalog_fallback = should_refresh_model_catalog(&model_state)
-        && refresh_model_catalog_for_provider_sync(&next)?;
-    save_config_to_store(state, &next).await?;
+    let catalog_refresh = should_refresh_model_catalog(&model_state)
+        .then(|| refresh_model_catalog_for_provider_sync(&next))
+        .transpose()?;
+    if let Err(error) = save_config_to_store(state, &next).await {
+        return Err(rollback_model_catalog_after_config_save(
+            catalog_refresh,
+            error,
+        ));
+    }
+    let model_catalog_fallback = catalog_refresh
+        .as_ref()
+        .is_some_and(|refresh| refresh.fallback);
     *state.config.write().await = next.clone();
     drop(_config_write_guard);
     let hot_reload = hot_reload_runtime_models(state, &next, &model_state).await;
@@ -545,8 +565,14 @@ pub async fn save_selected_models(
         }
     }
     config = config.normalize();
-    let model_catalog_fallback = refresh_model_catalog_or_fallback(&config)?;
-    save_config_to_store(state, &config).await?;
+    let catalog_refresh = refresh_model_catalog_or_fallback(&config)?;
+    if let Err(error) = save_config_to_store(state, &config).await {
+        return Err(rollback_model_catalog_after_config_save(
+            Some(catalog_refresh),
+            error,
+        ));
+    }
+    let model_catalog_fallback = catalog_refresh.fallback;
     *state.config.write().await = config.clone();
     let model_state = current_model_state(&config)?;
     let public_config = redacted_config(&config);
@@ -897,19 +923,53 @@ pub(super) fn should_refresh_model_catalog(
     !model_state.official_models.is_empty() || !model_state.third_party_models.is_empty()
 }
 
-fn refresh_model_catalog_for_provider_sync(config: &CodeyConfig) -> Result<bool, String> {
+struct ModelCatalogRefresh {
+    fallback: bool,
+    snapshot: model_catalog::CatalogSnapshot,
+}
+
+fn refresh_model_catalog_for_provider_sync(
+    config: &CodeyConfig,
+) -> Result<ModelCatalogRefresh, String> {
     refresh_model_catalog_or_fallback(config)
 }
 
-fn refresh_model_catalog_or_fallback(config: &CodeyConfig) -> Result<bool, String> {
+fn refresh_model_catalog_or_fallback(config: &CodeyConfig) -> Result<ModelCatalogRefresh, String> {
     let codex_runtime_version =
         model_catalog::desktop_runtime_version(None, &config.codex_app_path);
     let home = codex_home();
-    model_catalog_fallback(
+    let snapshot = model_catalog::snapshot(&home).map_err(|error| error.to_string())?;
+    let result = model_catalog_fallback(
         try_refresh_model_catalog(config, codex_runtime_version.as_deref()),
         &home,
         codex_runtime_version.as_deref(),
-    )
+    );
+    match result {
+        Ok(fallback) => Ok(ModelCatalogRefresh { fallback, snapshot }),
+        Err(error) => Err(rollback_model_catalog_snapshot(snapshot, error)),
+    }
+}
+
+fn rollback_model_catalog_after_config_save(
+    refresh: Option<ModelCatalogRefresh>,
+    error: String,
+) -> String {
+    match refresh {
+        Some(refresh) => rollback_model_catalog_snapshot(refresh.snapshot, error),
+        None => error,
+    }
+}
+
+fn rollback_model_catalog_snapshot(
+    snapshot: model_catalog::CatalogSnapshot,
+    error: String,
+) -> String {
+    match model_catalog::restore_snapshot(snapshot) {
+        Ok(()) => error,
+        Err(rollback_error) => {
+            format!("{error}；回滚 Codey 模型目录也失败：{rollback_error:#}")
+        }
+    }
 }
 
 fn model_catalog_fallback(
@@ -1084,6 +1144,26 @@ mod tests {
             synced.subagent_reasoning_effort,
             crate::config::DEFAULT_SUBAGENT_REASONING_EFFORT
         );
+    }
+
+    #[tokio::test]
+    async fn startup_model_sync_does_not_publish_memory_when_persistence_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let latest = CodeyConfig::default();
+        let mut next = latest.clone();
+        let provider_id = next.current_provider_id().unwrap().to_string();
+        next.upstream_models_by_provider
+            .insert(provider_id, vec!["provider-new".into()]);
+        let state = Arc::new(AppState {
+            store: crate::config::ConfigStore::new(directory.path()),
+            config: tokio::sync::RwLock::new(latest.clone()),
+            ..AppState::default()
+        });
+
+        let committed = commit_startup_model_sync(&state, latest.clone(), next, true).await;
+
+        assert_eq!(committed, latest);
+        assert_eq!(*state.config.read().await, latest);
     }
 
     #[test]

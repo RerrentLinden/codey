@@ -105,6 +105,38 @@ pub fn relative_path() -> &'static str {
     MODEL_CATALOG_RELATIVE_PATH
 }
 
+#[derive(Debug)]
+pub(crate) struct CatalogSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+}
+
+pub(crate) fn snapshot(home: &Path) -> Result<CatalogSnapshot> {
+    let path = home.join(relative_path());
+    let contents = match fs::read(&path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取现有 Codey 模型目录失败：{}", path.display()));
+        }
+    };
+    Ok(CatalogSnapshot { path, contents })
+}
+
+pub(crate) fn restore_snapshot(snapshot: CatalogSnapshot) -> Result<()> {
+    match snapshot.contents {
+        Some(contents) => atomic_write(&snapshot.path, &contents),
+        None => match fs::remove_file(&snapshot.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!("移除新建的 Codey 模型目录失败：{}", snapshot.path.display())
+            }),
+        },
+    }
+}
+
 pub fn desktop_runtime_version(
     app_dir: Option<&Path>,
     configured_app_path: &str,
@@ -1959,5 +1991,29 @@ mod tests {
             state.available_subagent_model("third-model"),
             Some("third-model")
         );
+    }
+
+    #[test]
+    fn catalog_snapshot_restores_existing_content_and_removes_new_content() {
+        let existing_home = tempfile::tempdir().unwrap();
+        let existing_path = existing_home.path().join(relative_path());
+        fs::create_dir_all(existing_path.parent().unwrap()).unwrap();
+        fs::write(&existing_path, b"original catalog\n").unwrap();
+        let existing_snapshot = snapshot(existing_home.path()).unwrap();
+        fs::write(&existing_path, b"replacement catalog\n").unwrap();
+
+        restore_snapshot(existing_snapshot).unwrap();
+
+        assert_eq!(fs::read(&existing_path).unwrap(), b"original catalog\n");
+
+        let new_home = tempfile::tempdir().unwrap();
+        let new_path = new_home.path().join(relative_path());
+        let new_snapshot = snapshot(new_home.path()).unwrap();
+        fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        fs::write(&new_path, b"new catalog\n").unwrap();
+
+        restore_snapshot(new_snapshot).unwrap();
+
+        assert!(!new_path.exists());
     }
 }

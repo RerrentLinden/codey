@@ -43,7 +43,12 @@ test("third-party model sync can fall back to manual model support configuration
   assert.match(modelCommandSource, /preserve_selected_third_party_models_except/);
   assert.match(
     modelCommandSource,
-    /let model_catalog_fallback = refresh_model_catalog_or_fallback\(&config\)\?/,
+    /let catalog_refresh = refresh_model_catalog_or_fallback\(&config\)\?/,
+  );
+  assert.match(modelCommandSource, /rollback_model_catalog_after_config_save/);
+  assert.match(
+    modelCommandSource,
+    /let model_catalog_fallback = catalog_refresh\.fallback/,
   );
   assert.match(
     modelCommandSource,

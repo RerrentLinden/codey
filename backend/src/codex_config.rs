@@ -694,11 +694,8 @@ fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool
     let endpoint_matches = state.applied_base_url.as_deref().is_none_or(|base_url| {
         provider_base_url(&current, provider_id).as_deref() == Some(base_url)
     });
-    if !state.preserve_provider_route && (!provider_matches || !endpoint_matches) {
-        restore_runtime_subagent_files(home, &state)?;
-        remove_optional(marker)?;
-        return Ok(false);
-    }
+    let route_still_applied =
+        state.preserve_provider_route || (provider_matches && endpoint_matches);
 
     let config_snapshot_dir = state
         .config_snapshot_dir
@@ -730,7 +727,7 @@ fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool
     }
     restore_runtime_subagent_files(home, &state)?;
     remove_optional(marker)?;
-    Ok(true)
+    Ok(route_still_applied)
 }
 
 fn restore_runtime_subagent_files(home: &Path, state: &RuntimeConfigLease) -> Result<()> {
@@ -3200,6 +3197,63 @@ args = ["serve"]
             original_agents_md
         );
         assert!(!home.join("agents/default.toml").exists());
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn non_route_lease_preserves_a_user_route_change_and_removes_owned_overlay() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            format!(
+                "model_provider = \"{GLOBAL_PROVIDER_ID}\"\n\n\
+                 [model_providers.{GLOBAL_PROVIDER_ID}]\n\
+                 base_url = \"{CHATGPT_CODEX_BASE_URL}\"\n"
+            ),
+        )
+        .unwrap();
+
+        apply_runtime_provider_config_at_mode(
+            &home,
+            &direct_profile(RelayProtocol::Responses),
+            GLOBAL_PROVIDER_ID,
+            ProviderApplyOptions {
+                fastctx_command: Some(Path::new("/tmp/codey-fastctx")),
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
+        )
+        .unwrap();
+        let mut current = fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        current["model_providers"][GLOBAL_PROVIDER_ID]["base_url"] =
+            value("https://user.example/v1");
+        fs::write(home.join("config.toml"), document_string(&current).unwrap()).unwrap();
+
+        assert!(!restore_runtime_provider_config_at(&home, &marker).unwrap());
+        let restored = fs::read_to_string(home.join("config.toml"))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(
+            restored["model_providers"][GLOBAL_PROVIDER_ID]["base_url"].as_str(),
+            Some("https://user.example/v1")
+        );
+        assert!(restored.get("model_catalog_json").is_none());
+        assert!(restored.get("service_tier").is_none());
+        assert!(restored.get("developer_instructions").is_none());
+        assert!(
+            restored
+                .get("mcp_servers")
+                .and_then(Item::as_table)
+                .and_then(|servers| servers.get(CODEY_FASTCTX_SERVER_ID))
+                .is_none()
+        );
         assert!(!marker.exists());
     }
 

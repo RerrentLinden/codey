@@ -72,6 +72,15 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   assert.doesNotMatch(app, /async function checkForUpdates\(/);
   assert.match(appUpdates, /export function useAppUpdates/);
   assert.match(appUpdates, /invoke<UpdateCheck>\("check_for_updates"\)/);
+  assert.equal(
+    appUpdates.match(/invoke<UpdateCheck>\("check_for_updates"\)/g)?.length,
+    1,
+  );
+  assert.match(
+    appUpdates,
+    /updateCheckInFlightRef = useRef<Promise<UpdateCheck> \| null>/,
+  );
+  assert.match(appUpdates, /const result = await requestUpdateCheck\(\)/);
   assert.match(appUpdates, /invoke<UpdateDownload>\("download_update"\)/);
   assert.match(appUpdates, /invoke\("install_downloaded_update"/);
   assert.match(app, /onRepairPluginMarketplace=\{handleRepairPluginMarketplace\}/);
@@ -80,6 +89,7 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   assert.match(app, /onFetchCurrentModels=\{fetchCurrentModels\}/);
   assert.match(app, /onSetDefaultModel=\{setDefaultModel\}/);
   assert.match(app, /onSave=\{saveModelSelection\}/);
+  assert.doesNotMatch(modelSelection, /withTimeout/);
   assert.doesNotMatch(app, /handleFetchCurrentModels|handleSetDefaultModel/);
   for (const callback of [
     "fetchCurrentModels",

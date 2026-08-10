@@ -215,28 +215,15 @@ pub(super) fn assess_update_manifest(
 }
 
 fn validate_update_asset(asset: &UpdateManifestAsset) -> Result<(), String> {
-    if asset.platform.trim().is_empty()
-        || asset.arch.trim().is_empty()
-        || asset.package_type.trim().is_empty()
-        || asset.file_name.trim().is_empty()
-        || asset.size == 0
-    {
-        return Err("更新清单包含不完整的安装包信息".to_string());
-    }
-    if asset.file_name.contains(['/', '\\'])
-        || Path::new(&asset.file_name).components().count() != 1
-    {
-        return Err(format!("安装包文件名无效：{}", asset.file_name));
-    }
-    let url = reqwest::Url::parse(&asset.url)
-        .map_err(|_| format!("安装包地址无效：{}", asset.file_name))?;
-    if url.scheme() != "https" {
-        return Err(format!("安装包地址必须使用 HTTPS：{}", asset.file_name));
-    }
-    if asset.sha256.len() != 64 || !asset.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("安装包 SHA-256 无效：{}", asset.file_name));
-    }
-    Ok(())
+    validate_update_asset_fields(
+        &asset.platform,
+        &asset.arch,
+        &asset.package_type,
+        &asset.file_name,
+        &asset.url,
+        &asset.sha256,
+        asset.size,
+    )
 }
 
 pub(super) fn current_update_platform() -> &'static str {
@@ -386,26 +373,43 @@ async fn download_update_asset(
 }
 
 fn validate_update_asset_info(asset: &UpdateAssetInfo) -> Result<(), String> {
-    if asset.platform.trim().is_empty()
-        || asset.arch.trim().is_empty()
-        || asset.package_type.trim().is_empty()
-        || asset.file_name.trim().is_empty()
-        || asset.size == 0
+    validate_update_asset_fields(
+        &asset.platform,
+        &asset.arch,
+        &asset.package_type,
+        &asset.file_name,
+        &asset.url,
+        &asset.sha256,
+        asset.size,
+    )
+}
+
+fn validate_update_asset_fields(
+    platform: &str,
+    arch: &str,
+    package_type: &str,
+    file_name: &str,
+    url: &str,
+    sha256: &str,
+    size: u64,
+) -> Result<(), String> {
+    if platform.trim().is_empty()
+        || arch.trim().is_empty()
+        || package_type.trim().is_empty()
+        || file_name.trim().is_empty()
+        || size == 0
     {
         return Err("更新清单包含不完整的安装包信息".to_string());
     }
-    if asset.file_name.contains(['/', '\\'])
-        || Path::new(&asset.file_name).components().count() != 1
-    {
-        return Err(format!("安装包文件名无效：{}", asset.file_name));
+    if file_name.contains(['/', '\\']) || Path::new(file_name).components().count() != 1 {
+        return Err(format!("安装包文件名无效：{file_name}"));
     }
-    let url = reqwest::Url::parse(&asset.url)
-        .map_err(|_| format!("安装包地址无效：{}", asset.file_name))?;
+    let url = reqwest::Url::parse(url).map_err(|_| format!("安装包地址无效：{file_name}"))?;
     if url.scheme() != "https" {
-        return Err(format!("安装包地址必须使用 HTTPS：{}", asset.file_name));
+        return Err(format!("安装包地址必须使用 HTTPS：{file_name}"));
     }
-    if asset.sha256.len() != 64 || !asset.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(format!("安装包 SHA-256 无效：{}", asset.file_name));
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!("安装包 SHA-256 无效：{file_name}"));
     }
     Ok(())
 }

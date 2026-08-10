@@ -90,6 +90,7 @@ pub struct AppState {
     pub store: ConfigStore,
     pub config: RwLock<CodeyConfig>,
     config_write_lock: Mutex<()>,
+    provider_model_sync_lock: Mutex<()>,
     pub http_client: reqwest::Client,
     pub webhook_http_client: reqwest::Client,
     pub runtime: Mutex<Option<Arc<CodeyRuntime>>>,
@@ -151,6 +152,7 @@ impl Default for AppState {
             store,
             config: RwLock::new(config),
             config_write_lock: Mutex::new(()),
+            provider_model_sync_lock: Mutex::new(()),
             http_client: reqwest::Client::builder()
                 .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(Duration::from_secs(5))
@@ -736,15 +738,19 @@ async fn save_codey_config_locked(
             || previous.subagent_reasoning_effort != config.subagent_reasoning_effort);
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let restart_required = runtime_config_requires_restart(state, &config).await;
-    if config.disable_trace_log_writes != previous.disable_trace_log_writes {
+    let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
+    let _diagnostic_operation = if trace_guard_changed {
+        Some(state.diagnostic_storage_operation.lock().await)
+    } else {
+        None
+    };
+    if trace_guard_changed {
         let home = codex_home();
         let disable_writes = config.disable_trace_log_writes;
-        let result =
-            tokio::task::spawn_blocking(move || trace_log_guard::configure(&home, disable_writes))
-                .await
-                .map_err(|error| format!("Trace 日志保护切换任务异常退出：{error}"))
-                .and_then(|result| result.map_err(|error| error.to_string()));
+        let result = configure_trace_log_guard(home.clone(), disable_writes).await;
         if let Err(error) = result {
+            let error =
+                rollback_trace_log_guard(home, previous.disable_trace_log_writes, error).await;
             error_log::record_failure(
                 "patch_failed",
                 "configure_trace_log_guard",
@@ -757,13 +763,53 @@ async fn save_codey_config_locked(
             return Err(error);
         }
     }
-    save_config_to_store(state, &config).await?;
+    if let Err(error) = save_config_to_store(state, &config).await {
+        if trace_guard_changed {
+            return Err(rollback_trace_log_guard(
+                codex_home(),
+                previous.disable_trace_log_writes,
+                error,
+            )
+            .await);
+        }
+        return Err(error);
+    }
     *state.config.write().await = config.clone();
     Ok(SavedCodeyConfig {
         config,
         restart_required,
         refresh_subagent_defaults,
     })
+}
+
+async fn configure_trace_log_guard(home: PathBuf, disable_writes: bool) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || trace_log_guard::configure(&home, disable_writes))
+        .await
+        .map_err(|error| format!("Trace 日志保护切换任务异常退出：{error}"))?
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+async fn rollback_trace_log_guard(
+    home: PathBuf,
+    previous_disable_writes: bool,
+    primary_error: String,
+) -> String {
+    match configure_trace_log_guard(home, previous_disable_writes).await {
+        Ok(()) => primary_error,
+        Err(rollback_error) => {
+            error_log::record_failure(
+                "restore_failed",
+                "rollback_trace_log_guard",
+                rollback_error.clone(),
+                json!({
+                    "disabled": previous_disable_writes,
+                    "source": "save_codey_config",
+                }),
+            );
+            format!("{primary_error}；回滚 Trace 日志保护也失败：{rollback_error}")
+        }
+    }
 }
 
 fn validate_subagent_model_selection(

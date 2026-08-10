@@ -34,15 +34,42 @@ pub struct TraceLogCleanupReport {
 /// remains responsible for its schema and migrations.
 pub fn configure(home: &Path, disable_writes: bool) -> Result<TraceLogGuardReport> {
     let mut report = TraceLogGuardReport::default();
+    let mut changed_paths: Vec<PathBuf> = Vec::new();
     for path in log_database_paths(home)? {
         report.databases_found += 1;
-        let outcome = configure_database(&path, disable_writes)
-            .with_context(|| format!("更新 Codex Trace 日志防护失败：{}", path.display()))?;
+        let outcome = match configure_database(&path, disable_writes) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let primary = format!(
+                    "更新 Codex Trace 日志防护失败：{}：{error:#}",
+                    path.display()
+                );
+                let rollback_errors = changed_paths
+                    .iter()
+                    .rev()
+                    .filter_map(|changed_path| {
+                        configure_database(changed_path, !disable_writes).err().map(
+                            |rollback_error| {
+                                format!("{}：{rollback_error:#}", changed_path.display())
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if rollback_errors.is_empty() {
+                    anyhow::bail!(primary);
+                }
+                anyhow::bail!(
+                    "{primary}；回滚已修改的 Trace 日志防护也失败：{}",
+                    rollback_errors.join("；")
+                );
+            }
+        };
         if outcome.table_found {
             report.log_tables_found += 1;
         }
         if outcome.changed {
             report.changed += 1;
+            changed_paths.push(path);
         }
     }
     Ok(report)
@@ -302,6 +329,25 @@ mod tests {
         assert_eq!(report.databases_found, 2);
         assert_eq!(report.log_tables_found, 2);
         assert_eq!(report.changed, 2);
+    }
+
+    #[test]
+    fn configure_rolls_back_earlier_databases_after_a_later_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid_path = temp.path().join("logs_1.sqlite");
+        create_log_database(&valid_path);
+        fs::write(temp.path().join("logs_2.sqlite"), b"not a sqlite database").unwrap();
+
+        let error = configure(temp.path(), true).unwrap_err();
+
+        assert!(error.to_string().contains("logs_2.sqlite"));
+        let connection = Connection::open(valid_path).unwrap();
+        assert_eq!(
+            connection
+                .execute("INSERT INTO logs(level) VALUES ('TRACE')", [])
+                .unwrap(),
+            1
+        );
     }
 
     #[test]

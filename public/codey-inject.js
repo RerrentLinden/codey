@@ -19,6 +19,7 @@
   const sidebarActionTooltipId = "codey-sidebar-action-tooltip";
   const threadUpdatedAtAttribute = "data-codey-thread-updated-at";
   const threadUpdatedAtMsAttribute = "data-codey-thread-updated-at-ms";
+  const threadRunningAttribute = "data-codey-thread-running";
   const sessionExportIcon = `
     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -266,6 +267,8 @@
       [data-app-action-sidebar-thread-row] [${threadUpdatedAtAttribute}] { display: block; flex: 0 0 auto; min-width: 26px; margin-inline-start: auto; color: inherit; font: 400 12px/16px system-ui, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: end; opacity: .52; pointer-events: none; white-space: nowrap; }
       [data-app-action-sidebar-thread-row]:hover [${threadUpdatedAtAttribute}],
       [data-app-action-sidebar-thread-row]:has(:focus-visible) [${threadUpdatedAtAttribute}] { opacity: 0; }
+      [role="list"] > [${threadRunningAttribute}="true"],
+      [data-app-action-sidebar-project-list-id] > [${threadRunningAttribute}="true"] { order: -1 !important; }
       [${sessionDeleteStateAttribute}] { display: none !important; }
       [${sessionExportAttribute}], [${tasksImportAttribute}], [${sessionDeleteAttribute}] { -webkit-app-region: no-drag !important; flex: 0 0 auto; pointer-events: auto !important; }
       [${projectImportAttribute}] { -webkit-app-region: no-drag !important; position: absolute; top: 50%; right: 62px; z-index: 35; flex: 0 0 auto; transform: translateY(-50%); opacity: 0; pointer-events: auto !important; transition: opacity .15s ease; }
@@ -973,6 +976,7 @@
   );
 
   const sidebarThreadTimestampState = (row) => {
+    const workInProgress = nativeThreadWorkInProgress(row);
     const identity = threadIdentityNode(row);
     if (!(identity instanceof HTMLElement)) {
       return {
@@ -980,6 +984,7 @@
         completedWork: false,
         hostId: "local",
         sessionId: "",
+        workInProgress,
       };
     }
     const sessionId = normalizeThreadSessionId(threadSessionIdFromRow(identity));
@@ -992,10 +997,10 @@
         hostId,
         kind,
         sessionId: "",
+        workInProgress,
       };
     }
     const cacheKey = threadTimestampCacheKey(hostId, sessionId);
-    const workInProgress = nativeThreadWorkInProgress(row);
     const previous = threadWorkStateByRow.get(row);
     const completedWork = Boolean(
       previous
@@ -1010,6 +1015,7 @@
       hostId,
       kind,
       sessionId,
+      workInProgress,
     };
   };
 
@@ -1046,6 +1052,18 @@
       current = parent;
     }
     return row instanceof HTMLElement ? row : null;
+  };
+
+  const updateThreadRunningPriority = (row, workInProgress) => {
+    const item = sidebarThreadListItem(row);
+    if (!(item instanceof HTMLElement)) return;
+    if (workInProgress) {
+      if (item.getAttribute(threadRunningAttribute) !== "true") {
+        item.setAttribute(threadRunningAttribute, "true");
+      }
+    } else if (item.hasAttribute(threadRunningAttribute)) {
+      item.removeAttribute(threadRunningAttribute);
+    }
   };
 
   const placeThreadUpdatedAt = (row, label) => {
@@ -1355,7 +1373,9 @@
         hostId,
         kind,
         sessionId,
+        workInProgress,
       } = sidebarThreadTimestampState(row);
+      updateThreadRunningPriority(row, workInProgress);
       renderCachedThreadUpdatedAt(row);
       if (!sessionId || sessionId.startsWith("client-new-thread:")) return;
       if (syncRemoteThreadUpdatedAt(row, {
@@ -2229,6 +2249,7 @@
   window.__codeyUpdateThreadUpdatedAt = updateThreadUpdatedAt;
   window.__codeyInstallThreadUpdatedTimes = installThreadUpdatedTimes;
   window.__codeyHasNativeThreadStatus = hasNativeThreadStatus;
+  window.__codeyUpdateThreadRunningPriority = updateThreadRunningPriority;
   window.__codeyRefreshRecentLocalSessions = refreshRecentLocalSessions;
   window.__codeyExportSession = exportSession;
   window.__codeyImportSessionFile = importSessionFile;

@@ -359,28 +359,39 @@ test("hides thread time from Codex React loading and unread status state", () =>
   assert.equal(content.querySelector("[data-codey-thread-updated-at]")?.textContent, "6 分");
 });
 
-test("leaves Codex-owned sidebar order untouched", async () => {
-  const olderIdle = sidebarThreadEntry({
-    sessionId: "thread-older",
+test("visually prioritizes running threads without changing official DOM order", async () => {
+  const olderIdle = sidebarThreadEntry({ sessionId: "thread-older" });
+  const firstRunning = sidebarThreadEntry({
+    running: true,
+    sessionId: "thread-running-1",
   });
-  const newerIdle = sidebarThreadEntry({ sessionId: "thread-newer" });
+  const unread = sidebarThreadEntry({ sessionId: "thread-unread" });
+  const secondRunning = sidebarThreadEntry({
+    running: true,
+    sessionId: "thread-running-2",
+  });
+  unread.row.__reactFiber$test = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: { statusState: { type: undefined, unread: true } },
+      return: null,
+    },
+  };
   const list = olderIdle.list;
-  list.appendChild(newerIdle.item);
+  list.appendChild(firstRunning.item);
+  list.appendChild(unread.item);
+  list.appendChild(secondRunning.item);
   loadInjection({
-    rows: [olderIdle.row, newerIdle.row],
+    rows: [olderIdle.row, firstRunning.row, unread.row, secondRunning.row],
     signalDispatcher: async (signal, request) => {
       assert.equal(signal, "send-cli-request-for-host");
       assert.equal(request.method, "thread/list");
       return {
         data: [
-        {
-            id: "thread-older",
-            recencyAt: 60,
-        },
-        {
-            id: "thread-newer",
-            recencyAt: 180,
-        },
+          { id: "thread-older", recencyAt: 60 },
+          { id: "thread-running-1", recencyAt: 120 },
+          { id: "thread-unread", recencyAt: 180 },
+          { id: "thread-running-2", recencyAt: 240 },
         ],
         nextCursor: null,
       };
@@ -388,11 +399,14 @@ test("leaves Codex-owned sidebar order untouched", async () => {
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(olderIdle.item.style.getPropertyValue("--codey-thread-sort-order"), "");
-  assert.equal(newerIdle.item.style.getPropertyValue("--codey-thread-sort-order"), "");
-  assert.equal(olderIdle.item.getAttribute("data-codey-thread-sort-order"), null);
-  assert.equal(newerIdle.item.getAttribute("data-codey-thread-sort-order"), null);
-  assert.deepEqual(list.children, [olderIdle.item, newerIdle.item]);
+  assert.equal(olderIdle.item.getAttribute("data-codey-thread-running"), null);
+  assert.equal(firstRunning.item.getAttribute("data-codey-thread-running"), "true");
+  assert.equal(unread.item.getAttribute("data-codey-thread-running"), null);
+  assert.equal(secondRunning.item.getAttribute("data-codey-thread-running"), "true");
+  assert.deepEqual(
+    list.children,
+    [olderIdle.item, firstRunning.item, unread.item, secondRunning.item],
+  );
 });
 
 test("refreshes the official timestamp when a running thread completes", async () => {
@@ -432,7 +446,7 @@ test("refreshes the official timestamp when a running thread completes", async (
     running.content.querySelector("[data-codey-thread-updated-at]")?.textContent,
     "2 分",
   );
-  assert.equal(running.item.getAttribute("data-codey-thread-sort-order"), null);
+  assert.equal(running.item.getAttribute("data-codey-thread-running"), null);
 });
 
 test("coalesces sidebar mutations before recomputing React status", async () => {
@@ -473,7 +487,7 @@ test("coalesces sidebar mutations before recomputing React status", async () => 
 
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(dispatcherCalls, 1);
-  assert.equal(entry.item.getAttribute("data-codey-thread-sort-order"), null);
+  assert.equal(entry.item.getAttribute("data-codey-thread-running"), "true");
   assert.ok(
     fiberReads <= 2,
     `100 mutations should converge in one scan, observed ${fiberReads} React fiber reads`,
@@ -1021,9 +1035,11 @@ test("accepts only a unique direct app-server request wrapper", () => {
 
 test("injects time styles that coexist with native statuses and yield to sidebar actions", () => {
   assert.match(source, /threadUpdatedAtAttribute = "data-codey-thread-updated-at"/);
+  assert.match(source, /threadRunningAttribute = "data-codey-thread-running"/);
   assert.doesNotMatch(source, /threadSortOrderAttribute|data-codey-thread-sort-order/);
   assert.doesNotMatch(source, /--codey-thread-sort-order|thread-sort-keys/);
-  assert.doesNotMatch(source, /data-codey-thread-running/);
+  assert.match(source, /threadRunningAttribute\}="true"\].*order: -1 !important/s);
+  assert.match(source, /updateThreadRunningPriority\(row, workInProgress\)/);
   assert.doesNotMatch(source, /sortKey:\s*"updated_at"/);
   assert.match(source, /threadTimestampRefreshIntervalMs = 60_000/);
   assert.match(source, /threadTimestampReadBatchSize = 32/);

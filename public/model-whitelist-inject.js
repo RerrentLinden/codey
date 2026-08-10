@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "8";
+  const patchVersion = "9";
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion) {
     void existingPatch.refresh();
@@ -28,6 +28,7 @@
   let refreshTimer = 0;
   let refreshUntil = 0;
   let refreshRetryDelay = 120;
+  let refreshDeliveryInFlight = false;
   let catalogLoadPromise = null;
   let catalogRevision = 0;
   let disposed = false;
@@ -715,6 +716,7 @@
     if (disposed) return;
     refreshUntil = Math.max(refreshUntil, Date.now() + durationMs);
     if (refreshTimer) return;
+    refreshRetryDelay = 120;
     const tick = () => {
       // Keep the fired handle truthy while the tick body runs: the
       // bridge-missing path inside loadModelCatalog calls scheduleRefresh
@@ -725,17 +727,28 @@
         return;
       }
       if (catalog.loaded) {
-        refreshRetryDelay = 120;
-        void deliverModelCatalog({ invalidate: false });
+        if (!refreshDeliveryInFlight) {
+          refreshDeliveryInFlight = true;
+          void deliverModelCatalog({ invalidate: false }).then(
+            () => {
+              refreshDeliveryInFlight = false;
+            },
+            (error) => {
+              refreshDeliveryInFlight = false;
+              console.warn("[Codey] scheduled model delivery failed", error);
+            },
+          );
+        }
       } else {
-        refreshRetryDelay = Math.min(refreshRetryDelay * 2, 2000);
         void loadModelCatalog();
       }
       if (Date.now() < refreshUntil) {
-        refreshTimer = window.setTimeout(
-          tick,
-          catalog.loaded ? 120 : refreshRetryDelay,
+        const nextDelay = refreshRetryDelay;
+        refreshRetryDelay = Math.min(
+          refreshRetryDelay * 2,
+          catalog.loaded ? 1000 : 2000,
         );
+        refreshTimer = window.setTimeout(tick, nextDelay);
       } else {
         refreshTimer = 0;
       }

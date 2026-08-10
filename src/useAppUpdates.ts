@@ -1,6 +1,7 @@
 import {
   type Dispatch,
   type SetStateAction,
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -19,7 +20,7 @@ import { formatBytes } from "./TraceLogModule";
 
 const UPDATE_AVAILABLE_EVENT = "codey-update-availability-changed";
 const AUTO_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
-const UPDATE_CHECK_TIMEOUT_MS = 10_000;
+const UPDATE_CHECK_TIMEOUT_MS = 12_000;
 
 declare global {
   interface Window {
@@ -79,7 +80,22 @@ export function useAppUpdates({
   const [downloadedUpdate, setDownloadedUpdate] =
     useState<UpdateDownload | null>(null);
   const updateCheckRef = useRef<UpdateCheck | null>(null);
-  const autoUpdateCheckInFlightRef = useRef(false);
+  const updateCheckInFlightRef = useRef<Promise<UpdateCheck> | null>(null);
+  const requestUpdateCheck = useCallback(() => {
+    const current = updateCheckInFlightRef.current;
+    if (current) return current;
+    const request = withTimeout(
+      invoke<UpdateCheck>("check_for_updates"),
+      UPDATE_CHECK_TIMEOUT_MS,
+      "检查更新超时，请检查网络",
+    ).finally(() => {
+      if (updateCheckInFlightRef.current === request) {
+        updateCheckInFlightRef.current = null;
+      }
+    });
+    updateCheckInFlightRef.current = request;
+    return request;
+  }, []);
 
   useEffect(() => {
     updateCheckRef.current = updateCheck;
@@ -132,16 +148,10 @@ export function useAppUpdates({
     };
 
     const checkForUpdatesSilently = async () => {
-      if (cancelled || shouldPause() || autoUpdateCheckInFlightRef.current)
-        return;
-      autoUpdateCheckInFlightRef.current = true;
+      if (cancelled || shouldPause()) return;
       setUpdateResult({ tone: "pending", text: "正在检查更新…" });
       try {
-        const result = await withTimeout(
-          invoke<UpdateCheck>("check_for_updates"),
-          UPDATE_CHECK_TIMEOUT_MS,
-          "检查更新超时",
-        );
+        const result = await requestUpdateCheck();
         if (cancelled) return;
         if (result.updateAvailable) {
           setUpdateCheck(result);
@@ -161,7 +171,6 @@ export function useAppUpdates({
         if (!cancelled) setUpdateResult({ tone: "idle", text: "" });
         // 更新地址不可达或检查超时时直接跳过；手动检查仍会展示具体错误。
       } finally {
-        autoUpdateCheckInFlightRef.current = false;
         if (!cancelled && !shouldPause()) schedule();
       }
     };
@@ -171,7 +180,7 @@ export function useAppUpdates({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [configLoaded, embedded]);
+  }, [configLoaded, embedded, requestUpdateCheck]);
 
   async function checkForUpdates() {
     if (!configLoaded || isBusy) return;
@@ -180,11 +189,7 @@ export function useAppUpdates({
     setUpdateCheck(null);
     setDownloadedUpdate(null);
     try {
-      const result = await withTimeout(
-        invoke<UpdateCheck>("check_for_updates"),
-        UPDATE_CHECK_TIMEOUT_MS,
-        "检查更新超时，请检查网络",
-      );
+      const result = await requestUpdateCheck();
       setUpdateCheck(result);
       publishUpdateAvailability(result);
       const text = updateCheckText(result);

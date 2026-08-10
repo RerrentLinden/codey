@@ -4,7 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 #[cfg(all(test, unix))]
 use std::{collections::HashSet, path::Path};
 
@@ -49,6 +49,7 @@ const CDP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const CDP_WATCHDOG_FAILURE_THRESHOLD: u8 = 2;
 const ROUTE_OVERLAY_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 const ROUTE_OVERLAY_STABLE_READS: u8 = 2;
+const ROUTE_OVERLAY_FULL_VALIDATION_TICKS: u8 = 30;
 const ROUTE_OVERLAY_ERROR_LOG_INITIAL_INTERVAL: Duration = Duration::from_secs(2);
 const ROUTE_OVERLAY_ERROR_LOG_MAX_INTERVAL: Duration = Duration::from_secs(30);
 pub const CODEX_APP_NOT_FOUND_ERROR: &str = "找不到 Codex App，请在 Codey 配置中填写路径";
@@ -1702,6 +1703,8 @@ fn spawn_route_overlay_watcher(
         let mut missing_config_streak = 0_u8;
         let mut route_changed_tx = Some(route_changed_tx);
         let mut error_limiter = RouteWatchErrorLimiter::new(Instant::now());
+        let mut observed_stamps = None;
+        let mut ticks_since_full_validation = 0_u8;
 
         loop {
             tokio::select! {
@@ -1709,15 +1712,51 @@ fn spawn_route_overlay_watcher(
                 _ = &mut shutdown_rx => break,
                 _ = interval.tick() => {}
             }
+            ticks_since_full_validation = ticks_since_full_validation.saturating_add(1);
+            let current_stamps = match read_route_file_stamps(&home).await {
+                Ok(stamps) => stamps,
+                Err(error) => {
+                    missing_config_streak = 0;
+                    let message = error.to_string();
+                    let error_key = format!("{:?}:{message}", error.kind());
+                    if let Some(suppressed_count) =
+                        error_limiter.should_log(&error_key, Instant::now())
+                    {
+                        error_log::record_failure_async(
+                            "route_overlay_watch_failed",
+                            "stat_cc_switch_live_route",
+                            message,
+                            serde_json::json!({
+                                "codexHome": home,
+                                "suppressedCount": suppressed_count,
+                            }),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
+            };
+            let metadata_unchanged = current_stamps.is_some() && current_stamps == observed_stamps;
+            if pending_external.is_none()
+                && metadata_unchanged
+                && ticks_since_full_validation < ROUTE_OVERLAY_FULL_VALIDATION_TICKS
+            {
+                error_limiter.reset();
+                continue;
+            }
             let current = match read_route_files(&home).await {
                 Ok(Some(current)) => {
                     error_limiter.reset();
                     missing_config_streak = 0;
+                    observed_stamps = current_stamps;
+                    ticks_since_full_validation = 0;
                     current
                 }
                 Ok(None) => {
                     error_limiter.reset();
                     pending_external = None;
+                    observed_stamps = None;
+                    ticks_since_full_validation = 0;
                     if !observe_missing_route_config(&mut missing_config_streak) {
                         continue;
                     }
@@ -1820,6 +1859,39 @@ fn observe_missing_route_config(missing_streak: &mut u8) -> bool {
 struct RouteFilesSnapshot {
     config: Vec<u8>,
     auth: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RouteFileStamp {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RouteFilesStamps {
+    config: RouteFileStamp,
+    auth: Option<RouteFileStamp>,
+}
+
+async fn read_route_file_stamp(path: &std::path::Path) -> std::io::Result<Option<RouteFileStamp>> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => Ok(Some(RouteFileStamp {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+async fn read_route_file_stamps(
+    home: &std::path::Path,
+) -> std::io::Result<Option<RouteFilesStamps>> {
+    let Some(config) = read_route_file_stamp(&home.join("config.toml")).await? else {
+        return Ok(None);
+    };
+    let auth = read_route_file_stamp(&home.join("auth.json")).await?;
+    Ok(Some(RouteFilesStamps { config, auth }))
 }
 
 async fn read_route_files(home: &std::path::Path) -> std::io::Result<Option<RouteFilesSnapshot>> {
@@ -2273,6 +2345,36 @@ base_url = \"https://api.example.com/v1\"\n"
         };
 
         assert!(route_files_changed(&array_auth, &numeric_auth));
+    }
+
+    #[tokio::test]
+    async fn route_file_stamps_change_only_when_route_files_change() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), b"model_provider = \"a\"\n").unwrap();
+        let initial = read_route_file_stamps(home.path()).await.unwrap();
+
+        assert_eq!(read_route_file_stamps(home.path()).await.unwrap(), initial);
+
+        std::fs::write(
+            home.path().join("auth.json"),
+            br#"{"OPENAI_API_KEY":"key"}"#,
+        )
+        .unwrap();
+        let with_auth = read_route_file_stamps(home.path()).await.unwrap();
+        assert_ne!(with_auth, initial);
+
+        std::fs::write(
+            home.path().join("config.toml"),
+            b"model_provider = \"provider-with-a-longer-id\"\n",
+        )
+        .unwrap();
+        assert_ne!(
+            read_route_file_stamps(home.path()).await.unwrap(),
+            with_auth
+        );
+
+        std::fs::remove_file(home.path().join("config.toml")).unwrap();
+        assert_eq!(read_route_file_stamps(home.path()).await.unwrap(), None);
     }
 
     #[test]
