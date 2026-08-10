@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 
 use codey_runtime_core::model_catalog::{
@@ -361,10 +365,12 @@ fn write_config(home: &Path, contents: &str) {
 struct ModelsServer {
     base_url: String,
     handle: thread::JoinHandle<Vec<ModelsRequest>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl ModelsServer {
     fn finish(self) -> Vec<ModelsRequest> {
+        self.shutdown.store(true, Ordering::Release);
         self.handle.join().unwrap()
     }
 }
@@ -382,18 +388,21 @@ fn spawn_models_server(payload: serde_json::Value) -> ModelsServer {
         .set_nonblocking(true)
         .expect("listener should switch to nonblocking mode");
     let models_body = payload.to_string();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let server_shutdown = Arc::clone(&shutdown);
     let handle = thread::spawn(move || {
-        let started = std::time::Instant::now();
         let mut requests = Vec::new();
-        while requests.is_empty() && started.elapsed() < std::time::Duration::from_secs(2) {
+        while requests.is_empty() && !server_shutdown.load(Ordering::Acquire) {
             let Ok((mut stream, _)) = listener.accept() else {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             };
+            stream
+                .set_nonblocking(true)
+                .expect("test stream should switch to nonblocking mode");
             let mut buffer = [0u8; 4096];
             let mut read = 0;
-            let read_started = std::time::Instant::now();
-            while read == 0 && read_started.elapsed() < std::time::Duration::from_secs(2) {
+            while read == 0 && !server_shutdown.load(Ordering::Acquire) {
                 match stream.read(&mut buffer) {
                     Ok(0) => std::thread::sleep(std::time::Duration::from_millis(10)),
                     Ok(bytes) => read = bytes,
@@ -432,5 +441,9 @@ fn spawn_models_server(payload: serde_json::Value) -> ModelsServer {
         }
         requests
     });
-    ModelsServer { base_url, handle }
+    ModelsServer {
+        base_url,
+        handle,
+        shutdown,
+    }
 }
