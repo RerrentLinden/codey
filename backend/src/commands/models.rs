@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use codey_runtime_core::settings::{RelayMode, RelayProfile};
 use serde_json::{Value, json};
 
 use super::{
@@ -401,83 +400,6 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
         "modelCatalogFallback":model_catalog_fallback,
         "restartRequired":restart_required,
     })))
-}
-
-pub async fn test_current_provider(state: &Arc<AppState>) -> Result<Value, String> {
-    let config = state.config.read().await.clone();
-    let profile = config
-        .active_profile()
-        .ok_or_else(|| "找不到当前线路".to_string())?;
-    if profile.cc_switch_read_only {
-        return Err("官方线路无需执行第三方 API 对话测试".to_string());
-    }
-    let model = config
-        .default_model()
-        .or_else(|| config.selected_models().first().map(String::as_str))
-        .or_else(|| config.upstream_models().first().map(String::as_str))
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .ok_or_else(|| "请先同步模型并设置默认模型".to_string())?
-        .to_string();
-    let base_url = profile.normalized_base_url();
-    let relay = RelayProfile {
-        id: profile.id.clone(),
-        name: profile.name.clone(),
-        model: model.clone(),
-        base_url: base_url.clone(),
-        upstream_base_url: base_url,
-        api_key: profile.api_key.clone(),
-        protocol: profile.protocol,
-        relay_mode: RelayMode::PureApi,
-        ..RelayProfile::default()
-    };
-    let result = codey_runtime_core::relay_config::test_relay_profile(&relay, &model)
-        .await
-        .map_err(|error| {
-            error_log::record_failure(
-                "provider_test_failed",
-                "test_current_provider",
-                "无法完成第三方模型对话测试",
-                json!({
-                    "provider": profile.id,
-                    "model": model,
-                    "protocol": profile.protocol,
-                    "errorKind": "request_failed",
-                }),
-            );
-            error.to_string()
-        })?;
-    if !(200..300).contains(&result.http_status) {
-        error_log::record_failure(
-            "provider_test_failed",
-            "test_current_provider",
-            format!("上游返回 HTTP {}", result.http_status),
-            json!({
-                "provider": profile.id,
-                "model": model,
-                "protocol": profile.protocol,
-                "httpStatus": result.http_status,
-                "responseBytes": result.response_preview.len(),
-            }),
-        );
-        return Err(format!(
-            "模型「{model}」对话测试失败：HTTP {}{}",
-            result.http_status,
-            if result.response_preview.trim().is_empty() {
-                String::new()
-            } else {
-                format!("，{}", result.response_preview.trim())
-            }
-        ));
-    }
-    Ok(json!({
-        "status": "ok",
-        "model": model,
-        "protocol": profile.protocol,
-        "httpStatus": result.http_status,
-        "endpoint": result.endpoint,
-        "responsePreview": result.response_preview,
-    }))
 }
 
 pub async fn save_selected_models(

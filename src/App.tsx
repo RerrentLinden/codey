@@ -445,20 +445,6 @@ export function App({
     });
   }
 
-  async function testCurrentProvider() {
-    await runOperation("test-provider", async () => {
-      const result = await invoke<{
-        model: string;
-        protocol: string;
-        httpStatus: number;
-      }>("test_current_provider");
-      setNotice({
-        tone: "success",
-        text: `模型「${result.model}」对话测试通过（HTTP ${result.httpStatus}）`,
-      });
-    });
-  }
-
   async function saveCurrent() {
     if (!config) return;
     await runOperation("save", async () => {
@@ -684,9 +670,6 @@ export function App({
         editConfig({ ...config, showAccountUsageInHeader: checked });
       }
     },
-  );
-  const handleTestCurrentProvider = useStableEvent(
-    () => void testCurrentProvider(),
   );
   const handleClearTraceLogs = useStableEvent(askClearTraceLogs);
   const handleRefreshTraceLogStats = useStableEvent(
@@ -942,7 +925,6 @@ export function App({
               showAccountUsageInHeader={config.showAccountUsageInHeader}
               onSyncCurrentProvider={handleSyncCurrentProvider}
               onFetchCurrentModels={fetchCurrentModels}
-              onTestCurrentProvider={handleTestCurrentProvider}
               onSetDefaultModel={setDefaultModel}
               onDeleteThirdPartyModel={deleteThirdPartyModel}
               manualThirdPartyModelKeys={manualThirdPartyModelKeys}

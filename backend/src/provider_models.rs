@@ -3,7 +3,10 @@ use std::fmt;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::{Client, header::ACCEPT};
+use reqwest::{
+    Client,
+    header::{ACCEPT, AUTHORIZATION},
+};
 use serde_json::Value;
 
 use crate::config::ProviderProfile;
@@ -18,13 +21,17 @@ pub(crate) const MAX_PROVIDER_MODEL_ID_BYTES: usize = 512;
 enum ModelListError {
     InvalidJson(serde_json::Error),
     UnsupportedFormat,
+    Empty,
     TooManyModels { limit: usize },
     ModelIdTooLong { limit: usize },
 }
 
 impl ModelListError {
     fn allows_endpoint_fallback(&self) -> bool {
-        matches!(self, Self::InvalidJson(_) | Self::UnsupportedFormat)
+        matches!(
+            self,
+            Self::InvalidJson(_) | Self::UnsupportedFormat | Self::Empty
+        )
     }
 }
 
@@ -33,6 +40,7 @@ impl fmt::Display for ModelListError {
         match self {
             Self::InvalidJson(error) => write!(formatter, "模型列表不是有效 JSON：{error}"),
             Self::UnsupportedFormat => formatter.write_str("上游模型列表格式不受支持"),
+            Self::Empty => formatter.write_str("上游返回空模型列表"),
             Self::TooManyModels { limit } => {
                 write!(formatter, "上游模型数量超过安全上限 {limit}")
             }
@@ -53,8 +61,17 @@ pub async fn fetch(profile: &ProviderProfile, client: &Client) -> Result<Vec<Str
     let endpoints = model_endpoints(&base)?;
     for (index, endpoint) in endpoints.iter().enumerate() {
         let mut request = client.get(endpoint).header(ACCEPT, "application/json");
-        if !profile.api_key.trim().is_empty() {
+        let has_custom_authorization = profile.model_request_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case(AUTHORIZATION.as_str()) && !value.trim().is_empty()
+        });
+        if !profile.api_key.trim().is_empty() && !has_custom_authorization {
             request = request.bearer_auth(profile.api_key.trim());
+        }
+        for (name, value) in &profile.model_request_headers {
+            if name.eq_ignore_ascii_case(AUTHORIZATION.as_str()) && value.trim().is_empty() {
+                continue;
+            }
+            request = request.header(name, value);
         }
         let response = request
             .timeout(PROVIDER_MODEL_REQUEST_TIMEOUT)
@@ -63,10 +80,14 @@ pub async fn fetch(profile: &ProviderProfile, client: &Client) -> Result<Vec<Str
             .with_context(|| format!("获取上游模型失败：{endpoint}"))?;
         let status = response.status();
         let has_fallback = index + 1 < endpoints.len();
-        if matches!(
-            status,
-            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
-        ) && has_fallback
+        if has_fallback
+            && (matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND
+                    | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    | reqwest::StatusCode::REQUEST_TIMEOUT
+                    | reqwest::StatusCode::TOO_MANY_REQUESTS
+            ) || status.is_server_error())
         {
             continue;
         }
@@ -120,24 +141,38 @@ async fn read_bounded_body(mut response: reqwest::Response, endpoint: &str) -> R
 }
 
 fn model_endpoints(base: &str) -> Result<Vec<String>> {
-    let mut url = reqwest::Url::parse(base).context("API 地址格式无效")?;
+    let skip_version_prefix = base.trim().ends_with('#');
+    let cleaned_base = base.trim().trim_end_matches('#').trim_end_matches('/');
+    let mut url = reqwest::Url::parse(cleaned_base).context("API 地址格式无效")?;
     if !matches!(url.scheme(), "http" | "https") {
         anyhow::bail!("API 地址仅支持 HTTP 或 HTTPS");
     }
     url.set_query(None);
     url.set_fragment(None);
-    let last_segment = url
-        .path()
-        .trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or_default();
-    let base = url.as_str().trim_end_matches('/');
-    Ok(match last_segment {
-        "models" => vec![base.to_string()],
-        "v1" => vec![format!("{base}/models")],
-        _ => vec![format!("{base}/v1/models"), format!("{base}/models")],
+    let mut path = url.path().trim_end_matches('/').to_string();
+    let mut base = url.as_str().trim_end_matches('/').to_string();
+    for suffix in ["/chat/completions", "/responses"] {
+        if path.to_ascii_lowercase().ends_with(suffix) {
+            path.truncate(path.len() - suffix.len());
+            base.truncate(base.len() - suffix.len());
+            break;
+        }
+    }
+    let last_segment = path.rsplit('/').next().unwrap_or_default();
+    Ok(if last_segment.eq_ignore_ascii_case("models") {
+        vec![base]
+    } else if skip_version_prefix || has_version_suffix(last_segment) {
+        vec![format!("{base}/models")]
+    } else {
+        vec![format!("{base}/v1/models"), format!("{base}/models")]
     })
+}
+
+fn has_version_suffix(segment: &str) -> bool {
+    segment
+        .strip_prefix('v')
+        .or_else(|| segment.strip_prefix('V'))
+        .is_some_and(|version| version.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
 }
 
 fn model_ids(body: &[u8]) -> std::result::Result<Vec<String>, ModelListError> {
@@ -150,39 +185,104 @@ fn model_ids_with_limits(
     max_model_id_bytes: usize,
 ) -> std::result::Result<Vec<String>, ModelListError> {
     let value = serde_json::from_slice::<Value>(body).map_err(ModelListError::InvalidJson)?;
-    let items = value
-        .as_array()
-        .or_else(|| value.get("data").and_then(Value::as_array))
-        .or_else(|| value.get("models").and_then(Value::as_array))
-        .ok_or(ModelListError::UnsupportedFormat)?;
-    let capacity = items.len().min(max_models);
-    let mut models = Vec::with_capacity(capacity);
-    let mut seen = HashSet::<String>::with_capacity(capacity);
-    for item in items {
-        let Some(model) = item.as_str().or_else(|| {
-            item.get("id")
-                .and_then(Value::as_str)
-                .or_else(|| item.get("name").and_then(Value::as_str))
-                .or_else(|| item.get("slug").and_then(Value::as_str))
-                .or_else(|| item.get("model").and_then(Value::as_str))
-        }) else {
-            continue;
-        };
-        let model = model.trim();
-        if model.is_empty() || !seen.insert(model_id::key(model)) {
-            continue;
+    let mut models = Vec::new();
+    let mut seen = HashSet::<String>::new();
+    let recognized = match &value {
+        Value::Array(items) => {
+            collect_model_items(
+                items,
+                &mut models,
+                &mut seen,
+                max_models,
+                max_model_id_bytes,
+            )?;
+            true
         }
-        if model.len() > max_model_id_bytes {
-            return Err(ModelListError::ModelIdTooLong {
-                limit: max_model_id_bytes,
-            });
+        Value::Object(object) => {
+            let mut recognized = false;
+            for key in ["data", "models", "items"] {
+                if let Some(items) = object.get(key).and_then(Value::as_array) {
+                    recognized = true;
+                    collect_model_items(
+                        items,
+                        &mut models,
+                        &mut seen,
+                        max_models,
+                        max_model_id_bytes,
+                    )?;
+                }
+            }
+            if !recognized && let Some(model) = model_id_value(&value) {
+                push_model_id(
+                    model,
+                    &mut models,
+                    &mut seen,
+                    max_models,
+                    max_model_id_bytes,
+                )?;
+                recognized = true;
+            }
+            recognized
         }
-        if models.len() >= max_models {
-            return Err(ModelListError::TooManyModels { limit: max_models });
-        }
-        models.push(model.to_string());
+        _ => false,
+    };
+    if !recognized {
+        return Err(ModelListError::UnsupportedFormat);
+    }
+    if models.is_empty() {
+        return Err(ModelListError::Empty);
     }
     Ok(models)
+}
+
+fn collect_model_items(
+    items: &[Value],
+    models: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    max_models: usize,
+    max_model_id_bytes: usize,
+) -> std::result::Result<(), ModelListError> {
+    for item in items {
+        if let Some(model) = model_id_value(item) {
+            push_model_id(model, models, seen, max_models, max_model_id_bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn model_id_value(value: &Value) -> Option<&str> {
+    value.as_str().or_else(|| {
+        let object = value.as_object()?;
+        ["id", "name", "slug", "model"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(Value::as_str))
+    })
+}
+
+fn push_model_id(
+    model: &str,
+    models: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    max_models: usize,
+    max_model_id_bytes: usize,
+) -> std::result::Result<(), ModelListError> {
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(());
+    }
+    if model.len() > max_model_id_bytes {
+        return Err(ModelListError::ModelIdTooLong {
+            limit: max_model_id_bytes,
+        });
+    }
+    if !seen.insert(model_id::key(model)) {
+        return Ok(());
+    }
+    if models.len() >= max_models {
+        return Err(ModelListError::TooManyModels { limit: max_models });
+    }
+    models.push(model.to_string());
+    Ok(())
 }
 
 #[cfg(test)]
@@ -196,6 +296,26 @@ mod tests {
         assert_eq!(
             model_endpoints("https://relay.example/v1").unwrap(),
             vec!["https://relay.example/v1/models"]
+        );
+        assert_eq!(
+            model_endpoints("https://relay.example/v1/chat/completions").unwrap(),
+            vec!["https://relay.example/v1/models"]
+        );
+        assert_eq!(
+            model_endpoints("https://relay.example/api/coding/v3").unwrap(),
+            vec!["https://relay.example/api/coding/v3/models"]
+        );
+        assert_eq!(
+            model_endpoints("https://relay.example/api%20space/v1/chat/completions").unwrap(),
+            vec!["https://relay.example/api%20space/v1/models"]
+        );
+        assert_eq!(
+            model_endpoints("https://relay.example/api/v1/v1beta").unwrap(),
+            vec!["https://relay.example/api/v1/v1beta/models"]
+        );
+        assert_eq!(
+            model_endpoints("https://relay.example/api#").unwrap(),
+            vec!["https://relay.example/api/models"]
         );
         assert_eq!(
             model_endpoints("https://relay.example/api").unwrap(),
@@ -212,6 +332,24 @@ mod tests {
             model_ids(br#"{"data":[{"id":"Provider-A"},{"name":"b"},{"id":"provider-a"}]}"#)
                 .unwrap();
         assert_eq!(models, vec!["Provider-A", "b"]);
+
+        assert_eq!(
+            model_ids(br#"{"items":[{"model":"item-model"}]}"#).unwrap(),
+            vec!["item-model"]
+        );
+        assert_eq!(
+            model_ids(br#"{"slug":"single-model"}"#).unwrap(),
+            vec!["single-model"]
+        );
+    }
+
+    #[test]
+    fn rejects_empty_model_lists() {
+        let error = model_ids(br#"{"data":[]}"#).unwrap_err();
+        assert!(matches!(error, ModelListError::Empty));
+
+        let error = model_ids(br#"{"data":[[["not-a-model"]]]}"#).unwrap_err();
+        assert!(matches!(error, ModelListError::Empty));
     }
 
     #[test]
@@ -254,6 +392,114 @@ mod tests {
         let error = fetch(&profile, &client).await.unwrap_err();
 
         assert!(error.to_string().contains("响应超过安全上限"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sends_custom_provider_headers_without_overwriting_authorization() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.contains("authorization: custom secret"));
+            assert!(!request.contains("authorization: bearer fallback-key"));
+            assert!(request.contains("x-route: manual"));
+            let body = r#"{"data":[{"id":"custom-model"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut profile = ProviderProfile::new("test");
+        profile.base_url = format!("http://{address}/v1");
+        profile.api_key = "fallback-key".to_string();
+        profile
+            .model_request_headers
+            .insert("Authorization".to_string(), "Custom secret".to_string());
+        profile
+            .model_request_headers
+            .insert("X-Route".to_string(), "manual".to_string());
+        let client = Client::builder().no_proxy().build().unwrap();
+
+        let models = fetch(&profile, &client).await.unwrap();
+
+        assert_eq!(models, vec!["custom-model"]);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_custom_authorization_does_not_suppress_bearer_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.contains("authorization: bearer fallback-key"));
+            assert_eq!(
+                request
+                    .lines()
+                    .filter(|line| line.starts_with("authorization:"))
+                    .count(),
+                1
+            );
+            let body = r#"{"data":[{"id":"bearer-model"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut profile = ProviderProfile::new("test");
+        profile.base_url = format!("http://{address}/v1");
+        profile.api_key = "fallback-key".to_string();
+        profile
+            .model_request_headers
+            .insert("Authorization".to_string(), " ".to_string());
+        let client = Client::builder().no_proxy().build().unwrap();
+
+        let models = fetch(&profile, &client).await.unwrap();
+
+        assert_eq!(models, vec!["bearer-model"]);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn falls_back_when_the_first_endpoint_returns_an_empty_list() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (expected_path, body) in [
+                ("/api/v1/models", r#"{"data":[]}"#),
+                ("/api/models", r#"{"models":["fallback-model"]}"#),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let read = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..read]);
+                assert!(request.starts_with(&format!("GET {expected_path} HTTP/1.1")));
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let mut profile = ProviderProfile::new("test");
+        profile.base_url = format!("http://{address}/api");
+        let client = Client::builder().no_proxy().build().unwrap();
+
+        let models = fetch(&profile, &client).await.unwrap();
+
+        assert_eq!(models, vec!["fallback-model"]);
         server.join().unwrap();
     }
 }

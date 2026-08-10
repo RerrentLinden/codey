@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -171,6 +171,12 @@ struct CcSwitchProtocolHint {
 struct CcSwitchSourceApi {
     base_url: String,
     api_key: String,
+    model_request_headers: BTreeMap<String, String>,
+}
+
+struct ProviderRequestExtensions {
+    api_key: Option<String>,
+    headers: BTreeMap<String, String>,
 }
 
 pub fn default_db_path() -> PathBuf {
@@ -267,14 +273,57 @@ fn provider_model_fetch_profile_from_paths(
 ) -> Result<ProviderProfile> {
     let takeover = route_takeover_state_from_paths(db_path, codex_home)?;
     if !(takeover.managed && takeover.live) {
-        return Ok(profile.clone());
+        let mut fetch_profile = profile.clone();
+        if let Some(extensions) = local_provider_model_request_extensions(codex_home, profile)? {
+            if let Some(api_key) = extensions.api_key {
+                fetch_profile.api_key = api_key;
+            }
+            fetch_profile.model_request_headers = extensions.headers;
+        }
+        return Ok(fetch_profile);
     }
 
     let source = read_current_cc_switch_source_api(db_path)?;
     let mut fetch_profile = profile.clone();
     fetch_profile.base_url = source.base_url;
     fetch_profile.api_key = source.api_key;
+    fetch_profile.model_request_headers = source.model_request_headers;
     Ok(fetch_profile)
+}
+
+fn local_provider_model_request_extensions(
+    codex_home: &Path,
+    profile: &ProviderProfile,
+) -> Result<Option<ProviderRequestExtensions>> {
+    let config_path = codex_home.join("config.toml");
+    let config = match fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取本地 Codex 配置失败：{}", config_path.display()));
+        }
+    };
+    let document = DocumentMut::from_str(&config)
+        .with_context(|| format!("解析本地 Codex 配置失败：{}", config_path.display()))?;
+    let provider_id = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(LOCAL_OFFICIAL_PROVIDER_ID);
+    if provider_id != profile.id {
+        return Ok(None);
+    }
+    let provider = document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table_like);
+    Ok(provider.map(|provider| ProviderRequestExtensions {
+        api_key: provider_config_api_key(&document, Some(provider)),
+        headers: provider_model_request_headers(provider),
+    }))
 }
 
 fn route_takeover_state_from_paths(
@@ -772,9 +821,10 @@ fn cc_switch_source_api(
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
     let config_api_key = provider_config_api_key(&document, Some(provider));
+    let model_request_headers = provider_model_request_headers(provider);
     let proxy_marker_present = auth_api_key.as_deref() == Some(PROXY_MANAGED_TOKEN)
         || config_api_key.as_deref() == Some(PROXY_MANAGED_TOKEN);
-    let api_key = [auth_api_key, config_api_key]
+    let api_key = [config_api_key, auth_api_key]
         .into_iter()
         .flatten()
         .find(|value| value != PROXY_MANAGED_TOKEN)
@@ -783,7 +833,11 @@ fn cc_switch_source_api(
         bail!("CC Switch 当前源线路仅包含路由占位凭据，无法安全同步模型");
     }
 
-    Ok(CcSwitchSourceApi { base_url, api_key })
+    Ok(CcSwitchSourceApi {
+        base_url,
+        api_key,
+        model_request_headers,
+    })
 }
 
 fn is_safe_source_api_url(base_url: &str) -> bool {
@@ -837,6 +891,7 @@ fn profile_from_provider(provider: &CurrentProvider, api_key: String) -> Provide
         name: provider.name.clone(),
         base_url: provider.base_url.clone(),
         api_key,
+        model_request_headers: BTreeMap::new(),
         protocol: provider.protocol,
         cc_switch_provider_id: None,
         cc_switch_read_only: provider.official,
@@ -1045,12 +1100,27 @@ fn provider_config_api_key(
     document: &DocumentMut,
     provider: Option<&dyn TableLike>,
 ) -> Option<String> {
+    provider_config_api_key_with_env(document, provider, &|name| std::env::var(name).ok())
+}
+
+fn provider_config_api_key_with_env(
+    document: &DocumentMut,
+    provider: Option<&dyn TableLike>,
+    env_value: &impl Fn(&str) -> Option<String>,
+) -> Option<String> {
     const PROVIDER_KEYS: &[&str] = &[
         "experimental_bearer_token",
         "api_key",
         "apikey",
         "bearer_token",
         "token",
+    ];
+    const PROVIDER_ENV_KEYS: &[&str] = &[
+        "env_key",
+        "api_key_env",
+        "api_key_env_var",
+        "key_env",
+        "bearer_token_env",
     ];
     PROVIDER_KEYS
         .iter()
@@ -1059,14 +1129,83 @@ fn provider_config_api_key(
                 .and_then(|provider| provider.get(key))
                 .and_then(Item::as_str)
         })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            PROVIDER_ENV_KEYS.iter().find_map(|key| {
+                let name = provider
+                    .and_then(|provider| provider.get(key))
+                    .and_then(Item::as_str)?
+                    .trim();
+                if name.is_empty() {
+                    return None;
+                }
+                env_value(name)
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+        })
         .or_else(|| {
             document
                 .get("experimental_bearer_token")
                 .and_then(Item::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
         })
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+}
+
+fn provider_model_request_headers(provider: &dyn TableLike) -> BTreeMap<String, String> {
+    provider_model_request_headers_with_env(provider, &|name| std::env::var(name).ok())
+}
+
+fn provider_model_request_headers_with_env(
+    provider: &dyn TableLike,
+    env_value: &impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
+    let mut headers = BTreeMap::new();
+    if let Some(configured) = provider.get("http_headers").and_then(Item::as_table_like) {
+        for (name, item) in configured.iter() {
+            if let Some(value) = item.as_str() {
+                insert_model_request_header(&mut headers, name, value);
+            }
+        }
+    }
+    if let Some(configured) = provider
+        .get("env_http_headers")
+        .and_then(Item::as_table_like)
+    {
+        for (name, item) in configured.iter() {
+            let Some(env_name) = item.as_str().map(str::trim).filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            let Some(value) = env_value(env_name)
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            insert_model_request_header(&mut headers, name, &value);
+        }
+    }
+    headers
+}
+
+fn insert_model_request_header(headers: &mut BTreeMap<String, String>, name: &str, value: &str) {
+    let name = name.trim();
+    if name.is_empty() || (name.eq_ignore_ascii_case("authorization") && value.trim().is_empty()) {
+        return;
+    }
+    if let Some(existing) = headers
+        .keys()
+        .find(|existing| existing.eq_ignore_ascii_case(name))
+        .cloned()
+    {
+        headers.remove(&existing);
+    }
+    headers.insert(name.to_string(), value.to_string());
 }
 
 fn is_official_base_url(base_url: &str) -> bool {
@@ -1357,6 +1496,7 @@ mod tests {
             name: format!("线路 {id}"),
             base_url: format!("https://{id}.example/v1"),
             api_key: format!("{id}-secret"),
+            model_request_headers: BTreeMap::new(),
             protocol: RelayProtocol::Responses,
             cc_switch_provider_id: Some(id.to_string()),
             cc_switch_read_only: false,
@@ -1812,6 +1952,7 @@ requires_openai_auth = true
             name: "CC Switch 路由".into(),
             base_url: "http://127.0.0.1:15721/v1".into(),
             api_key: PROXY_MANAGED_TOKEN.into(),
+            model_request_headers: BTreeMap::new(),
             protocol: RelayProtocol::Responses,
             cc_switch_provider_id: None,
             cc_switch_read_only: false,
@@ -1837,6 +1978,124 @@ requires_openai_auth = true
             provider_model_fetch_profile_from_paths(&profile, &home, &path).unwrap();
 
         assert_eq!(fetch_profile, profile);
+    }
+
+    #[test]
+    fn model_fetch_reads_codex_provider_tokens_and_request_headers() {
+        let (_directory, path, home) = fixture();
+        fs::write(
+            home.join("config.toml"),
+            r#"
+model_provider = "direct"
+
+[model_providers.direct]
+base_url = "https://direct.example/v1"
+experimental_bearer_token = "fresh-secret"
+
+[model_providers.direct.http_headers]
+X-Route = "manual"
+"#,
+        )
+        .unwrap();
+        let profile = saved_route_profile("direct");
+
+        let fetch_profile =
+            provider_model_fetch_profile_from_paths(&profile, &home, &path).unwrap();
+
+        assert_eq!(fetch_profile.api_key, "fresh-secret");
+        assert_eq!(
+            fetch_profile
+                .model_request_headers
+                .get("X-Route")
+                .map(String::as_str),
+            Some("manual")
+        );
+    }
+
+    #[test]
+    fn provider_request_extensions_resolve_environment_values() {
+        let document = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://custom.example/v1"
+env_key = "CUSTOM_API_KEY"
+
+[model_providers.custom.http_headers]
+X-Route = "static"
+Authorization = " "
+
+[model_providers.custom.env_http_headers]
+X-Environment = "CUSTOM_HEADER"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let provider = document["model_providers"]["custom"]
+            .as_table_like()
+            .unwrap();
+        let env_value = |name: &str| match name {
+            "CUSTOM_API_KEY" => Some("env-secret".to_string()),
+            "CUSTOM_HEADER" => Some("env-header".to_string()),
+            _ => None,
+        };
+
+        assert_eq!(
+            provider_config_api_key_with_env(&document, Some(provider), &env_value).as_deref(),
+            Some("env-secret")
+        );
+        assert_eq!(
+            provider_model_request_headers_with_env(provider, &env_value),
+            BTreeMap::from([
+                ("X-Environment".to_string(), "env-header".to_string()),
+                ("X-Route".to_string(), "static".to_string()),
+            ])
+        );
+
+        let no_env_key = r#"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://custom.example/v1"
+"#
+        .parse::<DocumentMut>()
+        .unwrap();
+        let provider = no_env_key["model_providers"]["custom"]
+            .as_table_like()
+            .unwrap();
+        assert_eq!(
+            provider_config_api_key_with_env(&no_env_key, Some(provider), &|_| {
+                Some("must-not-leak".to_string())
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn cc_switch_source_prefers_provider_token_and_keeps_request_headers() {
+        let settings = json!({
+            "auth": {"OPENAI_API_KEY": "stale-auth-secret"},
+            "config": r#"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "https://source.example/v1"
+experimental_bearer_token = "provider-secret"
+
+[model_providers.custom.http_headers]
+X-Route = "source"
+"#
+        });
+
+        let source = cc_switch_source_api("source", Some("custom"), &settings.to_string()).unwrap();
+
+        assert_eq!(source.api_key, "provider-secret");
+        assert_eq!(
+            source
+                .model_request_headers
+                .get("X-Route")
+                .map(String::as_str),
+            Some("source")
+        );
     }
 
     #[test]

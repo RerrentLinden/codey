@@ -26,7 +26,6 @@ type ModelSectionProps = {
   manualThirdPartyModelKeys: Set<string>;
   onSyncCurrentProvider: () => void;
   onFetchCurrentModels: () => void;
-  onTestCurrentProvider: () => void;
   onSetDefaultModel: (model: string) => void;
   onDeleteThirdPartyModel: (model: string) => void;
   onShowAccountUsageInHeaderChange: (checked: boolean) => void;
@@ -42,7 +41,6 @@ function ModelSectionComponent({
   manualThirdPartyModelKeys,
   onSyncCurrentProvider,
   onFetchCurrentModels,
-  onTestCurrentProvider,
   onSetDefaultModel,
   onDeleteThirdPartyModel,
   onShowAccountUsageInHeaderChange,
@@ -147,18 +145,6 @@ function ModelSectionComponent({
             </div>
             {!provider.official && (
               <div className="route-heading-actions">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={isBusy || !defaultModel}
-                  onClick={onTestCurrentProvider}
-                >
-                  <PlugZap
-                    className={busy === "test-provider" ? "spinner" : ""}
-                    aria-hidden="true"
-                  />
-                  测试对话
-                </Button>
                 <Button
                   variant="secondary"
                   size="sm"

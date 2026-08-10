@@ -58,13 +58,6 @@ pub struct RelayApplyResult {
     pub configured: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelayProfileTestResult {
-    pub http_status: u16,
-    pub endpoint: String,
-    pub response_preview: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexContextEntry {
@@ -508,96 +501,6 @@ pub fn apply_pure_api_config_to_home_with_protocol(
     proxy_port: u16,
 ) -> anyhow::Result<RelayApplyResult> {
     apply_relay_config_to_home_with_protocol(home, base_url, bearer_token, protocol, proxy_port)
-}
-
-pub async fn test_relay_profile(
-    profile: &RelayProfile,
-    model: &str,
-) -> anyhow::Result<RelayProfileTestResult> {
-    let base_url = relay_profile_base_url(profile);
-    let base_url = base_url.trim().trim_end_matches('/');
-    if base_url.is_empty() {
-        anyhow::bail!("Base URL 不能为空");
-    }
-    let api_key = relay_profile_api_key(profile);
-    let api_key = api_key.trim();
-    if api_key.is_empty() {
-        anyhow::bail!("API Key 不能为空");
-    }
-
-    let client = crate::http_client::proxied_client("CodeyRuntime/RelayTest")?;
-    let endpoint = match profile.protocol {
-        RelayProtocol::Responses => format!("{base_url}/responses"),
-        RelayProtocol::ChatCompletions => format!("{base_url}/chat/completions"),
-    };
-    let test_model = model.trim();
-    if test_model.is_empty() {
-        anyhow::bail!("测试模型不能为空");
-    }
-
-    let payload = relay_profile_test_payload(profile.protocol, test_model);
-    let response = client
-        .post(&endpoint)
-        .bearer_auth(api_key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&payload)
-        .send()
-        .await?;
-    let http_status = response.status().as_u16();
-
-    // 如果 404 且 base_url 末尾没有 /v1，尝试自动补 /v1 后再发一次。
-    // 许多上游（中转站、自建代理）暴露的路径以 /v1/ 开头，
-    // 用户容易遗漏这个前缀，导致 /responses 或 /chat/completions 404。
-    if http_status == 404 && !base_url.ends_with("/v1") {
-        let v1_url = format!("{base_url}/v1");
-        let v1_endpoint = match profile.protocol {
-            RelayProtocol::Responses => format!("{v1_url}/responses"),
-            RelayProtocol::ChatCompletions => format!("{v1_url}/chat/completions"),
-        };
-        let v1_response = client
-            .post(&v1_endpoint)
-            .bearer_auth(api_key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&payload)
-            .send()
-            .await?;
-        let v1_status = v1_response.status().as_u16();
-        if v1_status < 400 {
-            let response_text = v1_response.text().await.unwrap_or_default();
-            return Ok(RelayProfileTestResult {
-                http_status: v1_status,
-                endpoint: v1_endpoint,
-                response_preview: format!(
-                    "（Base URL 建议加上 /v1 前缀）{}",
-                    response_text.chars().take(280).collect::<String>()
-                ),
-            });
-        }
-    }
-
-    let response_text = response.text().await.unwrap_or_default();
-    Ok(RelayProfileTestResult {
-        http_status,
-        endpoint,
-        response_preview: response_text.chars().take(320).collect(),
-    })
-}
-
-fn relay_profile_test_payload(protocol: RelayProtocol, model: &str) -> Value {
-    match protocol {
-        RelayProtocol::Responses => serde_json::json!({
-            "model": model,
-            "input": "hi",
-            "max_output_tokens": 16
-        }),
-        RelayProtocol::ChatCompletions => serde_json::json!({
-            "model": model,
-            "messages": [
-                { "role": "user", "content": "hi" }
-            ],
-            "max_tokens": 16
-        }),
-    }
 }
 
 fn codex_base_url_for_protocol(base_url: &str, protocol: RelayProtocol, proxy_port: u16) -> String {

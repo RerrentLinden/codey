@@ -5,7 +5,6 @@ export const CODEY_API_COMMANDS = [
   "set_codex_app_path",
   "sync_current_provider",
   "fetch_current_provider_models",
-  "test_current_provider",
   "save_selected_models",
   "save_default_model",
   "runtime_status",

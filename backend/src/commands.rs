@@ -33,7 +33,7 @@ use models::{
 };
 pub use models::{
     fetch_current_provider_models, save_default_model, save_selected_models, sync_cc_switch_state,
-    sync_current_provider_command, test_current_provider,
+    sync_current_provider_command,
 };
 use runtime::refresh_injection_status;
 pub(crate) use runtime::{
@@ -470,7 +470,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         },
         "sync_current_provider" => sync_current_provider_command(state).await,
         "fetch_current_provider_models" => fetch_current_provider_models(state).await,
-        "test_current_provider" => test_current_provider(state).await,
         "save_selected_models" => match (
             argument::<Vec<String>>(&args, "officialModels"),
             argument::<Vec<String>>(&args, "thirdPartyModels"),

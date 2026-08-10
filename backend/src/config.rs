@@ -20,6 +20,11 @@ pub struct ProviderProfile {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
+    /// Request-only provider headers loaded from the active Codex/CC Switch
+    /// source. They may contain credentials, so they are never serialized into
+    /// Codey's store or exposed to the renderer.
+    #[serde(skip)]
+    pub model_request_headers: BTreeMap<String, String>,
     #[serde(default)]
     pub protocol: RelayProtocol,
     /// Stable id of the Codex provider in cc-switch.
@@ -40,6 +45,7 @@ impl ProviderProfile {
             name: name.into(),
             base_url: String::new(),
             api_key: String::new(),
+            model_request_headers: BTreeMap::new(),
             protocol: RelayProtocol::Responses,
             cc_switch_provider_id: None,
             cc_switch_read_only: false,
@@ -444,6 +450,19 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect::<Vec<_>>();
         assert_eq!(names, [std::ffi::OsString::from("config.json")]);
+    }
+
+    #[test]
+    fn request_only_provider_headers_are_never_serialized() {
+        let mut profile = ProviderProfile::new("Private Relay");
+        profile
+            .model_request_headers
+            .insert("Authorization".to_string(), "secret".to_string());
+
+        let serialized = serde_json::to_value(profile).unwrap();
+
+        assert!(serialized.get("modelRequestHeaders").is_none());
+        assert!(!serialized.to_string().contains("secret"));
     }
 
     #[test]
