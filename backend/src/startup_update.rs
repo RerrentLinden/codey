@@ -108,16 +108,13 @@ async fn run_with(
         return StartupUpdateOutcome::Continue;
     }
 
-    let should_update = match ui
+    let should_update = ui
         .confirm_update(
             &candidate.check.current_version,
             &candidate.check.latest_version,
         )
         .await
-    {
-        Ok(should_update) => should_update,
-        Err(_) => false,
-    };
+        .unwrap_or_default();
     if !should_update {
         return StartupUpdateOutcome::Continue;
     }

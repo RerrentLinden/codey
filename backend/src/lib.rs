@@ -62,9 +62,7 @@ pub fn run_error_log_helper_if_requested() -> Result<bool> {
 pub fn run_desktop_application() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        return native_update_ui::run_macos_application(|ui| {
-            build_async_runtime()?.block_on(run(ui))
-        });
+        native_update_ui::run_macos_application(|ui| build_async_runtime()?.block_on(run(ui)))
     }
 
     #[cfg(not(target_os = "macos"))]

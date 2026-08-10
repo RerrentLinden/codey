@@ -139,7 +139,7 @@ pub async fn install_downloaded_update(
 }
 
 pub(crate) fn start_downloaded_update(state: &AppState, file_path: &str) -> Result<(), String> {
-    let update_path = validate_downloaded_update_path(&state.store, &file_path)?;
+    let update_path = validate_downloaded_update_path(&state.store, file_path)?;
     spawn_update_installer(&update_path)
 }
 
