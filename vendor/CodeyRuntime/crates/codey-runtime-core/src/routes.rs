@@ -106,8 +106,6 @@ pub trait BridgeDataService: Send + Sync {
         session: SessionRef,
         target_cwd: String,
     ) -> anyhow::Result<Value>;
-    async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value>;
-    async fn thread_sort_keys(&self, sessions: Vec<SessionRef>) -> anyhow::Result<Value>;
 }
 
 pub async fn handle_bridge_request(
@@ -234,16 +232,6 @@ pub async fn handle_bridge_request(
                 .to_string();
             ctx.data
                 .move_thread_workspace(session_from_payload(&payload), target_cwd)
-                .await
-        }
-        "/thread-sort-key" => {
-            ctx.data
-                .thread_sort_key(session_from_payload(&payload))
-                .await
-        }
-        "/thread-sort-keys" => {
-            ctx.data
-                .thread_sort_keys(sessions_from_payload(&payload))
                 .await
         }
         _ => {
@@ -576,22 +564,6 @@ impl BridgeDataService for UnavailableDataService {
             "message": "Move workspace service is not wired in core launcher hooks"
         }))
     }
-
-    async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value> {
-        Ok(json!({
-            "status": "failed",
-            "session_id": session.session_id,
-            "message": "Thread sort service is not wired in core launcher hooks"
-        }))
-    }
-
-    async fn thread_sort_keys(&self, _sessions: Vec<SessionRef>) -> anyhow::Result<Value> {
-        Ok(json!({
-            "status": "failed",
-            "message": "Thread sort service is not wired in core launcher hooks",
-            "sort_keys": []
-        }))
-    }
 }
 
 fn settings_payload_value(
@@ -715,31 +687,6 @@ fn session_from_payload(payload: &Value) -> SessionRef {
             .unwrap_or_default()
             .to_string(),
     }
-}
-
-fn sessions_from_payload(payload: &Value) -> Vec<SessionRef> {
-    payload
-        .get("sessions")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_object())
-                .map(|item| SessionRef {
-                    session_id: item
-                        .get("session_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    title: item
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 pub fn devtools_url(debug_port: u16, target_id: &str) -> String {

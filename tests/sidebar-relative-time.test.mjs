@@ -4,6 +4,10 @@ import test from "node:test";
 import vm from "node:vm";
 
 const source = readFileSync(new URL("../public/codey-inject.js", import.meta.url), "utf8");
+const vendorSource = readFileSync(
+  new URL("../vendor/CodeyRuntime/assets/inject/renderer-inject.js", import.meta.url),
+  "utf8",
+);
 
 class FakeElement {
   constructor(tagName = "div") {
@@ -1034,4 +1038,22 @@ test("injects time styles that coexist with native statuses and yield to sidebar
   assert.match(source, /"disabled",\s*"class",/);
   assert.doesNotMatch(source, /"class",\s*"style",/);
   assert.match(source, /sidebar-thread-row\]:hover \[\$\{threadUpdatedAtAttribute\}\].*opacity: 0/s);
+});
+
+test("vendor project moves preserve Codex-owned thread ordering", () => {
+  assert.doesNotMatch(
+    vendorSource,
+    /prioritizeRunning|rowHasRunningStatus|ProjectMovePrioritizeRunning/,
+  );
+  assert.doesNotMatch(
+    vendorSource,
+    /thread-sort-key|sortMs|codexProjectMoveSortMs|ChatsSortTimer/,
+  );
+  assert.doesNotMatch(
+    vendorSource,
+    /const ordered = \[\.\.\.running, \.\.\.idle\]/,
+  );
+  assert.match(vendorSource, /function insertProjectedRowItem\(list, item, row, target\)/);
+  assert.match(vendorSource, /item\.parentElement !== list/);
+  assert.match(vendorSource, /list\.insertBefore\(item, firstNonThreadItem\)/);
 });

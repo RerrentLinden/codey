@@ -963,7 +963,7 @@ fn missing_db_and_unsupported_schema_return_failed_results() {
 }
 
 #[test]
-fn archived_lookup_workspace_move_and_sort_keys_match_expected_shape() {
+fn archived_lookup_and_workspace_move_match_expected_shape() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("state_5.sqlite");
     let rollout_path = tmp.path().join("rollout.jsonl");
@@ -999,49 +999,6 @@ fn archived_lookup_workspace_move_and_sort_keys_match_expected_shape() {
     let text = fs::read_to_string(&rollout_path).unwrap();
     assert!(text.contains("\"id\":\"t1\",\"cwd\":\"/new/project\""));
     assert!(text.contains("\"id\":\"other\",\"cwd\":\"/old/project\""));
-
-    assert_eq!(
-        adapter.codex_thread_sort_key(&session("local:t1", "Codex Thread")),
-        json!({
-            "status": "ok",
-            "session_id": "t1",
-            "updated_at": 100,
-            "updated_at_ms": 100000,
-            "created_at": null,
-            "created_at_ms": null,
-            "recency_at": null,
-            "recency_at_ms": null
-        })
-    );
-    assert_eq!(
-        adapter.codex_thread_sort_keys(&[
-            session("local:t2", "Second"),
-            session("local:t1", "Codex Thread")
-        ]),
-        json!({
-            "status": "ok",
-            "sort_keys": [
-                {
-                    "session_id": "t2",
-                    "updated_at": 200,
-                    "updated_at_ms": 200000,
-                    "created_at": null,
-                    "created_at_ms": null,
-                    "recency_at": null,
-                    "recency_at_ms": null
-                },
-                {
-                    "session_id": "t1",
-                    "updated_at": 100,
-                    "updated_at_ms": 100000,
-                    "created_at": null,
-                    "created_at_ms": null,
-                    "recency_at": null,
-                    "recency_at_ms": null
-                }
-            ]
-        })
-    );
 
     assert_eq!(
         adapter.codex_thread_usage_history(&session("local:t1", "Codex Thread")),

@@ -774,7 +774,7 @@ mod tests {
         let mut pending_serial = VecDeque::new();
         let mut ready = VecDeque::new();
         for (request_id, path) in [
-            ("sort", "/thread-sort-keys"),
+            ("usage", "/thread-usage-history"),
             ("delete-1", "/session/delete"),
             ("settings", "/settings/set"),
             ("delete-2", "/session/delete"),
@@ -794,7 +794,7 @@ mod tests {
                 .iter()
                 .map(|call| call.request_id.as_str())
                 .collect::<Vec<_>>(),
-            ["delete-1", "delete-2", "sort", "settings"]
+            ["delete-1", "delete-2", "usage", "settings"]
         );
     }
 

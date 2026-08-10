@@ -477,9 +477,7 @@
   window.__codexProjectMoveRuntimeId = (window.__codexProjectMoveRuntimeId || 0) + 1;
   const codexProjectMoveRuntimeId = window.__codexProjectMoveRuntimeId;
   clearTimeout(window.__codexProjectMoveProjectionTimer);
-  clearTimeout(window.__codexProjectMoveChatsSortTimer);
   window.__codexProjectMoveProjectionTimer = null;
-  window.__codexProjectMoveChatsSortTimer = null;
   clearTimeout(window.__codexThreadScrollSaveTimer);
   window.__codexThreadScrollSaveTimer = null;
   (window.__codexThreadScrollRestoreTimers || []).forEach((timer) => clearTimeout(timer));
@@ -4479,7 +4477,7 @@
     return timestamp < 1000000000000 ? timestamp * 1000 : timestamp;
   }
 
-  function sortMsForSession(sessionId, preferredValue) {
+  function timestampMsForSession(sessionId, preferredValue) {
     return numericTimestamp(preferredValue) || uuidV7TimestampMs(sessionId);
   }
 
@@ -4586,8 +4584,8 @@
           targetCwd: String(value.targetCwd),
           targetLabel: String(value.targetLabel || displayProjectName(value.targetCwd)),
           title: String(value.title || ""),
-          sortMs: sortMsForSession(sessionId, value.sortMs || value.updatedAtMs || value.updated_at_ms),
-          sortMsTrusted: false,
+          timestampMs: timestampMsForSession(sessionId, value.timestampMs || value.updatedAtMs || value.updated_at_ms),
+          timestampTrusted: false,
           at: typeof value.at === "number" ? value.at : now,
         };
       }
@@ -4618,8 +4616,8 @@
           targetCwd,
           targetLabel: String(value.targetLabel || value.label || (targetKind === "projectless" ? "普通对话" : displayProjectName(targetCwd))),
           title: String(value.title || ""),
-          sortMs: sortMsForSession(sessionId, value.sortMs || value.updatedAtMs || value.updated_at_ms),
-          sortMsTrusted: value.sortMsTrusted === true,
+          timestampMs: timestampMsForSession(sessionId, value.timestampMs || value.updatedAtMs || value.updated_at_ms),
+          timestampTrusted: value.timestampTrusted === true,
           at: typeof value.at === "number" ? value.at : now,
         };
       }
@@ -4639,7 +4637,7 @@
     }
   }
 
-  function saveProjectMoveProjection(ref, target, sortMs) {
+  function saveProjectMoveProjection(ref, target, timestampMs) {
     const id = projectMoveSessionKey(ref.session_id);
     if (!id || !target) return;
     const projection = readProjectMoveProjection();
@@ -4649,8 +4647,8 @@
       targetCwd: target.path || "",
       targetLabel: target.label || (target.kind === "projectless" ? "普通对话" : displayProjectName(target.path)),
       title: ref.title || "",
-      sortMs: sortMsForSession(ref.session_id, sortMs || target.sortMs),
-      sortMsTrusted: target.sortMsTrusted === true,
+      timestampMs: timestampMsForSession(ref.session_id, timestampMs || target.timestampMs),
+      timestampTrusted: target.timestampTrusted === true,
       at: Date.now(),
     };
     writeProjectMoveProjection(projection);
@@ -4855,10 +4853,10 @@
     return label;
   }
 
-  function updateRowTimeLabel(row, sortMs) {
+  function updateRowTimeLabel(row, timestampMs) {
     const label = ensureRowTimeLabelNode(row);
     if (!label) return;
-    const timestamp = numericTimestamp(sortMs);
+    const timestamp = numericTimestamp(timestampMs);
     const text = relativeTimeLabel(timestamp);
     label.dataset.codexProjectMoveTime = "true";
     label.dataset.codexProjectMoveTimeMs = String(timestamp || 0);
@@ -4870,8 +4868,8 @@
     return row?.dataset?.codexProjectMoveTargetKind || rowListItem(row)?.dataset?.codexProjectMoveTargetKind || "";
   }
 
-  function rowSortMs(row, ref = sessionRefFromRow(row), target = null) {
-    return sortMsForSession(ref.session_id, target?.sortMs || row?.dataset?.codexProjectMoveSortMs || rowListItem(row)?.dataset?.codexProjectMoveSortMs);
+  function rowTimestampMs(row, ref = sessionRefFromRow(row), target = null) {
+    return timestampMsForSession(ref.session_id, target?.timestampMs || row?.dataset?.codexProjectMoveTimestampMs || rowListItem(row)?.dataset?.codexProjectMoveTimestampMs);
   }
 
   function threadRowFromListItem(item) {
@@ -4880,58 +4878,16 @@
     return item.querySelector?.("[data-app-action-sidebar-thread-id]") || null;
   }
 
-  function rowHasRunningStatus(row) {
-    if (!(row instanceof HTMLElement)) return false;
-    if (row.querySelector?.(".animate-spin")) return true;
-    const fiberKey = Object.keys(row).find((key) => key.startsWith("__reactFiber$"));
-    let fiber = fiberKey ? row[fiberKey] : null;
-    for (let depth = 0; fiber && depth < 12; depth += 1, fiber = fiber.return) {
-      const statusState = fiber.memoizedProps?.statusState || fiber.pendingProps?.statusState;
-      if (!statusState || typeof statusState !== "object") continue;
-      return /^(?:loading|processing|running|working)$/i.test(String(statusState.type || ""));
-    }
-    return false;
-  }
-
-  function prioritizeRunningRowsInList(list) {
-    if (!(list instanceof HTMLElement)) return;
-    const children = Array.from(list.children);
-    const entries = children.map((item) => ({
-      item,
-      row: threadRowFromListItem(item),
-    })).filter(({ row }) => row instanceof HTMLElement);
-    if (entries.length < 2) return;
-    const running = entries.filter(({ row }) => rowHasRunningStatus(row));
-    if (running.length === 0 || running.length === entries.length) return;
-    const idle = entries.filter(({ row }) => !rowHasRunningStatus(row));
-    const ordered = [...running, ...idle];
-    if (ordered.every(({ item }, index) => item === entries[index].item)) return;
-    const firstNonThreadItem = children.find((child) => !threadRowFromListItem(child)) || null;
-    ordered.forEach(({ item }) => list.insertBefore(item, firstNonThreadItem));
-    cachedSessionRowsAt = 0;
-  }
-
-  function prioritizeRunningProjectRows() {
-    const lists = new Set();
-    sessionRows(true).forEach((row) => {
-      if (!row.closest?.('[data-app-action-sidebar-section-heading="Projects"]')) return;
-      const item = rowListItem(row);
-      if (item?.parentElement) lists.add(item.parentElement);
-    });
-    lists.forEach(prioritizeRunningRowsInList);
-  }
-
   function insertProjectedRowItem(list, item, row, target) {
     const ref = sessionRefFromRow(row);
-    const sortMs = rowSortMs(row, ref, target);
-    item.dataset.codexProjectMoveSortMs = String(sortMs || 0);
-    row.dataset.codexProjectMoveSortMs = String(sortMs || 0);
-    if (target?.sortMsTrusted) updateRowTimeLabel(row, sortMs);
+    const timestampMs = rowTimestampMs(row, ref, target);
+    item.dataset.codexProjectMoveTimestampMs = String(timestampMs || 0);
+    row.dataset.codexProjectMoveTimestampMs = String(timestampMs || 0);
+    if (target?.timestampTrusted) updateRowTimeLabel(row, timestampMs);
     if (item.parentElement !== list) {
       const firstNonThreadItem = Array.from(list.children).find((child) => !threadRowFromListItem(child)) || null;
       list.insertBefore(item, firstNonThreadItem);
     }
-    prioritizeRunningRowsInList(list);
   }
 
   function projectMoveInjectedList(projectItem) {
@@ -5076,7 +5032,6 @@
     });
     settledRefs.forEach(clearProjectMoveProjection);
     updateProjectMoveEmptyStates();
-    prioritizeRunningProjectRows();
   }
 
   function scheduleProjectMoveProjection() {
@@ -5099,10 +5054,7 @@
   }
 
   function refreshAfterProjectMove() {
-    const refreshVisibleSidebar = () => {
-      applyProjectMoveProjection();
-      prioritizeRunningProjectRows();
-    };
+    const refreshVisibleSidebar = () => applyProjectMoveProjection();
     refreshVisibleSidebar();
     void refreshRecentConversationsForHost().finally(() => {
       projectMoveRefreshDelaysMs.forEach((delay) => {
@@ -5160,16 +5112,9 @@
     await clearThreadWorkspaceHints(ref);
     await clearThreadWritableRoots(ref);
     await clearThreadProjectlessOutputDirectories(ref);
-    const sortKey = await postJson("/thread-sort-key", ref).catch(() => ({}));
     return {
       status: "moved",
       session_id: ref.session_id,
-      updated_at: sortKey?.updated_at,
-      updated_at_ms: sortKey?.updated_at_ms,
-      created_at: sortKey?.created_at,
-      created_at_ms: sortKey?.created_at_ms,
-      recency_at: sortKey?.recency_at,
-      recency_at_ms: sortKey?.recency_at_ms,
     };
   }
 
@@ -6297,16 +6242,23 @@
     showToast(result.message || "导出失败", null);
   }
 
-  function sortStateFromMoveResult(result, ref, row) {
-    const trustedSortMs = timestampMsFromPayload(result);
-    return { sortMs: trustedSortMs || rowSortMs(row, ref), sortMsTrusted: !!trustedSortMs };
+  function timestampStateFromMoveResult(result, ref, row) {
+    const trustedTimestampMs = timestampMsFromPayload(result);
+    return {
+      timestampMs: trustedTimestampMs || rowTimestampMs(row, ref),
+      timestampTrusted: !!trustedTimestampMs,
+    };
   }
 
   function finishProjectMove(row, button, ref, target, message) {
     releaseDeleteFocus(row, button);
     button.disabled = false;
     button.textContent = "移动";
-    saveProjectMoveProjection(ref, target, target.sortMs || rowSortMs(row, ref, target));
+    saveProjectMoveProjection(
+      ref,
+      target,
+      target.timestampMs || rowTimestampMs(row, ref, target),
+    );
     if (target.kind === "projectless") moveRowToChats(row, target);
     refreshAfterProjectMove();
     showToast(message, null);
@@ -6318,10 +6270,10 @@
     try {
       if (target.kind === "projectless") {
         const result = await moveSessionToProjectless(ref);
-        finishProjectMove(row, button, ref, { ...target, ...sortStateFromMoveResult(result, ref, row) }, `已移动到普通对话：“${ref.title || ref.session_id}”`);
+        finishProjectMove(row, button, ref, { ...target, ...timestampStateFromMoveResult(result, ref, row) }, `已移动到普通对话：“${ref.title || ref.session_id}”`);
       } else {
         const result = await moveSessionToProject(ref, target);
-        finishProjectMove(row, button, ref, { ...target, ...sortStateFromMoveResult(result, ref, row) }, `已移动到“${target.label}”：“${ref.title || ref.session_id}”`);
+        finishProjectMove(row, button, ref, { ...target, ...timestampStateFromMoveResult(result, ref, row) }, `已移动到“${target.label}”：“${ref.title || ref.session_id}”`);
       }
     } catch (error) {
       button.disabled = false;
@@ -7730,7 +7682,6 @@
     sessionRows().forEach(tryAttachButton);
     updateDeleteButtonOffsets();
     scheduleProjectMoveProjection();
-    prioritizeRunningProjectRows();
     archivedPageRows().forEach(attachArchivedPageDeleteButton);
     refreshConversationView();
     scheduleThreadScrollSync();
@@ -7834,7 +7785,6 @@
   window.__codexProjectMoveApplyProjection = applyProjectMoveProjection;
   window.__codexProjectMoveReadProjection = readProjectMoveProjection;
   window.__codexProjectMoveTargets = projectMoveTargets;
-  window.__codexProjectMovePrioritizeRunning = prioritizeRunningProjectRows;
   window.removeEventListener("resize", window.__codeyResizeHandler);
   let codeyResizeRafId = 0;
   window.__codeyResizeHandler = () => {

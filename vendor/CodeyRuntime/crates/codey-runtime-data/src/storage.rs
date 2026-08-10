@@ -580,78 +580,6 @@ impl SQLiteStorageAdapter {
         result.unwrap_or_else(|err| json!({"status": "failed", "session_id": session.session_id, "message": err.to_string()}))
     }
 
-    pub fn codex_thread_sort_key(&self, session: &SessionRef) -> serde_json::Value {
-        if !self.db_path.exists() {
-            return json!({"status": "failed", "session_id": session.session_id, "message": format!("Database not found: {}", self.db_path.to_string_lossy())});
-        }
-        let result = (|| -> anyhow::Result<Value> {
-            let db = Connection::open(&self.db_path)?;
-            if schema_kind(&db)? != Some(SchemaKind::CodexThreads) {
-                return Ok(
-                    json!({"status": "failed", "session_id": session.session_id, "message": "Unsupported local storage schema"}),
-                );
-            }
-            let thread_id = normalize_codex_thread_id(&session.session_id);
-            match fetch_thread_timestamp_payload(&db, &thread_id)? {
-                Some(mut payload) => {
-                    payload.insert("status".to_string(), json!("ok"));
-                    payload.insert("session_id".to_string(), json!(thread_id));
-                    Ok(Value::Object(payload))
-                }
-                None => Ok(
-                    json!({"status": "failed", "session_id": thread_id, "message": "Thread not found in local storage"}),
-                ),
-            }
-        })();
-        result.unwrap_or_else(|err| json!({"status": "failed", "session_id": session.session_id, "message": err.to_string()}))
-    }
-
-    pub fn codex_thread_sort_keys(&self, sessions: &[SessionRef]) -> serde_json::Value {
-        if !self.db_path.exists() {
-            return json!({"status": "failed", "message": format!("Database not found: {}", self.db_path.to_string_lossy()), "sort_keys": []});
-        }
-        let thread_ids = sessions
-            .iter()
-            .filter(|session| !session.session_id.is_empty())
-            .map(|session| normalize_codex_thread_id(&session.session_id))
-            .fold(Vec::<String>::new(), |mut acc, id| {
-                if !acc.contains(&id) && acc.len() < 200 {
-                    acc.push(id);
-                }
-                acc
-            });
-        if thread_ids.is_empty() {
-            return json!({"status": "ok", "sort_keys": []});
-        }
-        let result = (|| -> anyhow::Result<Value> {
-            let db = Connection::open(&self.db_path)?;
-            if schema_kind(&db)? != Some(SchemaKind::CodexThreads) {
-                return Ok(
-                    json!({"status": "failed", "message": "Unsupported local storage schema", "sort_keys": []}),
-                );
-            }
-            // The column probe and the statement are identical for every id, so
-            // hoisting them turns ~3 statements per thread into 2 in total.
-            let mut columns = vec!["id".to_string()];
-            columns.extend(codex_thread_timestamp_columns(&db)?);
-            let sql = format!("SELECT {} FROM threads WHERE id = ?1", columns.join(", "));
-            let mut stmt = db.prepare(&sql)?;
-            let mut sort_keys = Vec::new();
-            for thread_id in thread_ids {
-                if let Some(mut payload) =
-                    fetch_thread_timestamp_row(&mut stmt, &columns, &thread_id)?
-                {
-                    payload.insert("session_id".to_string(), json!(thread_id));
-                    sort_keys.push(Value::Object(payload));
-                }
-            }
-            Ok(json!({"status": "ok", "sort_keys": sort_keys}))
-        })();
-        result.unwrap_or_else(
-            |err| json!({"status": "failed", "message": err.to_string(), "sort_keys": []}),
-        )
-    }
-
     pub fn codex_thread_usage_history(&self, session: &SessionRef) -> serde_json::Value {
         if !self.db_path.exists() {
             return json!({
@@ -1532,43 +1460,6 @@ fn codex_thread_timestamp_columns(db: &Connection) -> anyhow::Result<Vec<String>
     .filter(|column| existing.contains(**column))
     .map(|column| column.to_string())
     .collect())
-}
-
-fn fetch_thread_timestamp_payload(
-    db: &Connection,
-    thread_id: &str,
-) -> anyhow::Result<Option<Map<String, Value>>> {
-    let timestamp_columns = codex_thread_timestamp_columns(db)?;
-    let mut columns = vec!["id".to_string()];
-    columns.extend(timestamp_columns);
-    let sql = format!("SELECT {} FROM threads WHERE id = ?1", columns.join(", "));
-    let mut stmt = db.prepare(&sql)?;
-    fetch_thread_timestamp_row(&mut stmt, &columns, thread_id)
-}
-
-/// Shared by the single-thread lookup and the batched sort-key path, which
-/// prepares the statement once and reuses it across every requested thread.
-fn fetch_thread_timestamp_row(
-    stmt: &mut rusqlite::Statement<'_>,
-    columns: &[String],
-    thread_id: &str,
-) -> anyhow::Result<Option<Map<String, Value>>> {
-    let row = stmt.query_row([thread_id], |row| {
-        let mut selected = Map::new();
-        for (index, column) in columns.iter().enumerate() {
-            selected.insert(column.clone(), sql_value_to_json(row.get_ref(index)?));
-        }
-        Ok(selected)
-    });
-    match row {
-        Ok(row) => {
-            let mut payload = Map::new();
-            add_timestamp_payload(&mut payload, &row);
-            Ok(Some(payload))
-        }
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(err) => Err(err.into()),
-    }
 }
 
 fn add_timestamp_payload(payload: &mut Map<String, Value>, row: &Map<String, Value>) {

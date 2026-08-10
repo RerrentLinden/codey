@@ -89,14 +89,6 @@ async fn bridge_routes_cover_all_current_paths() {
             "/move-thread-workspace",
             json!({"session_id": "s1", "title": "First", "target_cwd": "/new"}),
         ),
-        (
-            "/thread-sort-key",
-            json!({"session_id": "s1", "title": "First"}),
-        ),
-        (
-            "/thread-sort-keys",
-            json!({"sessions": [{"session_id": "s1", "title": "First"}]}),
-        ),
     ];
 
     for (path, payload) in cases {
@@ -527,22 +519,8 @@ async fn data_routes_forward_payloads_to_data_service() {
         json!({"status": "moved", "session_id": "s1", "target_cwd": "/new"})
     );
     assert_eq!(
-        handle_bridge_request(
-            ctx.clone(),
-            "/thread-sort-key",
-            json!({"session_id": "s1", "title": "First"}),
-        )
-        .await,
-        json!({"status": "ok", "session_id": "s1", "updated_at": 123})
-    );
-    assert_eq!(
-        handle_bridge_request(
-            ctx,
-            "/thread-sort-keys",
-            json!({"sessions": [{"session_id": "s1", "title": "First"}, null, {"session_id": "s2"}]}),
-        )
-        .await,
-        json!({"status": "ok", "sort_keys": [{"session_id": "s1"}, {"session_id": "s2"}]})
+        handle_bridge_request(ctx, "/missing-route", json!({})).await["message"],
+        "Unknown bridge path"
     );
 }
 
@@ -1322,20 +1300,6 @@ impl BridgeDataService for FakeData {
         target_cwd: String,
     ) -> anyhow::Result<Value> {
         Ok(json!({"status": "moved", "session_id": session.session_id, "target_cwd": target_cwd}))
-    }
-
-    async fn thread_sort_key(&self, session: SessionRef) -> anyhow::Result<Value> {
-        Ok(json!({"status": "ok", "session_id": session.session_id, "updated_at": 123}))
-    }
-
-    async fn thread_sort_keys(&self, sessions: Vec<SessionRef>) -> anyhow::Result<Value> {
-        Ok(json!({
-            "status": "ok",
-            "sort_keys": sessions
-                .into_iter()
-                .map(|session| json!({"session_id": session.session_id}))
-                .collect::<Vec<_>>()
-        }))
     }
 }
 
