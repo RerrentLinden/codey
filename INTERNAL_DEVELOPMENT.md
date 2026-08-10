@@ -6,7 +6,7 @@ Codey 是一个无界面的 Rust 桌面辅助进程，通过 CDP 连接官方 Co
 
 ## 当前能力
 
-- 原生任务 hydration 的 stream owner 发现按 renderer 内的 `clientCoordination` 实例隔离：成功结果以 `hostId + conversationId` 为键缓存 5 秒且最多保留 64 项，同一键的并发查询复用一份 in-flight Promise。缓存命中不创建超时定时器或发起协调查询；空结果、异常和 150 毫秒超时均不缓存，下一次仍会重新发现。协调器替换、renderer 重载或路由重启会随 WeakMap / 页面生命周期整体失效，避免主窗口与 Avatar Overlay 交叉复用 owner。
+- 原生任务 hydration 的 stream owner 发现按 renderer 内的 `clientCoordination` 实例隔离：同一 `hostId + conversationId` 的并发查询复用一份 in-flight Promise，查询完成后立即移除，不缓存成功 owner。后续 hydration 每次重新确认当前仍存活的 owner，避免已断开的旧 owner 让 renderer 误进入 follower 状态、跳过本地历史补载并忽略后续增量消息。空结果、异常和 150 毫秒超时同样不会保留，下一次仍会重新发现；协调器替换、renderer 重载或路由重启会随 WeakMap / 页面生命周期整体失效。
 - 启动器的 `CodeyRuntime::start()` 只负责编排七个有序阶段：诊断存储保护、线路快照解析、启动前存储维护、运行时 Provider 配置、补丁与路由监听、进程启动及首屏注入、运行期 watcher 安装；阶段顺序、错误记录、失败恢复和 receiver 返回语义保持不变。macOS / Windows 的 Electron 启动补丁源码独立维护在 `backend/src/codex_startup_patch.js`，Rust 通过 `include_str!` 编译进二进制，前端检查会先执行 Node 语法校验。共享 bridge 统一提供 Statsig 客户端发现、React 内部键枚举以及可配置祖先深度的 fiber 图检索；模型白名单与宠物盾牌不再各自实现 React host 扫描。模型配置 hook 在源头用 `useCallback` 发布业务回调，根 `App` 直接把这些回调传入 memo 子组件，不再为同一组回调逐个建立 ref、layout effect 和外层 callback。
 - 打开 Codey 时自动启动 Codex，并通过 CDP 注入 Codey 设置按钮、Fast 模式展示修复、插件市场修复和消息选择工具；设置按钮在 Codex 客户端内部打开 Shadow DOM 隔离的 Semi Modal 配置浮层，不跳转外部浏览器。
 - 配置页运行状态卡通过 `runtime_status` 展示 Codey 版本、Codex App 路径、Codex App 版本和维护状态；`codexAppVersion` 优先读取当前受控 runtime 的应用目录，其次读取用户保存的应用路径，不在普通状态轮询里做全系统发现。

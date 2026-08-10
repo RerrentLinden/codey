@@ -358,19 +358,18 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     const patchedOwnerDiscoverySource = await ownerDiscoveryResponse.text();
     assert.match(
       patchedOwnerDiscoverySource,
-      /__CODEY_THREAD_OWNER_DISCOVERY_V1__/,
+      /__CODEY_THREAD_OWNER_DISCOVERY_V2__/,
     );
     assert.match(
       patchedOwnerDiscoverySource,
       /setTimeout\(\(\)=>\{if\(settled\)return;settled=true;resolve\(null\)\},150\)/,
     );
-    assert.match(patchedOwnerDiscoverySource, /expiresAt:now\+5000/);
-    assert.match(patchedOwnerDiscoverySource, /state\.cache\.size>=64/);
+    assert.doesNotMatch(patchedOwnerDiscoverySource, /expiresAt|\.cache/);
     assert.doesNotMatch(
       patchedOwnerDiscoverySource,
       /owner=await Bm\.clientCoordination\.findThreadOwner/,
     );
-    delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__;
+    delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V2__;
     const maybeResume = Function(
       `${patchedOwnerDiscoverySource};return maybeResume`,
     )();
@@ -383,10 +382,11 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     };
     globalThis.clearTimeout = (timer) => ownerNativeClearTimeout(timer);
     let ownerLookupCalls = 0;
+    let currentOwner = "existing-owner";
     const primaryCoordination = {
       async findThreadOwner() {
         ownerLookupCalls += 1;
-        return "existing-owner";
+        return currentOwner;
       },
     };
     try {
@@ -402,8 +402,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       assert.equal(ownerLookupCalls, 1);
       assert.equal(scheduledOwnerTimers, 1);
 
-      // A positive answer in the same renderer/coordination generation is a
-      // cache hit: no IPC lookup and no fallback timer.
+      // A settled positive answer must not be reused. The owner may have
+      // disconnected before the next hydration attempt, and returning its
+      // stale client ID would skip local thread hydration indefinitely.
+      currentOwner = null;
       assert.equal(
         await maybeResume(
           { clientCoordination: primaryCoordination },
@@ -411,12 +413,12 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
           "thread-1",
           { followExistingOwner: true },
         ),
-        "existing-owner",
+        null,
       );
-      assert.equal(ownerLookupCalls, 1);
-      assert.equal(scheduledOwnerTimers, 1);
+      assert.equal(ownerLookupCalls, 2);
+      assert.equal(scheduledOwnerTimers, 2);
 
-      // A separate window/client never shares the positive owner cache.
+      // A separate window/client never shares in-flight discovery state.
       let overlayLookupCalls = 0;
       assert.equal(
         await maybeResume(
@@ -435,11 +437,11 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         "overlay-owner",
       );
       assert.equal(overlayLookupCalls, 1);
-      assert.equal(scheduledOwnerTimers, 2);
+      assert.equal(scheduledOwnerTimers, 3);
     } finally {
       globalThis.setTimeout = ownerNativeSetTimeout;
       globalThis.clearTimeout = ownerNativeClearTimeout;
-      delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__;
+      delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V2__;
     }
 
     // Concurrent hydration attempts in the same renderer share one discovery.
@@ -473,7 +475,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       await Promise.all([sharedOwnerFirst, sharedOwnerSecond]),
       ["shared-owner", "shared-owner"],
     );
-    delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__;
+    delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V2__;
 
     // A timeout is uncertainty, not a negative cache entry. The next attempt
     // must retry discovery and can immediately observe a newly available owner.
@@ -521,7 +523,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     } finally {
       globalThis.setTimeout = ownerNativeSetTimeout;
       globalThis.clearTimeout = ownerNativeClearTimeout;
-      delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__;
+      delete globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V2__;
     }
 
     const interactionPerformanceSource = [

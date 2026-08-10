@@ -69,8 +69,6 @@
   };
   const statsigBootstrapTimeoutMs = 1500;
   const threadOwnerDiscoveryTimeoutMs = 150;
-  const threadOwnerCacheTtlMs = 5000;
-  const threadOwnerCacheMaxEntries = 64;
   const statsigStartupRemainingMs =
     `Math.max(0,(globalThis.__CODEY_STATSIG_STARTUP_DEADLINE_MS__??=Date.now()+${statsigBootstrapTimeoutMs})-Date.now())`;
   const disableWindowsOptimizations = process.platform === "win32";
@@ -503,18 +501,13 @@
     conversationIdName,
   ) =>
     [
-      "await (globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V1__??=(()=>{",
-      "const states=new WeakMap;",
-      "const remember=(state,key,owner,now)=>{",
-      `if(state.cache.size>=${threadOwnerCacheMaxEntries})state.cache.delete(state.cache.keys().next().value);`,
-      `state.cache.set(key,{owner,expiresAt:now+${threadOwnerCacheTtlMs}})`,
-      "};",
+      "await (globalThis.__CODEY_THREAD_OWNER_DISCOVERY_V2__??=(()=>{",
+      "const requestsByClient=new WeakMap;",
       "return{find(client,hostId,conversationId){",
-      "let state=states.get(client);",
-      "if(state==null){state={cache:new Map,inflight:new Map};states.set(client,state)}",
-      "const key=String(hostId)+String.fromCharCode(0)+String(conversationId),now=Date.now(),cached=state.cache.get(key);",
-      "if(cached!=null){if(cached.expiresAt>now)return Promise.resolve(cached.owner);state.cache.delete(key)}",
-      "const existing=state.inflight.get(key);",
+      "let requests=requestsByClient.get(client);",
+      "if(requests==null){requests=new Map;requestsByClient.set(client,requests)}",
+      "const key=String(hostId)+String.fromCharCode(0)+String(conversationId);",
+      "const existing=requests.get(key);",
       "if(existing!=null)return existing;",
       "let settled=false,timer;",
       "const lookup=Promise.resolve().then(()=>client.findThreadOwner({hostId,conversationId}));",
@@ -523,14 +516,13 @@
       "lookup.then(owner=>{",
       "if(settled)return;",
       "settled=true;globalThis.clearTimeout(timer);",
-      "if(owner!=null)remember(state,key,owner,Date.now());",
       "resolve(owner)",
       "},error=>{",
       "if(settled)return;",
       "settled=true;globalThis.clearTimeout(timer);reject(error)",
       "})",
-      "}).finally(()=>{if(state.inflight.get(key)===request)state.inflight.delete(key)});",
-      "state.inflight.set(key,request);",
+      "}).finally(()=>{if(requests.get(key)===request)requests.delete(key)});",
+      "requests.set(key,request);",
       "return request",
       "}}",
       "})()).find(",
@@ -587,10 +579,11 @@
       && source.includes(".clientCoordination.findThreadOwner")
     ) {
       // Owner discovery is an optimization for reusing a stream already owned
-      // by another window. Cache only positive, recent answers within the same
-      // coordination client and merge duplicate in-flight lookups. Cache hits
-      // have no timer or IPC wait; misses retain a short safety window before
-      // local hydration. Null, rejected and timed-out lookups are never cached.
+      // by another window. Merge only duplicate in-flight lookups: a settled
+      // positive answer can become stale as soon as its owner disconnects, and
+      // reusing it would mark this renderer as a follower without receiving a
+      // snapshot. Every later hydration attempt revalidates the live owner.
+      // Lookups retain a short safety window before local hydration.
       patched = replaceUniqueRendererGate(
         patched,
         /await\s+([$A-Z_a-z][$\w]*)\.clientCoordination\.findThreadOwner\(\{\s*hostId\s*:\s*([$A-Z_a-z][$\w]*)\s*,\s*conversationId\s*:\s*([$A-Z_a-z][$\w]*)\s*\}\)/g,
@@ -600,7 +593,7 @@
             hostIdName,
             conversationIdName,
           ),
-        "thread owner discovery cache",
+        "thread owner discovery coalescing",
       );
     }
     if (
