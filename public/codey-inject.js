@@ -19,7 +19,6 @@
   const sidebarActionTooltipId = "codey-sidebar-action-tooltip";
   const threadUpdatedAtAttribute = "data-codey-thread-updated-at";
   const threadUpdatedAtMsAttribute = "data-codey-thread-updated-at-ms";
-  const threadSortOrderAttribute = "data-codey-thread-sort-order";
   const sessionExportIcon = `
     <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
@@ -56,10 +55,10 @@
   let sidebarActionTooltipAnchor = null;
   let threadUpdatedAtFetchTimer = 0;
   let threadUpdatedAtFetchInFlight = false;
+  let threadUpdatedAtFetchRetryCount = 0;
+  const threadUpdatedAtReadRetryCounts = new Map();
   const threadUpdatedAtCache = new Map();
-  const threadSortAtCache = new Map();
-  const threadOptimisticSortAtCache = new Map();
-  const threadOptimisticSortSessionByRow = new WeakMap();
+  const threadWorkStateByRow = new WeakMap();
   const threadUpdatedAtRequestedAt = new Map();
   const pendingThreadUpdatedAtRefs = new Map();
   const threadUpdatedAtRows = new Set();
@@ -83,8 +82,13 @@
   const sidebarThreadRowSelector = "[data-app-action-sidebar-thread-row]";
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
   const deletedSidebarSessionTtlMs = 10 * 60 * 1000;
-  const activeThreadSortRefreshIntervalMs = 3_000;
-  const idleThreadSortRefreshIntervalMs = 30_000;
+  const threadTimestampRefreshIntervalMs = 60_000;
+  const threadTimestampListPageSize = 100;
+  const maxThreadTimestampListPages = 5;
+  const threadTimestampReadBatchSize = 32;
+  const threadTimestampReadConcurrency = 4;
+  const maxThreadTimestampFetchRetries = 5;
+  const maxPendingThreadTimestampRefs = 200;
   const fallbackSessionExportMaxBytes = 64 * 1024 * 1024;
   const maxSessionCacheEntries = 2_048;
   const maxHardDeletedMessageKeys = 10_000;
@@ -262,7 +266,6 @@
       [data-app-action-sidebar-thread-row] [${threadUpdatedAtAttribute}] { display: block; flex: 0 0 auto; min-width: 26px; margin-inline-start: auto; color: inherit; font: 400 12px/16px system-ui, sans-serif; font-variant-numeric: tabular-nums; letter-spacing: 0; text-align: end; opacity: .52; pointer-events: none; white-space: nowrap; }
       [data-app-action-sidebar-thread-row]:hover [${threadUpdatedAtAttribute}],
       [data-app-action-sidebar-thread-row]:has(:focus-visible) [${threadUpdatedAtAttribute}] { opacity: 0; }
-      [${threadSortOrderAttribute}="true"] { order: var(--codey-thread-sort-order) !important; }
       [${sessionDeleteStateAttribute}] { display: none !important; }
       [${sessionExportAttribute}], [${tasksImportAttribute}], [${sessionDeleteAttribute}] { -webkit-app-region: no-drag !important; flex: 0 0 auto; pointer-events: auto !important; }
       [${projectImportAttribute}] { -webkit-app-region: no-drag !important; position: absolute; top: 50%; right: 62px; z-index: 35; flex: 0 0 auto; transform: translateY(-50%); opacity: 0; pointer-events: auto !important; transition: opacity .15s ease; }
@@ -711,11 +714,20 @@
       Date.now() + deletedSidebarSessionTtlMs,
     );
     sidebarTitleCache.delete(normalizedSessionId);
-    threadUpdatedAtCache.delete(normalizedSessionId);
-    threadSortAtCache.delete(normalizedSessionId);
-    threadOptimisticSortAtCache.delete(normalizedSessionId);
-    threadUpdatedAtRequestedAt.delete(normalizedSessionId);
-    pendingThreadUpdatedAtRefs.delete(normalizedSessionId);
+    [...threadUpdatedAtCache.keys()].forEach((key) => {
+      if (key.endsWith(`\u0000${normalizedSessionId}`)) threadUpdatedAtCache.delete(key);
+    });
+    [...threadUpdatedAtRequestedAt.keys()].forEach((key) => {
+      if (key.endsWith(`\u0000${normalizedSessionId}`)) threadUpdatedAtRequestedAt.delete(key);
+    });
+    [...pendingThreadUpdatedAtRefs.keys()].forEach((key) => {
+      if (key.endsWith(`\u0000${normalizedSessionId}`)) pendingThreadUpdatedAtRefs.delete(key);
+    });
+    [...threadUpdatedAtReadRetryCounts.keys()].forEach((key) => {
+      if (key.endsWith(`\u0000${normalizedSessionId}`)) {
+        threadUpdatedAtReadRetryCounts.delete(key);
+      }
+    });
     return normalizedSessionId;
   };
 
@@ -759,7 +771,6 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     pendingSidebarSessionDeleteIds.delete(normalizedSessionId);
     isDeletedSidebarThread(row);
-    syncSidebarThreadTimeState(row);
     renderCachedThreadUpdatedAt(row);
     queryWithin(
       document,
@@ -771,7 +782,6 @@
       ) {
         isDeletedSidebarThread(candidate);
         if (candidate !== row) {
-          syncSidebarThreadTimeState(candidate);
           renderCachedThreadUpdatedAt(candidate);
         }
       }
@@ -805,17 +815,15 @@
   const threadTimestampMsFromPayload = (payload) => (
     numericThreadTimestamp(payload?.recency_at_ms ?? payload?.recencyAtMs)
     || threadTimestampValueToMs(payload?.recency_at ?? payload?.recencyAt)
-    || numericThreadTimestamp(payload?.created_at_ms ?? payload?.createdAtMs)
-    || threadTimestampValueToMs(payload?.created_at ?? payload?.createdAt)
-    || uuidV7ThreadTimestampMs(payload?.session_id ?? payload?.sessionId)
     || numericThreadTimestamp(payload?.updated_at_ms ?? payload?.updatedAtMs)
     || threadTimestampValueToMs(payload?.updated_at ?? payload?.updatedAt)
-  );
-
-  const threadSortTimestampMsFromPayload = (payload) => (
-    numericThreadTimestamp(payload?.updated_at_ms ?? payload?.updatedAtMs)
-    || threadTimestampValueToMs(payload?.updated_at ?? payload?.updatedAt)
-    || threadTimestampMsFromPayload(payload)
+    || numericThreadTimestamp(payload?.created_at_ms ?? payload?.createdAtMs)
+    || threadTimestampValueToMs(payload?.created_at ?? payload?.createdAt)
+    || uuidV7ThreadTimestampMs(
+      payload?.id ?? payload?.thread_id ?? payload?.threadId
+      ?? payload?.conversation_id ?? payload?.conversationId
+      ?? payload?.session_id ?? payload?.sessionId,
+    )
   );
 
   const formatRelativeThreadTime = (timestampMs, nowMs = Date.now()) => {
@@ -922,6 +930,106 @@
     return (trailing || []).some((candidate) => nativeElementLooksLikeThreadStatus(candidate));
   };
 
+  const threadKindFromRow = (row) => {
+    const identity = threadIdentityNode(row);
+    return String(
+      identity?.getAttribute?.("data-app-action-sidebar-thread-kind")
+      || row?.getAttribute?.("data-app-action-sidebar-thread-kind")
+      || "",
+    ).trim();
+  };
+
+  const threadHostIdFromRow = (row) => {
+    if (threadKindFromRow(row) === "remote") return "remote";
+    const identity = threadIdentityNode(row);
+    return String(
+      identity?.getAttribute?.("data-app-action-sidebar-thread-host-id")
+      || row?.getAttribute?.("data-app-action-sidebar-thread-host-id")
+      || "local",
+    ).trim() || "local";
+  };
+
+  const remoteThreadTaskFromRow = (row, sessionId) => {
+    const identity = threadIdentityNode(row) || row;
+    if (!(identity instanceof HTMLElement)) return null;
+    const expectedTaskId = normalizeThreadSessionId(sessionId).replace(/^remote:/, "");
+    const reactKey = Object.keys(identity).find((key) => (
+      key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")
+    ));
+    let fiber = reactKey ? identity[reactKey] : null;
+    for (let depth = 0; fiber && depth < 18; depth += 1, fiber = fiber.return) {
+      for (const props of [fiber.memoizedProps, fiber.pendingProps]) {
+        const task = props?.task ?? props?.entry?.task;
+        if (!task || typeof task !== "object") continue;
+        const taskId = String(task.id || "").trim();
+        if (!expectedTaskId || !taskId || taskId === expectedTaskId) return task;
+      }
+    }
+    return null;
+  };
+
+  const threadTimestampCacheKey = (hostId, sessionId) => (
+    `${String(hostId || "local").trim() || "local"}\u0000${normalizeThreadSessionId(sessionId)}`
+  );
+
+  const sidebarThreadTimestampState = (row) => {
+    const identity = threadIdentityNode(row);
+    if (!(identity instanceof HTMLElement)) {
+      return {
+        cacheKey: "",
+        completedWork: false,
+        hostId: "local",
+        sessionId: "",
+      };
+    }
+    const sessionId = normalizeThreadSessionId(threadSessionIdFromRow(identity));
+    const hostId = threadHostIdFromRow(row);
+    const kind = threadKindFromRow(row);
+    if (!sessionId) {
+      return {
+        cacheKey: "",
+        completedWork: false,
+        hostId,
+        kind,
+        sessionId: "",
+      };
+    }
+    const cacheKey = threadTimestampCacheKey(hostId, sessionId);
+    const workInProgress = nativeThreadWorkInProgress(row);
+    const previous = threadWorkStateByRow.get(row);
+    const completedWork = Boolean(
+      previous
+      && previous.cacheKey === cacheKey
+      && previous.workInProgress
+      && !workInProgress
+    );
+    threadWorkStateByRow.set(row, { cacheKey, workInProgress });
+    return {
+      cacheKey,
+      completedWork,
+      hostId,
+      kind,
+      sessionId,
+    };
+  };
+
+  const syncRemoteThreadUpdatedAt = (row, state) => {
+    if (state.kind !== "remote") return false;
+    pendingThreadUpdatedAtRefs.delete(state.cacheKey);
+    threadUpdatedAtRequestedAt.delete(state.cacheKey);
+    threadUpdatedAtReadRetryCounts.delete(state.cacheKey);
+    const task = remoteThreadTaskFromRow(row, state.sessionId);
+    if (!task) return true;
+    const timestamp = threadTimestampMsFromPayload(task);
+    if (isDeletedSidebarSession(state.sessionId) || !timestamp) {
+      threadUpdatedAtCache.delete(state.cacheKey);
+    } else {
+      rememberBoundedMapValue(threadUpdatedAtCache, state.cacheKey, timestamp);
+    }
+    updateThreadUpdatedAt(row, timestamp);
+    return true;
+  };
+
   const sidebarThreadListItem = (row) => {
     let current = threadIdentityNode(row) || row;
     while (current instanceof HTMLElement) {
@@ -938,93 +1046,6 @@
       current = parent;
     }
     return row instanceof HTMLElement ? row : null;
-  };
-
-  const syncSidebarThreadTimeOrder = (row, sessionId = "") => {
-    if (!(row instanceof HTMLElement)) return;
-    const item = sidebarThreadListItem(row);
-    if (!(item instanceof HTMLElement)) return;
-    const identity = threadIdentityNode(row);
-    const normalizedSessionId = normalizeThreadSessionId(
-      sessionId || (
-        identity instanceof HTMLElement
-          ? threadSessionIdFromRow(identity)
-          : ""
-      ),
-    );
-    const timestamp = threadSortAtCache.get(normalizedSessionId) || 0;
-    if (!timestamp) {
-      if (item.getAttribute(threadSortOrderAttribute) === "true") {
-        item.removeAttribute(threadSortOrderAttribute);
-        item.style?.removeProperty?.("--codey-thread-sort-order");
-      }
-      return;
-    }
-    const order = String(-Math.floor(timestamp / 60_000));
-    if (
-      item.getAttribute(threadSortOrderAttribute) === "true"
-      && item.style?.getPropertyValue?.("--codey-thread-sort-order") === order
-    ) return;
-    item.setAttribute(threadSortOrderAttribute, "true");
-    item.style?.setProperty?.("--codey-thread-sort-order", order);
-  };
-
-  const syncOptimisticThreadSortTime = (
-    row,
-    sessionId,
-    workInProgress,
-    now = Date.now(),
-  ) => {
-    if (!(row instanceof HTMLElement)) return;
-    const normalizedSessionId = normalizeThreadSessionId(sessionId);
-    if (!normalizedSessionId) return;
-    const previousSessionId = threadOptimisticSortSessionByRow.get(row) || "";
-    const shouldSeed = workInProgress || normalizedSessionId.startsWith("client-new-thread:");
-    if (!shouldSeed) {
-      const hadOptimisticSort = Boolean(
-        previousSessionId || threadOptimisticSortAtCache.has(normalizedSessionId),
-      );
-      if (previousSessionId) {
-        threadOptimisticSortAtCache.delete(previousSessionId);
-        threadOptimisticSortSessionByRow.delete(row);
-      }
-      threadOptimisticSortAtCache.delete(normalizedSessionId);
-      if (hadOptimisticSort) threadUpdatedAtRequestedAt.delete(normalizedSessionId);
-      return;
-    }
-    if (
-      previousSessionId === normalizedSessionId
-      && threadOptimisticSortAtCache.has(normalizedSessionId)
-    ) return;
-    const timestamp = threadOptimisticSortAtCache.get(normalizedSessionId)
-      || threadOptimisticSortAtCache.get(previousSessionId)
-      || now;
-    if (previousSessionId && previousSessionId !== normalizedSessionId) {
-      threadOptimisticSortAtCache.delete(previousSessionId);
-      threadSortAtCache.delete(previousSessionId);
-    }
-    threadOptimisticSortSessionByRow.set(row, normalizedSessionId);
-    rememberBoundedMapValue(
-      threadOptimisticSortAtCache,
-      normalizedSessionId,
-      timestamp,
-    );
-    rememberBoundedMapValue(
-      threadSortAtCache,
-      normalizedSessionId,
-      Math.max(threadSortAtCache.get(normalizedSessionId) || 0, timestamp),
-    );
-  };
-
-  const syncSidebarThreadTimeState = (row, now = Date.now()) => {
-    const identity = threadIdentityNode(row);
-    if (!(identity instanceof HTMLElement)) return { sessionId: "", workInProgress: false };
-    const sessionId = threadSessionIdFromRow(identity);
-    if (!sessionId) return { sessionId: "", workInProgress: false };
-    const workInProgress = nativeThreadWorkInProgress(row);
-    syncOptimisticThreadSortTime(row, sessionId, workInProgress, now);
-    syncSidebarThreadTimeOrder(row, sessionId);
-    return { sessionId, workInProgress };
   };
 
   const placeThreadUpdatedAt = (row, label) => {
@@ -1085,11 +1106,12 @@
   const renderCachedThreadUpdatedAt = (row) => {
     const identity = threadIdentityNode(row);
     if (!(identity instanceof HTMLElement)) return "";
-    const sessionId = threadSessionIdFromRow(identity);
+    const sessionId = normalizeThreadSessionId(threadSessionIdFromRow(identity));
     if (!sessionId) return "";
     threadUpdatedAtRows.add(row);
-    syncSidebarThreadTimeOrder(row, sessionId);
-    const timestamp = threadUpdatedAtCache.get(sessionId);
+    const timestamp = threadUpdatedAtCache.get(
+      threadTimestampCacheKey(threadHostIdFromRow(row), sessionId),
+    );
     updateThreadUpdatedAt(row, timestamp || 0);
     return sessionId;
   };
@@ -1106,56 +1128,208 @@
 
   const flushThreadUpdatedAtFetch = async () => {
     if (threadUpdatedAtFetchInFlight || !pendingThreadUpdatedAtRefs.size) return;
-    const refs = [...pendingThreadUpdatedAtRefs.values()].slice(0, 200);
-    refs.forEach(({ session_id: sessionId }) => pendingThreadUpdatedAtRefs.delete(sessionId));
+    const refs = [...pendingThreadUpdatedAtRefs.values()].slice(0, maxPendingThreadTimestampRefs);
+    refs.forEach(({ cacheKey }) => pendingThreadUpdatedAtRefs.delete(cacheKey));
     threadUpdatedAtFetchInFlight = true;
+    let retryDelayMs = 40;
     try {
-      const result = await callBridge("/thread-sort-keys", { sessions: refs });
-      if (result?.status !== "ok" || !Array.isArray(result.sort_keys)) {
-        refs.forEach(({ session_id: sessionId }) => threadUpdatedAtRequestedAt.delete(sessionId));
-        return;
-      }
-      const returnedSessionIds = new Set();
-      result.sort_keys.forEach((item) => {
-        const sessionId = normalizeThreadSessionId(item?.session_id);
-        const timestamp = threadTimestampMsFromPayload(item);
-        const sortTimestamp = threadSortTimestampMsFromPayload(item);
-        const optimisticSortTimestamp = threadOptimisticSortAtCache.get(sessionId) || 0;
-        if (!sessionId) return;
-        returnedSessionIds.add(sessionId);
-        if (timestamp) {
-          rememberBoundedMapValue(threadUpdatedAtCache, sessionId, timestamp);
+      const dispatcher = await getCodexSignalDispatcher();
+      const refsByHost = new Map();
+      refs.forEach((ref) => {
+        const hostRefs = refsByHost.get(ref.hostId) || [];
+        hostRefs.push(ref);
+        refsByHost.set(ref.hostId, hostRefs);
+      });
+      const refreshedCacheKeys = new Set();
+      for (const [hostId, hostRefs] of refsByHost) {
+        const remainingSessionIds = new Set(hostRefs.map(({ sessionId }) => sessionId));
+        let cursor = null;
+        let pageCount = 0;
+        const seenCursors = new Set();
+        const listRefs = hostRefs.filter(({ exactReadOnly }) => !exactReadOnly);
+        if (listRefs.length) {
+          const listSessionIds = new Set(listRefs.map(({ sessionId }) => sessionId));
+          do {
+            const result = await dispatcher("send-cli-request-for-host", {
+              hostId,
+              method: "thread/list",
+              params: {
+                archived: false,
+                cursor,
+                limit: threadTimestampListPageSize,
+                modelProviders: null,
+                sortKey: "updated_at",
+                useStateDbOnly: true,
+              },
+              priority: "background",
+              source: "thread_list",
+            });
+            if (!Array.isArray(result?.data)) {
+              throw new Error("Codex thread/list response is unavailable");
+            }
+            pageCount += 1;
+            result.data.forEach((item) => {
+              const payload = item?.thread && typeof item.thread === "object" ? item.thread : item;
+              const sessionId = normalizeThreadSessionId(
+                payload?.id
+                ?? payload?.thread_id
+                ?? payload?.threadId
+                ?? payload?.conversation_id
+                ?? payload?.conversationId,
+              );
+              if (!listSessionIds.has(sessionId) || !remainingSessionIds.has(sessionId)) return;
+              const timestamp = threadTimestampMsFromPayload(payload);
+              const cacheKey = threadTimestampCacheKey(hostId, sessionId);
+              if (isDeletedSidebarSession(sessionId) || !timestamp) {
+                threadUpdatedAtCache.delete(cacheKey);
+              } else {
+                rememberBoundedMapValue(threadUpdatedAtCache, cacheKey, timestamp);
+              }
+              remainingSessionIds.delete(sessionId);
+              threadUpdatedAtReadRetryCounts.delete(cacheKey);
+              refreshedCacheKeys.add(cacheKey);
+            });
+            const nextCursor = result?.nextCursor ?? null;
+            if (![...listSessionIds].some((sessionId) => remainingSessionIds.has(sessionId))) {
+              break;
+            }
+            if (
+              nextCursor == null
+              || seenCursors.has(nextCursor)
+              || pageCount >= maxThreadTimestampListPages
+            ) break;
+            seenCursors.add(nextCursor);
+            cursor = nextCursor;
+          } while (true);
         }
-        else threadUpdatedAtCache.delete(sessionId);
-        if (sortTimestamp || optimisticSortTimestamp) {
-          rememberBoundedMapValue(
-            threadSortAtCache,
-            sessionId,
-            Math.max(sortTimestamp, optimisticSortTimestamp),
+
+        const fallbackRefs = hostRefs
+          .filter(({ sessionId }) => remainingSessionIds.has(sessionId));
+        for (
+          let chunkIndex = 0;
+          chunkIndex < fallbackRefs.length;
+          chunkIndex += threadTimestampReadBatchSize
+        ) {
+          const chunk = fallbackRefs.slice(
+            chunkIndex,
+            chunkIndex + threadTimestampReadBatchSize,
           );
+          for (
+            let index = 0;
+            index < chunk.length;
+            index += threadTimestampReadConcurrency
+          ) {
+            const batch = chunk.slice(index, index + threadTimestampReadConcurrency);
+            const results = await Promise.all(batch.map(async (ref) => {
+              try {
+                const result = await dispatcher("send-cli-request-for-host", {
+                  hostId,
+                  method: "thread/read",
+                  params: {
+                    includeTurns: false,
+                    threadId: ref.sessionId,
+                  },
+                  priority: "background",
+                  source: "thread_list",
+                });
+                const payload = result?.thread && typeof result.thread === "object"
+                  ? result.thread
+                  : result;
+                return { failed: false, payload, ref };
+              } catch {
+                return { failed: true, payload: null, ref };
+              }
+            }));
+            results.forEach(({ failed, payload, ref }) => {
+              if (failed) {
+                if (isDeletedSidebarSession(ref.sessionId)) {
+                  threadUpdatedAtReadRetryCounts.delete(ref.cacheKey);
+                  threadUpdatedAtRequestedAt.delete(ref.cacheKey);
+                  return;
+                }
+                const retryCount = (threadUpdatedAtReadRetryCounts.get(ref.cacheKey) || 0) + 1;
+                if (retryCount <= maxThreadTimestampFetchRetries) {
+                  threadUpdatedAtReadRetryCounts.set(ref.cacheKey, retryCount);
+                  threadUpdatedAtRequestedAt.delete(ref.cacheKey);
+                  pendingThreadUpdatedAtRefs.set(ref.cacheKey, {
+                    ...ref,
+                    exactReadOnly: true,
+                  });
+                  retryDelayMs = Math.max(
+                    retryDelayMs,
+                    Math.min(30_000, 500 * (2 ** (retryCount - 1))),
+                  );
+                } else {
+                  threadUpdatedAtReadRetryCounts.delete(ref.cacheKey);
+                  rememberBoundedMapValue(
+                    threadUpdatedAtRequestedAt,
+                    ref.cacheKey,
+                    Date.now(),
+                  );
+                }
+                return;
+              }
+              const timestamp = threadTimestampMsFromPayload(payload);
+              if (isDeletedSidebarSession(ref.sessionId) || !timestamp) {
+                threadUpdatedAtCache.delete(ref.cacheKey);
+              } else {
+                rememberBoundedMapValue(threadUpdatedAtCache, ref.cacheKey, timestamp);
+              }
+              remainingSessionIds.delete(ref.sessionId);
+              threadUpdatedAtReadRetryCounts.delete(ref.cacheKey);
+              rememberBoundedMapValue(
+                threadUpdatedAtRequestedAt,
+                ref.cacheKey,
+                Date.now(),
+              );
+              refreshedCacheKeys.add(ref.cacheKey);
+            });
+          }
         }
-        else threadSortAtCache.delete(sessionId);
-      });
-      refs.forEach(({ session_id: sessionId }) => {
-        if (returnedSessionIds.has(sessionId)) return;
-        threadUpdatedAtCache.delete(sessionId);
-        if (!threadOptimisticSortAtCache.has(sessionId)) threadSortAtCache.delete(sessionId);
-      });
-      const refreshedSessionIds = new Set(refs.map(({ session_id: sessionId }) => sessionId));
+      }
       forEachTrackedThreadRow((row) => {
         const identity = threadIdentityNode(row);
-        const sessionId = identity instanceof HTMLElement ? threadSessionIdFromRow(identity) : "";
-        if (refreshedSessionIds.has(sessionId)) renderCachedThreadUpdatedAt(row);
+        const sessionId = identity instanceof HTMLElement
+          ? normalizeThreadSessionId(threadSessionIdFromRow(identity))
+          : "";
+        const cacheKey = threadTimestampCacheKey(threadHostIdFromRow(row), sessionId);
+        if (
+          refreshedCacheKeys.has(cacheKey)
+          && !isDeletedSidebarSession(sessionId)
+        ) renderCachedThreadUpdatedAt(row);
       });
+      threadUpdatedAtFetchRetryCount = 0;
     } catch {
-      refs.forEach(({ session_id: sessionId }) => threadUpdatedAtRequestedAt.delete(sessionId));
+      refs.forEach((ref) => {
+        threadUpdatedAtRequestedAt.delete(ref.cacheKey);
+        if (!isDeletedSidebarSession(ref.sessionId)) {
+          const pendingRef = pendingThreadUpdatedAtRefs.get(ref.cacheKey);
+          pendingThreadUpdatedAtRefs.set(
+            ref.cacheKey,
+            pendingRef?.exactReadOnly ? pendingRef : ref,
+          );
+        }
+      });
+      threadUpdatedAtFetchRetryCount += 1;
+      if (threadUpdatedAtFetchRetryCount <= maxThreadTimestampFetchRetries) {
+        retryDelayMs = Math.min(30_000, 500 * (2 ** (threadUpdatedAtFetchRetryCount - 1)));
+      } else {
+        refs.forEach(({ cacheKey, sessionId }) => {
+          pendingThreadUpdatedAtRefs.delete(cacheKey);
+          threadUpdatedAtReadRetryCounts.delete(cacheKey);
+          if (!isDeletedSidebarSession(sessionId)) {
+            rememberBoundedMapValue(threadUpdatedAtRequestedAt, cacheKey, Date.now());
+          }
+        });
+        threadUpdatedAtFetchRetryCount = 0;
+      }
     } finally {
       threadUpdatedAtFetchInFlight = false;
       if (pendingThreadUpdatedAtRefs.size) {
         threadUpdatedAtFetchTimer = window.setTimeout(() => {
           threadUpdatedAtFetchTimer = 0;
           void flushThreadUpdatedAtFetch();
-        }, 40);
+        }, retryDelayMs);
       }
     }
   };
@@ -1176,24 +1350,33 @@
     forEachTrackedThreadRow(() => {});
     queryWithin(root, "[data-app-action-sidebar-thread-row]").forEach((row) => {
       if (!(row instanceof HTMLElement) || isDeletedSidebarThread(row)) return;
-      const { sessionId, workInProgress } = syncSidebarThreadTimeState(row, now);
+      const {
+        cacheKey,
+        completedWork,
+        hostId,
+        kind,
+        sessionId,
+      } = sidebarThreadTimestampState(row);
       renderCachedThreadUpdatedAt(row);
       if (!sessionId || sessionId.startsWith("client-new-thread:")) return;
-      const refreshIntervalMs = workInProgress
-        ? activeThreadSortRefreshIntervalMs
-        : idleThreadSortRefreshIntervalMs;
+      if (syncRemoteThreadUpdatedAt(row, {
+        cacheKey,
+        hostId,
+        kind,
+        sessionId,
+      })) return;
+      if (completedWork) threadUpdatedAtRequestedAt.delete(cacheKey);
       if (
         !forceRefresh
-        && now - (threadUpdatedAtRequestedAt.get(sessionId) || 0) < refreshIntervalMs
+        && now - (threadUpdatedAtRequestedAt.get(cacheKey) || 0)
+          < threadTimestampRefreshIntervalMs
       ) return;
-      const identity = threadIdentityNode(row);
-      pendingThreadUpdatedAtRefs.set(sessionId, {
-        session_id: sessionId,
-        title: String(
-          identity?.getAttribute("data-app-action-sidebar-thread-title") || "",
-        ).trim(),
+      pendingThreadUpdatedAtRefs.set(cacheKey, {
+        cacheKey,
+        hostId,
+        sessionId,
       });
-      rememberBoundedMapValue(threadUpdatedAtRequestedAt, sessionId, now);
+      rememberBoundedMapValue(threadUpdatedAtRequestedAt, cacheKey, now);
     });
     scheduleThreadUpdatedAtFetch();
   };
@@ -1218,19 +1401,30 @@
 
   const signalDispatcherFromModule = (module, namedSignalAsset) => {
     const preferred = namedSignalAsset ? [module?.rn, module?.O] : [module?.O, module?.rn];
-    const exports = Object.values(module || {}).filter((value) => typeof value === "function");
-    return [...preferred, ...exports].find((candidate, index, candidates) => {
-      if (typeof candidate !== "function" || candidates.indexOf(candidate) !== index) return false;
-      if (namedSignalAsset && preferred.includes(candidate)) return true;
+    const candidates = [...preferred, ...Object.values(module || {})].filter((
+      candidate,
+      index,
+      values,
+    ) => typeof candidate === "function" && values.indexOf(candidate) === index);
+    const matches = candidates.filter((candidate) => {
       let source = "";
       try {
         source = Function.prototype.toString.call(candidate);
       } catch {
         return false;
       }
-      return candidate.length >= 2 && /\.sendRequest\([^)]*\)/.test(source);
-    }) || null;
+      return (
+        candidate.length >= 2
+        && candidate.length <= 3
+        && !/\bthis\.[\w$]+\.sendRequest\(/.test(source)
+        && /(?:\breturn\b|=>)[^{};]{0,240}\b[A-Za-z_$][\w$]*\.sendRequest\(\s*[A-Za-z_$][\w$]*\s*,\s*[A-Za-z_$][\w$]*/.test(source)
+      );
+    });
+    const preferredMatches = matches.filter((candidate) => preferred.includes(candidate));
+    if (namedSignalAsset && preferredMatches.length === 1) return preferredMatches[0];
+    return matches.length === 1 ? matches[0] : null;
   };
+  window.__codeySignalDispatcherFromModule = signalDispatcherFromModule;
 
   const loadCodexSignalDispatcher = async () => {
     if (typeof window.__codeyCodexSignalDispatcher === "function") {
@@ -1272,13 +1466,17 @@
   };
   window.__codeyLoadCodexSignalDispatcher = loadCodexSignalDispatcher;
 
+  const getCodexSignalDispatcher = async () => {
+    codexSignalDispatcherPromise ||= loadCodexSignalDispatcher().catch((error) => {
+      codexSignalDispatcherPromise = null;
+      throw error;
+    });
+    return codexSignalDispatcherPromise;
+  };
+
   const refreshRecentLocalSessions = async () => {
     try {
-      codexSignalDispatcherPromise ||= loadCodexSignalDispatcher().catch((error) => {
-        codexSignalDispatcherPromise = null;
-        throw error;
-      });
-      const dispatcher = await codexSignalDispatcherPromise;
+      const dispatcher = await getCodexSignalDispatcher();
       await dispatcher("refresh-recent-conversations-for-host", {
         hostId: "local",
         sortKey: "updated_at",
@@ -1293,11 +1491,7 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return false;
     try {
-      codexSignalDispatcherPromise ||= loadCodexSignalDispatcher().catch((error) => {
-        codexSignalDispatcherPromise = null;
-        throw error;
-      });
-      const dispatcher = await codexSignalDispatcherPromise;
+      const dispatcher = await getCodexSignalDispatcher();
       await dispatcher("unsubscribe-thread-for-host", {
         hostId: "local",
         threadId: normalizedSessionId,
@@ -1312,11 +1506,7 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return false;
     try {
-      codexSignalDispatcherPromise ||= loadCodexSignalDispatcher().catch((error) => {
-        codexSignalDispatcherPromise = null;
-        throw error;
-      });
-      const dispatcher = await codexSignalDispatcherPromise;
+      const dispatcher = await getCodexSignalDispatcher();
       await dispatcher("handle-app-server-notification-for-host", {
         hostId: "local",
         notification: {
@@ -1333,11 +1523,7 @@
   const reloadConversationAfterHardDelete = async (sessionId, messageIds) => {
     const normalizedSessionId = String(sessionId || "").replace(/^local:/, "").trim();
     if (!normalizedSessionId || !messageIds.length) throw new Error("缺少会话或轮次 ID");
-    codexSignalDispatcherPromise ||= loadCodexSignalDispatcher().catch((error) => {
-      codexSignalDispatcherPromise = null;
-      throw error;
-    });
-    const dispatcher = await codexSignalDispatcherPromise;
+    const dispatcher = await getCodexSignalDispatcher();
 
     // This native path unsubscribes app-server memory while preserving the
     // active route and marking the React conversation as needing a resume.
@@ -2043,11 +2229,9 @@
   window.__codeyProjectPathFromRow = projectPathFromRow;
   window.__codeyFormatRelativeThreadTime = formatRelativeThreadTime;
   window.__codeyThreadTimestampMsFromPayload = threadTimestampMsFromPayload;
-  window.__codeyThreadSortTimestampMsFromPayload = threadSortTimestampMsFromPayload;
   window.__codeyUpdateThreadUpdatedAt = updateThreadUpdatedAt;
   window.__codeyInstallThreadUpdatedTimes = installThreadUpdatedTimes;
   window.__codeyHasNativeThreadStatus = hasNativeThreadStatus;
-  window.__codeySyncSidebarThreadTimeOrder = syncSidebarThreadTimeOrder;
   window.__codeyRefreshRecentLocalSessions = refreshRecentLocalSessions;
   window.__codeyExportSession = exportSession;
   window.__codeyImportSessionFile = importSessionFile;
@@ -2218,7 +2402,9 @@
       "aria-label",
       "data-turn-key",
       "data-request-user-input-auto-resolution-conversation-id",
+      "data-app-action-sidebar-thread-host-id",
       "data-app-action-sidebar-thread-id",
+      "data-app-action-sidebar-thread-kind",
       "data-app-action-sidebar-thread-title",
       "data-app-action-sidebar-project-id",
       "data-app-action-sidebar-project-row",
@@ -2229,8 +2415,8 @@
     childList: true,
     subtree: true,
   });
-  // forceRefresh bypasses the per-session throttle and re-fetches sort keys for
-  // every sidebar row, so alt-tabbing must not trigger it on every focus.
+  // forceRefresh bypasses the per-session throttle and re-fetches official
+  // thread metadata for every sidebar row, so alt-tabbing must stay debounced.
   let lastForcedThreadTimeRefresh = 0;
   const forcedThreadTimeRefreshIntervalMs = 10_000;
   const refreshThreadUpdatedTimesOnReturn = () => {
@@ -2255,7 +2441,9 @@
   }
   if (typeof window.setInterval === "function") {
     window.setInterval(() => {
-      if (document.visibilityState !== "hidden") renderThreadUpdatedTimeLabels();
-    }, 60_000);
+      if (document.visibilityState === "hidden") return;
+      renderThreadUpdatedTimeLabels();
+      refreshThreadUpdatedTimes(false);
+    }, threadTimestampRefreshIntervalMs);
   }
 })();

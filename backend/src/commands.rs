@@ -263,37 +263,6 @@ impl AppState {
                 json!({"status":"ok"})
             }
             "/session/titles" => cache_session_titles(self, &payload).await,
-            "/thread-sort-keys" => {
-                let sessions = payload
-                    .get("sessions")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|session| {
-                        let session_id = session.get("session_id")?.as_str()?.trim();
-                        if session_id.is_empty() {
-                            return None;
-                        }
-                        Some(codey_runtime_core::models::SessionRef {
-                            session_id: session_id.to_string(),
-                            title: session
-                                .get("title")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                let home = codex_home();
-                match with_session_metadata_cache(self, "读取线程排序键", move |cache| {
-                    cache.thread_sort_keys(&home, &sessions)
-                })
-                .await
-                {
-                    Ok(value) => value,
-                    Err(error) => api_error_message(error),
-                }
-            }
             "/session/delete" => {
                 let session_id = bridge_string(&payload, "sessionId");
                 let title = bridge_string(&payload, "title");
