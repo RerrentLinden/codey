@@ -89,6 +89,7 @@ if (import.meta.env.DEV) {
       manualThirdPartyModelsByProvider: {
         primary: ["provider-fast-coder"],
       },
+      declaredOfficialModelsByProvider: {} as Record<string, string[]>,
       upstreamModelsByProvider: { primary: previewUpstreamModels },
       defaultModelByProvider: {},
       disableTraceLogWrites: true,
@@ -350,19 +351,25 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "fetch_current_provider_models") {
+        const declaredOfficialModels =
+          previewConfig.declaredOfficialModelsByProvider.primary || [];
+        const effectiveModels = uniqueModelIds([
+          ...previewUpstreamModels,
+          ...declaredOfficialModels,
+        ]);
         previewModelState = {
           ...previewModelState,
           officialModels: previewOfficialModels.map((model) => ({
             ...model,
-            supported: includesModelId(previewUpstreamModels, model.slug),
+            supported: includesModelId(effectiveModels, model.slug),
           })),
           thirdPartyModels: previewModelState.thirdPartyModels.filter((model) =>
-            includesModelId(previewUpstreamModels, model)
+            includesModelId(effectiveModels, model)
           ),
           manualThirdPartyModels: previewModelState.manualThirdPartyModels.filter((model) =>
             !includesModelId(previewUpstreamModels, model)
           ),
-          upstreamModels: previewUpstreamModels,
+          upstreamModels: effectiveModels,
         };
         return {
           status: "ok",
@@ -390,6 +397,10 @@ if (import.meta.env.DEV) {
           manualThirdPartyModelsByProvider: {
             ...previewConfig.manualThirdPartyModelsByProvider,
             primary: manualThirdPartyModels,
+          },
+          declaredOfficialModelsByProvider: {
+            ...previewConfig.declaredOfficialModelsByProvider,
+            primary: officialModels,
           },
           upstreamModelsByProvider: {
             ...previewConfig.upstreamModelsByProvider,

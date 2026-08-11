@@ -34,6 +34,7 @@ export type Config = {
   userScripts: string[];
   selectedModelsByProvider: Record<string, string[]>;
   manualThirdPartyModelsByProvider: Record<string, string[]>;
+  declaredOfficialModelsByProvider: Record<string, string[]>;
   upstreamModelsByProvider: Record<string, string[]>;
   defaultModelByProvider: Record<string, string>;
   disableTraceLogWrites: boolean;

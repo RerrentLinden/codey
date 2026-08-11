@@ -159,11 +159,12 @@ fn config_with_current_provider_model_sync(
     } else {
         preserve_selected_third_party_models(Vec::new(), config.manual_third_party_models())
     };
-    let supported_models = if synced {
+    let mut supported_models = if synced {
         preserve_selected_third_party_models(provider_models, config.selected_models())
     } else {
         provider_models
     };
+    preserve_declared_official_models(&mut supported_models, config.declared_official_models());
     let mut next = config.clone();
     next.upstream_models_by_provider
         .insert(provider_id.clone(), supported_models);
@@ -229,6 +230,29 @@ pub(super) fn preserve_selected_third_party_models_except(
             continue;
         }
         upstream_models.push(model.to_string());
+    }
+}
+
+fn preserve_declared_official_models(
+    upstream_models: &mut Vec<String>,
+    declared_official_models: &[String],
+) {
+    let official_models_by_key = model_catalog::default_official_model_slugs()
+        .into_iter()
+        .map(|model| (model_id::key(&model), model))
+        .collect::<std::collections::HashMap<_, _>>();
+    for declared_model in declared_official_models {
+        let key = model_id::key(declared_model);
+        let Some(official_model) = official_models_by_key.get(&key) else {
+            continue;
+        };
+        if upstream_models
+            .iter()
+            .any(|existing| model_id::equal(existing, official_model))
+        {
+            continue;
+        }
+        upstream_models.push(official_model.clone());
     }
 }
 
@@ -457,6 +481,7 @@ pub async fn save_selected_models(
         config.manual_third_party_models(),
         &requested_manual_third_party_models,
     )?;
+    let declared_official_models = supported_official.clone();
     let mut supported_models = supported_official;
     preserve_selected_third_party_models_except(
         &mut supported_models,
@@ -467,6 +492,15 @@ pub async fn save_selected_models(
     config
         .upstream_models_by_provider
         .insert(provider_id.clone(), supported_models);
+    if declared_official_models.is_empty() {
+        config
+            .declared_official_models_by_provider
+            .remove(&provider_id);
+    } else {
+        config
+            .declared_official_models_by_provider
+            .insert(provider_id.clone(), declared_official_models);
+    }
     if selected.is_empty() {
         config.selected_models_by_provider.remove(&provider_id);
         config
@@ -1044,6 +1078,32 @@ mod tests {
         assert_eq!(
             synced.upstream_models_by_provider[&provider_id],
             ["provider-synced", "provider-manual"]
+        );
+    }
+
+    #[test]
+    fn provider_sync_preserves_only_user_declared_official_models() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = CodeyConfig::default();
+        let provider_id = config.current_provider_id().unwrap().to_string();
+        config.upstream_models_by_provider.insert(
+            provider_id.clone(),
+            vec!["gpt-5.6-sol".into(), "gpt-5.6-luna".into()],
+        );
+        config
+            .declared_official_models_by_provider
+            .insert(provider_id.clone(), vec![" GPT-5.6-SOL ".into()]);
+
+        let synced = config_with_current_provider_model_sync(
+            &config,
+            vec!["provider-custom-model".into()],
+            true,
+            home.path(),
+        );
+
+        assert_eq!(
+            synced.upstream_models_by_provider[&provider_id],
+            ["provider-custom-model", "gpt-5.6-sol"]
         );
     }
 

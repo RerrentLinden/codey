@@ -155,9 +155,13 @@ pub struct CodeyConfig {
     /// deleted from Codey's saved support list.
     #[serde(default)]
     pub manual_third_party_models_by_provider: BTreeMap<String, Vec<String>>,
-    /// Last synchronized or manually confirmed provider model support. This
-    /// keeps unsupported official models disabled between launches and lets
-    /// providers without a model-list endpoint retain manual selections.
+    /// Official model IDs that the user explicitly confirmed as supported by
+    /// each third-party provider. Kept separate from synchronized results so a
+    /// later model-list refresh cannot erase the user's declaration.
+    #[serde(default)]
+    pub declared_official_models_by_provider: BTreeMap<String, Vec<String>>,
+    /// Effective provider model support after combining the last synchronized
+    /// result with user-confirmed model declarations.
     #[serde(default)]
     pub upstream_models_by_provider: BTreeMap<String, Vec<String>>,
     /// Codey-owned default model selection per provider. Empty or unavailable
@@ -226,6 +230,7 @@ impl Default for CodeyConfig {
             user_scripts: Vec::new(),
             selected_models_by_provider: BTreeMap::new(),
             manual_third_party_models_by_provider: BTreeMap::new(),
+            declared_official_models_by_provider: BTreeMap::new(),
             upstream_models_by_provider: BTreeMap::new(),
             default_model_by_provider: BTreeMap::new(),
             disable_trace_log_writes: true,
@@ -268,6 +273,7 @@ impl CodeyConfig {
         }
         normalize_model_lists(&mut self.selected_models_by_provider);
         normalize_model_lists(&mut self.manual_third_party_models_by_provider);
+        normalize_model_lists(&mut self.declared_official_models_by_provider);
         normalize_upstream_model_lists(&mut self.upstream_models_by_provider);
         normalize_model_map(&mut self.default_model_by_provider);
         self.subagent_model = self.subagent_model.trim().to_string();
@@ -313,6 +319,13 @@ impl CodeyConfig {
     pub fn manual_third_party_models(&self) -> &[String] {
         self.current_provider_id()
             .and_then(|provider_id| self.manual_third_party_models_by_provider.get(provider_id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn declared_official_models(&self) -> &[String] {
+        self.current_provider_id()
+            .and_then(|provider_id| self.declared_official_models_by_provider.get(provider_id))
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
@@ -570,6 +583,10 @@ mod tests {
             provider_id.clone(),
             vec!["UPSTREAM-A".to_string(), "upstream-a".to_string()],
         );
+        config.declared_official_models_by_provider.insert(
+            provider_id.clone(),
+            vec![" GPT-5.6-SOL ".to_string(), "gpt-5.6-sol".to_string()],
+        );
 
         let normalized = config.normalize();
 
@@ -580,6 +597,10 @@ mod tests {
         assert_eq!(
             normalized.upstream_models_by_provider[&provider_id],
             ["UPSTREAM-A"]
+        );
+        assert_eq!(
+            normalized.declared_official_models_by_provider[&provider_id],
+            ["GPT-5.6-SOL"]
         );
     }
 
