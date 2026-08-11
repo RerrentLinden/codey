@@ -1476,7 +1476,15 @@ mod restart_tests {
                 "default_reasoning_effort": "low",
             })
         );
-        assert_eq!(catalog["model_metadata"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            catalog["model_metadata"][5],
+            json!({
+                "model": "provider-fast-coder",
+                "supported_reasoning_efforts": ["low", "medium", "high", "xhigh"],
+                "default_reasoning_effort": "low",
+            })
+        );
+        assert_eq!(catalog["model_metadata"].as_array().unwrap().len(), 6);
     }
 
     #[test]

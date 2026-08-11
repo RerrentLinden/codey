@@ -602,6 +602,36 @@ test("catalog model metadata overrides stale native reasoning efforts", async ()
   patch.dispose();
 });
 
+test("third-party metadata replaces a stale high-only native descriptor", async () => {
+  const client = statsigClient();
+  const queryClient = activeModelQueryClient(["provider-fast-coder"]);
+  const stale = queryClient.model("provider-fast-coder");
+  stale.defaultReasoningEffort = "high";
+  stale.supportedReasoningEfforts = [{
+    reasoningEffort: "high",
+    description: "high effort",
+  }];
+
+  const { patch } = await loadPatch({
+    status: "ok",
+    models: ["provider-fast-coder"],
+    default_model: "provider-fast-coder",
+    model_metadata: [{
+      model: "provider-fast-coder",
+      supported_reasoning_efforts: ["low", "medium", "high", "xhigh"],
+      default_reasoning_effort: "low",
+    }],
+  }, [client], { queryClient });
+
+  const repaired = queryClient.model("provider-fast-coder");
+  assert.deepEqual(
+    repaired.supportedReasoningEfforts.map((effort) => effort.reasoningEffort),
+    ["low", "medium", "high", "xhigh"],
+  );
+  assert.equal(repaired.defaultReasoningEffort, "low");
+  patch.dispose();
+});
+
 test("a refresh applies changed reasoning metadata when model ids stay unchanged", async () => {
   const client = statsigClient();
   const queryClient = activeModelQueryClient(["gpt-5.6-sol"]);

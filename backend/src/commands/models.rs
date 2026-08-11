@@ -803,6 +803,14 @@ pub(super) fn renderer_model_catalog_value(
                 "default_reasoning_effort": model.default_reasoning_effort,
             })
         })
+        .chain(model_state.third_party_models.iter().map(|model| {
+            json!({
+                "model": model,
+                "supported_reasoning_efforts": model_catalog::THIRD_PARTY_REASONING_EFFORTS,
+                "default_reasoning_effort":
+                    model_catalog::THIRD_PARTY_DEFAULT_REASONING_EFFORT,
+            })
+        }))
         .collect::<Vec<_>>();
     let active_profile = config
         .profiles

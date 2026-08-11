@@ -16,7 +16,8 @@ const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 // require an explicit `v2` marker, so Codey backports the newer
 // "anything except disabled" catalog semantics for them.
 const LEAF_SUBAGENT_MIN_CLIENT_VERSION: &str = "0.147.0-alpha.8";
-const ALLOWED_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+pub(crate) const THIRD_PARTY_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+pub(crate) const THIRD_PARTY_DEFAULT_REASONING_EFFORT: &str = "low";
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
 const OFFICIAL_MODELS: [(&str, &str); 7] = [
@@ -751,14 +752,14 @@ fn clamp_reasoning_efforts(model: &mut Value) {
             level
                 .get("effort")
                 .and_then(Value::as_str)
-                .is_some_and(|effort| ALLOWED_REASONING_EFFORTS.contains(&effort))
+                .is_some_and(|effort| THIRD_PARTY_REASONING_EFFORTS.contains(&effort))
         });
     }
     let default = model
         .get("default_reasoning_level")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if !ALLOWED_REASONING_EFFORTS.contains(&default) {
+    if !THIRD_PARTY_REASONING_EFFORTS.contains(&default) {
         model["default_reasoning_level"] = json!("xhigh");
     }
 }
@@ -859,6 +860,13 @@ fn synthetic_model(template: &Value, model_id: &str, index: usize) -> Value {
     model["priority"] = json!(1000 + index);
     model["supported_in_api"] = json!(true);
     model["codey_source"] = json!("third_party");
+    model["default_reasoning_level"] = json!(THIRD_PARTY_DEFAULT_REASONING_EFFORT);
+    model["supported_reasoning_levels"] = Value::Array(
+        THIRD_PARTY_REASONING_EFFORTS
+            .iter()
+            .map(|effort| json!({ "effort": effort }))
+            .collect(),
+    );
     if let Some(object) = model.as_object_mut() {
         object.remove("availability_nux");
         object.remove("upgrade");
@@ -1552,6 +1560,43 @@ mod tests {
                 .iter()
                 .find(|model| model["slug"] == "gpt-5.4")
                 .unwrap(),
+        );
+    }
+
+    #[test]
+    fn third_party_catalog_does_not_inherit_a_high_only_template() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache_with_sol_reasoning_metadata(
+            home.path(),
+            Some(json!([{"effort": "high"}])),
+            Some("high"),
+        );
+        let selected = vec!["provider-fast-coder".into()];
+
+        assert_eq!(
+            refresh_for_provider(
+                home.path(),
+                false,
+                Some(&selected),
+                &selected,
+                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+            )
+            .unwrap(),
+            1
+        );
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let model = &catalog["models"][0];
+        assert_eq!(model["slug"], "provider-fast-coder");
+        assert_eq!(
+            reasoning_efforts_from_value(model),
+            ["low", "medium", "high", "xhigh"]
+        );
+        assert_eq!(
+            model["default_reasoning_level"],
+            THIRD_PARTY_DEFAULT_REASONING_EFFORT
         );
     }
 

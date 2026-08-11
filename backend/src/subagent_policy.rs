@@ -129,10 +129,8 @@ pub(crate) fn reasoning_effort_for_model(
         .third_party_models
         .iter()
         .any(|candidate| model_id::equal(candidate, model))
-        && matches!(
-            preferred_reasoning_effort.as_str(),
-            "low" | "medium" | "high" | "xhigh"
-        )
+        && model_catalog::THIRD_PARTY_REASONING_EFFORTS
+            .contains(&preferred_reasoning_effort.as_str())
     {
         return preferred_reasoning_effort;
     }
