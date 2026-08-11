@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-#[cfg(test)]
+#[cfg(all(test, windows))]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -2409,6 +2409,7 @@ mod tests {
         assert!(should_refresh_model_catalog(&state));
     }
 
+    #[cfg(windows)]
     #[test]
     fn selected_codex_app_path_requires_a_desktop_executable() {
         let directory = tempfile::tempdir().unwrap();
@@ -2422,6 +2423,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn selected_codex_app_path_accepts_a_custom_install_root() {
         let directory = tempfile::tempdir().unwrap();
