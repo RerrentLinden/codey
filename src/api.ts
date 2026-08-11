@@ -1,8 +1,6 @@
 export const CODEY_API_COMMANDS = [
   "load_codey_config",
   "save_codey_config",
-  "pick_codex_app_directory",
-  "set_codex_app_path",
   "sync_current_provider",
   "fetch_current_provider_models",
   "save_selected_models",

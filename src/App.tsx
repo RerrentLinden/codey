@@ -48,14 +48,9 @@ import {
   ConfirmationDialogHost,
   useConfirmationController,
 } from "./useConfirmationDialog";
-import {
-  CodexAppPathDialogHost,
-  useCodexAppPathDialogController,
-} from "./CodexAppPathDialogHost";
 import type {
   AppProps,
   CcSwitchStatus,
-  CodexAppDirectorySelection,
   Config,
   CrashpadCleanup,
   FastContextToolsStatus,
@@ -161,7 +156,7 @@ export function App({
 }: AppProps) {
   const [config, setConfig] = useState<Config | null>(null);
   const persistedConfigRef = useRef<Config | null>(null);
-  const { status, setStatus, refreshStatus, refreshStatusForLoad } =
+  const { status, setStatus, refreshStatusForLoad } =
     useRuntimeStatus({
       active: !embedded || modalVisible,
       embedded,
@@ -181,7 +176,6 @@ export function App({
   const [traceSnapshotStale, setTraceSnapshotStale] = useState(false);
   const noticeController = useAppNoticeController();
   const confirmationController = useConfirmationController();
-  const codexAppPathDialog = useCodexAppPathDialogController();
   const setNotice = noticeController.setNotice;
   const setConfirmation = confirmationController.setConfirmation;
 
@@ -300,7 +294,6 @@ export function App({
         config: Config;
         modelState?: ModelState;
         startupError?: string;
-        codexAppPathSelectionRequired?: boolean;
         ccSwitch?: CcSwitchStatus;
         fastContextToolsStatus?: FastContextToolsStatus;
       }>("load_codey_config");
@@ -315,7 +308,6 @@ export function App({
         refreshPluginMarketplaceStatus(),
       ]);
       const startupError = next.startupError || result.startupError;
-      codexAppPathDialog.setOpen(Boolean(result.codexAppPathSelectionRequired));
       if (startupError) {
         setNotice({ tone: "error", text: `自动启动失败：${startupError}` });
       } else if (next.restartRequired) {
@@ -385,54 +377,6 @@ export function App({
     }
     setDirty(false);
     return result;
-  }
-
-  async function chooseCodexAppDirectory() {
-    if (isBusy) return;
-    setBusy("pick-codex-app-directory");
-    codexAppPathDialog.setError("");
-    try {
-      const result = await invoke<CodexAppDirectorySelection>(
-        "pick_codex_app_directory",
-      );
-      if (result.status === "selected" && result.path) {
-        codexAppPathDialog.setSelectedPath(result.path);
-      }
-    } catch (error) {
-      codexAppPathDialog.setError(errorText(error));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  async function confirmCodexAppPath() {
-    const selectedCodexAppPath =
-      codexAppPathDialog.getSnapshot().selectedPath;
-    if (!selectedCodexAppPath || isBusy) return;
-    setBusy("set-codex-app-path");
-    codexAppPathDialog.setError("");
-    try {
-      const result = await invoke<{
-        config: Config;
-        ccSwitch?: CcSwitchStatus;
-        modelState?: ModelState;
-      }>("set_codex_app_path", { path: selectedCodexAppPath });
-      setPersistedConfig(result.config);
-      if (result.ccSwitch) setCcSwitchStatus(result.ccSwitch);
-      if (result.modelState) setModelState(result.modelState);
-      await invoke("launch_codey");
-      await refreshStatus();
-      codexAppPathDialog.setOpen(false);
-      codexAppPathDialog.setSelectedPath("");
-      setNotice({
-        tone: "success",
-        text: "Codex 应用路径已校验并保存，客户端已启动",
-      });
-    } catch (error) {
-      codexAppPathDialog.setError(errorText(error));
-    } finally {
-      setBusy(null);
-    }
   }
 
   async function syncCurrentProvider() {
@@ -693,16 +637,6 @@ export function App({
   const handleModelPickerOpenChange = useStableEvent((open: boolean) => {
     if (!isBusy || open) setModelPickerVisible(open);
   });
-  const handleCodexAppPathOpenChange = useStableEvent((open: boolean) => {
-    if (!isBusy) codexAppPathDialog.setOpen(open);
-  });
-  const handleChooseCodexAppDirectory = useStableEvent(
-    () => void chooseCodexAppDirectory(),
-  );
-  const handleConfirmCodexAppPath = useStableEvent(
-    () => void confirmCodexAppPath(),
-  );
-
   if (!config || !provider) {
     const loadingContent = (
       <main className="app-shell loading-shell">
@@ -999,18 +933,6 @@ export function App({
         container={portalContainer}
         controller={confirmationController}
       />
-
-      {status.clientPlatform === "windows" && (
-        <CodexAppPathDialogHost
-          controller={codexAppPathDialog}
-          isBusy={isBusy}
-          busy={busy}
-          container={portalContainer}
-          onOpenChange={handleCodexAppPathOpenChange}
-          onChooseDirectory={handleChooseCodexAppDirectory}
-          onConfirm={handleConfirmCodexAppPath}
-        />
-      )}
     </main>
   );
   return embedded ? (

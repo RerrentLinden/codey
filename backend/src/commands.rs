@@ -14,8 +14,9 @@ mod updates;
 mod webhooks;
 
 #[cfg(windows)]
-use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved;
-use codey_runtime_core::app_paths::{build_codex_executable, normalize_codex_app_path};
+use codey_runtime_core::app_paths::{
+    build_codex_executable, normalize_codex_app_path, resolve_codex_app_dir_with_saved,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock, oneshot, watch};
@@ -466,11 +467,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Ok(config) => save_codey_config(state, config).await,
             Err(error) => Err(error),
         },
-        "pick_codex_app_directory" => pick_codex_app_directory().await,
-        "set_codex_app_path" => match string_argument(&args, "path") {
-            Ok(path) => set_codex_app_path(state, path).await,
-            Err(error) => Err(error),
-        },
         "sync_current_provider" => sync_current_provider_command(state).await,
         "fetch_current_provider_models" => fetch_current_provider_models(state).await,
         "save_selected_models" => match (
@@ -544,11 +540,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
 pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
     let config = state.config.read().await.clone();
     let startup_error = state.startup_error.read().await.clone();
-    #[cfg(windows)]
-    let codex_app_path_selection_required =
-        crate::launcher::needs_codex_app_path_selection(startup_error.as_deref());
-    #[cfg(not(windows))]
-    let codex_app_path_selection_required = false;
     let cc_switch = cc_switch::status_from_config(&config);
     let model_state = current_model_state(&config)?;
     let fast_context_tools_status = current_fast_context_tools_status();
@@ -561,7 +552,6 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         "config": public_config,
         "path": state.store.path().to_string_lossy(),
         "startupError": startup_error,
-        "codexAppPathSelectionRequired": codex_app_path_selection_required,
         "ccSwitch": cc_switch,
         "modelState": model_state,
         "fastContextToolsStatus": fast_context_tools_status,
@@ -586,26 +576,6 @@ async fn reveal_notification_channel(
     Ok(json!({"channel": channel}))
 }
 
-async fn pick_codex_app_directory() -> Result<Value, String> {
-    #[cfg(windows)]
-    {
-        let selected = select_codex_app_directory().await?;
-
-        Ok(match selected {
-            Some(path) => json!({
-                "status": "selected",
-                "path": path.to_string_lossy(),
-            }),
-            None => json!({"status": "cancelled"}),
-        })
-    }
-
-    #[cfg(not(windows))]
-    {
-        Err("Codex 应用目录选择仅在 Windows 上提供".to_string())
-    }
-}
-
 #[cfg(windows)]
 async fn select_codex_app_directory() -> Result<Option<PathBuf>, String> {
     tokio::task::spawn_blocking(|| {
@@ -617,6 +587,7 @@ async fn select_codex_app_directory() -> Result<Option<PathBuf>, String> {
     .map_err(|error| format!("打开 Codex 目录选择器失败：{error}"))
 }
 
+#[cfg(windows)]
 fn validate_codex_app_path(path: &str) -> Result<PathBuf, String> {
     let selected = path.trim();
     if selected.is_empty() {
@@ -668,17 +639,6 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
         .map_err(|error| format!("保存 Codex 桌面应用目录失败：{error}"))?;
     *state.config.write().await = config;
     Ok(())
-}
-
-async fn set_codex_app_path(state: &Arc<AppState>, path: String) -> Result<Value, String> {
-    let app_dir = validate_codex_app_path(&path)?;
-    let saved = {
-        let _config_write_guard = state.config_write_lock.lock().await;
-        let mut config = state.config.read().await.clone();
-        config.codex_app_path = app_dir.to_string_lossy().to_string();
-        save_codey_config_locked(state, config).await
-    }?;
-    finish_codey_config_save(state, saved).await
 }
 
 pub async fn save_codey_config(

@@ -153,3 +153,35 @@ test("Windows updates survive shutdown through the native helper", async () => {
   );
   assert.match(updateHelper, /raw_arg\(nsis_install_directory_argument/);
 });
+
+test("Windows missing Codex paths are recovered before Renderer startup", async () => {
+  const [commands, runtime, api, app] = await Promise.all([
+    readFile(new URL("../backend/src/commands.rs", import.meta.url), "utf8")
+      .then(normalizeLineEndings),
+    readFile(
+      new URL("../backend/src/commands/runtime.rs", import.meta.url),
+      "utf8",
+    ).then(normalizeLineEndings),
+    readFile(new URL("../src/api.ts", import.meta.url), "utf8")
+      .then(normalizeLineEndings),
+    readFile(new URL("../src/App.tsx", import.meta.url), "utf8")
+      .then(normalizeLineEndings),
+  ]);
+  const launch = runtime.slice(
+    runtime.indexOf("async fn launch_codey_inner_locked"),
+    runtime.indexOf("pub async fn launch_codey_runtime"),
+  );
+
+  assert.match(launch, /ensure_windows_codex_app_path\(state\)\.await\?/);
+  assert.ok(
+    launch.indexOf("ensure_windows_codex_app_path(state).await?")
+      < launch.indexOf("CodeyRuntime::start"),
+  );
+  assert.match(
+    commands,
+    /FileDialog::new\(\)[\s\S]*选择 Codex 桌面应用安装目录[\s\S]*pick_folder\(\)/,
+  );
+  assert.match(commands, /save_config_to_store\(state, &config\)/);
+  assert.doesNotMatch(api, /pick_codex_app_directory|set_codex_app_path/);
+  assert.doesNotMatch(app, /CodexAppPathDialog|codexAppPathSelectionRequired/);
+});

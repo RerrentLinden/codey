@@ -10,7 +10,6 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     appUpdates,
     notice,
     confirmation,
-    appPathDialog,
     sections,
     modelSelection,
   ] = await Promise.all([
@@ -18,7 +17,6 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     readFile(new URL("src/useAppUpdates.ts", root), "utf8"),
     readFile(new URL("src/useAppNotice.tsx", root), "utf8"),
     readFile(new URL("src/useConfirmationDialog.tsx", root), "utf8"),
-    readFile(new URL("src/CodexAppPathDialogHost.tsx", root), "utf8"),
     Promise.all(
       [
         "OperationsPanel.tsx",
@@ -36,8 +34,7 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   assert.match(notice, /export const NoticeToast = memo\(/);
   assert.match(confirmation, /useSyncExternalStore\(/);
   assert.match(confirmation, /export const ConfirmationDialogHost = memo\(/);
-  assert.match(appPathDialog, /useSyncExternalStore\(/);
-  assert.match(appPathDialog, /export const CodexAppPathDialogHost = memo\(/);
+  assert.doesNotMatch(app, /CodexAppPathDialog/);
   assert.doesNotMatch(app, /async function checkForUpdates\(/);
   assert.match(appUpdates, /export function useAppUpdates/);
   assert.match(appUpdates, /invoke<UpdateCheck>\("check_for_updates"\)/);

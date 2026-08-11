@@ -114,11 +114,6 @@ export type PluginMarketplaceStatus = {
   message?: string;
 };
 
-export type CodexAppDirectorySelection = {
-  status: "selected" | "cancelled";
-  path?: string;
-};
-
 export type CcSwitchStatus = {
   changed: boolean;
   provider: {
