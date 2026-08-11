@@ -29,6 +29,7 @@ import {
   FeaturePolicyCard,
   ModelSection,
   OperationsPanel,
+  PromptOptimizationCard,
 } from "./AppSections";
 import { NotificationChannelsCard } from "./notifications";
 import type { NotificationChannel } from "./notifications";
@@ -784,6 +785,17 @@ export function App({
               subagentModelOptions={subagentModelOptions}
               onConfigChange={handleConfigChange}
               onSubagentOptimizationChange={handleSubagentOptimizationChange}
+            />
+          </div>
+
+          {/* 提示词优化：整行独占排布 */}
+          <div className="full-row-section prompt-optimization-full-section">
+            <PromptOptimizationCard
+              config={config}
+              busy={busy}
+              isBusy={isBusy}
+              container={portalContainer}
+              onConfigChange={handleConfigChange}
             />
           </div>
 

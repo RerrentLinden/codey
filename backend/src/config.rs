@@ -58,6 +58,68 @@ impl ProviderProfile {
     }
 }
 
+/// Standalone OpenAI-compatible Chat Completions settings used by the
+/// prompt-optimization feature. Kept independent of the active provider so
+/// the feature works on the official login route as well. The API key follows
+/// the notification-channel credential pattern: redacted to the renderer,
+/// restored on save, cleared only on explicit request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptOptimizationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub api_key_configured: bool,
+    #[serde(default, skip_serializing)]
+    pub clear_api_key: bool,
+    #[serde(default)]
+    pub model: String,
+    /// Optional custom optimizer instructions. When empty the built-in
+    /// default system prompt is used.
+    #[serde(default)]
+    pub instruction: String,
+}
+
+impl PromptOptimizationConfig {
+    pub(crate) fn normalize(&mut self) {
+        self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
+        self.api_key = self.api_key.trim().to_string();
+        self.api_key_configured = !self.api_key.is_empty();
+        self.clear_api_key = false;
+        self.model = self.model.trim().to_string();
+        self.instruction = self.instruction.trim().to_string();
+    }
+
+    pub fn merge_redacted_secrets(&mut self, previous: &Self) {
+        if self.clear_api_key {
+            self.api_key.clear();
+            self.api_key_configured = false;
+            return;
+        }
+        if !self.api_key.trim().is_empty() || !self.api_key_configured {
+            return;
+        }
+        self.api_key = previous.api_key.clone();
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        let base_url = self.base_url.trim();
+        if base_url.is_empty() {
+            return Ok(());
+        }
+        let url = reqwest::Url::parse(base_url)
+            .map_err(|_| "提示词优化 API 地址不是有效的 HTTP(S) 地址".to_string())?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err("提示词优化 API 地址必须是有效的 HTTP(S) 地址".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum GpuLaunchMode {
@@ -79,6 +141,8 @@ pub struct CodeyConfig {
     #[serde(default)]
     pub webhook: WebhookConfig,
     #[serde(default)]
+    pub prompt_optimization: PromptOptimizationConfig,
+    #[serde(default)]
     pub codex_app_path: String,
     #[serde(default)]
     pub user_scripts: Vec<String>,
@@ -91,9 +155,13 @@ pub struct CodeyConfig {
     /// deleted from Codey's saved support list.
     #[serde(default)]
     pub manual_third_party_models_by_provider: BTreeMap<String, Vec<String>>,
-    /// Last synchronized or manually confirmed provider model support. This
-    /// keeps unsupported official models disabled between launches and lets
-    /// providers without a model-list endpoint retain manual selections.
+    /// Official model IDs that the user explicitly confirmed as supported by
+    /// each third-party provider. Kept separate from synchronized results so a
+    /// later model-list refresh cannot erase the user's declaration.
+    #[serde(default)]
+    pub declared_official_models_by_provider: BTreeMap<String, Vec<String>>,
+    /// Effective provider model support after combining the last synchronized
+    /// result with user-confirmed model declarations.
     #[serde(default)]
     pub upstream_models_by_provider: BTreeMap<String, Vec<String>>,
     /// Codey-owned default model selection per provider. Empty or unavailable
@@ -157,10 +225,12 @@ impl Default for CodeyConfig {
             active_profile_id: profile.id.clone(),
             profiles: vec![profile],
             webhook: WebhookConfig::default(),
+            prompt_optimization: PromptOptimizationConfig::default(),
             codex_app_path: String::new(),
             user_scripts: Vec::new(),
             selected_models_by_provider: BTreeMap::new(),
             manual_third_party_models_by_provider: BTreeMap::new(),
+            declared_official_models_by_provider: BTreeMap::new(),
             upstream_models_by_provider: BTreeMap::new(),
             default_model_by_provider: BTreeMap::new(),
             disable_trace_log_writes: true,
@@ -203,6 +273,7 @@ impl CodeyConfig {
         }
         normalize_model_lists(&mut self.selected_models_by_provider);
         normalize_model_lists(&mut self.manual_third_party_models_by_provider);
+        normalize_model_lists(&mut self.declared_official_models_by_provider);
         normalize_upstream_model_lists(&mut self.upstream_models_by_provider);
         normalize_model_map(&mut self.default_model_by_provider);
         self.subagent_model = self.subagent_model.trim().to_string();
@@ -214,6 +285,7 @@ impl CodeyConfig {
             self.subagent_reasoning_effort = default_subagent_reasoning_effort();
         }
         self.webhook.normalize();
+        self.prompt_optimization.normalize();
         self
     }
 
@@ -247,6 +319,13 @@ impl CodeyConfig {
     pub fn manual_third_party_models(&self) -> &[String] {
         self.current_provider_id()
             .and_then(|provider_id| self.manual_third_party_models_by_provider.get(provider_id))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn declared_official_models(&self) -> &[String] {
+        self.current_provider_id()
+            .and_then(|provider_id| self.declared_official_models_by_provider.get(provider_id))
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
@@ -504,6 +583,10 @@ mod tests {
             provider_id.clone(),
             vec!["UPSTREAM-A".to_string(), "upstream-a".to_string()],
         );
+        config.declared_official_models_by_provider.insert(
+            provider_id.clone(),
+            vec![" GPT-5.6-SOL ".to_string(), "gpt-5.6-sol".to_string()],
+        );
 
         let normalized = config.normalize();
 
@@ -514,6 +597,10 @@ mod tests {
         assert_eq!(
             normalized.upstream_models_by_provider[&provider_id],
             ["UPSTREAM-A"]
+        );
+        assert_eq!(
+            normalized.declared_official_models_by_provider[&provider_id],
+            ["GPT-5.6-SOL"]
         );
     }
 
@@ -727,5 +814,81 @@ mod tests {
             .normalize();
 
         assert!(config.show_account_usage_in_header);
+    }
+
+    #[test]
+    fn prompt_optimization_defaults_to_disabled_for_existing_configs() {
+        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
+            .unwrap()
+            .normalize();
+
+        assert!(!config.prompt_optimization.enabled);
+        assert!(config.prompt_optimization.api_key.is_empty());
+    }
+
+    #[test]
+    fn prompt_optimization_round_trips_without_persisting_clear_flag() {
+        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[],"promptOptimization":{"enabled":true,"baseUrl":" https://api.example.com/v1/ ","apiKey":"sk-secret","model":" gpt-x ","instruction":" 保持简洁 "}}"#)
+            .unwrap()
+            .normalize();
+        let serialized = serde_json::to_value(&config).unwrap();
+
+        assert!(config.prompt_optimization.enabled);
+        assert_eq!(
+            config.prompt_optimization.base_url,
+            "https://api.example.com/v1"
+        );
+        assert_eq!(config.prompt_optimization.api_key, "sk-secret");
+        assert!(config.prompt_optimization.api_key_configured);
+        assert_eq!(config.prompt_optimization.model, "gpt-x");
+        assert_eq!(config.prompt_optimization.instruction, "保持简洁");
+        assert!(
+            serialized["promptOptimization"]
+                .get("clearApiKey")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn redacted_prompt_optimization_key_is_restored_when_other_settings_are_saved() {
+        let previous = CodeyConfig {
+            prompt_optimization: PromptOptimizationConfig {
+                enabled: true,
+                base_url: "https://api.example.com/v1".to_string(),
+                api_key: "sk-secret".to_string(),
+                api_key_configured: true,
+                model: "gpt-x".to_string(),
+                ..PromptOptimizationConfig::default()
+            },
+            ..CodeyConfig::default()
+        };
+        let mut incoming = previous.clone();
+        incoming.prompt_optimization.api_key.clear();
+        incoming
+            .prompt_optimization
+            .merge_redacted_secrets(&previous.prompt_optimization);
+
+        assert_eq!(incoming.prompt_optimization.api_key, "sk-secret");
+    }
+
+    #[test]
+    fn explicit_prompt_optimization_key_clear_does_not_restore_the_previous_secret() {
+        let previous = CodeyConfig {
+            prompt_optimization: PromptOptimizationConfig {
+                api_key: "sk-secret".to_string(),
+                api_key_configured: true,
+                ..PromptOptimizationConfig::default()
+            },
+            ..CodeyConfig::default()
+        };
+        let mut incoming = previous.clone();
+        incoming.prompt_optimization.api_key.clear();
+        incoming.prompt_optimization.clear_api_key = true;
+        incoming
+            .prompt_optimization
+            .merge_redacted_secrets(&previous.prompt_optimization);
+
+        assert!(incoming.prompt_optimization.api_key.is_empty());
+        assert!(!incoming.prompt_optimization.api_key_configured);
     }
 }

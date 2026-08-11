@@ -14,15 +14,27 @@ export type Profile = {
   ccSwitchReadOnly: boolean;
 };
 
+export type PromptOptimizationConfig = {
+  enabled: boolean;
+  baseUrl: string;
+  apiKey: string;
+  apiKeyConfigured: boolean;
+  clearApiKey?: boolean;
+  model: string;
+  instruction: string;
+};
+
 export type Config = {
   settingsRevision: number;
   activeProfileId: string;
   profiles: Profile[];
   webhook: { channels: NotificationChannel[] };
+  promptOptimization: PromptOptimizationConfig;
   codexAppPath: string;
   userScripts: string[];
   selectedModelsByProvider: Record<string, string[]>;
   manualThirdPartyModelsByProvider: Record<string, string[]>;
+  declaredOfficialModelsByProvider: Record<string, string[]>;
   upstreamModelsByProvider: Record<string, string[]>;
   defaultModelByProvider: Record<string, string>;
   disableTraceLogWrites: boolean;
