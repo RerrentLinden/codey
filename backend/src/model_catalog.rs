@@ -619,6 +619,14 @@ fn complete_reasoning_metadata(model: &mut Value, fallbacks: &[&Value]) {
 fn normalize_official_model(model: &mut Value, slug: &str, display_name: &str, priority: usize) {
     model["slug"] = json!(slug);
     model["display_name"] = json!(display_name);
+    if !model
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|description| !description.is_empty())
+    {
+        model["description"] = json!(display_name);
+    }
     model["visibility"] = json!("list");
     model["priority"] = json!(priority);
     model["supported_in_api"] = json!(true);
@@ -740,6 +748,11 @@ fn runtime_compatible_models(models: &[Value]) -> bool {
                 .get("base_instructions")
                 .and_then(Value::as_str)
                 .is_some()
+                && model
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_some_and(|description| !description.is_empty())
         })
 }
 
@@ -1322,6 +1335,64 @@ mod tests {
     }
 
     #[test]
+    fn generated_catalog_fills_missing_or_empty_official_descriptions() {
+        let home = tempfile::tempdir().unwrap();
+        let mut cache = official_cache();
+        let models = cache["models"].as_array_mut().unwrap();
+        models
+            .iter_mut()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap()["description"] = json!("Local Sol description");
+        models
+            .iter_mut()
+            .find(|model| model["slug"] == "gpt-5.5")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("description");
+        models
+            .iter_mut()
+            .find(|model| model["slug"] == "gpt-5.4")
+            .unwrap()["description"] = json!("   ");
+        fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+
+        refresh_for_provider(
+            home.path(),
+            true,
+            None,
+            &[],
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+        )
+        .unwrap();
+
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert!(models.iter().all(|model| {
+            model
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|description| !description.is_empty())
+        }));
+        let sol = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(sol["description"], "Local Sol description");
+        for slug in ["gpt-5.5", "gpt-5.4"] {
+            let model = models.iter().find(|model| model["slug"] == slug).unwrap();
+            assert_eq!(model["description"], model["display_name"]);
+        }
+    }
+
+    #[test]
     fn incomplete_local_reasoning_metadata_is_completed_from_fallback_catalog() {
         let cases = [
             (None, None, "low"),
@@ -1673,10 +1744,39 @@ mod tests {
     }
 
     #[test]
+    fn existing_catalog_without_description_is_not_reused_as_a_runtime_fallback() {
+        let home = tempfile::tempdir().unwrap();
+        let mut catalog = official_cache();
+        for model in catalog["models"].as_array_mut().unwrap() {
+            model["description"] = json!(model["display_name"].as_str().unwrap_or("Model"));
+        }
+        catalog["models"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("description");
+        let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+
+        assert!(!is_available_for_runtime(
+            home.path(),
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION)
+        ));
+    }
+
+    #[test]
     fn legacy_runtime_rejects_a_previous_catalog_without_v2_markers() {
         let home = tempfile::tempdir().unwrap();
         let mut catalog = official_cache();
         for model in catalog["models"].as_array_mut().unwrap() {
+            if !model
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|description| !description.is_empty())
+            {
+                model["description"] = json!(model["slug"].as_str().unwrap_or("Model"));
+            }
             model.as_object_mut().unwrap().remove("multi_agent_version");
         }
         let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
