@@ -1,12 +1,17 @@
 import ReactDOM from "react-dom/client";
 import "../node_modules/@douyinfe/semi-ui/lib/es/_base/base.css";
 import { App } from "./App";
-import appStyles from "./styles.css?inline";
+import coreStyles from "./styles.css?inline";
+import operationsStyles from "./styles.operations.css?inline";
+import modelStyles from "./styles.models.css?inline";
+import featureStyles from "./styles.features.css?inline";
+import diagnosticStyles from "./styles.diagnostics.css?inline";
+import componentStyles from "./styles.components.css?inline";
+import responsiveStyles from "./styles.responsive.css?inline";
 import overlayStyles from "./overlay.css?inline";
 import { codeyApiPath } from "./api";
+import { SETTINGS_OVERLAY_Z_INDEX_CSS } from "./overlay.constants";
 import { SETTINGS_OPENED_EVENT } from "./useRuntimeStatus";
-
-const SETTINGS_OVERLAY_Z_INDEX = "2147483647";
 
 type OverlayController = {
   open: () => void;
@@ -34,18 +39,36 @@ window.__codeyInvokeApi = async (command, args) => {
 };
 
 if (!window.__codeySettingsOverlay) {
-  const componentStyles = window.__codeyComponentStyles ?? "";
+  const injectedComponentStyles = window.__codeyComponentStyles ?? "";
   delete window.__codeyComponentStyles;
   const host = document.createElement("div");
   host.id = "codey-settings-overlay-host";
   host.style.display = "none";
   host.style.setProperty("inset", "0", "important");
   host.style.setProperty("position", "fixed", "important");
-  host.style.setProperty("z-index", SETTINGS_OVERLAY_Z_INDEX, "important");
+  host.style.setProperty(
+    "--codey-settings-overlay-z-index",
+    SETTINGS_OVERLAY_Z_INDEX_CSS,
+  );
+  host.style.setProperty(
+    "z-index",
+    SETTINGS_OVERLAY_Z_INDEX_CSS,
+    "important",
+  );
   host.setAttribute("aria-hidden", "true");
   const shadow = host.attachShadow({ mode: "open" });
   const style = document.createElement("style");
-  style.textContent = `${componentStyles}\n${overlayStyles}\n${appStyles}`;
+  style.textContent = [
+    injectedComponentStyles,
+    overlayStyles,
+    coreStyles,
+    operationsStyles,
+    modelStyles,
+    featureStyles,
+    diagnosticStyles,
+    componentStyles,
+    responsiveStyles,
+  ].join("\n");
   const rootElement = document.createElement("div");
   rootElement.id = "codey-overlay-root";
   const modalContainer = document.createElement("div");

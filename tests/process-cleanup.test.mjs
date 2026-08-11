@@ -5,13 +5,17 @@ import test from "node:test";
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
 test("every shutdown path reaps Codex and Codey process trees", async () => {
-  const [library, launcher, launcherPlatform, commands, cleanup, processTree] =
+  const [library, launcher, launcherProcess, launcherPlatform, commands, cleanup, processTree] =
     await Promise.all([
     readFile(new URL("../backend/src/lib.rs", import.meta.url), "utf8").then(
       normalizeLineEndings,
     ),
     readFile(
       new URL("../backend/src/launcher.rs", import.meta.url),
+      "utf8",
+    ).then(normalizeLineEndings),
+    readFile(
+      new URL("../backend/src/launcher/process.rs", import.meta.url),
       "utf8",
     ).then(normalizeLineEndings),
     readFile(
@@ -31,7 +35,7 @@ test("every shutdown path reaps Codex and Codey process trees", async () => {
       "utf8",
     ).then(normalizeLineEndings),
     ]);
-  const launcherModules = `${launcher}\n${launcherPlatform}`;
+  const launcherModules = `${launcher}\n${launcherProcess}\n${launcherPlatform}`;
 
   const finalShutdown = library.slice(
     library.indexOf("let shutdown_reason = 'runtime: loop"),

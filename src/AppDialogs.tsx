@@ -9,6 +9,12 @@ import {
 } from "@tabler/icons-react";
 
 import type { Confirmation, ModelState } from "./App.types";
+import {
+  filterModelOptions,
+  MODEL_PICKER_PAGE_SIZE,
+  nextVisibleModelCount,
+  visibleModelOptions,
+} from "./modelPickerPagination";
 import { modelKey } from "./modelIds";
 import {
   Badge,
@@ -43,8 +49,6 @@ type ModelPickerDialogProps = {
   onSave: () => void;
 };
 
-const MODEL_PICKER_PAGE_SIZE = 200;
-
 function ModelPickerDialogComponent({
   open,
   isBusy,
@@ -75,14 +79,10 @@ function ModelPickerDialogComponent({
   }, [open]);
   const filteredThirdPartyModels = useMemo(() => {
     if (!open) return [];
-    const query = modelQuery.trim().toLowerCase();
-    if (!query) return thirdPartyModelOptions;
-    return thirdPartyModelOptions.filter((model) =>
-      model.toLowerCase().includes(query)
-    );
+    return filterModelOptions(thirdPartyModelOptions, modelQuery);
   }, [modelQuery, open, thirdPartyModelOptions]);
-  const visibleThirdPartyModels = filteredThirdPartyModels.slice(
-    0,
+  const visibleThirdPartyModels = visibleModelOptions(
+    filteredThirdPartyModels,
     visibleThirdPartyCount,
   );
   const selectedThirdPartyModelKeys = useMemo(
@@ -236,8 +236,8 @@ function ModelPickerDialogComponent({
                 disabled={isBusy}
                 onClick={() =>
                   setVisibleThirdPartyCount((count) =>
-                    Math.min(
-                      count + MODEL_PICKER_PAGE_SIZE,
+                    nextVisibleModelCount(
+                      count,
                       filteredThirdPartyModels.length,
                     )
                   )}

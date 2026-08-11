@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { readAppStyles } from "./helpers/read-app-styles.mjs";
+
 const root = new URL("../", import.meta.url);
 
 test("script injection diagnostics report runtime evidence without continuous polling", async () => {
@@ -28,7 +30,7 @@ test("script injection diagnostics report runtime evidence without continuous po
     readFile(new URL("src/App.types.ts", root), "utf8"),
     readFile(new URL("src/OperationsPanel.tsx", root), "utf8"),
     readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8"),
-    readFile(new URL("src/styles.css", root), "utf8"),
+    readAppStyles(root),
   ]);
 
   assert.match(cdp, /window\.__codeyInjectionStatus/);

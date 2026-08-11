@@ -1,7 +1,6 @@
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -15,7 +14,6 @@ import {
   IconRefresh as RefreshCw,
   IconX,
 } from "@tabler/icons-react";
-import SemiModal from "@douyinfe/semi-ui/lib/es/modal";
 import { invoke } from "./api";
 import {
   formatBytes,
@@ -35,6 +33,7 @@ import {
 import { NotificationChannelsCard } from "./notifications";
 import type { NotificationChannel } from "./notifications";
 import { errorText, withTimeout } from "./appUtils";
+import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { useModelSelection } from "./useModelSelection";
 import { useNotifications } from "./useNotifications";
 import { useRuntimeStatus } from "./useRuntimeStatus";
@@ -48,6 +47,7 @@ import {
   ConfirmationDialogHost,
   useConfirmationController,
 } from "./useConfirmationDialog";
+import { useStableEvent } from "./useStableEvent";
 import type {
   AppProps,
   CcSwitchStatus,
@@ -62,90 +62,12 @@ import { Badge, Button, Button as SaveButton } from "./components/semi";
 
 const Check = IconCheck;
 const X = IconX;
-const SETTINGS_OVERLAY_Z_INDEX = 2147483647;
 const FEEDBACK_GROUP_QR_URL =
   "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev/qr.png";
 const UNKNOWN_FAST_CONTEXT_TOOLS_STATUS: FastContextToolsStatus = {
   userConfigured: false,
   detectionFailed: true,
 };
-
-function CodeyBrandMark() {
-  return (
-    <svg
-      className="config-brand-mark"
-      viewBox="0 0 350 350"
-      aria-hidden="true"
-      focusable="false"
-    >
-      <rect x="0" y="0" width="350" height="350" rx="34" fill="#fff" />
-      <path
-        d="M70 301c-16 0-24-18-13-30l73-77c8-8 8-20 0-28L65 101C50 86 57 61 78 57c9-2 18 1 25 8l91 91c18 18 18 46 0 64l-66 66c-6 6-2 15 7 15h183"
-        fill="none"
-        stroke="currentColor"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-        strokeWidth="22"
-      />
-    </svg>
-  );
-}
-
-type SettingsModalShellProps = {
-  afterClose?: () => void;
-  children: React.ReactNode;
-  container?: HTMLElement | null;
-  header?: React.ReactNode;
-  onCancel: () => void;
-  title?: React.ReactNode;
-  visible: boolean;
-};
-
-function SettingsModalShell({
-  afterClose,
-  children,
-  container,
-  header,
-  onCancel,
-  title,
-  visible,
-}: SettingsModalShellProps) {
-  const headingProps = header === undefined ? { title } : { header };
-  return (
-    <SemiModal
-      {...headingProps}
-      afterClose={afterClose}
-      centered
-      className="codey-settings-modal-layer"
-      closeOnEsc={false}
-      closable={header === undefined}
-      footer={null}
-      getPopupContainer={container ? () => container : undefined}
-      mask
-      maskClosable={false}
-      modalContentClass="codey-settings-modal-content"
-      onCancel={onCancel}
-      visible={visible}
-      width={1040}
-      zIndex={SETTINGS_OVERLAY_Z_INDEX}
-    >
-      {children}
-    </SemiModal>
-  );
-}
-
-function useStableEvent<Args extends unknown[], Result>(
-  callback: (...args: Args) => Result,
-): (...args: Args) => Result {
-  const callbackRef = useRef(callback);
-  useLayoutEffect(() => {
-    callbackRef.current = callback;
-  }, [callback]);
-  return useCallback(
-    (...args: Args) => callbackRef.current(...args),
-    [],
-  );
-}
 
 export function App({
   embedded = false,

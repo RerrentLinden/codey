@@ -670,26 +670,31 @@ test("API and ChatGPT auth share model-aware native service-tier controls", asyn
 });
 
 test("starting or restarting Codex replaces the old runtime with one managed by Codey", async () => {
-  const [runtimeSource, launcherSource, launcherPlatformSource, appSource] =
+  const [runtimeSource, launcherSource, launcherProcessSource, launcherPlatformSource, appSource] =
     await Promise.all([
     readFile(new URL("../backend/src/commands/runtime.rs", import.meta.url), "utf8")
       .then(normalizeLineEndings),
     readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8")
       .then(normalizeLineEndings),
     readFile(
+      new URL("../backend/src/launcher/process.rs", import.meta.url),
+      "utf8",
+    ).then(normalizeLineEndings),
+    readFile(
       new URL("../backend/src/launcher/platform.rs", import.meta.url),
       "utf8",
     ).then(normalizeLineEndings),
     readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
   ]);
-  const launcherModules = `${launcherSource}\n${launcherPlatformSource}`;
+  const launcherModules =
+    `${launcherSource}\n${launcherProcessSource}\n${launcherPlatformSource}`;
   const restartFlow = runtimeSource.slice(
     runtimeSource.indexOf("pub async fn schedule_restart_codey_runtime"),
     runtimeSource.indexOf("pub async fn stop_codey_runtime"),
   );
-  const prepareLaunchFlow = launcherSource.slice(
-    launcherSource.indexOf("async fn prepare_codex_for_launch"),
-    launcherSource.indexOf("fn startup_patch_detail"),
+  const prepareLaunchFlow = launcherProcessSource.slice(
+    launcherProcessSource.indexOf("async fn prepare_codex_for_launch"),
+    launcherProcessSource.indexOf("fn startup_patch_detail"),
   );
 
   assert.match(restartFlow, /runtime_operation\.lock\(\)/);
@@ -726,7 +731,7 @@ test("starting or restarting Codex replaces the old runtime with one managed by 
     /if macos_codex_is_running\(app_dir\)\.await\? \{[\s\S]*?terminate_unix_codex_processes\(app_dir, None, None, None\)[\s\S]*?\.await/,
   );
   assert.doesNotMatch(prepareLaunchFlow, /anyhow::bail!/);
-  assert.match(launcherSource, /build_codex_executable\(app_dir\)/);
+  assert.match(launcherModules, /build_codex_executable\(app_dir\)/);
   assert.match(launcherModules, /owned_unix_codex_process_ids/);
   assert.match(launcherModules, /libc::SIGKILL/);
   assert.doesNotMatch(runtimeSource, /"close_codex"/);

@@ -8,6 +8,7 @@ test("Crashpad pending protection is bounded, allowlisted, and surfaced with Tra
     config,
     launcher,
     commands,
+    diagnosticCommands,
     runtime,
     app,
     diagnostics,
@@ -20,6 +21,10 @@ test("Crashpad pending protection is bounded, allowlisted, and surfaced with Tra
     readFile(new URL("../backend/src/config.rs", import.meta.url), "utf8"),
     readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8"),
     readFile(new URL("../backend/src/commands.rs", import.meta.url), "utf8"),
+    readFile(
+      new URL("../backend/src/commands/diagnostics.rs", import.meta.url),
+      "utf8",
+    ),
     readFile(
       new URL("../backend/src/commands/runtime.rs", import.meta.url),
       "utf8",
@@ -55,14 +60,14 @@ test("Crashpad pending protection is bounded, allowlisted, and surfaced with Tra
   assert.match(commands, /"refresh_diagnostic_storage_stats"/);
   assert.match(commands, /"clear_diagnostic_storage"/);
   assert.match(
-    commands,
+    diagnosticCommands,
     /refresh_diagnostic_storage_stats[\s\S]*?diagnostic_storage_operation\.lock\(\)\.await/,
   );
   assert.doesNotMatch(
-    commands,
+    diagnosticCommands,
     /refresh_diagnostic_storage_stats[\s\S]*?diagnostic_storage_operation\.try_lock\(\)/,
   );
-  assert.match(commands, /"status": if errors\.is_empty\(\) \{ "ok" \} else \{ "partial" \}/);
+  assert.match(diagnosticCommands, /"status": if errors\.is_empty\(\) \{ "ok" \} else \{ "partial" \}/);
   assert.match(runtime, /"crashpadPendingStats"/);
 
   assert.match(app, /invoke<\{[\s\S]*?\}>\("clear_diagnostic_storage"\)/);

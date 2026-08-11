@@ -24,10 +24,11 @@ test("startup renders a loading state until config and provider are ready", asyn
 });
 
 test("error log is failure-only, daily, structured, and cross-process serialized", async () => {
-  const [errorLog, launcher, cdp, commands, runtimeCommands, lib, startupPatch, startupPatchLoader] =
+  const [errorLog, launcher, launcherProcess, cdp, commands, runtimeCommands, lib, startupPatch, startupPatchLoader] =
     await Promise.all([
       source("backend/src/error_log.rs"),
       source("backend/src/launcher.rs"),
+      source("backend/src/launcher/process.rs"),
       source("backend/src/cdp.rs"),
       source("backend/src/commands.rs"),
       source("backend/src/commands/runtime.rs"),
@@ -63,7 +64,7 @@ test("error log is failure-only, daily, structured, and cross-process serialized
     "configure_trace_log_guard",
     "restore_runtime_provider_config",
   ]) {
-    assert.match(launcher, new RegExp(`"${operation}"`));
+    assert.match(`${launcher}\n${launcherProcess}`, new RegExp(`"${operation}"`));
   }
   assert.match(cdp, /"injection_script_failed"/);
   assert.match(cdp, /"injection_status_failed"/);

@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { readAppStyles } from "./helpers/read-app-styles.mjs";
+
 const root = new URL("../", import.meta.url);
 
 test("three-position GPU slider is accessible and disabled on macOS", async () => {
   const [sectionsSource, stylesSource, appSource, previewSource] = await Promise.all([
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
-    readFile(new URL("src/styles.css", root), "utf8"),
+    readAppStyles(root),
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/main.tsx", root), "utf8"),
   ]);

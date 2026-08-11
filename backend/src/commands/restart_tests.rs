@@ -1,0 +1,484 @@
+use super::*;
+
+#[test]
+fn subagent_selection_validation_uses_dynamic_model_state() {
+    let state = model_catalog::ModelSelectionState {
+        subagent_model_ids: vec!["gpt-5.6-luna".into(), "provider-coder".into()],
+        third_party_models: vec!["provider-coder".into()],
+        official_models: vec![model_catalog::OfficialModelAvailability {
+            slug: "gpt-5.6-luna".into(),
+            display_name: "GPT-5.6-Luna".into(),
+            supported: true,
+            supported_reasoning_efforts: vec!["low".into(), "high".into()],
+            default_reasoning_effort: "low".into(),
+        }],
+        ..model_catalog::ModelSelectionState::default()
+    };
+
+    assert!(validate_subagent_model_selection("GPT-5.6-LUNA", &state).is_ok());
+    assert!(validate_subagent_model_selection("provider-coder", &state).is_ok());
+    assert!(
+        validate_subagent_model_selection("gpt-5.6-sol", &state)
+            .unwrap_err()
+            .contains("当前不能用于子代理")
+    );
+}
+
+#[test]
+fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
+    let mut config = CodeyConfig::default();
+    config.profiles[0].cc_switch_provider_id = Some("cc-switch-provider".into());
+    let official_models = [
+        ("gpt-5.6-sol", "GPT-5.6-Sol"),
+        ("gpt-5.6-terra", "GPT-5.6-Terra"),
+        ("gpt-5.6-luna", "GPT-5.6-Luna"),
+        ("gpt-5.5", "GPT-5.5"),
+        ("gpt-5.4", "GPT-5.4"),
+        ("gpt-5.4-mini", "GPT-5.4-Mini"),
+        ("gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark"),
+    ]
+    .into_iter()
+    .map(
+        |(slug, display_name)| model_catalog::OfficialModelAvailability {
+            slug: slug.into(),
+            display_name: display_name.into(),
+            supported: !matches!(slug, "gpt-5.6-terra" | "gpt-5.4-mini"),
+            supported_reasoning_efforts: vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+            ],
+            default_reasoning_effort: "low".into(),
+        },
+    )
+    .collect::<Vec<_>>();
+    let model_state = model_catalog::ModelSelectionState {
+        official_model_ids: official_models
+            .iter()
+            .map(|model| model.slug.clone())
+            .collect(),
+        subagent_model_ids: vec!["gpt-5.6-sol".into()],
+        official_models,
+        third_party_models: vec!["provider-fast-coder".into()],
+        manual_third_party_models: vec!["provider-fast-coder".into()],
+        upstream_models: vec!["provider-fast-coder".into()],
+        default_model: "gpt-5.6-sol".into(),
+    };
+
+    let catalog = renderer_model_catalog_value(&config, &model_state);
+
+    assert_eq!(
+        catalog["models"],
+        json!([
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.3-codex-spark",
+            "provider-fast-coder"
+        ])
+    );
+    assert_eq!(catalog["default_model"], "gpt-5.6-sol");
+    assert_eq!(catalog["model_provider"], "cc-switch-provider");
+    assert_eq!(
+        catalog["model_metadata"][0],
+        json!({
+            "model": "gpt-5.6-sol",
+            "supported_reasoning_efforts": ["low", "medium", "high", "xhigh"],
+            "default_reasoning_effort": "low",
+        })
+    );
+    assert_eq!(
+        catalog["model_metadata"][5],
+        json!({
+            "model": "provider-fast-coder",
+            "supported_reasoning_efforts": ["low", "medium", "high", "xhigh"],
+            "default_reasoning_effort": "low",
+        })
+    );
+    assert_eq!(catalog["model_metadata"].as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn renderer_catalog_uses_applied_route_while_provider_restart_is_pending() {
+    let applied = CodeyConfig::default();
+    let mut current = applied.clone();
+    let mut third_party = crate::config::ProviderProfile::new("第三方线路");
+    third_party.base_url = "https://api.example.test/v1".into();
+    current.active_profile_id = third_party.id.clone();
+    current.profiles.push(third_party);
+
+    assert!(std::ptr::eq(
+        model_catalog_config_for_runtime(&current, Some(&applied)),
+        &applied
+    ));
+}
+
+#[test]
+fn renderer_catalog_uses_current_config_for_model_only_changes() {
+    let applied = CodeyConfig::default();
+    let mut current = applied.clone();
+    let provider_id = current.current_provider_id().unwrap().to_string();
+    current
+        .default_model_by_provider
+        .insert(provider_id, "provider-default".into());
+
+    assert!(std::ptr::eq(
+        model_catalog_config_for_runtime(&current, Some(&applied)),
+        &current
+    ));
+}
+
+#[test]
+fn restart_sensitive_config_changes_are_detected() {
+    let applied = CodeyConfig::default();
+    let applied_models = RuntimeModelConfig::from_config(&applied);
+    let applied_subagent = RuntimeSubagentConfig::from_config(&applied);
+
+    let mut model_change = applied.clone();
+    let provider_id = model_change.current_provider_id().unwrap().to_string();
+    model_change
+        .selected_models_by_provider
+        .insert(provider_id, vec!["third-party-model".into()]);
+    assert!(config_requires_restart(
+        &applied,
+        &applied_models,
+        &applied_subagent,
+        &model_change
+    ));
+    assert!(!config_requires_restart(
+        &applied,
+        &RuntimeModelConfig::from_config(&model_change),
+        &applied_subagent,
+        &model_change
+    ));
+
+    let mut default_model_change = applied.clone();
+    let provider_id = default_model_change
+        .current_provider_id()
+        .unwrap()
+        .to_string();
+    default_model_change
+        .default_model_by_provider
+        .insert(provider_id, "provider-default".into());
+    assert!(config_requires_restart(
+        &applied,
+        &applied_models,
+        &applied_subagent,
+        &default_model_change
+    ));
+    assert!(!config_requires_restart(
+        &applied,
+        &RuntimeModelConfig::from_config(&default_model_change),
+        &applied_subagent,
+        &default_model_change
+    ));
+
+    let mut gpu_mode_change = applied.clone();
+    gpu_mode_change.gpu_launch_mode = crate::config::GpuLaunchMode::DisableGpuRasterization;
+    assert!(config_requires_restart(
+        &applied,
+        &applied_models,
+        &applied_subagent,
+        &gpu_mode_change
+    ));
+
+    let mut account_usage_change = applied.clone();
+    account_usage_change.show_account_usage_in_header = true;
+    assert!(!config_requires_restart(
+        &applied,
+        &applied_models,
+        &applied_subagent,
+        &account_usage_change
+    ));
+
+    let mut fast_startup_change = applied.clone();
+    fast_startup_change.fast_codex_startup = !fast_startup_change.fast_codex_startup;
+    assert!(config_requires_restart(
+        &applied,
+        &applied_models,
+        &applied_subagent,
+        &fast_startup_change
+    ));
+
+    let mut disabled_subagent_change = applied.clone();
+    disabled_subagent_change.subagent_model = "gpt-5.6-sol".into();
+    assert!(!config_requires_restart(
+        &applied,
+        &applied_models,
+        &applied_subagent,
+        &disabled_subagent_change
+    ));
+
+    let mut enabled_subagents = applied.clone();
+    enabled_subagents.subagent_optimization = true;
+    let enabled_models = RuntimeModelConfig::from_config(&enabled_subagents);
+    let enabled_subagent = RuntimeSubagentConfig::from_config(&enabled_subagents);
+    let mut changed_subagent = enabled_subagents.clone();
+    changed_subagent.subagent_model = "gpt-5.6-sol".into();
+    changed_subagent.subagent_reasoning_effort = "high".into();
+    assert!(config_requires_restart(
+        &enabled_subagents,
+        &enabled_models,
+        &enabled_subagent,
+        &changed_subagent
+    ));
+    assert!(!config_requires_restart(
+        &enabled_subagents,
+        &enabled_models,
+        &RuntimeSubagentConfig::from_config(&changed_subagent),
+        &changed_subagent
+    ));
+}
+
+#[tokio::test]
+async fn shutdown_cancels_a_restart_waiting_for_the_runtime_lock() {
+    let state = Arc::new(AppState::default());
+    let _operation = state.runtime_operation.lock().await;
+    let response = schedule_restart_codey_runtime(&state).await.unwrap();
+    assert_eq!(response["status"], "restarting");
+    tokio::time::sleep(Duration::from_millis(275)).await;
+
+    tokio::time::timeout(Duration::from_secs(1), begin_shutdown(&state))
+        .await
+        .expect("shutdown waited on a restart blocked by the runtime lock");
+
+    assert!(state.is_shutting_down());
+    assert!(!state.restart_in_progress.load(Ordering::Acquire));
+    assert!(state.restart_task.lock().await.is_none());
+}
+
+#[tokio::test]
+async fn shutdown_rejects_new_runtime_launches_and_restarts() {
+    let state = Arc::new(AppState::default());
+    begin_shutdown(&state).await;
+
+    assert!(
+        launch_codey_inner(&state)
+            .await
+            .unwrap_err()
+            .contains("正在退出")
+    );
+    assert!(
+        schedule_restart_codey_runtime(&state)
+            .await
+            .unwrap_err()
+            .contains("正在退出")
+    );
+}
+
+#[test]
+fn live_config_changes_do_not_require_restart() {
+    let applied = CodeyConfig::default();
+    let applied_models = RuntimeModelConfig::from_config(&applied);
+    let applied_subagent = RuntimeSubagentConfig::from_config(&applied);
+    let mut current = applied.clone();
+    current.webhook.channels.push(NotificationChannelConfig {
+        url: "https://example.test/webhook".into(),
+        ..NotificationChannelConfig::default()
+    });
+    current.disable_trace_log_writes = !current.disable_trace_log_writes;
+    current.protect_crashpad_pending = !current.protect_crashpad_pending;
+
+    assert!(!config_requires_restart(
+        &applied,
+        &applied_models,
+        &applied_subagent,
+        &current
+    ));
+}
+
+#[tokio::test]
+async fn runtime_status_does_not_wait_for_a_lifecycle_operation() {
+    let state = Arc::new(AppState::default());
+    let _operation = state.runtime_operation.lock().await;
+
+    let status = tokio::time::timeout(Duration::from_millis(100), runtime_status(&state))
+        .await
+        .expect("runtime status should not wait for the lifecycle operation lock")
+        .unwrap();
+
+    assert_eq!(status["running"], false);
+}
+
+#[tokio::test]
+async fn runtime_status_exposes_cached_available_update() {
+    let state = Arc::new(AppState::default());
+    *state.available_update.write().await = Some(UpdateCheck {
+        current_version: "1.0.0".to_string(),
+        latest_version: "2.0.0".to_string(),
+        update_available: true,
+        selected_asset: None,
+    });
+
+    let status = runtime_status(&state).await.unwrap();
+
+    assert_eq!(status["availableUpdate"]["currentVersion"], "1.0.0");
+    assert_eq!(status["availableUpdate"]["latestVersion"], "2.0.0");
+    assert_eq!(status["availableUpdate"]["updateAvailable"], true);
+}
+
+#[test]
+fn successful_startup_model_sync_filters_unsupported_models() {
+    let mut config = CodeyConfig::default();
+    let provider_id = config.current_provider_id().unwrap().to_string();
+    config.selected_models_by_provider.insert(
+        provider_id,
+        vec!["provider-fast-coder".into(), "provider-missing".into()],
+    );
+    let synced = config_with_current_provider_models(
+        &config,
+        vec!["gpt-5.6-sol".into(), "provider-fast-coder".into()],
+    );
+    let home = tempfile::tempdir().unwrap();
+
+    let state = model_catalog::selection_state(
+        home.path(),
+        false,
+        synced.upstream_models_snapshot(),
+        synced.selected_models(),
+        synced.default_model(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        state
+            .official_models
+            .iter()
+            .filter(|model| model.supported)
+            .map(|model| model.slug.as_str())
+            .collect::<Vec<_>>(),
+        ["gpt-5.6-sol"]
+    );
+    assert_eq!(state.third_party_models, ["provider-fast-coder"]);
+}
+
+#[test]
+fn failed_startup_model_sync_falls_back_to_exactly_seven_models() {
+    let mut config = CodeyConfig::default();
+    let provider_id = config.current_provider_id().unwrap().to_string();
+    config
+        .selected_models_by_provider
+        .insert(provider_id.clone(), vec!["provider-fast-coder".into()]);
+    config
+        .default_model_by_provider
+        .insert(provider_id, "provider-fast-coder".into());
+    let expected = model_catalog::default_official_model_slugs();
+    let (fallback_models, synced) = startup_model_sync_models_or_fallback(Vec::new(), None);
+    assert!(!synced);
+    assert_eq!(fallback_models, expected);
+    let fallback = config_with_current_provider_models(&config, fallback_models);
+    let home = tempfile::tempdir().unwrap();
+
+    let state = model_catalog::selection_state(
+        home.path(),
+        false,
+        fallback.upstream_models_snapshot(),
+        fallback.selected_models(),
+        fallback.default_model(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        state
+            .official_models
+            .iter()
+            .filter(|model| model.supported)
+            .map(|model| model.slug.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(state.third_party_models.is_empty());
+    assert_eq!(state.default_model, "gpt-5.6-sol");
+}
+
+#[test]
+fn failed_startup_model_sync_preserves_a_saved_manual_selection() {
+    let saved = vec!["gpt-5.6-luna".into(), "provider-manual-model".into()];
+
+    let (fallback_models, synced) = startup_model_sync_models_or_fallback(Vec::new(), Some(&saved));
+
+    assert!(!synced);
+    assert_eq!(fallback_models, saved);
+}
+
+#[test]
+fn successful_model_sync_preserves_user_confirmed_other_models() {
+    let merged = preserve_selected_third_party_models(
+        vec!["gpt-5.6-sol".into(), "provider-listed".into()],
+        &[
+            "provider-manual".into(),
+            "provider-listed".into(),
+            "gpt-5.4".into(),
+        ],
+    );
+
+    assert_eq!(
+        merged,
+        ["gpt-5.6-sol", "provider-listed", "provider-manual",]
+    );
+}
+
+#[test]
+fn manual_model_selection_deletion_removes_saved_other_model_support() {
+    let official = model_catalog::default_official_model_slugs();
+    let deleted =
+        validate_deleted_third_party_models(&official, &["provider-manual".into()]).unwrap();
+    let mut supported_models = vec!["gpt-5.6-sol".into()];
+
+    preserve_selected_third_party_models_except(
+        &mut supported_models,
+        &[
+            "provider-listed".into(),
+            "provider-manual".into(),
+            "gpt-5.4".into(),
+        ],
+        &deleted,
+    );
+    preserve_selected_third_party_models_except(
+        &mut supported_models,
+        &["provider-listed".into()],
+        &std::collections::HashSet::new(),
+    );
+
+    assert_eq!(supported_models, ["gpt-5.6-sol", "provider-listed"]);
+}
+
+#[test]
+fn manual_model_selection_deletion_rejects_official_models() {
+    let official = model_catalog::default_official_model_slugs();
+
+    let error =
+        validate_deleted_third_party_models(&official, &[" GPT-5.6-SOL ".into()]).unwrap_err();
+
+    assert!(error.contains("官方模型"));
+}
+
+#[test]
+fn manual_model_selection_separates_official_and_other_models() {
+    let official = model_catalog::default_official_model_slugs();
+
+    let (supported_official, selected_third_party) = validate_manual_model_selection(
+        &official,
+        &["gpt-5.6-luna".into(), "gpt-5.4".into()],
+        &[
+            " provider-manual-model ".into(),
+            "provider-manual-model".into(),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(supported_official, ["gpt-5.6-luna", "gpt-5.4"]);
+    assert_eq!(selected_third_party, ["provider-manual-model"]);
+}
+
+#[test]
+fn manual_model_selection_rejects_official_models_in_the_other_model_input() {
+    let official = model_catalog::default_official_model_slugs();
+
+    let error =
+        validate_manual_model_selection(&official, &[], &[" GPT-5.6-SOL ".into()]).unwrap_err();
+
+    assert!(error.contains("已在官方模型列表中"));
+}

@@ -3,7 +3,7 @@
   color-scheme: light;
   inset: 0 !important;
   position: fixed !important;
-  z-index: 2147483647 !important;
+  z-index: var(--codey-settings-overlay-z-index) !important;
 }
 
 #codey-overlay-root,

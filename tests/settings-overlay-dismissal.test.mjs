@@ -2,25 +2,33 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { readAppStyles } from "./helpers/read-app-styles.mjs";
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
+
 const root = new URL("../", import.meta.url);
 
 test("settings Semi modal dismissal restores unsaved config", async () => {
-  const [appSource, overlaySource, overlayStyles] = await Promise.all([
+  const [appSource, shellSource, overlaySource, overlayStyles] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
+    readFile(new URL("src/SettingsModalShell.tsx", root), "utf8"),
     readFile(new URL("src/overlay.tsx", root), "utf8"),
     readFile(new URL("src/overlay.css", root), "utf8"),
   ]);
+  const { SETTINGS_OVERLAY_Z_INDEX, SETTINGS_OVERLAY_Z_INDEX_CSS } =
+    await loadTypeScriptModule(
+      new URL("../src/overlay.constants.ts", import.meta.url),
+    );
 
   assert.match(
     appSource,
     /function closeSettings\(\) \{[\s\S]*setConfig\(persistedConfigRef\.current\)[\s\S]*setDirty\(false\)[\s\S]*onClose\?\.\(\)/,
   );
   assert.match(
-    appSource,
+    shellSource,
     /import SemiModal from "@douyinfe\/semi-ui\/lib\/es\/modal"/,
   );
   assert.match(
-    appSource,
+    shellSource,
     /<SemiModal[\s\S]*closeOnEsc=\{false\}[\s\S]*closable=\{header === undefined\}[\s\S]*maskClosable=\{false\}[\s\S]*onCancel=\{onCancel\}/,
   );
   assert.match(appSource, /onCancel=\{handleCloseSettings\}/);
@@ -31,12 +39,16 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
   assert.match(overlaySource, /onClose=\{close\}/);
   assert.match(overlaySource, /SETTINGS_OPENED_EVENT \} from "\.\/useRuntimeStatus"/);
   assert.match(overlaySource, /toggle: open/);
-  assert.match(appSource, /const SETTINGS_OVERLAY_Z_INDEX = 2147483647/);
-  assert.match(appSource, /zIndex=\{SETTINGS_OVERLAY_Z_INDEX\}/);
-  assert.match(overlaySource, /const SETTINGS_OVERLAY_Z_INDEX = "2147483647"/);
+  assert.equal(SETTINGS_OVERLAY_Z_INDEX, 2_147_483_647);
+  assert.equal(SETTINGS_OVERLAY_Z_INDEX_CSS, "2147483647");
+  assert.match(
+    shellSource,
+    /import \{ SETTINGS_OVERLAY_Z_INDEX \} from "\.\/overlay\.constants"/,
+  );
+  assert.match(shellSource, /zIndex=\{SETTINGS_OVERLAY_Z_INDEX\}/);
   assert.match(
     overlaySource,
-    /host\.style\.setProperty\("z-index", SETTINGS_OVERLAY_Z_INDEX, "important"\)/,
+    /"z-index",\s*SETTINGS_OVERLAY_Z_INDEX_CSS,\s*"important"/,
   );
   assert.match(
     overlaySource,
@@ -44,7 +56,7 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
   );
   assert.match(
     overlayStyles,
-    /:host \{[\s\S]*z-index:\s*2147483647 !important;/,
+    /:host \{[\s\S]*z-index:\s*var\(--codey-settings-overlay-z-index\) !important;/,
   );
 });
 
@@ -78,7 +90,7 @@ test("settings notice toast is scoped to the settings page", async () => {
   const [appSource, noticeSource, stylesSource] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/useAppNotice.tsx", root), "utf8"),
-    readFile(new URL("src/styles.css", root), "utf8"),
+    readAppStyles(root),
   ]);
 
   assert.match(appSource, /<main[\s\S]*className=\{`app-shell/);

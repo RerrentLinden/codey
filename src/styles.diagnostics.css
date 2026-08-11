@@ -1,0 +1,350 @@
+/* ==========================================================================
+   Trace Log Module (Diagnostics)
+   ========================================================================== */
+
+.trace-card {
+  min-height: 200px;
+  padding: 18px 20px;
+  border-radius: 12px;
+}
+
+.trace-warning {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 12px;
+  border: 1px solid rgba(255, 149, 0, 0.2);
+  border-radius: 8px;
+  background: rgba(255, 149, 0, 0.06);
+  padding: 8px 12px;
+  color: #9a5b0f;
+  font-size: 11px;
+}
+
+.trace-section-title {
+  margin-bottom: 14px;
+}
+
+.trace-module-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.trace-clear-button {
+  color: #d70015 !important;
+  background: rgba(255, 59, 48, 0.07) !important;
+  border: 1px solid rgba(255, 59, 48, 0.18) !important;
+  box-shadow: none !important;
+  transition: all 0.15s ease !important;
+}
+
+.trace-clear-button:hover:not(:disabled) {
+  background: rgba(255, 59, 48, 0.14) !important;
+  border-color: rgba(255, 59, 48, 0.3) !important;
+}
+
+.trace-snapshot-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+  margin-bottom: 16px;
+}
+
+.trace-snapshot-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.trace-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #8e8e93;
+  flex-shrink: 0;
+  transition: all 0.3s ease;
+}
+
+.trace-status-dot.active {
+  background: #34c759;
+  box-shadow: 0 0 0 3px rgba(52, 199, 89, 0.2);
+}
+
+.trace-snapshot-info strong {
+  font-size: 13px;
+  font-weight: 600;
+  color: #1d1d1f;
+}
+
+.trace-snapshot-info span {
+  font-size: 11px;
+  color: #6e6e73;
+}
+
+.trace-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 12px;
+}
+
+.trace-metric-card {
+  position: relative;
+  display: flex;
+  grid-column: span 2;
+  min-width: 0;
+  min-height: 98px;
+  align-items: flex-start;
+  gap: 10px;
+  overflow: hidden;
+  border: 1px solid rgba(0, 0, 0, 0.07);
+  border-radius: 12px;
+  background: #ffffff;
+  padding: 14px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.02);
+  transition: border-color 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              background-color 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.trace-metrics-grid.has-crashpad .trace-metric-card-crashpad-reports,
+.trace-metrics-grid.has-crashpad .trace-metric-card-crashpad-storage {
+  grid-column: span 3;
+}
+
+@media (max-width: 840px) {
+  .trace-metrics-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .trace-metric-card,
+  .trace-metrics-grid.has-crashpad .trace-metric-card-crashpad-reports,
+  .trace-metrics-grid.has-crashpad .trace-metric-card-crashpad-storage {
+    grid-column: span 1;
+  }
+}
+
+@media (max-width: 580px) {
+  .trace-metrics-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.trace-metric-card:hover {
+  transform: translateY(-2px);
+  background: #ffffff;
+  border-color: rgba(0, 0, 0, 0.12);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.06);
+}
+
+.trace-metric-card::after {
+  display: none;
+}
+
+.trace-metric-icon {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.04);
+  color: #48484a;
+  transition: all 0.2s ease;
+}
+
+.trace-metric-card-rows .trace-metric-icon {
+  background: rgba(0, 122, 255, 0.09);
+  color: #007aff;
+}
+.trace-metric-card-rows:hover {
+  border-color: rgba(0, 122, 255, 0.3);
+  box-shadow: 0 6px 16px rgba(0, 122, 255, 0.08);
+}
+
+.trace-metric-card-storage .trace-metric-icon {
+  background: rgba(88, 86, 214, 0.09);
+  color: #5856d6;
+}
+.trace-metric-card-storage:hover {
+  border-color: rgba(88, 86, 214, 0.3);
+  box-shadow: 0 6px 16px rgba(88, 86, 214, 0.08);
+}
+
+.trace-metric-card-content .trace-metric-icon {
+  background: rgba(48, 176, 199, 0.09);
+  color: #30b0c7;
+}
+.trace-metric-card-content:hover {
+  border-color: rgba(48, 176, 199, 0.3);
+  box-shadow: 0 6px 16px rgba(48, 176, 199, 0.08);
+}
+
+.trace-metric-card-crashpad-reports .trace-metric-icon {
+  background: rgba(255, 149, 0, 0.09);
+  color: #ff9500;
+}
+.trace-metric-card-crashpad-reports:hover {
+  border-color: rgba(255, 149, 0, 0.3);
+  box-shadow: 0 6px 16px rgba(255, 149, 0, 0.08);
+}
+
+.trace-metric-card-crashpad-storage .trace-metric-icon {
+  background: rgba(255, 45, 85, 0.09);
+  color: #ff2d55;
+}
+.trace-metric-card-crashpad-storage:hover {
+  border-color: rgba(255, 45, 85, 0.3);
+  box-shadow: 0 6px 16px rgba(255, 45, 85, 0.08);
+}
+
+.trace-metric-content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 3px;
+}
+
+.trace-metric-content span {
+  display: block;
+  color: #6e6e73;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1.3;
+}
+
+.trace-metric-content strong {
+  display: block;
+  color: #1d1d1f;
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+}
+
+.trace-metric-content small {
+  display: block;
+  color: #8e8e93;
+  font-size: 11px;
+  line-height: 1.35;
+  white-space: normal;
+  word-break: break-word;
+}
+
+.trace-empty-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 160px;
+}
+
+.trace-empty {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  text-align: left;
+}
+
+.trace-empty-copy {
+  min-width: 0;
+}
+
+.trace-empty-badge {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  border-radius: 12px;
+  background: rgba(0, 122, 255, 0.06);
+  border: 1px solid rgba(0, 122, 255, 0.12);
+}
+
+.trace-empty-icon {
+  color: var(--mac-blue);
+  display: grid;
+  place-items: center;
+}
+
+.trace-empty-copy h3 {
+  margin: 0 0 4px;
+  font-size: 14px;
+  font-weight: 600;
+  color: #1d1d1f;
+  letter-spacing: -0.01em;
+}
+
+.trace-empty-copy p {
+  margin: 0;
+  font-size: 12px;
+  color: #6e6e73;
+  line-height: 1.4;
+}
+
+.trace-start-btn,
+.trace-start-btn.semi-button {
+  padding: 0 16px !important;
+  height: 34px !important;
+  border: 1px solid #007aff !important;
+  border-radius: 8px !important;
+  background: #007aff !important;
+  background-color: #007aff !important;
+  color: #ffffff !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08) !important;
+}
+
+.trace-start-btn *,
+.trace-start-btn span,
+.trace-start-btn svg,
+.trace-start-btn .semi-button-content,
+.trace-start-btn .semi-button-content-text {
+  color: #ffffff !important;
+  fill: #ffffff !important;
+  stroke: #ffffff !important;
+}
+
+.trace-start-btn:hover:not(:disabled) {
+  background: #0066d6 !important;
+  background-color: #0066d6 !important;
+  border-color: #0066d6 !important;
+  box-shadow: 0 2px 4px rgba(0, 122, 255, 0.2) !important;
+}
+
+.trace-start-btn:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.trace-start-btn:disabled,
+.trace-start-btn.semi-button-disabled {
+  background: rgba(0, 122, 255, 0.08) !important;
+  background-color: rgba(0, 122, 255, 0.08) !important;
+  border: 1px solid rgba(0, 122, 255, 0.25) !important;
+  border-color: rgba(0, 122, 255, 0.25) !important;
+  box-shadow: none !important;
+  opacity: 0.85 !important;
+  cursor: not-allowed !important;
+}
+
+.trace-start-btn:disabled *,
+.trace-start-btn:disabled span,
+.trace-start-btn:disabled svg,
+.trace-start-btn:disabled .semi-button-content,
+.trace-start-btn:disabled .semi-button-content-text,
+.trace-start-btn.semi-button-disabled *,
+.trace-start-btn.semi-button-disabled span,
+.trace-start-btn.semi-button-disabled svg,
+.trace-start-btn.semi-button-disabled .semi-button-content,
+.trace-start-btn.semi-button-disabled .semi-button-content-text {
+  color: #007aff !important;
+  fill: #007aff !important;
+  stroke: #007aff !important;
+}

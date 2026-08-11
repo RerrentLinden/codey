@@ -1,0 +1,184 @@
+use super::*;
+
+#[test]
+fn chat_provider_builds_an_explicit_protocol_proxy_snapshot() {
+    let mut config = CodeyConfig::default();
+    let mut profile = crate::config::ProviderProfile::new("DeepSeek");
+    profile.base_url = "https://relay.example/v1".to_string();
+    profile.api_key = "sk-test".to_string();
+    profile.protocol = RelayProtocol::ChatCompletions;
+    config.active_profile_id = profile.id.clone();
+    config.profiles = vec![profile.clone()];
+    config
+        .default_model_by_provider
+        .insert(profile.id.clone(), "deepseek-reasoner".to_string());
+
+    let settings = protocol_proxy_settings(&profile, config.default_model()).unwrap();
+    let relay = settings.active_relay_profile();
+    assert_eq!(settings.active_relay_id, profile.id);
+    assert_eq!(relay.base_url, "https://relay.example/v1");
+    assert_eq!(relay.api_key, "sk-test");
+    assert_eq!(relay.model, "deepseek-reasoner");
+    assert_eq!(relay.protocol, RelayProtocol::ChatCompletions);
+    assert_eq!(relay.relay_mode, RelayMode::PureApi);
+}
+
+#[test]
+fn responses_provider_does_not_start_a_protocol_proxy() {
+    let mut config = CodeyConfig::default();
+    let mut profile = crate::config::ProviderProfile::new("Responses");
+    profile.base_url = "https://relay.example/v1".to_string();
+    config.active_profile_id = profile.id.clone();
+    config.profiles = vec![profile.clone()];
+
+    assert!(protocol_proxy_settings(&profile, config.default_model()).is_none());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_launch_forces_a_new_app_instance() {
+    let command = build_fresh_macos_open_command(
+        std::path::Path::new("/Applications/ChatGPT.app"),
+        9229,
+        &["--inspect-brk=127.0.0.1:19321".to_string()],
+    );
+    assert_eq!(command.first().map(String::as_str), Some("open"));
+    assert!(command.iter().any(|part| part == "-n"));
+    assert!(command.iter().any(|part| part == "-W"));
+    assert!(
+        command
+            .iter()
+            .any(|part| part == "--remote-debugging-port=9229")
+    );
+    assert!(
+        command
+            .iter()
+            .any(|part| part == "--inspect-brk=127.0.0.1:19321")
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn macos_running_check_does_not_match_an_unrelated_app_path() {
+    let running = macos_codex_is_running(std::path::Path::new(
+        "/Applications/Definitely Not Codex.app",
+    ))
+    .await
+    .unwrap();
+    assert!(!running);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_running_check_matches_only_the_app_main_executable() {
+    let processes = crate::process_tree::parse_unix_process_snapshot(
+        b"100 1 100 Thu Jul 23 19:23:12 2026 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT --remote-debugging-port=9229\n\
+          101 100 100 Thu Jul 23 19:23:13 2026 /Applications/ChatGPT.app/Contents/Resources/codex app-server\n\
+          102 101 102 Thu Jul 23 19:23:14 2026 /Applications/ChatGPT.app/Contents/Frameworks/Chromium Helper\n",
+    );
+    assert!(macos_main_executable_is_running(
+        &processes,
+        Path::new("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+    ));
+    assert!(!macos_main_executable_is_running(
+        &processes[1..],
+        Path::new("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+    ));
+}
+
+#[test]
+fn owned_codex_tree_includes_bundle_helpers_and_external_descendants() {
+    let processes = crate::process_tree::parse_unix_process_snapshot(
+        b"100 1 100 Thu Jul 23 19:23:12 2026 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT --inspect\n\
+          101 100 100 Thu Jul 23 19:23:13 2026 /Applications/ChatGPT.app/Contents/Resources/codex app-server\n\
+          102 101 102 Thu Jul 23 19:23:14 2026 node ./mcp/server.mjs\n\
+          103 1 103 Thu Jul 23 19:23:15 2026 /Applications/ChatGPT.app/Contents/Frameworks/browser_crashpad_handler\n\
+          200 1 200 Thu Jul 23 19:23:16 2026 unrelated\n",
+    );
+    assert_eq!(
+        owned_unix_codex_process_ids(
+            &processes,
+            Path::new("/Applications/ChatGPT.app"),
+            None,
+            None,
+            Some("--inspect"),
+        ),
+        HashSet::from([100, 101, 102, 103])
+    );
+}
+
+#[tokio::test]
+async fn unix_shutdown_terminates_the_spawned_process_group() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "sleep 30 & wait"]);
+    command.process_group(0);
+    let mut child = command.spawn().expect("spawn process tree");
+    let process_id = child.id().expect("child process id");
+
+    terminate_unix_codex_processes(
+        Path::new("/definitely-not-a-real-codex-app"),
+        Some(process_id),
+        Some(process_id),
+        None,
+    )
+    .await
+    .expect("terminate process tree");
+
+    tokio::time::timeout(Duration::from_secs(2), child.wait())
+        .await
+        .expect("root process was left running")
+        .expect("wait for root process");
+}
+
+#[tokio::test]
+async fn exit_watcher_reports_a_naturally_exited_child() {
+    let child = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawn short-lived child");
+    let child = Arc::new(Mutex::new(Some(child)));
+    let exited = Arc::new(AtomicBool::new(false));
+    let (_shutdown, exit_rx, task) = spawn_codex_exit_watcher(child, exited.clone());
+
+    tokio::time::timeout(Duration::from_secs(2), exit_rx)
+        .await
+        .expect("watcher timed out")
+        .expect("watcher was cancelled");
+    task.await.expect("watcher task failed");
+    assert!(exited.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn exit_watcher_returns_the_child_to_stop_on_shutdown() {
+    let child = Command::new("sh")
+        .args(["-c", "sleep 30"])
+        .spawn()
+        .expect("spawn long-lived child");
+    let child = Arc::new(Mutex::new(Some(child)));
+    let exited = Arc::new(AtomicBool::new(false));
+    let (shutdown, _exit_rx, task) = spawn_codex_exit_watcher(child.clone(), exited.clone());
+
+    shutdown.send(()).expect("send watcher shutdown");
+    task.await.expect("watcher task failed");
+
+    assert!(!exited.load(Ordering::Acquire));
+    let mut process = child
+        .lock()
+        .await
+        .take()
+        .expect("watcher should return the child");
+    process.kill().await.expect("kill child");
+    process.wait().await.expect("reap child");
+}
+
+#[test]
+fn cdp_watchdog_requires_consecutive_failures_before_reinjecting() {
+    let mut failures = 0;
+
+    assert!(!watchdog_should_reinject(&mut failures, false));
+    assert_eq!(failures, 1);
+    assert!(!watchdog_should_reinject(&mut failures, true));
+    assert_eq!(failures, 0);
+    assert!(!watchdog_should_reinject(&mut failures, false));
+    assert!(watchdog_should_reinject(&mut failures, false));
+}

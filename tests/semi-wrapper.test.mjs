@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { readAppStyles } from "./helpers/read-app-styles.mjs";
+
 const root = new URL("../", import.meta.url);
 
 test("local badge does not pull the Semi Tag and Avatar dependency chain", async () => {
   const [wrapper, styles] = await Promise.all([
     readFile(new URL("src/components/semi/index.tsx", root), "utf8"),
-    readFile(new URL("src/styles.css", root), "utf8"),
+    readAppStyles(root),
   ]);
 
   assert.doesNotMatch(wrapper, /@douyinfe\/semi-ui\/lib\/es\/tag/);

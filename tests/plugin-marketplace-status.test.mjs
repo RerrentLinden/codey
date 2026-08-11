@@ -6,11 +6,11 @@ const root = new URL("../", import.meta.url);
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
 test("plugin marketplace repair is explicit and status checks stay read-only", async () => {
-  const [marketplaceSource, commandSource, launcherSource, appSource, sectionsSource] =
+  const [marketplaceSource, pluginCommands, launcherSource, appSource, sectionsSource] =
     await Promise.all([
       readFile(new URL("backend/src/plugin_marketplace.rs", root), "utf8")
         .then(normalizeLineEndings),
-      readFile(new URL("backend/src/commands.rs", root), "utf8")
+      readFile(new URL("backend/src/commands/plugins.rs", root), "utf8")
         .then(normalizeLineEndings),
       readFile(new URL("backend/src/launcher.rs", root), "utf8")
         .then(normalizeLineEndings),
@@ -20,11 +20,11 @@ test("plugin marketplace repair is explicit and status checks stay read-only", a
         .then(normalizeLineEndings),
     ]);
 
-  const statusFunction = commandSource.match(
-    /pub async fn plugin_marketplace_status\(\)[\s\S]*?\n}\n\npub async fn repair_plugin_marketplace/,
+  const statusFunction = pluginCommands.match(
+    /pub\(super\) async fn plugin_marketplace_status\(\)[\s\S]*?\n}\n\npub\(super\) async fn repair_plugin_marketplace/,
   )?.[0] || "";
-  const repairFunction = commandSource.match(
-    /pub async fn repair_plugin_marketplace\(\)[\s\S]*?\n}\n\nfn decorate_plugin_marketplace_status/,
+  const repairFunction = pluginCommands.match(
+    /pub\(super\) async fn repair_plugin_marketplace\(\)[\s\S]*?\n}\n\nfn decorate_plugin_marketplace_status/,
   )?.[0] || "";
 
   assert.match(marketplaceSource, /pub fn marketplaces_status\(home: &Path\) -> Value/);

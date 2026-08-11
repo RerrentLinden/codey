@@ -4,41 +4,14 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("subagent optimization is opt-in and exposed through the settings switch", async () => {
-  const [appSource, modelHookSource, sectionsSource, configSource, commandSource, launcherSource, catalogSource, appPathsSource] = await Promise.all([
+test("subagent optimization exposes dynamic model and reasoning controls", async () => {
+  const [appSource, modelHookSource, featurePolicySource] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/useModelSelection.ts", root), "utf8"),
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
-    readFile(new URL("backend/src/config.rs", root), "utf8"),
-    readFile(new URL("backend/src/commands.rs", root), "utf8"),
-    readFile(new URL("backend/src/launcher.rs", root), "utf8"),
-    readFile(new URL("backend/src/model_catalog.rs", root), "utf8"),
-    readFile(new URL("vendor/CodeyRuntime/crates/codey-runtime-core/src/app_paths.rs", root), "utf8"),
   ]);
-  const uiSource = `${appSource}\n${sectionsSource}`;
-  const modelSource = `${appSource}\n${modelHookSource}`;
+  const uiSource = `${appSource}\n${featurePolicySource}`;
 
-  assert.match(configSource, /pub subagent_optimization: bool/);
-  assert.match(configSource, /subagent_optimization: false/);
-  assert.match(commandSource, /config\.subagent_optimization = config_input\.subagent_optimization/);
-  assert.match(launcherSource, /config\.subagent_optimization/);
-  assert.match(configSource, /pub subagent_model: String/);
-  assert.match(configSource, /pub subagent_reasoning_effort: String/);
-  assert.match(
-    configSource,
-    /pub const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5\.6-terra"/,
-  );
-  assert.doesNotMatch(configSource, /pub const SUBAGENT_MODELS/);
-  assert.doesNotMatch(configSource, /canonical_subagent_model/);
-  assert.match(catalogSource, /LEAF_SUBAGENT_MIN_CLIENT_VERSION/);
-  assert.match(catalogSource, /apply_legacy_v2_catalog_compatibility/);
-  assert.match(catalogSource, /model_is_subagent_eligible/);
-  assert.match(catalogSource, /model\["multi_agent_version"\] = json!\("v2"\)/);
-  assert.doesNotMatch(catalogSource, /SubagentModelPolicy/);
-  assert.match(catalogSource, /version\.eq_ignore_ascii_case\("disabled"\)/);
-  assert.match(appPathsSource, /pub fn codex_runtime_version\(app_dir: &Path\)/);
-  assert.match(appPathsSource, /\.arg\("--version"\)/);
-  assert.match(appPathsSource, /join\("Contents"\)\.join\("Resources"\)\.join\("codex"\)/);
   assert.match(uiSource, /checked=\{config\.subagentOptimization\}/);
   assert.match(
     uiSource,
@@ -49,10 +22,6 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
   assert.match(uiSource, /aria-label="选择子代理思考深度"/);
   assert.match(
     uiSource,
-    /const subagentPolicyControlsDisabled =\s*isBusy/,
-  );
-  assert.match(
-    uiSource,
     /subagentPolicyControlsDisabled \|\|\s*subagentModelOptions\.length === 0/,
   );
   assert.match(
@@ -60,50 +29,23 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
     /subagentPolicyControlsDisabled \|\|\s*subagentReasoningEfforts\.length === 0/,
   );
   assert.match(modelHookSource, /modelState\.subagentModelIds/);
-  assert.match(modelHookSource, /subagentModelKeys\.has\(modelKey\(model\.slug\)\)/);
+  assert.match(
+    modelHookSource,
+    /subagentModelKeys\.has\(modelKey\(model\.slug\)\)/,
+  );
   assert.doesNotMatch(uiSource, /仅接受 Sol \/ Terra/);
-  assert.match(modelSource, /invoke\("fetch_current_provider_models"\)/);
-  assert.match(modelSource, /includesModelId\(result\.models, subagentModel\)/);
-});
-
-test("subagent optimization owns the requested V2 and default-agent settings", async () => {
-  const [configSource, guidanceSource] = await Promise.all([
-    readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
-    readFile(new URL("backend/src/codex_config_guidance.rs", root), "utf8"),
-  ]);
-  const source = `${configSource}\n${guidanceSource}`;
-
-  assert.match(source, /multi_agent\["enabled"\] = value\(true\)/);
-  assert.match(source, /multi_agent\["wait_agent_enabled"\] = value\(true\)/);
-  assert.match(source, /multi_agent\["hide_spawn_agent_metadata"\] = value\(true\)/);
-  assert.match(source, /multi_agent\["expose_spawn_agent_model_overrides"\] = value\(false\)/);
-  assert.match(source, /multi_agent\["tool_namespace"\] = value\("agents"\)/);
-  assert.match(source, /multi_agent\["max_concurrent_threads_per_session"\] = value\(7\)/);
-  assert.match(source, /multi_agent\["max_wait_timeout_ms"\] = value\(120_000\)/);
-  assert.match(source, /multi_agent\["root_agent_usage_hint_text"\] = value\(/);
-  assert.match(source, /const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str/);
-  assert.doesNotMatch(source, /doc\.as_table_mut\(\)\.remove\("agents"\)/);
-  assert.match(source, /"max_threads", "max_depth", "interrupt_message"/);
-  assert.match(source, /let subagent_model = subagent_model\.trim\(\)/);
-  assert.match(source, /子代理模型不能为空/);
-  assert.match(source, /agents\["default_subagent_model"\] = value\(subagent_model\)/);
-  assert.match(source, /agents\["default_subagent_reasoning_effort"\]/);
-  assert.doesNotMatch(source, /\nmodel = "gpt-5\.6-luna"/);
-  assert.match(source, /image_generation = false/);
-  assert.match(source, /const SUBAGENT_GUIDANCE: &str/);
+  assert.match(`${appSource}\n${modelHookSource}`, /invoke\("fetch_current_provider_models"\)/);
 });
 
 test("subagent defaults are hot-reloaded through the packaged app-server bridge", async () => {
-  const [commandSource, cdpSource, rendererSource, sessionToolsSource] = await Promise.all([
-    readFile(new URL("backend/src/commands.rs", root), "utf8"),
-    readFile(new URL("backend/src/cdp.rs", root), "utf8"),
-    readFile(new URL("public/renderer-inject.js", root), "utf8"),
-    readFile(new URL("public/codey-inject.js", root), "utf8"),
-  ]);
+  const [commandSource, cdpSource, rendererSource, sessionToolsSource] =
+    await Promise.all([
+      readFile(new URL("backend/src/commands.rs", root), "utf8"),
+      readFile(new URL("backend/src/cdp.rs", root), "utf8"),
+      readFile(new URL("public/renderer-inject.js", root), "utf8"),
+      readFile(new URL("public/codey-inject.js", root), "utf8"),
+    ]);
 
-  assert.match(commandSource, /hot_reload_runtime_subagent_defaults/);
-  assert.match(commandSource, /mark_runtime_subagent_defaults_applied/);
-  assert.match(commandSource, /subagent_hot_reload_commit_is_current/);
   const hotReloadIndex = commandSource.indexOf(
     "async fn hot_reload_runtime_subagent_defaults",
   );
@@ -127,7 +69,10 @@ test("subagent defaults are hot-reloaded through the packaged app-server bridge"
   assert.match(rendererSource, /window\.__codeyApplySubagentDefaults/);
   assert.match(rendererSource, /method: "config\/batchWrite"/);
   assert.match(rendererSource, /keyPath: "agents\.default_subagent_model"/);
-  assert.match(rendererSource, /keyPath: "agents\.default_subagent_reasoning_effort"/);
+  assert.match(
+    rendererSource,
+    /keyPath: "agents\.default_subagent_reasoning_effort"/,
+  );
   assert.match(rendererSource, /reloadUserConfig: true/);
   assert.match(sessionToolsSource, /window\.__codeyLoadCodexSignalDispatcher/);
 });

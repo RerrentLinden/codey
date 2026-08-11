@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
+
 const root = new URL("../", import.meta.url);
 
 test("settings panels keep stable handlers and skip unrelated parent renders", async () => {
@@ -72,30 +74,35 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   }
 });
 
-test("runtime polling preserves stable slices and narrows panel props", async () => {
-  const [app, runtimeHook, runtimeSnapshot, updateCard, featureCard, operations] =
-    await Promise.all([
-      readFile(new URL("src/App.tsx", root), "utf8"),
-      readFile(new URL("src/useRuntimeStatus.ts", root), "utf8"),
-      readFile(new URL("src/runtimeStatusSnapshot.ts", root), "utf8"),
-      readFile(new URL("src/AppUpdateCard.tsx", root), "utf8"),
-      readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
-      readFile(new URL("src/OperationsPanel.tsx", root), "utf8"),
-    ]);
-
-  assert.match(runtimeHook, /reconcileRuntimeStatus/);
-  assert.equal(
-    runtimeHook.match(/reconcileRuntimeStatus\(current, next\)/g)?.length,
-    4,
+test("runtime polling preserves referentially stable status slices", async () => {
+  const { reconcileRuntimeStatus } = await loadTypeScriptModule(
+    new URL("../src/runtimeStatusSnapshot.ts", import.meta.url),
   );
-  assert.match(runtimeSnapshot, /if \(valuesEqual\(current, next\)\) return current/);
-  assert.match(runtimeSnapshot, /current\.traceLogStats/);
-  assert.match(runtimeSnapshot, /current\.injectionScripts/);
-  assert.match(app, /const operationsStatus = useMemo\(/);
-  assert.match(app, /status=\{operationsStatus\}/);
-  assert.match(app, /appVersion=\{status\.appVersion\}/);
-  assert.match(app, /isMacClient=\{status\.clientPlatform === "macos"\}/);
-  assert.doesNotMatch(updateCard, /RuntimeStatus/);
-  assert.doesNotMatch(featureCard, /RuntimeStatus/);
-  assert.match(operations, /type OperationsRuntimeStatus = Pick</);
+  const current = {
+    running: false,
+    appVersion: "1.0.0",
+    maintenance: { sessionStatus: "ready", sessionFilesFixed: 2 },
+    injectionScripts: [{ id: "bridge", status: "effective" }],
+    traceLogStats: { pending: false, rows: 3 },
+    crashpadPendingStats: { pending: false, reports: 1 },
+  };
+
+  const equalSnapshot = structuredClone(current);
+  assert.equal(reconcileRuntimeStatus(current, equalSnapshot), current);
+
+  const changedRoot = reconcileRuntimeStatus(current, {
+    ...structuredClone(current),
+    running: true,
+  });
+  assert.notEqual(changedRoot, current);
+  assert.equal(changedRoot.maintenance, current.maintenance);
+  assert.equal(changedRoot.injectionScripts, current.injectionScripts);
+  assert.equal(changedRoot.traceLogStats, current.traceLogStats);
+  assert.equal(changedRoot.crashpadPendingStats, current.crashpadPendingStats);
+
+  const changedMaintenance = reconcileRuntimeStatus(current, {
+    ...structuredClone(current),
+    maintenance: { sessionStatus: "error", sessionFilesFixed: 2 },
+  });
+  assert.notEqual(changedMaintenance.maintenance, current.maintenance);
 });

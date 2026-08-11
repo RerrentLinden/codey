@@ -4,7 +4,7 @@ import test from "node:test";
 
 async function loadWindowsStartupSource() {
   const [launcher, launcherPlatform] = await Promise.all([
-    readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8"),
+    readFile(new URL("../backend/src/launcher/process.rs", import.meta.url), "utf8"),
     readFile(
       new URL("../backend/src/launcher/platform.rs", import.meta.url),
       "utf8",

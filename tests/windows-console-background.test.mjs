@@ -91,8 +91,8 @@ test("Windows background helpers never create console windows", async () => {
 });
 
 test("Windows packaged Codex exit uses an OS process wait instead of polling snapshots", async () => {
-  const [launcher, coreLauncher] = await Promise.all([
-    readFile(new URL("../backend/src/launcher.rs", import.meta.url), "utf8")
+  const [launcherProcess, coreLauncher] = await Promise.all([
+    readFile(new URL("../backend/src/launcher/process.rs", import.meta.url), "utf8")
       .then(normalizeLineEndings),
     readFile(
       new URL(
@@ -102,9 +102,9 @@ test("Windows packaged Codex exit uses an OS process wait instead of polling sna
       "utf8",
     ).then(normalizeLineEndings),
   ]);
-  const watcher = launcher.slice(
-    launcher.indexOf("#[cfg(windows)]\nfn spawn_codex_exit_watcher"),
-    launcher.indexOf("struct SpawnedCodex"),
+  const watcher = launcherProcess.slice(
+    launcherProcess.indexOf("#[cfg(windows)]\npub(super) fn spawn_codex_exit_watcher"),
+    launcherProcess.indexOf("struct SpawnedCodex"),
   );
 
   assert.match(
