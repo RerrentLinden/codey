@@ -19,7 +19,7 @@ Codey's optional built-in context tool sidecar includes FastCtx.
 
 | Component | Locked version | License | Source or copyright |
 | --- | --- | --- | --- |
-| `fastctx` | 0.2.4 | Apache-2.0 | [yc-duan/fastctx](https://github.com/yc-duan/fastctx); Copyright (c) 2026 yc-duan <dy2958830371@gmail.com> |
+| `fastctx` | 0.2.5 | Apache-2.0 | [yc-duan/fastctx](https://github.com/yc-duan/fastctx); Copyright (c) 2026 yc-duan <dy2958830371@gmail.com> |
 
 FastCtx's Apache License 2.0 text and NOTICE file are preserved in
 `licenses/FastCtx/`.

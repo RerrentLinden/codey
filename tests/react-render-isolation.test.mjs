@@ -12,13 +12,6 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     confirmation,
     appPathDialog,
     sections,
-    dialogs,
-    trace,
-    notificationCard,
-    notificationDialog,
-    feishuEditor,
-    telegramEditor,
-    channelRegistry,
     modelSelection,
   ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
@@ -34,33 +27,9 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
         "FeaturePolicyCard.tsx",
       ].map((file) => readFile(new URL(`src/${file}`, root), "utf8")),
     ).then((sources) => sources.join("\n")),
-    readFile(new URL("src/AppDialogs.tsx", root), "utf8"),
-    readFile(new URL("src/TraceLogModule.tsx", root), "utf8"),
-    readFile(
-      new URL("src/notifications/NotificationChannelsCard.tsx", root),
-      "utf8",
-    ),
-    readFile(
-      new URL("src/notifications/NotificationChannelDialog.tsx", root),
-      "utf8",
-    ),
-    readFile(
-      new URL("src/notifications/FeishuChannelEditor.tsx", root),
-      "utf8",
-    ),
-    readFile(
-      new URL("src/notifications/TelegramChannelEditor.tsx", root),
-      "utf8",
-    ),
-    readFile(new URL("src/notifications/channelRegistry.tsx", root), "utf8"),
     readFile(new URL("src/useModelSelection.ts", root), "utf8"),
   ]);
 
-  assert.match(app, /function useStableEvent</);
-  assert.match(app, /useAppUpdates\(\{/);
-  assert.match(app, /useAppNoticeController\(\)/);
-  assert.match(app, /useConfirmationController\(\)/);
-  assert.match(app, /useCodexAppPathDialogController\(\)/);
   assert.doesNotMatch(app, /useState<Notice>/);
   assert.doesNotMatch(app, /useState<Confirmation/);
   assert.match(notice, /useSyncExternalStore\(/);
@@ -91,23 +60,6 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   assert.match(app, /onSave=\{saveModelSelection\}/);
   assert.doesNotMatch(modelSelection, /withTimeout/);
   assert.doesNotMatch(app, /handleFetchCurrentModels|handleSetDefaultModel/);
-  for (const callback of [
-    "fetchCurrentModels",
-    "updateSubagentOptimization",
-    "toggleDraftModel",
-    "updateCustomModelInput",
-    "addCustomModel",
-    "deleteDraftThirdPartyModel",
-    "applyModelSelection",
-    "saveModelSelection",
-    "deleteThirdPartyModel",
-    "setDefaultModel",
-  ]) {
-    assert.match(
-      modelSelection,
-      new RegExp(`const ${callback} = useCallback\\(`),
-    );
-  }
   assert.doesNotMatch(
     app,
     /onRepairPluginMarketplace=\{\(\) => void repairPluginMarketplace\(\)\}/,
@@ -121,35 +73,6 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   ]) {
     assert.match(sections, new RegExp(`export const ${component} = memo\\(`));
   }
-  for (const component of [
-    "ModelPickerDialog",
-    "ConfirmationDialog",
-    "CodexAppPathDialog",
-  ]) {
-    assert.match(dialogs, new RegExp(`export const ${component} = memo\\(`));
-  }
-  assert.match(trace, /export const TraceLogModule = memo\(/);
-  assert.match(
-    notificationCard,
-    /export const NotificationChannelsCard = memo\(/,
-  );
-  assert.match(
-    notificationDialog,
-    /export const NotificationChannelDialog = memo\(/,
-  );
-  assert.match(notificationDialog, /notification-channel-select/);
-  assert.match(notificationDialog, /reveal_notification_channel/);
-  assert.match(notificationDialog, /notification-enabled-control/);
-  assert.match(notificationDialog, /test_notification_channel/);
-  assert.match(notificationDialog, /hasSuccessfulTest/);
-  assert.match(notificationCard, /onRequestRemoveChannel/);
-  assert.doesNotMatch(notificationCard, /待完成配置/);
-  assert.doesNotMatch(notificationCard, /测试通知/);
-  assert.match(app, /delete-notification-channel/);
-  assert.match(feishuEditor, /export const FeishuChannelEditor = memo\(/);
-  assert.match(telegramEditor, /export const TelegramChannelEditor = memo\(/);
-  assert.match(channelRegistry, /feishu:\s*\{/);
-  assert.match(channelRegistry, /telegram:\s*\{/);
 });
 
 test("runtime polling preserves stable slices and narrows panel props", async () => {

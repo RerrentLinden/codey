@@ -34,7 +34,6 @@ use crate::error_log;
 use crate::maintenance_lock;
 use crate::model_catalog;
 use crate::pet_slim_patch;
-use crate::plugin_marketplace;
 use crate::provider_lease;
 use crate::session_index_cleanup::{self, SessionIndexCleanupReport};
 use crate::startup_maintenance::{self, ProviderSyncPlan};
@@ -86,19 +85,15 @@ mod app_path_selection_tests {
 #[serde(rename_all = "camelCase")]
 pub struct MaintenanceStatus {
     pub session_status: String,
-    pub session_detail: String,
     pub session_files_fixed: usize,
     pub sqlite_rows_updated: usize,
     pub ghost_tasks_pruned: usize,
-    pub plugin_status: String,
-    pub plugin_detail: String,
     pub performance_status: String,
     pub performance_detail: String,
 }
 
 struct SessionMaintenanceSummary {
     status: String,
-    detail: String,
     files_fixed: usize,
     sqlite_rows_updated: usize,
     ghost_tasks_pruned: usize,
@@ -664,48 +659,9 @@ async fn await_initial_storage_guards(
 type PetSlimTaskResult =
     std::result::Result<Result<pet_slim_patch::PetSlimReport>, tokio::task::JoinError>;
 
-async fn read_startup_patch_status(
-    home: &std::path::Path,
-    slim_codex_pet: bool,
-) -> (String, String, PetSlimTaskResult) {
-    let marketplace_home = home.to_path_buf();
-    let marketplace_task = tokio::task::spawn_blocking(move || {
-        plugin_marketplace::marketplaces_status(&marketplace_home)
-    });
+async fn configure_startup_pet(home: &std::path::Path, slim_codex_pet: bool) -> PetSlimTaskResult {
     let pet_home = home.to_path_buf();
-    let pet_task =
-        tokio::task::spawn_blocking(move || pet_slim_patch::configure(&pet_home, slim_codex_pet));
-    let (marketplace_result, pet_result) = tokio::join!(marketplace_task, pet_task);
-    let (plugin_status, plugin_detail) = match marketplace_result {
-        Ok(status)
-            if !status
-                .get("needsRepair")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true) =>
-        {
-            (
-                "ready".to_string(),
-                "插件市场状态正常；启动时未执行修复".to_string(),
-            )
-        }
-        Ok(_) => (
-            "needs_repair".to_string(),
-            "插件市场需要修复；可在 Codey 配置页手动处理".to_string(),
-        ),
-        Err(error) => {
-            error_log::record_failure(
-                "patch_status_failed",
-                "read_plugin_marketplace_status",
-                error.to_string(),
-                serde_json::json!({}),
-            );
-            (
-                "error".to_string(),
-                format!("插件市场状态任务异常退出：{error}"),
-            )
-        }
-    };
-    (plugin_status, plugin_detail, pet_result)
+    tokio::task::spawn_blocking(move || pet_slim_patch::configure(&pet_home, slim_codex_pet)).await
 }
 
 async fn stop_runtime_watcher(
@@ -988,8 +944,6 @@ struct PreparedProviderState {
 }
 
 struct StartupPatchState {
-    plugin_status: String,
-    plugin_detail: String,
     debug_port: u16,
     route_overlay_shutdown: Option<oneshot::Sender<()>>,
     route_overlay_task: Option<tokio::task::JoinHandle<()>>,
@@ -1226,8 +1180,7 @@ async fn prepare_startup_patches_and_overlay(
         };
 
     let slim_codex_pet = config.slim_codex_pet;
-    let (plugin_status, plugin_detail, pet_result) =
-        read_startup_patch_status(home, slim_codex_pet).await;
+    let pet_result = configure_startup_pet(home, slim_codex_pet).await;
     let debug_port = codey_runtime_core::ports::select_packaged_codex_debug_port(9229);
     if let Some(applied_route_files) = applied_route_files {
         let current_route_files = read_route_files(home)
@@ -1276,8 +1229,6 @@ async fn prepare_startup_patches_and_overlay(
         }
     };
     Ok(StartupPatchState {
-        plugin_status,
-        plugin_detail,
         debug_port,
         route_overlay_shutdown,
         route_overlay_task,
@@ -1309,12 +1260,9 @@ async fn spawn_and_inject_runtime(
     };
     let maintenance = MaintenanceStatus {
         session_status: storage.session_maintenance.status,
-        session_detail: storage.session_maintenance.detail,
         session_files_fixed: storage.session_maintenance.files_fixed,
         sqlite_rows_updated: storage.session_maintenance.sqlite_rows_updated,
         ghost_tasks_pruned: storage.session_maintenance.ghost_tasks_pruned,
-        plugin_status: patch.plugin_status.clone(),
-        plugin_detail: patch.plugin_detail.clone(),
         performance_status: spawned.performance_status.clone(),
         performance_detail: spawned.performance_detail.clone(),
     };
@@ -2089,41 +2037,16 @@ fn session_maintenance_summary(
     provider_sync: &ProviderSyncResult,
     index_cleanup: &Result<SessionIndexCleanupReport>,
 ) -> SessionMaintenanceSummary {
-    let mut errors = Vec::new();
-    if provider_sync.status != ProviderSyncStatus::Synced {
-        errors.push(provider_sync.message.clone());
-    }
-    if !provider_sync.skipped_locked_rollout_files.is_empty() {
-        errors.push(format!(
-            "跳过 {} 个被占用的会话文件",
-            provider_sync.skipped_locked_rollout_files.len()
-        ));
-    }
     let pruned_entries = match index_cleanup {
         Ok(report) => report.pruned_entries,
-        Err(error) => {
-            errors.push(format!("幽灵任务索引清理失败：{error}"));
-            0
-        }
+        Err(_) => 0,
     };
-    let mut detail = format!(
-        "已同步到 {}：修复 {} 个会话文件，更新 {} 行数据库索引，清理 {} 条幽灵任务",
-        provider_sync.target_provider,
-        provider_sync.changed_session_files,
-        provider_sync.sqlite_rows_updated,
-        pruned_entries,
-    );
-    if provider_sync.encrypted_content_warning.is_some() {
-        detail.push_str("；检测到跨 Provider 加密历史警告");
-    }
-    if !errors.is_empty() {
-        detail.push('；');
-        detail.push_str(&errors.join("；"));
-    }
-    let status = if errors.is_empty() { "ready" } else { "error" };
+    let has_errors = provider_sync.status != ProviderSyncStatus::Synced
+        || !provider_sync.skipped_locked_rollout_files.is_empty()
+        || index_cleanup.is_err();
+    let status = if has_errors { "error" } else { "ready" };
     SessionMaintenanceSummary {
         status: status.to_string(),
-        detail,
         files_fixed: provider_sync.changed_session_files,
         sqlite_rows_updated: provider_sync.sqlite_rows_updated,
         ghost_tasks_pruned: pruned_entries,
@@ -2442,12 +2365,9 @@ mod maintenance_status_tests {
         let summary = session_maintenance_summary(&provider_sync, &cleanup);
         let status = MaintenanceStatus {
             session_status: summary.status,
-            session_detail: summary.detail,
             session_files_fixed: summary.files_fixed,
             sqlite_rows_updated: summary.sqlite_rows_updated,
             ghost_tasks_pruned: summary.ghost_tasks_pruned,
-            plugin_status: "ready".to_string(),
-            plugin_detail: String::new(),
             performance_status: "ready".to_string(),
             performance_detail: String::new(),
         };
@@ -2456,12 +2376,6 @@ mod maintenance_status_tests {
         assert_eq!(value["sessionFilesFixed"], 3);
         assert_eq!(value["sqliteRowsUpdated"], 7);
         assert_eq!(value["ghostTasksPruned"], 2);
-        assert!(
-            value["sessionDetail"]
-                .as_str()
-                .unwrap()
-                .contains("修复 3 个")
-        );
     }
 }
 

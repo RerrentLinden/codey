@@ -58,6 +58,7 @@ import type {
   CodexAppDirectorySelection,
   Config,
   CrashpadCleanup,
+  FastContextToolsStatus,
   ModelState,
   PluginMarketplaceStatus,
   TraceLogCleanup,
@@ -68,7 +69,11 @@ const Check = IconCheck;
 const X = IconX;
 const SETTINGS_OVERLAY_Z_INDEX = 2147483647;
 const FEEDBACK_GROUP_QR_URL =
-  "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev/qr.jpg";
+  "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev/qr.png";
+const UNKNOWN_FAST_CONTEXT_TOOLS_STATUS: FastContextToolsStatus = {
+  userConfigured: false,
+  detectionFailed: true,
+};
 
 function CodeyBrandMark() {
   return (
@@ -166,6 +171,8 @@ export function App({
   const [ccSwitchStatus, setCcSwitchStatus] = useState<CcSwitchStatus | null>(
     null,
   );
+  const [fastContextToolsStatus, setFastContextToolsStatus] =
+    useState<FastContextToolsStatus>(UNKNOWN_FAST_CONTEXT_TOOLS_STATUS);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [portalContainer, setPortalContainer] = useState<HTMLElement | null>(
@@ -295,9 +302,13 @@ export function App({
         startupError?: string;
         codexAppPathSelectionRequired?: boolean;
         ccSwitch?: CcSwitchStatus;
+        fastContextToolsStatus?: FastContextToolsStatus;
       }>("load_codey_config");
       setPersistedConfig(result.config);
       setCcSwitchStatus(result.ccSwitch ?? null);
+      setFastContextToolsStatus(
+        result.fastContextToolsStatus ?? UNKNOWN_FAST_CONTEXT_TOOLS_STATUS,
+      );
       if (result.modelState) setModelState(result.modelState);
       const [next] = await Promise.all([
         refreshStatusForLoad(),
@@ -353,8 +364,12 @@ export function App({
       restartRequired?: boolean;
       subagentDefaultsHotReloaded?: boolean;
       subagentDefaultsHotReloadError?: string;
+      fastContextToolsStatus?: FastContextToolsStatus;
     }>("save_codey_config", { config: next });
     setPersistedConfig(result.config);
+    setFastContextToolsStatus(
+      result.fastContextToolsStatus ?? UNKNOWN_FAST_CONTEXT_TOOLS_STATUS,
+    );
     window.dispatchEvent(
       new CustomEvent("codey:config-changed", {
         detail: { config: result.config },
@@ -747,7 +762,7 @@ export function App({
             aria-label="问题反馈群，悬浮或聚焦查看二维码"
             className="feedback-group-trigger"
             size="sm"
-            variant="ghost"
+            variant="outline"
           >
             <IconMessageCircleQuestion aria-hidden="true" />
             <span className="feedback-group-label">问题反馈群</span>
@@ -905,7 +920,9 @@ export function App({
           <div className="full-row-section feature-full-section">
             <FeaturePolicyCard
               config={config}
+              fastContextToolsStatus={fastContextToolsStatus}
               isMacClient={status.clientPlatform === "macos"}
+              tooltipContainer={portalContainer}
               busy={busy}
               isBusy={isBusy}
               subagentModelOptions={subagentModelOptions}

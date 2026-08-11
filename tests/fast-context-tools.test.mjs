@@ -4,9 +4,16 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("FastCtx optimization is opt-in and exposed through the settings switch", async () => {
-  const [appSource, sectionsSource, configSource, commandSource] = await Promise.all([
+test("user FastCtx blocks embedded tools across the backend and settings", async () => {
+  const [
+    appSource,
+    appTypesSource,
+    sectionsSource,
+    configSource,
+    commandSource,
+  ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
+    readFile(new URL("src/App.types.ts", root), "utf8"),
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
     readFile(new URL("backend/src/config.rs", root), "utf8"),
     readFile(new URL("backend/src/commands.rs", root), "utf8"),
@@ -15,13 +22,17 @@ test("FastCtx optimization is opt-in and exposed through the settings switch", a
 
   assert.match(configSource, /pub fast_context_tools: bool/);
   assert.match(configSource, /fast_context_tools: false/);
-  assert.match(commandSource, /config\.fast_context_tools = config_input\.fast_context_tools/);
-  assert.match(uiSource, /checked=\{config\.fastContextTools\}/);
-  assert.match(uiSource, /<strong>FastCtx 上下文工具<\/strong>/);
-  assert.match(uiSource, /<Badge variant="secondary">v0\.2\.4<\/Badge>/);
+  assert.match(appTypesSource, /export type FastContextToolsStatus = \{[\s\S]*userConfigured: boolean;[\s\S]*detectionFailed: boolean;[\s\S]*serverId\?: string;/);
+  assert.match(commandSource, /fastContextToolsStatus/);
+  assert.match(commandSource, /embedded_fast_context_tools_enabled\([\s\S]*config_input\.fast_context_tools/);
+  assert.doesNotMatch(commandSource, /current_fast_context_tools_status\(\)\?/);
+  assert.match(appSource, /setFastContextToolsStatus\([\s\S]*result\.fastContextToolsStatus/);
+  assert.match(uiSource, /const fastContextToolsEnabled =\s*config\.fastContextTools && !fastctxStatusBlocksEmbedded/);
+  assert.match(uiSource, /checked=\{fastContextToolsEnabled\}/);
+  assert.match(uiSource, /disabled=\{isBusy \|\| fastctxStatusBlocksEmbedded\}/);
   assert.match(uiSource, /aria-label="启用 FastCtx 上下文工具"/);
-  assert.match(uiSource, /优先复用已配置的 FastCtx；未配置时加载 Codey 内置工具/);
-  assert.doesNotMatch(uiSource, /下次启动提供分页读取、搜索、文件发现与批量替换/);
+  assert.match(uiSource, /<Tooltip[\s\S]*content=\{fastctxBlockedReason\}[\s\S]*getPopupContainer=\{\(\) => tooltipContainer \?\? document\.body\}/);
+  assert.match(uiSource, /className="fastctx-disabled-switch-tooltip"[\s\S]*tabIndex=\{0\}/);
 });
 
 test("Codey keeps FastCtx in the dedicated sidecar", async () => {
@@ -33,7 +44,6 @@ test("Codey keeps FastCtx in the dedicated sidecar", async () => {
     readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
   ]);
 
-  assert.match(manifest, /fastctx = \{ git = "https:\/\/github\.com\/yc-duan\/fastctx", rev = "86dac0c99efae7859ed2be468f68c16e58f5e16a", default-features = false \}/);
   assert.match(manifest, /name = "codey-fastctx"/);
   assert.match(sidecarSource, /fastctx::cli::run_server/);
   assert.match(sidecarSource, /fastctx::cli::run\(\)/);
@@ -48,4 +58,7 @@ test("Codey keeps FastCtx in the dedicated sidecar", async () => {
   assert.match(configPatchSource, /CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx"/);
   assert.match(configPatchSource, /CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx"/);
   assert.match(configPatchSource, /FASTCTX_TOKEN_BUDGET/);
+  assert.match(configPatchSource, /configured_user_fastctx_server_id\(doc\)\.is_some\(\)[\s\S]*disable_fast_context_tools\(doc\);[\s\S]*return Ok\(None\)/);
+  assert.match(configPatchSource, /persist_previous_fastctx_guidance_migration/);
+  assert.match(configPatchSource, /remove_previous_codey_fastctx_guidance/);
 });

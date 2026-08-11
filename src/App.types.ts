@@ -56,14 +56,17 @@ export type ModelState = {
   defaultModel: string;
 };
 
+export type FastContextToolsStatus = {
+  userConfigured: boolean;
+  detectionFailed: boolean;
+  serverId?: string;
+};
+
 export type Maintenance = {
   sessionStatus?: string;
-  sessionDetail?: string;
   sessionFilesFixed?: number;
   sqliteRowsUpdated?: number;
   ghostTasksPruned?: number;
-  pluginStatus?: string;
-  pluginDetail?: string;
   performanceStatus?: string;
   performanceDetail?: string;
 };

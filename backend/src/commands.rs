@@ -63,7 +63,10 @@ use webhooks::{
 use crate::account_usage;
 use crate::cc_switch;
 use crate::cdp;
-use crate::codex_config::{codex_home, mark_runtime_subagent_defaults_applied};
+use crate::codex_config::{
+    FastContextToolsStatus, codex_home, fast_context_tools_status,
+    mark_runtime_subagent_defaults_applied,
+};
 use crate::config::{CodeyConfig, ConfigStore};
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
@@ -548,7 +551,12 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
     let codex_app_path_selection_required = false;
     let cc_switch = cc_switch::status_from_config(&config);
     let model_state = current_model_state(&config)?;
-    let public_config = redacted_config(&config);
+    let fast_context_tools_status = current_fast_context_tools_status();
+    let mut public_config = redacted_config(&config);
+    public_config.fast_context_tools = embedded_fast_context_tools_enabled(
+        public_config.fast_context_tools,
+        &fast_context_tools_status,
+    );
     Ok(json!({
         "config": public_config,
         "path": state.store.path().to_string_lossy(),
@@ -556,6 +564,7 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         "codexAppPathSelectionRequired": codex_app_path_selection_required,
         "ccSwitch": cc_switch,
         "modelState": model_state,
+        "fastContextToolsStatus": fast_context_tools_status,
     }))
 }
 
@@ -687,6 +696,7 @@ struct SavedCodeyConfig {
     config: CodeyConfig,
     restart_required: bool,
     refresh_subagent_defaults: bool,
+    fast_context_tools_status: FastContextToolsStatus,
 }
 
 async fn save_codey_config_locked(
@@ -711,7 +721,11 @@ async fn save_codey_config_locked(
     config.protect_crashpad_pending = config_input.protect_crashpad_pending;
     config.slim_codex_pet = config_input.slim_codex_pet;
     config.gpu_launch_mode = config_input.gpu_launch_mode;
-    config.fast_context_tools = config_input.fast_context_tools;
+    let fast_context_tools_status = current_fast_context_tools_status();
+    config.fast_context_tools = embedded_fast_context_tools_enabled(
+        config_input.fast_context_tools,
+        &fast_context_tools_status,
+    );
     config.fast_codex_startup = config_input.fast_codex_startup;
     config.subagent_optimization = config_input.subagent_optimization;
     config.subagent_model = config_input.subagent_model;
@@ -778,7 +792,26 @@ async fn save_codey_config_locked(
         config,
         restart_required,
         refresh_subagent_defaults,
+        fast_context_tools_status,
     })
+}
+
+fn current_fast_context_tools_status() -> FastContextToolsStatus {
+    fast_context_tools_status_or_blocked(fast_context_tools_status(&codex_home()))
+}
+
+fn fast_context_tools_status_or_blocked<E>(
+    status: Result<FastContextToolsStatus, E>,
+) -> FastContextToolsStatus {
+    status.unwrap_or_else(|_| FastContextToolsStatus {
+        user_configured: false,
+        detection_failed: true,
+        server_id: None,
+    })
+}
+
+fn embedded_fast_context_tools_enabled(requested: bool, status: &FastContextToolsStatus) -> bool {
+    requested && !status.user_configured && !status.detection_failed
 }
 
 async fn configure_trace_log_guard(home: PathBuf, disable_writes: bool) -> Result<(), String> {
@@ -856,6 +889,7 @@ async fn finish_codey_config_save(
         "config":public_config,
         "ccSwitch":cc_switch,
         "modelState":model_state,
+        "fastContextToolsStatus":saved.fast_context_tools_status,
         "restartRequired":restart_required,
         "subagentDefaultsHotReloaded":subagent_defaults_hot_reloaded,
         "subagentDefaultsHotReloadError":subagent_defaults_hot_reload_error,
@@ -2051,6 +2085,34 @@ mod tests {
         assert_eq!(bridge_u64(&payload, "offset"), Some(42));
         assert_eq!(bridge_u64(&payload, "missing"), None);
         assert_eq!(bridge_u64(&payload, "wrongOffset"), None);
+    }
+
+    #[test]
+    fn user_fastctx_prevents_enabling_the_embedded_tools() {
+        let available = FastContextToolsStatus::default();
+        assert!(embedded_fast_context_tools_enabled(true, &available));
+        assert!(!embedded_fast_context_tools_enabled(false, &available));
+
+        let user_configured = FastContextToolsStatus {
+            user_configured: true,
+            detection_failed: false,
+            server_id: Some("fastctx".to_string()),
+        };
+        assert!(!embedded_fast_context_tools_enabled(true, &user_configured));
+
+        let detection_failed = FastContextToolsStatus {
+            user_configured: false,
+            detection_failed: true,
+            server_id: None,
+        };
+        assert!(!embedded_fast_context_tools_enabled(
+            true,
+            &detection_failed
+        ));
+        assert_eq!(
+            fast_context_tools_status_or_blocked::<&str>(Err("invalid config")),
+            detection_failed
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

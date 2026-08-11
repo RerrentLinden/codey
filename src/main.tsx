@@ -139,6 +139,10 @@ if (import.meta.env.DEV) {
           modelState: previewModelState,
           startupError: undefined,
           ccSwitch: previewCcSwitch,
+          fastContextToolsStatus: {
+            userConfigured: false,
+            detectionFailed: false,
+          },
         };
       }
       if (command === "runtime_status") {
@@ -157,9 +161,9 @@ if (import.meta.env.DEV) {
           codexAppPath: previewConfig.codexAppPath,
           maintenance: {
             sessionStatus: "ready",
-            sessionDetail: "会话索引与恢复链路正常 (18 线程活跃)",
-            pluginStatus: "ready",
-            pluginDetail: "Codex 插件已注入，且会话生命周期托管中",
+            sessionFilesFixed: 3,
+            sqliteRowsUpdated: 7,
+            ghostTasksPruned: 2,
             performanceStatus: "ready",
             performanceDetail:
               previewClientPlatform === "windows"
@@ -251,6 +255,10 @@ if (import.meta.env.DEV) {
           config: previewConfig,
           modelState: previewModelState,
           ccSwitch: previewCcSwitch,
+          fastContextToolsStatus: {
+            userConfigured: false,
+            detectionFailed: false,
+          },
           restartRequired: false,
         };
       }

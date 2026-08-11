@@ -17,7 +17,7 @@ use crate::codex_config_guidance::{
     SUBAGENT_GUIDANCE, append_root_agent_collaboration_usage_hint, append_subagent_guidance,
     codey_fastctx_guidance_blocks, codey_fastctx_guidance_for_namespace,
     default_agent_config_with_fastctx_guidance, remove_codey_fastctx_guidance,
-    remove_subagent_guidance,
+    remove_previous_codey_fastctx_guidance, remove_subagent_guidance,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -40,6 +40,7 @@ const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
 const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
+const CODEY_FASTCTX_ARG_MARKER: &str = "--codey-fastctx-mcp";
 const CODEY_FASTCTX_TOKEN_BUDGET: &str = "8500";
 const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 15;
 const SUBAGENT_DEFAULTS_VERIFY_TIMEOUT_MS: u64 = 1_500;
@@ -60,6 +61,8 @@ const RESERVED_PROVIDER_IDS: [&str; 6] = [
 #[serde(rename_all = "camelCase")]
 struct RuntimeConfigLease {
     backup_dir: PathBuf,
+    // Older route-overlay leases may point at a rebased snapshot. Current
+    // runtimes restart on route changes, but still need to restore those leases.
     #[serde(default)]
     config_snapshot_dir: Option<PathBuf>,
     original_config_exists: bool,
@@ -112,6 +115,15 @@ pub(crate) struct RuntimeProviderConfigOptions<'a> {
 
 pub(crate) struct AppliedRuntimeProviderConfig {
     pub config_contents: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FastContextToolsStatus {
+    pub user_configured: bool,
+    pub detection_failed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
 }
 
 struct ProviderApplyOptions<'a> {
@@ -226,6 +238,62 @@ fn fastctx_server_command() -> Result<PathBuf> {
         })
 }
 
+fn persist_previous_fastctx_guidance_migration(
+    path: &Path,
+    original: Option<Vec<u8>>,
+    include_subagent_guidance: bool,
+    label: &str,
+) -> Result<Option<Vec<u8>>> {
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    let existing = str::from_utf8(&original).with_context(|| format!("{label} 不是 UTF-8"))?;
+    let Some(migrated) =
+        migrate_previous_fastctx_guidance(existing, include_subagent_guidance, label)?
+    else {
+        return Ok(Some(original));
+    };
+    if read_optional(path)?.as_deref() != Some(original.as_slice()) {
+        bail!("{label} 在历史 FastCtx 提示词迁移期间发生变化；已取消本次启动");
+    }
+    atomic_write(path, migrated.as_bytes())
+        .with_context(|| format!("持久化 {label} 的历史 FastCtx 提示词迁移失败"))?;
+    Ok(Some(migrated.into_bytes()))
+}
+
+fn migrate_previous_fastctx_guidance(
+    existing: &str,
+    include_subagent_guidance: bool,
+    label: &str,
+) -> Result<Option<String>> {
+    if !existing.contains("Codey FastCtx context tools are enabled.") {
+        return Ok(None);
+    }
+    let mut document = parse_document(existing).with_context(|| format!("解析 {label} 失败"))?;
+    let root_changed = remove_guidance_from_table(
+        document.as_table_mut(),
+        "developer_instructions",
+        remove_previous_codey_fastctx_guidance,
+    );
+    let subagent_changed = include_subagent_guidance
+        && document
+            .get_mut("features")
+            .and_then(Item::as_table_mut)
+            .and_then(|features| features.get_mut("multi_agent_v2"))
+            .and_then(Item::as_table_mut)
+            .is_some_and(|multi_agent| {
+                remove_guidance_from_table(
+                    multi_agent,
+                    "subagent_developer_instructions",
+                    remove_previous_codey_fastctx_guidance,
+                )
+            });
+    if !root_changed && !subagent_changed {
+        return Ok(None);
+    }
+    document_string(&document).map(Some)
+}
+
 fn apply_runtime_provider_config_at_mode(
     home: &Path,
     profile: &ProviderProfile,
@@ -251,23 +319,35 @@ fn apply_runtime_provider_config_at_mode(
     let agents_md_path = home.join("AGENTS.md");
     let agents_dir = home.join("agents");
     let default_agent_path = agents_dir.join("default.toml");
-    let original_config = read_optional(&config_path)?;
+    let original_config_on_disk = read_optional(&config_path)?;
     if let Some(expected_config) = expected_config
-        && original_config.as_deref() != Some(expected_config)
+        && original_config_on_disk.as_deref() != Some(expected_config)
     {
         bail!("CC Switch Live 配置在启动准备期间发生变化；已取消本次启动以避免混用线路");
     }
+    let original_agents_dir_exists = agents_dir.is_dir();
+    let original_config = persist_previous_fastctx_guidance_migration(
+        &config_path,
+        original_config_on_disk,
+        true,
+        "Codex config.toml",
+    )?;
+    let migrated_default_agent = persist_previous_fastctx_guidance_migration(
+        &default_agent_path,
+        read_optional(&default_agent_path)?,
+        false,
+        "Codex agents/default.toml",
+    )?;
     let original_agents_md = if subagent_optimization {
         read_optional(&agents_md_path)?
     } else {
         None
     };
     let original_default_agent = if subagent_optimization {
-        read_optional(&default_agent_path)?
+        migrated_default_agent
     } else {
         None
     };
-    let original_agents_dir_exists = agents_dir.is_dir();
     create_private_dir_all(backup_root)?;
     prune_stale_backup_dirs(backup_root, marker);
     let backup_dir = backup_root.join(format!("{}-{}", timestamp_millis(), std::process::id()));
@@ -310,7 +390,13 @@ fn apply_runtime_provider_config_at_mode(
         let fastctx_namespace = if fastctx_command.is_some() {
             let updated_document =
                 parse_document(&updated).context("解析已应用 Codex 临时配置失败")?;
-            configured_fastctx_tool_namespace(&updated_document)
+            updated_document
+                .get("mcp_servers")
+                .and_then(Item::as_table)
+                .and_then(|servers| servers.get(CODEY_FASTCTX_SERVER_ID))
+                .and_then(Item::as_table)
+                .is_some_and(fastctx_table_server_is_codey_owned)
+                .then(|| CODEY_FASTCTX_NAMESPACE.to_string())
         } else {
             None
         };
@@ -370,6 +456,17 @@ fn apply_runtime_provider_config_at_mode(
         return Err(error);
     }
 
+    let inputs_unchanged = optional_file_matches(&config_path, original_config.as_deref())?
+        && (!subagent_optimization
+            || (optional_file_matches(&agents_md_path, original_agents_md.as_deref())?
+                && optional_file_matches(&default_agent_path, original_default_agent.as_deref())?));
+    if !inputs_unchanged {
+        discard_runtime_lease(marker, &backup_dir).with_context(|| {
+            "Codex 配置在 Codey 保存运行时快照后发生变化；取消启动时清理租约失败，恢复备份已保留"
+        })?;
+        bail!("Codex 配置在 Codey 保存运行时快照后发生变化；已取消本次启动");
+    }
+
     let write_result = (|| -> Result<()> {
         atomic_write(&config_path, updated.as_bytes())?;
         if let Some(updated_agents_md) = updated_agents_md.as_deref() {
@@ -386,39 +483,29 @@ fn apply_runtime_provider_config_at_mode(
         Ok(())
     })();
     if let Err(write_error) = write_result {
-        let mut rollback_results = vec![restore_optional_bytes(
-            &config_path,
-            original_config.as_deref(),
-        )];
-        if subagent_optimization {
-            rollback_results.push(restore_optional_bytes(
-                &agents_md_path,
-                original_agents_md.as_deref(),
-            ));
-            rollback_results.push(restore_optional_bytes(
-                &default_agent_path,
-                original_default_agent.as_deref(),
-            ));
-        }
-        let rollback_errors = rollback_results
-            .into_iter()
-            .filter_map(Result::err)
-            .map(|error| error.to_string())
-            .collect::<Vec<_>>();
-        if rollback_errors.is_empty() {
-            if subagent_optimization && !original_agents_dir_exists {
-                remove_empty_dir(&agents_dir)?;
+        match restore_runtime_provider_config_at(home, marker) {
+            Ok(_) => {
+                let _ = fs::remove_dir_all(&backup_dir);
+                return Err(write_error);
             }
-            let _ = remove_optional(marker);
-            let _ = fs::remove_dir_all(&backup_dir);
-            return Err(write_error);
+            Err(rollback_error) => {
+                anyhow::bail!(
+                    "写入 Codey 临时 Codex 配置失败：{write_error}；按租约恢复原配置也失败：{rollback_error:#}"
+                );
+            }
         }
-        anyhow::bail!(
-            "写入 Codey 临时 Codex 配置失败：{write_error}；回滚原配置也失败：{}",
-            rollback_errors.join("；")
-        );
     }
     Ok(backup_dir)
+}
+
+fn optional_file_matches(path: &Path, expected: Option<&[u8]>) -> Result<bool> {
+    Ok(read_optional(path)?.as_deref() == expected)
+}
+
+fn discard_runtime_lease(marker: &Path, backup_dir: &Path) -> Result<()> {
+    remove_optional(marker)?;
+    let _ = fs::remove_dir_all(backup_dir);
+    Ok(())
 }
 
 fn restore_optional_bytes(path: &Path, original: Option<&[u8]>) -> Result<()> {
@@ -492,8 +579,10 @@ fn mark_runtime_subagent_defaults_applied_at(
         .as_deref()
         .unwrap_or(&state.backup_dir);
     let applied_path = snapshot_dir.join(APPLIED_CONFIG_FILE);
-    let applied = fs::read_to_string(&applied_path)
+    let applied_bytes = fs::read(&applied_path)
         .with_context(|| format!("读取 Codey 已应用配置快照失败：{}", applied_path.display()))?;
+    let applied =
+        String::from_utf8(applied_bytes.clone()).context("Codey 已应用配置快照不是 UTF-8")?;
     let mut applied_doc = applied
         .parse::<DocumentMut>()
         .context("解析 Codey 已应用配置快照失败")?;
@@ -506,10 +595,35 @@ fn mark_runtime_subagent_defaults_applied_at(
         read_optional(&config_path)?.as_deref() == Some(current_bytes.as_slice()),
         "Codex config.toml 在 Codey 更新租约快照前再次变化"
     );
-    atomic_write(&applied_path, updated_applied.as_bytes())?;
     state.subagent_model = model.to_string();
     state.subagent_reasoning_effort = reasoning_effort;
-    write_lease(marker, &state)
+    commit_runtime_subagent_snapshot(
+        marker,
+        &state,
+        &applied_path,
+        &applied_bytes,
+        updated_applied.as_bytes(),
+    )
+}
+
+fn commit_runtime_subagent_snapshot(
+    marker: &Path,
+    state: &RuntimeConfigLease,
+    applied_path: &Path,
+    previous_applied: &[u8],
+    updated_applied: &[u8],
+) -> Result<()> {
+    atomic_write(applied_path, updated_applied)?;
+    if let Err(lease_error) = write_lease(marker, state) {
+        if let Err(rollback_error) = atomic_write(applied_path, previous_applied) {
+            anyhow::bail!(
+                "更新 Codey 子代理运行时租约失败：{lease_error:#}；\
+                 恢复已应用配置快照也失败：{rollback_error:#}"
+            );
+        }
+        return Err(lease_error).context("更新 Codey 子代理运行时租约失败；已恢复原快照");
+    }
+    Ok(())
 }
 
 fn wait_for_subagent_defaults_in_config(
@@ -553,119 +667,6 @@ fn read_subagent_defaults_config(
             .and_then(Item::as_str)
             == Some(reasoning_effort);
     Ok(matches_defaults.then_some(bytes))
-}
-
-#[cfg(test)]
-fn reconcile_runtime_config_overlay_at(home: &Path, marker: &Path) -> Result<Option<Vec<u8>>> {
-    let mut state = match fs::read_to_string(marker) {
-        Ok(contents) => serde_json::from_str::<RuntimeConfigLease>(&contents)
-            .with_context(|| format!("解析 Codey Codex lease 失败：{}", marker.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    if !state.preserve_provider_route {
-        return Ok(None);
-    }
-
-    let config_path = home.join("config.toml");
-    let Some(current_bytes) = read_optional(&config_path)? else {
-        // CC Switch writes its Live file independently. Do not recreate a file
-        // that may be between replacement steps; the watcher will retry.
-        return Ok(None);
-    };
-    let current =
-        String::from_utf8(current_bytes.clone()).context("Codex config.toml 不是 UTF-8")?;
-    let snapshot_dir = state
-        .config_snapshot_dir
-        .as_deref()
-        .unwrap_or(&state.backup_dir);
-    let applied_path = snapshot_dir.join(APPLIED_CONFIG_FILE);
-    let applied_bytes = fs::read(&applied_path)
-        .with_context(|| format!("读取 Codey 已应用配置快照失败：{}", applied_path.display()))?;
-    let normalized_subagent_model = {
-        let model = state.subagent_model.trim();
-        if model.is_empty() {
-            DEFAULT_SUBAGENT_MODEL.to_string()
-        } else {
-            model.to_string()
-        }
-    };
-    let normalized_subagent_reasoning_effort = {
-        let effort = state.subagent_reasoning_effort.trim().to_ascii_lowercase();
-        if SUBAGENT_REASONING_EFFORTS.contains(&effort.as_str()) {
-            effort
-        } else {
-            DEFAULT_SUBAGENT_REASONING_EFFORT.to_string()
-        }
-    };
-    let subagent_defaults_changed = state.subagent_optimization_applied
-        && (state.subagent_model != normalized_subagent_model
-            || state.subagent_reasoning_effort != normalized_subagent_reasoning_effort);
-    if current_bytes == applied_bytes && !subagent_defaults_changed {
-        return Ok(Some(current_bytes));
-    }
-
-    let original = if state.original_config_exists {
-        let original_path = snapshot_dir.join("config.toml");
-        fs::read_to_string(&original_path)
-            .with_context(|| format!("找不到 Codex 原配置备份：{}", original_path.display()))?
-    } else {
-        String::new()
-    };
-    let applied = String::from_utf8(applied_bytes).context("Codey 已应用配置快照不是 UTF-8")?;
-    let baseline = restore_owned_config_changes(&original, &applied, &current)
-        .context("提取 CC Switch 最新 Live 配置失败")?;
-    let updated = patch_config_preserving_provider_route(
-        &baseline,
-        state.fastctx_command.as_deref(),
-        state.subagent_optimization_applied,
-        &normalized_subagent_model,
-        &normalized_subagent_reasoning_effort,
-        state.protocol_proxy_base_url.as_deref(),
-    )
-    .context("重新应用 Codey 运行时增强失败")?;
-
-    if read_optional(&config_path)?.as_deref() != Some(current_bytes.as_slice()) {
-        anyhow::bail!("Codex Live 配置在 Codey 准备重新应用增强时再次变化");
-    }
-
-    let snapshots_root = state.backup_dir.join("route-snapshots");
-    create_private_dir_all(&snapshots_root)?;
-    let next_snapshot_dir =
-        snapshots_root.join(format!("{}-{}", timestamp_millis(), std::process::id()));
-    create_private_dir_all(&next_snapshot_dir)?;
-    write_private_file(&next_snapshot_dir.join("config.toml"), baseline.as_bytes())?;
-    write_private_file(
-        &next_snapshot_dir.join(APPLIED_CONFIG_FILE),
-        updated.as_bytes(),
-    )?;
-
-    let previous_snapshot_dir = state.config_snapshot_dir.replace(next_snapshot_dir);
-    state.original_config_exists = true;
-    state.provider_id = root_key_string(&updated, "model_provider");
-    state.applied_base_url = state
-        .provider_id
-        .as_deref()
-        .and_then(|provider_id| provider_base_url(&updated, provider_id));
-    if state.subagent_optimization_applied {
-        state.subagent_model = normalized_subagent_model;
-        state.subagent_reasoning_effort = normalized_subagent_reasoning_effort;
-    }
-    write_lease(marker, &state)?;
-    if read_optional(&config_path)?.as_deref() != Some(current_bytes.as_slice()) {
-        anyhow::bail!("Codex Live 配置在 Codey 保存增强快照后再次变化");
-    }
-    if updated.as_bytes() != current_bytes {
-        atomic_write(&config_path, updated.as_bytes())?;
-    }
-    // The rolled lease now points at the new snapshot, so the superseded one
-    // is unreachable for every recovery path and can be dropped immediately.
-    if let Some(previous) = previous_snapshot_dir
-        .filter(|previous| Some(previous) != state.config_snapshot_dir.as_ref())
-    {
-        let _ = fs::remove_dir_all(previous);
-    }
-    Ok(Some(updated.into_bytes()))
 }
 
 pub fn restore_runtime_provider_config(home: &Path) -> Result<bool> {
@@ -883,7 +884,7 @@ fn restore_legacy_owned_config_changes(
         .and_then(Item::as_table)
         .and_then(|servers| servers.get(CODEY_FASTCTX_SERVER_ID))
         .and_then(Item::as_table)
-        .filter(|server| legacy_fastctx_server_is_codey_owned(server))
+        .filter(|server| fastctx_table_server_is_codey_owned(server))
     {
         let mut applied_server = table_with_selected_fields(
             server,
@@ -1007,15 +1008,11 @@ fn table_with_selected_fields(source: &Table, fields: &[&str]) -> Table {
     selected
 }
 
-fn legacy_fastctx_server_is_codey_owned(server: &Table) -> bool {
+fn fastctx_table_server_is_codey_owned(server: &Table) -> bool {
     server
         .get("args")
         .and_then(Item::as_array)
-        .is_some_and(|arguments| {
-            arguments
-                .iter()
-                .any(|argument| argument.as_str() == Some("--codey-fastctx-mcp"))
-        })
+        .is_some_and(arguments_have_codey_fastctx_marker)
 }
 
 fn fastctx_namespaces(document: &DocumentMut) -> Option<&Array> {
@@ -1066,6 +1063,15 @@ pub fn current_model_provider(home: &Path) -> Result<String> {
         .to_string())
 }
 
+pub(crate) fn fast_context_tools_status(home: &Path) -> Result<FastContextToolsStatus> {
+    let config_path = home.join("config.toml");
+    let original = read_optional(&config_path)?;
+    let existing =
+        String::from_utf8(original.unwrap_or_default()).context("Codex config.toml 不是 UTF-8")?;
+    let document = parse_document(&existing)?;
+    Ok(fast_context_tools_status_from_document(&document))
+}
+
 #[cfg(test)]
 pub fn patch_config(
     existing: &str,
@@ -1096,7 +1102,7 @@ fn patch_config_with_fastctx(
     fastctx_command: Option<&Path>,
     subagent_optimization: bool,
 ) -> Result<String> {
-    patch_config_with_fastctx_mode(
+    patch_config_with_fastctx_mode_and_proxy(
         existing,
         profile,
         provider_id,
@@ -1111,16 +1117,6 @@ fn patch_config_with_fastctx(
             protocol_proxy_base_url: None,
         },
     )
-}
-
-#[cfg(test)]
-fn patch_config_with_fastctx_mode(
-    existing: &str,
-    profile: &ProviderProfile,
-    provider_id: &str,
-    options: ProviderPatchOptions<'_>,
-) -> Result<String> {
-    patch_config_with_fastctx_mode_and_proxy(existing, profile, provider_id, options)
 }
 
 struct ProviderPatchOptions<'a> {
@@ -1206,7 +1202,7 @@ fn patch_config_with_fastctx_mode_and_proxy(
     enable_desktop_reasoning_efforts(&mut doc)?;
     ensure_default_service_tier(&mut doc);
     let fastctx_namespace = if let Some(command) = fastctx_command {
-        Some(enable_fast_context_tools(&mut doc, command)?)
+        enable_fast_context_tools(&mut doc, command)?
     } else {
         disable_fast_context_tools(&mut doc);
         None
@@ -1220,36 +1216,6 @@ fn patch_config_with_fastctx_mode_and_proxy(
         )?;
     }
     document_string(&doc)
-}
-
-#[cfg(test)]
-fn patch_config_preserving_provider_route(
-    existing: &str,
-    fastctx_command: Option<&Path>,
-    subagent_optimization: bool,
-    subagent_model: &str,
-    subagent_reasoning_effort: &str,
-    protocol_proxy_base_url: Option<&str>,
-) -> Result<String> {
-    let mut profile = ProviderProfile::new("route-preserve");
-    if protocol_proxy_base_url.is_some() {
-        profile.protocol = RelayProtocol::ChatCompletions;
-    }
-    patch_config_with_fastctx_mode_and_proxy(
-        existing,
-        &profile,
-        "",
-        ProviderPatchOptions {
-            model_catalog_path: None,
-            default_model: None,
-            fastctx_command,
-            subagent_optimization,
-            subagent_model,
-            subagent_reasoning_effort,
-            preserve_provider_route: true,
-            protocol_proxy_base_url,
-        },
-    )
 }
 
 fn enable_subagent_optimization(
@@ -1321,23 +1287,23 @@ fn enable_subagent_optimization(
     Ok(())
 }
 
-fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<String> {
-    let codey_owned_server = doc
-        .get("mcp_servers")
-        .and_then(Item::as_table)
-        .and_then(|servers| servers.get(CODEY_FASTCTX_SERVER_ID))
-        .and_then(Item::as_table)
-        .is_some_and(legacy_fastctx_server_is_codey_owned);
-    if let Some(namespace) = configured_fastctx_tool_namespace(doc).filter(|_| !codey_owned_server)
-    {
-        apply_fastctx_guidance(doc, &namespace)?;
-        return Ok(namespace);
+fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<Option<String>> {
+    let codey_owned_server = mcp_server_is_codey_owned_by_id(doc, CODEY_FASTCTX_SERVER_ID);
+    if configured_user_fastctx_server_id(doc).is_some() {
+        disable_fast_context_tools(doc);
+        return Ok(None);
     }
 
-    let mcp_servers = ensure_root_table(doc, "mcp_servers")?;
-    if !codey_owned_server {
-        mcp_servers.insert(CODEY_FASTCTX_SERVER_ID, Item::Table(Table::new()));
-    }
+    let mcp_servers = ensure_mcp_servers_table(doc)?;
+    let server_table = if codey_owned_server {
+        mcp_servers
+            .get(CODEY_FASTCTX_SERVER_ID)
+            .and_then(item_table_clone)
+            .unwrap_or_default()
+    } else {
+        Table::new()
+    };
+    mcp_servers.insert(CODEY_FASTCTX_SERVER_ID, Item::Table(server_table));
     let server = mcp_servers
         .get_mut(CODEY_FASTCTX_SERVER_ID)
         .and_then(Item::as_table_mut)
@@ -1346,14 +1312,13 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<St
         })?;
     server["command"] = value(command.to_string_lossy().to_string());
     let mut args = Array::new();
-    args.push("--codey-fastctx-mcp");
+    args.push(CODEY_FASTCTX_ARG_MARKER);
     server["args"] = Item::Value(toml_edit::Value::Array(args));
     server["startup_timeout_sec"] = value(CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS);
     server["tool_timeout_sec"] = value(120);
     let mut env = server
         .get("env")
-        .and_then(Item::as_table)
-        .cloned()
+        .and_then(item_table_clone)
         .unwrap_or_default();
     env["FASTCTX_TOKEN_BUDGET"] = value(CODEY_FASTCTX_TOKEN_BUDGET);
     server["env"] = Item::Table(env);
@@ -1368,7 +1333,7 @@ fn enable_fast_context_tools(doc: &mut DocumentMut, command: &Path) -> Result<St
         doc["tool_output_token_limit"] = value(10_000);
     }
     apply_fastctx_guidance(doc, CODEY_FASTCTX_NAMESPACE)?;
-    Ok(CODEY_FASTCTX_NAMESPACE.to_string())
+    Ok(Some(CODEY_FASTCTX_NAMESPACE.to_string()))
 }
 
 fn apply_fastctx_guidance(doc: &mut DocumentMut, namespace: &str) -> Result<()> {
@@ -1416,35 +1381,47 @@ fn apply_fastctx_guidance_to_table(
 }
 
 fn disable_fast_context_tools(doc: &mut DocumentMut) {
-    let codey_owned_server_removed =
-        if let Some(mcp_servers) = doc.get_mut("mcp_servers").and_then(Item::as_table_mut) {
+    let codey_owned_server_removed = match doc.get_mut("mcp_servers") {
+        Some(Item::Table(mcp_servers)) => {
             let codey_owned_server = mcp_servers
                 .get(CODEY_FASTCTX_SERVER_ID)
-                .and_then(Item::as_table)
-                .is_some_and(legacy_fastctx_server_is_codey_owned);
+                .is_some_and(fastctx_item_server_is_codey_owned);
             if codey_owned_server {
                 mcp_servers.remove(CODEY_FASTCTX_SERVER_ID);
             }
             codey_owned_server
-        } else {
-            false
-        };
+        }
+        Some(Item::Value(Value::InlineTable(mcp_servers))) => {
+            let codey_owned_server = mcp_servers
+                .get(CODEY_FASTCTX_SERVER_ID)
+                .is_some_and(fastctx_value_server_is_codey_owned);
+            if codey_owned_server {
+                mcp_servers.remove(CODEY_FASTCTX_SERVER_ID);
+            }
+            codey_owned_server
+        }
+        _ => false,
+    };
 
-    let codey_guidance_removed =
-        remove_fastctx_guidance_from_table(doc.as_table_mut(), "developer_instructions");
+    let codey_guidance_removed = remove_guidance_from_table(
+        doc.as_table_mut(),
+        "developer_instructions",
+        remove_codey_fastctx_guidance,
+    );
     let subagent_guidance_removed = doc
         .get_mut("features")
         .and_then(Item::as_table_mut)
         .and_then(|features| features.get_mut("multi_agent_v2"))
         .and_then(Item::as_table_mut)
         .is_some_and(|multi_agent| {
-            remove_fastctx_guidance_from_table(multi_agent, "subagent_developer_instructions")
+            remove_guidance_from_table(
+                multi_agent,
+                "subagent_developer_instructions",
+                remove_codey_fastctx_guidance,
+            )
         });
 
-    let reserved_server_remains = doc
-        .get("mcp_servers")
-        .and_then(Item::as_table)
-        .is_some_and(|mcp_servers| mcp_servers.contains_key(CODEY_FASTCTX_SERVER_ID));
+    let reserved_server_remains = mcp_server_exists(doc, CODEY_FASTCTX_SERVER_ID);
     if (codey_owned_server_removed || codey_guidance_removed || subagent_guidance_removed)
         && !reserved_server_remains
     {
@@ -1468,11 +1445,15 @@ fn remove_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> 
     namespaces.len() != original_len
 }
 
-fn remove_fastctx_guidance_from_table(table: &mut Table, key: &str) -> bool {
+fn remove_guidance_from_table(
+    table: &mut Table,
+    key: &str,
+    remove_guidance: fn(&str) -> Option<String>,
+) -> bool {
     let restored_guidance = table
         .get(key)
         .and_then(Item::as_str)
-        .and_then(remove_codey_fastctx_guidance);
+        .and_then(remove_guidance);
     let Some(restored_guidance) = restored_guidance else {
         return false;
     };
@@ -1484,52 +1465,140 @@ fn remove_fastctx_guidance_from_table(table: &mut Table, key: &str) -> bool {
     true
 }
 
-fn configured_fastctx_tool_namespace(doc: &DocumentMut) -> Option<String> {
-    configured_fastctx_server_id(doc).map(|server_id| format!("mcp__{server_id}"))
+fn fast_context_tools_status_from_document(doc: &DocumentMut) -> FastContextToolsStatus {
+    let server_id = configured_user_fastctx_server_id(doc);
+    FastContextToolsStatus {
+        user_configured: server_id.is_some(),
+        detection_failed: false,
+        server_id,
+    }
 }
 
-fn configured_fastctx_server_id(doc: &DocumentMut) -> Option<String> {
-    let mcp_servers = doc.get("mcp_servers").and_then(Item::as_table)?;
+fn configured_user_fastctx_server_id(doc: &DocumentMut) -> Option<String> {
+    match doc.get("mcp_servers")? {
+        Item::Table(mcp_servers) => mcp_servers.iter().find_map(|(server_id, server)| {
+            (mcp_server_mentions_fastctx(server_id, server)
+                && !fastctx_item_server_is_codey_owned(server))
+            .then(|| server_id.to_string())
+        }),
+        Item::Value(Value::InlineTable(mcp_servers)) => {
+            mcp_servers.iter().find_map(|(server_id, server)| {
+                (mcp_server_value_mentions_fastctx(server_id, server)
+                    && !fastctx_value_server_is_codey_owned(server))
+                .then(|| server_id.to_string())
+            })
+        }
+        _ => None,
+    }
+}
 
-    mcp_servers.iter().find_map(|(server_id, server)| {
-        mcp_server_mentions_fastctx(server_id, server).then(|| server_id.to_string())
-    })
+fn arguments_have_codey_fastctx_marker(arguments: &Array) -> bool {
+    arguments
+        .iter()
+        .any(|argument| argument.as_str() == Some(CODEY_FASTCTX_ARG_MARKER))
+}
+
+fn fastctx_item_server_is_codey_owned(server: &Item) -> bool {
+    server
+        .as_table()
+        .is_some_and(fastctx_table_server_is_codey_owned)
+        || matches!(server, Item::Value(value) if fastctx_value_server_is_codey_owned(value))
+}
+
+fn fastctx_value_server_is_codey_owned(server: &Value) -> bool {
+    matches!(
+        server,
+        Value::InlineTable(server)
+            if server
+                .get("args")
+                .and_then(Value::as_array)
+                .is_some_and(arguments_have_codey_fastctx_marker)
+    )
+}
+
+fn mcp_server_is_codey_owned_by_id(doc: &DocumentMut, server_id: &str) -> bool {
+    match doc.get("mcp_servers") {
+        Some(Item::Table(mcp_servers)) => mcp_servers
+            .get(server_id)
+            .is_some_and(fastctx_item_server_is_codey_owned),
+        Some(Item::Value(Value::InlineTable(mcp_servers))) => mcp_servers
+            .get(server_id)
+            .is_some_and(fastctx_value_server_is_codey_owned),
+        _ => false,
+    }
+}
+
+fn mcp_server_exists(doc: &DocumentMut, server_id: &str) -> bool {
+    match doc.get("mcp_servers") {
+        Some(Item::Table(mcp_servers)) => mcp_servers.contains_key(server_id),
+        Some(Item::Value(Value::InlineTable(mcp_servers))) => mcp_servers.contains_key(server_id),
+        _ => false,
+    }
+}
+
+fn ensure_mcp_servers_table(doc: &mut DocumentMut) -> Result<&mut Table> {
+    let inline_table = match doc.get("mcp_servers") {
+        Some(Item::Value(Value::InlineTable(mcp_servers))) => Some(mcp_servers.clone()),
+        _ => None,
+    };
+    if let Some(inline_table) = inline_table {
+        let mut table = Table::new();
+        for (server_id, server) in inline_table.iter() {
+            table.insert(server_id, Item::Value(server.clone()));
+        }
+        doc.as_table_mut().insert("mcp_servers", Item::Table(table));
+    }
+    ensure_root_table(doc, "mcp_servers")
+}
+
+fn item_table_clone(item: &Item) -> Option<Table> {
+    match item {
+        Item::Table(table) => Some(table.clone()),
+        Item::Value(Value::InlineTable(inline_table)) => {
+            let mut table = Table::new();
+            for (key, value) in inline_table.iter() {
+                table.insert(key, Item::Value(value.clone()));
+            }
+            Some(table)
+        }
+        _ => None,
+    }
 }
 
 fn mcp_server_mentions_fastctx(server_id: &str, server: &Item) -> bool {
     mentions_fastctx(server_id)
         || server.as_table().is_some_and(|server| {
-            server
-                .get("command")
-                .and_then(Item::as_str)
-                .is_some_and(mentions_fastctx)
-                || server
-                    .get("args")
-                    .and_then(Item::as_array)
-                    .is_some_and(|arguments| {
-                        arguments
-                            .iter()
-                            .filter_map(toml_edit::Value::as_str)
-                            .any(mentions_fastctx)
-                    })
+            mcp_server_fields_mention_fastctx(
+                server.get("command").and_then(Item::as_str),
+                server.get("args").and_then(Item::as_array),
+            )
         })
-        || matches!(
-            server,
-            Item::Value(Value::InlineTable(server))
-                if server
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .is_some_and(mentions_fastctx)
-                    || server
-                        .get("args")
-                        .and_then(Value::as_array)
-                        .is_some_and(|arguments| {
-                            arguments
-                                .iter()
-                                .filter_map(Value::as_str)
-                                .any(mentions_fastctx)
-                        })
-        )
+        || matches!(server, Item::Value(value) if mcp_server_value_fields_mention_fastctx(value))
+}
+
+fn mcp_server_value_mentions_fastctx(server_id: &str, server: &Value) -> bool {
+    mentions_fastctx(server_id) || mcp_server_value_fields_mention_fastctx(server)
+}
+
+fn mcp_server_value_fields_mention_fastctx(server: &Value) -> bool {
+    matches!(
+        server,
+        Value::InlineTable(server)
+            if mcp_server_fields_mention_fastctx(
+                server.get("command").and_then(Value::as_str),
+                server.get("args").and_then(Value::as_array),
+            )
+    )
+}
+
+fn mcp_server_fields_mention_fastctx(command: Option<&str>, arguments: Option<&Array>) -> bool {
+    command.is_some_and(mentions_fastctx)
+        || arguments.is_some_and(|arguments| {
+            arguments
+                .iter()
+                .filter_map(Value::as_str)
+                .any(mentions_fastctx)
+        })
 }
 
 fn mentions_fastctx(value: &str) -> bool {
@@ -1814,9 +1883,87 @@ fn prune_stale_backup_dirs(backup_root: &Path, marker: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex_config_guidance::{CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG};
+    use crate::codex_config_guidance::{
+        CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG, PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3,
+    };
 
     const GLOBAL_PROVIDER_ID: &str = "codey_global";
+
+    #[test]
+    fn runtime_input_guard_detects_concurrent_file_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+
+        assert!(optional_file_matches(&path, None).unwrap());
+        fs::write(&path, b"original").unwrap();
+        assert!(!optional_file_matches(&path, None).unwrap());
+        assert!(optional_file_matches(&path, Some(b"original")).unwrap());
+        fs::write(&path, b"concurrent").unwrap();
+        assert!(!optional_file_matches(&path, Some(b"original")).unwrap());
+    }
+
+    #[test]
+    fn failed_lease_marker_removal_keeps_the_recovery_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("codex-lease.json");
+        let backup_dir = temp.path().join("codex-backups/active");
+        fs::create_dir_all(&marker).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(backup_dir.join("config.toml"), b"recoverable").unwrap();
+
+        let error = discard_runtime_lease(&marker, &backup_dir)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("删除文件失败"));
+        assert!(marker.is_dir());
+        assert!(backup_dir.is_dir());
+        assert_eq!(
+            fs::read(backup_dir.join("config.toml")).unwrap(),
+            b"recoverable"
+        );
+    }
+
+    #[test]
+    fn failed_subagent_lease_write_restores_the_previous_applied_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("codex-lease.json");
+        let backup_dir = temp.path().join("codex-backups/active");
+        let applied_path = backup_dir.join(APPLIED_CONFIG_FILE);
+        fs::create_dir_all(&marker).unwrap();
+        fs::create_dir_all(&backup_dir).unwrap();
+        fs::write(&applied_path, b"previous applied").unwrap();
+        let state = RuntimeConfigLease {
+            backup_dir,
+            config_snapshot_dir: None,
+            original_config_exists: true,
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+            fastctx_command: None,
+            subagent_optimization_applied: true,
+            subagent_model: "provider-coder".into(),
+            subagent_reasoning_effort: "high".into(),
+            original_agents_md_exists: false,
+            original_default_agent_exists: false,
+            original_agents_dir_exists: false,
+            provider_id: Some(GLOBAL_PROVIDER_ID.into()),
+            applied_base_url: None,
+        };
+
+        let error = commit_runtime_subagent_snapshot(
+            &marker,
+            &state,
+            &applied_path,
+            b"previous applied",
+            b"updated applied",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("已恢复原快照"));
+        assert_eq!(fs::read(&applied_path).unwrap(), b"previous applied");
+        assert!(marker.is_dir());
+    }
 
     #[test]
     fn stale_backup_dirs_are_pruned_beyond_retention() {
@@ -2118,7 +2265,7 @@ experimental_bearer_token = "PROXY_MANAGED"
 [features.cc_switch_owned]
 enabled = true
 "#;
-        let result = patch_config_with_fastctx_mode(
+        let result = patch_config_with_fastctx_mode_and_proxy(
             existing,
             &direct_profile(RelayProtocol::ChatCompletions),
             GLOBAL_PROVIDER_ID,
@@ -2176,7 +2323,7 @@ name = "CC Switch Live"
 base_url = "http://127.0.0.1:15721/v1"
 wire_api = "chat"
 "#;
-        let error = patch_config_with_fastctx_mode(
+        let error = patch_config_with_fastctx_mode_and_proxy(
             existing,
             &direct_profile(RelayProtocol::Responses),
             GLOBAL_PROVIDER_ID,
@@ -2246,7 +2393,177 @@ experimental_bearer_token = "PROXY_MANAGED"
     }
 
     #[test]
-    fn fast_context_tools_reuse_user_fastctx_without_registering_the_embedded_server() {
+    fn fast_context_tools_status_reports_only_user_configured_servers() {
+        let document = parse_document(
+            r#"
+[mcp_servers.codey_fastctx]
+command = "/Applications/Codey.app/Contents/MacOS/codey-fastctx"
+args = ["--codey-fastctx-mcp"]
+
+[mcp_servers.context_tools]
+command = "uvx"
+args = ["fastctx", "--stdio"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fast_context_tools_status_from_document(&document),
+            FastContextToolsStatus {
+                user_configured: true,
+                detection_failed: false,
+                server_id: Some("context_tools".to_string()),
+            }
+        );
+
+        let owned_only = parse_document(
+            r#"
+[mcp_servers.codey_fastctx]
+command = "/Applications/Codey.app/Contents/MacOS/codey-fastctx"
+args = ["--codey-fastctx-mcp"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fast_context_tools_status_from_document(&owned_only),
+            FastContextToolsStatus::default()
+        );
+    }
+
+    #[test]
+    fn fast_context_tools_status_reads_the_current_codex_config() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            fast_context_tools_status(temp.path()).unwrap(),
+            FastContextToolsStatus::default()
+        );
+
+        fs::write(
+            temp.path().join("config.toml"),
+            r#"[mcp_servers.fastctx]
+command = "/custom/fastctx"
+args = ["serve"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fast_context_tools_status(temp.path()).unwrap(),
+            FastContextToolsStatus {
+                user_configured: true,
+                detection_failed: false,
+                server_id: Some("fastctx".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn fast_context_tools_detect_root_inline_user_servers() {
+        let existing = r#"
+mcp_servers = { context_tools = { command = "uvx", args = ["fastctx", "--stdio"] } }
+"#;
+        let document = parse_document(existing).unwrap();
+
+        assert_eq!(
+            fast_context_tools_status_from_document(&document),
+            FastContextToolsStatus {
+                user_configured: true,
+                detection_failed: false,
+                server_id: Some("context_tools".to_string()),
+            }
+        );
+
+        let result = patch_config_with_fastctx(
+            existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            Some(Path::new("/tmp/codey-fastctx")),
+            false,
+        )
+        .unwrap();
+        let document = parse_document(&result).unwrap();
+        assert!(!mcp_server_exists(&document, CODEY_FASTCTX_SERVER_ID));
+        assert_eq!(
+            configured_user_fastctx_server_id(&document).as_deref(),
+            Some("context_tools")
+        );
+    }
+
+    #[test]
+    fn disabling_fast_context_tools_removes_inline_owned_servers() {
+        for existing in [
+            r#"
+[mcp_servers]
+codey_fastctx = { command = "/tmp/codey-fastctx", args = ["--codey-fastctx-mcp"] }
+
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__codey_fastctx"]
+"#,
+            r#"
+mcp_servers = { codey_fastctx = { command = "/tmp/codey-fastctx", args = ["--codey-fastctx-mcp"] } }
+
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__codey_fastctx"]
+"#,
+        ] {
+            let result = patch_config_with_fastctx(
+                existing,
+                &official_profile(),
+                GLOBAL_PROVIDER_ID,
+                relative_model_catalog_path(),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+            let document = parse_document(&result).unwrap();
+
+            assert!(!mcp_server_exists(&document, CODEY_FASTCTX_SERVER_ID));
+            assert!(
+                document["features"]["code_mode"]["direct_only_tool_namespaces"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn enabling_fast_context_tools_normalizes_inline_owned_servers() {
+        let existing = r#"
+mcp_servers = { codey_fastctx = { command = "/old/codey", args = ["--codey-fastctx-mcp"], env = { CUSTOM = "preserve" } } }
+"#;
+        let result = patch_config_with_fastctx(
+            existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            Some(Path::new("/new/codey-fastctx")),
+            false,
+        )
+        .unwrap();
+        let document = parse_document(&result).unwrap();
+        let server = document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]
+            .as_table()
+            .unwrap();
+
+        assert_eq!(server["command"].as_str(), Some("/new/codey-fastctx"));
+        assert_eq!(server["env"]["CUSTOM"].as_str(), Some("preserve"));
+        assert_eq!(
+            server["env"]["FASTCTX_TOKEN_BUDGET"].as_str(),
+            Some(CODEY_FASTCTX_TOKEN_BUDGET)
+        );
+        assert_eq!(
+            fast_context_tools_status_from_document(&document),
+            FastContextToolsStatus::default()
+        );
+    }
+
+    #[test]
+    fn user_fastctx_blocks_the_embedded_server_without_injecting_codey_guidance() {
         let existing = r#"
 developer_instructions = "Keep my guidance."
 tool_output_token_limit = 16000
@@ -2299,20 +2616,9 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__fastctx"]
                 .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE))
         );
         let guidance = document["developer_instructions"].as_str().unwrap();
-        assert_eq!(
-            guidance,
-            format!(
-                "Keep my guidance.\n\n{}",
-                codey_fastctx_guidance_for_namespace("mcp__fastctx")
-            )
-        );
-        assert!(guidance.contains("tools.mcp__fastctx__read"));
-        assert!(guidance.contains("Call them directly when visible"));
-        assert!(guidance.contains("no separate tool discovery is needed"));
-        assert!(!guidance.contains("list_mcp_resources"));
-        assert!(!guidance.contains("read_mcp_resource"));
+        assert_eq!(guidance, "Keep my guidance.");
+        assert!(!guidance.contains("Codey FastCtx context tools are enabled"));
         assert!(!guidance.contains("mcp__codey_fastctx"));
-        assert!(!guidance.contains("resources/read"));
     }
 
     #[test]
@@ -2393,14 +2699,7 @@ args = ["fastctx", "--stdio"]
                 .get(CODEY_FASTCTX_SERVER_ID)
                 .is_none()
         );
-        let guidance = document["developer_instructions"].as_str().unwrap();
-        assert!(guidance.contains("tools.mcp__context_tools__read"));
-        assert!(guidance.contains("`mcp__context_tools__grep`"));
-        assert!(guidance.contains("no separate tool discovery is needed"));
-        assert!(!guidance.contains("list_mcp_resources"));
-        assert!(!guidance.contains("read_mcp_resource"));
-        assert!(!guidance.contains("mcp__codey_fastctx"));
-        assert!(!guidance.contains("resources/read"));
+        assert!(document.get("developer_instructions").is_none());
         assert!(document.get("tool_output_token_limit").is_none());
     }
 
@@ -2724,7 +3023,7 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
         assert_eq!(first.matches(CODEY_FASTCTX_GUIDANCE).count(), 1);
         let document = first.parse::<DocumentMut>().unwrap();
         let guidance = document["developer_instructions"].as_str().unwrap();
-        assert!(guidance.contains("tools.mcp__codey_fastctx__read"));
+        assert!(guidance.contains("tools.mcp__codey_fastctx__inspect_local_file"));
         assert!(guidance.contains("available inside a code-mode program"));
         assert!(guidance.contains("drive-letter path such as `E:/repo/file.ts`"));
         assert!(!guidance.contains("list_mcp_resources"));
@@ -2763,7 +3062,7 @@ custom_setting = "preserved"
 subagent_developer_instructions = "Preserve my subagent guidance."
 root_agent_usage_hint_text = "Preserve my root usage hint."
 "#;
-        let result = patch_config_with_fastctx_mode(
+        let result = patch_config_with_fastctx_mode_and_proxy(
             existing,
             &official_profile(),
             GLOBAL_PROVIDER_ID,
@@ -2834,7 +3133,7 @@ root_agent_usage_hint_text = "Preserve my root usage hint."
 
     #[test]
     fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
-        let patched = patch_config_with_fastctx_mode(
+        let patched = patch_config_with_fastctx_mode_and_proxy(
             "",
             &official_profile(),
             GLOBAL_PROVIDER_ID,
@@ -2856,7 +3155,7 @@ root_agent_usage_hint_text = "Preserve my root usage hint."
             Some("gpt-5.6-luna")
         );
 
-        let error = patch_config_with_fastctx_mode(
+        let error = patch_config_with_fastctx_mode_and_proxy(
             "",
             &official_profile(),
             GLOBAL_PROVIDER_ID,
@@ -2954,7 +3253,7 @@ root_agent_usage_hint_text = "Preserve my root usage hint."
     }
 
     #[test]
-    fn subagent_default_agent_uses_the_configured_fastctx_namespace() {
+    fn user_fastctx_does_not_inject_codey_guidance_into_subagents() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         let marker = temp.path().join("codey/codex-lease.json");
@@ -2993,29 +3292,16 @@ args = ["serve"]
                 .is_none()
         );
         let default_agent = fs::read_to_string(home.join("agents/default.toml")).unwrap();
-        assert!(default_agent.contains("tools.mcp__fastctx__read"));
-        assert!(default_agent.contains("`mcp__fastctx__grep`"));
-        assert!(default_agent.contains("Call them directly when visible"));
-        assert!(default_agent.contains("no separate tool discovery is needed"));
+        assert_eq!(default_agent, DEFAULT_AGENT_CONFIG);
         assert!(default_agent.contains("每次工具调用都必须推进任务本身"));
-        assert!(!default_agent.contains("list_mcp_resources"));
-        assert!(!default_agent.contains("read_mcp_resource"));
-        assert!(!default_agent.contains("Write-Output"));
-        assert!(!default_agent.contains("mcp__codey_fastctx"));
-        assert!(!default_agent.contains("resources/read"));
-        let root_guidance = document["developer_instructions"].as_str().unwrap();
-        let subagent_guidance =
-            document["features"]["multi_agent_v2"]["subagent_developer_instructions"]
-                .as_str()
-                .unwrap();
-        assert_eq!(subagent_guidance, root_guidance);
-        assert!(subagent_guidance.contains("tools.mcp__fastctx__read"));
-        assert!(subagent_guidance.contains("no separate tool discovery is needed"));
-        assert!(subagent_guidance.contains("put progress and corrections in commentary"));
-        assert!(!subagent_guidance.contains("list_mcp_resources"));
-        assert!(!subagent_guidance.contains("read_mcp_resource"));
-        assert!(!subagent_guidance.contains("Write-Output"));
-        assert!(!subagent_guidance.contains("mcp__codey_fastctx"));
+        assert!(document.get("developer_instructions").is_none());
+        assert!(
+            document["features"]["multi_agent_v2"]
+                .as_table()
+                .unwrap()
+                .get("subagent_developer_instructions")
+                .is_none()
+        );
 
         assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
         assert_eq!(
@@ -3023,6 +3309,85 @@ args = ["serve"]
             original_config
         );
         assert!(!home.join("agents/default.toml").exists());
+    }
+
+    #[test]
+    fn previous_fastctx_guidance_is_migrated_before_the_runtime_lease() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(home.join("agents")).unwrap();
+        let dynamic_previous = PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3
+            .replace(CODEY_FASTCTX_NAMESPACE, "mcp__legacy_fastctx");
+        let original_config = format!(
+            r#"model_provider = "codey_global"
+developer_instructions = {}
+
+[model_providers.codey_global]
+base_url = "https://chatgpt.com/backend-api/codex"
+
+[features.multi_agent_v2]
+subagent_developer_instructions = {}
+"#,
+            Value::from(format!(
+                "Root user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3}"
+            )),
+            Value::from(format!("Subagent user guidance.\n\n{dynamic_previous}")),
+        );
+        let original_default_agent = format!(
+            r#"name = "custom"
+developer_instructions = {}
+"#,
+            Value::from(format!(
+                "Default user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3}"
+            )),
+        );
+        fs::write(home.join("config.toml"), original_config).unwrap();
+        fs::write(home.join("agents/default.toml"), original_default_agent).unwrap();
+
+        apply_runtime_provider_config_at_mode(
+            &home,
+            &direct_profile(RelayProtocol::Responses),
+            GLOBAL_PROVIDER_ID,
+            ProviderApplyOptions {
+                fastctx_command: Some(Path::new("/tmp/codey-fastctx")),
+                subagent_optimization: true,
+                ..ProviderApplyOptions::for_test(&marker, &backup_root)
+            },
+        )
+        .unwrap();
+
+        let temporary_config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(temporary_config.contains(CODEY_FASTCTX_GUIDANCE));
+        assert!(!temporary_config.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3));
+        let temporary_default = fs::read_to_string(home.join("agents/default.toml")).unwrap();
+        assert!(temporary_default.contains(CODEY_FASTCTX_GUIDANCE));
+        assert!(!temporary_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3));
+
+        assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+        let restored_config = fs::read_to_string(home.join("config.toml")).unwrap();
+        let restored_document = parse_document(&restored_config).unwrap();
+        assert_eq!(
+            restored_document["developer_instructions"].as_str(),
+            Some("Root user guidance.")
+        );
+        assert_eq!(
+            restored_document["features"]["multi_agent_v2"]["subagent_developer_instructions"]
+                .as_str(),
+            Some("Subagent user guidance.")
+        );
+        assert!(!restored_config.contains(CODEY_FASTCTX_GUIDANCE));
+        assert!(!restored_config.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3));
+
+        let restored_default = fs::read_to_string(home.join("agents/default.toml")).unwrap();
+        let restored_default_document = parse_document(&restored_default).unwrap();
+        assert_eq!(
+            restored_default_document["developer_instructions"].as_str(),
+            Some("Default user guidance.")
+        );
+        assert!(!restored_default.contains(CODEY_FASTCTX_GUIDANCE));
+        assert!(!restored_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3));
     }
 
     #[test]
@@ -3314,7 +3679,7 @@ args = ["serve"]
     }
 
     #[test]
-    fn route_lease_rebases_after_cc_switch_hot_swap_and_restores_latest_route() {
+    fn route_lease_restores_latest_cc_switch_route_before_restart() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         let marker = temp.path().join("codey/codex-lease.json");
@@ -3382,37 +3747,6 @@ command = "cc-switch-tool-v2"
 "#;
         fs::write(home.join("config.toml"), route_b).unwrap();
 
-        let reconciled = reconcile_runtime_config_overlay_at(&home, &marker)
-            .unwrap()
-            .unwrap();
-        let applied_b = String::from_utf8(reconciled).unwrap();
-        assert_eq!(
-            root_key_string(&applied_b, "model_provider").as_deref(),
-            Some("route-b")
-        );
-        assert_eq!(
-            root_key_string(&applied_b, "model").as_deref(),
-            Some("model-b")
-        );
-        assert_eq!(
-            root_key_string(&applied_b, "model_catalog_json").as_deref(),
-            Some("/cc-switch/catalog-b.json")
-        );
-        assert_eq!(
-            provider_base_url(&applied_b, "route-b").as_deref(),
-            Some("http://localhost:15721/v1")
-        );
-        let applied_b_doc = parse_document(&applied_b).unwrap();
-        assert_eq!(
-            applied_b_doc["mcp_servers"]["cc-switch"]["command"].as_str(),
-            Some("cc-switch-tool-v2")
-        );
-        assert!(
-            applied_b_doc["mcp_servers"][CODEY_FASTCTX_SERVER_ID]
-                .as_table()
-                .is_some()
-        );
-
         assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
         let restored = fs::read_to_string(home.join("config.toml")).unwrap();
         let expected = parse_document(route_b).unwrap();
@@ -3425,71 +3759,7 @@ command = "cc-switch-tool-v2"
     }
 
     #[test]
-    fn route_lease_preserves_dynamic_subagent_defaults() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("codex-home");
-        let marker = temp.path().join("codey/codex-lease.json");
-        let backup_root = temp.path().join("codey/codex-backups");
-        fs::create_dir_all(&home).unwrap();
-        let route = r#"
-model_provider = "route-a"
-model = "model-a"
-
-[model_providers.route-a]
-name = "Route A"
-base_url = "http://127.0.0.1:15721/v1"
-wire_api = "responses"
-experimental_bearer_token = "PROXY_MANAGED"
-"#;
-        fs::write(home.join("config.toml"), route).unwrap();
-
-        apply_runtime_provider_config_at_mode(
-            &home,
-            &direct_profile(RelayProtocol::Responses),
-            "route-a",
-            ProviderApplyOptions {
-                use_official_catalog: false,
-                default_model: None,
-                fastctx_command: None,
-                subagent_optimization: true,
-                subagent_model: DEFAULT_SUBAGENT_MODEL,
-                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-                marker: &marker,
-                backup_root: &backup_root,
-                preserve_provider_route: true,
-                protocol_proxy_base_url: None,
-                expected_config: None,
-            },
-        )
-        .unwrap();
-
-        let mut lease =
-            serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap())
-                .unwrap();
-        let legacy_applied = fs::read_to_string(home.join("config.toml"))
-            .unwrap()
-            .replace(DEFAULT_SUBAGENT_MODEL, "gpt-5.6-luna");
-        fs::write(home.join("config.toml"), &legacy_applied).unwrap();
-        fs::write(lease.backup_dir.join(APPLIED_CONFIG_FILE), &legacy_applied).unwrap();
-        lease.subagent_model = "gpt-5.6-luna".into();
-        write_lease(&marker, &lease).unwrap();
-
-        let reconciled = reconcile_runtime_config_overlay_at(&home, &marker)
-            .unwrap()
-            .unwrap();
-        let document = parse_document(std::str::from_utf8(&reconciled).unwrap()).unwrap();
-        assert_eq!(
-            document["agents"]["default_subagent_model"].as_str(),
-            Some("gpt-5.6-luna")
-        );
-        let reconciled_lease =
-            serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap())
-                .unwrap();
-        assert_eq!(reconciled_lease.subagent_model, "gpt-5.6-luna");
-    }
-
-    #[test]
-    fn chat_route_lease_reapplies_the_protocol_proxy_after_a_live_hot_swap() {
+    fn chat_route_lease_removes_protocol_proxy_from_latest_route_before_restart() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("codex-home");
         let marker = temp.path().join("codey/codex-lease.json");
@@ -3544,19 +3814,6 @@ wire_api = "chat"
 experimental_bearer_token = "PROXY_MANAGED"
 "#;
         fs::write(home.join("config.toml"), route_b).unwrap();
-        let reconciled = reconcile_runtime_config_overlay_at(&home, &marker)
-            .unwrap()
-            .unwrap();
-        let applied_b = String::from_utf8(reconciled).unwrap();
-        assert_eq!(
-            root_key_string(&applied_b, "model_provider").as_deref(),
-            Some("route-b")
-        );
-        assert_eq!(
-            provider_base_url(&applied_b, "route-b").as_deref(),
-            Some("http://127.0.0.1:43123/v1")
-        );
-        assert!(applied_b.contains("wire_api = \"responses\""));
 
         assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
         let restored =

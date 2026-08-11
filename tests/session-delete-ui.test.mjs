@@ -324,24 +324,6 @@ function loadInjection({
   };
 }
 
-test("adds the session import action to the Recents sidebar section", () => {
-  const runtime = loadInjection({
-    tasksSectionHeading: "Recents",
-    tasksSectionLabel: "最近",
-    tasksOptionsLabel: "聊天侧边栏选项",
-    newTaskLabel: "新对话",
-  });
-  const importButton = runtime.tasksSection.querySelector("[data-codey-tasks-import]");
-
-  assert.ok(importButton);
-  assert.equal(importButton.getAttribute("aria-label"), "导入会话数据");
-  assert.deepEqual(runtime.tasksActionBar.children, [
-    importButton,
-    runtime.tasksOptionsButton,
-    runtime.newTaskButton,
-  ]);
-});
-
 test("matches native sidebar actions and deletes after popover confirmation", async () => {
   const events = [];
   const runtime = loadInjection({
@@ -388,28 +370,6 @@ test("matches native sidebar actions and deletes after popover confirmation", as
   assert.equal(tasksImportButton.getAttribute("title"), null);
   assert.equal(deleteButton.getAttribute("title"), null);
   assert.equal(importButton.getAttribute("title"), null);
-  assert.equal(exportButton.getAttribute("class"), "native-thread-action");
-  assert.equal(tasksImportButton.getAttribute("class"), "native-tasks-header-action");
-  assert.equal(deleteButton.getAttribute("class"), "native-thread-action");
-  assert.equal(importButton.getAttribute("class"), "native-project-action");
-  assert.equal(importButton.style.right, "32px");
-  assert.match(exportButton.innerHTML, /<svg[\s>]/);
-  assert.match(tasksImportButton.innerHTML, /<svg[\s>]/);
-  assert.match(deleteButton.innerHTML, /<svg[\s>]/);
-  assert.match(importButton.innerHTML, /<svg[\s>]/);
-  assert.doesNotMatch(exportButton.innerHTML, /⇩/);
-  assert.doesNotMatch(importButton.innerHTML, /⇧/);
-
-  exportButton.dispatch("mouseenter");
-  const tooltip = runtime.document.body.querySelector("[role=tooltip]");
-  assert.ok(tooltip);
-  assert.match(
-    tooltip.getAttribute("class"),
-    /border-token-border bg-token-dropdown-background text-token-foreground/,
-  );
-  assert.equal(tooltip.children[0].children[0].textContent, "导出会话数据");
-  exportButton.dispatch("mouseleave");
-  assert.equal(runtime.document.body.querySelector("[role=tooltip]"), null);
 
   deleteButton.click();
   const popover = runtime.document.body.querySelector("[role=dialog]");

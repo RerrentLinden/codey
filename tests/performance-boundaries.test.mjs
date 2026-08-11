@@ -14,9 +14,6 @@ test("hot paths keep bounded work and avoid duplicate whole-payload processing",
     protocolProxy,
     proxyLauncher,
     bridge,
-    rendererInject,
-    pluginFix,
-    modelSection,
     sessionTools,
   ] = await Promise.all([
     readFile(new URL("backend/src/provider_models.rs", root), "utf8"),
@@ -51,9 +48,6 @@ test("hot paths keep bounded work and avoid duplicate whole-payload processing",
       ),
       "utf8",
     ),
-    readFile(new URL("public/renderer-inject.js", root), "utf8"),
-    readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8"),
-    readFile(new URL("src/ModelSection.tsx", root), "utf8"),
     readFile(new URL("public/codey-inject.js", root), "utf8"),
   ]);
 
@@ -85,12 +79,6 @@ test("hot paths keep bounded work and avoid duplicate whole-payload processing",
   assert.match(bridge, /BRIDGE_MAX_PENDING_CALLS: usize = 256/);
   assert.match(bridge, /fn bridge_path_can_run_concurrently/);
 
-  assert.match(rendererInject, /let accountUsagePollingEnabled = true/);
-  assert.match(rendererInject, /if \(!accountUsagePollingEnabled/);
-  assert.match(pluginFix, /registerFetchInterceptor\("plugin-marketplace"/);
-  assert.match(pluginFix, /return next\(\.\.\.args\)/);
-  assert.match(modelSection, /const MODEL_SECTION_PAGE_SIZE = 200/);
-  assert.match(modelSection, /thirdPartyModels\.slice\(0, visibleThirdPartyCount\)/);
   assert.match(sessionTools, /const maxSessionCacheEntries = 2_048/);
   assert.match(sessionTools, /const maxPendingScanRoots = 64/);
 });

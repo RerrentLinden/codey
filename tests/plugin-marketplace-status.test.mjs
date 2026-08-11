@@ -32,7 +32,7 @@ test("plugin marketplace repair is explicit and status checks stay read-only", a
   assert.match(statusFunction, /marketplaces_status/);
   assert.match(repairFunction, /ensure_marketplaces/);
   assert.doesNotMatch(launcherSource, /plugin_marketplace::ensure_marketplaces/);
-  assert.match(launcherSource, /plugin_marketplace::marketplaces_status/);
+  assert.doesNotMatch(launcherSource, /plugin_marketplace::marketplaces_status/);
 
   assert.match(
     appSource,

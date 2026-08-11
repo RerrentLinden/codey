@@ -339,11 +339,10 @@ input:focus-visible,
 .feedback-group-trigger {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  border: 1px solid rgba(0, 0, 0, 0.09) !important;
+  border: 1px solid rgba(0, 122, 255, 0.28) !important;
   border-radius: 8px;
-  background: rgba(0, 0, 0, 0.035) !important;
-  color: #4b4b50 !important;
+  background: rgba(0, 122, 255, 0.06) !important;
+  color: #0068d9 !important;
   font-weight: 600;
   white-space: nowrap;
   transition: background 150ms ease, border-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
@@ -351,10 +350,16 @@ input:focus-visible,
 
 .feedback-group-trigger:hover,
 .feedback-group-trigger:focus-visible {
-  border-color: rgba(0, 122, 255, 0.25) !important;
-  background: rgba(0, 122, 255, 0.08) !important;
-  color: #0068d9 !important;
-  box-shadow: 0 2px 8px rgba(0, 122, 255, 0.12);
+  border-color: rgba(0, 122, 255, 0.42) !important;
+  background: rgba(0, 122, 255, 0.12) !important;
+  color: #005ecb !important;
+  box-shadow: 0 2px 8px rgba(0, 122, 255, 0.14);
+}
+
+.feedback-group-trigger .semi-button-content {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
 }
 
 .feedback-group-trigger svg {
@@ -1507,6 +1512,17 @@ input:focus-visible,
   font-size: 11px;
   color: #6e6e73;
   line-height: 1.45;
+}
+
+.fastctx-disabled-switch-tooltip {
+  display: inline-flex;
+  border-radius: 999px;
+  cursor: help;
+}
+
+.fastctx-disabled-switch-tooltip:focus-visible {
+  outline: 2px solid rgba(0, 122, 255, 0.45);
+  outline-offset: 3px;
 }
 
 .subagent-policy-body {

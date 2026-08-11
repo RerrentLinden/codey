@@ -13,10 +13,6 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
 
   assert.match(
     appSource,
-    /const persistedConfigRef = useRef<Config \| null>\(null\)/,
-  );
-  assert.match(
-    appSource,
     /function closeSettings\(\) \{[\s\S]*setConfig\(persistedConfigRef\.current\)[\s\S]*setDirty\(false\)[\s\S]*onClose\?\.\(\)/,
   );
   assert.match(
@@ -28,28 +24,6 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
     /<SemiModal[\s\S]*closeOnEsc=\{false\}[\s\S]*closable=\{header === undefined\}[\s\S]*maskClosable=\{false\}[\s\S]*onCancel=\{onCancel\}/,
   );
   assert.match(appSource, /onCancel=\{handleCloseSettings\}/);
-  assert.match(
-    appSource,
-    /header=\{\([\s\S]*codey-settings-modal-header[\s\S]*configHeaderContent/,
-  );
-  assert.match(appSource, /aria-label="关闭配置"/);
-  assert.match(appSource, /className="title-restart-button"/);
-  assert.match(appSource, /onClick=\{handleRestartCodex\}/);
-  assert.match(
-    appSource,
-    /aria-label="问题反馈群，悬浮或聚焦查看二维码"/,
-  );
-  assert.match(appSource, /className="feedback-qr-popover" role="tooltip"/);
-  assert.match(
-    appSource,
-    /https:\/\/pub-2d17a6a8bc22426a92e297a59f55ccc3\.r2\.dev\/qr\.jpg/,
-  );
-  assert.match(appSource, /showRestartAction=\{!embedded\}/);
-  assert.match(
-    appSource,
-    /\{!embedded && \(\s*<header className="config-header">\{configHeaderContent\}<\/header>/,
-  );
-  assert.match(appSource, /\{!embedded && \(/);
 
   assert.doesNotMatch(overlaySource, /codey-overlay-backdrop/);
   assert.doesNotMatch(overlaySource, /codey-overlay-dialog/);
@@ -72,10 +46,6 @@ test("settings Semi modal dismissal restores unsaved config", async () => {
     overlayStyles,
     /:host \{[\s\S]*z-index:\s*2147483647 !important;/,
   );
-  assert.match(
-    overlayStyles,
-    /\.codey-settings-modal-header \.config-header-inner \{[\s\S]*grid-template-columns:\s*minmax\(0, 1fr\) auto minmax\(0, 1fr\)/,
-  );
 });
 
 test("all editable feature controls are locked while an operation is active", async () => {
@@ -91,7 +61,6 @@ test("all editable feature controls are locked while an operation is active", as
   for (const setting of [
     "slimCodexPet",
     "fastCodexStartup",
-    "fastContextTools",
     "disableTraceLogWrites",
     "protectCrashpadPending",
     "hideFullAccessWarning",

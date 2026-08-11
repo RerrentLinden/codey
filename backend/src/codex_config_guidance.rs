@@ -89,6 +89,20 @@ image_generation = false
 "#####;
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Use \
+`mcp__codey_fastctx__inspect_local_file`, `mcp__codey_fastctx__grep`, \
+`mcp__codey_fastctx__glob`, and \
+`mcp__codey_fastctx__replace` for local workspace files. Call them directly when visible. When these \
+functions are available inside a code-mode program, use the same names on the `tools` object, for example \
+`await tools.mcp__codey_fastctx__inspect_local_file({ file_path: absolutePath })`. Use FastCtx file \
+tools directly for local-file operations, including when a local reference is URI-shaped; pass the \
+equivalent plain absolute filesystem path. Keep local file inspection, content search, discovery, and \
+deterministic replacement on these FastCtx functions; no separate tool discovery is needed. On Windows, \
+convert the reference to a drive-letter path such as `E:/repo/file.ts` before the call. Use terminal \
+commands only for builds, tests, Git, package managers, or after a FastCtx function actually fails. \
+Every tool call must advance the requested task; put progress and corrections in commentary. Follow \
+every Complete or Partial continuation exactly.";
+
+pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3: &str = "Codey FastCtx context tools are enabled. Use \
 `mcp__codey_fastctx__read`, `mcp__codey_fastctx__grep`, `mcp__codey_fastctx__glob`, and \
 `mcp__codey_fastctx__replace` for local workspace files. Call them directly when visible. When these \
 functions are available inside a code-mode program, use the same names on the `tools` object, for example \
@@ -144,6 +158,15 @@ follow every Complete or Partial pagination note exactly.";
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     CODEY_FASTCTX_GUIDANCE,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE,
+    OLDER_CODEY_FASTCTX_GUIDANCE_V2,
+    OLDER_CODEY_FASTCTX_GUIDANCE,
+    LEGACY_CODEY_FASTCTX_GUIDANCE,
+];
+
+const PREVIOUS_CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE,
     OLDER_CODEY_FASTCTX_GUIDANCE_V2,
     OLDER_CODEY_FASTCTX_GUIDANCE,
@@ -167,8 +190,16 @@ pub(crate) fn default_agent_config_with_fastctx_guidance(namespace: Option<&str>
 }
 
 pub(crate) fn codey_fastctx_guidance_blocks(current: &str) -> Vec<String> {
+    fastctx_guidance_blocks(current, CODEY_FASTCTX_GUIDANCE_VERSIONS)
+}
+
+fn previous_codey_fastctx_guidance_blocks(current: &str) -> Vec<String> {
+    fastctx_guidance_blocks(current, PREVIOUS_CODEY_FASTCTX_GUIDANCE_VERSIONS)
+}
+
+fn fastctx_guidance_blocks(current: &str, versions: &[&str]) -> Vec<String> {
     let mut blocks = Vec::new();
-    for &guidance in CODEY_FASTCTX_GUIDANCE_VERSIONS {
+    for &guidance in versions {
         if current.contains(guidance) {
             blocks.push(guidance.to_string());
         }
@@ -197,8 +228,12 @@ fn dynamic_codey_fastctx_guidance_at(
     guidance_template: &str,
 ) -> Option<String> {
     let prefix_end = guidance_template.find(DEFAULT_FASTCTX_TOOL_NAMESPACE)?;
+    let after_template_namespace =
+        guidance_template.get(prefix_end + DEFAULT_FASTCTX_TOOL_NAMESPACE.len()..)?;
+    let tool_suffix_end = after_template_namespace.find('`')?;
+    let tool_suffix = &after_template_namespace[..=tool_suffix_end];
     let after_prefix = current.get(start + prefix_end..)?;
-    let namespace_end = after_prefix.find("__read`")?;
+    let namespace_end = after_prefix.find(tool_suffix)?;
     let namespace = &after_prefix[..namespace_end];
     if namespace.is_empty()
         || namespace.contains('`')
@@ -272,9 +307,17 @@ pub(crate) fn remove_subagent_guidance(current: &str) -> Option<String> {
 }
 
 pub(crate) fn remove_codey_fastctx_guidance(current: &str) -> Option<String> {
+    remove_fastctx_guidance_blocks(current, codey_fastctx_guidance_blocks(current))
+}
+
+pub(crate) fn remove_previous_codey_fastctx_guidance(current: &str) -> Option<String> {
+    remove_fastctx_guidance_blocks(current, previous_codey_fastctx_guidance_blocks(current))
+}
+
+fn remove_fastctx_guidance_blocks(current: &str, guidance_blocks: Vec<String>) -> Option<String> {
     let mut restored = current.to_string();
     let mut changed = false;
-    for guidance in codey_fastctx_guidance_blocks(current) {
+    for guidance in guidance_blocks {
         while let Some(without_guidance) = remove_owned_guidance_paragraph(&restored, &guidance) {
             restored = without_guidance;
             changed = true;
@@ -323,18 +366,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fastctx_guidance_routes_uri_shaped_local_files_through_the_read_tool() {
+    fn fastctx_guidance_routes_uri_shaped_local_files_through_the_inspection_tool() {
         assert_eq!(
             codey_fastctx_guidance_for_namespace("mcp__codey_fastctx"),
             CODEY_FASTCTX_GUIDANCE
         );
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Call them directly when visible"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("tools.mcp__codey_fastctx__read"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("tools.mcp__codey_fastctx__inspect_local_file"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("reused FastCtx server"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("available inside a code-mode program"));
-        assert!(
-            CODEY_FASTCTX_GUIDANCE
-                .contains("`file_path` to a plain absolute filesystem path (never a URI)")
-        );
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("including when a local reference is URI-shaped"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("equivalent plain absolute filesystem path"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("drive-letter path such as `E:/repo/file.ts`"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("no separate tool discovery is needed"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Every tool call must advance the requested task"));
@@ -342,13 +384,14 @@ mod tests {
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("read_mcp_resource"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("Write-Output"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("file:///"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("__read"));
     }
 
     #[test]
     fn default_agent_config_can_include_the_fastctx_namespace_guidance() {
         let config = default_agent_config_with_fastctx_guidance(Some("mcp__fastctx"));
 
-        assert!(config.contains("tools.mcp__fastctx__read"));
+        assert!(config.contains("tools.mcp__fastctx__inspect_local_file"));
         assert!(config.contains("Call them directly when visible"));
         assert!(config.contains("no separate tool discovery is needed"));
         assert!(config.contains("put progress and corrections in commentary"));
@@ -434,6 +477,30 @@ mod tests {
 
         assert_eq!(
             remove_codey_fastctx_guidance(&configured).as_deref(),
+            Some("User guidance.\n\nConcurrent guidance.")
+        );
+    }
+
+    #[test]
+    fn previous_fastctx_guidance_cleanup_keeps_the_current_version() {
+        let configured =
+            format!("{CODEY_FASTCTX_GUIDANCE}\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3}");
+
+        assert_eq!(
+            remove_previous_codey_fastctx_guidance(&configured).as_deref(),
+            Some(CODEY_FASTCTX_GUIDANCE)
+        );
+        assert!(remove_previous_codey_fastctx_guidance(CODEY_FASTCTX_GUIDANCE).is_none());
+    }
+
+    #[test]
+    fn previous_fastctx_guidance_cleanup_migrates_dynamic_namespaces() {
+        let previous = PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3
+            .replace(DEFAULT_FASTCTX_TOOL_NAMESPACE, "mcp__fastctx");
+        let configured = format!("User guidance.\n\n{previous}\n\nConcurrent guidance.");
+
+        assert_eq!(
+            remove_previous_codey_fastctx_guidance(&configured).as_deref(),
             Some("User guidance.\n\nConcurrent guidance.")
         );
     }

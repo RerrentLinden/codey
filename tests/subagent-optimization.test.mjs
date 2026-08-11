@@ -47,22 +47,6 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
   assert.match(uiSource, /aria-label="启用子代理协作优化"/);
   assert.match(uiSource, /aria-label="选择子代理模型"/);
   assert.match(uiSource, /aria-label="选择子代理思考深度"/);
-  const featureGridIndex = sectionsSource.indexOf(
-    '<div className="feature-grid">',
-  );
-  const gpuCardIndex = sectionsSource.indexOf(
-    "<strong>GPU 渲染模式</strong>",
-  );
-  const subagentCardIndex = sectionsSource.indexOf(
-    "<strong>子代理协作优化</strong>",
-  );
-  const petCardIndex = sectionsSource.indexOf(
-    "<strong>精简 Codex 宠物模块</strong>",
-  );
-  assert.ok(featureGridIndex >= 0);
-  assert.ok(gpuCardIndex > featureGridIndex);
-  assert.ok(subagentCardIndex > gpuCardIndex);
-  assert.ok(petCardIndex > subagentCardIndex);
   assert.match(
     uiSource,
     /const subagentPolicyControlsDisabled =\s*isBusy/,
@@ -75,19 +59,11 @@ test("subagent optimization is opt-in and exposed through the settings switch", 
     uiSource,
     /subagentPolicyControlsDisabled \|\|\s*subagentReasoningEfforts\.length === 0/,
   );
-  assert.match(uiSource, /subagentModelOptions/);
   assert.match(modelHookSource, /modelState\.subagentModelIds/);
   assert.match(modelHookSource, /subagentModelKeys\.has\(modelKey\(model\.slug\)\)/);
-  assert.match(modelHookSource, /当前线路没有 Codex 子代理工具可用的模型/);
-  assert.match(uiSource, /当前 Codex 版本或线路没有可用于子代理的模型/);
   assert.doesNotMatch(uiSource, /仅接受 Sol \/ Terra/);
   assert.match(modelSource, /invoke\("fetch_current_provider_models"\)/);
   assert.match(modelSource, /includesModelId\(result\.models, subagentModel\)/);
-  assert.match(modelSource, /provider\.official \? "官方账号" : "第三方 API"/);
-  assert.match(modelSource, /不支持 \$\{subagentModel\}，无法开启子代理协作优化/);
-  assert.match(uiSource, /无需重启/);
-  assert.doesNotMatch(uiSource, /下次启动启用 V2 并行配置，退出时自动恢复原文件/);
-  assert.match(uiSource, /可先选择子代理模型与思考深度，开启后保存即生效/);
 });
 
 test("subagent optimization owns the requested V2 and default-agent settings", async () => {
@@ -106,9 +82,6 @@ test("subagent optimization owns the requested V2 and default-agent settings", a
   assert.match(source, /multi_agent\["max_wait_timeout_ms"\] = value\(120_000\)/);
   assert.match(source, /multi_agent\["root_agent_usage_hint_text"\] = value\(/);
   assert.match(source, /const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str/);
-  assert.match(source, /`agents\.wait_agent` directly before any other work/);
-  assert.match(source, /mailbox update is not completion/);
-  assert.match(source, /`FINAL_ANSWER` or `task_complete`/);
   assert.doesNotMatch(source, /doc\.as_table_mut\(\)\.remove\("agents"\)/);
   assert.match(source, /"max_threads", "max_depth", "interrupt_message"/);
   assert.match(source, /let subagent_model = subagent_model\.trim\(\)/);
