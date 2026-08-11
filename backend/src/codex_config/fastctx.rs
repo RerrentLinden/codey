@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
+use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value, value};
 
 use super::{
     CODEY_FASTCTX_ARG_MARKER, CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID,
@@ -138,9 +138,9 @@ pub(super) fn disable_fast_context_tools(doc: &mut DocumentMut) {
     );
     let subagent_guidance_removed = doc
         .get_mut("features")
-        .and_then(Item::as_table_mut)
+        .and_then(Item::as_table_like_mut)
         .and_then(|features| features.get_mut("multi_agent_v2"))
-        .and_then(Item::as_table_mut)
+        .and_then(Item::as_table_like_mut)
         .is_some_and(|multi_agent| {
             remove_guidance_from_table(
                 multi_agent,
@@ -158,14 +158,7 @@ pub(super) fn disable_fast_context_tools(doc: &mut DocumentMut) {
 }
 
 fn remove_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> bool {
-    let Some(namespaces) = doc
-        .get_mut("features")
-        .and_then(Item::as_table_mut)
-        .and_then(|features| features.get_mut("code_mode"))
-        .and_then(Item::as_table_mut)
-        .and_then(|code_mode| code_mode.get_mut("direct_only_tool_namespaces"))
-        .and_then(Item::as_array_mut)
-    else {
+    let Some(namespaces) = direct_only_tool_namespaces_mut(doc) else {
         return false;
     };
     let original_len = namespaces.len();
@@ -173,8 +166,26 @@ fn remove_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> 
     namespaces.len() != original_len
 }
 
+pub(super) fn direct_only_tool_namespaces(doc: &DocumentMut) -> Option<&Array> {
+    doc.get("features")
+        .and_then(Item::as_table_like)
+        .and_then(|features| features.get("code_mode"))
+        .and_then(Item::as_table_like)
+        .and_then(|code_mode| code_mode.get("direct_only_tool_namespaces"))
+        .and_then(Item::as_array)
+}
+
+pub(super) fn direct_only_tool_namespaces_mut(doc: &mut DocumentMut) -> Option<&mut Array> {
+    doc.get_mut("features")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|features| features.get_mut("code_mode"))
+        .and_then(Item::as_table_like_mut)
+        .and_then(|code_mode| code_mode.get_mut("direct_only_tool_namespaces"))
+        .and_then(Item::as_array_mut)
+}
+
 pub(super) fn remove_guidance_from_table(
-    table: &mut Table,
+    table: &mut dyn TableLike,
     key: &str,
     remove_guidance: fn(&str) -> Option<String>,
 ) -> bool {
@@ -188,7 +199,7 @@ pub(super) fn remove_guidance_from_table(
     if restored_guidance.trim().is_empty() {
         table.remove(key);
     } else {
-        table[key] = value(restored_guidance);
+        table.insert(key, value(restored_guidance));
     }
     true
 }

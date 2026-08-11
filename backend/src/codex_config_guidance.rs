@@ -91,6 +91,25 @@ image_generation = false
 pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Use \
 `mcp__codey_fastctx__inspect_local_file`, `mcp__codey_fastctx__grep`, \
 `mcp__codey_fastctx__glob`, and \
+`mcp__codey_fastctx__replace` for local workspace files. `mcp__codey_fastctx` is a direct tool namespace, \
+not an MCP Resources server ID; FastCtx publishes tools, not Resources. Never call `list_mcp_resources`, \
+`list_mcp_resource_templates`, `read_mcp_resource`, or any `resources/*` method for FastCtx or local \
+workspace files, and never pass `mcp__codey_fastctx` as the `server` argument. When FastCtx tools are \
+deferred or not visible, use `tool_search` to load these direct tools, then call the discovered FastCtx \
+function; do not probe or invent MCP resource server names. Call the tools directly when visible. When \
+these functions are available inside a code-mode program, use the same names on the `tools` object, for \
+example `await tools.mcp__codey_fastctx__inspect_local_file({ file_path: absolutePath })`. Use FastCtx \
+file tools directly for local-file operations, including when a local reference is URI-shaped; pass the \
+equivalent plain absolute filesystem path. Keep local file inspection, content search, discovery, and \
+deterministic replacement on these FastCtx functions. On Windows, convert the reference to a drive-letter \
+path such as `E:/repo/file.ts` before the call. Use terminal commands only for builds, tests, Git, package \
+managers, or when `tool_search` cannot expose the needed FastCtx function or that function fails. Every \
+tool call must advance the requested task; put progress and corrections in commentary. Follow every \
+Complete or Partial continuation exactly.";
+
+pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4: &str = "Codey FastCtx context tools are enabled. Use \
+`mcp__codey_fastctx__inspect_local_file`, `mcp__codey_fastctx__grep`, \
+`mcp__codey_fastctx__glob`, and \
 `mcp__codey_fastctx__replace` for local workspace files. Call them directly when visible. When these \
 functions are available inside a code-mode program, use the same names on the `tools` object, for example \
 `await tools.mcp__codey_fastctx__inspect_local_file({ file_path: absolutePath })`. Use FastCtx file \
@@ -158,6 +177,7 @@ follow every Complete or Partial pagination note exactly.";
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     CODEY_FASTCTX_GUIDANCE,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE,
     OLDER_CODEY_FASTCTX_GUIDANCE_V2,
@@ -166,6 +186,7 @@ pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
 ];
 
 const PREVIOUS_CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE,
     OLDER_CODEY_FASTCTX_GUIDANCE_V2,
@@ -371,17 +392,29 @@ mod tests {
             codey_fastctx_guidance_for_namespace("mcp__codey_fastctx"),
             CODEY_FASTCTX_GUIDANCE
         );
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("Call them directly when visible"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Call the tools directly when visible"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("tools.mcp__codey_fastctx__inspect_local_file"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("reused FastCtx server"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("available inside a code-mode program"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("including when a local reference is URI-shaped"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("equivalent plain absolute filesystem path"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("drive-letter path such as `E:/repo/file.ts`"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("no separate tool discovery is needed"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains(
+            "`mcp__codey_fastctx` is a direct tool namespace, not an MCP Resources server ID"
+        ));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("FastCtx publishes tools, not Resources"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Never call `list_mcp_resources`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("`read_mcp_resource`"));
+        assert!(
+            CODEY_FASTCTX_GUIDANCE
+                .contains("never pass `mcp__codey_fastctx` as the `server` argument")
+        );
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("use `tool_search` to load these direct tools"));
+        assert!(
+            CODEY_FASTCTX_GUIDANCE.contains("do not probe or invent MCP resource server names")
+        );
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Every tool call must advance the requested task"));
-        assert!(!CODEY_FASTCTX_GUIDANCE.contains("list_mcp_resources"));
-        assert!(!CODEY_FASTCTX_GUIDANCE.contains("read_mcp_resource"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("no separate tool discovery is needed"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("Write-Output"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("file:///"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("__read"));
@@ -392,11 +425,18 @@ mod tests {
         let config = default_agent_config_with_fastctx_guidance(Some("mcp__fastctx"));
 
         assert!(config.contains("tools.mcp__fastctx__inspect_local_file"));
-        assert!(config.contains("Call them directly when visible"));
-        assert!(config.contains("no separate tool discovery is needed"));
+        assert!(config.contains("Call the tools directly when visible"));
+        assert!(
+            config.contains(
+                "`mcp__fastctx` is a direct tool namespace, not an MCP Resources server ID"
+            )
+        );
+        assert!(config.contains("Never call `list_mcp_resources`"));
+        assert!(config.contains("`read_mcp_resource`"));
+        assert!(config.contains("never pass `mcp__fastctx` as the `server` argument"));
+        assert!(config.contains("use `tool_search` to load these direct tools"));
         assert!(config.contains("put progress and corrections in commentary"));
-        assert!(!config.contains("list_mcp_resources"));
-        assert!(!config.contains("read_mcp_resource"));
+        assert!(!config.contains("no separate tool discovery is needed"));
         assert!(!config.contains("Write-Output"));
         assert!(!config.contains("mcp__codey_fastctx"));
         assert!(config.contains("[features]"));
@@ -484,7 +524,7 @@ mod tests {
     #[test]
     fn previous_fastctx_guidance_cleanup_keeps_the_current_version() {
         let configured =
-            format!("{CODEY_FASTCTX_GUIDANCE}\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3}");
+            format!("{CODEY_FASTCTX_GUIDANCE}\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4}");
 
         assert_eq!(
             remove_previous_codey_fastctx_guidance(&configured).as_deref(),
@@ -495,7 +535,7 @@ mod tests {
 
     #[test]
     fn previous_fastctx_guidance_cleanup_migrates_dynamic_namespaces() {
-        let previous = PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3
+        let previous = PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4
             .replace(DEFAULT_FASTCTX_TOOL_NAMESPACE, "mcp__fastctx");
         let configured = format!("User guidance.\n\n{previous}\n\nConcurrent guidance.");
 

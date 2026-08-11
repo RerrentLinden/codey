@@ -94,8 +94,8 @@ pub(super) fn restore_legacy_owned_config_changes(
             .insert(CODEY_FASTCTX_SERVER_ID, Item::Table(applied_server));
     }
 
-    let original_namespaces = fastctx_namespaces(&original_document);
-    let current_namespaces = fastctx_namespaces(&current_document);
+    let original_namespaces = direct_only_tool_namespaces(&original_document);
+    let current_namespaces = direct_only_tool_namespaces(&current_document);
     let original_has_fastctx = original_namespaces.is_some_and(|namespaces| {
         namespaces
             .iter()
@@ -199,16 +199,6 @@ fn table_with_selected_fields(source: &Table, fields: &[&str]) -> Table {
         }
     }
     selected
-}
-
-fn fastctx_namespaces(document: &DocumentMut) -> Option<&Array> {
-    document
-        .get("features")
-        .and_then(Item::as_table)
-        .and_then(|features| features.get("code_mode"))
-        .and_then(Item::as_table)
-        .and_then(|code_mode| code_mode.get("direct_only_tool_namespaces"))
-        .and_then(Item::as_array)
 }
 
 fn is_legacy_reasoning_efforts(item: &Item) -> bool {

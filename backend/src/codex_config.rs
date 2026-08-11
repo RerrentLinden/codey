@@ -31,8 +31,8 @@ mod toml_restore;
 
 use fastctx::{
     apply_fastctx_guidance_to_table, arguments_have_codey_fastctx_marker,
-    disable_fast_context_tools, enable_fast_context_tools, fast_context_tools_status_from_document,
-    remove_guidance_from_table,
+    direct_only_tool_namespaces, direct_only_tool_namespaces_mut, disable_fast_context_tools,
+    enable_fast_context_tools, fast_context_tools_status_from_document, remove_guidance_from_table,
 };
 #[cfg(test)]
 use fastctx::{configured_user_fastctx_server_id, mcp_server_exists};
@@ -287,9 +287,9 @@ fn migrate_previous_fastctx_guidance(
     let subagent_changed = include_subagent_guidance
         && document
             .get_mut("features")
-            .and_then(Item::as_table_mut)
+            .and_then(Item::as_table_like_mut)
             .and_then(|features| features.get_mut("multi_agent_v2"))
-            .and_then(Item::as_table_mut)
+            .and_then(Item::as_table_like_mut)
             .is_some_and(|multi_agent| {
                 remove_guidance_from_table(
                     multi_agent,

@@ -1,6 +1,6 @@
 use super::*;
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG, PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3,
+    CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG, PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4,
     codey_fastctx_guidance_for_namespace, remove_codey_fastctx_guidance,
 };
 
@@ -1143,8 +1143,12 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
     assert!(guidance.contains("tools.mcp__codey_fastctx__inspect_local_file"));
     assert!(guidance.contains("available inside a code-mode program"));
     assert!(guidance.contains("drive-letter path such as `E:/repo/file.ts`"));
-    assert!(!guidance.contains("list_mcp_resources"));
-    assert!(!guidance.contains("read_mcp_resource"));
+    assert!(guidance.contains(
+        "`mcp__codey_fastctx` is a direct tool namespace, not an MCP Resources server ID"
+    ));
+    assert!(guidance.contains("Never call `list_mcp_resources`"));
+    assert!(guidance.contains("`read_mcp_resource`"));
+    assert!(guidance.contains("use `tool_search` to load these direct tools"));
     assert!(!guidance.contains("Write-Output"));
     for stale_guidance in &CODEY_FASTCTX_GUIDANCE_VERSIONS[1..] {
         assert!(!guidance.contains(stale_guidance));
@@ -1162,6 +1166,46 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
         document["tool_output_token_limit"].as_integer(),
         Some(10_000)
     );
+}
+
+#[test]
+fn fast_context_tools_remove_direct_only_namespace_from_inline_tables() {
+    for existing in [
+        r#"
+features = { code_mode = { direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx"] }, user_flag = true }
+"#,
+        r#"
+[features]
+code_mode = { direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx"] }
+user_flag = true
+"#,
+    ] {
+        let result = patch_config_with_fastctx(
+            existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            relative_model_catalog_path(),
+            None,
+            Some(Path::new("/tmp/codey")),
+            false,
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+        let namespaces = direct_only_tool_namespaces(&document).unwrap();
+
+        assert_eq!(
+            namespaces
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>(),
+            vec!["mcp__existing"]
+        );
+        assert_eq!(
+            document["features"]["user_flag"].as_bool(),
+            Some(true),
+            "inline feature fields must be preserved"
+        );
+    }
 }
 
 #[test]
@@ -1429,6 +1473,36 @@ args = ["serve"]
 }
 
 #[test]
+fn previous_fastctx_guidance_migration_handles_inline_subagent_tables() {
+    let dynamic_previous =
+        PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4.replace(CODEY_FASTCTX_NAMESPACE, "mcp__legacy_fastctx");
+    let existing = format!(
+        "developer_instructions = {}\n\
+         features = {{ multi_agent_v2 = {{ subagent_developer_instructions = {} }} }}\n",
+        Value::from(format!(
+            "Root user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4}"
+        )),
+        Value::from(format!("Subagent user guidance.\n\n{dynamic_previous}")),
+    );
+
+    let migrated = migrate_previous_fastctx_guidance(&existing, true, "inline config")
+        .unwrap()
+        .unwrap();
+    let document = parse_document(&migrated).unwrap();
+
+    assert_eq!(
+        document["developer_instructions"].as_str(),
+        Some("Root user guidance.")
+    );
+    assert_eq!(
+        document["features"]["multi_agent_v2"]["subagent_developer_instructions"].as_str(),
+        Some("Subagent user guidance.")
+    );
+    assert!(!migrated.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4));
+    assert!(!migrated.contains("mcp__legacy_fastctx"));
+}
+
+#[test]
 fn previous_fastctx_guidance_is_migrated_before_the_runtime_lease() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
@@ -1436,7 +1510,7 @@ fn previous_fastctx_guidance_is_migrated_before_the_runtime_lease() {
     let backup_root = temp.path().join("codey/codex-backups");
     fs::create_dir_all(home.join("agents")).unwrap();
     let dynamic_previous =
-        PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3.replace(CODEY_FASTCTX_NAMESPACE, "mcp__legacy_fastctx");
+        PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4.replace(CODEY_FASTCTX_NAMESPACE, "mcp__legacy_fastctx");
     let original_config = format!(
         r#"model_provider = "codey_global"
 developer_instructions = {}
@@ -1448,7 +1522,7 @@ base_url = "https://chatgpt.com/backend-api/codex"
 subagent_developer_instructions = {}
 "#,
         Value::from(format!(
-            "Root user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3}"
+            "Root user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4}"
         )),
         Value::from(format!("Subagent user guidance.\n\n{dynamic_previous}")),
     );
@@ -1457,7 +1531,7 @@ subagent_developer_instructions = {}
 developer_instructions = {}
 "#,
         Value::from(format!(
-            "Default user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3}"
+            "Default user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4}"
         )),
     );
     fs::write(home.join("config.toml"), original_config).unwrap();
@@ -1476,11 +1550,25 @@ developer_instructions = {}
     .unwrap();
 
     let temporary_config = fs::read_to_string(home.join("config.toml")).unwrap();
-    assert!(temporary_config.contains(CODEY_FASTCTX_GUIDANCE));
-    assert!(!temporary_config.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3));
+    let temporary_document = parse_document(&temporary_config).unwrap();
+    let temporary_root_guidance = temporary_document["developer_instructions"]
+        .as_str()
+        .unwrap();
+    let temporary_subagent_guidance =
+        temporary_document["features"]["multi_agent_v2"]["subagent_developer_instructions"]
+            .as_str()
+            .unwrap();
+    for guidance in [temporary_root_guidance, temporary_subagent_guidance] {
+        assert!(guidance.contains(CODEY_FASTCTX_GUIDANCE));
+        assert!(guidance.contains("Never call `list_mcp_resources`"));
+        assert!(guidance.contains("use `tool_search` to load these direct tools"));
+        assert!(!guidance.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4));
+    }
     let temporary_default = fs::read_to_string(home.join("agents/default.toml")).unwrap();
     assert!(temporary_default.contains(CODEY_FASTCTX_GUIDANCE));
-    assert!(!temporary_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3));
+    assert!(temporary_default.contains("Never call `list_mcp_resources`"));
+    assert!(temporary_default.contains("use `tool_search` to load these direct tools"));
+    assert!(!temporary_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4));
 
     assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
     let restored_config = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -1494,7 +1582,7 @@ developer_instructions = {}
         Some("Subagent user guidance.")
     );
     assert!(!restored_config.contains(CODEY_FASTCTX_GUIDANCE));
-    assert!(!restored_config.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3));
+    assert!(!restored_config.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4));
 
     let restored_default = fs::read_to_string(home.join("agents/default.toml")).unwrap();
     let restored_default_document = parse_document(&restored_default).unwrap();
@@ -1503,7 +1591,7 @@ developer_instructions = {}
         Some("Default user guidance.")
     );
     assert!(!restored_default.contains(CODEY_FASTCTX_GUIDANCE));
-    assert!(!restored_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3));
+    assert!(!restored_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4));
 }
 
 #[test]
@@ -2487,6 +2575,40 @@ note = "user replacement"
     assert_eq!(
         restored["mcp_servers"][CODEY_FASTCTX_SERVER_ID]["note"].as_str(),
         Some("user replacement")
+    );
+}
+
+#[test]
+fn restore_reverts_inline_fastctx_namespace_changes_after_concurrent_edits() {
+    let original = r#"
+features = { code_mode = { direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx"] }, user_flag = "original" }
+"#;
+    let applied = r#"
+features = { code_mode = { direct_only_tool_namespaces = ["mcp__existing"] }, user_flag = "original" }
+"#;
+    let current = r#"
+features = { code_mode = { direct_only_tool_namespaces = ["mcp__existing", "mcp__concurrent"] }, user_flag = "concurrent" }
+"#;
+
+    let restored = restore_owned_config_changes(original, applied, current)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    let namespaces = direct_only_tool_namespaces(&restored).unwrap();
+
+    assert!(
+        namespaces
+            .iter()
+            .any(|entry| { entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE) })
+    );
+    assert!(
+        namespaces
+            .iter()
+            .any(|entry| { entry.as_str() == Some("mcp__concurrent") })
+    );
+    assert_eq!(
+        restored["features"]["user_flag"].as_str(),
+        Some("concurrent")
     );
 }
 

@@ -3,7 +3,10 @@ use std::collections::BTreeSet;
 use anyhow::{Context, Result};
 use toml_edit::{Item, Table, Value, value};
 
-use super::{CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID, document_string, parse_document};
+use super::{
+    CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID, direct_only_tool_namespaces,
+    direct_only_tool_namespaces_mut, document_string, parse_document,
+};
 use crate::codex_config_guidance::{
     codey_fastctx_guidance_blocks, remove_owned_guidance_block, remove_owned_guidance_paragraph,
     root_agent_collaboration_usage_hint_blocks,
@@ -22,10 +25,49 @@ pub(super) fn restore_owned_config_changes(
         applied.as_table(),
         current.as_table_mut(),
     );
+    restore_fastctx_direct_only_namespace(&original, &applied, &mut current);
     if current.as_table().is_empty() {
         Ok(String::new())
     } else {
         document_string(&current)
+    }
+}
+
+fn restore_fastctx_direct_only_namespace(
+    original: &toml_edit::DocumentMut,
+    applied: &toml_edit::DocumentMut,
+    current: &mut toml_edit::DocumentMut,
+) {
+    let contains_fastctx = |entries: Option<&toml_edit::Array>| {
+        entries.is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
+        })
+    };
+    let original_has_namespace = contains_fastctx(direct_only_tool_namespaces(original));
+    let applied_has_namespace = contains_fastctx(direct_only_tool_namespaces(applied));
+    if original_has_namespace == applied_has_namespace {
+        return;
+    }
+
+    let Some(current_namespaces) = direct_only_tool_namespaces_mut(current) else {
+        return;
+    };
+    if applied_has_namespace {
+        let fastctx_index = current_namespaces
+            .iter()
+            .position(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE));
+        if let Some(index) = fastctx_index {
+            current_namespaces.remove(index);
+        }
+    } else {
+        let namespace_is_missing = current_namespaces
+            .iter()
+            .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE));
+        if namespace_is_missing {
+            current_namespaces.push(CODEY_FASTCTX_NAMESPACE);
+        }
     }
 }
 
