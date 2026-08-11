@@ -21,6 +21,7 @@ mod pet_slim_patch;
 mod plugin_marketplace;
 mod process_cleanup;
 mod process_tree;
+mod prompt_optimization;
 mod provider_lease;
 mod provider_models;
 mod session_delete;

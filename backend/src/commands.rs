@@ -13,6 +13,7 @@ use std::time::Duration;
 mod diagnostics;
 mod models;
 mod plugins;
+mod prompt_optimization;
 mod runtime;
 mod updates;
 mod webhooks;
@@ -45,6 +46,10 @@ pub use models::{
     sync_current_provider_command,
 };
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
+use prompt_optimization::{
+    fetch_prompt_optimization_models_command, optimize_prompt_command,
+    test_prompt_optimization_command,
+};
 use runtime::refresh_injection_status;
 pub(crate) use runtime::{
     CC_SWITCH_ROUTE_RECOVERY_INTERVAL, CC_SWITCH_ROUTE_RECOVERY_STABLE_READS,
@@ -77,7 +82,7 @@ use crate::codex_config::{
     FastContextToolsStatus, codex_home, fast_context_tools_status,
     mark_runtime_subagent_defaults_applied,
 };
-use crate::config::{CodeyConfig, ConfigStore};
+use crate::config::{CodeyConfig, ConfigStore, PromptOptimizationConfig};
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
 };
@@ -533,6 +538,22 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Ok(channel_id) => reveal_notification_channel(state, channel_id).await,
             Err(error) => Err(error),
         },
+        "optimize_prompt" => match string_argument(&args, "text") {
+            Ok(text) => optimize_prompt_command(state, text).await,
+            Err(error) => Err(error),
+        },
+        "test_prompt_optimization" => {
+            match optional_argument::<PromptOptimizationConfig>(&args, "config") {
+                Ok(draft) => test_prompt_optimization_command(state, draft).await,
+                Err(error) => Err(error),
+            }
+        }
+        "fetch_prompt_optimization_models" => {
+            match optional_argument::<PromptOptimizationConfig>(&args, "config") {
+                Ok(draft) => fetch_prompt_optimization_models_command(state, draft).await,
+                Err(error) => Err(error),
+            }
+        }
         "check_for_updates" => check_for_updates(state).await,
         "download_update" => download_update(state).await,
         "install_downloaded_update" => match string_argument(&args, "filePath") {
@@ -684,6 +705,11 @@ async fn save_codey_config_locked(
         .merge_redacted_secrets(&previous.webhook);
     config_input.webhook.validate()?;
     config.webhook = config_input.webhook;
+    config_input
+        .prompt_optimization
+        .merge_redacted_secrets(&previous.prompt_optimization);
+    config_input.prompt_optimization.validate()?;
+    config.prompt_optimization = config_input.prompt_optimization;
     config.codex_app_path = config_input.codex_app_path;
     config.user_scripts = config_input.user_scripts;
     config.disable_trace_log_writes = config_input.disable_trace_log_writes;
@@ -1037,6 +1063,9 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
         channel.bot_token_configured = !channel.bot_token.trim().is_empty();
         channel.bot_token.clear();
     }
+    public.prompt_optimization.api_key_configured =
+        !public.prompt_optimization.api_key.trim().is_empty();
+    public.prompt_optimization.api_key.clear();
     public
 }
 
