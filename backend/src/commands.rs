@@ -803,7 +803,7 @@ fn current_fast_context_tools_status() -> FastContextToolsStatus {
 fn fast_context_tools_status_or_blocked<E>(
     status: Result<FastContextToolsStatus, E>,
 ) -> FastContextToolsStatus {
-    status.unwrap_or_else(|_| FastContextToolsStatus {
+    status.unwrap_or(FastContextToolsStatus {
         user_configured: false,
         detection_failed: true,
         server_id: None,
