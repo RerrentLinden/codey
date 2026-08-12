@@ -44,7 +44,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
 
   try {
     const expression = await loadPatchExpression();
-    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v21");
+    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v22");
 
     const patchedElectron = Module._load("electron");
     const passthroughGitHandler = () => "git-handler";
@@ -71,6 +71,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.equal(startupGitGuardStatus.status, "ok");
     assert.equal(startupGitGuardStatus.guard.gitHandlerPatched, true);
     assert.equal(startupGitGuardStatus.guard.statusHandlerPatched, true);
+    assert.equal(startupGitGuardStatus.guard.ipcHandlersWrapped, 2);
     const startupWmiSamplerStatus = ipcHandlers.get(
       "codex_desktop:message-from-view",
     )(null, { type: "codey-windows-wmi-sampler-status" });
@@ -80,6 +81,26 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       true,
     );
     assert.equal(startupWmiSamplerStatus.sampler.blocked, 0);
+    assert.equal(
+      startupWmiSamplerStatus.sampler.esmExportsSynchronized,
+      true,
+    );
+
+    const renamedMessageChannel = "codex_desktop:messages:v2";
+    const renamedMessageHandler = () => "renamed-message-handler";
+    fakeElectron.ipcMain.handle(renamedMessageChannel, renamedMessageHandler);
+    const guardedRenamedMessageHandler =
+      ipcHandlers.get(renamedMessageChannel);
+    assert.notEqual(guardedRenamedMessageHandler, renamedMessageHandler);
+    const renamedChannelStatus = guardedRenamedMessageHandler(null, {
+      type: "codey-git-request-guard-status",
+    });
+    assert.equal(renamedChannelStatus.status, "ok");
+    assert.equal(
+      renamedChannelStatus.guard.lastWrappedChannel,
+      renamedMessageChannel,
+    );
+    assert.equal(renamedChannelStatus.guard.ipcHandlersWrapped, 3);
 
     let gitGuardTime = 10_000;
     let nextGitGuardTimer = 0;
@@ -417,6 +438,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
   } finally {
     childProcess.spawn = originalSpawn;
     workerThreads.Worker = NativeWorker;
+    Module.syncBuiltinESMExports?.();
     Module._load = originalLoad;
     Module._extensions[".js"] = originalJsExtension;
   }

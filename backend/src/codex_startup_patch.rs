@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-const PATCH_RESULT: &str = "codey-startup-patch-installed-v21";
+const PATCH_RESULT: &str = "codey-startup-patch-installed-v22";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
@@ -244,7 +244,7 @@ mod tests {
 
     #[test]
     fn patch_result_is_stable_for_launch_status_validation() {
-        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v21");
+        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v22");
     }
 
     #[test]
@@ -280,7 +280,8 @@ mod tests {
         assert!(expression.contains("get disableAppStateHeartbeat()"));
         assert!(expression.contains("get optionalMainBundlePatchFailures()"));
         assert!(expression.contains("__CODEY_MAIN_GIT_REQUEST_GUARD__"));
-        assert!(expression.contains("codex_desktop:worker:git:from-view"));
+        assert!(expression.contains("wrapIpcHandler"));
+        assert!(expression.contains("electron/main"));
         assert!(expression.contains("codey-git-request-guard-status"));
         assert!(expression.contains("get mainGitRequestGuard()"));
         assert!(expression.contains("module._compile(source, filename)"));

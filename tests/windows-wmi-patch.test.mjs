@@ -36,13 +36,15 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
     const workerThreads = process.getBuiltinModule("worker_threads");
     const originalLoad = Module._load;
     const NativeWorker = workerThreads.Worker;
+    const esmWorkerThreads = await import("node:worker_threads");
+    assert.equal(esmWorkerThreads.Worker, NativeWorker);
     const temporaryDirectory = await mkdtemp(
       join(tmpdir(), "codey-wmi-worker-"),
     );
 
     try {
       const expression = await loadPatchExpression();
-      assert.equal((0, eval)(expression), "codey-startup-patch-installed-v21");
+      assert.equal((0, eval)(expression), "codey-startup-patch-installed-v22");
 
       const blocked = new workerThreads.Worker(
         "C:\\Codex\\resources\\app\\.vite\\build\\child-process-snapshot-worker.js",
@@ -50,6 +52,16 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
       );
       assert.equal(blocked.threadId, -1);
       assert.deepEqual((await once(blocked, "message"))[0], { type: "ok", value: [] });
+
+      assert.notEqual(esmWorkerThreads.Worker, NativeWorker);
+      const esmBlocked = new esmWorkerThreads.Worker(
+        "C:\\Codex\\resources\\app\\.vite\\build\\child-process-snapshot-worker-esm.js",
+      );
+      assert.equal(esmBlocked.threadId, -1);
+      assert.deepEqual((await once(esmBlocked, "message"))[0], {
+        type: "ok",
+        value: [],
+      });
 
       const hashedKnownWorker = new workerThreads.Worker(
         new URL(
@@ -142,11 +154,13 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
         globalThis.__CODEY_CODEX_STARTUP_PATCH__.windowsWmiSampler;
       assert.equal(sampler.installed, true);
       assert.equal(sampler.workerWrapperPatched, true);
-      assert.equal(sampler.blocked, 5);
+      assert.equal(sampler.esmExportsSynchronized, true);
+      assert.equal(sampler.blocked, 6);
       assert.equal(sampler.sourceSignatureMatches, 3);
       assert.equal(sampler.lastMatchReason, "source-signature");
     } finally {
       workerThreads.Worker = NativeWorker;
+      Module.syncBuiltinESMExports?.();
       Module._load = originalLoad;
       await rm(temporaryDirectory, { recursive: true, force: true });
     }

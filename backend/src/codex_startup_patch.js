@@ -76,8 +76,6 @@
   const disableWindowsWmiSampler = disableWindowsOptimizations;
   const Module = process.getBuiltinModule("module");
   const originalLoad = Module._load;
-  const mainGitGuardWorkerChannel = "codex_desktop:worker:git:from-view";
-  const mainGitGuardStatusChannel = "codex_desktop:message-from-view";
   const mainGitGuardStatusRequestType = "codey-git-request-guard-status";
   const windowsWmiSamplerStatusRequestType =
     "codey-windows-wmi-sampler-status";
@@ -86,6 +84,7 @@
     version: 2,
     enabled: disableWindowsWmiSampler,
     workerWrapperPatched: false,
+    esmExportsSynchronized: false,
     workersObserved: 0,
     sourceInspections: 0,
     sourceSignatureMatches: 0,
@@ -99,7 +98,8 @@
     ...windowsWmiSamplerEvidence,
     installed:
       !windowsWmiSamplerEvidence.enabled ||
-      windowsWmiSamplerEvidence.workerWrapperPatched,
+      (windowsWmiSamplerEvidence.workerWrapperPatched &&
+        windowsWmiSamplerEvidence.esmExportsSynchronized),
     observationMs: Math.max(0, Date.now() - windowsWmiSamplerInstalledAtMs),
   });
   const createMainGitRequestGuard = ({
@@ -137,6 +137,8 @@
     let drainTimerAt = Number.POSITIVE_INFINITY;
     let gitHandlerPatched = false;
     let statusHandlerPatched = false;
+    let ipcHandlersWrapped = 0;
+    let lastWrappedChannel = "";
     let lastMethod = "";
 
     const now = () => {
@@ -361,6 +363,8 @@
       strategy: enabled ? "main-process-ipc" : "not-required",
       gitHandlerPatched,
       statusHandlerPatched,
+      ipcHandlersWrapped,
+      lastWrappedChannel,
       queued: queue.length,
       matched: counters.matched,
       sent: counters.sent,
@@ -426,10 +430,22 @@
       });
       return wrapped;
     };
+    const wrapIpcHandler = (handler, channel = "") => {
+      if (typeof handler !== "function") return handler;
+      if (handler.__codeyMainIpcGuardOwner === api) return handler;
+      const wrapped = wrapStatusHandler(wrapGitHandler(handler));
+      Object.defineProperty(wrapped, "__codeyMainIpcGuardOwner", {
+        value: api,
+      });
+      ipcHandlersWrapped += 1;
+      lastWrappedChannel = String(channel || "").slice(0, 160);
+      return wrapped;
+    };
     const api = Object.freeze({
       enabled,
       snapshot,
       wrapGitHandler,
+      wrapIpcHandler,
       wrapStatusHandler,
     });
     return api;
@@ -1490,6 +1506,13 @@
   }
   windowsWmiSamplerEvidence.workerWrapperPatched =
     workerThreads.Worker?.__codeyNoInspectWrapper === true;
+  try {
+    Module.syncBuiltinESMExports?.();
+    windowsWmiSamplerEvidence.esmExportsSynchronized = true;
+  } catch (error) {
+    windowsWmiSamplerEvidence.esmExportsSynchronized = false;
+    recordCodeyPatchFailure("sync_worker_threads_esm_exports", error);
+  }
 
   const temporaryWebViews = new WeakMap();
   const temporaryWebViewLifecycle = Object.freeze({
@@ -1974,11 +1997,51 @@
   let electronProxy = null;
   let electronProtocolProxy = null;
   let electronIpcMainProxy = null;
+  const electronMainRequests = new Set(["electron", "electron/main"]);
+  const installNativeIpcMainGuards = (ipcMain) => {
+    if (!ipcMain) return false;
+    let installed = false;
+    for (const property of ["handle", "handleOnce"]) {
+      const original = ipcMain[property];
+      if (typeof original !== "function") continue;
+      if (original.__codeyMainIpcRegistrationGuard === true) {
+        installed = true;
+        continue;
+      }
+      const guarded = function (channel, handler, ...rest) {
+        return Reflect.apply(original, ipcMain, [
+          channel,
+          mainGitRequestGuard.wrapIpcHandler(handler, channel),
+          ...rest,
+        ]);
+      };
+      Object.defineProperty(guarded, "__codeyMainIpcRegistrationGuard", {
+        value: true,
+      });
+      try {
+        ipcMain[property] = guarded;
+      } catch {}
+      if (ipcMain[property] !== guarded) {
+        try {
+          Object.defineProperty(ipcMain, property, {
+            configurable: true,
+            value: guarded,
+            writable: true,
+          });
+        } catch {}
+      }
+      installed ||= ipcMain[property] === guarded;
+    }
+    return installed;
+  };
   Module._load = function codeyStartupPatchLoader(request, parent, isMain) {
     if (disableMicro && request === "@worklouder/device-kit-oai") return microStub;
 
     const loaded = Reflect.apply(originalLoad, this, arguments);
-    if (request !== "electron" || !loaded?.BrowserWindow) return loaded;
+    if (
+      !electronMainRequests.has(request) ||
+      (!loaded?.BrowserWindow && !loaded?.ipcMain && !loaded?.protocol)
+    ) return loaded;
     if (electronProxy) return electronProxy;
 
     if (loaded.protocol) {
@@ -2000,30 +2063,26 @@
       });
     }
     if (loaded.ipcMain) {
-      electronIpcMainProxy = new Proxy(loaded.ipcMain, {
-        get(target, property, receiver) {
-          if (
-            (property === "handle" || property === "handleOnce") &&
-            typeof target[property] === "function"
-          ) {
-            return (channel, handler, ...rest) => {
-              const effectiveHandler =
-                channel === mainGitGuardWorkerChannel
-                  ? mainGitRequestGuard.wrapGitHandler(handler)
-                  : channel === mainGitGuardStatusChannel
-                    ? mainGitRequestGuard.wrapStatusHandler(handler)
-                    : handler;
-              return Reflect.apply(target[property], target, [
-                channel,
-                effectiveHandler,
-                ...rest,
-              ]);
-            };
-          }
-          const value = Reflect.get(target, property, receiver);
-          return typeof value === "function" ? value.bind(target) : value;
-        },
-      });
+      const nativeGuardInstalled = installNativeIpcMainGuards(loaded.ipcMain);
+      electronIpcMainProxy = nativeGuardInstalled
+        ? loaded.ipcMain
+        : new Proxy(loaded.ipcMain, {
+            get(target, property, receiver) {
+              if (
+                (property === "handle" || property === "handleOnce") &&
+                typeof target[property] === "function"
+              ) {
+                return (channel, handler, ...rest) =>
+                  Reflect.apply(target[property], target, [
+                    channel,
+                    mainGitRequestGuard.wrapIpcHandler(handler, channel),
+                    ...rest,
+                  ]);
+              }
+              const value = Reflect.get(target, property, receiver);
+              return typeof value === "function" ? value.bind(target) : value;
+            },
+          });
     }
     electronProxy = new Proxy(loaded, {
       get(target, property, receiver) {
@@ -2034,6 +2093,13 @@
     });
     return electronProxy;
   };
+  for (const request of electronMainRequests) {
+    try {
+      const parent = typeof module === "object" ? module : undefined;
+      Module._load(request, parent, false);
+      if (electronProxy) break;
+    } catch {}
+  }
   globalThis.__CODEY_CODEX_STARTUP_PATCH__ = Object.freeze({
     disableWindowsOptimizations,
     disableMicro,
@@ -2075,5 +2141,5 @@
   setImmediate(() => {
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v21";
+  return "codey-startup-patch-installed-v22";
 })()
