@@ -50,6 +50,17 @@ commentary tools. Call them only through their declared direct tool schemas. Aft
 call `agents.wait_agent` directly before any other work. Use `timeout_ms <= 120000`; a returned mailbox \
 update is not completion. If it reports `MESSAGE`, process that update and call `agents.wait_agent` \
 again. Treat an agent as done only after its `FINAL_ANSWER` or `task_complete` notification, and \
+continue until every spawned agent is done. While spawned subagents are active, Codey's runtime gate \
+denies non-collaboration local tools and prevents the root turn from finishing; do not retry a blocked \
+tool, wait for the agents instead. The `functions.exec` tool world is a separate route and does not \
+contain collaboration tools.";
+
+pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V2: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
+commentary tools. Call them only through their declared direct tool schemas. After spawning agents, \
+call `agents.wait_agent` directly before any other work. Use `timeout_ms <= 120000`; a returned mailbox \
+update is not completion. If it reports `MESSAGE`, process that update and call `agents.wait_agent` \
+again. Treat an agent as done only after its `FINAL_ANSWER` or `task_complete` notification, and \
 continue until every spawned agent is done. The `functions.exec` tool world is a separate route and \
 does not contain collaboration tools.";
 
@@ -61,6 +72,7 @@ route and does not contain collaboration tools.";
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V2,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
 ];
 

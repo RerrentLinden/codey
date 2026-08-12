@@ -31,6 +31,7 @@ mod session_transfer;
 mod sqlite_util;
 mod startup_maintenance;
 mod startup_update;
+mod subagent_gate;
 mod subagent_policy;
 mod trace_log_guard;
 mod trace_log_stats;
@@ -58,6 +59,10 @@ pub fn run_update_helper_if_requested() -> Result<bool> {
 
 pub fn run_error_log_helper_if_requested() -> Result<bool> {
     error_log::run_helper_if_requested()
+}
+
+pub fn run_subagent_gate_hook_if_requested() -> Result<bool> {
+    subagent_gate::run_hook_if_requested()
 }
 
 pub fn run_desktop_application() -> Result<()> {

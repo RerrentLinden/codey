@@ -349,6 +349,7 @@ fn direct_chat_patch_routes_codex_through_the_local_responses_proxy() {
         &direct_profile(RelayProtocol::ChatCompletions),
         "relay",
         ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: None,
             default_model: None,
             fastctx_command: None,
@@ -387,6 +388,7 @@ enabled = true
         &direct_profile(RelayProtocol::ChatCompletions),
         GLOBAL_PROVIDER_ID,
         ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: Some("codey-model"),
             fastctx_command: Some(Path::new("/opt/codey")),
@@ -445,6 +447,7 @@ wire_api = "chat"
         &direct_profile(RelayProtocol::Responses),
         GLOBAL_PROVIDER_ID,
         ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: None,
             default_model: None,
             fastctx_command: None,
@@ -481,6 +484,7 @@ experimental_bearer_token = "PROXY_MANAGED"
         &direct_profile(RelayProtocol::ChatCompletions),
         GLOBAL_PROVIDER_ID,
         ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: None,
             default_model: None,
             fastctx_command: None,
@@ -1222,12 +1226,20 @@ enabled = false
 custom_setting = "preserved"
 subagent_developer_instructions = "Preserve my subagent guidance."
 root_agent_usage_hint_text = "Preserve my root usage hint."
+
+[[hooks.PreToolUse]]
+matcher = "Bash"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "echo preserve-user-hook"
 "#;
     let result = patch_config_with_fastctx_mode_and_proxy(
         existing,
         &official_profile(),
         GLOBAL_PROVIDER_ID,
         ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
             fastctx_command: None,
@@ -1283,6 +1295,7 @@ root_agent_usage_hint_text = "Preserve my root usage hint."
         Some(120_000)
     );
     assert_eq!(multi_agent["custom_setting"].as_str(), Some("preserved"));
+    assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
     assert_eq!(
         multi_agent["subagent_developer_instructions"].as_str(),
         Some("Preserve my subagent guidance.")
@@ -1290,6 +1303,57 @@ root_agent_usage_hint_text = "Preserve my root usage hint."
     let root_usage_hint = multi_agent["root_agent_usage_hint_text"].as_str().unwrap();
     assert!(root_usage_hint.contains("Preserve my root usage hint."));
     assert!(root_usage_hint.contains(ROOT_AGENT_COLLABORATION_USAGE_HINT));
+
+    let pre_tool_use = document["hooks"]["PreToolUse"]
+        .as_array_of_tables()
+        .unwrap();
+    assert_eq!(pre_tool_use.len(), 2);
+    let preserved_handler = pre_tool_use.get(0).unwrap()["hooks"]
+        .as_array_of_tables()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        preserved_handler["command"].as_str(),
+        Some("echo preserve-user-hook")
+    );
+    let gate_handler = pre_tool_use.get(1).unwrap()["hooks"]
+        .as_array_of_tables()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(gate_handler["type"].as_str(), Some("command"));
+    assert!(
+        gate_handler["command"]
+            .as_str()
+            .unwrap()
+            .contains(crate::subagent_gate::HOOK_ARGUMENT)
+    );
+    assert!(
+        gate_handler["commandWindows"]
+            .as_str()
+            .unwrap()
+            .contains(crate::subagent_gate::HOOK_ARGUMENT)
+    );
+    assert_eq!(
+        gate_handler["timeout"].as_integer(),
+        Some(crate::subagent_gate::HOOK_TIMEOUT_SECONDS as i64)
+    );
+    for event in ["SubagentStart", "SubagentStop", "Stop", "SessionEnd"] {
+        assert_eq!(
+            document["hooks"][event].as_array_of_tables().unwrap().len(),
+            1,
+            "{event}"
+        );
+    }
+    let hook_state = document["hooks"]["state"].as_table().unwrap();
+    assert_eq!(hook_state.len(), 5);
+    let pre_tool_key = "/tmp/codey-codex/config.toml:pre_tool_use:1:0";
+    assert!(
+        hook_state[pre_tool_key]["trusted_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+    );
 }
 
 #[test]
@@ -1299,6 +1363,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
         &official_profile(),
         GLOBAL_PROVIDER_ID,
         ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
             fastctx_command: None,
@@ -1321,6 +1386,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
         &official_profile(),
         GLOBAL_PROVIDER_ID,
         ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
             fastctx_command: None,
@@ -1389,6 +1455,15 @@ fn subagent_lease_applies_and_restores_all_owned_files() {
     assert_eq!(
         document["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
         Some(ROOT_AGENT_COLLABORATION_USAGE_HINT)
+    );
+    assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+    assert!(
+        temporary_config.contains(crate::subagent_gate::HOOK_ARGUMENT),
+        "runtime config should install the subagent gate hooks"
+    );
+    assert_eq!(
+        document["hooks"]["state"].as_table().unwrap().len(),
+        SUBAGENT_GATE_HOOKS.len()
     );
     assert!(
         fs::read_to_string(home.join("AGENTS.md"))
@@ -2684,6 +2759,142 @@ note = "user replacement"
     assert_eq!(
         restored["mcp_servers"][CODEY_FASTCTX_SERVER_ID]["note"].as_str(),
         Some("user replacement")
+    );
+}
+
+#[test]
+fn restore_removes_only_codey_gate_hooks_after_concurrent_hook_edits() {
+    let original = r#"
+[[hooks.PreToolUse]]
+matcher = "Shell"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/user/pre-tool"
+timeout = 5
+"#;
+    let applied = format!(
+        r#"{original}
+[[hooks.PreToolUse]]
+matcher = "*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "'/tmp/codey' {hook_argument}"
+commandWindows = "C:\\Codey\\codey.exe {hook_argument}"
+timeout = 5
+
+[hooks.state."/tmp/config.toml:pre_tool_use:1:0"]
+trusted_hash = "sha256:codey"
+"#,
+        hook_argument = crate::subagent_gate::HOOK_ARGUMENT,
+    );
+    let current = format!(
+        r#"{applied}
+[[hooks.PreToolUse]]
+matcher = "MCP"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/user/concurrent"
+timeout = 7
+
+[hooks.state."user:pre_tool_use:2:0"]
+trusted_hash = "sha256:user"
+"#,
+    )
+    .replacen(
+        "timeout = 5\n\n[hooks.state",
+        "timeout = 30\nstatusMessage = \"concurrently edited gate\"\n\n[hooks.state",
+        1,
+    );
+
+    let restored = restore_owned_config_changes(original, &applied, &current)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    let groups = restored["hooks"]["PreToolUse"]
+        .as_array_of_tables()
+        .unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(
+        groups.get(0).unwrap()["hooks"]
+            .as_array_of_tables()
+            .unwrap()
+            .get(0)
+            .unwrap()["command"]
+            .as_str(),
+        Some("/user/pre-tool")
+    );
+    assert_eq!(
+        groups.get(1).unwrap()["hooks"]
+            .as_array_of_tables()
+            .unwrap()
+            .get(0)
+            .unwrap()["command"]
+            .as_str(),
+        Some("/user/concurrent")
+    );
+    assert!(
+        restored["hooks"]["state"]
+            .as_table()
+            .unwrap()
+            .get("/tmp/config.toml:pre_tool_use:1:0")
+            .is_none()
+    );
+    assert_eq!(
+        restored["hooks"]["state"]["user:pre_tool_use:2:0"]["trusted_hash"].as_str(),
+        Some("sha256:user")
+    );
+    assert!(
+        !restored
+            .to_string()
+            .contains(crate::subagent_gate::HOOK_ARGUMENT)
+    );
+}
+
+#[test]
+fn restore_removes_codey_gate_from_inline_hook_arrays() {
+    let original = r#"
+[hooks]
+PreToolUse = []
+"#;
+    let applied = format!(
+        r#"
+[hooks]
+PreToolUse = [{{ matcher = "*", hooks = [{{ type = "command", command = "'/tmp/codey' {hook_argument}", commandWindows = "C:\\Codey\\codey.exe {hook_argument}", timeout = 5 }}] }}]
+"#,
+        hook_argument = crate::subagent_gate::HOOK_ARGUMENT,
+    );
+    let current = format!(
+        r#"
+[hooks]
+PreToolUse = [{{ matcher = "*", hooks = [{{ type = "command", command = "'/tmp/codey' {hook_argument}", commandWindows = "C:\\Codey\\codey.exe {hook_argument}", timeout = 30, statusMessage = "concurrently edited gate" }}] }}, {{ matcher = "MCP", hooks = [{{ type = "command", command = "/user/concurrent", timeout = 7 }}] }}]
+"#,
+        hook_argument = crate::subagent_gate::HOOK_ARGUMENT,
+    );
+
+    let restored = restore_owned_config_changes(original, &applied, &current)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    let groups = restored["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups.get(0).unwrap().as_inline_table().unwrap()["hooks"]
+            .as_array()
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .as_inline_table()
+            .unwrap()["command"]
+            .as_str(),
+        Some("/user/concurrent")
+    );
+    assert!(
+        !restored
+            .to_string()
+            .contains(crate::subagent_gate::HOOK_ARGUMENT)
     );
 }
 

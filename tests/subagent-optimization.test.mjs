@@ -76,3 +76,24 @@ test("subagent defaults are hot-reloaded through the packaged app-server bridge"
   assert.match(rendererSource, /reloadUserConfig: true/);
   assert.match(sessionToolsSource, /window\.__codeyLoadCodexSignalDispatcher/);
 });
+
+test("subagent optimization installs a root-only runtime wait gate", async () => {
+  const [gateSource, configSource, mainSource] = await Promise.all([
+    readFile(new URL("backend/src/subagent_gate.rs", root), "utf8"),
+    readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
+    readFile(new URL("backend/src/main.rs", root), "utf8"),
+  ]);
+
+  assert.match(mainSource, /run_subagent_gate_hook_if_requested/);
+  assert.match(configSource, /enable_subagent_gate_hooks\(doc, config_path\)/);
+  assert.match(configSource, /toml_event: "PreToolUse"/);
+  assert.match(configSource, /toml_event: "SubagentStart"/);
+  assert.match(configSource, /toml_event: "SubagentStop"/);
+  assert.match(configSource, /toml_event: "Stop"/);
+  assert.match(configSource, /trusted_hash/);
+  assert.match(gateSource, /nonempty\(input\.agent_id\.as_deref\(\)\)\.is_some\(\)/);
+  assert.match(gateSource, /permissionDecision": "deny"/);
+  assert.match(gateSource, /"decision": "block"/);
+  assert.match(gateSource, /is_collaboration_tool/);
+  assert.match(gateSource, /SubagentStop/);
+});

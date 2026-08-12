@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use codey_runtime_core::settings::RelayProtocol;
 use serde::{Deserialize, Serialize};
-use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
+use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
 #[cfg(test)]
 use crate::codex_config_guidance::{
@@ -384,6 +384,7 @@ fn apply_runtime_provider_config_at_mode(
         profile,
         &provider_id,
         ProviderPatchOptions {
+            config_path: &config_path,
             model_catalog_path: model_catalog_path.as_deref(),
             default_model,
             fastctx_command,
@@ -951,6 +952,7 @@ fn patch_config_with_fastctx(
         profile,
         provider_id,
         ProviderPatchOptions {
+            config_path: Path::new("config.toml"),
             model_catalog_path,
             default_model,
             fastctx_command,
@@ -964,6 +966,7 @@ fn patch_config_with_fastctx(
 }
 
 struct ProviderPatchOptions<'a> {
+    config_path: &'a Path,
     model_catalog_path: Option<&'a Path>,
     default_model: Option<&'a str>,
     fastctx_command: Option<&'a Path>,
@@ -981,6 +984,7 @@ fn patch_config_with_fastctx_mode_and_proxy(
     options: ProviderPatchOptions<'_>,
 ) -> Result<String> {
     let ProviderPatchOptions {
+        config_path,
         model_catalog_path,
         default_model,
         fastctx_command,
@@ -1054,6 +1058,7 @@ fn patch_config_with_fastctx_mode_and_proxy(
     if subagent_optimization {
         enable_subagent_optimization(
             &mut doc,
+            config_path,
             subagent_model,
             subagent_reasoning_effort,
             fastctx_namespace.as_deref(),
@@ -1064,6 +1069,7 @@ fn patch_config_with_fastctx_mode_and_proxy(
 
 fn enable_subagent_optimization(
     doc: &mut DocumentMut,
+    config_path: &Path,
     subagent_model: &str,
     subagent_reasoning_effort: &str,
     fastctx_namespace: Option<&str>,
@@ -1128,7 +1134,152 @@ fn enable_subagent_optimization(
             "features.multi_agent_v2.subagent_developer_instructions",
         )?;
     }
+    features["hooks"] = value(true);
+    enable_subagent_gate_hooks(doc, config_path)?;
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct SubagentGateHookSpec {
+    toml_event: &'static str,
+    event_key: &'static str,
+    matcher: Option<&'static str>,
+    timeout_seconds: u64,
+}
+
+const SUBAGENT_GATE_HOOKS: [SubagentGateHookSpec; 5] = [
+    SubagentGateHookSpec {
+        toml_event: "PreToolUse",
+        event_key: "pre_tool_use",
+        matcher: Some("*"),
+        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
+    },
+    SubagentGateHookSpec {
+        toml_event: "SubagentStart",
+        event_key: "subagent_start",
+        matcher: None,
+        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
+    },
+    SubagentGateHookSpec {
+        toml_event: "SubagentStop",
+        event_key: "subagent_stop",
+        matcher: None,
+        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
+    },
+    SubagentGateHookSpec {
+        toml_event: "Stop",
+        event_key: "stop",
+        matcher: None,
+        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
+    },
+    SubagentGateHookSpec {
+        toml_event: "SessionEnd",
+        event_key: "session_end",
+        matcher: None,
+        timeout_seconds: crate::subagent_gate::SESSION_END_HOOK_TIMEOUT_SECONDS,
+    },
+];
+
+fn enable_subagent_gate_hooks(doc: &mut DocumentMut, config_path: &Path) -> Result<()> {
+    let commands = crate::subagent_gate::hook_commands()?;
+    let selected_command = if cfg!(windows) {
+        commands.command_windows.as_str()
+    } else {
+        commands.command.as_str()
+    };
+
+    for spec in SUBAGENT_GATE_HOOKS {
+        let group_index = {
+            let hooks = ensure_root_table(doc, "hooks")?;
+            append_subagent_gate_hook(hooks, spec, &commands)?
+        };
+        let key = format!(
+            "{}:{}:{group_index}:0",
+            config_path.display(),
+            spec.event_key
+        );
+        let trusted_hash = crate::subagent_gate::hook_trust_hash(
+            spec.event_key,
+            spec.matcher,
+            selected_command,
+            spec.timeout_seconds,
+        );
+        let hooks = ensure_root_table(doc, "hooks")?;
+        let state = ensure_child_table(hooks, "state")?;
+        let mut entry = Table::new();
+        entry["trusted_hash"] = value(trusted_hash);
+        state.insert(&key, Item::Table(entry));
+    }
+    Ok(())
+}
+
+fn append_subagent_gate_hook(
+    hooks: &mut Table,
+    spec: SubagentGateHookSpec,
+    commands: &crate::subagent_gate::HookCommands,
+) -> Result<usize> {
+    if hooks.get(spec.toml_event).is_none() {
+        hooks.insert(spec.toml_event, Item::ArrayOfTables(ArrayOfTables::new()));
+    }
+    let event = hooks
+        .get_mut(spec.toml_event)
+        .expect("subagent gate hook event was initialized");
+    match event {
+        Item::ArrayOfTables(groups) => {
+            let index = groups.len();
+            let mut group = Table::new();
+            if let Some(matcher) = spec.matcher {
+                group["matcher"] = value(matcher);
+            }
+            let mut handlers = ArrayOfTables::new();
+            handlers.push(subagent_gate_hook_table(spec, commands));
+            group["hooks"] = Item::ArrayOfTables(handlers);
+            groups.push(group);
+            Ok(index)
+        }
+        Item::Value(Value::Array(groups)) => {
+            let index = groups.len();
+            let mut group = InlineTable::new();
+            if let Some(matcher) = spec.matcher {
+                group.insert("matcher", Value::from(matcher));
+            }
+            let mut handlers = Array::new();
+            handlers.push(Value::InlineTable(subagent_gate_hook_inline_table(
+                spec, commands,
+            )));
+            group.insert("hooks", Value::Array(handlers));
+            groups.push(Value::InlineTable(group));
+            Ok(index)
+        }
+        _ => bail!("hooks.{} 必须是 Hook 配置数组", spec.toml_event),
+    }
+}
+
+fn subagent_gate_hook_table(
+    spec: SubagentGateHookSpec,
+    commands: &crate::subagent_gate::HookCommands,
+) -> Table {
+    let mut handler = Table::new();
+    handler["type"] = value("command");
+    handler["command"] = value(&commands.command);
+    handler["commandWindows"] = value(&commands.command_windows);
+    handler["timeout"] = value(spec.timeout_seconds as i64);
+    handler
+}
+
+fn subagent_gate_hook_inline_table(
+    spec: SubagentGateHookSpec,
+    commands: &crate::subagent_gate::HookCommands,
+) -> InlineTable {
+    let mut handler = InlineTable::new();
+    handler.insert("type", Value::from("command"));
+    handler.insert("command", Value::from(commands.command.as_str()));
+    handler.insert(
+        "commandWindows",
+        Value::from(commands.command_windows.as_str()),
+    );
+    handler.insert("timeout", Value::from(spec.timeout_seconds as i64));
+    handler
 }
 
 fn direct_provider_table(
