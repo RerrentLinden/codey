@@ -5,6 +5,9 @@
   const scriptId = "git-request-guard";
   const version = 3;
   const mainProcessStatusRequestType = "codey-git-request-guard-status";
+  const mainProcessStatusResponseType =
+    "codey-git-request-guard-status-response";
+  const mainProcessProbeTimeoutMs = 1_000;
   const targetMethods = new Set([
     "git-origins",
     "status-summary",
@@ -69,7 +72,7 @@
   let mainProcessProbeAttempts = 0;
   let mainProcessProbeError = "";
   let mainProcessSnapshot = null;
-  let mainProcessCompatibilityConfirmed = false;
+  let mainProcessProbeTransport = "";
 
   const now = () => {
     const value = Number(Date.now());
@@ -183,9 +186,7 @@
     if (!entry) return;
     const detail = enabled
       ? mainProcessProtected
-        ? mainProcessCompatibilityConfirmed
-          ? "Windows Git 请求限流已由主进程接管（兼容确认）"
-          : "Windows Git 请求限流已由主进程接管"
+        ? "Windows Git 请求限流已由主进程接管"
         : "Windows Git 请求限流已由 Renderer 接管"
       : "Git 请求保护已就绪，当前平台无需启用";
     const changed =
@@ -469,30 +470,52 @@
       return null;
     }
     mainProcessProbeAttempts += 1;
+    const requestId =
+      window.crypto?.randomUUID?.() ??
+      `codey-git-guard-${Date.now()}-${mainProcessProbeAttempts}`;
+    let responseListener = null;
+    let responseTimer = 0;
+    let finishResponseWait = null;
+    const responseWait = new Promise((resolve) => {
+      let settled = false;
+      finishResponseWait = (value) => {
+        if (settled) return;
+        settled = true;
+        if (responseListener) {
+          window.removeEventListener?.("message", responseListener);
+        }
+        if (responseTimer) window.clearTimeout?.(responseTimer);
+        resolve(value);
+      };
+      responseListener = (event) => {
+        const message = event?.data;
+        if (
+          message?.type === mainProcessStatusResponseType &&
+          message?.requestId === requestId
+        ) {
+          finishResponseWait(message);
+        }
+      };
+      if (typeof window.addEventListener !== "function") {
+        finishResponseWait(null);
+        return;
+      }
+      window.addEventListener("message", responseListener);
+      responseTimer = window.setTimeout?.(
+        () => finishResponseWait(null),
+        mainProcessProbeTimeoutMs,
+      ) ?? 0;
+    });
     const request = Promise.resolve()
       .then(() =>
         Reflect.apply(sendStatusRequest, bridge, [
-          { type: mainProcessStatusRequestType, version },
+          { type: mainProcessStatusRequestType, version, requestId },
         ]),
       )
-      .then((result) => {
-        if (result === undefined) {
-          mainProcessProtected = true;
-          mainProcessCompatibilityConfirmed = true;
-          mainProcessSnapshot = {
-            enabled: true,
-            gitHandlerPatched: true,
-            statusHandlerPatched: true,
-            strategy: "main-process-ipc",
-            tokenRefillMs,
-            compatibilityConfirmed: true,
-          };
-          mainProcessProbeError = "";
-          if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
-          bridgeRetryTimer = 0;
-          markEffective();
-          return;
-        }
+      .then(async (directResult) => {
+        const result = directResult === undefined
+          ? await responseWait
+          : directResult;
         const guard = result?.guard;
         if (
           result?.status === "ok" &&
@@ -500,7 +523,8 @@
           guard?.gitHandlerPatched === true
         ) {
           mainProcessProtected = true;
-          mainProcessCompatibilityConfirmed = false;
+          mainProcessProbeTransport =
+            directResult === undefined ? "renderer-event" : "invoke-return";
           mainProcessSnapshot = guard;
           mainProcessProbeError = "";
           if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
@@ -511,7 +535,7 @@
         mainProcessProbeError =
           result?.status === "ok"
             ? "主进程 Git handler 尚未注册"
-            : "主进程未返回保护状态";
+            : "主进程未回传保护状态";
       })
       .catch((error) => {
         mainProcessProbeError = String(
@@ -519,6 +543,7 @@
         ).slice(0, 160);
       })
       .finally(() => {
+        finishResponseWait?.(null);
         if (mainProcessProbePending === request) {
           mainProcessProbePending = null;
         }
@@ -561,7 +586,7 @@
     mainProcessProbeAttempts,
     mainProcessProbeError,
     mainProcessSnapshot,
-    mainProcessCompatibilityConfirmed,
+    mainProcessProbeTransport,
     bridgePatched,
     responseObserverPatched,
     observedGitSubscriptions,

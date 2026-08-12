@@ -5,6 +5,8 @@
   const scriptId = "windows-wmi-sampler";
   const version = 1;
   const statusRequestType = "codey-windows-wmi-sampler-status";
+  const statusResponseType = "codey-windows-wmi-sampler-status-response";
+  const probeTimeoutMs = 1_000;
   const observationWindowMs = 45_000;
 
   const existing = window[guardKey];
@@ -26,13 +28,12 @@
   let probePending = null;
   let probeAttempts = 0;
   let probeError = "";
-  let mainProcessCompatibilityConfirmed = false;
+  let probeTransport = "";
 
   const snapshot = () => {
     const installed = enabled
-      ? mainProcessCompatibilityConfirmed ||
-        (mainProcessSnapshot?.installed === true &&
-          mainProcessSnapshot?.workerWrapperPatched === true)
+      ? mainProcessSnapshot?.installed === true &&
+        mainProcessSnapshot?.workerWrapperPatched === true
       : true;
     const blocked = Number(mainProcessSnapshot?.blocked) || 0;
     const observationMs = Number(mainProcessSnapshot?.observationMs) || 0;
@@ -42,9 +43,7 @@
       version,
       enabled,
       installed,
-      confirmed:
-        !enabled || mainProcessCompatibilityConfirmed || (installed && blocked > 0),
-      mainProcessCompatibilityConfirmed,
+      confirmed: !enabled || (installed && blocked > 0),
       blocked,
       observationMs,
       observationWindowMs,
@@ -55,6 +54,7 @@
       sourceReadFailures,
       probeAttempts,
       probeError,
+      probeTransport,
       mainProcessSnapshot,
     };
   };
@@ -70,9 +70,6 @@
     if (!current.enabled) {
       status = "effective";
       detail = "WMI 周期采样保护已就绪，当前平台无需启用";
-    } else if (current.mainProcessCompatibilityConfirmed) {
-      status = "effective";
-      detail = "WMI 周期采样保护已由主进程接管（兼容确认）";
     } else if (!current.installed && current.mainProcessSnapshot) {
       status = "failed";
       detail = "WMI 周期采样 Worker 拦截器未安装";
@@ -137,23 +134,58 @@
     }
 
     probeAttempts += 1;
+    const requestId =
+      window.crypto?.randomUUID?.() ??
+      `codey-wmi-guard-${Date.now()}-${probeAttempts}`;
+    let responseListener = null;
+    let responseTimer = 0;
+    let finishResponseWait = null;
+    const responseWait = new Promise((resolve) => {
+      let settled = false;
+      finishResponseWait = (value) => {
+        if (settled) return;
+        settled = true;
+        if (responseListener) {
+          window.removeEventListener?.("message", responseListener);
+        }
+        if (responseTimer) window.clearTimeout?.(responseTimer);
+        resolve(value);
+      };
+      responseListener = (event) => {
+        const message = event?.data;
+        if (
+          message?.type === statusResponseType &&
+          message?.requestId === requestId
+        ) {
+          finishResponseWait(message);
+        }
+      };
+      if (typeof window.addEventListener !== "function") {
+        finishResponseWait(null);
+        return;
+      }
+      window.addEventListener("message", responseListener);
+      responseTimer = window.setTimeout?.(
+        () => finishResponseWait(null),
+        probeTimeoutMs,
+      ) ?? 0;
+    });
     const request = Promise.resolve()
       .then(() =>
         Reflect.apply(sendStatusRequest, bridge, [
-          { type: statusRequestType, version },
+          { type: statusRequestType, version, requestId },
         ]),
       )
-      .then((result) => {
-        if (result === undefined) {
-          mainProcessCompatibilityConfirmed = true;
-          probeError = "";
-          return;
-        }
+      .then(async (directResult) => {
+        const result = directResult === undefined
+          ? await responseWait
+          : directResult;
         if (result?.status !== "ok" || !result?.sampler) {
-          probeError = "主进程未返回 WMI 保护状态";
+          probeError = "主进程未回传 WMI 保护状态";
           return;
         }
-        mainProcessCompatibilityConfirmed = false;
+        probeTransport =
+          directResult === undefined ? "renderer-event" : "invoke-return";
         mainProcessSnapshot = result.sampler;
         probeError = "";
       })
@@ -165,6 +197,7 @@
         ).slice(0, 160);
       })
       .finally(() => {
+        finishResponseWait?.(null);
         if (probePending === request) probePending = null;
         updateInjectionEntry();
       });

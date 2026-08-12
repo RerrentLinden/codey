@@ -32,6 +32,7 @@ function createRuntime({
   const events = [];
   const statusRequests = [];
   const subscriptions = new Map();
+  const messageListeners = new Set();
   const sendImpl =
     send ??
     ((workerId, message) =>
@@ -48,6 +49,9 @@ function createRuntime({
         error: null,
       },
     },
+    addEventListener(type, listener) {
+      if (type === "message") messageListeners.add(listener);
+    },
     clearTimeout(id) {
       timers.delete(id);
     },
@@ -59,8 +63,14 @@ function createRuntime({
       });
       return id;
     },
+    removeEventListener(type, listener) {
+      if (type === "message") messageListeners.delete(listener);
+    },
     dispatchEvent(event) {
       events.push(event);
+      if (event.type === "message") {
+        for (const listener of [...messageListeners]) listener(event);
+      }
       return true;
     },
   };
@@ -77,6 +87,25 @@ function createRuntime({
   if (mainGuardReady !== null) {
     electronBridge.sendMessageFromView = (message) => {
       statusRequests.push(message);
+      const guard = {
+        enabled: true,
+        gitHandlerPatched: true,
+        statusHandlerPatched: true,
+        strategy: "main-process-ipc",
+        tokenRefillMs: 1_000,
+      };
+      if (mainGuardReady === "event") {
+        window.dispatchEvent({
+          type: "message",
+          data: {
+            type: "codey-git-request-guard-status-response",
+            requestId: message.requestId,
+            status: "ok",
+            guard,
+          },
+        });
+        return Promise.resolve(undefined);
+      }
       if (mainGuardReady === "no-return") {
         return Promise.resolve(undefined);
       }
@@ -91,13 +120,7 @@ function createRuntime({
       }
       return Promise.resolve({
         status: "ok",
-        guard: {
-          enabled: true,
-          gitHandlerPatched: true,
-          statusHandlerPatched: true,
-          strategy: "main-process-ipc",
-          tokenRefillMs: 1_000,
-        },
+        guard,
       });
     };
   }
@@ -119,6 +142,8 @@ function createRuntime({
   const run = () => vm.runInNewContext(source, context);
   const flush = async () => {
     await Promise.resolve();
+    await Promise.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
     await Promise.resolve();
     await Promise.resolve();
   };
@@ -355,6 +380,7 @@ test("Git request guard accepts main-process protection when contextBridge is fr
   assert.equal(snapshot.version, 3);
   assert.equal(snapshot.bridgePatched, false);
   assert.equal(snapshot.mainProcessProtected, true);
+  assert.equal(snapshot.mainProcessProbeTransport, "invoke-return");
   assert.equal(snapshot.installed, true);
   assert.equal(snapshot.strategy, "main-process-ipc");
   assert.equal(runtime.statusRequests.length, 1);
@@ -379,26 +405,49 @@ test("Git request guard accepts main-process protection when contextBridge is fr
   assert.equal(snapshot.matched, 0);
 });
 
-test("Git request guard accepts the no-return preload status bridge", async () => {
+test("Git request guard verifies a no-return preload through a renderer event", async () => {
   const runtime = createRuntime({
     freezeBridge: true,
-    mainGuardReady: "no-return",
+    mainGuardReady: "event",
   });
   await runtime.flush();
 
   const snapshot = runtime.window.__codeyGitRequestGuard.snapshot();
   assert.equal(snapshot.bridgePatched, false);
   assert.equal(snapshot.mainProcessProtected, true);
-  assert.equal(snapshot.mainProcessCompatibilityConfirmed, true);
-  assert.equal(snapshot.mainProcessSnapshot.compatibilityConfirmed, true);
+  assert.equal(snapshot.mainProcessProbeTransport, "renderer-event");
+  assert.equal(snapshot.mainProcessSnapshot.gitHandlerPatched, true);
   assert.equal(snapshot.installed, true);
   assert.equal(
     runtime.window.__codeyInjectionStatus["git-request-guard"].status,
     "effective",
   );
-  assert.match(
+  assert.equal(
     runtime.window.__codeyInjectionStatus["git-request-guard"].detail,
-    /兼容确认/,
+    "Windows Git 请求限流已由主进程接管",
+  );
+});
+
+test("Git request guard does not treat a missing status response as verified", async () => {
+  const runtime = createRuntime({
+    freezeBridge: true,
+    mainGuardReady: "no-return",
+  });
+  await runtime.flush();
+
+  assert.equal(
+    runtime.window.__codeyGitRequestGuard.snapshot().mainProcessProtected,
+    false,
+  );
+  await runtime.advance(1_000);
+  await runtime.flush();
+  assert.equal(
+    runtime.window.__codeyGitRequestGuard.snapshot().mainProcessProtected,
+    false,
+  );
+  assert.notEqual(
+    runtime.window.__codeyInjectionStatus["git-request-guard"].status,
+    "effective",
   );
 });
 

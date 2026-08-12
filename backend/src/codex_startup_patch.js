@@ -77,8 +77,13 @@
   const Module = process.getBuiltinModule("module");
   const originalLoad = Module._load;
   const mainGitGuardStatusRequestType = "codey-git-request-guard-status";
+  const mainGitGuardStatusResponseType =
+    "codey-git-request-guard-status-response";
   const windowsWmiSamplerStatusRequestType =
     "codey-windows-wmi-sampler-status";
+  const windowsWmiSamplerStatusResponseType =
+    "codey-windows-wmi-sampler-status-response";
+  const rendererMessageChannel = "codex_desktop:message-for-view";
   const windowsWmiSamplerInstalledAtMs = Date.now();
   const windowsWmiSamplerEvidence = {
     version: 2,
@@ -417,11 +422,30 @@
       }
       statusHandlerPatched = true;
       const wrapped = function (...args) {
-        if (args[1]?.type === mainGitGuardStatusRequestType) {
-          return { status: "ok", guard: snapshot() };
+        const event = args[0];
+        const message = args[1];
+        const sendStatusResponse = (type, payload) => {
+          const requestId =
+            typeof message?.requestId === "string" ? message.requestId : "";
+          if (!requestId || typeof event?.sender?.send !== "function") return;
+          try {
+            event.sender.send(rendererMessageChannel, {
+              type,
+              requestId,
+              status: "ok",
+              ...payload,
+            });
+          } catch {}
+        };
+        if (message?.type === mainGitGuardStatusRequestType) {
+          const guard = snapshot();
+          sendStatusResponse(mainGitGuardStatusResponseType, { guard });
+          return { status: "ok", guard };
         }
-        if (args[1]?.type === windowsWmiSamplerStatusRequestType) {
-          return { status: "ok", sampler: windowsWmiSamplerSnapshot() };
+        if (message?.type === windowsWmiSamplerStatusRequestType) {
+          const sampler = windowsWmiSamplerSnapshot();
+          sendStatusResponse(windowsWmiSamplerStatusResponseType, { sampler });
+          return { status: "ok", sampler };
         }
         return Reflect.apply(handler, this, args);
       };

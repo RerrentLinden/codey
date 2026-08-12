@@ -25,6 +25,14 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
   const NativeWorker = workerThreads.Worker;
   const spawnCalls = [];
   const ipcHandlers = new Map();
+  const rendererStatusResponses = [];
+  const rendererEvent = {
+    sender: {
+      send(channel, message) {
+        rendererStatusResponses.push({ channel, message });
+      },
+    },
+  };
   const fakeElectron = {
     BrowserWindow: class BrowserWindow {},
     ipcMain: {
@@ -67,14 +75,20 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     );
     const startupGitGuardStatus = ipcHandlers.get(
       "codex_desktop:message-from-view",
-    )(null, { type: "codey-git-request-guard-status" });
+    )(rendererEvent, {
+      type: "codey-git-request-guard-status",
+      requestId: "git-status-1",
+    });
     assert.equal(startupGitGuardStatus.status, "ok");
     assert.equal(startupGitGuardStatus.guard.gitHandlerPatched, true);
     assert.equal(startupGitGuardStatus.guard.statusHandlerPatched, true);
     assert.equal(startupGitGuardStatus.guard.ipcHandlersWrapped, 2);
     const startupWmiSamplerStatus = ipcHandlers.get(
       "codex_desktop:message-from-view",
-    )(null, { type: "codey-windows-wmi-sampler-status" });
+    )(rendererEvent, {
+      type: "codey-windows-wmi-sampler-status",
+      requestId: "wmi-status-1",
+    });
     assert.equal(startupWmiSamplerStatus.status, "ok");
     assert.equal(
       startupWmiSamplerStatus.sampler.workerWrapperPatched,
@@ -84,6 +98,25 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.equal(
       startupWmiSamplerStatus.sampler.esmExportsSynchronized,
       true,
+    );
+    assert.deepEqual(
+      rendererStatusResponses.map(({ channel, message }) => ({
+        channel,
+        requestId: message.requestId,
+        type: message.type,
+      })),
+      [
+        {
+          channel: "codex_desktop:message-for-view",
+          requestId: "git-status-1",
+          type: "codey-git-request-guard-status-response",
+        },
+        {
+          channel: "codex_desktop:message-for-view",
+          requestId: "wmi-status-1",
+          type: "codey-windows-wmi-sampler-status-response",
+        },
+      ],
     );
 
     const renamedMessageChannel = "codex_desktop:messages:v2";

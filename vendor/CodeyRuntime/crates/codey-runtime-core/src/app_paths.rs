@@ -5,6 +5,9 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 #[derive(Debug, Clone, Copy)]
 struct AppPackageSpec {
     identity: &'static str,
@@ -92,6 +95,7 @@ pub fn find_latest_codex_app_dir_default() -> Option<PathBuf> {
 #[cfg(windows)]
 fn find_latest_codex_app_dir_from_appx_package() -> Option<PathBuf> {
     let output = Command::new("powershell")
+        .creation_flags(crate::windows_create_no_window())
         .args([
             "-NoProfile",
             "-ExecutionPolicy",

@@ -14,7 +14,7 @@ const cdpSource = await readFile(
 
 function createRuntime({
   platform = "Win32",
-  returnStatus = true,
+  statusTransport = "return",
   sampler = {
     enabled: true,
     installed: true,
@@ -26,6 +26,7 @@ function createRuntime({
   let currentSampler = sampler;
   const events = [];
   const requests = [];
+  const messageListeners = new Set();
   const window = {
     navigator: {
       platform,
@@ -38,18 +39,41 @@ function createRuntime({
         error: null,
       },
     },
+    addEventListener(type, listener) {
+      if (type === "message") messageListeners.add(listener);
+    },
+    clearTimeout,
     electronBridge: {
       sendMessageFromView(message) {
         requests.push(message);
-        if (!returnStatus) return Promise.resolve(undefined);
-        return Promise.resolve({
+        const response = {
           status: "ok",
           sampler: { ...currentSampler },
-        });
+        };
+        if (statusTransport === "event") {
+          window.dispatchEvent({
+            type: "message",
+            data: {
+              type: "codey-windows-wmi-sampler-status-response",
+              requestId: message.requestId,
+              ...response,
+            },
+          });
+          return Promise.resolve(undefined);
+        }
+        if (statusTransport === "none") return Promise.resolve(undefined);
+        return Promise.resolve(response);
       },
     },
+    removeEventListener(type, listener) {
+      if (type === "message") messageListeners.delete(listener);
+    },
+    setTimeout,
     dispatchEvent(event) {
       events.push(event);
+      if (event.type === "message") {
+        for (const listener of [...messageListeners]) listener(event);
+      }
       return true;
     },
   };
@@ -129,18 +153,27 @@ test("WMI sampler guard distinguishes installation from an actual blocked sample
   );
 });
 
-test("WMI sampler guard accepts the no-return preload status bridge", async () => {
-  const runtime = createRuntime({ returnStatus: false });
+test("WMI sampler guard verifies a no-return preload through a renderer event", async () => {
+  const runtime = createRuntime({
+    statusTransport: "event",
+    sampler: {
+      enabled: true,
+      installed: true,
+      workerWrapperPatched: true,
+      blocked: 3,
+      observationMs: 31_000,
+    },
+  });
   await runtime.flush();
 
   const entry =
     runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
   const snapshot = runtime.window.__codeyWindowsWmiSamplerGuard.snapshot();
   assert.equal(entry.status, "effective");
-  assert.match(entry.detail, /兼容确认/);
+  assert.match(entry.detail, /已阻止 3 次/);
   assert.equal(snapshot.installed, true);
   assert.equal(snapshot.confirmed, true);
-  assert.equal(snapshot.mainProcessCompatibilityConfirmed, true);
+  assert.equal(snapshot.probeTransport, "renderer-event");
   assert.equal(runtime.requests.length, 1);
 });
 
