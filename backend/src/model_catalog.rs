@@ -20,6 +20,7 @@ pub(crate) const THIRD_PARTY_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "h
 pub(crate) const THIRD_PARTY_DEFAULT_REASONING_EFFORT: &str = "low";
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
+const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 const OFFICIAL_MODELS: [(&str, &str); 7] = [
     ("gpt-5.6-sol", "GPT-5.6-Sol"),
     ("gpt-5.6-terra", "GPT-5.6-Terra"),
@@ -735,10 +736,17 @@ fn catalog_models_from_value(value: &Value) -> Vec<Value> {
 }
 
 fn ensure_runtime_compatible_models(models: &[Value]) -> Result<()> {
-    if runtime_compatible_models(models) {
+    if source_models_are_runtime_compatible(models) {
         return Ok(());
     }
     Err(RuntimeModelCacheUnavailable.into())
+}
+
+fn source_models_are_runtime_compatible(models: &[Value]) -> bool {
+    !models.is_empty()
+        && models.iter().all(|model| {
+            model_instruction_source(model).is_some() && model_has_runtime_description(model)
+        })
 }
 
 fn runtime_compatible_models(models: &[Value]) -> bool {
@@ -748,12 +756,47 @@ fn runtime_compatible_models(models: &[Value]) -> bool {
                 .get("base_instructions")
                 .and_then(Value::as_str)
                 .is_some()
-                && model
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .is_some_and(|description| !description.is_empty())
+                && model_has_runtime_description(model)
         })
+}
+
+fn model_instruction_source(model: &Value) -> Option<&str> {
+    model
+        .get("base_instructions")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            model
+                .get("model_messages")
+                .and_then(|messages| messages.get("instructions_template"))
+                .and_then(Value::as_str)
+        })
+}
+
+fn legacy_base_instructions(model: &Value) -> Option<String> {
+    if let Some(base_instructions) = model.get("base_instructions").and_then(Value::as_str) {
+        return Some(base_instructions.to_owned());
+    }
+    let messages = model.get("model_messages")?;
+    let template = messages.get("instructions_template")?.as_str()?;
+    let Some(variables) = messages
+        .get("instructions_variables")
+        .filter(|variables| !variables.is_null())
+    else {
+        return Some(template.to_owned());
+    };
+    let personality = variables
+        .get("personality_default")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Some(template.replace(PERSONALITY_PLACEHOLDER, personality))
+}
+
+fn model_has_runtime_description(model: &Value) -> bool {
+    model
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|description| !description.is_empty())
 }
 
 fn clamp_reasoning_efforts(model: &mut Value) {
@@ -778,6 +821,16 @@ fn clamp_reasoning_efforts(model: &mut Value) {
 }
 
 fn ensure_catalog_compatibility(model: &mut Value) {
+    if model
+        .get("base_instructions")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        let instructions = legacy_base_instructions(model);
+        if let Some(instructions) = instructions {
+            model["base_instructions"] = json!(instructions);
+        }
+    }
     if !model
         .get("supports_reasoning_summaries")
         .is_some_and(Value::is_boolean)
@@ -1061,6 +1114,27 @@ mod tests {
         .unwrap();
     }
 
+    fn write_cache_with_template_only(home: &Path) {
+        let mut cache = official_cache();
+        for model in cache["models"].as_array_mut().unwrap() {
+            let slug = model["slug"].as_str().unwrap_or("test-model").to_owned();
+            model.as_object_mut().unwrap().remove("base_instructions");
+            model["model_messages"] = json!({
+                "instructions_template": "test-only prefix {{ personality }} suffix",
+                "instructions_variables": {
+                    "personality_default": format!("test-only default personality for {slug}"),
+                    "personality_friendly": "test-only friendly personality",
+                    "personality_pragmatic": "test-only pragmatic personality"
+                }
+            });
+        }
+        fs::write(
+            home.join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+    }
+
     fn write_cache_without_fast_metadata(home: &Path) {
         let mut cache = official_cache();
         for model in cache["models"].as_array_mut().unwrap() {
@@ -1335,6 +1409,38 @@ mod tests {
     }
 
     #[test]
+    fn generated_catalog_derives_base_instructions_from_the_local_template() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache_with_template_only(home.path());
+
+        refresh_for_provider(
+            home.path(),
+            true,
+            None,
+            &[],
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+        )
+        .unwrap();
+
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert!(models.iter().all(|model| {
+            let template = model["model_messages"]["instructions_template"]
+                .as_str()
+                .unwrap();
+            let personality =
+                model["model_messages"]["instructions_variables"]["personality_default"]
+                    .as_str()
+                    .unwrap();
+            model["base_instructions"] == template.replace(PERSONALITY_PLACEHOLDER, personality)
+        }));
+        assert!(is_available(home.path()));
+    }
+
+    #[test]
     fn generated_catalog_fills_missing_or_empty_official_descriptions() {
         let home = tempfile::tempdir().unwrap();
         let mut cache = official_cache();
@@ -1547,7 +1653,7 @@ mod tests {
     #[test]
     fn third_party_catalog_keeps_supported_official_models_before_configured_models() {
         let home = tempfile::tempdir().unwrap();
-        write_cache(home.path());
+        write_cache_with_template_only(home.path());
         let upstream = vec![
             "gpt-5.6-sol".into(),
             "gpt-5.4".into(),
@@ -1619,6 +1725,17 @@ mod tests {
             ["low", "medium", "high", "xhigh"]
         );
         assert_eq!(custom["supports_reasoning_summaries"], true);
+        let custom_template = custom["model_messages"]["instructions_template"]
+            .as_str()
+            .unwrap();
+        let custom_personality =
+            custom["model_messages"]["instructions_variables"]["personality_default"]
+                .as_str()
+                .unwrap();
+        assert_eq!(
+            custom["base_instructions"],
+            custom_template.replace(PERSONALITY_PLACEHOLDER, custom_personality)
+        );
         assert_native_fast(custom);
         assert_native_fast(
             models
