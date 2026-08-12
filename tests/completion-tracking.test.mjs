@@ -95,6 +95,7 @@ function loadInjection({
   const stopButton = new FakeElement({ "aria-label": "停止" });
   let running = initialRunning;
   const bridgeCalls = [];
+  const alerts = [];
   let reloadCount = 0;
   const timers = [];
   const toolbar = new FakeElement();
@@ -144,7 +145,7 @@ function loadInjection({
     },
     __codeyCodexSignalDispatcher: codexSignalDispatcher,
     addEventListener: () => {},
-    alert: () => {},
+    alert: (message) => alerts.push(String(message)),
     clearTimeout: () => {},
     confirm: () => true,
     dispatchEvent: () => true,
@@ -188,12 +189,16 @@ function loadInjection({
     URLSearchParams,
     window,
   });
+  rows.forEach((row) => {
+    row.dataset.codeyMessageId = window.__codeyGetMessageId(row);
+  });
   return {
     appendTurn: (turnId) => {
       const row = new FakeElement({ "data-turn-key": turnId });
       rows.push(row);
       return row;
     },
+    alerts,
     bridgeCalls,
     getReloadCount: () => reloadCount,
     getTurnRow: (index = 0) => rows[index] || null,
@@ -291,7 +296,7 @@ test("removes a hard-deleted turn and rejects a stale React rerender", async () 
   assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-2"]);
 });
 
-test("removes a failed message that was never written to the session", async () => {
+test("keeps a turn visible when no persisted turn was deleted", async () => {
   let deleteCalls = 0;
   let dispatcherCalls = 0;
   const runtime = loadInjection({
@@ -312,10 +317,69 @@ test("removes a failed message that was never written to the session", async () 
 
   assert.equal(deleteCalls, 1);
   assert.equal(dispatcherCalls, 0);
-  assert.deepEqual(runtime.getVisibleTurnIds(), []);
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["failed-turn"]);
+  assert.equal(runtime.alerts.length, 1);
+  assert.match(runtime.alerts[0], /未在会话文件中找到所选轮次/);
 
   runtime.appendTurn("failed-turn");
   runtime.window.__codeyInstallMessageSelection();
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["failed-turn", "failed-turn"]);
+});
+
+test("keeps all selected rows visible when only part of a delete is confirmed", async () => {
+  const runtime = loadInjection({
+    initialRunning: false,
+    turnIds: ["turn-1", "turn-2"],
+    selectedTurnIds: ["turn-1", "turn-2"],
+    bridgeHandler: async (path) => (
+      path === "/session/delete-messages"
+        ? { status: "ok", deleted: 1 }
+        : { status: "ok" }
+    ),
+  });
+
+  await runtime.window.__codeyDeleteSelectedMessages();
+
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-1", "turn-2"]);
+  assert.equal(runtime.alerts.length, 1);
+  assert.match(runtime.alerts[0], /只永久删除了 1\/2 轮对话/);
+});
+
+test("normalizes Codex history-content turn keys to rollout turn ids", () => {
+  const runtime = loadInjection();
+  const row = new FakeElement({
+    "data-turn-key": "history-content:turn:019ff498-5f1c-7452-aac5-88e4eb99e657",
+  });
+
+  assert.equal(
+    runtime.window.__codeyGetMessageId(row),
+    "019ff498-5f1c-7452-aac5-88e4eb99e657",
+  );
+});
+
+test("sends the normalized rollout turn id to the delete bridge", async () => {
+  const uiTurnKey = "history-content:turn:019ff498-5f1c-7452-aac5-88e4eb99e657";
+  const runtime = loadInjection({
+    initialRunning: false,
+    turnIds: [uiTurnKey],
+    selectedTurnIds: [uiTurnKey],
+    codexSignalDispatcher: async () => {},
+    bridgeHandler: async (path) => (
+      path === "/session/delete-messages"
+        ? { status: "ok", deleted: 1 }
+        : { status: "ok" }
+    ),
+  });
+
+  await runtime.window.__codeyDeleteSelectedMessages();
+
+  const deletion = runtime.bridgeCalls.find(
+    (call) => call.path === "/session/delete-messages",
+  );
+  assert.deepEqual(JSON.parse(JSON.stringify(deletion?.payload)), {
+    sessionId: "session-1",
+    messageIds: ["019ff498-5f1c-7452-aac5-88e4eb99e657"],
+  });
   assert.deepEqual(runtime.getVisibleTurnIds(), []);
 });
 

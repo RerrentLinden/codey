@@ -90,7 +90,7 @@ use crate::error_log;
 #[cfg(windows)]
 use crate::launcher::{CODEX_APP_NOT_FOUND_ERROR, CODEX_APP_PATH_INVALID_ERROR};
 use crate::launcher::{CodeyRuntime, RuntimeModelConfig, RuntimeSubagentConfig};
-use crate::message_delete::delete_messages;
+use crate::message_delete::delete_messages_persistently;
 use crate::model_catalog;
 use crate::notifications::NotificationChannelConfig;
 use crate::pending_approval;
@@ -1197,11 +1197,12 @@ pub async fn delete_selected_messages(
     message_ids: Vec<String>,
 ) -> Result<Value, String> {
     let home = codex_home();
-    let result =
-        tokio::task::spawn_blocking(move || delete_messages(&home, &session_id, &message_ids))
-            .await
-            .map_err(|error| format!("消息删除任务异常退出：{error}"))?
-            .map_err(|error| error.to_string())?;
+    let result = tokio::task::spawn_blocking(move || {
+        delete_messages_persistently(&home, &session_id, &message_ids)
+    })
+    .await
+    .map_err(|error| format!("消息删除任务异常退出：{error}"))?
+    .map_err(|error| error.to_string())?;
     serde_json::to_value(result).map_err(|error| error.to_string())
 }
 

@@ -207,17 +207,32 @@
     if (event.key === "Enter" && !event.isComposing) wakeSessionWatcher();
   };
 
+  const normalizeMessageId = (value) => {
+    const normalized = String(value || "").trim();
+    const turnMarker = ":turn:";
+    const markerIndex = normalized.lastIndexOf(turnMarker);
+    return markerIndex >= 0
+      ? normalized.slice(markerIndex + turnMarker.length).trim()
+      : normalized;
+  };
+
   const getMessageId = (row) => {
     const direct = ["data-turn-key", "data-message-id", "data-messageid", "data-item-id", "data-id"]
       .map((key) => row.getAttribute(key)).find(Boolean);
-    if (direct) return direct;
+    if (direct) return normalizeMessageId(direct);
     const child = row.querySelector("[data-turn-key], [data-message-id], [data-item-id], [data-id]");
-    return child?.getAttribute("data-turn-key") || child?.getAttribute("data-message-id") || child?.getAttribute("data-item-id") || child?.getAttribute("data-id") || "";
+    return normalizeMessageId(
+      child?.getAttribute("data-turn-key")
+      || child?.getAttribute("data-message-id")
+      || child?.getAttribute("data-item-id")
+      || child?.getAttribute("data-id")
+      || "",
+    );
   };
 
   const hardDeletedMessageKey = (sessionId, messageId) => {
     const normalizedSessionId = String(sessionId || "").replace(/^local:/, "").trim();
-    const normalizedMessageId = String(messageId || "").trim();
+    const normalizedMessageId = normalizeMessageId(messageId);
     return normalizedSessionId && normalizedMessageId
       ? `${normalizedSessionId}\u0000${normalizedMessageId}`
       : "";
@@ -2114,16 +2129,19 @@
       return;
     }
     const deleted = Number(result?.deleted || 0);
+    if (deleted !== messageIds.length) {
+      window.alert(
+        deleted
+          ? `只永久删除了 ${deleted}/${messageIds.length} 轮对话。页面不会隐藏未确认删除的轮次，请重启 Codex 刷新会话后重试。`
+          : "未在会话文件中找到所选轮次，页面不会再假装删除。请更新或重启 Codey 后重试。",
+      );
+      return;
+    }
     rememberHardDeletedMessages(sessionId, messageIds);
     rows.forEach((row) => row.remove());
     lastSelectedRow = null;
     syncSelectionGroups();
     updateToolbar();
-    const locallyRemoved = Math.max(0, messageIds.length - deleted);
-    if (!deleted) {
-      showRuntimeToast(`已移除 ${locallyRemoved} 条未写入会话的消息`);
-      return;
-    }
     try {
       await reloadConversationAfterHardDelete(sessionId, messageIds);
     } catch (error) {
@@ -2132,11 +2150,7 @@
       return;
     }
     window.dispatchEvent(new CustomEvent("codey-session-refresh", { detail: { sessionId, messageIds } }));
-    showRuntimeToast(
-      locallyRemoved
-        ? `已永久删除 ${deleted} 轮对话，并移除 ${locallyRemoved} 条未写入会话的消息`
-        : `已永久删除 ${deleted} 轮对话`,
-    );
+    showRuntimeToast(`已永久删除 ${deleted} 轮对话`);
   };
 
   const mountToolbar = () => {
