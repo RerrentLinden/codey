@@ -40,9 +40,9 @@ use fs_io::{
     atomic_write, create_private_dir_all, read_optional, remove_optional, write_private_file,
 };
 use legacy_restore::restore_legacy_owned_config_changes;
-use toml_restore::restore_owned_config_changes;
 #[cfg(test)]
 use toml_restore::{items_semantically_equal, tables_semantically_equal};
+use toml_restore::{restore_owned_config_changes, restore_owned_model_provider_changes};
 
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
@@ -680,6 +680,63 @@ fn read_subagent_defaults_config(
 
 pub fn restore_runtime_provider_config(home: &Path) -> Result<bool> {
     restore_runtime_provider_config_at(home, &lease_marker_path())
+}
+
+pub(crate) fn restore_runtime_cc_switch_provider_config(home: &Path) -> Result<bool> {
+    restore_runtime_cc_switch_provider_config_at(home, &lease_marker_path())
+}
+
+fn restore_runtime_cc_switch_provider_config_at(home: &Path, marker: &Path) -> Result<bool> {
+    let state = match fs::read_to_string(marker) {
+        Ok(contents) => serde_json::from_str::<RuntimeConfigLease>(&contents)
+            .with_context(|| format!("解析 Codey Codex lease 失败：{}", marker.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if state.preserve_provider_route || state.protocol_proxy_base_url.is_none() {
+        return Ok(false);
+    }
+    let Some(provider_id) = state.provider_id.as_deref() else {
+        return Ok(false);
+    };
+    let Some(applied_base_url) = state.applied_base_url.as_deref() else {
+        return Ok(false);
+    };
+    let config_path = home.join("config.toml");
+    let current = match fs::read_to_string(&config_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 Codex 配置失败：{}", config_path.display()));
+        }
+    };
+    let provider_still_active =
+        root_key_string(&current, "model_provider").as_deref() == Some(provider_id);
+    let proxy_still_applied =
+        provider_base_url(&current, provider_id).as_deref() == Some(applied_base_url);
+    if !provider_still_active || !proxy_still_applied {
+        return Ok(false);
+    }
+
+    let config_snapshot_dir = state
+        .config_snapshot_dir
+        .as_deref()
+        .unwrap_or(&state.backup_dir);
+    let original = if state.original_config_exists {
+        fs::read_to_string(config_snapshot_dir.join("config.toml"))
+            .context("读取 Codex 原配置备份失败")?
+    } else {
+        String::new()
+    };
+    let applied = fs::read_to_string(config_snapshot_dir.join(APPLIED_CONFIG_FILE))
+        .context("读取 Codey 已应用配置快照失败")?;
+    let restored = restore_owned_model_provider_changes(&original, &applied, &current)?;
+    if restored == current || !optional_file_matches(&config_path, Some(current.as_bytes()))? {
+        return Ok(false);
+    }
+    atomic_write(&config_path, restored.as_bytes())?;
+    Ok(true)
 }
 
 fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool> {

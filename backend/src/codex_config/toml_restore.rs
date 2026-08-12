@@ -33,6 +33,42 @@ pub(super) fn restore_owned_config_changes(
     }
 }
 
+pub(super) fn restore_owned_model_provider_changes(
+    original: &str,
+    applied: &str,
+    current: &str,
+) -> Result<String> {
+    let original = parse_document(original).context("解析 Codex 原配置备份失败")?;
+    let applied = parse_document(applied).context("解析 Codey 已应用配置快照失败")?;
+    let mut current = parse_document(current).context("解析 Codex 当前配置失败")?;
+    let empty_original = Table::new();
+    let empty_applied = Table::new();
+    let original_providers = original
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .unwrap_or(&empty_original);
+    let applied_providers = applied
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .unwrap_or(&empty_applied);
+    let original_providers_missing = original.get("model_providers").is_none();
+    let remove_empty_providers = current
+        .get_mut("model_providers")
+        .and_then(Item::as_table_mut)
+        .is_some_and(|current_providers| {
+            restore_table_changes(original_providers, applied_providers, current_providers);
+            original_providers_missing && current_providers.is_empty()
+        });
+    if remove_empty_providers {
+        current.as_table_mut().remove("model_providers");
+    }
+    if current.as_table().is_empty() {
+        Ok(String::new())
+    } else {
+        document_string(&current)
+    }
+}
+
 fn restore_fastctx_direct_only_namespace(
     original: &toml_edit::DocumentMut,
     applied: &toml_edit::DocumentMut,

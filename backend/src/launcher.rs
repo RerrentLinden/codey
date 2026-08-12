@@ -24,7 +24,8 @@ use crate::cc_switch::{self, RouteTakeoverState};
 use crate::cdp;
 use crate::codex_config::{
     RuntimeProviderConfigOptions, apply_runtime_provider_config, codex_home,
-    current_model_provider, restore_runtime_provider_config,
+    current_model_provider, restore_runtime_cc_switch_provider_config,
+    restore_runtime_provider_config,
 };
 use crate::config::{CodeyConfig, GpuLaunchMode, ProviderProfile};
 use crate::crashpad_pending_guard::{self, CrashpadPendingStatsHandle};
@@ -1394,6 +1395,7 @@ impl CodeyRuntime {
             injected_target,
         } = spawn_and_inject_runtime(&home, config, &handler, &injection_scripts, storage, &patch)
             .await?;
+        restore_cc_switch_provider_after_startup(&home, &route).await;
         #[cfg(target_os = "macos")]
         let inspector_argument = spawned.inspector_argument.clone();
         let process_id = spawned.process_id;
@@ -1547,6 +1549,37 @@ fn preserve_cc_switch_route(state: RouteTakeoverState) -> Result<bool> {
         );
     }
     Ok(state.live)
+}
+
+async fn restore_cc_switch_provider_after_startup(
+    home: &std::path::Path,
+    route: &StartupRouteContext,
+) {
+    if route.preserve_provider_route
+        || route.current_profile.protocol != RelayProtocol::ChatCompletions
+        || route.current_profile.cc_switch_provider_id.is_none()
+    {
+        return;
+    }
+    let home = home.to_path_buf();
+    let restored =
+        tokio::task::spawn_blocking(move || restore_runtime_cc_switch_provider_config(&home))
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(error).context("还原 CC Switch Provider 任务异常退出")
+            })
+            .and_then(|result| result);
+    if let Err(error) = restored {
+        error_log::record_failure(
+            "restore_failed",
+            "restore_cc_switch_provider_after_startup",
+            format!("{error:#}"),
+            serde_json::json!({
+                "provider": route.original_provider,
+            }),
+        );
+        eprintln!("Codex 启动后还原 CC Switch Provider 失败：{error:#}");
+    }
 }
 
 fn spawn_crashpad_guard_watcher(

@@ -1851,6 +1851,115 @@ fn lease_restores_the_exact_original_config() {
 }
 
 #[test]
+fn cc_switch_chat_route_is_restored_on_disk_after_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey/codex-lease.json");
+    let backup_root = temp.path().join("codey/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original = r#"model_provider = "cc-switch"
+
+[model_providers.cc-switch]
+name = "CC Switch Chat"
+base_url = "https://chat.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "original-secret"
+
+[model_providers.cc-switch.http_headers]
+X-Route = "original"
+"#;
+    fs::write(home.join("config.toml"), original).unwrap();
+    let mut profile = direct_profile(RelayProtocol::ChatCompletions);
+    profile.base_url = "https://chat.example/v1".to_string();
+    profile.cc_switch_provider_id = Some("chat-route".to_string());
+
+    apply_runtime_provider_config_at_mode(
+        &home,
+        &profile,
+        "cc-switch",
+        ProviderApplyOptions {
+            protocol_proxy_base_url: Some("http://127.0.0.1:43123/v1"),
+            ..ProviderApplyOptions::for_test(&marker, &backup_root)
+        },
+    )
+    .unwrap();
+    let temporary = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert_eq!(
+        provider_base_url(&temporary, "cc-switch").as_deref(),
+        Some("http://127.0.0.1:43123/v1")
+    );
+
+    assert!(restore_runtime_cc_switch_provider_config_at(&home, &marker).unwrap());
+    let visible = fs::read_to_string(home.join("config.toml")).unwrap();
+    let original = parse_document(original).unwrap();
+    let visible = parse_document(&visible).unwrap();
+    assert!(tables_semantically_equal(
+        original["model_providers"]["cc-switch"].as_table().unwrap(),
+        visible["model_providers"]["cc-switch"].as_table().unwrap()
+    ));
+    assert_eq!(
+        visible["service_tier"].as_str(),
+        Some("default"),
+        "Codey 的其他运行时增强应继续留在租约内"
+    );
+    assert!(marker.exists());
+
+    assert!(!restore_runtime_provider_config_at(&home, &marker).unwrap());
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        original.to_string()
+    );
+    assert!(!marker.exists());
+}
+
+#[test]
+fn cc_switch_provider_restore_does_not_overwrite_a_concurrent_route_switch() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey/codex-lease.json");
+    let backup_root = temp.path().join("codey/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        r#"model_provider = "cc-switch"
+
+[model_providers.cc-switch]
+base_url = "https://chat.example/v1"
+wire_api = "responses"
+"#,
+    )
+    .unwrap();
+    let mut profile = direct_profile(RelayProtocol::ChatCompletions);
+    profile.base_url = "https://chat.example/v1".to_string();
+    profile.cc_switch_provider_id = Some("chat-route".to_string());
+    apply_runtime_provider_config_at_mode(
+        &home,
+        &profile,
+        "cc-switch",
+        ProviderApplyOptions {
+            protocol_proxy_base_url: Some("http://127.0.0.1:43123/v1"),
+            ..ProviderApplyOptions::for_test(&marker, &backup_root)
+        },
+    )
+    .unwrap();
+
+    let switched = r#"model_provider = "other-route"
+
+[model_providers.other-route]
+base_url = "https://other.example/v1"
+wire_api = "responses"
+"#;
+    fs::write(home.join("config.toml"), switched).unwrap();
+
+    assert!(!restore_runtime_cc_switch_provider_config_at(&home, &marker).unwrap());
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        switched
+    );
+    assert!(marker.exists());
+}
+
+#[test]
 fn route_apply_rejects_a_config_changed_after_live_snapshot_validation() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
