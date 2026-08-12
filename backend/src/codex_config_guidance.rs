@@ -114,7 +114,29 @@ developer_instructions = """
 image_generation = false
 "#####;
 
-pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Use \
+pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Route local \
+workspace tool use by task: use `mcp__codey_fastctx__inspect_local_file` for file inspection, \
+`mcp__codey_fastctx__grep` for content search, `mcp__codey_fastctx__glob` for file discovery, and \
+`mcp__codey_fastctx__replace` for deterministic replacement. This FastCtx route takes precedence over \
+generic `rg`, `grep`, `find`, `sed`, or shell-first guidance for those operations. Use CodeGraph only for \
+semantic code understanding such as symbols, callers, callees, and call paths; CodeGraph does not replace \
+FastCtx for ordinary file inspection, content search, or file discovery. `mcp__codey_fastctx` is a direct \
+tool namespace, not an MCP Resources server ID; FastCtx publishes tools, not Resources. Never call \
+`list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`, or any `resources/*` method for \
+FastCtx or local workspace files, and never pass `mcp__codey_fastctx` as the `server` argument. When \
+FastCtx tools are deferred or not visible, use `tool_search` to load these direct tools, then call the \
+discovered FastCtx function. Inside a code-mode program, if `tool_search` is not exposed, inspect \
+`ALL_TOOLS` for the exact FastCtx names and call the matching function on the `tools` object, for example \
+`await tools.mcp__codey_fastctx__inspect_local_file({ file_path: absolutePath })`; do not fall back to \
+shell before trying the applicable discovery route, and do not probe or invent MCP resource server names. \
+Call the tools directly when visible. Use FastCtx file tools directly for local-file operations, including \
+when a local reference is URI-shaped; pass the equivalent plain absolute filesystem path. On Windows, \
+convert the reference to a drive-letter path such as `E:/repo/file.ts` before the call. Use terminal \
+commands only for builds, tests, Git, package managers, or when the applicable discovery route cannot \
+expose the needed FastCtx function or that function fails. Every tool call must advance the requested \
+task; put progress and corrections in commentary. Follow every Complete or Partial continuation exactly.";
+
+pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5: &str = "Codey FastCtx context tools are enabled. Use \
 `mcp__codey_fastctx__inspect_local_file`, `mcp__codey_fastctx__grep`, \
 `mcp__codey_fastctx__glob`, and \
 `mcp__codey_fastctx__replace` for local workspace files. `mcp__codey_fastctx` is a direct tool namespace, \
@@ -203,6 +225,7 @@ follow every Complete or Partial pagination note exactly.";
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     CODEY_FASTCTX_GUIDANCE,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE,
@@ -212,6 +235,7 @@ pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
 ];
 
 const PREVIOUS_CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V3,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE,
@@ -418,10 +442,25 @@ mod tests {
             codey_fastctx_guidance_for_namespace("mcp__codey_fastctx"),
             CODEY_FASTCTX_GUIDANCE
         );
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Route local workspace tool use by task"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains(
+            "This FastCtx route takes precedence over generic `rg`, `grep`, `find`, `sed`, or shell-first guidance"
+        ));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains(
+            "Use CodeGraph only for semantic code understanding such as symbols, callers, callees, and call paths"
+        ));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains(
+            "CodeGraph does not replace FastCtx for ordinary file inspection, content search, or file discovery"
+        ));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Call the tools directly when visible"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("tools.mcp__codey_fastctx__inspect_local_file"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Inside a code-mode program"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("inspect `ALL_TOOLS`"));
+        assert!(
+            CODEY_FASTCTX_GUIDANCE
+                .contains("do not fall back to shell before trying the applicable discovery route")
+        );
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("reused FastCtx server"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("available inside a code-mode program"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("including when a local reference is URI-shaped"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("equivalent plain absolute filesystem path"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("drive-letter path such as `E:/repo/file.ts`"));
@@ -451,6 +490,10 @@ mod tests {
         let config = default_agent_config_with_fastctx_guidance(Some("mcp__fastctx"));
 
         assert!(config.contains("tools.mcp__fastctx__inspect_local_file"));
+        assert!(config.contains("Route local workspace tool use by task"));
+        assert!(config.contains("takes precedence over generic `rg`"));
+        assert!(config.contains("Use CodeGraph only for semantic code understanding"));
+        assert!(config.contains("inspect `ALL_TOOLS`"));
         assert!(config.contains("Call the tools directly when visible"));
         assert!(
             config.contains(
@@ -554,7 +597,7 @@ mod tests {
     #[test]
     fn previous_fastctx_guidance_cleanup_keeps_the_current_version() {
         let configured =
-            format!("{CODEY_FASTCTX_GUIDANCE}\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4}");
+            format!("{CODEY_FASTCTX_GUIDANCE}\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5}");
 
         assert_eq!(
             remove_previous_codey_fastctx_guidance(&configured).as_deref(),
@@ -565,7 +608,7 @@ mod tests {
 
     #[test]
     fn previous_fastctx_guidance_cleanup_migrates_dynamic_namespaces() {
-        let previous = PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4
+        let previous = PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5
             .replace(DEFAULT_FASTCTX_TOOL_NAMESPACE, "mcp__fastctx");
         let configured = format!("User guidance.\n\n{previous}\n\nConcurrent guidance.");
 

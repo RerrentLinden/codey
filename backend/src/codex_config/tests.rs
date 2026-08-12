@@ -1,7 +1,8 @@
 use super::*;
 use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG, PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4,
-    codey_fastctx_guidance_for_namespace, remove_codey_fastctx_guidance,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5, codey_fastctx_guidance_for_namespace,
+    remove_codey_fastctx_guidance,
 };
 
 const GLOBAL_PROVIDER_ID: &str = "codey_global";
@@ -1145,7 +1146,10 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
     let document = first.parse::<DocumentMut>().unwrap();
     let guidance = document["developer_instructions"].as_str().unwrap();
     assert!(guidance.contains("tools.mcp__codey_fastctx__inspect_local_file"));
-    assert!(guidance.contains("available inside a code-mode program"));
+    assert!(guidance.contains("Route local workspace tool use by task"));
+    assert!(guidance.contains("takes precedence over generic `rg`"));
+    assert!(guidance.contains("Use CodeGraph only for semantic code understanding"));
+    assert!(guidance.contains("inspect `ALL_TOOLS`"));
     assert!(guidance.contains("drive-letter path such as `E:/repo/file.ts`"));
     assert!(guidance.contains(
         "`mcp__codey_fastctx` is a direct tool namespace, not an MCP Resources server ID"
@@ -1558,12 +1562,12 @@ args = ["serve"]
 #[test]
 fn previous_fastctx_guidance_migration_handles_inline_subagent_tables() {
     let dynamic_previous =
-        PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4.replace(CODEY_FASTCTX_NAMESPACE, "mcp__legacy_fastctx");
+        PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5.replace(CODEY_FASTCTX_NAMESPACE, "mcp__legacy_fastctx");
     let existing = format!(
         "developer_instructions = {}\n\
          features = {{ multi_agent_v2 = {{ subagent_developer_instructions = {} }} }}\n",
         Value::from(format!(
-            "Root user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4}"
+            "Root user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5}"
         )),
         Value::from(format!("Subagent user guidance.\n\n{dynamic_previous}")),
     );
@@ -1581,7 +1585,7 @@ fn previous_fastctx_guidance_migration_handles_inline_subagent_tables() {
         document["features"]["multi_agent_v2"]["subagent_developer_instructions"].as_str(),
         Some("Subagent user guidance.")
     );
-    assert!(!migrated.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4));
+    assert!(!migrated.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
     assert!(!migrated.contains("mcp__legacy_fastctx"));
 }
 
@@ -1593,7 +1597,7 @@ fn previous_fastctx_guidance_is_migrated_before_the_runtime_lease() {
     let backup_root = temp.path().join("codey/codex-backups");
     fs::create_dir_all(home.join("agents")).unwrap();
     let dynamic_previous =
-        PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4.replace(CODEY_FASTCTX_NAMESPACE, "mcp__legacy_fastctx");
+        PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5.replace(CODEY_FASTCTX_NAMESPACE, "mcp__legacy_fastctx");
     let original_config = format!(
         r#"model_provider = "codey_global"
 developer_instructions = {}
@@ -1605,7 +1609,7 @@ base_url = "https://chatgpt.com/backend-api/codex"
 subagent_developer_instructions = {}
 "#,
         Value::from(format!(
-            "Root user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4}"
+            "Root user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5}"
         )),
         Value::from(format!("Subagent user guidance.\n\n{dynamic_previous}")),
     );
@@ -1614,7 +1618,7 @@ subagent_developer_instructions = {}
 developer_instructions = {}
 "#,
         Value::from(format!(
-            "Default user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4}"
+            "Default user guidance.\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5}"
         )),
     );
     fs::write(home.join("config.toml"), original_config).unwrap();
@@ -1643,15 +1647,21 @@ developer_instructions = {}
             .unwrap();
     for guidance in [temporary_root_guidance, temporary_subagent_guidance] {
         assert!(guidance.contains(CODEY_FASTCTX_GUIDANCE));
+        assert!(guidance.contains("takes precedence over generic `rg`"));
+        assert!(guidance.contains("Use CodeGraph only for semantic code understanding"));
+        assert!(guidance.contains("inspect `ALL_TOOLS`"));
         assert!(guidance.contains("Never call `list_mcp_resources`"));
         assert!(guidance.contains("use `tool_search` to load these direct tools"));
-        assert!(!guidance.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4));
+        assert!(!guidance.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
     }
     let temporary_default = fs::read_to_string(home.join("agents/default.toml")).unwrap();
     assert!(temporary_default.contains(CODEY_FASTCTX_GUIDANCE));
+    assert!(temporary_default.contains("takes precedence over generic `rg`"));
+    assert!(temporary_default.contains("Use CodeGraph only for semantic code understanding"));
+    assert!(temporary_default.contains("inspect `ALL_TOOLS`"));
     assert!(temporary_default.contains("Never call `list_mcp_resources`"));
     assert!(temporary_default.contains("use `tool_search` to load these direct tools"));
-    assert!(!temporary_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4));
+    assert!(!temporary_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
 
     assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
     let restored_config = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -1665,7 +1675,7 @@ developer_instructions = {}
         Some("Subagent user guidance.")
     );
     assert!(!restored_config.contains(CODEY_FASTCTX_GUIDANCE));
-    assert!(!restored_config.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4));
+    assert!(!restored_config.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
 
     let restored_default = fs::read_to_string(home.join("agents/default.toml")).unwrap();
     let restored_default_document = parse_document(&restored_default).unwrap();
