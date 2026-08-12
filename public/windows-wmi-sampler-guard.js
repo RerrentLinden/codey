@@ -3,7 +3,7 @@
 
   const guardKey = "__codeyWindowsWmiSamplerGuard";
   const scriptId = "windows-wmi-sampler";
-  const version = 1;
+  const version = 2;
   const statusRequestType = "codey-windows-wmi-sampler-status";
   const statusResponseType = "codey-windows-wmi-sampler-status-response";
   const probeTimeoutMs = 1_000;
@@ -36,6 +36,7 @@
         mainProcessSnapshot?.workerWrapperPatched === true
       : true;
     const blocked = Number(mainProcessSnapshot?.blocked) || 0;
+    const selfTestPassed = mainProcessSnapshot?.selfTestPassed === true;
     const observationMs = Number(mainProcessSnapshot?.observationMs) || 0;
     const sourceReadFailures =
       Number(mainProcessSnapshot?.sourceReadFailures) || 0;
@@ -43,8 +44,9 @@
       version,
       enabled,
       installed,
-      confirmed: !enabled || (installed && blocked > 0),
+      confirmed: !enabled || (installed && (selfTestPassed || blocked > 0)),
       blocked,
+      selfTestPassed,
       observationMs,
       observationWindowMs,
       sourceInspections:
@@ -84,6 +86,19 @@
           : matchReason === "worker-option-name"
             ? "（通过 Worker 语义名称识别）"
             : "");
+    } else if (current.selfTestPassed) {
+      status = "effective";
+      const workersObserved =
+        Number(current.mainProcessSnapshot?.workersObserved) || 0;
+      detail =
+        "WMI 周期采样保护一次性自检通过" +
+        (workersObserved > 0
+          ? `；已观察 ${workersObserved} 个其他 Worker，实际目标采样尚未触发`
+          : "；实际目标采样尚未触发");
+    } else if (current.mainProcessSnapshot?.selfTestError) {
+      status = "failed";
+      detail = `WMI 周期采样保护自检失败：${current.mainProcessSnapshot.selfTestError}`;
+      error = detail;
     } else if (current.sourceReadFailures > 0) {
       detail =
         `有 ${current.sourceReadFailures} 个 Worker 源码无法检查，` +

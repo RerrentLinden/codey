@@ -57,6 +57,12 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
     try {
       const expression = await loadPatchExpression();
       assert.equal((0, eval)(expression), "codey-startup-patch-installed-v22");
+      const initialSampler =
+        globalThis.__CODEY_CODEX_STARTUP_PATCH__.windowsWmiSampler;
+      assert.equal(initialSampler.selfTestPassed, true);
+      assert.equal(initialSampler.selfTestError, "");
+      assert.equal(initialSampler.blocked, 0);
+      assert.equal(initialSampler.workersObserved, 0);
 
       const blocked = new workerThreads.Worker(
         "C:\\Codex\\resources\\app\\.vite\\build\\child-process-snapshot-worker.js",
@@ -181,9 +187,16 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
       assert.equal(sampler.installed, true);
       assert.equal(sampler.workerWrapperPatched, true);
       assert.equal(sampler.esmExportsSynchronized, true);
+      assert.equal(sampler.selfTestPassed, true);
       assert.equal(sampler.blocked, 7);
       assert.equal(sampler.sourceSignatureMatches, 3);
       assert.equal(sampler.lastMatchReason, "source-signature");
+      assert.equal(sampler.lastObservedWorkerName, "eval-worker");
+      assert.equal(
+        sampler.lastObservedThreadName,
+        "child-process-snapshot-preview",
+      );
+      assert.deepEqual(sampler.lastObservedSourceSignals, ["workerMessaging"]);
     } finally {
       workerThreads.Worker = NativeWorker;
       Module.syncBuiltinESMExports?.();

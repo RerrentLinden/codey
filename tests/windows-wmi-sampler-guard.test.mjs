@@ -19,6 +19,7 @@ function createRuntime({
     enabled: true,
     installed: true,
     workerWrapperPatched: true,
+    selfTestPassed: true,
     blocked: 0,
     observationMs: 1_000,
   },
@@ -116,21 +117,23 @@ test("WMI sampler guard is registered as an independently probed CDP script", ()
     /"windows-wmi-sampler",\s*"Windows WMI 周期采样保护",\s*WINDOWS_WMI_SAMPLER_GUARD_SCRIPT/,
   );
   assert.match(cdpSource, /window\.__codeyWindowsWmiSamplerGuard/);
+  assert.match(cdpSource, /snapshot\.selfTestPassed === true/);
   assert.doesNotMatch(source, /setInterval/);
 });
 
-test("WMI sampler guard distinguishes installation from an actual blocked sample", async () => {
+test("WMI sampler guard verifies protection once and reports actual blocks separately", async () => {
   const runtime = createRuntime();
   await runtime.flush();
 
   const entry =
     runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
-  assert.equal(entry.status, "executed");
-  assert.match(entry.detail, /已安装，等待首次采样确认/);
+  assert.equal(entry.status, "effective");
+  assert.match(entry.detail, /一次性自检通过/);
+  assert.match(entry.detail, /实际目标采样尚未触发/);
   assert.equal(runtime.requests[0].type, "codey-windows-wmi-sampler-status");
   assert.equal(
     runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
-    false,
+    true,
   );
 
   runtime.setSampler({
@@ -183,6 +186,7 @@ test("WMI sampler guard keeps an unmatched observation window unverified", async
       enabled: true,
       installed: true,
       workerWrapperPatched: true,
+      selfTestPassed: false,
       blocked: 0,
       observationMs: 46_000,
       sourceInspections: 2,
@@ -203,12 +207,44 @@ test("WMI sampler guard keeps an unmatched observation window unverified", async
   );
 });
 
+test("WMI sampler self-test is not downgraded by an unrelated observed Worker", async () => {
+  const runtime = createRuntime({
+    sampler: {
+      enabled: true,
+      installed: true,
+      workerWrapperPatched: true,
+      selfTestPassed: true,
+      blocked: 0,
+      observationMs: 46_000,
+      workersObserved: 1,
+      sourceInspections: 1,
+      sourceSignatureMisses: 1,
+      lastObservedWorkerName: "worker.js",
+      lastObservedThreadName: "",
+      lastObservedSourceSignals: ["workerMessaging"],
+    },
+  });
+  await runtime.flush();
+
+  const entry =
+    runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
+  assert.equal(entry.status, "effective");
+  assert.match(entry.detail, /一次性自检通过/);
+  assert.match(entry.detail, /已观察 1 个其他 Worker/);
+  assert.match(entry.detail, /实际目标采样尚未触发/);
+  assert.equal(
+    runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
+    true,
+  );
+});
+
 test("WMI sampler guard stays unverified when a Worker source could not be read", async () => {
   const runtime = createRuntime({
     sampler: {
       enabled: true,
       installed: true,
       workerWrapperPatched: true,
+      selfTestPassed: false,
       blocked: 0,
       observationMs: 60_000,
       sourceReadFailures: 1,
@@ -220,6 +256,31 @@ test("WMI sampler guard stays unverified when a Worker source could not be read"
     runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
   assert.equal(entry.status, "executed");
   assert.match(entry.detail, /1 个 Worker 源码无法检查/);
+  assert.equal(
+    runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
+    false,
+  );
+});
+
+test("WMI sampler guard surfaces a failed one-shot self-test", async () => {
+  const runtime = createRuntime({
+    sampler: {
+      enabled: true,
+      installed: true,
+      workerWrapperPatched: true,
+      selfTestPassed: false,
+      selfTestError: "probe was not intercepted",
+      blocked: 0,
+      observationMs: 1_000,
+    },
+  });
+  await runtime.flush();
+
+  const entry =
+    runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
+  assert.equal(entry.status, "failed");
+  assert.match(entry.detail, /自检失败/);
+  assert.match(entry.detail, /probe was not intercepted/);
   assert.equal(
     runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
     false,

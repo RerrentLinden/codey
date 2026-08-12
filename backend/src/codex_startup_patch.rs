@@ -306,6 +306,8 @@ mod tests {
         assert!(expression.contains("isKnownWmiSnapshotWorkerName"));
         assert!(expression.contains("isKnownWmiSnapshotWorkerThreadName"));
         assert!(expression.contains("worker-option-name"));
+        assert!(expression.contains("__codeyRunWmiSamplerSelfTest"));
+        assert!(expression.contains("selfTestPassed"));
         assert!(expression.contains("hasWmiSnapshotSourceSignature"));
         assert!(expression.contains("Get-(?:CimInstance|WmiObject)"));
         assert!(expression.contains("Win32_Process"));

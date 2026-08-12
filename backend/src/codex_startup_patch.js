@@ -86,10 +86,12 @@
   const rendererMessageChannel = "codex_desktop:message-for-view";
   const windowsWmiSamplerInstalledAtMs = Date.now();
   const windowsWmiSamplerEvidence = {
-    version: 2,
+    version: 3,
     enabled: disableWindowsWmiSampler,
     workerWrapperPatched: false,
     esmExportsSynchronized: false,
+    selfTestPassed: false,
+    selfTestError: "",
     workersObserved: 0,
     sourceInspections: 0,
     sourceSignatureMatches: 0,
@@ -98,6 +100,9 @@
     blocked: 0,
     lastMatchReason: "",
     lastWorkerName: "",
+    lastObservedWorkerName: "",
+    lastObservedThreadName: "",
+    lastObservedSourceSignals: [],
   };
   const windowsWmiSamplerSnapshot = () => ({
     ...windowsWmiSamplerEvidence,
@@ -1347,6 +1352,7 @@
 
   const workerThreads = process.getBuiltinModule("worker_threads");
   const NativeWorker = workerThreads.Worker;
+  const windowsWmiSamplerSelfTest = Symbol("codey-wmi-sampler-self-test");
   if (!NativeWorker.__codeyNoInspectWrapper) {
     const EventEmitter = process.getBuiltinModule("events").EventEmitter;
     const maximumWmiWorkerSourceBytes = 2 * 1024 * 1024;
@@ -1369,8 +1375,11 @@
       if (typeof filename?.href === "string") return filename.href;
       return String(filename ?? "");
     };
-    const workerDisplayName = (filename) => {
-      const specifier = workerSpecifierText(filename)
+    const workerDisplayName = (filename, options) => {
+      const rawSpecifier = workerSpecifierText(filename);
+      if (options?.eval === true) return "eval-worker";
+      if (/^data:/i.test(rawSpecifier)) return "data-worker";
+      const specifier = rawSpecifier
         .replace(/[?#].*$/, "")
         .replace(/[/\\]+$/, "");
       const encodedName = specifier.split(/[/\\]/).at(-1) || "unknown-worker";
@@ -1386,12 +1395,24 @@
     const isKnownWmiSnapshotWorkerThreadName = (options) =>
       typeof options?.name === "string" &&
       /^child[-_]process[-_]snapshot$/i.test(options.name.trim());
-    const hasWmiSnapshotSourceSignature = (source) =>
-      /Get-(?:CimInstance|WmiObject)/i.test(source) &&
-      /\bWin32_Process\b/i.test(source) &&
-      /\bWin32_Perf(?:Formatted|Raw)Data_PerfProc_Process\b/i.test(source) &&
-      /powershell(?:\.exe)?/i.test(source) &&
-      /(?:worker_threads|parentPort|postMessage|workerData)/.test(source);
+    const workerThreadName = (options) =>
+      typeof options?.name === "string"
+        ? options.name
+            .replace(/[\u0000-\u001f\u007f]/g, " ")
+            .trim()
+            .slice(0, 80)
+        : "";
+    const wmiSnapshotSourceSignals = (source) => ({
+      cim: /Get-(?:CimInstance|WmiObject)/i.test(source),
+      win32Process: /\bWin32_Process\b/i.test(source),
+      perfProcess:
+        /\bWin32_Perf(?:Formatted|Raw)Data_PerfProc_Process\b/i.test(source),
+      powershell: /powershell(?:\.exe)?/i.test(source),
+      workerMessaging:
+        /(?:worker_threads|parentPort|postMessage|workerData)/.test(source),
+    });
+    const hasWmiSnapshotSourceSignature = (signals) =>
+      Object.values(signals).every(Boolean);
     const decodeDataWorkerSource = (specifier) => {
       const commaIndex = specifier.indexOf(",");
       if (commaIndex < 0) return "";
@@ -1448,8 +1469,15 @@
     };
     const classifyWmiSnapshotWorker = (filename, options) => {
       if (!disableWindowsWmiSampler) return null;
+      const workerName = workerDisplayName(filename, options);
+      if (options?.[windowsWmiSamplerSelfTest] === true) {
+        return { reason: "self-test", workerName };
+      }
       windowsWmiSamplerEvidence.workersObserved += 1;
-      const workerName = workerDisplayName(filename);
+      windowsWmiSamplerEvidence.lastObservedWorkerName = workerName;
+      windowsWmiSamplerEvidence.lastObservedThreadName =
+        workerThreadName(options);
+      windowsWmiSamplerEvidence.lastObservedSourceSignals = [];
       if (isKnownWmiSnapshotWorkerName(filename)) {
         return { reason: "known-worker-name", workerName };
       }
@@ -1474,7 +1502,13 @@
           return null;
         }
         windowsWmiSamplerEvidence.sourceInspections += 1;
-        const matched = hasWmiSnapshotSourceSignature(loaded.source);
+        const sourceSignals = wmiSnapshotSourceSignals(loaded.source);
+        windowsWmiSamplerEvidence.lastObservedSourceSignals = Object.entries(
+          sourceSignals,
+        )
+          .filter(([, matched]) => matched)
+          .map(([signal]) => signal);
+        const matched = hasWmiSnapshotSourceSignature(sourceSignals);
         if (matched) {
           windowsWmiSamplerEvidence.sourceSignatureMatches += 1;
           const match = { reason: "source-signature", workerName };
@@ -1500,13 +1534,16 @@
     // Return the protocol's valid empty snapshot without creating a thread,
     // process, timer, or PowerShell child.
     class CodeyDisabledWmiSnapshotWorker extends EventEmitter {
-      constructor() {
+      constructor(selfTest = false) {
         super();
         this.threadId = -1;
         this.stdin = null;
         this.stdout = null;
         this.stderr = null;
         this.codeyTerminated = false;
+        Object.defineProperty(this, "__codeyWmiSamplerSelfTest", {
+          value: selfTest,
+        });
         process.nextTick(() => {
           if (this.codeyTerminated) return;
           this.emit("message", { type: "ok", value: [] });
@@ -1529,10 +1566,13 @@
       constructor(filename, options = {}) {
         const match = classifyWmiSnapshotWorker(filename, options);
         if (match) {
-          windowsWmiSamplerEvidence.blocked += 1;
-          windowsWmiSamplerEvidence.lastMatchReason = match.reason;
-          windowsWmiSamplerEvidence.lastWorkerName = match.workerName;
-          return new CodeyDisabledWmiSnapshotWorker();
+          const selfTest = match.reason === "self-test";
+          if (!selfTest) {
+            windowsWmiSamplerEvidence.blocked += 1;
+            windowsWmiSamplerEvidence.lastMatchReason = match.reason;
+            windowsWmiSamplerEvidence.lastWorkerName = match.workerName;
+          }
+          return new CodeyDisabledWmiSnapshotWorker(selfTest);
         }
         super(filename, {
           ...options,
@@ -1543,6 +1583,23 @@
     Object.defineProperty(CodeyNoInspectWorker, "__codeyNoInspectWrapper", {
       value: true,
     });
+    Object.defineProperty(
+      CodeyNoInspectWorker,
+      "__codeyRunWmiSamplerSelfTest",
+      {
+        value() {
+          const probe = new CodeyNoInspectWorker(
+            "codey-wmi-sampler-self-test.js",
+            { [windowsWmiSamplerSelfTest]: true },
+          );
+          const passed =
+            probe?.__codeyWmiSamplerSelfTest === true &&
+            probe?.threadId === -1;
+          probe?.terminate?.();
+          return passed;
+        },
+      },
+    );
     workerThreads.Worker = CodeyNoInspectWorker;
   }
   windowsWmiSamplerEvidence.workerWrapperPatched =
@@ -1553,6 +1610,26 @@
   } catch (error) {
     windowsWmiSamplerEvidence.esmExportsSynchronized = false;
     recordCodeyPatchFailure("sync_worker_threads_esm_exports", error);
+  }
+  if (
+    disableWindowsWmiSampler &&
+    windowsWmiSamplerEvidence.workerWrapperPatched &&
+    windowsWmiSamplerEvidence.esmExportsSynchronized
+  ) {
+    try {
+      const runSelfTest =
+        workerThreads.Worker?.__codeyRunWmiSamplerSelfTest;
+      windowsWmiSamplerEvidence.selfTestPassed =
+        typeof runSelfTest === "function" && runSelfTest();
+      if (!windowsWmiSamplerEvidence.selfTestPassed) {
+        throw new Error("WMI sampler Worker wrapper did not intercept its self-test");
+      }
+    } catch (error) {
+      windowsWmiSamplerEvidence.selfTestPassed = false;
+      windowsWmiSamplerEvidence.selfTestError =
+        error instanceof Error ? error.message.slice(0, 240) : String(error);
+      recordCodeyPatchFailure("wmi_sampler_self_test", error);
+    }
   }
 
   const temporaryWebViews = new WeakMap();

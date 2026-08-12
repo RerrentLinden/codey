@@ -210,6 +210,20 @@ pub fn prepare_injection_scripts(
                     : "";
                 return `已阻止 ${snapshot.blocked} 次 WMI 周期进程采样${matchDetail}`;
               }
+              if (snapshot.selfTestPassed === true) {
+                const workersObserved =
+                  Number(snapshot.mainProcessSnapshot?.workersObserved) || 0;
+                return "WMI 周期采样保护一次性自检通过" +
+                  (workersObserved > 0
+                    ? `；已观察 ${workersObserved} 个其他 Worker，实际目标采样尚未触发`
+                    : "；实际目标采样尚未触发");
+              }
+              if (snapshot.mainProcessSnapshot?.selfTestError) {
+                return {
+                  effective: false,
+                  detail: `WMI 周期采样保护自检失败：${snapshot.mainProcessSnapshot.selfTestError}`,
+                };
+              }
               if (snapshot.sourceReadFailures > 0) {
                 return {
                   effective: false,
