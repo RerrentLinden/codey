@@ -28,7 +28,6 @@ type FeaturePolicyCardProps = {
   isMacClient: boolean;
   popupContainer: HTMLElement | null;
   tooltipContainer: HTMLElement | null;
-  busy: string | null;
   isBusy: boolean;
   subagentModelOptions: SubagentModelOption[];
   onConfigChange: (config: Config) => void;
@@ -41,7 +40,6 @@ function FeaturePolicyCardComponent({
   isMacClient,
   popupContainer,
   tooltipContainer,
-  busy,
   isBusy,
   subagentModelOptions,
   onConfigChange,
@@ -174,7 +172,6 @@ function FeaturePolicyCardComponent({
               <Switch
                 checked={config.subagentOptimization}
                 disabled={isBusy}
-                aria-busy={busy === "check-subagent-model"}
                 onCheckedChange={(checked) =>
                   onSubagentOptimizationChange(checked)
                 }
@@ -191,8 +188,8 @@ function FeaturePolicyCardComponent({
                     value={selectedSubagentModel?.value}
                     placeholder={
                       subagentModelOptions.length === 0
-                        ? "当前线路无兼容模型"
-                        : "请选择兼容模型"
+                        ? "当前线路暂无模型"
+                        : "请选择模型"
                     }
                     disabled={
                       subagentPolicyControlsDisabled ||
@@ -256,10 +253,8 @@ function FeaturePolicyCardComponent({
                 </label>
               </div>
               <small>
-                {busy === "check-subagent-model"
-                  ? `正在校验当前线路是否支持 ${config.subagentModel}`
-                  : subagentModelOptions.length === 0
-                    ? "当前 Codex 版本或线路没有可用于子代理的模型"
+                {subagentModelOptions.length === 0
+                  ? "请先在模型管理中添加当前线路可用模型"
                   : config.subagentOptimization
                     ? "保存后立即用于当前任务后续新启动的子代理，无需重启"
                     : "可先选择子代理模型与思考深度，开启后保存即生效"}

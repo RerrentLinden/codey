@@ -46,7 +46,6 @@ type UseModelSelectionOptions = {
   setPersistedConfig: (config: Config) => void;
   setStatus: Dispatch<SetStateAction<RuntimeStatus>>;
   setNotice: Dispatch<SetStateAction<Notice>>;
-  setSubagentOptimization: (enabled: boolean) => void;
 };
 
 type ModelRuntimeUpdate = {
@@ -62,12 +61,10 @@ export function useModelSelection({
   setPersistedConfig,
   setStatus,
   setNotice,
-  setSubagentOptimization,
 }: UseModelSelectionOptions) {
   const [modelState, setModelState] = useState<ModelState>({
     officialModels: [],
     officialModelIds: [],
-    subagentModelIds: [],
     thirdPartyModels: [],
     manualThirdPartyModels: [],
     upstreamModels: [],
@@ -100,10 +97,6 @@ export function useModelSelection({
   const deletedThirdPartyModelKeys = useMemo(
     () => new Set(deletedThirdPartyModels.map(modelKey)),
     [deletedThirdPartyModels],
-  );
-  const subagentModelKeys = useMemo(
-    () => new Set(modelState.subagentModelIds.map(modelKey)),
-    [modelState.subagentModelIds],
   );
   const thirdPartyModelOptions = useMemo(
     () => {
@@ -138,10 +131,7 @@ export function useModelSelection({
   const subagentModelOptions = useMemo<SubagentModelOption[]>(
     () => [
       ...modelState.officialModels
-        .filter(
-          (model) =>
-            model.supported && subagentModelKeys.has(modelKey(model.slug)),
-        )
+        .filter((model) => model.supported)
         .map((model) => ({
           value: model.slug,
           label: model.displayName,
@@ -152,7 +142,6 @@ export function useModelSelection({
           defaultReasoningEffort: model.defaultReasoningEffort || "low",
         })),
       ...modelState.thirdPartyModels
-        .filter((model) => subagentModelKeys.has(modelKey(model)))
         .map((model) => ({
           value: model,
           label: model,
@@ -160,11 +149,7 @@ export function useModelSelection({
           defaultReasoningEffort: "low",
         })),
     ],
-    [
-      modelState.officialModels,
-      modelState.thirdPartyModels,
-      subagentModelKeys,
-    ],
+    [modelState.officialModels, modelState.thirdPartyModels],
   );
 
   const openModelPicker = useCallback((state: ModelState, warning = "") => {
@@ -212,91 +197,6 @@ export function useModelSelection({
     runOperation,
     setNotice,
     setStatus,
-  ]);
-
-  const updateSubagentOptimization = useCallback(async (
-    checked: boolean,
-    selectedModel: string,
-  ) => {
-    if (!checked) {
-      setSubagentOptimization(false);
-      return;
-    }
-    if (!provider) {
-      setNotice({
-        tone: "error",
-        text: "当前线路尚未就绪，无法校验子代理模型",
-      });
-      return;
-    }
-    const selectedSubagentModelKey = modelKey(selectedModel);
-    if (subagentModelOptions.length === 0) {
-      setNotice({
-        tone: "error",
-        text: "当前线路没有 Codex 子代理工具可用的模型，无法开启子代理协作优化",
-      });
-      return;
-    }
-    const subagentModel = subagentModelOptions.find(
-      (option) => modelKey(option.value) === selectedSubagentModelKey,
-    )?.value;
-    if (!subagentModel) {
-      setNotice({
-        tone: "error",
-        text: "请先选择 Codex 子代理工具支持的模型",
-      });
-      return;
-    }
-    await runOperation("check-subagent-model", async () => {
-      let supported = false;
-      if (provider.official) {
-        supported = modelState.officialModels.some(
-          (model) =>
-            modelKey(model.slug) === modelKey(subagentModel) && model.supported,
-        );
-      } else {
-        let result: {
-          models: string[];
-          modelState: ModelState;
-        } & ModelRuntimeUpdate;
-        try {
-          result = await invoke("fetch_current_provider_models");
-        } catch (error) {
-          throw new Error(
-            `无法确认当前第三方 API 是否支持 ${subagentModel}：${errorText(error)}`,
-          );
-        }
-        setModelState(result.modelState);
-        if (typeof result.restartRequired === "boolean") {
-          setStatus((current) => ({
-            ...current,
-            restartRequired: result.restartRequired,
-          }));
-        }
-        supported = includesModelId(result.models, subagentModel);
-      }
-
-      if (!supported) {
-        setNotice({
-          tone: "error",
-          text: `当前${provider.official ? "官方账号" : "第三方 API"}不支持 ${subagentModel}，无法开启子代理协作优化`,
-        });
-        return;
-      }
-      setSubagentOptimization(true);
-      setNotice({
-        tone: "success",
-        text: `已确认当前线路支持 ${subagentModel}，保存并重启 Codex 后生效`,
-      });
-    });
-  }, [
-    modelState.officialModels,
-    provider,
-    runOperation,
-    setNotice,
-    setStatus,
-    setSubagentOptimization,
-    subagentModelOptions,
   ]);
 
   const toggleDraftModel = useCallback((model: string, checked: boolean) => {
@@ -569,7 +469,6 @@ export function useModelSelection({
     manualThirdPartyModelKeys,
     thirdPartyModelOptions,
     fetchCurrentModels,
-    updateSubagentOptimization,
     toggleDraftModel,
     deleteDraftThirdPartyModel,
     updateCustomModelInput,

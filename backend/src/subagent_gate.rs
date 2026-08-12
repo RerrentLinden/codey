@@ -196,8 +196,12 @@ fn is_collaboration_tool(tool_name: &str) -> bool {
         .rsplit("__")
         .next()
         .unwrap_or(normalized.as_str());
+    let flattened_leaf = normalized
+        .strip_prefix("agents")
+        .map(|name| name.trim_start_matches(['.', '/', ':', '_']))
+        .unwrap_or(leaf);
     matches!(
-        leaf,
+        flattened_leaf,
         "agent"
             | "spawn_agent"
             | "wait_agent"
@@ -407,6 +411,7 @@ mod tests {
             "Agent",
             "spawn_agent",
             "agents__wait_agent",
+            "agentswait_agent",
             "agents.list_agents",
             "agents/interrupt_agent",
             "agents::send_message",

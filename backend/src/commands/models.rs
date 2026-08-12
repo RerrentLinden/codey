@@ -55,22 +55,15 @@ pub async fn sync_cc_switch_state(
 ) -> Result<cc_switch::CcSwitchStatus, String> {
     let home = codex_home();
     let mut status = sync_cc_switch_state_with(state, move |config| {
-        let previous_provider_id = config.current_provider_id().map(ToString::to_string);
         let (mut next, mut status) =
             cc_switch::sync_current_provider(&config, &home).map_err(|error| error.to_string())?;
-        subagent_policy::apply_after_provider_sync(
-            previous_provider_id.as_deref(),
-            &status.provider.id,
-            &mut next,
-            &home,
-            status.provider.official,
-        );
+        subagent_policy::reconcile_for_current_provider(&mut next, &home, status.provider.official);
         next = next.normalize();
         status.changed = next != config;
         Ok((next, status))
     })
     .await?;
-    let (_, subagent_changed) = reconcile_current_subagent_catalog(state, None).await?;
+    let (_, subagent_changed) = reconcile_current_subagent_defaults(state, None).await?;
     status.changed |= subagent_changed;
     Ok(status)
 }
@@ -278,11 +271,11 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
         return config;
     };
     if profile.cc_switch_read_only {
-        return reconcile_current_subagent_catalog(state, None)
+        return reconcile_current_subagent_defaults(state, None)
             .await
             .map(|(config, _)| config)
             .unwrap_or_else(|error| {
-                eprintln!("启动时验证官方线路子代理模型失败，沿用当前设置：{error}");
+                eprintln!("启动时刷新官方线路模型目录失败，沿用当前设置：{error}");
                 config
             });
     }
@@ -365,11 +358,11 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
     let next = config_with_current_provider_model_sync(&latest, models, synced, &codex_home());
     let committed = commit_startup_model_sync(state, latest, next, synced).await;
     drop(_config_write_guard);
-    reconcile_current_subagent_catalog(state, persistence_base.as_ref())
+    reconcile_current_subagent_defaults(state, persistence_base.as_ref())
         .await
         .map(|(config, _)| config)
         .unwrap_or_else(|error| {
-            eprintln!("启动时验证第三方线路子代理模型失败，沿用当前设置：{error}");
+            eprintln!("启动时刷新第三方线路模型目录失败，沿用当前设置：{error}");
             committed
         })
 }
@@ -823,7 +816,7 @@ pub(super) fn current_model_state(
         .iter()
         .find(|profile| profile.id == config.active_profile_id)
         .is_none_or(|profile| profile.cc_switch_read_only);
-    let mut state = model_catalog::selection_state_with_verified_subagent_catalog(
+    model_catalog::selection_state_with_manual_models(
         &codex_home(),
         official,
         config.upstream_models_snapshot(),
@@ -831,13 +824,7 @@ pub(super) fn current_model_state(
         config.manual_third_party_models(),
         config.default_model(),
     )
-    .map_err(|error| error.to_string())?;
-    let codex_runtime_version =
-        model_catalog::desktop_runtime_version(None, &config.codex_app_path);
-    if !model_catalog::is_available_for_runtime(&codex_home(), codex_runtime_version.as_deref()) {
-        state.subagent_model_ids.clear();
-    }
-    Ok(state)
+    .map_err(|error| error.to_string())
 }
 
 pub(super) fn current_renderer_model_catalog(config: &CodeyConfig) -> Result<Value, String> {
@@ -930,22 +917,16 @@ fn refresh_model_catalog_for_provider_sync(
 }
 
 fn refresh_model_catalog_or_fallback(config: &CodeyConfig) -> Result<ModelCatalogRefresh, String> {
-    let codex_runtime_version =
-        model_catalog::desktop_runtime_version(None, &config.codex_app_path);
     let home = codex_home();
     let snapshot = model_catalog::snapshot(&home).map_err(|error| error.to_string())?;
-    let result = model_catalog_fallback(
-        try_refresh_model_catalog(config, codex_runtime_version.as_deref()),
-        &home,
-        codex_runtime_version.as_deref(),
-    );
+    let result = model_catalog_fallback(try_refresh_model_catalog(config), &home);
     match result {
         Ok(fallback) => Ok(ModelCatalogRefresh { fallback, snapshot }),
         Err(error) => Err(rollback_model_catalog_snapshot(snapshot, error)),
     }
 }
 
-async fn reconcile_current_subagent_catalog(
+async fn reconcile_current_subagent_defaults(
     state: &Arc<AppState>,
     persistence_base: Option<&CodeyConfig>,
 ) -> Result<(CodeyConfig, bool), String> {
@@ -1021,21 +1002,17 @@ fn rollback_model_catalog_snapshot(
 fn model_catalog_fallback(
     result: anyhow::Result<()>,
     home: &std::path::Path,
-    codex_runtime_version: Option<&str>,
 ) -> Result<bool, String> {
     match result {
         Ok(()) => Ok(false),
-        Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => Ok(
-            !model_catalog::is_available_for_runtime(home, codex_runtime_version),
-        ),
+        Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => {
+            Ok(!model_catalog::is_available(home))
+        }
         Err(error) => Err(error.to_string()),
     }
 }
 
-fn try_refresh_model_catalog(
-    config: &CodeyConfig,
-    codex_runtime_version: Option<&str>,
-) -> anyhow::Result<()> {
+fn try_refresh_model_catalog(config: &CodeyConfig) -> anyhow::Result<()> {
     let official = config
         .profiles
         .iter()
@@ -1046,7 +1023,6 @@ fn try_refresh_model_catalog(
         official,
         config.upstream_models_snapshot(),
         config.selected_models(),
-        codex_runtime_version,
     )
     .map(|_| ())
 }
@@ -1096,13 +1072,12 @@ mod tests {
     fn model_changes_accept_only_the_known_builtin_catalog_fallback() {
         let home = tempfile::tempdir().unwrap();
         let missing_cache =
-            model_catalog::refresh_for_provider(home.path(), false, Some(&[]), &[], None)
-                .unwrap_err();
+            model_catalog::refresh_for_provider(home.path(), false, Some(&[]), &[]).unwrap_err();
 
-        assert!(model_catalog_fallback(Err(missing_cache), home.path(), None).unwrap());
-        assert!(!model_catalog_fallback(Ok(()), home.path(), None).unwrap());
+        assert!(model_catalog_fallback(Err(missing_cache), home.path()).unwrap());
+        assert!(!model_catalog_fallback(Ok(()), home.path()).unwrap());
         assert_eq!(
-            model_catalog_fallback(Err(anyhow::anyhow!("模型目录写入失败")), home.path(), None)
+            model_catalog_fallback(Err(anyhow::anyhow!("模型目录写入失败")), home.path())
                 .unwrap_err(),
             "模型目录写入失败"
         );
@@ -1190,7 +1165,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_model_refresh_disables_subagent_optimization_after_selected_model_disappears() {
+    fn provider_model_refresh_preserves_subagent_settings_when_no_replacement_is_selected() {
         let home = tempfile::tempdir().unwrap();
         let mut config = CodeyConfig {
             subagent_optimization: true,
@@ -1210,12 +1185,9 @@ mod tests {
             home.path(),
         );
 
-        assert!(!synced.subagent_optimization);
-        assert_eq!(synced.subagent_model, crate::config::DEFAULT_SUBAGENT_MODEL);
-        assert_eq!(
-            synced.subagent_reasoning_effort,
-            crate::config::DEFAULT_SUBAGENT_REASONING_EFFORT
-        );
+        assert!(synced.subagent_optimization);
+        assert_eq!(synced.subagent_model, "gpt-5.6-sol");
+        assert_eq!(synced.subagent_reasoning_effort, "high");
     }
 
     #[tokio::test]

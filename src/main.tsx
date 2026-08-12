@@ -131,11 +131,6 @@ if (import.meta.env.DEV) {
         supported: includesModelId(previewUpstreamModels, model.slug),
       })),
       officialModelIds: previewOfficialModels.map((model) => model.slug),
-      subagentModelIds: [
-        ...previewOfficialModels.map((model) => model.slug),
-        "provider-fast-coder",
-        "claude-sonnet-4-5",
-      ],
       thirdPartyModels: ["provider-fast-coder", "claude-sonnet-4-5"],
       manualThirdPartyModels: ["provider-fast-coder"],
       upstreamModels: previewUpstreamModels,

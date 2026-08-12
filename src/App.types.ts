@@ -62,7 +62,6 @@ export type OfficialModelState = {
 export type ModelState = {
   officialModels: OfficialModelState[];
   officialModelIds: string[];
-  subagentModelIds: string[];
   thirdPartyModels: string[];
   manualThirdPartyModels: string[];
   upstreamModels: string[];

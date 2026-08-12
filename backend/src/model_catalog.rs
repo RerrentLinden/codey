@@ -4,18 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use codey_runtime_core::app_paths::resolve_codex_runtime_version;
-use semver::Version;
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::model_id;
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
-// First published Codex tag containing openai/codex#36892. Older runtimes
-// require an explicit `v2` marker, so Codey backports the newer
-// "anything except disabled" catalog semantics for them.
-const LEAF_SUBAGENT_MIN_CLIENT_VERSION: &str = "0.147.0-alpha.8";
 pub(crate) const THIRD_PARTY_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 pub(crate) const THIRD_PARTY_DEFAULT_REASONING_EFFORT: &str = "low";
 const FAST_SERVICE_TIER_ID: &str = "priority";
@@ -66,7 +60,6 @@ pub struct OfficialModelAvailability {
 pub struct ModelSelectionState {
     pub official_models: Vec<OfficialModelAvailability>,
     pub official_model_ids: Vec<String>,
-    pub subagent_model_ids: Vec<String>,
     pub third_party_models: Vec<String>,
     pub manual_third_party_models: Vec<String>,
     pub upstream_models: Vec<String>,
@@ -74,14 +67,9 @@ pub struct ModelSelectionState {
 }
 
 impl ModelSelectionState {
-    pub fn available_subagent_model(&self, requested: &str) -> Option<&str> {
+    pub fn available_model(&self, requested: &str) -> Option<&str> {
         let requested = requested.trim();
-        if requested.is_empty()
-            || !self
-                .subagent_model_ids
-                .iter()
-                .any(|model| model.eq_ignore_ascii_case(requested))
-        {
+        if requested.is_empty() {
             return None;
         }
         self.official_models
@@ -96,10 +84,12 @@ impl ModelSelectionState {
             })
     }
 
-    pub fn first_available_subagent_model(&self) -> Option<&str> {
-        self.subagent_model_ids
+    pub fn first_available_model(&self) -> Option<&str> {
+        self.official_models
             .iter()
-            .find_map(|model| self.available_subagent_model(model))
+            .find(|model| model.supported)
+            .map(|model| model.slug.as_str())
+            .or_else(|| self.third_party_models.first().map(String::as_str))
     }
 }
 
@@ -139,17 +129,6 @@ pub(crate) fn restore_snapshot(snapshot: CatalogSnapshot) -> Result<()> {
     }
 }
 
-pub fn desktop_runtime_version(
-    app_dir: Option<&Path>,
-    configured_app_path: &str,
-) -> Option<String> {
-    let configured_app_path = configured_app_path.trim();
-    resolve_codex_runtime_version(
-        app_dir,
-        (!configured_app_path.is_empty()).then_some(configured_app_path),
-    )
-}
-
 pub fn default_official_model_slugs() -> Vec<String> {
     OFFICIAL_MODELS
         .iter()
@@ -162,7 +141,6 @@ pub fn refresh_for_provider(
     official_provider: bool,
     upstream_models: Option<&[String]>,
     selected_models: &[String],
-    codex_runtime_version: Option<&str>,
 ) -> Result<usize> {
     let official_models = read_official_entries(home)?;
     ensure_runtime_compatible_models(&official_models)?;
@@ -222,7 +200,7 @@ pub fn refresh_for_provider(
             catalog_models.push(synthetic_model(&template, model_id, index));
         }
     }
-    apply_legacy_v2_catalog_compatibility(&mut catalog_models, codex_runtime_version);
+    enable_subagents_for_all_models(&mut catalog_models);
 
     write_catalog(home, &catalog_models)?;
     let written_models = read_runtime_catalog_models(home)?;
@@ -323,17 +301,6 @@ pub fn selection_state_with_manual_models(
             })
             .collect()
     };
-    let mut subagent_model_ids = official_entries
-        .iter()
-        .filter(|model| model_is_subagent_eligible(model))
-        .filter_map(|model| {
-            model
-                .get("slug")
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-        })
-        .collect::<Vec<_>>();
-    subagent_model_ids.extend(third_party_models.iter().cloned());
     let manual_model_keys = manual_third_party_models
         .iter()
         .map(|model| model_id::key(model))
@@ -355,7 +322,6 @@ pub fn selection_state_with_manual_models(
     Ok(ModelSelectionState {
         official_models,
         official_model_ids,
-        subagent_model_ids,
         third_party_models,
         manual_third_party_models,
         upstream_models: if official_provider {
@@ -367,109 +333,10 @@ pub fn selection_state_with_manual_models(
     })
 }
 
-pub fn selection_state_with_verified_subagent_catalog(
-    home: &Path,
-    official_provider: bool,
-    upstream_models: Option<&[String]>,
-    selected_models: &[String],
-    manual_third_party_models: &[String],
-    requested_default_model: Option<&str>,
-) -> Result<ModelSelectionState> {
-    let mut state = selection_state_with_manual_models(
-        home,
-        official_provider,
-        upstream_models,
-        selected_models,
-        manual_third_party_models,
-        requested_default_model,
-    )?;
-    let verified_model_keys = read_runtime_catalog_models(home)
-        .map(|models| {
-            models
-                .iter()
-                .filter(|model| model_is_verified_v2_subagent(model))
-                .filter_map(|model| model.get("slug").and_then(Value::as_str))
-                .map(model_id::key)
-                .collect::<HashSet<_>>()
-        })
-        .unwrap_or_default();
-    state
-        .subagent_model_ids
-        .retain(|model| verified_model_keys.contains(&model_id::key(model)));
-    Ok(state)
-}
-
-fn legacy_v2_catalog_compatibility_required(codex_runtime_version: Option<&str>) -> bool {
-    legacy_v2_catalog_compatibility_required_for_platform(codex_runtime_version, cfg!(windows))
-}
-
-fn legacy_v2_catalog_compatibility_required_for_platform(
-    codex_runtime_version: Option<&str>,
-    windows_packaged_activation: bool,
-) -> bool {
-    // Packaged Windows launches use a versionless AUMID. The registered package
-    // that Windows activates can therefore differ from the versioned app
-    // directory used above to inspect resources/codex.exe (for example while an
-    // update leaves the previous package directory behind). Explicit V2 markers
-    // are accepted by both runtime generations, so keep them on Windows instead
-    // of trusting a version probe that may belong to a different package.
-    if windows_packaged_activation {
-        return true;
-    }
-    let client_version = codex_runtime_version
-        .map(str::trim)
-        .map(|version| version.trim_start_matches('v'))
-        .and_then(|version| Version::parse(version).ok());
-    let leaf_minimum = Version::parse(LEAF_SUBAGENT_MIN_CLIENT_VERSION)
-        .expect("leaf-subagent minimum is a valid semantic version");
-    client_version.is_none_or(|version| version < leaf_minimum)
-}
-
-fn apply_legacy_v2_catalog_compatibility(
-    models: &mut [Value],
-    codex_runtime_version: Option<&str>,
-) {
-    apply_legacy_v2_catalog_compatibility_for_platform(
-        models,
-        codex_runtime_version,
-        cfg!(windows),
-    );
-}
-
-fn apply_legacy_v2_catalog_compatibility_for_platform(
-    models: &mut [Value],
-    codex_runtime_version: Option<&str>,
-    windows_packaged_activation: bool,
-) {
-    if !legacy_v2_catalog_compatibility_required_for_platform(
-        codex_runtime_version,
-        windows_packaged_activation,
-    ) {
-        return;
-    }
+fn enable_subagents_for_all_models(models: &mut [Value]) {
     for model in models {
-        if model.get("visibility").and_then(Value::as_str) == Some("list")
-            && model_is_subagent_eligible(model)
-        {
-            model["multi_agent_version"] = json!("v2");
-        }
+        model["multi_agent_version"] = json!("v2");
     }
-}
-
-fn model_is_subagent_eligible(model: &Value) -> bool {
-    let multi_agent_version = model
-        .get("multi_agent_version")
-        .and_then(Value::as_str)
-        .map(str::trim);
-    !multi_agent_version.is_some_and(|version| version.eq_ignore_ascii_case("disabled"))
-}
-
-fn model_is_verified_v2_subagent(model: &Value) -> bool {
-    model.get("visibility").and_then(Value::as_str) == Some("list")
-        && model
-            .get("multi_agent_version")
-            .and_then(Value::as_str)
-            .is_some_and(|version| version.trim().eq_ignore_ascii_case("v2"))
 }
 
 fn effective_default_model(
@@ -502,39 +369,10 @@ fn effective_default_model(
         .unwrap_or_default()
 }
 
-#[cfg(test)]
 pub fn is_available(home: &Path) -> bool {
     read_catalog_value(&home.join(relative_path())).is_some_and(|value| {
         let models = catalog_models_from_value(&value);
         runtime_compatible_models(&models)
-    })
-}
-
-pub fn is_available_for_runtime(home: &Path, codex_runtime_version: Option<&str>) -> bool {
-    read_catalog_value(&home.join(relative_path())).is_some_and(|value| {
-        let models = catalog_models_from_value(&value);
-        runtime_compatible_models(&models)
-            && catalog_matches_runtime_subagent_compatibility(&models, codex_runtime_version)
-    })
-}
-
-fn catalog_matches_runtime_subagent_compatibility(
-    models: &[Value],
-    codex_runtime_version: Option<&str>,
-) -> bool {
-    if !legacy_v2_catalog_compatibility_required(codex_runtime_version) {
-        return true;
-    }
-    models.iter().all(|model| {
-        if model.get("visibility").and_then(Value::as_str) == Some("list")
-            && model_is_subagent_eligible(model)
-        {
-            return model
-                .get("multi_agent_version")
-                .and_then(Value::as_str)
-                .is_some_and(|version| version.trim().eq_ignore_ascii_case("v2"));
-        }
-        true
     })
 }
 
@@ -1109,7 +947,7 @@ mod tests {
 
     fn official_cache() -> Value {
         let mut cache = json!({
-            "client_version": LEAF_SUBAGENT_MIN_CLIENT_VERSION,
+            "client_version": "test-client",
             "models": [
                 {
                     "slug": "gpt-5.6-sol",
@@ -1326,30 +1164,13 @@ mod tests {
         assert!(!declares_fast_speed_support(model));
     }
 
-    fn assert_runtime_multi_agent_version(model: &Value, non_windows_version: Option<&str>) {
-        if cfg!(windows) {
-            assert_eq!(model["multi_agent_version"], "v2");
-        } else if let Some(version) = non_windows_version {
-            assert_eq!(model["multi_agent_version"], version);
-        } else {
-            assert!(model.get("multi_agent_version").is_none());
-        }
-    }
-
     #[test]
     fn official_catalog_keeps_the_fixed_order_and_native_fast_metadata() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
 
         assert_eq!(
-            refresh_for_provider(
-                home.path(),
-                true,
-                None,
-                &[],
-                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-            )
-            .unwrap(),
+            refresh_for_provider(home.path(), true, None, &[]).unwrap(),
             OFFICIAL_MODELS.len()
         );
         let catalog: Value = serde_json::from_slice(
@@ -1387,17 +1208,17 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.5")
             .unwrap();
         assert_eq!(gpt_55["service_tiers"][0]["id"], "priority");
-        assert_runtime_multi_agent_version(gpt_55, None);
+        assert_eq!(gpt_55["multi_agent_version"], "v2");
         let luna = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.6-luna")
             .unwrap();
-        assert_runtime_multi_agent_version(luna, Some("v1"));
+        assert_eq!(luna["multi_agent_version"], "v2");
         let gpt_54 = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.4")
             .unwrap();
-        assert_eq!(gpt_54["multi_agent_version"], "disabled");
+        assert_eq!(gpt_54["multi_agent_version"], "v2");
         let spark = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.3-codex-spark")
@@ -1427,31 +1248,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_runtime_promotes_every_visible_non_disabled_official_model_to_v2() {
+    fn generated_catalog_enables_every_official_model_for_subagents() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
 
-        refresh_for_provider(home.path(), true, None, &[], Some("0.147.0-alpha.1.2")).unwrap();
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
 
         let catalog: Value = serde_json::from_slice(
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
         )
         .unwrap();
         for model in catalog["models"].as_array().unwrap() {
-            if model["slug"] == "gpt-5.4" {
-                assert_eq!(model["multi_agent_version"], "disabled");
-            } else {
-                assert_eq!(
-                    model["multi_agent_version"], "v2",
-                    "{} was not promoted",
-                    model["slug"]
-                );
-            }
+            assert_eq!(
+                model["multi_agent_version"], "v2",
+                "{} was not enabled",
+                model["slug"]
+            );
         }
     }
 
     #[test]
-    fn windows_packaged_activation_keeps_explicit_v2_markers_for_new_runtimes() {
+    fn subagent_enablement_overrides_upstream_model_markers() {
         let mut models = vec![
             json!({
                 "slug": "gpt-5.6-luna",
@@ -1465,18 +1282,14 @@ mod tests {
             }),
         ];
 
-        apply_legacy_v2_catalog_compatibility_for_platform(
-            &mut models,
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-            true,
-        );
+        enable_subagents_for_all_models(&mut models);
 
         assert_eq!(models[0]["multi_agent_version"], "v2");
-        assert_eq!(models[1]["multi_agent_version"], "disabled");
+        assert_eq!(models[1]["multi_agent_version"], "v2");
     }
 
     #[test]
-    fn legacy_runtime_promotes_selected_third_party_models_to_v2() {
+    fn generated_catalog_enables_selected_third_party_models_for_subagents() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
         let upstream = vec![
@@ -1485,29 +1298,17 @@ mod tests {
             "provider-custom-model".into(),
         ];
 
-        refresh_for_provider(
-            home.path(),
-            false,
-            Some(&upstream),
-            &upstream,
-            Some("0.146.1"),
-        )
-        .unwrap();
+        refresh_for_provider(home.path(), false, Some(&upstream), &upstream).unwrap();
 
         let catalog: Value = serde_json::from_slice(
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
         )
         .unwrap();
         let models = catalog["models"].as_array().unwrap();
-        for slug in ["gpt-5.6-luna", "provider-custom-model"] {
+        for slug in ["gpt-5.6-luna", "gpt-5.4", "provider-custom-model"] {
             let model = models.iter().find(|model| model["slug"] == slug).unwrap();
             assert_eq!(model["multi_agent_version"], "v2");
         }
-        let disabled = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.4")
-            .unwrap();
-        assert_eq!(disabled["multi_agent_version"], "disabled");
     }
 
     #[test]
@@ -1515,14 +1316,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cache_with_prompt_fields(home.path());
 
-        refresh_for_provider(
-            home.path(),
-            true,
-            None,
-            &[],
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-        )
-        .unwrap();
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
 
         let catalog: Value = serde_json::from_slice(
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
@@ -1549,14 +1343,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cache_with_template_only(home.path());
 
-        refresh_for_provider(
-            home.path(),
-            true,
-            None,
-            &[],
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-        )
-        .unwrap();
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
 
         let catalog: Value = serde_json::from_slice(
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
@@ -1602,14 +1389,7 @@ mod tests {
         )
         .unwrap();
 
-        refresh_for_provider(
-            home.path(),
-            true,
-            None,
-            &[],
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-        )
-        .unwrap();
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
 
         let catalog: Value = serde_json::from_slice(
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
@@ -1666,14 +1446,7 @@ mod tests {
             );
             assert_eq!(sol_state.default_reasoning_effort, expected_default);
 
-            refresh_for_provider(
-                home.path(),
-                true,
-                None,
-                &[],
-                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-            )
-            .unwrap();
+            refresh_for_provider(home.path(), true, None, &[]).unwrap();
             let catalog: Value = serde_json::from_slice(
                 &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
             )
@@ -1730,14 +1503,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
 
-        refresh_for_provider(
-            home.path(),
-            true,
-            None,
-            &[],
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-        )
-        .unwrap();
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
 
         let mode = fs::metadata(home.path().join(MODEL_CATALOG_RELATIVE_PATH))
             .unwrap()
@@ -1752,14 +1518,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         write_cache_without_fast_metadata(home.path());
 
-        refresh_for_provider(
-            home.path(),
-            true,
-            None,
-            &[],
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-        )
-        .unwrap();
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
 
         let catalog: Value = serde_json::from_slice(
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
@@ -1799,14 +1558,7 @@ mod tests {
         let selected = upstream.clone();
 
         assert_eq!(
-            refresh_for_provider(
-                home.path(),
-                false,
-                Some(&upstream),
-                &selected,
-                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-            )
-            .unwrap(),
+            refresh_for_provider(home.path(), false, Some(&upstream), &selected,).unwrap(),
             4
         );
         let catalog: Value = serde_json::from_slice(
@@ -1850,7 +1602,7 @@ mod tests {
         let custom = models.last().unwrap();
         assert_eq!(custom["slug"], "claude-sonnet");
         assert_eq!(custom["codey_source"], "third_party");
-        assert_runtime_multi_agent_version(custom, None);
+        assert_eq!(custom["multi_agent_version"], "v2");
         assert_eq!(
             custom["supported_reasoning_levels"]
                 .as_array()
@@ -1898,14 +1650,7 @@ mod tests {
         let selected = vec!["provider-fast-coder".into()];
 
         assert_eq!(
-            refresh_for_provider(
-                home.path(),
-                false,
-                Some(&selected),
-                &selected,
-                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-            )
-            .unwrap(),
+            refresh_for_provider(home.path(), false, Some(&selected), &selected,).unwrap(),
             1
         );
         let catalog: Value = serde_json::from_slice(
@@ -1931,14 +1676,7 @@ mod tests {
         let selected = vec!["provider-fast-coder".into()];
 
         assert_eq!(
-            refresh_for_provider(
-                home.path(),
-                false,
-                None,
-                &selected,
-                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-            )
-            .unwrap(),
+            refresh_for_provider(home.path(), false, None, &selected,).unwrap(),
             OFFICIAL_MODELS.len() + 1
         );
         let catalog: Value = serde_json::from_slice(
@@ -1964,14 +1702,7 @@ mod tests {
     fn prompt_free_cold_start_falls_back_instead_of_writing_an_invalid_catalog() {
         let home = tempfile::tempdir().unwrap();
 
-        let error = refresh_for_provider(
-            home.path(),
-            true,
-            None,
-            &[],
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-        )
-        .unwrap_err();
+        let error = refresh_for_provider(home.path(), true, None, &[]).unwrap_err();
 
         assert!(error.to_string().contains("模型缓存缺少运行时必需字段"));
         assert!(is_runtime_model_cache_unavailable(&error));
@@ -2011,53 +1742,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
 
-        assert!(!is_available_for_runtime(
-            home.path(),
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION)
-        ));
-    }
-
-    #[test]
-    fn legacy_runtime_rejects_a_previous_catalog_without_v2_markers() {
-        let home = tempfile::tempdir().unwrap();
-        let mut catalog = official_cache();
-        for model in catalog["models"].as_array_mut().unwrap() {
-            if model
-                .get("description")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .is_none_or(|description| description.is_empty())
-            {
-                model["description"] = json!(model["slug"].as_str().unwrap_or("Model"));
-            }
-            model.as_object_mut().unwrap().remove("multi_agent_version");
-        }
-        let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
-
-        assert!(is_available(home.path()));
-        assert!(!is_available_for_runtime(
-            home.path(),
-            Some("0.147.0-alpha.6.5")
-        ));
-        assert_eq!(
-            is_available_for_runtime(home.path(), Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION)),
-            !cfg!(windows)
-        );
-    }
-
-    #[test]
-    fn legacy_runtime_accepts_a_previous_catalog_with_v2_markers() {
-        let home = tempfile::tempdir().unwrap();
-        write_cache(home.path());
-
-        refresh_for_provider(home.path(), true, None, &[], Some("0.147.0-alpha.6.5")).unwrap();
-
-        assert!(is_available_for_runtime(
-            home.path(),
-            Some("0.147.0-alpha.6.5")
-        ));
+        assert!(!is_available(home.path()));
     }
 
     #[test]
@@ -2071,14 +1756,7 @@ mod tests {
         fs::create_dir_all(catalog_path.parent().unwrap()).unwrap();
         fs::write(&catalog_path, serde_json::to_vec(&stale_catalog).unwrap()).unwrap();
 
-        refresh_for_provider(
-            home.path(),
-            true,
-            None,
-            &[],
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-        )
-        .unwrap();
+        refresh_for_provider(home.path(), true, None, &[]).unwrap();
 
         let catalog: Value = serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
         for slug in ["gpt-5.4-mini", "gpt-5.3-codex-spark"] {
@@ -2098,14 +1776,7 @@ mod tests {
         write_cache(home.path());
         let upstream = Vec::<String>::new();
         assert_eq!(
-            refresh_for_provider(
-                home.path(),
-                false,
-                Some(&upstream),
-                &[],
-                Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-            )
-            .unwrap(),
+            refresh_for_provider(home.path(), false, Some(&upstream), &[],).unwrap(),
             0
         );
         let catalog: Value = serde_json::from_slice(
@@ -2261,26 +1932,11 @@ mod tests {
 
         assert_eq!(state.default_model, "third-model");
         assert_eq!(
-            state.subagent_model_ids,
-            [
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-5.5",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex-spark",
-                "third-model",
-            ]
-        );
-        assert_eq!(
-            state.available_subagent_model(" GPT-5.6-LUNA "),
+            state.available_model(" GPT-5.6-LUNA "),
             Some("gpt-5.6-luna")
         );
-        assert_eq!(
-            state.available_subagent_model("third-model"),
-            Some("third-model")
-        );
-        assert_eq!(state.available_subagent_model("gpt-5.4"), None);
+        assert_eq!(state.available_model("third-model"), Some("third-model"));
+        assert_eq!(state.available_model("gpt-5.4"), None);
         let sol = state
             .official_models
             .iter()
@@ -2311,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn selection_exposes_all_non_disabled_models_independently_of_cache_client_version() {
+    fn selection_exposes_every_model_available_on_the_current_route() {
         let home = tempfile::tempdir().unwrap();
         fs::write(
             home.path().join("models_cache.json"),
@@ -2334,26 +1990,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            state.subagent_model_ids,
-            [
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-5.5",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex-spark",
-                "third-model",
-            ]
-        );
-        assert_eq!(
-            state.available_subagent_model("gpt-5.6-luna"),
-            Some("gpt-5.6-luna")
-        );
-        assert_eq!(
-            state.available_subagent_model("third-model"),
-            Some("third-model")
-        );
+        for model in &upstream {
+            assert!(state.available_model(model).is_some(), "{model}");
+        }
+        assert_eq!(state.available_model("gpt-5.4"), None);
     }
 
     #[test]
@@ -2381,99 +2021,25 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            state.available_subagent_model("gpt-5.6-luna"),
-            Some("gpt-5.6-luna")
-        );
-        assert_eq!(
-            state.available_subagent_model("third-model"),
-            Some("third-model")
-        );
+        assert_eq!(state.available_model("gpt-5.6-luna"), Some("gpt-5.6-luna"));
+        assert_eq!(state.available_model("third-model"), Some("third-model"));
     }
 
     #[test]
-    fn verified_selection_exposes_models_marked_v2_in_the_runtime_catalog() {
+    fn selection_does_not_depend_on_a_generated_runtime_catalog() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
 
-        refresh_for_provider(
-            home.path(),
-            true,
-            None,
-            &[],
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
-        )
-        .unwrap();
+        let state = selection_state(home.path(), true, None, &[], None).unwrap();
 
-        let state =
-            selection_state_with_verified_subagent_catalog(home.path(), true, None, &[], &[], None)
-                .unwrap();
-
-        // Windows packaged activation promotes every compatible model to an explicit V2 marker.
-        let expected_subagent_model_ids = if cfg!(windows) {
-            vec![
-                "gpt-5.6-sol",
-                "gpt-5.6-terra",
-                "gpt-5.6-luna",
-                "gpt-5.5",
-                "gpt-5.4-mini",
-                "gpt-5.3-codex-spark",
-            ]
-        } else {
-            vec!["gpt-5.6-sol", "gpt-5.6-terra"]
-        };
-        assert_eq!(state.subagent_model_ids, expected_subagent_model_ids);
-        assert_eq!(
-            state.available_subagent_model("gpt-5.6-luna"),
-            cfg!(windows).then_some("gpt-5.6-luna")
-        );
-        assert_eq!(
-            state.available_subagent_model("gpt-5.6-terra"),
-            Some("gpt-5.6-terra")
-        );
-    }
-
-    #[test]
-    fn verified_selection_is_empty_when_runtime_catalog_is_missing() {
-        let home = tempfile::tempdir().unwrap();
-        write_cache(home.path());
-
-        let state =
-            selection_state_with_verified_subagent_catalog(home.path(), true, None, &[], &[], None)
-                .unwrap();
-
-        assert!(state.subagent_model_ids.is_empty());
-        assert!(state.first_available_subagent_model().is_none());
-        assert!(!state.official_models.is_empty());
-    }
-
-    #[test]
-    fn verified_selection_rejects_models_from_a_stale_provider_catalog() {
-        let home = tempfile::tempdir().unwrap();
-        write_cache(home.path());
-        let provider_a = vec!["provider-a-model".into()];
-        refresh_for_provider(
-            home.path(),
-            false,
-            Some(&provider_a),
-            &provider_a,
-            Some("0.147.0-alpha.6.5"),
-        )
-        .unwrap();
-        let provider_b = vec!["provider-b-model".into()];
-
-        let state = selection_state_with_verified_subagent_catalog(
-            home.path(),
-            false,
-            Some(&provider_b),
-            &provider_b,
-            &[],
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(state.third_party_models, ["provider-b-model"]);
-        assert!(state.subagent_model_ids.is_empty());
+        assert!(!home.path().join(relative_path()).exists());
+        for model in &state.official_models {
+            assert_eq!(
+                state.available_model(&model.slug),
+                Some(model.slug.as_str())
+            );
+        }
+        assert!(state.first_available_model().is_some());
     }
 
     #[test]

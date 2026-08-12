@@ -404,7 +404,6 @@ struct PreparedCodexStartupState {
 async fn prepare_startup_model_catalog(
     config: &CodeyConfig,
     current_profile: &ProviderProfile,
-    app_dir: &std::path::Path,
     home: &std::path::Path,
     preserve_provider_route: bool,
 ) -> Result<StartupModelCatalog> {
@@ -421,25 +420,16 @@ async fn prepare_startup_model_catalog(
     let selected_models = config.selected_models().to_vec();
     let manual_models = config.manual_third_party_models().to_vec();
     let requested_default_model = config.default_model().map(str::to_owned);
-    let app_dir = app_dir.to_path_buf();
-    let configured_app_path = config.codex_app_path.clone();
     let (refresh_result, catalog_available, selection_result) =
         tokio::task::spawn_blocking(move || {
-            let codex_runtime_version =
-                model_catalog::desktop_runtime_version(Some(&app_dir), &configured_app_path);
             let refresh = model_catalog::refresh_for_provider(
                 &catalog_home,
                 official_provider,
                 upstream_models.as_deref(),
                 &selected_models,
-                codex_runtime_version.as_deref(),
             );
-            let catalog_available = refresh.is_err()
-                && model_catalog::is_available_for_runtime(
-                    &catalog_home,
-                    codex_runtime_version.as_deref(),
-                );
-            let selection = model_catalog::selection_state_with_verified_subagent_catalog(
+            let catalog_available = refresh.is_err() && model_catalog::is_available(&catalog_home);
+            let selection = model_catalog::selection_state_with_manual_models(
                 &catalog_home,
                 official_provider,
                 upstream_models.as_deref(),
@@ -501,7 +491,7 @@ async fn prepare_startup_model_catalog(
             false
         }
     };
-    let mut model_state = match selection_result {
+    let model_state = match selection_result {
         Ok(state) => state,
         Err(error) => {
             error_log::record_failure(
@@ -516,9 +506,6 @@ async fn prepare_startup_model_catalog(
             model_catalog::ModelSelectionState::default()
         }
     };
-    if !use_official_catalog {
-        model_state.subagent_model_ids.clear();
-    }
     Ok(StartupModelCatalog {
         use_official_catalog,
         model_state,
@@ -528,7 +515,6 @@ async fn prepare_startup_model_catalog(
 async fn prepare_codex_startup_state(
     config: &CodeyConfig,
     current_profile: &ProviderProfile,
-    app_dir: &std::path::Path,
     home: &std::path::Path,
     options: CodexStartupStateOptions<'_>,
 ) -> Result<PreparedCodexStartupState> {
@@ -541,14 +527,8 @@ async fn prepare_codex_startup_state(
     let StartupModelCatalog {
         use_official_catalog,
         model_state,
-    } = prepare_startup_model_catalog(
-        config,
-        current_profile,
-        app_dir,
-        home,
-        preserve_provider_route,
-    )
-    .await?;
+    } = prepare_startup_model_catalog(config, current_profile, home, preserve_provider_route)
+        .await?;
     let runtime_config_home = home.to_path_buf();
     let runtime_config_profile = current_profile.clone();
     let runtime_config_provider = original_provider.to_string();
@@ -1160,7 +1140,6 @@ async fn prepare_runtime_provider_state(
     home: &std::path::Path,
     config: &CodeyConfig,
     route: &StartupRouteContext,
-    app_dir: &std::path::Path,
 ) -> Result<PreparedProviderState> {
     let protocol_proxy =
         start_runtime_protocol_proxy(&route.current_profile, config.default_model())
@@ -1183,7 +1162,6 @@ async fn prepare_runtime_provider_state(
     let prepared_startup = prepare_codex_startup_state(
         config,
         &route.current_profile,
-        app_dir,
         home,
         CodexStartupStateOptions {
             original_provider: &route.original_provider,
@@ -1450,7 +1428,7 @@ impl CodeyRuntime {
             protocol_proxy,
             applied_route_files,
             runtime_config,
-        } = prepare_runtime_provider_state(&home, config, &route, &storage.app_dir).await?;
+        } = prepare_runtime_provider_state(&home, config, &route).await?;
         let patch =
             prepare_startup_patches_and_overlay(&home, config, applied_route_files.as_ref())
                 .await?;

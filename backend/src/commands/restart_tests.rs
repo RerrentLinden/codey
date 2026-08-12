@@ -1,9 +1,8 @@
 use super::*;
 
 #[test]
-fn subagent_selection_validation_uses_dynamic_model_state() {
+fn every_available_route_model_can_be_selected_for_subagents() {
     let state = model_catalog::ModelSelectionState {
-        subagent_model_ids: vec!["gpt-5.6-luna".into(), "provider-coder".into()],
         third_party_models: vec!["provider-coder".into()],
         official_models: vec![model_catalog::OfficialModelAvailability {
             slug: "gpt-5.6-luna".into(),
@@ -15,13 +14,12 @@ fn subagent_selection_validation_uses_dynamic_model_state() {
         ..model_catalog::ModelSelectionState::default()
     };
 
-    assert!(validate_subagent_model_selection("GPT-5.6-LUNA", &state).is_ok());
-    assert!(validate_subagent_model_selection("provider-coder", &state).is_ok());
-    assert!(
-        validate_subagent_model_selection("gpt-5.6-sol", &state)
-            .unwrap_err()
-            .contains("当前不能用于子代理")
+    assert_eq!(state.available_model("GPT-5.6-LUNA"), Some("gpt-5.6-luna"));
+    assert_eq!(
+        state.available_model("provider-coder"),
+        Some("provider-coder")
     );
+    assert_eq!(state.available_model("gpt-5.6-sol"), None);
 }
 
 #[test]
@@ -58,7 +56,6 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
             .iter()
             .map(|model| model.slug.clone())
             .collect(),
-        subagent_model_ids: vec!["gpt-5.6-sol".into()],
         official_models,
         third_party_models: vec!["provider-fast-coder".into()],
         manual_third_party_models: vec!["provider-fast-coder".into()],

@@ -91,6 +91,7 @@ use crate::error_log;
 use crate::launcher::{CODEX_APP_NOT_FOUND_ERROR, CODEX_APP_PATH_INVALID_ERROR};
 use crate::launcher::{CodeyRuntime, RuntimeModelConfig, RuntimeSubagentConfig};
 use crate::message_delete::delete_messages_persistently;
+#[cfg(test)]
 use crate::model_catalog;
 use crate::notifications::NotificationChannelConfig;
 use crate::pending_approval;
@@ -750,15 +751,8 @@ async fn save_codey_config_locked(
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     let mut config = config.normalize();
     if config.subagent_optimization {
-        let model_state = current_model_state(&config)?;
-        subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
-        if config.subagent_optimization {
-            validate_subagent_model_selection(&config.subagent_model, &model_state)?;
-            config.subagent_reasoning_effort = subagent_policy::reasoning_effort_for_model(
-                &model_state,
-                &config.subagent_model,
-                &config.subagent_reasoning_effort,
-            );
+        if let Ok(model_state) = current_model_state(&config) {
+            subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
         }
     }
     let subagent_model_changed = previous.subagent_model != config.subagent_model;
@@ -859,19 +853,6 @@ async fn rollback_trace_log_guard(
             format!("{primary_error}；回滚 Trace 日志保护也失败：{rollback_error}")
         }
     }
-}
-
-fn validate_subagent_model_selection(
-    model: &str,
-    state: &model_catalog::ModelSelectionState,
-) -> Result<(), String> {
-    if state.available_subagent_model(model).is_some() {
-        return Ok(());
-    }
-    if state.first_available_subagent_model().is_none() {
-        return Err("当前 Codex 版本或线路没有可用于子代理的模型".to_string());
-    }
-    Err(format!("模型 {} 当前不能用于子代理", model.trim()))
 }
 
 async fn finish_codey_config_save(
@@ -989,13 +970,6 @@ async fn hot_reload_runtime_subagent_defaults(
     config: &CodeyConfig,
 ) -> Option<Result<(), String>> {
     let runtime = state.runtime.lock().await.clone()?;
-    let model_state = match current_model_state(config) {
-        Ok(state) => state,
-        Err(error) => return Some(Err(error)),
-    };
-    if let Err(error) = validate_subagent_model_selection(&config.subagent_model, &model_state) {
-        return Some(Err(error));
-    }
     let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
     let websocket_url = runtime.renderer_websocket_url().await;
     let result = cdp::refresh_subagent_defaults(

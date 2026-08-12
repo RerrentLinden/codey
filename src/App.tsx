@@ -176,7 +176,6 @@ export function App({
     manualThirdPartyModelKeys,
     thirdPartyModelOptions,
     fetchCurrentModels,
-    updateSubagentOptimization,
     toggleDraftModel,
     deleteDraftThirdPartyModel,
     updateCustomModelInput,
@@ -190,7 +189,6 @@ export function App({
     setPersistedConfig,
     setStatus,
     setNotice,
-    setSubagentOptimization,
   });
   const {
     addNotificationChannel,
@@ -573,11 +571,8 @@ export function App({
   const handleRequestRemoveNotificationChannel = useStableEvent(
     askRemoveNotificationChannel,
   );
-  const handleSubagentOptimizationChange = useCallback(
-    (checked: boolean) => {
-      void updateSubagentOptimization(checked, config?.subagentModel ?? "");
-    },
-    [config?.subagentModel, updateSubagentOptimization],
+  const handleSubagentOptimizationChange = useStableEvent(
+    (checked: boolean) => setSubagentOptimization(checked),
   );
   const handleSyncCurrentProvider = useStableEvent(
     () => void syncCurrentProvider(),
@@ -827,7 +822,6 @@ export function App({
               isMacClient={status.clientPlatform === "macos"}
               popupContainer={popupContainer}
               tooltipContainer={portalContainer}
-              busy={busy}
               isBusy={isBusy}
               subagentModelOptions={subagentModelOptions}
               onConfigChange={handleConfigChange}

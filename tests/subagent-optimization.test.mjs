@@ -28,13 +28,17 @@ test("subagent optimization exposes dynamic model and reasoning controls", async
     uiSource,
     /subagentPolicyControlsDisabled \|\|\s*subagentReasoningEfforts\.length === 0/,
   );
-  assert.match(modelHookSource, /modelState\.subagentModelIds/);
   assert.match(
     modelHookSource,
-    /subagentModelKeys\.has\(modelKey\(model\.slug\)\)/,
+    /modelState\.officialModels\s*\.filter\(\(model\) => model\.supported\)/,
+  );
+  assert.match(modelHookSource, /\.\.\.modelState\.thirdPartyModels\s*\.map/);
+  assert.doesNotMatch(modelHookSource, /subagentModelIds|subagentModelKeys/);
+  assert.doesNotMatch(
+    uiSource,
+    /check-subagent-model|当前线路没有 Codex 子代理工具可用的模型/,
   );
   assert.doesNotMatch(uiSource, /仅接受 Sol \/ Terra/);
-  assert.match(`${appSource}\n${modelHookSource}`, /invoke\("fetch_current_provider_models"\)/);
 });
 
 test("subagent defaults are hot-reloaded through the packaged app-server bridge", async () => {
