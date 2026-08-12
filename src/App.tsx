@@ -1,10 +1,4 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconCheck,
   IconDeviceFloppy as Save,
@@ -21,9 +15,7 @@ import {
   type CrashpadPendingStats,
   type TraceLogStats,
 } from "./TraceLogModule";
-import {
-  ModelPickerDialog,
-} from "./AppDialogs";
+import { ModelPickerDialog } from "./AppDialogs";
 import {
   AppUpdateCard,
   FeaturePolicyCard,
@@ -70,6 +62,23 @@ const UNKNOWN_FAST_CONTEXT_TOOLS_STATUS: FastContextToolsStatus = {
   detectionFailed: true,
 };
 
+function configWithoutPromptOptimization(config: Config): Partial<Config> {
+  const comparable: Partial<Config> = { ...config };
+  delete comparable.settingsRevision;
+  delete comparable.promptOptimization;
+  return comparable;
+}
+
+function hasUnsavedConfigOutsidePromptOptimization(
+  current: Config,
+  persisted: Config,
+) {
+  return (
+    JSON.stringify(configWithoutPromptOptimization(current)) !==
+    JSON.stringify(configWithoutPromptOptimization(persisted))
+  );
+}
+
 export function App({
   embedded = false,
   modalContainer,
@@ -79,11 +88,10 @@ export function App({
 }: AppProps) {
   const [config, setConfig] = useState<Config | null>(null);
   const persistedConfigRef = useRef<Config | null>(null);
-  const { status, setStatus, refreshStatusForLoad } =
-    useRuntimeStatus({
-      active: !embedded || modalVisible,
-      embedded,
-    });
+  const { status, setStatus, refreshStatusForLoad } = useRuntimeStatus({
+    active: !embedded || modalVisible,
+    embedded,
+  });
   const [pluginMarketplaceStatus, setPluginMarketplaceStatus] =
     useState<PluginMarketplaceStatus | null>(null);
   const [ccSwitchStatus, setCcSwitchStatus] = useState<CcSwitchStatus | null>(
@@ -327,6 +335,41 @@ export function App({
     });
   }
 
+  async function syncPromptOptimizationCurrentProvider() {
+    if (!config || isBusy) return false;
+    const currentConfig = config;
+    setBusy("sync-prompt-provider");
+    try {
+      const result = await invoke<{ config: Config }>(
+        "sync_prompt_optimization_current_provider",
+        { config: currentConfig.promptOptimization },
+      );
+      const hasOtherDraft = hasUnsavedConfigOutsidePromptOptimization(
+        currentConfig,
+        result.config,
+      );
+      persistedConfigRef.current = result.config;
+      setConfig(
+        hasOtherDraft
+          ? {
+              ...currentConfig,
+              settingsRevision: result.config.settingsRevision,
+              promptOptimization: result.config.promptOptimization,
+            }
+          : result.config,
+      );
+      setDirty(hasOtherDraft);
+      window.dispatchEvent(
+        new CustomEvent("codey:config-changed", {
+          detail: { config: result.config },
+        }),
+      );
+      return true;
+    } finally {
+      setBusy(null);
+    }
+  }
+
   async function saveCurrent() {
     if (!config) return;
     await runOperation("save", async () => {
@@ -472,8 +515,7 @@ export function App({
         `${crashpadCleanup.reportsDeleted} 份 Crashpad 报告、` +
         `${crashpadCleanup.filesDeleted} 个文件`;
       const reclaimed =
-        (traceCleanup?.bytesReclaimed ?? 0) +
-        crashpadCleanup.bytesReclaimed;
+        (traceCleanup?.bytesReclaimed ?? 0) + crashpadCleanup.bytesReclaimed;
       const protectionDetail =
         result.traceProtectionEnabled && result.crashpadProtectionEnabled
           ? "双重保护保持开启"
@@ -517,12 +559,8 @@ export function App({
     () => void repairPluginMarketplace(),
   );
   const handleRestartCodex = useStableEvent(askRestartCodex);
-  const handleCheckForUpdates = useStableEvent(
-    () => void checkForUpdates(),
-  );
-  const handleDownloadUpdate = useStableEvent(
-    () => void downloadUpdate(),
-  );
+  const handleCheckForUpdates = useStableEvent(() => void checkForUpdates());
+  const handleDownloadUpdate = useStableEvent(() => void downloadUpdate());
   const handleInstallDownloadedUpdate = useStableEvent(
     askInstallDownloadedUpdate,
   );
@@ -536,15 +574,15 @@ export function App({
   );
   const handleSubagentOptimizationChange = useCallback(
     (checked: boolean) => {
-      void updateSubagentOptimization(
-        checked,
-        config?.subagentModel ?? "",
-      );
+      void updateSubagentOptimization(checked, config?.subagentModel ?? "");
     },
     [config?.subagentModel, updateSubagentOptimization],
   );
   const handleSyncCurrentProvider = useStableEvent(
     () => void syncCurrentProvider(),
+  );
+  const handleSyncPromptOptimizationCurrentProvider = useStableEvent(
+    syncPromptOptimizationCurrentProvider,
   );
   const handleShowAccountUsageInHeaderChange = useStableEvent(
     (checked: boolean) => {
@@ -589,7 +627,9 @@ export function App({
       >
         {loadingContent}
       </SettingsModalShell>
-    ) : loadingContent;
+    ) : (
+      loadingContent
+    );
   }
 
   const configHeaderContent = (
@@ -626,9 +666,7 @@ export function App({
           </Button>
           <div className="feedback-qr-popover" role="tooltip">
             <img src={FEEDBACK_GROUP_QR_URL} alt="问题反馈群二维码" />
-            <span id="codey-feedback-qr-description">
-              扫码加入问题反馈群
-            </span>
+            <span id="codey-feedback-qr-description">扫码加入问题反馈群</span>
           </div>
         </div>
       )}
@@ -792,10 +830,14 @@ export function App({
           <div className="full-row-section prompt-optimization-full-section">
             <PromptOptimizationCard
               config={config}
+              provider={provider}
               busy={busy}
               isBusy={isBusy}
-              container={portalContainer}
+              container={modalContainer}
               onConfigChange={handleConfigChange}
+              onSyncCurrentProvider={
+                handleSyncPromptOptimizationCurrentProvider
+              }
             />
           </div>
 
@@ -873,15 +915,17 @@ export function App({
     <SettingsModalShell
       afterClose={onAfterClose}
       container={modalContainer}
-      header={(
+      header={
         <div className="semi-modal-header codey-settings-modal-header">
           {configHeaderContent}
         </div>
-      )}
+      }
       onCancel={handleCloseSettings}
       visible={modalVisible}
     >
       {appContent}
     </SettingsModalShell>
-  ) : appContent;
+  ) : (
+    appContent
+  );
 }

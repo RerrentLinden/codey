@@ -48,7 +48,7 @@ pub use models::{
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
 use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
-    test_prompt_optimization_command,
+    sync_prompt_optimization_current_provider_command, test_prompt_optimization_command,
 };
 use runtime::refresh_injection_status;
 pub(crate) use runtime::{
@@ -482,6 +482,12 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Err(error) => Err(error),
         },
         "sync_current_provider" => sync_current_provider_command(state).await,
+        "sync_prompt_optimization_current_provider" => {
+            match optional_argument::<PromptOptimizationConfig>(&args, "config") {
+                Ok(draft) => sync_prompt_optimization_current_provider_command(state, draft).await,
+                Err(error) => Err(error),
+            }
+        }
         "fetch_current_provider_models" => fetch_current_provider_models(state).await,
         "save_selected_models" => match (
             argument::<Vec<String>>(&args, "officialModels"),
@@ -538,6 +544,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Ok(channel_id) => reveal_notification_channel(state, channel_id).await,
             Err(error) => Err(error),
         },
+        "reveal_prompt_optimization_api_key" => reveal_prompt_optimization_api_key(state).await,
         "optimize_prompt" => match string_argument(&args, "text") {
             Ok(text) => optimize_prompt_command(state, text).await,
             Err(error) => Err(error),
@@ -604,6 +611,20 @@ async fn reveal_notification_channel(
         .cloned()
         .ok_or_else(|| "找不到要编辑的通知渠道".to_string())?;
     Ok(json!({"channel": channel}))
+}
+
+async fn reveal_prompt_optimization_api_key(state: &Arc<AppState>) -> Result<Value, String> {
+    let api_key = state
+        .config
+        .read()
+        .await
+        .prompt_optimization
+        .api_key
+        .clone();
+    if api_key.trim().is_empty() {
+        return Err("提示词优化 API Key 尚未保存".to_string());
+    }
+    Ok(json!({"apiKey": api_key}))
 }
 
 #[cfg(windows)]

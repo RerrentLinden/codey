@@ -21,6 +21,7 @@ export type PromptOptimizationConfig = {
   apiKeyConfigured: boolean;
   clearApiKey?: boolean;
   model: string;
+  protocol: "responses" | "chatCompletions";
   instruction: string;
 };
 

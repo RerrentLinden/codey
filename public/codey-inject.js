@@ -298,14 +298,24 @@
   const selectedRows = () => [...document.querySelectorAll(`.${selectedClass}[data-codey-message-id]`)];
 
   const showRuntimeToast = (message, tone = "success") => {
+    const sharedToast = window.__codeyShowRuntimeToast;
+    if (typeof sharedToast === "function" && sharedToast !== showRuntimeToast) {
+      sharedToast(message, tone);
+      return;
+    }
     document.getElementById(toastId)?.remove();
     const toast = document.createElement("div");
     toast.id = toastId;
     toast.dataset.tone = tone;
+    toast.setAttribute("role", tone === "error" ? "alert" : "status");
+    toast.setAttribute("aria-live", tone === "error" ? "assertive" : "polite");
     toast.textContent = message;
     document.documentElement.appendChild(toast);
     window.setTimeout(() => toast.remove(), tone === "error" ? 8000 : 3500);
   };
+  if (typeof window.__codeyShowRuntimeToast !== "function") {
+    window.__codeyShowRuntimeToast = showRuntimeToast;
+  }
 
   const stopSidebarActionEvent = (event) => {
     event.preventDefault();

@@ -6,6 +6,7 @@ import SemiCard from "@douyinfe/semi-ui/lib/es/card";
 import SemiCheckbox from "@douyinfe/semi-ui/lib/es/checkbox";
 import SemiInput from "@douyinfe/semi-ui/lib/es/input";
 import Modal from "@douyinfe/semi-ui/lib/es/modal";
+import SemiSelect from "@douyinfe/semi-ui/lib/es/select";
 import SemiSwitch from "@douyinfe/semi-ui/lib/es/switch";
 import Tooltip from "@douyinfe/semi-ui/lib/es/tooltip";
 
@@ -153,6 +154,19 @@ export function AutoComplete({ className, ...props }: AutoCompleteProps) {
     <SemiAutoComplete
       {...props}
       className={classNames("codey-autocomplete", className)}
+    />
+  );
+}
+
+type SemiSelectProps = React.ComponentProps<typeof SemiSelect>;
+
+export type SelectProps = SemiSelectProps;
+
+export function Select({ className, ...props }: SelectProps) {
+  return (
+    <SemiSelect
+      {...props}
+      className={classNames("codey-select", className)}
     />
   );
 }

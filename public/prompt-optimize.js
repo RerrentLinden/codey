@@ -1,9 +1,9 @@
-// Prompt-optimization button injected next to the Codex composer.
-// The button is a fixed-position pill tracked to the composer input's
-// top-right corner, so it never mutates Codex's own layout. The enabled flag
-// is read from /settings/get at runtime, so the console switch applies
-// without a Codex restart. All API traffic goes through the Codey bridge and
-// never carries the configured API key into this page.
+// Prompt-optimization button injected next to the Codex composer model picker.
+// The button joins the composer's native action row so it follows normal
+// responsive layout instead of floating above the input. The enabled flag is
+// read from /settings/get at runtime, so the console switch applies without a
+// Codex restart. All API traffic goes through the Codey bridge and never
+// carries the configured API key into this page.
 (() => {
   const moduleLoaded = window.__codeyPromptOptimizeModuleLoaded === true;
   window.__codeyPromptOptimizeModuleLoaded = true;
@@ -15,20 +15,22 @@
   const optimizePath = "/api/optimize_prompt";
   const buttonId = "codey-prompt-optimize-button";
   const styleId = "codey-prompt-optimize-style";
-  const errorId = "codey-prompt-optimize-error";
+  const toastId = "codey-runtime-toast";
   const configChangedEvent = "codey:config-changed";
   const optimizeTimeoutMs = 75_000;
   const scanDelayMs = 250;
   const repositionDelayMs = 100;
-  const errorDismissMs = 6_000;
-  const zIndex = 2147483640;
   const composerAnchorSelector = "[data-above-composer-conversation-id]";
+  const composerCandidateSelector =
+    "textarea, [contenteditable='true'], [role='textbox']";
+  const composerFallbackSelector =
+    "main textarea, main [contenteditable='true'], main [role='textbox'], textarea, [contenteditable='true'][role='textbox']";
+  const composerControlSelector = "button, [role='button']";
 
   let enabled = false;
   let ready = false;
   let inputElement = null;
   let button = null;
-  let errorPopover = null;
   let busy = false;
   let scanTimer = 0;
   let repositionTimer = 0;
@@ -63,14 +65,17 @@
       #${buttonId} {
         -webkit-app-region: no-drag !important;
         pointer-events: auto !important;
-        position: fixed !important;
-        z-index: ${zIndex} !important;
+        position: relative !important;
+        z-index: 1 !important;
         display: none;
+        flex: 0 0 auto;
         align-items: center;
-        gap: 5px;
+        gap: 4px;
         box-sizing: border-box;
-        height: 26px;
-        padding: 0 9px;
+        min-height: 28px !important;
+        height: 28px !important;
+        margin: 0 6px 0 0;
+        padding: 0 8px;
         border: 0;
         border-radius: 999px;
         background: rgba(30, 30, 30, .92);
@@ -84,21 +89,15 @@
       }
       #${buttonId}:hover { opacity: 1; }
       #${buttonId}:active { transform: translateY(1px); }
-      #${buttonId}[data-busy="true"] { opacity: .55; pointer-events: none; }
-      #${buttonId} svg { flex: 0 0 auto; width: 13px; height: 13px; }
-      #${errorId} {
-        position: fixed !important;
-        z-index: ${zIndex} !important;
-        display: none;
-        box-sizing: border-box;
-        max-width: 300px;
-        padding: 7px 10px;
-        border-radius: 8px;
-        background: rgba(200, 40, 40, .95);
-        color: #fff;
-        font: 12px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-        box-shadow: 0 2px 8px rgba(0, 0, 0, .4);
-      }
+      #${buttonId}:disabled { cursor: not-allowed; box-shadow: none; opacity: .42; }
+      #${buttonId}[data-busy="true"] { cursor: wait; opacity: .7; }
+      #${buttonId} svg { flex: 0 0 auto; width: 12px; height: 12px; }
+      #${buttonId} [data-codey-optimize-spinner] { display: none; animation: codey-prompt-optimize-spin .75s linear infinite; }
+      #${buttonId}[data-busy="true"] [data-codey-optimize-icon] { display: none; }
+      #${buttonId}[data-busy="true"] [data-codey-optimize-spinner] { display: block; }
+      @keyframes codey-prompt-optimize-spin { to { transform: rotate(360deg); } }
+      #${toastId} { -webkit-app-region: no-drag !important; position: fixed; right: 20px; bottom: 22px; z-index: 2147483645; max-width: 360px; border: 1px solid rgba(124, 140, 255, .4); border-radius: 11px; padding: 10px 13px; background: rgba(20, 24, 36, .97); color: #eef2ff; box-shadow: 0 12px 36px rgba(0,0,0,.4); font: 12px/1.45 system-ui, sans-serif; }
+      #${toastId}[data-tone="error"] { border-color: rgba(248, 113, 113, .6); color: #fecaca; }
     `;
     document.documentElement.appendChild(style);
   };
@@ -109,11 +108,18 @@
     element.type = "button";
     element.dataset.codeyPromptOptimize = "true";
     element.setAttribute("aria-label", "优化提示词");
+    element.setAttribute("aria-disabled", "true");
+    element.setAttribute("aria-busy", "false");
+    element.disabled = true;
     element.innerHTML = `
-      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none"
+      <svg data-codey-optimize-icon viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none"
         stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"></path>
         <path d="M19 15l.9 2.4L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.6z"></path>
+      </svg>
+      <svg data-codey-optimize-spinner viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none"
+        stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
+        <path d="M20 12a8 8 0 1 1-5.3-7.5"></path>
       </svg>
       <span>优化</span>
     `;
@@ -121,19 +127,30 @@
     return element;
   };
 
-  const createErrorPopover = () => {
-    const element = document.createElement("div");
-    element.id = errorId;
-    element.setAttribute("role", "status");
-    element.setAttribute("aria-live", "polite");
-    document.documentElement.appendChild(element);
-    return element;
+  const installRuntimeToast = () => {
+    if (typeof window.__codeyShowRuntimeToast === "function") return;
+    window.__codeyShowRuntimeToast = (message, tone = "success") => {
+      document.getElementById(toastId)?.remove();
+      const toast = document.createElement("div");
+      toast.id = toastId;
+      toast.dataset.tone = tone;
+      toast.setAttribute("role", tone === "error" ? "alert" : "status");
+      toast.setAttribute(
+        "aria-live",
+        tone === "error" ? "assertive" : "polite",
+      );
+      toast.textContent = message;
+      document.documentElement.appendChild(toast);
+      setTimeout(() => toast.remove(), tone === "error" ? 8_000 : 3_500);
+    };
   };
 
   const isComposerInput = (element) => {
     if (!element) return false;
     if (element.tagName === "TEXTAREA") return true;
-    return element.isContentEditable === true;
+    if (element.isContentEditable === true) return true;
+    if (element.getAttribute?.("contenteditable") === "true") return true;
+    return element.getAttribute?.("role") === "textbox";
   };
 
   const isVisible = (element) => {
@@ -152,71 +169,155 @@
       if (seen.has(anchor)) continue;
       seen.add(anchor);
       const scope = anchor.parentElement || anchor;
-      const candidates = [
-        ...scope.querySelectorAll("textarea, [contenteditable]"),
-      ];
+      const candidates = [...scope.querySelectorAll(composerCandidateSelector)];
       for (const candidate of candidates) {
         if (isVisible(candidate)) return candidate;
       }
     }
-    // Fallback: the largest visible textarea inside the main content area is
-    // almost certainly the composer.
+    // New conversations do not have a conversation-id anchor yet. Prefer the
+    // lowest visible editable textbox, then its area, so the composer wins over
+    // search fields and historical message editors.
     let best = null;
-    let bestArea = 0;
-    for (const candidate of document.querySelectorAll("main textarea")) {
+    let bestScore = -1;
+    const viewportHeight =
+      window.innerHeight || document.documentElement.clientHeight || 0;
+    for (const candidate of document.querySelectorAll(
+      composerFallbackSelector,
+    )) {
       if (!isVisible(candidate)) continue;
       const rect = candidate.getBoundingClientRect();
+      if (
+        viewportHeight > 0 &&
+        (rect.bottom <= 0 || rect.top >= viewportHeight)
+      )
+        continue;
       const area = rect.width * rect.height;
-      if (area > bestArea) {
+      const score =
+        Math.max(0, rect.bottom) * 10_000 + Math.min(area, 9_999_999);
+      if (score > bestScore) {
         best = candidate;
-        bestArea = area;
+        bestScore = score;
       }
     }
     return best;
   };
 
+  const controlDescriptor = (element) =>
+    [
+      element?.getAttribute?.("aria-label"),
+      element?.getAttribute?.("title"),
+      element?.getAttribute?.("data-testid"),
+      element?.textContent,
+      element?.innerText,
+    ]
+      .filter((value) => typeof value === "string" && value.trim())
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const isVisibleControl = (element) => {
+    if (!element || element === button) return false;
+    if (element.closest?.("[hidden], [aria-hidden='true']")) return false;
+    if (element.disabled) return false;
+    const style = window.getComputedStyle(element);
+    if (style.display === "none" || style.visibility === "hidden") return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+
+  const modelControlScore = (control, inputRect) => {
+    const rect = control.getBoundingClientRect();
+    const descriptor = controlDescriptor(control);
+    const visibleText = [control.textContent, control.innerText]
+      .filter((value) => typeof value === "string" && value.trim())
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const hasModelHint = /(^|[^a-z])model([^a-z]|$)|模型/i.test(descriptor);
+    if (!hasModelHint && !visibleText) return Number.NEGATIVE_INFINITY;
+    if (
+      !hasModelHint &&
+      /完全访问|full access|附件|attach|上传|upload|优化/i.test(descriptor)
+    ) {
+      return Number.NEGATIVE_INFINITY;
+    }
+    if (
+      !hasModelHint &&
+      inputRect.width > 0 &&
+      rect.right < inputRect.left + inputRect.width * 0.45
+    ) {
+      return Number.NEGATIVE_INFINITY;
+    }
+    return (
+      (hasModelHint ? 1_000_000 : 0) +
+      (control.getAttribute?.("aria-haspopup") ? 100_000 : 0) +
+      Math.max(0, rect.right) * 10 +
+      Math.min(rect.width, 500)
+    );
+  };
+
+  const findModelInsertionTarget = () => {
+    if (!inputElement?.parentElement) return null;
+    const inputRect = inputElement.getBoundingClientRect();
+    const seen = new Set();
+    let bestControl = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    let scope = inputElement.parentElement;
+    let depth = 0;
+    while (scope && depth < 8) {
+      for (const control of scope.querySelectorAll?.(composerControlSelector) ||
+        []) {
+        if (seen.has(control) || !isVisibleControl(control)) continue;
+        seen.add(control);
+        const score = modelControlScore(control, inputRect);
+        if (score > bestScore) {
+          bestControl = control;
+          bestScore = score;
+        }
+      }
+      if (bestScore >= 1_000_000) break;
+      scope = scope.parentElement;
+      depth += 1;
+    }
+    if (!bestControl) return null;
+
+    let anchor = bestControl;
+    let host = bestControl.parentElement;
+    while (host?.parentElement && host.children?.length === 1) {
+      anchor = host;
+      host = host.parentElement;
+    }
+    if (!host?.insertBefore) return null;
+    return { anchor, host };
+  };
+
+  const isMountedBefore = (element, anchor, host) => {
+    if (element?.parentElement !== host) return false;
+    const children = [...(host.children || [])];
+    return children.indexOf(element) + 1 === children.indexOf(anchor);
+  };
+
   const updateButtonPosition = () => {
     if (!button || !inputElement) return;
-    const rect = inputElement.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) {
+    if (!isVisible(inputElement)) {
+      inputElement = null;
+      button.style.display = "none";
+      scheduleScan();
+      return;
+    }
+    const target = findModelInsertionTarget();
+    if (!target) {
       button.style.display = "none";
       return;
     }
-    const margin = 6;
-    const buttonHeight = button.offsetHeight || 26;
-    const buttonWidth = button.offsetWidth || 64;
-    // 按钮位于输入框外部右上方：不遮输入框内的文字，也不挡输入框
-    // 右下角的发送按键；上移 12px 避开输入框上缘的相邻控件。
-    button.style.display = "inline-flex";
-    button.style.top = `${Math.max(margin, rect.top - buttonHeight - margin * 2)}px`;
-    button.style.left = `${Math.max(
-      margin,
-      Math.min(rect.right - buttonWidth - margin, window.innerWidth - buttonWidth - margin),
-    )}px`;
-    if (errorPopover && errorPopover.style.display !== "none") {
-      positionErrorPopover();
+    if (!isMountedBefore(button, target.anchor, target.host)) {
+      target.host.insertBefore(button, target.anchor);
     }
-  };
-
-  const positionErrorPopover = () => {
-    if (!errorPopover || !button) return;
-    const buttonRect = button.getBoundingClientRect();
-    errorPopover.style.top = `${buttonRect.bottom + 6}px`;
-    errorPopover.style.left = `${Math.max(
-      8,
-      Math.min(buttonRect.left, window.innerWidth - errorPopover.offsetWidth - 8),
-    )}px`;
-  };
-
-  const showError = (message) => {
-    if (!errorPopover) errorPopover = createErrorPopover();
-    errorPopover.textContent = message;
-    errorPopover.style.display = "block";
-    positionErrorPopover();
-    clearTimeout(errorPopover._dismissTimer);
-    errorPopover._dismissTimer = setTimeout(() => {
-      errorPopover.style.display = "none";
-    }, errorDismissMs);
+    button.style.top = "";
+    button.style.left = "";
+    button.style.display = "inline-flex";
+    button.dataset.codeyPromptOptimizeLayout = "model-picker";
+    updateButtonState();
   };
 
   const readComposerText = () => {
@@ -227,10 +328,30 @@
     return inputElement.innerText || "";
   };
 
+  const updateButtonState = () => {
+    if (!button) return;
+    const empty = !readComposerText().trim();
+    const disabled = busy || empty;
+    button.disabled = disabled;
+    button.dataset.busy = String(busy);
+    button.dataset.empty = String(empty);
+    button.setAttribute("aria-busy", String(busy));
+    button.setAttribute("aria-disabled", String(disabled));
+    button.setAttribute(
+      "aria-label",
+      busy ? "正在优化提示词" : empty ? "请输入内容后优化" : "优化提示词",
+    );
+  };
+
+  const showError = (message) => {
+    window.__codeyShowRuntimeToast?.(message, "error");
+  };
+
   const replaceComposerText = (text) => {
     if (inputElement.tagName === "TEXTAREA") {
       const prototype = window.HTMLTextAreaElement?.prototype;
-      const setter = prototype && Object.getOwnPropertyDescriptor(prototype, "value")?.set;
+      const setter =
+        prototype && Object.getOwnPropertyDescriptor(prototype, "value")?.set;
       if (setter) {
         setter.call(inputElement, text);
       } else {
@@ -240,11 +361,13 @@
       return;
     }
     inputElement.innerText = text;
-    inputElement.dispatchEvent(new InputEvent("input", {
-      bubbles: true,
-      inputType: "insertText",
-      data: text,
-    }));
+    inputElement.dispatchEvent(
+      new InputEvent("input", {
+        bubbles: true,
+        inputType: "insertText",
+        data: text,
+      }),
+    );
   };
 
   const handleClick = (event) => {
@@ -253,19 +376,24 @@
     if (busy) return;
     const text = readComposerText().trim();
     if (!text) {
-      showError("请先在输入框输入要优化的内容");
+      updateButtonState();
       return;
     }
     busy = true;
-    button.dataset.busy = "true";
+    updateButtonState();
     const bridgeCall = callBridge(optimizePath, { text });
-    const result = withTimeout(bridgeCall, optimizeTimeoutMs, "优化请求超时，请稍后重试");
+    const result = withTimeout(
+      bridgeCall,
+      optimizeTimeoutMs,
+      "优化请求超时，请稍后重试",
+    );
     result
       .then((value) => {
         if (value?.status === "failed") {
           throw new Error(value.message || "优化失败");
         }
-        const optimized = typeof value?.optimized === "string" ? value.optimized : "";
+        const optimized =
+          typeof value?.optimized === "string" ? value.optimized : "";
         if (!optimized) {
           throw new Error("优化结果为空");
         }
@@ -273,12 +401,13 @@
         if (inputElement?.focus) inputElement.focus();
       })
       .catch((error) => {
-        const message = error instanceof Error ? error.message : String(error || "优化失败");
+        const message =
+          error instanceof Error ? error.message : String(error || "优化失败");
         showError(message);
       })
       .finally(() => {
         busy = false;
-        button.dataset.busy = "false";
+        updateButtonState();
       });
   };
 
@@ -299,14 +428,16 @@
     }
     if (!button) {
       button = createButton();
-      document.documentElement.appendChild(button);
     }
     updateButtonPosition();
   };
 
   const scheduleScan = () => {
-    clearTimeout(scanTimer);
-    scanTimer = setTimeout(refreshButton, scanDelayMs);
+    if (scanTimer) return;
+    scanTimer = setTimeout(() => {
+      scanTimer = 0;
+      refreshButton();
+    }, scanDelayMs);
   };
 
   const scheduleReposition = () => {
@@ -323,8 +454,9 @@
         let nextEnabled = false;
         try {
           const optimization = config?.promptOptimization;
-          nextEnabled = optimization?.enabled === true
-            && optimization.apiKeyConfigured === true;
+          nextEnabled =
+            optimization?.enabled === true &&
+            optimization.apiKeyConfigured === true;
           if (nextEnabled !== enabled) {
             enabled = nextEnabled;
             refreshButton();
@@ -333,7 +465,10 @@
         } catch (error) {
           // A script-side error must not look like a missing bridge; report
           // it once and leave the switch in its last known state.
-          if (typeof console !== "undefined" && typeof console.error === "function") {
+          if (
+            typeof console !== "undefined" &&
+            typeof console.error === "function"
+          ) {
             console.error("Codey 提示词优化脚本异常：", error);
           }
         }
@@ -350,15 +485,31 @@
   };
 
   const installObserver = () => {
-    observer = new MutationObserver(() => {
-      if (enabled && (!inputElement || !inputElement.isConnected)) {
-        scheduleScan();
-      }
+    observer = new MutationObserver((mutations) => {
+      if (!enabled) return;
+      const hasExternalMutation = mutations.some((mutation) => {
+        const target = mutation.target;
+        if (!target) return true;
+        if (target === button || target.id === toastId) return false;
+        if (target.id === styleId) return false;
+        return !target.closest?.(`#${buttonId}, #${toastId}`);
+      });
+      if (hasExternalMutation) scheduleScan();
     });
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
-      attributes: false,
+      attributes: true,
+      attributeFilter: [
+        "aria-hidden",
+        "class",
+        "contenteditable",
+        "data-above-composer-conversation-id",
+        "disabled",
+        "hidden",
+        "role",
+        "style",
+      ],
     });
   };
 
@@ -368,15 +519,29 @@
   });
   window.addEventListener("scroll", scheduleReposition, true);
   window.addEventListener("resize", scheduleReposition);
-  document.addEventListener("input", (event) => {
-    if (event.target === inputElement) scheduleReposition();
-  }, true);
+  window.addEventListener("hashchange", scheduleScan);
+  window.addEventListener("popstate", scheduleScan);
+  document.addEventListener(
+    "input",
+    (event) => {
+      if (event.target === inputElement) updateButtonState();
+    },
+    true,
+  );
 
   addStyle();
+  installRuntimeToast();
   installObserver();
   loadConfig();
 
   window.__codeyPromptOptimize = {
-    snapshot: () => ({ ready: ready, enabled: enabled }),
+    snapshot: () => ({
+      ready: ready,
+      enabled: enabled,
+      hasInput: Boolean(inputElement && isVisible(inputElement)),
+      hasButton: Boolean(button && button.style.display !== "none"),
+      buttonBusy: Boolean(button && busy),
+      buttonDisabled: Boolean(button?.disabled),
+    }),
   };
 })();

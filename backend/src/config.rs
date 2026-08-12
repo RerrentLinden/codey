@@ -58,12 +58,10 @@ impl ProviderProfile {
     }
 }
 
-/// Standalone OpenAI-compatible Chat Completions settings used by the
-/// prompt-optimization feature. Kept independent of the active provider so
-/// the feature works on the official login route as well. The API key follows
-/// the notification-channel credential pattern: redacted to the renderer,
-/// restored on save, cleared only on explicit request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+/// Prompt-optimization settings. The API key follows the notification-channel
+/// credential pattern: redacted to the renderer, restored on save, cleared
+/// only on explicit request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptOptimizationConfig {
     #[serde(default)]
@@ -78,10 +76,31 @@ pub struct PromptOptimizationConfig {
     pub clear_api_key: bool,
     #[serde(default)]
     pub model: String,
+    #[serde(default = "default_prompt_optimization_protocol")]
+    pub protocol: RelayProtocol,
     /// Optional custom optimizer instructions. When empty the built-in
     /// default system prompt is used.
     #[serde(default)]
     pub instruction: String,
+}
+
+fn default_prompt_optimization_protocol() -> RelayProtocol {
+    RelayProtocol::ChatCompletions
+}
+
+impl Default for PromptOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            api_key: String::new(),
+            api_key_configured: false,
+            clear_api_key: false,
+            model: String::new(),
+            protocol: default_prompt_optimization_protocol(),
+            instruction: String::new(),
+        }
+    }
 }
 
 impl PromptOptimizationConfig {
@@ -824,11 +843,15 @@ mod tests {
 
         assert!(!config.prompt_optimization.enabled);
         assert!(config.prompt_optimization.api_key.is_empty());
+        assert_eq!(
+            config.prompt_optimization.protocol,
+            RelayProtocol::ChatCompletions
+        );
     }
 
     #[test]
     fn prompt_optimization_round_trips_without_persisting_clear_flag() {
-        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[],"promptOptimization":{"enabled":true,"baseUrl":" https://api.example.com/v1/ ","apiKey":"sk-secret","model":" gpt-x ","instruction":" 保持简洁 "}}"#)
+        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[],"promptOptimization":{"enabled":true,"baseUrl":" https://api.example.com/v1/ ","apiKey":"sk-secret","model":" gpt-x ","protocol":"responses","instruction":" 保持简洁 "}}"#)
             .unwrap()
             .normalize();
         let serialized = serde_json::to_value(&config).unwrap();
@@ -841,6 +864,10 @@ mod tests {
         assert_eq!(config.prompt_optimization.api_key, "sk-secret");
         assert!(config.prompt_optimization.api_key_configured);
         assert_eq!(config.prompt_optimization.model, "gpt-x");
+        assert_eq!(
+            config.prompt_optimization.protocol,
+            RelayProtocol::Responses
+        );
         assert_eq!(config.prompt_optimization.instruction, "保持简洁");
         assert!(
             serialized["promptOptimization"]

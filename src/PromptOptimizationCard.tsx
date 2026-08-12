@@ -1,23 +1,40 @@
-import { memo, useRef, useState } from "react";
+import { memo, useId, useRef, useState } from "react";
 
-import { IconKey, IconRobot, IconSparkles, IconWorld } from "@tabler/icons-react";
+import {
+  IconChevronDown,
+  IconEye,
+  IconEyeOff,
+  IconKey,
+  IconPlugConnected,
+  IconRefresh,
+  IconRobot,
+  IconSparkles,
+  IconWorld,
+} from "@tabler/icons-react";
 
-import type { Config, InlineResult } from "./App.types";
+import type { CcSwitchStatus, Config, InlineResult } from "./App.types";
 import { invoke } from "./api";
 import { errorText, withTimeout } from "./appUtils";
-import { AutoComplete, Button, Card, Input, Switch } from "./components/semi";
+import { Button, Card, Input, Select, Switch } from "./components/semi";
 
 const TEST_TIMEOUT_MS = 65_000;
 const FETCH_MODELS_TIMEOUT_MS = 20_000;
+const SAVED_API_KEY_MASK = "****************";
+const DEFAULT_OPTIMIZER_INSTRUCTION =
+  "你是提示词优化专家。用户会提供一段提示词，请在不改变其意图的前提下，把它重写为更清晰、更具体、可执行的高质量提示词。只输出优化后的提示词本身，不要添加任何解释、前言、后记或代码围栏。";
+const PROMPT_OPTIMIZATION_PROTOCOL_OPTIONS = [
+  { label: "Responses API", value: "responses" },
+  { label: "Chat Completions", value: "chatCompletions" },
+];
 
 type PromptOptimizationCardProps = {
   config: Config;
+  provider: CcSwitchStatus["provider"];
   isBusy: boolean;
   busy: string | null;
-  /** Popup container inside the overlay shadow DOM; dropdowns rendered into
-   * `document.body` would be hidden behind the overlay host. */
   container?: HTMLElement | null;
   onConfigChange: (config: Config) => void;
+  onSyncCurrentProvider: () => Promise<boolean>;
 };
 
 type TestResult = {
@@ -27,14 +44,25 @@ type TestResult = {
 
 function PromptOptimizationCardComponent({
   config,
+  provider,
   isBusy,
   busy,
   container,
   onConfigChange,
+  onSyncCurrentProvider,
 }: PromptOptimizationCardProps) {
   const optimization = config.promptOptimization;
+  const controlId = useId();
   const requestSequenceRef = useRef(0);
-  const activeOperationRef = useRef<"models" | "test" | null>(null);
+  const activeOperationRef = useRef<"sync" | "models" | "test" | null>(null);
+  const [apiKeyVisible, setApiKeyVisible] = useState(false);
+  const [revealedApiKey, setRevealedApiKey] = useState<string | null>(null);
+  const [revealingApiKey, setRevealingApiKey] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState<InlineResult>({
+    tone: "idle",
+    text: "",
+  });
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<InlineResult>({
     tone: "idle",
@@ -46,12 +74,117 @@ function PromptOptimizationCardComponent({
     tone: "idle",
     text: "",
   });
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
 
   const updateOptimization = (patch: Partial<Config["promptOptimization"]>) => {
     onConfigChange({
       ...config,
       promptOptimization: { ...optimization, ...patch },
     });
+  };
+  const showingSavedApiKey =
+    optimization.apiKeyConfigured &&
+    optimization.apiKey.trim() === "" &&
+    revealedApiKey === null;
+  const apiKeyValue =
+    revealedApiKey ??
+    (showingSavedApiKey ? SAVED_API_KEY_MASK : optimization.apiKey);
+  const apiKeyTextVisible = apiKeyVisible && !showingSavedApiKey;
+  const apiKeyInputId = `${controlId}-api-key`;
+  const modelInputId = `${controlId}-model`;
+  const modelListboxId = `${controlId}-model-listbox`;
+  const hasModelSuggestions = cloudModels.length > 0;
+  const modelMenuVisible = modelMenuOpen && hasModelSuggestions;
+
+  const handleApiKeyChange = (value: string) => {
+    setRevealedApiKey(null);
+    if (value === "") {
+      updateOptimization({
+        apiKey: "",
+        apiKeyConfigured: false,
+        clearApiKey: optimization.apiKeyConfigured,
+      });
+      return;
+    }
+    if (showingSavedApiKey) {
+      if (/^\*+$/.test(value)) {
+        updateOptimization({
+          apiKey: "",
+          apiKeyConfigured: true,
+          clearApiKey: false,
+        });
+        return;
+      }
+    }
+    const nextValue = showingSavedApiKey
+      ? value.replace(SAVED_API_KEY_MASK, "")
+      : value;
+    updateOptimization({
+      apiKey: nextValue,
+      apiKeyConfigured: nextValue.trim() !== "",
+      clearApiKey: false,
+    });
+  };
+
+  const toggleApiKeyVisibility = async () => {
+    if (apiKeyTextVisible) {
+      setApiKeyVisible(false);
+      return;
+    }
+    if (showingSavedApiKey) {
+      setRevealingApiKey(true);
+      setSyncResult({ tone: "idle", text: "" });
+      try {
+        const result = await invoke<{ apiKey?: string }>(
+          "reveal_prompt_optimization_api_key",
+        );
+        setRevealedApiKey(result.apiKey ?? "");
+      } catch (error) {
+        setSyncResult({
+          tone: "error",
+          text: `无法回显 API Key：${errorText(error)}`,
+        });
+        return;
+      } finally {
+        setRevealingApiKey(false);
+      }
+    }
+    setApiKeyVisible(true);
+  };
+
+  const clearModelSuggestions = () => {
+    setCloudModels([]);
+    setModelMenuOpen(false);
+    setModelsResult({ tone: "idle", text: "" });
+  };
+
+  const updateModel = (model: string) => {
+    updateOptimization({ model });
+  };
+
+  const runSyncCurrentProvider = async () => {
+    if (busy || provider.official || activeOperationRef.current) return;
+    activeOperationRef.current = "sync";
+    setSyncing(true);
+    setSyncResult({ tone: "pending", text: "正在同步当前线路配置…" });
+    setTestResult({ tone: "idle", text: "" });
+    try {
+      const synced = await onSyncCurrentProvider();
+      if (!synced) return;
+      setRevealedApiKey(null);
+      setApiKeyVisible(false);
+      setCloudModels([]);
+      setModelsResult({ tone: "idle", text: "" });
+      setSyncResult({
+        tone: "success",
+        text: `已同步「${provider.name}」的地址、密钥、上游格式和默认模型`,
+      });
+    } catch (error) {
+      setSyncResult({ tone: "error", text: errorText(error) });
+    } finally {
+      activeOperationRef.current = null;
+      setSyncing(false);
+    }
   };
 
   const runFetchModels = async () => {
@@ -60,7 +193,10 @@ function PromptOptimizationCardComponent({
     const requestId = requestSequenceRef.current + 1;
     requestSequenceRef.current = requestId;
     setFetchingModels(true);
-    setModelsResult({ tone: "pending", text: "正在获取云端模型…" });
+    setModelsResult({
+      tone: "pending",
+      text: "正在获取模型列表…",
+    });
     try {
       const result = await withTimeout(
         invoke<{ models?: string[] }>("fetch_prompt_optimization_models", {
@@ -72,6 +208,7 @@ function PromptOptimizationCardComponent({
       if (requestSequenceRef.current !== requestId) return;
       const models = result?.models ?? [];
       setCloudModels(models);
+      setModelMenuOpen(models.length > 0);
       setModelsResult(
         models.length > 0
           ? { tone: "success", text: `已获取 ${models.length} 个模型` }
@@ -95,6 +232,7 @@ function PromptOptimizationCardComponent({
     const requestId = requestSequenceRef.current + 1;
     requestSequenceRef.current = requestId;
     setTesting(true);
+    setSyncResult({ tone: "idle", text: "" });
     setTestResult({ tone: "pending", text: "正在测试 API 连通性…" });
     try {
       // 测试直接使用当前编辑的草稿，无需先保存；已保存的 API Key
@@ -145,14 +283,14 @@ function PromptOptimizationCardComponent({
       <div className="section-title compact">
         <div>
           <h2 id="prompt-optimization-title">提示词优化</h2>
-          <p>在 Codex 输入框旁一键优化提示词，使用任意 OpenAI 兼容接口。</p>
+          <p>在 Codex 输入框旁一键重写与优化提示词。</p>
         </div>
       </div>
       <Card className="secondary-card prompt-optimization-card">
         <div className="feature-card prompt-optimization-toggle">
           <div className="feature-card-header">
             <div className="feature-card-title">
-              <IconSparkles size={15} aria-hidden="true" />
+              <IconSparkles size={16} aria-hidden="true" />
               <strong>启用提示词优化</strong>
             </div>
             <Switch
@@ -164,130 +302,277 @@ function PromptOptimizationCardComponent({
               }
             />
           </div>
-          <div className="feature-card-body">
-            <small>
-              启用后，Codex 输入框旁会出现「优化」按钮；输入内容后点击即可
-              调用 API 重写提示词并直接替换输入框内容。配置变更即时生效，
-              无需重启 Codex。
-            </small>
-          </div>
         </div>
-        <div className="prompt-optimization-fields">
-          <label className="field">
-            <span>API 地址</span>
-            <div className="input-shell">
-              <IconWorld size={15} aria-hidden="true" />
-              <Input
-                value={optimization.baseUrl}
+
+        {optimization.enabled ? (
+          <div className="prompt-optimization-fields">
+            <div className="prompt-optimization-actions-row">
+              <div className="prompt-optimization-action-result">
+                {syncResult.text ? (
+                  <span className={`inline-result ${syncResult.tone}`}>
+                    {syncResult.text}
+                  </span>
+                ) : testResult.text ? (
+                  <span className={`inline-result ${testResult.tone}`}>
+                    {testResult.text}
+                  </span>
+                ) : null}
+              </div>
+              <div className="prompt-optimization-action-buttons">
+                {!provider.official ? (
+                  <Button
+                    variant="secondary"
+                    size="xs"
+                    disabled={isBusy || testing || fetchingModels}
+                    onClick={() => void runSyncCurrentProvider()}
+                  >
+                    <IconRefresh
+                      className={
+                        syncing || busy === "sync-prompt-provider"
+                          ? "spinner"
+                          : ""
+                      }
+                      aria-hidden="true"
+                    />
+                    {syncing ? "同步中…" : "同步当前线路配置"}
+                  </Button>
+                ) : null}
+                <Button
+                  variant="secondary"
+                  size="xs"
+                  disabled={isBusy || testing || fetchingModels}
+                  onClick={() => void runTest()}
+                >
+                  <IconPlugConnected aria-hidden="true" />
+                  {testing ? "测试中…" : "测试 API 连通性"}
+                </Button>
+              </div>
+            </div>
+
+            <div className="prompt-optimization-config-grid">
+              <label className="field prompt-optimization-address-field">
+                <span>API 地址</span>
+                <div className="input-shell">
+                  <IconWorld size={15} aria-hidden="true" />
+                  <Input
+                    value={optimization.baseUrl}
+                    disabled={isBusy}
+                    onChange={(event) => {
+                      clearModelSuggestions();
+                      updateOptimization({ baseUrl: event.target.value });
+                    }}
+                    placeholder="https://api.openai.com/v1"
+                    spellCheck={false}
+                  />
+                </div>
+              </label>
+
+              <div className="field prompt-optimization-key-field">
+                <label htmlFor={apiKeyInputId}>API Key</label>
+                <div className="input-shell">
+                  <IconKey size={15} aria-hidden="true" />
+                  <input
+                    id={apiKeyInputId}
+                    type={apiKeyTextVisible ? "text" : "password"}
+                    className="prompt-optimization-secret-input"
+                    value={apiKeyValue}
+                    disabled={isBusy}
+                    onChange={(event) => {
+                      clearModelSuggestions();
+                      handleApiKeyChange(event.target.value);
+                    }}
+                    onFocus={(event) => {
+                      if (showingSavedApiKey) event.currentTarget.select();
+                    }}
+                    placeholder={
+                      optimization.apiKeyConfigured
+                        ? "已保存（输入新 Key 可替换）"
+                        : "sk-…"
+                    }
+                    autoComplete="new-password"
+                    spellCheck={false}
+                  />
+                  <button
+                    type="button"
+                    className="prompt-optimization-icon-button"
+                    disabled={isBusy || revealingApiKey}
+                    aria-label={
+                      apiKeyTextVisible ? "隐藏 API Key" : "显示 API Key"
+                    }
+                    title={
+                      revealingApiKey
+                        ? "正在读取 API Key"
+                        : apiKeyTextVisible
+                          ? "隐藏 API Key"
+                          : "显示 API Key"
+                    }
+                    onClick={() => void toggleApiKeyVisibility()}
+                  >
+                    {apiKeyTextVisible ? (
+                      <IconEyeOff size={15} aria-hidden="true" />
+                    ) : (
+                      <IconEye size={15} aria-hidden="true" />
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              <label className="field prompt-optimization-protocol-field">
+                <span>上游格式</span>
+                <div className="input-shell">
+                  <IconPlugConnected size={15} aria-hidden="true" />
+                  <Select
+                    className="prompt-optimization-protocol-select"
+                    value={optimization.protocol}
+                    disabled={isBusy}
+                    aria-label="提示词优化上游 API 格式"
+                    optionList={PROMPT_OPTIMIZATION_PROTOCOL_OPTIONS}
+                    dropdownClassName="prompt-optimization-protocol-dropdown"
+                    showClear={false}
+                    filter={false}
+                    getPopupContainer={container ? () => container : undefined}
+                    onChange={(value) => {
+                      clearModelSuggestions();
+                      updateOptimization({
+                        protocol: String(value) as
+                          "responses" | "chatCompletions",
+                      });
+                    }}
+                  />
+                </div>
+              </label>
+
+              <div className="field prompt-optimization-model-field">
+                <label htmlFor={modelInputId}>模型</label>
+                <div className="prompt-optimization-model-control">
+                  <div
+                    className="prompt-optimization-model-picker"
+                    onBlur={(event) => {
+                      const nextTarget = event.relatedTarget;
+                      if (
+                        !(nextTarget instanceof Node) ||
+                        !event.currentTarget.contains(nextTarget)
+                      ) {
+                        setModelMenuOpen(false);
+                      }
+                    }}
+                  >
+                    <div className="input-shell prompt-optimization-model-row">
+                      <IconRobot size={15} aria-hidden="true" />
+                      <input
+                        id={modelInputId}
+                        value={optimization.model}
+                        disabled={isBusy || fetchingModels}
+                        role="combobox"
+                        aria-autocomplete="list"
+                        aria-controls={modelListboxId}
+                        aria-expanded={modelMenuVisible}
+                        onFocus={() => {
+                          if (hasModelSuggestions) setModelMenuOpen(true);
+                        }}
+                        onChange={(event) => {
+                          updateModel(event.target.value);
+                          if (hasModelSuggestions) setModelMenuOpen(true);
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Escape") {
+                            setModelMenuOpen(false);
+                            return;
+                          }
+                          if (
+                            event.key === "ArrowDown" &&
+                            hasModelSuggestions
+                          ) {
+                            event.preventDefault();
+                            setModelMenuOpen(true);
+                          }
+                        }}
+                        placeholder="gpt-4o-mini"
+                        spellCheck={false}
+                      />
+                      <button
+                        type="button"
+                        className="prompt-optimization-icon-button prompt-optimization-model-toggle"
+                        disabled={
+                          isBusy || fetchingModels || !hasModelSuggestions
+                        }
+                        aria-label="展开模型列表"
+                        aria-controls={modelListboxId}
+                        aria-expanded={modelMenuVisible}
+                        onClick={() =>
+                          setModelMenuOpen((open) =>
+                            hasModelSuggestions ? !open : false,
+                          )
+                        }
+                      >
+                        <IconChevronDown size={16} aria-hidden="true" />
+                      </button>
+                    </div>
+                    {modelMenuVisible ? (
+                      <div
+                        id={modelListboxId}
+                        className="prompt-optimization-model-menu"
+                        role="listbox"
+                        aria-label="可用模型"
+                      >
+                        {cloudModels.map((model) => (
+                          <button
+                            type="button"
+                            key={model}
+                            className={
+                              model === optimization.model
+                                ? "prompt-optimization-model-option selected"
+                                : "prompt-optimization-model-option"
+                            }
+                            role="option"
+                            aria-selected={model === optimization.model}
+                            onMouseDown={(event) => event.preventDefault()}
+                            onClick={() => {
+                              updateModel(model);
+                              setModelMenuOpen(false);
+                            }}
+                          >
+                            {model}
+                          </button>
+                        ))}
+                      </div>
+                    ) : null}
+                  </div>
+                  <Button
+                    variant="secondary"
+                    size="xs"
+                    disabled={isBusy || fetchingModels || testing}
+                    onClick={() => void runFetchModels()}
+                  >
+                    {fetchingModels ? "获取中…" : "获取列表"}
+                  </Button>
+                </div>
+                {modelsResult.text ? (
+                  <span className={`inline-result ${modelsResult.tone}`}>
+                    {modelsResult.text}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+
+            <label className="field">
+              <span>优化指令</span>
+              <textarea
+                className="prompt-optimization-instruction"
+                value={
+                  optimization.instruction || DEFAULT_OPTIMIZER_INSTRUCTION
+                }
                 disabled={isBusy}
                 onChange={(event) =>
-                  updateOptimization({ baseUrl: event.target.value })
+                  updateOptimization({ instruction: event.target.value })
                 }
-                placeholder="https://api.openai.com/v1（也可直接填完整的 /chat/completions 地址）"
+                rows={3}
+                placeholder="自定义优化指令…"
                 spellCheck={false}
               />
-            </div>
-          </label>
-          <label className="field">
-            <span>模型</span>
-            <div className="input-shell prompt-optimization-model-row">
-              <IconRobot size={15} aria-hidden="true" />
-              <AutoComplete
-                value={optimization.model}
-                disabled={isBusy || fetchingModels}
-                data={cloudModels}
-                getPopupContainer={container ? () => container : undefined}
-                onChange={(value) =>
-                  updateOptimization({ model: String(value ?? "") })
-                }
-                onSelect={(value) =>
-                  updateOptimization({ model: String(value ?? "") })
-                }
-                placeholder="gpt-4o-mini（可输入，也可从云端获取后选择）"
-              />
-              <Button
-                variant="secondary"
-                size="xs"
-                disabled={isBusy || fetchingModels || testing}
-                onClick={() => void runFetchModels()}
-              >
-                {fetchingModels ? "获取中…" : "获取列表"}
-              </Button>
-            </div>
-            <span className={`inline-result ${modelsResult.tone}`}>
-              {modelsResult.text}
-            </span>
-          </label>
-          <label className="field">
-            <span>API Key</span>
-            <div className="input-shell">
-              <IconKey size={15} aria-hidden="true" />
-              <Input
-                type="password"
-                value={optimization.apiKey}
-                disabled={isBusy}
-                onChange={(event) =>
-                  updateOptimization({
-                    apiKey: event.target.value,
-                    clearApiKey: false,
-                  })
-                }
-                placeholder={
-                  optimization.apiKeyConfigured
-                    ? "已保存；输入新 Key 可替换"
-                    : "sk-…"
-                }
-                autoComplete="new-password"
-                spellCheck={false}
-              />
-            </div>
-          </label>
-          {optimization.apiKeyConfigured ? (
-            <div className="notification-secret-action">
-              <Button
-                variant="ghost"
-                size="xs"
-                disabled={isBusy}
-                onClick={() =>
-                  updateOptimization({
-                    apiKey: "",
-                    apiKeyConfigured: false,
-                    clearApiKey: true,
-                  })
-                }
-              >
-                清除已保存的 API Key
-              </Button>
-            </div>
-          ) : null}
-          <label className="field">
-            <span>自定义优化指令（可选）</span>
-            <textarea
-              className="prompt-optimization-instruction"
-              value={optimization.instruction}
-              disabled={isBusy}
-              onChange={(event) =>
-                updateOptimization({ instruction: event.target.value })
-              }
-              placeholder="留空使用内置指令：只输出优化后的提示词本身，不添加解释、前言或代码围栏"
-              rows={3}
-              spellCheck={false}
-            />
-          </label>
-          <div className="prompt-optimization-test-row">
-            <Button
-              variant="secondary"
-              size="xs"
-              disabled={isBusy || testing || fetchingModels}
-              onClick={() => void runTest()}
-            >
-              {testing ? "测试中…" : "测试 API 连通性"}
-            </Button>
-            <span className={`inline-result ${testResult.tone}`}>
-              {testResult.text}
-            </span>
+            </label>
           </div>
-        </div>
+        ) : null}
       </Card>
     </section>
   );
