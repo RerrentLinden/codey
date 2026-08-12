@@ -1326,9 +1326,11 @@ mod tests {
         assert!(!declares_fast_speed_support(model));
     }
 
-    fn assert_no_multi_agent_version_unless_windows_v2(model: &Value) {
+    fn assert_runtime_multi_agent_version(model: &Value, non_windows_version: Option<&str>) {
         if cfg!(windows) {
             assert_eq!(model["multi_agent_version"], "v2");
+        } else if let Some(version) = non_windows_version {
+            assert_eq!(model["multi_agent_version"], version);
         } else {
             assert!(model.get("multi_agent_version").is_none());
         }
@@ -1385,12 +1387,12 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.5")
             .unwrap();
         assert_eq!(gpt_55["service_tiers"][0]["id"], "priority");
-        assert_no_multi_agent_version_unless_windows_v2(gpt_55);
+        assert_runtime_multi_agent_version(gpt_55, None);
         let luna = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.6-luna")
             .unwrap();
-        assert_eq!(luna["multi_agent_version"], "v1");
+        assert_runtime_multi_agent_version(luna, Some("v1"));
         let gpt_54 = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.4")
@@ -1848,7 +1850,7 @@ mod tests {
         let custom = models.last().unwrap();
         assert_eq!(custom["slug"], "claude-sonnet");
         assert_eq!(custom["codey_source"], "third_party");
-        assert_no_multi_agent_version_unless_windows_v2(custom);
+        assert_runtime_multi_agent_version(custom, None);
         assert_eq!(
             custom["supported_reasoning_levels"]
                 .as_array()
@@ -2390,7 +2392,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_selection_only_exposes_explicit_v2_models_from_runtime_catalog() {
+    fn verified_selection_exposes_models_marked_v2_in_the_runtime_catalog() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
 
@@ -2407,8 +2409,24 @@ mod tests {
             selection_state_with_verified_subagent_catalog(home.path(), true, None, &[], &[], None)
                 .unwrap();
 
-        assert_eq!(state.subagent_model_ids, ["gpt-5.6-sol", "gpt-5.6-terra"]);
-        assert_eq!(state.available_subagent_model("gpt-5.6-luna"), None);
+        // Windows packaged activation promotes every compatible model to an explicit V2 marker.
+        let expected_subagent_model_ids = if cfg!(windows) {
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ]
+        } else {
+            vec!["gpt-5.6-sol", "gpt-5.6-terra"]
+        };
+        assert_eq!(state.subagent_model_ids, expected_subagent_model_ids);
+        assert_eq!(
+            state.available_subagent_model("gpt-5.6-luna"),
+            cfg!(windows).then_some("gpt-5.6-luna")
+        );
         assert_eq!(
             state.available_subagent_model("gpt-5.6-terra"),
             Some("gpt-5.6-terra")
