@@ -354,6 +354,22 @@ pub fn selection_state_with_manual_models(
 }
 
 fn legacy_v2_catalog_compatibility_required(codex_runtime_version: Option<&str>) -> bool {
+    legacy_v2_catalog_compatibility_required_for_platform(codex_runtime_version, cfg!(windows))
+}
+
+fn legacy_v2_catalog_compatibility_required_for_platform(
+    codex_runtime_version: Option<&str>,
+    windows_packaged_activation: bool,
+) -> bool {
+    // Packaged Windows launches use a versionless AUMID. The registered package
+    // that Windows activates can therefore differ from the versioned app
+    // directory used above to inspect resources/codex.exe (for example while an
+    // update leaves the previous package directory behind). Explicit V2 markers
+    // are accepted by both runtime generations, so keep them on Windows instead
+    // of trusting a version probe that may belong to a different package.
+    if windows_packaged_activation {
+        return true;
+    }
     let client_version = codex_runtime_version
         .map(str::trim)
         .map(|version| version.trim_start_matches('v'))
@@ -367,7 +383,22 @@ fn apply_legacy_v2_catalog_compatibility(
     models: &mut [Value],
     codex_runtime_version: Option<&str>,
 ) {
-    if !legacy_v2_catalog_compatibility_required(codex_runtime_version) {
+    apply_legacy_v2_catalog_compatibility_for_platform(
+        models,
+        codex_runtime_version,
+        cfg!(windows),
+    );
+}
+
+fn apply_legacy_v2_catalog_compatibility_for_platform(
+    models: &mut [Value],
+    codex_runtime_version: Option<&str>,
+    windows_packaged_activation: bool,
+) {
+    if !legacy_v2_catalog_compatibility_required_for_platform(
+        codex_runtime_version,
+        windows_packaged_activation,
+    ) {
         return;
     }
     for model in models {
@@ -1337,6 +1368,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn windows_packaged_activation_keeps_explicit_v2_markers_for_new_runtimes() {
+        let mut models = vec![
+            json!({
+                "slug": "gpt-5.6-luna",
+                "visibility": "list",
+                "multi_agent_version": "v1",
+            }),
+            json!({
+                "slug": "gpt-5.4",
+                "visibility": "list",
+                "multi_agent_version": "disabled",
+            }),
+        ];
+
+        apply_legacy_v2_catalog_compatibility_for_platform(
+            &mut models,
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+            true,
+        );
+
+        assert_eq!(models[0]["multi_agent_version"], "v2");
+        assert_eq!(models[1]["multi_agent_version"], "disabled");
     }
 
     #[test]
