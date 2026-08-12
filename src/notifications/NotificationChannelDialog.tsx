@@ -3,11 +3,9 @@ import {
   useEffect,
   useLayoutEffect,
   useState,
-  type FocusEvent,
 } from "react";
 import {
   IconCheck,
-  IconChevronDown,
   IconLoader2 as LoaderCircle,
   IconSend,
 } from "@tabler/icons-react";
@@ -22,8 +20,10 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  Select,
   Switch,
 } from "../components/semi";
+import { SETTINGS_OVERLAY_Z_INDEX } from "../overlay.constants";
 import {
   createNotificationChannel,
   getNotificationChannelDefinition,
@@ -35,6 +35,7 @@ const defaultNotificationChannelKind = notificationChannelDefinitions[0].kind;
 
 type NotificationChannelDialogProps = {
   container: HTMLElement | null;
+  popupContainer: HTMLElement | null;
   editingChannel: NotificationChannel | null;
   isBusy: boolean;
   open: boolean;
@@ -44,6 +45,7 @@ type NotificationChannelDialogProps = {
 
 function NotificationChannelDialogComponent({
   container,
+  popupContainer,
   editingChannel,
   isBusy,
   open,
@@ -59,7 +61,6 @@ function NotificationChannelDialogComponent({
     tone: "idle" | "pending" | "success" | "error";
   }>({ tone: "idle", text: "" });
   const [hasSuccessfulTest, setHasSuccessfulTest] = useState(false);
-  const [isChannelMenuOpen, setIsChannelMenuOpen] = useState(false);
   const isEditing = editingChannel !== null;
   const definition = draft
     ? getNotificationChannelDefinition(draft.kind)
@@ -73,7 +74,6 @@ function NotificationChannelDialogComponent({
       setIsTesting(false);
       setTestResult({ tone: "idle", text: "" });
       setHasSuccessfulTest(false);
-      setIsChannelMenuOpen(false);
       return;
     }
     setDraft(
@@ -86,7 +86,6 @@ function NotificationChannelDialogComponent({
     setIsTesting(false);
     setTestResult({ tone: "idle", text: "" });
     setHasSuccessfulTest(false);
-    setIsChannelMenuOpen(false);
   }, [editingChannel?.id, open]);
 
   useEffect(() => {
@@ -110,17 +109,10 @@ function NotificationChannelDialogComponent({
     };
   }, [editingChannel?.id, open]);
 
-  useEffect(() => {
-    if (!open || isEditing || isBusy || isRevealing || isTesting) {
-      setIsChannelMenuOpen(false);
-    }
-  }, [isBusy, isEditing, isRevealing, isTesting, open]);
-
   function selectChannel(kind: NotificationChannelKind) {
     if (draft?.kind === kind) return;
     setDraft(createNotificationChannel(kind));
     resetTestResult();
-    setIsChannelMenuOpen(false);
   }
 
   function resetTestResult() {
@@ -137,13 +129,6 @@ function NotificationChannelDialogComponent({
 
   function closeDialog() {
     if (!isBusy && !isTesting) onOpenChange(false);
-  }
-
-  function handleChannelSelectBlur(event: FocusEvent<HTMLDivElement>) {
-    const nextTarget = event.relatedTarget;
-    if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
-      setIsChannelMenuOpen(false);
-    }
   }
 
   function saveChannel() {
@@ -190,6 +175,11 @@ function NotificationChannelDialogComponent({
 
   const ChannelEditor = definition?.Editor;
   const SelectedChannelIcon = definition?.Icon;
+  const notificationChannelOptions = notificationChannelDefinitions.map((item) => ({
+    Icon: item.Icon,
+    label: item.displayName,
+    value: item.kind,
+  }));
   const formBusy = isBusy || isRevealing || isTesting;
   const canTest = Boolean(draft && definition?.isConfigured(draft));
   const canSave = Boolean(
@@ -240,13 +230,7 @@ function NotificationChannelDialogComponent({
                   : "选择发送渠道，并填写该渠道需要的专属配置。"}
               </DialogDescription>
             </DialogHeader>
-            <div
-              className="notification-channel-select"
-              onBlur={handleChannelSelectBlur}
-              onKeyDown={(event) => {
-                if (event.key === "Escape") setIsChannelMenuOpen(false);
-              }}
-            >
+            <div className="notification-channel-select">
               <span
                 id="notification-channel-select-label"
                 className="notification-channel-select-label"
@@ -254,50 +238,52 @@ function NotificationChannelDialogComponent({
                 发送渠道
               </span>
               <div className="notification-channel-select-shell">
-                <button
-                  type="button"
-                  className={`notification-channel-select-trigger ${isChannelMenuOpen ? "open" : ""}`}
+                <Select
+                  className="notification-channel-kind-select"
+                  value={draft.kind}
                   disabled={isEditing || formBusy}
-                  aria-haspopup="listbox"
-                  aria-expanded={isChannelMenuOpen}
-                  aria-labelledby="notification-channel-select-label notification-channel-selected-name"
-                  onClick={() => setIsChannelMenuOpen((current) => !current)}
-                >
-                  <span className="notification-channel-app-icon">
-                    <SelectedChannelIcon size={20} aria-hidden="true" />
-                  </span>
-                  <span id="notification-channel-selected-name">
-                    {definition.displayName}
-                  </span>
-                  <IconChevronDown size={15} aria-hidden="true" />
-                </button>
-                {isChannelMenuOpen ? (
-                  <div
-                    className="notification-channel-select-menu"
-                    role="listbox"
-                    aria-labelledby="notification-channel-select-label"
-                  >
-                    {notificationChannelDefinitions.map((item) => {
-                      const OptionIcon = item.Icon;
-                      const selected = draft.kind === item.kind;
-                      return (
-                        <button
-                          type="button"
-                          className={`notification-channel-select-option ${selected ? "selected" : ""}`}
-                          key={item.kind}
-                          role="option"
-                          aria-selected={selected}
-                          onClick={() => selectChannel(item.kind)}
-                        >
-                          <span className="notification-channel-app-icon">
-                            <OptionIcon size={20} aria-hidden="true" />
-                          </span>
-                          <span>{item.displayName}</span>
-                        </button>
-                      );
-                    })}
-                  </div>
-                ) : null}
+                  aria-labelledby="notification-channel-select-label"
+                  optionList={notificationChannelOptions}
+                  dropdownClassName="notification-channel-select-dropdown"
+                  showClear={false}
+                  filter={false}
+                  prefix={
+                    <span className="notification-channel-app-icon">
+                      <SelectedChannelIcon size={20} aria-hidden="true" />
+                    </span>
+                  }
+                  getPopupContainer={() => popupContainer ?? document.body}
+                  zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                  renderOptionItem={(option) => {
+                    const optionDefinition = notificationChannelDefinitions.find(
+                      (item) => item.kind === option.value,
+                    );
+                    const OptionIcon = optionDefinition?.Icon;
+                    const selected = option.selected === true;
+                    const focused = option.focused === true;
+                    const label =
+                      optionDefinition?.displayName ?? option.label;
+                    if (!OptionIcon) return label;
+                    return (
+                      <div
+                        className={`notification-channel-select-option ${option.className ?? ""}${selected ? " selected" : ""}${focused ? " focused" : ""}`}
+                        role="option"
+                        aria-selected={selected}
+                        style={option.style}
+                        onMouseEnter={option.onMouseEnter}
+                        onClick={option.onClick}
+                      >
+                        <span className="notification-channel-app-icon">
+                          <OptionIcon size={20} aria-hidden="true" />
+                        </span>
+                        <span>{label}</span>
+                      </div>
+                    );
+                  }}
+                  onChange={(value) =>
+                    selectChannel(String(value) as NotificationChannelKind)
+                  }
+                />
               </div>
             </div>
             <div className="notification-fields notification-dialog-fields">

@@ -464,8 +464,9 @@ function OperationsPanelComponent({
                     getPopupContainer={getTooltipContainer}
                     position="top"
                   >
-                    <button
-                      type="button"
+                    <Button
+                      variant="ghost"
+                      size="icon"
                       className={`operations-icon-badge tone-${item.tone}${isExpanded ? " active" : ""}`}
                       onClick={() => toggleCard(item.title)}
                       aria-expanded={isExpanded}
@@ -476,7 +477,7 @@ function OperationsPanelComponent({
                         className="operations-icon-dot"
                         aria-hidden="true"
                       />
-                    </button>
+                    </Button>
                   </Tooltip>
                 );
               })}

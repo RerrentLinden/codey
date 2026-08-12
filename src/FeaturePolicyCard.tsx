@@ -1,7 +1,8 @@
 import { memo, type CSSProperties } from "react";
 
 import type { Config, FastContextToolsStatus } from "./App.types";
-import { Badge, Card, Switch, Tooltip } from "./components/semi";
+import { Badge, Card, Select, Switch, Tooltip } from "./components/semi";
+import { SETTINGS_OVERLAY_Z_INDEX } from "./overlay.constants";
 import type { SubagentModelOption } from "./useModelSelection";
 
 const GPU_LAUNCH_MODES = [
@@ -25,6 +26,7 @@ type FeaturePolicyCardProps = {
   config: Config;
   fastContextToolsStatus: FastContextToolsStatus;
   isMacClient: boolean;
+  popupContainer: HTMLElement | null;
   tooltipContainer: HTMLElement | null;
   busy: string | null;
   isBusy: boolean;
@@ -37,6 +39,7 @@ function FeaturePolicyCardComponent({
   config,
   fastContextToolsStatus,
   isMacClient,
+  popupContainer,
   tooltipContainer,
   busy,
   isBusy,
@@ -63,6 +66,14 @@ function FeaturePolicyCardComponent({
     selectedSubagentModel?.supportedReasoningEfforts ?? [];
   const subagentPolicyControlsDisabled =
     isBusy;
+  const subagentModelSelectOptions = subagentModelOptions.map((option) => ({
+    label: option.label,
+    value: option.value,
+  }));
+  const subagentReasoningEffortOptions = subagentReasoningEfforts.map((effort) => ({
+    label: REASONING_EFFORT_LABELS[effort] ?? effort,
+    value: effort,
+  }));
   const fastctxStatusBlocksEmbedded =
     fastContextToolsStatus.userConfigured ||
     fastContextToolsStatus.detectionFailed;
@@ -174,16 +185,28 @@ function FeaturePolicyCardComponent({
               <div className="subagent-policy-controls">
                 <label>
                   <span>子代理模型</span>
-                  <select
+                  <Select
+                    className="subagent-policy-select"
                     aria-label="选择子代理模型"
-                    value={selectedSubagentModel?.value ?? ""}
+                    value={selectedSubagentModel?.value}
+                    placeholder={
+                      subagentModelOptions.length === 0
+                        ? "当前线路无兼容模型"
+                        : "请选择兼容模型"
+                    }
                     disabled={
                       subagentPolicyControlsDisabled ||
                       subagentModelOptions.length === 0
                     }
-                    onChange={(event) => {
+                    optionList={subagentModelSelectOptions}
+                    dropdownClassName="subagent-policy-dropdown"
+                    showClear={false}
+                    filter={false}
+                    getPopupContainer={() => popupContainer ?? document.body}
+                    zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                    onChange={(value) => {
                       const option = subagentModelOptions.find(
-                        (candidate) => candidate.value === event.target.value,
+                        (candidate) => candidate.value === String(value ?? ""),
                       );
                       if (!option) return;
                       const reasoningEffort =
@@ -198,49 +221,38 @@ function FeaturePolicyCardComponent({
                         subagentReasoningEffort: reasoningEffort,
                       });
                     }}
-                  >
-                    {!selectedSubagentModel && (
-                      <option value="">
-                        {subagentModelOptions.length === 0
-                          ? "当前线路无兼容模型"
-                          : "请选择兼容模型"}
-                      </option>
-                    )}
-                    {subagentModelOptions.map((option) => (
-                      <option key={option.value} value={option.value}>
-                        {option.label}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </label>
                 <label>
                   <span>思考深度</span>
-                  <select
+                  <Select
+                    className="subagent-policy-select"
                     aria-label="选择子代理思考深度"
                     value={
                       subagentReasoningEfforts.includes(
                         config.subagentReasoningEffort,
                       )
                         ? config.subagentReasoningEffort
-                        : ""
+                        : undefined
                     }
+                    placeholder="暂无可选深度"
                     disabled={
                       subagentPolicyControlsDisabled ||
                       subagentReasoningEfforts.length === 0
                     }
-                    onChange={(event) =>
+                    optionList={subagentReasoningEffortOptions}
+                    dropdownClassName="subagent-policy-dropdown"
+                    showClear={false}
+                    filter={false}
+                    getPopupContainer={() => popupContainer ?? document.body}
+                    zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                    onChange={(value) =>
                       onConfigChange({
                         ...config,
-                        subagentReasoningEffort: event.target.value,
+                        subagentReasoningEffort: String(value ?? ""),
                       })
                     }
-                  >
-                    {subagentReasoningEfforts.map((effort) => (
-                      <option key={effort} value={effort}>
-                        {REASONING_EFFORT_LABELS[effort] ?? effort}
-                      </option>
-                    ))}
-                  </select>
+                  />
                 </label>
               </div>
               <small>

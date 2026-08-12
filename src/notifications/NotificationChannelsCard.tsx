@@ -15,6 +15,7 @@ import type { NotificationChannel } from "./types";
 type NotificationChannelsCardProps = {
   config: Config;
   container: HTMLElement | null;
+  popupContainer: HTMLElement | null;
   isBusy: boolean;
   onAddChannel: (channel: NotificationChannel) => void;
   onChannelChange: (
@@ -27,6 +28,7 @@ type NotificationChannelsCardProps = {
 function NotificationChannelsCardComponent({
   config,
   container,
+  popupContainer,
   isBusy,
   onAddChannel,
   onChannelChange,
@@ -143,6 +145,7 @@ function NotificationChannelsCardComponent({
       </section>
       <NotificationChannelDialog
         container={container}
+        popupContainer={popupContainer}
         editingChannel={editingChannel}
         isBusy={isBusy}
         open={dialogOpen}

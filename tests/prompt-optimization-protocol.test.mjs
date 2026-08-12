@@ -25,6 +25,25 @@ test("prompt optimization exposes the persisted upstream API format", () => {
   assert.match(cardSource, /updateOptimization\(\{\s*protocol:/);
 });
 
+test("prompt optimization refreshes the creatable model picker after fetching", () => {
+  assert.match(
+    cardSource,
+    /const modelSelectKey = JSON\.stringify\(cloudModels\)/,
+  );
+  assert.match(
+    cardSource,
+    /<Select\s+key=\{modelSelectKey\}[\s\S]*?optionList=\{modelSelectOptions\}[\s\S]*?allowCreate/,
+  );
+  assert.match(
+    cardSource,
+    /renderCreateItem=\{\(inputValue, focused, style\) =>/,
+  );
+  assert.match(
+    cardSource,
+    /prompt-optimization-model-create-option\$\{focused \? " focused" : ""\}/,
+  );
+});
+
 test("prompt optimization reuses the runtime protocol converters", () => {
   assert.match(backendSource, /responses_to_chat_completions/);
   assert.match(backendSource, /chat_completion_to_response_with_request/);

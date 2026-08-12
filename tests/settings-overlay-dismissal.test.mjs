@@ -145,3 +145,55 @@ test("operations tooltips stay inside the settings overlay", async () => {
   assert.match(appSectionsSource, /ref=\{operationsHubRef\}/);
   assert.match(appSectionsSource, /getPopupContainer=\{getTooltipContainer\}/);
 });
+
+test("settings select popups stay inside the settings overlay", async () => {
+  const [
+    appSource,
+    featurePolicySource,
+    promptOptimizationSource,
+    notificationCardSource,
+    notificationDialogSource,
+  ] = await Promise.all([
+    readFile(new URL("src/App.tsx", root), "utf8"),
+    readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
+    readFile(new URL("src/PromptOptimizationCard.tsx", root), "utf8"),
+    readFile(new URL("src/notifications/NotificationChannelsCard.tsx", root), "utf8"),
+    readFile(new URL("src/notifications/NotificationChannelDialog.tsx", root), "utf8"),
+  ]);
+
+  assert.match(
+    appSource,
+    /const popupContainer = modalContainer \?\? null/,
+  );
+  assert.match(
+    appSource,
+    /<NotificationChannelsCard[\s\S]*popupContainer=\{popupContainer\}/,
+  );
+  assert.match(
+    appSource,
+    /<FeaturePolicyCard[\s\S]*popupContainer=\{popupContainer\}/,
+  );
+  assert.match(
+    appSource,
+    /<PromptOptimizationCard[\s\S]*popupContainer=\{popupContainer\}/,
+  );
+  assert.match(
+    notificationCardSource,
+    /<NotificationChannelDialog[\s\S]*popupContainer=\{popupContainer\}/,
+  );
+
+  for (const source of [
+    featurePolicySource,
+    promptOptimizationSource,
+    notificationDialogSource,
+  ]) {
+    assert.match(
+      source,
+      /getPopupContainer=\{\(\) => popupContainer \?\? document\.body\}/,
+    );
+    assert.doesNotMatch(
+      source,
+      /getPopupContainer=\{\(\) => document\.body\}/,
+    );
+  }
+});

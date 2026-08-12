@@ -1,10 +1,10 @@
 import { memo, useId, useRef, useState } from "react";
 
 import {
-  IconChevronDown,
   IconEye,
   IconEyeOff,
   IconKey,
+  IconPlus,
   IconPlugConnected,
   IconRefresh,
   IconRobot,
@@ -16,6 +16,7 @@ import type { CcSwitchStatus, Config, InlineResult } from "./App.types";
 import { invoke } from "./api";
 import { errorText, withTimeout } from "./appUtils";
 import { Button, Card, Input, Select, Switch } from "./components/semi";
+import { SETTINGS_OVERLAY_Z_INDEX } from "./overlay.constants";
 
 const TEST_TIMEOUT_MS = 65_000;
 const FETCH_MODELS_TIMEOUT_MS = 20_000;
@@ -32,7 +33,7 @@ type PromptOptimizationCardProps = {
   provider: CcSwitchStatus["provider"];
   isBusy: boolean;
   busy: string | null;
-  container?: HTMLElement | null;
+  popupContainer: HTMLElement | null;
   onConfigChange: (config: Config) => void;
   onSyncCurrentProvider: () => Promise<boolean>;
 };
@@ -47,7 +48,7 @@ function PromptOptimizationCardComponent({
   provider,
   isBusy,
   busy,
-  container,
+  popupContainer,
   onConfigChange,
   onSyncCurrentProvider,
 }: PromptOptimizationCardProps) {
@@ -74,7 +75,6 @@ function PromptOptimizationCardComponent({
     tone: "idle",
     text: "",
   });
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
 
   const updateOptimization = (patch: Partial<Config["promptOptimization"]>) => {
     onConfigChange({
@@ -92,9 +92,16 @@ function PromptOptimizationCardComponent({
   const apiKeyTextVisible = apiKeyVisible && !showingSavedApiKey;
   const apiKeyInputId = `${controlId}-api-key`;
   const modelInputId = `${controlId}-model`;
-  const modelListboxId = `${controlId}-model-listbox`;
-  const hasModelSuggestions = cloudModels.length > 0;
-  const modelMenuVisible = modelMenuOpen && hasModelSuggestions;
+  const modelSelectOptions = [
+    ...(optimization.model.trim() !== "" &&
+    !cloudModels.includes(optimization.model)
+      ? [{ label: optimization.model, value: optimization.model }]
+      : []),
+    ...cloudModels.map((model) => ({ label: model, value: model })),
+  ];
+  // Semi Select retains stale options when a controlled, creatable Select gets
+  // a new optionList. Remount only when the fetched list actually changes.
+  const modelSelectKey = JSON.stringify(cloudModels);
 
   const handleApiKeyChange = (value: string) => {
     setRevealedApiKey(null);
@@ -154,7 +161,6 @@ function PromptOptimizationCardComponent({
 
   const clearModelSuggestions = () => {
     setCloudModels([]);
-    setModelMenuOpen(false);
     setModelsResult({ tone: "idle", text: "" });
   };
 
@@ -208,7 +214,6 @@ function PromptOptimizationCardComponent({
       if (requestSequenceRef.current !== requestId) return;
       const models = result?.models ?? [];
       setCloudModels(models);
-      setModelMenuOpen(models.length > 0);
       setModelsResult(
         models.length > 0
           ? { tone: "success", text: `已获取 ${models.length} 个模型` }
@@ -392,8 +397,9 @@ function PromptOptimizationCardComponent({
                     autoComplete="new-password"
                     spellCheck={false}
                   />
-                  <button
-                    type="button"
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     className="prompt-optimization-icon-button"
                     disabled={isBusy || revealingApiKey}
                     aria-label={
@@ -413,7 +419,7 @@ function PromptOptimizationCardComponent({
                     ) : (
                       <IconEye size={15} aria-hidden="true" />
                     )}
-                  </button>
+                  </Button>
                 </div>
               </div>
 
@@ -430,7 +436,8 @@ function PromptOptimizationCardComponent({
                     dropdownClassName="prompt-optimization-protocol-dropdown"
                     showClear={false}
                     filter={false}
-                    getPopupContainer={container ? () => container : undefined}
+                    getPopupContainer={() => popupContainer ?? document.body}
+                    zIndex={SETTINGS_OVERLAY_Z_INDEX}
                     onChange={(value) => {
                       clearModelSuggestions();
                       updateOptimization({
@@ -445,98 +452,52 @@ function PromptOptimizationCardComponent({
               <div className="field prompt-optimization-model-field">
                 <label htmlFor={modelInputId}>模型</label>
                 <div className="prompt-optimization-model-control">
-                  <div
-                    className="prompt-optimization-model-picker"
-                    onBlur={(event) => {
-                      const nextTarget = event.relatedTarget;
-                      if (
-                        !(nextTarget instanceof Node) ||
-                        !event.currentTarget.contains(nextTarget)
-                      ) {
-                        setModelMenuOpen(false);
-                      }
-                    }}
-                  >
+                  <div className="prompt-optimization-model-picker">
                     <div className="input-shell prompt-optimization-model-row">
                       <IconRobot size={15} aria-hidden="true" />
-                      <input
+                      <Select
+                        key={modelSelectKey}
                         id={modelInputId}
-                        value={optimization.model}
+                        className="prompt-optimization-model-select"
+                        value={optimization.model || undefined}
                         disabled={isBusy || fetchingModels}
-                        role="combobox"
-                        aria-autocomplete="list"
-                        aria-controls={modelListboxId}
-                        aria-expanded={modelMenuVisible}
-                        onFocus={() => {
-                          if (hasModelSuggestions) setModelMenuOpen(true);
-                        }}
-                        onChange={(event) => {
-                          updateModel(event.target.value);
-                          if (hasModelSuggestions) setModelMenuOpen(true);
-                        }}
-                        onKeyDown={(event) => {
-                          if (event.key === "Escape") {
-                            setModelMenuOpen(false);
-                            return;
-                          }
-                          if (
-                            event.key === "ArrowDown" &&
-                            hasModelSuggestions
-                          ) {
-                            event.preventDefault();
-                            setModelMenuOpen(true);
-                          }
-                        }}
+                        aria-label="提示词优化模型"
+                        optionList={modelSelectOptions}
                         placeholder="gpt-4o-mini"
-                        spellCheck={false}
+                        dropdownClassName="prompt-optimization-model-dropdown"
+                        emptyContent={
+                          cloudModels.length > 0
+                            ? "没有匹配模型"
+                            : "暂无模型列表，可输入后回车创建"
+                        }
+                        showClear={false}
+                        filter
+                        allowCreate
+                        searchPosition="trigger"
+                        getPopupContainer={() => popupContainer ?? document.body}
+                        zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                        renderCreateItem={(inputValue, focused, style) =>
+                          inputValue ? (
+                            <div
+                              className={`prompt-optimization-model-create-option${focused ? " focused" : ""}`}
+                              style={style}
+                            >
+                              <IconPlus size={14} aria-hidden="true" />
+                              <span className="prompt-optimization-model-create-label">
+                                使用
+                              </span>
+                              <span className="prompt-optimization-model-create-value">
+                                {String(inputValue)}
+                              </span>
+                            </div>
+                          ) : null
+                        }
+                        onChange={(value) => updateModel(String(value ?? ""))}
+                        onCreate={(option) =>
+                          updateModel(String(option.value ?? ""))
+                        }
                       />
-                      <button
-                        type="button"
-                        className="prompt-optimization-icon-button prompt-optimization-model-toggle"
-                        disabled={
-                          isBusy || fetchingModels || !hasModelSuggestions
-                        }
-                        aria-label="展开模型列表"
-                        aria-controls={modelListboxId}
-                        aria-expanded={modelMenuVisible}
-                        onClick={() =>
-                          setModelMenuOpen((open) =>
-                            hasModelSuggestions ? !open : false,
-                          )
-                        }
-                      >
-                        <IconChevronDown size={16} aria-hidden="true" />
-                      </button>
                     </div>
-                    {modelMenuVisible ? (
-                      <div
-                        id={modelListboxId}
-                        className="prompt-optimization-model-menu"
-                        role="listbox"
-                        aria-label="可用模型"
-                      >
-                        {cloudModels.map((model) => (
-                          <button
-                            type="button"
-                            key={model}
-                            className={
-                              model === optimization.model
-                                ? "prompt-optimization-model-option selected"
-                                : "prompt-optimization-model-option"
-                            }
-                            role="option"
-                            aria-selected={model === optimization.model}
-                            onMouseDown={(event) => event.preventDefault()}
-                            onClick={() => {
-                              updateModel(model);
-                              setModelMenuOpen(false);
-                            }}
-                          >
-                            {model}
-                          </button>
-                        ))}
-                      </div>
-                    ) : null}
                   </div>
                   <Button
                     variant="secondary"

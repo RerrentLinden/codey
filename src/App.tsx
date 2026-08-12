@@ -104,6 +104,7 @@ export function App({
   const [portalContainer, setPortalContainer] = useState<HTMLElement | null>(
     null,
   );
+  const popupContainer = modalContainer ?? null;
   const [traceSnapshotStale, setTraceSnapshotStale] = useState(false);
   const noticeController = useAppNoticeController();
   const confirmationController = useConfirmationController();
@@ -737,17 +738,23 @@ export function App({
       {!embedded && (
         <div className="macos-titlebar">
           <div className="macos-traffic-lights">
-            <button
+            <Button
+              variant="ghost"
+              size="icon"
               className="traffic-light close"
               title="关闭"
               aria-label="关闭窗口"
             />
-            <button
+            <Button
+              variant="ghost"
+              size="icon"
               className="traffic-light minimize"
               title="最小化"
               aria-label="最小化窗口"
             />
-            <button
+            <Button
+              variant="ghost"
+              size="icon"
               className="traffic-light zoom"
               title="缩放"
               aria-label="全屏缩放"
@@ -803,6 +810,7 @@ export function App({
               <NotificationChannelsCard
                 config={config}
                 container={portalContainer}
+                popupContainer={popupContainer}
                 isBusy={isBusy}
                 onAddChannel={handleAddNotificationChannel}
                 onChannelChange={handleNotificationChannelChange}
@@ -817,6 +825,7 @@ export function App({
               config={config}
               fastContextToolsStatus={fastContextToolsStatus}
               isMacClient={status.clientPlatform === "macos"}
+              popupContainer={popupContainer}
               tooltipContainer={portalContainer}
               busy={busy}
               isBusy={isBusy}
@@ -833,7 +842,7 @@ export function App({
               provider={provider}
               busy={busy}
               isBusy={isBusy}
-              container={modalContainer}
+              popupContainer={popupContainer}
               onConfigChange={handleConfigChange}
               onSyncCurrentProvider={
                 handleSyncPromptOptimizationCurrentProvider

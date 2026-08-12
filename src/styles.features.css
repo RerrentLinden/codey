@@ -168,36 +168,52 @@
   font-weight: 500;
 }
 
-.subagent-policy-controls select {
+.subagent-policy-select {
   width: 100%;
   min-width: 0;
   height: 32px;
-  border: 1px solid rgba(0, 0, 0, 0.12);
-  border-radius: 7px;
-  background: #fff;
-  padding: 0 10px;
+  border: 1px solid rgba(0, 0, 0, 0.12) !important;
+  border-radius: 7px !important;
+  background: #ffffff !important;
   color: #1d1d1f;
   font: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  outline: none;
   transition:
     border-color 0.15s ease,
     box-shadow 0.15s ease;
 }
 
-.subagent-policy-controls select:hover:not(:disabled) {
+.subagent-policy-select .semi-select-selection {
+  color: #1d1d1f;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.subagent-policy-select .semi-select-selection-placeholder {
+  color: #8e8e93;
+}
+
+.subagent-policy-select .semi-select-arrow {
+  color: #6e6e73;
+}
+
+.subagent-policy-select:hover:not(.semi-select-disabled) {
   border-color: rgba(0, 0, 0, 0.22);
 }
 
-.subagent-policy-controls select:focus-visible {
+.subagent-policy-select.semi-select-focus,
+.subagent-policy-select.semi-select-open {
   border-color: rgba(0, 122, 255, 0.65);
   box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.12);
 }
 
-.subagent-policy-controls select:disabled {
+.subagent-policy-select.semi-select-disabled {
   cursor: not-allowed;
   opacity: 0.55;
+}
+
+.subagent-policy-dropdown {
+  border-radius: 10px;
 }
 
 .gpu-mode-card-body {
@@ -561,80 +577,75 @@
   width: min(100%, 260px);
 }
 
-.notification-channel-select-trigger,
-.notification-channel-select-option {
+.notification-channel-kind-select {
+  width: 100%;
+  height: 40px;
+  border: 1px solid rgba(0, 0, 0, 0.13) !important;
+  border-radius: 8px !important;
+  background: #ffffff !important;
   display: flex;
   align-items: center;
-  gap: 8px;
   color: #1d1d1f;
   font: inherit;
   font-size: 12px;
   font-weight: 650;
-}
-
-.notification-channel-select-trigger {
-  width: 100%;
-  height: 40px;
-  padding: 0 10px;
-  border: 1px solid rgba(0, 0, 0, 0.13);
-  border-radius: 8px;
-  background: #ffffff;
-  cursor: pointer;
-  text-align: left;
   transition:
     background 0.15s ease,
     border-color 0.15s ease,
     box-shadow 0.15s ease;
 }
 
-.notification-channel-select-trigger:hover:not(:disabled),
-.notification-channel-select-trigger.open {
+.notification-channel-kind-select:hover:not(.semi-select-disabled),
+.notification-channel-kind-select.semi-select-open,
+.notification-channel-kind-select.semi-select-focus {
   border-color: rgba(0, 122, 255, 0.38);
   background: #fbfdff;
   box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.08);
 }
 
-.notification-channel-select-trigger:disabled {
+.notification-channel-kind-select.semi-select-disabled {
   cursor: not-allowed;
   opacity: 0.72;
 }
 
-.notification-channel-select-trigger > svg {
-  margin-left: auto;
+.notification-channel-kind-select .semi-select-selection {
+  color: #1d1d1f;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.notification-channel-kind-select .semi-select-prefix {
+  margin-right: 8px;
+}
+
+.notification-channel-kind-select .semi-select-arrow {
   color: #8e8e93;
-  transition: transform 0.15s ease;
 }
 
-.notification-channel-select-trigger.open > svg {
-  transform: rotate(180deg);
-}
-
-.notification-channel-select-menu {
-  position: absolute;
-  z-index: 20;
-  top: calc(100% + 6px);
-  left: 0;
-  display: grid;
-  width: 100%;
-  gap: 2px;
-  padding: 4px;
-  border: 1px solid rgba(0, 0, 0, 0.11);
-  border-radius: 8px;
-  background: #ffffff;
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.12);
+.notification-channel-select-dropdown {
+  border-radius: 10px;
 }
 
 .notification-channel-select-option {
-  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
   padding: 0 8px;
   border: 0;
   border-radius: 6px;
   background: transparent;
+  color: #1d1d1f;
   cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
   text-align: left;
 }
 
 .notification-channel-select-option:hover,
+.notification-channel-select-option.focused,
 .notification-channel-select-option.selected {
   background: rgba(0, 122, 255, 0.08);
 }
@@ -792,7 +803,8 @@
   height: 38px;
 }
 
-.prompt-optimization-model-row input {
+.prompt-optimization-model-row .prompt-optimization-model-select {
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -829,56 +841,8 @@
   opacity: 0.45;
 }
 
-.prompt-optimization-model-menu {
-  position: absolute;
-  z-index: 30;
-  top: calc(100% + 6px);
-  right: 0;
-  left: 0;
-  display: grid;
-  gap: 2px;
-  max-height: 236px;
-  overflow-y: auto;
-  padding: 6px;
-  border: 1px solid rgba(0, 0, 0, 0.1);
-  border-radius: 10px;
-  background: #ffffff;
-  box-shadow:
-    0 12px 30px rgba(0, 0, 0, 0.16),
-    0 2px 8px rgba(0, 0, 0, 0.08);
-}
-
-.prompt-optimization-model-option {
-  display: block;
-  width: 100%;
-  min-height: 32px;
-  padding: 7px 9px;
-  border: 0;
-  border-radius: 7px;
-  outline: 0;
-  background: transparent;
-  color: #1d1d1f;
-  font: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  text-align: left;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.prompt-optimization-model-option:hover,
-.prompt-optimization-model-option:focus-visible {
-  background: rgba(0, 122, 255, 0.08);
-}
-
-.prompt-optimization-model-option.selected {
-  background: rgba(0, 122, 255, 0.12);
-  color: var(--mac-blue);
-}
-
-.prompt-optimization-protocol-select {
+.prompt-optimization-protocol-select,
+.prompt-optimization-model-select {
   min-width: 0;
   flex: 1 1 auto;
   width: 100%;
@@ -894,13 +858,19 @@
 .prompt-optimization-protocol-select:focus,
 .prompt-optimization-protocol-select:active,
 .prompt-optimization-protocol-select.semi-select-open,
-.prompt-optimization-protocol-select.semi-select-focus {
+.prompt-optimization-protocol-select.semi-select-focus,
+.prompt-optimization-model-select:hover,
+.prompt-optimization-model-select:focus,
+.prompt-optimization-model-select:active,
+.prompt-optimization-model-select.semi-select-open,
+.prompt-optimization-model-select.semi-select-focus {
   border-color: transparent !important;
   background: transparent !important;
   box-shadow: none !important;
 }
 
-.prompt-optimization-protocol-select .semi-select-selection {
+.prompt-optimization-protocol-select .semi-select-selection,
+.prompt-optimization-model-select .semi-select-selection {
   min-width: 0;
   margin-left: 0;
   color: #1d1d1f;
@@ -909,18 +879,75 @@
   font-weight: 500;
 }
 
-.prompt-optimization-protocol-select .semi-select-arrow {
+.prompt-optimization-protocol-select .semi-select-arrow,
+.prompt-optimization-model-select .semi-select-arrow {
   width: 24px;
   color: #1d1d1f;
 }
 
-.prompt-optimization-protocol-select:disabled {
+.prompt-optimization-protocol-select:disabled,
+.prompt-optimization-protocol-select.semi-select-disabled,
+.prompt-optimization-model-select:disabled,
+.prompt-optimization-model-select.semi-select-disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
 
-.prompt-optimization-protocol-dropdown {
+.prompt-optimization-protocol-dropdown,
+.prompt-optimization-model-dropdown {
   border-radius: 10px;
+}
+
+.prompt-optimization-model-dropdown {
+  width: 0;
+}
+
+.prompt-optimization-model-dropdown .semi-select-option-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.prompt-optimization-model-create-option {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  min-height: 34px;
+  padding: 7px 12px;
+  box-sizing: border-box;
+  border-radius: 6px;
+  color: #1d1d1f;
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  transition: background-color 120ms ease;
+}
+
+.prompt-optimization-model-create-option:hover,
+.prompt-optimization-model-create-option.focused {
+  background: rgba(0, 122, 255, 0.08);
+}
+
+.prompt-optimization-model-create-option svg {
+  flex: 0 0 auto;
+  color: var(--mac-blue);
+}
+
+.prompt-optimization-model-create-label {
+  flex: 0 0 auto;
+  color: #6e6e73;
+}
+
+.prompt-optimization-model-create-value {
+  min-width: 0;
+  overflow: hidden;
+  color: #1d1d1f;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Input shell with icon */

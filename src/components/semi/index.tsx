@@ -159,13 +159,29 @@ export function AutoComplete({ className, ...props }: AutoCompleteProps) {
 }
 
 type SemiSelectProps = React.ComponentProps<typeof SemiSelect>;
+type SemiSelectInstance = React.ComponentRef<typeof SemiSelect>;
 
 export type SelectProps = SemiSelectProps;
 
 export function Select({ className, ...props }: SelectProps) {
+  const selectRef = React.useRef<SemiSelectInstance>(null);
+
+  React.useEffect(() => {
+    const scrollContainer = selectRef.current?.triggerRef.current
+      ?.closest<HTMLElement>(".page-scroll");
+    if (!scrollContainer) return;
+
+    const closeDropdown = () => selectRef.current?.close();
+    scrollContainer.addEventListener("scroll", closeDropdown, {
+      passive: true,
+    });
+    return () => scrollContainer.removeEventListener("scroll", closeDropdown);
+  }, []);
+
   return (
     <SemiSelect
       {...props}
+      ref={selectRef}
       className={classNames("codey-select", className)}
     />
   );

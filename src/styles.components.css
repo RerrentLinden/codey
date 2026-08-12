@@ -71,6 +71,78 @@
   height: 30px;
 }
 
+.app-shell .codey-switch.semi-switch-checked {
+  background-color: #007aff !important;
+}
+
+.app-shell .codey-switch.semi-switch-checked:hover {
+  background-color: #006fe6 !important;
+}
+
+.app-shell .codey-switch.semi-switch-disabled.semi-switch-checked {
+  background-color: rgba(0, 122, 255, 0.45) !important;
+}
+
+.app-shell .traffic-light.codey-button {
+  width: 12px;
+  min-width: 12px;
+  height: 12px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.12) !important;
+  border-radius: 50%;
+  box-shadow: none !important;
+}
+
+.app-shell .traffic-light.codey-button .semi-button-content {
+  display: none;
+}
+
+.app-shell .traffic-light.close.codey-button {
+  background: #ff5f56 !important;
+}
+
+.app-shell .traffic-light.minimize.codey-button {
+  background: #ffbd2e !important;
+}
+
+.app-shell .traffic-light.zoom.codey-button {
+  background: #27c93f !important;
+}
+
+.app-shell .operations-icon-badge.codey-button {
+  display: grid;
+  width: 32px;
+  min-width: 32px;
+  height: 32px;
+  padding: 0;
+  place-items: center;
+}
+
+.app-shell .operations-icon-badge.codey-button .semi-button-content {
+  display: grid;
+  place-items: center;
+}
+
+.app-shell .prompt-optimization-icon-button.codey-button {
+  width: 28px;
+  min-width: 28px;
+  height: 28px;
+  border: 0 !important;
+  border-radius: 7px;
+  background: transparent !important;
+  box-shadow: none !important;
+  color: #6e6e73 !important;
+}
+
+.app-shell .prompt-optimization-icon-button.codey-button:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.06) !important;
+  color: #1d1d1f !important;
+}
+
+.app-shell .prompt-optimization-icon-button.codey-button:focus-visible {
+  box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.16) !important;
+}
+
 .codey-dialog-layer .semi-modal-mask {
   background: rgba(0, 0, 0, 0.25);
   backdrop-filter: blur(20px);
