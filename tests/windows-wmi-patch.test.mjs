@@ -74,6 +74,20 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
         value: [],
       });
 
+      const semanticNamedBlocked = new workerThreads.Worker(
+        "C:\\Codex\\resources\\app\\.vite\\build\\src-A1B2.js",
+        { name: "child-process-snapshot", workerData: 42 },
+      );
+      assert.equal(semanticNamedBlocked.threadId, -1);
+      assert.deepEqual((await once(semanticNamedBlocked, "message"))[0], {
+        type: "ok",
+        value: [],
+      });
+      assert.equal(
+        globalThis.__CODEY_CODEX_STARTUP_PATCH__.windowsWmiSampler.lastMatchReason,
+        "worker-option-name",
+      );
+
       const renamedWmiWorkerPath = join(
         temporaryDirectory,
         "process-telemetry-A1B2.mjs",
@@ -145,7 +159,7 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
 
       const normal = new workerThreads.Worker(
         'require("node:worker_threads").parentPort.postMessage("normal-worker-ran")',
-        { eval: true },
+        { eval: true, name: "child-process-snapshot-preview" },
       );
       assert.equal((await once(normal, "message"))[0], "normal-worker-ran");
       await normal.terminate();
@@ -155,7 +169,7 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
       assert.equal(sampler.installed, true);
       assert.equal(sampler.workerWrapperPatched, true);
       assert.equal(sampler.esmExportsSynchronized, true);
-      assert.equal(sampler.blocked, 6);
+      assert.equal(sampler.blocked, 7);
       assert.equal(sampler.sourceSignatureMatches, 3);
       assert.equal(sampler.lastMatchReason, "source-signature");
     } finally {

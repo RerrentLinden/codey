@@ -1370,6 +1370,9 @@
     const isKnownWmiSnapshotWorkerName = (filename) =>
       /(?:^|[/\\])child[-_]process[-_]snapshot[-_]worker(?:[-.][^/\\?#]+)?\.(?:c?js|mjs)(?:[?#].*)?$/i
         .test(workerSpecifierText(filename));
+    const isKnownWmiSnapshotWorkerThreadName = (options) =>
+      typeof options?.name === "string" &&
+      /^child[-_]process[-_]snapshot$/i.test(options.name.trim());
     const hasWmiSnapshotSourceSignature = (source) =>
       /Get-(?:CimInstance|WmiObject)/i.test(source) &&
       /\bWin32_Process\b/i.test(source) &&
@@ -1436,6 +1439,9 @@
       const workerName = workerDisplayName(filename);
       if (isKnownWmiSnapshotWorkerName(filename)) {
         return { reason: "known-worker-name", workerName };
+      }
+      if (isKnownWmiSnapshotWorkerThreadName(options)) {
+        return { reason: "worker-option-name", workerName };
       }
 
       const specifier = workerSpecifierText(filename);

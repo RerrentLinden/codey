@@ -202,7 +202,13 @@ pub fn prepare_injection_scripts(
                 return "WMI 周期采样保护已就绪，当前平台无需启用";
               }
               if (snapshot.blocked > 0) {
-                return `已阻止 ${snapshot.blocked} 次 WMI 周期进程采样`;
+                const matchReason = snapshot.mainProcessSnapshot?.lastMatchReason;
+                const matchDetail = matchReason === "source-signature"
+                  ? "（通过 Worker 源码特征识别）"
+                  : matchReason === "worker-option-name"
+                    ? "（通过 Worker 语义名称识别）"
+                    : "";
+                return `已阻止 ${snapshot.blocked} 次 WMI 周期进程采样${matchDetail}`;
               }
               if (snapshot.sourceReadFailures > 0) {
                 return {

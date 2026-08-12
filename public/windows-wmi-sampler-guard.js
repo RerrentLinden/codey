@@ -75,12 +75,15 @@
       detail = "WMI 周期采样 Worker 拦截器未安装";
       error = detail;
     } else if (current.blocked > 0) {
+      const matchReason = current.mainProcessSnapshot?.lastMatchReason;
       status = "effective";
       detail =
         `已阻止 ${current.blocked} 次 WMI 周期进程采样` +
-        (current.mainProcessSnapshot?.lastMatchReason === "source-signature"
+        (matchReason === "source-signature"
           ? "（通过 Worker 源码特征识别）"
-          : "");
+          : matchReason === "worker-option-name"
+            ? "（通过 Worker 语义名称识别）"
+            : "");
     } else if (current.sourceReadFailures > 0) {
       detail =
         `有 ${current.sourceReadFailures} 个 Worker 源码无法检查，` +
