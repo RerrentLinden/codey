@@ -123,11 +123,16 @@ fn handle_hook(input: &HookInput, state_root: &Path) -> Result<Value> {
 }
 
 fn pre_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
-    if nonempty(input.agent_id.as_deref()).is_some()
-        || input
-            .tool_name
-            .as_deref()
-            .is_some_and(is_collaboration_tool)
+    if nonempty(input.agent_id.as_deref()).is_some() {
+        if input.tool_name.as_deref().is_some_and(is_spawn_agent_tool) {
+            return Ok(subagent_spawn_denial());
+        }
+        return Ok(json!({}));
+    }
+    if input
+        .tool_name
+        .as_deref()
+        .is_some_and(is_collaboration_tool)
     {
         return Ok(json!({}));
     }
@@ -200,6 +205,16 @@ fn pre_tool_denial(active: usize) -> Value {
             "permissionDecisionReason": format!(
                 "Codey 子代理门禁：仍有 {active} 个子代理在运行。现在只可调用 agents.* 协作工具；请立即调用 agents.wait_agent，并在 MESSAGE 后继续等待，直到收到 FINAL_ANSWER 或 task_complete。"
             ),
+        }
+    })
+}
+
+fn subagent_spawn_denial() -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Codey 子代理门禁：子代理不能继续派生子代理。请停止调用 Agent 或 agents.spawn_agent；如需进一步拆分，请把建议返回给主代理。",
         }
     })
 }
@@ -295,6 +310,13 @@ fn is_collaboration_tool(tool_name: &str) -> bool {
 
 fn is_wait_agent_tool(tool_name: &str) -> bool {
     normalized_collaboration_tool(tool_name) == "wait_agent"
+}
+
+fn is_spawn_agent_tool(tool_name: &str) -> bool {
+    matches!(
+        normalized_collaboration_tool(tool_name).as_str(),
+        "agent" | "spawn_agent"
+    )
 }
 
 fn normalized_collaboration_tool(tool_name: &str) -> String {
@@ -475,6 +497,36 @@ mod tests {
     }
 
     #[test]
+    fn child_cannot_spawn_nested_subagents_through_any_supported_alias() {
+        let temp = tempfile::tempdir().unwrap();
+        for tool in [
+            "Agent",
+            "agents.Agent",
+            "spawn_agent",
+            "agents.spawn_agent",
+            "agents__spawn_agent",
+            "agentsspawn_agent",
+        ] {
+            let mut child_spawn = input("PreToolUse", "session-a");
+            child_spawn.agent_id = Some("agent-a".to_string());
+            child_spawn.tool_name = Some(tool.to_string());
+
+            let denied = handle_hook(&child_spawn, temp.path()).unwrap();
+            assert_eq!(
+                denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+                Some("deny"),
+                "{tool}"
+            );
+            assert!(
+                denied["hookSpecificOutput"]["permissionDecisionReason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("子代理不能继续派生子代理")),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
     fn subagent_stop_releases_root_and_stop_hook_cannot_finish_early() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -624,6 +676,11 @@ mod tests {
         }
         assert!(!is_collaboration_tool("functions.exec"));
         assert!(!is_collaboration_tool("update_plan"));
+        assert!(is_spawn_agent_tool("Agent"));
+        assert!(is_spawn_agent_tool("agents.spawn_agent"));
+        assert!(is_spawn_agent_tool("agents__spawn_agent"));
+        assert!(is_spawn_agent_tool("agentsspawn_agent"));
+        assert!(!is_spawn_agent_tool("agents.wait_agent"));
     }
 
     #[test]

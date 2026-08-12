@@ -81,7 +81,7 @@ test("subagent defaults are hot-reloaded through the packaged app-server bridge"
   assert.match(sessionToolsSource, /window\.__codeyLoadCodexSignalDispatcher/);
 });
 
-test("subagent optimization installs a root-only runtime wait gate", async () => {
+test("subagent optimization installs root waiting and nested-spawn runtime gates", async () => {
   const [gateSource, configSource, mainSource] = await Promise.all([
     readFile(new URL("backend/src/subagent_gate.rs", root), "utf8"),
     readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
@@ -101,6 +101,9 @@ test("subagent optimization installs a root-only runtime wait gate", async () =>
   assert.match(gateSource, /permissionDecision": "deny"/);
   assert.match(gateSource, /"decision": "block"/);
   assert.match(gateSource, /is_collaboration_tool/);
+  assert.match(gateSource, /is_spawn_agent_tool/);
+  assert.match(gateSource, /subagent_spawn_denial/);
+  assert.match(gateSource, /子代理不能继续派生子代理/);
   assert.match(gateSource, /post_wait_continuation/);
   assert.match(gateSource, /不得分析局部结果/);
   assert.match(gateSource, /SubagentStop/);

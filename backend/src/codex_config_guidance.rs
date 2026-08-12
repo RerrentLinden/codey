@@ -514,6 +514,7 @@ mod tests {
 
     #[test]
     fn default_agent_never_uses_terminal_commands_as_narration() {
+        assert!(DEFAULT_AGENT_CONFIG.contains("不要派生、调用或者请求新的子代理"));
         assert!(DEFAULT_AGENT_CONFIG.contains("每次工具调用都必须推进任务本身"));
         assert!(DEFAULT_AGENT_CONFIG.contains("进度、道歉、自我提醒和纠错写在回复中"));
         assert!(DEFAULT_AGENT_CONFIG.contains("直接改用正确工具"));
