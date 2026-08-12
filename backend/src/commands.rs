@@ -750,10 +750,10 @@ async fn save_codey_config_locked(
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     let mut config = config.normalize();
-    if config.subagent_optimization {
-        if let Ok(model_state) = current_model_state(&config) {
-            subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
-        }
+    if config.subagent_optimization
+        && let Ok(model_state) = current_model_state(&config)
+    {
+        subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     }
     let subagent_model_changed = previous.subagent_model != config.subagent_model;
     let refresh_subagent_defaults = previous.subagent_optimization
