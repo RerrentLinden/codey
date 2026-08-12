@@ -54,7 +54,7 @@ pub async fn sync_cc_switch_state(
     state: &Arc<AppState>,
 ) -> Result<cc_switch::CcSwitchStatus, String> {
     let home = codex_home();
-    sync_cc_switch_state_with(state, move |config| {
+    let mut status = sync_cc_switch_state_with(state, move |config| {
         let previous_provider_id = config.current_provider_id().map(ToString::to_string);
         let (mut next, mut status) =
             cc_switch::sync_current_provider(&config, &home).map_err(|error| error.to_string())?;
@@ -69,7 +69,10 @@ pub async fn sync_cc_switch_state(
         status.changed = next != config;
         Ok((next, status))
     })
-    .await
+    .await?;
+    let (_, subagent_changed) = reconcile_current_subagent_catalog(state, None).await?;
+    status.changed |= subagent_changed;
+    Ok(status)
 }
 
 pub(super) async fn sync_cc_switch_state_with<F>(
@@ -275,7 +278,13 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
         return config;
     };
     if profile.cc_switch_read_only {
-        return config;
+        return reconcile_current_subagent_catalog(state, None)
+            .await
+            .map(|(config, _)| config)
+            .unwrap_or_else(|error| {
+                eprintln!("启动时验证官方线路子代理模型失败，沿用当前设置：{error}");
+                config
+            });
     }
     let Some(provider_id) = config.current_provider_id().map(ToString::to_string) else {
         return config;
@@ -352,8 +361,17 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
         eprintln!("启动时同步模型期间当前线路已变化，忽略旧线路的同步结果");
         return latest;
     }
+    let persistence_base = (!synced).then(|| latest.clone());
     let next = config_with_current_provider_model_sync(&latest, models, synced, &codex_home());
-    commit_startup_model_sync(state, latest, next, synced).await
+    let committed = commit_startup_model_sync(state, latest, next, synced).await;
+    drop(_config_write_guard);
+    reconcile_current_subagent_catalog(state, persistence_base.as_ref())
+        .await
+        .map(|(config, _)| config)
+        .unwrap_or_else(|error| {
+            eprintln!("启动时验证第三方线路子代理模型失败，沿用当前设置：{error}");
+            committed
+        })
 }
 
 async fn commit_startup_model_sync(
@@ -394,16 +412,20 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
     if latest.current_provider_id() != Some(provider_id.as_str()) {
         return Err("同步模型期间当前线路已变化，请重试".to_string());
     }
-    let next = config_with_current_provider_model_sync(
+    let mut next = config_with_current_provider_model_sync(
         &latest,
         fetched_models.clone(),
         true,
         &codex_home(),
     );
-    let model_state = current_model_state(&next)?;
-    let catalog_refresh = should_refresh_model_catalog(&model_state)
+    let pre_refresh_model_state = current_model_state(&next)?;
+    let catalog_refresh = should_refresh_model_catalog(&pre_refresh_model_state)
         .then(|| refresh_model_catalog_for_provider_sync(&next))
         .transpose()?;
+    let validated_model_state = current_model_state(&next)?;
+    subagent_policy::reconcile_with_model_state(&mut next, Some(&validated_model_state));
+    next = next.normalize();
+    let model_state = current_model_state(&next)?;
     if let Err(error) = save_config_to_store(state, &next).await {
         return Err(rollback_model_catalog_after_config_save(
             catalog_refresh,
@@ -522,6 +544,9 @@ pub async fn save_selected_models(
     }
     config = config.normalize();
     let catalog_refresh = refresh_model_catalog_or_fallback(&config)?;
+    let validated_model_state = current_model_state(&config)?;
+    subagent_policy::reconcile_with_model_state(&mut config, Some(&validated_model_state));
+    config = config.normalize();
     if let Err(error) = save_config_to_store(state, &config).await {
         return Err(rollback_model_catalog_after_config_save(
             Some(catalog_refresh),
@@ -798,7 +823,7 @@ pub(super) fn current_model_state(
         .iter()
         .find(|profile| profile.id == config.active_profile_id)
         .is_none_or(|profile| profile.cc_switch_read_only);
-    model_catalog::selection_state_with_manual_models(
+    let mut state = model_catalog::selection_state_with_verified_subagent_catalog(
         &codex_home(),
         official,
         config.upstream_models_snapshot(),
@@ -806,7 +831,13 @@ pub(super) fn current_model_state(
         config.manual_third_party_models(),
         config.default_model(),
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    let codex_runtime_version =
+        model_catalog::desktop_runtime_version(None, &config.codex_app_path);
+    if !model_catalog::is_available_for_runtime(&codex_home(), codex_runtime_version.as_deref()) {
+        state.subagent_model_ids.clear();
+    }
+    Ok(state)
 }
 
 pub(super) fn current_renderer_model_catalog(config: &CodeyConfig) -> Result<Value, String> {
@@ -912,6 +943,57 @@ fn refresh_model_catalog_or_fallback(config: &CodeyConfig) -> Result<ModelCatalo
         Ok(fallback) => Ok(ModelCatalogRefresh { fallback, snapshot }),
         Err(error) => Err(rollback_model_catalog_snapshot(snapshot, error)),
     }
+}
+
+async fn reconcile_current_subagent_catalog(
+    state: &Arc<AppState>,
+    persistence_base: Option<&CodeyConfig>,
+) -> Result<(CodeyConfig, bool), String> {
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let current = state.config.read().await.clone();
+    let catalog_refresh = refresh_model_catalog_or_fallback(&current)?;
+    let model_state = match current_model_state(&current) {
+        Ok(model_state) => model_state,
+        Err(error) => {
+            return Err(rollback_model_catalog_after_config_save(
+                Some(catalog_refresh),
+                error,
+            ));
+        }
+    };
+    let mut next = current.clone();
+    subagent_policy::reconcile_with_model_state(&mut next, Some(&model_state));
+    next = next.normalize();
+    if next == current {
+        return Ok((current, false));
+    }
+    let persisted = persistence_base.map_or_else(
+        || next.clone(),
+        |base| config_with_reconciled_subagent_defaults(base, &next),
+    );
+    if let Err(error) = save_config_to_store(state, &persisted).await {
+        return Err(rollback_model_catalog_after_config_save(
+            Some(catalog_refresh),
+            error,
+        ));
+    }
+    *state.config.write().await = next.clone();
+    Ok((next, true))
+}
+
+fn config_with_reconciled_subagent_defaults(
+    persistence_base: &CodeyConfig,
+    reconciled: &CodeyConfig,
+) -> CodeyConfig {
+    let mut persisted = persistence_base.clone();
+    persisted.subagent_optimization = reconciled.subagent_optimization;
+    persisted
+        .subagent_model
+        .clone_from(&reconciled.subagent_model);
+    persisted
+        .subagent_reasoning_effort
+        .clone_from(&reconciled.subagent_reasoning_effort);
+    persisted.normalize()
 }
 
 fn rollback_model_catalog_after_config_save(
@@ -1154,6 +1236,33 @@ mod tests {
 
         assert_eq!(committed, latest);
         assert_eq!(*state.config.read().await, latest);
+    }
+
+    #[test]
+    fn startup_fallback_persists_only_reconciled_subagent_defaults() {
+        let mut persisted = CodeyConfig::default();
+        persisted.subagent_optimization = true;
+        persisted.subagent_model = "gpt-5.6-luna".into();
+        persisted.subagent_reasoning_effort = "high".into();
+        let provider_id = persisted.current_provider_id().unwrap().to_string();
+        persisted
+            .upstream_models_by_provider
+            .insert(provider_id.clone(), vec!["saved-model".into()]);
+
+        let mut runtime_fallback = persisted.clone();
+        runtime_fallback
+            .upstream_models_by_provider
+            .insert(provider_id.clone(), vec!["fallback-model".into()]);
+        runtime_fallback.subagent_model = crate::config::DEFAULT_SUBAGENT_MODEL.into();
+
+        let next = config_with_reconciled_subagent_defaults(&persisted, &runtime_fallback);
+
+        assert_eq!(
+            next.upstream_models_by_provider.get(&provider_id),
+            Some(&vec!["saved-model".into()])
+        );
+        assert_eq!(next.subagent_model, crate::config::DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(next.subagent_reasoning_effort, "high");
     }
 
     #[test]

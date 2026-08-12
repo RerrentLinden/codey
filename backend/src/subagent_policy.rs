@@ -23,13 +23,16 @@ fn reset_for_current_provider(
     codex_home: &Path,
     official_provider: bool,
 ) {
-    let (model, reasoning_effort, compatible_model_available) =
-        defaults_for_current_provider(config, codex_home, official_provider);
-    config.subagent_model = model;
-    config.subagent_reasoning_effort = reasoning_effort;
-    if !compatible_model_available {
-        config.subagent_optimization = false;
-    }
+    let state = model_catalog::selection_state_with_manual_models(
+        codex_home,
+        official_provider,
+        config.upstream_models_snapshot(),
+        config.selected_models(),
+        config.manual_third_party_models(),
+        Some(DEFAULT_SUBAGENT_MODEL),
+    )
+    .ok();
+    reset_with_model_state(config, state.as_ref());
 }
 
 pub(crate) fn reconcile_for_current_provider(
@@ -40,42 +43,60 @@ pub(crate) fn reconcile_for_current_provider(
     if !config.subagent_optimization {
         return;
     }
-    let Ok(state) = model_catalog::selection_state_with_manual_models(
+    let state = model_catalog::selection_state_with_manual_models(
         codex_home,
         official_provider,
         config.upstream_models_snapshot(),
         config.selected_models(),
         config.manual_third_party_models(),
         Some(DEFAULT_SUBAGENT_MODEL),
-    ) else {
+    )
+    .ok();
+    reconcile_with_model_state(config, state.as_ref());
+}
+
+pub(crate) fn reconcile_with_model_state(
+    config: &mut CodeyConfig,
+    state: Option<&model_catalog::ModelSelectionState>,
+) {
+    if !config.subagent_optimization {
+        return;
+    }
+    let Some(state) = state else {
+        reset_with_model_state(config, None);
         return;
     };
     let model = config.subagent_model.trim().to_string();
     if state.available_subagent_model(&model).is_none() {
-        reset_for_current_provider(config, codex_home, official_provider);
+        reset_with_model_state(config, Some(state));
         return;
     }
     config.subagent_reasoning_effort =
         reasoning_effort_for_model(&state, &model, &config.subagent_reasoning_effort);
 }
 
-fn defaults_for_current_provider(
+fn reset_with_model_state(
+    config: &mut CodeyConfig,
+    state: Option<&model_catalog::ModelSelectionState>,
+) {
+    let (model, reasoning_effort, compatible_model_available) =
+        defaults_for_model_state(config, state);
+    config.subagent_model = model;
+    config.subagent_reasoning_effort = reasoning_effort;
+    if !compatible_model_available {
+        config.subagent_optimization = false;
+    }
+}
+
+fn defaults_for_model_state(
     config: &CodeyConfig,
-    codex_home: &Path,
-    official_provider: bool,
+    state: Option<&model_catalog::ModelSelectionState>,
 ) -> (String, String, bool) {
-    let Ok(state) = model_catalog::selection_state_with_manual_models(
-        codex_home,
-        official_provider,
-        config.upstream_models_snapshot(),
-        config.selected_models(),
-        config.manual_third_party_models(),
-        Some(DEFAULT_SUBAGENT_MODEL),
-    ) else {
+    let Some(state) = state else {
         return (
             DEFAULT_SUBAGENT_MODEL.to_string(),
             DEFAULT_SUBAGENT_REASONING_EFFORT.to_string(),
-            official_provider,
+            false,
         );
     };
     let Some(model) = state
@@ -141,6 +162,25 @@ pub(crate) fn reasoning_effort_for_model(
 mod tests {
     use super::*;
     use crate::config::ProviderProfile;
+
+    fn verified_subagent_state(model_ids: &[&str]) -> model_catalog::ModelSelectionState {
+        model_catalog::ModelSelectionState {
+            official_models: ["gpt-5.6-luna", DEFAULT_SUBAGENT_MODEL]
+                .into_iter()
+                .map(|slug| model_catalog::OfficialModelAvailability {
+                    slug: slug.to_string(),
+                    display_name: slug.to_string(),
+                    supported: true,
+                    supported_reasoning_efforts: vec!["low".into(), "high".into()],
+                    default_reasoning_effort: "low".into(),
+                })
+                .collect(),
+            official_model_ids: vec!["gpt-5.6-luna".into(), DEFAULT_SUBAGENT_MODEL.into()],
+            subagent_model_ids: model_ids.iter().map(|model| (*model).to_string()).collect(),
+            default_model: "gpt-5.6-luna".into(),
+            ..model_catalog::ModelSelectionState::default()
+        }
+    }
 
     fn route_config(provider_id: &str) -> CodeyConfig {
         let mut profile = ProviderProfile::new("Route");
@@ -218,6 +258,36 @@ mod tests {
                 case.expected_model
             );
         }
+    }
+
+    #[test]
+    fn verified_state_falls_back_from_luna_to_terra() {
+        let mut config = route_config("route-a");
+        config.subagent_model = "gpt-5.6-luna".into();
+        config.subagent_reasoning_effort = "high".into();
+        let state = verified_subagent_state(&[DEFAULT_SUBAGENT_MODEL]);
+
+        reconcile_with_model_state(&mut config, Some(&state));
+
+        assert!(config.subagent_optimization);
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(config.subagent_reasoning_effort, "high");
+    }
+
+    #[test]
+    fn missing_verified_subagent_catalog_disables_optimization() {
+        let mut config = route_config("route-a");
+        config.subagent_model = "gpt-5.6-luna".into();
+        config.subagent_reasoning_effort = "high".into();
+
+        reconcile_with_model_state(&mut config, None);
+
+        assert!(!config.subagent_optimization);
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(
+            config.subagent_reasoning_effort,
+            DEFAULT_SUBAGENT_REASONING_EFFORT
+        );
     }
 
     #[test]

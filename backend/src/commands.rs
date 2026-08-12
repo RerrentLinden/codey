@@ -749,18 +749,19 @@ async fn save_codey_config_locked(
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     let mut config = config.normalize();
-    let subagent_model_changed = previous.subagent_model != config.subagent_model;
     if config.subagent_optimization {
         let model_state = current_model_state(&config)?;
-        if !previous.subagent_optimization || subagent_model_changed {
+        subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
+        if config.subagent_optimization {
             validate_subagent_model_selection(&config.subagent_model, &model_state)?;
+            config.subagent_reasoning_effort = subagent_policy::reasoning_effort_for_model(
+                &model_state,
+                &config.subagent_model,
+                &config.subagent_reasoning_effort,
+            );
         }
-        config.subagent_reasoning_effort = subagent_policy::reasoning_effort_for_model(
-            &model_state,
-            &config.subagent_model,
-            &config.subagent_reasoning_effort,
-        );
     }
+    let subagent_model_changed = previous.subagent_model != config.subagent_model;
     let refresh_subagent_defaults = previous.subagent_optimization
         && config.subagent_optimization
         && (subagent_model_changed
@@ -988,6 +989,13 @@ async fn hot_reload_runtime_subagent_defaults(
     config: &CodeyConfig,
 ) -> Option<Result<(), String>> {
     let runtime = state.runtime.lock().await.clone()?;
+    let model_state = match current_model_state(config) {
+        Ok(state) => state,
+        Err(error) => return Some(Err(error)),
+    };
+    if let Err(error) = validate_subagent_model_selection(&config.subagent_model, &model_state) {
+        return Some(Err(error));
+    }
     let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
     let websocket_url = runtime.renderer_websocket_url().await;
     let result = cdp::refresh_subagent_defaults(

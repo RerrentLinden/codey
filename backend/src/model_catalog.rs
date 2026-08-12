@@ -225,6 +225,20 @@ pub fn refresh_for_provider(
     apply_legacy_v2_catalog_compatibility(&mut catalog_models, codex_runtime_version);
 
     write_catalog(home, &catalog_models)?;
+    let written_models = read_runtime_catalog_models(home)?;
+    let expected_model_keys = catalog_models
+        .iter()
+        .filter_map(|model| model.get("slug").and_then(Value::as_str))
+        .map(model_id::key)
+        .collect::<Vec<_>>();
+    let written_model_keys = written_models
+        .iter()
+        .filter_map(|model| model.get("slug").and_then(Value::as_str))
+        .map(model_id::key)
+        .collect::<Vec<_>>();
+    if written_model_keys != expected_model_keys {
+        bail!("写入后的 Codey 模型目录与本次生成结果不一致");
+    }
     Ok(catalog_models.len())
 }
 
@@ -353,6 +367,38 @@ pub fn selection_state_with_manual_models(
     })
 }
 
+pub fn selection_state_with_verified_subagent_catalog(
+    home: &Path,
+    official_provider: bool,
+    upstream_models: Option<&[String]>,
+    selected_models: &[String],
+    manual_third_party_models: &[String],
+    requested_default_model: Option<&str>,
+) -> Result<ModelSelectionState> {
+    let mut state = selection_state_with_manual_models(
+        home,
+        official_provider,
+        upstream_models,
+        selected_models,
+        manual_third_party_models,
+        requested_default_model,
+    )?;
+    let verified_model_keys = read_runtime_catalog_models(home)
+        .map(|models| {
+            models
+                .iter()
+                .filter(|model| model_is_verified_v2_subagent(model))
+                .filter_map(|model| model.get("slug").and_then(Value::as_str))
+                .map(model_id::key)
+                .collect::<HashSet<_>>()
+        })
+        .unwrap_or_default();
+    state
+        .subagent_model_ids
+        .retain(|model| verified_model_keys.contains(&model_id::key(model)));
+    Ok(state)
+}
+
 fn legacy_v2_catalog_compatibility_required(codex_runtime_version: Option<&str>) -> bool {
     legacy_v2_catalog_compatibility_required_for_platform(codex_runtime_version, cfg!(windows))
 }
@@ -416,6 +462,14 @@ fn model_is_subagent_eligible(model: &Value) -> bool {
         .and_then(Value::as_str)
         .map(str::trim);
     !multi_agent_version.is_some_and(|version| version.eq_ignore_ascii_case("disabled"))
+}
+
+fn model_is_verified_v2_subagent(model: &Value) -> bool {
+    model.get("visibility").and_then(Value::as_str) == Some("list")
+        && model
+            .get("multi_agent_version")
+            .and_then(Value::as_str)
+            .is_some_and(|version| version.trim().eq_ignore_ascii_case("v2"))
 }
 
 fn effective_default_model(
@@ -998,6 +1052,22 @@ fn read_catalog_value(path: &Path) -> Option<Value> {
     fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+}
+
+fn read_runtime_catalog_models(home: &Path) -> Result<Vec<Value>> {
+    let path = home.join(relative_path());
+    let bytes = fs::read(&path)
+        .with_context(|| format!("读取 Codey 运行时模型目录失败：{}", path.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析 Codey 运行时模型目录失败：{}", path.display()))?;
+    if value.get("models").and_then(Value::as_array).is_none() {
+        bail!("Codey 运行时模型目录缺少 models 数组");
+    }
+    let models = catalog_models_from_value(&value);
+    if !models.is_empty() && !runtime_compatible_models(&models) {
+        bail!("Codey 运行时模型目录缺少 Codex 必需字段");
+    }
+    Ok(models)
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -2309,6 +2379,75 @@ mod tests {
             state.available_subagent_model("third-model"),
             Some("third-model")
         );
+    }
+
+    #[test]
+    fn verified_selection_only_exposes_explicit_v2_models_from_runtime_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+
+        refresh_for_provider(
+            home.path(),
+            true,
+            None,
+            &[],
+            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION),
+        )
+        .unwrap();
+
+        let state =
+            selection_state_with_verified_subagent_catalog(home.path(), true, None, &[], &[], None)
+                .unwrap();
+
+        assert_eq!(state.subagent_model_ids, ["gpt-5.6-sol", "gpt-5.6-terra"]);
+        assert_eq!(state.available_subagent_model("gpt-5.6-luna"), None);
+        assert_eq!(
+            state.available_subagent_model("gpt-5.6-terra"),
+            Some("gpt-5.6-terra")
+        );
+    }
+
+    #[test]
+    fn verified_selection_is_empty_when_runtime_catalog_is_missing() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+
+        let state =
+            selection_state_with_verified_subagent_catalog(home.path(), true, None, &[], &[], None)
+                .unwrap();
+
+        assert!(state.subagent_model_ids.is_empty());
+        assert!(state.first_available_subagent_model().is_none());
+        assert!(!state.official_models.is_empty());
+    }
+
+    #[test]
+    fn verified_selection_rejects_models_from_a_stale_provider_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let provider_a = vec!["provider-a-model".into()];
+        refresh_for_provider(
+            home.path(),
+            false,
+            Some(&provider_a),
+            &provider_a,
+            Some("0.147.0-alpha.6.5"),
+        )
+        .unwrap();
+        let provider_b = vec!["provider-b-model".into()];
+
+        let state = selection_state_with_verified_subagent_catalog(
+            home.path(),
+            false,
+            Some(&provider_b),
+            &provider_b,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(state.third_party_models, ["provider-b-model"]);
+        assert!(state.subagent_model_ids.is_empty());
     }
 
     #[test]

@@ -391,15 +391,28 @@ struct CodexStartupStateOptions<'a> {
     expected_config: Option<&'a [u8]>,
 }
 
+struct StartupModelCatalog {
+    use_official_catalog: bool,
+    model_state: model_catalog::ModelSelectionState,
+}
+
+struct PreparedCodexStartupState {
+    config_contents: Vec<u8>,
+    runtime_config: CodeyConfig,
+}
+
 async fn prepare_startup_model_catalog(
     config: &CodeyConfig,
     current_profile: &ProviderProfile,
     app_dir: &std::path::Path,
     home: &std::path::Path,
     preserve_provider_route: bool,
-) -> Result<(bool, String)> {
+) -> Result<StartupModelCatalog> {
     if preserve_provider_route {
-        return Ok((false, String::new()));
+        return Ok(StartupModelCatalog {
+            use_official_catalog: false,
+            model_state: model_catalog::ModelSelectionState::default(),
+        });
     }
 
     let catalog_home = home.to_path_buf();
@@ -426,7 +439,7 @@ async fn prepare_startup_model_catalog(
                     &catalog_home,
                     codex_runtime_version.as_deref(),
                 );
-            let selection = model_catalog::selection_state_with_manual_models(
+            let selection = model_catalog::selection_state_with_verified_subagent_catalog(
                 &catalog_home,
                 official_provider,
                 upstream_models.as_deref(),
@@ -488,8 +501,8 @@ async fn prepare_startup_model_catalog(
             false
         }
     };
-    let default_model = match selection_result {
-        Ok(state) => state.default_model,
+    let mut model_state = match selection_result {
+        Ok(state) => state,
         Err(error) => {
             error_log::record_failure(
                 "patch_failed",
@@ -500,10 +513,16 @@ async fn prepare_startup_model_catalog(
                     "officialProvider": official_provider,
                 }),
             );
-            String::new()
+            model_catalog::ModelSelectionState::default()
         }
     };
-    Ok((use_official_catalog, default_model))
+    if !use_official_catalog {
+        model_state.subagent_model_ids.clear();
+    }
+    Ok(StartupModelCatalog {
+        use_official_catalog,
+        model_state,
+    })
 }
 
 async fn prepare_codex_startup_state(
@@ -512,14 +531,17 @@ async fn prepare_codex_startup_state(
     app_dir: &std::path::Path,
     home: &std::path::Path,
     options: CodexStartupStateOptions<'_>,
-) -> Result<Vec<u8>> {
+) -> Result<PreparedCodexStartupState> {
     let CodexStartupStateOptions {
         original_provider,
         preserve_provider_route,
         protocol_proxy_base_url,
         expected_config,
     } = options;
-    let (use_official_catalog, default_model) = prepare_startup_model_catalog(
+    let StartupModelCatalog {
+        use_official_catalog,
+        model_state,
+    } = prepare_startup_model_catalog(
         config,
         current_profile,
         app_dir,
@@ -530,17 +552,14 @@ async fn prepare_codex_startup_state(
     let runtime_config_home = home.to_path_buf();
     let runtime_config_profile = current_profile.clone();
     let runtime_config_provider = original_provider.to_string();
-    let runtime_default_model = (!default_model.is_empty()).then_some(default_model);
+    let runtime_default_model =
+        (!model_state.default_model.is_empty()).then_some(model_state.default_model.clone());
     let fast_context_tools = config.fast_context_tools;
     let mut runtime_subagent_config = config.clone();
-    subagent_policy::reconcile_for_current_provider(
-        &mut runtime_subagent_config,
-        home,
-        current_profile.cc_switch_read_only,
-    );
+    subagent_policy::reconcile_with_model_state(&mut runtime_subagent_config, Some(&model_state));
     let subagent_optimization = runtime_subagent_config.subagent_optimization;
-    let subagent_model = runtime_subagent_config.subagent_model;
-    let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort;
+    let subagent_model = runtime_subagent_config.subagent_model.clone();
+    let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort.clone();
     let protocol_proxy_base_url = protocol_proxy_base_url.map(str::to_string);
     let protocol_proxy_enabled = protocol_proxy_base_url.is_some();
     let expected_config = expected_config.map(<[u8]>::to_vec);
@@ -597,7 +616,10 @@ async fn prepare_codex_startup_state(
         );
         error
     })?;
-    Ok(applied.config_contents)
+    Ok(PreparedCodexStartupState {
+        config_contents: applied.config_contents,
+        runtime_config: runtime_subagent_config,
+    })
 }
 
 async fn await_initial_storage_guards(
@@ -962,6 +984,7 @@ struct StartupStorageState {
 struct PreparedProviderState {
     protocol_proxy: Option<ProtocolProxyHandle>,
     applied_route_files: Option<RouteFilesSnapshot>,
+    runtime_config: CodeyConfig,
 }
 
 struct StartupPatchState {
@@ -1157,7 +1180,7 @@ async fn prepare_runtime_provider_state(
     let protocol_proxy_base_url = protocol_proxy
         .as_ref()
         .map(|proxy| proxy.base_url().to_string());
-    let applied_config = prepare_codex_startup_state(
+    let prepared_startup = prepare_codex_startup_state(
         config,
         &route.current_profile,
         app_dir,
@@ -1177,12 +1200,13 @@ async fn prepare_runtime_provider_state(
         .live_route
         .as_ref()
         .map(|live_route| RouteFilesSnapshot {
-            config: applied_config,
+            config: prepared_startup.config_contents,
             auth: live_route.auth_contents().map(<[u8]>::to_vec),
         });
     Ok(PreparedProviderState {
         protocol_proxy,
         applied_route_files,
+        runtime_config: prepared_startup.runtime_config,
     })
 }
 
@@ -1425,6 +1449,7 @@ impl CodeyRuntime {
         let PreparedProviderState {
             protocol_proxy,
             applied_route_files,
+            runtime_config,
         } = prepare_runtime_provider_state(&home, config, &route, &storage.app_dir).await?;
         let patch =
             prepare_startup_patches_and_overlay(&home, config, applied_route_files.as_ref())
@@ -1466,9 +1491,11 @@ impl CodeyRuntime {
             Self {
                 codex_app_path: app_dir,
                 maintenance,
-                applied_config: config.clone(),
-                applied_model_config: RwLock::new(RuntimeModelConfig::from_config(config)),
-                applied_subagent_config: RwLock::new(RuntimeSubagentConfig::from_config(config)),
+                applied_model_config: RwLock::new(RuntimeModelConfig::from_config(&runtime_config)),
+                applied_subagent_config: RwLock::new(RuntimeSubagentConfig::from_config(
+                    &runtime_config,
+                )),
+                applied_config: runtime_config,
                 injection_statuses,
                 injection_scripts,
                 injection_websocket_url,
