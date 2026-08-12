@@ -64,6 +64,7 @@
   // row. Preserve the last confirmed running state until a delayed rescan.
   const threadRunningStateByCacheKey = new Map();
   const threadRunningRecheckTimers = new Map();
+  const projectRunningRecoveryClickedAt = new WeakMap();
   const threadUpdatedAtRequestedAt = new Map();
   const pendingThreadUpdatedAtRefs = new Map();
   const threadUpdatedAtRows = new Set();
@@ -83,8 +84,11 @@
     "[data-app-action-sidebar-section]",
     "[data-app-action-sidebar-thread-row]",
     "[data-app-action-sidebar-project-row]",
+    "[data-app-action-sidebar-project-list-id]",
   ].join(", ");
   const sidebarThreadRowSelector = "[data-app-action-sidebar-thread-row]";
+  const sidebarProjectListSelector = "[data-app-action-sidebar-project-list-id]";
+  const sidebarProjectShowAllAttribute = "data-app-action-sidebar-project-show-all";
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
   const deletedSidebarSessionTtlMs = 10 * 60 * 1000;
   const threadRunningLossGraceMs = 2_000;
@@ -99,6 +103,7 @@
   const maxSessionCacheEntries = 2_048;
   const maxHardDeletedMessageKeys = 10_000;
   const maxPendingScanRoots = 64;
+  const projectRunningRecoveryClickCooldownMs = 1_000;
   const rememberBoundedMapValue = (cache, key, value, limit = maxSessionCacheEntries) => {
     cache.delete(key);
     cache.set(key, value);
@@ -1014,6 +1019,12 @@
     `${String(hostId || "local").trim() || "local"}\u0000${normalizeThreadSessionId(sessionId)}`
   );
 
+  const threadProjectListIdFromRow = (row) => String(
+    row?.closest?.(sidebarProjectListSelector)
+      ?.getAttribute?.("data-app-action-sidebar-project-list-id")
+    || "",
+  ).trim();
+
   const cancelThreadRunningRecheck = (cacheKey) => {
     if (!threadRunningRecheckTimers.has(cacheKey)) return;
     window.clearTimeout(threadRunningRecheckTimers.get(cacheKey));
@@ -1044,6 +1055,7 @@
     cacheKey,
     detectedWorkInProgress,
     previouslyRunning = false,
+    runningContext = {},
     now = Date.now(),
   ) => {
     if (!cacheKey) return detectedWorkInProgress;
@@ -1051,17 +1063,24 @@
       rememberBoundedMapValue(
         threadRunningStateByCacheKey,
         cacheKey,
-        { missingSince: null },
+        {
+          ...(threadRunningStateByCacheKey.get(cacheKey) || {}),
+          ...runningContext,
+          missingSince: null,
+        },
       );
       cancelThreadRunningRecheck(cacheKey);
       return true;
     }
     let state = threadRunningStateByCacheKey.get(cacheKey);
     if (!state && previouslyRunning) {
-      state = { missingSince: now };
+      state = { ...runningContext, missingSince: now };
       rememberBoundedMapValue(threadRunningStateByCacheKey, cacheKey, state);
     }
     if (!state) return false;
+    if (runningContext.sessionId) state.sessionId = runningContext.sessionId;
+    if (runningContext.hostId) state.hostId = runningContext.hostId;
+    if (runningContext.projectListId) state.projectListId = runningContext.projectListId;
     if (!Number.isFinite(state.missingSince)) {
       state.missingSince = now;
       rememberBoundedMapValue(threadRunningStateByCacheKey, cacheKey, state);
@@ -1119,6 +1138,11 @@
       cacheKey,
       detectedWorkInProgress,
       previous?.workInProgress === true,
+      {
+        hostId,
+        projectListId: threadProjectListIdFromRow(row),
+        sessionId,
+      },
       now,
     );
     const completedWork = Boolean(
@@ -1183,6 +1207,116 @@
     } else if (item.hasAttribute(threadRunningAttribute)) {
       item.removeAttribute(threadRunningAttribute);
     }
+  };
+
+  const projectThreadSessionIdsFromReact = (projectList) => {
+    const sessionIds = new Set();
+    if (!(projectList instanceof HTMLElement)) return sessionIds;
+    const reactKey = Object.keys(projectList).find((key) => (
+      key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$")
+    ));
+    let fiber = reactKey ? projectList[reactKey] : null;
+    for (let depth = 0; fiber && depth < 8; depth += 1, fiber = fiber.return) {
+      for (const props of [fiber.memoizedProps, fiber.pendingProps]) {
+        const threadKeys = Array.isArray(props?.threadKeys)
+          ? props.threadKeys
+          : props?.group?.threadKeys;
+        if (!Array.isArray(threadKeys)) continue;
+        threadKeys.slice(0, maxSessionCacheEntries).forEach((threadKey) => {
+          const sessionId = normalizeThreadSessionId(
+            typeof threadKey === "string"
+              ? threadKey
+              : threadKey?.sessionId ?? threadKey?.threadId ?? threadKey?.id,
+          );
+          if (sessionId) sessionIds.add(sessionId);
+        });
+        return sessionIds;
+      }
+    }
+    return sessionIds;
+  };
+
+  const visibleProjectThreadSessionIds = (projectList) => new Set(
+    queryWithin(projectList, sidebarThreadRowSelector)
+      .map((row) => threadIdentityNode(row) || row)
+      .filter((row) => row instanceof HTMLElement)
+      .map((row) => normalizeThreadSessionId(threadSessionIdFromRow(row)))
+      .filter(Boolean),
+  );
+
+  const projectListIsExpanded = (projectList) => {
+    const projectItem = projectList.closest?.('[role="listitem"]');
+    if (!(projectItem instanceof HTMLElement)) return true;
+    const toggle = queryWithin(projectItem, "button, [role=button]").find((button) => (
+      !button.closest?.(sidebarProjectListSelector)
+      && button.getAttribute?.("aria-expanded") != null
+    ));
+    return !toggle || toggle.getAttribute("aria-expanded") === "true";
+  };
+
+  const projectShowAllButtonText = (button) => String(
+    button?.textContent
+    || button?.innerText
+    || button?.getAttribute?.("aria-label")
+    || button?.getAttribute?.("title")
+    || "",
+  ).replace(/\s+/g, " ").trim();
+
+  const projectShowAllButton = (projectList) => queryWithin(
+    projectList,
+    "button, [role=button]",
+  ).find((button) => (
+    !button.disabled
+    && button.getAttribute?.("aria-disabled") !== "true"
+    && !button.closest?.(sidebarThreadRowSelector)
+    && /^(?:展开显示|继续展开|显示更多|查看更多|加载更多|全部显示|显示全部|Show more|Load more|Show all)$/i
+      .test(projectShowAllButtonText(button))
+  )) || null;
+
+  const projectListsForRunningRecovery = (root) => {
+    const directLists = queryWithin(root, sidebarProjectListSelector);
+    if (directLists.length || !(root instanceof HTMLElement)) return directLists;
+    const projectItem = root.closest?.('[role="listitem"]');
+    return projectItem instanceof HTMLElement
+      ? queryWithin(projectItem, sidebarProjectListSelector)
+      : directLists;
+  };
+
+  const recoverHiddenRunningThreads = (root = document) => {
+    if (!threadRunningStateByCacheKey.size) return;
+    const runningStates = [...threadRunningStateByCacheKey.values()]
+      .filter((state) => state?.sessionId);
+    if (!runningStates.length) return;
+    const now = Date.now();
+    projectListsForRunningRecovery(root).forEach((projectList) => {
+      if (!(projectList instanceof HTMLElement)) return;
+      if (projectList.getAttribute(sidebarProjectShowAllAttribute) === "true") return;
+      if (!projectListIsExpanded(projectList)) return;
+      const projectListId = String(
+        projectList.getAttribute("data-app-action-sidebar-project-list-id") || "",
+      ).trim();
+      const allSessionIds = projectThreadSessionIdsFromReact(projectList);
+      const visibleSessionIds = visibleProjectThreadSessionIds(projectList);
+      const hasHiddenRunningThread = runningStates.some((state) => {
+        const sessionId = normalizeThreadSessionId(state.sessionId);
+        if (!sessionId || visibleSessionIds.has(sessionId)) return false;
+        if (allSessionIds.has(sessionId)) return true;
+        return !allSessionIds.size
+          && Boolean(projectListId)
+          && state.projectListId === projectListId;
+      });
+      if (!hasHiddenRunningThread) return;
+      const lastClickedAt = projectRunningRecoveryClickedAt.get(projectList) || 0;
+      if (now - lastClickedAt < projectRunningRecoveryClickCooldownMs) return;
+      const button = projectShowAllButton(projectList);
+      if (!(button instanceof HTMLElement) || typeof button.click !== "function") return;
+      projectRunningRecoveryClickedAt.set(projectList, now);
+      try {
+        button.click();
+      } catch {
+        projectRunningRecoveryClickedAt.delete(projectList);
+      }
+    });
   };
 
   const placeThreadUpdatedAt = (row, label) => {
@@ -2352,6 +2486,7 @@
     installSessionDeleteButtons(root);
     installProjectImportButtons(root);
     installThreadUpdatedTimes(root);
+    recoverHiddenRunningThreads(root);
     installMessageSelection(root);
     if (syncTitles) syncSidebarTitles(root);
   };
@@ -2368,6 +2503,7 @@
   window.__codeyInstallThreadUpdatedTimes = installThreadUpdatedTimes;
   window.__codeyHasNativeThreadStatus = hasNativeThreadStatus;
   window.__codeyUpdateThreadRunningPriority = updateThreadRunningPriority;
+  window.__codeyRecoverHiddenRunningThreads = recoverHiddenRunningThreads;
   window.__codeyRefreshRecentLocalSessions = refreshRecentLocalSessions;
   window.__codeyExportSession = exportSession;
   window.__codeyImportSessionFile = importSessionFile;
@@ -2537,6 +2673,7 @@
     attributes: true,
     attributeFilter: [
       "aria-label",
+      "aria-expanded",
       "aria-hidden",
       "data-turn-key",
       "data-request-user-input-auto-resolution-conversation-id",
@@ -2545,7 +2682,9 @@
       "data-app-action-sidebar-thread-kind",
       "data-app-action-sidebar-thread-title",
       "data-app-action-sidebar-project-id",
+      "data-app-action-sidebar-project-list-id",
       "data-app-action-sidebar-project-row",
+      sidebarProjectShowAllAttribute,
       "data-testid",
       "disabled",
       "hidden",

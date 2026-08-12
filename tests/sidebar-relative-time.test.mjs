@@ -63,6 +63,8 @@ class FakeElement {
     if (/^[a-z]+$/i.test(selector)) return this.tagName.toLowerCase() === selector.toLowerCase();
     const classContains = selector.match(/^\[class\*=(['"]?)([^\]'"]+)\1\]$/)?.[2];
     if (classContains) return String(this.className || "").includes(classContains);
+    const attributeEquals = selector.match(/^\[([^=\]]+)=(['"]?)([^\]'" ]+)\2\]$/);
+    if (attributeEquals) return this.getAttribute(attributeEquals[1]) === attributeEquals[3];
     const attribute = selector.match(/^\[([^\]]+)\]$/)?.[1];
     return attribute ? this.hasAttribute(attribute) : false;
   }
@@ -232,6 +234,26 @@ function sidebarThreadEntry({ running = false, sessionId = "" } = {}) {
     row,
     spinner,
   };
+}
+
+function sidebarProjectList({ projectId = "project-1", showAll = false } = {}) {
+  const projectItem = new FakeElement();
+  projectItem.setAttribute("role", "listitem");
+  const projectRow = new FakeElement();
+  projectRow.setAttribute("data-app-action-sidebar-project-row", "");
+  projectRow.setAttribute("data-app-action-sidebar-project-id", projectId);
+  const toggle = new FakeElement("button");
+  toggle.setAttribute("aria-expanded", "true");
+  projectRow.appendChild(toggle);
+  const projectList = new FakeElement();
+  projectList.setAttribute("data-app-action-sidebar-project-list-id", projectId);
+  projectList.setAttribute("data-app-action-sidebar-project-show-all", String(showAll));
+  const list = new FakeElement();
+  list.setAttribute("role", "list");
+  projectList.appendChild(list);
+  projectItem.appendChild(projectRow);
+  projectItem.appendChild(projectList);
+  return { list, projectItem, projectList, projectRow, toggle };
 }
 
 test("formats compact relative times for the sidebar", () => {
@@ -510,6 +532,91 @@ test("keeps running priority while a placeholder thread receives its canonical i
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(running.item.getAttribute("data-codey-thread-running"), "true");
+});
+
+test("reveals a paginated running thread when its project is expanded", () => {
+  const sessionId = "client-new-thread:hidden-running";
+  const project = sidebarProjectList({ projectId: "project-running" });
+  const running = sidebarThreadEntry({ running: true, sessionId });
+  project.list.appendChild(running.item);
+  project.projectList.__reactFiber$test = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: {
+        threadKeys: [
+          ...Array.from({ length: 5 }, (_, index) => `local:client-new-thread:idle-${index}`),
+          `local:${sessionId}`,
+        ],
+      },
+      return: null,
+    },
+  };
+  const { window } = loadInjection({ rows: [running.row] });
+  const replacement = sidebarThreadEntry({ running: true, sessionId });
+  running.item.remove();
+  Array.from({ length: 5 }, (_, index) => sidebarThreadEntry({
+    sessionId: `client-new-thread:idle-${index}`,
+  })).forEach((entry) => project.list.appendChild(entry.item));
+  const footer = new FakeElement();
+  footer.setAttribute("role", "listitem");
+  const showAllButton = new FakeElement("button");
+  showAllButton.textContent = "展开显示";
+  let clicks = 0;
+  showAllButton.click = () => {
+    clicks += 1;
+    project.projectList.setAttribute("data-app-action-sidebar-project-show-all", "true");
+    footer.remove();
+    project.list.appendChild(replacement.item);
+  };
+  footer.appendChild(showAllButton);
+  project.list.appendChild(footer);
+
+  project.toggle.setAttribute("aria-expanded", "false");
+  window.__codeyRecoverHiddenRunningThreads(project.projectRow);
+  assert.equal(clicks, 0);
+
+  project.toggle.setAttribute("aria-expanded", "true");
+  window.__codeyRecoverHiddenRunningThreads(project.projectRow);
+
+  assert.equal(clicks, 1);
+  assert.equal(
+    project.projectList.getAttribute("data-app-action-sidebar-project-show-all"),
+    "true",
+  );
+  window.__codeyInstallThreadUpdatedTimes(project.projectList);
+  assert.equal(replacement.item.getAttribute("data-codey-thread-running"), "true");
+});
+
+test("does not expand a project that has no hidden running thread", () => {
+  const runningProject = sidebarProjectList({ projectId: "project-running" });
+  const running = sidebarThreadEntry({
+    running: true,
+    sessionId: "client-new-thread:running-elsewhere",
+  });
+  runningProject.list.appendChild(running.item);
+  const { window } = loadInjection({ rows: [running.row] });
+  const idleProject = sidebarProjectList({ projectId: "project-idle" });
+  idleProject.projectList.__reactFiber$test = {
+    memoizedProps: {},
+    return: {
+      memoizedProps: { threadKeys: ["local:client-new-thread:idle-hidden"] },
+      return: null,
+    },
+  };
+  const footer = new FakeElement();
+  footer.setAttribute("role", "listitem");
+  const showAllButton = new FakeElement("button");
+  showAllButton.textContent = "展开显示";
+  let clicks = 0;
+  showAllButton.click = () => {
+    clicks += 1;
+  };
+  footer.appendChild(showAllButton);
+  idleProject.list.appendChild(footer);
+
+  window.__codeyRecoverHiddenRunningThreads(idleProject.projectList);
+
+  assert.equal(clicks, 0);
 });
 
 test("refreshes the official timestamp when a running thread completes", async () => {
@@ -1146,6 +1253,9 @@ test("injects time styles that coexist with native statuses and yield to sidebar
   assert.match(source, /threadUpdatedAtAttribute = "data-codey-thread-updated-at"/);
   assert.match(source, /threadRunningAttribute = "data-codey-thread-running"/);
   assert.match(source, /threadRunningLossGraceMs = 2_000/);
+  assert.match(source, /sidebarProjectShowAllAttribute = "data-app-action-sidebar-project-show-all"/);
+  assert.match(source, /projectThreadSessionIdsFromReact/);
+  assert.match(source, /recoverHiddenRunningThreads\(root\)/);
   assert.doesNotMatch(source, /threadSortOrderAttribute|data-codey-thread-sort-order/);
   assert.doesNotMatch(source, /--codey-thread-sort-order|thread-sort-keys/);
   assert.match(source, /threadRunningAttribute\}="true"\].*order: -1 !important/s);
@@ -1162,6 +1272,7 @@ test("injects time styles that coexist with native statuses and yield to sidebar
   assert.match(source, /placeThreadUpdatedAt\(row, label\)/);
   assert.match(source, /mount\.insertBefore\(label, before\)/);
   assert.match(source, /"aria-hidden",/);
+  assert.match(source, /"aria-expanded",/);
   assert.match(source, /"disabled",\s*"hidden",\s*"class",/);
   assert.doesNotMatch(source, /"class",\s*"style",/);
   assert.match(source, /sidebar-thread-row\]:hover \[\$\{threadUpdatedAtAttribute\}\].*opacity: 0/s);
