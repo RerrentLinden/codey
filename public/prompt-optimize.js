@@ -65,6 +65,10 @@
     style.id = styleId;
     style.textContent = `
       #${buttonId} {
+        --codey-ai-foreground: linear-gradient(278deg, #e945ff 0%, #a647ff 30%, #6b61ff 60%, #2e8cff 100%);
+        --codey-ai-surface: linear-gradient(278deg, #eff7ff 0%, #f4f4ff 30%, #f8edff 60%, #fff2ff 100%);
+        --codey-ai-surface-hover: linear-gradient(278deg, #d5ebff 0%, #dfe0ff 30%, #f2daff 60%, #ffdbfe 100%);
+        --codey-ai-surface-active: linear-gradient(278deg, #abd5ff 0%, #c1c0ff 30%, #e3b5ff 60%, #feb5ff 100%);
         -webkit-app-region: no-drag !important;
         pointer-events: auto !important;
         position: relative !important;
@@ -72,28 +76,30 @@
         display: none;
         flex: 0 0 auto;
         align-items: center;
-        gap: 4px;
+        justify-content: center;
+        gap: 5px;
         box-sizing: border-box;
-        min-height: 28px !important;
-        height: 28px !important;
+        min-height: 30px !important;
+        height: 30px !important;
         margin: 0 6px 0 0;
-        padding: 0 8px;
+        padding: 0 11px;
         border: 0;
         border-radius: 999px;
-        background: rgba(30, 30, 30, .92);
-        color: #f5f5f5;
-        font: 12px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: var(--codey-ai-surface);
+        color: #8244ed;
+        font: 600 13px/16px system-ui, -apple-system, "Segoe UI", sans-serif;
         cursor: pointer;
         user-select: none;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, .35);
-        opacity: .88;
-        transition: opacity .15s ease, transform .15s ease;
+        box-shadow: 0 1px 2px rgba(65, 51, 104, .1);
+        transition: box-shadow .15s ease, opacity .15s ease, transform .1s ease;
       }
-      #${buttonId}:hover { opacity: 1; }
-      #${buttonId}:active { transform: translateY(1px); }
-      #${buttonId}:disabled { cursor: not-allowed; box-shadow: none; opacity: .42; }
-      #${buttonId}[data-busy="true"] { cursor: wait; opacity: .7; }
-      #${buttonId} svg { flex: 0 0 auto; width: 12px; height: 12px; }
+      #${buttonId}:hover { background: var(--codey-ai-surface-hover); box-shadow: 0 2px 5px rgba(65, 51, 104, .14); }
+      #${buttonId}:focus-visible { outline: 2px solid rgba(166, 71, 255, .55); outline-offset: 2px; }
+      #${buttonId}:active { background: var(--codey-ai-surface-active); transform: translateY(1px); }
+      #${buttonId}:disabled { cursor: not-allowed; background: var(--codey-ai-surface); box-shadow: none; opacity: .45; transform: none; }
+      #${buttonId}[data-busy="true"] { cursor: wait; opacity: .72; }
+      #${buttonId} svg { flex: 0 0 auto; width: 14px; height: 14px; }
+      #${buttonId} > span { background: var(--codey-ai-foreground); background-clip: text; -webkit-background-clip: text; color: transparent; -webkit-text-fill-color: transparent; }
       #${buttonId} [data-codey-optimize-spinner] { display: none; animation: codey-prompt-optimize-spin .75s linear infinite; }
       #${buttonId}[data-busy="true"] [data-codey-optimize-icon] { display: none; }
       #${buttonId}[data-busy="true"] [data-codey-optimize-spinner] { display: block; }
@@ -114,10 +120,17 @@
     element.setAttribute("aria-busy", "false");
     element.disabled = true;
     element.innerHTML = `
-      <svg data-codey-optimize-icon viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none"
-        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"></path>
-        <path d="M19 15l.9 2.4L22 18l-2.1.9L19 21l-.9-2.1L16 18l2.1-.6z"></path>
+      <svg data-codey-optimize-icon viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <defs>
+          <linearGradient id="codey-prompt-optimize-ai-gradient" x1="2" y1="12" x2="22" y2="12" gradientUnits="userSpaceOnUse">
+            <stop offset="0" stop-color="#e945ff"></stop>
+            <stop offset=".3" stop-color="#a647ff"></stop>
+            <stop offset=".6" stop-color="#6b61ff"></stop>
+            <stop offset="1" stop-color="#2e8cff"></stop>
+          </linearGradient>
+        </defs>
+        <path fill="url(#codey-prompt-optimize-ai-gradient)" d="M8.5 2.5l1.6 4.4 4.4 1.6-4.4 1.6-1.6 4.4-1.6-4.4-4.4-1.6 4.4-1.6 1.6-4.4Z"></path>
+        <path fill="url(#codey-prompt-optimize-ai-gradient)" d="M17.5 12.5l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6Z"></path>
       </svg>
       <svg data-codey-optimize-spinner viewBox="0 0 24 24" aria-hidden="true" focusable="false" fill="none"
         stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
