@@ -278,6 +278,7 @@ pub async fn fetch_models_resolved(
     Err("服务端没有返回可用模型".to_string())
 }
 
+#[cfg(test)]
 fn extract_model_ids(value: &Value) -> Vec<String> {
     extract_model_ids_with_recognition(value).1
 }
@@ -643,6 +644,7 @@ async fn parse_optimized_response(
 
 /// Extracts `choices[0].message.content`, accepting both the plain string
 /// form and the newer part-array form (`{type:"text",text:...}`).
+#[cfg(test)]
 fn extract_optimized_text(response: &Value) -> Option<String> {
     let content = response.pointer("/choices/0/message/content")?;
     match content {
