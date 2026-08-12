@@ -1,7 +1,4 @@
-import type {
-  CrashpadPendingStats,
-  TraceLogStats,
-} from "./TraceLogModule";
+import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
 import type { NotificationChannel } from "./notifications/types";
 
 export type Profile = {

@@ -13,6 +13,7 @@ use reqwest::{
 use serde_json::{Value, json};
 
 use crate::config::PromptOptimizationConfig;
+use crate::model_list::{self, ModelEndpointError};
 
 /// Built-in optimizer instruction used when the user leaves the custom
 /// instruction empty. The model must return only the rewritten prompt so the
@@ -165,37 +166,12 @@ fn models_endpoints_from_base(base_url: &str) -> Result<Vec<String>, String> {
     if base_url.is_empty() {
         return Err("请先配置 OpenAI 兼容 API 地址".to_string());
     }
-    let mut url =
-        reqwest::Url::parse(base_url).map_err(|_| "API 地址不是有效的 HTTP(S) 地址".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err("API 地址必须是有效的 HTTP(S) 地址".to_string());
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    let mut path = url.path().trim_end_matches('/').to_string();
-    let mut base = url.as_str().trim_end_matches('/').to_string();
-    for suffix in ["/chat/completions", "/responses"] {
-        if path.to_ascii_lowercase().ends_with(suffix) {
-            path.truncate(path.len() - suffix.len());
-            base.truncate(base.len() - suffix.len());
-            break;
+    model_list::model_endpoints(base_url, false, true).map_err(|error| match error {
+        ModelEndpointError::InvalidUrl => "API 地址不是有效的 HTTP(S) 地址".to_string(),
+        ModelEndpointError::UnsupportedSchemeOrHost => {
+            "API 地址必须是有效的 HTTP(S) 地址".to_string()
         }
-    }
-    let last_segment = path.rsplit('/').next().unwrap_or_default();
-    if last_segment.eq_ignore_ascii_case("models") {
-        Ok(vec![base])
-    } else if has_version_suffix(last_segment) {
-        Ok(vec![format!("{base}/models")])
-    } else {
-        Ok(vec![format!("{base}/v1/models"), format!("{base}/models")])
-    }
-}
-
-fn has_version_suffix(segment: &str) -> bool {
-    segment
-        .strip_prefix('v')
-        .or_else(|| segment.strip_prefix('V'))
-        .is_some_and(|version| version.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+    })
 }
 
 /// Fetches the model IDs advertised by the configured OpenAI-compatible
@@ -298,52 +274,12 @@ fn parse_model_ids(body: &[u8]) -> Result<Vec<String>, ModelListBodyError> {
 fn extract_model_ids_with_recognition(value: &Value) -> (bool, Vec<String>) {
     let mut seen = std::collections::HashSet::new();
     let mut models = Vec::new();
-    let recognized = match value {
-        Value::Array(items) => {
-            collect_model_ids(items, &mut seen, &mut models);
-            true
-        }
-        Value::Object(object) => {
-            let mut recognized = false;
-            for key in ["data", "models", "items"] {
-                if let Some(items) = object.get(key).and_then(Value::as_array) {
-                    recognized = true;
-                    collect_model_ids(items, &mut seen, &mut models);
-                }
-            }
-            if !recognized && let Some(id) = model_id_value(value) {
-                push_model_id(id, &mut seen, &mut models);
-                recognized = true;
-            }
-            recognized
-        }
-        _ => false,
-    };
-    (recognized, models)
-}
-
-fn collect_model_ids(
-    items: &[Value],
-    seen: &mut std::collections::HashSet<String>,
-    models: &mut Vec<String>,
-) {
-    for item in items {
-        if let Some(id) = model_id_value(item) {
-            push_model_id(id, seen, models);
-        }
-        if models.len() >= MAX_MODELS {
-            break;
-        }
-    }
-}
-
-fn model_id_value(value: &Value) -> Option<&str> {
-    value.as_str().or_else(|| {
-        let object = value.as_object()?;
-        ["id", "name", "slug", "model"]
-            .iter()
-            .find_map(|key| object.get(*key).and_then(Value::as_str))
+    let recognized = model_list::visit_model_ids(value, &mut |id| {
+        push_model_id(id, &mut seen, &mut models);
+        Result::<bool, std::convert::Infallible>::Ok(models.len() < MAX_MODELS)
     })
+    .unwrap_or_else(|never| match never {});
+    (recognized, models)
 }
 
 fn push_model_id(id: &str, seen: &mut std::collections::HashSet<String>, models: &mut Vec<String>) {
@@ -856,6 +792,13 @@ mod tests {
                 "https://api.example.com/models",
             ]
         );
+        assert_eq!(
+            models_endpoints_from_base("https://api.example.com#").unwrap(),
+            [
+                "https://api.example.com/v1/models",
+                "https://api.example.com/models",
+            ]
+        );
         config.base_url = "https://api.example.com/v1/responses".to_string();
         assert_eq!(
             models_endpoint(&config).unwrap(),
@@ -879,6 +822,10 @@ mod tests {
         });
         let models = extract_model_ids(&response);
         assert_eq!(models, ["model-a", "model-b", "model-c"]);
+        assert_eq!(
+            extract_model_ids(&json!({"models": ["Provider-A", "provider-a"]})),
+            ["Provider-A", "provider-a"]
+        );
 
         assert_eq!(
             extract_model_ids(&json!({"object": "list"})),

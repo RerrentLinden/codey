@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::config::ProviderProfile;
 use crate::model_id;
+use crate::model_list::{self, ModelEndpointError};
 
 const PROVIDER_MODEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const MAX_PROVIDER_MODEL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -141,38 +142,12 @@ async fn read_bounded_body(mut response: reqwest::Response, endpoint: &str) -> R
 }
 
 fn model_endpoints(base: &str) -> Result<Vec<String>> {
-    let skip_version_prefix = base.trim().ends_with('#');
-    let cleaned_base = base.trim().trim_end_matches('#').trim_end_matches('/');
-    let mut url = reqwest::Url::parse(cleaned_base).context("API 地址格式无效")?;
-    if !matches!(url.scheme(), "http" | "https") {
-        anyhow::bail!("API 地址仅支持 HTTP 或 HTTPS");
-    }
-    url.set_query(None);
-    url.set_fragment(None);
-    let mut path = url.path().trim_end_matches('/').to_string();
-    let mut base = url.as_str().trim_end_matches('/').to_string();
-    for suffix in ["/chat/completions", "/responses"] {
-        if path.to_ascii_lowercase().ends_with(suffix) {
-            path.truncate(path.len() - suffix.len());
-            base.truncate(base.len() - suffix.len());
-            break;
+    model_list::model_endpoints(base, true, false).map_err(|error| match error {
+        ModelEndpointError::InvalidUrl => anyhow::anyhow!("API 地址格式无效"),
+        ModelEndpointError::UnsupportedSchemeOrHost => {
+            anyhow::anyhow!("API 地址仅支持 HTTP 或 HTTPS")
         }
-    }
-    let last_segment = path.rsplit('/').next().unwrap_or_default();
-    Ok(if last_segment.eq_ignore_ascii_case("models") {
-        vec![base]
-    } else if skip_version_prefix || has_version_suffix(last_segment) {
-        vec![format!("{base}/models")]
-    } else {
-        vec![format!("{base}/v1/models"), format!("{base}/models")]
     })
-}
-
-fn has_version_suffix(segment: &str) -> bool {
-    segment
-        .strip_prefix('v')
-        .or_else(|| segment.strip_prefix('V'))
-        .is_some_and(|version| version.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
 }
 
 fn model_ids(body: &[u8]) -> std::result::Result<Vec<String>, ModelListError> {
@@ -187,45 +162,16 @@ fn model_ids_with_limits(
     let value = serde_json::from_slice::<Value>(body).map_err(ModelListError::InvalidJson)?;
     let mut models = Vec::new();
     let mut seen = HashSet::<String>::new();
-    let recognized = match &value {
-        Value::Array(items) => {
-            collect_model_items(
-                items,
-                &mut models,
-                &mut seen,
-                max_models,
-                max_model_id_bytes,
-            )?;
-            true
-        }
-        Value::Object(object) => {
-            let mut recognized = false;
-            for key in ["data", "models", "items"] {
-                if let Some(items) = object.get(key).and_then(Value::as_array) {
-                    recognized = true;
-                    collect_model_items(
-                        items,
-                        &mut models,
-                        &mut seen,
-                        max_models,
-                        max_model_id_bytes,
-                    )?;
-                }
-            }
-            if !recognized && let Some(model) = model_id_value(&value) {
-                push_model_id(
-                    model,
-                    &mut models,
-                    &mut seen,
-                    max_models,
-                    max_model_id_bytes,
-                )?;
-                recognized = true;
-            }
-            recognized
-        }
-        _ => false,
-    };
+    let recognized = model_list::visit_model_ids(&value, &mut |model| {
+        push_model_id(
+            model,
+            &mut models,
+            &mut seen,
+            max_models,
+            max_model_id_bytes,
+        )?;
+        Ok(true)
+    })?;
     if !recognized {
         return Err(ModelListError::UnsupportedFormat);
     }
@@ -233,30 +179,6 @@ fn model_ids_with_limits(
         return Err(ModelListError::Empty);
     }
     Ok(models)
-}
-
-fn collect_model_items(
-    items: &[Value],
-    models: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-    max_models: usize,
-    max_model_id_bytes: usize,
-) -> std::result::Result<(), ModelListError> {
-    for item in items {
-        if let Some(model) = model_id_value(item) {
-            push_model_id(model, models, seen, max_models, max_model_id_bytes)?;
-        }
-    }
-    Ok(())
-}
-
-fn model_id_value(value: &Value) -> Option<&str> {
-    value.as_str().or_else(|| {
-        let object = value.as_object()?;
-        ["id", "name", "slug", "model"]
-            .iter()
-            .find_map(|key| object.get(*key).and_then(Value::as_str))
-    })
 }
 
 fn push_model_id(

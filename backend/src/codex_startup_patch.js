@@ -1350,7 +1350,20 @@
   if (!NativeWorker.__codeyNoInspectWrapper) {
     const EventEmitter = process.getBuiltinModule("events").EventEmitter;
     const maximumWmiWorkerSourceBytes = 2 * 1024 * 1024;
+    const maximumWmiWorkerSourceCacheEntries = 256;
     const workerSourceMatchCache = new Map();
+    const rememberWorkerSourceMatch = (key, value) => {
+      if (!key) return;
+      workerSourceMatchCache.delete(key);
+      workerSourceMatchCache.set(key, value);
+      while (
+        workerSourceMatchCache.size > maximumWmiWorkerSourceCacheEntries
+      ) {
+        const oldestKey = workerSourceMatchCache.keys().next().value;
+        if (oldestKey === undefined) break;
+        workerSourceMatchCache.delete(oldestKey);
+      }
+    };
     const workerSpecifierText = (filename) => {
       if (typeof filename === "string") return filename;
       if (typeof filename?.href === "string") return filename.href;
@@ -1457,7 +1470,7 @@
       try {
         const loaded = readWorkerSource(filename, options);
         if (!loaded) {
-          if (cacheKey) workerSourceMatchCache.set(cacheKey, null);
+          rememberWorkerSourceMatch(cacheKey, null);
           return null;
         }
         windowsWmiSamplerEvidence.sourceInspections += 1;
@@ -1465,18 +1478,16 @@
         if (matched) {
           windowsWmiSamplerEvidence.sourceSignatureMatches += 1;
           const match = { reason: "source-signature", workerName };
-          if (loaded.cacheKey) {
-            workerSourceMatchCache.set(loaded.cacheKey, match);
-          }
+          rememberWorkerSourceMatch(loaded.cacheKey, match);
           if (cacheKey && cacheKey !== loaded.cacheKey) {
-            workerSourceMatchCache.set(cacheKey, match);
+            rememberWorkerSourceMatch(cacheKey, match);
           }
           return match;
         }
         windowsWmiSamplerEvidence.sourceSignatureMisses += 1;
-        if (loaded.cacheKey) workerSourceMatchCache.set(loaded.cacheKey, null);
+        rememberWorkerSourceMatch(loaded.cacheKey, null);
         if (cacheKey && cacheKey !== loaded.cacheKey) {
-          workerSourceMatchCache.set(cacheKey, null);
+          rememberWorkerSourceMatch(cacheKey, null);
         }
       } catch {
         windowsWmiSamplerEvidence.sourceReadFailures += 1;

@@ -388,16 +388,23 @@ pub(super) async fn prepare_codex_for_launch(app_dir: &std::path::Path) -> Resul
     // relaunch it under Codey instead of leaving the user to quit it manually.
     #[cfg(windows)]
     {
-        let executable = codey_runtime_core::app_paths::build_codex_executable(app_dir);
-        let executable = std::fs::canonicalize(&executable).unwrap_or(executable);
-        let executable = normalized_windows_path(&executable);
-        let already_running = codey_runtime_core::windows_enumerate_processes()
-            .into_iter()
-            .filter_map(|process| process.executable_path)
-            .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
-            .any(|path| normalized_windows_path(&path) == executable);
+        let app_dir = app_dir.to_path_buf();
+        let process_scan_app_dir = app_dir.clone();
+        let already_running = tokio::task::spawn_blocking(move || {
+            let executable =
+                codey_runtime_core::app_paths::build_codex_executable(&process_scan_app_dir);
+            let executable = std::fs::canonicalize(&executable).unwrap_or(executable);
+            let executable = normalized_windows_path(&executable);
+            codey_runtime_core::windows_enumerate_processes()
+                .into_iter()
+                .filter_map(|process| process.executable_path)
+                .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+                .any(|path| normalized_windows_path(&path) == executable)
+        })
+        .await
+        .context("检测正在运行的 Codex 任务异常退出")?;
         if already_running {
-            terminate_windows_codex_processes(app_dir, None)
+            terminate_windows_codex_processes(&app_dir, None)
                 .await
                 .context("停止正在运行的 Codex 失败")?;
         }

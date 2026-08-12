@@ -12,40 +12,8 @@ import {
 } from "@tabler/icons-react";
 
 import { Badge, Button, Card } from "./components/semi";
-
-export type TraceLogStats = {
-  pending: boolean;
-  capturedAt: number;
-  databasesFound: number;
-  databasesScanned: number;
-  databaseBytes: number;
-  rowCount: number;
-  estimatedLogBytes: number;
-  oldestTimestamp?: number;
-  newestTimestamp?: number;
-  errors: string[];
-};
-
-export type CrashpadPendingStats = {
-  pending: boolean;
-  capturedAt: number;
-  directoriesFound: number;
-  reportsFound: number;
-  completeReports: number;
-  filesFound: number;
-  managedFiles: number;
-  orphanFiles: number;
-  unmanagedFiles: number;
-  pendingBytes: number;
-  managedBytes: number;
-  oldestTimestamp?: number;
-  newestTimestamp?: number;
-  hardLimitBytes: number;
-  targetBytes: number;
-  overLimit: boolean;
-  protectionEnabled: boolean;
-  errors: string[];
-};
+import { formatBytes } from "./formatters";
+import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
 
 type TraceLogModuleProps = {
   stats?: TraceLogStats;
@@ -74,14 +42,6 @@ const rangeDateFormatter = new Intl.DateTimeFormat("zh-CN", {
   month: "2-digit",
   day: "2-digit",
 });
-
-export function formatBytes(bytes: number): string {
-  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-  const value = bytes / (1024 ** index);
-  return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
-}
 
 function formatCount(value: number): string {
   return countFormatter.format(Number.isFinite(value) ? value : 0);

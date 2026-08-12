@@ -855,7 +855,7 @@ fn spawn_injection_watchdog(
     let (shutdown, mut shutdown_rx) = oneshot::channel();
     let watchdog_statuses = statuses.clone();
     let watchdog_websocket_url = websocket_url.clone();
-    let watchdog_scripts = injection_scripts.clone();
+    let watchdog_scripts = injection_scripts;
     let task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(CDP_WATCHDOG_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

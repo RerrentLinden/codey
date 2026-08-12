@@ -16,7 +16,7 @@ import type {
   UpdateDownload,
 } from "./App.types";
 import { errorText, withTimeout } from "./appUtils";
-import { formatBytes } from "./TraceLogModule";
+import { formatBytes } from "./formatters";
 
 const UPDATE_AVAILABLE_EVENT = "codey-update-availability-changed";
 const AUTO_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;

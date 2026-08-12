@@ -39,7 +39,7 @@ pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Valu
     let cc_switch = sync_cc_switch_state(state).await?;
     let config = state.config.read().await.clone();
     let restart_required = runtime_config_requires_restart(state, &config).await;
-    let model_state = current_model_state(&config)?;
+    let model_state = current_model_state_async(&config).await?;
     let public_config = redacted_config(&config);
     Ok(json!({
         "status":"ok",
@@ -411,19 +411,11 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
         true,
         &codex_home(),
     );
-    let pre_refresh_model_state = current_model_state(&next)?;
-    let catalog_refresh = should_refresh_model_catalog(&pre_refresh_model_state)
-        .then(|| refresh_model_catalog_for_provider_sync(&next))
-        .transpose()?;
-    let validated_model_state = current_model_state(&next)?;
-    subagent_policy::reconcile_with_model_state(&mut next, Some(&validated_model_state));
+    let (catalog_refresh, model_state) = refreshed_model_state_async(&next, true).await?;
+    subagent_policy::reconcile_with_model_state(&mut next, Some(&model_state));
     next = next.normalize();
-    let model_state = current_model_state(&next)?;
     if let Err(error) = save_config_to_store(state, &next).await {
-        return Err(rollback_model_catalog_after_config_save(
-            catalog_refresh,
-            error,
-        ));
+        return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
     }
     let model_catalog_fallback = catalog_refresh
         .as_ref()
@@ -536,19 +528,16 @@ pub async fn save_selected_models(
         }
     }
     config = config.normalize();
-    let catalog_refresh = refresh_model_catalog_or_fallback(&config)?;
-    let validated_model_state = current_model_state(&config)?;
-    subagent_policy::reconcile_with_model_state(&mut config, Some(&validated_model_state));
+    let (catalog_refresh, model_state) = refreshed_model_state_async(&config, false).await?;
+    subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     config = config.normalize();
     if let Err(error) = save_config_to_store(state, &config).await {
-        return Err(rollback_model_catalog_after_config_save(
-            Some(catalog_refresh),
-            error,
-        ));
+        return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
     }
-    let model_catalog_fallback = catalog_refresh.fallback;
+    let model_catalog_fallback = catalog_refresh
+        .as_ref()
+        .is_some_and(|refresh| refresh.fallback);
     *state.config.write().await = config.clone();
-    let model_state = current_model_state(&config)?;
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
     let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
@@ -727,7 +716,7 @@ pub async fn save_default_model(
     if requested_model.is_empty() {
         return Err("默认模型不能为空".to_string());
     }
-    let model_state = current_model_state(&config)?;
+    let mut model_state = current_model_state_async(&config).await?;
     let canonical_model = model_state
         .official_models
         .iter()
@@ -748,11 +737,13 @@ pub async fn save_default_model(
         .to_string();
     config
         .default_model_by_provider
-        .insert(provider_id, canonical_model);
+        .insert(provider_id, canonical_model.clone());
     config = config.normalize();
     save_config_to_store(state, &config).await?;
     *state.config.write().await = config.clone();
-    let model_state = current_model_state(&config)?;
+    // The requested model was canonicalized against this exact selection state;
+    // changing only the provider default cannot alter the available model lists.
+    model_state.default_model = canonical_model;
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
     let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
@@ -827,9 +818,27 @@ pub(super) fn current_model_state(
     .map_err(|error| error.to_string())
 }
 
-pub(super) fn current_renderer_model_catalog(config: &CodeyConfig) -> Result<Value, String> {
+pub(super) async fn current_model_state_async(
+    config: &CodeyConfig,
+) -> Result<model_catalog::ModelSelectionState, String> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || current_model_state(&config))
+        .await
+        .map_err(|error| format!("读取 Codey 模型目录的任务异常退出：{error}"))?
+}
+
+fn current_renderer_model_catalog(config: &CodeyConfig) -> Result<Value, String> {
     let model_state = current_model_state(config)?;
     Ok(renderer_model_catalog_value(config, &model_state))
+}
+
+pub(super) async fn current_renderer_model_catalog_async(
+    config: &CodeyConfig,
+) -> Result<Value, String> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || current_renderer_model_catalog(&config))
+        .await
+        .map_err(|error| format!("读取渲染进程模型目录的任务异常退出：{error}"))?
 }
 
 pub(super) fn provider_route_requires_restart(
@@ -910,12 +919,6 @@ struct ModelCatalogRefresh {
     snapshot: model_catalog::CatalogSnapshot,
 }
 
-fn refresh_model_catalog_for_provider_sync(
-    config: &CodeyConfig,
-) -> Result<ModelCatalogRefresh, String> {
-    refresh_model_catalog_or_fallback(config)
-}
-
 fn refresh_model_catalog_or_fallback(config: &CodeyConfig) -> Result<ModelCatalogRefresh, String> {
     let home = codex_home();
     let snapshot = model_catalog::snapshot(&home).map_err(|error| error.to_string())?;
@@ -926,22 +929,42 @@ fn refresh_model_catalog_or_fallback(config: &CodeyConfig) -> Result<ModelCatalo
     }
 }
 
+async fn refreshed_model_state_async(
+    config: &CodeyConfig,
+    refresh_only_when_populated: bool,
+) -> Result<
+    (
+        Option<ModelCatalogRefresh>,
+        model_catalog::ModelSelectionState,
+    ),
+    String,
+> {
+    let config = config.clone();
+    tokio::task::spawn_blocking(move || {
+        let should_refresh = if refresh_only_when_populated {
+            should_refresh_model_catalog(&current_model_state(&config)?)
+        } else {
+            true
+        };
+        let refresh = should_refresh
+            .then(|| refresh_model_catalog_or_fallback(&config))
+            .transpose()?;
+        match current_model_state(&config) {
+            Ok(model_state) => Ok((refresh, model_state)),
+            Err(error) => Err(rollback_model_catalog_after_config_save(refresh, error)),
+        }
+    })
+    .await
+    .map_err(|error| format!("刷新 Codey 模型目录的任务异常退出：{error}"))?
+}
+
 async fn reconcile_current_subagent_defaults(
     state: &Arc<AppState>,
     persistence_base: Option<&CodeyConfig>,
 ) -> Result<(CodeyConfig, bool), String> {
     let _config_write_guard = state.config_write_lock.lock().await;
     let current = state.config.read().await.clone();
-    let catalog_refresh = refresh_model_catalog_or_fallback(&current)?;
-    let model_state = match current_model_state(&current) {
-        Ok(model_state) => model_state,
-        Err(error) => {
-            return Err(rollback_model_catalog_after_config_save(
-                Some(catalog_refresh),
-                error,
-            ));
-        }
-    };
+    let (catalog_refresh, model_state) = refreshed_model_state_async(&current, false).await?;
     let mut next = current.clone();
     subagent_policy::reconcile_with_model_state(&mut next, Some(&model_state));
     next = next.normalize();
@@ -953,10 +976,7 @@ async fn reconcile_current_subagent_defaults(
         |base| config_with_reconciled_subagent_defaults(base, &next),
     );
     if let Err(error) = save_config_to_store(state, &persisted).await {
-        return Err(rollback_model_catalog_after_config_save(
-            Some(catalog_refresh),
-            error,
-        ));
+        return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
     }
     *state.config.write().await = next.clone();
     Ok((next, true))
@@ -985,6 +1005,18 @@ fn rollback_model_catalog_after_config_save(
         Some(refresh) => rollback_model_catalog_snapshot(refresh.snapshot, error),
         None => error,
     }
+}
+
+async fn rollback_model_catalog_after_config_save_async(
+    refresh: Option<ModelCatalogRefresh>,
+    error: String,
+) -> String {
+    let primary_error = error.clone();
+    tokio::task::spawn_blocking(move || rollback_model_catalog_after_config_save(refresh, error))
+        .await
+        .unwrap_or_else(|join_error| {
+            format!("{primary_error}；回滚 Codey 模型目录的任务异常退出：{join_error}")
+        })
 }
 
 fn rollback_model_catalog_snapshot(

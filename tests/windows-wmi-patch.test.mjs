@@ -19,6 +19,18 @@ async function loadPatchExpression() {
     .replaceAll("__FAST_CODEX_STARTUP__", "true");
 }
 
+test("Windows worker source signature cache is bounded", async () => {
+  const source = await loadPatchExpression();
+
+  assert.match(source, /maximumWmiWorkerSourceCacheEntries = 256/);
+  assert.match(source, /const rememberWorkerSourceMatch = \(key, value\) =>/);
+  assert.match(
+    source,
+    /workerSourceMatchCache\.size > maximumWmiWorkerSourceCacheEntries/,
+  );
+  assert.match(source, /workerSourceMatchCache\.delete\(oldestKey\)/);
+});
+
 async function withWindowsPlatform(run) {
   const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
   assert.ok(descriptor?.configurable, "the Node test process platform should be configurable");

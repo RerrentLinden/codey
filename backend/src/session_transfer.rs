@@ -455,17 +455,18 @@ fn import_session_bundle(
         return Err(error);
     }
 
+    let message = if duplicated {
+        format!("已导入“{title}”；原会话已存在，已创建副本")
+    } else {
+        format!("已导入会话“{title}”")
+    };
     Ok(SessionImportResult {
         status: "imported",
-        session_id: session_id.clone(),
-        title: title.clone(),
+        session_id,
+        title,
         project_path: project.to_string_lossy().to_string(),
         duplicated,
-        message: if duplicated {
-            format!("已导入“{title}”；原会话已存在，已创建副本")
-        } else {
-            format!("已导入会话“{title}”")
-        },
+        message,
     })
 }
 

@@ -50,15 +50,19 @@ test("script injection diagnostics report runtime evidence without continuous po
     commands,
     /"refresh_injection_status"\s*=>\s*refresh_injection_status/,
   );
-  assert.match(runtimeHook, /invoke\("refresh_injection_status"\)/);
-  assert.match(runtimeHook, /if \(shouldRefreshInjectionStatus\)/);
+  assert.match(runtimeHook, /refreshInjectionStatus: refreshesInjectionStatus/);
+  assert.match(runtimeHook, /runtimeStatusFlightRef/);
+  assert.equal(
+    runtimeHook.match(/invoke<RuntimeStatus>\("runtime_status"/g)?.length,
+    1,
+  );
   assert.match(runtimeHook, /codey-injection-status-changed/);
   assert.match(runtimeHook, /codey-settings-opened/);
   assert.match(
     overlay,
     /window\.dispatchEvent\(new CustomEvent\(SETTINGS_OPENED_EVENT\)\)/,
   );
-  assert.match(runtimeHook, /injectionStatusRefreshRef/);
+  assert.match(runtimeHook, /type StatusPollTask/);
   assert.match(app, /active: !embedded \|\| modalVisible/);
   assert.match(runtimeHook, /if \(!activeRef\.current\) return/);
   assert.match(
@@ -68,9 +72,9 @@ test("script injection diagnostics report runtime evidence without continuous po
   assert.match(runtimeHook, /STATUS_POLL_MAX_DURATION_MS/);
   assert.match(runtimeHook, /GIT_GUARD_PROBE_MAX_DURATION_MS = 30_000/);
   assert.match(runtimeHook, /WMI_SAMPLER_PROBE_MAX_DURATION_MS = 60_000/);
-  assert.match(runtimeHook, /gitGuardStatus !== "executed"/);
-  assert.match(runtimeHook, /wmiSamplerStatus !== "executed"/);
-  assert.match(runtimeHook, /const next = await refreshInjectionStatus\(\)/);
+  assert.match(runtimeHook, /gitGuardStatus === "executed"/);
+  assert.match(runtimeHook, /wmiSamplerStatus === "executed"/);
+  assert.match(runtimeHook, /dueTasks\.some\(\(task\) => task\.refreshesInjectionStatus\)/);
   assert.match(cdp, /completedEntry\.status === \\"pending\\"/);
   assert.match(pluginFix, /markPluginBridgeEffective/);
   assert.match(pluginFix, /entry\.status = "effective"/);

@@ -9,12 +9,7 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import { invoke } from "./api";
-import {
-  formatBytes,
-  TraceLogModule,
-  type CrashpadPendingStats,
-  type TraceLogStats,
-} from "./TraceLogModule";
+import { TraceLogModule } from "./TraceLogModule";
 import { ModelPickerDialog } from "./AppDialogs";
 import {
   AppUpdateCard,
@@ -26,8 +21,10 @@ import {
 import { NotificationChannelsCard } from "./notifications";
 import type { NotificationChannel } from "./notifications";
 import { errorText, withTimeout } from "./appUtils";
+import { formatBytes } from "./formatters";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { useModelSelection } from "./useModelSelection";
+import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
 import { useNotifications } from "./useNotifications";
 import { useRuntimeStatus } from "./useRuntimeStatus";
 import { useAppUpdates } from "./useAppUpdates";

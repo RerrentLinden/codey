@@ -28,7 +28,7 @@ test("prompt optimization exposes the persisted upstream API format", () => {
 test("prompt optimization refreshes the creatable model picker after fetching", () => {
   assert.match(
     cardSource,
-    /const modelSelectKey = JSON\.stringify\(cloudModels\)/,
+    /const modelSelectKey = useMemo\(\s*\(\) => JSON\.stringify\(cloudModels\)/,
   );
   assert.match(
     cardSource,

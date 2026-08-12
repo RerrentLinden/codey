@@ -1,4 +1,4 @@
-import { memo, useId, useRef, useState } from "react";
+import { memo, useId, useMemo, useRef, useState } from "react";
 
 import {
   IconEye,
@@ -92,16 +92,22 @@ function PromptOptimizationCardComponent({
   const apiKeyTextVisible = apiKeyVisible && !showingSavedApiKey;
   const apiKeyInputId = `${controlId}-api-key`;
   const modelInputId = `${controlId}-model`;
-  const modelSelectOptions = [
-    ...(optimization.model.trim() !== "" &&
-    !cloudModels.includes(optimization.model)
-      ? [{ label: optimization.model, value: optimization.model }]
-      : []),
-    ...cloudModels.map((model) => ({ label: model, value: model })),
-  ];
+  const modelSelectOptions = useMemo(
+    () => [
+      ...(optimization.model.trim() !== "" &&
+      !cloudModels.includes(optimization.model)
+        ? [{ label: optimization.model, value: optimization.model }]
+        : []),
+      ...cloudModels.map((model) => ({ label: model, value: model })),
+    ],
+    [cloudModels, optimization.model],
+  );
   // Semi Select retains stale options when a controlled, creatable Select gets
   // a new optionList. Remount only when the fetched list actually changes.
-  const modelSelectKey = JSON.stringify(cloudModels);
+  const modelSelectKey = useMemo(
+    () => JSON.stringify(cloudModels),
+    [cloudModels],
+  );
 
   const handleApiKeyChange = (value: string) => {
     setRevealedApiKey(null);

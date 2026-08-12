@@ -443,6 +443,36 @@ test("ordinary conversation app requests do not refresh the local plugin marketp
   assert.equal(localCalls.length, 0);
 });
 
+test("plugin response normalization handles cyclic bridge payloads", async () => {
+  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const window = {
+    __codeyLocalPlugins: [],
+    clearTimeout() {},
+    dispatchEvent() {},
+    electronBridge: {
+      sendMessageFromView() {
+        return Promise.resolve({ status: "ok" });
+      },
+    },
+    setTimeout() {
+      return 1;
+    },
+  };
+  window.window = window;
+  vm.runInNewContext(source, {
+    CustomEvent: class {},
+    console,
+    window,
+  });
+  const response = { plugins: [{ id: "local", hidden: true }] };
+  response.self = response;
+
+  const patched = window.__codeyPatchPluginResponse(response);
+
+  assert.equal(patched.self, patched);
+  assert.equal(patched.plugins[0].hidden, false);
+});
+
 test("plugin mutations queue one trailing list refresh while a refresh is in flight", async () => {
   const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
   const listResolvers = [];

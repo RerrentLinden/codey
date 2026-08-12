@@ -449,6 +449,39 @@
     repositionTimer = setTimeout(updateButtonPosition, repositionDelayMs);
   };
 
+  const nodeTouchesTrackedComposer = (node, includeAncestors = false) => {
+    if (!node || typeof node !== "object") return false;
+    const buttonHost = button?.parentElement;
+    return Boolean(
+      node === inputElement ||
+        node === buttonHost ||
+        node === inputElement?.parentElement ||
+        node === buttonHost?.parentElement ||
+        inputElement?.contains?.(node) ||
+        buttonHost?.contains?.(node) ||
+        (includeAncestors &&
+          (node.contains?.(inputElement) || node.contains?.(buttonHost))),
+    );
+  };
+
+  const nodeContainsComposerCandidate = (node) =>
+    Boolean(
+      isComposerInput(node) ||
+        node?.querySelector?.(composerCandidateSelector) ||
+        node?.querySelector?.(composerAnchorSelector),
+    );
+
+  const mutationRequiresComposerScan = (mutation) => {
+    if (!inputElement?.isConnected) return true;
+    if (nodeTouchesTrackedComposer(mutation.target)) return true;
+    if (mutation.type !== "childList") return false;
+    return [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])].some(
+      (node) =>
+        nodeTouchesTrackedComposer(node, true) ||
+        nodeContainsComposerCandidate(node),
+    );
+  };
+
   const loadConfig = () => {
     configLoadAttempts += 1;
     callBridge(settingsPath, {})
@@ -496,7 +529,10 @@
         if (!target) return true;
         if (target === button || target.id === toastId) return false;
         if (target.id === styleId) return false;
-        return !target.closest?.(`#${buttonId}, #${toastId}`);
+        return (
+          !target.closest?.(`#${buttonId}, #${toastId}`) &&
+          mutationRequiresComposerScan(mutation)
+        );
       });
       if (hasExternalMutation) scheduleScan();
     });

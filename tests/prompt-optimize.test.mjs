@@ -101,6 +101,11 @@ class FakeElement {
     return null;
   }
 
+  contains(node) {
+    if (node === this) return true;
+    return this.children.some((child) => child.contains(node));
+  }
+
   querySelectorAll() {
     return [];
   }
@@ -169,6 +174,7 @@ const createEnvironment = (options = {}) => {
       apiKeyConfigured: options.apiKeyConfigured ?? true,
     },
   };
+  let composerQueryCount = 0;
   const optimizeResult = options.optimizeResult ?? {
     optimized: "优化后的提示词",
   };
@@ -314,6 +320,7 @@ const createEnvironment = (options = {}) => {
     querySelector: () => null,
     querySelectorAll: (selector) => {
       if (selector === "[data-above-composer-conversation-id]") {
+        composerQueryCount += 1;
         return options.anchors === false ? [] : [anchor];
       }
       if (
@@ -383,6 +390,7 @@ const createEnvironment = (options = {}) => {
     modelButton,
     scope,
     getElementById: (id) => findById(documentElement, id),
+    getComposerQueryCount: () => composerQueryCount,
     snapshot: () => context.window.__codeyPromptOptimize.snapshot(),
     setConfig: (next) => {
       config = next;
@@ -395,8 +403,8 @@ const createEnvironment = (options = {}) => {
         handler.call(window);
       }
     },
-    emitMutation: () =>
-      latestMutationObserver?.callback([{ target: documentElement }]),
+    emitMutation: (mutations = [{ type: "childList", target: documentElement }]) =>
+      latestMutationObserver?.callback(mutations),
     emitInput: (target = textarea) => {
       for (const handler of documentListeners.get("input") || []) {
         handler.call(document, { type: "input", target });
@@ -574,7 +582,14 @@ test("rescans when a connected composer is replaced during navigation", async ()
   nextInput.innerText = "新对话里的提示词";
   env.scope.appendChild(nextInput);
   env.setFallbackInputs([env.textarea, nextInput]);
-  env.emitMutation();
+  env.emitMutation([
+    {
+      type: "childList",
+      target: env.scope,
+      addedNodes: [nextInput],
+      removedNodes: [],
+    },
+  ]);
   await new Promise((resolve) => setTimeout(resolve, 280));
 
   button.dispatchEvent({
@@ -586,6 +601,28 @@ test("rescans when a connected composer is replaced during navigation", async ()
 
   assert.equal(nextInput.innerText, "优化后的提示词");
   assert.equal(env.textarea.value, "");
+});
+
+test("ignores unrelated DOM mutations while the composer remains connected", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    anchors: false,
+  });
+  await flush();
+  const queryCount = env.getComposerQueryCount();
+  const unrelated = new FakeElement("aside");
+
+  env.emitMutation([
+    {
+      type: "attributes",
+      target: unrelated,
+      attributeName: "class",
+    },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+
+  assert.equal(env.getComposerQueryCount(), queryCount);
 });
 
 test("clicking the button calls the bridge and replaces the composer text", async () => {

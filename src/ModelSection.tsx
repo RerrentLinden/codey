@@ -13,8 +13,11 @@ import {
 import type { CcSwitchStatus, ModelState } from "./App.types";
 import { Badge, Button, Card, Switch } from "./components/semi";
 import { modelIdsEqual, modelKey } from "./modelIds";
-
-const MODEL_SECTION_PAGE_SIZE = 200;
+import {
+  MODEL_PICKER_PAGE_SIZE,
+  nextVisibleModelCount,
+  visibleModelOptions,
+} from "./modelPickerPagination";
 
 type ModelSectionProps = {
   provider: CcSwitchStatus["provider"];
@@ -51,13 +54,17 @@ function ModelSectionComponent({
     0,
   );
   const [visibleThirdPartyCount, setVisibleThirdPartyCount] = useState(
-    MODEL_SECTION_PAGE_SIZE,
+    MODEL_PICKER_PAGE_SIZE,
   );
   useEffect(() => {
-    setVisibleThirdPartyCount(MODEL_SECTION_PAGE_SIZE);
+    setVisibleThirdPartyCount(MODEL_PICKER_PAGE_SIZE);
   }, [provider.id, modelState.thirdPartyModels]);
   const visibleThirdPartyModels = useMemo(
-    () => modelState.thirdPartyModels.slice(0, visibleThirdPartyCount),
+    () =>
+      visibleModelOptions(
+        modelState.thirdPartyModels,
+        visibleThirdPartyCount,
+      ),
     [modelState.thirdPartyModels, visibleThirdPartyCount],
   );
   return (
@@ -283,8 +290,8 @@ function ModelSectionComponent({
                         disabled={isBusy}
                         onClick={() =>
                           setVisibleThirdPartyCount((count) =>
-                            Math.min(
-                              count + MODEL_SECTION_PAGE_SIZE,
+                            nextVisibleModelCount(
+                              count,
                               modelState.thirdPartyModels.length,
                             ),
                           )
@@ -292,7 +299,7 @@ function ModelSectionComponent({
                       >
                         再显示{" "}
                         {Math.min(
-                          MODEL_SECTION_PAGE_SIZE,
+                          MODEL_PICKER_PAGE_SIZE,
                           modelState.thirdPartyModels.length -
                             visibleThirdPartyModels.length,
                         )}{" "}

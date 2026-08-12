@@ -59,9 +59,26 @@
     if (!output.marketplacePath) output.marketplacePath = output.path || output.localPath || output.marketplaceName;
     return output;
   };
-  const mergePlugins = (value) => {
+  const mergePlugins = (
+    value,
+    depth = 0,
+    seen = new WeakMap(),
+    budget = { remaining: 512 },
+  ) => {
+    if (!value || typeof value !== "object") return value;
+    if (seen.has(value)) return seen.get(value);
+    if (depth >= 12 || budget.remaining <= 0) return value;
     if (Array.isArray(value)) {
-      const current = value.map(mergePlugins);
+      const current = [];
+      seen.set(value, current);
+      for (const child of value) {
+        if (budget.remaining <= 0) {
+          current.push(child);
+          continue;
+        }
+        budget.remaining -= 1;
+        current.push(mergePlugins(child, depth + 1, seen, budget));
+      }
       const existing = new Set(current.filter(pluginLike).map((plugin) => plugin.id || `${plugin.name}@${plugin.marketplaceName || ""}`));
       for (const plugin of window.__codeyLocalPlugins || []) {
         const normalized = normalizePlugin(plugin);
@@ -70,10 +87,13 @@
       }
       return current;
     }
-    if (!value || typeof value !== "object") return value;
     const output = normalizePlugin(value);
+    seen.set(value, output);
     for (const [key, child] of Object.entries(output)) {
-      if (child && typeof child === "object") output[key] = mergePlugins(child);
+      if (!child || typeof child !== "object") continue;
+      if (budget.remaining <= 0) break;
+      budget.remaining -= 1;
+      output[key] = mergePlugins(child, depth + 1, seen, budget);
     }
     return output;
   };

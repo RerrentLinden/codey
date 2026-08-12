@@ -14,6 +14,7 @@ mod maintenance_lock;
 mod message_delete;
 mod model_catalog;
 mod model_id;
+mod model_list;
 mod native_update_ui;
 mod notifications;
 mod pending_approval;

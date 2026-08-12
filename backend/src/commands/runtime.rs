@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use codey_runtime_core::app_paths::{codex_app_version, resolve_codex_app_dir_with_saved};
 use serde_json::{Value, json};
@@ -22,6 +22,14 @@ use crate::launcher::{CodeyRuntime, restore_previous_runtime_state, restore_runt
 
 pub(crate) const CC_SWITCH_ROUTE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const CC_SWITCH_ROUTE_RECOVERY_STABLE_READS: u8 = 2;
+const CODEX_APP_VERSION_CACHE_TTL: Duration = Duration::from_secs(30);
+
+pub(super) struct CodexAppVersionCache {
+    runtime_app_path: Option<PathBuf>,
+    configured_app_path: String,
+    version: String,
+    checked_at: Instant,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RestartTrigger {
@@ -51,6 +59,13 @@ pub(crate) async fn cc_switch_route_ready_for_recovery() -> bool {
 }
 
 pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
+    runtime_status_with_options(state, false).await
+}
+
+pub(super) async fn runtime_status_with_options(
+    state: &Arc<AppState>,
+    refresh_injection_status: bool,
+) -> Result<Value, String> {
     let runtime = state.runtime.lock().await.clone();
     // 先在无锁状态取运行时模型基线，再持配置读锁做同步比较：读守卫跨
     // await 会让排队写者阻塞所有新的桥接请求。
@@ -92,7 +107,8 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
     });
     drop(config);
     let codex_app_version =
-        codex_app_version_for_status(runtime_codex_app_path, configured_codex_app_path).await;
+        codex_app_version_for_status(state, runtime_codex_app_path, configured_codex_app_path)
+            .await;
     if let Some(object) = status.as_object_mut() {
         object.insert("codexAppVersion".into(), Value::String(codex_app_version));
     }
@@ -120,7 +136,11 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
             "maintenance".into(),
             serde_json::to_value(&runtime.maintenance).unwrap_or_else(|_| json!({})),
         );
-        let injection_statuses = runtime.injection_statuses.read().await.clone();
+        let injection_statuses = if refresh_injection_status {
+            runtime.refresh_injection_statuses().await
+        } else {
+            runtime.injection_statuses.read().await.clone()
+        };
         let injection_statuses = runtime.injection_statuses_for_display(injection_statuses);
         object.insert(
             "injectionScripts".into(),
@@ -141,14 +161,26 @@ pub async fn runtime_status(state: &Arc<AppState>) -> Result<Value, String> {
 }
 
 async fn codex_app_version_for_status(
+    state: &AppState,
     runtime_app_path: Option<PathBuf>,
     configured_app_path: String,
 ) -> String {
-    tokio::task::spawn_blocking(move || {
-        let configured_app_path = configured_app_path.trim();
+    let mut cache = state.codex_app_version_cache.lock().await;
+    if let Some(cached) = cache.as_ref()
+        && cached.runtime_app_path == runtime_app_path
+        && cached.configured_app_path == configured_app_path
+        && cached.checked_at.elapsed() < CODEX_APP_VERSION_CACHE_TTL
+    {
+        return cached.version.clone();
+    }
+
+    let checked_runtime_app_path = runtime_app_path.clone();
+    let checked_configured_app_path = configured_app_path.clone();
+    let version = tokio::task::spawn_blocking(move || {
+        let configured_app_path = checked_configured_app_path.trim();
         let configured_app_path =
             (!configured_app_path.is_empty()).then(|| PathBuf::from(configured_app_path));
-        let app_dir = runtime_app_path.or_else(|| {
+        let app_dir = checked_runtime_app_path.or_else(|| {
             configured_app_path
                 .as_deref()
                 .and_then(|path| resolve_codex_app_dir_with_saved(Some(path), None))
@@ -159,7 +191,14 @@ async fn codex_app_version_for_status(
             .unwrap_or_default()
     })
     .await
-    .unwrap_or_default()
+    .unwrap_or_default();
+    *cache = Some(CodexAppVersionCache {
+        runtime_app_path,
+        configured_app_path,
+        version: version.clone(),
+        checked_at: Instant::now(),
+    });
+    version
 }
 
 pub(super) async fn refresh_injection_status(state: &Arc<AppState>) -> Result<Value, String> {

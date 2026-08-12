@@ -38,8 +38,8 @@ use models::{
     validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
-    current_model_state, current_renderer_model_catalog, provider_route_requires_restart,
-    sync_provider_models_for_launch,
+    current_model_state_async, current_renderer_model_catalog_async,
+    provider_route_requires_restart, sync_provider_models_for_launch,
 };
 pub use models::{
     fetch_current_provider_models, save_default_model, save_selected_models, sync_cc_switch_state,
@@ -50,7 +50,6 @@ use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
     sync_prompt_optimization_current_provider_command, test_prompt_optimization_command,
 };
-use runtime::refresh_injection_status;
 pub(crate) use runtime::{
     CC_SWITCH_ROUTE_RECOVERY_INTERVAL, CC_SWITCH_ROUTE_RECOVERY_STABLE_READS,
     cc_switch_route_ready_for_recovery, is_cc_switch_route_recovery_error,
@@ -60,6 +59,7 @@ use runtime::{begin_shutdown, launch_codey_inner};
 pub use runtime::{
     launch_codey_runtime, runtime_status, schedule_restart_codey_runtime, stop_codey_runtime,
 };
+use runtime::{refresh_injection_status, runtime_status_with_options};
 use updates::current_update_platform;
 #[cfg(test)]
 pub(crate) use updates::{UpdateAssetInfo, UpdateCheck};
@@ -119,6 +119,8 @@ pub struct AppState {
     pub crashpad_pending_stats: CrashpadPendingStatsHandle,
     pub startup_error: RwLock<Option<String>>,
     available_update: RwLock<Option<updates::UpdateCheck>>,
+    update_candidate_cache: Mutex<Option<updates::CachedUpdateCandidate>>,
+    codex_app_version_cache: Mutex<Option<runtime::CodexAppVersionCache>>,
     restart_in_progress: AtomicBool,
     shutting_down: AtomicBool,
     restart_task: Mutex<Option<ScheduledRestart>>,
@@ -186,6 +188,8 @@ impl Default for AppState {
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
             startup_error: RwLock::new(None),
             available_update: RwLock::new(None),
+            update_candidate_cache: Mutex::new(None),
+            codex_app_version_cache: Mutex::new(None),
             restart_in_progress: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             restart_task: Mutex::new(None),
@@ -277,7 +281,9 @@ impl AppState {
                     runtime.as_ref().map(|runtime| &runtime.applied_config),
                 )
                 .clone();
-                current_renderer_model_catalog(&catalog_config).unwrap_or_else(api_error_message)
+                current_renderer_model_catalog_async(&catalog_config)
+                    .await
+                    .unwrap_or_else(api_error_message)
             }
             "/backend/status" => {
                 let mut value = runtime_status(self).await.unwrap_or_else(api_error_message);
@@ -520,7 +526,13 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Ok(model) => save_default_model(state, model).await,
             Err(error) => Err(error),
         },
-        "runtime_status" => runtime_status(state).await,
+        "runtime_status" => {
+            let refresh_injection_status = args
+                .get("refreshInjectionStatus")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            runtime_status_with_options(state, refresh_injection_status).await
+        }
         "refresh_injection_status" => refresh_injection_status(state).await,
         "refresh_diagnostic_storage_stats" => refresh_diagnostic_storage_stats(state).await,
         "refresh_trace_log_stats" => refresh_trace_log_stats(state).await,
@@ -579,7 +591,7 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
     let config = state.config.read().await.clone();
     let startup_error = state.startup_error.read().await.clone();
     let cc_switch = cc_switch::status_from_config(&config);
-    let model_state = current_model_state(&config)?;
+    let model_state = current_model_state_async(&config).await?;
     let fast_context_tools_status = current_fast_context_tools_status();
     let mut public_config = redacted_config(&config);
     public_config.fast_context_tools = embedded_fast_context_tools_enabled(
@@ -751,7 +763,7 @@ async fn save_codey_config_locked(
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     let mut config = config.normalize();
     if config.subagent_optimization
-        && let Ok(model_state) = current_model_state(&config)
+        && let Ok(model_state) = current_model_state_async(&config).await
     {
         subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     }
@@ -880,7 +892,7 @@ async fn finish_codey_config_save(
         saved.restart_required
     };
     let cc_switch = cc_switch::status_from_config(&saved.config);
-    let model_state = current_model_state(&saved.config)?;
+    let model_state = current_model_state_async(&saved.config).await?;
     let public_config = redacted_config(&saved.config);
     Ok(json!({
         "status":"ok",

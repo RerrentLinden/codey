@@ -2,7 +2,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::header::USER_AGENT;
@@ -14,6 +14,9 @@ use tokio::io::AsyncWriteExt;
 
 use super::AppState;
 use crate::config::ConfigStore;
+
+const UPDATE_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
+const UPDATE_DOWNLOAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct UpdateManifest {
@@ -71,13 +74,19 @@ pub(crate) struct UpdateCandidate {
     pub(crate) check: UpdateCheck,
 }
 
+pub(super) struct CachedUpdateCandidate {
+    manifest_url: String,
+    candidate: UpdateCandidate,
+    checked_at: Instant,
+}
+
 pub async fn check_for_updates(state: &Arc<AppState>) -> Result<Value, String> {
     let candidate = check_for_update_candidate(state).await?;
     serde_json::to_value(candidate.check).map_err(|error| error.to_string())
 }
 
 pub async fn download_update(state: &Arc<AppState>) -> Result<Value, String> {
-    let candidate = check_for_update_candidate(state).await?;
+    let candidate = update_candidate_with_ttl(state, UPDATE_DOWNLOAD_CACHE_TTL).await?;
     let download = download_update_candidate(state, &candidate).await?;
     serde_json::to_value(download).map_err(|error| error.to_string())
 }
@@ -85,10 +94,44 @@ pub async fn download_update(state: &Arc<AppState>) -> Result<Value, String> {
 pub(crate) async fn check_for_update_candidate(
     state: &Arc<AppState>,
 ) -> Result<UpdateCandidate, String> {
-    let manifest = fetch_configured_update_manifest(state).await?;
+    update_candidate_with_ttl(state, UPDATE_CHECK_CACHE_TTL).await
+}
+
+async fn update_candidate_with_ttl(
+    state: &Arc<AppState>,
+    cache_ttl: Duration,
+) -> Result<UpdateCandidate, String> {
+    let manifest_url = configured_update_manifest_url(state).await?;
+    let mut cache = state.update_candidate_cache.lock().await;
+    let now = Instant::now();
+    if let Some(candidate) =
+        reusable_update_candidate(cache.as_ref(), &manifest_url, now, cache_ttl)
+    {
+        return Ok(candidate);
+    }
+
+    let manifest = fetch_configured_update_manifest(state, &manifest_url).await?;
     let check = assess_update_manifest(env!("CARGO_PKG_VERSION"), &manifest)?;
     *state.available_update.write().await = check.update_available.then(|| check.clone());
-    Ok(UpdateCandidate { check })
+    let candidate = UpdateCandidate { check };
+    *cache = Some(CachedUpdateCandidate {
+        manifest_url,
+        candidate: candidate.clone(),
+        checked_at: Instant::now(),
+    });
+    Ok(candidate)
+}
+
+fn reusable_update_candidate(
+    cached: Option<&CachedUpdateCandidate>,
+    manifest_url: &str,
+    now: Instant,
+    cache_ttl: Duration,
+) -> Option<UpdateCandidate> {
+    let cached = cached?;
+    (cached.manifest_url == manifest_url
+        && now.saturating_duration_since(cached.checked_at) < cache_ttl)
+        .then(|| cached.candidate.clone())
 }
 
 pub(crate) async fn download_update_candidate(
@@ -143,7 +186,7 @@ pub(crate) fn start_downloaded_update(state: &AppState, file_path: &str) -> Resu
     spawn_update_installer(&update_path)
 }
 
-async fn fetch_configured_update_manifest(state: &Arc<AppState>) -> Result<UpdateManifest, String> {
+async fn configured_update_manifest_url(state: &AppState) -> Result<String, String> {
     let manifest_url = state
         .config
         .read()
@@ -154,8 +197,14 @@ async fn fetch_configured_update_manifest(state: &Arc<AppState>) -> Result<Updat
     if manifest_url.is_empty() {
         return Err("内置更新地址未配置，请检查构建配置".to_string());
     }
+    Ok(manifest_url)
+}
 
-    let url = reqwest::Url::parse(&manifest_url)
+async fn fetch_configured_update_manifest(
+    state: &AppState,
+    manifest_url: &str,
+) -> Result<UpdateManifest, String> {
+    let url = reqwest::Url::parse(manifest_url)
         .map_err(|_| "更新地址必须是有效的 HTTPS URL".to_string())?;
     if url.scheme() != "https" {
         return Err("更新地址必须使用 HTTPS".to_string());
@@ -581,6 +630,49 @@ mod tests {
         assert!(!check.update_available);
         assert_eq!(check.current_version, "2.0.0");
         assert_eq!(check.latest_version, "2.0.0");
+    }
+
+    #[test]
+    fn update_candidate_cache_obeys_url_and_ttl() {
+        let checked_at = Instant::now();
+        let candidate = UpdateCandidate {
+            check: assess_update_manifest("1.0.0", &valid_manifest("2.0.0")).unwrap(),
+        };
+        let cached = CachedUpdateCandidate {
+            manifest_url: "https://updates.example.test/manifest.json".to_string(),
+            candidate: candidate.clone(),
+            checked_at,
+        };
+
+        assert_eq!(
+            reusable_update_candidate(
+                Some(&cached),
+                "https://updates.example.test/manifest.json",
+                checked_at + UPDATE_CHECK_CACHE_TTL - Duration::from_millis(1),
+                UPDATE_CHECK_CACHE_TTL,
+            )
+            .unwrap()
+            .check,
+            candidate.check,
+        );
+        assert!(
+            reusable_update_candidate(
+                Some(&cached),
+                "https://updates.example.test/manifest.json",
+                checked_at + UPDATE_CHECK_CACHE_TTL,
+                UPDATE_CHECK_CACHE_TTL,
+            )
+            .is_none()
+        );
+        assert!(
+            reusable_update_candidate(
+                Some(&cached),
+                "https://mirror.example.test/manifest.json",
+                checked_at,
+                UPDATE_DOWNLOAD_CACHE_TTL,
+            )
+            .is_none()
+        );
     }
 
     #[test]

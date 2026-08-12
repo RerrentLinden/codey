@@ -149,11 +149,10 @@ fn repair_incomplete_tail(path: &Path) -> std::io::Result<()> {
     if serde_json::from_slice::<Value>(&tail).is_ok() {
         file.seek(SeekFrom::End(0))?;
         file.write_all(b"\n")?;
-        file.flush()
     } else {
         file.set_len(line_start)?;
-        file.flush()
     }
+    file.flush()
 }
 
 pub fn initialize() {
