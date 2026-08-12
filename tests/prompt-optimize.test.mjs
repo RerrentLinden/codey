@@ -73,7 +73,31 @@ class FakeElement {
     this.isConnected = false;
   }
 
-  closest() {
+  closest(selector) {
+    const selectors = String(selector)
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    let element = this;
+    while (element) {
+      const matches = selectors.some((candidate) => {
+        if (candidate.startsWith("#")) {
+          return element.id === candidate.slice(1);
+        }
+        const attribute = candidate.match(
+          /^\[([^=\]]+)(?:=['"]?([^'"\]]+)['"]?)?\]$/,
+        );
+        if (attribute) {
+          const actual = element.getAttribute(attribute[1]);
+          return attribute[2] === undefined
+            ? actual !== null
+            : actual === attribute[2];
+        }
+        return element.tagName === candidate.toUpperCase();
+      });
+      if (matches) return element;
+      element = element.parentElement;
+    }
     return null;
   }
 
@@ -202,6 +226,33 @@ const createEnvironment = (options = {}) => {
       width: 36,
     },
   });
+  const dialog = new FakeElement("div");
+  dialog.setAttribute("role", "dialog");
+  dialog.setAttribute("aria-modal", "true");
+  const dialogInput = new FakeElement("textarea", {
+    rect: {
+      bottom: 700,
+      height: 180,
+      left: 120,
+      right: 920,
+      top: 520,
+      width: 800,
+    },
+  });
+  dialogInput.value = options.dialogInitialText ?? "Git 提交信息";
+  const dialogToolbar = new FakeElement("div");
+  const dialogControl = new FakeElement("button", {
+    rect: {
+      bottom: 690,
+      height: 36,
+      left: 960,
+      right: 1160,
+      top: 654,
+      width: 200,
+    },
+  });
+  dialogControl.textContent = "提交并推送";
+  dialogControl.setAttribute("aria-haspopup", "menu");
   documentElement.appendChild(body);
   body.appendChild(scope);
   scope.appendChild(anchor);
@@ -212,13 +263,35 @@ const createEnvironment = (options = {}) => {
   toolbar.appendChild(modelButton);
   toolbar.appendChild(microphoneButton);
   toolbar.appendChild(sendButton);
+  if (options.dialogComposer || options.dialogControl) {
+    scope.appendChild(dialog);
+  }
+  if (options.dialogComposer) {
+    dialog.appendChild(dialogInput);
+  }
+  if (options.dialogControl) {
+    dialog.appendChild(dialogToolbar);
+    dialogToolbar.appendChild(dialogControl);
+  }
   let fallbackInputs = options.newChatComposer ? [newChatInput] : [textarea];
+  if (options.dialogComposer) {
+    fallbackInputs = options.onlyDialogComposer
+      ? [dialogInput]
+      : [...fallbackInputs, dialogInput];
+  }
   scope.querySelectorAll = (selector) => {
     if (selector === "textarea, [contenteditable='true'], [role='textbox']") {
       return [textarea];
     }
     if (selector === "button, [role='button']") {
-      return [accessButton, modelButton, microphoneButton, sendButton];
+      const controls = [
+        accessButton,
+        modelButton,
+        microphoneButton,
+        sendButton,
+      ];
+      if (options.dialogControl) controls.push(dialogControl);
+      return controls;
     }
     return [];
   };
@@ -299,6 +372,9 @@ const createEnvironment = (options = {}) => {
 
   return {
     calls,
+    dialog,
+    dialogControl,
+    dialogInput,
     inputEvents,
     newChatInput,
     textarea,
@@ -411,6 +487,47 @@ test("keeps the button hidden when no composer input is found", async () => {
   await flush();
 
   assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
+});
+
+test("ignores Git commit textboxes inside modal dialogs", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    anchors: false,
+    dialogComposer: true,
+    initialText: "正常对话提示词",
+  });
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.ok(button, "the normal composer should still receive the button");
+  button.dispatchEvent({
+    type: "click",
+    preventDefault() {},
+    stopPropagation() {},
+  });
+  await flush();
+
+  const optimizeCall = env.calls.find(
+    (call) => call.path === "/api/optimize_prompt",
+  );
+  assert.equal(optimizeCall?.payload.text, "正常对话提示词");
+  assert.equal(env.textarea.value, "优化后的提示词");
+  assert.equal(env.dialogInput.value, "Git 提交信息");
+});
+
+test("does not use controls inside modal dialogs as insertion targets", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    dialogControl: true,
+  });
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.ok(button);
+  assert.equal(button.parentElement, env.toolbar);
+  assert.equal(env.dialogControl.parentElement.parentElement, env.dialog);
 });
 
 test("mounts the optimize button for a new-chat contenteditable composer", async () => {

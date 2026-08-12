@@ -67,7 +67,9 @@ test("script injection diagnostics report runtime evidence without continuous po
   );
   assert.match(runtimeHook, /STATUS_POLL_MAX_DURATION_MS/);
   assert.match(runtimeHook, /GIT_GUARD_PROBE_MAX_DURATION_MS = 30_000/);
+  assert.match(runtimeHook, /WMI_SAMPLER_PROBE_MAX_DURATION_MS = 60_000/);
   assert.match(runtimeHook, /gitGuardStatus !== "executed"/);
+  assert.match(runtimeHook, /wmiSamplerStatus !== "executed"/);
   assert.match(runtimeHook, /const next = await refreshInjectionStatus\(\)/);
   assert.match(cdp, /completedEntry\.status === \\"pending\\"/);
   assert.match(pluginFix, /markPluginBridgeEffective/);
@@ -81,7 +83,10 @@ test("script injection diagnostics report runtime evidence without continuous po
   assert.match(sections, /生效探针通过/);
   assert.match(sections, /脚本已执行，但没有生效证据/);
   assert.match(sections, /Codex 启动后将记录每个脚本的注入结果/);
-  assert.match(sections, /性能策略已生效：采样与泄漏修复/);
+  assert.match(
+    sections,
+    /性能策略已生效：WMI 采样保护与泄漏回收已确认/,
+  );
   assert.doesNotMatch(sections, /setInterval/);
   assert.match(styles, /text-wrap:\s*balance/);
   assert.match(styles, /word-break:\s*normal/);

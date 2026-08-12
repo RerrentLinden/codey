@@ -71,6 +71,15 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.equal(startupGitGuardStatus.status, "ok");
     assert.equal(startupGitGuardStatus.guard.gitHandlerPatched, true);
     assert.equal(startupGitGuardStatus.guard.statusHandlerPatched, true);
+    const startupWmiSamplerStatus = ipcHandlers.get(
+      "codex_desktop:message-from-view",
+    )(null, { type: "codey-windows-wmi-sampler-status" });
+    assert.equal(startupWmiSamplerStatus.status, "ok");
+    assert.equal(
+      startupWmiSamplerStatus.sampler.workerWrapperPatched,
+      true,
+    );
+    assert.equal(startupWmiSamplerStatus.sampler.blocked, 0);
 
     let gitGuardTime = 10_000;
     let nextGitGuardTimer = 0;

@@ -79,6 +79,29 @@
   const mainGitGuardWorkerChannel = "codex_desktop:worker:git:from-view";
   const mainGitGuardStatusChannel = "codex_desktop:message-from-view";
   const mainGitGuardStatusRequestType = "codey-git-request-guard-status";
+  const windowsWmiSamplerStatusRequestType =
+    "codey-windows-wmi-sampler-status";
+  const windowsWmiSamplerInstalledAtMs = Date.now();
+  const windowsWmiSamplerEvidence = {
+    version: 2,
+    enabled: disableWindowsWmiSampler,
+    workerWrapperPatched: false,
+    workersObserved: 0,
+    sourceInspections: 0,
+    sourceSignatureMatches: 0,
+    sourceSignatureMisses: 0,
+    sourceReadFailures: 0,
+    blocked: 0,
+    lastMatchReason: "",
+    lastWorkerName: "",
+  };
+  const windowsWmiSamplerSnapshot = () => ({
+    ...windowsWmiSamplerEvidence,
+    installed:
+      !windowsWmiSamplerEvidence.enabled ||
+      windowsWmiSamplerEvidence.workerWrapperPatched,
+    observationMs: Math.max(0, Date.now() - windowsWmiSamplerInstalledAtMs),
+  });
   const createMainGitRequestGuard = ({
     enabled = false,
     clock = () => Date.now(),
@@ -392,6 +415,9 @@
       const wrapped = function (...args) {
         if (args[1]?.type === mainGitGuardStatusRequestType) {
           return { status: "ok", guard: snapshot() };
+        }
+        if (args[1]?.type === windowsWmiSamplerStatusRequestType) {
+          return { status: "ok", sampler: windowsWmiSamplerSnapshot() };
         }
         return Reflect.apply(handler, this, args);
       };
@@ -1283,9 +1309,134 @@
   const NativeWorker = workerThreads.Worker;
   if (!NativeWorker.__codeyNoInspectWrapper) {
     const EventEmitter = process.getBuiltinModule("events").EventEmitter;
-    const isWmiSnapshotWorker = (filename) =>
-      disableWindowsWmiSampler &&
-      /(?:^|[/\\])child-process-snapshot-worker\.js(?:[?#].*)?$/i.test(String(filename));
+    const maximumWmiWorkerSourceBytes = 2 * 1024 * 1024;
+    const workerSourceMatchCache = new Map();
+    const workerSpecifierText = (filename) => {
+      if (typeof filename === "string") return filename;
+      if (typeof filename?.href === "string") return filename.href;
+      return String(filename ?? "");
+    };
+    const workerDisplayName = (filename) => {
+      const specifier = workerSpecifierText(filename)
+        .replace(/[?#].*$/, "")
+        .replace(/[/\\]+$/, "");
+      const encodedName = specifier.split(/[/\\]/).at(-1) || "unknown-worker";
+      try {
+        return decodeURIComponent(encodedName).slice(0, 160);
+      } catch {
+        return encodedName.slice(0, 160);
+      }
+    };
+    const isKnownWmiSnapshotWorkerName = (filename) =>
+      /(?:^|[/\\])child[-_]process[-_]snapshot[-_]worker(?:[-.][^/\\?#]+)?\.(?:c?js|mjs)(?:[?#].*)?$/i
+        .test(workerSpecifierText(filename));
+    const hasWmiSnapshotSourceSignature = (source) =>
+      /Get-(?:CimInstance|WmiObject)/i.test(source) &&
+      /\bWin32_Process\b/i.test(source) &&
+      /\bWin32_Perf(?:Formatted|Raw)Data_PerfProc_Process\b/i.test(source) &&
+      /powershell(?:\.exe)?/i.test(source) &&
+      /(?:worker_threads|parentPort|postMessage|workerData)/.test(source);
+    const decodeDataWorkerSource = (specifier) => {
+      const commaIndex = specifier.indexOf(",");
+      if (commaIndex < 0) return "";
+      const metadata = specifier.slice(0, commaIndex);
+      const payload = specifier.slice(commaIndex + 1);
+      const source = /;base64(?:;|$)/i.test(metadata)
+        ? Buffer.from(payload, "base64").toString("utf8")
+        : decodeURIComponent(payload);
+      return source.slice(0, maximumWmiWorkerSourceBytes);
+    };
+    const workerFilePath = (filename) => {
+      const specifier = workerSpecifierText(filename);
+      if (/^file:/i.test(specifier)) {
+        const urlModule = process.getBuiltinModule("url");
+        const url = new urlModule.URL(specifier);
+        url.search = "";
+        url.hash = "";
+        return urlModule.fileURLToPath(url);
+      }
+      if (
+        /^[A-Za-z][A-Za-z+.-]*:/.test(specifier) &&
+        !/^[A-Za-z]:[/\\]/.test(specifier)
+      ) {
+        return null;
+      }
+      return specifier.replace(/[?#].*$/, "");
+    };
+    const readWorkerSource = (filename, options) => {
+      if (options?.eval === true) {
+        return {
+          cacheKey: null,
+          source: String(filename ?? "").slice(
+            0,
+            maximumWmiWorkerSourceBytes,
+          ),
+        };
+      }
+      const specifier = workerSpecifierText(filename);
+      if (/^data:/i.test(specifier)) {
+        return {
+          cacheKey: null,
+          source: decodeDataWorkerSource(specifier),
+        };
+      }
+      const path = workerFilePath(filename);
+      if (!path) return null;
+      return {
+        cacheKey: path,
+        source: process
+          .getBuiltinModule("fs")
+          .readFileSync(path, "utf8")
+          .slice(0, maximumWmiWorkerSourceBytes),
+      };
+    };
+    const classifyWmiSnapshotWorker = (filename, options) => {
+      if (!disableWindowsWmiSampler) return null;
+      windowsWmiSamplerEvidence.workersObserved += 1;
+      const workerName = workerDisplayName(filename);
+      if (isKnownWmiSnapshotWorkerName(filename)) {
+        return { reason: "known-worker-name", workerName };
+      }
+
+      const specifier = workerSpecifierText(filename);
+      const cacheKey =
+        options?.eval === true || /^data:/i.test(specifier)
+          ? null
+          : specifier;
+      if (cacheKey && workerSourceMatchCache.has(cacheKey)) {
+        const cached = workerSourceMatchCache.get(cacheKey);
+        return cached ? { ...cached, workerName } : null;
+      }
+
+      try {
+        const loaded = readWorkerSource(filename, options);
+        if (!loaded) {
+          if (cacheKey) workerSourceMatchCache.set(cacheKey, null);
+          return null;
+        }
+        windowsWmiSamplerEvidence.sourceInspections += 1;
+        const matched = hasWmiSnapshotSourceSignature(loaded.source);
+        if (matched) {
+          windowsWmiSamplerEvidence.sourceSignatureMatches += 1;
+          const match = { reason: "source-signature", workerName };
+          if (loaded.cacheKey) {
+            workerSourceMatchCache.set(loaded.cacheKey, match);
+          }
+          if (cacheKey && cacheKey !== loaded.cacheKey) {
+            workerSourceMatchCache.set(cacheKey, match);
+          }
+          return match;
+        }
+        windowsWmiSamplerEvidence.sourceSignatureMisses += 1;
+        if (loaded.cacheKey) workerSourceMatchCache.set(loaded.cacheKey, null);
+        if (cacheKey && cacheKey !== loaded.cacheKey) {
+          workerSourceMatchCache.set(cacheKey, null);
+        }
+      } catch {
+        windowsWmiSamplerEvidence.sourceReadFailures += 1;
+      }
+      return null;
+    };
 
     // Codex starts this telemetry worker every 30 seconds. On Windows the
     // worker shells out to PowerShell for two full CIM/WMI process scans.
@@ -1319,7 +1470,11 @@
 
     class CodeyNoInspectWorker extends NativeWorker {
       constructor(filename, options = {}) {
-        if (isWmiSnapshotWorker(filename)) {
+        const match = classifyWmiSnapshotWorker(filename, options);
+        if (match) {
+          windowsWmiSamplerEvidence.blocked += 1;
+          windowsWmiSamplerEvidence.lastMatchReason = match.reason;
+          windowsWmiSamplerEvidence.lastWorkerName = match.workerName;
           return new CodeyDisabledWmiSnapshotWorker();
         }
         super(filename, {
@@ -1333,6 +1488,8 @@
     });
     workerThreads.Worker = CodeyNoInspectWorker;
   }
+  windowsWmiSamplerEvidence.workerWrapperPatched =
+    workerThreads.Worker?.__codeyNoInspectWrapper === true;
 
   const temporaryWebViews = new WeakMap();
   const temporaryWebViewLifecycle = Object.freeze({
@@ -1908,6 +2065,9 @@
     restoreNativeModelAndSpeedControls: true,
     destroyTemporaryWebViews: true,
     disableWindowsWmiSampler,
+    get windowsWmiSampler() {
+      return windowsWmiSamplerSnapshot();
+    },
     get mainGitRequestGuard() {
       return mainGitRequestGuard.snapshot();
     },

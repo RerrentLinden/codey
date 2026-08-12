@@ -26,6 +26,8 @@
   const composerFallbackSelector =
     "main textarea, main [contenteditable='true'], main [role='textbox'], textarea, [contenteditable='true'][role='textbox']";
   const composerControlSelector = "button, [role='button']";
+  const ignoredComposerContainerSelector =
+    "dialog, [role='dialog'], [aria-modal='true']";
 
   let enabled = false;
   let ready = false;
@@ -155,6 +157,7 @@
 
   const isVisible = (element) => {
     if (!isComposerInput(element)) return false;
+    if (element.closest?.(ignoredComposerContainerSelector)) return false;
     if (element.closest?.("[hidden], [aria-hidden='true']")) return false;
     if (element.disabled) return false;
     const style = window.getComputedStyle(element);
@@ -217,6 +220,7 @@
 
   const isVisibleControl = (element) => {
     if (!element || element === button) return false;
+    if (element.closest?.(ignoredComposerContainerSelector)) return false;
     if (element.closest?.("[hidden], [aria-hidden='true']")) return false;
     if (element.disabled) return false;
     const style = window.getComputedStyle(element);

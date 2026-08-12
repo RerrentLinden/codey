@@ -120,8 +120,22 @@ function OperationsPanelComponent({
   const injectionStatusPending = injectionScripts.length === 0;
   const injectionError = failedInjectionScriptCount > 0;
   const isWindowsClient = status.clientPlatform === "windows";
-  const windowsPatchReady = maintenance?.performanceStatus === "ready";
-  const windowsPatchFailed = performanceError || Boolean(status.startupError);
+  const windowsWmiSampler = injectionScripts.find(
+    (script) => script.id === "windows-wmi-sampler",
+  );
+  const windowsStartupPatchInstalled =
+    maintenance?.performanceStatus === "ready";
+  const windowsWmiSamplerConfirmed =
+    windowsWmiSampler?.status === "effective";
+  const windowsWmiSamplerFailed =
+    windowsWmiSampler?.status === "failed" ||
+    windowsWmiSampler?.status === "unknown";
+  const windowsPatchReady =
+    windowsStartupPatchInstalled && windowsWmiSamplerConfirmed;
+  const windowsPatchFailed =
+    performanceError ||
+    Boolean(status.startupError) ||
+    windowsWmiSamplerFailed;
   const windowsPatchTone = windowsPatchReady
     ? "success"
     : windowsPatchFailed
@@ -131,14 +145,22 @@ function OperationsPanelComponent({
     ? "已启用"
     : windowsPatchFailed
       ? "未生效"
-      : "待检测";
+      : windowsStartupPatchInstalled
+        ? "待确认"
+        : "待检测";
   const windowsPatchDetail = windowsPatchReady
-    ? maintenance?.performanceDetail ||
-      "WMI 周期采样、临时 WebView 残留与执行环境泄漏修复已生效。"
+    ? windowsWmiSampler?.detail ||
+      "WMI 周期采样保护已确认，临时 WebView 与执行环境回收已启用。"
     : windowsPatchFailed
-      ? maintenance?.performanceDetail ||
-        status.startupError ||
+      ? status.startupError ||
+        windowsWmiSampler?.error ||
+        windowsWmiSampler?.detail ||
+        maintenance?.performanceDetail ||
         "Windows 优化补丁加载异常。"
+      : windowsStartupPatchInstalled
+        ? windowsWmiSampler?.detail ||
+          maintenance?.performanceDetail ||
+          "Windows 启动补丁已安装，正在等待 WMI 周期采样保护的运行时证据。"
       : status.running
         ? "正在确认 Windows 优化补丁状态。"
         : "将在 Codex 启动时自动安装并校验 Windows 优化补丁。";
@@ -208,9 +230,15 @@ function OperationsPanelComponent({
         id: "opt-patch",
         icon: isWindowsClient ? IconBrandWindows : IconCpu,
         tooltip: windowsPatchReady
-          ? "性能策略已生效：采样与泄漏修复"
-          : "性能策略：运行确认中",
-        tone: windowsPatchReady ? "success" : "warning",
+          ? "性能策略已生效：WMI 采样保护与泄漏回收已确认"
+          : windowsPatchFailed
+            ? "性能策略：Windows 保护存在异常"
+            : "性能策略：WMI 采样保护运行确认中",
+        tone: windowsPatchReady
+          ? "success"
+          : windowsPatchFailed
+            ? "destructive"
+            : "warning",
       },
       {
         id: "opt-injection",
@@ -240,6 +268,7 @@ function OperationsPanelComponent({
       injectionScripts.length,
       isWindowsClient,
       unverifiedInjectionScriptCount,
+      windowsPatchFailed,
       windowsPatchReady,
     ],
   );

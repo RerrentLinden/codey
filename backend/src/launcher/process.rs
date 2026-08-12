@@ -417,7 +417,8 @@ pub(super) async fn prepare_codex_for_launch(app_dir: &std::path::Path) -> Resul
 fn startup_patch_detail() -> String {
     #[cfg(windows)]
     {
-        "Windows 启动补丁已启用：WMI 周期采样、临时 WebView 残留和执行环境泄漏已修复".to_string()
+        "Windows 启动补丁已安装：WMI 周期采样保护等待运行时确认，临时 WebView 与执行环境回收已启用"
+            .to_string()
     }
     #[cfg(not(windows))]
     {

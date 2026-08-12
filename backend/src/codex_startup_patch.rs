@@ -302,9 +302,15 @@ mod tests {
         });
 
         assert!(expression.contains("process.platform === \"win32\""));
-        assert!(expression.contains("child-process-snapshot-worker\\.js"));
+        assert!(expression.contains("isKnownWmiSnapshotWorkerName"));
+        assert!(expression.contains("hasWmiSnapshotSourceSignature"));
+        assert!(expression.contains("Get-(?:CimInstance|WmiObject)"));
+        assert!(expression.contains("Win32_Process"));
+        assert!(expression.contains("Win32_Perf(?:Formatted|Raw)Data_PerfProc_Process"));
         assert!(expression.contains("CodeyDisabledWmiSnapshotWorker"));
         assert!(expression.contains("this.emit(\"message\", { type: \"ok\", value: [] })"));
+        assert!(expression.contains("codey-windows-wmi-sampler-status"));
+        assert!(expression.contains("get windowsWmiSampler()"));
         assert!(expression.contains("super(filename, {"));
     }
 

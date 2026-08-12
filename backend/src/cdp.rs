@@ -21,6 +21,8 @@ const FAST_STARTUP_SHIELD_SCRIPT: &str =
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
 const GIT_REQUEST_GUARD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/git-request-guard.js");
+const WINDOWS_WMI_SAMPLER_GUARD_SCRIPT: &str =
+    include_str!("../../dist-overlay/inject/windows-wmi-sampler-guard.js");
 const MODEL_WHITELIST_INJECT_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/model-whitelist-inject.js");
 const RENDERER_INJECT_SCRIPT: &str = include_str!("../../dist-overlay/inject/renderer-inject.js");
@@ -188,6 +190,47 @@ pub fn prepare_injection_scripts(
                 .to_string(),
         ),
         (
+            "windows-wmi-sampler",
+            "Windows WMI 周期采样保护",
+            WINDOWS_WMI_SAMPLER_GUARD_SCRIPT,
+            r#"(() => {
+              const guard = window.__codeyWindowsWmiSamplerGuard;
+              if (!guard || typeof guard.snapshot !== "function") return "";
+              guard.requestProbe?.();
+              const snapshot = guard.snapshot();
+              if (snapshot.enabled === false && snapshot.installed === true) {
+                return "WMI 周期采样保护已就绪，当前平台无需启用";
+              }
+              if (snapshot.blocked > 0) {
+                return `已阻止 ${snapshot.blocked} 次 WMI 周期进程采样`;
+              }
+              if (snapshot.sourceReadFailures > 0) {
+                return {
+                  effective: false,
+                  detail: `有 ${snapshot.sourceReadFailures} 个 Worker 源码无法检查，WMI 周期采样保护尚不能确认`,
+                };
+              }
+              if (snapshot.installed === true) {
+                const observationComplete =
+                  snapshot.observationMs >= snapshot.observationWindowMs;
+                const detail = observationComplete
+                  ? snapshot.sourceInspections > 0
+                    ? `已检查 ${snapshot.sourceInspections} 个 Worker，尚未命中完整 WMI 周期采样特征；若 WMI 仍高占用，当前来源尚未被识别`
+                    : "WMI 周期采样保护已安装，但观察窗内未匹配到可识别的目标 Worker"
+                  : `WMI 周期采样保护已安装，等待首次采样确认（已观察 ${Math.floor(snapshot.observationMs / 1000)} 秒）`;
+                return {
+                  effective: false,
+                  detail,
+                };
+              }
+              return {
+                effective: false,
+                detail: `WMI 周期采样保护待确认：${snapshot.probeError || "等待主进程保护注册"}`,
+              };
+            })()"#
+                .to_string(),
+        ),
+        (
             "model-whitelist",
             "模型白名单",
             MODEL_WHITELIST_INJECT_SCRIPT,
@@ -288,6 +331,7 @@ pub fn prepare_injection_scripts(
         FAST_STARTUP_SHIELD_SCRIPT.len()
             + CODEY_BRIDGE_SCRIPT.len()
             + GIT_REQUEST_GUARD_SCRIPT.len()
+            + WINDOWS_WMI_SAMPLER_GUARD_SCRIPT.len()
             + MODEL_WHITELIST_INJECT_SCRIPT.len()
             + RENDERER_INJECT_SCRIPT.len()
             + PET_CONTROL_SHIELD_SCRIPT.len()
@@ -1209,6 +1253,7 @@ mod tests {
         assert!(core.contains(r#"["true"][0]==="true""#));
         assert!(core.contains("window.__codeyBridgeHelpersInstalled"));
         assert!(core.contains("__codeyGitRequestGuard"));
+        assert!(core.contains("__codeyWindowsWmiSamplerGuard"));
         assert!(core.contains("window.__codeyModelWhitelistPatch"));
         assert!(core.contains("/codex-model-catalog"));
         assert!(core.contains("window.__codeyRendererCoreLoaded"));
@@ -1225,14 +1270,16 @@ mod tests {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 11);
-        assert_eq!(prepared.descriptors[10].id, "user-script-1");
-        assert_eq!(prepared.descriptors[10].source, "user");
+        assert_eq!(prepared.descriptors.len(), 12);
+        assert_eq!(prepared.descriptors[11].id, "user-script-1");
+        assert_eq!(prepared.descriptors[11].source, "user");
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
         assert!(snapshot_script.contains("Windows Git 请求限流已由主进程接管"));
         assert!(snapshot_script.contains("guard.ensureInstalled?.()"));
         assert!(snapshot_script.contains("snapshot.mainProcessProtected === true"));
+        assert!(snapshot_script.contains("WMI 周期采样保护已安装"));
+        assert!(snapshot_script.contains("snapshot.blocked > 0"));
         assert!(snapshot_script.contains("effective: false"));
         assert!(snapshot_script.contains("Object.prototype.hasOwnProperty.call"));
         assert!(snapshot_script.contains("模型目录已加载"));
@@ -1288,8 +1335,10 @@ mod tests {
         assert_eq!(statuses[1].status, "unknown");
         assert_eq!(statuses[2].id, "git-request-guard");
         assert_eq!(statuses[2].status, "unknown");
-        assert_eq!(statuses[3].id, "model-whitelist");
+        assert_eq!(statuses[3].id, "windows-wmi-sampler");
         assert_eq!(statuses[3].status, "unknown");
+        assert_eq!(statuses[4].id, "model-whitelist");
+        assert_eq!(statuses[4].status, "unknown");
         assert_eq!(
             statuses.last().map(|status| status.id.as_str()),
             Some("user-script-1")

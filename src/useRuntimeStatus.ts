@@ -16,6 +16,7 @@ const STATUS_POLL_MAX_DURATION_MS = 5 * 60 * 1_000;
 const STATUS_POLL_MAX_CONSECUTIVE_ERRORS = 5;
 const GIT_GUARD_PROBE_DELAYS_MS = [500, 1_000, 2_000, 5_000];
 const GIT_GUARD_PROBE_MAX_DURATION_MS = 30_000;
+const WMI_SAMPLER_PROBE_MAX_DURATION_MS = 60_000;
 
 export function useRuntimeStatus({
   active,
@@ -100,14 +101,25 @@ export function useRuntimeStatus({
   const gitGuardStatus = status.injectionScripts?.find(
     (script) => script.id === "git-request-guard",
   )?.status;
+  const wmiSamplerStatus = status.injectionScripts?.find(
+    (script) => script.id === "windows-wmi-sampler",
+  )?.status;
 
   useEffect(() => {
-    if (!active || gitGuardStatus !== "executed") return;
+    if (
+      !active ||
+      gitGuardStatus !== "executed" &&
+        wmiSamplerStatus !== "executed"
+    ) return;
     let cancelled = false;
     let timer = 0;
     let delayIndex = 0;
     let consecutiveErrors = 0;
-    const deadline = Date.now() + GIT_GUARD_PROBE_MAX_DURATION_MS;
+    const deadline =
+      Date.now() +
+      (wmiSamplerStatus === "executed"
+        ? WMI_SAMPLER_PROBE_MAX_DURATION_MS
+        : GIT_GUARD_PROBE_MAX_DURATION_MS);
     const poll = () => {
       if (cancelled || Date.now() >= deadline) return;
       const delay =
@@ -123,7 +135,13 @@ export function useRuntimeStatus({
           const nextGitGuardStatus = next.injectionScripts?.find(
             (script) => script.id === "git-request-guard",
           )?.status;
-          if (nextGitGuardStatus === "executed") poll();
+          const nextWmiSamplerStatus = next.injectionScripts?.find(
+            (script) => script.id === "windows-wmi-sampler",
+          )?.status;
+          if (
+            nextGitGuardStatus === "executed" ||
+            nextWmiSamplerStatus === "executed"
+          ) poll();
         } catch {
           consecutiveErrors += 1;
           if (consecutiveErrors < STATUS_POLL_MAX_CONSECUTIVE_ERRORS) poll();
@@ -135,7 +153,7 @@ export function useRuntimeStatus({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [active, gitGuardStatus, refreshInjectionStatus]);
+  }, [active, gitGuardStatus, refreshInjectionStatus, wmiSamplerStatus]);
 
   useEffect(() => {
     if (

@@ -34,6 +34,7 @@ if (import.meta.env.DEV) {
       backup: "https://backup.example.invalid/v1",
       feishu: "https://webhook.example.invalid/feishu/preview-only",
     } as const;
+    const previewApiKey = "preview-only-not-a-secret";
     let previewConfig = {
       settingsRevision: 0,
       activeProfileId: "primary",
@@ -42,7 +43,7 @@ if (import.meta.env.DEV) {
           id: "primary",
           name: "主力代理 (ChatGPT)",
           baseUrl: previewEndpoints.primary,
-          apiKey: "preview-only-not-a-secret",
+          apiKey: previewApiKey,
           protocol: "responses" as const,
           ccSwitchProviderId: "primary",
           ccSwitchReadOnly: false,
@@ -80,6 +81,16 @@ if (import.meta.env.DEV) {
             chatId: "preview-chat-id",
           },
         ],
+      },
+      promptOptimization: {
+        enabled: true,
+        baseUrl: previewEndpoints.primary,
+        apiKey: "",
+        apiKeyConfigured: true,
+        clearApiKey: false,
+        model: "gpt-5.6-sol",
+        protocol: "responses" as const,
+        instruction: "",
       },
       codexAppPath: "/Applications/ChatGPT.app",
       userScripts: [],
@@ -174,7 +185,7 @@ if (import.meta.env.DEV) {
             performanceStatus: "ready",
             performanceDetail:
               previewClientPlatform === "windows"
-                ? "Windows 启动补丁已启用：WMI 周期采样、临时 WebView 残留和执行环境泄漏已修复"
+                ? "Windows 启动补丁已安装：WMI 周期采样保护等待运行时确认，临时 WebView 与执行环境回收已启用"
                 : "启动补丁已启用：临时 WebView 和执行环境会自动回收",
           },
           injectionScripts: [
@@ -184,6 +195,13 @@ if (import.meta.env.DEV) {
               source: "builtin",
               status: "effective",
               detail: "桥接函数可调用",
+            },
+            {
+              id: "windows-wmi-sampler",
+              name: "Windows WMI 周期采样保护",
+              source: "builtin",
+              status: "effective",
+              detail: "已阻止 2 次 WMI 周期进程采样",
             },
             {
               id: "model-whitelist",
@@ -278,6 +296,14 @@ if (import.meta.env.DEV) {
           ? { channel }
           : { status: "failed", message: "找不到要编辑的通知渠道" };
       }
+      if (command === "reveal_prompt_optimization_api_key") {
+        return previewConfig.promptOptimization.apiKeyConfigured
+          ? { apiKey: previewApiKey }
+          : {
+              status: "failed",
+              message: "提示词优化 API Key 尚未保存",
+            };
+      }
       if (command === "sync_current_provider") {
         return {
           config: previewConfig,
@@ -285,6 +311,22 @@ if (import.meta.env.DEV) {
           ccSwitch: previewCcSwitch,
           restartRequired: false,
         };
+      }
+      if (command === "sync_prompt_optimization_current_provider") {
+        previewConfig = {
+          ...previewConfig,
+          settingsRevision: previewConfig.settingsRevision + 1,
+          promptOptimization: {
+            ...previewConfig.promptOptimization,
+            baseUrl: previewCcSwitch.provider.baseUrl,
+            apiKey: "",
+            apiKeyConfigured: true,
+            clearApiKey: false,
+            model: previewModelState.defaultModel,
+            protocol: previewCcSwitch.provider.protocol,
+          },
+        };
+        return { config: previewConfig };
       }
       if (command === "clear_codex_trace_logs") {
         return {
@@ -510,6 +552,15 @@ if (import.meta.env.DEV) {
         return configured
           ? { status: "ok", eventId: "preview-notification-test" }
           : { status: "failed", message: "请先完成渠道配置" };
+      }
+      if (command === "fetch_prompt_optimization_models") {
+        return { models: previewModelState.upstreamModels };
+      }
+      if (command === "test_prompt_optimization") {
+        return {
+          status: "ok",
+          result: { httpStatus: 200, responsePreview: "preview" },
+        };
       }
       return { status: "ok" };
     };
