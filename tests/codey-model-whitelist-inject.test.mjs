@@ -307,7 +307,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "9");
+  assert.equal(patch.version, "10");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -575,6 +575,42 @@ test("an unchanged model list repairs missing reasoning effort options", async (
     ["minimal", "low", "medium", "high", "xhigh"],
   );
   assert.equal(repaired.defaultReasoningEffort, "medium");
+  patch.dispose();
+});
+
+test("an unchanged model list repairs missing native Fast tiers", async () => {
+  const client = statsigClient();
+  const queryClient = activeModelQueryClient(["gpt-5.6-sol"]);
+  const existing = queryClient.model("gpt-5.6-sol");
+  existing.serviceTiers = [{
+    id: "standard",
+    name: "Standard",
+    description: "Default speed",
+  }];
+  existing.additionalSpeedTiers = ["standard"];
+  delete existing.defaultServiceTier;
+
+  const { patch } = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+  }, [client], { queryClient });
+
+  const repaired = queryClient.model("gpt-5.6-sol");
+  assert.deepEqual(repaired.serviceTiers, [
+    {
+      id: "standard",
+      name: "Standard",
+      description: "Default speed",
+    },
+    {
+      id: "priority",
+      name: "Fast",
+      description: "1.5x speed, increased usage",
+    },
+  ]);
+  assert.deepEqual(repaired.additionalSpeedTiers, ["standard", "fast"]);
+  assert.equal(repaired.defaultServiceTier, null);
   patch.dispose();
 });
 

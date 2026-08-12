@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "9";
+  const patchVersion = "10";
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion) {
     void existingPatch.refresh();
@@ -10,6 +10,8 @@
 
   const modelConfigId = "107580212";
   const modelCatalogPath = "/codex-model-catalog";
+  const fastServiceTierId = "priority";
+  const fastSpeedTierId = "fast";
   const interactionEvents = ["pointerdown", "focusin"];
   const modelQueryKey = ["models", "list"];
   const modelResponseEvent = "message";
@@ -137,6 +139,34 @@
     "xhigh",
   ]);
 
+  const fastServiceTier = () => ({
+    id: fastServiceTierId,
+    name: "Fast",
+    description: "1.5x speed, increased usage",
+  });
+
+  const nativeFastServiceTiers = (value) => {
+    const tiers = Array.isArray(value) ? value : [];
+    const fastTierIndex = tiers.findIndex((tier) => tier?.id === fastServiceTierId);
+    if (fastTierIndex < 0) return [...tiers, fastServiceTier()];
+    const currentFastTier = tiers[fastTierIndex];
+    if (
+      !currentFastTier
+      || typeof currentFastTier !== "object"
+      || !Object.hasOwn(currentFastTier, "iconKind")
+    ) return tiers;
+    const nativeFastTier = { ...currentFastTier };
+    delete nativeFastTier.iconKind;
+    const nextTiers = [...tiers];
+    nextTiers[fastTierIndex] = nativeFastTier;
+    return nextTiers;
+  };
+
+  const nativeFastSpeedTiers = (value) => {
+    const tiers = Array.isArray(value) ? value : [];
+    return tiers.includes(fastSpeedTierId) ? tiers : [...tiers, fastSpeedTierId];
+  };
+
   const modelDescriptor = (modelName, current = null) => {
     const metadata = catalog.modelMetadata[modelName];
     const supportedReasoningEfforts = reasoningEffortDescriptors(
@@ -176,10 +206,11 @@
       isDefault: modelName === catalog.defaultModel,
       defaultReasoningEffort: requestedDefault?.trim() || "medium",
       supportedReasoningEfforts: resolvedReasoningEfforts,
-      serviceTiers: Array.isArray(current?.serviceTiers) ? current.serviceTiers : [],
-      additionalSpeedTiers: Array.isArray(current?.additionalSpeedTiers)
-        ? current.additionalSpeedTiers
-        : [],
+      serviceTiers: nativeFastServiceTiers(current?.serviceTiers),
+      additionalSpeedTiers: nativeFastSpeedTiers(current?.additionalSpeedTiers),
+      defaultServiceTier: Object.hasOwn(current || {}, "defaultServiceTier")
+        ? current.defaultServiceTier
+        : null,
     };
   };
 
@@ -249,6 +280,9 @@
           model?.supportedReasoningEfforts,
           nextModels[index]?.supportedReasoningEfforts,
         )
+        && model?.serviceTiers === nextModels[index]?.serviceTiers
+        && model?.additionalSpeedTiers === nextModels[index]?.additionalSpeedTiers
+        && model?.defaultServiceTier === nextModels[index]?.defaultServiceTier
       ))
     );
     return unchanged ? null : nextModels;
