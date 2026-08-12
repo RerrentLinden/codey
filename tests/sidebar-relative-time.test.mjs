@@ -111,6 +111,7 @@ class FakeElement {
 }
 
 function loadInjection({
+  advanceTimeoutClock = false,
   bridgeHandler,
   now,
   rows = [],
@@ -118,6 +119,8 @@ function loadInjection({
 } = {}) {
   const placeholder = new FakeElement();
   const intervalCallbacks = [];
+  const canceledTimeouts = new Set();
+  let nextTimeoutId = 1;
   let mutationCallback = null;
   let nowMs = Number.isFinite(now) ? now : Date.now();
   class FakeDate extends Date {
@@ -148,16 +151,24 @@ function loadInjection({
     __codexSessionDeleteBridge: bridgeHandler,
     __codeyCodexSignalDispatcher: signalDispatcher,
     addEventListener() {},
-    clearTimeout() {},
+    clearTimeout(timeoutId) {
+      canceledTimeouts.add(timeoutId);
+    },
     dispatchEvent() {},
     localStorage: { length: 0, key: () => null, getItem: () => null, setItem() {} },
     setInterval: (callback) => {
       intervalCallbacks.push(callback);
       return intervalCallbacks.length;
     },
-    setTimeout: (callback) => {
-      queueMicrotask(callback);
-      return 1;
+    setTimeout: (callback, delayMs = 0) => {
+      const timeoutId = nextTimeoutId;
+      nextTimeoutId += 1;
+      queueMicrotask(() => {
+        if (canceledTimeouts.delete(timeoutId)) return;
+        if (advanceTimeoutClock) nowMs += Math.max(0, Number(delayMs) || 0);
+        callback();
+      });
+      return timeoutId;
     },
   };
   window.window = window;
@@ -175,7 +186,7 @@ function loadInjection({
     URLSearchParams,
     window,
   };
-  if (Number.isFinite(now)) context.Date = FakeDate;
+  if (Number.isFinite(now) || advanceTimeoutClock) context.Date = FakeDate;
   vm.runInNewContext(source, context);
   return {
     advanceTime: (milliseconds) => {
@@ -350,6 +361,10 @@ test("hides thread time from Codex React loading and unread status state", () =>
   window.__codeyUpdateThreadUpdatedAt(row, timestamp);
   assert.equal(content.querySelector("[data-codey-thread-updated-at]"), null);
 
+  statusFiber.memoizedProps.statusState = { type: "streaming", unread: false };
+  window.__codeyUpdateThreadUpdatedAt(row, timestamp);
+  assert.equal(content.querySelector("[data-codey-thread-updated-at]"), null);
+
   statusFiber.memoizedProps.statusState = { type: undefined, unread: true };
   window.__codeyUpdateThreadUpdatedAt(row, timestamp);
   assert.equal(content.querySelector("[data-codey-thread-updated-at]"), null);
@@ -409,6 +424,94 @@ test("visually prioritizes running threads without changing official DOM order",
   );
 });
 
+test("keeps three running threads prioritized through a transient status gap", async () => {
+  const firstRunning = sidebarThreadEntry({
+    running: true,
+    sessionId: "client-new-thread:running-1",
+  });
+  const secondRunning = sidebarThreadEntry({
+    running: true,
+    sessionId: "client-new-thread:running-2",
+  });
+  const thirdRunning = sidebarThreadEntry({
+    running: true,
+    sessionId: "client-new-thread:running-3",
+  });
+  const list = firstRunning.list;
+  list.appendChild(secondRunning.item);
+  list.appendChild(thirdRunning.item);
+  const { window } = loadInjection({
+    rows: [firstRunning.row, secondRunning.row, thirdRunning.row],
+  });
+
+  assert.deepEqual(
+    [firstRunning.item, secondRunning.item, thirdRunning.item].map((item) => (
+      item.getAttribute("data-codey-thread-running")
+    )),
+    ["true", "true", "true"],
+  );
+
+  secondRunning.spinner.remove();
+  window.__codeyInstallThreadUpdatedTimes(secondRunning.row);
+
+  assert.equal(secondRunning.item.getAttribute("data-codey-thread-running"), "true");
+  assert.deepEqual(list.children, [firstRunning.item, secondRunning.item, thirdRunning.item]);
+
+  secondRunning.nativeStatusRail.appendChild(secondRunning.spinner);
+  window.__codeyInstallThreadUpdatedTimes(secondRunning.row);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(secondRunning.item.getAttribute("data-codey-thread-running"), "true");
+});
+
+test("carries running priority across a transient React row replacement", async () => {
+  const sessionId = "client-new-thread:replaced-running";
+  const running = sidebarThreadEntry({ running: true, sessionId });
+  const rows = [running.row];
+  const { window } = loadInjection({ rows });
+  const replacement = sidebarThreadEntry({ sessionId });
+  const list = running.list;
+  running.item.remove();
+  list.appendChild(replacement.item);
+  rows[0] = replacement.row;
+
+  window.__codeyInstallThreadUpdatedTimes(replacement.row);
+
+  assert.equal(replacement.item.getAttribute("data-codey-thread-running"), "true");
+
+  replacement.nativeStatusRail.appendChild(replacement.spinner);
+  window.__codeyInstallThreadUpdatedTimes(replacement.row);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(replacement.item.getAttribute("data-codey-thread-running"), "true");
+});
+
+test("keeps running priority while a placeholder thread receives its canonical id", async () => {
+  const running = sidebarThreadEntry({
+    running: true,
+    sessionId: "client-new-thread:pending-id",
+  });
+  const { window } = loadInjection({
+    rows: [running.row],
+    signalDispatcher: async () => ({
+      data: [{ id: "thread-canonical", recencyAt: Date.now() / 1_000 }],
+      nextCursor: null,
+    }),
+  });
+
+  running.spinner.remove();
+  running.row.setAttribute("data-app-action-sidebar-thread-id", "thread-canonical");
+  window.__codeyInstallThreadUpdatedTimes(running.row);
+
+  assert.equal(running.item.getAttribute("data-codey-thread-running"), "true");
+
+  running.nativeStatusRail.appendChild(running.spinner);
+  window.__codeyInstallThreadUpdatedTimes(running.row);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(running.item.getAttribute("data-codey-thread-running"), "true");
+});
+
 test("refreshes the official timestamp when a running thread completes", async () => {
   const running = sidebarThreadEntry({
     running: true,
@@ -418,6 +521,7 @@ test("refreshes the official timestamp when a running thread completes", async (
   const firstTimestamp = Date.now() - 60 * 60_000;
   const completedTimestamp = Date.now() - 2 * 60_000;
   const { window } = loadInjection({
+    advanceTimeoutClock: true,
     rows: [running.row],
     signalDispatcher: async () => {
       dispatcherCalls += 1;
@@ -439,6 +543,10 @@ test("refreshes the official timestamp when a running thread completes", async (
 
   running.spinner.remove();
   window.__codeyInstallThreadUpdatedTimes(running.row);
+
+  assert.equal(dispatcherCalls, 1);
+  assert.equal(running.item.getAttribute("data-codey-thread-running"), "true");
+
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(dispatcherCalls, 2);
@@ -514,6 +622,7 @@ test("keeps an existing thread time when a native completion marker appears", as
   row.appendChild(content);
 
   const { window } = loadInjection({
+    advanceTimeoutClock: true,
     rows: [row],
     signalDispatcher: async () => ({
       data: [{ id: "thread-1", recencyAt: timestamp / 1_000 }],
@@ -1036,6 +1145,7 @@ test("accepts only a unique direct app-server request wrapper", () => {
 test("injects time styles that coexist with native statuses and yield to sidebar actions", () => {
   assert.match(source, /threadUpdatedAtAttribute = "data-codey-thread-updated-at"/);
   assert.match(source, /threadRunningAttribute = "data-codey-thread-running"/);
+  assert.match(source, /threadRunningLossGraceMs = 2_000/);
   assert.doesNotMatch(source, /threadSortOrderAttribute|data-codey-thread-sort-order/);
   assert.doesNotMatch(source, /--codey-thread-sort-order|thread-sort-keys/);
   assert.match(source, /threadRunningAttribute\}="true"\].*order: -1 !important/s);
@@ -1051,7 +1161,8 @@ test("injects time styles that coexist with native statuses and yield to sidebar
   assert.match(source, /font-variant-numeric: tabular-nums/);
   assert.match(source, /placeThreadUpdatedAt\(row, label\)/);
   assert.match(source, /mount\.insertBefore\(label, before\)/);
-  assert.match(source, /"disabled",\s*"class",/);
+  assert.match(source, /"aria-hidden",/);
+  assert.match(source, /"disabled",\s*"hidden",\s*"class",/);
   assert.doesNotMatch(source, /"class",\s*"style",/);
   assert.match(source, /sidebar-thread-row\]:hover \[\$\{threadUpdatedAtAttribute\}\].*opacity: 0/s);
 });

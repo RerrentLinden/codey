@@ -842,18 +842,18 @@ async fn dispatch_webhook_channels(
     event: &NotificationEvent,
     notification_key: &str,
 ) -> Result<(), WebhookDispatchError> {
-    let deliveries = {
+    let mut deliveries = channels
+        .into_iter()
+        .filter(|channel| channel.enabled && channel.is_configured())
+        .map(|channel| {
+            let delivery_key = format!("channel:{}:{notification_key}", channel.id);
+            (channel, delivery_key)
+        })
+        .collect::<Vec<_>>();
+    {
         let notifications = state.webhook_notifications.lock().await;
-        channels
-            .into_iter()
-            .filter(|channel| channel.enabled && channel.is_configured())
-            .map(|channel| {
-                let delivery_key = format!("channel:{}:{notification_key}", channel.id);
-                (channel, delivery_key)
-            })
-            .filter(|(_, delivery_key)| !notifications.was_settled(delivery_key))
-            .collect::<Vec<_>>()
-    };
+        deliveries.retain(|(_, delivery_key)| !notifications.was_settled(delivery_key));
+    }
     let deliveries = deliveries.into_iter().map(|(channel, delivery_key)| {
         let client = state.webhook_http_client.clone();
         let event = event.clone();

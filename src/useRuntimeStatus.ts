@@ -35,12 +35,127 @@ type StatusPollTask = {
   refreshesInjectionStatus: boolean;
 };
 
+type StatusPollScheduler = {
+  add: (task: StatusPollTask) => void;
+  remove: (task: StatusPollTask) => void;
+};
+
+function createStatusPollScheduler(
+  requestRuntimeStatus: (
+    refreshesInjectionStatus: boolean,
+  ) => Promise<RuntimeStatus>,
+): StatusPollScheduler {
+  const tasks = new Map<StatusPollTask["kind"], StatusPollTask>();
+  let timer = 0;
+  let requestInProgress = false;
+
+  const schedule = () => {
+    if (requestInProgress) return;
+    window.clearTimeout(timer);
+    timer = 0;
+    if (tasks.size === 0) return;
+    const nextAt = Math.min(...[...tasks.values()].map((task) => task.nextAt));
+    timer = window.setTimeout(() => {
+      timer = 0;
+      void poll();
+    }, Math.max(0, nextAt - Date.now()));
+  };
+
+  const poll = async () => {
+    if (requestInProgress || tasks.size === 0) return;
+    const requestStartedAt = Date.now();
+    const dueTasks = [...tasks.values()].filter(
+      (task) => task.nextAt <= requestStartedAt,
+    );
+    if (dueTasks.length === 0) {
+      schedule();
+      return;
+    }
+
+    requestInProgress = true;
+    try {
+      const next = await requestRuntimeStatus(
+        dueTasks.some((task) => task.refreshesInjectionStatus),
+      );
+      const completedAt = Date.now();
+      for (const task of dueTasks) {
+        if (tasks.get(task.kind) !== task) continue;
+        task.errors = 0;
+        task.delayIndex = Math.min(
+          task.delayIndex + 1,
+          task.delays.length - 1,
+        );
+        if (completedAt >= task.deadline || !task.pending(next)) {
+          tasks.delete(task.kind);
+          continue;
+        }
+        task.nextAt =
+          completedAt +
+          (task.kind === "restart" ? 500 : task.delays[task.delayIndex]);
+      }
+    } catch {
+      const failedAt = Date.now();
+      for (const task of dueTasks) {
+        if (tasks.get(task.kind) !== task) continue;
+        task.errors += 1;
+        task.delayIndex = Math.min(
+          task.delayIndex + 1,
+          task.delays.length - 1,
+        );
+        if (
+          failedAt >= task.deadline ||
+          task.errors >= STATUS_POLL_MAX_CONSECUTIVE_ERRORS
+        ) {
+          tasks.delete(task.kind);
+          continue;
+        }
+        task.nextAt =
+          failedAt +
+          (task.kind === "restart"
+            ? Math.min(500 * 2 ** task.errors, 5_000)
+            : task.delays[task.delayIndex]);
+      }
+    } finally {
+      requestInProgress = false;
+      schedule();
+    }
+  };
+
+  return {
+    add(task) {
+      tasks.set(task.kind, task);
+      schedule();
+    },
+    remove(task) {
+      if (tasks.get(task.kind) === task) {
+        tasks.delete(task.kind);
+        schedule();
+      }
+    },
+  };
+}
+
+function createStatusPollTask(
+  task: Omit<StatusPollTask, "deadline" | "delayIndex" | "errors" | "nextAt">,
+  duration: number,
+): StatusPollTask {
+  const now = Date.now();
+  return {
+    ...task,
+    deadline: now + duration,
+    delayIndex: 0,
+    errors: 0,
+    nextAt: now + task.delays[0],
+  };
+}
+
 export function useRuntimeStatus({
   active,
   embedded,
 }: UseRuntimeStatusOptions) {
   const [status, setStatus] = useState<RuntimeStatus>({ running: false });
   const runtimeStatusFlightRef = useRef<RuntimeStatusFlight | null>(null);
+  const statusPollSchedulerRef = useRef<StatusPollScheduler | null>(null);
   const settingsOpenRefreshRequestedRef = useRef(false);
   const activeRef = useRef(active);
   activeRef.current = active;
@@ -106,6 +221,13 @@ export function useRuntimeStatus({
     [requestRuntimeStatus],
   );
 
+  if (statusPollSchedulerRef.current === null) {
+    statusPollSchedulerRef.current = createStatusPollScheduler(
+      requestRuntimeStatus,
+    );
+  }
+  const statusPollScheduler = statusPollSchedulerRef.current;
+
   const refreshStatusForLoad = useCallback(() => {
     const shouldRefreshInjectionStatus =
       !embedded || !settingsOpenRefreshRequestedRef.current;
@@ -148,148 +270,80 @@ export function useRuntimeStatus({
   const wmiSamplerStatus = status.injectionScripts?.find(
     (script) => script.id === "windows-wmi-sampler",
   )?.status;
+  const gitGuardProbePending = gitGuardStatus === "executed";
+  const wmiSamplerProbePending = wmiSamplerStatus === "executed";
 
   useEffect(() => {
-    if (!active) return;
-    const now = Date.now();
-    let tasks: StatusPollTask[] = [];
-    const addTask = (
-      task: Omit<StatusPollTask, "deadline" | "delayIndex" | "errors" | "nextAt">,
-      duration: number,
-    ) => {
-      tasks.push({
-        ...task,
-        deadline: now + duration,
-        delayIndex: 0,
-        errors: 0,
-        nextAt: now + task.delays[0],
-      });
-    };
-
-    if (gitGuardStatus === "executed" || wmiSamplerStatus === "executed") {
-      addTask(
-        {
-          kind: "injection",
-          delays: GIT_GUARD_PROBE_DELAYS_MS,
-          pending: (next) =>
-            next.injectionScripts?.some(
-              (script) =>
-                (script.id === "git-request-guard" ||
-                  script.id === "windows-wmi-sampler") &&
-                script.status === "executed",
-            ) ?? false,
-          refreshesInjectionStatus: true,
-        },
-        wmiSamplerStatus === "executed"
-          ? WMI_SAMPLER_PROBE_MAX_DURATION_MS
-          : GIT_GUARD_PROBE_MAX_DURATION_MS,
-      );
-    }
-    if (
-      status.traceLogStats?.pending ||
-      status.crashpadPendingStats?.pending
-    ) {
-      addTask(
-        {
-          kind: "diagnostics",
-          delays: DIAGNOSTIC_PROBE_DELAYS_MS,
-          pending: (next) =>
-            Boolean(
-              next.traceLogStats?.pending ||
-              next.crashpadPendingStats?.pending,
-            ),
-          refreshesInjectionStatus: false,
-        },
-        STATUS_POLL_MAX_DURATION_MS,
-      );
-    }
-    if (status.restartInProgress) {
-      addTask(
-        {
-          kind: "restart",
-          delays: [500],
-          pending: (next) => Boolean(next.restartInProgress),
-          refreshesInjectionStatus: false,
-        },
-        STATUS_POLL_MAX_DURATION_MS,
-      );
-    }
-    if (tasks.length === 0) return;
-
-    let cancelled = false;
-    let timer = 0;
-    const schedule = () => {
-      if (cancelled || tasks.length === 0) return;
-      const nextAt = Math.min(...tasks.map((task) => task.nextAt));
-      timer = window.setTimeout(async () => {
-        const requestStartedAt = Date.now();
-        const dueTasks = tasks.filter(
-          (task) => task.nextAt <= requestStartedAt && requestStartedAt < task.deadline,
-        );
-        if (dueTasks.length === 0) {
-          tasks = tasks.filter((task) => requestStartedAt < task.deadline);
-          schedule();
-          return;
-        }
-        try {
-          const next = await requestRuntimeStatus(
-            dueTasks.some((task) => task.refreshesInjectionStatus),
-          );
-          if (cancelled) return;
-          const completedAt = Date.now();
-          for (const task of dueTasks) {
-            task.errors = 0;
-            task.delayIndex = Math.min(
-              task.delayIndex + 1,
-              task.delays.length - 1,
-            );
-            task.nextAt =
-              completedAt +
-              (task.kind === "restart"
-                ? 500
-                : task.delays[task.delayIndex]);
-          }
-          tasks = tasks.filter(
-            (task) => completedAt < task.deadline && task.pending(next),
-          );
-        } catch {
-          if (cancelled) return;
-          const failedAt = Date.now();
-          for (const task of dueTasks) {
-            task.errors += 1;
-            task.delayIndex = Math.min(
-              task.delayIndex + 1,
-              task.delays.length - 1,
-            );
-            task.nextAt =
-              failedAt +
-              (task.kind === "restart"
-                ? Math.min(500 * 2 ** task.errors, 5_000)
-                : task.delays[task.delayIndex]);
-          }
-          tasks = tasks.filter(
-            (task) =>
-              failedAt < task.deadline &&
-              task.errors < STATUS_POLL_MAX_CONSECUTIVE_ERRORS,
-          );
-        }
-        schedule();
-      }, Math.max(0, nextAt - Date.now()));
-    };
-    schedule();
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
+    if (!active || (!gitGuardProbePending && !wmiSamplerProbePending)) return;
+    const task = createStatusPollTask(
+      {
+        kind: "injection",
+        delays: GIT_GUARD_PROBE_DELAYS_MS,
+        pending: (next) =>
+          next.injectionScripts?.some(
+            (script) =>
+              (script.id === "git-request-guard" ||
+                script.id === "windows-wmi-sampler") &&
+              script.status === "executed",
+          ) ?? false,
+        refreshesInjectionStatus: true,
+      },
+      wmiSamplerProbePending
+        ? WMI_SAMPLER_PROBE_MAX_DURATION_MS
+        : GIT_GUARD_PROBE_MAX_DURATION_MS,
+    );
+    statusPollScheduler.add(task);
+    return () => statusPollScheduler.remove(task);
   }, [
     active,
-    gitGuardStatus,
-    requestRuntimeStatus,
-    status.crashpadPendingStats?.pending,
-    status.restartInProgress,
-    status.traceLogStats?.pending,
-    wmiSamplerStatus,
+    gitGuardProbePending,
+    statusPollScheduler,
+    wmiSamplerProbePending,
   ]);
+
+  useEffect(() => {
+    if (
+      !active ||
+      (!status.traceLogStats?.pending &&
+        !status.crashpadPendingStats?.pending)
+    )
+      return;
+    const task = createStatusPollTask(
+      {
+        kind: "diagnostics",
+        delays: DIAGNOSTIC_PROBE_DELAYS_MS,
+        pending: (next) =>
+          Boolean(
+            next.traceLogStats?.pending ||
+              next.crashpadPendingStats?.pending,
+          ),
+        refreshesInjectionStatus: false,
+      },
+      STATUS_POLL_MAX_DURATION_MS,
+    );
+    statusPollScheduler.add(task);
+    return () => statusPollScheduler.remove(task);
+  }, [
+    active,
+    status.crashpadPendingStats?.pending,
+    status.traceLogStats?.pending,
+    statusPollScheduler,
+  ]);
+
+  useEffect(() => {
+    if (!active || !status.restartInProgress) return;
+    const task = createStatusPollTask(
+      {
+        kind: "restart",
+        delays: [500],
+        pending: (next) => Boolean(next.restartInProgress),
+        refreshesInjectionStatus: false,
+      },
+      STATUS_POLL_MAX_DURATION_MS,
+    );
+    statusPollScheduler.add(task);
+    return () => statusPollScheduler.remove(task);
+  }, [active, status.restartInProgress, statusPollScheduler]);
 
   return {
     status,

@@ -60,6 +60,10 @@
   const threadUpdatedAtReadRetryCounts = new Map();
   const threadUpdatedAtCache = new Map();
   const threadWorkStateByRow = new WeakMap();
+  // React can briefly detach the native status rail or replace a virtualized
+  // row. Preserve the last confirmed running state until a delayed rescan.
+  const threadRunningStateByCacheKey = new Map();
+  const threadRunningRecheckTimers = new Map();
   const threadUpdatedAtRequestedAt = new Map();
   const pendingThreadUpdatedAtRefs = new Map();
   const threadUpdatedAtRows = new Set();
@@ -83,6 +87,7 @@
   const sidebarThreadRowSelector = "[data-app-action-sidebar-thread-row]";
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
   const deletedSidebarSessionTtlMs = 10 * 60 * 1000;
+  const threadRunningLossGraceMs = 2_000;
   const threadTimestampRefreshIntervalMs = 60_000;
   const threadTimestampListPageSize = 100;
   const maxThreadTimestampListPages = 5;
@@ -756,6 +761,11 @@
         threadUpdatedAtReadRetryCounts.delete(key);
       }
     });
+    [...threadRunningStateByCacheKey.keys()].forEach((key) => {
+      if (!key.endsWith(`\u0000${normalizedSessionId}`)) return;
+      threadRunningStateByCacheKey.delete(key);
+      cancelThreadRunningRecheck(key);
+    });
     return normalizedSessionId;
   };
 
@@ -924,11 +934,15 @@
     return null;
   };
 
+  const nativeThreadStatusTypeLooksActive = (value) => (
+    /^(?:loading|processing|running|working|streaming|generating|in(?:[_ -]?progress))$/i
+      .test(String(value || "").trim())
+  );
+
   const nativeReactThreadStatusVisible = (row) => {
     const statusState = nativeReactThreadStatusState(row);
     if (!statusState) return false;
-    const type = String(statusState.type || "");
-    return statusState.unread === true || /^(?:loading|processing|running|working)$/i.test(type);
+    return statusState.unread === true || nativeThreadStatusTypeLooksActive(statusState.type);
   };
 
   const nativeElementLooksLikeThreadStatus = (element) => {
@@ -951,7 +965,7 @@
 
   const nativeThreadWorkInProgress = (row) => {
     const statusState = nativeReactThreadStatusState(row);
-    if (/^(?:loading|processing|running|working)$/i.test(String(statusState?.type || ""))) {
+    if (nativeThreadStatusTypeLooksActive(statusState?.type)) {
       return true;
     }
     const { trailing } = threadUpdatedAtPlacement(row);
@@ -1000,8 +1014,70 @@
     `${String(hostId || "local").trim() || "local"}\u0000${normalizeThreadSessionId(sessionId)}`
   );
 
-  const sidebarThreadTimestampState = (row) => {
-    const workInProgress = nativeThreadWorkInProgress(row);
+  const cancelThreadRunningRecheck = (cacheKey) => {
+    if (!threadRunningRecheckTimers.has(cacheKey)) return;
+    window.clearTimeout(threadRunningRecheckTimers.get(cacheKey));
+    threadRunningRecheckTimers.delete(cacheKey);
+  };
+
+  const scheduleThreadRunningRecheck = (cacheKey, delayMs) => {
+    if (!cacheKey || threadRunningRecheckTimers.has(cacheKey)) return;
+    const timer = window.setTimeout(() => {
+      threadRunningRecheckTimers.delete(cacheKey);
+      const state = threadRunningStateByCacheKey.get(cacheKey);
+      if (!state || !Number.isFinite(state.missingSince)) return;
+      const remainingMs = threadRunningLossGraceMs - (Date.now() - state.missingSince);
+      if (remainingMs > 0) {
+        scheduleThreadRunningRecheck(cacheKey, remainingMs);
+        return;
+      }
+      installThreadUpdatedTimes(document);
+      const current = threadRunningStateByCacheKey.get(cacheKey);
+      if (current === state && current?.missingSince === state.missingSince) {
+        threadRunningStateByCacheKey.delete(cacheKey);
+      }
+    }, Math.max(0, Number(delayMs) || 0));
+    threadRunningRecheckTimers.set(cacheKey, timer);
+  };
+
+  const stableThreadWorkInProgress = (
+    cacheKey,
+    detectedWorkInProgress,
+    previouslyRunning = false,
+    now = Date.now(),
+  ) => {
+    if (!cacheKey) return detectedWorkInProgress;
+    if (detectedWorkInProgress) {
+      rememberBoundedMapValue(
+        threadRunningStateByCacheKey,
+        cacheKey,
+        { missingSince: null },
+      );
+      cancelThreadRunningRecheck(cacheKey);
+      return true;
+    }
+    let state = threadRunningStateByCacheKey.get(cacheKey);
+    if (!state && previouslyRunning) {
+      state = { missingSince: now };
+      rememberBoundedMapValue(threadRunningStateByCacheKey, cacheKey, state);
+    }
+    if (!state) return false;
+    if (!Number.isFinite(state.missingSince)) {
+      state.missingSince = now;
+      rememberBoundedMapValue(threadRunningStateByCacheKey, cacheKey, state);
+    }
+    const remainingMs = threadRunningLossGraceMs - (now - state.missingSince);
+    if (remainingMs > 0) {
+      scheduleThreadRunningRecheck(cacheKey, remainingMs);
+      return true;
+    }
+    threadRunningStateByCacheKey.delete(cacheKey);
+    cancelThreadRunningRecheck(cacheKey);
+    return false;
+  };
+
+  const sidebarThreadTimestampState = (row, now = Date.now()) => {
+    const detectedWorkInProgress = nativeThreadWorkInProgress(row);
     const identity = threadIdentityNode(row);
     if (!(identity instanceof HTMLElement)) {
       return {
@@ -1009,7 +1085,7 @@
         completedWork: false,
         hostId: "local",
         sessionId: "",
-        workInProgress,
+        workInProgress: detectedWorkInProgress,
       };
     }
     const sessionId = normalizeThreadSessionId(threadSessionIdFromRow(identity));
@@ -1022,11 +1098,29 @@
         hostId,
         kind,
         sessionId: "",
-        workInProgress,
+        workInProgress: detectedWorkInProgress,
       };
     }
     const cacheKey = threadTimestampCacheKey(hostId, sessionId);
     const previous = threadWorkStateByRow.get(row);
+    if (previous?.cacheKey && previous.cacheKey !== cacheKey) {
+      const previousRunningState = threadRunningStateByCacheKey.get(previous.cacheKey);
+      if (previousRunningState && !threadRunningStateByCacheKey.has(cacheKey)) {
+        rememberBoundedMapValue(
+          threadRunningStateByCacheKey,
+          cacheKey,
+          previousRunningState,
+        );
+      }
+      threadRunningStateByCacheKey.delete(previous.cacheKey);
+      cancelThreadRunningRecheck(previous.cacheKey);
+    }
+    const workInProgress = stableThreadWorkInProgress(
+      cacheKey,
+      detectedWorkInProgress,
+      previous?.workInProgress === true,
+      now,
+    );
     const completedWork = Boolean(
       previous
       && previous.cacheKey === cacheKey
@@ -1399,7 +1493,7 @@
         kind,
         sessionId,
         workInProgress,
-      } = sidebarThreadTimestampState(row);
+      } = sidebarThreadTimestampState(row, now);
       updateThreadRunningPriority(row, workInProgress);
       renderCachedThreadUpdatedAt(row);
       if (!sessionId || sessionId.startsWith("client-new-thread:")) return;
@@ -2443,6 +2537,7 @@
     attributes: true,
     attributeFilter: [
       "aria-label",
+      "aria-hidden",
       "data-turn-key",
       "data-request-user-input-auto-resolution-conversation-id",
       "data-app-action-sidebar-thread-host-id",
@@ -2453,6 +2548,7 @@
       "data-app-action-sidebar-project-row",
       "data-testid",
       "disabled",
+      "hidden",
       "class",
     ],
     childList: true,
