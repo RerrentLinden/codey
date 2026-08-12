@@ -14,6 +14,7 @@ const cdpSource = await readFile(
 
 function createRuntime({
   platform = "Win32",
+  returnStatus = true,
   sampler = {
     enabled: true,
     installed: true,
@@ -40,6 +41,7 @@ function createRuntime({
     electronBridge: {
       sendMessageFromView(message) {
         requests.push(message);
+        if (!returnStatus) return Promise.resolve(undefined);
         return Promise.resolve({
           status: "ok",
           sampler: { ...currentSampler },
@@ -125,6 +127,21 @@ test("WMI sampler guard distinguishes installation from an actual blocked sample
     runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
     true,
   );
+});
+
+test("WMI sampler guard accepts the no-return preload status bridge", async () => {
+  const runtime = createRuntime({ returnStatus: false });
+  await runtime.flush();
+
+  const entry =
+    runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
+  const snapshot = runtime.window.__codeyWindowsWmiSamplerGuard.snapshot();
+  assert.equal(entry.status, "effective");
+  assert.match(entry.detail, /兼容确认/);
+  assert.equal(snapshot.installed, true);
+  assert.equal(snapshot.confirmed, true);
+  assert.equal(snapshot.mainProcessCompatibilityConfirmed, true);
+  assert.equal(runtime.requests.length, 1);
 });
 
 test("WMI sampler guard keeps an unmatched observation window unverified", async () => {

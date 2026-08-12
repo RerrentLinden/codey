@@ -77,6 +77,9 @@ function createRuntime({
   if (mainGuardReady !== null) {
     electronBridge.sendMessageFromView = (message) => {
       statusRequests.push(message);
+      if (mainGuardReady === "no-return") {
+        return Promise.resolve(undefined);
+      }
       if (!mainGuardReady) {
         return Promise.resolve({
           status: "ok",
@@ -374,6 +377,29 @@ test("Git request guard accepts main-process protection when contextBridge is fr
   );
   assert.equal(runtime.nativeCalls.length, 1);
   assert.equal(snapshot.matched, 0);
+});
+
+test("Git request guard accepts the no-return preload status bridge", async () => {
+  const runtime = createRuntime({
+    freezeBridge: true,
+    mainGuardReady: "no-return",
+  });
+  await runtime.flush();
+
+  const snapshot = runtime.window.__codeyGitRequestGuard.snapshot();
+  assert.equal(snapshot.bridgePatched, false);
+  assert.equal(snapshot.mainProcessProtected, true);
+  assert.equal(snapshot.mainProcessCompatibilityConfirmed, true);
+  assert.equal(snapshot.mainProcessSnapshot.compatibilityConfirmed, true);
+  assert.equal(snapshot.installed, true);
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["git-request-guard"].status,
+    "effective",
+  );
+  assert.match(
+    runtime.window.__codeyInjectionStatus["git-request-guard"].detail,
+    /兼容确认/,
+  );
 });
 
 test("Git request guard re-arms bridge retries when an existing guard is re-injected", async () => {

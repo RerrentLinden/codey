@@ -201,6 +201,9 @@ pub fn prepare_injection_scripts(
               if (snapshot.enabled === false && snapshot.installed === true) {
                 return "WMI 周期采样保护已就绪，当前平台无需启用";
               }
+              if (snapshot.mainProcessCompatibilityConfirmed === true) {
+                return "WMI 周期采样保护已由主进程接管（兼容确认）";
+              }
               if (snapshot.blocked > 0) {
                 return `已阻止 ${snapshot.blocked} 次 WMI 周期进程采样`;
               }

@@ -69,6 +69,7 @@
   let mainProcessProbeAttempts = 0;
   let mainProcessProbeError = "";
   let mainProcessSnapshot = null;
+  let mainProcessCompatibilityConfirmed = false;
 
   const now = () => {
     const value = Number(Date.now());
@@ -182,7 +183,9 @@
     if (!entry) return;
     const detail = enabled
       ? mainProcessProtected
-        ? "Windows Git 请求限流已由主进程接管"
+        ? mainProcessCompatibilityConfirmed
+          ? "Windows Git 请求限流已由主进程接管（兼容确认）"
+          : "Windows Git 请求限流已由主进程接管"
         : "Windows Git 请求限流已由 Renderer 接管"
       : "Git 请求保护已就绪，当前平台无需启用";
     const changed =
@@ -473,6 +476,23 @@
         ]),
       )
       .then((result) => {
+        if (result === undefined) {
+          mainProcessProtected = true;
+          mainProcessCompatibilityConfirmed = true;
+          mainProcessSnapshot = {
+            enabled: true,
+            gitHandlerPatched: true,
+            statusHandlerPatched: true,
+            strategy: "main-process-ipc",
+            tokenRefillMs,
+            compatibilityConfirmed: true,
+          };
+          mainProcessProbeError = "";
+          if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
+          bridgeRetryTimer = 0;
+          markEffective();
+          return;
+        }
         const guard = result?.guard;
         if (
           result?.status === "ok" &&
@@ -480,6 +500,7 @@
           guard?.gitHandlerPatched === true
         ) {
           mainProcessProtected = true;
+          mainProcessCompatibilityConfirmed = false;
           mainProcessSnapshot = guard;
           mainProcessProbeError = "";
           if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
@@ -540,6 +561,7 @@
     mainProcessProbeAttempts,
     mainProcessProbeError,
     mainProcessSnapshot,
+    mainProcessCompatibilityConfirmed,
     bridgePatched,
     responseObserverPatched,
     observedGitSubscriptions,

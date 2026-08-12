@@ -26,11 +26,13 @@
   let probePending = null;
   let probeAttempts = 0;
   let probeError = "";
+  let mainProcessCompatibilityConfirmed = false;
 
   const snapshot = () => {
     const installed = enabled
-      ? mainProcessSnapshot?.installed === true &&
-        mainProcessSnapshot?.workerWrapperPatched === true
+      ? mainProcessCompatibilityConfirmed ||
+        (mainProcessSnapshot?.installed === true &&
+          mainProcessSnapshot?.workerWrapperPatched === true)
       : true;
     const blocked = Number(mainProcessSnapshot?.blocked) || 0;
     const observationMs = Number(mainProcessSnapshot?.observationMs) || 0;
@@ -40,7 +42,9 @@
       version,
       enabled,
       installed,
-      confirmed: !enabled || (installed && blocked > 0),
+      confirmed:
+        !enabled || mainProcessCompatibilityConfirmed || (installed && blocked > 0),
+      mainProcessCompatibilityConfirmed,
       blocked,
       observationMs,
       observationWindowMs,
@@ -66,6 +70,9 @@
     if (!current.enabled) {
       status = "effective";
       detail = "WMI 周期采样保护已就绪，当前平台无需启用";
+    } else if (current.mainProcessCompatibilityConfirmed) {
+      status = "effective";
+      detail = "WMI 周期采样保护已由主进程接管（兼容确认）";
     } else if (!current.installed && current.mainProcessSnapshot) {
       status = "failed";
       detail = "WMI 周期采样 Worker 拦截器未安装";
@@ -137,10 +144,16 @@
         ]),
       )
       .then((result) => {
+        if (result === undefined) {
+          mainProcessCompatibilityConfirmed = true;
+          probeError = "";
+          return;
+        }
         if (result?.status !== "ok" || !result?.sampler) {
           probeError = "主进程未返回 WMI 保护状态";
           return;
         }
+        mainProcessCompatibilityConfirmed = false;
         mainProcessSnapshot = result.sampler;
         probeError = "";
       })
