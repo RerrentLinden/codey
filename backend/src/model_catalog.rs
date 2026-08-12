@@ -1326,6 +1326,14 @@ mod tests {
         assert!(!declares_fast_speed_support(model));
     }
 
+    fn assert_no_multi_agent_version_unless_windows_v2(model: &Value) {
+        if cfg!(windows) {
+            assert_eq!(model["multi_agent_version"], "v2");
+        } else {
+            assert!(model.get("multi_agent_version").is_none());
+        }
+    }
+
     #[test]
     fn official_catalog_keeps_the_fixed_order_and_native_fast_metadata() {
         let home = tempfile::tempdir().unwrap();
@@ -1377,7 +1385,7 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.5")
             .unwrap();
         assert_eq!(gpt_55["service_tiers"][0]["id"], "priority");
-        assert!(gpt_55.get("multi_agent_version").is_none());
+        assert_no_multi_agent_version_unless_windows_v2(gpt_55);
         let luna = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.6-luna")
@@ -1840,7 +1848,7 @@ mod tests {
         let custom = models.last().unwrap();
         assert_eq!(custom["slug"], "claude-sonnet");
         assert_eq!(custom["codey_source"], "third_party");
-        assert!(custom.get("multi_agent_version").is_none());
+        assert_no_multi_agent_version_unless_windows_v2(custom);
         assert_eq!(
             custom["supported_reasoning_levels"]
                 .as_array()
@@ -2031,10 +2039,10 @@ mod tests {
             home.path(),
             Some("0.147.0-alpha.6.5")
         ));
-        assert!(is_available_for_runtime(
-            home.path(),
-            Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION)
-        ));
+        assert_eq!(
+            is_available_for_runtime(home.path(), Some(LEAF_SUBAGENT_MIN_CLIENT_VERSION)),
+            !cfg!(windows)
+        );
     }
 
     #[test]
