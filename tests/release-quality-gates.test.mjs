@@ -98,6 +98,13 @@ test("Windows release publishes the installer without a portable zip", () => {
   assert.match(workflow, /name: codey-windows-x64-installer/);
   assert.match(workflow, /windows-x64-setup\.exe/);
   assert.match(nsisInstallStep, /choco install nsis --yes --no-progress/);
+  assert.match(nsisInstallStep, /\$maxAttempts = 3/);
+  assert.match(nsisInstallStep, /\$installExitCode = \$LASTEXITCODE/);
+  assert.match(nsisInstallStep, /Start-Sleep -Seconds \$delaySeconds/);
+  assert.match(
+    nsisInstallStep,
+    /Chocolatey failed to install NSIS after \$maxAttempts attempts/,
+  );
   assert.match(nsisInstallStep, /NSIS\\Bin\\makensis\.exe/);
   assert.match(nsisInstallStep, /GITHUB_PATH/);
   assert.match(nsisInstallStep, /MAKENSIS=/);

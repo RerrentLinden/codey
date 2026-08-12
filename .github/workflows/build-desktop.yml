@@ -143,7 +143,25 @@ jobs:
       - name: Install NSIS
         shell: pwsh
         run: |
-          choco install nsis --yes --no-progress
+          $maxAttempts = 3
+          $installExitCode = 1
+          for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            choco install nsis --yes --no-progress
+            $installExitCode = $LASTEXITCODE
+            if ($installExitCode -eq 0) {
+              break
+            }
+
+            if ($attempt -lt $maxAttempts) {
+              $delaySeconds = 15 * $attempt
+              Write-Warning "Chocolatey failed to install NSIS (attempt $attempt/$maxAttempts, exit code $installExitCode). Retrying in $delaySeconds seconds."
+              Start-Sleep -Seconds $delaySeconds
+            }
+          }
+          if ($installExitCode -ne 0) {
+            throw "Chocolatey failed to install NSIS after $maxAttempts attempts (exit code $installExitCode)."
+          }
+
           $makensis = @(
             "${env:ProgramFiles(x86)}\NSIS\makensis.exe",
             "${env:ProgramFiles}\NSIS\makensis.exe",
