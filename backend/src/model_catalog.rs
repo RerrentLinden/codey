@@ -705,11 +705,11 @@ fn complete_reasoning_metadata(model: &mut Value, fallbacks: &[&Value]) {
 fn normalize_official_model(model: &mut Value, slug: &str, display_name: &str, priority: usize) {
     model["slug"] = json!(slug);
     model["display_name"] = json!(display_name);
-    if !model
+    if model
         .get("description")
         .and_then(Value::as_str)
         .map(str::trim)
-        .is_some_and(|description| !description.is_empty())
+        .is_none_or(|description| description.is_empty())
     {
         model["description"] = json!(display_name);
     }
@@ -2020,11 +2020,11 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut catalog = official_cache();
         for model in catalog["models"].as_array_mut().unwrap() {
-            if !model
+            if model
                 .get("description")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .is_some_and(|description| !description.is_empty())
+                .is_none_or(|description| description.is_empty())
             {
                 model["description"] = json!(model["slug"].as_str().unwrap_or("Model"));
             }

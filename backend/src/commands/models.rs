@@ -1240,10 +1240,12 @@ mod tests {
 
     #[test]
     fn startup_fallback_persists_only_reconciled_subagent_defaults() {
-        let mut persisted = CodeyConfig::default();
-        persisted.subagent_optimization = true;
-        persisted.subagent_model = "gpt-5.6-luna".into();
-        persisted.subagent_reasoning_effort = "high".into();
+        let mut persisted = CodeyConfig {
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-luna".into(),
+            subagent_reasoning_effort: "high".into(),
+            ..CodeyConfig::default()
+        };
         let provider_id = persisted.current_provider_id().unwrap().to_string();
         persisted
             .upstream_models_by_provider

@@ -72,7 +72,7 @@ pub(crate) fn reconcile_with_model_state(
         return;
     }
     config.subagent_reasoning_effort =
-        reasoning_effort_for_model(&state, &model, &config.subagent_reasoning_effort);
+        reasoning_effort_for_model(state, &model, &config.subagent_reasoning_effort);
 }
 
 fn reset_with_model_state(
@@ -113,7 +113,7 @@ fn defaults_for_model_state(
     };
     let model = model.to_string();
     let reasoning_effort =
-        reasoning_effort_for_model(&state, &model, &config.subagent_reasoning_effort);
+        reasoning_effort_for_model(state, &model, &config.subagent_reasoning_effort);
     (model, reasoning_effort, true)
 }
 
