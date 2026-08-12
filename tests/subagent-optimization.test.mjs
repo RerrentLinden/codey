@@ -91,6 +91,8 @@ test("subagent optimization installs a root-only runtime wait gate", async () =>
   assert.match(mainSource, /run_subagent_gate_hook_if_requested/);
   assert.match(configSource, /enable_subagent_gate_hooks\(doc, config_path\)/);
   assert.match(configSource, /toml_event: "PreToolUse"/);
+  assert.match(configSource, /toml_event: "PostToolUse"/);
+  assert.match(configSource, /matcher: Some\("\.\*wait_agent\$"\)/);
   assert.match(configSource, /toml_event: "SubagentStart"/);
   assert.match(configSource, /toml_event: "SubagentStop"/);
   assert.match(configSource, /toml_event: "Stop"/);
@@ -99,5 +101,7 @@ test("subagent optimization installs a root-only runtime wait gate", async () =>
   assert.match(gateSource, /permissionDecision": "deny"/);
   assert.match(gateSource, /"decision": "block"/);
   assert.match(gateSource, /is_collaboration_tool/);
+  assert.match(gateSource, /post_wait_continuation/);
+  assert.match(gateSource, /不得分析局部结果/);
   assert.match(gateSource, /SubagentStop/);
 });

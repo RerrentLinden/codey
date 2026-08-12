@@ -28,6 +28,8 @@ struct HookInput {
     agent_id: Option<String>,
     #[serde(default)]
     tool_name: Option<String>,
+    #[serde(default)]
+    tool_response: Option<Value>,
 }
 
 pub fn run_hook_if_requested() -> Result<bool> {
@@ -114,6 +116,7 @@ fn handle_hook(input: &HookInput, state_root: &Path) -> Result<Value> {
             Ok(json!({}))
         }
         "PreToolUse" => pre_tool_use_output(input, state_root),
+        "PostToolUse" => post_tool_use_output(input, state_root),
         "Stop" => stop_output(input, state_root),
         _ => Ok(json!({})),
     }
@@ -133,6 +136,20 @@ fn pre_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
         return Ok(json!({}));
     }
     Ok(pre_tool_denial(active))
+}
+
+fn post_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
+    if nonempty(input.agent_id.as_deref()).is_some()
+        || !input.tool_name.as_deref().is_some_and(is_wait_agent_tool)
+        || wait_was_interrupted_by_user(input.tool_response.as_ref())
+    {
+        return Ok(json!({}));
+    }
+    let active = active_agent_count(state_root, &input.session_id)?;
+    if active == 0 {
+        return Ok(json!({}));
+    }
+    Ok(post_wait_continuation(active, input.tool_response.as_ref()))
 }
 
 fn stop_output(input: &HookInput, state_root: &Path) -> Result<Value> {
@@ -158,6 +175,15 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
                 "permissionDecisionReason": reason,
             }
         }),
+        "PostToolUse"
+            if nonempty(input.agent_id.as_deref()).is_none()
+                && input.tool_name.as_deref().is_some_and(is_wait_agent_tool) =>
+        {
+            json!({
+                "decision": "block",
+                "reason": reason,
+            })
+        }
         "Stop" if nonempty(input.agent_id.as_deref()).is_none() => json!({
             "decision": "block",
             "reason": reason,
@@ -178,6 +204,16 @@ fn pre_tool_denial(active: usize) -> Value {
     })
 }
 
+fn post_wait_continuation(active: usize, tool_response: Option<&Value>) -> Value {
+    let returned_update = render_wait_result(tool_response);
+    json!({
+        "decision": "block",
+        "reason": format!(
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 只返回了一次局部更新，仍有 {active} 个子代理在运行。保留下方已返回内容，等全部子代理完成后再统一处理；现在不得分析局部结果、下结论、宣布开始修改或执行后续工作，也不要输出进度说明。必须立即再次调用 agents.wait_agent，并持续等待到每个已派生子代理都返回 FINAL_ANSWER 或 task_complete。\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+        ),
+    })
+}
+
 fn stop_continuation(active: usize) -> Value {
     json!({
         "decision": "block",
@@ -187,7 +223,81 @@ fn stop_continuation(active: usize) -> Value {
     })
 }
 
+fn render_wait_result(tool_response: Option<&Value>) -> String {
+    match tool_response {
+        Some(Value::String(response)) => response.clone(),
+        Some(response) => serde_json::to_string(response)
+            .unwrap_or_else(|_| "（wait_agent 返回内容无法序列化）".to_string()),
+        None => "（wait_agent 未提供返回内容）".to_string(),
+    }
+}
+
+fn wait_was_interrupted_by_user(tool_response: Option<&Value>) -> bool {
+    tool_response.is_some_and(value_reports_user_interrupt)
+}
+
+fn value_reports_user_interrupt(value: &Value) -> bool {
+    match value {
+        Value::String(value) => text_reports_user_interrupt(value),
+        Value::Array(values) => values.iter().any(value_reports_user_interrupt),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            let normalized_key = key
+                .chars()
+                .filter(|character| character.is_ascii_alphanumeric())
+                .flat_map(char::to_lowercase)
+                .collect::<String>();
+            (matches!(
+                normalized_key.as_str(),
+                "interruptedbynewinput"
+                    | "interruptedbyuserinput"
+                    | "newuserinput"
+                    | "steeredinput"
+                    | "steereduserinput"
+            ) && !matches!(value, Value::Bool(false) | Value::Null))
+                || value_reports_user_interrupt(value)
+        }),
+        _ => false,
+    }
+}
+
+fn text_reports_user_interrupt(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    let interrupted = normalized.contains("interrupt") || normalized.contains("steer");
+    let user_input = [
+        "new input",
+        "new_input",
+        "user input",
+        "user_input",
+        "steered input",
+        "steered_input",
+        "user message",
+        "user_message",
+        "new message",
+        "new_message",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    interrupted && user_input
+}
+
 fn is_collaboration_tool(tool_name: &str) -> bool {
+    matches!(
+        normalized_collaboration_tool(tool_name).as_str(),
+        "agent"
+            | "spawn_agent"
+            | "wait_agent"
+            | "list_agents"
+            | "interrupt_agent"
+            | "send_message"
+            | "followup_task"
+    )
+}
+
+fn is_wait_agent_tool(tool_name: &str) -> bool {
+    normalized_collaboration_tool(tool_name) == "wait_agent"
+}
+
+fn normalized_collaboration_tool(tool_name: &str) -> String {
     let normalized = tool_name.trim().to_ascii_lowercase();
     let leaf = normalized
         .rsplit(['.', '/', ':'])
@@ -200,16 +310,7 @@ fn is_collaboration_tool(tool_name: &str) -> bool {
         .strip_prefix("agents")
         .map(|name| name.trim_start_matches(['.', '/', ':', '_']))
         .unwrap_or(leaf);
-    matches!(
-        flattened_leaf,
-        "agent"
-            | "spawn_agent"
-            | "wait_agent"
-            | "list_agents"
-            | "interrupt_agent"
-            | "send_message"
-            | "followup_task"
-    )
+    flattened_leaf.to_string()
 }
 
 fn create_active_marker(state_root: &Path, session_id: &str, agent_id: &str) -> Result<()> {
@@ -343,6 +444,7 @@ mod tests {
             session_id: session.to_string(),
             agent_id: None,
             tool_name: None,
+            tool_response: None,
         }
     }
 
@@ -389,6 +491,107 @@ mod tests {
         assert_eq!(
             handle_hook(&input("Stop", "session-a"), root).unwrap(),
             json!({})
+        );
+    }
+
+    #[test]
+    fn partial_wait_updates_keep_root_blocked_until_every_subagent_stops() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for agent_id in ["agent-a", "agent-b", "agent-c"] {
+            let mut start = input("SubagentStart", "session-a");
+            start.agent_id = Some(agent_id.to_string());
+            handle_hook(&start, root).unwrap();
+        }
+
+        let mut stop_a = input("SubagentStop", "session-a");
+        stop_a.agent_id = Some("agent-a".to_string());
+        handle_hook(&stop_a, root).unwrap();
+
+        let mut first_wait = input("PostToolUse", "session-a");
+        first_wait.tool_name = Some("agents.wait_agent".to_string());
+        first_wait.tool_response = Some(json!({
+            "status": "FINAL_ANSWER",
+            "agent_id": "agent-a",
+            "message": "first result"
+        }));
+        let blocked_after_first = handle_hook(&first_wait, root).unwrap();
+        assert_eq!(blocked_after_first["decision"].as_str(), Some("block"));
+        let first_reason = blocked_after_first["reason"].as_str().unwrap();
+        assert!(first_reason.contains("仍有 2 个子代理"));
+        assert!(first_reason.contains("first result"));
+        assert!(first_reason.contains("不得分析局部结果"));
+
+        let mut root_patch = input("PreToolUse", "session-a");
+        root_patch.tool_name = Some("apply_patch".to_string());
+        assert_eq!(
+            handle_hook(&root_patch, root).unwrap()["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+        assert_eq!(
+            handle_hook(&input("Stop", "session-a"), root).unwrap()["decision"].as_str(),
+            Some("block")
+        );
+
+        let mut stop_b = input("SubagentStop", "session-a");
+        stop_b.agent_id = Some("agent-b".to_string());
+        handle_hook(&stop_b, root).unwrap();
+        let blocked_after_second = handle_hook(&first_wait, root).unwrap();
+        assert!(
+            blocked_after_second["reason"]
+                .as_str()
+                .unwrap()
+                .contains("仍有 1 个子代理")
+        );
+
+        let mut stop_c = input("SubagentStop", "session-a");
+        stop_c.agent_id = Some("agent-c".to_string());
+        handle_hook(&stop_c, root).unwrap();
+        assert_eq!(handle_hook(&first_wait, root).unwrap(), json!({}));
+        assert_eq!(handle_hook(&root_patch, root).unwrap(), json!({}));
+        assert_eq!(
+            handle_hook(&input("Stop", "session-a"), root).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn post_wait_gate_does_not_block_children_or_user_interrupts() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut start = input("SubagentStart", "session-a");
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook(&start, root).unwrap();
+
+        let mut child_wait = input("PostToolUse", "session-a");
+        child_wait.agent_id = Some("agent-a".to_string());
+        child_wait.tool_name = Some("agentswait_agent".to_string());
+        assert_eq!(handle_hook(&child_wait, root).unwrap(), json!({}));
+
+        let mut interrupted_wait = input("PostToolUse", "session-a");
+        interrupted_wait.tool_name = Some("agents__wait_agent".to_string());
+        interrupted_wait.tool_response = Some(json!({
+            "output": "Wait interrupted by new input"
+        }));
+        assert_eq!(handle_hook(&interrupted_wait, root).unwrap(), json!({}));
+
+        interrupted_wait.tool_response = Some(json!({
+            "kind": "steered_input"
+        }));
+        assert_eq!(handle_hook(&interrupted_wait, root).unwrap(), json!({}));
+
+        interrupted_wait.tool_response = Some(json!({
+            "interrupted_by_user_input": true
+        }));
+        assert_eq!(handle_hook(&interrupted_wait, root).unwrap(), json!({}));
+
+        interrupted_wait.tool_response = Some(json!({
+            "message": "Wait completed after an agent update"
+        }));
+        assert_eq!(
+            handle_hook(&interrupted_wait, root).unwrap()["decision"].as_str(),
+            Some("block")
         );
     }
 

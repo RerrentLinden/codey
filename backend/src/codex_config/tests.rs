@@ -1339,6 +1339,14 @@ command = "echo preserve-user-hook"
         gate_handler["timeout"].as_integer(),
         Some(crate::subagent_gate::HOOK_TIMEOUT_SECONDS as i64)
     );
+    let post_tool_use = document["hooks"]["PostToolUse"]
+        .as_array_of_tables()
+        .unwrap();
+    assert_eq!(post_tool_use.len(), 1);
+    assert_eq!(
+        post_tool_use.get(0).unwrap()["matcher"].as_str(),
+        Some(".*wait_agent$")
+    );
     for event in ["SubagentStart", "SubagentStop", "Stop", "SessionEnd"] {
         assert_eq!(
             document["hooks"][event].as_array_of_tables().unwrap().len(),
@@ -1347,7 +1355,7 @@ command = "echo preserve-user-hook"
         );
     }
     let hook_state = document["hooks"]["state"].as_table().unwrap();
-    assert_eq!(hook_state.len(), 5);
+    assert_eq!(hook_state.len(), 6);
     let pre_tool_key = "/tmp/codey-codex/config.toml:pre_tool_use:1:0";
     assert!(
         hook_state[pre_tool_key]["trusted_hash"]

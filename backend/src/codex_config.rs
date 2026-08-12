@@ -1147,11 +1147,17 @@ struct SubagentGateHookSpec {
     timeout_seconds: u64,
 }
 
-const SUBAGENT_GATE_HOOKS: [SubagentGateHookSpec; 5] = [
+const SUBAGENT_GATE_HOOKS: [SubagentGateHookSpec; 6] = [
     SubagentGateHookSpec {
         toml_event: "PreToolUse",
         event_key: "pre_tool_use",
         matcher: Some("*"),
+        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
+    },
+    SubagentGateHookSpec {
+        toml_event: "PostToolUse",
+        event_key: "post_tool_use",
+        matcher: Some(".*wait_agent$"),
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
     SubagentGateHookSpec {

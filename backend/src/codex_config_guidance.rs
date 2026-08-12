@@ -48,6 +48,19 @@ pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
 commentary tools. Call them only through their declared direct tool schemas. After spawning agents, \
 call `agents.wait_agent` directly before any other work. Use `timeout_ms <= 120000`; a returned mailbox \
+update is not completion. After a `MESSAGE`, timeout, or any other wait result, if even one spawned \
+agent remains active, immediately call `agents.wait_agent` again without analyzing or synthesizing \
+partial results, announcing a conclusion or next step, or beginning other work. Treat an agent as done \
+only after its `FINAL_ANSWER` or `task_complete` notification, and continue until every spawned agent \
+is done. While spawned subagents are active, Codey's runtime gate rejects partial wait continuation, \
+denies non-collaboration local tools, and prevents the root turn from finishing; do not retry a \
+blocked tool, wait for the agents instead. The `functions.exec` tool world is a separate route and does \
+not contain collaboration tools.";
+
+pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V3: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
+commentary tools. Call them only through their declared direct tool schemas. After spawning agents, \
+call `agents.wait_agent` directly before any other work. Use `timeout_ms <= 120000`; a returned mailbox \
 update is not completion. If it reports `MESSAGE`, process that update and call `agents.wait_agent` \
 again. Treat an agent as done only after its `FINAL_ANSWER` or `task_complete` notification, and \
 continue until every spawned agent is done. While spawned subagents are active, Codey's runtime gate \
@@ -72,6 +85,7 @@ route and does not contain collaboration tools.";
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V3,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V2,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
 ];
@@ -495,19 +509,23 @@ mod tests {
 
     #[test]
     fn root_agent_usage_hint_migrates_only_complete_owned_paragraphs() {
-        let configured = format!(
-            "User hint.\n\n{PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT}\n\nConcurrent hint."
-        );
-        let migrated = append_root_agent_collaboration_usage_hint(&configured);
+        for previous in [
+            PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V3,
+            PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V2,
+            PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
+        ] {
+            let configured = format!("User hint.\n\n{previous}\n\nConcurrent hint.");
+            let migrated = append_root_agent_collaboration_usage_hint(&configured);
 
-        assert_eq!(
-            migrated,
-            format!("User hint.\n\nConcurrent hint.\n\n{ROOT_AGENT_COLLABORATION_USAGE_HINT}")
-        );
-        assert_eq!(
-            root_agent_collaboration_usage_hint_blocks(&migrated),
-            vec![ROOT_AGENT_COLLABORATION_USAGE_HINT]
-        );
+            assert_eq!(
+                migrated,
+                format!("User hint.\n\nConcurrent hint.\n\n{ROOT_AGENT_COLLABORATION_USAGE_HINT}")
+            );
+            assert_eq!(
+                root_agent_collaboration_usage_hint_blocks(&migrated),
+                vec![ROOT_AGENT_COLLABORATION_USAGE_HINT]
+            );
+        }
 
         let inline = format!("Keep inline: {PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT} end.");
         let with_current = append_root_agent_collaboration_usage_hint(&inline);
