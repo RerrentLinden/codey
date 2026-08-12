@@ -443,16 +443,16 @@ test("mounts the optimize button when enabled and an API key is configured", asy
   assert.equal(env.snapshot().buttonDisabled, true);
 });
 
-test("uses the enlarged Semi AI light-gradient treatment", async () => {
+test("keeps the original dark treatment at a 26px height", async () => {
   const env = createEnvironment({ enabled: true, apiKeyConfigured: true });
   await flush();
 
   const button = env.getElementById("codey-prompt-optimize-button");
   const style = env.getElementById("codey-prompt-optimize-style");
-  assert.match(style.textContent, /height: 30px !important/);
-  assert.match(style.textContent, /--codey-ai-surface: linear-gradient\(278deg/);
-  assert.match(style.textContent, /--codey-ai-foreground: linear-gradient\(278deg/);
-  assert.match(button.innerHTML, /codey-prompt-optimize-ai-gradient/);
+  assert.match(style.textContent, /height: 26px !important/);
+  assert.match(style.textContent, /background: rgba\(30, 30, 30, \.92\)/);
+  assert.doesNotMatch(style.textContent, /--codey-ai-/);
+  assert.doesNotMatch(button.innerHTML, /codey-prompt-optimize-ai-gradient/);
 });
 
 test("enables the optimize button only while the composer has content", async () => {
