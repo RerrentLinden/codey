@@ -322,8 +322,11 @@ function FeaturePolicyCardComponent({
               {fastctxStatusBlocksEmbedded ? (
                 <Tooltip
                   content={fastctxBlockedReason}
-                  getPopupContainer={() => tooltipContainer ?? document.body}
+                  getPopupContainer={() =>
+                    popupContainer ?? tooltipContainer ?? document.body
+                  }
                   position="top"
+                  zIndex={SETTINGS_OVERLAY_Z_INDEX}
                 >
                   <span
                     className="fastctx-disabled-switch-tooltip"
