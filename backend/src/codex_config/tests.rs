@@ -3345,6 +3345,7 @@ fn cc_switch_runtime_constraints_stay_out_of_config_and_restore_hooks() {
     let backup_root = state_dir.join("codex-backups");
     fs::create_dir_all(&home).unwrap();
     let original_config = br#"model_provider = "relay"
+model_catalog_json = "/cc-switch/catalog.json"
 developer_instructions = "Keep the user's instructions."
 
 [model_providers.relay]
@@ -3368,6 +3369,21 @@ wire_api = "responses"
 "#;
     fs::write(home.join("config.toml"), original_config).unwrap();
     fs::write(home.join("hooks.json"), original_hooks).unwrap();
+    let model_catalog_path = home.join(crate::model_catalog::relative_path());
+    fs::create_dir_all(model_catalog_path.parent().unwrap()).unwrap();
+    fs::write(
+        &model_catalog_path,
+        serde_json::to_vec(&serde_json::json!({
+            "models": [{
+                "slug": "gpt-5.6-luna",
+                "description": "Luna test model",
+                "base_instructions": "Test instructions",
+                "multi_agent_version": "v2"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let seeded_constraints_dir = state_dir.join(CODEY_CONSTRAINTS_DIR);
     fs::create_dir_all(&seeded_constraints_dir).unwrap();
     fs::write(
@@ -3403,6 +3419,18 @@ wire_api = "responses"
             .runtime_config_overrides
             .iter()
             .any(|entry| entry.starts_with("developer_instructions="))
+    );
+    let model_catalog_override = applied
+        .runtime_config_overrides
+        .iter()
+        .find(|entry| entry.starts_with("model_catalog_json="))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    let expected_model_catalog_path = model_catalog_path.to_string_lossy().into_owned();
+    assert_eq!(
+        model_catalog_override["model_catalog_json"].as_str(),
+        Some(expected_model_catalog_path.as_str())
     );
     assert!(
         applied
@@ -3455,6 +3483,7 @@ wire_api = "responses"
             .any(|entry| entry.starts_with("mcp_servers.codey_fastctx.command="))
     );
     for required_key in [
+        "model_catalog_json",
         "desktop.enabled-reasoning-efforts",
         "service_tier",
         "developer_instructions",

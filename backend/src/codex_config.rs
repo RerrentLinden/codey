@@ -510,10 +510,13 @@ fn apply_isolated_cc_switch_runtime_config(
     } else {
         (None, Vec::new())
     };
+    let model_catalog_path = (subagent_optimization && crate::model_catalog::is_available(home))
+        .then(|| home.join(crate::model_catalog::relative_path()));
     let runtime_config_overrides = build_isolated_runtime_overrides(
         &effective_document,
         root_instructions.as_deref(),
         &runtime_agents,
+        model_catalog_path.as_deref(),
         fastctx_namespace,
         protocol_proxy_base_url,
         &provider_id,
@@ -1980,6 +1983,7 @@ fn build_isolated_runtime_overrides(
     effective: &DocumentMut,
     root_instructions: Option<&str>,
     runtime_agents: &[RuntimeAgentRegistration],
+    model_catalog_path: Option<&Path>,
     fastctx_namespace: Option<&str>,
     protocol_proxy_base_url: Option<&str>,
     provider_id: &str,
@@ -2063,6 +2067,13 @@ fn build_isolated_runtime_overrides(
     }
 
     if !runtime_agents.is_empty() {
+        if let Some(model_catalog_path) = model_catalog_path {
+            push_runtime_override_value(
+                &mut overrides,
+                "model_catalog_json",
+                &Value::from(model_catalog_path.to_string_lossy().into_owned()),
+            );
+        }
         for (path, key) in [
             (
                 &["agents", "default_subagent_model"][..],
