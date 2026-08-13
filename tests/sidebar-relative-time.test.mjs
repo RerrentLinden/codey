@@ -233,6 +233,7 @@ function sidebarThreadEntry({ running = false, sessionId = "" } = {}) {
     nativeStatusRail,
     row,
     spinner,
+    titleRegion,
   };
 }
 
@@ -709,6 +710,67 @@ test("coalesces sidebar mutations before recomputing React status", async () => 
   );
 });
 
+test("ignores cosmetic descendant class churn but tracks status class changes", async () => {
+  const entry = sidebarThreadEntry({ sessionId: "thread-class-change" });
+  let fiberReads = 0;
+  Object.defineProperty(entry.row, "__reactFiber$test", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      fiberReads += 1;
+      return { memoizedProps: {}, return: null };
+    },
+  });
+  const { notifyMutations } = loadInjection({
+    rows: [entry.row],
+    signalDispatcher: async () => ({
+      data: [{ id: "thread-class-change", updatedAt: 60 }],
+      nextCursor: null,
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  fiberReads = 0;
+
+  entry.titleRegion.className = "flex min-w-0 flex-1 items-center gap-2 selected";
+  notifyMutations([{
+    type: "attributes",
+    target: entry.titleRegion,
+    attributeName: "class",
+    oldValue: "flex min-w-0 flex-1 items-center gap-2",
+  }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fiberReads, 0, "cosmetic descendant class changes should not rescan the row");
+
+  entry.nativeStatusRail.appendChild(entry.spinner);
+  notifyMutations([{
+    type: "attributes",
+    target: entry.spinner,
+    attributeName: "class",
+    oldValue: "rounded-full",
+  }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(fiberReads > 0, "status class changes must still refresh the row");
+  assert.equal(entry.item.getAttribute("data-codey-thread-running"), "true");
+
+  const readsAfterStatusAppeared = fiberReads;
+  const persistentSpinner = new FakeElement();
+  persistentSpinner.className = "animate-pulse";
+  entry.nativeStatusRail.appendChild(persistentSpinner);
+  entry.spinner.className = "rounded-full";
+  notifyMutations([{
+    type: "attributes",
+    target: entry.spinner,
+    attributeName: "class",
+    oldValue: "animate-spin rounded-full",
+  }]);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(
+    fiberReads > readsAfterStatusAppeared,
+    "removing a status class must refresh the row through MutationRecord.oldValue",
+  );
+  assert.equal(entry.item.getAttribute("data-codey-thread-running"), "true");
+});
+
 test("keeps an existing thread time when a native completion marker appears", async () => {
   const timestamp = Date.now() - 2 * 60_000;
   const row = new FakeElement();
@@ -932,6 +994,7 @@ test("refreshes official metadata on the visible one-minute tick", async () => {
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(listCalls, 1);
+  const fullScanQueries = fixture.document.threadRowQueries;
 
   fixture.advanceTime(60_000);
   timestamp = now + 60_000 - 2 * 60_000;
@@ -940,9 +1003,71 @@ test("refreshes official metadata on the visible one-minute tick", async () => {
 
   assert.equal(listCalls, 2);
   assert.equal(
+    fixture.document.threadRowQueries,
+    fullScanQueries,
+    "the minute tick should revisit tracked rows without scanning the document",
+  );
+  assert.equal(
     content.querySelector("[data-codey-thread-updated-at]")?.textContent,
     "2 分",
   );
+});
+
+test("tracks virtualized sidebar rows discovered after the initial scan", async () => {
+  const now = Date.UTC(2026, 7, 10, 12);
+  const first = sidebarThreadEntry({ sessionId: "thread-first" });
+  const second = sidebarThreadEntry({ sessionId: "thread-second" });
+  const rows = [first.row];
+  const timestamps = new Map([
+    ["thread-first", now - 5 * 60_000],
+    ["thread-second", now - 8 * 60_000],
+  ]);
+  let listCalls = 0;
+  const fixture = loadInjection({
+    now,
+    rows,
+    signalDispatcher: async () => {
+      listCalls += 1;
+      return {
+        data: rows.map((row) => {
+          const id = row.getAttribute("data-app-action-sidebar-thread-id");
+          return { id, recencyAt: timestamps.get(id) / 1_000 };
+        }),
+        nextCursor: null,
+      };
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(listCalls, 1);
+  const fullScanQueries = fixture.document.threadRowQueries;
+
+  rows.push(second.row);
+  fixture.notifyMutations([{
+    type: "childList",
+    target: second.list,
+    addedNodes: [second.row],
+    removedNodes: [],
+  }]);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(listCalls, 2);
+  assert.equal(
+    second.content.querySelector("[data-codey-thread-updated-at]")?.textContent,
+    "8 分",
+  );
+  assert.equal(fixture.document.threadRowQueries, fullScanQueries);
+
+  fixture.advanceTime(60_000);
+  timestamps.set("thread-second", now - 60_000);
+  fixture.runIntervals();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(listCalls, 3);
+  assert.equal(
+    second.content.querySelector("[data-codey-thread-updated-at]")?.textContent,
+    "2 分",
+  );
+  assert.equal(fixture.document.threadRowQueries, fullScanQueries);
 });
 
 test("follows official thread list cursors until a visible thread is found", async () => {

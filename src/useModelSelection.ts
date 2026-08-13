@@ -18,7 +18,9 @@ import { errorText } from "./appUtils";
 import {
   includesModelId,
   modelKey,
+  partitionModelIdsByKey,
   uniqueModelIds,
+  withoutModelId,
 } from "./modelIds";
 
 const THIRD_PARTY_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
@@ -202,7 +204,7 @@ export function useModelSelection({
   const toggleDraftModel = useCallback((model: string, checked: boolean) => {
     if (checked) {
       setDeletedThirdPartyModels((current) =>
-        current.filter((item) => modelKey(item) !== modelKey(model)),
+        withoutModelId(current, model),
       );
     }
     setDraftModels((current) =>
@@ -210,11 +212,11 @@ export function useModelSelection({
         ? includesModelId(current, model)
           ? current
           : [...current, model]
-        : current.filter((item) => modelKey(item) !== modelKey(model)),
+        : withoutModelId(current, model),
     );
     if (!checked) {
       setDraftManualThirdPartyModels((current) =>
-        current.filter((item) => modelKey(item) !== modelKey(model)),
+        withoutModelId(current, model),
       );
     }
   }, []);
@@ -264,7 +266,7 @@ export function useModelSelection({
       );
     }
     setDeletedThirdPartyModels((current) =>
-      current.filter((item) => modelKey(item) !== modelKey(model)),
+      withoutModelId(current, model),
     );
     setCustomModelInput("");
     setModelInputError("");
@@ -279,17 +281,18 @@ export function useModelSelection({
   const deleteDraftThirdPartyModel = useCallback((model: string) => {
     const normalized = model.trim();
     if (!normalized) return;
-    const wasManual = draftManualThirdPartyModelKeys.has(modelKey(normalized));
+    const normalizedKey = modelKey(normalized);
+    const wasManual = draftManualThirdPartyModelKeys.has(normalizedKey);
     if (!wasManual) return;
     setDraftModels((current) =>
-      current.filter((item) => modelKey(item) !== modelKey(normalized)),
+      withoutModelId(current, normalized),
     );
     setDraftManualThirdPartyModels((current) =>
-      current.filter((item) => modelKey(item) !== modelKey(normalized)),
+      withoutModelId(current, normalized),
     );
     setDeletedThirdPartyModels((current) =>
-      !manualThirdPartyModelKeys.has(modelKey(normalized)) ||
-      current.some((item) => modelKey(item) === modelKey(normalized))
+      !manualThirdPartyModelKeys.has(normalizedKey) ||
+      current.some((item) => modelKey(item) === normalizedKey)
         ? current
         : [...current, normalized],
     );
@@ -347,12 +350,10 @@ export function useModelSelection({
   const saveModelSelection = useCallback(async () => {
     await runOperation("save-models", async () => {
       const normalizedDraftModels = uniqueModelIds(draftModels);
-      const officialModels = normalizedDraftModels.filter((model) =>
-        officialSlugKeys.has(modelKey(model))
-      );
-      const thirdPartyModels = normalizedDraftModels.filter((model) =>
-        !officialSlugKeys.has(modelKey(model))
-      );
+      const {
+        matching: officialModels,
+        remaining: thirdPartyModels,
+      } = partitionModelIdsByKey(normalizedDraftModels, officialSlugKeys);
       const thirdPartyModelKeys = new Set(thirdPartyModels.map(modelKey));
       const manualThirdPartyModels = draftManualThirdPartyModels.filter((model) =>
         thirdPartyModelKeys.has(modelKey(model))
@@ -391,11 +392,13 @@ export function useModelSelection({
       const officialModels = modelState.officialModels
         .filter((candidate) => candidate.supported)
         .map((candidate) => candidate.slug);
-      const thirdPartyModels = modelState.thirdPartyModels.filter(
-        (candidate) => modelKey(candidate) !== deletedKey,
+      const thirdPartyModels = withoutModelId(
+        modelState.thirdPartyModels,
+        normalized,
       );
-      const manualThirdPartyModels = modelState.manualThirdPartyModels.filter(
-        (candidate) => modelKey(candidate) !== deletedKey,
+      const manualThirdPartyModels = withoutModelId(
+        modelState.manualThirdPartyModels,
+        normalized,
       );
       await applyModelSelection(
         officialModels,
@@ -406,10 +409,10 @@ export function useModelSelection({
         false,
       );
       setDraftModels((current) =>
-        current.filter((item) => modelKey(item) !== deletedKey),
+        withoutModelId(current, normalized),
       );
       setDraftManualThirdPartyModels((current) =>
-        current.filter((item) => modelKey(item) !== deletedKey),
+        withoutModelId(current, normalized),
       );
     });
   }, [

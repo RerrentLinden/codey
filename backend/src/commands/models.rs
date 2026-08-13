@@ -994,6 +994,9 @@ fn config_with_reconciled_subagent_defaults(
     persisted
         .subagent_reasoning_effort
         .clone_from(&reconciled.subagent_reasoning_effort);
+    persisted
+        .subagent_roles
+        .clone_from(&reconciled.subagent_roles);
     persisted.normalize()
 }
 
@@ -1203,6 +1206,7 @@ mod tests {
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol".into(),
             subagent_reasoning_effort: "high".into(),
+            subagent_roles: crate::config::uniform_subagent_roles("gpt-5.6-sol", "high"),
             ..CodeyConfig::default()
         };
         let provider_id = config.current_provider_id().unwrap().to_string();
@@ -1248,6 +1252,7 @@ mod tests {
             subagent_optimization: true,
             subagent_model: "gpt-5.6-luna".into(),
             subagent_reasoning_effort: "high".into(),
+            subagent_roles: crate::config::uniform_subagent_roles("gpt-5.6-luna", "high"),
             ..CodeyConfig::default()
         };
         let provider_id = persisted.current_provider_id().unwrap().to_string();
@@ -1260,6 +1265,10 @@ mod tests {
             .upstream_models_by_provider
             .insert(provider_id.clone(), vec!["fallback-model".into()]);
         runtime_fallback.subagent_model = crate::config::DEFAULT_SUBAGENT_MODEL.into();
+        runtime_fallback.subagent_roles.insert(
+            crate::config::SUBAGENT_ROLE_DEFAULT.into(),
+            crate::config::SubagentRoleConfig::new(crate::config::DEFAULT_SUBAGENT_MODEL, "high"),
+        );
 
         let next = config_with_reconciled_subagent_defaults(&persisted, &runtime_fallback);
 

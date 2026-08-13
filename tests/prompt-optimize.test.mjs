@@ -145,11 +145,19 @@ class FakeMutationObserver {
   constructor(callback) {
     this.callback = callback;
     this.observed = false;
+    this.observeCalls = 0;
+    this.disconnectCalls = 0;
     latestMutationObserver = this;
   }
 
   observe() {
     this.observed = true;
+    this.observeCalls += 1;
+  }
+
+  disconnect() {
+    this.observed = false;
+    this.disconnectCalls += 1;
   }
 }
 
@@ -376,6 +384,7 @@ const createEnvironment = (options = {}) => {
   }
   const context = vm.createContext(sandbox);
   vm.runInContext(source, context);
+  const installedObserver = latestMutationObserver;
 
   return {
     calls,
@@ -391,6 +400,11 @@ const createEnvironment = (options = {}) => {
     scope,
     getElementById: (id) => findById(documentElement, id),
     getComposerQueryCount: () => composerQueryCount,
+    getObserverState: () => ({
+      active: installedObserver?.observed === true,
+      disconnectCalls: installedObserver?.disconnectCalls ?? 0,
+      observeCalls: installedObserver?.observeCalls ?? 0,
+    }),
     snapshot: () => context.window.__codeyPromptOptimize.snapshot(),
     setConfig: (next) => {
       config = next;
@@ -403,8 +417,9 @@ const createEnvironment = (options = {}) => {
         handler.call(window);
       }
     },
-    emitMutation: (mutations = [{ type: "childList", target: documentElement }]) =>
-      latestMutationObserver?.callback(mutations),
+    emitMutation: (mutations = [{ type: "childList", target: documentElement }]) => {
+      if (installedObserver?.observed) installedObserver.callback(mutations);
+    },
     emitInput: (target = textarea) => {
       for (const handler of documentListeners.get("input") || []) {
         handler.call(document, { type: "input", target });
@@ -449,6 +464,11 @@ test("mounts the optimize button when enabled and an API key is configured", asy
   assert.equal(env.snapshot().enabled, true);
   assert.equal(env.snapshot().ready, true);
   assert.equal(env.snapshot().buttonDisabled, true);
+  assert.deepEqual(env.getObserverState(), {
+    active: true,
+    disconnectCalls: 0,
+    observeCalls: 1,
+  });
 });
 
 test("keeps the original dark treatment at a 26px height", async () => {
@@ -488,6 +508,37 @@ test("does not mount the button when the feature is disabled", async () => {
 
   assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
   assert.equal(env.snapshot().enabled, false);
+  assert.deepEqual(env.getObserverState(), {
+    active: false,
+    disconnectCalls: 0,
+    observeCalls: 0,
+  });
+});
+
+test("disconnects the document observer when prompt optimization is turned off", async () => {
+  const env = createEnvironment({ enabled: true, apiKeyConfigured: true });
+  await flush();
+  assert.equal(env.getObserverState().active, true);
+
+  env.setConfig({
+    promptOptimization: { enabled: false, apiKeyConfigured: true },
+  });
+  env.emitConfigChanged();
+  await flush();
+
+  const scansAfterDisable = env.getComposerQueryCount();
+  assert.deepEqual(env.getObserverState(), {
+    active: false,
+    disconnectCalls: 1,
+    observeCalls: 1,
+  });
+  assert.equal(
+    env.getElementById("codey-prompt-optimize-button").style.display,
+    "none",
+  );
+  env.emitMutation();
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(env.getComposerQueryCount(), scansAfterDisable);
 });
 
 test("does not mount the button when no API key is configured yet", async () => {
@@ -746,4 +797,6 @@ test("re-applies the switch when the console saves config", async () => {
 
   assert.ok(env.getElementById("codey-prompt-optimize-button"));
   assert.equal(env.snapshot().enabled, true);
+  assert.equal(env.getObserverState().active, true);
+  assert.equal(env.getObserverState().observeCalls, 1);
 });

@@ -63,6 +63,13 @@ test("script injection diagnostics report runtime evidence without continuous po
     /window\.dispatchEvent\(new CustomEvent\(SETTINGS_OPENED_EVENT\)\)/,
   );
   assert.match(runtimeHook, /type StatusPollTask/);
+  assert.match(runtimeHook, /clear: \(\) => void/);
+  assert.match(runtimeHook, /requestGenerationRef/);
+  assert.match(runtimeHook, /mountedRef\.current &&/);
+  assert.match(runtimeHook, /activeRef\.current &&/);
+  assert.match(runtimeHook, /const queuedGeneration = requestGenerationRef\.current/);
+  assert.match(runtimeHook, /requestCanCommit\(queuedGeneration\)/);
+  assert.match(runtimeHook, /statusPollScheduler\.clear\(\)/);
   assert.match(app, /active: !embedded \|\| modalVisible/);
   assert.match(runtimeHook, /if \(!activeRef\.current\) return/);
   assert.match(

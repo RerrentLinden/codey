@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 pub(crate) const HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook";
+pub(crate) const RUNTIME_ACTIVE_ENV: &str = "CODEY_SUBAGENT_GATE_ACTIVE";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
 pub(crate) const SESSION_END_HOOK_TIMEOUT_SECONDS: u64 = 3;
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
@@ -36,6 +37,10 @@ pub fn run_hook_if_requested() -> Result<bool> {
     if std::env::args_os().nth(1).as_deref() != Some(OsStr::new(HOOK_ARGUMENT)) {
         return Ok(false);
     }
+    if !runtime_gate_is_active(std::env::var_os(RUNTIME_ACTIVE_ENV).as_deref()) {
+        write_hook_output(&json!({}))?;
+        return Ok(true);
+    }
 
     let mut raw = Vec::new();
     std::io::stdin()
@@ -52,11 +57,20 @@ pub fn run_hook_if_requested() -> Result<bool> {
         eprintln!("Codey 子代理门禁 Hook 失败：{error:#}");
         fail_closed_output(&input, &error)
     });
+    write_hook_output(&output)?;
+    Ok(true)
+}
+
+fn runtime_gate_is_active(value: Option<&OsStr>) -> bool {
+    value == Some(OsStr::new("1"))
+}
+
+fn write_hook_output(output: &Value) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer(&mut stdout, &output).context("序列化 Codex 子代理门禁 Hook 输出失败")?;
+    serde_json::to_writer(&mut stdout, output).context("序列化 Codex 子代理门禁 Hook 输出失败")?;
     stdout.write_all(b"\n")?;
     stdout.flush()?;
-    Ok(true)
+    Ok(())
 }
 
 pub(crate) fn hook_commands() -> Result<HookCommands> {
@@ -432,8 +446,30 @@ fn nonempty(value: Option<&str>) -> Option<&str> {
 }
 
 fn quote_posix(path: &Path) -> String {
-    let path = path.to_string_lossy();
+    let raw_path = path.to_string_lossy();
+    #[cfg(windows)]
+    let path = windows_path_to_wsl(&raw_path).unwrap_or_else(|| raw_path.into_owned());
+    #[cfg(not(windows))]
+    let path = raw_path.into_owned();
     format!("'{}'", path.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(any(windows, test))]
+fn windows_path_to_wsl(path: &str) -> Option<String> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let bytes = path.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || !matches!(bytes[2], b'\\' | b'/')
+    {
+        return None;
+    }
+    Some(format!(
+        "/mnt/{}/{}",
+        (bytes[0] as char).to_ascii_lowercase(),
+        path[3..].replace('\\', "/")
+    ))
 }
 
 fn quote_windows(path: &Path) -> String {
@@ -681,6 +717,27 @@ mod tests {
         assert!(is_spawn_agent_tool("agents__spawn_agent"));
         assert!(is_spawn_agent_tool("agentsspawn_agent"));
         assert!(!is_spawn_agent_tool("agents.wait_agent"));
+    }
+
+    #[test]
+    fn gate_only_activates_for_a_codey_runtime() {
+        assert!(!runtime_gate_is_active(None));
+        assert!(!runtime_gate_is_active(Some(OsStr::new("0"))));
+        assert!(!runtime_gate_is_active(Some(OsStr::new("true"))));
+        assert!(runtime_gate_is_active(Some(OsStr::new("1"))));
+    }
+
+    #[test]
+    fn windows_hook_executable_paths_translate_to_wsl_mounts() {
+        assert_eq!(
+            windows_path_to_wsl(r"C:\Program Files\Codey\codey.exe").as_deref(),
+            Some("/mnt/c/Program Files/Codey/codey.exe")
+        );
+        assert_eq!(
+            windows_path_to_wsl(r"\\?\D:\Apps\Codey.exe").as_deref(),
+            Some("/mnt/d/Apps/Codey.exe")
+        );
+        assert_eq!(windows_path_to_wsl("/Applications/Codey"), None);
     }
 
     #[test]

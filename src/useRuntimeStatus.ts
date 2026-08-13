@@ -37,6 +37,7 @@ type StatusPollTask = {
 
 type StatusPollScheduler = {
   add: (task: StatusPollTask) => void;
+  clear: () => void;
   remove: (task: StatusPollTask) => void;
 };
 
@@ -126,6 +127,11 @@ function createStatusPollScheduler(
       tasks.set(task.kind, task);
       schedule();
     },
+    clear() {
+      tasks.clear();
+      window.clearTimeout(timer);
+      timer = 0;
+    },
     remove(task) {
       if (tasks.get(task.kind) === task) {
         tasks.delete(task.kind);
@@ -157,18 +163,30 @@ export function useRuntimeStatus({
   const runtimeStatusFlightRef = useRef<RuntimeStatusFlight | null>(null);
   const statusPollSchedulerRef = useRef<StatusPollScheduler | null>(null);
   const settingsOpenRefreshRequestedRef = useRef(false);
+  const mountedRef = useRef(true);
+  const requestGenerationRef = useRef(0);
   const activeRef = useRef(active);
   activeRef.current = active;
 
   const requestRuntimeStatus = useCallback(
     (shouldRefreshInjectionStatus: boolean): Promise<RuntimeStatus> => {
-      const startRequest = (refreshesInjectionStatus: boolean) =>
-        invoke<RuntimeStatus>("runtime_status", {
+      const requestCanCommit = (requestGeneration: number) =>
+        mountedRef.current &&
+        activeRef.current &&
+        requestGenerationRef.current === requestGeneration;
+      const startRequest = (
+        refreshesInjectionStatus: boolean,
+        requestGeneration = requestGenerationRef.current,
+      ) => {
+        return invoke<RuntimeStatus>("runtime_status", {
           refreshInjectionStatus: refreshesInjectionStatus,
         }).then((next) => {
-          setStatus((current) => reconcileRuntimeStatus(current, next));
+          if (requestCanCommit(requestGeneration)) {
+            setStatus((current) => reconcileRuntimeStatus(current, next));
+          }
           return next;
         });
+      };
 
       const currentFlight = runtimeStatusFlightRef.current;
       if (currentFlight) {
@@ -179,11 +197,17 @@ export function useRuntimeStatus({
           return currentFlight.promise;
         }
 
+        const queuedGeneration = requestGenerationRef.current;
+        const startQueuedRefresh = () =>
+          requestCanCommit(queuedGeneration)
+            ? startRequest(true, queuedGeneration)
+            : null;
         const queuedFlight: RuntimeStatusFlight = {
           refreshesInjectionStatus: true,
-          promise: currentFlight.promise
-            .catch(() => undefined)
-            .then(() => startRequest(true)),
+          promise: currentFlight.promise.then(
+            (next) => startQueuedRefresh() ?? next,
+            (error) => startQueuedRefresh() ?? Promise.reject(error),
+          ),
         };
         runtimeStatusFlightRef.current = queuedFlight;
         const clearQueuedFlight = () => {
@@ -227,6 +251,25 @@ export function useRuntimeStatus({
     );
   }
   const statusPollScheduler = statusPollSchedulerRef.current;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      requestGenerationRef.current += 1;
+      runtimeStatusFlightRef.current = null;
+      statusPollScheduler.clear();
+    };
+  }, [statusPollScheduler]);
+
+  useEffect(() => {
+    if (active) return;
+    // Ignore requests started for a panel that is no longer visible and make
+    // the next activation start a fresh single-flight request.
+    requestGenerationRef.current += 1;
+    runtimeStatusFlightRef.current = null;
+    statusPollScheduler.clear();
+  }, [active, statusPollScheduler]);
 
   const refreshStatusForLoad = useCallback(() => {
     const shouldRefreshInjectionStatus =

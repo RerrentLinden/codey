@@ -227,6 +227,18 @@ fn restart_sensitive_config_changes_are_detected() {
         &RuntimeSubagentConfig::from_config(&changed_subagent),
         &changed_subagent
     ));
+
+    let mut changed_task_role = enabled_subagents.clone();
+    changed_task_role.subagent_roles.insert(
+        crate::config::SUBAGENT_ROLE_QUICK_SCAN.into(),
+        crate::config::SubagentRoleConfig::new("gpt-5.6-sol", "high"),
+    );
+    assert!(config_requires_restart(
+        &enabled_subagents,
+        &enabled_models,
+        &enabled_subagent,
+        &changed_task_role
+    ));
 }
 
 #[tokio::test]

@@ -950,6 +950,8 @@
     return statusState.unread === true || nativeThreadStatusTypeLooksActive(statusState.type);
   };
 
+  const nativeThreadStatusClassPattern = /\b(?:animate-|spinner)\b/i;
+
   const nativeElementLooksLikeThreadStatus = (element) => {
     if (!(element instanceof HTMLElement)) return false;
     if (element.matches?.("button, [role=button], [role=menuitem]")) return false;
@@ -964,7 +966,7 @@
     // selected. Only active work should temporarily displace the timestamp.
     if (/(running|processing|working|loading|streaming|generating|in progress|运行中|进行中|处理中|加载中|生成中)/i.test(statusText)) return true;
     const className = String(element.className || "");
-    if (/\b(?:animate-|spinner)\b/i.test(className)) return true;
+    if (nativeThreadStatusClassPattern.test(className)) return true;
     return [...(element.children || [])].some((child) => nativeElementLooksLikeThreadStatus(child));
   };
 
@@ -1612,53 +1614,67 @@
     }, 40);
   };
 
+  const refreshThreadUpdatedAtRow = (row, now, forceRefresh = false) => {
+    if (!(row instanceof HTMLElement) || isDeletedSidebarThread(row)) return;
+    const {
+      cacheKey,
+      completedWork,
+      hostId,
+      kind,
+      sessionId,
+      workInProgress,
+    } = sidebarThreadTimestampState(row, now);
+    updateThreadRunningPriority(row, workInProgress);
+    renderCachedThreadUpdatedAt(row);
+    if (!sessionId || sessionId.startsWith("client-new-thread:")) return;
+    if (syncRemoteThreadUpdatedAt(row, {
+      cacheKey,
+      hostId,
+      kind,
+      sessionId,
+    })) return;
+    if (completedWork) threadUpdatedAtRequestedAt.delete(cacheKey);
+    if (
+      !forceRefresh
+      && now - (threadUpdatedAtRequestedAt.get(cacheKey) || 0)
+        < threadTimestampRefreshIntervalMs
+    ) return;
+    pendingThreadUpdatedAtRefs.set(cacheKey, {
+      cacheKey,
+      hostId,
+      sessionId,
+    });
+    rememberBoundedMapValue(threadUpdatedAtRequestedAt, cacheKey, now);
+  };
+
   const installThreadUpdatedTimes = (root = document, forceRefresh = false) => {
     const now = Date.now();
     // Virtualized sidebar rows can be replaced without another metadata
-    // response. Release detached rows on every sidebar scan instead of waiting
-    // for the one-minute relative-time repaint.
+    // response. Release detached rows whenever an incremental/full scan runs.
     forEachTrackedThreadRow(() => {});
     queryWithin(root, "[data-app-action-sidebar-thread-row]").forEach((row) => {
-      if (!(row instanceof HTMLElement) || isDeletedSidebarThread(row)) return;
-      const {
-        cacheKey,
-        completedWork,
-        hostId,
-        kind,
-        sessionId,
-        workInProgress,
-      } = sidebarThreadTimestampState(row, now);
-      updateThreadRunningPriority(row, workInProgress);
-      renderCachedThreadUpdatedAt(row);
-      if (!sessionId || sessionId.startsWith("client-new-thread:")) return;
-      if (syncRemoteThreadUpdatedAt(row, {
-        cacheKey,
-        hostId,
-        kind,
-        sessionId,
-      })) return;
-      if (completedWork) threadUpdatedAtRequestedAt.delete(cacheKey);
-      if (
-        !forceRefresh
-        && now - (threadUpdatedAtRequestedAt.get(cacheKey) || 0)
-          < threadTimestampRefreshIntervalMs
-      ) return;
-      pendingThreadUpdatedAtRefs.set(cacheKey, {
-        cacheKey,
-        hostId,
-        sessionId,
-      });
-      rememberBoundedMapValue(threadUpdatedAtRequestedAt, cacheKey, now);
+      refreshThreadUpdatedAtRow(row, now, forceRefresh);
     });
     scheduleThreadUpdatedAtFetch();
   };
 
-  const renderThreadUpdatedTimeLabels = () => {
-    forEachTrackedThreadRow(renderCachedThreadUpdatedAt);
+  const refreshTrackedThreadUpdatedTimes = () => {
+    const now = Date.now();
+    // The mutation observer and initial install already register visible rows.
+    // A minute tick only needs those rows; a full document query is reserved
+    // for focus/pageshow recovery where missed host mutations are possible.
+    forEachTrackedThreadRow((row) => {
+      refreshThreadUpdatedAtRow(row, now, false);
+    });
+    scheduleThreadUpdatedAtFetch();
   };
 
   const refreshThreadUpdatedTimes = (forceRefresh = false) => {
-    installThreadUpdatedTimes(document, forceRefresh);
+    if (forceRefresh) {
+      installThreadUpdatedTimes(document, true);
+      return;
+    }
+    refreshTrackedThreadUpdatedTimes();
   };
 
   const codexAppAssetUrls = () => [...new Set([
@@ -2568,6 +2584,11 @@
     if (!(element instanceof HTMLElement)) return null;
     return element.closest?.(scanBoundarySelector) || element;
   };
+  const threadClassMutationMayAffectStatus = (target, threadRow, oldClassName) => (
+    target === threadRow
+    || nativeThreadStatusClassPattern.test(String(oldClassName || ""))
+    || nativeThreadStatusClassPattern.test(String(target?.className || ""))
+  );
   const addPendingScanRoot = (root) => {
     if (!(root instanceof HTMLElement)) return;
     if (
@@ -2618,7 +2639,10 @@
       if (mutation.type === "attributes") {
         if (target && !isCodeyOwned(target)) {
           const threadRow = target.closest?.(sidebarThreadRowSelector) || null;
-          if (threadRow || mutation.attributeName !== "class") {
+          const relevantThreadClassChange = threadRow
+            && mutation.attributeName === "class"
+            && threadClassMutationMayAffectStatus(target, threadRow, mutation.oldValue);
+          if (relevantThreadClassChange || mutation.attributeName !== "class") {
             addPendingScanRoot(threadRow || nearestScanRoot(target));
           }
         }
@@ -2671,6 +2695,7 @@
     }
   }).observe(document.documentElement, {
     attributes: true,
+    attributeOldValue: true,
     attributeFilter: [
       "aria-label",
       "aria-expanded",
@@ -2720,7 +2745,6 @@
   if (typeof window.setInterval === "function") {
     window.setInterval(() => {
       if (document.visibilityState === "hidden") return;
-      renderThreadUpdatedTimeLabels();
       refreshThreadUpdatedTimes(false);
     }, threadTimestampRefreshIntervalMs);
   }

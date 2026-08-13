@@ -22,6 +22,19 @@ export type PromptOptimizationConfig = {
   instruction: string;
 };
 
+export type SubagentRoleId =
+  | "codey_quick_scan"
+  | "codey_deep_research"
+  | "codey_visual_analysis"
+  | "codey_worker"
+  | "codey_visual_worker"
+  | "default";
+
+export type SubagentRoleConfig = {
+  model: string;
+  reasoningEffort: string;
+};
+
 export type Config = {
   settingsRevision: number;
   activeProfileId: string;
@@ -44,6 +57,7 @@ export type Config = {
   subagentOptimization: boolean;
   subagentModel: string;
   subagentReasoningEffort: string;
+  subagentRoles: Record<SubagentRoleId, SubagentRoleConfig>;
   hideFullAccessWarning: boolean;
   showAccountUsageInHeader: boolean;
 };

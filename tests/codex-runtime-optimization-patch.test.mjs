@@ -4,15 +4,26 @@ import test from "node:test";
 
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
-async function loadPatchExpression() {
+async function loadPatchExpression(
+  runtimeConfigOverrides = [],
+  subagentGateActive = runtimeConfigOverrides.includes("features.hooks=true"),
+) {
   const template = normalizeLineEndings(await readFile(
     new URL("../backend/src/codex_startup_patch.js", import.meta.url),
     "utf8",
   ));
   assert.ok(template, "startup patch template should be readable by the regression test");
   return template
+    .replaceAll(
+      '"__CODEY_RUNTIME_CONFIG_OVERRIDES__"',
+      JSON.stringify(runtimeConfigOverrides),
+    )
     .replaceAll("__DISABLE_PET__", "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "true");
+    .replaceAll("__FAST_CODEX_STARTUP__", "true")
+    .replaceAll(
+      "__SUBAGENT_GATE_ACTIVE__",
+      subagentGateActive ? "true" : "false",
+    );
 }
 
 test("startup patch disables Codex analytics and trims diagnostic polling", async () => {
@@ -51,7 +62,19 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
   };
 
   try {
-    const expression = await loadPatchExpression();
+    const runtimeConfigOverrides = [
+      "features.hooks=true",
+      'developer_instructions="Codey route"',
+      'mcp_servers.codey_fastctx.command="C:\\\\Program Files\\\\Codey\\\\codey-fastctx.exe"',
+      'agents.default.config_file="D:\\\\Codey\\\\runtime\\\\default.toml"',
+      'hooks.state."C:\\\\Users\\\\Kim\\\\.codex\\\\hooks.json:pre_tool_use:1:0".trusted_hash="sha256:test"',
+      '__CODEY_WSL_ONLY__:hooks.state."C:\\\\Users\\\\Kim\\\\.codex\\\\hooks.json:pre_tool_use:1:0".trusted_hash="sha256:wsl"',
+      `hooks.PreToolUse=[{ hooks = [{ type = "command", command = "'C:\\\\Program Files\\\\Codey\\\\codey.exe' --codey-subagent-gate-hook" }] }]`,
+    ];
+    const nativeRuntimeConfigOverrides = runtimeConfigOverrides.filter(
+      (config) => !config.startsWith("__CODEY_WSL_ONLY__:"),
+    );
+    const expression = await loadPatchExpression(runtimeConfigOverrides);
     assert.equal((0, eval)(expression), "codey-startup-patch-installed-v22");
 
     const patchedElectron = Module._load("electron");
@@ -210,8 +233,20 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       "features.code_mode_host=true",
       "-c",
       "analytics.enabled=false",
+      ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
       "app-server",
     ]);
+    assert.equal(
+      spawnCalls.at(-1)[2].env.CODEY_SUBAGENT_GATE_ACTIVE,
+      "1",
+    );
+    const alreadyPatchedDirectArgs = spawnCalls.at(-1)[1];
+    childProcess.spawn("codex", alreadyPatchedDirectArgs);
+    assert.equal(spawnCalls.at(-1)[1], alreadyPatchedDirectArgs);
+    assert.equal(
+      spawnCalls.at(-1)[2].env.CODEY_SUBAGENT_GATE_ACTIVE,
+      "1",
+    );
 
     const configuredArgs = [
       "-c",
@@ -223,6 +258,16 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.deepEqual(spawnCalls.at(-1)[1], [
       "-c",
       "analytics.enabled=false",
+      ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
+      "app-server",
+    ]);
+
+    const argsWithoutLegacyAnalyticsFlag = ["app-server"];
+    childProcess.spawn("codex", argsWithoutLegacyAnalyticsFlag);
+    assert.deepEqual(spawnCalls.at(-1)[1], [
+      "-c",
+      "analytics.enabled=false",
+      ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
       "app-server",
     ]);
 
@@ -243,8 +288,29 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.doesNotMatch(patchedShellCommand, /--analytics-default-enabled/);
     assert.match(
       patchedShellCommand,
-      /-c features\.code_mode_host=true -c analytics\.enabled=false app-server/,
+      /CODEY_SUBAGENT_GATE_ACTIVE=1 exec \/usr\/bin\/codex/,
     );
+    assert.match(
+      patchedShellCommand,
+      /-c 'mcp_servers\.codey_fastctx\.command="\/mnt\/c\/Program Files\/Codey\/codey-fastctx\.exe"'/,
+    );
+    assert.match(
+      patchedShellCommand,
+      /-c 'agents\.default\.config_file="\/mnt\/d\/Codey\/runtime\/default\.toml"'/,
+    );
+    assert.match(
+      patchedShellCommand,
+      /-c 'hooks\.state\."\/mnt\/c\/Users\/Kim\/\.codex\/hooks\.json:pre_tool_use:1:0"\.trusted_hash="sha256:wsl"'/,
+    );
+    assert.doesNotMatch(patchedShellCommand, /sha256:test/);
+    assert.match(
+      patchedShellCommand,
+      /\/mnt\/c\/Program Files\/Codey\/codey\.exe/,
+    );
+    assert.doesNotMatch(patchedShellCommand, /[A-Za-z]:\\\\/);
+    const alreadyPatchedShellArgs = spawnCalls.at(-1)[1];
+    childProcess.spawn("wsl.exe", alreadyPatchedShellArgs);
+    assert.equal(spawnCalls.at(-1)[1], alreadyPatchedShellArgs);
 
     const configuredShellCommand = [
       "source /etc/profile;",
@@ -262,11 +328,34 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     const patchedConfiguredShellCommand = spawnCalls.at(-1)[1].at(-1);
     assert.match(
       patchedConfiguredShellCommand,
-      /--config=analytics\.enabled=false app-server/,
+      /CODEY_SUBAGENT_GATE_ACTIVE=1 exec \/usr\/bin\/codex/,
+    );
+    assert.match(
+      patchedConfiguredShellCommand,
+      /--config=analytics\.enabled=false/,
     );
     assert.equal(
       patchedConfiguredShellCommand.match(/analytics\.enabled=false/g)?.length,
       1,
+    );
+
+    const shellWithoutLegacyAnalyticsFlag =
+      "source /etc/profile; exec /usr/bin/codex app-server";
+    childProcess.spawn("wsl.exe", [
+      "-d",
+      "Ubuntu",
+      "--",
+      "/usr/bin/bash",
+      "-lc",
+      shellWithoutLegacyAnalyticsFlag,
+    ]);
+    assert.match(
+      spawnCalls.at(-1)[1].at(-1),
+      /CODEY_SUBAGENT_GATE_ACTIVE=1 exec \/usr\/bin\/codex/,
+    );
+    assert.match(
+      spawnCalls.at(-1)[1].at(-1),
+      /-c 'analytics\.enabled=false'/,
     );
 
     const unrelatedArgs = ["--version"];
@@ -299,7 +388,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.equal(spawnCalls.at(-1)[1], spawnOptions);
     assert.equal(
       globalThis.__CODEY_CODEX_STARTUP_PATCH__.appServerAnalyticsPatchCount,
-      4,
+      6,
     );
 
     const desktopAnalyticsFixture = [

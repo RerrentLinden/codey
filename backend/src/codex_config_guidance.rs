@@ -1,4 +1,4 @@
-pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 子代理在我们的工作里用于探索，他是你的探子。
 把子代理当成你手边最顺手的、用于「宽而重」读取的工具。工作的任何时候，只要你觉得需要就可以派。只有在它能减少主线程上下文污染、提高并行度或者提供独立核验的时候才使用。
@@ -43,6 +43,35 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 需要多个子代理的时候在同一轮并发派发；派发之后主代理立即 `wait_agent`，停止其余的分析、检索、命令执行以及文件修改，直至全部返回。
 - 收到某个子代理结果之后，如果提供了 `close_agent` 就必须立即关闭；每个子代理只用一轮，不复用、不追派。
 - 特别注意：子代理自派生起累计运行 10 分钟仍未完成：视为异常，主代理必须介入、不得继续盲等；检查代理状态或运行记录，已有可用 MESSAGE 时采用其部分结果，然后停止这个子代理。并自行判断是否需要再派生或拆分更小任务重新分派。"#;
+
+pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+
+子代理用于把宽而重的检索、独立核验或边界清晰的实现从主线程中拆出。只有当委派能减少上下文污染、提高并行度或提供独立证据时才派发；已知位置的小文件、即将修改的确切代码和奠基性文档仍由主代理亲自读取。
+
+### 任务类型路由
+
+派生时必须按任务性质显式选择下列 `agent_type`，不要用模型名代替任务类型：
+
+- `codey_quick_scan`：只读的快速定位、精确事实查找、重复性检查和低风险小范围检索。
+- `codey_deep_research`：只读的跨文件、日志、代码或文档宽范围检索、归纳和架构探索。
+- `codey_visual_analysis`：只读的截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索或独立核验。
+- `codey_worker`：可写的低到中等复杂度、边界清晰、可回滚且可测试的非视觉实现。
+- `codey_visual_worker`：可写的页面、GUI、PDF 或其他依赖视觉证据与渲染验证的实现。
+- `default`：只读兜底；任务不符合以上专用类型时使用，不承担代码实施。
+
+除 `codey_worker` 和 `codey_visual_worker` 外，子代理默认只做探索、检索和核验，不改动文件。可写角色也只处理被明确授权且边界清晰的实现；方案取舍、关键代码复核和最终验证仍由主代理负责。
+
+### 委派与验证
+
+- 任务必须自包含，写清检索范围、具体问题、允许的改动范围和期望输出；精度重要时要求返回 `file:line`、符号名及必要关键原文。
+- 多个相互独立的任务应在同一轮并发派发。派生时显式使用 `fork_turns = "none"`，不给子代理复制主线程历史。
+- 子代理结果只是压缩后的线索。主代理沿其出处抽查关键部分，不要把已外包的材料完整重读一遍；但即将修改的确切代码和奠基性文档必须由主代理亲自完整读取。
+- 每个子代理只用一轮，不复用、不追派；子代理不得继续派生其他子代理。
+- 派发后立即等待全部子代理完成，再继续分析、命令或修改。子代理累计运行 10 分钟仍未完成时，检查状态并终止异常任务，必要时拆成更小任务重新派发。
+"#;
+
+pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] =
+    &[SUBAGENT_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE];
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
@@ -93,6 +122,7 @@ pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
 pub(crate) const DEFAULT_AGENT_CONFIG: &str = r#####"name = "default"
 
 description = "General-purpose exploration subagent using the configured default model and reasoning effort."
+sandbox_mode = "read-only"
 
 developer_instructions = """
 你是通用子代理，是主代理派出去的探子。你只做探索、检索、核验：不改动任何东西，不做方案取舍或者最终判断——那些是主代理的事。
@@ -113,6 +143,97 @@ developer_instructions = """
 [features]
 image_generation = false
 "#####;
+
+pub(crate) fn previous_default_agent_config_without_sandbox() -> String {
+    DEFAULT_AGENT_CONFIG.replacen("sandbox_mode = \"read-only\"\n", "", 1)
+}
+
+pub(crate) const QUICK_SCAN_AGENT_CONFIG: &str = r#####"name = "codey_quick_scan"
+
+description = "Read-only fast lookup for exact locations, repetitive checks, and low-risk factual retrieval."
+sandbox_mode = "read-only"
+
+developer_instructions = """
+你是快速定位子代理。只做只读、范围明确、低风险的定位与事实检索，不修改任何文件，不做方案取舍，也不派生其他子代理。
+优先返回最短可核验证据：确切路径、`file:line`、符号名、匹配数量和必要的关键原文。任务超出小范围快速检索时，明确说明应改派深度检索或视觉分析角色。
+你的回复直接供主代理使用：密而不水，区分事实与推断，不寒暄、不复述过程。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) const DEEP_RESEARCH_AGENT_CONFIG: &str = r#####"name = "codey_deep_research"
+
+description = "Read-only broad research across code, logs, and documents for synthesis and architecture exploration."
+sandbox_mode = "read-only"
+
+developer_instructions = """
+你是深度检索子代理。负责跨文件、跨目录的代码、日志和文档检索、归纳与架构探索；不修改任何文件，不做最终方案取舍，也不派生其他子代理。
+覆盖任务给定范围，返回符号关系、关键路径、`file:line` 和必要原文。把已确认事实、推断、缺口与矛盾分开，保留足够证据供主代理低成本抽查。
+你的输出直接喂给主代理：结构紧凑、信息密集，不写面向最终用户的包装文字。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) const VISUAL_ANALYSIS_AGENT_CONFIG: &str = r#####"name = "codey_visual_analysis"
+
+description = "Read-only visual analysis for screenshots, pages, GUI states, PDFs, and independent evidence review."
+sandbox_mode = "read-only"
+
+developer_instructions = """
+你是视觉分析子代理。负责截图、页面、GUI、PDF 和渲染结果的只读观察，也可承担需要视觉证据的复杂探索与独立核验；不修改文件，不做最终方案取舍，也不派生其他子代理。
+先读取或捕获必要视觉证据，再报告可见事实、位置关系、状态差异和可复核出处；推断必须单独标注。不要仅凭文件名或代码猜测视觉结果。
+你的输出直接供主代理决策，保持精炼、具体、可核验。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) const WORKER_AGENT_CONFIG: &str = r#####"name = "codey_worker"
+
+description = "Writable implementation for bounded, reversible, testable, low-to-medium complexity non-visual tasks."
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+你是代码实施子代理。只处理主代理明确授权、边界清晰、可回滚且可测试的低到中等复杂度非视觉实现；不要扩大范围，不做跨模块架构取舍，也不派生其他子代理。
+修改前读取将要编辑的确切代码，保留并适配其他人的并行改动。完成后运行与改动风险相称的最小验证，并返回修改文件、关键位置、测试结果和仍存风险。
+遇到需要产品选择、破坏性操作或范围不明确时停止修改，把阻塞点交回主代理。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) const VISUAL_WORKER_AGENT_CONFIG: &str = r#####"name = "codey_visual_worker"
+
+description = "Writable implementation for pages, GUI, PDFs, and tasks that require visual evidence or render verification."
+sandbox_mode = "workspace-write"
+
+developer_instructions = """
+你是视觉实施子代理。只处理主代理明确授权、边界清晰且需要截图、页面、GUI、PDF 或渲染证据的低到中等复杂度实现；不要扩大范围，不做架构取舍，也不派生其他子代理。
+修改前读取确切代码与视觉基线，修改后必须通过实际渲染或截图核验结果，并报告修改文件、关键位置、视觉验证证据、测试结果和仍存风险。
+保留并适配其他人的并行改动；遇到需要产品选择、破坏性操作或范围不明确时停止并交回主代理。
+"""
+
+[features]
+image_generation = false
+"#####;
+
+pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
+    match role {
+        "codey_quick_scan" => Some(QUICK_SCAN_AGENT_CONFIG),
+        "codey_deep_research" => Some(DEEP_RESEARCH_AGENT_CONFIG),
+        "codey_visual_analysis" => Some(VISUAL_ANALYSIS_AGENT_CONFIG),
+        "codey_worker" => Some(WORKER_AGENT_CONFIG),
+        "codey_visual_worker" => Some(VISUAL_WORKER_AGENT_CONFIG),
+        "default" => Some(DEFAULT_AGENT_CONFIG),
+        _ => None,
+    }
+}
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Route local \
 workspace tool use by task: use `mcp__codey_fastctx__inspect_local_file` for file inspection, \
@@ -319,10 +440,20 @@ fn dynamic_codey_fastctx_guidance_at(
 }
 
 pub(crate) fn append_subagent_guidance(existing: &str) -> String {
-    if existing.contains(SUBAGENT_GUIDANCE) {
-        return existing.to_string();
+    let current_is_present = existing.contains(SUBAGENT_GUIDANCE);
+    let mut updated = existing.to_string();
+    for &guidance in SUBAGENT_GUIDANCE_VERSIONS {
+        if current_is_present && guidance == SUBAGENT_GUIDANCE {
+            continue;
+        }
+        while let Some(without_guidance) = remove_owned_guidance_block(&updated, guidance) {
+            updated = without_guidance;
+        }
     }
-    let mut updated = existing.trim_end().to_string();
+    if current_is_present {
+        return updated;
+    }
+    let mut updated = updated.trim_end().to_string();
     if !updated.is_empty() {
         updated.push_str("\n\n");
     }
@@ -363,18 +494,15 @@ pub(crate) fn root_agent_collaboration_usage_hint_blocks(current: &str) -> Vec<&
 }
 
 pub(crate) fn remove_subagent_guidance(current: &str) -> Option<String> {
-    let guidance_start = current.find(SUBAGENT_GUIDANCE)?;
-    let mut owned_start = guidance_start;
-    if current[..owned_start].ends_with("\n\n") {
-        owned_start -= 2;
+    let mut restored = current.to_string();
+    let mut changed = false;
+    for &guidance in SUBAGENT_GUIDANCE_VERSIONS {
+        while let Some(without_guidance) = remove_owned_guidance_block(&restored, guidance) {
+            restored = without_guidance;
+            changed = true;
+        }
     }
-    let mut owned_end = guidance_start + SUBAGENT_GUIDANCE.len();
-    if current[owned_end..].starts_with('\n') {
-        owned_end += 1;
-    }
-    let mut restored = current[..owned_start].to_string();
-    restored.push_str(&current[owned_end..]);
-    Some(restored)
+    changed.then_some(restored)
 }
 
 pub(crate) fn remove_codey_fastctx_guidance(current: &str) -> Option<String> {
@@ -575,6 +703,45 @@ mod tests {
         let with_current = append_root_agent_collaboration_usage_hint(&inline);
         assert!(with_current.starts_with(&inline));
         assert!(with_current.ends_with(ROOT_AGENT_COLLABORATION_USAGE_HINT));
+    }
+
+    #[test]
+    fn subagent_guidance_migrates_the_previous_owned_block() {
+        let configured =
+            format!("User guidance.\n\n{PREVIOUS_SUBAGENT_GUIDANCE}\n\nConcurrent guidance.");
+        let migrated = append_subagent_guidance(&configured);
+
+        assert!(migrated.contains("User guidance."));
+        assert!(migrated.contains("Concurrent guidance."));
+        assert!(migrated.contains(SUBAGENT_GUIDANCE));
+        assert!(!migrated.contains(PREVIOUS_SUBAGENT_GUIDANCE));
+        assert_eq!(append_subagent_guidance(&migrated), migrated);
+        assert_eq!(
+            remove_subagent_guidance(&migrated).as_deref(),
+            Some("User guidance.\n\nConcurrent guidance.\n")
+        );
+    }
+
+    #[test]
+    fn every_task_role_has_a_named_editable_source_template() {
+        for (role, writable) in [
+            ("codey_quick_scan", false),
+            ("codey_deep_research", false),
+            ("codey_visual_analysis", false),
+            ("codey_worker", true),
+            ("codey_visual_worker", true),
+            ("default", false),
+        ] {
+            let source = subagent_source_config(role).unwrap();
+            assert!(source.contains(&format!("name = \"{role}\"")));
+            assert!(source.contains("description = \""));
+            let expected = if writable {
+                "sandbox_mode = \"workspace-write\""
+            } else {
+                "sandbox_mode = \"read-only\""
+            };
+            assert!(source.contains(expected), "{role}");
+        }
     }
 
     #[test]

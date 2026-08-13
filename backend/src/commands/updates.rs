@@ -10,7 +10,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::AppState;
 use crate::config::ConfigStore;
@@ -72,6 +72,12 @@ pub(crate) struct UpdateDownload {
 #[derive(Clone, Debug)]
 pub(crate) struct UpdateCandidate {
     pub(crate) check: UpdateCheck,
+}
+
+#[derive(Debug)]
+struct VerifiedDownloadedUpdate {
+    path: PathBuf,
+    asset: UpdateAssetInfo,
 }
 
 pub(super) struct CachedUpdateCandidate {
@@ -170,7 +176,7 @@ pub async fn install_downloaded_update(
     state: &Arc<AppState>,
     file_path: String,
 ) -> Result<Value, String> {
-    start_downloaded_update(state, &file_path)?;
+    start_downloaded_update(state, &file_path).await?;
     let shutdown_state = Arc::clone(state);
     tokio::spawn(async move {
         // Let the bridge deliver the response before Codex/Codey starts
@@ -181,9 +187,18 @@ pub async fn install_downloaded_update(
     Ok(json!({"status":"installing"}))
 }
 
-pub(crate) fn start_downloaded_update(state: &AppState, file_path: &str) -> Result<(), String> {
-    let update_path = validate_downloaded_update_path(&state.store, file_path)?;
-    spawn_update_installer(&update_path)
+pub(crate) async fn start_downloaded_update(
+    state: &AppState,
+    file_path: &str,
+) -> Result<(), String> {
+    let expected_update = state
+        .available_update
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| "无法确认更新包来源，请重新检查并下载更新".to_string())?;
+    let verified = verify_downloaded_update(&state.store, file_path, &expected_update).await?;
+    spawn_update_installer(&verified.path, &verified.asset)
 }
 
 async fn configured_update_manifest_url(state: &AppState) -> Result<String, String> {
@@ -486,13 +501,88 @@ fn validate_downloaded_update_path(
     Ok(canonical)
 }
 
+async fn verify_downloaded_update(
+    store: &ConfigStore,
+    file_path: &str,
+    expected_update: &UpdateCheck,
+) -> Result<VerifiedDownloadedUpdate, String> {
+    if !expected_update.update_available {
+        return Err("当前没有可安装的更新".to_string());
+    }
+    let asset = expected_update
+        .selected_asset
+        .as_ref()
+        .ok_or_else(|| "没有适用于当前系统的可安装更新包".to_string())?;
+    validate_update_asset_info(asset)?;
+    let version = Version::parse(&expected_update.latest_version)
+        .map_err(|error| format!("待安装更新版本无效：{error}"))?;
+    let update_path = validate_downloaded_update_path(store, file_path)?;
+    let expected_directory = update_download_dir(store)?
+        .join(format!("v{version}"))
+        .canonicalize()
+        .map_err(|error| format!("读取预期更新缓存目录失败：{error}"))?;
+    let expected_path = expected_directory.join(&asset.file_name);
+    if update_path != expected_path {
+        return Err("更新安装包与最近下载的版本不匹配，请重新下载".to_string());
+    }
+
+    let metadata = tokio::fs::metadata(&update_path)
+        .await
+        .map_err(|error| format!("读取更新安装包信息失败：{error}"))?;
+    if metadata.len() != asset.size {
+        return Err(format!(
+            "安装前校验失败：安装包大小应为 {} 字节，实际为 {} 字节",
+            asset.size,
+            metadata.len()
+        ));
+    }
+
+    // The cache can be modified after the original download completed. Hash
+    // the final on-disk bytes again immediately before launching the installer.
+    let mut file = tokio::fs::File::open(&update_path)
+        .await
+        .map_err(|error| format!("打开更新安装包失败：{error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut bytes_read = 0u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| format!("安装前读取更新安装包失败：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(read as u64);
+        if bytes_read > asset.size {
+            return Err("安装前校验失败：安装包大小超过更新清单声明".to_string());
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if bytes_read != asset.size {
+        return Err(format!(
+            "安装前校验失败：安装包大小应为 {} 字节，实际为 {} 字节",
+            asset.size, bytes_read
+        ));
+    }
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if !actual_sha256.eq_ignore_ascii_case(&asset.sha256) {
+        return Err("安装前校验失败：安装包 SHA-256 不匹配，请重新下载".to_string());
+    }
+    Ok(VerifiedDownloadedUpdate {
+        path: update_path,
+        asset: asset.clone(),
+    })
+}
+
 #[cfg(target_os = "windows")]
-fn spawn_update_installer(update_path: &Path) -> Result<(), String> {
-    crate::update_helper::spawn_update_installer(update_path)
+fn spawn_update_installer(update_path: &Path, asset: &UpdateAssetInfo) -> Result<(), String> {
+    crate::update_helper::spawn_update_installer(update_path, asset.size, &asset.sha256)
 }
 
 #[cfg(target_os = "macos")]
-fn spawn_update_installer(update_path: &Path) -> Result<(), String> {
+fn spawn_update_installer(update_path: &Path, asset: &UpdateAssetInfo) -> Result<(), String> {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     if !update_path
@@ -507,40 +597,83 @@ fn spawn_update_installer(update_path: &Path) -> Result<(), String> {
     let script_path = update_path
         .parent()
         .ok_or_else(|| "更新安装包路径无父目录".to_string())?
-        .join("install-codey-update.sh");
-    fs::write(
-        &script_path,
+        .join(format!(
+            ".install-codey-update-{}-{}.sh",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+    let mut script = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&script_path)
+        .map_err(|error| format!("创建更新安装脚本失败：{error}"))?;
+    if let Err(error) = script.write_all(
         r#"#!/bin/sh
 set -eu
+rm -f "$0"
 parent_pid="$1"
 archive="$2"
 app_bundle="$3"
 app_parent="$(dirname "$app_bundle")"
 app_name="$(basename "$app_bundle")"
+stage_dir=""
+tmp_dir=""
+cleanup() {
+  if [ -n "$stage_dir" ]; then rm -rf "$stage_dir"; fi
+  if [ -n "$tmp_dir" ]; then rm -rf "$tmp_dir"; fi
+}
+trap cleanup EXIT HUP INT TERM
 while kill -0 "$parent_pid" 2>/dev/null; do
   sleep 0.2
 done
+expected_size="$4"
+expected_sha256="$5"
+archive_parent="$(dirname "$archive")"
+archive_name="$(basename "$archive")"
+stage_dir="$(/usr/bin/mktemp -d "$archive_parent/.codey-update-stage.XXXXXX")"
+/bin/chmod 700 "$stage_dir"
+staged_archive="$stage_dir/$archive_name"
+/bin/mv "$archive" "$staged_archive"
+/bin/chmod 400 "$staged_archive"
+actual_size="$(/usr/bin/stat -f '%z' "$staged_archive")"
+test "$actual_size" = "$expected_size"
+actual_sha256="$(/usr/bin/shasum -a 256 "$staged_archive" | /usr/bin/awk '{print $1}')"
+test "$(printf '%s' "$actual_sha256" | /usr/bin/tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$expected_sha256" | /usr/bin/tr '[:upper:]' '[:lower:]')"
 tmp_dir="$app_parent/.${app_name}.codey-update.$$"
 rm -rf "$tmp_dir"
 mkdir -p "$tmp_dir"
-/usr/bin/ditto -x -k "$archive" "$tmp_dir"
+/usr/bin/ditto -x -k "$staged_archive" "$tmp_dir"
 test -d "$tmp_dir/$app_name"
 rm -rf "$app_bundle"
 mv "$tmp_dir/$app_name" "$app_bundle"
-rm -rf "$tmp_dir"
 /usr/bin/open "$app_bundle"
-"#,
-    )
-    .map_err(|error| format!("写入更新安装脚本失败：{error}"))?;
-    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
-        .map_err(|error| format!("设置更新安装脚本权限失败：{error}"))?;
-    std::process::Command::new("/bin/sh")
+"#
+        .as_bytes(),
+    ) {
+        let _ = fs::remove_file(&script_path);
+        return Err(format!("写入更新安装脚本失败：{error}"));
+    }
+    if let Err(error) = script.sync_all() {
+        let _ = fs::remove_file(&script_path);
+        return Err(format!("刷新更新安装脚本失败：{error}"));
+    }
+    drop(script);
+    if let Err(error) = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700)) {
+        let _ = fs::remove_file(&script_path);
+        return Err(format!("设置更新安装脚本权限失败：{error}"));
+    }
+    let spawn_result = std::process::Command::new("/bin/sh")
         .arg(&script_path)
         .arg(std::process::id().to_string())
         .arg(update_path)
         .arg(app_bundle)
-        .spawn()
-        .map_err(|error| format!("启动更新安装脚本失败：{error}"))?;
+        .arg(asset.size.to_string())
+        .arg(&asset.sha256)
+        .spawn();
+    if let Err(error) = spawn_result {
+        let _ = fs::remove_file(&script_path);
+        return Err(format!("启动更新安装脚本失败：{error}"));
+    }
     Ok(())
 }
 
@@ -554,7 +687,7 @@ fn current_macos_app_bundle() -> Option<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn spawn_update_installer(_update_path: &Path) -> Result<(), String> {
+fn spawn_update_installer(_update_path: &Path, _asset: &UpdateAssetInfo) -> Result<(), String> {
     Err("当前平台暂不支持自动安装更新".to_string())
 }
 
@@ -587,6 +720,19 @@ mod tests {
             version: version.to_string(),
             tag: format!("v{version}"),
             assets: vec![valid_asset()],
+        }
+    }
+
+    fn install_check(version: &str, file_name: &str, contents: &[u8]) -> UpdateCheck {
+        let mut asset = asset_info(&valid_asset());
+        asset.file_name = file_name.to_string();
+        asset.size = contents.len() as u64;
+        asset.sha256 = format!("{:x}", Sha256::digest(contents));
+        UpdateCheck {
+            current_version: "1.0.0".to_string(),
+            latest_version: version.to_string(),
+            update_available: true,
+            selected_asset: Some(asset),
         }
     }
 
@@ -705,6 +851,87 @@ mod tests {
             validate_downloaded_update_path(&store, version_dir.to_str().unwrap())
                 .unwrap_err()
                 .contains("必须指向文件")
+        );
+    }
+
+    #[tokio::test]
+    async fn downloaded_update_is_reverified_immediately_before_install() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let version_dir = directory.path().join("updates/v2.0.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let update = version_dir.join("codey-update.pkg");
+        let original = b"verified";
+        std::fs::write(&update, original).unwrap();
+        let check = install_check("2.0.0", "codey-update.pkg", original);
+
+        assert_eq!(
+            verify_downloaded_update(&store, update.to_str().unwrap(), &check)
+                .await
+                .unwrap()
+                .path,
+            update.canonicalize().unwrap()
+        );
+
+        // Keep the byte length unchanged so the digest check, rather than only
+        // the metadata check, proves that replacement is rejected.
+        std::fs::write(&update, b"tampered").unwrap();
+        assert!(
+            verify_downloaded_update(&store, update.to_str().unwrap(), &check)
+                .await
+                .unwrap_err()
+                .contains("SHA-256")
+        );
+    }
+
+    #[tokio::test]
+    async fn downloaded_update_must_match_the_selected_version_and_file_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let version_dir = directory.path().join("updates/v2.0.0");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        let unexpected = version_dir.join("other.pkg");
+        let contents = b"verified";
+        std::fs::write(&unexpected, contents).unwrap();
+        let check = install_check("2.0.0", "codey-update.pkg", contents);
+
+        assert!(
+            verify_downloaded_update(&store, unexpected.to_str().unwrap(), &check)
+                .await
+                .unwrap_err()
+                .contains("最近下载的版本")
+        );
+    }
+
+    #[tokio::test]
+    async fn downloaded_update_requires_a_current_valid_candidate() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        let mut check = install_check("2.0.0", "codey-update.pkg", b"verified");
+
+        check.update_available = false;
+        assert!(
+            verify_downloaded_update(&store, "unused", &check)
+                .await
+                .unwrap_err()
+                .contains("没有可安装")
+        );
+
+        check.update_available = true;
+        check.selected_asset = None;
+        assert!(
+            verify_downloaded_update(&store, "unused", &check)
+                .await
+                .unwrap_err()
+                .contains("适用于当前系统")
+        );
+
+        check = install_check("not-a-version", "codey-update.pkg", b"verified");
+        assert!(
+            verify_downloaded_update(&store, "unused", &check)
+                .await
+                .unwrap_err()
+                .contains("版本无效")
         );
     }
 

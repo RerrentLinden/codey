@@ -151,7 +151,7 @@ test("Windows updates survive shutdown through the native helper", async () => {
   );
   assert.match(
     updates,
-    /crate::update_helper::spawn_update_installer\(update_path\)/,
+    /crate::update_helper::spawn_update_installer\(update_path, asset\.size, &asset\.sha256\)/,
   );
   assert.doesNotMatch(updates, /powershell\.exe|install-codey-update\.ps1/i);
   assert.match(

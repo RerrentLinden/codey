@@ -8,6 +8,7 @@ const PATCH_RESULT: &str = "codey-startup-patch-installed-v22";
 pub struct PatchOptions {
     pub disable_pet: bool,
     pub fast_codex_startup: bool,
+    pub subagent_gate_active: bool,
 }
 
 pub fn inspector_argument(port: u16) -> String {
@@ -16,7 +17,15 @@ pub fn inspector_argument(port: u16) -> String {
 
 const STARTUP_PATCH_TEMPLATE: &str = concat!("\n", include_str!("codex_startup_patch.js"));
 
+#[cfg(test)]
 fn patch_expression(options: PatchOptions) -> String {
+    patch_expression_with_runtime_overrides(options, &[])
+}
+
+fn patch_expression_with_runtime_overrides(
+    options: PatchOptions,
+    runtime_config_overrides: &[String],
+) -> String {
     let error_logger_executable = match std::env::current_exe() {
         Ok(path) => serde_json::to_string(&path.to_string_lossy().to_string())
             .expect("error logger executable path should serialize"),
@@ -31,6 +40,11 @@ fn patch_expression(options: PatchOptions) -> String {
         }
     };
     STARTUP_PATCH_TEMPLATE
+        .replace(
+            "\"__CODEY_RUNTIME_CONFIG_OVERRIDES__\"",
+            &serde_json::to_string(runtime_config_overrides)
+                .expect("runtime config overrides should serialize"),
+        )
         .replace(
             "\"__CODEY_ERROR_LOGGER_EXECUTABLE__\"",
             &error_logger_executable,
@@ -47,6 +61,14 @@ fn patch_expression(options: PatchOptions) -> String {
                 "false"
             },
         )
+        .replace(
+            "__SUBAGENT_GATE_ACTIVE__",
+            if options.subagent_gate_active {
+                "true"
+            } else {
+                "false"
+            },
+        )
 }
 
 pub fn reserve_loopback_port() -> Result<u16> {
@@ -54,9 +76,13 @@ pub fn reserve_loopback_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-pub async fn install(port: u16, options: PatchOptions) -> Result<()> {
+pub async fn install(
+    port: u16,
+    options: PatchOptions,
+    runtime_config_overrides: &[String],
+) -> Result<()> {
     let websocket_url = wait_for_inspector(port).await?;
-    let expression = patch_expression(options);
+    let expression = patch_expression_with_runtime_overrides(options, runtime_config_overrides);
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         install_over_websocket(&websocket_url, &expression),
@@ -252,6 +278,7 @@ mod tests {
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
             fast_codex_startup: true,
+            subagent_gate_active: true,
         });
 
         assert!(expression.contains("const disablePet = true"));
@@ -296,10 +323,32 @@ mod tests {
     }
 
     #[test]
+    fn patch_expression_embeds_runtime_config_overrides_as_json() {
+        let overrides = vec![
+            "features.hooks=true".to_string(),
+            "developer_instructions=\"line one\\nline two\"".to_string(),
+        ];
+        let expression = patch_expression_with_runtime_overrides(
+            PatchOptions {
+                disable_pet: false,
+                fast_codex_startup: true,
+                subagent_gate_active: true,
+            },
+            &overrides,
+        );
+
+        assert!(expression.contains("const codeyRuntimeConfigOverrides = ["));
+        assert!(expression.contains("features.hooks=true"));
+        assert!(expression.contains("developer_instructions="));
+        assert!(!expression.contains("__CODEY_RUNTIME_CONFIG_OVERRIDES__"));
+    }
+
+    #[test]
     fn windows_lag_patch_only_short_circuits_the_wmi_snapshot_worker() {
         let expression = patch_expression(PatchOptions {
             disable_pet: false,
             fast_codex_startup: true,
+            subagent_gate_active: true,
         });
 
         assert!(expression.contains("process.platform === \"win32\""));
@@ -324,10 +373,13 @@ mod tests {
         let expression = patch_expression(PatchOptions {
             disable_pet: false,
             fast_codex_startup: false,
+            subagent_gate_active: false,
         });
 
         assert!(expression.contains("const fastCodexStartup = false"));
+        assert!(expression.contains("typeof false === \"boolean\""));
         assert!(!expression.contains("__FAST_CODEX_STARTUP__"));
+        assert!(!expression.contains("__SUBAGENT_GATE_ACTIVE__"));
     }
 
     #[test]
@@ -335,6 +387,7 @@ mod tests {
         let expression = patch_expression(PatchOptions {
             disable_pet: false,
             fast_codex_startup: true,
+            subagent_gate_active: true,
         });
 
         assert!(expression.contains("__CODEY_TEMP_WEBVIEW_LIFECYCLE__.close"));
@@ -461,6 +514,7 @@ mod tests {
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
             fast_codex_startup: true,
+            subagent_gate_active: true,
         });
         install_over_websocket(&format!("ws://{address}"), &expression)
             .await
@@ -521,6 +575,7 @@ mod tests {
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
             fast_codex_startup: true,
+            subagent_gate_active: true,
         });
         let error = tokio::time::timeout(
             std::time::Duration::from_millis(500),

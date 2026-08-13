@@ -100,6 +100,7 @@ impl RuntimeModelConfig {
 pub struct RuntimeSubagentConfig {
     model: String,
     reasoning_effort: String,
+    roles: std::collections::BTreeMap<String, crate::config::SubagentRoleConfig>,
 }
 
 impl RuntimeSubagentConfig {
@@ -107,6 +108,7 @@ impl RuntimeSubagentConfig {
         Self {
             model: config.subagent_model.clone(),
             reasoning_effort: config.subagent_reasoning_effort.clone(),
+            roles: config.subagent_roles.clone(),
         }
     }
 }
@@ -136,6 +138,7 @@ pub struct CodeyRuntime {
     crashpad_guard_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     crashpad_guard_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     protocol_proxy: Mutex<Option<ProtocolProxyHandle>>,
+    isolated_runtime_constraints: bool,
 }
 
 fn protocol_proxy_settings(
@@ -399,6 +402,8 @@ struct StartupModelCatalog {
 struct PreparedCodexStartupState {
     config_contents: Vec<u8>,
     runtime_config: CodeyConfig,
+    runtime_config_overrides: Vec<String>,
+    isolated_runtime_constraints: bool,
 }
 
 async fn prepare_startup_model_catalog(
@@ -540,6 +545,7 @@ async fn prepare_codex_startup_state(
     let subagent_optimization = runtime_subagent_config.subagent_optimization;
     let subagent_model = runtime_subagent_config.subagent_model.clone();
     let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort.clone();
+    let subagent_roles = runtime_subagent_config.subagent_roles.clone();
     let protocol_proxy_base_url = protocol_proxy_base_url.map(str::to_string);
     let protocol_proxy_enabled = protocol_proxy_base_url.is_some();
     let expected_config = expected_config.map(<[u8]>::to_vec);
@@ -555,6 +561,7 @@ async fn prepare_codex_startup_state(
                 subagent_optimization,
                 subagent_model: &subagent_model,
                 subagent_reasoning_effort: &subagent_reasoning_effort,
+                subagent_roles: Some(&subagent_roles),
                 preserve_provider_route,
                 protocol_proxy_base_url: protocol_proxy_base_url.as_deref(),
                 expected_config: expected_config.as_deref(),
@@ -599,6 +606,8 @@ async fn prepare_codex_startup_state(
     Ok(PreparedCodexStartupState {
         config_contents: applied.config_contents,
         runtime_config: runtime_subagent_config,
+        runtime_config_overrides: applied.runtime_config_overrides,
+        isolated_runtime_constraints: applied.isolated_runtime_constraints,
     })
 }
 
@@ -965,6 +974,8 @@ struct PreparedProviderState {
     protocol_proxy: Option<ProtocolProxyHandle>,
     applied_route_files: Option<RouteFilesSnapshot>,
     runtime_config: CodeyConfig,
+    runtime_config_overrides: Vec<String>,
+    isolated_runtime_constraints: bool,
 }
 
 struct StartupPatchState {
@@ -1185,6 +1196,8 @@ async fn prepare_runtime_provider_state(
         protocol_proxy,
         applied_route_files,
         runtime_config: prepared_startup.runtime_config,
+        runtime_config_overrides: prepared_startup.runtime_config_overrides,
+        isolated_runtime_constraints: prepared_startup.isolated_runtime_constraints,
     })
 }
 
@@ -1266,13 +1279,16 @@ async fn spawn_and_inject_runtime(
     injection_scripts: &cdp::PreparedInjectionScripts,
     storage: StartupStorageState,
     patch: &StartupPatchState,
+    runtime_config_overrides: &[String],
 ) -> Result<SpawnedRenderer> {
     let mut spawned = match spawn_codex(
         &storage.app_dir,
         patch.debug_port,
         config.slim_codex_pet,
         config.fast_codex_startup,
+        config.subagent_optimization,
         config.gpu_launch_mode,
+        runtime_config_overrides,
     )
     .await
     {
@@ -1373,6 +1389,10 @@ impl CodeyRuntime {
         *self.applied_subagent_config.write().await = RuntimeSubagentConfig::from_config(config);
     }
 
+    pub fn supports_subagent_defaults_hot_reload(&self) -> bool {
+        !self.isolated_runtime_constraints
+    }
+
     pub fn set_crashpad_pending_protection(&self, enabled: bool) {
         self.crashpad_guard_enabled
             .store(enabled, Ordering::Release);
@@ -1428,6 +1448,8 @@ impl CodeyRuntime {
             protocol_proxy,
             applied_route_files,
             runtime_config,
+            runtime_config_overrides,
+            isolated_runtime_constraints,
         } = prepare_runtime_provider_state(&home, config, &route).await?;
         let patch =
             prepare_startup_patches_and_overlay(&home, config, applied_route_files.as_ref())
@@ -1438,8 +1460,16 @@ impl CodeyRuntime {
             child,
             maintenance,
             injected_target,
-        } = spawn_and_inject_runtime(&home, config, &handler, &injection_scripts, storage, &patch)
-            .await?;
+        } = spawn_and_inject_runtime(
+            &home,
+            config,
+            &handler,
+            &injection_scripts,
+            storage,
+            &patch,
+            &runtime_config_overrides,
+        )
+        .await?;
         restore_cc_switch_provider_after_startup(&home, &route).await;
         #[cfg(target_os = "macos")]
         let inspector_argument = spawned.inspector_argument.clone();
@@ -1493,6 +1523,7 @@ impl CodeyRuntime {
                 crashpad_guard_shutdown: Mutex::new(Some(crashpad_guard_shutdown)),
                 crashpad_guard_task: Mutex::new(Some(crashpad_guard_task)),
                 protocol_proxy: Mutex::new(protocol_proxy),
+                isolated_runtime_constraints,
             },
             codex_exit,
             patch.route_changed,

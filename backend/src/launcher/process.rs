@@ -144,15 +144,23 @@ pub(super) async fn spawn_codex(
     debug_port: u16,
     disable_codex_pet: bool,
     fast_codex_startup: bool,
+    subagent_gate_active: bool,
     gpu_launch_mode: GpuLaunchMode,
+    runtime_config_overrides: &[String],
 ) -> Result<SpawnedCodex> {
     #[cfg(any(windows, target_os = "macos"))]
     let patch_options = crate::codex_startup_patch::PatchOptions {
         disable_pet: disable_codex_pet,
         fast_codex_startup,
+        subagent_gate_active,
     };
     #[cfg(not(any(windows, target_os = "macos")))]
-    let _ = (disable_codex_pet, fast_codex_startup);
+    let _ = (
+        disable_codex_pet,
+        fast_codex_startup,
+        subagent_gate_active,
+        runtime_config_overrides,
+    );
     let runtime_arguments = codex_runtime_arguments(gpu_launch_mode, !cfg!(target_os = "macos"));
 
     #[cfg(windows)]
@@ -174,7 +182,13 @@ pub(super) async fn spawn_codex(
         let mut launch_arguments = vec![inspector_arg];
         launch_arguments.extend(runtime_arguments.iter().cloned());
         let mut spawned = spawn_windows_codex(app_dir, debug_port, &launch_arguments).await?;
-        match crate::codex_startup_patch::install(inspector_port, patch_options).await {
+        match crate::codex_startup_patch::install(
+            inspector_port,
+            patch_options,
+            runtime_config_overrides,
+        )
+        .await
+        {
             Ok(()) => {
                 spawned.performance_status = "ready".to_string();
                 spawned.performance_detail = startup_patch_detail();
@@ -198,6 +212,11 @@ pub(super) async fn spawn_codex(
                 {
                     anyhow::bail!(
                         "Codex 启动补丁未能安装，且无法安全清理暂停的启动进程：{patch_error}；{cleanup_error:#}"
+                    );
+                }
+                if !runtime_config_overrides.is_empty() || subagent_gate_active {
+                    anyhow::bail!(
+                        "Codex 启动补丁未能安装；为避免丢失 Codey 运行时约束，已停止 Codex：{patch_error}"
                     );
                 }
                 match spawn_windows_codex(app_dir, debug_port, &runtime_arguments).await {
@@ -250,7 +269,13 @@ pub(super) async fn spawn_codex(
         };
         let mut spawned = spawn_command(command)?;
         spawned.inspector_argument = Some(inspector_arg.clone());
-        match crate::codex_startup_patch::install(inspector_port, patch_options).await {
+        match crate::codex_startup_patch::install(
+            inspector_port,
+            patch_options,
+            runtime_config_overrides,
+        )
+        .await
+        {
             Ok(()) => {
                 spawned.performance_status = "ready".to_string();
                 spawned.performance_detail = startup_patch_detail();

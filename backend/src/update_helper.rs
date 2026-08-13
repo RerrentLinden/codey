@@ -1,6 +1,9 @@
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "windows")]
+use sha2::{Digest, Sha256};
+
 const UPDATE_HELPER_FLAG: &str = "--codey-install-update";
 #[cfg(target_os = "windows")]
 const UPDATE_HELPER_FILE_PREFIX: &str = "install-codey-update-helper-";
@@ -14,6 +17,8 @@ struct UpdateHelperInvocation {
     installer: PathBuf,
     executable: PathBuf,
     install_dir: PathBuf,
+    expected_size: u64,
+    expected_sha256: String,
 }
 
 pub(crate) fn run_if_requested() -> Result<bool, String> {
@@ -59,6 +64,25 @@ where
         .next()
         .map(PathBuf::from)
         .ok_or_else(|| "更新助手缺少 Codey 安装目录".to_string())?;
+    let expected_size = arguments
+        .next()
+        .ok_or_else(|| "更新助手缺少安装包大小".to_string())?
+        .to_str()
+        .ok_or_else(|| "更新助手收到无效的安装包大小".to_string())?
+        .parse::<u64>()
+        .map_err(|_| "更新助手收到无效的安装包大小".to_string())?;
+    if expected_size == 0 {
+        return Err("更新助手收到无效的安装包大小".to_string());
+    }
+    let expected_sha256 = arguments
+        .next()
+        .ok_or_else(|| "更新助手缺少安装包 SHA-256".to_string())?
+        .into_string()
+        .map_err(|_| "更新助手收到无效的安装包 SHA-256".to_string())?;
+    if expected_sha256.len() != 64 || !expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("更新助手收到无效的安装包 SHA-256".to_string());
+    }
     if arguments.next().is_some() {
         return Err("更新助手收到多余参数".to_string());
     }
@@ -67,6 +91,8 @@ where
         installer,
         executable,
         install_dir,
+        expected_size,
+        expected_sha256,
     }))
 }
 
@@ -78,7 +104,11 @@ fn nsis_install_directory_argument(install_dir: &Path) -> OsString {
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn spawn_update_installer(update_path: &Path) -> Result<(), String> {
+pub(crate) fn spawn_update_installer(
+    update_path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
 
@@ -117,6 +147,8 @@ pub(crate) fn spawn_update_installer(update_path: &Path) -> Result<(), String> {
         .arg(update_path)
         .arg(&executable)
         .arg(install_dir)
+        .arg(expected_size.to_string())
+        .arg(expected_sha256)
         .current_dir(update_dir)
         .creation_flags(
             codey_runtime_core::windows_create_no_window()
@@ -270,6 +302,8 @@ fn install_windows_update(
 
     wait_for_executable_unlock(&invocation.executable, std::time::Duration::from_secs(180))?;
     append_update_log(log_path, "Installed executable lock released");
+    let _verified_installer_lock = open_verified_windows_installer(invocation)?;
+    append_update_log(log_path, "Installer integrity verified");
 
     let mut command = std::process::Command::new(&invocation.installer);
     command
@@ -295,6 +329,62 @@ fn install_windows_update(
         return Err(format!("安装包返回失败状态：{status}"));
     }
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn open_verified_windows_installer(
+    invocation: &UpdateHelperInvocation,
+) -> Result<std::fs::File, String> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    // Keep this handle alive while NSIS runs. Sharing reads lets Windows load
+    // the executable while denying writers and path replacement after the hash
+    // check has completed.
+    const FILE_SHARE_READ: u32 = 0x00000001;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(&invocation.installer)
+        .map_err(|error| format!("打开更新安装包失败：{error}"))?;
+    let actual_size = file
+        .metadata()
+        .map_err(|error| format!("读取更新安装包信息失败：{error}"))?
+        .len();
+    if actual_size != invocation.expected_size {
+        return Err(format!(
+            "安装包大小校验失败：期望 {} 字节，实际 {} 字节",
+            invocation.expected_size, actual_size
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut bytes_read = 0u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("读取更新安装包失败：{error}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read.saturating_add(read as u64);
+        if bytes_read > invocation.expected_size {
+            return Err("安装包大小超过更新清单声明".to_string());
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if bytes_read != invocation.expected_size {
+        return Err(format!(
+            "安装包大小校验失败：期望 {} 字节，实际 {} 字节",
+            invocation.expected_size, bytes_read
+        ));
+    }
+    let actual_sha256 = format!("{:x}", hasher.finalize());
+    if !actual_sha256.eq_ignore_ascii_case(&invocation.expected_sha256) {
+        return Err("安装包 SHA-256 校验失败".to_string());
+    }
+    Ok(file)
 }
 
 #[cfg(target_os = "windows")]
@@ -402,12 +492,15 @@ mod tests {
 
     #[test]
     fn update_helper_arguments_preserve_paths_with_spaces() {
+        let expected_sha256 = "a".repeat(64);
         let parsed = parse_update_helper_invocation([
             OsString::from("helper.exe"),
             OsString::from(UPDATE_HELPER_FLAG),
             OsString::from(r"C:\Users\Test User\updates\Codey setup.exe"),
             OsString::from(r"C:\Users\Test User\Programs\Codey\Codey.exe"),
             OsString::from(r"C:\Users\Test User\Programs\Codey"),
+            OsString::from("123456"),
+            OsString::from(expected_sha256.as_str()),
         ])
         .unwrap()
         .unwrap();
@@ -418,6 +511,8 @@ mod tests {
                 installer: PathBuf::from(r"C:\Users\Test User\updates\Codey setup.exe"),
                 executable: PathBuf::from(r"C:\Users\Test User\Programs\Codey\Codey.exe"),
                 install_dir: PathBuf::from(r"C:\Users\Test User\Programs\Codey"),
+                expected_size: 123456,
+                expected_sha256,
             }
         );
         assert_eq!(
@@ -436,5 +531,32 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("Codey 可执行文件路径"));
+    }
+
+    #[test]
+    fn update_helper_rejects_invalid_integrity_arguments() {
+        let size_error = parse_update_helper_invocation([
+            OsString::from("helper.exe"),
+            OsString::from(UPDATE_HELPER_FLAG),
+            OsString::from("installer.exe"),
+            OsString::from("Codey.exe"),
+            OsString::from("install-dir"),
+            OsString::from("0"),
+            OsString::from("not-a-digest"),
+        ])
+        .unwrap_err();
+        assert!(size_error.contains("安装包大小"));
+
+        let digest_error = parse_update_helper_invocation([
+            OsString::from("helper.exe"),
+            OsString::from(UPDATE_HELPER_FLAG),
+            OsString::from("installer.exe"),
+            OsString::from("Codey.exe"),
+            OsString::from("install-dir"),
+            OsString::from("1"),
+            OsString::from("not-a-digest"),
+        ])
+        .unwrap_err();
+        assert!(digest_error.contains("SHA-256"));
     }
 }

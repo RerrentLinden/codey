@@ -22,7 +22,9 @@ test("model IDs compare case-insensitively while preserving first spelling", asy
     includesModelId,
     modelIdsEqual,
     modelKey,
+    partitionModelIdsByKey,
     uniqueModelIds,
+    withoutModelId,
   } = await loadModelIdHelpers();
 
   assert.equal(modelKey(" Provider-Coder "), "provider-coder");
@@ -39,5 +41,22 @@ test("model IDs compare case-insensitively while preserving first spelling", asy
       "",
     ]),
     ["Provider-Coder", "Provider-Reasoner"],
+  );
+  assert.deepEqual(
+    withoutModelId(
+      ["Provider-Coder", "Provider-Reasoner", "provider-coder"],
+      " PROVIDER-CODER ",
+    ),
+    ["Provider-Reasoner"],
+  );
+  assert.deepEqual(
+    partitionModelIdsByKey(
+      ["Provider-Coder", "other-model", "PROVIDER-REASONER"],
+      new Set(["provider-coder", "provider-reasoner"]),
+    ),
+    {
+      matching: ["Provider-Coder", "PROVIDER-REASONER"],
+      remaining: ["other-model"],
+    },
   );
 });

@@ -28,6 +28,7 @@ pub(super) struct CodexAppVersionCache {
     runtime_app_path: Option<PathBuf>,
     configured_app_path: String,
     version: String,
+    lookup_started_at: Instant,
     checked_at: Instant,
 }
 
@@ -165,15 +166,22 @@ async fn codex_app_version_for_status(
     runtime_app_path: Option<PathBuf>,
     configured_app_path: String,
 ) -> String {
-    let mut cache = state.codex_app_version_cache.lock().await;
-    if let Some(cached) = cache.as_ref()
-        && cached.runtime_app_path == runtime_app_path
-        && cached.configured_app_path == configured_app_path
-        && cached.checked_at.elapsed() < CODEX_APP_VERSION_CACHE_TTL
+    let lookup_started_at = Instant::now();
     {
-        return cached.version.clone();
+        let cache = state.codex_app_version_cache.lock().await;
+        if let Some(cached) = cache.as_ref()
+            && cached.runtime_app_path == runtime_app_path
+            && cached.configured_app_path == configured_app_path
+            && lookup_started_at.saturating_duration_since(cached.checked_at)
+                < CODEX_APP_VERSION_CACHE_TTL
+        {
+            return cached.version.clone();
+        }
     }
 
+    // App bundle discovery performs blocking filesystem work. Do not keep the
+    // async cache mutex locked while it runs: concurrent status requests should
+    // remain independent even when the application lives on a slow volume.
     let checked_runtime_app_path = runtime_app_path.clone();
     let checked_configured_app_path = configured_app_path.clone();
     let version = tokio::task::spawn_blocking(move || {
@@ -192,12 +200,29 @@ async fn codex_app_version_for_status(
     })
     .await
     .unwrap_or_default();
-    *cache = Some(CodexAppVersionCache {
-        runtime_app_path,
-        configured_app_path,
-        version: version.clone(),
-        checked_at: Instant::now(),
-    });
+
+    let mut cache = state.codex_app_version_cache.lock().await;
+    if let Some(cached) = cache.as_ref()
+        && cached.runtime_app_path == runtime_app_path
+        && cached.configured_app_path == configured_app_path
+        && cached.lookup_started_at >= lookup_started_at
+    {
+        // Another request completed the same lookup while this one was doing
+        // filesystem work. Reuse the newer result instead of replacing it.
+        return cached.version.clone();
+    }
+    if cache
+        .as_ref()
+        .is_none_or(|cached| cached.lookup_started_at < lookup_started_at)
+    {
+        *cache = Some(CodexAppVersionCache {
+            runtime_app_path,
+            configured_app_path,
+            version: version.clone(),
+            lookup_started_at,
+            checked_at: Instant::now(),
+        });
+    }
     version
 }
 

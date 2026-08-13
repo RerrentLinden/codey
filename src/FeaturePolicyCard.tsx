@@ -1,6 +1,11 @@
 import { memo, type CSSProperties } from "react";
+import { IconInfoCircle } from "@tabler/icons-react";
 
-import type { Config, FastContextToolsStatus } from "./App.types";
+import type {
+  Config,
+  FastContextToolsStatus,
+  SubagentRoleId,
+} from "./App.types";
 import { Badge, Card, Select, Switch, Tooltip } from "./components/semi";
 import { SETTINGS_OVERLAY_Z_INDEX } from "./overlay.constants";
 import type { SubagentModelOption } from "./useModelSelection";
@@ -21,6 +26,42 @@ const REASONING_EFFORT_LABELS: Record<string, string> = {
   max: "最大",
   ultra: "超高",
 };
+const SUBAGENT_TASK_TYPES = [
+  {
+    id: "codey_quick_scan",
+    name: "快速定位",
+    description: "只读；用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
+  },
+  {
+    id: "codey_deep_research",
+    name: "深度检索",
+    description: "只读；用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
+  },
+  {
+    id: "codey_visual_analysis",
+    name: "视觉分析",
+    description: "只读；用于截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索和独立核验。",
+  },
+  {
+    id: "codey_worker",
+    name: "代码实施",
+    description: "可写；用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
+  },
+  {
+    id: "codey_visual_worker",
+    name: "视觉实施",
+    description: "可写；用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
+  },
+  {
+    id: "default",
+    name: "通用兜底",
+    description: "只读；任务不符合专用类型时使用，负责一般探索、检索和核验，不承担实施。",
+  },
+] as const satisfies ReadonlyArray<{
+  id: SubagentRoleId;
+  name: string;
+  description: string;
+}>;
 
 type FeaturePolicyCardProps = {
   config: Config;
@@ -55,22 +96,10 @@ function FeaturePolicyCardComponent({
   const gpuLaunchModeStyle = {
     "--gpu-mode-offset": `${gpuLaunchModeIndex * 100}%`,
   } as CSSProperties;
-  const selectedSubagentModel = subagentModelOptions.find(
-    (option) =>
-      option.value.trim().toLowerCase() ===
-      config.subagentModel.trim().toLowerCase(),
-  );
-  const subagentReasoningEfforts =
-    selectedSubagentModel?.supportedReasoningEfforts ?? [];
-  const subagentPolicyControlsDisabled =
-    isBusy;
+  const subagentPolicyControlsDisabled = isBusy;
   const subagentModelSelectOptions = subagentModelOptions.map((option) => ({
     label: option.label,
     value: option.value,
-  }));
-  const subagentReasoningEffortOptions = subagentReasoningEfforts.map((effort) => ({
-    label: REASONING_EFFORT_LABELS[effort] ?? effort,
-    value: effort,
   }));
   const fastctxStatusBlocksEmbedded =
     fastContextToolsStatus.userConfigured ||
@@ -179,86 +208,157 @@ function FeaturePolicyCardComponent({
               />
             </div>
             <div className="feature-card-body subagent-policy-body">
-              <div className="subagent-policy-controls">
-                <label>
-                  <span>子代理模型</span>
-                  <Select
-                    className="subagent-policy-select"
-                    aria-label="选择子代理模型"
-                    value={selectedSubagentModel?.value}
-                    placeholder={
-                      subagentModelOptions.length === 0
-                        ? "当前线路暂无模型"
-                        : "请选择模型"
-                    }
-                    disabled={
-                      subagentPolicyControlsDisabled ||
-                      subagentModelOptions.length === 0
-                    }
-                    optionList={subagentModelSelectOptions}
-                    dropdownClassName="subagent-policy-dropdown"
-                    showClear={false}
-                    filter={false}
-                    getPopupContainer={() => popupContainer ?? document.body}
-                    zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                    onChange={(value) => {
-                      const option = subagentModelOptions.find(
-                        (candidate) => candidate.value === String(value ?? ""),
+              {config.subagentOptimization ? (
+                <>
+                  <div className="subagent-policy-columns" aria-hidden="true">
+                    <span>任务类型</span>
+                    <span>模型</span>
+                    <span>思考深度</span>
+                  </div>
+                  <div className="subagent-policy-rows">
+                    {SUBAGENT_TASK_TYPES.map((task) => {
+                      const selection = config.subagentRoles[task.id] ?? {
+                        model: config.subagentModel,
+                        reasoningEffort: config.subagentReasoningEffort,
+                      };
+                      const selectedModel = subagentModelOptions.find(
+                        (option) =>
+                          option.value.trim().toLowerCase() ===
+                          selection.model.trim().toLowerCase(),
                       );
-                      if (!option) return;
-                      const reasoningEffort =
-                        option.supportedReasoningEfforts.includes(
-                          config.subagentReasoningEffort,
-                        )
-                          ? config.subagentReasoningEffort
-                          : option.defaultReasoningEffort;
-                      onConfigChange({
-                        ...config,
-                        subagentModel: option.value,
-                        subagentReasoningEffort: reasoningEffort,
-                      });
-                    }}
-                  />
-                </label>
-                <label>
-                  <span>思考深度</span>
-                  <Select
-                    className="subagent-policy-select"
-                    aria-label="选择子代理思考深度"
-                    value={
-                      subagentReasoningEfforts.includes(
-                        config.subagentReasoningEffort,
-                      )
-                        ? config.subagentReasoningEffort
-                        : undefined
-                    }
-                    placeholder="暂无可选深度"
-                    disabled={
-                      subagentPolicyControlsDisabled ||
-                      subagentReasoningEfforts.length === 0
-                    }
-                    optionList={subagentReasoningEffortOptions}
-                    dropdownClassName="subagent-policy-dropdown"
-                    showClear={false}
-                    filter={false}
-                    getPopupContainer={() => popupContainer ?? document.body}
-                    zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                    onChange={(value) =>
-                      onConfigChange({
-                        ...config,
-                        subagentReasoningEffort: String(value ?? ""),
-                      })
-                    }
-                  />
-                </label>
-              </div>
-              <small>
-                {subagentModelOptions.length === 0
-                  ? "请先在模型管理中添加当前线路可用模型"
-                  : config.subagentOptimization
-                    ? "保存后立即用于当前任务后续新启动的子代理，无需重启"
-                    : "可先选择子代理模型与思考深度，开启后保存即生效"}
-              </small>
+                      const reasoningEfforts =
+                        selectedModel?.supportedReasoningEfforts ?? [];
+                      const reasoningOptions = reasoningEfforts.map((effort) => ({
+                        label: REASONING_EFFORT_LABELS[effort] ?? effort,
+                        value: effort,
+                      }));
+                      const updateRole = (
+                        model: string,
+                        reasoningEffort: string,
+                      ) => {
+                        const legacyFallback =
+                          task.id === "default"
+                            ? {
+                                subagentModel: model,
+                                subagentReasoningEffort: reasoningEffort,
+                              }
+                            : {};
+                        onConfigChange({
+                          ...config,
+                          ...legacyFallback,
+                          subagentRoles: {
+                            ...config.subagentRoles,
+                            [task.id]: { model, reasoningEffort },
+                          },
+                        });
+                      };
+
+                      return (
+                        <div className="subagent-policy-row" key={task.id}>
+                          <div className="subagent-task-name">
+                            <span>{task.name}</span>
+                            <Tooltip
+                              content={task.description}
+                              getPopupContainer={() =>
+                                popupContainer ?? tooltipContainer ?? document.body
+                              }
+                              position="top"
+                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                            >
+                              <button
+                                type="button"
+                                className="subagent-task-help"
+                                aria-label={`${task.name}：${task.description}`}
+                              >
+                                <IconInfoCircle size={15} aria-hidden="true" />
+                              </button>
+                            </Tooltip>
+                          </div>
+                          <label>
+                            <span id={`${task.id}-model-label`} className="sr-only">
+                              {task.name}模型
+                            </span>
+                            <span className="subagent-mobile-field-label">模型</span>
+                            <Select
+                              className="subagent-policy-select"
+                              aria-labelledby={`${task.id}-model-label`}
+                              value={selectedModel?.value}
+                              placeholder={
+                                subagentModelOptions.length === 0
+                                  ? "当前线路暂无模型"
+                                  : "请选择模型"
+                              }
+                              disabled={
+                                subagentPolicyControlsDisabled ||
+                                subagentModelOptions.length === 0
+                              }
+                              optionList={subagentModelSelectOptions}
+                              dropdownClassName="subagent-policy-dropdown"
+                              showClear={false}
+                              filter={false}
+                              getPopupContainer={() => popupContainer ?? document.body}
+                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                              onChange={(value) => {
+                                const option = subagentModelOptions.find(
+                                  (candidate) =>
+                                    candidate.value === String(value ?? ""),
+                                );
+                                if (!option) return;
+                                const reasoningEffort =
+                                  option.supportedReasoningEfforts.includes(
+                                    selection.reasoningEffort,
+                                  )
+                                    ? selection.reasoningEffort
+                                    : option.defaultReasoningEffort;
+                                updateRole(option.value, reasoningEffort);
+                              }}
+                            />
+                          </label>
+                          <label>
+                            <span id={`${task.id}-effort-label`} className="sr-only">
+                              {task.name}思考深度
+                            </span>
+                            <span className="subagent-mobile-field-label">思考深度</span>
+                            <Select
+                              className="subagent-policy-select"
+                              aria-labelledby={`${task.id}-effort-label`}
+                              value={
+                                reasoningEfforts.includes(selection.reasoningEffort)
+                                  ? selection.reasoningEffort
+                                  : undefined
+                              }
+                              placeholder="暂无可选深度"
+                              disabled={
+                                subagentPolicyControlsDisabled ||
+                                reasoningEfforts.length === 0
+                              }
+                              optionList={reasoningOptions}
+                              dropdownClassName="subagent-policy-dropdown"
+                              showClear={false}
+                              filter={false}
+                              getPopupContainer={() => popupContainer ?? document.body}
+                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                              onChange={(value) =>
+                                updateRole(
+                                  selection.model,
+                                  String(value ?? ""),
+                                )
+                              }
+                            />
+                          </label>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <small>
+                    {subagentModelOptions.length === 0
+                      ? "请先在模型管理中添加当前线路可用模型"
+                      : "保存后重启 Codex，新的任务类型路由和模型配置才会生效"}
+                  </small>
+                </>
+              ) : (
+                <small>开启后可分别设置六类子代理任务的模型与思考深度</small>
+              )}
             </div>
           </div>
 

@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use crate::config::{CodeyConfig, DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
+use crate::config::{
+    CodeyConfig, DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT, SUBAGENT_ROLE_DEFAULT,
+    SUBAGENT_ROLE_IDS, SubagentRoleConfig, uniform_subagent_roles,
+};
 use crate::model_catalog;
 use crate::model_id;
 
@@ -9,6 +12,7 @@ pub(crate) fn reconcile_for_current_provider(
     codex_home: &Path,
     official_provider: bool,
 ) {
+    prepare_subagent_roles(config);
     let state = model_catalog::selection_state_with_manual_models(
         codex_home,
         official_provider,
@@ -25,25 +29,69 @@ pub(crate) fn reconcile_with_model_state(
     config: &mut CodeyConfig,
     state: Option<&model_catalog::ModelSelectionState>,
 ) {
+    prepare_subagent_roles(config);
     let Some(state) = state else {
-        if config.subagent_model.trim().is_empty() {
-            config.subagent_model = DEFAULT_SUBAGENT_MODEL.to_string();
-        }
+        sync_legacy_default(config);
         return;
     };
-    let requested = config.subagent_model.trim();
-    let Some(model) = state
-        .available_model(requested)
-        .or_else(|| state.available_model(&state.default_model))
-        .or_else(|| state.available_model(DEFAULT_SUBAGENT_MODEL))
-        .or_else(|| state.first_available_model())
-    else {
+    for selection in config.subagent_roles.values_mut() {
+        let requested = selection.model.trim();
+        let Some(model) = state
+            .available_model(requested)
+            .or_else(|| state.available_model(&state.default_model))
+            .or_else(|| state.available_model(DEFAULT_SUBAGENT_MODEL))
+            .or_else(|| state.first_available_model())
+        else {
+            continue;
+        };
+        let model = model.to_string();
+        selection.reasoning_effort =
+            reasoning_effort_for_model(state, &model, &selection.reasoning_effort);
+        selection.model = model;
+    }
+    sync_legacy_default(config);
+}
+
+fn prepare_subagent_roles(config: &mut CodeyConfig) {
+    if config.subagent_model.trim().is_empty() {
+        config.subagent_model = DEFAULT_SUBAGENT_MODEL.to_string();
+    }
+    if config.subagent_roles.is_empty() {
+        config.subagent_roles =
+            uniform_subagent_roles(&config.subagent_model, &config.subagent_reasoning_effort);
         return;
-    };
-    let model = model.to_string();
-    config.subagent_reasoning_effort =
-        reasoning_effort_for_model(state, &model, &config.subagent_reasoning_effort);
-    config.subagent_model = model;
+    }
+
+    // The scalar fields are retained as the compatibility representation of
+    // the fallback role. A caller that still mutates those fields directly
+    // therefore continues to update `default` without resetting other roles.
+    config.subagent_roles.insert(
+        SUBAGENT_ROLE_DEFAULT.to_string(),
+        SubagentRoleConfig::new(
+            config.subagent_model.clone(),
+            config.subagent_reasoning_effort.clone(),
+        ),
+    );
+    let fallback = config
+        .subagent_roles
+        .get(SUBAGENT_ROLE_DEFAULT)
+        .cloned()
+        .expect("fallback subagent role was inserted");
+    for role in SUBAGENT_ROLE_IDS {
+        config
+            .subagent_roles
+            .entry(role.to_string())
+            .or_insert_with(|| fallback.clone());
+    }
+}
+
+fn sync_legacy_default(config: &mut CodeyConfig) {
+    if let Some(selection) = config.subagent_roles.get(SUBAGENT_ROLE_DEFAULT) {
+        config.subagent_model.clone_from(&selection.model);
+        config
+            .subagent_reasoning_effort
+            .clone_from(&selection.reasoning_effort);
+    }
 }
 
 pub(crate) fn reasoning_effort_for_model(
@@ -314,5 +362,33 @@ mod tests {
         assert!(config.subagent_optimization);
         assert_eq!(config.subagent_model, "gpt-5.6-sol");
         assert_eq!(config.subagent_reasoning_effort, "medium");
+    }
+
+    #[test]
+    fn task_roles_keep_independent_models_and_reasoning_efforts() {
+        let mut config = route_config("route-a").normalize();
+        config.subagent_model = DEFAULT_SUBAGENT_MODEL.into();
+        config.subagent_reasoning_effort = "low".into();
+        config.subagent_roles.insert(
+            crate::config::SUBAGENT_ROLE_QUICK_SCAN.into(),
+            crate::config::SubagentRoleConfig::new("gpt-5.6-luna", "low"),
+        );
+        config.subagent_roles.insert(
+            crate::config::SUBAGENT_ROLE_DEEP_RESEARCH.into(),
+            crate::config::SubagentRoleConfig::new(DEFAULT_SUBAGENT_MODEL, "high"),
+        );
+
+        reconcile_with_model_state(&mut config, Some(&model_state()));
+
+        assert_eq!(
+            config.subagent_roles[crate::config::SUBAGENT_ROLE_QUICK_SCAN],
+            crate::config::SubagentRoleConfig::new("gpt-5.6-luna", "low")
+        );
+        assert_eq!(
+            config.subagent_roles[crate::config::SUBAGENT_ROLE_DEEP_RESEARCH],
+            crate::config::SubagentRoleConfig::new(DEFAULT_SUBAGENT_MODEL, "high")
+        );
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
+        assert_eq!(config.subagent_reasoning_effort, "low");
     }
 }

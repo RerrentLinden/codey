@@ -276,6 +276,116 @@ async fn stale_concurrent_config_saves_are_rejected_without_diverging_disk_and_m
     assert_eq!(memory.user_scripts.len(), 1);
 }
 
+#[tokio::test]
+async fn legacy_save_without_subagent_roles_preserves_differentiated_roles() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut initial = CodeyConfig::default();
+    initial
+        .subagent_roles
+        .get_mut("codey_worker")
+        .unwrap()
+        .model = "worker-specialized".to_string();
+    initial
+        .subagent_roles
+        .get_mut("codey_deep_research")
+        .unwrap()
+        .reasoning_effort = "ultra".to_string();
+    let expected_roles = initial.subagent_roles.clone();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(initial.clone()),
+        ..AppState::default()
+    });
+    let mut payload = serde_json::to_value(initial).unwrap();
+    payload.as_object_mut().unwrap().remove("subagentRoles");
+    payload["slimCodexPet"] = json!(false);
+
+    let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
+
+    assert_eq!(result["status"], "ok");
+    let saved = state.config.read().await;
+    assert_eq!(saved.subagent_roles, expected_roles);
+    assert!(!saved.slim_codex_pet);
+}
+
+#[tokio::test]
+async fn legacy_subagent_scalars_update_only_the_default_role() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut initial = CodeyConfig::default();
+    initial
+        .subagent_roles
+        .get_mut("codey_worker")
+        .unwrap()
+        .model = "worker-specialized".to_string();
+    let expected_worker = initial.subagent_roles["codey_worker"].clone();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(initial.clone()),
+        ..AppState::default()
+    });
+    let mut payload = serde_json::to_value(initial).unwrap();
+    let fields = payload.as_object_mut().unwrap();
+    fields.remove("subagentRoles");
+    fields.insert("subagentModel".to_string(), json!("legacy-default"));
+    fields.insert("subagentReasoningEffort".to_string(), json!("high"));
+
+    let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
+
+    assert_eq!(result["status"], "ok");
+    let saved = state.config.read().await;
+    assert_eq!(saved.subagent_roles["codey_worker"], expected_worker);
+    assert_eq!(
+        saved.subagent_roles[SUBAGENT_ROLE_DEFAULT].model,
+        "legacy-default"
+    );
+    assert_eq!(
+        saved.subagent_roles[SUBAGENT_ROLE_DEFAULT].reasoning_effort,
+        "high"
+    );
+    assert_eq!(saved.subagent_model, "legacy-default");
+    assert_eq!(saved.subagent_reasoning_effort, "high");
+}
+
+#[tokio::test]
+async fn partial_subagent_role_payload_merges_with_existing_roles() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut initial = CodeyConfig::default();
+    initial
+        .subagent_roles
+        .get_mut("codey_deep_research")
+        .unwrap()
+        .model = "research-specialized".to_string();
+    let expected_research = initial.subagent_roles["codey_deep_research"].clone();
+    let expected_default = initial.subagent_roles[SUBAGENT_ROLE_DEFAULT].clone();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(initial.clone()),
+        ..AppState::default()
+    });
+    let mut payload = serde_json::to_value(initial).unwrap();
+    payload["subagentRoles"] = json!({
+        "codey_worker": {
+            "model": "worker-updated",
+            "reasoningEffort": "max"
+        }
+    });
+
+    let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
+
+    assert_eq!(result["status"], "ok");
+    let saved = state.config.read().await;
+    assert_eq!(
+        saved.subagent_roles["codey_deep_research"],
+        expected_research
+    );
+    assert_eq!(
+        saved.subagent_roles[SUBAGENT_ROLE_DEFAULT],
+        expected_default
+    );
+    assert_eq!(saved.subagent_roles["codey_worker"].model, "worker-updated");
+    assert_eq!(saved.subagent_roles["codey_worker"].reasoning_effort, "max");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_join_does_not_hold_the_config_write_lock() {
     let directory = tempfile::tempdir().unwrap();

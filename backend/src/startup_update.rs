@@ -55,7 +55,7 @@ impl StartupUpdateUi for NativeUpdateUi {
 trait StartupUpdateBackend: Send + Sync {
     async fn check(&self) -> Result<UpdateCandidate, String>;
     async fn download(&self, candidate: &UpdateCandidate) -> Result<UpdateDownload, String>;
-    fn install(&self, file_path: &str) -> Result<(), String>;
+    async fn install(&self, file_path: &str) -> Result<(), String>;
 }
 
 struct LiveBackend<'a> {
@@ -72,8 +72,8 @@ impl StartupUpdateBackend for LiveBackend<'_> {
         commands::download_update_candidate(self.state, candidate).await
     }
 
-    fn install(&self, file_path: &str) -> Result<(), String> {
-        commands::start_downloaded_update(self.state, file_path)
+    async fn install(&self, file_path: &str) -> Result<(), String> {
+        commands::start_downloaded_update(self.state, file_path).await
     }
 }
 
@@ -139,7 +139,7 @@ async fn run_with(
             return StartupUpdateOutcome::Continue;
         }
     };
-    if let Err(error) = backend.install(&download.file_path) {
+    if let Err(error) = backend.install(&download.file_path).await {
         let _ = ui.hide_status();
         let _ = ui.show_update_failure(&error).await;
         return StartupUpdateOutcome::Continue;
@@ -221,7 +221,7 @@ mod tests {
             self.download.clone()
         }
 
-        fn install(&self, _file_path: &str) -> Result<(), String> {
+        async fn install(&self, _file_path: &str) -> Result<(), String> {
             self.installs.fetch_add(1, Ordering::Relaxed);
             match &self.install_error {
                 Some(error) => Err(error.clone()),

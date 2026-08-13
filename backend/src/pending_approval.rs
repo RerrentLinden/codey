@@ -849,18 +849,23 @@ fn query_recent_codey_rollouts(
     recent_after: i64,
 ) -> rusqlite::Result<Vec<(String, PathBuf)>> {
     let mut rollouts = Vec::new();
+    // SQLite columns can contain values that violate their declared affinity.
+    // Ignore only malformed rows here; prepare/query failures still invalidate
+    // the cached connection so a replaced database is reopened next poll.
     let mut statement = connection.prepare(
         "SELECT id, rollout_path FROM threads \
          WHERE archived=0 AND updated_at >= ?1 \
+           AND typeof(id)='text' AND typeof(rollout_path)='text' \
          ORDER BY updated_at DESC LIMIT ?2",
     )?;
     let rows = statement.query_map(params![recent_after, MAX_RECENT_SESSIONS], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
-    for row in rows.filter_map(Result::ok) {
-        let path = PathBuf::from(&row.1);
+    for row in rows {
+        let (session_id, rollout_path) = row?;
+        let path = PathBuf::from(rollout_path);
         rollouts.push((
-            row.0,
+            session_id,
             if path.is_absolute() {
                 path
             } else {
@@ -968,6 +973,49 @@ mod tests {
         assert!(!rollout_is_subagent(root));
         assert!(rollout_is_subagent(child));
         assert!(rollout_is_subagent(legacy_child));
+    }
+
+    #[test]
+    fn recent_rollout_query_skips_malformed_rows_without_losing_valid_sessions() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT NOT NULL,
+                    rollout_path,
+                    archived INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path, archived, updated_at)
+                 VALUES (?1, ?2, 0, ?3)",
+                params!["valid", "rollouts/valid.jsonl", 1_i64],
+            )
+            .unwrap();
+
+        let home = Path::new("codey-home");
+        assert_eq!(
+            query_recent_codey_rollouts(&connection, home, 0).unwrap(),
+            vec![("valid".to_string(), home.join("rollouts/valid.jsonl"),)]
+        );
+
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path, archived, updated_at)
+                 VALUES (?1, NULL, 0, ?2)",
+                params!["invalid", 2_i64],
+            )
+            .unwrap();
+        assert_eq!(
+            query_recent_codey_rollouts(&connection, home, 0).unwrap(),
+            vec![("valid".to_string(), home.join("rollouts/valid.jsonl"),)]
+        );
+
+        connection.execute_batch("DROP TABLE threads;").unwrap();
+        assert!(query_recent_codey_rollouts(&connection, home, 0).is_err());
     }
 
     #[test]

@@ -112,6 +112,14 @@ if (import.meta.env.DEV) {
       subagentOptimization: false,
       subagentModel: "gpt-5.6-terra",
       subagentReasoningEffort: "medium",
+      subagentRoles: {
+        codey_quick_scan: { model: "gpt-5.6-sol", reasoningEffort: "low" },
+        codey_deep_research: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+        codey_visual_analysis: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+        codey_worker: { model: "provider-fast-coder", reasoningEffort: "medium" },
+        codey_visual_worker: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+        default: { model: "gpt-5.6-sol", reasoningEffort: "medium" },
+      },
       hideFullAccessWarning: false,
       showAccountUsageInHeader: true,
     };

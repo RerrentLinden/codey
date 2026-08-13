@@ -82,7 +82,10 @@ use crate::codex_config::{
     FastContextToolsStatus, codex_home, fast_context_tools_status,
     mark_runtime_subagent_defaults_applied,
 };
-use crate::config::{CodeyConfig, ConfigStore, PromptOptimizationConfig};
+use crate::config::{
+    CodeyConfig, ConfigStore, PromptOptimizationConfig, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
+    SubagentRoleConfig,
+};
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
 };
@@ -484,8 +487,8 @@ async fn resolve_session_name_cached(
 pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Value {
     let result = match command {
         "load_codey_config" => load_codey_config(state).await,
-        "save_codey_config" => match argument::<CodeyConfig>(&args, "config") {
-            Ok(config) => save_codey_config(state, config).await,
+        "save_codey_config" => match codey_config_save_input(&args) {
+            Ok(input) => save_codey_config_input(state, input).await,
             Err(error) => Err(error),
         },
         "sync_current_provider" => sync_current_provider_command(state).await,
@@ -705,9 +708,57 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn save_codey_config(
     state: &Arc<AppState>,
     config_input: CodeyConfig,
+) -> Result<Value, String> {
+    save_codey_config_input(state, CodeyConfigSaveInput::complete(config_input)).await
+}
+
+struct CodeyConfigSaveInput {
+    config: CodeyConfig,
+    subagent_roles_present: bool,
+    subagent_model_present: bool,
+    subagent_reasoning_effort_present: bool,
+}
+
+#[cfg(test)]
+impl CodeyConfigSaveInput {
+    fn complete(config: CodeyConfig) -> Self {
+        Self {
+            config,
+            subagent_roles_present: true,
+            subagent_model_present: true,
+            subagent_reasoning_effort_present: true,
+        }
+    }
+}
+
+fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String> {
+    let config_value = args
+        .get("config")
+        .cloned()
+        .ok_or_else(|| "缺少参数：config".to_string())?;
+    let fields = config_value
+        .as_object()
+        .ok_or_else(|| "参数 config 无效：必须是 object".to_string())?;
+    let subagent_roles_present = fields.contains_key("subagentRoles");
+    let subagent_model_present = fields.contains_key("subagentModel");
+    let subagent_reasoning_effort_present = fields.contains_key("subagentReasoningEffort");
+    let config = serde_json::from_value(config_value)
+        .map_err(|error| format!("参数 config 无效：{error}"))?;
+    Ok(CodeyConfigSaveInput {
+        config,
+        subagent_roles_present,
+        subagent_model_present,
+        subagent_reasoning_effort_present,
+    })
+}
+
+async fn save_codey_config_input(
+    state: &Arc<AppState>,
+    config_input: CodeyConfigSaveInput,
 ) -> Result<Value, String> {
     let saved = {
         let _config_write_guard = state.config_write_lock.lock().await;
@@ -725,8 +776,14 @@ struct SavedCodeyConfig {
 
 async fn save_codey_config_locked(
     state: &Arc<AppState>,
-    mut config_input: CodeyConfig,
+    input: CodeyConfigSaveInput,
 ) -> Result<SavedCodeyConfig, String> {
+    let CodeyConfigSaveInput {
+        config: mut config_input,
+        subagent_roles_present,
+        subagent_model_present,
+        subagent_reasoning_effort_present,
+    } = input;
     let previous = state.config.read().await.clone();
     if config_input.settings_revision != previous.settings_revision {
         return Err("Codey 设置已被其他操作更新，请关闭后重新打开设置页面再保存".to_string());
@@ -757,8 +814,32 @@ async fn save_codey_config_locked(
     );
     config.fast_codex_startup = config_input.fast_codex_startup;
     config.subagent_optimization = config_input.subagent_optimization;
-    config.subagent_model = config_input.subagent_model;
-    config.subagent_reasoning_effort = config_input.subagent_reasoning_effort;
+    let default_role_supplied = subagent_roles_present
+        && !config_input.subagent_roles.is_empty()
+        && config_input
+            .subagent_roles
+            .contains_key(SUBAGENT_ROLE_DEFAULT);
+    if subagent_roles_present && !config_input.subagent_roles.is_empty() {
+        for (role, selection) in config_input.subagent_roles {
+            if SUBAGENT_ROLE_IDS.contains(&role.as_str()) {
+                config.subagent_roles.insert(role, selection);
+            }
+        }
+    }
+    if !default_role_supplied && (subagent_model_present || subagent_reasoning_effort_present) {
+        let fallback_model = config.subagent_model.clone();
+        let fallback_effort = config.subagent_reasoning_effort.clone();
+        let default_role = config
+            .subagent_roles
+            .entry(SUBAGENT_ROLE_DEFAULT.to_string())
+            .or_insert_with(|| SubagentRoleConfig::new(fallback_model, fallback_effort));
+        if subagent_model_present {
+            default_role.model = config_input.subagent_model;
+        }
+        if subagent_reasoning_effort_present {
+            default_role.reasoning_effort = config_input.subagent_reasoning_effort;
+        }
+    }
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     let mut config = config.normalize();
@@ -767,11 +848,11 @@ async fn save_codey_config_locked(
     {
         subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     }
-    let subagent_model_changed = previous.subagent_model != config.subagent_model;
-    let refresh_subagent_defaults = previous.subagent_optimization
-        && config.subagent_optimization
-        && (subagent_model_changed
-            || previous.subagent_reasoning_effort != config.subagent_reasoning_effort);
+    // Per-task agent files are composed at process startup. Updating only the
+    // legacy scalar defaults through config/batchWrite would leave the other
+    // role files stale, so every role change intentionally follows the normal
+    // restart-required path.
+    let refresh_subagent_defaults = false;
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let restart_required = runtime_config_requires_restart(state, &config).await;
     let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
@@ -982,6 +1063,9 @@ async fn hot_reload_runtime_subagent_defaults(
     config: &CodeyConfig,
 ) -> Option<Result<(), String>> {
     let runtime = state.runtime.lock().await.clone()?;
+    if !runtime.supports_subagent_defaults_hot_reload() {
+        return None;
+    }
     let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
     let websocket_url = runtime.renderer_websocket_url().await;
     let result = cdp::refresh_subagent_defaults(

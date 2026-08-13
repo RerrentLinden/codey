@@ -986,6 +986,56 @@
   // Remove that opt-in and add a command-local config override without touching
   // the user's persistent Codex configuration.
   const appServerAnalyticsConfig = "analytics.enabled=false";
+  const codeyRuntimeConfigOverrides = "__CODEY_RUNTIME_CONFIG_OVERRIDES__";
+  const wslOnlyRuntimeOverridePrefix = "__CODEY_WSL_ONLY__:";
+  const validRuntimeConfigOverrides = Array.isArray(codeyRuntimeConfigOverrides)
+    ? codeyRuntimeConfigOverrides.filter(
+        (entry) => typeof entry === "string" && entry.length > 0,
+      )
+    : [];
+  const nativeRuntimeConfigOverrides = validRuntimeConfigOverrides.filter(
+    (entry) => !entry.startsWith(wslOnlyRuntimeOverridePrefix),
+  );
+  const wslOnlyRuntimeConfigOverrides = validRuntimeConfigOverrides
+    .filter((entry) => entry.startsWith(wslOnlyRuntimeOverridePrefix))
+    .map((entry) => entry.slice(wslOnlyRuntimeOverridePrefix.length));
+  const appServerRuntimeConfigs = [
+    appServerAnalyticsConfig,
+    ...nativeRuntimeConfigOverrides,
+  ];
+  const subagentGateRuntimeEnv = "CODEY_SUBAGENT_GATE_ACTIVE";
+  const subagentGateRuntimeActive =
+    typeof __SUBAGENT_GATE_ACTIVE__ === "boolean" &&
+    __SUBAGENT_GATE_ACTIVE__;
+  const rewriteTomlWindowsPathsForWsl = (config) => {
+    if (typeof config !== "string") return config;
+    return config.replace(/"(?:\\.|[^"\\])*"/g, (literal) => {
+      try {
+        const value = JSON.parse(literal);
+        const match = /^(['"]?)([A-Za-z]):[\\/](.*)$/s.exec(value);
+        if (match == null) return literal;
+        const [, quote, drive, rest] = match;
+        return JSON.stringify(
+          `${quote}/mnt/${drive.toLowerCase()}/${rest.replace(/\\/g, "/")}`,
+        );
+      } catch {
+        return literal;
+      }
+    });
+  };
+  const hasAppServerConfigArg = (args, config) => {
+    for (let index = 0; index < args.length; index += 1) {
+      const argument = args[index];
+      if (
+        (argument === "-c" || argument === "--config") &&
+        args[index + 1] === config
+      ) {
+        return true;
+      }
+      if (argument === `--config=${config}`) return true;
+    }
+    return false;
+  };
   const rewriteCodexAppServerArgs = (args) => {
     if (!Array.isArray(args)) return args;
     const appServerIndexes = args
@@ -994,7 +1044,7 @@
     const analyticsFlagCount = args
       .filter((argument) => argument === "--analytics-default-enabled")
       .length;
-    if (appServerIndexes.length !== 1 || analyticsFlagCount !== 1) return args;
+    if (appServerIndexes.length !== 1 || analyticsFlagCount > 1) return args;
 
     const rewritten = args.filter(
       (argument) => argument !== "--analytics-default-enabled",
@@ -1013,13 +1063,46 @@
         hasAnalyticsConfig = true;
       }
     }
-    if (!hasAnalyticsConfig) {
-      const appServerIndex = rewritten.indexOf("app-server");
-      rewritten.splice(appServerIndex, 0, "-c", appServerAnalyticsConfig);
+    const appServerIndex = rewritten.indexOf("app-server");
+    const missingRuntimeConfigs = appServerRuntimeConfigs.filter(
+      (config) => !hasAppServerConfigArg(rewritten, config),
+    );
+    if (!hasAnalyticsConfig && !missingRuntimeConfigs.includes(appServerAnalyticsConfig)) {
+      missingRuntimeConfigs.unshift(appServerAnalyticsConfig);
+    }
+    if (missingRuntimeConfigs.length > 0) {
+      rewritten.splice(
+        appServerIndex,
+        0,
+        ...missingRuntimeConfigs.flatMap((config) => ["-c", config]),
+      );
+    }
+    if (
+      rewritten.length === args.length &&
+      rewritten.every((argument, index) => argument === args[index])
+    ) {
+      return args;
     }
     return rewritten;
   };
-  const rewriteCodexAppServerShellCommand = (command) => {
+  const shellQuote = (value) => `'${String(value).replace(/'/g, "'\\''")}'`;
+  const escapeRegExp = (value) =>
+    String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const hasShellConfigArg = (command, config) => {
+    const forms = [config, shellQuote(config)];
+    return forms.some((form) => {
+      const escaped = escapeRegExp(form);
+      return new RegExp(
+        `(?:^|[\\s;])(?:-c|--config)\\s+${escaped}(?=$|[\\s;&|])`,
+      ).test(command) || new RegExp(
+        `(?:^|[\\s;])--config=${escaped}(?=$|[\\s;&|])`,
+      ).test(command);
+    });
+  };
+  const rewriteCodexAppServerShellCommand = (
+    command,
+    runtimeConfigs = appServerRuntimeConfigs,
+  ) => {
     if (typeof command !== "string") return command;
     const execMatches = [...command.matchAll(/(?:^|;)\s*exec\s+/g)];
     if (execMatches.length !== 1) return command;
@@ -1041,11 +1124,14 @@
     const analyticsFlagMatches = execCommand.match(
       /(?:^|[\s;])--analytics-default-enabled(?=$|[\s;&|])/g,
     );
-    if (appServerMatches?.length !== 1 || analyticsFlagMatches?.length !== 1) {
+    if (appServerMatches?.length !== 1 || (analyticsFlagMatches?.length ?? 0) > 1) {
       return command;
     }
 
-    let hasAnalyticsConfig = false;
+    let hasAnalyticsConfig = hasShellConfigArg(
+      execCommand,
+      appServerAnalyticsConfig,
+    );
     let rewritten = execCommand.replace(
       /(^|[\s;])(-c|--config)\s+analytics\.enabled=[^\s;&|]+(?=$|[\s;&|])/g,
       (_match, prefix, configFlag) => {
@@ -1064,13 +1150,30 @@
       /(^|[\s;])--analytics-default-enabled(?=$|[\s;&|])/g,
       (_match, prefix) => prefix,
     );
-    if (!hasAnalyticsConfig) {
+    const missingRuntimeConfigs = runtimeConfigs.filter(
+      (config) =>
+        config !== appServerAnalyticsConfig &&
+        !hasShellConfigArg(rewritten, config),
+    );
+    const injectedConfigs = [
+      ...(!hasAnalyticsConfig ? [appServerAnalyticsConfig] : []),
+      ...missingRuntimeConfigs,
+    ];
+    if (injectedConfigs.length > 0) {
       rewritten = rewritten.replace(
         /\bapp-server\b/,
-        `-c ${appServerAnalyticsConfig} app-server`,
+        `${injectedConfigs.map((config) => `-c ${shellQuote(config)}`).join(" ")} app-server`,
       );
     }
-    return command.slice(0, execCommandOffset) + rewritten;
+    let commandPrefix = command.slice(0, execCommandOffset);
+    if (subagentGateRuntimeActive) {
+      const execKeywordIndex = commandPrefix.lastIndexOf("exec");
+      commandPrefix =
+        commandPrefix.slice(0, execKeywordIndex) +
+        `${subagentGateRuntimeEnv}=1 ` +
+        commandPrefix.slice(execKeywordIndex);
+    }
+    return commandPrefix + rewritten;
   };
   const rewriteCodexAppServerSpawnArgs = (command, args) => {
     if (!Array.isArray(args)) return args;
@@ -1091,8 +1194,21 @@
     ) {
       return args;
     }
+    const runtimeOverrideKey = (config) =>
+      config.slice(0, Math.max(0, config.indexOf("=")));
+    const wslReplacementKeys = new Set(
+      wslOnlyRuntimeConfigOverrides.map(runtimeOverrideKey),
+    );
+    const wslRuntimeConfigs = [
+      appServerAnalyticsConfig,
+      ...nativeRuntimeConfigOverrides.filter(
+        (config) => !wslReplacementKeys.has(runtimeOverrideKey(config)),
+      ),
+      ...wslOnlyRuntimeConfigOverrides,
+    ].map(rewriteTomlWindowsPathsForWsl);
     const rewrittenCommand = rewriteCodexAppServerShellCommand(
       args[shellFlagIndex + 1],
+      wslRuntimeConfigs,
     );
     if (rewrittenCommand === args[shellFlagIndex + 1]) return args;
     const rewritten = [...args];
@@ -1109,13 +1225,45 @@
   const childProcess = process.getBuiltinModule("child_process");
   const NativeSpawn = childProcess.spawn;
   if (!NativeSpawn.__codeyAppServerAnalyticsDisabled) {
+    const isDirectCodexAppServerSpawn = (command, args) =>
+      subagentGateRuntimeActive &&
+      /(?:^|[/\\])codex(?:\.exe)?$/i.test(String(command ?? "")) &&
+      Array.isArray(args) &&
+      args.filter((argument) => argument === "app-server").length === 1;
+    const withSubagentGateEnvironment = (rest) => {
+      const options = rest[0];
+      if (options == null) {
+        return [{
+          env: {
+            ...process.env,
+            [subagentGateRuntimeEnv]: "1",
+          },
+        }];
+      }
+      if (typeof options !== "object" || Array.isArray(options)) return rest;
+      const inheritedEnvironment = options.env == null ? process.env : options.env;
+      return [{
+        ...options,
+        env: {
+          ...inheritedEnvironment,
+          [subagentGateRuntimeEnv]: "1",
+        },
+      }, ...rest.slice(1)];
+    };
     const codeyAnalyticsDisabledSpawn = function (command, args, ...rest) {
       const rewritten = rewriteCodexAppServerSpawnArgs(command, args);
-      if (rewritten === args) {
+      const rewrittenRest = isDirectCodexAppServerSpawn(command, rewritten)
+        ? withSubagentGateEnvironment(rest)
+        : rest;
+      if (rewritten === args && rewrittenRest === rest) {
         return Reflect.apply(NativeSpawn, this, arguments);
       }
-      appServerAnalyticsPatchCount += 1;
-      return Reflect.apply(NativeSpawn, this, [command, rewritten, ...rest]);
+      if (rewritten !== args) appServerAnalyticsPatchCount += 1;
+      return Reflect.apply(NativeSpawn, this, [
+        command,
+        rewritten,
+        ...rewrittenRest,
+      ]);
     };
     Object.defineProperty(
       codeyAnalyticsDisabledSpawn,

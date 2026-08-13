@@ -40,7 +40,7 @@
   let configLoadBackoffMs = 120;
   let configLoadAttempts = 0;
   let observer = null;
-  let trackedScrollRoot = null;
+  let observerActive = false;
 
   const MAX_CONFIG_LOAD_ATTEMPTS = 10;
 
@@ -437,7 +437,7 @@
   };
 
   const scheduleScan = () => {
-    if (scanTimer) return;
+    if (!enabled || scanTimer) return;
     scanTimer = setTimeout(() => {
       scanTimer = 0;
       refreshButton();
@@ -445,6 +445,7 @@
   };
 
   const scheduleReposition = () => {
+    if (!enabled || !button || !inputElement) return;
     clearTimeout(repositionTimer);
     repositionTimer = setTimeout(updateButtonPosition, repositionDelayMs);
   };
@@ -482,23 +483,77 @@
     );
   };
 
+  const installObserver = () => {
+    observer = new MutationObserver((mutations) => {
+      if (!enabled) return;
+      const hasExternalMutation = mutations.some((mutation) => {
+        const target = mutation.target;
+        if (!target) return true;
+        if (target === button || target.id === toastId) return false;
+        if (target.id === styleId) return false;
+        return (
+          !target.closest?.(`#${buttonId}, #${toastId}`) &&
+          mutationRequiresComposerScan(mutation)
+        );
+      });
+      if (hasExternalMutation) scheduleScan();
+    });
+  };
+
+  const observeComposerMutations = () => {
+    if (!observer || observerActive || !enabled) return;
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: [
+        "aria-hidden",
+        "class",
+        "contenteditable",
+        "data-above-composer-conversation-id",
+        "disabled",
+        "hidden",
+        "role",
+        "style",
+      ],
+    });
+    observerActive = true;
+  };
+
+  const disconnectComposerObserver = () => {
+    if (!observer || !observerActive) return;
+    observer.disconnect();
+    observerActive = false;
+  };
+
+  const applyEnabledState = (nextEnabled) => {
+    enabled = nextEnabled;
+    if (enabled) {
+      observeComposerMutations();
+      refreshButton();
+      return;
+    }
+
+    disconnectComposerObserver();
+    clearTimeout(scanTimer);
+    clearTimeout(repositionTimer);
+    scanTimer = 0;
+    repositionTimer = 0;
+    refreshButton();
+  };
+
   const loadConfig = () => {
     configLoadAttempts += 1;
     callBridge(settingsPath, {})
       .then((config) => {
         configLoadAttempts = 0;
         configLoadBackoffMs = 120;
-        let nextEnabled = false;
         try {
           const optimization = config?.promptOptimization;
-          nextEnabled =
+          applyEnabledState(
             optimization?.enabled === true &&
-            optimization.apiKeyConfigured === true;
-          if (nextEnabled !== enabled) {
-            enabled = nextEnabled;
-            refreshButton();
-          }
-          if (enabled) refreshButton();
+              optimization.apiKeyConfigured === true,
+          );
         } catch (error) {
           // A script-side error must not look like a missing bridge; report
           // it once and leave the switch in its last known state.
@@ -519,38 +574,6 @@
         configLoadTimer = setTimeout(loadConfig, configLoadBackoffMs);
         configLoadBackoffMs = Math.min(configLoadBackoffMs * 2, 2_000);
       });
-  };
-
-  const installObserver = () => {
-    observer = new MutationObserver((mutations) => {
-      if (!enabled) return;
-      const hasExternalMutation = mutations.some((mutation) => {
-        const target = mutation.target;
-        if (!target) return true;
-        if (target === button || target.id === toastId) return false;
-        if (target.id === styleId) return false;
-        return (
-          !target.closest?.(`#${buttonId}, #${toastId}`) &&
-          mutationRequiresComposerScan(mutation)
-        );
-      });
-      if (hasExternalMutation) scheduleScan();
-    });
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: [
-        "aria-hidden",
-        "class",
-        "contenteditable",
-        "data-above-composer-conversation-id",
-        "disabled",
-        "hidden",
-        "role",
-        "style",
-      ],
-    });
   };
 
   window.addEventListener(configChangedEvent, () => {
