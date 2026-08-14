@@ -39,6 +39,7 @@ mod trace_log_guard;
 mod trace_log_stats;
 mod update_helper;
 
+use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(unix)]
@@ -98,9 +99,9 @@ fn build_async_runtime() -> Result<tokio::runtime::Runtime> {
 async fn run(ui: NativeUpdateUi) -> Result<()> {
     error_log::initialize();
     let state = Arc::new(AppState::default());
+    let codex_home = codex_config::codex_home();
     let restore_started_at = std::time::Instant::now();
-    if let Err(error) = launcher::restore_previous_runtime_state(&codex_config::codex_home()).await
-    {
+    if let Err(error) = launcher::restore_previous_runtime_state(&codex_home).await {
         error_log::record_failure_with_metadata(
             "restore_failed",
             "restore_previous_runtime_state_at_startup",
@@ -117,6 +118,21 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
             serde_json::json!({}),
         );
         eprintln!("Codey 启动前恢复上次临时配置失败：{error:#}");
+    }
+    match repair_legacy_model_catalog(&codex_home).await {
+        Ok(true) => eprintln!("已修复旧版 Codey 模型目录缺失的 description 字段"),
+        Ok(false) => {}
+        Err(error) => {
+            error_log::record_failure(
+                "repair_failed",
+                "repair_legacy_model_catalog",
+                format!("{error:#}"),
+                serde_json::json!({
+                    "codexHome": codex_home,
+                }),
+            );
+            eprintln!("修复旧版 Codey 模型目录失败：{error:#}");
+        }
     }
     let mut shutdown = Box::pin(shutdown_signal());
     let startup_update = startup_update::run(&state, &ui);
@@ -213,6 +229,13 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
         }
     }
     cleanup.map_err(anyhow::Error::msg)
+}
+
+async fn repair_legacy_model_catalog(home: &Path) -> Result<bool> {
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || model_catalog::repair_missing_descriptions(&home))
+        .await
+        .map_err(anyhow::Error::from)?
 }
 
 async fn stop_runtime_with_retry(state: &Arc<AppState>) -> Result<(), String> {

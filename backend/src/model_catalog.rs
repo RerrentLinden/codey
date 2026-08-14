@@ -376,6 +376,62 @@ pub fn is_available(home: &Path) -> bool {
     })
 }
 
+/// Repairs catalogs written by older Codey versions that copied model-cache
+/// entries without Codex's now-required `description` field.
+pub(crate) fn repair_missing_descriptions(home: &Path) -> Result<bool> {
+    let path = home.join(relative_path());
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取待修复的 Codey 模型目录失败：{}", path.display()));
+        }
+    };
+    let mut catalog: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析待修复的 Codey 模型目录失败：{}", path.display()))?;
+    let models = catalog
+        .get_mut("models")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow::anyhow!("待修复的 Codey 模型目录缺少 models 数组"))?;
+    if !models
+        .iter()
+        .any(|model| !model_has_runtime_description(model))
+    {
+        return Ok(false);
+    }
+    let mut repaired = false;
+    for model in models.iter_mut() {
+        if model_has_runtime_description(model) {
+            continue;
+        }
+        let description = model
+            .get("display_name")
+            .and_then(Value::as_str)
+            .or_else(|| model.get("slug").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(ToString::to_string);
+        if let Some(description) = description {
+            model["description"] = json!(description);
+            repaired = true;
+        }
+    }
+    if models
+        .iter()
+        .any(|model| !model_has_runtime_description(model))
+    {
+        bail!("旧版 Codey 模型目录存在无法自动补全 description 的条目");
+    }
+    debug_assert!(repaired);
+
+    let mut contents =
+        serde_json::to_vec_pretty(&catalog).context("序列化已修复的 Codey 模型目录失败")?;
+    contents.push(b'\n');
+    atomic_write(&path, &contents)?;
+    Ok(true)
+}
+
 pub fn is_runtime_model_cache_unavailable(error: &anyhow::Error) -> bool {
     error.is::<RuntimeModelCacheUnavailable>()
 }
@@ -1743,6 +1799,69 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
 
         assert!(!is_available(home.path()));
+    }
+
+    #[test]
+    fn startup_repair_fills_legacy_catalog_descriptions_once() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "models": [
+                    {
+                        "slug": "model-a",
+                        "display_name": "Model A",
+                        "base_instructions": "instructions"
+                    },
+                    {
+                        "slug": "model-b",
+                        "description": "   ",
+                        "base_instructions": "instructions"
+                    },
+                    {
+                        "slug": "model-c",
+                        "display_name": "Model C",
+                        "description": "Existing description",
+                        "base_instructions": "instructions"
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(repair_missing_descriptions(home.path()).unwrap());
+
+        let repaired: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(repaired["models"][0]["description"], "Model A");
+        assert_eq!(repaired["models"][1]["description"], "model-b");
+        assert_eq!(repaired["models"][2]["description"], "Existing description");
+        assert!(is_available(home.path()));
+        let repaired_contents = fs::read(&path).unwrap();
+
+        assert!(!repair_missing_descriptions(home.path()).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), repaired_contents);
+    }
+
+    #[test]
+    fn startup_repair_leaves_unrepairable_catalog_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = serde_json::to_vec(&json!({
+            "models": [{
+                "base_instructions": "instructions"
+            }]
+        }))
+        .unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let error = repair_missing_descriptions(home.path()).unwrap_err();
+
+        assert!(error.to_string().contains("无法自动补全 description"));
+        assert_eq!(fs::read(&path).unwrap(), original);
     }
 
     #[test]
