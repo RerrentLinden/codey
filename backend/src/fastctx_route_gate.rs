@@ -7,7 +7,8 @@ use serde_json::{Value, json};
 
 pub(crate) const HOOK_ARGUMENT: &str = "--codey-fastctx-route-hook";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
-pub(crate) const HOOK_MATCHER: &str = "^Bash$";
+pub(crate) const HOOK_MATCHER: &str =
+    "^(Bash|list_mcp_resources|list_mcp_resource_templates|read_mcp_resource)$";
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 const FALLBACK_MARKER: &str = "# codey-fastctx-fallback";
 
@@ -86,13 +87,15 @@ fn write_hook_output(output: &Value) -> Result<()> {
 }
 
 fn handle_hook(input: &HookInput) -> Value {
-    if input.hook_event_name != "PreToolUse"
-        || !input
-            .tool_name
-            .as_deref()
-            .is_some_and(|tool| tool.eq_ignore_ascii_case("Bash"))
-    {
+    if input.hook_event_name != "PreToolUse" {
         return json!({});
+    }
+    let Some(tool_name) = input.tool_name.as_deref() else {
+        return json!({});
+    };
+
+    if !tool_name.eq_ignore_ascii_case("Bash") {
+        return handle_resource_tool(tool_name, input.tool_input.as_ref());
     }
     let Some(command) = input
         .tool_input
@@ -106,14 +109,107 @@ fn handle_hook(input: &HookInput) -> Value {
         return json!({});
     };
 
+    deny(format!(
+        "Codey FastCtx 路由：这个终端调用只包含本地文件读取、搜索或发现操作。请优先调用 `{}`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位后调用。Windows 路径请转换为 `E:/repo/file.ts` 形式的绝对盘符路径。只有在对应 FastCtx 工具确实不可见或调用失败后，才可把 `{FALLBACK_MARKER}` 作为命令的第一行重试终端；不要在未尝试 FastCtx 前使用该回退标记。",
+        route.tool_name(),
+    ))
+}
+
+fn handle_resource_tool(tool_name: &str, tool_input: Option<&Value>) -> Value {
+    if matches_resource_tool(tool_name, "read_mcp_resource") {
+        return guard_resource_read(tool_input);
+    }
+    if matches_resource_tool(tool_name, "list_mcp_resources")
+        || matches_resource_tool(tool_name, "list_mcp_resource_templates")
+    {
+        return guard_resource_list(tool_input);
+    }
+    json!({})
+}
+
+fn guard_resource_read(tool_input: Option<&Value>) -> Value {
+    let server = string_field(tool_input, "server");
+    let uri = string_field(tool_input, "uri");
+    if server.is_none_or(str::is_empty) || uri.is_none_or(str::is_empty) {
+        return deny(invalid_resource_read_reason());
+    }
+    if server.is_some_and(is_codey_fastctx_resource_alias) {
+        return deny(fastctx_resource_reason());
+    }
+    if uri.is_some_and(|uri| is_plain_local_path(uri) || !has_uri_scheme(uri)) {
+        return deny(invalid_resource_read_reason());
+    }
+    json!({})
+}
+
+fn guard_resource_list(tool_input: Option<&Value>) -> Value {
+    let Some(server) = explicit_string_field(tool_input, "server") else {
+        return json!({});
+    };
+    if server.trim().is_empty() {
+        return deny(
+            "MCP 资源发现已停止：若要查询全部已配置服务器，请省略 `server`；若要查询单个服务器，请传入配置中真实存在的名称。"
+                .to_string(),
+        );
+    }
+    if is_codey_fastctx_resource_alias(server) {
+        return deny(fastctx_resource_reason());
+    }
+    json!({})
+}
+
+fn explicit_string_field<'a>(tool_input: Option<&'a Value>, field: &str) -> Option<&'a str> {
+    tool_input?.get(field)?.as_str()
+}
+
+fn string_field<'a>(tool_input: Option<&'a Value>, field: &str) -> Option<&'a str> {
+    explicit_string_field(tool_input, field).map(str::trim)
+}
+
+fn matches_resource_tool(actual: &str, expected: &str) -> bool {
+    actual.eq_ignore_ascii_case(expected)
+}
+
+fn is_codey_fastctx_resource_alias(server: &str) -> bool {
+    matches!(
+        server.trim().to_ascii_lowercase().as_str(),
+        "codey_fastctx" | "mcp__codey_fastctx"
+    )
+}
+
+fn is_plain_local_path(uri: &str) -> bool {
+    let bytes = uri.as_bytes();
+    uri.starts_with('/')
+        || uri.starts_with("\\\\")
+        || bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\')
+}
+
+fn has_uri_scheme(uri: &str) -> bool {
+    let Some((scheme, _)) = uri.split_once(':') else {
+        return false;
+    };
+    let mut bytes = scheme.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+fn invalid_resource_read_reason() -> String {
+    "MCP 资源读取已停止：`server` 和 `uri` 必须原样使用成功资源发现返回的真实值，不能填写 `x`、`none`、本地路径或其他占位内容。本地工作区文件请直接调用 `mcp__codey_fastctx__inspect_local_file`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位。".to_string()
+}
+
+fn fastctx_resource_reason() -> String {
+    "Codey FastCtx 只提供直接调用的文件工具，不能作为资源服务器使用。本地文件请调用 `mcp__codey_fastctx__inspect_local_file`，搜索与发现请分别调用 `mcp__codey_fastctx__grep` 和 `mcp__codey_fastctx__glob`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位。".to_string()
+}
+
+fn deny(reason: String) -> Value {
     json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": format!(
-                "Codey FastCtx 路由：这个终端调用只包含本地文件读取、搜索或发现操作。请优先调用 `{}`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位后调用。Windows 路径请转换为 `E:/repo/file.ts` 形式的绝对盘符路径。只有在对应 FastCtx 工具确实不可见或调用失败后，才可把 `{FALLBACK_MARKER}` 作为命令的第一行重试终端；不要在未尝试 FastCtx 前使用该回退标记。",
-                route.tool_name(),
-            ),
+            "permissionDecisionReason": reason,
         }
     })
 }
@@ -456,11 +552,25 @@ mod tests {
     use super::*;
 
     fn hook_input(command: &str) -> HookInput {
+        tool_hook_input("Bash", json!({ "command": command }))
+    }
+
+    fn tool_hook_input(tool_name: &str, tool_input: Value) -> HookInput {
         HookInput {
             hook_event_name: "PreToolUse".to_string(),
-            tool_name: Some("Bash".to_string()),
-            tool_input: Some(json!({ "command": command })),
+            tool_name: Some(tool_name.to_string()),
+            tool_input: Some(tool_input),
         }
+    }
+
+    fn assert_denied(output: &Value) -> &str {
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        output["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
     }
 
     #[test]
@@ -513,16 +623,68 @@ mod tests {
     #[test]
     fn pre_tool_use_denial_names_the_route_and_safe_fallback() {
         let output = handle_hook(&hook_input("rg -n needle src"));
-        assert_eq!(
-            output["hookSpecificOutput"]["permissionDecision"].as_str(),
-            Some("deny")
-        );
-        let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-            .as_str()
-            .unwrap();
+        let reason = assert_denied(&output);
         assert!(reason.contains("mcp__codey_fastctx__grep"));
         assert!(reason.contains(FALLBACK_MARKER));
         assert!(reason.contains("E:/repo/file.ts"));
+    }
+
+    #[test]
+    fn blocks_placeholder_and_plain_path_resource_reads() {
+        for (server, uri) in [
+            ("x", "x"),
+            ("none", "none"),
+            ("filesystem", "/workspace/src/main.rs"),
+            ("filesystem", "C:\\workspace\\src\\main.rs"),
+        ] {
+            let output = handle_hook(&tool_hook_input(
+                "read_mcp_resource",
+                json!({ "server": server, "uri": uri }),
+            ));
+            let reason = assert_denied(&output);
+            assert!(reason.contains("mcp__codey_fastctx__inspect_local_file"));
+            assert!(reason.contains("成功资源发现返回的真实值"));
+        }
+    }
+
+    #[test]
+    fn blocks_fastctx_resource_aliases() {
+        for tool_name in [
+            "read_mcp_resource",
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+        ] {
+            let input = if tool_name == "read_mcp_resource" {
+                json!({ "server": "mcp__codey_fastctx", "uri": "file:///workspace/src/main.rs" })
+            } else {
+                json!({ "server": "codey_fastctx" })
+            };
+            let output = handle_hook(&tool_hook_input(tool_name, input));
+            let reason = assert_denied(&output);
+            assert!(reason.contains("不能作为资源服务器使用"));
+        }
+    }
+
+    #[test]
+    fn allows_global_discovery_and_valid_remote_resource_uris() {
+        assert_eq!(
+            handle_hook(&tool_hook_input("list_mcp_resources", json!({}))),
+            json!({})
+        );
+        assert_eq!(
+            handle_hook(&tool_hook_input(
+                "read_mcp_resource",
+                json!({ "server": "docs", "uri": "docs://guide/getting-started" }),
+            )),
+            json!({})
+        );
+        assert_eq!(
+            handle_hook(&tool_hook_input(
+                "read_mcp_resource",
+                json!({ "server": "filesystem", "uri": "file:///workspace/src/main.rs" }),
+            )),
+            json!({})
+        );
     }
 
     #[test]

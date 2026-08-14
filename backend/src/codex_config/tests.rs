@@ -1207,12 +1207,11 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
     assert!(guidance.contains("Use CodeGraph only for semantic code understanding"));
     assert!(guidance.contains("inspect `ALL_TOOLS`"));
     assert!(guidance.contains("drive-letter path such as `E:/repo/file.ts`"));
-    assert!(guidance.contains(
-        "`mcp__codey_fastctx` is a direct tool namespace, not an MCP Resources server ID"
-    ));
-    assert!(guidance.contains("Never call `list_mcp_resources`"));
-    assert!(guidance.contains("`read_mcp_resource`"));
-    assert!(guidance.contains("use `tool_search` to load these direct tools"));
+    assert!(guidance.contains("FastCtx publishes only the four exact callable functions"));
+    assert!(guidance.contains("do not discover or invent a substitute server"));
+    assert!(guidance.contains("use `tool_search` to load them"));
+    assert!(!guidance.contains("list_mcp_resources"));
+    assert!(!guidance.contains("read_mcp_resource"));
     assert!(!guidance.contains("Write-Output"));
     for stale_guidance in &CODEY_FASTCTX_GUIDANCE_VERSIONS[1..] {
         assert!(!guidance.contains(stale_guidance));
@@ -1753,8 +1752,9 @@ developer_instructions = {}
         assert!(guidance.contains("takes precedence over generic `rg`"));
         assert!(guidance.contains("Use CodeGraph only for semantic code understanding"));
         assert!(guidance.contains("inspect `ALL_TOOLS`"));
-        assert!(guidance.contains("Never call `list_mcp_resources`"));
-        assert!(guidance.contains("use `tool_search` to load these direct tools"));
+        assert!(guidance.contains("FastCtx publishes only the four exact callable functions"));
+        assert!(guidance.contains("use `tool_search` to load them"));
+        assert!(!guidance.contains("list_mcp_resources"));
         assert!(!guidance.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
     }
     let temporary_default = fs::read_to_string(home.join("agents/default.toml")).unwrap();
@@ -1762,8 +1762,9 @@ developer_instructions = {}
     assert!(temporary_default.contains("takes precedence over generic `rg`"));
     assert!(temporary_default.contains("Use CodeGraph only for semantic code understanding"));
     assert!(temporary_default.contains("inspect `ALL_TOOLS`"));
-    assert!(temporary_default.contains("Never call `list_mcp_resources`"));
-    assert!(temporary_default.contains("use `tool_search` to load these direct tools"));
+    assert!(temporary_default.contains("FastCtx publishes only the four exact callable functions"));
+    assert!(temporary_default.contains("use `tool_search` to load them"));
+    assert!(!temporary_default.contains("list_mcp_resources"));
     assert!(!temporary_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
 
     assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
