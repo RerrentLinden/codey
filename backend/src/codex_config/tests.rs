@@ -1,7 +1,7 @@
 use super::*;
 use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE, DEFAULT_AGENT_CONFIG, PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4,
-    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5, PREVIOUS_SUBAGENT_GUIDANCE,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5, PREVIOUS_SUBAGENT_GUIDANCE_V2,
     codey_fastctx_guidance_for_namespace, remove_codey_fastctx_guidance,
 };
 
@@ -3491,7 +3491,7 @@ wire_api = "responses"
     fs::create_dir_all(&seeded_constraints_dir).unwrap();
     fs::write(
         seeded_constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE),
-        PREVIOUS_SUBAGENT_GUIDANCE,
+        PREVIOUS_SUBAGENT_GUIDANCE_V2,
     )
     .unwrap();
     let profile = direct_profile(RelayProtocol::Responses);

@@ -13,9 +13,9 @@ use serde::{Deserialize, Serialize};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE, ROOT_AGENT_COLLABORATION_USAGE_HINT,
-    ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, SUBAGENT_GUIDANCE,
-    append_root_agent_collaboration_usage_hint, append_subagent_guidance,
+    CODEY_FASTCTX_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE_V2,
+    ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
+    SUBAGENT_GUIDANCE, append_root_agent_collaboration_usage_hint, append_subagent_guidance,
     codey_fastctx_guidance_blocks, default_agent_config_with_fastctx_guidance,
     previous_default_agent_config_without_sandbox, remove_codey_fastctx_guidance,
     remove_previous_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
@@ -464,7 +464,7 @@ fn apply_isolated_cc_switch_runtime_config(
         let root_instructions = read_or_create_constraint_file_with_exact_migration(
             &root_path,
             SUBAGENT_GUIDANCE,
-            &[PREVIOUS_SUBAGENT_GUIDANCE],
+            &[PREVIOUS_SUBAGENT_GUIDANCE_V2, PREVIOUS_SUBAGENT_GUIDANCE],
         )?;
         let collaboration_hint = read_or_create_constraint_file(
             &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),

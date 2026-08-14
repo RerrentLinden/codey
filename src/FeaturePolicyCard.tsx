@@ -353,11 +353,11 @@ function FeaturePolicyCardComponent({
                   <small>
                     {subagentModelOptions.length === 0
                       ? "请先在模型管理中添加当前线路可用模型"
-                      : "保存后重启 Codex，新的任务类型路由和模型配置才会生效"}
+                      : "保存并重启 Codex 后，适合拆分的任务会主动使用对应子代理"}
                   </small>
                 </>
               ) : (
-                <small>开启后可分别设置六类子代理任务的模型与思考深度</small>
+                <small>开启后会主动拆分适合委派的任务，并可设置六类子代理的模型与思考深度</small>
               )}
             </div>
           </div>

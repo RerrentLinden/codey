@@ -44,7 +44,7 @@ pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 收到某个子代理结果之后，如果提供了 `close_agent` 就必须立即关闭；每个子代理只用一轮，不复用、不追派。
 - 特别注意：子代理自派生起累计运行 10 分钟仍未完成：视为异常，主代理必须介入、不得继续盲等；检查代理状态或运行记录，已有可用 MESSAGE 时采用其部分结果，然后停止这个子代理。并自行判断是否需要再派生或拆分更小任务重新分派。"#;
 
-pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V2: &str = r#"## 子代理使用
 
 子代理用于把宽而重的检索、独立核验或边界清晰的实现从主线程中拆出。只有当委派能减少上下文污染、提高并行度或提供独立证据时才派发；已知位置的小文件、即将修改的确切代码和奠基性文档仍由主代理亲自读取。
 
@@ -70,8 +70,50 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 派发后立即等待全部子代理完成，再继续分析、命令或修改。子代理累计运行 10 分钟仍未完成时，检查状态并终止异常任务，必要时拆成更小任务重新派发。
 "#;
 
-pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] =
-    &[SUBAGENT_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE];
+pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+
+本 AGENTS.md 明确要求主代理在适用任务中主动使用子代理；无需等待用户逐次点名。子代理用于把宽而重的检索、独立核验或边界清晰的实现从主线程中拆出，减少上下文污染、提高并行度并提供独立证据。
+
+### 主动派发要求
+
+除下述“直接处理”例外外，只要符合任一条件，必须派发至少一个合适的子代理：
+
+- 需要先定位未知实现位置，或需要跨多个文件、目录、日志或文档检索；
+- 可以拆成两个或更多相互独立的探索、核验或实现分支；
+- 预计会产生大量搜索结果、日志、页面或其他外围材料，需要压缩后再判断；
+- 存在边界清晰、可回滚且可测试的独立实现，可交给写入型角色处理。
+
+不要因为用户没有明确要求子代理、主代理自己也能完成、任务已不在开头，或派发会增加一次工具调用而跳过。若多个条件同时成立，应优先拆成多个互不重叠的任务并在同一轮并发派发。
+
+以下内容由主代理直接处理，不派子代理：已知位置的小文件或少量代码、即将修改的确切代码、奠基性文档，以及派发与复核成本明确不低于直接处理的单一事实。若任务只命中这些例外，不要为了满足数量而形式化派发。
+
+### 任务类型路由
+
+派生时必须按任务性质显式选择下列 `agent_type`，不要用模型名代替任务类型：
+
+- `codey_quick_scan`：只读的快速定位、精确事实查找、重复性检查和低风险小范围检索。
+- `codey_deep_research`：只读的跨文件、日志、代码或文档宽范围检索、归纳和架构探索。
+- `codey_visual_analysis`：只读的截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索或独立核验。
+- `codey_worker`：可写的低到中等复杂度、边界清晰、可回滚且可测试的非视觉实现。
+- `codey_visual_worker`：可写的页面、GUI、PDF 或其他依赖视觉证据与渲染验证的实现。
+- `default`：只读兜底；任务不符合以上专用类型时使用，不承担代码实施。
+
+除 `codey_worker` 和 `codey_visual_worker` 外，子代理默认只做探索、检索和核验，不改动文件。可写角色也只处理被明确授权且边界清晰的实现；方案取舍、关键代码复核和最终验证仍由主代理负责。
+
+### 委派与验证
+
+- 任务必须自包含，写清检索范围、具体问题、允许的改动范围和期望输出；精度重要时要求返回 `file:line`、符号名及必要关键原文。
+- 多个相互独立的任务应在同一轮并发派发。派生时显式使用 `fork_turns = "none"`，不给子代理复制主线程历史。
+- 子代理结果只是压缩后的线索。主代理沿其出处抽查关键部分，不要把已外包的材料完整重读一遍；但即将修改的确切代码和奠基性文档必须由主代理亲自完整读取。
+- 每个子代理只用一轮，不复用、不追派；子代理不得继续派生其他子代理。
+- 派发后立即等待全部子代理完成，再继续分析、命令或修改。子代理累计运行 10 分钟仍未完成时，检查状态并终止异常任务，必要时拆成更小任务重新派发。
+"#;
+
+pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
+    SUBAGENT_GUIDANCE,
+    PREVIOUS_SUBAGENT_GUIDANCE_V2,
+    PREVIOUS_SUBAGENT_GUIDANCE,
+];
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
@@ -707,19 +749,29 @@ mod tests {
 
     #[test]
     fn subagent_guidance_migrates_the_previous_owned_block() {
-        let configured =
-            format!("User guidance.\n\n{PREVIOUS_SUBAGENT_GUIDANCE}\n\nConcurrent guidance.");
-        let migrated = append_subagent_guidance(&configured);
+        for previous in [PREVIOUS_SUBAGENT_GUIDANCE_V2, PREVIOUS_SUBAGENT_GUIDANCE] {
+            let configured = format!("User guidance.\n\n{previous}\n\nConcurrent guidance.");
+            let migrated = append_subagent_guidance(&configured);
 
-        assert!(migrated.contains("User guidance."));
-        assert!(migrated.contains("Concurrent guidance."));
-        assert!(migrated.contains(SUBAGENT_GUIDANCE));
-        assert!(!migrated.contains(PREVIOUS_SUBAGENT_GUIDANCE));
-        assert_eq!(append_subagent_guidance(&migrated), migrated);
-        assert_eq!(
-            remove_subagent_guidance(&migrated).as_deref(),
-            Some("User guidance.\n\nConcurrent guidance.\n")
-        );
+            assert!(migrated.contains("User guidance."));
+            assert!(migrated.contains("Concurrent guidance."));
+            assert!(migrated.contains(SUBAGENT_GUIDANCE));
+            assert!(!migrated.contains(previous));
+            assert_eq!(append_subagent_guidance(&migrated), migrated);
+            assert_eq!(
+                remove_subagent_guidance(&migrated).as_deref(),
+                Some("User guidance.\n\nConcurrent guidance.\n")
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_guidance_explicitly_requests_proactive_delegation() {
+        assert!(SUBAGENT_GUIDANCE.contains("明确要求主代理在适用任务中主动使用子代理"));
+        assert!(SUBAGENT_GUIDANCE.contains("无需等待用户逐次点名"));
+        assert!(SUBAGENT_GUIDANCE.contains("必须派发至少一个合适的子代理"));
+        assert!(SUBAGENT_GUIDANCE.contains("跨多个文件、目录、日志或文档检索"));
+        assert!(SUBAGENT_GUIDANCE.contains("若任务只命中这些例外，不要为了满足数量而形式化派发"));
     }
 
     #[test]
