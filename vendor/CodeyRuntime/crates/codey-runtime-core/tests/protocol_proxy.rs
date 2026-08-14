@@ -1809,6 +1809,9 @@ struct ChatRequest {
 }
 
 fn spawn_chat_server() -> ChatServer {
+    // The first reqwest client can spend several seconds loading platform TLS state.
+    // Initialize it before the mock server's five-second accept deadline begins.
+    upstream_http_client().expect("upstream HTTP client should initialize before server timeout");
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let base_url = format!("http://{address}/v1");
