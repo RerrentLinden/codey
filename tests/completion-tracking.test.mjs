@@ -464,6 +464,7 @@ test("resolves a local project path from the current opaque project row id", () 
 test("exports a session through ordered chunks and finalizes the transfer", async () => {
   const exported = Buffer.from("{\"format\":\"codey.session\",\"version\":1}");
   const chunkBytes = 11;
+  const conversationId = "019f8339-ddc1-7652-8922-13e2b52d0d00";
   const written = [];
   const runtime = loadInjection({
     bridgeHandler: async (path, payload) => {
@@ -498,13 +499,26 @@ test("exports a session through ordered chunks and finalizes the transfer", asyn
     }),
   });
   const thread = new FakeElement({
-    "data-app-action-sidebar-thread-id": "local:session-1",
+    "data-app-action-sidebar-thread-id": "local:client-new-thread:temporary-id",
   });
+  thread.__reactFiber$test = {
+    memoizedProps: {
+      entry: { conversationId },
+    },
+    pendingProps: null,
+    return: null,
+  };
   const button = new FakeElement();
 
   await runtime.window.__codeyExportSession(thread, button);
 
   assert.equal(Buffer.concat(written).toString("utf8"), exported.toString("utf8"));
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      runtime.bridgeCalls.find((call) => call.path === "/session/export/start")?.payload,
+    )),
+    { sessionId: conversationId },
+  );
   assert.deepEqual(
     runtime.bridgeCalls
       .map((call) => call.path)

@@ -473,10 +473,8 @@
   };
 
   const exportSession = async (thread, button) => {
-    const sessionId = String(thread.getAttribute("data-app-action-sidebar-thread-id") || "")
-      .replace(/^local:/, "")
-      .trim();
-    if (!sessionId) {
+    const sessionId = threadSessionIdFromRow(thread);
+    if (!sessionId || sessionId.startsWith("client-new-thread:")) {
       showRuntimeToast("导出失败：无法识别会话 ID", "error");
       return;
     }
