@@ -6,6 +6,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
 #[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 #[derive(Debug, Clone, Copy)]
@@ -186,22 +188,22 @@ pub fn resolve_codex_app_dir(app_dir: Option<&Path>) -> Option<PathBuf> {
 /// Search for standalone Codex installations (non-MS Store).
 ///
 /// Common paths:
+/// - %LOCALAPPDATA%\Programs\Codex\  (standalone installer)
 /// - %LOCALAPPDATA%\OpenAI\Codex\bin\  (standalone installer)
 /// - %LOCALAPPDATA%\OpenAI\Codex\      (user data root)
 /// - %LOCALAPPDATA%\Programs\OpenAI\Codex\ (alternative)
 pub fn find_standalone_codex_app_dir() -> Option<PathBuf> {
     let local_appdata = std::env::var_os("LOCALAPPDATA")?;
 
+    find_standalone_codex_app_dir_from(Path::new(&local_appdata))
+}
+
+fn find_standalone_codex_app_dir_from(local_appdata: &Path) -> Option<PathBuf> {
     let candidates: &[PathBuf] = &[
-        PathBuf::from(&local_appdata)
-            .join("OpenAI")
-            .join("Codex")
-            .join("bin"),
-        PathBuf::from(&local_appdata).join("OpenAI").join("Codex"),
-        PathBuf::from(&local_appdata)
-            .join("Programs")
-            .join("OpenAI")
-            .join("Codex"),
+        local_appdata.join("Programs").join("Codex"),
+        local_appdata.join("OpenAI").join("Codex").join("bin"),
+        local_appdata.join("OpenAI").join("Codex"),
+        local_appdata.join("Programs").join("OpenAI").join("Codex"),
     ];
 
     for candidate in candidates {
@@ -311,6 +313,196 @@ pub fn codex_app_version(app_dir: &Path) -> Option<String> {
         .or_else(|| codex_directory_version(app_dir))
         .or_else(|| codex_version_file(package_dir))
         .or_else(|| codex_version_file(app_dir))
+        .or_else(|| codex_executable_product_version(app_dir))
+}
+
+#[cfg(windows)]
+fn codex_executable_product_version(app_dir: &Path) -> Option<String> {
+    use std::ffi::c_void;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FFI_SIGNATURE, VS_FIXEDFILEINFO,
+        VerQueryValueW,
+    };
+    use windows::core::PCWSTR;
+
+    let executable = build_codex_executable(app_dir);
+    let executable_wide = executable
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let info_size = unsafe { GetFileVersionInfoSizeW(PCWSTR(executable_wide.as_ptr()), None) };
+    if info_size == 0 {
+        return None;
+    }
+
+    let mut info = vec![0u8; info_size as usize];
+    unsafe {
+        GetFileVersionInfoW(
+            PCWSTR(executable_wide.as_ptr()),
+            0,
+            info_size,
+            info.as_mut_ptr().cast(),
+        )
+        .ok()?;
+    }
+
+    for (language, code_page) in windows_version_translations(&info) {
+        let sub_block = format!(r"\StringFileInfo\{language:04x}{code_page:04x}\ProductVersion");
+        if let Some(version) = query_windows_version_string(&info, &sub_block) {
+            return Some(version);
+        }
+    }
+
+    // Some installers omit the translation table but still use one of the
+    // conventional Unicode or Windows-1252 English string tables.
+    for sub_block in [
+        r"\StringFileInfo\040904b0\ProductVersion",
+        r"\StringFileInfo\040904e4\ProductVersion",
+    ] {
+        if let Some(version) = query_windows_version_string(&info, sub_block) {
+            return Some(version);
+        }
+    }
+
+    let mut fixed_info = std::ptr::null_mut::<c_void>();
+    let mut fixed_info_len = 0u32;
+    let root = ['\\' as u16, 0];
+    if !unsafe {
+        VerQueryValueW(
+            info.as_ptr().cast(),
+            PCWSTR(root.as_ptr()),
+            &mut fixed_info,
+            &mut fixed_info_len,
+        )
+    }
+    .as_bool()
+        || fixed_info.is_null()
+        || fixed_info_len < std::mem::size_of::<VS_FIXEDFILEINFO>() as u32
+    {
+        return None;
+    }
+
+    let fixed_info = unsafe { fixed_info.cast::<VS_FIXEDFILEINFO>().read_unaligned() };
+    if fixed_info.dwSignature != VS_FFI_SIGNATURE as u32 {
+        return None;
+    }
+    fixed_windows_product_version(&fixed_info)
+}
+
+#[cfg(windows)]
+fn windows_version_translations(info: &[u8]) -> Vec<(u16, u16)> {
+    use std::ffi::c_void;
+    use windows::Win32::Storage::FileSystem::VerQueryValueW;
+    use windows::core::PCWSTR;
+
+    let sub_block = r"\VarFileInfo\Translation"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut translations = std::ptr::null_mut::<c_void>();
+    let mut translations_len = 0u32;
+    if !unsafe {
+        VerQueryValueW(
+            info.as_ptr().cast(),
+            PCWSTR(sub_block.as_ptr()),
+            &mut translations,
+            &mut translations_len,
+        )
+    }
+    .as_bool()
+        || translations.is_null()
+        || translations_len < 4
+    {
+        return Vec::new();
+    }
+
+    let translations =
+        unsafe { std::slice::from_raw_parts(translations.cast::<u8>(), translations_len as usize) };
+    translations
+        .chunks_exact(4)
+        .map(|pair| {
+            (
+                u16::from_le_bytes([pair[0], pair[1]]),
+                u16::from_le_bytes([pair[2], pair[3]]),
+            )
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn query_windows_version_string(info: &[u8], sub_block: &str) -> Option<String> {
+    use std::ffi::c_void;
+    use windows::Win32::Storage::FileSystem::VerQueryValueW;
+    use windows::core::PCWSTR;
+
+    let sub_block = sub_block
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut value = std::ptr::null_mut::<c_void>();
+    let mut value_len = 0u32;
+    if !unsafe {
+        VerQueryValueW(
+            info.as_ptr().cast(),
+            PCWSTR(sub_block.as_ptr()),
+            &mut value,
+            &mut value_len,
+        )
+    }
+    .as_bool()
+        || value.is_null()
+        || value_len == 0
+    {
+        return None;
+    }
+
+    let value = (0..value_len as usize)
+        .map(|index| unsafe { value.cast::<u16>().add(index).read_unaligned() })
+        .take_while(|unit| *unit != 0)
+        .collect::<Vec<_>>();
+    String::from_utf16(&value)
+        .ok()
+        .and_then(|value| normalize_version_value(&value))
+}
+
+#[cfg(windows)]
+fn fixed_windows_product_version(
+    info: &windows::Win32::Storage::FileSystem::VS_FIXEDFILEINFO,
+) -> Option<String> {
+    let (version_ms, version_ls) = if info.dwProductVersionMS != 0 || info.dwProductVersionLS != 0 {
+        (info.dwProductVersionMS, info.dwProductVersionLS)
+    } else {
+        (info.dwFileVersionMS, info.dwFileVersionLS)
+    };
+    let mut parts = vec![
+        version_ms >> 16,
+        version_ms & 0xffff,
+        version_ls >> 16,
+        version_ls & 0xffff,
+    ];
+    while parts.len() > 2 && parts.last() == Some(&0) {
+        parts.pop();
+    }
+    let version = parts
+        .into_iter()
+        .map(|part| part.to_string())
+        .collect::<Vec<_>>()
+        .join(".");
+    normalize_version_value(&version)
+}
+
+#[cfg(not(windows))]
+fn codex_executable_product_version(_app_dir: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(any(windows, test))]
+fn normalize_version_value(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_start_matches(|character| character == 'v' || character == 'V');
+    is_version_like(value).then(|| value.to_string())
 }
 
 pub fn codex_runtime_executable(app_dir: &Path) -> Option<PathBuf> {
@@ -607,4 +799,31 @@ fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'
     }
     let (head, rest) = value.split_at(prefix.len());
     head.eq_ignore_ascii_case(prefix).then_some(rest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standalone_discovery_includes_local_programs_codex() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("Programs").join("Codex");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("Codex.exe"), []).unwrap();
+
+        assert_eq!(
+            find_standalone_codex_app_dir_from(temp.path()).as_deref(),
+            Some(app_dir.as_path())
+        );
+    }
+
+    #[test]
+    fn product_version_normalization_accepts_desktop_version_format() {
+        assert_eq!(
+            normalize_version_value("  v26.803.81509  ").as_deref(),
+            Some("26.803.81509")
+        );
+        assert_eq!(normalize_version_value("Codex 26.803.81509"), None);
+    }
 }
