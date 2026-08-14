@@ -1,5 +1,7 @@
 export type NotificationChannelKind = "feishu" | "telegram";
 
+export const MAX_NOTIFICATION_CHANNELS = 32;
+
 export type NotificationChannel = {
   id: string;
   kind: NotificationChannelKind;

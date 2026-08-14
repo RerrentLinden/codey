@@ -115,6 +115,7 @@ pub struct AppState {
     provider_model_sync_lock: Mutex<()>,
     pub http_client: reqwest::Client,
     pub webhook_http_client: reqwest::Client,
+    account_usage_cache: Mutex<account_usage::AccountUsageCache>,
     pub runtime: Mutex<Option<Arc<CodeyRuntime>>>,
     runtime_operation: Mutex<()>,
     diagnostic_storage_operation: Mutex<()>,
@@ -184,6 +185,7 @@ impl Default for AppState {
                 .expect("shared Codey HTTP client should be constructible"),
             webhook_http_client: crate::notifications::notification_http_client()
                 .expect("notification HTTP client should be constructible"),
+            account_usage_cache: Mutex::new(account_usage::AccountUsageCache::default()),
             runtime: Mutex::new(None),
             runtime_operation: Mutex::new(()),
             diagnostic_storage_operation: Mutex::new(()),
@@ -1181,7 +1183,9 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
         });
     }
 
-    match account_usage::fetch_official_account_usage(&state.http_client, &codex_home()).await {
+    let home = codex_home();
+    let mut cache = state.account_usage_cache.lock().await;
+    match cache.fetch(&state.http_client, &home).await {
         Ok(snapshot) => {
             let mut value = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
             if let Some(object) = value.as_object_mut() {

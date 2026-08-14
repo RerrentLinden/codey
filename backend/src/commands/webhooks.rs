@@ -1,10 +1,11 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use futures_util::future::join_all;
+use futures_util::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, oneshot};
@@ -24,6 +25,7 @@ struct WaitingNotificationLedger {
 }
 
 const WEBHOOK_NOTIFICATION_HISTORY_LIMIT: usize = 2048;
+const MAX_CONCURRENT_WEBHOOK_DELIVERIES: usize = 4;
 const WEBHOOK_TURN_HISTORY_LIMIT: usize =
     pending_approval::MAX_RECENT_SESSIONS * pending_approval::MAX_CACHED_TERMINAL_TURNS_PER_ROLLOUT;
 
@@ -862,7 +864,7 @@ async fn dispatch_webhook_channels(
             (delivery_key, dispatcher.send(&event).await)
         }
     });
-    let results = join_all(deliveries).await;
+    let results = collect_webhook_deliveries(deliveries).await;
     let mut errors = Vec::new();
     let mut uncertain = false;
     let mut notifications = state.webhook_notifications.lock().await;
@@ -889,6 +891,23 @@ async fn dispatch_webhook_channels(
             uncertain,
         })
     }
+}
+
+async fn collect_webhook_deliveries<F, T>(deliveries: impl IntoIterator<Item = F>) -> Vec<T>
+where
+    F: Future<Output = T>,
+{
+    let mut results: Vec<(usize, T)> = stream::iter(
+        deliveries
+            .into_iter()
+            .enumerate()
+            .map(|(index, delivery)| async move { (index, delivery.await) }),
+    )
+    .buffer_unordered(MAX_CONCURRENT_WEBHOOK_DELIVERIES)
+    .collect()
+    .await;
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1195,7 +1214,7 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
-    use tokio::sync::{Mutex, RwLock, oneshot};
+    use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 
     use super::*;
     use crate::notifications::NotificationChannelKind;
@@ -1227,6 +1246,45 @@ mod tests {
             ),
             ..RecentSessionEvents::default()
         }
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_concurrency_is_bounded() {
+        let delivery_count = MAX_CONCURRENT_WEBHOOK_DELIVERIES + 3;
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(Semaphore::new(0));
+        let deliveries = (0..delivery_count)
+            .map(|_| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let gate = Arc::clone(&gate);
+                async move {
+                    let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                    peak.fetch_max(current, Ordering::AcqRel);
+                    let permit = gate.acquire_owned().await.unwrap();
+                    permit.forget();
+                    active.fetch_sub(1, Ordering::AcqRel);
+                }
+            })
+            .collect::<Vec<_>>();
+        let delivery_task = tokio::spawn(collect_webhook_deliveries(deliveries));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while peak.load(Ordering::Acquire) < MAX_CONCURRENT_WEBHOOK_DELIVERIES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bounded delivery window should fill");
+        assert_eq!(
+            peak.load(Ordering::Acquire),
+            MAX_CONCURRENT_WEBHOOK_DELIVERIES
+        );
+
+        gate.add_permits(delivery_count);
+        delivery_task.await.unwrap();
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
     #[test]

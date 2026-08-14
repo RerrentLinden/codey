@@ -884,14 +884,15 @@ fn spawn_injection_watchdog(
                     match result {
                         Ok(healthy) => healthy,
                         Err(error) => {
-                            error_log::record_failure(
+                            error_log::record_failure_async(
                                 "injection_health_check_failed",
                                 "check_cdp_bridge_health",
                                 format!("{error:#}"),
                                 serde_json::json!({
                                     "websocketUrl": target.websocket_url(),
                                 }),
-                            );
+                            )
+                            .await;
                             false
                         }
                     }
@@ -921,7 +922,7 @@ fn spawn_injection_watchdog(
                 }
                 Err(error) => {
                     let error_message = format!("{error:#}");
-                    error_log::record_failure_with_metadata(
+                    error_log::record_failure_with_metadata_async(
                         "injection_failed",
                         "reinject_cdp_bridge",
                         error_message.clone(),
@@ -935,7 +936,8 @@ fn spawn_injection_watchdog(
                         serde_json::json!({
                             "debugPort": debug_port,
                         }),
-                    );
+                    )
+                    .await;
                     *watchdog_statuses.write().await = watchdog_scripts
                         .statuses_with_error(format!("脚本重新注入失败：{error_message}"));
                     eprintln!("Codey CDP bridge 恢复失败：{error_message}");

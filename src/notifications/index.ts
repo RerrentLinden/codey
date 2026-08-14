@@ -1,4 +1,5 @@
 export { NotificationChannelsCard } from "./NotificationChannelsCard";
+export { MAX_NOTIFICATION_CHANNELS } from "./types";
 export {
   createNotificationChannel,
   getNotificationChannelDefinition,

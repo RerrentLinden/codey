@@ -50,6 +50,13 @@ Codey 是一个无界面的 Rust 桌面辅助进程，通过 CDP 连接官方 Co
 - 官方 curated 和本地工具插件市场通过 CodeyRuntime core 的兼容逻辑注册；`openai-curated-remote` 仅作为外部流程产生的可选本地缓存，缺失时不判为故障，存在时必须注册到其精确缓存路径。页面层合并可用的本地插件并清理隐藏/远程路径字段。
 - 配置面板可保存用户脚本；脚本作为独立 CDP 文档脚本在内置修复脚本之后执行。
 
+## 运行时性能约束
+
+- 后台会话扫描每轮仍枚举 `CODEX_HOME/sqlite` 以发现新增和删除，但会按数据库、WAL 元数据及 Unix 文件身份缓存 schema 探测结果；未变化候选不再重复打开 SQLite 查询 `sqlite_master`。已确认的会话库继续复用只读连接，近期会话查询使用连接级 prepared statement cache；数据库或 WAL 变化、同路径替换和 legacy `state_5.sqlite` 仍保持原有发现语义。
+- CDP watchdog、重新注入和注入状态复核的周期错误日志通过 Tokio blocking pool 写入，避免文件锁、尾行修复和 flush 占用仅有的 async worker；启动、退出和恢复关键路径仍保留同步日志语义。
+- 通知配置最多保存 32 个渠道，单个事件最多并发投递 4 个渠道；结果仍按渠道汇总，去重与不确定投递语义不变。
+- 官方额度快照在后端成功缓存 30 秒；专用 mutex 合并同一时刻的 bridge 请求。失败后按 60、120、240、300 秒退避并封顶 300 秒，退避期间不重复读取 `auth.json` 或请求远端；成功后立即清除失败状态。
+
 ## 构建
 
 需要 Rust 与 Node.js。首次构建前在本目录安装 `package.json` 中的前端依赖：

@@ -3,6 +3,8 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub const MAX_NOTIFICATION_CHANNELS: usize = 32;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum NotificationChannelKind {
@@ -154,6 +156,11 @@ impl WebhookConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.channels.len() > MAX_NOTIFICATION_CHANNELS {
+            return Err(format!(
+                "通知渠道最多只能配置 {MAX_NOTIFICATION_CHANNELS} 个"
+            ));
+        }
         for channel in &self.channels {
             if channel.kind == NotificationChannelKind::Feishu && !channel.url.trim().is_empty() {
                 channel.feishu_webhook_url().map_err(ToString::to_string)?;
@@ -228,6 +235,21 @@ mod tests {
         assert!(config.channels[0].url_configured);
         assert_eq!(config.channels[1].kind, NotificationChannelKind::Telegram);
         assert!(config.channels[1].bot_token_configured);
+    }
+
+    #[test]
+    fn rejects_channel_lists_above_the_resource_limit() {
+        let config = WebhookConfig {
+            channels: (0..=MAX_NOTIFICATION_CHANNELS)
+                .map(|_| NotificationChannelConfig::default())
+                .collect(),
+            ..WebhookConfig::default()
+        };
+
+        assert_eq!(
+            config.validate().unwrap_err(),
+            format!("通知渠道最多只能配置 {MAX_NOTIFICATION_CHANNELS} 个")
+        );
     }
 
     #[test]

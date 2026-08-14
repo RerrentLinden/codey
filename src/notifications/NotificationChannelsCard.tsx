@@ -10,7 +10,10 @@ import type { Config } from "../App.types";
 import { Badge, Button, Card } from "../components/semi";
 import { getNotificationChannelDefinition } from "./channelRegistry";
 import { NotificationChannelDialog } from "./NotificationChannelDialog";
-import type { NotificationChannel } from "./types";
+import {
+  MAX_NOTIFICATION_CHANNELS,
+  type NotificationChannel,
+} from "./types";
 
 type NotificationChannelsCardProps = {
   config: Config;
@@ -39,6 +42,8 @@ function NotificationChannelsCardComponent({
   const editingChannel = editingChannelId
     ? config.webhook.channels.find((channel) => channel.id === editingChannelId) ?? null
     : null;
+  const channelLimitReached =
+    config.webhook.channels.length >= MAX_NOTIFICATION_CHANNELS;
 
   function openAddDialog() {
     setEditingChannelId(null);
@@ -74,7 +79,12 @@ function NotificationChannelsCardComponent({
             <Button
               variant="secondary"
               size="xs"
-              disabled={isBusy}
+              disabled={isBusy || channelLimitReached}
+              title={
+                channelLimitReached
+                  ? `最多可添加 ${MAX_NOTIFICATION_CHANNELS} 个通知渠道`
+                  : undefined
+              }
               onClick={openAddDialog}
             >
               <IconPlus aria-hidden="true" />

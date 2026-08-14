@@ -596,29 +596,30 @@ pub async fn read_injection_statuses(
 
     match result {
         Ok(statuses) => {
-            record_failed_injection_statuses(websocket_url, &statuses);
+            record_failed_injection_statuses(websocket_url, &statuses).await;
             Ok(statuses)
         }
         Err(error) => {
-            error_log::record_failure(
+            error_log::record_failure_async(
                 "injection_status_failed",
                 "read_injection_statuses",
                 format!("{error:#}"),
                 serde_json::json!({
                     "websocketUrl": websocket_url,
                 }),
-            );
+            )
+            .await;
             Err(error)
         }
     }
 }
 
-fn record_failed_injection_statuses(websocket_url: &str, statuses: &[InjectionScriptStatus]) {
+async fn record_failed_injection_statuses(websocket_url: &str, statuses: &[InjectionScriptStatus]) {
     for status in statuses
         .iter()
         .filter(|status| status.status == "failed" || status.error.is_some())
     {
-        error_log::record_failure(
+        error_log::record_failure_async(
             "injection_script_failed",
             status.id.clone(),
             status
@@ -631,7 +632,8 @@ fn record_failed_injection_statuses(websocket_url: &str, statuses: &[InjectionSc
                 "detail": status.detail.as_deref(),
                 "websocketUrl": websocket_url,
             }),
-        );
+        )
+        .await;
     }
 }
 

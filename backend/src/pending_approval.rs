@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home;
+use codey_runtime_core::codex_sqlite::CodexSessionDbDiscoveryCache;
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Serialize;
 use serde_json::Value;
@@ -75,6 +75,28 @@ pub struct RecentSessionEvents {
 struct RolloutSignature {
     len: u64,
     modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl RolloutSignature {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -464,6 +486,7 @@ struct CachedDatabaseConnection {
 #[derive(Debug, Default)]
 pub struct RecentSessionEventCache {
     rollouts: HashMap<PathBuf, CachedRolloutEvents>,
+    database_discovery: CodexSessionDbDiscoveryCache,
     database_connections: HashMap<PathBuf, CachedDatabaseConnection>,
     last_snapshot: Option<Arc<RecentSessionEvents>>,
     #[cfg(test)]
@@ -492,7 +515,7 @@ impl RecentSessionEventCache {
     }
 
     fn recent_codey_rollouts(&mut self, home: &Path, recent_after: i64) -> Vec<(String, PathBuf)> {
-        let database_paths = codex_session_db_paths_from_home(home);
+        let database_paths = self.database_discovery.session_db_paths_from_home(home);
         let active_database_paths = database_paths.iter().cloned().collect::<HashSet<_>>();
         self.database_connections
             .retain(|path, _| active_database_paths.contains(path));
@@ -503,10 +526,7 @@ impl RecentSessionEventCache {
                 self.database_connections.remove(&database_path);
                 continue;
             };
-            let signature = RolloutSignature {
-                len: metadata.len(),
-                modified: metadata.modified().ok(),
-            };
+            let signature = RolloutSignature::from_metadata(&metadata);
             let connection_is_current = self
                 .database_connections
                 .get(&database_path)
@@ -572,10 +592,7 @@ impl RecentSessionEventCache {
                 self.rollouts.remove(rollout_path);
                 continue;
             };
-            let signature = RolloutSignature {
-                len: metadata.len(),
-                modified: metadata.modified().ok(),
-            };
+            let signature = RolloutSignature::from_metadata(&metadata);
             let cache_is_current = self.rollouts.get(rollout_path).is_some_and(|cached| {
                 cached.session_id == *session_id && cached.signature == signature
             });
@@ -852,7 +869,7 @@ fn query_recent_codey_rollouts(
     // SQLite columns can contain values that violate their declared affinity.
     // Ignore only malformed rows here; prepare/query failures still invalidate
     // the cached connection so a replaced database is reopened next poll.
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT id, rollout_path FROM threads \
          WHERE archived=0 AND updated_at >= ?1 \
            AND typeof(id)='text' AND typeof(rollout_path)='text' \

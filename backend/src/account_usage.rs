@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use reqwest::{Client, StatusCode, header::ACCEPT};
@@ -14,6 +14,9 @@ const USAGE_ENDPOINTS: [&str; 2] = [
     "https://chatgpt.com/backend-api/wham/usage",
     "https://chatgpt.com/backend-api/api/codex/usage",
 ];
+const ACCOUNT_USAGE_CACHE_TTL: Duration = Duration::from_secs(30);
+const ACCOUNT_USAGE_FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(60);
+const ACCOUNT_USAGE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, PartialEq)]
 struct OfficialAuth {
@@ -51,6 +54,76 @@ pub struct AccountCredits {
     pub unlimited: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct AccountUsageCache {
+    snapshot: Option<AccountUsageSnapshot>,
+    expires_at: Option<Instant>,
+    consecutive_failures: u32,
+    retry_at: Option<Instant>,
+    last_error: Option<String>,
+}
+
+impl AccountUsageCache {
+    pub async fn fetch(
+        &mut self,
+        client: &Client,
+        codex_home: &Path,
+    ) -> Result<AccountUsageSnapshot> {
+        if let Some(cached) = self.cached_result(Instant::now()) {
+            return cached.map_err(anyhow::Error::msg);
+        }
+
+        match fetch_official_account_usage(client, codex_home).await {
+            Ok(snapshot) => {
+                self.record_success(snapshot.clone(), Instant::now());
+                Ok(snapshot)
+            }
+            Err(error) => {
+                self.record_failure(error.to_string(), Instant::now());
+                Err(error)
+            }
+        }
+    }
+
+    fn cached_result(
+        &self,
+        now: Instant,
+    ) -> Option<std::result::Result<AccountUsageSnapshot, String>> {
+        if self.expires_at.is_some_and(|expires_at| now < expires_at) {
+            return self.snapshot.clone().map(Ok);
+        }
+        if self.retry_at.is_some_and(|retry_at| now < retry_at) {
+            return Some(Err(self.last_error.clone().unwrap_or_else(|| {
+                "官方额度暂时无法更新，稍后自动重试".to_string()
+            })));
+        }
+        None
+    }
+
+    fn record_success(&mut self, snapshot: AccountUsageSnapshot, now: Instant) {
+        self.snapshot = Some(snapshot);
+        self.expires_at = Some(now + ACCOUNT_USAGE_CACHE_TTL);
+        self.consecutive_failures = 0;
+        self.retry_at = None;
+        self.last_error = None;
+    }
+
+    fn record_failure(&mut self, error: String, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.retry_at = Some(now + account_usage_failure_backoff(self.consecutive_failures));
+        self.last_error = Some(error);
+    }
+}
+
+fn account_usage_failure_backoff(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(3);
+    let seconds = ACCOUNT_USAGE_FAILURE_BACKOFF_INITIAL
+        .as_secs()
+        .saturating_mul(1_u64 << shift)
+        .min(ACCOUNT_USAGE_FAILURE_BACKOFF_MAX.as_secs());
+    Duration::from_secs(seconds)
 }
 
 pub async fn fetch_official_account_usage(
@@ -282,6 +355,67 @@ fn unix_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_snapshot() -> AccountUsageSnapshot {
+        AccountUsageSnapshot {
+            plan_type: Some("plus".to_string()),
+            primary: None,
+            secondary: None,
+            credits: Some(AccountCredits {
+                has_credits: true,
+                unlimited: false,
+                balance: Some("10".to_string()),
+            }),
+            fetched_at: 1_700_000_000,
+        }
+    }
+
+    #[test]
+    fn successful_snapshots_are_reused_only_within_the_ttl() {
+        let started_at = Instant::now();
+        let snapshot = sample_snapshot();
+        let mut cache = AccountUsageCache::default();
+        cache.record_success(snapshot.clone(), started_at);
+
+        assert_eq!(
+            cache
+                .cached_result(started_at + ACCOUNT_USAGE_CACHE_TTL - Duration::from_millis(1))
+                .unwrap()
+                .unwrap(),
+            snapshot
+        );
+        assert!(
+            cache
+                .cached_result(started_at + ACCOUNT_USAGE_CACHE_TTL)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn failures_back_off_exponentially_and_success_resets_the_delay() {
+        let mut cache = AccountUsageCache::default();
+        let mut attempt_at = Instant::now();
+        for expected_seconds in [60, 120, 240, 300, 300] {
+            cache.record_failure("offline".to_string(), attempt_at);
+            assert_eq!(
+                cache.retry_at.unwrap().duration_since(attempt_at),
+                Duration::from_secs(expected_seconds)
+            );
+            assert_eq!(
+                cache
+                    .cached_result(attempt_at + Duration::from_secs(expected_seconds - 1))
+                    .unwrap()
+                    .unwrap_err(),
+                "offline"
+            );
+            attempt_at += Duration::from_secs(expected_seconds);
+        }
+
+        cache.record_success(sample_snapshot(), attempt_at);
+        assert_eq!(cache.consecutive_failures, 0);
+        assert!(cache.retry_at.is_none());
+        assert!(cache.last_error.is_none());
+    }
 
     #[test]
     fn reads_chatgpt_auth_without_exposing_other_fields() {
