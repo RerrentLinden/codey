@@ -8,6 +8,7 @@ mod commands;
 mod config;
 mod crashpad_pending_guard;
 mod error_log;
+mod fastctx_route_gate;
 mod fs_util;
 mod launcher;
 mod maintenance_lock;
@@ -64,6 +65,10 @@ pub fn run_error_log_helper_if_requested() -> Result<bool> {
 
 pub fn run_subagent_gate_hook_if_requested() -> Result<bool> {
     subagent_gate::run_hook_if_requested()
+}
+
+pub fn run_fastctx_route_hook_if_requested() -> Result<bool> {
+    fastctx_route_gate::run_hook_if_requested()
 }
 
 pub fn run_desktop_application() -> Result<()> {

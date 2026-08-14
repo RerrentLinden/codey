@@ -1230,6 +1230,17 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
         document["tool_output_token_limit"].as_integer(),
         Some(10_000)
     );
+    assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
+    let route_hooks = document["hooks"]["PreToolUse"]
+        .as_array_of_tables()
+        .unwrap();
+    assert_eq!(route_hooks.len(), 1);
+    assert_eq!(
+        route_hooks.get(0).unwrap()["matcher"].as_str(),
+        Some(crate::fastctx_route_gate::HOOK_MATCHER)
+    );
+    assert!(first.contains(crate::fastctx_route_gate::HOOK_ARGUMENT));
+    assert_eq!(document["hooks"]["state"].as_table().unwrap().len(), 1);
 }
 
 #[test]
@@ -1998,6 +2009,7 @@ fn non_route_lease_preserves_a_user_route_change_and_removes_owned_overlay() {
     assert!(restored.get("model_catalog_json").is_none());
     assert!(restored.get("service_tier").is_none());
     assert!(restored.get("developer_instructions").is_none());
+    assert!(restored.get("hooks").is_none());
     assert!(
         restored
             .get("mcp_servers")
@@ -2898,8 +2910,21 @@ timeout = 5
 
 [hooks.state."/tmp/config.toml:pre_tool_use:1:0"]
 trusted_hash = "sha256:codey"
+
+[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "'/tmp/codey' {route_hook_argument}"
+commandWindows = "C:\\Codey\\codey.exe {route_hook_argument}"
+timeout = 5
+
+[hooks.state."/tmp/config.toml:pre_tool_use:2:0"]
+trusted_hash = "sha256:fastctx-route"
 "#,
         hook_argument = crate::subagent_gate::HOOK_ARGUMENT,
+        route_hook_argument = crate::fastctx_route_gate::HOOK_ARGUMENT,
     );
     let current = format!(
         r#"{applied}
@@ -2962,6 +2987,11 @@ trusted_hash = "sha256:user"
         !restored
             .to_string()
             .contains(crate::subagent_gate::HOOK_ARGUMENT)
+    );
+    assert!(
+        !restored
+            .to_string()
+            .contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
     );
 }
 
@@ -3337,6 +3367,79 @@ fn preserves_an_existing_non_reserved_provider() {
 }
 
 #[test]
+fn isolated_fastctx_installs_route_hook_without_subagent_optimization() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let state_dir = temp.path().join("codey-state");
+    let marker = state_dir.join("codex-lease.json");
+    let backup_root = state_dir.join("codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original_config = br#"model_provider = "relay"
+
+[model_providers.relay]
+name = "Relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+"#;
+    fs::write(home.join("config.toml"), original_config).unwrap();
+
+    let applied = apply_isolated_cc_switch_runtime_config(
+        &home,
+        &direct_profile(RelayProtocol::Responses),
+        "relay",
+        Some(Path::new("/opt/codey/codey-fastctx")),
+        false,
+        DEFAULT_SUBAGENT_MODEL,
+        DEFAULT_SUBAGENT_REASONING_EFFORT,
+        None,
+        None,
+        Some(original_config),
+        &marker,
+        &backup_root,
+    )
+    .unwrap();
+
+    assert!(
+        applied
+            .runtime_config_overrides
+            .iter()
+            .any(|entry| entry == "features.hooks=true")
+    );
+    assert_eq!(
+        applied
+            .runtime_config_overrides
+            .iter()
+            .filter(|entry| entry.starts_with("hooks.state."))
+            .count(),
+        FASTCTX_ROUTE_HOOKS.len()
+    );
+    assert!(
+        !applied
+            .runtime_config_overrides
+            .iter()
+            .any(|entry| entry.starts_with("features.multi_agent_v2."))
+    );
+    let hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.join("hooks.json")).unwrap()).unwrap();
+    let groups = hooks["hooks"]["PreToolUse"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(
+        groups[0]["matcher"].as_str(),
+        Some(crate::fastctx_route_gate::HOOK_MATCHER)
+    );
+    assert!(
+        groups[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
+    );
+
+    assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
+    assert!(!home.join("hooks.json").exists());
+}
+
+#[test]
 fn cc_switch_runtime_constraints_stay_out_of_config_and_restore_hooks() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
@@ -3476,6 +3579,27 @@ wire_api = "responses"
     assert!(applied.runtime_config_overrides.iter().any(|entry| {
         entry.starts_with(&pre_tool_prefix) && entry.contains(&expected_pre_tool_hash)
     }));
+    let fastctx_state_key = format!("{}:pre_tool_use:2:0", home.join("hooks.json").display());
+    let fastctx_state_prefix = format!(
+        "hooks.state.{}.trusted_hash=",
+        toml_string_literal(&fastctx_state_key)
+    );
+    let fastctx_hook_commands =
+        crate::subagent_gate::hook_commands_for(crate::fastctx_route_gate::HOOK_ARGUMENT).unwrap();
+    let selected_fastctx_command = if cfg!(windows) {
+        fastctx_hook_commands.command_windows.as_str()
+    } else {
+        fastctx_hook_commands.command.as_str()
+    };
+    let expected_fastctx_hash = crate::subagent_gate::hook_trust_hash(
+        "pre_tool_use",
+        Some(crate::fastctx_route_gate::HOOK_MATCHER),
+        selected_fastctx_command,
+        crate::fastctx_route_gate::HOOK_TIMEOUT_SECONDS,
+    );
+    assert!(applied.runtime_config_overrides.iter().any(|entry| {
+        entry.starts_with(&fastctx_state_prefix) && entry.contains(&expected_fastctx_hash)
+    }));
     assert!(
         applied
             .runtime_config_overrides
@@ -3524,7 +3648,7 @@ wire_api = "responses"
             .iter()
             .filter(|entry| entry.starts_with("hooks.state."))
             .count(),
-        SUBAGENT_GATE_HOOKS.len()
+        SUBAGENT_GATE_HOOKS.len() + FASTCTX_ROUTE_HOOKS.len()
     );
     assert_eq!(
         applied
@@ -3533,7 +3657,7 @@ wire_api = "responses"
             .filter(|entry| entry.starts_with(CODEY_WSL_ONLY_OVERRIDE_PREFIX))
             .count(),
         if cfg!(windows) {
-            SUBAGENT_GATE_HOOKS.len()
+            SUBAGENT_GATE_HOOKS.len() + FASTCTX_ROUTE_HOOKS.len()
         } else {
             0
         }
@@ -3551,10 +3675,20 @@ wire_api = "responses"
 
     let hooks: serde_json::Value =
         serde_json::from_slice(&fs::read(home.join("hooks.json")).unwrap()).unwrap();
-    assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+    assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
     assert_eq!(
         hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str(),
         Some("/usr/bin/true")
+    );
+    assert_eq!(
+        hooks["hooks"]["PreToolUse"][2]["matcher"].as_str(),
+        Some(crate::fastctx_route_gate::HOOK_MATCHER)
+    );
+    assert!(
+        hooks["hooks"]["PreToolUse"][2]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
     );
     for event in [
         "PostToolUse",

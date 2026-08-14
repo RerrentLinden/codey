@@ -1,0 +1,537 @@
+use std::ffi::OsStr;
+use std::io::{Read, Write};
+
+use anyhow::{Context, Result, bail};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+pub(crate) const HOOK_ARGUMENT: &str = "--codey-fastctx-route-hook";
+pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
+pub(crate) const HOOK_MATCHER: &str = "^Bash$";
+const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
+const FALLBACK_MARKER: &str = "# codey-fastctx-fallback";
+
+#[derive(Debug, Deserialize)]
+struct HookInput {
+    hook_event_name: String,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    tool_input: Option<Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastctxRoute {
+    Inspect,
+    Search,
+    Discover,
+}
+
+impl FastctxRoute {
+    fn tool_name(self) -> &'static str {
+        match self {
+            Self::Inspect => "mcp__codey_fastctx__inspect_local_file",
+            Self::Search => "mcp__codey_fastctx__grep",
+            Self::Discover => "mcp__codey_fastctx__glob",
+        }
+    }
+
+    fn priority(self) -> u8 {
+        match self {
+            Self::Inspect => 1,
+            Self::Discover => 2,
+            Self::Search => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SegmentClass {
+    Harmless,
+    Routed(FastctxRoute),
+    Unknown,
+}
+
+pub fn run_hook_if_requested() -> Result<bool> {
+    if std::env::args_os().nth(1).as_deref() != Some(OsStr::new(HOOK_ARGUMENT)) {
+        return Ok(false);
+    }
+
+    let mut raw = Vec::new();
+    std::io::stdin()
+        .take(MAX_HOOK_INPUT_BYTES + 1)
+        .read_to_end(&mut raw)
+        .context("读取 Codex FastCtx 路由 Hook 输入失败")?;
+    if raw.len() as u64 > MAX_HOOK_INPUT_BYTES {
+        bail!("Codex FastCtx 路由 Hook 输入超过 1 MiB 上限");
+    }
+    let output = match serde_json::from_slice::<HookInput>(&raw) {
+        Ok(input) => handle_hook(&input),
+        Err(error) => {
+            eprintln!("Codey FastCtx 路由 Hook 输入无效，已放行：{error:#}");
+            json!({})
+        }
+    };
+    write_hook_output(&output)?;
+    Ok(true)
+}
+
+fn write_hook_output(output: &Value) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, output)
+        .context("序列化 Codex FastCtx 路由 Hook 输出失败")?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn handle_hook(input: &HookInput) -> Value {
+    if input.hook_event_name != "PreToolUse"
+        || !input
+            .tool_name
+            .as_deref()
+            .is_some_and(|tool| tool.eq_ignore_ascii_case("Bash"))
+    {
+        return json!({});
+    }
+    let Some(command) = input
+        .tool_input
+        .as_ref()
+        .and_then(|tool_input| tool_input.get("command"))
+        .and_then(Value::as_str)
+    else {
+        return json!({});
+    };
+    let Some(route) = route_for_command(command) else {
+        return json!({});
+    };
+
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": format!(
+                "Codey FastCtx 路由：这个终端调用只包含本地文件读取、搜索或发现操作。请优先调用 `{}`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位后调用。Windows 路径请转换为 `E:/repo/file.ts` 形式的绝对盘符路径。只有在对应 FastCtx 工具确实不可见或调用失败后，才可把 `{FALLBACK_MARKER}` 作为命令的第一行重试终端；不要在未尝试 FastCtx 前使用该回退标记。",
+                route.tool_name(),
+            ),
+        }
+    })
+}
+
+fn route_for_command(command: &str) -> Option<FastctxRoute> {
+    if command
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.trim() == FALLBACK_MARKER)
+    {
+        return None;
+    }
+    let segments = split_shell_segments(command)?;
+    let compound = segments.len() > 1;
+    let mut route = None;
+    for segment in segments {
+        match classify_segment(&segment, compound) {
+            SegmentClass::Unknown => return None,
+            SegmentClass::Harmless => {}
+            SegmentClass::Routed(candidate) => {
+                if route
+                    .is_none_or(|current: FastctxRoute| candidate.priority() > current.priority())
+                {
+                    route = Some(candidate);
+                }
+            }
+        }
+    }
+    route
+}
+
+fn split_shell_segments(command: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut quote = Quote::None;
+    let mut current = String::new();
+    let mut segments = Vec::new();
+    let mut chars = command.chars().peekable();
+    while let Some(character) = chars.next() {
+        match quote {
+            Quote::Single => {
+                current.push(character);
+                if character == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => {
+                if character == '"' {
+                    quote = Quote::None;
+                    current.push(character);
+                } else if character == '`' || (character == '$' && chars.peek() == Some(&'(')) {
+                    return None;
+                } else {
+                    current.push(character);
+                }
+            }
+            Quote::None => match character {
+                '\'' => {
+                    quote = Quote::Single;
+                    current.push(character);
+                }
+                '"' => {
+                    quote = Quote::Double;
+                    current.push(character);
+                }
+                '>' | '<' | '`' | '(' | ')' => return None,
+                '$' if chars.peek() == Some(&'(') => return None,
+                '&' => {
+                    chars.next_if_eq(&'&')?;
+                    push_segment(&mut segments, &mut current);
+                }
+                '|' => {
+                    let _ = chars.next_if_eq(&'|');
+                    push_segment(&mut segments, &mut current);
+                }
+                ';' | '\n' => push_segment(&mut segments, &mut current),
+                '\r' => {}
+                '\\' => {
+                    current.push(character);
+                    if let Some(next) = chars.peek().copied()
+                        && matches!(next, ' ' | '\t' | '\'' | '"' | ';' | '|' | '&' | '>' | '<')
+                    {
+                        current.push(chars.next().expect("peeked escaped shell character"));
+                    }
+                }
+                _ => current.push(character),
+            },
+        }
+    }
+    if quote != Quote::None {
+        return None;
+    }
+    push_segment(&mut segments, &mut current);
+    (!segments.is_empty()).then_some(segments)
+}
+
+fn push_segment(segments: &mut Vec<String>, current: &mut String) {
+    let segment = current.trim();
+    if !segment.is_empty() {
+        segments.push(segment.to_string());
+    }
+    current.clear();
+}
+
+fn classify_segment(segment: &str, compound: bool) -> SegmentClass {
+    let Some(words) = shell_words(segment) else {
+        return SegmentClass::Unknown;
+    };
+    let Some((command, arguments)) = command_and_arguments(&words) else {
+        return SegmentClass::Harmless;
+    };
+    let command = normalized_command(command);
+    let lower_arguments = arguments
+        .iter()
+        .map(|argument| argument.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let args = lower_arguments
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+
+    match command.as_str() {
+        "cd" | "pwd" | "pushd" | "popd" | "set-location" => SegmentClass::Harmless,
+        "rg" | "ripgrep" if safe_ripgrep(&args) && args.contains(&"--files") => {
+            SegmentClass::Routed(FastctxRoute::Discover)
+        }
+        "rg" | "ripgrep" if safe_ripgrep(&args) && !args.is_empty() => {
+            SegmentClass::Routed(FastctxRoute::Search)
+        }
+        "grep" | "egrep" | "fgrep" | "findstr" | "select-string" | "sls"
+            if args.len() >= 2 || compound && !args.is_empty() =>
+        {
+            SegmentClass::Routed(FastctxRoute::Search)
+        }
+        "cat" | "bat" | "batcat" | "get-content" | "gc" if has_file_operand(&args) => {
+            SegmentClass::Routed(FastctxRoute::Inspect)
+        }
+        "cat" | "bat" | "batcat" | "get-content" | "gc" if !args.is_empty() => {
+            SegmentClass::Harmless
+        }
+        "head" | "tail" | "nl" | "wc" if has_file_operand(&args) => {
+            SegmentClass::Routed(FastctxRoute::Inspect)
+        }
+        "head" | "tail" | "nl" | "wc" if !args.is_empty() => SegmentClass::Harmless,
+        "sed" if safe_read_only_sed(&args) => SegmentClass::Routed(FastctxRoute::Inspect),
+        "sed" if safe_stdin_sed(&args) => SegmentClass::Harmless,
+        "find" if safe_file_find(&args) => SegmentClass::Routed(FastctxRoute::Discover),
+        "fd" | "fdfind" if requests_files_only(&args) => {
+            SegmentClass::Routed(FastctxRoute::Discover)
+        }
+        "get-childitem" | "gci" if args.contains(&"-file") => {
+            SegmentClass::Routed(FastctxRoute::Discover)
+        }
+        "ls" if !args.iter().any(|argument| argument.starts_with("--dired")) => {
+            SegmentClass::Routed(FastctxRoute::Discover)
+        }
+        _ => SegmentClass::Unknown,
+    }
+}
+
+fn command_and_arguments(words: &[String]) -> Option<(&str, &[String])> {
+    let mut index = 0;
+    while words.get(index).is_some_and(|word| shell_assignment(word)) {
+        index += 1;
+    }
+    if words
+        .get(index)
+        .is_some_and(|word| matches!(normalized_command(word).as_str(), "command" | "builtin"))
+    {
+        index += 1;
+    }
+    let command = words.get(index)?;
+    Some((command, &words[index + 1..]))
+}
+
+fn normalized_command(command: &str) -> String {
+    let basename = command
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+    basename
+        .strip_suffix(".exe")
+        .or_else(|| basename.strip_suffix(".cmd"))
+        .or_else(|| basename.strip_suffix(".bat"))
+        .unwrap_or(&basename)
+        .to_string()
+}
+
+fn shell_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    !name.is_empty()
+        && name.bytes().enumerate().all(|(index, byte)| {
+            byte == b'_' || byte.is_ascii_alphanumeric() && (index > 0 || !byte.is_ascii_digit())
+        })
+}
+
+fn shell_words(segment: &str) -> Option<Vec<String>> {
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+    }
+
+    let mut quote = Quote::None;
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = segment.chars().peekable();
+    while let Some(character) = chars.next() {
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                } else {
+                    current.push(character);
+                }
+            }
+            Quote::Double => {
+                if character == '"' {
+                    quote = Quote::None;
+                } else {
+                    current.push(character);
+                }
+            }
+            Quote::None => match character {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                ' ' | '\t' => push_word(&mut words, &mut current),
+                '\\' => {
+                    if let Some(next) = chars.peek().copied()
+                        && matches!(next, ' ' | '\t' | '\'' | '"' | '\\')
+                    {
+                        current.push(chars.next().expect("peeked escaped word character"));
+                    } else {
+                        current.push(character);
+                    }
+                }
+                _ => current.push(character),
+            },
+        }
+    }
+    if quote != Quote::None {
+        return None;
+    }
+    push_word(&mut words, &mut current);
+    Some(words)
+}
+
+fn push_word(words: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        words.push(std::mem::take(current));
+    }
+}
+
+fn has_file_operand(arguments: &[&str]) -> bool {
+    arguments.iter().any(|argument| {
+        !argument.is_empty()
+            && !argument.starts_with('-')
+            && !argument.starts_with('/')
+            && !argument.bytes().all(|byte| byte.is_ascii_digit())
+    }) || arguments
+        .iter()
+        .any(|argument| argument.contains(['/', '\\']) || argument.contains('.'))
+}
+
+fn safe_read_only_sed(arguments: &[&str]) -> bool {
+    safe_stdin_sed(arguments) && arguments.len() >= 3 && has_file_operand(arguments)
+}
+
+fn safe_ripgrep(arguments: &[&str]) -> bool {
+    !arguments.iter().any(|argument| {
+        matches!(*argument, "-r" | "--replace" | "--pre" | "--pre-glob")
+            || argument.starts_with("--replace=")
+            || argument.starts_with("--pre=")
+    })
+}
+
+fn safe_stdin_sed(arguments: &[&str]) -> bool {
+    arguments.contains(&"-n")
+        && !arguments
+            .iter()
+            .any(|argument| *argument == "-i" || argument.starts_with("--in-place"))
+        && arguments.len() >= 2
+}
+
+fn safe_file_find(arguments: &[&str]) -> bool {
+    if arguments.iter().any(|argument| {
+        matches!(
+            *argument,
+            "-delete"
+                | "-exec"
+                | "-execdir"
+                | "-ok"
+                | "-okdir"
+                | "-fls"
+                | "-fprint"
+                | "-fprint0"
+                | "-fprintf"
+                | "-printf"
+                | "-ls"
+        )
+    }) {
+        return false;
+    }
+    arguments
+        .windows(2)
+        .any(|pair| pair[0] == "-type" && pair[1] == "f")
+}
+
+fn requests_files_only(arguments: &[&str]) -> bool {
+    if arguments.iter().any(|argument| {
+        matches!(*argument, "-x" | "-X" | "--exec" | "--exec-batch")
+            || argument.starts_with("--exec=")
+            || argument.starts_with("--exec-batch=")
+    }) {
+        return false;
+    }
+    arguments.iter().any(|argument| {
+        matches!(
+            *argument,
+            "-tf" | "--type=f" | "--type=file" | "--type" | "-t"
+        )
+    }) && (arguments.contains(&"f")
+        || arguments.contains(&"file")
+        || arguments.contains(&"-tf")
+        || arguments.contains(&"--type=f")
+        || arguments.contains(&"--type=file"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hook_input(command: &str) -> HookInput {
+        HookInput {
+            hook_event_name: "PreToolUse".to_string(),
+            tool_name: Some("Bash".to_string()),
+            tool_input: Some(json!({ "command": command })),
+        }
+    }
+
+    #[test]
+    fn routes_common_posix_and_windows_file_commands() {
+        for (command, expected) in [
+            ("rg -n needle src", FastctxRoute::Search),
+            ("/usr/bin/rg --files", FastctxRoute::Discover),
+            ("cat src/main.rs", FastctxRoute::Inspect),
+            ("nl -ba src/main.rs | sed -n '1,80p'", FastctxRoute::Inspect),
+            ("cd C:\\repo && rg --files", FastctxRoute::Discover),
+            ("Get-Content .\\src\\main.rs", FastctxRoute::Inspect),
+            (
+                "Get-ChildItem -Recurse -File | Select-String needle",
+                FastctxRoute::Search,
+            ),
+            ("find . -type f -name '*.rs'", FastctxRoute::Discover),
+        ] {
+            assert_eq!(route_for_command(command), Some(expected), "{command}");
+        }
+    }
+
+    #[test]
+    fn allows_non_file_and_potentially_mutating_shell_commands() {
+        for command in [
+            "cargo test",
+            "git grep needle",
+            "npm run build",
+            "find . -delete",
+            "find . -type f -exec rm {} +",
+            "find . -type f -printf '%p %s\\n'",
+            "fd -t f --exec rm {}",
+            "rg --replace new old src",
+            "sed -i 's/old/new/' file.rs",
+            "cat input.txt > output.txt",
+            "rg needle src && cargo test",
+            "powershell -Command Get-Content file.rs",
+        ] {
+            assert_eq!(route_for_command(command), None, "{command}");
+        }
+    }
+
+    #[test]
+    fn explicit_fallback_marker_allows_terminal_retry() {
+        assert_eq!(
+            route_for_command("# codey-fastctx-fallback\nrg needle src"),
+            None
+        );
+    }
+
+    #[test]
+    fn pre_tool_use_denial_names_the_route_and_safe_fallback() {
+        let output = handle_hook(&hook_input("rg -n needle src"));
+        assert_eq!(
+            output["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        let reason = output["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains("mcp__codey_fastctx__grep"));
+        assert!(reason.contains(FALLBACK_MARKER));
+        assert!(reason.contains("E:/repo/file.ts"));
+    }
+
+    #[test]
+    fn unrelated_hook_events_and_tools_are_ignored() {
+        let mut input = hook_input("rg needle src");
+        input.tool_name = Some("apply_patch".to_string());
+        assert_eq!(handle_hook(&input), json!({}));
+        input.tool_name = Some("Bash".to_string());
+        input.hook_event_name = "PostToolUse".to_string();
+        assert_eq!(handle_hook(&input), json!({}));
+    }
+}

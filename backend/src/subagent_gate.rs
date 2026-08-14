@@ -74,10 +74,14 @@ fn write_hook_output(output: &Value) -> Result<()> {
 }
 
 pub(crate) fn hook_commands() -> Result<HookCommands> {
+    hook_commands_for(HOOK_ARGUMENT)
+}
+
+pub(crate) fn hook_commands_for(argument: &str) -> Result<HookCommands> {
     let executable = std::env::current_exe().context("定位 Codey 子代理门禁程序失败")?;
     Ok(HookCommands {
-        command: format!("{} {HOOK_ARGUMENT}", quote_posix(&executable)),
-        command_windows: format!("{} {HOOK_ARGUMENT}", quote_windows(&executable)),
+        command: format!("{} {argument}", quote_posix(&executable)),
+        command_windows: format!("{} {argument}", quote_windows(&executable)),
     })
 }
 

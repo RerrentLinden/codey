@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use toml_edit::{Item, Table, Value, value};
 
 use super::{
-    CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID, SUBAGENT_GATE_HOOKS,
+    CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID, CODEY_HOOK_EVENTS,
     direct_only_tool_namespaces, direct_only_tool_namespaces_mut, document_string, parse_document,
 };
 use crate::codex_config_guidance::{
@@ -25,7 +25,7 @@ pub(super) fn restore_owned_config_changes(
         applied.as_table(),
         current.as_table_mut(),
     );
-    restore_subagent_gate_hooks(&original, &applied, &mut current);
+    restore_codey_hooks(&original, &applied, &mut current);
     restore_fastctx_direct_only_namespace(&original, &applied, &mut current);
     if current.as_table().is_empty() {
         Ok(String::new())
@@ -34,7 +34,7 @@ pub(super) fn restore_owned_config_changes(
     }
 }
 
-fn restore_subagent_gate_hooks(
+fn restore_codey_hooks(
     original: &toml_edit::DocumentMut,
     applied: &toml_edit::DocumentMut,
     current: &mut toml_edit::DocumentMut,
@@ -45,158 +45,155 @@ fn restore_subagent_gate_hooks(
         return;
     };
 
-    for spec in SUBAGENT_GATE_HOOKS {
-        let original_event = original_hooks.and_then(|hooks| hooks.get(spec.toml_event));
-        let applied_event = applied_hooks.and_then(|hooks| hooks.get(spec.toml_event));
-        let remove_empty_added_event = match (
-            original_event,
-            applied_event,
-            current_hooks.get_mut(spec.toml_event),
-        ) {
-            (
-                original_event,
-                Some(Item::ArrayOfTables(applied_groups)),
-                Some(Item::ArrayOfTables(current_groups)),
-            ) => {
-                let original_groups = original_event.and_then(Item::as_array_of_tables);
-                let original_gate_count = original_groups
-                    .map(|groups| {
-                        groups
-                            .iter()
-                            .filter(|group| table_is_subagent_gate_group(group))
-                            .count()
-                    })
-                    .unwrap_or_default();
-                let added_gate_count = applied_groups
-                    .iter()
-                    .filter(|group| table_is_subagent_gate_group(group))
-                    .count()
-                    .saturating_sub(original_gate_count);
-                let mut removed_gate_count = 0;
-                let mut original_matches = original_groups
-                    .map(|groups| vec![false; groups.len()])
-                    .unwrap_or_default();
-                for applied_group in applied_groups
-                    .iter()
-                    .filter(|group| table_is_subagent_gate_group(group))
-                {
-                    let matching_original = original_groups.and_then(|groups| {
-                        groups.iter().enumerate().position(|(index, group)| {
-                            !original_matches[index]
-                                && tables_semantically_equal(group, applied_group)
+    for event in CODEY_HOOK_EVENTS {
+        let original_event = original_hooks.and_then(|hooks| hooks.get(event));
+        let applied_event = applied_hooks.and_then(|hooks| hooks.get(event));
+        let remove_empty_added_event =
+            match (original_event, applied_event, current_hooks.get_mut(event)) {
+                (
+                    original_event,
+                    Some(Item::ArrayOfTables(applied_groups)),
+                    Some(Item::ArrayOfTables(current_groups)),
+                ) => {
+                    let original_groups = original_event.and_then(Item::as_array_of_tables);
+                    let original_gate_count = original_groups
+                        .map(|groups| {
+                            groups
+                                .iter()
+                                .filter(|group| table_is_codey_hook_group(group))
+                                .count()
                         })
-                    });
-                    if let Some(index) = matching_original {
-                        original_matches[index] = true;
-                        continue;
-                    }
-                    let current_match = current_groups
+                        .unwrap_or_default();
+                    let added_gate_count = applied_groups
                         .iter()
-                        .enumerate()
-                        .filter(|(_, group)| tables_semantically_equal(group, applied_group))
-                        .map(|(index, _)| index)
-                        .last();
-                    if let Some(index) = current_match {
+                        .filter(|group| table_is_codey_hook_group(group))
+                        .count()
+                        .saturating_sub(original_gate_count);
+                    let mut removed_gate_count = 0;
+                    let mut original_matches = original_groups
+                        .map(|groups| vec![false; groups.len()])
+                        .unwrap_or_default();
+                    for applied_group in applied_groups
+                        .iter()
+                        .filter(|group| table_is_codey_hook_group(group))
+                    {
+                        let matching_original = original_groups.and_then(|groups| {
+                            groups.iter().enumerate().position(|(index, group)| {
+                                !original_matches[index]
+                                    && tables_semantically_equal(group, applied_group)
+                            })
+                        });
+                        if let Some(index) = matching_original {
+                            original_matches[index] = true;
+                            continue;
+                        }
+                        let current_match = current_groups
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, group)| tables_semantically_equal(group, applied_group))
+                            .map(|(index, _)| index)
+                            .last();
+                        if let Some(index) = current_match {
+                            current_groups.remove(index);
+                            removed_gate_count += 1;
+                        }
+                    }
+                    while removed_gate_count < added_gate_count {
+                        let current_gate_count = current_groups
+                            .iter()
+                            .filter(|group| table_is_codey_hook_group(group))
+                            .count();
+                        if current_gate_count <= original_gate_count {
+                            break;
+                        }
+                        let current_match = current_groups
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, group)| table_is_codey_hook_group(group))
+                            .map(|(index, _)| index)
+                            .last();
+                        let Some(index) = current_match else {
+                            break;
+                        };
                         current_groups.remove(index);
                         removed_gate_count += 1;
                     }
+                    original_event.is_none() && current_groups.is_empty()
                 }
-                while removed_gate_count < added_gate_count {
-                    let current_gate_count = current_groups
-                        .iter()
-                        .filter(|group| table_is_subagent_gate_group(group))
-                        .count();
-                    if current_gate_count <= original_gate_count {
-                        break;
-                    }
-                    let current_match = current_groups
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, group)| table_is_subagent_gate_group(group))
-                        .map(|(index, _)| index)
-                        .last();
-                    let Some(index) = current_match else {
-                        break;
-                    };
-                    current_groups.remove(index);
-                    removed_gate_count += 1;
-                }
-                original_event.is_none() && current_groups.is_empty()
-            }
-            (
-                original_event,
-                Some(Item::Value(Value::Array(applied_groups))),
-                Some(Item::Value(Value::Array(current_groups))),
-            ) => {
-                let original_groups = original_event.and_then(Item::as_array);
-                let original_gate_count = original_groups
-                    .map(|groups| {
-                        groups
-                            .iter()
-                            .filter(|group| value_is_subagent_gate_group(group))
-                            .count()
-                    })
-                    .unwrap_or_default();
-                let added_gate_count = applied_groups
-                    .iter()
-                    .filter(|group| value_is_subagent_gate_group(group))
-                    .count()
-                    .saturating_sub(original_gate_count);
-                let mut removed_gate_count = 0;
-                let mut original_matches = original_groups
-                    .map(|groups| vec![false; groups.len()])
-                    .unwrap_or_default();
-                for applied_group in applied_groups
-                    .iter()
-                    .filter(|group| value_is_subagent_gate_group(group))
-                {
-                    let matching_original = original_groups.and_then(|groups| {
-                        groups.iter().enumerate().position(|(index, group)| {
-                            !original_matches[index]
-                                && values_semantically_equal(group, applied_group)
+                (
+                    original_event,
+                    Some(Item::Value(Value::Array(applied_groups))),
+                    Some(Item::Value(Value::Array(current_groups))),
+                ) => {
+                    let original_groups = original_event.and_then(Item::as_array);
+                    let original_gate_count = original_groups
+                        .map(|groups| {
+                            groups
+                                .iter()
+                                .filter(|group| value_is_codey_hook_group(group))
+                                .count()
                         })
-                    });
-                    if let Some(index) = matching_original {
-                        original_matches[index] = true;
-                        continue;
-                    }
-                    let current_match = current_groups
+                        .unwrap_or_default();
+                    let added_gate_count = applied_groups
                         .iter()
-                        .enumerate()
-                        .filter(|(_, group)| values_semantically_equal(group, applied_group))
-                        .map(|(index, _)| index)
-                        .last();
-                    if let Some(index) = current_match {
+                        .filter(|group| value_is_codey_hook_group(group))
+                        .count()
+                        .saturating_sub(original_gate_count);
+                    let mut removed_gate_count = 0;
+                    let mut original_matches = original_groups
+                        .map(|groups| vec![false; groups.len()])
+                        .unwrap_or_default();
+                    for applied_group in applied_groups
+                        .iter()
+                        .filter(|group| value_is_codey_hook_group(group))
+                    {
+                        let matching_original = original_groups.and_then(|groups| {
+                            groups.iter().enumerate().position(|(index, group)| {
+                                !original_matches[index]
+                                    && values_semantically_equal(group, applied_group)
+                            })
+                        });
+                        if let Some(index) = matching_original {
+                            original_matches[index] = true;
+                            continue;
+                        }
+                        let current_match = current_groups
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, group)| values_semantically_equal(group, applied_group))
+                            .map(|(index, _)| index)
+                            .last();
+                        if let Some(index) = current_match {
+                            current_groups.remove(index);
+                            removed_gate_count += 1;
+                        }
+                    }
+                    while removed_gate_count < added_gate_count {
+                        let current_gate_count = current_groups
+                            .iter()
+                            .filter(|group| value_is_codey_hook_group(group))
+                            .count();
+                        if current_gate_count <= original_gate_count {
+                            break;
+                        }
+                        let current_match = current_groups
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, group)| value_is_codey_hook_group(group))
+                            .map(|(index, _)| index)
+                            .last();
+                        let Some(index) = current_match else {
+                            break;
+                        };
                         current_groups.remove(index);
                         removed_gate_count += 1;
                     }
+                    original_event.is_none() && current_groups.is_empty()
                 }
-                while removed_gate_count < added_gate_count {
-                    let current_gate_count = current_groups
-                        .iter()
-                        .filter(|group| value_is_subagent_gate_group(group))
-                        .count();
-                    if current_gate_count <= original_gate_count {
-                        break;
-                    }
-                    let current_match = current_groups
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, group)| value_is_subagent_gate_group(group))
-                        .map(|(index, _)| index)
-                        .last();
-                    let Some(index) = current_match else {
-                        break;
-                    };
-                    current_groups.remove(index);
-                    removed_gate_count += 1;
-                }
-                original_event.is_none() && current_groups.is_empty()
-            }
-            _ => false,
-        };
+                _ => false,
+            };
         if remove_empty_added_event {
-            current_hooks.remove(spec.toml_event);
+            current_hooks.remove(event);
         }
     }
 
@@ -206,37 +203,43 @@ fn restore_subagent_gate_hooks(
     }
 }
 
-fn table_is_subagent_gate_group(group: &Table) -> bool {
+fn table_is_codey_hook_group(group: &Table) -> bool {
     group
         .get("hooks")
         .and_then(Item::as_array_of_tables)
-        .is_some_and(|handlers| handlers.iter().any(table_is_subagent_gate_handler))
+        .is_some_and(|handlers| handlers.iter().any(table_is_codey_hook_handler))
 }
 
-fn table_is_subagent_gate_handler(handler: &Table) -> bool {
+fn table_is_codey_hook_handler(handler: &Table) -> bool {
     ["command", "commandWindows"].iter().any(|field| {
         handler
             .get(field)
             .and_then(Item::as_str)
-            .is_some_and(|command| command.contains(crate::subagent_gate::HOOK_ARGUMENT))
+            .is_some_and(|command| {
+                command.contains(crate::subagent_gate::HOOK_ARGUMENT)
+                    || command.contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
+            })
     })
 }
 
-fn value_is_subagent_gate_group(group: &Value) -> bool {
+fn value_is_codey_hook_group(group: &Value) -> bool {
     group
         .as_inline_table()
         .and_then(|group| group.get("hooks"))
         .and_then(Value::as_array)
-        .is_some_and(|handlers| handlers.iter().any(value_is_subagent_gate_handler))
+        .is_some_and(|handlers| handlers.iter().any(value_is_codey_hook_handler))
 }
 
-fn value_is_subagent_gate_handler(handler: &Value) -> bool {
+fn value_is_codey_hook_handler(handler: &Value) -> bool {
     handler.as_inline_table().is_some_and(|handler| {
         ["command", "commandWindows"].iter().any(|field| {
             handler
                 .get(field)
                 .and_then(Value::as_str)
-                .is_some_and(|command| command.contains(crate::subagent_gate::HOOK_ARGUMENT))
+                .is_some_and(|command| {
+                    command.contains(crate::subagent_gate::HOOK_ARGUMENT)
+                        || command.contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
+                })
         })
     })
 }

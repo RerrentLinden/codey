@@ -75,7 +75,7 @@ const CODEY_SUBAGENT_SOURCE_FILE: &str = "subagent.toml";
 const CODEY_RUNTIME_DEFAULT_AGENT_FILE: &str = "runtime/default-agent.toml";
 const CODEY_SUBAGENT_SOURCES_DIR: &str = "agents";
 const CODEY_RUNTIME_AGENTS_DIR: &str = "runtime/agents";
-const CODEY_HOOKS_DESCRIPTION: &str = "Codey runtime subagent coordination gate.";
+const CODEY_HOOKS_DESCRIPTION: &str = "Codey runtime routing and coordination hooks.";
 const CODEY_RUNTIME_CONFIG_LOCK_FILE: &str = "codex-runtime-config.lock";
 const CODEY_WSL_ONLY_OVERRIDE_PREFIX: &str = "__CODEY_WSL_ONLY__:";
 const RESERVED_PROVIDER_IDS: [&str; 6] = [
@@ -492,19 +492,28 @@ fn apply_isolated_cc_switch_runtime_config(
         collaboration_hint.as_deref(),
     )?;
 
-    let original_hooks = if subagent_optimization {
+    let runtime_hooks_enabled = subagent_optimization || fastctx_namespace.is_some();
+    let original_hooks = if runtime_hooks_enabled {
         read_optional(&hooks_path)?
     } else {
         None
     };
-    let (updated_hooks, hook_trust_entries) = if subagent_optimization {
+    let subagent_hook_commands = subagent_optimization
+        .then(crate::subagent_gate::hook_commands)
+        .transpose()?;
+    let fastctx_hook_commands = fastctx_namespace
+        .is_some()
+        .then(|| crate::subagent_gate::hook_commands_for(crate::fastctx_route_gate::HOOK_ARGUMENT))
+        .transpose()?;
+    let (updated_hooks, hook_trust_entries) = if runtime_hooks_enabled {
         let RuntimeHooksFile {
             contents,
             trust_entries,
         } = build_runtime_hooks_file(
             original_hooks.as_deref(),
             &hooks_path,
-            &crate::subagent_gate::hook_commands()?,
+            subagent_hook_commands.as_ref(),
+            fastctx_hook_commands.as_ref(),
         )?;
         (Some(contents), trust_entries)
     } else {
@@ -566,7 +575,7 @@ fn apply_isolated_cc_switch_runtime_config(
     }
 
     let inputs_unchanged = optional_file_matches(&config_path, original_config.as_deref())?
-        && (!subagent_optimization
+        && (!runtime_hooks_enabled
             || optional_file_matches(&hooks_path, original_hooks.as_deref())?);
     if !inputs_unchanged {
         discard_runtime_lease(marker, &backup_dir).with_context(|| {
@@ -1739,6 +1748,10 @@ fn patch_config_with_fastctx_mode_and_proxy(
             fastctx_namespace.as_deref(),
         )?;
     }
+    if fastctx_namespace.is_some() {
+        enable_hooks_feature(&mut doc)?;
+        enable_fastctx_route_hook(&mut doc, config_path)?;
+    }
     document_string(&doc)
 }
 
@@ -1815,7 +1828,7 @@ fn enable_subagent_optimization(
 }
 
 #[derive(Clone, Copy)]
-struct SubagentGateHookSpec {
+struct CodeyHookSpec {
     toml_event: &'static str,
     event_key: &'static str,
     matcher: Option<&'static str>,
@@ -1833,38 +1846,38 @@ struct RuntimeHooksFile {
     trust_entries: Vec<RuntimeHookTrustEntry>,
 }
 
-const SUBAGENT_GATE_HOOKS: [SubagentGateHookSpec; 6] = [
-    SubagentGateHookSpec {
+const SUBAGENT_GATE_HOOKS: [CodeyHookSpec; 6] = [
+    CodeyHookSpec {
         toml_event: "PreToolUse",
         event_key: "pre_tool_use",
         matcher: Some("*"),
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
-    SubagentGateHookSpec {
+    CodeyHookSpec {
         toml_event: "PostToolUse",
         event_key: "post_tool_use",
         matcher: Some(".*wait_agent$"),
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
-    SubagentGateHookSpec {
+    CodeyHookSpec {
         toml_event: "SubagentStart",
         event_key: "subagent_start",
         matcher: None,
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
-    SubagentGateHookSpec {
+    CodeyHookSpec {
         toml_event: "SubagentStop",
         event_key: "subagent_stop",
         matcher: None,
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
-    SubagentGateHookSpec {
+    CodeyHookSpec {
         toml_event: "Stop",
         event_key: "stop",
         matcher: None,
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
-    SubagentGateHookSpec {
+    CodeyHookSpec {
         toml_event: "SessionEnd",
         event_key: "session_end",
         matcher: None,
@@ -1872,10 +1885,27 @@ const SUBAGENT_GATE_HOOKS: [SubagentGateHookSpec; 6] = [
     },
 ];
 
+const FASTCTX_ROUTE_HOOKS: [CodeyHookSpec; 1] = [CodeyHookSpec {
+    toml_event: "PreToolUse",
+    event_key: "pre_tool_use",
+    matcher: Some(crate::fastctx_route_gate::HOOK_MATCHER),
+    timeout_seconds: crate::fastctx_route_gate::HOOK_TIMEOUT_SECONDS,
+}];
+
+const CODEY_HOOK_EVENTS: [&str; 6] = [
+    "PreToolUse",
+    "PostToolUse",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+    "SessionEnd",
+];
+
 fn build_runtime_hooks_file(
     existing: Option<&[u8]>,
     hooks_path: &Path,
-    commands: &crate::subagent_gate::HookCommands,
+    subagent_commands: Option<&crate::subagent_gate::HookCommands>,
+    fastctx_commands: Option<&crate::subagent_gate::HookCommands>,
 ) -> Result<RuntimeHooksFile> {
     let mut root = match existing {
         Some(existing) => serde_json::from_slice::<serde_json::Value>(existing)
@@ -1901,60 +1931,73 @@ fn build_runtime_hooks_file(
         }
     }
 
-    let selected_command = if cfg!(windows) {
-        commands.command_windows.as_str()
-    } else {
-        commands.command.as_str()
-    };
-    let mut trust_entries = Vec::with_capacity(SUBAGENT_GATE_HOOKS.len());
-    for spec in SUBAGENT_GATE_HOOKS {
-        let groups = hooks
-            .entry(spec.toml_event.to_string())
-            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
-            .as_array_mut()
-            .ok_or_else(|| anyhow::anyhow!("hooks.json hooks.{} 必须是数组", spec.toml_event))?;
-        let group_index = groups.len();
-        let mut group = serde_json::Map::new();
-        if let Some(matcher) = spec.matcher {
+    let mut trust_entries = Vec::with_capacity(
+        subagent_commands.map_or(0, |_| SUBAGENT_GATE_HOOKS.len())
+            + fastctx_commands.map_or(0, |_| FASTCTX_ROUTE_HOOKS.len()),
+    );
+    for (specs, commands) in [
+        (&SUBAGENT_GATE_HOOKS[..], subagent_commands),
+        (&FASTCTX_ROUTE_HOOKS[..], fastctx_commands),
+    ] {
+        let Some(commands) = commands else {
+            continue;
+        };
+        let selected_command = if cfg!(windows) {
+            commands.command_windows.as_str()
+        } else {
+            commands.command.as_str()
+        };
+        for &spec in specs {
+            let groups = hooks
+                .entry(spec.toml_event.to_string())
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                .as_array_mut()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("hooks.json hooks.{} 必须是数组", spec.toml_event)
+                })?;
+            let group_index = groups.len();
+            let mut group = serde_json::Map::new();
+            if let Some(matcher) = spec.matcher {
+                group.insert(
+                    "matcher".to_string(),
+                    serde_json::Value::String(matcher.to_string()),
+                );
+            }
             group.insert(
-                "matcher".to_string(),
-                serde_json::Value::String(matcher.to_string()),
+                "hooks".to_string(),
+                serde_json::json!([{
+                    "type": "command",
+                    "command": commands.command,
+                    "commandWindows": commands.command_windows,
+                    "timeout": spec.timeout_seconds,
+                }]),
             );
-        }
-        group.insert(
-            "hooks".to_string(),
-            serde_json::json!([{
-                "type": "command",
-                "command": commands.command,
-                "commandWindows": commands.command_windows,
-                "timeout": spec.timeout_seconds,
-            }]),
-        );
-        groups.push(serde_json::Value::Object(group));
+            groups.push(serde_json::Value::Object(group));
 
-        let state_key = format!(
-            "{}:{}:{group_index}:0",
-            hooks_path.display(),
-            spec.event_key
-        );
-        let trusted_hash = crate::subagent_gate::hook_trust_hash(
-            spec.event_key,
-            spec.matcher,
-            selected_command,
-            spec.timeout_seconds,
-        );
-        trust_entries.push(RuntimeHookTrustEntry {
-            state_key,
-            trusted_hash,
-            wsl_trusted_hash: cfg!(windows).then(|| {
-                crate::subagent_gate::hook_trust_hash(
-                    spec.event_key,
-                    spec.matcher,
-                    &commands.command,
-                    spec.timeout_seconds,
-                )
-            }),
-        });
+            let state_key = format!(
+                "{}:{}:{group_index}:0",
+                hooks_path.display(),
+                spec.event_key
+            );
+            let trusted_hash = crate::subagent_gate::hook_trust_hash(
+                spec.event_key,
+                spec.matcher,
+                selected_command,
+                spec.timeout_seconds,
+            );
+            trust_entries.push(RuntimeHookTrustEntry {
+                state_key,
+                trusted_hash,
+                wsl_trusted_hash: cfg!(windows).then(|| {
+                    crate::subagent_gate::hook_trust_hash(
+                        spec.event_key,
+                        spec.matcher,
+                        &commands.command,
+                        spec.timeout_seconds,
+                    )
+                }),
+            });
+        }
     }
     let mut rendered = serde_json::to_vec_pretty(&serde_json::Value::Object(root.clone()))?;
     rendered.push(b'\n');
@@ -1973,7 +2016,10 @@ fn json_hook_group_is_codey_owned(group: &serde_json::Value) -> bool {
                 ["command", "commandWindows", "command_windows"]
                     .into_iter()
                     .filter_map(|key| handler.get(key).and_then(serde_json::Value::as_str))
-                    .any(|command| command.contains("--codey-subagent-gate-hook"))
+                    .any(|command| {
+                        command.contains(crate::subagent_gate::HOOK_ARGUMENT)
+                            || command.contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
+                    })
             })
         })
 }
@@ -2131,7 +2177,6 @@ fn build_isolated_runtime_overrides(
                 &["features", "multi_agent_v2", "root_agent_usage_hint_text"][..],
                 "features.multi_agent_v2.root_agent_usage_hint_text",
             ),
-            (&["features", "hooks"][..], "features.hooks"),
         ] {
             push_required_document_override(&mut overrides, effective, path, key)?;
         }
@@ -2159,9 +2204,22 @@ fn build_isolated_runtime_overrides(
                 &Value::from(registration.description.as_str()),
             );
         }
+    }
+    if !hook_trust_entries.is_empty() {
+        push_required_document_override(
+            &mut overrides,
+            effective,
+            &["features", "hooks"],
+            "features.hooks",
+        )?;
+        let expected_hook_count = if runtime_agents.is_empty() {
+            0
+        } else {
+            SUBAGENT_GATE_HOOKS.len()
+        } + usize::from(fastctx_namespace.is_some());
         anyhow::ensure!(
-            hook_trust_entries.len() == SUBAGENT_GATE_HOOKS.len(),
-            "Codey 子代理 Hook 信任项不完整"
+            hook_trust_entries.len() == expected_hook_count,
+            "Codey Hook 信任项不完整"
         );
         for trust_entry in hook_trust_entries {
             let state_segment = toml_string_literal(&trust_entry.state_key);
@@ -2253,16 +2311,43 @@ fn append_constraint_text(existing: &str, addition: &str) -> String {
 
 fn enable_subagent_gate_hooks(doc: &mut DocumentMut, config_path: &Path) -> Result<()> {
     let commands = crate::subagent_gate::hook_commands()?;
+    enable_codey_hooks(doc, config_path, &SUBAGENT_GATE_HOOKS, &commands)
+}
+
+fn enable_hooks_feature(doc: &mut DocumentMut) -> Result<()> {
+    if doc.get("features").is_none() {
+        doc["features"] = Item::Table(Table::new());
+    }
+    let features = doc
+        .get_mut("features")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| anyhow::anyhow!("features 必须是 TOML table 或 inline table"))?;
+    features.insert("hooks", value(true));
+    Ok(())
+}
+
+fn enable_fastctx_route_hook(doc: &mut DocumentMut, config_path: &Path) -> Result<()> {
+    let commands =
+        crate::subagent_gate::hook_commands_for(crate::fastctx_route_gate::HOOK_ARGUMENT)?;
+    enable_codey_hooks(doc, config_path, &FASTCTX_ROUTE_HOOKS, &commands)
+}
+
+fn enable_codey_hooks(
+    doc: &mut DocumentMut,
+    config_path: &Path,
+    specs: &[CodeyHookSpec],
+    commands: &crate::subagent_gate::HookCommands,
+) -> Result<()> {
     let selected_command = if cfg!(windows) {
         commands.command_windows.as_str()
     } else {
         commands.command.as_str()
     };
 
-    for spec in SUBAGENT_GATE_HOOKS {
+    for &spec in specs {
         let group_index = {
             let hooks = ensure_root_table(doc, "hooks")?;
-            append_subagent_gate_hook(hooks, spec, &commands)?
+            append_codey_hook(hooks, spec, commands)?
         };
         let key = format!(
             "{}:{}:{group_index}:0",
@@ -2284,9 +2369,9 @@ fn enable_subagent_gate_hooks(doc: &mut DocumentMut, config_path: &Path) -> Resu
     Ok(())
 }
 
-fn append_subagent_gate_hook(
+fn append_codey_hook(
     hooks: &mut Table,
-    spec: SubagentGateHookSpec,
+    spec: CodeyHookSpec,
     commands: &crate::subagent_gate::HookCommands,
 ) -> Result<usize> {
     if hooks.get(spec.toml_event).is_none() {
@@ -2294,30 +2379,40 @@ fn append_subagent_gate_hook(
     }
     let event = hooks
         .get_mut(spec.toml_event)
-        .expect("subagent gate hook event was initialized");
+        .expect("Codey hook event was initialized");
     match event {
         Item::ArrayOfTables(groups) => {
+            if let Some(index) = groups
+                .iter()
+                .position(|group| table_has_hook_definition(group, spec, commands))
+            {
+                return Ok(index);
+            }
             let index = groups.len();
             let mut group = Table::new();
             if let Some(matcher) = spec.matcher {
                 group["matcher"] = value(matcher);
             }
             let mut handlers = ArrayOfTables::new();
-            handlers.push(subagent_gate_hook_table(spec, commands));
+            handlers.push(codey_hook_table(spec, commands));
             group["hooks"] = Item::ArrayOfTables(handlers);
             groups.push(group);
             Ok(index)
         }
         Item::Value(Value::Array(groups)) => {
+            if let Some(index) = groups
+                .iter()
+                .position(|group| value_has_hook_definition(group, spec, commands))
+            {
+                return Ok(index);
+            }
             let index = groups.len();
             let mut group = InlineTable::new();
             if let Some(matcher) = spec.matcher {
                 group.insert("matcher", Value::from(matcher));
             }
             let mut handlers = Array::new();
-            handlers.push(Value::InlineTable(subagent_gate_hook_inline_table(
-                spec, commands,
-            )));
+            handlers.push(Value::InlineTable(codey_hook_inline_table(spec, commands)));
             group.insert("hooks", Value::Array(handlers));
             groups.push(Value::InlineTable(group));
             Ok(index)
@@ -2326,10 +2421,53 @@ fn append_subagent_gate_hook(
     }
 }
 
-fn subagent_gate_hook_table(
-    spec: SubagentGateHookSpec,
+fn table_has_hook_definition(
+    group: &Table,
+    spec: CodeyHookSpec,
     commands: &crate::subagent_gate::HookCommands,
-) -> Table {
+) -> bool {
+    group.get("matcher").and_then(Item::as_str) == spec.matcher
+        && group
+            .get("hooks")
+            .and_then(Item::as_array_of_tables)
+            .is_some_and(|handlers| {
+                handlers.iter().any(|handler| {
+                    handler.get("command").and_then(Item::as_str) == Some(commands.command.as_str())
+                        && handler.get("commandWindows").and_then(Item::as_str)
+                            == Some(commands.command_windows.as_str())
+                        && handler.get("timeout").and_then(Item::as_integer)
+                            == i64::try_from(spec.timeout_seconds).ok()
+                })
+            })
+}
+
+fn value_has_hook_definition(
+    group: &Value,
+    spec: CodeyHookSpec,
+    commands: &crate::subagent_gate::HookCommands,
+) -> bool {
+    let Some(group) = group.as_inline_table() else {
+        return false;
+    };
+    group.get("matcher").and_then(Value::as_str) == spec.matcher
+        && group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .is_some_and(|handlers| {
+                handlers.iter().any(|handler| {
+                    handler.as_inline_table().is_some_and(|handler| {
+                        handler.get("command").and_then(Value::as_str)
+                            == Some(commands.command.as_str())
+                            && handler.get("commandWindows").and_then(Value::as_str)
+                                == Some(commands.command_windows.as_str())
+                            && handler.get("timeout").and_then(Value::as_integer)
+                                == i64::try_from(spec.timeout_seconds).ok()
+                    })
+                })
+            })
+}
+
+fn codey_hook_table(spec: CodeyHookSpec, commands: &crate::subagent_gate::HookCommands) -> Table {
     let mut handler = Table::new();
     handler["type"] = value("command");
     handler["command"] = value(&commands.command);
@@ -2338,8 +2476,8 @@ fn subagent_gate_hook_table(
     handler
 }
 
-fn subagent_gate_hook_inline_table(
-    spec: SubagentGateHookSpec,
+fn codey_hook_inline_table(
+    spec: CodeyHookSpec,
     commands: &crate::subagent_gate::HookCommands,
 ) -> InlineTable {
     let mut handler = InlineTable::new();
