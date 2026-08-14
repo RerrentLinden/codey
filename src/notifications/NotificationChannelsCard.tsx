@@ -17,11 +17,11 @@ type NotificationChannelsCardProps = {
   container: HTMLElement | null;
   popupContainer: HTMLElement | null;
   isBusy: boolean;
-  onAddChannel: (channel: NotificationChannel) => void;
+  onAddChannel: (channel: NotificationChannel) => Promise<boolean>;
   onChannelChange: (
     channelId: string,
     patch: Partial<NotificationChannel>,
-  ) => void;
+  ) => Promise<boolean>;
   onRequestRemoveChannel: (channel: NotificationChannel) => void;
 };
 
@@ -55,12 +55,11 @@ function NotificationChannelsCardComponent({
     setDialogOpen(open);
   }
 
-  function saveChannel(channel: NotificationChannel) {
+  async function saveChannel(channel: NotificationChannel) {
     if (editingChannelId) {
-      onChannelChange(editingChannelId, channel);
-    } else {
-      onAddChannel(channel);
+      return onChannelChange(editingChannelId, channel);
     }
+    return onAddChannel(channel);
   }
 
   return (

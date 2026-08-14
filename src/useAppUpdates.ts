@@ -35,6 +35,7 @@ type UseAppUpdatesOptions = {
   setBusy: Dispatch<SetStateAction<string | null>>;
   setNotice: Dispatch<SetStateAction<Notice>>;
   setConfirmation: Dispatch<SetStateAction<Confirmation | null>>;
+  beforeInstall: () => Promise<void>;
 };
 
 const updateAvailable = (
@@ -71,6 +72,7 @@ export function useAppUpdates({
   setBusy,
   setNotice,
   setConfirmation,
+  beforeInstall,
 }: UseAppUpdatesOptions) {
   const [updateResult, setUpdateResult] = useState<InlineResult>({
     tone: "idle",
@@ -250,7 +252,7 @@ export function useAppUpdates({
     setConfirmation({
       action: "install-update",
       title: "安装更新",
-      description: `Codey 将退出当前实例，安装 ${downloadedUpdate.fileName}，然后尝试启动新版。`,
+      description: `Codey 会先保存未保存的设置，再退出当前实例，安装 ${downloadedUpdate.fileName}，然后尝试启动新版。`,
       confirmLabel: "安装并重启",
       run: () => void installDownloadedUpdate(),
     });
@@ -261,6 +263,7 @@ export function useAppUpdates({
     setBusy("install-update");
     setUpdateResult({ tone: "pending", text: "正在启动安装器…" });
     try {
+      await beforeInstall();
       await invoke("install_downloaded_update", {
         filePath: downloadedUpdate.filePath,
       });

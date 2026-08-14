@@ -40,7 +40,7 @@ type NotificationChannelDialogProps = {
   isBusy: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onSave: (channel: NotificationChannel) => void;
+  onSave: (channel: NotificationChannel) => Promise<boolean>;
 };
 
 function NotificationChannelDialogComponent({
@@ -56,6 +56,7 @@ function NotificationChannelDialogComponent({
   const [isRevealing, setIsRevealing] = useState(false);
   const [revealError, setRevealError] = useState("");
   const [isTesting, setIsTesting] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [testResult, setTestResult] = useState<{
     text: string;
     tone: "idle" | "pending" | "success" | "error";
@@ -72,6 +73,7 @@ function NotificationChannelDialogComponent({
       setIsRevealing(false);
       setRevealError("");
       setIsTesting(false);
+      setIsSaving(false);
       setTestResult({ tone: "idle", text: "" });
       setHasSuccessfulTest(false);
       return;
@@ -84,6 +86,7 @@ function NotificationChannelDialogComponent({
     setIsRevealing(editingChannel !== null);
     setRevealError("");
     setIsTesting(false);
+    setIsSaving(false);
     setTestResult({ tone: "idle", text: "" });
     setHasSuccessfulTest(false);
   }, [editingChannel?.id, open]);
@@ -128,10 +131,10 @@ function NotificationChannelDialogComponent({
   }
 
   function closeDialog() {
-    if (!isBusy && !isTesting) onOpenChange(false);
+    if (!isBusy && !isTesting && !isSaving) onOpenChange(false);
   }
 
-  function saveChannel() {
+  async function saveChannel() {
     if (
       !draft ||
       isRevealing ||
@@ -140,8 +143,12 @@ function NotificationChannelDialogComponent({
     ) {
       return;
     }
-    onSave(draft);
-    onOpenChange(false);
+    setIsSaving(true);
+    try {
+      if (await onSave(draft)) onOpenChange(false);
+    } finally {
+      setIsSaving(false);
+    }
   }
 
   async function testChannel() {
@@ -180,7 +187,7 @@ function NotificationChannelDialogComponent({
     label: item.displayName,
     value: item.kind,
   }));
-  const formBusy = isBusy || isRevealing || isTesting;
+  const formBusy = isBusy || isRevealing || isTesting || isSaving;
   const canTest = Boolean(draft && definition?.isConfigured(draft));
   const canSave = Boolean(
     draft && definition?.isConfigured(draft) && hasSuccessfulTest,
@@ -188,16 +195,16 @@ function NotificationChannelDialogComponent({
 
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => {
-      if (nextOpen || (!isBusy && !isTesting)) onOpenChange(nextOpen);
+      if (nextOpen || (!isBusy && !isTesting && !isSaving)) onOpenChange(nextOpen);
     }}>
       <DialogContent
         className="notification-channel-dialog"
         container={container}
         onEscapeKeyDown={(event) => {
-          if (isBusy || isTesting) event.preventDefault();
+          if (isBusy || isTesting || isSaving) event.preventDefault();
         }}
         onPointerDownOutside={(event) => {
-          if (isBusy || isTesting) event.preventDefault();
+          if (isBusy || isTesting || isSaving) event.preventDefault();
         }}
       >
         {isEditing && isRevealing ? (
@@ -353,10 +360,18 @@ function NotificationChannelDialogComponent({
               </Button>
               <Button
                 disabled={formBusy || !canSave}
-                onClick={saveChannel}
+                onClick={() => void saveChannel()}
               >
-                <IconCheck aria-hidden="true" />
-                {isEditing ? "保存配置" : "添加渠道"}
+                {isSaving ? (
+                  <LoaderCircle className="spinner" aria-hidden="true" />
+                ) : (
+                  <IconCheck aria-hidden="true" />
+                )}
+                {isSaving
+                  ? "正在保存"
+                  : isEditing
+                    ? "保存配置"
+                    : "添加渠道"}
               </Button>
             </DialogFooter>
           </>

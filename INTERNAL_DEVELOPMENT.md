@@ -101,6 +101,7 @@ Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周�
 ## 配置与路径
 
 - Codey 配置：由 `directories` 根据系统保存到 Codey 配置目录下的 `config.json`。
+- 通知渠道在渠道弹窗确认后立即通过统一配置保存事务落盘并同步通知 watcher，不依赖控制台顶部的二次保存；安装更新前还会提交当前未保存设置，避免更新重启丢失仅存在于渲染器内的草稿。
 - cc-switch 配置：数据库用于判断 CC Switch 路由接管状态、匹配直连线路的协议提示，以及在有效路由接管下为模型目录请求只读解析当前源 API；不会替代 Codex 配置成为活动线路来源，也不会持久化源凭据。`CC_SWITCH_DB_PATH` 指定的数据库文件优先级最高；否则读取 cc-switch Tauri Store 中的 `app_config_dir_override` 并跟随其自定义数据目录，未配置覆盖时使用 `~/.cc-switch/cc-switch.db`。Windows 还与 cc-switch 一致：仅在默认数据库不存在时兼容旧版 `HOME/.cc-switch/cc-switch.db`。
 - Codex 配置：使用 Codex 默认 `CODEX_HOME`（通常是 `~/.codex`）。
 - Trace 写盘防护由 `disableTraceLogWrites` 控制，默认开启；macOS / Windows 使用相同启动时机更新 Codex 根目录及旧版 `sqlite/` 目录中现有的 `logs_*.sqlite`，不会创建、清空或压缩日志库。macOS Crashpad 容量保护由独立的 `protectCrashpadPending` 控制，默认开启且保存后热切换；Windows 保留兼容配置字段但不扫描 Crashpad 目录。

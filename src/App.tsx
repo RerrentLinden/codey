@@ -25,7 +25,6 @@ import { formatBytes } from "./formatters";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { useModelSelection } from "./useModelSelection";
 import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
-import { useNotifications } from "./useNotifications";
 import { useRuntimeStatus } from "./useRuntimeStatus";
 import { useAppUpdates } from "./useAppUpdates";
 import {
@@ -188,14 +187,6 @@ export function App({
     setNotice,
   });
   const {
-    addNotificationChannel,
-    updateNotificationChannel,
-    removeNotificationChannel,
-  } = useNotifications({
-    setConfig,
-    setDirty,
-  });
-  const {
     updateResult,
     updateCheck,
     downloadedUpdate,
@@ -209,6 +200,9 @@ export function App({
     setBusy,
     setNotice,
     setConfirmation,
+    beforeInstall: async () => {
+      if (config && dirty) await persist(config);
+    },
   });
 
   useEffect(() => {
@@ -304,6 +298,72 @@ export function App({
     }
     setDirty(false);
     return result;
+  }
+
+  async function persistNotificationChannels(
+    current: Config,
+    channels: NotificationChannel[],
+    successText: string,
+  ) {
+    if (isBusy) return false;
+    setBusy("save-notification-channel");
+    try {
+      await persist({
+        ...current,
+        webhook: {
+          ...current.webhook,
+          channels,
+        },
+      });
+      setNotice({ tone: "success", text: successText });
+      return true;
+    } catch (error) {
+      setNotice({ tone: "error", text: errorText(error) });
+      return false;
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function addNotificationChannel(channel: NotificationChannel) {
+    if (!config) return false;
+    const channels = config.webhook.channels.some(
+      (existing) => existing.id === channel.id,
+    )
+      ? config.webhook.channels
+      : [...config.webhook.channels, channel];
+    return persistNotificationChannels(
+      config,
+      channels,
+      "通知渠道已保存，自动通知已生效",
+    );
+  }
+
+  async function updateNotificationChannel(
+    channelId: string,
+    patch: Partial<NotificationChannel>,
+  ) {
+    if (!config) return false;
+    const channels = config.webhook.channels.map((channel) =>
+      channel.id === channelId ? { ...channel, ...patch } : channel,
+    );
+    return persistNotificationChannels(
+      config,
+      channels,
+      "通知渠道已更新，自动通知已生效",
+    );
+  }
+
+  async function removeNotificationChannel(channelId: string) {
+    if (!config) return false;
+    const channels = config.webhook.channels.filter(
+      (channel) => channel.id !== channelId,
+    );
+    return persistNotificationChannels(
+      config,
+      channels,
+      "通知渠道已删除",
+    );
   }
 
   async function syncCurrentProvider() {
@@ -427,9 +487,9 @@ export function App({
       action: "delete-notification-channel",
       title: `删除${channelName}通知渠道？`,
       description:
-        "将从当前设置中移除这个通知渠道。删除后不会再接收自动通知；如果尚未保存，可关闭设置页面撤销本次更改。",
+        "将立即移除这个通知渠道，删除后不会再接收自动通知。",
       confirmLabel: "删除渠道",
-      run: () => removeNotificationChannel(channel.id),
+      run: () => void removeNotificationChannel(channel.id),
     });
   }
 
