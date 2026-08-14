@@ -812,11 +812,7 @@ fn ports_non_windows_keeps_requested_even_when_busy() {
 #[tokio::test]
 async fn default_helper_serves_backend_status_over_http() {
     let hooks = DefaultLaunchHooks::default();
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
-    hooks.start_helper(port).await.unwrap();
+    let port = hooks.start_helper(0).await.unwrap();
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let response = client
         .post(format!("http://127.0.0.1:{port}/backend/status"))
@@ -846,11 +842,7 @@ async fn default_helper_accepts_diagnostic_log_events_over_http() {
     let log_path = temp.path().join("codey.log");
     codey_runtime_core::diagnostic_log::set_diagnostic_log_path_for_tests(Some(log_path.clone()));
     let hooks = DefaultLaunchHooks::default();
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    drop(listener);
-
-    hooks.start_helper(port).await.unwrap();
+    let port = hooks.start_helper(0).await.unwrap();
     let response = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -1707,9 +1699,9 @@ impl LaunchHooks for FakeHooks {
         Ok(())
     }
 
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         self.event(format!("start-helper:{helper_port}"));
-        Ok(())
+        Ok(helper_port)
     }
 
     async fn launch_codex(

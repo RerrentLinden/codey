@@ -257,7 +257,7 @@ pub trait LaunchHooks: Send + Sync {
     ) -> anyhow::Result<()> {
         Ok(())
     }
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()>;
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16>;
     async fn launch_codex(
         &self,
         app_dir: &Path,
@@ -411,7 +411,7 @@ where
             helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
         }
         if settings.enhancements_enabled || protocol_proxy_enabled {
-            hooks.start_helper(helper_port).await?;
+            helper_port = hooks.start_helper(helper_port).await?;
             helper_started = true;
         }
 
@@ -722,19 +722,23 @@ impl LaunchHooks for DefaultLaunchHooks {
         Ok(())
     }
 
-    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<()> {
+    async fn start_helper(&self, helper_port: u16) -> anyhow::Result<u16> {
         let bind_host = helper_bind_host();
         let listener = tokio::net::TcpListener::bind((bind_host.as_str(), helper_port))
             .await
             .with_context(|| {
                 format!("failed to bind helper runtime on {bind_host}:{helper_port}")
             })?;
+        let bound_port = listener
+            .local_addr()
+            .context("failed to read helper runtime address")?
+            .port();
         let _ = crate::diagnostic_log::append_diagnostic_log(
             "helper.listening",
             serde_json::json!({
-                "helper_port": helper_port,
+                "helper_port": bound_port,
                 "bind_host": bind_host,
-                "address": format!("http://{bind_host}:{helper_port}")
+                "address": format!("http://{bind_host}:{bound_port}")
             }),
         );
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
@@ -756,7 +760,7 @@ impl LaunchHooks for DefaultLaunchHooks {
             shutdown: shutdown_tx,
             task,
         });
-        Ok(())
+        Ok(bound_port)
     }
 
     async fn launch_codex(
