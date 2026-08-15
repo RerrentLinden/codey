@@ -76,23 +76,9 @@ pub struct InjectedTarget {
 #[derive(Debug)]
 pub struct InjectionRetryFailure {
     error: anyhow::Error,
-    attempts: u64,
-    duration_ms: u64,
 }
 
 impl InjectionRetryFailure {
-    pub fn attempts(&self) -> u64 {
-        self.attempts
-    }
-
-    pub fn duration_ms(&self) -> u64 {
-        self.duration_ms
-    }
-
-    pub fn timeout_ms(&self) -> u64 {
-        u64::try_from(CDP_INJECTION_TIMEOUT.as_millis()).unwrap_or(u64::MAX)
-    }
-
     pub fn into_error(self) -> anyhow::Error {
         self.error
     }
@@ -477,12 +463,9 @@ pub async fn retry_inject_with_scripts(
     // more than ten seconds before the first injectable page appears. Keep
     // enough budget for the bridge commands after discovery while retaining a
     // hard startup deadline.
-    let started_at = tokio::time::Instant::now();
-    let deadline = started_at + CDP_INJECTION_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + CDP_INJECTION_TIMEOUT;
     let mut delay = Duration::from_millis(100);
-    let mut attempts = 0_u64;
     let last_error = loop {
-        attempts = attempts.saturating_add(1);
         match tokio::time::timeout_at(
             deadline,
             inject_with_scripts(debug_port, handler.clone(), scripts),
@@ -505,11 +488,7 @@ pub async fn retry_inject_with_scripts(
             }
         }
     };
-    Err(InjectionRetryFailure {
-        error: last_error,
-        attempts,
-        duration_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-    })
+    Err(InjectionRetryFailure { error: last_error })
 }
 
 async fn inject_with_scripts(

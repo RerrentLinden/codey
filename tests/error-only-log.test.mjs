@@ -23,8 +23,8 @@ test("startup renders a loading state until config and provider are ready", asyn
   assert.match(notice, /return <>\{notice\.text\}<\/>/);
 });
 
-test("error log is failure-only, daily, structured, and cross-process serialized", async () => {
-  const [errorLog, launcher, launcherProcess, cdp, commands, runtimeCommands, lib, startupPatch, startupPatchLoader] =
+test("error log is minimal, failure-only, daily, and crash-aware", async () => {
+  const [errorLog, launcher, launcherProcess, cdp, commands, runtimeCommands, lib, main, fastctx, startupPatch, startupPatchLoader] =
     await Promise.all([
       source("backend/src/error_log.rs"),
       source("backend/src/launcher.rs"),
@@ -33,6 +33,8 @@ test("error log is failure-only, daily, structured, and cross-process serialized
       source("backend/src/commands.rs"),
       source("backend/src/commands/runtime.rs"),
       source("backend/src/lib.rs"),
+      source("backend/src/main.rs"),
+      source("backend/src/bin/codey-fastctx.rs"),
       source("backend/src/codex_startup_patch.js"),
       source("backend/src/codex_startup_patch.rs"),
     ]);
@@ -44,15 +46,15 @@ test("error log is failure-only, daily, structured, and cross-process serialized
   assert.match(errorLog, /--codey-record-error/);
   assert.match(errorLog, /repair_incomplete_tail/);
   assert.match(errorLog, /struct FailureMetadata/);
-  for (const field of [
-    "stage",
-    "duration_ms",
-    "attempts",
-    "timeout_ms",
-    "recoverable",
-  ]) {
+  for (const field of ["stage", "recoverable"]) {
     assert.match(errorLog, new RegExp(`${field}: Option`));
   }
+  for (const removedField of ["timestamp_ms", "pid: u32", "duration_ms", "attempts", "timeout_ms"]) {
+    assert.doesNotMatch(errorLog.slice(0, errorLog.indexOf("#[cfg(test)]")), new RegExp(removedField));
+  }
+  assert.match(errorLog, /BEIJING_OFFSET_SECONDS/);
+  assert.match(errorLog, /versions: ErrorVersions/);
+  assert.match(errorLog, /install_panic_hook/);
   assert.match(cdp, /timeout_at\(\s*deadline/);
 
   for (const operation of [
@@ -75,6 +77,14 @@ test("error log is failure-only, daily, structured, and cross-process serialized
   assert.match(startupPatch, /recordCodeyPatchFailure/);
   assert.match(startupPatch, /spawnSync/);
   assert.match(startupPatch, /startup\.renderer_asset_patch/);
-  assert.match(startupPatch, /electronVersion/);
+  assert.match(startupPatch, /versions:\s*\{/);
+  assert.match(startupPatch, /electron:\s*process\.versions/);
+  assert.doesNotMatch(startupPatch, /timestampMs:/);
+  assert.doesNotMatch(startupPatch, /pid:\s*process\.pid/);
+  assert.match(main, /install_crash_log_hook\("codey"/);
+  assert.match(main, /record_process_failure/);
+  assert.match(fastctx, /install_crash_log_hook\("fastctx"/);
+  assert.match(fastctx, /fastctx_transport_closed/);
+  assert.match(fastctx, /fastctx_process_failed/);
   assert.match(startupPatchLoader, /include_str!\("codex_startup_patch\.js"\)/);
 });

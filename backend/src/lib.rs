@@ -64,6 +64,19 @@ pub fn run_error_log_helper_if_requested() -> Result<bool> {
     error_log::run_helper_if_requested()
 }
 
+pub fn install_crash_log_hook(component: &'static str, stage: &'static str) {
+    error_log::install_panic_hook(component, stage);
+}
+
+pub fn record_process_failure(
+    event: impl Into<String>,
+    operation: impl Into<String>,
+    error: impl Into<String>,
+    stage: impl Into<String>,
+) {
+    error_log::record_process_failure(event, operation, error, stage);
+}
+
 pub fn run_subagent_gate_hook_if_requested() -> Result<bool> {
     subagent_gate::run_hook_if_requested()
 }
@@ -100,7 +113,6 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
     error_log::initialize();
     let state = Arc::new(AppState::default());
     let codex_home = codex_config::codex_home();
-    let restore_started_at = std::time::Instant::now();
     if let Err(error) = launcher::restore_previous_runtime_state(&codex_home).await {
         error_log::record_failure_with_metadata(
             "restore_failed",
@@ -108,11 +120,6 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
             format!("{error:#}"),
             error_log::FailureMetadata {
                 stage: Some("startup.restore_previous_state".to_string()),
-                duration_ms: Some(
-                    u64::try_from(restore_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
-                ),
-                attempts: Some(1),
-                timeout_ms: None,
                 recoverable: Some(true),
             },
             serde_json::json!({}),

@@ -1,8 +1,16 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 fn main() {
+    codey_lib::install_crash_log_hook("codey", "runtime.codey");
     if let Err(error) = run() {
-        eprintln!("Codey 运行失败：{error:#}");
+        let error = format!("{error:#}");
+        codey_lib::record_process_failure(
+            "process_failed",
+            "run_codey",
+            error.clone(),
+            "runtime.codey",
+        );
+        eprintln!("Codey 运行失败：{error}");
         std::process::exit(1);
     }
 }

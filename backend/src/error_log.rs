@@ -7,45 +7,130 @@ use std::sync::{Mutex, OnceLock};
 use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::Context;
-use chrono::{DateTime, Local, NaiveDate, SecondsFormat};
+use chrono::{DateTime, FixedOffset, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 const ERROR_LOG_FILE: &str = "codey-errors.log";
 const ERROR_LOG_HELPER_ARGUMENT: &str = "--codey-record-error";
 const MAX_HELPER_INPUT_BYTES: u64 = 1024 * 1024;
+const BEIJING_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 static ERROR_LOG_WRITER: OnceLock<Mutex<ErrorLogWriter>> = OnceLock::new();
+static PANIC_LOG_HOOK: OnceLock<()> = OnceLock::new();
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ErrorVersions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    electron: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chrome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+}
+
+impl ErrorVersions {
+    fn current() -> Self {
+        Self {
+            codey: Some(env!("CARGO_PKG_VERSION").to_string()),
+            ..Self::default()
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ErrorRecord {
     timestamp: String,
-    timestamp_ms: i64,
-    pid: u32,
     platform: String,
+    #[serde(default)]
+    versions: ErrorVersions,
     event: String,
     operation: String,
     error: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    duration_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    attempts: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    timeout_ms: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     recoverable: Option<bool>,
+    #[serde(default, skip_serializing_if = "is_empty_context")]
     context: Value,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct FailureMetadata {
     pub stage: Option<String>,
-    pub duration_ms: Option<u64>,
-    pub attempts: Option<u64>,
-    pub timeout_ms: Option<u64>,
     pub recoverable: Option<bool>,
+}
+
+fn beijing_offset() -> FixedOffset {
+    FixedOffset::east_opt(BEIJING_OFFSET_SECONDS).expect("valid Beijing UTC offset")
+}
+
+fn beijing_now() -> DateTime<FixedOffset> {
+    Utc::now().with_timezone(&beijing_offset())
+}
+
+fn format_beijing_timestamp(timestamp: DateTime<FixedOffset>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::Secs, false)
+}
+
+fn normalize_beijing_timestamp(timestamp: &str) -> String {
+    DateTime::parse_from_rfc3339(timestamp)
+        .map(|timestamp| format_beijing_timestamp(timestamp.with_timezone(&beijing_offset())))
+        .unwrap_or_else(|_| format_beijing_timestamp(beijing_now()))
+}
+
+fn is_empty_context(context: &Value) -> bool {
+    match context {
+        Value::Null => true,
+        Value::Object(values) => values.is_empty(),
+        Value::Array(values) => values.is_empty(),
+        _ => false,
+    }
+}
+
+fn take_context_version(context: &mut Value, key: &str) -> Option<String> {
+    let values = context.as_object_mut()?;
+    let version = values
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|version| !version.is_empty())?
+        .to_string();
+    values.remove(key);
+    Some(version)
+}
+
+fn normalize_record(record: &mut ErrorRecord) {
+    record.timestamp = normalize_beijing_timestamp(&record.timestamp);
+    if record.platform.trim().is_empty() {
+        record.platform = std::env::consts::OS.to_string();
+    }
+    record.versions.codey = Some(env!("CARGO_PKG_VERSION").to_string());
+    record.versions.codex = record
+        .versions
+        .codex
+        .take()
+        .or_else(|| take_context_version(&mut record.context, "codexVersion"));
+    record.versions.electron = record
+        .versions
+        .electron
+        .take()
+        .or_else(|| take_context_version(&mut record.context, "electronVersion"));
+    record.versions.chrome = record
+        .versions
+        .chrome
+        .take()
+        .or_else(|| take_context_version(&mut record.context, "chromeVersion"));
+    record.versions.node = record
+        .versions
+        .node
+        .take()
+        .or_else(|| take_context_version(&mut record.context, "nodeVersion"));
 }
 
 #[derive(Default)]
@@ -157,7 +242,7 @@ fn repair_incomplete_tail(path: &Path) -> std::io::Result<()> {
 
 pub fn initialize() {
     let path = error_log_path();
-    let today = Local::now().date_naive();
+    let today = beijing_now().date_naive();
     let writer = ERROR_LOG_WRITER.get_or_init(|| Mutex::new(ErrorLogWriter));
     let result = writer
         .lock()
@@ -184,30 +269,88 @@ pub fn record_failure_with_metadata(
     metadata: FailureMetadata,
     context: impl Serialize,
 ) {
-    let now = Local::now();
+    let now = beijing_now();
     let context = serde_json::to_value(context).unwrap_or_else(|serialization_error| {
         serde_json::json!({
             "contextSerializationError": serialization_error.to_string(),
         })
     });
     let record = ErrorRecord {
-        timestamp: now.to_rfc3339_opts(SecondsFormat::Millis, false),
-        timestamp_ms: now.timestamp_millis(),
-        pid: std::process::id(),
+        timestamp: format_beijing_timestamp(now),
         platform: std::env::consts::OS.to_string(),
+        versions: ErrorVersions::current(),
         event: event.into(),
         operation: operation.into(),
         error: error.into(),
         stage: metadata.stage,
-        duration_ms: metadata.duration_ms,
-        attempts: metadata.attempts,
-        timeout_ms: metadata.timeout_ms,
         recoverable: metadata.recoverable,
         context,
     };
     if let Err(error) = append_record(&record, now.date_naive()) {
         eprintln!("写入 Codey 错误日志失败：{error}");
     }
+}
+
+pub fn record_process_failure(
+    event: impl Into<String>,
+    operation: impl Into<String>,
+    error: impl Into<String>,
+    stage: impl Into<String>,
+) {
+    record_failure_with_metadata(
+        event,
+        operation,
+        error,
+        FailureMetadata {
+            stage: Some(stage.into()),
+            recoverable: Some(false),
+        },
+        serde_json::json!({}),
+    );
+}
+
+pub fn install_panic_hook(component: &'static str, stage: &'static str) {
+    PANIC_LOG_HOOK.get_or_init(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let message = panic_info
+                .payload()
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| {
+                    panic_info
+                        .payload()
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                })
+                .unwrap_or("unknown panic");
+            let location = panic_info
+                .location()
+                .map(|location| {
+                    format!(
+                        "{}:{}:{}",
+                        location.file(),
+                        location.line(),
+                        location.column()
+                    )
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            record_failure_with_metadata(
+                "process_panicked",
+                "uncaught_panic",
+                message,
+                FailureMetadata {
+                    stage: Some(stage.to_string()),
+                    recoverable: Some(false),
+                },
+                serde_json::json!({
+                    "component": component,
+                    "location": location,
+                }),
+            );
+            previous_hook(panic_info);
+        }));
+    });
 }
 
 pub async fn record_failure_async<C>(
@@ -266,7 +409,7 @@ pub fn run_helper_if_requested() -> anyhow::Result<bool> {
         u64::try_from(input.len()).unwrap_or(u64::MAX) <= MAX_HELPER_INPUT_BYTES,
         "Codey 错误日志 helper 输入过大"
     );
-    let record: ErrorRecord =
+    let mut record: ErrorRecord =
         serde_json::from_str(&input).context("解析 Codey 错误日志 helper 输入失败")?;
     anyhow::ensure!(
         !record.event.trim().is_empty()
@@ -274,7 +417,8 @@ pub fn run_helper_if_requested() -> anyhow::Result<bool> {
             && !record.error.trim().is_empty(),
         "Codey 错误日志 helper 缺少失败信息"
     );
-    append_record(&record, Local::now().date_naive()).context("Codey 错误日志 helper 写入失败")?;
+    normalize_record(&mut record);
+    append_record(&record, beijing_now().date_naive()).context("Codey 错误日志 helper 写入失败")?;
     Ok(true)
 }
 
@@ -300,7 +444,10 @@ fn file_is_from_different_day(path: &Path, today: NaiveDate) -> std::io::Result<
         Err(error) => return Err(error),
     };
     let modified = metadata.modified()?;
-    Ok(DateTime::<Local>::from(modified).date_naive() != today)
+    Ok(DateTime::<Utc>::from(modified)
+        .with_timezone(&beijing_offset())
+        .date_naive()
+        != today)
 }
 
 #[cfg(test)]
@@ -317,20 +464,20 @@ mod tests {
     }
 
     #[test]
-    fn record_contains_diagnostic_fields() {
-        let now = Local::now();
+    fn record_contains_minimal_diagnostic_fields() {
+        let now = beijing_now();
         let record = ErrorRecord {
-            timestamp: now.to_rfc3339_opts(SecondsFormat::Millis, false),
-            timestamp_ms: now.timestamp_millis(),
-            pid: 42,
+            timestamp: format_beijing_timestamp(now),
             platform: "windows".to_string(),
+            versions: ErrorVersions {
+                codey: Some("0.7.3".to_string()),
+                electron: Some("151.0.0".to_string()),
+                ..ErrorVersions::default()
+            },
             event: "injection_failed".to_string(),
             operation: "inject_cdp_bridge".to_string(),
             error: "renderer unavailable".to_string(),
             stage: Some("startup.renderer_injection".to_string()),
-            duration_ms: Some(15_003),
-            attempts: Some(11),
-            timeout_ms: Some(15_000),
             recoverable: Some(false),
             context: serde_json::json!({"debugPort": 9229}),
         };
@@ -340,18 +487,22 @@ mod tests {
         assert_eq!(value["operation"], "inject_cdp_bridge");
         assert_eq!(value["error"], "renderer unavailable");
         assert_eq!(value["platform"], "windows");
+        assert_eq!(value["versions"]["codey"], "0.7.3");
+        assert_eq!(value["versions"]["electron"], "151.0.0");
         assert_eq!(value["stage"], "startup.renderer_injection");
-        assert_eq!(value["durationMs"], 15_003);
-        assert_eq!(value["attempts"], 11);
-        assert_eq!(value["timeoutMs"], 15_000);
         assert_eq!(value["recoverable"], false);
         assert_eq!(value["context"]["debugPort"], 9229);
-        assert!(value["timestampMs"].is_i64());
+        assert_eq!(value["timestamp"].as_str().unwrap().len(), 25);
+        assert!(value.get("timestampMs").is_none());
+        assert!(value.get("pid").is_none());
+        assert!(value.get("durationMs").is_none());
+        assert!(value.get("attempts").is_none());
+        assert!(value.get("timeoutMs").is_none());
     }
 
     #[test]
     fn legacy_helper_records_remain_compatible() {
-        let record = serde_json::from_value::<ErrorRecord>(serde_json::json!({
+        let mut record = serde_json::from_value::<ErrorRecord>(serde_json::json!({
             "timestamp": "2026-08-02T11:21:24.543+08:00",
             "timestampMs": 1_785_640_884_543_i64,
             "pid": 4255,
@@ -363,18 +514,48 @@ mod tests {
         }))
         .unwrap();
 
+        normalize_record(&mut record);
         assert_eq!(record.stage, None);
-        assert_eq!(record.duration_ms, None);
-        assert_eq!(record.attempts, None);
-        assert_eq!(record.timeout_ms, None);
         assert_eq!(record.recoverable, None);
+        assert_eq!(record.timestamp, "2026-08-02T11:21:24+08:00");
+        assert_eq!(
+            record.versions.codey.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(record.context["matchCount"], 0);
+    }
+
+    #[test]
+    fn legacy_runtime_versions_move_out_of_context() {
+        let mut record = serde_json::from_value::<ErrorRecord>(serde_json::json!({
+            "timestamp": "2026-08-15T08:28:19.264Z",
+            "platform": "windows",
+            "event": "patch_failed",
+            "operation": "renderer_patch:model visibility",
+            "error": "gate matched 0 times",
+            "context": {
+                "matchCount": 0,
+                "electronVersion": "151.0.0",
+                "chromeVersion": "151.0.0",
+                "nodeVersion": "24.14.0"
+            }
+        }))
+        .unwrap();
+
+        normalize_record(&mut record);
+
+        assert_eq!(record.timestamp, "2026-08-15T16:28:19+08:00");
+        assert_eq!(record.versions.electron.as_deref(), Some("151.0.0"));
+        assert_eq!(record.versions.chrome.as_deref(), Some("151.0.0"));
+        assert_eq!(record.versions.node.as_deref(), Some("24.14.0"));
+        assert_eq!(record.context, serde_json::json!({"matchCount": 0}));
     }
 
     #[test]
     fn same_day_failures_are_appended() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(ERROR_LOG_FILE);
-        let today = Local::now().date_naive();
+        let today = beijing_now().date_naive();
         let mut writer = ErrorLogWriter;
 
         writer.append(&path, today, r#"{"error":"first"}"#).unwrap();
@@ -392,7 +573,7 @@ mod tests {
     fn crossing_into_a_new_day_clears_old_failures() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(ERROR_LOG_FILE);
-        let first_day = Local::now().date_naive();
+        let first_day = beijing_now().date_naive();
         let next_day = first_day.succ_opt().unwrap();
         let mut writer = ErrorLogWriter;
 
@@ -414,7 +595,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join(ERROR_LOG_FILE);
         std::fs::write(&path, b"{\"error\":\"complete\"}\n{\"error\":").unwrap();
-        let today = Local::now().date_naive();
+        let today = beijing_now().date_naive();
         let mut writer = ErrorLogWriter;
 
         writer.append(&path, today, r#"{"error":"next"}"#).unwrap();
@@ -429,7 +610,7 @@ mod tests {
     fn concurrent_writers_keep_each_json_line_intact() {
         let temp = tempfile::tempdir().unwrap();
         let path = std::sync::Arc::new(temp.path().join(ERROR_LOG_FILE));
-        let today = Local::now().date_naive();
+        let today = beijing_now().date_naive();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
         let threads = (0..8)
             .map(|thread_id| {

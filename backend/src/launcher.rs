@@ -789,9 +789,6 @@ async fn inject_initial_renderer(
     let error_message = format!("{failure:#}");
     let failure_metadata = error_log::FailureMetadata {
         stage: Some("startup.renderer_injection".to_string()),
-        duration_ms: Some(failure.duration_ms()),
-        attempts: Some(failure.attempts()),
-        timeout_ms: Some(failure.timeout_ms()),
         recoverable: Some(false),
     };
     let error = failure.into_error();
@@ -928,9 +925,6 @@ fn spawn_injection_watchdog(
                         error_message.clone(),
                         error_log::FailureMetadata {
                             stage: Some("runtime.renderer_reinjection".to_string()),
-                            duration_ms: Some(error.duration_ms()),
-                            attempts: Some(error.attempts()),
-                            timeout_ms: Some(error.timeout_ms()),
                             recoverable: Some(true),
                         },
                         serde_json::json!({

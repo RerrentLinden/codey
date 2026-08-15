@@ -9,19 +9,27 @@ use std::ffi::OsStr;
 const CODEY_FASTCTX_MCP_ARGUMENT: &str = "--codey-fastctx-mcp";
 
 fn main() {
-    if let Err(error) = run() {
-        eprintln!("Codey FastCtx 运行失败：{error:#}");
+    let mode = FastCtxMode::from_arguments(std::env::args_os());
+    codey_lib::install_crash_log_hook("fastctx", mode.stage());
+    if let Err(error) = run(mode) {
+        let error = format!("{error:#}");
+        codey_lib::record_process_failure(
+            classify_fastctx_failure(&error),
+            mode.operation(),
+            error.clone(),
+            mode.stage(),
+        );
+        eprintln!("Codey FastCtx 运行失败：{error}");
         std::process::exit(1);
     }
 }
 
-fn run() -> anyhow::Result<()> {
-    let force_mcp_server = should_force_mcp_server(std::env::args_os());
+fn run(mode: FastCtxMode) -> anyhow::Result<()> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async move {
-            let result = if force_mcp_server {
+            let result = if mode == FastCtxMode::Mcp {
                 fastctx::cli::run_server().await
             } else {
                 // FastCtx 会用当前可执行文件拉起 runtime-bootstrap 和
@@ -33,15 +41,64 @@ fn run() -> anyhow::Result<()> {
         })
 }
 
-fn should_force_mcp_server<I, S>(arguments: I) -> bool
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<OsStr>,
-{
-    arguments
-        .into_iter()
-        .nth(1)
-        .is_some_and(|argument| argument.as_ref() == OsStr::new(CODEY_FASTCTX_MCP_ARGUMENT))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastCtxMode {
+    Mcp,
+    RuntimeBootstrap,
+    RuntimeHost,
+    Cli,
+}
+
+impl FastCtxMode {
+    fn from_arguments<I, S>(arguments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        match arguments.into_iter().nth(1).as_ref().map(AsRef::as_ref) {
+            Some(argument) if argument == OsStr::new(CODEY_FASTCTX_MCP_ARGUMENT) => Self::Mcp,
+            Some(argument) if argument == OsStr::new("runtime-bootstrap") => Self::RuntimeBootstrap,
+            Some(argument) if argument == OsStr::new("runtime-host") => Self::RuntimeHost,
+            _ => Self::Cli,
+        }
+    }
+
+    const fn stage(self) -> &'static str {
+        match self {
+            Self::Mcp => "runtime.fastctx_mcp",
+            Self::RuntimeBootstrap => "runtime.fastctx_bootstrap",
+            Self::RuntimeHost => "runtime.fastctx_host",
+            Self::Cli => "runtime.fastctx_cli",
+        }
+    }
+
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::Mcp => "run_fastctx_mcp",
+            Self::RuntimeBootstrap => "run_fastctx_runtime_bootstrap",
+            Self::RuntimeHost => "run_fastctx_runtime_host",
+            Self::Cli => "run_fastctx_cli",
+        }
+    }
+}
+
+fn classify_fastctx_failure(error: &str) -> &'static str {
+    let error = error.to_ascii_lowercase();
+    if [
+        "transport closed",
+        "connection closed",
+        "unexpectedly closed",
+        "broken pipe",
+        "stdin read",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|marker| error.contains(marker))
+    {
+        "fastctx_transport_closed"
+    } else {
+        "fastctx_process_failed"
+    }
 }
 
 #[cfg(test)]
@@ -50,18 +107,45 @@ mod tests {
 
     #[test]
     fn codey_marker_forces_the_stdio_mcp_entry() {
-        assert!(should_force_mcp_server([
-            "codey-fastctx",
-            CODEY_FASTCTX_MCP_ARGUMENT,
-        ]));
+        assert_eq!(
+            FastCtxMode::from_arguments(["codey-fastctx", CODEY_FASTCTX_MCP_ARGUMENT]),
+            FastCtxMode::Mcp
+        );
     }
 
     #[test]
     fn fastctx_internal_runtime_commands_reach_the_cli_dispatcher() {
-        assert!(!should_force_mcp_server([
-            "codey-fastctx",
-            "runtime-bootstrap",
-        ]));
-        assert!(!should_force_mcp_server(["codey-fastctx", "runtime-host",]));
+        assert_ne!(
+            FastCtxMode::from_arguments(["codey-fastctx", "runtime-bootstrap"]),
+            FastCtxMode::Mcp
+        );
+        assert_ne!(
+            FastCtxMode::from_arguments(["codey-fastctx", "runtime-host"]),
+            FastCtxMode::Mcp
+        );
+    }
+
+    #[test]
+    fn runtime_commands_have_distinct_diagnostic_stages() {
+        assert_eq!(
+            FastCtxMode::from_arguments(["codey-fastctx", "runtime-bootstrap"]).stage(),
+            "runtime.fastctx_bootstrap"
+        );
+        assert_eq!(
+            FastCtxMode::from_arguments(["codey-fastctx", "runtime-host"]).stage(),
+            "runtime.fastctx_host"
+        );
+    }
+
+    #[test]
+    fn transport_failures_are_classified_separately() {
+        assert_eq!(
+            classify_fastctx_failure("control center connection unexpectedly closed"),
+            "fastctx_transport_closed"
+        );
+        assert_eq!(
+            classify_fastctx_failure("Cannot start the MCP server"),
+            "fastctx_process_failed"
+        );
     }
 }
