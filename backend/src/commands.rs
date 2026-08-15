@@ -1185,7 +1185,7 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
 
     let home = codex_home();
     let mut cache = state.account_usage_cache.lock().await;
-    match cache.fetch(&state.http_client, &home).await {
+    match cache.fetch(&home).await {
         Ok(snapshot) => {
             let mut value = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
             if let Some(object) = value.as_object_mut() {

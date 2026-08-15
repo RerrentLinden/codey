@@ -17,6 +17,7 @@ const USAGE_ENDPOINTS: [&str; 2] = [
 const ACCOUNT_USAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 const ACCOUNT_USAGE_FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(60);
 const ACCOUNT_USAGE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
+const ACCOUNT_USAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq)]
 struct OfficialAuth {
@@ -66,16 +67,20 @@ pub struct AccountUsageCache {
 }
 
 impl AccountUsageCache {
-    pub async fn fetch(
-        &mut self,
-        client: &Client,
-        codex_home: &Path,
-    ) -> Result<AccountUsageSnapshot> {
+    pub async fn fetch(&mut self, codex_home: &Path) -> Result<AccountUsageSnapshot> {
         if let Some(cached) = self.cached_result(Instant::now()) {
             return cached.map_err(anyhow::Error::msg);
         }
 
-        match fetch_official_account_usage(client, codex_home).await {
+        // reqwest snapshots the current system proxy when a client is built. Rebuild the
+        // dedicated usage client for each network refresh so proxy changes do not require
+        // restarting Codey. Cached results still avoid unnecessary requests and rebuilds.
+        let result = match account_usage_http_client() {
+            Ok(client) => fetch_official_account_usage(&client, codex_home).await,
+            Err(error) => Err(error),
+        };
+
+        match result {
             Ok(snapshot) => {
                 self.record_success(snapshot.clone(), Instant::now());
                 Ok(snapshot)
@@ -115,6 +120,14 @@ impl AccountUsageCache {
         self.retry_at = Some(now + account_usage_failure_backoff(self.consecutive_failures));
         self.last_error = Some(error);
     }
+}
+
+fn account_usage_http_client() -> Result<Client> {
+    Client::builder()
+        .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(ACCOUNT_USAGE_CONNECT_TIMEOUT)
+        .build()
+        .context("创建官方额度网络客户端失败")
 }
 
 fn account_usage_failure_backoff(consecutive_failures: u32) -> Duration {
