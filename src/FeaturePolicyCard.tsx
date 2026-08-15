@@ -196,7 +196,7 @@ function FeaturePolicyCardComponent({
             <div className="feature-card-header">
               <div className="feature-card-title">
                 <strong>子代理协作优化</strong>
-                <Badge variant="warning">模型与深度可配置</Badge>
+                <Badge variant="warning">角色配置可热生效</Badge>
               </div>
               <Switch
                 checked={config.subagentOptimization}
@@ -353,7 +353,7 @@ function FeaturePolicyCardComponent({
                   <small>
                     {subagentModelOptions.length === 0
                       ? "请先在模型管理中添加当前线路可用模型"
-                      : "保存并重启 Codex 后，适合拆分的任务会主动使用对应子代理"}
+                      : "首次开启需重启；之后调整模型或思考深度，保存后对下一次派生立即生效"}
                   </small>
                 </>
               ) : (

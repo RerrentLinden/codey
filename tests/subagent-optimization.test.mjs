@@ -66,14 +66,16 @@ test("subagent optimization exposes per-task model and reasoning controls", asyn
   assert.doesNotMatch(uiSource, /仅接受 Sol \/ Terra/);
 });
 
-test("per-task subagent files are composed at startup and require restart", async () => {
+test("per-task subagent files are composed at startup and hot-refreshed after save", async () => {
   const [commandSource, configSource, launcherSource] = await Promise.all([
     readFile(new URL("backend/src/commands.rs", root), "utf8"),
     readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
     readFile(new URL("backend/src/launcher.rs", root), "utf8"),
   ]);
 
-  assert.match(commandSource, /let refresh_subagent_defaults = false/);
+  assert.match(commandSource, /hot_reload_runtime_subagent_config/);
+  assert.match(commandSource, /refresh_runtime_subagent_roles/);
+  assert.doesNotMatch(commandSource, /let refresh_subagent_defaults = false/);
   assert.match(configSource, /fn prepare_runtime_agent_files/);
   assert.match(configSource, /document\["model"\] = value\(model\)/);
   assert.match(
@@ -82,7 +84,11 @@ test("per-task subagent files are composed at startup and require restart", asyn
   );
   assert.match(configSource, /register_runtime_agents/);
   assert.match(configSource, /agents\.\{\}\.config_file/);
+  assert.match(configSource, /pub fn refresh_runtime_subagent_roles/);
+  assert.match(configSource, /verify_runtime_agent_files/);
+  assert.match(configSource, /restore_runtime_agent_files_and_lease/);
   assert.match(launcherSource, /subagent_roles: Some\(&subagent_roles\)/);
+  assert.match(launcherSource, /supports_subagent_config_hot_reload/);
 });
 
 test("subagent optimization installs root waiting and nested-spawn runtime gates", async () => {

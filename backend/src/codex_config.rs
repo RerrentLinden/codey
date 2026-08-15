@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::thread;
-use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -24,12 +22,12 @@ use crate::codex_config_guidance::{
 use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE_VERSIONS, PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
 };
+use crate::config::{
+    CodeyConfig, ProviderProfile, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT,
+    SUBAGENT_ROLE_IDS, SubagentRoleConfig, default_config_path,
+};
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
-use crate::config::{
-    ProviderProfile, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
-    SubagentRoleConfig, default_config_path,
-};
 use crate::fs_util::timestamp_millis;
 use crate::provider_lease::CODEY_PROVIDER_ID;
 
@@ -61,8 +59,6 @@ const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_ARG_MARKER: &str = "--codey-fastctx-mcp";
 const CODEY_FASTCTX_TOKEN_BUDGET: &str = "8500";
 const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 15;
-const SUBAGENT_DEFAULTS_VERIFY_TIMEOUT_MS: u64 = 1_500;
-const SUBAGENT_DEFAULTS_VERIFY_POLL_MS: u64 = 75;
 const APPLIED_CONFIG_FILE: &str = "applied-config.toml";
 const APPLIED_AGENTS_MD_FILE: &str = "applied-AGENTS.md";
 const APPLIED_DEFAULT_AGENT_FILE: &str = "agents/applied-default.toml";
@@ -108,6 +104,8 @@ struct RuntimeConfigLease {
     subagent_model: String,
     #[serde(default)]
     subagent_reasoning_effort: String,
+    #[serde(default)]
+    subagent_roles: BTreeMap<String, SubagentRoleConfig>,
     #[serde(default)]
     original_agents_md_exists: bool,
     #[serde(default)]
@@ -234,6 +232,12 @@ struct RuntimeAgentRegistration {
     role: String,
     description: String,
     config_file: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeAgentFileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
 }
 
 pub(crate) fn apply_runtime_provider_config(
@@ -560,6 +564,11 @@ fn apply_isolated_cc_switch_runtime_config(
         subagent_optimization_applied: subagent_optimization,
         subagent_model: subagent_model.to_string(),
         subagent_reasoning_effort: subagent_reasoning_effort.to_string(),
+        subagent_roles: runtime_subagent_roles(
+            subagent_roles,
+            subagent_model,
+            subagent_reasoning_effort,
+        ),
         original_agents_md_exists: false,
         original_default_agent_exists: false,
         original_agents_dir_exists: home.join("agents").is_dir(),
@@ -681,13 +690,7 @@ fn prepare_runtime_agent_files(
         } else {
             read_or_create_constraint_file(&source_path, default_source)?
         };
-        let runtime_path = if role == SUBAGENT_ROLE_DEFAULT {
-            constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)
-        } else {
-            constraints_dir
-                .join(CODEY_RUNTIME_AGENTS_DIR)
-                .join(format!("{role}.toml"))
-        };
+        let runtime_path = runtime_agent_path(constraints_dir, role);
         let description = write_runtime_agent(
             &source,
             role,
@@ -702,6 +705,16 @@ fn prepare_runtime_agent_files(
         });
     }
     Ok(registrations)
+}
+
+fn runtime_agent_path(constraints_dir: &Path, role: &str) -> PathBuf {
+    if role == SUBAGENT_ROLE_DEFAULT {
+        constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)
+    } else {
+        constraints_dir
+            .join(CODEY_RUNTIME_AGENTS_DIR)
+            .join(format!("{role}.toml"))
+    }
 }
 
 fn write_runtime_agent(
@@ -1053,6 +1066,11 @@ fn apply_runtime_provider_config_at_mode(
         subagent_optimization_applied: subagent_optimization,
         subagent_model: subagent_model.to_string(),
         subagent_reasoning_effort: subagent_reasoning_effort.to_string(),
+        subagent_roles: runtime_subagent_roles(
+            subagent_roles,
+            subagent_model,
+            subagent_reasoning_effort,
+        ),
         original_agents_md_exists: original_agents_md.is_some(),
         original_default_agent_exists: original_default_agent.is_some(),
         original_agents_dir_exists,
@@ -1157,142 +1175,148 @@ fn write_lease(path: &Path, state: &RuntimeConfigLease) -> Result<()> {
     atomic_write(path, &serde_json::to_vec_pretty(state)?)
 }
 
-pub fn mark_runtime_subagent_defaults_applied(
-    home: &Path,
-    model: &str,
-    reasoning_effort: &str,
-) -> Result<()> {
+/// Rebuilds the registered role files used by the active Codex runtime.
+///
+/// Codex keeps each role's `config_file` path in the parent session, but reads
+/// the referenced TOML again for every spawn. Updating those stable files is
+/// therefore sufficient for the next child without reloading the app-server
+/// configuration. The lease and all six files are treated as one recoverable
+/// transaction so a failed save never advertises a partially applied policy.
+pub fn refresh_runtime_subagent_roles(config: &CodeyConfig) -> Result<()> {
     let marker = lease_marker_path();
     let _runtime_config_lock = RuntimeConfigLock::acquire(&marker)?;
-    mark_runtime_subagent_defaults_applied_at(home, &marker, model, reasoning_effort)
+    refresh_runtime_subagent_roles_at(config, &marker)
 }
 
-fn mark_runtime_subagent_defaults_applied_at(
-    home: &Path,
-    marker: &Path,
-    model: &str,
-    reasoning_effort: &str,
-) -> Result<()> {
-    let model = model.trim();
-    anyhow::ensure!(!model.is_empty(), "子代理模型不能为空");
-    let reasoning_effort = reasoning_effort.trim().to_ascii_lowercase();
+fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &Path) -> Result<()> {
     anyhow::ensure!(
-        SUBAGENT_REASONING_EFFORTS.contains(&reasoning_effort.as_str()),
-        "子代理思考深度无效：{reasoning_effort}"
+        config.subagent_optimization,
+        "当前 Codey 配置未启用子代理协作优化"
     );
-
-    let mut state = fs::read_to_string(marker)
-        .with_context(|| format!("读取 Codey Codex lease 失败：{}", marker.display()))
-        .and_then(|contents| {
-            serde_json::from_str::<RuntimeConfigLease>(&contents)
-                .with_context(|| format!("解析 Codey Codex lease 失败：{}", marker.display()))
-        })?;
-    anyhow::ensure!(
-        !state.isolated_runtime_constraints,
-        "CC Switch Live 模式的子代理默认配置通过启动覆盖项生效，需要重启 Codex"
-    );
+    let original_lease = fs::read(marker)
+        .with_context(|| format!("读取 Codey Codex lease 失败：{}", marker.display()))?;
+    let mut state = serde_json::from_slice::<RuntimeConfigLease>(&original_lease)
+        .with_context(|| format!("解析 Codey Codex lease 失败：{}", marker.display()))?;
     anyhow::ensure!(
         state.subagent_optimization_applied,
-        "当前 Codey 运行时未启用子代理协作优化"
+        "当前 Codex 运行时未注册 Codey 子代理任务类型，需要重启 Codex"
     );
 
-    let config_path = home.join("config.toml");
-    let current_bytes =
-        wait_for_subagent_defaults_in_config(&config_path, model, &reasoning_effort)?;
-
-    let snapshot_dir = state
-        .config_snapshot_dir
-        .as_deref()
-        .unwrap_or(&state.backup_dir);
-    let applied_path = snapshot_dir.join(APPLIED_CONFIG_FILE);
-    let applied_bytes = fs::read(&applied_path)
-        .with_context(|| format!("读取 Codey 已应用配置快照失败：{}", applied_path.display()))?;
-    let applied =
-        String::from_utf8(applied_bytes.clone()).context("Codey 已应用配置快照不是 UTF-8")?;
-    let mut applied_doc = applied
-        .parse::<DocumentMut>()
-        .context("解析 Codey 已应用配置快照失败")?;
-    let agents = ensure_root_table(&mut applied_doc, "agents")?;
-    agents["default_subagent_model"] = value(model);
-    agents["default_subagent_reasoning_effort"] = value(&reasoning_effort);
-    let updated_applied = document_string(&applied_doc)?;
-
-    anyhow::ensure!(
-        read_optional(&config_path)?.as_deref() == Some(current_bytes.as_slice()),
-        "Codex config.toml 在 Codey 更新租约快照前再次变化"
+    let constraints_dir = marker
+        .parent()
+        .unwrap_or_else(|| Path::new(".codey"))
+        .join(CODEY_CONSTRAINTS_DIR);
+    create_private_dir_all(&constraints_dir)?;
+    let runtime_roles = runtime_subagent_roles(
+        Some(&config.subagent_roles),
+        &config.subagent_model,
+        &config.subagent_reasoning_effort,
     );
-    state.subagent_model = model.to_string();
-    state.subagent_reasoning_effort = reasoning_effort;
-    commit_runtime_subagent_snapshot(
-        marker,
-        &state,
-        &applied_path,
-        &applied_bytes,
-        updated_applied.as_bytes(),
-    )
-}
+    let fastctx_instructions = if config.fast_context_tools {
+        Some(read_or_create_constraint_file(
+            &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
+            CODEY_FASTCTX_GUIDANCE,
+        )?)
+    } else {
+        None
+    };
+    let snapshots = snapshot_runtime_agent_files(&constraints_dir)?;
 
-fn commit_runtime_subagent_snapshot(
-    marker: &Path,
-    state: &RuntimeConfigLease,
-    applied_path: &Path,
-    previous_applied: &[u8],
-    updated_applied: &[u8],
-) -> Result<()> {
-    atomic_write(applied_path, updated_applied)?;
-    if let Err(lease_error) = write_lease(marker, state) {
-        if let Err(rollback_error) = atomic_write(applied_path, previous_applied) {
+    let update = (|| -> Result<()> {
+        let registrations = prepare_runtime_agent_files(
+            &constraints_dir,
+            &runtime_roles,
+            fastctx_instructions.as_deref(),
+        )?;
+        verify_runtime_agent_files(&registrations, &runtime_roles)?;
+        state.subagent_model.clone_from(&config.subagent_model);
+        state
+            .subagent_reasoning_effort
+            .clone_from(&config.subagent_reasoning_effort);
+        state.subagent_roles.clone_from(&runtime_roles);
+        write_lease(marker, &state)
+    })();
+
+    if let Err(error) = update {
+        if let Err(rollback_error) =
+            restore_runtime_agent_files_and_lease(&snapshots, marker, &original_lease)
+        {
             anyhow::bail!(
-                "更新 Codey 子代理运行时租约失败：{lease_error:#}；\
-                 恢复已应用配置快照也失败：{rollback_error:#}"
+                "更新 Codey 子代理运行时文件失败：{error:#}；回滚运行时文件也失败：{rollback_error:#}"
             );
         }
-        return Err(lease_error).context("更新 Codey 子代理运行时租约失败；已恢复原快照");
+        return Err(error).context("更新 Codey 子代理运行时文件失败；已恢复原配置");
     }
     Ok(())
 }
 
-fn wait_for_subagent_defaults_in_config(
-    config_path: &Path,
-    model: &str,
-    reasoning_effort: &str,
-) -> Result<Vec<u8>> {
-    let deadline = Instant::now() + Duration::from_millis(SUBAGENT_DEFAULTS_VERIFY_TIMEOUT_MS);
-    loop {
-        let error = match read_subagent_defaults_config(config_path, model, reasoning_effort) {
-            Ok(Some(bytes)) => return Ok(bytes),
-            Ok(None) => "Codex config.toml 尚未写入新的子代理默认配置".to_string(),
-            Err(error) => format!("{error:#}"),
-        };
-        if Instant::now() >= deadline {
-            anyhow::bail!("{error}");
-        }
-        thread::sleep(Duration::from_millis(SUBAGENT_DEFAULTS_VERIFY_POLL_MS));
-    }
+fn snapshot_runtime_agent_files(constraints_dir: &Path) -> Result<Vec<RuntimeAgentFileSnapshot>> {
+    SUBAGENT_ROLE_IDS
+        .into_iter()
+        .map(|role| {
+            let path = runtime_agent_path(constraints_dir, role);
+            let contents = read_optional(&path)?;
+            Ok(RuntimeAgentFileSnapshot { path, contents })
+        })
+        .collect()
 }
 
-fn read_subagent_defaults_config(
-    config_path: &Path,
-    model: &str,
-    reasoning_effort: &str,
-) -> Result<Option<Vec<u8>>> {
-    let bytes = fs::read(config_path)
-        .with_context(|| format!("读取 Codex 配置失败：{}", config_path.display()))?;
-    let current = String::from_utf8(bytes.clone()).context("Codex config.toml 不是 UTF-8")?;
-    let document = current
-        .parse::<DocumentMut>()
-        .context("解析 Codex config.toml 失败")?;
-    let agents = document
-        .get("agents")
-        .and_then(Item::as_table)
-        .context("Codex config.toml 缺少 [agents] 配置")?;
-    let matches_defaults = agents.get("default_subagent_model").and_then(Item::as_str)
-        == Some(model)
-        && agents
-            .get("default_subagent_reasoning_effort")
-            .and_then(Item::as_str)
-            == Some(reasoning_effort);
-    Ok(matches_defaults.then_some(bytes))
+fn verify_runtime_agent_files(
+    registrations: &[RuntimeAgentRegistration],
+    roles: &BTreeMap<String, SubagentRoleConfig>,
+) -> Result<()> {
+    anyhow::ensure!(
+        registrations.len() == SUBAGENT_ROLE_IDS.len(),
+        "Codey 子代理运行时文件数量不完整"
+    );
+    for registration in registrations {
+        let expected = roles
+            .get(&registration.role)
+            .with_context(|| format!("缺少 Codey 子代理任务类型配置：{}", registration.role))?;
+        let contents = fs::read_to_string(&registration.config_file).with_context(|| {
+            format!(
+                "读取 Codey 子代理运行时文件失败：{}",
+                registration.config_file.display()
+            )
+        })?;
+        let document = contents.parse::<DocumentMut>().with_context(|| {
+            format!(
+                "验证 Codey 子代理运行时文件失败：{}",
+                registration.config_file.display()
+            )
+        })?;
+        let expected_model = expected.model.trim();
+        let expected_effort = expected.reasoning_effort.trim().to_ascii_lowercase();
+        anyhow::ensure!(
+            document.get("name").and_then(Item::as_str) == Some(registration.role.as_str())
+                && document.get("model").and_then(Item::as_str) == Some(expected_model)
+                && document
+                    .get("model_reasoning_effort")
+                    .and_then(Item::as_str)
+                    == Some(expected_effort.as_str()),
+            "Codey 子代理运行时文件校验不一致：{}",
+            registration.role
+        );
+    }
+    Ok(())
+}
+
+fn restore_runtime_agent_files_and_lease(
+    snapshots: &[RuntimeAgentFileSnapshot],
+    marker: &Path,
+    original_lease: &[u8],
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for snapshot in snapshots {
+        if let Err(error) = restore_optional_bytes(&snapshot.path, snapshot.contents.as_deref()) {
+            failures.push(format!("{}：{error:#}", snapshot.path.display()));
+        }
+    }
+    if let Err(error) = atomic_write(marker, original_lease) {
+        failures.push(format!("{}：{error:#}", marker.display()));
+    }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("；"));
+    Ok(())
 }
 
 pub fn restore_runtime_provider_config(home: &Path) -> Result<bool> {

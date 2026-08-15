@@ -93,50 +93,6 @@ fn failed_lease_marker_removal_keeps_the_recovery_backup() {
 }
 
 #[test]
-fn failed_subagent_lease_write_restores_the_previous_applied_snapshot() {
-    let temp = tempfile::tempdir().unwrap();
-    let marker = temp.path().join("codex-lease.json");
-    let backup_dir = temp.path().join("codex-backups/active");
-    let applied_path = backup_dir.join(APPLIED_CONFIG_FILE);
-    fs::create_dir_all(&marker).unwrap();
-    fs::create_dir_all(&backup_dir).unwrap();
-    fs::write(&applied_path, b"previous applied").unwrap();
-    let state = RuntimeConfigLease {
-        backup_dir,
-        config_snapshot_dir: None,
-        original_config_exists: true,
-        preserve_provider_route: false,
-        protocol_proxy_base_url: None,
-        fastctx_command: None,
-        subagent_optimization_applied: true,
-        subagent_model: "provider-coder".into(),
-        subagent_reasoning_effort: "high".into(),
-        original_agents_md_exists: false,
-        original_default_agent_exists: false,
-        original_agents_dir_exists: false,
-        provider_id: Some(GLOBAL_PROVIDER_ID.into()),
-        applied_base_url: None,
-        isolated_runtime_constraints: false,
-        runtime_hooks_applied: false,
-        original_hooks_file_exists: false,
-    };
-
-    let error = commit_runtime_subagent_snapshot(
-        &marker,
-        &state,
-        &applied_path,
-        b"previous applied",
-        b"updated applied",
-    )
-    .unwrap_err()
-    .to_string();
-
-    assert!(error.contains("已恢复原快照"));
-    assert_eq!(fs::read(&applied_path).unwrap(), b"previous applied");
-    assert!(marker.is_dir());
-}
-
-#[test]
 fn stale_backup_dirs_are_pruned_beyond_retention() {
     let temp = tempfile::tempdir().unwrap();
     let backup_root = temp.path().join("codex-backups");
@@ -204,6 +160,7 @@ fn write_legacy_runtime_lease(
             subagent_optimization_applied: false,
             subagent_model: String::new(),
             subagent_reasoning_effort: String::new(),
+            subagent_roles: BTreeMap::new(),
             original_agents_md_exists: false,
             original_default_agent_exists: false,
             original_agents_dir_exists: false,
@@ -1792,14 +1749,17 @@ developer_instructions = {}
 }
 
 #[test]
-fn hot_reloaded_subagent_defaults_are_adopted_by_runtime_lease() {
+fn runtime_subagent_roles_refresh_in_place_for_the_next_spawn() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
     let marker = temp.path().join("codey/codex-lease.json");
     let backup_root = temp.path().join("codey/codex-backups");
     fs::create_dir_all(&home).unwrap();
-    let original_config = b"model_provider = \"codey_global\"\n\n[agents]\ncustom = \"keep\"\n\n[model_providers.codey_global]\nbase_url = \"https://chatgpt.com/backend-api/codex\"\n";
-    fs::write(home.join("config.toml"), original_config).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "model_provider = \"codey_global\"\n",
+    )
+    .unwrap();
 
     apply_runtime_provider_config_at_mode(
         &home,
@@ -1812,39 +1772,50 @@ fn hot_reloaded_subagent_defaults_are_adopted_by_runtime_lease() {
     )
     .unwrap();
 
-    let mut current = fs::read_to_string(home.join("config.toml"))
-        .unwrap()
-        .parse::<DocumentMut>()
-        .unwrap();
-    current["agents"]["default_subagent_model"] = value("provider-coder");
-    current["agents"]["default_subagent_reasoning_effort"] = value("high");
-    fs::write(home.join("config.toml"), document_string(&current).unwrap()).unwrap();
-
-    mark_runtime_subagent_defaults_applied_at(&home, &marker, "provider-coder", "high").unwrap();
-
-    let state =
+    let mut lease =
         serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap()).unwrap();
-    assert_eq!(state.subagent_model, "provider-coder");
-    assert_eq!(state.subagent_reasoning_effort, "high");
-    let snapshot_dir = state
-        .config_snapshot_dir
-        .as_deref()
-        .unwrap_or(&state.backup_dir);
-    let applied = fs::read_to_string(snapshot_dir.join(APPLIED_CONFIG_FILE))
-        .unwrap()
-        .parse::<DocumentMut>()
-        .unwrap();
-    assert_eq!(
-        applied["agents"]["default_subagent_model"].as_str(),
-        Some("provider-coder")
-    );
-    assert_eq!(
-        applied["agents"]["default_subagent_reasoning_effort"].as_str(),
-        Some("high")
-    );
+    lease.isolated_runtime_constraints = true;
+    write_lease(&marker, &lease).unwrap();
 
-    assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
-    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
+    let mut config = CodeyConfig::default();
+    config.subagent_optimization = true;
+    config.fast_context_tools = false;
+    for (index, role) in SUBAGENT_ROLE_IDS.into_iter().enumerate() {
+        config.subagent_roles.insert(
+            role.to_string(),
+            SubagentRoleConfig::new(
+                format!("provider-role-{index}"),
+                if index % 2 == 0 { "low" } else { "high" },
+            ),
+        );
+    }
+    config = config.normalize();
+
+    refresh_runtime_subagent_roles_at(&config, &marker).unwrap();
+
+    let constraints_dir = marker.parent().unwrap().join(CODEY_CONSTRAINTS_DIR);
+    for role in SUBAGENT_ROLE_IDS {
+        let document = fs::read_to_string(runtime_agent_path(&constraints_dir, role))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let expected = &config.subagent_roles[role];
+        assert_eq!(document["name"].as_str(), Some(role));
+        assert_eq!(document["model"].as_str(), Some(expected.model.as_str()));
+        assert_eq!(
+            document["model_reasoning_effort"].as_str(),
+            Some(expected.reasoning_effort.as_str())
+        );
+    }
+    let refreshed =
+        serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap()).unwrap();
+    assert!(refreshed.isolated_runtime_constraints);
+    assert_eq!(refreshed.subagent_roles, config.subagent_roles);
+    assert_eq!(refreshed.subagent_model, config.subagent_model);
+    assert_eq!(
+        refreshed.subagent_reasoning_effort,
+        config.subagent_reasoning_effort
+    );
 }
 
 #[test]

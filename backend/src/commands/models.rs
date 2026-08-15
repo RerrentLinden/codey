@@ -4,8 +4,8 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::{
-    AppState, STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT, redacted_config,
-    runtime_config_requires_restart, save_config_to_store,
+    AppState, STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT, hot_reload_runtime_subagent_config,
+    redacted_config, runtime_config_requires_restart, save_config_to_store,
 };
 use crate::cc_switch;
 use crate::cdp;
@@ -33,6 +33,24 @@ impl ModelHotReloadOutcome {
         }
         response
     }
+}
+
+fn add_subagent_hot_reload_to_response(
+    mut response: Value,
+    outcome: Option<Result<(), String>>,
+) -> Value {
+    let (reloaded, error) = match outcome {
+        Some(Ok(())) => (true, None),
+        Some(Err(error)) => (false, Some(error)),
+        None => (false, None),
+    };
+    if let Some(object) = response.as_object_mut() {
+        object.insert("subagentConfigHotReloaded".into(), Value::Bool(reloaded));
+        if let Some(error) = error {
+            object.insert("subagentConfigHotReloadError".into(), Value::String(error));
+        }
+    }
+    response
 }
 
 pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Value, String> {
@@ -423,14 +441,18 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
     *state.config.write().await = next.clone();
     drop(_config_write_guard);
     let hot_reload = hot_reload_runtime_models(state, &next, &model_state).await;
+    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &next).await;
     let restart_required = runtime_config_requires_restart(state, &next).await;
-    Ok(hot_reload.add_to_response(json!({
-        "status":"ok",
-        "models":fetched_models,
-        "modelState":model_state,
-        "modelCatalogFallback":model_catalog_fallback,
-        "restartRequired":restart_required,
-    })))
+    Ok(add_subagent_hot_reload_to_response(
+        hot_reload.add_to_response(json!({
+            "status":"ok",
+            "models":fetched_models,
+            "modelState":model_state,
+            "modelCatalogFallback":model_catalog_fallback,
+            "restartRequired":restart_required,
+        })),
+        subagent_hot_reload,
+    ))
 }
 
 pub async fn save_selected_models(
@@ -541,14 +563,18 @@ pub async fn save_selected_models(
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
     let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
-    Ok(hot_reload.add_to_response(json!({
-        "status":"ok",
-        "config":public_config,
-        "modelState":model_state,
-        "modelCatalogFallback":model_catalog_fallback,
-        "restartRequired":restart_required,
-    })))
+    Ok(add_subagent_hot_reload_to_response(
+        hot_reload.add_to_response(json!({
+            "status":"ok",
+            "config":public_config,
+            "modelState":model_state,
+            "modelCatalogFallback":model_catalog_fallback,
+            "restartRequired":restart_required,
+        })),
+        subagent_hot_reload,
+    ))
 }
 
 fn validate_requested_model_list_bounds(label: &str, models: &[String]) -> Result<(), String> {

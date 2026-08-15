@@ -1391,8 +1391,11 @@ impl CodeyRuntime {
         *self.applied_subagent_config.write().await = RuntimeSubagentConfig::from_config(config);
     }
 
-    pub fn supports_subagent_defaults_hot_reload(&self) -> bool {
-        !self.isolated_runtime_constraints
+    pub fn supports_subagent_config_hot_reload(&self, config: &CodeyConfig) -> bool {
+        self.applied_config.subagent_optimization
+            && config.subagent_optimization
+            && self.applied_config.fast_context_tools == config.fast_context_tools
+            && self.applied_config.active_profile() == config.active_profile()
     }
 
     pub fn set_crashpad_pending_protection(&self, enabled: bool) {

@@ -79,8 +79,7 @@ use crate::account_usage;
 use crate::cc_switch;
 use crate::cdp;
 use crate::codex_config::{
-    FastContextToolsStatus, codex_home, fast_context_tools_status,
-    mark_runtime_subagent_defaults_applied,
+    FastContextToolsStatus, codex_home, fast_context_tools_status, refresh_runtime_subagent_roles,
 };
 use crate::config::{
     CodeyConfig, ConfigStore, PromptOptimizationConfig, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
@@ -772,7 +771,7 @@ async fn save_codey_config_input(
 struct SavedCodeyConfig {
     config: CodeyConfig,
     restart_required: bool,
-    refresh_subagent_defaults: bool,
+    refresh_subagent_config: bool,
     fast_context_tools_status: FastContextToolsStatus,
 }
 
@@ -850,11 +849,15 @@ async fn save_codey_config_locked(
     {
         subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     }
-    // Per-task agent files are composed at process startup. Updating only the
-    // legacy scalar defaults through config/batchWrite would leave the other
-    // role files stale, so every role change intentionally follows the normal
-    // restart-required path.
-    let refresh_subagent_defaults = false;
+    // Codex resolves role declarations at startup but reads each registered
+    // config_file again when spawning a child. Rebuild the stable runtime files
+    // only when an already-enabled policy changed; enabling or disabling the
+    // feature itself still requires a restart to register/unregister tools and
+    // hooks.
+    let refresh_subagent_config = previous.subagent_optimization
+        && config.subagent_optimization
+        && RuntimeSubagentConfig::from_config(&previous)
+            != RuntimeSubagentConfig::from_config(&config);
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let restart_required = runtime_config_requires_restart(state, &config).await;
     let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
@@ -897,7 +900,7 @@ async fn save_codey_config_locked(
     Ok(SavedCodeyConfig {
         config,
         restart_required,
-        refresh_subagent_defaults,
+        refresh_subagent_config,
         fast_context_tools_status,
     })
 }
@@ -959,17 +962,17 @@ async fn finish_codey_config_save(
         runtime.set_crashpad_pending_protection(saved.config.protect_crashpad_pending);
     }
     schedule_crashpad_pending_refresh(state, saved.config.protect_crashpad_pending);
-    let mut subagent_defaults_hot_reloaded = false;
-    let mut subagent_defaults_hot_reload_error = None;
-    if saved.refresh_subagent_defaults
-        && let Some(result) = hot_reload_runtime_subagent_defaults(state, &saved.config).await
+    let mut subagent_config_hot_reloaded = false;
+    let mut subagent_config_hot_reload_error = None;
+    if saved.refresh_subagent_config
+        && let Some(result) = hot_reload_runtime_subagent_config(state, &saved.config).await
     {
         match result {
-            Ok(()) => subagent_defaults_hot_reloaded = true,
-            Err(error) => subagent_defaults_hot_reload_error = Some(error),
+            Ok(()) => subagent_config_hot_reloaded = true,
+            Err(error) => subagent_config_hot_reload_error = Some(error),
         }
     }
-    let restart_required = if saved.refresh_subagent_defaults {
+    let restart_required = if saved.refresh_subagent_config {
         runtime_config_requires_restart(state, &saved.config).await
     } else {
         saved.restart_required
@@ -984,8 +987,11 @@ async fn finish_codey_config_save(
         "modelState":model_state,
         "fastContextToolsStatus":saved.fast_context_tools_status,
         "restartRequired":restart_required,
-        "subagentDefaultsHotReloaded":subagent_defaults_hot_reloaded,
-        "subagentDefaultsHotReloadError":subagent_defaults_hot_reload_error,
+        "subagentConfigHotReloaded":subagent_config_hot_reloaded,
+        "subagentConfigHotReloadError":subagent_config_hot_reload_error.clone(),
+        // Keep the original response keys for older injected consoles.
+        "subagentDefaultsHotReloaded":subagent_config_hot_reloaded,
+        "subagentDefaultsHotReloadError":subagent_config_hot_reload_error,
     }))
 }
 
@@ -1060,29 +1066,57 @@ fn subagent_hot_reload_commit_is_current(
         && !has_startup_error
 }
 
-async fn hot_reload_runtime_subagent_defaults(
+pub(super) async fn hot_reload_runtime_subagent_config(
     state: &Arc<AppState>,
     config: &CodeyConfig,
 ) -> Option<Result<(), String>> {
     let runtime = state.runtime.lock().await.clone()?;
-    if !runtime.supports_subagent_defaults_hot_reload() {
+    if !runtime.supports_subagent_config_hot_reload(config) {
+        return None;
+    }
+    let desired_config = RuntimeSubagentConfig::from_config(config);
+    if runtime.applied_subagent_config().await == desired_config {
         return None;
     }
     let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
-    let websocket_url = runtime.renderer_websocket_url().await;
-    let result = cdp::refresh_subagent_defaults(
-        &websocket_url,
-        &config.subagent_model,
-        &config.subagent_reasoning_effort,
-    )
-    .await;
+    // Runtime role files are small and each individual write is atomic. Hold
+    // the lifecycle lock across the group so stop/restart cannot swap the lease
+    // while it is being committed.
+    let _runtime_operation = state.runtime_operation.lock().await;
+    let current_runtime = state.runtime.lock().await.clone();
+    let same_runtime = current_runtime
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, &runtime));
+    let current_generation = state.runtime_generation.load(Ordering::Acquire);
+    let current_config = state.config.read().await;
+    let config_matches = current_config.subagent_optimization
+        && RuntimeSubagentConfig::from_config(&current_config) == desired_config
+        && current_config.fast_context_tools == config.fast_context_tools;
+    drop(current_config);
+    let has_startup_error = state.startup_error.read().await.is_some();
+    if !subagent_hot_reload_commit_is_current(
+        state.is_shutting_down(),
+        state.restart_in_progress.load(Ordering::Acquire),
+        runtime_generation,
+        current_generation,
+        same_runtime,
+        config_matches,
+        has_startup_error,
+    ) {
+        return Some(Err(
+            "Codex 运行时在子代理配置热更新前发生变化；已跳过过期配置".to_string(),
+        ));
+    }
+
+    let runtime_config = config.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        refresh_runtime_subagent_roles(&runtime_config).map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("子代理运行时文件更新任务异常退出：{error}"))
+    .and_then(std::convert::identity);
     match result {
         Ok(()) => {
-            // CDP may wait for the renderer. Acquire the lifecycle lock only
-            // for the final lease commit so stop/restart stays responsive while
-            // the request is in flight, but cannot restore the lease in parallel
-            // with the commit below.
-            let _runtime_operation = state.runtime_operation.lock().await;
             let current_runtime = state.runtime.lock().await.clone();
             let same_runtime = current_runtime
                 .as_ref()
@@ -1090,8 +1124,8 @@ async fn hot_reload_runtime_subagent_defaults(
             let current_generation = state.runtime_generation.load(Ordering::Acquire);
             let current_config = state.config.read().await;
             let config_matches = current_config.subagent_optimization
-                && current_config.subagent_model == config.subagent_model
-                && current_config.subagent_reasoning_effort == config.subagent_reasoning_effort;
+                && RuntimeSubagentConfig::from_config(&current_config) == desired_config
+                && current_config.fast_context_tools == config.fast_context_tools;
             drop(current_config);
             let has_startup_error = state.startup_error.read().await.is_some();
             if !subagent_hot_reload_commit_is_current(
@@ -1104,30 +1138,8 @@ async fn hot_reload_runtime_subagent_defaults(
                 has_startup_error,
             ) {
                 return Some(Err(
-                    "Codex 运行时在子代理默认配置热更新期间发生变化；已跳过过期租约提交"
-                        .to_string(),
+                    "Codex 运行时在子代理配置热更新期间发生变化；已跳过过期运行时提交".to_string(),
                 ));
-            }
-            let home = codex_home();
-            let model = config.subagent_model.clone();
-            let reasoning_effort = config.subagent_reasoning_effort.clone();
-            if let Err(error) = tokio::task::spawn_blocking(move || {
-                mark_runtime_subagent_defaults_applied(&home, &model, &reasoning_effort)
-            })
-            .await
-            .map_err(|error| format!("子代理运行时租约更新任务异常退出：{error}"))
-            .and_then(|result| result.map_err(|error| format!("{error:#}")))
-            {
-                error_log::record_failure(
-                    "patch_verification_failed",
-                    "adopt_subagent_defaults_lease",
-                    error.clone(),
-                    json!({
-                        "model": config.subagent_model,
-                        "reasoningEffort": config.subagent_reasoning_effort,
-                    }),
-                );
-                return Some(Err(error));
             }
             runtime.mark_subagent_config_applied(config).await;
             Some(Ok(()))
@@ -1136,12 +1148,10 @@ async fn hot_reload_runtime_subagent_defaults(
             let error = format!("{error:#}");
             error_log::record_failure(
                 "patch_verification_failed",
-                "refresh_subagent_defaults",
+                "refresh_subagent_runtime_files",
                 error.clone(),
                 json!({
-                    "model": config.subagent_model,
-                    "reasoningEffort": config.subagent_reasoning_effort,
-                    "websocketUrl": websocket_url,
+                    "roleCount": config.subagent_roles.len(),
                 }),
             );
             Some(Err(error))

@@ -275,6 +275,8 @@ export function App({
       ccSwitch?: CcSwitchStatus;
       modelState?: ModelState;
       restartRequired?: boolean;
+      subagentConfigHotReloaded?: boolean;
+      subagentConfigHotReloadError?: string;
       subagentDefaultsHotReloaded?: boolean;
       subagentDefaultsHotReloadError?: string;
       fastContextToolsStatus?: FastContextToolsStatus;
@@ -430,15 +432,20 @@ export function App({
     if (!config) return;
     await runOperation("save", async () => {
       const result = await persist(config);
+      const subagentHotReloaded = Boolean(
+        result.subagentConfigHotReloaded ??
+          result.subagentDefaultsHotReloaded,
+      );
       const subagentHotReloadFailed = Boolean(
-        result.subagentDefaultsHotReloadError,
+        result.subagentConfigHotReloadError ??
+          result.subagentDefaultsHotReloadError,
       );
       setNotice({
         tone:
           result.restartRequired || subagentHotReloadFailed
             ? "info"
             : "success",
-        text: result.subagentDefaultsHotReloaded
+        text: subagentHotReloaded
           ? "Codey 设置已保存；子代理模型和思考深度已实时更新"
           : subagentHotReloadFailed
             ? "Codey 设置已保存；子代理配置暂未能热更新，重启 Codex 后生效"

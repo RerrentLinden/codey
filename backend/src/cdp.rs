@@ -652,68 +652,6 @@ pub async fn refresh_model_whitelist(
     verify_model_whitelist_refresh_response(&response)
 }
 
-pub async fn refresh_subagent_defaults(
-    websocket_url: &str,
-    model: &str,
-    reasoning_effort: &str,
-) -> Result<()> {
-    let response = codey_runtime_core::bridge::evaluate_script_with_await_promise(
-        websocket_url,
-        &subagent_defaults_refresh_script(model, reasoning_effort),
-        true,
-    )
-    .await
-    .context("请求 Codex 热更新子代理默认配置失败")?;
-    verify_subagent_defaults_refresh_response(&response)
-}
-
-fn subagent_defaults_refresh_script(model: &str, reasoning_effort: &str) -> String {
-    let model = serde_json::to_string(model).expect("subagent model should serialize");
-    let reasoning_effort =
-        serde_json::to_string(reasoning_effort).expect("reasoning effort should serialize");
-    format!(
-        r#"(async () => {{
-  const defaults = {{ model: {model}, reasoningEffort: {reasoning_effort} }};
-  let lastError = "子代理运行时补丁尚未就绪";
-  for (const delay of [0, 80, 200, 500]) {{
-    if (delay > 0) {{
-      await new Promise((resolve) => window.setTimeout(resolve, delay));
-    }}
-    const applyDefaults = window.__codeyApplySubagentDefaults;
-    if (typeof applyDefaults !== "function") {{
-      continue;
-    }}
-    try {{
-      const result = await applyDefaults(defaults);
-      if (result?.applied === true) {{
-        return JSON.stringify({{ ok: true, result }});
-      }}
-      lastError = result?.error || "Codex 未确认子代理默认配置已更新";
-    }} catch (error) {{
-      lastError = error instanceof Error ? error.message : String(error);
-    }}
-  }}
-  return JSON.stringify({{ ok: false, error: lastError }});
-}})()"#
-    )
-}
-
-fn verify_subagent_defaults_refresh_response(response: &serde_json::Value) -> Result<()> {
-    let payload = runtime_value(response)
-        .and_then(serde_json::Value::as_str)
-        .context("Codex 子代理默认配置热更新未返回可解析结果")?;
-    let report = serde_json::from_str::<serde_json::Value>(payload)
-        .context("解析 Codex 子代理默认配置热更新结果失败")?;
-    if report.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-        return Ok(());
-    }
-    let error = report
-        .get("error")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("子代理默认配置刷新结果未通过校验");
-    anyhow::bail!("Codex 子代理默认配置热更新失败：{error}")
-}
-
 fn model_whitelist_refresh_script(
     expected_models: &[String],
     expected_default_model: &str,
@@ -1238,17 +1176,6 @@ mod tests {
         });
         let error = verify_model_whitelist_refresh_response(&mismatch).unwrap_err();
         assert!(format!("{error:#}").contains("快照与已保存配置不一致"));
-    }
-
-    #[test]
-    fn subagent_defaults_refresh_script_uses_renderer_runtime_bridge() {
-        let script = subagent_defaults_refresh_script("provider-\"quoted", "xhigh");
-
-        assert!(script.contains("window.__codeyApplySubagentDefaults"));
-        assert!(script.contains(r#"provider-\"quoted"#));
-        assert!(script.contains(r#"reasoningEffort: "xhigh""#));
-        assert!(script.contains("[0, 80, 200, 500]"));
-        assert!(script.contains("result?.applied === true"));
     }
 
     #[test]

@@ -54,6 +54,8 @@ type ModelRuntimeUpdate = {
   restartRequired?: boolean;
   modelHotReloaded?: boolean;
   modelHotReloadError?: string;
+  subagentConfigHotReloaded?: boolean;
+  subagentConfigHotReloadError?: string;
   modelCatalogFallback?: boolean;
 };
 
@@ -329,14 +331,19 @@ export function useModelSelection({
       setModelPickerVisible(false);
     }
     setDeletedThirdPartyModels([]);
-    const hotReloadFailed = Boolean(result.modelHotReloadError);
+    const hotReloadFailed = Boolean(
+      result.modelHotReloadError || result.subagentConfigHotReloadError,
+    );
+    const subagentSuffix = result.subagentConfigHotReloaded
+      ? "；受影响的子代理角色也已同步"
+      : "";
     setNotice({
       tone:
         hotReloadFailed || result.restartRequired ? "info" : "success",
       text: result.modelHotReloaded
         ? result.restartRequired
           ? `${summary}；Codex 模型列表已立即更新，其他设置仍需重启`
-          : `${summary}；Codex 模型列表已立即更新`
+          : `${summary}；Codex 模型列表已立即更新${subagentSuffix}`
         : hotReloadFailed || result.restartRequired
           ? `${summary}；当前 Codex 模型列表暂未能刷新，重启 Codex 后生效`
           : summary,

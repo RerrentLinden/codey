@@ -499,9 +499,7 @@ fn codex_executable_product_version(_app_dir: &Path) -> Option<String> {
 
 #[cfg(any(windows, test))]
 fn normalize_version_value(value: &str) -> Option<String> {
-    let value = value
-        .trim()
-        .trim_start_matches(|character| character == 'v' || character == 'V');
+    let value = value.trim().trim_start_matches(['v', 'V']);
     is_version_like(value).then(|| value.to_string())
 }
 

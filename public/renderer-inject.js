@@ -1148,54 +1148,6 @@
     return sessionToolsLoadPromise;
   };
 
-  const normalizeSubagentDefaults = (defaults) => {
-    const model = String(defaults?.model || "").trim();
-    const reasoningEffort = String(defaults?.reasoningEffort || "").trim().toLowerCase();
-    if (!model || !["low", "medium", "high", "xhigh", "max", "ultra"].includes(reasoningEffort)) {
-      return null;
-    }
-    return { model, reasoningEffort };
-  };
-
-  window.__codeyApplySubagentDefaults = async (defaults) => {
-    const normalized = normalizeSubagentDefaults(defaults);
-    if (!normalized) {
-      throw new Error("子代理模型或思考深度无效");
-    }
-    if (!await loadSessionTools()) {
-      throw new Error(window.__codeySessionToolsError || "Codex 会话工具尚未就绪");
-    }
-    const loadDispatcher = window.__codeyLoadCodexSignalDispatcher;
-    if (typeof loadDispatcher !== "function") {
-      throw new Error("Codex app-server 配置接口尚未就绪");
-    }
-    const dispatcher = await loadDispatcher();
-    await dispatcher("send-cli-request-for-host", {
-      hostId: "local",
-      method: "config/batchWrite",
-      params: {
-        edits: [
-          {
-            keyPath: "agents.default_subagent_model",
-            value: normalized.model,
-            mergeStrategy: "upsert",
-          },
-          {
-            keyPath: "agents.default_subagent_reasoning_effort",
-            value: normalized.reasoningEffort,
-            mergeStrategy: "upsert",
-          },
-        ],
-        reloadUserConfig: true,
-      },
-    });
-    return {
-      applied: true,
-      futureThreads: true,
-      reloadedUserConfig: true,
-    };
-  };
-
   const loadSessionToolsFromInteraction = (event) => {
     const target = event?.target instanceof Element
       ? event.target
