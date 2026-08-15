@@ -67,10 +67,12 @@ test("subagent optimization exposes per-task model and reasoning controls", asyn
 });
 
 test("per-task subagent files are composed at startup and hot-refreshed after save", async () => {
-  const [commandSource, configSource, launcherSource] = await Promise.all([
+  const [commandSource, configSource, launcherSource, rendererSource, vendorRendererSource] = await Promise.all([
     readFile(new URL("backend/src/commands.rs", root), "utf8"),
     readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
     readFile(new URL("backend/src/launcher.rs", root), "utf8"),
+    readFile(new URL("public/renderer-inject.js", root), "utf8"),
+    readFile(new URL("vendor/CodeyRuntime/assets/inject/renderer-inject.js", root), "utf8"),
   ]);
 
   assert.match(commandSource, /hot_reload_runtime_subagent_config/);
@@ -89,6 +91,9 @@ test("per-task subagent files are composed at startup and hot-refreshed after sa
   assert.match(configSource, /restore_runtime_agent_files_and_lease/);
   assert.match(launcherSource, /subagent_roles: Some\(&subagent_roles\)/);
   assert.match(launcherSource, /supports_subagent_config_hot_reload/);
+  assert.doesNotMatch(rendererSource, /__codeyApplySubagentDefaults/);
+  assert.doesNotMatch(vendorRendererSource, /__codeyApplySubagentDefaults/);
+  assert.doesNotMatch(vendorRendererSource, /patchAppServerSubagentRequestParams/);
 });
 
 test("subagent optimization installs root waiting and nested-spawn runtime gates", async () => {

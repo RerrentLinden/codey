@@ -4205,78 +4205,16 @@
     return result;
   }
 
-  const codeyAppServerRequestClients = new Set();
-  let codeySubagentDefaults = null;
-
-  function normalizedSubagentDefaults(defaults) {
-    const model = String(defaults?.model || "").trim();
-    const reasoningEffort = String(defaults?.reasoningEffort || "").trim().toLowerCase();
-    if (!model || !["low", "medium", "high", "xhigh", "max", "ultra"].includes(reasoningEffort)) {
-      return null;
-    }
-    return { model, reasoningEffort };
-  }
-
-  function mergeSubagentDefaultsIntoThreadParams(params) {
-    if (!codeySubagentDefaults) return params;
-    const source = params && typeof params === "object" ? params : {};
-    const config = source.config && typeof source.config === "object" ? source.config : {};
-    const agents = config.agents && typeof config.agents === "object" ? config.agents : {};
-    return {
-      ...source,
-      config: {
-        ...config,
-        agents: {
-          ...agents,
-          default_subagent_model: codeySubagentDefaults.model,
-          default_subagent_reasoning_effort: codeySubagentDefaults.reasoningEffort,
-        },
-      },
-    };
-  }
-
-  function patchAppServerSubagentRequestParams(method, params) {
-    if (!codeySubagentDefaults) return params;
-    const requestMethod = appServerModelRequestMethod(String(method || ""), params);
-    if (requestMethod !== "thread/start" && requestMethod !== "thread/resume") return params;
-    if (method === "send-cli-request-for-host") {
-      return {
-        ...(params || {}),
-        params: mergeSubagentDefaultsIntoThreadParams(params?.params),
-      };
-    }
-    return mergeSubagentDefaultsIntoThreadParams(params);
-  }
-
-  function appServerRequestFailure(result) {
-    const error = result?.error ?? result?.response?.error;
-    if (error) {
-      if (typeof error === "string") return error;
-      if (typeof error?.message === "string") return error.message;
-      try {
-        return JSON.stringify(error);
-      } catch {
-        return String(error);
-      }
-    }
-    if (result?.status === "error" || result?.ok === false) {
-      return String(result?.message || "Codex app-server 返回失败状态");
-    }
-    return "";
-  }
-
   function patchAppServerModelRequestClient(client) {
     if (!client || typeof client.sendRequest !== "function") return false;
-    codeyAppServerRequestClients.add(client);
     if (client.__codeyModelRequestPatch === codexAppServerModelRequestPatchVersion) return true;
     const originalSendRequest = client.__codeyModelOriginalSendRequest || client.sendRequest.bind(client);
     client.__codeyModelOriginalSendRequest = originalSendRequest;
     client.sendRequest = async function codeyModelPatchedSendRequest(method, params, options) {
-      const nextParams = patchAppServerSubagentRequestParams(method, params);
-      const result = await originalSendRequest(method, nextParams, options);
+      const result = await originalSendRequest(method, params, options);
       if (!codeyModelUnlockEnabled()) return result;
       if (!codexModelCatalogLoadedAt) await loadCodexModelCatalog();
-      return patchAppServerModelResult(appServerModelRequestMethod(String(method || ""), nextParams), result);
+      return patchAppServerModelResult(appServerModelRequestMethod(String(method || ""), params), result);
     };
     client.__codeyModelRequestPatch = codexAppServerModelRequestPatchVersion;
     return true;
@@ -4348,51 +4286,6 @@
     };
     void patch();
   }
-
-  window.__codeyApplySubagentDefaults = async function applyCodeySubagentDefaults(defaults) {
-    const normalized = normalizedSubagentDefaults(defaults);
-    if (!normalized) {
-      throw new Error("子代理模型或思考深度无效");
-    }
-    codeySubagentDefaults = normalized;
-    appServerModelRequestPatchDisabled = false;
-    appServerModelRequestPatchMissCount = 0;
-    for (const delay of [0, 80, 200, 500]) {
-      if (delay > 0) await new Promise((resolve) => window.setTimeout(resolve, delay));
-      installAppServerModelRequestPatch();
-      if (codeyAppServerRequestClients.size > 0) break;
-    }
-    const client = [...codeyAppServerRequestClients][0];
-    if (!client) {
-      throw new Error("Codex app-server 请求客户端尚未就绪");
-    }
-    const session = currentSessionRef();
-    const threadId = String(session?.session_id || "").replace(/^local:/, "").trim();
-    if (!threadId) {
-      return { applied: true, futureThreads: true, threadId: "" };
-    }
-    const threadParams = mergeSubagentDefaultsIntoThreadParams({ threadId });
-    try {
-      const result = await client.sendRequest("thread/resume", threadParams);
-      const failure = appServerRequestFailure(result);
-      if (failure) throw new Error(failure);
-    } catch (directError) {
-      try {
-        const result = await client.sendRequest("send-cli-request-for-host", {
-          hostId: session?.host_id || "local",
-          method: "thread/resume",
-          params: threadParams,
-        });
-        const failure = appServerRequestFailure(result);
-        if (failure) throw new Error(failure);
-      } catch (hostError) {
-        const directMessage = directError instanceof Error ? directError.message : String(directError);
-        const hostMessage = hostError instanceof Error ? hostError.message : String(hostError);
-        throw new Error(`当前任务热更新失败：${directMessage}；${hostMessage}`);
-      }
-    }
-    return { applied: true, futureThreads: true, threadId };
-  };
 
   function ensureCodexModelWhitelistInstalls() {
     if (!codeyModelUnlockEnabled()) return;

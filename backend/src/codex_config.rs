@@ -180,7 +180,6 @@ pub(crate) struct RuntimeProviderConfigOptions<'a> {
 pub(crate) struct AppliedRuntimeProviderConfig {
     pub config_contents: Vec<u8>,
     pub runtime_config_overrides: Vec<String>,
-    pub isolated_runtime_constraints: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
@@ -297,7 +296,6 @@ pub(crate) fn apply_runtime_provider_config(
     Ok(AppliedRuntimeProviderConfig {
         config_contents,
         runtime_config_overrides: Vec::new(),
-        isolated_runtime_constraints: false,
     })
 }
 
@@ -611,7 +609,6 @@ fn apply_isolated_cc_switch_runtime_config(
     Ok(AppliedRuntimeProviderConfig {
         config_contents: original_config.unwrap_or_default(),
         runtime_config_overrides,
-        isolated_runtime_constraints: true,
     })
 }
 

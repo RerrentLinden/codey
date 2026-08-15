@@ -1777,9 +1777,10 @@ fn runtime_subagent_roles_refresh_in_place_for_the_next_spawn() {
     lease.isolated_runtime_constraints = true;
     write_lease(&marker, &lease).unwrap();
 
-    let mut config = CodeyConfig::default();
-    config.subagent_optimization = true;
-    config.fast_context_tools = false;
+    let mut config = CodeyConfig {
+        subagent_optimization: true,
+        ..CodeyConfig::default()
+    };
     for (index, role) in SUBAGENT_ROLE_IDS.into_iter().enumerate() {
         config.subagent_roles.insert(
             role.to_string(),
@@ -1816,6 +1817,35 @@ fn runtime_subagent_roles_refresh_in_place_for_the_next_spawn() {
         refreshed.subagent_reasoning_effort,
         config.subagent_reasoning_effort
     );
+
+    let original_lease = fs::read(&marker).unwrap();
+    let original_runtime_files = SUBAGENT_ROLE_IDS
+        .into_iter()
+        .map(|role| {
+            let path = runtime_agent_path(&constraints_dir, role);
+            (path.clone(), fs::read(path).unwrap())
+        })
+        .collect::<Vec<_>>();
+    let mut invalid = config.clone();
+    for (index, role) in SUBAGENT_ROLE_IDS.into_iter().enumerate() {
+        invalid.subagent_roles.insert(
+            role.to_string(),
+            SubagentRoleConfig::new(format!("partial-update-{index}"), "medium"),
+        );
+    }
+    invalid
+        .subagent_roles
+        .get_mut(SUBAGENT_ROLE_DEFAULT)
+        .unwrap()
+        .reasoning_effort = "invalid".into();
+
+    let error = refresh_runtime_subagent_roles_at(&invalid, &marker).unwrap_err();
+
+    assert!(format!("{error:#}").contains("已恢复原配置"));
+    assert_eq!(fs::read(&marker).unwrap(), original_lease);
+    for (path, contents) in original_runtime_files {
+        assert_eq!(fs::read(path).unwrap(), contents);
+    }
 }
 
 #[test]
@@ -3484,7 +3514,6 @@ wire_api = "responses"
     )
     .unwrap();
 
-    assert!(applied.isolated_runtime_constraints);
     assert_eq!(applied.config_contents, original_config);
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
     assert!(!home.join("AGENTS.md").exists());

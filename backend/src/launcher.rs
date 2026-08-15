@@ -138,7 +138,6 @@ pub struct CodeyRuntime {
     crashpad_guard_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     crashpad_guard_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     protocol_proxy: Mutex<Option<ProtocolProxyHandle>>,
-    isolated_runtime_constraints: bool,
 }
 
 fn protocol_proxy_settings(
@@ -403,7 +402,6 @@ struct PreparedCodexStartupState {
     config_contents: Vec<u8>,
     runtime_config: CodeyConfig,
     runtime_config_overrides: Vec<String>,
-    isolated_runtime_constraints: bool,
 }
 
 async fn prepare_startup_model_catalog(
@@ -607,7 +605,6 @@ async fn prepare_codex_startup_state(
         config_contents: applied.config_contents,
         runtime_config: runtime_subagent_config,
         runtime_config_overrides: applied.runtime_config_overrides,
-        isolated_runtime_constraints: applied.isolated_runtime_constraints,
     })
 }
 
@@ -971,7 +968,6 @@ struct PreparedProviderState {
     applied_route_files: Option<RouteFilesSnapshot>,
     runtime_config: CodeyConfig,
     runtime_config_overrides: Vec<String>,
-    isolated_runtime_constraints: bool,
 }
 
 struct StartupPatchState {
@@ -1193,7 +1189,6 @@ async fn prepare_runtime_provider_state(
         applied_route_files,
         runtime_config: prepared_startup.runtime_config,
         runtime_config_overrides: prepared_startup.runtime_config_overrides,
-        isolated_runtime_constraints: prepared_startup.isolated_runtime_constraints,
     })
 }
 
@@ -1448,7 +1443,6 @@ impl CodeyRuntime {
             applied_route_files,
             runtime_config,
             runtime_config_overrides,
-            isolated_runtime_constraints,
         } = prepare_runtime_provider_state(&home, config, &route).await?;
         let patch =
             prepare_startup_patches_and_overlay(&home, config, applied_route_files.as_ref())
@@ -1522,7 +1516,6 @@ impl CodeyRuntime {
                 crashpad_guard_shutdown: Mutex::new(Some(crashpad_guard_shutdown)),
                 crashpad_guard_task: Mutex::new(Some(crashpad_guard_task)),
                 protocol_proxy: Mutex::new(protocol_proxy),
-                isolated_runtime_constraints,
             },
             codex_exit,
             patch.route_changed,
