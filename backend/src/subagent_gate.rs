@@ -81,7 +81,10 @@ pub(crate) fn hook_commands_for(argument: &str) -> Result<HookCommands> {
     let executable = std::env::current_exe().context("定位 Codey 子代理门禁程序失败")?;
     Ok(HookCommands {
         command: format!("{} {argument}", quote_posix(&executable)),
-        command_windows: format!("{} {argument}", quote_windows(&executable)),
+        command_windows: format!(
+            "{} {argument}",
+            powershell_executable_invocation(&executable)
+        ),
     })
 }
 
@@ -497,8 +500,8 @@ fn windows_path_to_wsl(path: &str) -> Option<String> {
     ))
 }
 
-fn quote_windows(path: &Path) -> String {
-    format!("\"{}\"", path.to_string_lossy().replace('"', "\\\""))
+fn powershell_executable_invocation(path: &Path) -> String {
+    format!("& '{}'", path.to_string_lossy().replace('\'', "''"))
 }
 
 fn canonical_json(value: &Value) -> Value {
@@ -807,6 +810,20 @@ mod tests {
             Some("/mnt/d/Apps/Codey.exe")
         );
         assert_eq!(windows_path_to_wsl("/Applications/Codey"), None);
+    }
+
+    #[test]
+    fn windows_hook_executable_paths_are_powershell_invocations() {
+        assert_eq!(
+            powershell_executable_invocation(Path::new(r"C:\Program Files\Codey\codey.exe")),
+            r#"& 'C:\Program Files\Codey\codey.exe'"#
+        );
+        assert_eq!(
+            powershell_executable_invocation(Path::new(
+                r"C:\Users\O'Brien\$Codey` Preview\codey.exe"
+            )),
+            r#"& 'C:\Users\O''Brien\$Codey` Preview\codey.exe'"#
+        );
     }
 
     #[test]

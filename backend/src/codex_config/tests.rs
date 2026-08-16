@@ -1399,12 +1399,9 @@ command = "echo preserve-user-hook"
             .unwrap()
             .contains(crate::subagent_gate::HOOK_ARGUMENT)
     );
-    assert!(
-        gate_handler["commandWindows"]
-            .as_str()
-            .unwrap()
-            .contains(crate::subagent_gate::HOOK_ARGUMENT)
-    );
+    let windows_command = gate_handler["commandWindows"].as_str().unwrap();
+    assert!(windows_command.starts_with("& '"), "{windows_command}");
+    assert!(windows_command.contains(crate::subagent_gate::HOOK_ARGUMENT));
     assert_eq!(
         gate_handler["timeout"].as_integer(),
         Some(crate::subagent_gate::HOOK_TIMEOUT_SECONDS as i64)
@@ -3812,6 +3809,17 @@ wire_api = "responses"
             .unwrap()
             .contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
     );
+    for (group_index, hook_argument) in [
+        (1, crate::subagent_gate::HOOK_ARGUMENT),
+        (2, crate::fastctx_route_gate::HOOK_ARGUMENT),
+    ] {
+        let windows_command =
+            hooks["hooks"]["PreToolUse"][group_index]["hooks"][0]["commandWindows"]
+                .as_str()
+                .unwrap();
+        assert!(windows_command.starts_with("& '"), "{windows_command}");
+        assert!(windows_command.contains(hook_argument));
+    }
     for event in [
         "PostToolUse",
         "SubagentStart",
