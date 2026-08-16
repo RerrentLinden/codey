@@ -13,7 +13,7 @@ fn chat_provider_builds_an_explicit_protocol_proxy_snapshot() {
         .default_model_by_provider
         .insert(profile.id.clone(), "deepseek-reasoner".to_string());
 
-    let settings = protocol_proxy_settings(&profile, config.default_model()).unwrap();
+    let settings = protocol_proxy_settings(&profile, config.default_model(), &[]).unwrap();
     let relay = settings.active_relay_profile();
     assert_eq!(settings.active_relay_id, profile.id);
     assert_eq!(relay.base_url, "https://relay.example/v1");
@@ -24,14 +24,26 @@ fn chat_provider_builds_an_explicit_protocol_proxy_snapshot() {
 }
 
 #[test]
-fn responses_provider_does_not_start_a_protocol_proxy() {
+fn responses_provider_starts_a_per_model_proxy_only_for_third_party_models() {
     let mut config = CodeyConfig::default();
     let mut profile = crate::config::ProviderProfile::new("Responses");
     profile.base_url = "https://relay.example/v1".to_string();
     config.active_profile_id = profile.id.clone();
     config.profiles = vec![profile.clone()];
 
-    assert!(protocol_proxy_settings(&profile, config.default_model()).is_none());
+    assert!(protocol_proxy_settings(&profile, config.default_model(), &[]).is_none());
+    // 即使目录里有第三方模型，无第三方模型的 Responses 线路保持直连。
+    let third_party = vec!["kimi-k2.6".to_string()];
+    assert!(
+        protocol_proxy_settings(&profile, config.default_model(), &third_party).is_some(),
+        "Responses 线路存在第三方模型时应启动按模型选路的本地代理"
+    );
+    let settings = protocol_proxy_settings(&profile, config.default_model(), &third_party).unwrap();
+    let relay = settings.active_relay_profile();
+    assert_eq!(relay.protocol, RelayProtocol::Responses);
+    assert_eq!(relay.chat_completions_models, vec!["kimi-k2.6".to_string()]);
+    assert_eq!(relay.base_url, "https://relay.example/v1");
+    assert_eq!(relay.relay_mode, RelayMode::PureApi);
 }
 
 #[cfg(target_os = "macos")]

@@ -143,10 +143,22 @@ pub struct CodeyRuntime {
 fn protocol_proxy_settings(
     profile: &ProviderProfile,
     default_model: Option<&str>,
+    third_party_models: &[String],
 ) -> Option<BackendSettings> {
-    if profile.cc_switch_read_only || profile.protocol != RelayProtocol::ChatCompletions {
+    if profile.cc_switch_read_only {
         return None;
     }
+    let chat_completions_models = match profile.protocol {
+        RelayProtocol::ChatCompletions => Vec::new(),
+        RelayProtocol::Responses => {
+            // Responses 线路只有在存在第三方模型（claude/kimi 等，通常不支持
+            // /v1/responses）时才经本地代理；官方模型逐请求直通，行为不变。
+            if third_party_models.is_empty() {
+                return None;
+            }
+            third_party_models.to_vec()
+        }
+    };
     let base_url = profile.normalized_base_url();
     let relay = RelayProfile {
         id: profile.id.clone(),
@@ -155,8 +167,9 @@ fn protocol_proxy_settings(
         base_url: base_url.clone(),
         upstream_base_url: base_url,
         api_key: profile.api_key.clone(),
-        protocol: RelayProtocol::ChatCompletions,
+        protocol: profile.protocol,
         relay_mode: RelayMode::PureApi,
+        chat_completions_models,
         ..RelayProfile::default()
     };
     Some(BackendSettings {
@@ -170,14 +183,15 @@ fn protocol_proxy_settings(
 async fn start_runtime_protocol_proxy(
     profile: &ProviderProfile,
     default_model: Option<&str>,
+    third_party_models: &[String],
 ) -> Result<Option<ProtocolProxyHandle>> {
-    let Some(settings) = protocol_proxy_settings(profile, default_model) else {
+    let Some(settings) = protocol_proxy_settings(profile, default_model, third_party_models) else {
         return Ok(None);
     };
     start_protocol_proxy(settings)
         .await
         .map(Some)
-        .context("启动 Chat Completions 本地协议代理失败")
+        .context("启动本地协议代理失败")
 }
 
 async fn resolve_startup_provider(home: &std::path::Path) -> Result<String> {
@@ -520,6 +534,7 @@ async fn prepare_codex_startup_state(
     current_profile: &ProviderProfile,
     home: &std::path::Path,
     options: CodexStartupStateOptions<'_>,
+    startup_catalog: StartupModelCatalog,
 ) -> Result<PreparedCodexStartupState> {
     let CodexStartupStateOptions {
         original_provider,
@@ -530,8 +545,7 @@ async fn prepare_codex_startup_state(
     let StartupModelCatalog {
         use_official_catalog,
         model_state,
-    } = prepare_startup_model_catalog(config, current_profile, home, preserve_provider_route)
-        .await?;
+    } = startup_catalog;
     let runtime_config_home = home.to_path_buf();
     let runtime_config_profile = current_profile.clone();
     let runtime_config_provider = original_provider.to_string();
@@ -1144,21 +1158,34 @@ async fn prepare_runtime_provider_state(
     config: &CodeyConfig,
     route: &StartupRouteContext,
 ) -> Result<PreparedProviderState> {
-    let protocol_proxy =
-        start_runtime_protocol_proxy(&route.current_profile, config.default_model())
-            .await
-            .map_err(|error| {
-                error_log::record_failure(
-                    "protocol_proxy_start_failed",
-                    "start_chat_completions_protocol_proxy",
-                    format!("{error:#}"),
-                    serde_json::json!({
-                        "provider": route.original_provider,
-                        "protocol": route.current_profile.protocol,
-                    }),
-                );
-                error
-            })?;
+    // 模型目录先于协议代理准备：Responses 线路是否需要本地代理、以及哪些
+    // 模型要走 Chat Completions 转换，都取决于目录里的第三方模型集合。
+    let startup_catalog = prepare_startup_model_catalog(
+        config,
+        &route.current_profile,
+        home,
+        route.preserve_provider_route,
+    )
+    .await?;
+    let protocol_proxy = start_runtime_protocol_proxy(
+        &route.current_profile,
+        config.default_model(),
+        &startup_catalog.model_state.third_party_models,
+    )
+    .await
+    .map_err(|error| {
+        error_log::record_failure(
+            "protocol_proxy_start_failed",
+            "start_protocol_proxy",
+            format!("{error:#}"),
+            serde_json::json!({
+                "provider": route.original_provider,
+                "protocol": route.current_profile.protocol,
+                "thirdPartyModels": startup_catalog.model_state.third_party_models.len(),
+            }),
+        );
+        error
+    })?;
     let protocol_proxy_base_url = protocol_proxy
         .as_ref()
         .map(|proxy| proxy.base_url().to_string());
@@ -1175,6 +1202,7 @@ async fn prepare_runtime_provider_state(
                 .as_ref()
                 .map(|route| route.config_contents()),
         },
+        startup_catalog,
     )
     .await?;
     let applied_route_files = route

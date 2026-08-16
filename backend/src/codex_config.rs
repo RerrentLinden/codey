@@ -2533,13 +2533,18 @@ fn direct_provider_table(
     existing_local_provider: Option<Table>,
     protocol_proxy_base_url: Option<&str>,
 ) -> Result<Table> {
-    let base_url = match profile.protocol {
-        RelayProtocol::Responses => profile.normalized_base_url(),
-        RelayProtocol::ChatCompletions => protocol_proxy_base_url
-            .map(str::trim)
-            .filter(|base_url| !base_url.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| anyhow::anyhow!("Chat Completions 线路的本地协议代理尚未启动"))?,
+    // 本地协议代理启动后统一接管 base_url：Chat Completions 线路整体转换，
+    // Responses 线路仅第三方模型逐请求转换、官方模型直通。
+    let proxied_base_url = protocol_proxy_base_url
+        .map(str::trim)
+        .filter(|base_url| !base_url.is_empty())
+        .map(str::to_string);
+    let base_url = match (proxied_base_url, profile.protocol) {
+        (Some(proxy_base_url), _) => proxy_base_url,
+        (None, RelayProtocol::Responses) => profile.normalized_base_url(),
+        (None, RelayProtocol::ChatCompletions) => {
+            anyhow::bail!("Chat Completions 线路的本地协议代理尚未启动")
+        }
     };
     if base_url.is_empty() {
         anyhow::bail!("第三方线路缺少 API 地址");

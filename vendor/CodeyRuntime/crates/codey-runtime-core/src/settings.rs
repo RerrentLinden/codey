@@ -84,6 +84,12 @@ pub struct RelayProfile {
         skip_serializing_if = "String::is_empty"
     )]
     pub user_agent: String,
+    /// 按模型覆盖线路协议：请求的 model 命中该集合时，走 Chat Completions
+    /// 转换（本地 Responses→Chat 代理），否则按 `protocol` 的默认线路发送。
+    /// 典型场景：Responses 中继上的第三方模型（claude/kimi 等）不支持
+    /// /v1/responses，需要逐请求降级到 chat completions。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chat_completions_models: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -140,6 +146,7 @@ impl Default for RelayProfile {
             model_list: String::new(),
             model_windows: String::new(),
             user_agent: String::new(),
+            chat_completions_models: Vec::new(),
         }
     }
 }
@@ -408,6 +415,7 @@ impl BackendSettings {
                 model_list: String::new(),
                 model_windows: String::new(),
                 user_agent: String::new(),
+                chat_completions_models: Vec::new(),
             };
         }
 
@@ -453,6 +461,7 @@ impl BackendSettings {
             model_list: String::new(),
             model_windows: String::new(),
             user_agent: String::new(),
+            chat_completions_models: Vec::new(),
         }
     }
 

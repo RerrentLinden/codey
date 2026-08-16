@@ -770,7 +770,7 @@ fn upstream_request_parts<'a>(
     relay: &crate::settings::RelayProfile,
     request_json: &'a Value,
 ) -> anyhow::Result<(String, Cow<'a, Value>, UpstreamWireApi)> {
-    match relay.protocol {
+    match effective_relay_protocol(relay, request_json) {
         RelayProtocol::Responses => Ok((
             responses_url(&relay.base_url),
             Cow::Borrowed(request_json),
@@ -782,6 +782,28 @@ fn upstream_request_parts<'a>(
             UpstreamWireApi::ChatCompletions,
         )),
     }
+}
+
+/// 请求级协议选择：model 命中 relay.chat_completions_models 时降级为
+/// Chat Completions 转换，其余请求沿用线路默认协议。
+fn effective_relay_protocol(
+    relay: &crate::settings::RelayProfile,
+    request_json: &Value,
+) -> RelayProtocol {
+    let model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !model.is_empty()
+        && relay
+            .chat_completions_models
+            .iter()
+            .any(|candidate| candidate.trim() == model)
+    {
+        return RelayProtocol::ChatCompletions;
+    }
+    relay.protocol
 }
 
 fn upstream_request_builder(

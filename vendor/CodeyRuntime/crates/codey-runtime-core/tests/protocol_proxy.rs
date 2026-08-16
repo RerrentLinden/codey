@@ -1662,6 +1662,76 @@ async fn explicit_protocol_proxy_bridges_responses_to_a_chat_upstream() {
 }
 
 #[tokio::test]
+async fn responses_relay_routes_models_per_request_between_passthrough_and_chat() {
+    let server = spawn_sequence_server(2);
+    let relay = RelayProfile {
+        id: "mixed".to_string(),
+        name: "Mixed".to_string(),
+        base_url: server.base_url.clone(),
+        upstream_base_url: server.base_url.clone(),
+        api_key: "sk-mixed".to_string(),
+        protocol: RelayProtocol::Responses,
+        relay_mode: RelayMode::PureApi,
+        chat_completions_models: vec!["kimi-k2.6".to_string()],
+        ..RelayProfile::default()
+    };
+    let settings = BackendSettings {
+        active_relay_id: relay.id.clone(),
+        relay_profiles: vec![relay],
+        enhancements_enabled: false,
+        ..BackendSettings::default()
+    };
+    let proxy = start_protocol_proxy(settings).await.unwrap();
+    let client = reqwest::Client::new();
+
+    // 命中 chat_completions_models 的模型走 Chat Completions 转换。
+    let converted = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .json(&json!({
+            "model": "kimi-k2.6",
+            "input": "hello",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(converted.status(), reqwest::StatusCode::OK);
+
+    // 未命中的官方模型保持 Responses 直通。
+    let passthrough = client
+        .post(format!("{}/responses", proxy.base_url()))
+        .json(&json!({
+            "model": "gpt-5.5",
+            "input": "hello",
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(passthrough.status(), reqwest::StatusCode::OK);
+    // 直通响应体原样回传，不做 Chat→Responses 转换。
+    let passthrough_body: serde_json::Value = passthrough.json().await.unwrap();
+    assert_eq!(passthrough_body["object"], "chat.completion");
+
+    proxy.shutdown().await.unwrap();
+    let requests = server.finish();
+    let chat_request = requests
+        .iter()
+        .find(|request| request.request_line.contains("/chat/completions"))
+        .expect("converted request should hit the chat completions endpoint");
+    let chat_body: serde_json::Value = serde_json::from_str(&chat_request.body).unwrap();
+    assert_eq!(chat_body["model"], "kimi-k2.6");
+    assert_eq!(chat_body["messages"][0]["content"], "hello");
+    let responses_request = requests
+        .iter()
+        .find(|request| request.request_line.contains("POST /v1/responses"))
+        .expect("official model should pass through to the responses endpoint");
+    let responses_body: serde_json::Value = serde_json::from_str(&responses_request.body).unwrap();
+    assert_eq!(responses_body["model"], "gpt-5.5");
+    assert_eq!(responses_body["input"], "hello");
+}
+
+#[tokio::test]
 async fn protocol_proxy_shutdown_aborts_inflight_streams() {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -1788,6 +1858,117 @@ impl Drop for SettingsPathGuard {
     fn drop(&mut self) {
         codey_runtime_core::paths::set_settings_path_for_tests(self.previous.take());
     }
+}
+
+struct SequenceServer {
+    base_url: String,
+    handle: thread::JoinHandle<Vec<ChatRequest>>,
+}
+
+impl SequenceServer {
+    fn finish(self) -> Vec<ChatRequest> {
+        self.handle.join().unwrap()
+    }
+}
+
+/// 顺序接受 `expected` 个请求的测试上游，用于同一中继上的多次选路断言。
+fn spawn_sequence_server(expected: usize) -> SequenceServer {
+    upstream_http_client().expect("upstream HTTP client should initialize before server timeout");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let base_url = format!("http://{address}/v1");
+    listener.set_nonblocking(true).unwrap();
+    let handle = thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let mut requests = Vec::new();
+        for _ in 0..expected {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            started.elapsed() < std::time::Duration::from_secs(10),
+                            "test upstream did not receive all expected requests"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("failed to accept test request: {error}"),
+                }
+            };
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let request = loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break String::from_utf8_lossy(&buffer).to_string(),
+                    Ok(bytes) => {
+                        buffer.extend_from_slice(&chunk[..bytes]);
+                        // 请求体读完后短暂等待，避免把分片请求截断。
+                        let partial = String::from_utf8_lossy(&buffer).to_string();
+                        if let Some((_, body)) = partial.split_once("\r\n\r\n") {
+                            let content_length = partial
+                                .lines()
+                                .find_map(|line| {
+                                    line.split_once(':').and_then(|(name, value)| {
+                                        name.eq_ignore_ascii_case("content-length")
+                                            .then(|| value.trim().to_string())
+                                    })
+                                })
+                                .and_then(|value| value.parse::<usize>().ok());
+                            if content_length.is_some_and(|length| body.len() >= length) {
+                                break partial;
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        if !buffer.is_empty() {
+                            break String::from_utf8_lossy(&buffer).to_string();
+                        }
+                    }
+                    Err(error) => panic!("failed to read test request: {error}"),
+                }
+            };
+            let user_agent = request
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("user-agent")
+                            .then(|| value.trim().to_string())
+                    })
+                })
+                .unwrap_or_default();
+            let authorization = request
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("authorization")
+                            .then(|| value.trim().to_string())
+                    })
+                })
+                .unwrap_or_default();
+            let request_line = request.lines().next().unwrap_or_default().to_string();
+            let body = request
+                .split_once("\r\n\r\n")
+                .map(|(_, body)| body.to_string())
+                .unwrap_or_default();
+            let response_body = r#"{"id":"chatcmpl-test","object":"chat.completion","model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"pong"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            requests.push(ChatRequest {
+                user_agent,
+                authorization,
+                request_line,
+                body,
+            });
+        }
+        requests
+    });
+    SequenceServer { base_url, handle }
 }
 
 struct ChatServer {

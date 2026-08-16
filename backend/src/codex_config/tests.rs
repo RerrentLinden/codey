@@ -357,6 +357,34 @@ fn direct_chat_patch_requires_the_local_protocol_proxy() {
 }
 
 #[test]
+fn direct_responses_patch_routes_codex_through_the_local_proxy_when_it_is_running() {
+    // Responses 线路存在第三方模型时代理接管 base_url；官方模型直通、
+    // 第三方模型由代理逐请求转换为 Chat Completions。
+    let result = patch_config_with_fastctx_mode_and_proxy(
+        "model_provider = \"relay\"\n",
+        &direct_profile(RelayProtocol::Responses),
+        "relay",
+        ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
+            model_catalog_path: None,
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            preserve_provider_route: false,
+            protocol_proxy_base_url: Some("http://127.0.0.1:43123/v1"),
+        },
+    )
+    .unwrap();
+
+    assert!(result.contains("base_url = \"http://127.0.0.1:43123/v1\""));
+    assert!(result.contains("wire_api = \"responses\""));
+    assert!(result.contains("experimental_bearer_token = \"sk-direct\""));
+    assert!(!result.contains("https://relay.example/v1"));
+}
+
+#[test]
 fn direct_chat_patch_routes_codex_through_the_local_responses_proxy() {
     let result = patch_config_with_fastctx_mode_and_proxy(
         "model_provider = \"relay\"\n",
