@@ -396,10 +396,7 @@ pub(crate) fn repair_missing_descriptions(home: &Path) -> Result<bool> {
         .get_mut("models")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| anyhow::anyhow!("待修复的 Codey 模型目录缺少 models 数组"))?;
-    if !models
-        .iter()
-        .any(model_needs_description_repair)
-    {
+    if !models.iter().any(model_needs_description_repair) {
         return Ok(false);
     }
     let mut repaired = false;
@@ -433,10 +430,7 @@ pub(crate) fn repair_missing_descriptions(home: &Path) -> Result<bool> {
             }
         }
     }
-    if models
-        .iter()
-        .any(model_needs_description_repair)
-    {
+    if models.iter().any(model_needs_description_repair) {
         bail!("旧版 Codey 模型目录存在无法自动补全 description 的条目");
     }
     debug_assert!(repaired);
