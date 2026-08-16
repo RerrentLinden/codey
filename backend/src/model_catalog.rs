@@ -12,6 +12,12 @@ use crate::model_id;
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 pub(crate) const THIRD_PARTY_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
 pub(crate) const THIRD_PARTY_DEFAULT_REASONING_EFFORT: &str = "low";
+const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 4] = [
+    ("low", "Fast responses with lighter reasoning"),
+    ("medium", "Balances speed and reasoning depth for everyday tasks"),
+    ("high", "Greater reasoning depth for complex problems"),
+    ("xhigh", "Extra high reasoning depth for complex problems"),
+];
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
@@ -377,7 +383,8 @@ pub fn is_available(home: &Path) -> bool {
 }
 
 /// Repairs catalogs written by older Codey versions that copied model-cache
-/// entries without Codex's now-required `description` field.
+/// entries without Codex's now-required `description` fields on models and
+/// their reasoning levels.
 pub(crate) fn repair_missing_descriptions(home: &Path) -> Result<bool> {
     let path = home.join(relative_path());
     let bytes = match fs::read(&path) {
@@ -394,33 +401,41 @@ pub(crate) fn repair_missing_descriptions(home: &Path) -> Result<bool> {
         .get_mut("models")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| anyhow::anyhow!("待修复的 Codey 模型目录缺少 models 数组"))?;
-    if !models
-        .iter()
-        .any(|model| !model_has_runtime_description(model))
-    {
+    if !models.iter().any(|model| model_needs_description_repair(model)) {
         return Ok(false);
     }
     let mut repaired = false;
     for model in models.iter_mut() {
-        if model_has_runtime_description(model) {
-            continue;
+        if !model_has_runtime_description(model) {
+            let description = model
+                .get("display_name")
+                .and_then(Value::as_str)
+                .or_else(|| model.get("slug").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(ToString::to_string);
+            if let Some(description) = description {
+                model["description"] = json!(description);
+                repaired = true;
+            }
         }
-        let description = model
-            .get("display_name")
-            .and_then(Value::as_str)
-            .or_else(|| model.get("slug").and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|description| !description.is_empty())
-            .map(ToString::to_string);
-        if let Some(description) = description {
-            model["description"] = json!(description);
-            repaired = true;
+        if let Some(levels) = model
+            .get_mut("supported_reasoning_levels")
+            .and_then(Value::as_array_mut)
+        {
+            for level in levels {
+                if level_has_runtime_description(level) {
+                    continue;
+                }
+                let effort = level.get("effort").and_then(Value::as_str);
+                if let Some(effort) = effort {
+                    level["description"] = json!(reasoning_level_description(effort));
+                    repaired = true;
+                }
+            }
         }
     }
-    if models
-        .iter()
-        .any(|model| !model_has_runtime_description(model))
-    {
+    if models.iter().any(|model| model_needs_description_repair(model)) {
         bail!("旧版 Codey 模型目录存在无法自动补全 description 的条目");
     }
     debug_assert!(repaired);
@@ -778,6 +793,30 @@ fn model_has_runtime_description(model: &Value) -> bool {
         .is_some_and(|description| !description.is_empty())
 }
 
+fn reasoning_level_description(effort: &str) -> String {
+    REASONING_LEVEL_DESCRIPTIONS
+        .iter()
+        .find(|(known_effort, _)| *known_effort == effort)
+        .map(|(_, description)| (*description).to_string())
+        .unwrap_or_else(|| format!("{effort} reasoning"))
+}
+
+fn level_has_runtime_description(level: &Value) -> bool {
+    level
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|description| !description.is_empty())
+}
+
+fn model_needs_description_repair(model: &Value) -> bool {
+    !model_has_runtime_description(model)
+        || model
+            .get("supported_reasoning_levels")
+            .and_then(Value::as_array)
+            .is_some_and(|levels| levels.iter().any(|level| !level_has_runtime_description(level)))
+}
+
 fn clamp_reasoning_efforts(model: &mut Value) {
     if let Some(levels) = model
         .get_mut("supported_reasoning_levels")
@@ -909,7 +948,9 @@ fn synthetic_model(template: &Value, model_id: &str, index: usize) -> Value {
     model["supported_reasoning_levels"] = Value::Array(
         THIRD_PARTY_REASONING_EFFORTS
             .iter()
-            .map(|effort| json!({ "effort": effort }))
+            .map(|effort| {
+                json!({ "effort": effort, "description": reasoning_level_description(effort) })
+            })
             .collect(),
     );
     if let Some(object) = model.as_object_mut() {
@@ -1723,6 +1764,13 @@ mod tests {
             model["default_reasoning_level"],
             THIRD_PARTY_DEFAULT_REASONING_EFFORT
         );
+        for level in model["supported_reasoning_levels"].as_array().unwrap() {
+            assert!(
+                level_has_runtime_description(level),
+                "{} level lacks the runtime-required description",
+                level["effort"]
+            );
+        }
     }
 
     #[test]
@@ -1813,7 +1861,11 @@ mod tests {
                     {
                         "slug": "model-a",
                         "display_name": "Model A",
-                        "base_instructions": "instructions"
+                        "base_instructions": "instructions",
+                        "supported_reasoning_levels": [
+                            { "effort": "low" },
+                            { "effort": "high", "description": "Existing level" }
+                        ]
                     },
                     {
                         "slug": "model-b",
@@ -1836,6 +1888,14 @@ mod tests {
 
         let repaired: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(repaired["models"][0]["description"], "Model A");
+        assert_eq!(
+            repaired["models"][0]["supported_reasoning_levels"][0]["description"],
+            "Fast responses with lighter reasoning"
+        );
+        assert_eq!(
+            repaired["models"][0]["supported_reasoning_levels"][1]["description"],
+            "Existing level"
+        );
         assert_eq!(repaired["models"][1]["description"], "model-b");
         assert_eq!(repaired["models"][2]["description"], "Existing description");
         assert!(is_available(home.path()));
