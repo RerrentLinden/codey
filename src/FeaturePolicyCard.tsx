@@ -30,32 +30,32 @@ const SUBAGENT_TASK_TYPES = [
   {
     id: "codey_quick_scan",
     name: "快速定位",
-    description: "只读；用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
+    description: "默认只读；用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
   },
   {
     id: "codey_deep_research",
     name: "深度检索",
-    description: "只读；用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
+    description: "默认只读；用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
   },
   {
     id: "codey_visual_analysis",
     name: "视觉分析",
-    description: "只读；用于截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索和独立核验。",
+    description: "默认只读；用于截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索和独立核验。",
   },
   {
     id: "codey_worker",
     name: "代码实施",
-    description: "可写；用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
+    description: "默认可写；用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
   },
   {
     id: "codey_visual_worker",
     name: "视觉实施",
-    description: "可写；用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
+    description: "默认可写；用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
   },
   {
     id: "default",
     name: "通用兜底",
-    description: "只读；任务不符合专用类型时使用，负责一般探索、检索和核验，不承担实施。",
+    description: "默认只读；任务不符合专用类型时使用，负责一般探索、检索和核验，不承担实施。",
   },
 ] as const satisfies ReadonlyArray<{
   id: SubagentRoleId;
@@ -195,8 +195,8 @@ function FeaturePolicyCardComponent({
           >
             <div className="feature-card-header">
               <div className="feature-card-title">
-                <strong>子代理协作优化</strong>
-                <Badge variant="warning">角色配置可热生效</Badge>
+                <strong>Codey 子代理角色与调度增强</strong>
+                <Badge variant="warning">基于 Codex 原生子代理</Badge>
               </div>
               <Switch
                 checked={config.subagentOptimization}
@@ -204,7 +204,7 @@ function FeaturePolicyCardComponent({
                 onCheckedChange={(checked) =>
                   onSubagentOptimizationChange(checked)
                 }
-                aria-label="启用子代理协作优化"
+                aria-label="启用 Codey 子代理角色与调度增强"
               />
             </div>
             <div className="feature-card-body subagent-policy-body">
@@ -353,11 +353,11 @@ function FeaturePolicyCardComponent({
                   <small>
                     {subagentModelOptions.length === 0
                       ? "请先在模型管理中添加当前线路可用模型"
-                      : "首次开启需重启；之后调整模型或思考深度，保存后对下一次派生立即生效"}
+                      : "首次开启需重启；模型或思考深度保存后对下一次派生生效。角色权限是默认值，实际受父任务权限模式约束"}
                   </small>
                 </>
               ) : (
-                <small>开启后会主动拆分适合委派的任务，并可设置六类子代理的模型与思考深度</small>
+                <small>开启后为 Codex 原生子代理增加主动委派、六类角色和汇合门禁；不会扩大父任务权限</small>
               )}
             </div>
           </div>

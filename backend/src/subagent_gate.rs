@@ -224,7 +224,7 @@ fn pre_tool_denial(active: usize) -> Value {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": format!(
-                "Codey 子代理门禁：仍有 {active} 个子代理在运行。现在只可调用 agents.* 协作工具；请立即调用 agents.wait_agent，并在 MESSAGE 后继续等待，直到收到 FINAL_ANSWER 或 task_complete。"
+                "Codey 子代理门禁：仍有 {active} 个子代理在运行。现在只可调用 agents.* 协作工具做必要的查看、转向或停止，随后调用 agents.wait_agent；请持续等待到每个子代理都返回 FINAL_ANSWER 或 task_complete。"
             ),
         }
     })
@@ -245,7 +245,7 @@ fn post_wait_continuation(active: usize, tool_response: Option<&Value>) -> Value
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 只返回了一次局部更新，仍有 {active} 个子代理在运行。保留下方已返回内容，等全部子代理完成后再统一处理；现在不得分析局部结果、下结论、宣布开始修改或执行后续工作，也不要输出进度说明。必须立即再次调用 agents.wait_agent，并持续等待到每个已派生子代理都返回 FINAL_ANSWER 或 task_complete。\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回了局部更新，仍有 {active} 个子代理在运行。保留下方内容；可读取它并仅使用 agents.send_message、agents.followup_task、agents.interrupt_agent 或 agents.list_agents 做必要协调，随后继续调用 agents.wait_agent。在每个已派生子代理都返回 FINAL_ANSWER 或 task_complete 前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -633,7 +633,12 @@ mod tests {
         let first_reason = blocked_after_first["reason"].as_str().unwrap();
         assert!(first_reason.contains("仍有 2 个子代理"));
         assert!(first_reason.contains("first result"));
-        assert!(first_reason.contains("不得分析局部结果"));
+        assert!(first_reason.contains("可读取它并仅使用 agents.send_message"));
+        assert!(first_reason.contains("不得恢复非协作本地工作"));
+
+        let mut root_steer = input("PreToolUse", "session-a");
+        root_steer.tool_name = Some("agents.send_message".to_string());
+        assert_eq!(handle_hook(&root_steer, root).unwrap(), json!({}));
 
         let mut root_patch = input("PreToolUse", "session-a");
         root_patch.tool_name = Some("apply_patch".to_string());

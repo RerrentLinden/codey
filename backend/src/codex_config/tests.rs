@@ -1240,7 +1240,7 @@ user_flag = true
 }
 
 #[test]
-fn subagent_optimization_enables_v2_and_removes_legacy_agents() {
+fn subagent_optimization_writes_public_agents_schema_and_migrates_legacy_threads() {
     let existing = r#"
 [agents]
 max_threads = 6
@@ -1250,6 +1250,9 @@ custom_setting = "preserved"
 
 [features.multi_agent_v2]
 enabled = false
+max_concurrent_threads_per_session = 2
+default_subagent_model = "legacy-v2-model"
+default_subagent_reasoning_effort = "low"
 custom_setting = "preserved"
 subagent_developer_instructions = "Preserve my subagent guidance."
 root_agent_usage_hint_text = "Preserve my root usage hint."
@@ -1284,8 +1287,13 @@ command = "echo preserve-user-hook"
 
     assert!(agents.get("max_threads").is_none());
     assert!(agents.get("max_depth").is_none());
-    assert!(agents.get("interrupt_message").is_none());
+    assert_eq!(agents["interrupt_message"].as_bool(), Some(true));
     assert_eq!(agents["custom_setting"].as_str(), Some("preserved"));
+    assert_eq!(agents["enabled"].as_bool(), Some(true));
+    assert_eq!(
+        agents["max_concurrent_threads_per_session"].as_integer(),
+        Some(6)
+    );
     assert_eq!(
         agents["default_subagent_model"].as_str(),
         Some("gpt-5.6-sol")
@@ -1305,9 +1313,16 @@ command = "echo preserve-user-hook"
         Some(false)
     );
     assert_eq!(multi_agent["tool_namespace"].as_str(), Some("agents"));
-    assert_eq!(
-        multi_agent["max_concurrent_threads_per_session"].as_integer(),
-        Some(7)
+    assert!(
+        multi_agent
+            .get("max_concurrent_threads_per_session")
+            .is_none()
+    );
+    assert!(multi_agent.get("default_subagent_model").is_none());
+    assert!(
+        multi_agent
+            .get("default_subagent_reasoning_effort")
+            .is_none()
     );
     assert_eq!(
         multi_agent["min_wait_timeout_ms"].as_integer(),
@@ -1388,6 +1403,71 @@ command = "echo preserve-user-hook"
         hook_state[pre_tool_key]["trusted_hash"]
             .as_str()
             .is_some_and(|hash| hash.starts_with("sha256:"))
+    );
+}
+
+#[test]
+fn subagent_optimization_keeps_explicit_agents_concurrency_over_legacy_max_threads() {
+    let existing = r#"
+[agents]
+max_threads = 6
+max_concurrent_threads_per_session = 4
+
+[features.multi_agent_v2]
+max_concurrent_threads_per_session = 2
+default_subagent_model = "legacy-v2-model"
+default_subagent_reasoning_effort = "low"
+"#;
+    let result = patch_config_with_fastctx_mode_and_proxy(
+        existing,
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
+            model_catalog_path: relative_model_catalog_path(),
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol",
+            subagent_reasoning_effort: "high",
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+        },
+    )
+    .unwrap();
+    let document = result.parse::<DocumentMut>().unwrap();
+
+    assert!(
+        document["agents"]
+            .as_table()
+            .unwrap()
+            .get("max_threads")
+            .is_none()
+    );
+    assert_eq!(
+        document["agents"]["max_concurrent_threads_per_session"].as_integer(),
+        Some(4)
+    );
+    assert!(
+        document["features"]["multi_agent_v2"]
+            .as_table()
+            .unwrap()
+            .get("max_concurrent_threads_per_session")
+            .is_none()
+    );
+    assert!(
+        document["features"]["multi_agent_v2"]
+            .as_table()
+            .unwrap()
+            .get("default_subagent_model")
+            .is_none()
+    );
+    assert!(
+        document["features"]["multi_agent_v2"]
+            .as_table()
+            .unwrap()
+            .get("default_subagent_reasoning_effort")
+            .is_none()
     );
 }
 
@@ -3540,6 +3620,18 @@ wire_api = "responses"
         applied
             .runtime_config_overrides
             .iter()
+            .any(|entry| entry == "agents.enabled=true")
+    );
+    assert!(
+        applied
+            .runtime_config_overrides
+            .iter()
+            .any(|entry| entry == "agents.max_concurrent_threads_per_session=7")
+    );
+    assert!(
+        applied
+            .runtime_config_overrides
+            .iter()
             .any(|entry| entry == "agents.default_subagent_model=\"gpt-5.6-mini\"")
     );
     assert!(
@@ -3618,6 +3710,8 @@ wire_api = "responses"
         "mcp_servers.codey_fastctx.tool_timeout_sec",
         "mcp_servers.codey_fastctx.env.FASTCTX_TOKEN_BUDGET",
         "tool_output_token_limit",
+        "agents.enabled",
+        "agents.max_concurrent_threads_per_session",
         "agents.default_subagent_model",
         "agents.default_subagent_reasoning_effort",
         "agents.default.config_file",
@@ -3627,7 +3721,6 @@ wire_api = "responses"
         "features.multi_agent_v2.hide_spawn_agent_metadata",
         "features.multi_agent_v2.expose_spawn_agent_model_overrides",
         "features.multi_agent_v2.tool_namespace",
-        "features.multi_agent_v2.max_concurrent_threads_per_session",
         "features.multi_agent_v2.min_wait_timeout_ms",
         "features.multi_agent_v2.default_wait_timeout_ms",
         "features.multi_agent_v2.max_wait_timeout_ms",

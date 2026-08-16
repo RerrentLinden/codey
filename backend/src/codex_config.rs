@@ -1798,8 +1798,19 @@ fn enable_subagent_optimization(
             .to_string()
     });
     let agents = ensure_root_table(doc, "agents")?;
-    for legacy_key in ["max_threads", "max_depth", "interrupt_message"] {
-        agents.remove(legacy_key);
+    let legacy_max_threads = agents.remove("max_threads");
+    agents.remove("max_depth");
+    agents["enabled"] = value(true);
+    if agents.get("max_concurrent_threads_per_session").is_none() {
+        if let Some(legacy_max_threads) = legacy_max_threads {
+            if legacy_max_threads.as_integer().is_some() {
+                agents["max_concurrent_threads_per_session"] = legacy_max_threads;
+            } else {
+                agents["max_concurrent_threads_per_session"] = value(7);
+            }
+        } else {
+            agents["max_concurrent_threads_per_session"] = value(7);
+        }
     }
     agents["default_subagent_model"] = value(subagent_model);
     agents["default_subagent_reasoning_effort"] = value(subagent_reasoning_effort);
@@ -1810,12 +1821,20 @@ fn enable_subagent_optimization(
     let multi_agent = features["multi_agent_v2"]
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("features.multi_agent_v2 必须是 TOML table"))?;
+    // Keep the v2 flag for current runtime compatibility; the public subagent
+    // settings now live under [agents].
     multi_agent["enabled"] = value(true);
     multi_agent["wait_agent_enabled"] = value(true);
     multi_agent["hide_spawn_agent_metadata"] = value(true);
     multi_agent["expose_spawn_agent_model_overrides"] = value(false);
     multi_agent["tool_namespace"] = value("agents");
-    multi_agent["max_concurrent_threads_per_session"] = value(7);
+    for migrated_key in [
+        "max_concurrent_threads_per_session",
+        "default_subagent_model",
+        "default_subagent_reasoning_effort",
+    ] {
+        multi_agent.remove(migrated_key);
+    }
     multi_agent["min_wait_timeout_ms"] = value(10_000);
     multi_agent["default_wait_timeout_ms"] = value(30_000);
     multi_agent["max_wait_timeout_ms"] = value(120_000);
@@ -2142,6 +2161,11 @@ fn build_isolated_runtime_overrides(
             );
         }
         for (path, key) in [
+            (&["agents", "enabled"][..], "agents.enabled"),
+            (
+                &["agents", "max_concurrent_threads_per_session"][..],
+                "agents.max_concurrent_threads_per_session",
+            ),
             (
                 &["agents", "default_subagent_model"][..],
                 "agents.default_subagent_model",
@@ -2173,14 +2197,6 @@ fn build_isolated_runtime_overrides(
             (
                 &["features", "multi_agent_v2", "tool_namespace"][..],
                 "features.multi_agent_v2.tool_namespace",
-            ),
-            (
-                &[
-                    "features",
-                    "multi_agent_v2",
-                    "max_concurrent_threads_per_session",
-                ][..],
-                "features.multi_agent_v2.max_concurrent_threads_per_session",
             ),
             (
                 &["features", "multi_agent_v2", "min_wait_timeout_ms"][..],

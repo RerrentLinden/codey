@@ -14,7 +14,10 @@ pub(crate) const THIRD_PARTY_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "h
 pub(crate) const THIRD_PARTY_DEFAULT_REASONING_EFFORT: &str = "low";
 const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 4] = [
     ("low", "Fast responses with lighter reasoning"),
-    ("medium", "Balances speed and reasoning depth for everyday tasks"),
+    (
+        "medium",
+        "Balances speed and reasoning depth for everyday tasks",
+    ),
     ("high", "Greater reasoning depth for complex problems"),
     ("xhigh", "Extra high reasoning depth for complex problems"),
 ];
@@ -206,8 +209,6 @@ pub fn refresh_for_provider(
             catalog_models.push(synthetic_model(&template, model_id, index));
         }
     }
-    enable_subagents_for_all_models(&mut catalog_models);
-
     write_catalog(home, &catalog_models)?;
     let written_models = read_runtime_catalog_models(home)?;
     let expected_model_keys = catalog_models
@@ -339,12 +340,6 @@ pub fn selection_state_with_manual_models(
     })
 }
 
-fn enable_subagents_for_all_models(models: &mut [Value]) {
-    for model in models {
-        model["multi_agent_version"] = json!("v2");
-    }
-}
-
 fn effective_default_model(
     official_models: &[OfficialModelAvailability],
     third_party_models: &[String],
@@ -401,7 +396,10 @@ pub(crate) fn repair_missing_descriptions(home: &Path) -> Result<bool> {
         .get_mut("models")
         .and_then(Value::as_array_mut)
         .ok_or_else(|| anyhow::anyhow!("待修复的 Codey 模型目录缺少 models 数组"))?;
-    if !models.iter().any(|model| model_needs_description_repair(model)) {
+    if !models
+        .iter()
+        .any(model_needs_description_repair)
+    {
         return Ok(false);
     }
     let mut repaired = false;
@@ -435,7 +433,10 @@ pub(crate) fn repair_missing_descriptions(home: &Path) -> Result<bool> {
             }
         }
     }
-    if models.iter().any(|model| model_needs_description_repair(model)) {
+    if models
+        .iter()
+        .any(model_needs_description_repair)
+    {
         bail!("旧版 Codey 模型目录存在无法自动补全 description 的条目");
     }
     debug_assert!(repaired);
@@ -814,7 +815,11 @@ fn model_needs_description_repair(model: &Value) -> bool {
         || model
             .get("supported_reasoning_levels")
             .and_then(Value::as_array)
-            .is_some_and(|levels| levels.iter().any(|level| !level_has_runtime_description(level)))
+            .is_some_and(|levels| {
+                levels
+                    .iter()
+                    .any(|level| !level_has_runtime_description(level))
+            })
 }
 
 fn clamp_reasoning_efforts(model: &mut Value) {
@@ -957,10 +962,8 @@ fn synthetic_model(template: &Value, model_id: &str, index: usize) -> Value {
         object.remove("availability_nux");
         object.remove("upgrade");
         object.remove("default_service_tier");
-        // Provider-defined models must not inherit the template model's
-        // capability marker. The runtime-version compatibility pass below
-        // decides whether this concrete catalog entry needs an explicit V2
-        // marker.
+        // Provider-defined models are leaf candidates in current Codex releases,
+        // but they must not inherit the template model's coordinator capability.
         object.remove("multi_agent_version");
     }
     model["service_tiers"] = json!([]);
@@ -1305,17 +1308,17 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.5")
             .unwrap();
         assert_eq!(gpt_55["service_tiers"][0]["id"], "priority");
-        assert_eq!(gpt_55["multi_agent_version"], "v2");
+        assert!(gpt_55.get("multi_agent_version").is_none());
         let luna = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.6-luna")
             .unwrap();
-        assert_eq!(luna["multi_agent_version"], "v2");
+        assert_eq!(luna["multi_agent_version"], "v1");
         let gpt_54 = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.4")
             .unwrap();
-        assert_eq!(gpt_54["multi_agent_version"], "v2");
+        assert_eq!(gpt_54["multi_agent_version"], "disabled");
         let spark = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.3-codex-spark")
@@ -1345,7 +1348,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_catalog_enables_every_official_model_for_subagents() {
+    fn generated_catalog_preserves_official_multi_agent_markers() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
 
@@ -1355,38 +1358,24 @@ mod tests {
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
         )
         .unwrap();
-        for model in catalog["models"].as_array().unwrap() {
-            assert_eq!(
-                model["multi_agent_version"], "v2",
-                "{} was not enabled",
-                model["slug"]
-            );
-        }
+        let models = catalog["models"].as_array().unwrap();
+        let marker = |slug: &str| {
+            models
+                .iter()
+                .find(|model| model["slug"] == slug)
+                .and_then(|model| model.get("multi_agent_version"))
+                .and_then(Value::as_str)
+        };
+
+        assert_eq!(marker("gpt-5.6-sol"), Some("v2"));
+        assert_eq!(marker("gpt-5.6-terra"), Some("v2"));
+        assert_eq!(marker("gpt-5.6-luna"), Some("v1"));
+        assert_eq!(marker("gpt-5.4"), Some("disabled"));
+        assert_eq!(marker("gpt-5.5"), None);
     }
 
     #[test]
-    fn subagent_enablement_overrides_upstream_model_markers() {
-        let mut models = vec![
-            json!({
-                "slug": "gpt-5.6-luna",
-                "visibility": "list",
-                "multi_agent_version": "v1",
-            }),
-            json!({
-                "slug": "gpt-5.4",
-                "visibility": "list",
-                "multi_agent_version": "disabled",
-            }),
-        ];
-
-        enable_subagents_for_all_models(&mut models);
-
-        assert_eq!(models[0]["multi_agent_version"], "v2");
-        assert_eq!(models[1]["multi_agent_version"], "v2");
-    }
-
-    #[test]
-    fn generated_catalog_enables_selected_third_party_models_for_subagents() {
+    fn generated_catalog_keeps_leaf_models_without_v2_coordinator_markers() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
         let upstream = vec![
@@ -1402,10 +1391,21 @@ mod tests {
         )
         .unwrap();
         let models = catalog["models"].as_array().unwrap();
-        for slug in ["gpt-5.6-luna", "gpt-5.4", "provider-custom-model"] {
-            let model = models.iter().find(|model| model["slug"] == slug).unwrap();
-            assert_eq!(model["multi_agent_version"], "v2");
-        }
+        let luna = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-luna")
+            .unwrap();
+        assert_eq!(luna["multi_agent_version"], "v1");
+        let gpt_54 = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.4")
+            .unwrap();
+        assert_eq!(gpt_54["multi_agent_version"], "disabled");
+        let custom = models
+            .iter()
+            .find(|model| model["slug"] == "provider-custom-model")
+            .unwrap();
+        assert!(custom.get("multi_agent_version").is_none());
     }
 
     #[test]
@@ -1699,7 +1699,7 @@ mod tests {
         let custom = models.last().unwrap();
         assert_eq!(custom["slug"], "claude-sonnet");
         assert_eq!(custom["codey_source"], "third_party");
-        assert_eq!(custom["multi_agent_version"], "v2");
+        assert!(custom.get("multi_agent_version").is_none());
         assert_eq!(
             custom["supported_reasoning_levels"]
                 .as_array()

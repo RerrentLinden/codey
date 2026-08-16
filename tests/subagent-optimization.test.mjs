@@ -17,7 +17,9 @@ test("subagent optimization exposes per-task model and reasoning controls", asyn
     uiSource,
     /onCheckedChange=\{\(checked\) =>\s*onSubagentOptimizationChange\(checked\)\s*\}/,
   );
-  assert.match(uiSource, /aria-label="启用子代理协作优化"/);
+  assert.match(uiSource, /Codey 子代理角色与调度增强/);
+  assert.match(uiSource, /aria-label="启用 Codey 子代理角色与调度增强"/);
+  assert.match(uiSource, /实际受父任务权限模式约束/);
   for (const role of [
     "codey_quick_scan",
     "codey_deep_research",
@@ -64,6 +66,24 @@ test("subagent optimization exposes per-task model and reasoning controls", asyn
     /check-subagent-model|当前线路没有 Codex 子代理工具可用的模型/,
   );
   assert.doesNotMatch(uiSource, /仅接受 Sol \/ Terra/);
+});
+
+test("leaf subagent models do not inherit coordinator capability markers", async () => {
+  const catalogSource = await readFile(
+    new URL("backend/src/model_catalog.rs", root),
+    "utf8",
+  );
+
+  assert.doesNotMatch(catalogSource, /enable_subagents_for_all_models/);
+  assert.match(catalogSource, /object\.remove\("multi_agent_version"\)/);
+  assert.match(
+    catalogSource,
+    /generated_catalog_preserves_official_multi_agent_markers/,
+  );
+  assert.match(
+    catalogSource,
+    /generated_catalog_keeps_leaf_models_without_v2_coordinator_markers/,
+  );
 });
 
 test("per-task subagent files are composed at startup and hot-refreshed after save", async () => {
@@ -120,6 +140,7 @@ test("subagent optimization installs root waiting and nested-spawn runtime gates
   assert.match(gateSource, /subagent_spawn_denial/);
   assert.match(gateSource, /子代理不能继续派生子代理/);
   assert.match(gateSource, /post_wait_continuation/);
-  assert.match(gateSource, /不得分析局部结果/);
+  assert.match(gateSource, /可读取它并仅使用 agents\.send_message/);
+  assert.match(gateSource, /不得恢复非协作本地工作/);
   assert.match(gateSource, /SubagentStop/);
 });
