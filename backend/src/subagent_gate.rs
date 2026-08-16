@@ -13,7 +13,7 @@ pub(crate) const RUNTIME_ACTIVE_ENV: &str = "CODEY_SUBAGENT_GATE_ACTIVE";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
 pub(crate) const SESSION_END_HOOK_TIMEOUT_SECONDS: u64 = 3;
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
-const STATE_DIRECTORY: &str = "codey-subagent-gate-v1";
+const STATE_DIRECTORY: &str = "codey-subagent-gate-v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HookCommands {
@@ -164,8 +164,11 @@ fn pre_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
 fn post_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
     if nonempty(input.agent_id.as_deref()).is_some()
         || !input.tool_name.as_deref().is_some_and(is_wait_agent_tool)
-        || wait_was_interrupted_by_user(input.tool_response.as_ref())
     {
+        return Ok(json!({}));
+    }
+    if wait_was_interrupted_by_user(input.tool_response.as_ref()) {
+        remove_session_state(state_root, &input.session_id)?;
         return Ok(json!({}));
     }
     let active = active_agent_count(state_root, &input.session_id)?;
@@ -283,6 +286,15 @@ fn value_reports_user_interrupt(value: &Value) -> bool {
                 normalized_key.as_str(),
                 "interruptedbynewinput"
                     | "interruptedbyuserinput"
+                    | "interruptedbyuser"
+                    | "cancelledbyuser"
+                    | "canceledbyuser"
+                    | "abortedbyuser"
+                    | "stoppedbyuser"
+                    | "usercancelled"
+                    | "usercanceled"
+                    | "useraborted"
+                    | "userstopped"
                     | "newuserinput"
                     | "steeredinput"
                     | "steereduserinput"
@@ -295,8 +307,12 @@ fn value_reports_user_interrupt(value: &Value) -> bool {
 
 fn text_reports_user_interrupt(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
-    let interrupted = normalized.contains("interrupt") || normalized.contains("steer");
-    let user_input = [
+    let interrupted = normalized.contains("interrupt")
+        || normalized.contains("steer")
+        || normalized.contains("cancel")
+        || normalized.contains("abort")
+        || normalized.contains("stop");
+    let user_action = [
         "new input",
         "new_input",
         "user input",
@@ -307,10 +323,15 @@ fn text_reports_user_interrupt(value: &str) -> bool {
         "user_message",
         "new message",
         "new_message",
+        "by user",
+        "manual",
+        "user cancel",
+        "user abort",
+        "user stop",
     ]
     .iter()
     .any(|needle| normalized.contains(needle));
-    interrupted && user_input
+    interrupted && user_action
 }
 
 fn is_collaboration_tool(tool_name: &str) -> bool {
@@ -649,42 +670,81 @@ mod tests {
     }
 
     #[test]
-    fn post_wait_gate_does_not_block_children_or_user_interrupts() {
+    fn interrupted_root_wait_clears_session_gate_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+
+        let mut child_wait = input("PostToolUse", "child-session");
+        child_wait.agent_id = Some("agent-a".to_string());
+        child_wait.tool_name = Some("agentswait_agent".to_string());
+        assert_eq!(handle_hook(&child_wait, root).unwrap(), json!({}));
+
+        for (index, tool_response) in [
+            json!({ "output": "Wait interrupted by new input" }),
+            json!({ "output": "Wait cancelled by user" }),
+            json!({ "message": "Wait manually stopped" }),
+            json!({ "kind": "steered_input" }),
+            json!({ "interrupted_by_user_input": true }),
+            json!({ "canceled_by_user": true }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = format!("interrupted-session-{index}");
+            for agent_id in ["agent-a", "agent-b"] {
+                let mut start = input("SubagentStart", &session_id);
+                start.agent_id = Some(agent_id.to_string());
+                handle_hook(&start, root).unwrap();
+            }
+
+            let mut interrupted_wait = input("PostToolUse", &session_id);
+            interrupted_wait.tool_name = Some("agents__wait_agent".to_string());
+            interrupted_wait.tool_response = Some(tool_response);
+            assert_eq!(handle_hook(&interrupted_wait, root).unwrap(), json!({}));
+            assert_eq!(active_agent_count(root, &session_id).unwrap(), 0);
+
+            let mut root_patch = input("PreToolUse", &session_id);
+            root_patch.tool_name = Some("apply_patch".to_string());
+            assert_eq!(handle_hook(&root_patch, root).unwrap(), json!({}));
+            assert_eq!(
+                handle_hook(&input("Stop", &session_id), root).unwrap(),
+                json!({})
+            );
+        }
+
+        let mut start = input("SubagentStart", "active-session");
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook(&start, root).unwrap();
+        let mut completed_wait = input("PostToolUse", "active-session");
+        completed_wait.tool_name = Some("agents__wait_agent".to_string());
+        completed_wait.tool_response = Some(json!({
+            "message": "Wait completed after an agent update"
+        }));
+        assert_eq!(
+            handle_hook(&completed_wait, root).unwrap()["decision"].as_str(),
+            Some("block")
+        );
+    }
+
+    #[test]
+    fn late_subagent_stop_after_interrupted_wait_is_idempotent() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let mut start = input("SubagentStart", "session-a");
         start.agent_id = Some("agent-a".to_string());
         handle_hook(&start, root).unwrap();
 
-        let mut child_wait = input("PostToolUse", "session-a");
-        child_wait.agent_id = Some("agent-a".to_string());
-        child_wait.tool_name = Some("agentswait_agent".to_string());
-        assert_eq!(handle_hook(&child_wait, root).unwrap(), json!({}));
-
         let mut interrupted_wait = input("PostToolUse", "session-a");
-        interrupted_wait.tool_name = Some("agents__wait_agent".to_string());
+        interrupted_wait.tool_name = Some("agents.wait_agent".to_string());
         interrupted_wait.tool_response = Some(json!({
-            "output": "Wait interrupted by new input"
+            "output": "Wait interrupted by new user input"
         }));
-        assert_eq!(handle_hook(&interrupted_wait, root).unwrap(), json!({}));
+        handle_hook(&interrupted_wait, root).unwrap();
 
-        interrupted_wait.tool_response = Some(json!({
-            "kind": "steered_input"
-        }));
-        assert_eq!(handle_hook(&interrupted_wait, root).unwrap(), json!({}));
-
-        interrupted_wait.tool_response = Some(json!({
-            "interrupted_by_user_input": true
-        }));
-        assert_eq!(handle_hook(&interrupted_wait, root).unwrap(), json!({}));
-
-        interrupted_wait.tool_response = Some(json!({
-            "message": "Wait completed after an agent update"
-        }));
-        assert_eq!(
-            handle_hook(&interrupted_wait, root).unwrap()["decision"].as_str(),
-            Some("block")
-        );
+        let mut late_stop = input("SubagentStop", "session-a");
+        late_stop.agent_id = Some("agent-a".to_string());
+        assert_eq!(handle_hook(&late_stop, root).unwrap(), json!({}));
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 0);
     }
 
     #[test]
