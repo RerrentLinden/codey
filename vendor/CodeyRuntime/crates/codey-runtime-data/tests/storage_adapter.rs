@@ -723,6 +723,31 @@ fn move_thread_workspace_from_paths_uses_database_that_contains_thread() {
 }
 
 #[test]
+fn move_thread_workspace_rolls_back_database_when_rollout_update_fails() {
+    let tmp = tempdir().unwrap();
+    let db_path = tmp.path().join("state_5.sqlite");
+    let rollout_path = tmp.path().join("rollout.jsonl");
+    fs::write(&rollout_path, [0xff, 0xfe]).unwrap();
+    create_codex_thread_db(&db_path, &rollout_path);
+    let adapter = SQLiteStorageAdapter::new(&db_path, BackupStore::new(tmp.path().join("backups")));
+
+    let result =
+        adapter.move_codex_thread_workspace(&session("local:t1", "Codex Thread"), "/new/project");
+
+    assert_eq!(result["status"], "failed");
+    assert_eq!(
+        Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT cwd FROM threads WHERE id = 't1'", [], |row| row
+                .get::<_, String>(
+                0
+            ))
+            .unwrap(),
+        "/old/project"
+    );
+}
+
+#[test]
 fn list_local_sessions_reads_codex_threads_ordered_by_update_time() {
     let tmp = tempdir().unwrap();
     let db_path = tmp.path().join("state_5.sqlite");

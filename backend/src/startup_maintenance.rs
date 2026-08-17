@@ -293,8 +293,8 @@ fn rollout_file_headers_match(files: &[PathBuf], target_provider: &str) -> Resul
                         break;
                     };
                     match rollout_header_matches(path, target_provider) {
-                        Ok(true) => {}
-                        Ok(false) => {
+                        Ok(Some(true)) | Ok(None) => {}
+                        Ok(Some(false)) => {
                             mismatch.store(true, Ordering::Relaxed);
                             stop.store(true, Ordering::Relaxed);
                         }
@@ -356,7 +356,7 @@ fn collect_rollout_files(home: &Path, root: &Path, files: &mut Vec<RolloutFile>)
     Ok(())
 }
 
-fn rollout_header_matches(path: &Path, target_provider: &str) -> Result<bool> {
+fn rollout_header_matches(path: &Path, target_provider: &str) -> Result<Option<bool>> {
     let file =
         fs::File::open(path).with_context(|| format!("读取会话头失败：{}", path.display()))?;
     let reader = BufReader::new(file).take(MAX_ROLLOUT_HEADER_BYTES);
@@ -374,9 +374,12 @@ fn rollout_header_matches(path: &Path, target_provider: &str) -> Result<bool> {
         let provider = record
             .pointer("/payload/model_provider")
             .and_then(Value::as_str);
-        return Ok(provider == Some(target_provider));
+        return Ok(Some(provider == Some(target_provider)));
     }
-    Ok(false)
+    // Provider sync deliberately ignores rollout files without a parseable
+    // session_meta record. Treat the same files as outside validation so a
+    // stale or partial rollout cannot force a full sync on every launch.
+    Ok(None)
 }
 
 fn read_rollout_header_cache(
@@ -561,6 +564,27 @@ mod tests {
         let plan = provider_sync_plan_at(temp.path(), "codey_global", &marker).unwrap();
 
         assert_eq!(plan, ProviderSyncPlan::Cached);
+    }
+
+    #[test]
+    fn rollout_without_parseable_session_meta_does_not_force_repeated_sync() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = temp.path().join("sessions/2026/07/20");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join("rollout-partial.jsonl"),
+            "{\"type\":\"response_item\",\"payload\":\"partial\"}\n",
+        )
+        .unwrap();
+        let cache = temp.path().join("codey/rollout-headers.json");
+
+        let first = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+        let second = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+
+        assert!(first.matches);
+        assert_eq!(first.headers_read, 1);
+        assert!(second.matches);
+        assert_eq!(second.headers_read, 0);
     }
 
     #[test]

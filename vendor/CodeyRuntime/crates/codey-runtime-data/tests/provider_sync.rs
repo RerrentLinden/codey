@@ -276,10 +276,10 @@ fn provider_sync_updates_rollout_sqlite_visibility_and_creates_backup() {
     assert_eq!(result.status, ProviderSyncStatus::Synced);
     assert_eq!(result.target_provider, "apigather");
     assert_eq!(result.changed_session_files, 1);
-    assert_eq!(result.sqlite_rows_updated, 3);
+    assert_eq!(result.sqlite_rows_updated, 2);
     assert_eq!(result.sqlite_provider_rows_updated, 1);
     assert_eq!(result.sqlite_user_event_rows_updated, 1);
-    assert_eq!(result.sqlite_cwd_rows_updated, 1);
+    assert_eq!(result.sqlite_cwd_rows_updated, 0);
     let first: serde_json::Value = serde_json::from_str(
         fs::read_to_string(&rollout)
             .unwrap()
@@ -303,10 +303,7 @@ fn provider_sync_updates_rollout_sqlite_visibility_and_creates_backup() {
             },
         )
         .unwrap();
-    assert_eq!(
-        row,
-        ("apigather".to_string(), 1, "C:/workspace".to_string())
-    );
+    assert_eq!(row, ("apigather".to_string(), 1, "C:/old".to_string()));
     let backup_dir = result.backup_dir.unwrap();
     assert!(backup_dir.join("session-meta-backup.json").exists());
     assert!(backup_dir.join("db/state_5.sqlite").exists());
@@ -327,7 +324,7 @@ fn provider_sync_updates_new_codex_sqlite_directory_db() {
     let result = run_provider_sync(Some(&home));
 
     assert_eq!(result.status, ProviderSyncStatus::Synced);
-    assert_eq!(result.sqlite_rows_updated, 3);
+    assert_eq!(result.sqlite_rows_updated, 2);
     let db = Connection::open(&db_path).unwrap();
     let row = db
         .query_row(
@@ -342,10 +339,7 @@ fn provider_sync_updates_new_codex_sqlite_directory_db() {
             },
         )
         .unwrap();
-    assert_eq!(
-        row,
-        ("apigather".to_string(), 1, "C:/workspace".to_string())
-    );
+    assert_eq!(row, ("apigather".to_string(), 1, "C:/old".to_string()));
     let backup_dir = result.backup_dir.unwrap();
     assert!(backup_dir.join("db/sqlite/codex-dev.db").exists());
 }
@@ -443,7 +437,7 @@ fn provider_sync_rejects_invalid_explicit_target_before_writes() {
 }
 
 #[test]
-fn provider_sync_repairs_sqlite_when_rollout_provider_matches_and_normalizes_paths() {
+fn provider_sync_repairs_visibility_without_rewriting_project_paths() {
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");
     fs::create_dir(&home).unwrap();
@@ -471,29 +465,33 @@ fn provider_sync_repairs_sqlite_when_rollout_provider_matches_and_normalizes_pat
 
     assert_eq!(result.status, ProviderSyncStatus::Synced);
     assert_eq!(result.changed_session_files, 0);
-    assert_eq!(result.sqlite_rows_updated, 3);
+    assert_eq!(result.sqlite_rows_updated, 2);
     assert_eq!(result.sqlite_provider_rows_updated, 1);
     assert_eq!(result.sqlite_user_event_rows_updated, 1);
-    assert_eq!(result.sqlite_cwd_rows_updated, 1);
+    assert_eq!(result.sqlite_cwd_rows_updated, 0);
+    assert_eq!(result.updated_workspace_roots, 0);
     let db = Connection::open(home.join("state_5.sqlite")).unwrap();
     let row: String = db
         .query_row("SELECT cwd FROM threads WHERE id = 'thread-1'", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(row, "C:/workspace");
+    assert_eq!(row, "C:/old");
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(home.join(".codex-global-state.json")).unwrap())
             .unwrap();
     assert_eq!(
         state["electron-saved-workspace-roots"],
-        json!(["C:/workspace"])
+        json!(["\\\\?\\C:\\workspace"])
     );
-    assert_eq!(state["project-order"], json!(["C:/workspace"]));
-    assert_eq!(state["active-workspace-roots"], json!("C:/workspace"));
+    assert_eq!(state["project-order"], json!(["\\\\?\\C:\\workspace"]));
+    assert_eq!(
+        state["active-workspace-roots"],
+        json!("\\\\?\\C:\\workspace")
+    );
     assert_eq!(
         state["electron-workspace-root-labels"],
-        json!({"C:/workspace": "Workspace"})
+        json!({"\\\\?\\C:\\workspace": "Workspace"})
     );
 }
 
@@ -533,7 +531,7 @@ fn provider_sync_does_not_restore_cwd_for_projectless_threads() {
 }
 
 #[test]
-fn provider_sync_normalizes_open_in_target_preferences_per_path() {
+fn provider_sync_preserves_open_in_target_preferences_per_path() {
     let tmp = tempdir().unwrap();
     let home = tmp.path().join(".codex");
     fs::create_dir(&home).unwrap();
@@ -570,9 +568,9 @@ fn provider_sync_normalizes_open_in_target_preferences_per_path() {
             .unwrap();
     assert_eq!(
         state["open-in-target-preferences"]["perPath"],
-        json!({"C:/workspace": "terminal"})
+        json!({"\\\\?\\C:\\workspace": "terminal"})
     );
-    assert!(home.join(".codex-global-state.json.bak").exists());
+    assert!(!home.join(".codex-global-state.json.bak").exists());
 }
 
 #[test]
@@ -639,12 +637,12 @@ fn provider_sync_rolls_back_sqlite_provider_update_when_later_update_fails() {
     )
     .unwrap();
     db.execute(
-        "INSERT INTO threads VALUES ('thread-1', 'old-provider', 0, 1, 'C:/old')",
+        "INSERT INTO threads VALUES ('thread-1', 'old-provider', 0, 0, 'C:/old')",
         [],
     )
     .unwrap();
     db.execute(
-        "CREATE TRIGGER fail_cwd_update BEFORE UPDATE OF cwd ON threads BEGIN SELECT RAISE(ABORT, 'boom'); END",
+        "CREATE TRIGGER fail_user_event_update BEFORE UPDATE OF has_user_event ON threads BEGIN SELECT RAISE(ABORT, 'boom'); END",
         [],
     )
     .unwrap();
@@ -667,7 +665,7 @@ fn provider_sync_rolls_back_sqlite_provider_update_when_later_update_fails() {
             },
         )
         .unwrap();
-    assert_eq!(row, ("old-provider".to_string(), 1, "C:/old".to_string()));
+    assert_eq!(row, ("old-provider".to_string(), 0, "C:/old".to_string()));
 }
 
 #[test]

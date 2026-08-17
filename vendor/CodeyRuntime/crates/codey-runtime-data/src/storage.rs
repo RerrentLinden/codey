@@ -509,7 +509,7 @@ impl SQLiteStorageAdapter {
             return json!({"status": "failed", "session_id": session.session_id, "message": format!("Database not found: {}", self.db_path.to_string_lossy())});
         }
         let result = (|| -> anyhow::Result<Value> {
-            let db = Connection::open(&self.db_path)?;
+            let mut db = Connection::open(&self.db_path)?;
             if schema_kind(&db)? != Some(SchemaKind::CodexThreads)
                 || !has_columns(&db, "threads", &["cwd", "rollout_path"])?
             {
@@ -544,6 +544,7 @@ impl SQLiteStorageAdapter {
                 }
                 Err(err) => return Err(err.into()),
             };
+            drop(stmt);
             let previous_cwd = row
                 .get("cwd")
                 .and_then(Value::as_str)
@@ -554,19 +555,28 @@ impl SQLiteStorageAdapter {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            db.execute(
+            let tx = db.transaction()?;
+            tx.execute(
                 "UPDATE threads SET cwd = ?1 WHERE id = ?2",
                 (target, thread_id.as_str()),
             )?;
-            let rollout = update_rollout_session_meta_cwd(&rollout_path, &thread_id, target);
+            let rollout_updated =
+                update_rollout_session_meta_cwd(&rollout_path, &thread_id, target)?;
+            if let Err(error) = tx.commit() {
+                if rollout_updated {
+                    let _ =
+                        update_rollout_session_meta_cwd(&rollout_path, &thread_id, &previous_cwd);
+                }
+                return Err(error.into());
+            }
             let mut payload = json!({
                 "status": "moved",
                 "session_id": thread_id,
                 "message": "已移动对话",
                 "previous_cwd": previous_cwd,
                 "target_cwd": target,
-                "rollout_updated": rollout.0,
-                "rollout_error": rollout.1,
+                "rollout_updated": rollout_updated,
+                "rollout_error": "",
             });
             if let Some(payload) = payload.as_object_mut() {
                 add_timestamp_payload(payload, &row);
@@ -1410,40 +1420,41 @@ fn update_rollout_session_meta_cwd(
     rollout_path: &str,
     thread_id: &str,
     target_cwd: &str,
-) -> (bool, String) {
+) -> anyhow::Result<bool> {
     if rollout_path.is_empty() || !Path::new(rollout_path).is_file() {
-        return (false, String::new());
+        return Ok(false);
     }
-    let result = (|| -> anyhow::Result<bool> {
-        let text = fs::read_to_string(rollout_path)?;
-        let mut changed = false;
-        let mut output = String::new();
-        for line in text.split_inclusive('\n') {
-            let (body, end) = line
-                .strip_suffix('\n')
-                .map_or((line, ""), |body| (body, "\n"));
-            let mut raw = line.to_string();
-            if let Ok(mut item) = serde_json::from_str::<Value>(body)
-                && item.get("type") == Some(&json!("session_meta"))
-                && item["payload"]["id"] == thread_id
-                && item["payload"]["cwd"] != target_cwd
+    let text = fs::read_to_string(rollout_path)?;
+    let mut matched = false;
+    let mut changed = false;
+    let mut output = String::new();
+    for line in text.split_inclusive('\n') {
+        let (body, end) = line
+            .strip_suffix('\n')
+            .map_or((line, ""), |body| (body, "\n"));
+        let mut raw = line.to_string();
+        if let Ok(mut item) = serde_json::from_str::<Value>(body)
+            && item.get("type") == Some(&json!("session_meta"))
+            && item["payload"]["id"] == thread_id
+        {
+            matched = true;
+            if item["payload"]["cwd"] != target_cwd
                 && let Some(payload) = item.get_mut("payload").and_then(Value::as_object_mut)
             {
                 payload.insert("cwd".to_string(), json!(target_cwd));
                 raw = serde_json::to_string(&item)? + end;
                 changed = true;
             }
-            output.push_str(&raw);
         }
-        if changed {
-            fs::write(rollout_path, output)?;
-        }
-        Ok(changed)
-    })();
-    match result {
-        Ok(changed) => (changed, String::new()),
-        Err(err) => (false, err.to_string()),
+        output.push_str(&raw);
     }
+    if !matched {
+        anyhow::bail!("Rollout does not contain session metadata for thread {thread_id}");
+    }
+    if changed {
+        fs::write(rollout_path, output)?;
+    }
+    Ok(changed)
 }
 
 fn codex_thread_timestamp_columns(db: &Connection) -> anyhow::Result<Vec<String>> {

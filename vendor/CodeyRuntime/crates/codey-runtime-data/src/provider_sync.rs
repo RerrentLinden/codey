@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,7 +65,6 @@ struct SessionChange {
     path: PathBuf,
     original_session_meta_lines: Vec<String>,
     thread_id: Option<String>,
-    cwd: Option<String>,
     has_user_event: bool,
     rewrite_needed: bool,
     original_mtime: Option<SystemTime>,
@@ -76,7 +75,6 @@ struct RolloutRewrite {
     next_text: String,
     rewrite_needed: bool,
     thread_id: Option<String>,
-    cwd: Option<String>,
     providers: Vec<String>,
     original_session_meta_lines: Vec<String>,
     session_meta_count: usize,
@@ -86,7 +84,6 @@ struct RolloutRewrite {
 struct RolloutInspection {
     rewrite_needed: bool,
     thread_id: Option<String>,
-    cwd: Option<String>,
     providers: Vec<String>,
     original_session_meta_lines: Vec<String>,
     session_meta_count: usize,
@@ -111,18 +108,16 @@ struct AppliedSessionChanges {
 struct SqliteUpdateCounts {
     provider_rows: usize,
     user_event_rows: usize,
-    cwd_rows: usize,
 }
 
 impl SqliteUpdateCounts {
     fn total(&self) -> usize {
-        self.provider_rows + self.user_event_rows + self.cwd_rows
+        self.provider_rows + self.user_event_rows
     }
 
     fn add(&mut self, other: Self) {
         self.provider_rows += other.provider_rows;
         self.user_event_rows += other.user_event_rows;
-        self.cwd_rows += other.cwd_rows;
     }
 }
 
@@ -182,14 +177,6 @@ pub fn run_provider_sync_with_target(
             .filter(|change| change.has_user_event)
             .filter_map(|change| change.thread_id.clone())
             .collect::<HashSet<_>>();
-        let projectless_thread_ids =
-            load_projectless_thread_ids(&home.join(".codex-global-state.json"))?;
-        let cwd_by_thread_id = collected
-            .changes
-            .iter()
-            .filter_map(|change| Some((change.thread_id.clone()?, change.cwd.clone()?)))
-            .filter(|(thread_id, _)| !projectless_thread_ids.contains(thread_id))
-            .collect::<HashMap<_, _>>();
         // SessionChange can own two complete copies of a rollout. Move the
         // changed entries into the apply list instead of cloning them so a
         // large history is never retained three times during startup.
@@ -203,12 +190,8 @@ pub fn run_provider_sync_with_target(
             &sqlite_paths,
             &target_provider,
             &thread_ids_with_user_events,
-            &cwd_by_thread_id,
         )?;
-        let global_state_update_count =
-            count_global_state_updates(&home.join(".codex-global-state.json"))?;
-        if rewrite_changes.is_empty() && sqlite_update_count == 0 && global_state_update_count == 0
-        {
+        if rewrite_changes.is_empty() && sqlite_update_count == 0 {
             let mut synced = result(
                 ProviderSyncStatus::Synced,
                 "Provider sync already up to date",
@@ -223,19 +206,16 @@ pub fn run_provider_sync_with_target(
         }
         let backup_dir = create_backup(&home, &target_provider, &rewrite_changes)?;
         let applied = apply_session_changes(&rewrite_changes, &target_provider)?;
-        let apply_result = (|| -> anyhow::Result<(SqliteUpdateCounts, usize)> {
+        let apply_result = (|| -> anyhow::Result<SqliteUpdateCounts> {
             let sqlite_updates = apply_sqlite_update_for_paths(
                 &sqlite_paths,
                 &target_provider,
                 &thread_ids_with_user_events,
-                &cwd_by_thread_id,
             )?;
-            let updated_workspace_roots =
-                apply_global_state_update(&home.join(".codex-global-state.json"))?;
             prune_backups(&home)?;
-            Ok((sqlite_updates, updated_workspace_roots))
+            Ok(sqlite_updates)
         })();
-        let (sqlite_updates, updated_workspace_roots) = match apply_result {
+        let sqlite_updates = match apply_result {
             Ok(counts) => counts,
             Err(err) => {
                 let _ = restore_session_changes(&applied.changes);
@@ -258,8 +238,6 @@ pub fn run_provider_sync_with_target(
         synced.skipped_locked_rollout_files.dedup();
         synced.sqlite_provider_rows_updated = sqlite_updates.provider_rows;
         synced.sqlite_user_event_rows_updated = sqlite_updates.user_event_rows;
-        synced.sqlite_cwd_rows_updated = sqlite_updates.cwd_rows;
-        synced.updated_workspace_roots = updated_workspace_roots;
         synced.encrypted_content_warning = encrypted_content_warning;
         Ok(synced)
     })();
@@ -529,7 +507,6 @@ fn collect_session_changes(home: &Path, target_provider: &str) -> anyhow::Result
             path,
             original_session_meta_lines: inspection.original_session_meta_lines,
             thread_id: inspection.thread_id,
-            cwd: inspection.cwd,
             has_user_event: inspection.has_user_event,
             rewrite_needed: inspection.rewrite_needed,
             original_mtime,
@@ -625,12 +602,6 @@ fn inspect_rollout(path: &Path, target_provider: &str) -> std::io::Result<Rollou
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
         }
-        if inspection.cwd.is_none() {
-            inspection.cwd = payload
-                .get("cwd")
-                .and_then(Value::as_str)
-                .and_then(to_desktop_workspace_path);
-        }
         let provider = payload
             .get("model_provider")
             .and_then(Value::as_str)
@@ -686,12 +657,6 @@ fn rewrite_rollout_session_meta_providers(
                 .get("id")
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
-        }
-        if rewrite.cwd.is_none() {
-            rewrite.cwd = payload
-                .get("cwd")
-                .and_then(Value::as_str)
-                .and_then(to_desktop_workspace_path);
         }
         let provider = payload
             .get("model_provider")
@@ -786,21 +751,6 @@ fn split_line_ending(segment: &str) -> (&str, &str) {
     } else {
         (segment, "")
     }
-}
-
-fn to_desktop_workspace_path(value: &str) -> Option<String> {
-    let stripped = value.trim();
-    if stripped.is_empty() {
-        return None;
-    }
-    let lower = stripped.to_ascii_lowercase();
-    if lower.starts_with(r"\\?\unc\") {
-        return Some(format!(r"\\{}", stripped[8..].replace('/', r"\")));
-    }
-    if let Some(stripped) = stripped.strip_prefix(r"\\?\") {
-        return Some(stripped.replace('\\', "/"));
-    }
-    Some(stripped.to_string())
 }
 
 fn is_locked_io_error(error: &std::io::Error) -> bool {
@@ -1056,7 +1006,6 @@ fn count_sqlite_updates(
     path: &Path,
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
-    cwd_by_thread_id: &HashMap<String, String>,
 ) -> anyhow::Result<usize> {
     if !path.exists() {
         return Ok(0);
@@ -1080,15 +1029,6 @@ fn count_sqlite_updates(
             )? as usize;
         }
     }
-    if columns.contains("cwd") {
-        for (thread_id, cwd) in cwd_by_thread_id {
-            total += db.query_row(
-                "SELECT COUNT(*) FROM threads WHERE id = ?1 AND COALESCE(cwd, '') <> ?2",
-                (thread_id, cwd),
-                |row| row.get::<_, i64>(0),
-            )? as usize;
-        }
-    }
     Ok(total)
 }
 
@@ -1096,16 +1036,10 @@ fn count_sqlite_updates_for_paths(
     paths: &[PathBuf],
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
-    cwd_by_thread_id: &HashMap<String, String>,
 ) -> anyhow::Result<usize> {
     let mut total = 0;
     for path in paths {
-        total += count_sqlite_updates(
-            path,
-            target_provider,
-            user_event_thread_ids,
-            cwd_by_thread_id,
-        )?;
+        total += count_sqlite_updates(path, target_provider, user_event_thread_ids)?;
     }
     Ok(total)
 }
@@ -1114,7 +1048,6 @@ fn apply_sqlite_update(
     path: &Path,
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
-    cwd_by_thread_id: &HashMap<String, String>,
 ) -> anyhow::Result<SqliteUpdateCounts> {
     if !path.exists() {
         return Ok(SqliteUpdateCounts::default());
@@ -1140,14 +1073,6 @@ fn apply_sqlite_update(
             )?;
         }
     }
-    if columns.contains("cwd") {
-        for (thread_id, cwd) in cwd_by_thread_id {
-            counts.cwd_rows += tx.execute(
-                "UPDATE threads SET cwd = ?1 WHERE id = ?2 AND COALESCE(cwd, '') <> ?1",
-                (cwd, thread_id),
-            )?;
-        }
-    }
     tx.commit()?;
     Ok(counts)
 }
@@ -1156,7 +1081,6 @@ fn apply_sqlite_update_for_paths(
     paths: &[PathBuf],
     target_provider: &str,
     user_event_thread_ids: &HashSet<String>,
-    cwd_by_thread_id: &HashMap<String, String>,
 ) -> anyhow::Result<SqliteUpdateCounts> {
     let mut total = SqliteUpdateCounts::default();
     for path in paths {
@@ -1164,169 +1088,9 @@ fn apply_sqlite_update_for_paths(
             path,
             target_provider,
             user_event_thread_ids,
-            cwd_by_thread_id,
         )?);
     }
     Ok(total)
-}
-
-fn load_global_state(path: &Path) -> anyhow::Result<Map<String, Value>> {
-    if !path.exists() {
-        return Ok(Map::new());
-    }
-    Ok(serde_json::from_str::<Value>(&fs::read_to_string(path)?)?
-        .as_object()
-        .cloned()
-        .unwrap_or_default())
-}
-
-fn load_projectless_thread_ids(path: &Path) -> anyhow::Result<HashSet<String>> {
-    let state = load_global_state(path)?;
-    let mut ids = HashSet::new();
-    if let Some(items) = state
-        .get("projectless-thread-ids")
-        .and_then(Value::as_array)
-    {
-        for item in items {
-            if let Some(id) = item.as_str().filter(|id| !id.trim().is_empty()) {
-                ids.insert(id.to_string());
-            }
-        }
-    }
-    Ok(ids)
-}
-
-fn normalized_global_state(state: &Map<String, Value>) -> Map<String, Value> {
-    let mut next = Map::new();
-    if let Some(value) = state.get("electron-saved-workspace-roots") {
-        next.insert(
-            "electron-saved-workspace-roots".to_string(),
-            json!(dedupe_paths(path_array(value))),
-        );
-    }
-    if let Some(value) = state.get("project-order") {
-        next.insert(
-            "project-order".to_string(),
-            json!(dedupe_paths(path_array(value))),
-        );
-    }
-    if let Some(value) = state.get("active-workspace-roots") {
-        let normalized = dedupe_paths(path_array(value));
-        let next_value = if value.is_array() {
-            json!(normalized)
-        } else if let Some(first) = normalized.first() {
-            json!(first)
-        } else {
-            value.clone()
-        };
-        next.insert("active-workspace-roots".to_string(), next_value);
-    }
-    if let Some(value) = state
-        .get("electron-workspace-root-labels")
-        .and_then(Value::as_object)
-    {
-        let mut labels = Map::new();
-        for (key, item) in value {
-            labels.insert(
-                to_desktop_workspace_path(key).unwrap_or_else(|| key.clone()),
-                item.clone(),
-            );
-        }
-        next.insert(
-            "electron-workspace-root-labels".to_string(),
-            Value::Object(labels),
-        );
-    }
-    if let Some(open_targets) = state
-        .get("open-in-target-preferences")
-        .and_then(Value::as_object)
-    {
-        let mut next_open_targets = open_targets.clone();
-        if let Some(per_path) =
-            copy_resolved_object_keys(open_targets.get("perPath").and_then(Value::as_object))
-        {
-            next_open_targets.insert("perPath".to_string(), Value::Object(per_path));
-        }
-        next.insert(
-            "open-in-target-preferences".to_string(),
-            Value::Object(next_open_targets),
-        );
-    }
-    next
-}
-
-fn copy_resolved_object_keys(value: Option<&Map<String, Value>>) -> Option<Map<String, Value>> {
-    let value = value?;
-    let mut next = Map::new();
-    for (key, item) in value {
-        next.insert(
-            to_desktop_workspace_path(key).unwrap_or_else(|| key.clone()),
-            item.clone(),
-        );
-    }
-    Some(next)
-}
-
-fn count_global_state_updates(path: &Path) -> anyhow::Result<usize> {
-    let state = load_global_state(path)?;
-    let next = normalized_global_state(&state);
-    Ok(next
-        .iter()
-        .filter(|(key, value)| state.get(*key) != Some(*value))
-        .count())
-}
-
-fn apply_global_state_update(path: &Path) -> anyhow::Result<usize> {
-    let mut state = load_global_state(path)?;
-    let next = normalized_global_state(&state);
-    let count = next
-        .iter()
-        .filter(|(key, value)| state.get(*key) != Some(*value))
-        .count();
-    if count > 0 {
-        for (key, value) in next {
-            state.insert(key, value);
-        }
-        let text = serde_json::to_string_pretty(&Value::Object(state))?;
-        fs::write(path, &text)?;
-        if let Some(parent) = path.parent() {
-            fs::write(parent.join(".codex-global-state.json.bak"), text)?;
-        }
-    }
-    Ok(count)
-}
-
-fn path_array(value: &Value) -> Vec<String> {
-    if let Some(items) = value.as_array() {
-        items
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|item| !item.trim().is_empty())
-            .map(ToString::to_string)
-            .collect()
-    } else if let Some(value) = value.as_str().filter(|item| !item.trim().is_empty()) {
-        vec![value.to_string()]
-    } else {
-        Vec::new()
-    }
-}
-
-fn dedupe_paths(paths: Vec<String>) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut result = Vec::new();
-    for path in paths {
-        let Some(desktop) = to_desktop_workspace_path(&path) else {
-            continue;
-        };
-        let comparable = desktop
-            .replace('/', r"\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase();
-        if seen.insert(comparable) {
-            result.push(desktop);
-        }
-    }
-    result
 }
 
 fn prune_backups(home: &Path) -> anyhow::Result<()> {
@@ -1402,6 +1166,5 @@ mod memory_tests {
                 < 1024
         );
         assert_eq!(change.thread_id.as_deref(), Some("thread-1"));
-        assert_eq!(change.cwd.as_deref(), Some("/tmp/project"));
     }
 }
