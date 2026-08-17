@@ -23,6 +23,28 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
+fn chat_response_with_tool_call(upstream_name: &str) -> serde_json::Value {
+    json!({
+        "id": "chatcmpl_alias",
+        "created": 123,
+        "model": "gpt-5-mini",
+        "choices": [{
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_alias",
+                    "type": "function",
+                    "function": {
+                        "name": upstream_name,
+                        "arguments": "{}"
+                    }
+                }]
+            }
+        }]
+    })
+}
+
 #[test]
 fn responses_request_converts_to_chat_completions() {
     let converted = responses_to_chat_completions(json!({
@@ -482,6 +504,167 @@ fn responses_request_maps_codex_custom_and_namespace_tools_to_chat_functions() {
         converted["tool_choice"]["function"]["name"],
         "mcp__vscode_mcp__open_file"
     );
+}
+
+#[test]
+fn responses_request_flattens_agents_namespace_tools_to_chat_functions() {
+    let converted = responses_to_chat_completions(json!({
+        "model": "gpt-5-mini",
+        "input": "hi",
+        "tools": [{
+            "type": "namespace",
+            "name": "agents",
+            "tools": [{
+                "type": "function",
+                "name": "wait_agent",
+                "parameters": {}
+            }]
+        }]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        converted["tools"][0]["function"]["name"],
+        "agents__wait_agent"
+    );
+}
+
+#[test]
+fn chat_completion_response_restores_agents_wait_agent_namespace_aliases() {
+    let request = json!({
+        "model": "gpt-5-mini",
+        "tools": [{
+            "type": "namespace",
+            "name": "agents",
+            "tools": [{
+                "type": "function",
+                "name": "wait_agent",
+                "parameters": {}
+            }]
+        }]
+    });
+
+    for upstream_name in [
+        "agents.wait_agent",
+        "agents/wait_agent",
+        "agents:wait_agent",
+        "functions.wait_agent",
+        "functions.wait",
+        "wait_agent",
+    ] {
+        let converted = chat_completion_to_response_with_request(
+            chat_response_with_tool_call(upstream_name),
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(converted["output"][0]["type"], "function_call");
+        assert_eq!(
+            converted["output"][0]["name"], "wait_agent",
+            "{upstream_name}"
+        );
+        assert_eq!(
+            converted["output"][0]["namespace"], "agents",
+            "{upstream_name}"
+        );
+    }
+}
+
+#[test]
+fn chat_completion_response_restores_namespace_separator_aliases() {
+    let request = json!({
+        "model": "gpt-5-mini",
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__vscode_mcp__",
+            "tools": [{
+                "type": "function",
+                "name": "open_file",
+                "parameters": {}
+            }]
+        }]
+    });
+
+    for upstream_name in [
+        "mcp__vscode_mcp__.open_file",
+        "mcp__vscode_mcp__/open_file",
+        "mcp__vscode_mcp__:open_file",
+    ] {
+        let converted = chat_completion_to_response_with_request(
+            chat_response_with_tool_call(upstream_name),
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(converted["output"][0]["type"], "function_call");
+        assert_eq!(
+            converted["output"][0]["name"], "open_file",
+            "{upstream_name}"
+        );
+        assert_eq!(
+            converted["output"][0]["namespace"], "mcp__vscode_mcp__",
+            "{upstream_name}"
+        );
+    }
+}
+
+#[test]
+fn chat_completion_response_does_not_map_functions_wait_without_agents_tool() {
+    let converted = chat_completion_to_response_with_request(
+        chat_response_with_tool_call("functions.wait"),
+        &json!({
+            "model": "gpt-5-mini",
+            "tools": [{
+                "type": "namespace",
+                "name": "functions",
+                "tools": [{
+                    "type": "function",
+                    "name": "wait",
+                    "parameters": {}
+                }]
+            }]
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(converted["output"][0]["type"], "function_call");
+    assert_eq!(converted["output"][0]["name"], "functions.wait");
+    assert!(converted["output"][0].get("namespace").is_none());
+}
+
+#[test]
+fn chat_completion_response_keeps_ambiguous_namespace_alias_unnamespaced() {
+    let converted = chat_completion_to_response_with_request(
+        chat_response_with_tool_call("wait_agent"),
+        &json!({
+            "model": "gpt-5-mini",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "agents",
+                    "tools": [{
+                        "type": "function",
+                        "name": "wait_agent",
+                        "parameters": {}
+                    }]
+                },
+                {
+                    "type": "namespace",
+                    "name": "helpers",
+                    "tools": [{
+                        "type": "function",
+                        "name": "wait_agent",
+                        "parameters": {}
+                    }]
+                }
+            ]
+        }),
+    )
+    .unwrap();
+
+    assert_eq!(converted["output"][0]["type"], "function_call");
+    assert_eq!(converted["output"][0]["name"], "wait_agent");
+    assert!(converted["output"][0].get("namespace").is_none());
 }
 
 #[test]

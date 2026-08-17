@@ -1896,7 +1896,7 @@ const SUBAGENT_GATE_HOOKS: [CodeyHookSpec; 6] = [
     CodeyHookSpec {
         toml_event: "PostToolUse",
         event_key: "post_tool_use",
-        matcher: Some(".*wait_agent$"),
+        matcher: Some(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER),
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
     CodeyHookSpec {

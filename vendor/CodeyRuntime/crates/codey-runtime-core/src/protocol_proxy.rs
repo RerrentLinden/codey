@@ -111,7 +111,11 @@ impl CodexToolContext {
     }
 
     fn openai_name_for_function_tool(&self, upstream_name: &str) -> (String, String) {
-        let Some(spec) = self.function_tools.get(upstream_name) else {
+        let Some(spec) = self
+            .function_tools
+            .get(upstream_name)
+            .or_else(|| self.unique_namespace_alias_match(upstream_name))
+        else {
             return (upstream_name.to_string(), String::new());
         };
         let name = if spec.name.is_empty() {
@@ -120,6 +124,18 @@ impl CodexToolContext {
             spec.name.clone()
         };
         (name, spec.namespace.clone())
+    }
+
+    fn unique_namespace_alias_match(&self, upstream_name: &str) -> Option<&CodexFunctionToolSpec> {
+        let mut matches = self
+            .function_tools
+            .values()
+            .filter(|spec| namespace_alias_matches(upstream_name, spec));
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None;
+        }
+        Some(first)
     }
 }
 
@@ -2869,6 +2885,29 @@ fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
     } else {
         format!("{namespace}__{name}")
     }
+}
+
+fn namespace_alias_matches(upstream_name: &str, spec: &CodexFunctionToolSpec) -> bool {
+    if spec.namespace.is_empty() || spec.name.is_empty() {
+        return false;
+    }
+
+    if upstream_name == "functions.wait" {
+        return spec.namespace == "agents" && spec.name == "wait_agent";
+    }
+
+    if upstream_name == spec.name {
+        return spec.name == "wait_agent";
+    }
+
+    [".", "/", ":"].into_iter().any(|separator| {
+        upstream_name.len() == spec.namespace.len() + separator.len() + spec.name.len()
+            && upstream_name.starts_with(&spec.namespace)
+            && upstream_name[spec.namespace.len()..].starts_with(separator)
+            && upstream_name[spec.namespace.len() + separator.len()..] == spec.name
+    }) || (spec.namespace == "agents"
+        && spec.name == "wait_agent"
+        && upstream_name == "functions.wait_agent")
 }
 
 fn responses_tool_choice_to_chat(tool_choice: &Value, context: &CodexToolContext) -> Option<Value> {

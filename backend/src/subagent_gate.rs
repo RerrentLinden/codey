@@ -12,6 +12,7 @@ pub(crate) const HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook";
 pub(crate) const RUNTIME_ACTIVE_ENV: &str = "CODEY_SUBAGENT_GATE_ACTIVE";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
 pub(crate) const SESSION_END_HOOK_TIMEOUT_SECONDS: u64 = 3;
+pub(crate) const WAIT_AGENT_HOOK_MATCHER: &str = ".*wait_agent$|^functions(__|[./:_])wait$";
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 const STATE_DIRECTORY: &str = "codey-subagent-gate-v2";
 
@@ -174,6 +175,11 @@ fn post_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
         remove_session_state(state_root, &input.session_id)?;
         return Ok(json!({}));
     }
+    remove_completed_agents_from_wait_response(
+        state_root,
+        &input.session_id,
+        input.tool_response.as_ref(),
+    )?;
     let active = active_agent_count(state_root, &input.session_id)?;
     if active == 0 {
         return Ok(json!({}));
@@ -275,16 +281,79 @@ fn wait_was_interrupted_by_user(tool_response: Option<&Value>) -> bool {
     tool_response.is_some_and(value_reports_user_interrupt)
 }
 
+fn remove_completed_agents_from_wait_response(
+    state_root: &Path,
+    session_id: &str,
+    tool_response: Option<&Value>,
+) -> Result<()> {
+    let Some(tool_response) = tool_response else {
+        return Ok(());
+    };
+    let mut completed_agent_ids = Vec::new();
+    collect_completed_agent_ids(tool_response, &mut completed_agent_ids);
+    completed_agent_ids.sort();
+    completed_agent_ids.dedup();
+    for agent_id in completed_agent_ids {
+        remove_active_marker(state_root, session_id, &agent_id)?;
+    }
+    Ok(())
+}
+
+fn collect_completed_agent_ids(value: &Value, completed_agent_ids: &mut Vec<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_completed_agent_ids(value, completed_agent_ids);
+            }
+        }
+        Value::Object(values) => {
+            if let Some(agent_id) = object_agent_id(values)
+                && object_reports_agent_completion(values)
+            {
+                completed_agent_ids.push(agent_id.to_string());
+            }
+            for value in values.values() {
+                collect_completed_agent_ids(value, completed_agent_ids);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn object_agent_id(values: &Map<String, Value>) -> Option<&str> {
+    values.iter().find_map(|(key, value)| {
+        (normalized_ascii_identifier(key) == "agentid")
+            .then(|| nonempty(value.as_str()))
+            .flatten()
+    })
+}
+
+fn object_reports_agent_completion(values: &Map<String, Value>) -> bool {
+    values.iter().any(|(key, value)| {
+        is_agent_completion_field(key) && value.as_str().is_some_and(is_agent_completion_value)
+    })
+}
+
+fn is_agent_completion_field(key: &str) -> bool {
+    matches!(
+        normalized_ascii_identifier(key).as_str(),
+        "status" | "type" | "kind" | "event" | "messagetype" | "messagekind" | "eventname"
+    )
+}
+
+fn is_agent_completion_value(value: &str) -> bool {
+    matches!(
+        normalized_ascii_identifier(value).as_str(),
+        "finalanswer" | "taskcomplete"
+    )
+}
+
 fn value_reports_user_interrupt(value: &Value) -> bool {
     match value {
         Value::String(value) => text_reports_user_interrupt(value),
         Value::Array(values) => values.iter().any(value_reports_user_interrupt),
         Value::Object(values) => values.iter().any(|(key, value)| {
-            let normalized_key = key
-                .chars()
-                .filter(|character| character.is_ascii_alphanumeric())
-                .flat_map(char::to_lowercase)
-                .collect::<String>();
+            let normalized_key = normalized_ascii_identifier(key);
             (matches!(
                 normalized_key.as_str(),
                 "interruptedbynewinput"
@@ -306,6 +375,14 @@ fn value_reports_user_interrupt(value: &Value) -> bool {
         }),
         _ => false,
     }
+}
+
+fn normalized_ascii_identifier(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn text_reports_user_interrupt(value: &str) -> bool {
@@ -363,6 +440,9 @@ fn is_spawn_agent_tool(tool_name: &str) -> bool {
 
 fn normalized_collaboration_tool(tool_name: &str) -> String {
     let normalized = tool_name.trim().to_ascii_lowercase();
+    if is_functions_wait_alias(&normalized) {
+        return "wait_agent".to_string();
+    }
     let leaf = normalized
         .rsplit(['.', '/', ':'])
         .next()
@@ -375,6 +455,15 @@ fn normalized_collaboration_tool(tool_name: &str) -> String {
         .map(|name| name.trim_start_matches(['.', '/', ':', '_']))
         .unwrap_or(leaf);
     flattened_leaf.to_string()
+}
+
+fn is_functions_wait_alias(normalized_tool_name: &str) -> bool {
+    let Some(remainder) = normalized_tool_name.strip_prefix("functions") else {
+        return false;
+    };
+    ["__", ".", "/", ":", "_"]
+        .iter()
+        .any(|separator| remainder.strip_prefix(separator) == Some("wait"))
 }
 
 fn create_active_marker(state_root: &Path, session_id: &str, agent_id: &str) -> Result<()> {
@@ -555,9 +644,26 @@ mod tests {
         child_bash.tool_name = Some("Bash".to_string());
         assert_eq!(handle_hook(&child_bash, root).unwrap(), json!({}));
 
-        let mut wait = input("PreToolUse", "session-a");
-        wait.tool_name = Some("agents.wait_agent".to_string());
-        assert_eq!(handle_hook(&wait, root).unwrap(), json!({}));
+        for tool in [
+            "agents.wait_agent",
+            "functions.wait",
+            "functions/wait",
+            "functions:wait",
+            "functions__wait",
+            "functions_wait",
+        ] {
+            let mut wait = input("PreToolUse", "session-a");
+            wait.tool_name = Some(tool.to_string());
+            assert_eq!(handle_hook(&wait, root).unwrap(), json!({}), "{tool}");
+        }
+
+        let mut functions_exec = input("PreToolUse", "session-a");
+        functions_exec.tool_name = Some("functions.exec".to_string());
+        assert_eq!(
+            handle_hook(&functions_exec, root).unwrap()["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
     }
 
     #[test]
@@ -678,6 +784,73 @@ mod tests {
     }
 
     #[test]
+    fn completed_wait_response_releases_matching_active_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for agent_id in ["agent-a", "agent-b"] {
+            let mut start = input("SubagentStart", "session-a");
+            start.agent_id = Some(agent_id.to_string());
+            handle_hook(&start, root).unwrap();
+        }
+
+        let mut completed_wait = input("PostToolUse", "session-a");
+        completed_wait.tool_name = Some("functions.wait".to_string());
+        completed_wait.tool_response = Some(json!({
+            "updates": [
+                {
+                    "agentId": "agent-a",
+                    "status": "FINAL_ANSWER",
+                    "message": "done"
+                },
+                {
+                    "nested": {
+                        "agent_id": "agent-b",
+                        "kind": "task-complete"
+                    }
+                }
+            ]
+        }));
+
+        assert_eq!(handle_hook(&completed_wait, root).unwrap(), json!({}));
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 0);
+
+        for agent_id in ["agent-a", "agent-b"] {
+            let mut late_stop = input("SubagentStop", "session-a");
+            late_stop.agent_id = Some(agent_id.to_string());
+            assert_eq!(handle_hook(&late_stop, root).unwrap(), json!({}));
+        }
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 0);
+    }
+
+    #[test]
+    fn non_terminal_or_unattributed_wait_updates_do_not_release_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for (index, tool_response) in [
+            json!({ "agent_id": "agent-a", "status": "partial" }),
+            json!({ "agentId": "agent-a", "type": "MESSAGE" }),
+            json!({ "status": "FINAL_ANSWER", "message": "done" }),
+            json!({ "agent_id": "agent-a", "message": "FINAL_ANSWER" }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let session_id = format!("session-{index}");
+            let mut start = input("SubagentStart", &session_id);
+            start.agent_id = Some("agent-a".to_string());
+            handle_hook(&start, root).unwrap();
+
+            let mut wait = input("PostToolUse", &session_id);
+            wait.tool_name = Some("agents.wait_agent".to_string());
+            wait.tool_response = Some(tool_response);
+            let blocked = handle_hook(&wait, root).unwrap();
+
+            assert_eq!(blocked["decision"].as_str(), Some("block"));
+            assert_eq!(active_agent_count(root, &session_id).unwrap(), 1);
+        }
+    }
+
+    #[test]
     fn interrupted_root_wait_clears_session_gate_state() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -779,11 +952,19 @@ mod tests {
             "agents/interrupt_agent",
             "agents::send_message",
             "followup_task",
+            "functions.wait",
+            "functions/wait",
+            "functions:wait",
+            "functions__wait",
+            "functions_wait",
         ] {
             assert!(is_collaboration_tool(tool), "{tool}");
         }
         assert!(!is_collaboration_tool("functions.exec"));
         assert!(!is_collaboration_tool("update_plan"));
+        assert!(is_wait_agent_tool("functions.wait"));
+        assert!(is_wait_agent_tool("functions__wait"));
+        assert!(!is_wait_agent_tool("functions.exec"));
         assert!(is_spawn_agent_tool("Agent"));
         assert!(is_spawn_agent_tool("agents.spawn_agent"));
         assert!(is_spawn_agent_tool("agents__spawn_agent"));
