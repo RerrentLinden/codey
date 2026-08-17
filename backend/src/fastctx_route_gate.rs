@@ -110,7 +110,7 @@ fn handle_hook(input: &HookInput) -> Value {
     };
 
     deny(format!(
-        "Codey FastCtx 路由：这个终端调用只包含本地文件读取、搜索或发现操作。请优先调用 `{}`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位后调用。Windows 路径请转换为 `E:/repo/file.ts` 形式的绝对盘符路径。只有在对应 FastCtx 工具确实不可见或调用失败后，才可把 `{FALLBACK_MARKER}` 作为命令的第一行重试终端；不要在未尝试 FastCtx 前使用该回退标记。",
+        "Codey FastCtx：请改用 `{}`；仅当该工具不可用时，才以 `{FALLBACK_MARKER}` 作为命令首行重试。",
         route.tool_name(),
     ))
 }
@@ -621,12 +621,13 @@ mod tests {
     }
 
     #[test]
-    fn pre_tool_use_denial_names_the_route_and_safe_fallback() {
+    fn pre_tool_use_denial_is_concise_and_names_the_safe_fallback() {
         let output = handle_hook(&hook_input("rg -n needle src"));
         let reason = assert_denied(&output);
-        assert!(reason.contains("mcp__codey_fastctx__grep"));
-        assert!(reason.contains(FALLBACK_MARKER));
-        assert!(reason.contains("E:/repo/file.ts"));
+        assert_eq!(
+            reason,
+            "Codey FastCtx：请改用 `mcp__codey_fastctx__grep`；仅当该工具不可用时，才以 `# codey-fastctx-fallback` 作为命令首行重试。"
+        );
     }
 
     #[test]

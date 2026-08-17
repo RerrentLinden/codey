@@ -126,6 +126,8 @@ Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周�
 - Codex App 路径：留空时使用 CodeyRuntime 的平台发现逻辑。Windows 自动发现失败或已保存路径失效时，会在启动阶段打开原生目录选择器并持久化规范化后的应用目录，因此自定义盘符不依赖尚未启动的 Codex 页面；配置页只展示当前解析结果，不提供无法在首次启动失败时触达的恢复弹窗。目录解析兼容安装根目录下的 `app`、`bin`、`current` 与 `versions/current` 布局。
 - CDP 默认端口：`9229`，如 Windows 端口被占用会按 core 的逻辑选择可用回环端口。
 
+- FastCtx 路由 Hook 会对每个命中的 `PreToolUse` 独立执行；拒绝原因只保留目标函数与显式回退标记，完整的工具发现、code mode 和 Windows 路径规则由运行时 FastCtx 指引统一提供，避免连续读取时在 Codex 钩子面板重复刷出整段说明。
+
 ### 通知渠道扩展
 
 通知实现按“公共调度 + 渠道适配”拆分。后端 `backend/src/notifications/` 中的配置、事件、格式化和调度器不依赖具体渠道；每个发送渠道放在 `channels/` 的独立文件中，实现 `NotificationChannelAdapter`，并在 `channels/mod.rs` 注册。新增渠道时需要同时补齐渠道枚举与配置字段、请求构造、明确的成功响应校验、传输与响应错误脱敏及对应单元测试；HTTP 成功但响应损坏或缺少渠道成功字段仍按发送失败处理。
