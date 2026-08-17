@@ -1819,6 +1819,7 @@ async fn explicit_protocol_proxy_bridges_responses_to_a_chat_upstream() {
 
     let response = reqwest::Client::new()
         .post(format!("{}/responses", proxy.base_url()))
+        .header("x-codex-installation-id", "installation-test-id")
         .json(&json!({
             "model": "deepseek-reasoner",
             "input": "hello",
@@ -1839,6 +1840,7 @@ async fn explicit_protocol_proxy_bridges_responses_to_a_chat_upstream() {
             .starts_with("POST /v1/chat/completions ")
     );
     assert_eq!(request.authorization, "Bearer sk-explicit");
+    assert_eq!(request.installation_id, "installation-test-id");
     let upstream_body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
     assert_eq!(upstream_body["model"], "deepseek-reasoner");
     assert_eq!(upstream_body["messages"][0]["content"], "hello");
@@ -2130,6 +2132,15 @@ fn spawn_sequence_server(expected: usize) -> SequenceServer {
                     })
                 })
                 .unwrap_or_default();
+            let installation_id = request
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("x-codex-installation-id")
+                            .then(|| value.trim().to_string())
+                    })
+                })
+                .unwrap_or_default();
             let request_line = request.lines().next().unwrap_or_default().to_string();
             let body = request
                 .split_once("\r\n\r\n")
@@ -2145,6 +2156,7 @@ fn spawn_sequence_server(expected: usize) -> SequenceServer {
             requests.push(ChatRequest {
                 user_agent,
                 authorization,
+                installation_id,
                 request_line,
                 body,
             });
@@ -2168,6 +2180,7 @@ impl ChatServer {
 struct ChatRequest {
     user_agent: String,
     authorization: String,
+    installation_id: String,
     request_line: String,
     body: String,
 }
@@ -2225,6 +2238,15 @@ fn spawn_chat_server() -> ChatServer {
                 })
             })
             .unwrap_or_default();
+        let installation_id = request
+            .lines()
+            .find_map(|line| {
+                line.split_once(':').and_then(|(name, value)| {
+                    name.eq_ignore_ascii_case("x-codex-installation-id")
+                        .then(|| value.trim().to_string())
+                })
+            })
+            .unwrap_or_default();
         let request_line = request.lines().next().unwrap_or_default().to_string();
         let request_body = request
             .split_once("\r\n\r\n")
@@ -2240,6 +2262,7 @@ fn spawn_chat_server() -> ChatServer {
         ChatRequest {
             user_agent,
             authorization,
+            installation_id,
             request_line,
             body: request_body,
         }

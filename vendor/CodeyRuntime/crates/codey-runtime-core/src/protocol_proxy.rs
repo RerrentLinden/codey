@@ -18,6 +18,7 @@ pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_STREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
+const CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 const THINK_OPEN_TAG: &str = "<think>";
 const THINK_CLOSE_TAG: &str = "</think>";
 const EXTRA_CHAT_PASSTHROUGH_FIELDS: &[&str] = &[
@@ -504,11 +505,20 @@ pub(crate) async fn open_responses_proxy_request_value(
     request_json: &Value,
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_responses_proxy_request_value_with_headers(request_json, original_user_agent, None).await
+}
+
+pub(crate) async fn open_responses_proxy_request_value_with_headers(
+    request_json: &Value,
+    original_user_agent: Option<&str>,
+    original_installation_id: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
-    open_responses_proxy_request_value_with_settings_and_user_agent(
+    open_responses_proxy_request_value_with_settings_and_headers(
         request_json,
         settings,
         original_user_agent,
+        original_installation_id,
     )
     .await
 }
@@ -526,18 +536,20 @@ pub async fn open_responses_proxy_request_with_settings_and_user_agent(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let request_json: Value = serde_json::from_str(body)?;
-    open_responses_proxy_request_value_with_settings_and_user_agent(
+    open_responses_proxy_request_value_with_settings_and_headers(
         &request_json,
         settings,
         original_user_agent,
+        None,
     )
     .await
 }
 
-pub(crate) async fn open_responses_proxy_request_value_with_settings_and_user_agent(
+pub(crate) async fn open_responses_proxy_request_value_with_settings_and_headers(
     request_json: &Value,
     settings: crate::settings::BackendSettings,
     original_user_agent: Option<&str>,
+    original_installation_id: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
     let model = request_json
         .get("model")
@@ -583,6 +595,7 @@ pub(crate) async fn open_responses_proxy_request_value_with_settings_and_user_ag
                 &endpoint,
                 relay.api_key.trim(),
                 &effective_user_agent(&relay.user_agent, original_user_agent),
+                original_installation_id,
                 is_stream,
                 upstream_body.as_ref(),
             ),
@@ -682,6 +695,13 @@ pub(crate) async fn open_responses_proxy_request_value_with_settings_and_user_ag
 pub async fn open_models_proxy_request(
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_models_proxy_request_with_headers(original_user_agent, None).await
+}
+
+pub(crate) async fn open_models_proxy_request_with_headers(
+    original_user_agent: Option<&str>,
+    original_installation_id: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = crate::relay_rotation::select_relay_for_probe(&settings)?;
     validate_upstream(&relay)?;
@@ -696,7 +716,7 @@ pub async fn open_models_proxy_request(
             "wireApi": UpstreamWireApi::Responses
         }),
     );
-    let upstream = send_upstream_request(
+    let upstream = send_upstream_request(with_codex_installation_id(
         upstream_http_client()?
             .get(endpoint)
             .header(
@@ -704,7 +724,8 @@ pub async fn open_models_proxy_request(
                 effective_user_agent(&relay.user_agent, original_user_agent),
             )
             .bearer_auth(relay.api_key.trim()),
-    )
+        original_installation_id,
+    ))
     .await?;
     let status_code = upstream.status().as_u16();
     let content_type = upstream
@@ -727,6 +748,14 @@ pub async fn open_chat_completions_proxy_request(
     body: &str,
     original_user_agent: Option<&str>,
 ) -> anyhow::Result<UpstreamProxyResponse> {
+    open_chat_completions_proxy_request_with_headers(body, original_user_agent, None).await
+}
+
+pub(crate) async fn open_chat_completions_proxy_request_with_headers(
+    body: &str,
+    original_user_agent: Option<&str>,
+    original_installation_id: Option<&str>,
+) -> anyhow::Result<UpstreamProxyResponse> {
     let settings = SettingsStore::default().load().unwrap_or_default();
     let relay = settings.active_relay_profile();
     if relay.protocol != RelayProtocol::ChatCompletions {
@@ -745,15 +774,18 @@ pub async fn open_chat_completions_proxy_request(
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let upstream = send_upstream_request_for_responses(
-        upstream_http_client()?
-            .post(chat_completions_url(&relay.base_url))
-            .bearer_auth(relay.api_key.trim())
-            .header(
-                reqwest::header::USER_AGENT,
-                effective_user_agent(&relay.user_agent, original_user_agent),
-            )
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&request_json),
+        with_codex_installation_id(
+            upstream_http_client()?
+                .post(chat_completions_url(&relay.base_url))
+                .bearer_auth(relay.api_key.trim())
+                .header(
+                    reqwest::header::USER_AGENT,
+                    effective_user_agent(&relay.user_agent, original_user_agent),
+                )
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&request_json),
+            original_installation_id,
+        ),
         is_stream,
     )
     .await?;
@@ -827,6 +859,7 @@ fn upstream_request_builder(
     endpoint: &str,
     api_key: &str,
     user_agent: &str,
+    installation_id: Option<&str>,
     is_stream: bool,
     upstream_body: &Value,
 ) -> reqwest::RequestBuilder {
@@ -840,7 +873,20 @@ fn upstream_request_builder(
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header(reqwest::header::CACHE_CONTROL, "no-cache");
     }
-    builder.json(upstream_body)
+    with_codex_installation_id(builder, installation_id).json(upstream_body)
+}
+
+fn with_codex_installation_id(
+    builder: reqwest::RequestBuilder,
+    installation_id: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match installation_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => builder.header(CODEX_INSTALLATION_ID_HEADER, value),
+        None => builder,
+    }
 }
 
 fn validate_upstream(relay: &crate::settings::RelayProfile) -> anyhow::Result<()> {

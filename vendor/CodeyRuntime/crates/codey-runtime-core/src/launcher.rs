@@ -1079,6 +1079,7 @@ async fn handle_helper_connection_with_settings(
     let path = raw_path.split('?').next().unwrap_or(raw_path);
     let request_body = http_request_body(&request);
     let request_user_agent = header_value_from_request(&request, "user-agent");
+    let request_installation_id = header_value_from_request(&request, "x-codex-installation-id");
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
 
     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -1097,6 +1098,7 @@ async fn handle_helper_connection_with_settings(
             &mut stream,
             request_body,
             request_user_agent.as_deref(),
+            request_installation_id.as_deref(),
             method,
             path,
             remote_addr_text,
@@ -1109,6 +1111,7 @@ async fn handle_helper_connection_with_settings(
             &mut stream,
             request_body,
             request_user_agent.as_deref(),
+            request_installation_id.as_deref(),
             method,
             path,
             remote_addr_text,
@@ -1119,6 +1122,7 @@ async fn handle_helper_connection_with_settings(
         return handle_models_proxy_connection(
             &mut stream,
             request_user_agent.as_deref(),
+            request_installation_id.as_deref(),
             method,
             path,
             remote_addr_text,
@@ -1289,6 +1293,7 @@ fn overlay_image_content_type(path: &Path) -> Option<&'static str> {
 async fn handle_models_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_user_agent: Option<&str>,
+    request_installation_id: Option<&str>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
@@ -1304,7 +1309,11 @@ async fn handle_models_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
-    let upstream = match crate::protocol_proxy::open_models_proxy_request(request_user_agent).await
+    let upstream = match crate::protocol_proxy::open_models_proxy_request_with_headers(
+        request_user_agent,
+        request_installation_id,
+    )
+    .await
     {
         Ok(upstream) => upstream,
         Err(error) => {
@@ -1356,6 +1365,7 @@ async fn handle_protocol_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
     request_user_agent: Option<&str>,
+    request_installation_id: Option<&str>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
@@ -1366,16 +1376,18 @@ async fn handle_protocol_proxy_connection(
     ) {
         Ok(request_json) => {
             let upstream_result = if let Some(settings) = proxy_settings {
-                crate::protocol_proxy::open_responses_proxy_request_value_with_settings_and_user_agent(
-                        &request_json,
-                        settings.clone(),
-                        request_user_agent,
-                    )
-                    .await
+                crate::protocol_proxy::open_responses_proxy_request_value_with_settings_and_headers(
+                    &request_json,
+                    settings.clone(),
+                    request_user_agent,
+                    request_installation_id,
+                )
+                .await
             } else {
-                crate::protocol_proxy::open_responses_proxy_request_value(
+                crate::protocol_proxy::open_responses_proxy_request_value_with_headers(
                     &request_json,
                     request_user_agent,
+                    request_installation_id,
                 )
                 .await
             };
@@ -1551,13 +1563,15 @@ async fn handle_chat_completions_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
     request_user_agent: Option<&str>,
+    request_installation_id: Option<&str>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
-    let upstream = match crate::protocol_proxy::open_chat_completions_proxy_request(
+    let upstream = match crate::protocol_proxy::open_chat_completions_proxy_request_with_headers(
         request_body,
         request_user_agent,
+        request_installation_id,
     )
     .await
     {
