@@ -78,6 +78,16 @@
     "[data-testid=conversation-turn]",
     "[data-message-id]",
   ].join(", ");
+  // Rich conversation tooltips (notably Hooks details) can be taller than the
+  // collision-limited tooltip box. Clip the overflowing children inside that
+  // box so they cannot cover their trigger and create a pointer enter/leave
+  // loop. aria-describedby is present only while the native tooltip is open.
+  const conversationRichTooltipSelector = conversationTurnSelector
+    .split(", ")
+    .map((turnSelector) => (
+      `body:has(${turnSelector} span[tabindex="0"][aria-describedby]) [role="tooltip"]`
+    ))
+    .join(", ");
   const sidebarScanRootSelector = [
     "header",
     "nav",
@@ -283,6 +293,7 @@
       [data-turn-key]:hover > [data-codey-message-select], [data-codey-message-select]:focus-visible, [data-codey-message-select][aria-pressed="true"] { opacity: 1; }
       [data-codey-message-select]:hover { transform: scale(1.06); }
       [data-codey-message-select][aria-pressed="true"] { background: #5968de; border-color: #a5aeff; color: white; }
+      ${conversationRichTooltipSelector} { overflow-x: hidden !important; overflow-y: auto !important; overscroll-behavior: contain; }
       @media (max-width: 760px) { [data-codey-message-select] { left: 4px; top: -34px; } }
       #${toastId} { -webkit-app-region: no-drag !important; position: fixed; right: 20px; bottom: 22px; z-index: 2147483645; max-width: 360px; border: 1px solid rgba(124, 140, 255, .4); border-radius: 11px; padding: 10px 13px; background: rgba(20, 24, 36, .97); color: #eef2ff; box-shadow: 0 12px 36px rgba(0,0,0,.4); font: 12px/1.45 system-ui, sans-serif; }
       #${toastId}[data-tone="error"] { border-color: rgba(248, 113, 113, .6); color: #fecaca; }
