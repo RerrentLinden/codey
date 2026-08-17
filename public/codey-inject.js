@@ -2376,7 +2376,15 @@
       return;
     }
     if (!window.confirm(`删除 ${messageIds.length} 轮对话？\n无法撤销。`)) return;
-    const result = await callBridge("/session/delete-messages", { sessionId, messageIds });
+    showRuntimeToast(`正在永久删除 ${messageIds.length} 轮对话…`);
+    let result;
+    try {
+      result = await callBridge("/session/delete-messages", { sessionId, messageIds });
+    } catch (error) {
+      const message = typeof error?.message === "string" ? error.message : String(error);
+      window.alert(`删除失败：${message}`);
+      return;
+    }
     if (result?.status === "failed") {
       window.alert(`删除失败：${result.message || "未知错误"}`);
       return;
@@ -2390,19 +2398,25 @@
       );
       return;
     }
-    rememberHardDeletedMessages(sessionId, messageIds);
+    const resolvedMessageIds = Array.isArray(result?.resolvedMessageIds)
+      && result.resolvedMessageIds.length === messageIds.length
+      ? result.resolvedMessageIds.map(normalizeMessageId).filter(Boolean)
+      : messageIds;
+    rememberHardDeletedMessages(sessionId, [...messageIds, ...resolvedMessageIds]);
     rows.forEach((row) => row.remove());
     lastSelectedRow = null;
     syncSelectionGroups();
     updateToolbar();
     try {
-      await reloadConversationAfterHardDelete(sessionId, messageIds);
+      await reloadConversationAfterHardDelete(sessionId, resolvedMessageIds);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       window.alert(`消息已从会话文件永久删除，但 Codex 内存会话卸载失败。\n请重启 Codex 后再继续对话。\n\n${message}`);
       return;
     }
-    window.dispatchEvent(new CustomEvent("codey-session-refresh", { detail: { sessionId, messageIds } }));
+    window.dispatchEvent(new CustomEvent("codey-session-refresh", {
+      detail: { sessionId, messageIds: resolvedMessageIds },
+    }));
     showRuntimeToast(`已永久删除 ${deleted} 轮对话`);
   };
 

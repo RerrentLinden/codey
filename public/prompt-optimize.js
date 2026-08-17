@@ -18,6 +18,7 @@
   const toastId = "codey-runtime-toast";
   const configChangedEvent = "codey:config-changed";
   const optimizeTimeoutMs = 75_000;
+  const pendingOptimizationLimit = 20;
   const scanDelayMs = 250;
   const repositionDelayMs = 100;
   const composerAnchorSelector = "[data-above-composer-conversation-id]";
@@ -28,6 +29,9 @@
   const composerControlSelector = "button, [role='button']";
   const ignoredComposerContainerSelector =
     "dialog, [role='dialog'], [aria-modal='true']";
+  const ignoredControlContainerSelector =
+    `${ignoredComposerContainerSelector}, [role='menu'], [role='listbox'], ` +
+    "[cmdk-list], [data-radix-popper-content-wrapper]";
 
   let enabled = false;
   let ready = false;
@@ -41,6 +45,7 @@
   let configLoadAttempts = 0;
   let observer = null;
   let observerActive = false;
+  const pendingOptimizations = new Map();
 
   const MAX_CONFIG_LOAD_ATTEMPTS = 10;
 
@@ -220,7 +225,7 @@
 
   const isVisibleControl = (element) => {
     if (!element || element === button) return false;
-    if (element.closest?.(ignoredComposerContainerSelector)) return false;
+    if (element.closest?.(ignoredControlContainerSelector)) return false;
     if (element.closest?.("[hidden], [aria-hidden='true']")) return false;
     if (element.disabled) return false;
     const style = window.getComputedStyle(element);
@@ -231,6 +236,7 @@
 
   const modelControlScore = (control, inputRect) => {
     const rect = control.getBoundingClientRect();
+    if (rect.bottom <= inputRect.top) return Number.NEGATIVE_INFINITY;
     const descriptor = controlDescriptor(control);
     const visibleText = [control.textContent, control.innerText]
       .filter((value) => typeof value === "string" && value.trim())
@@ -324,13 +330,65 @@
     updateButtonState();
   };
 
-  const readComposerText = () => {
-    if (!inputElement) return "";
-    if (inputElement.tagName === "TEXTAREA") {
-      return inputElement.value;
+  const readComposerText = (element = inputElement) => {
+    if (!element) return "";
+    if (element.tagName === "TEXTAREA") {
+      return element.value;
     }
-    return inputElement.innerText || "";
+    return element.innerText || "";
   };
+
+  const findComposerConversationId = (element) => {
+    if (!element) return null;
+    for (const anchor of document.querySelectorAll(composerAnchorSelector)) {
+      const scope = anchor.parentElement || anchor;
+      if (scope === element || scope.contains?.(element)) {
+        const conversationId = anchor.getAttribute?.(
+          "data-above-composer-conversation-id",
+        );
+        return typeof conversationId === "string" && conversationId
+          ? conversationId
+          : null;
+      }
+    }
+    return null;
+  };
+
+  const currentLocationKey = () =>
+    typeof window.location?.href === "string" ? window.location.href : "";
+
+  const composerContextKey = (conversationId, locationKey) =>
+    conversationId
+      ? `conversation:${conversationId}`
+      : `location:${locationKey}`;
+
+  const captureComposerContext = (element) => {
+    const conversationId = findComposerConversationId(element);
+    const locationKey = currentLocationKey();
+    return {
+      element,
+      conversationId,
+      key: composerContextKey(conversationId, locationKey),
+      locationKey,
+      text: readComposerText(element),
+    };
+  };
+
+  const elementMatchesComposerContext = (context, element) => {
+    if (!element || element.isConnected === false) return false;
+    const conversationId = findComposerConversationId(element);
+    if (context.conversationId !== null || conversationId !== null) {
+      return conversationId === context.conversationId;
+    }
+    return currentLocationKey() === context.locationKey;
+  };
+
+  const isCurrentComposerContext = (context) =>
+    enabled &&
+    inputElement === context.element &&
+    elementMatchesComposerContext(context, context.element) &&
+    isVisible(context.element) &&
+    readComposerText(context.element) === context.text;
 
   const updateButtonState = () => {
     if (!button) return;
@@ -351,21 +409,22 @@
     window.__codeyShowRuntimeToast?.(message, "error");
   };
 
-  const replaceComposerText = (text) => {
-    if (inputElement.tagName === "TEXTAREA") {
+  const replaceComposerText = (text, element = inputElement) => {
+    if (!element) return;
+    if (element.tagName === "TEXTAREA") {
       const prototype = window.HTMLTextAreaElement?.prototype;
       const setter =
         prototype && Object.getOwnPropertyDescriptor(prototype, "value")?.set;
       if (setter) {
-        setter.call(inputElement, text);
+        setter.call(element, text);
       } else {
-        inputElement.value = text;
+        element.value = text;
       }
-      inputElement.dispatchEvent(new Event("input", { bubbles: true }));
+      element.dispatchEvent(new Event("input", { bubbles: true }));
       return;
     }
-    inputElement.innerText = text;
-    inputElement.dispatchEvent(
+    element.innerText = text;
+    element.dispatchEvent(
       new InputEvent("input", {
         bubbles: true,
         inputType: "insertText",
@@ -374,11 +433,46 @@
     );
   };
 
+  const rememberPendingOptimization = (context, optimized) => {
+    pendingOptimizations.delete(context.key);
+    pendingOptimizations.set(context.key, {
+      optimized,
+      text: context.text,
+    });
+    while (pendingOptimizations.size > pendingOptimizationLimit) {
+      const oldestKey = pendingOptimizations.keys().next().value;
+      pendingOptimizations.delete(oldestKey);
+    }
+  };
+
+  const applyPendingOptimization = (element) => {
+    if (!element) return false;
+    const context = captureComposerContext(element);
+    const pending = pendingOptimizations.get(context.key);
+    if (!pending) return false;
+    pendingOptimizations.delete(context.key);
+    if (readComposerText(element) !== pending.text) return false;
+    replaceComposerText(pending.optimized, element);
+    return true;
+  };
+
+  const deliverOptimization = (context, optimized) => {
+    if (elementMatchesComposerContext(context, context.element)) {
+      if (readComposerText(context.element) === context.text) {
+        replaceComposerText(optimized, context.element);
+      }
+      return;
+    }
+    rememberPendingOptimization(context, optimized);
+    applyPendingOptimization(inputElement);
+  };
+
   const handleClick = (event) => {
     event.preventDefault();
     event.stopPropagation();
     if (busy) return;
-    const text = readComposerText().trim();
+    const context = captureComposerContext(inputElement);
+    const text = context.text.trim();
     if (!text) {
       updateButtonState();
       return;
@@ -401,10 +495,14 @@
         if (!optimized) {
           throw new Error("优化结果为空");
         }
-        replaceComposerText(optimized);
-        if (inputElement?.focus) inputElement.focus();
+        const shouldFocus = isCurrentComposerContext(context);
+        deliverOptimization(context, optimized);
+        if (shouldFocus && context.element?.focus) {
+          context.element.focus();
+        }
       })
       .catch((error) => {
+        if (!isCurrentComposerContext(context)) return;
         const message =
           error instanceof Error ? error.message : String(error || "优化失败");
         showError(message);
@@ -421,6 +519,7 @@
       return;
     }
     const input = findComposerInput();
+    if (input) applyPendingOptimization(input);
     if (input === inputElement && input) {
       updateButtonPosition();
       return;
@@ -475,6 +574,12 @@
   const mutationRequiresComposerScan = (mutation) => {
     if (!inputElement?.isConnected) return true;
     if (nodeTouchesTrackedComposer(mutation.target)) return true;
+    if (
+      mutation.type === "attributes" &&
+      mutation.attributeName === "data-above-composer-conversation-id"
+    ) {
+      return true;
+    }
     if (mutation.type !== "childList") return false;
     return [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])].some(
       (node) =>

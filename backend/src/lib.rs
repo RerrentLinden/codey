@@ -77,6 +77,22 @@ pub fn record_process_failure(
     error_log::record_process_failure(event, operation, error, stage);
 }
 
+pub fn record_process_failure_with_recoverability(
+    event: impl Into<String>,
+    operation: impl Into<String>,
+    error: impl Into<String>,
+    stage: impl Into<String>,
+    recoverable: bool,
+) {
+    error_log::record_process_failure_with_recoverability(
+        event,
+        operation,
+        error,
+        stage,
+        recoverable,
+    );
+}
+
 pub fn run_subagent_gate_hook_if_requested() -> Result<bool> {
     subagent_gate::run_hook_if_requested()
 }

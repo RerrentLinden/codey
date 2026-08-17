@@ -297,13 +297,23 @@ pub fn record_process_failure(
     error: impl Into<String>,
     stage: impl Into<String>,
 ) {
+    record_process_failure_with_recoverability(event, operation, error, stage, false);
+}
+
+pub fn record_process_failure_with_recoverability(
+    event: impl Into<String>,
+    operation: impl Into<String>,
+    error: impl Into<String>,
+    stage: impl Into<String>,
+    recoverable: bool,
+) {
     record_failure_with_metadata(
         event,
         operation,
         error,
         FailureMetadata {
             stage: Some(stage.into()),
-            recoverable: Some(false),
+            recoverable: Some(recoverable),
         },
         serde_json::json!({}),
     );

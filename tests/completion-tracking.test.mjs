@@ -296,6 +296,39 @@ test("removes a hard-deleted turn and rejects a stale React rerender", async () 
   assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-2"]);
 });
 
+test("reuses the resolved turn id when cleaning up a deleted tail turn", async () => {
+  const tailKey = "history-content:tail:0:local:temporary-id";
+  let deleteCalls = 0;
+  const runtime = loadInjection({
+    initialRunning: false,
+    turnIds: [tailKey],
+    selectedTurnIds: [tailKey],
+    codexSignalDispatcher: async () => {},
+    bridgeHandler: async (path) => {
+      if (path !== "/session/delete-messages") return { status: "ok" };
+      deleteCalls += 1;
+      return {
+        status: "ok",
+        deleted: deleteCalls === 1 ? 1 : 0,
+        resolvedMessageIds: ["stable-last-turn"],
+      };
+    },
+  });
+
+  await runtime.window.__codeyDeleteSelectedMessages();
+
+  const deletions = runtime.bridgeCalls.filter(
+    (call) => call.path === "/session/delete-messages",
+  );
+  assert.equal(deletions.length, 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(deletions[0].payload.messageIds)), [tailKey]);
+  assert.deepEqual(JSON.parse(JSON.stringify(deletions[1].payload.messageIds)), [
+    "stable-last-turn",
+  ]);
+  assert.deepEqual(runtime.getVisibleTurnIds(), []);
+  assert.deepEqual(runtime.alerts, []);
+});
+
 test("keeps a turn visible when no persisted turn was deleted", async () => {
   let deleteCalls = 0;
   let dispatcherCalls = 0;
@@ -324,6 +357,24 @@ test("keeps a turn visible when no persisted turn was deleted", async () => {
   runtime.appendTurn("failed-turn");
   runtime.window.__codeyInstallMessageSelection();
   assert.deepEqual(runtime.getVisibleTurnIds(), ["failed-turn", "failed-turn"]);
+});
+
+test("reports a rejected delete bridge call without hiding the selected turn", async () => {
+  const runtime = loadInjection({
+    initialRunning: false,
+    turnIds: ["bridge-failed-turn"],
+    selectedTurnIds: ["bridge-failed-turn"],
+    bridgeHandler: async (path) => {
+      if (path === "/session/delete-messages") throw new Error("bridge stopped");
+      return { status: "ok" };
+    },
+  });
+
+  await runtime.window.__codeyDeleteSelectedMessages();
+
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["bridge-failed-turn"]);
+  assert.equal(runtime.alerts.length, 1);
+  assert.match(runtime.alerts[0], /删除失败：bridge stopped/);
 });
 
 test("keeps all selected rows visible when only part of a delete is confirmed", async () => {

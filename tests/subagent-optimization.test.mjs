@@ -127,7 +127,14 @@ test("subagent optimization installs root waiting and nested-spawn runtime gates
   assert.match(configSource, /enable_subagent_gate_hooks\(doc, config_path\)/);
   assert.match(configSource, /toml_event: "PreToolUse"/);
   assert.match(configSource, /toml_event: "PostToolUse"/);
-  assert.match(configSource, /matcher: Some\("\.\*wait_agent\$"\)/);
+  assert.match(
+    configSource,
+    /matcher: Some\(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER\)/,
+  );
+  assert.match(
+    gateSource,
+    /WAIT_AGENT_HOOK_MATCHER: &str = "\.\*wait_agent\$\|\^functions\(__\|\[\.\/:_\]\)wait\$"/,
+  );
   assert.match(configSource, /toml_event: "SubagentStart"/);
   assert.match(configSource, /toml_event: "SubagentStop"/);
   assert.match(configSource, /toml_event: "Stop"/);

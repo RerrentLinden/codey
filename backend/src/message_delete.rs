@@ -17,11 +17,13 @@ const TOMBSTONE_DIR: &str = ".codey-message-delete-tombstones-v1";
 const TOMBSTONE_LOCK_FILE: &str = ".codey-message-delete-tombstones-v1.lock";
 static TOMBSTONE_LOCK: Mutex<()> = Mutex::new(());
 type PendingDeleteTombstones = BTreeMap<String, (BTreeSet<String>, Vec<PathBuf>)>;
+type ResolvedPersistentMessageIds = (BTreeSet<String>, Vec<(String, String)>);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageDeleteResult {
     pub deleted: usize,
+    pub resolved_message_ids: Vec<String>,
     pub unsupported_databases: Vec<String>,
 }
 
@@ -66,7 +68,10 @@ pub fn delete_messages_persistently(
     // can flush stale history after this request returns; startup maintenance
     // replays the tombstone after that writer has been stopped.
     let _guard = lock_message_deletes(home)?;
+    let (message_ids, resolved_tail_aliases) =
+        resolve_persistent_message_ids(home, &session_id, &message_ids)?;
     record_delete_tombstones_unlocked(home, &session_id, &message_ids)?;
+    record_resolved_tail_aliases_unlocked(home, &session_id, &resolved_tail_aliases)?;
     delete_messages(
         home,
         &session_id,
@@ -175,6 +180,71 @@ fn record_delete_tombstones_unlocked(
         }
     }
     sync_directory(&directory)
+}
+
+fn record_resolved_tail_aliases_unlocked(
+    home: &Path,
+    session_id: &str,
+    aliases: &[(String, String)],
+) -> Result<()> {
+    if aliases.is_empty() {
+        return Ok(());
+    }
+    let directory = tombstone_directory(home);
+    create_private_directory(&directory)?;
+    for (selector, message_id) in aliases {
+        let tombstone = MessageDeleteTombstone {
+            version: TOMBSTONE_VERSION,
+            session_id: session_id.to_string(),
+            message_id: message_id.to_string(),
+        };
+        let path = tombstone_path(&directory, session_id, selector);
+        if path.exists() {
+            let existing: MessageDeleteTombstone = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("解析消息删除尾部别名失败：{}", path.display()))?;
+            if existing == tombstone {
+                continue;
+            }
+            let is_legacy_selector = existing.version == TOMBSTONE_VERSION
+                && existing.session_id == session_id
+                && normalize_message_id(&existing.message_id) == normalize_message_id(selector);
+            if !is_legacy_selector {
+                anyhow::bail!("消息删除尾部别名哈希冲突：{}", path.display());
+            }
+        }
+        let temp = crate::fs_util::unique_temp_path(&path);
+        let bytes = serde_json::to_vec(&tombstone)?;
+        if let Err(error) = write_private_file(&temp, &bytes) {
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+        crate::fs_util::persist_temp_file(&temp, &path)
+            .with_context(|| format!("保存消息删除尾部别名失败：{}", path.display()))?;
+    }
+    sync_directory(&directory)
+}
+
+fn read_resolved_tail_alias_unlocked(
+    home: &Path,
+    session_id: &str,
+    selector: &str,
+) -> Result<Option<String>> {
+    let path = tombstone_path(&tombstone_directory(home), session_id, selector);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let tombstone: MessageDeleteTombstone = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析消息删除尾部别名失败：{}", path.display()))?;
+    if tombstone.version != TOMBSTONE_VERSION || tombstone.session_id != session_id {
+        anyhow::bail!("无效的消息删除尾部别名：{}", path.display());
+    }
+    let message_id = normalize_message_id(&tombstone.message_id);
+    if message_id.is_empty() {
+        anyhow::bail!("无效的消息删除尾部别名：{}", path.display());
+    }
+    Ok((message_id != normalize_message_id(selector)).then_some(message_id))
 }
 
 fn read_delete_tombstones_unlocked(home: &Path) -> Result<PendingDeleteTombstones> {
@@ -296,6 +366,7 @@ pub fn delete_messages(
     }
     let mut result = MessageDeleteResult {
         deleted: 0,
+        resolved_message_ids: message_ids.clone(),
         unsupported_databases: Vec::new(),
     };
     if let Some(rollout_path) = find_rollout_path(home, session_id)? {
@@ -329,6 +400,50 @@ fn normalize_message_id(value: &str) -> String {
         .map(|(_, turn_id)| turn_id.trim())
         .unwrap_or(value)
         .to_string()
+}
+
+fn tail_message_index(value: &str) -> Option<usize> {
+    value
+        .strip_prefix("history-content:tail:")?
+        .split(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn resolve_persistent_message_ids(
+    home: &Path,
+    session_id: &str,
+    message_ids: &BTreeSet<String>,
+) -> Result<ResolvedPersistentMessageIds> {
+    let tail_message_ids = message_ids
+        .iter()
+        .filter_map(|message_id| tail_message_index(message_id).map(|index| (message_id, index)))
+        .collect::<Vec<_>>();
+    if tail_message_ids.is_empty() {
+        return Ok((message_ids.clone(), Vec::new()));
+    }
+    if tail_message_ids.len() != 1 || tail_message_ids[0].1 != 0 {
+        anyhow::bail!("无法安全解析多个或非当前页面尾部轮次");
+    }
+
+    let tail_message_id = tail_message_ids[0].0;
+    let stable_turn_id = if let Some(message_id) =
+        read_resolved_tail_alias_unlocked(home, session_id, tail_message_id)?
+    {
+        message_id
+    } else {
+        let rollout_path =
+            find_rollout_path(home, session_id)?.context("找不到页面尾部轮次对应的会话记录")?;
+        let canonical_rollout = canonical_rollout_path(home, &rollout_path)?;
+        let original = fs::read_to_string(&canonical_rollout)
+            .with_context(|| format!("读取会话记录失败：{}", canonical_rollout.display()))?;
+        last_stable_rollout_turn_id(&original).context("页面尾部轮次尚未稳定写入会话记录")?
+    };
+    let mut resolved = message_ids.clone();
+    resolved.remove(tail_message_id);
+    resolved.insert(stable_turn_id.clone());
+    Ok((resolved, vec![(tail_message_id.clone(), stable_turn_id)]))
 }
 
 fn find_rollout_path(home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
@@ -371,15 +486,7 @@ fn delete_turns_from_rollout(
     rollout_path: &Path,
     selected: &HashSet<String>,
 ) -> Result<usize> {
-    let canonical_home = home
-        .canonicalize()
-        .with_context(|| format!("找不到 Codex 数据目录：{}", home.display()))?;
-    let canonical_rollout = rollout_path
-        .canonicalize()
-        .with_context(|| format!("找不到会话记录：{}", rollout_path.display()))?;
-    if !canonical_rollout.starts_with(&canonical_home) {
-        anyhow::bail!("会话记录不在 Codex 数据目录内，已拒绝修改");
-    }
+    let canonical_rollout = canonical_rollout_path(home, rollout_path)?;
 
     let original = fs::read_to_string(&canonical_rollout)
         .with_context(|| format!("读取会话记录失败：{}", canonical_rollout.display()))?;
@@ -413,6 +520,53 @@ fn delete_turns_from_rollout(
     rewrite_in_place(&canonical_rollout, output.as_bytes())
         .with_context(|| format!("写回会话记录失败：{}", canonical_rollout.display()))?;
     Ok(found.len())
+}
+
+fn canonical_rollout_path(home: &Path, rollout_path: &Path) -> Result<PathBuf> {
+    let canonical_home = home
+        .canonicalize()
+        .with_context(|| format!("找不到 Codex 数据目录：{}", home.display()))?;
+    let canonical_rollout = rollout_path
+        .canonicalize()
+        .with_context(|| format!("找不到会话记录：{}", rollout_path.display()))?;
+    if !canonical_rollout.starts_with(&canonical_home) {
+        anyhow::bail!("会话记录不在 Codex 数据目录内，已拒绝修改");
+    }
+    Ok(canonical_rollout)
+}
+
+fn last_stable_rollout_turn_id(rollout: &str) -> Option<String> {
+    let mut last_boundary = None;
+    let mut last_terminal = None;
+    for line in rollout.lines() {
+        if let Some(turn_id) = turn_boundary_id(line) {
+            last_boundary = Some(turn_id);
+        }
+        if let Some(turn_id) = terminal_turn_id(line) {
+            last_terminal = Some(turn_id);
+        }
+    }
+    match (last_boundary, last_terminal) {
+        (Some(boundary), Some(terminal)) if boundary == terminal => Some(boundary),
+        _ => None,
+    }
+}
+
+fn terminal_turn_id(line: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+        return None;
+    }
+    let payload = value.get("payload")?;
+    match payload.get("type").and_then(Value::as_str) {
+        Some("task_complete" | "turn_aborted") => payload
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|turn_id| !turn_id.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
 }
 
 fn is_compacted_summary(line: &str) -> bool {
@@ -608,6 +762,113 @@ mod tests {
         assert!(!remaining.contains("cmp_1"));
         assert!(remaining.contains("t2"));
         assert!(remaining.contains("t3"));
+    }
+
+    #[test]
+    fn resolves_a_current_tail_key_idempotently_before_deleting_the_last_turn() {
+        let home = tempdir().unwrap();
+        let rollout_dir = home.path().join("sessions/2026/08/17");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-tail-key.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"keep\"}]}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t2\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t2\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"remove tail\"}]}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"t2\"}}\n",
+            ),
+        )
+        .unwrap();
+        let db = home.path().join("state_5.sqlite");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                params!["s1", rollout.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let tail_key = "history-content:tail:0:local:temporary-id";
+        record_delete_tombstones_unlocked(
+            home.path(),
+            "s1",
+            &BTreeSet::from([tail_key.to_string()]),
+        )
+        .unwrap();
+        let old_tombstone = tombstone_path(&tombstone_directory(home.path()), "s1", tail_key);
+
+        let result = delete_messages_persistently(home.path(), "s1", &[tail_key.into()]).unwrap();
+
+        assert_eq!(result.deleted, 1);
+        assert_eq!(result.resolved_message_ids, ["t2"]);
+        assert!(old_tombstone.exists());
+        let alias: MessageDeleteTombstone =
+            serde_json::from_slice(&fs::read(&old_tombstone).unwrap()).unwrap();
+        assert_eq!(alias.message_id, "t2");
+        assert!(tombstone_path(&tombstone_directory(home.path()), "s1", "t2").exists());
+        let remaining = fs::read_to_string(&rollout).unwrap();
+        assert!(remaining.contains("t1"));
+        assert!(remaining.contains("keep"));
+        assert!(!remaining.contains("t2"));
+        assert!(!remaining.contains("remove tail"));
+
+        let repeated = delete_messages_persistently(home.path(), "s1", &[tail_key.into()]).unwrap();
+
+        assert_eq!(repeated.deleted, 0);
+        assert_eq!(repeated.resolved_message_ids, ["t2"]);
+        let remaining = fs::read_to_string(&rollout).unwrap();
+        assert!(remaining.contains("t1"));
+        assert!(remaining.contains("keep"));
+    }
+
+    #[test]
+    fn refuses_to_guess_a_tail_key_when_the_last_rollout_turn_is_not_terminal() {
+        let home = tempdir().unwrap();
+        let rollout_dir = home.path().join("sessions/2026/08/17");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-unstable-tail-key.jsonl");
+        let original = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t2\"}}\n",
+        );
+        fs::write(&rollout, original).unwrap();
+        let db = home.path().join("state_5.sqlite");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                params!["s1", rollout.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let tail_key = "history-content:tail:0:local:temporary-id";
+        let error =
+            delete_messages_persistently(home.path(), "s1", &[tail_key.into()]).unwrap_err();
+
+        assert!(error.to_string().contains("尚未稳定写入"));
+        assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
+        assert!(!tombstone_path(&tombstone_directory(home.path()), "s1", tail_key).exists());
     }
 
     #[test]

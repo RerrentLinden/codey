@@ -190,6 +190,10 @@ const createEnvironment = (options = {}) => {
   const documentElement = new FakeElement("html");
   const body = new FakeElement("body");
   const anchor = new FakeElement("div");
+  anchor.setAttribute(
+    "data-above-composer-conversation-id",
+    options.conversationId ?? "conversation-1",
+  );
   const scope = new FakeElement("div");
   const textarea = new FakeElement("textarea");
   textarea.value = options.initialText ?? "";
@@ -267,6 +271,33 @@ const createEnvironment = (options = {}) => {
   });
   dialogControl.textContent = "提交并推送";
   dialogControl.setAttribute("aria-haspopup", "menu");
+  const slashCommandList = new FakeElement("div");
+  slashCommandList.setAttribute("role", "listbox");
+  const slashModelCommand = new FakeElement("button", {
+    rect: {
+      bottom: 140,
+      height: 44,
+      left: 120,
+      right: 1160,
+      top: 96,
+      width: 1040,
+    },
+  });
+  slashModelCommand.textContent = "模型";
+  const slashGoalCommand = new FakeElement("button", {
+    rect: {
+      bottom: 96,
+      height: 44,
+      left: 120,
+      right: 1160,
+      top: 52,
+      width: 1040,
+    },
+  });
+  slashGoalCommand.textContent = "目标";
+  slashCommandList.appendChild(slashModelCommand);
+  slashCommandList.appendChild(slashGoalCommand);
+  let slashCommandsOpen = options.slashCommands === true;
   documentElement.appendChild(body);
   body.appendChild(scope);
   scope.appendChild(anchor);
@@ -277,6 +308,9 @@ const createEnvironment = (options = {}) => {
   toolbar.appendChild(modelButton);
   toolbar.appendChild(microphoneButton);
   toolbar.appendChild(sendButton);
+  if (slashCommandsOpen) {
+    scope.appendChild(slashCommandList);
+  }
   if (options.dialogComposer || options.dialogControl) {
     scope.appendChild(dialog);
   }
@@ -305,6 +339,9 @@ const createEnvironment = (options = {}) => {
         sendButton,
       ];
       if (options.dialogControl) controls.push(dialogControl);
+      if (slashCommandsOpen) {
+        controls.push(slashModelCommand, slashGoalCommand);
+      }
       return controls;
     }
     return [];
@@ -349,6 +386,7 @@ const createEnvironment = (options = {}) => {
   const window = {
     innerHeight: 800,
     innerWidth: 1280,
+    location: { href: options.locationHref ?? "codex://conversation/1" },
     addEventListener(type, handler) {
       const handlers = windowListeners.get(type) || [];
       handlers.push(handler);
@@ -387,6 +425,7 @@ const createEnvironment = (options = {}) => {
   const installedObserver = latestMutationObserver;
 
   return {
+    anchor,
     calls,
     dialog,
     dialogControl,
@@ -397,6 +436,7 @@ const createEnvironment = (options = {}) => {
     toolbar,
     accessButton,
     modelButton,
+    slashCommandList,
     scope,
     getElementById: (id) => findById(documentElement, id),
     getComposerQueryCount: () => composerQueryCount,
@@ -427,6 +467,14 @@ const createEnvironment = (options = {}) => {
     },
     setFallbackInputs: (inputs) => {
       fallbackInputs = inputs;
+    },
+    openSlashCommands: () => {
+      if (slashCommandsOpen) return;
+      slashCommandsOpen = true;
+      scope.appendChild(slashCommandList);
+    },
+    setLocationHref: (href) => {
+      window.location.href = href;
     },
   };
 };
@@ -601,6 +649,27 @@ test("does not use controls inside modal dialogs as insertion targets", async ()
   assert.equal(env.dialogControl.parentElement.parentElement, env.dialog);
 });
 
+test("keeps the optimize button in the composer when slash commands open", async () => {
+  const env = createEnvironment({ enabled: true, apiKeyConfigured: true });
+  await flush();
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.equal(button.parentElement, env.toolbar);
+
+  env.openSlashCommands();
+  env.emitMutation([
+    {
+      type: "childList",
+      target: env.scope,
+      addedNodes: [env.slashCommandList],
+      removedNodes: [],
+    },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+
+  assert.equal(button.parentElement, env.toolbar);
+  assert.equal(env.slashCommandList.contains(button), false);
+});
+
 test("mounts the optimize button for a new-chat contenteditable composer", async () => {
   const env = createEnvironment({
     enabled: true,
@@ -737,6 +806,116 @@ test("shows a disabled loading state while optimization is pending", async () =>
   assert.equal(button.dataset.busy, "false");
   assert.equal(button.getAttribute("aria-busy"), "false");
   assert.equal(env.textarea.value, "优化完成");
+});
+
+test("restores a pending optimization to its original composer after navigation", async () => {
+  let resolveOptimization;
+  const optimizeResult = new Promise((resolve) => {
+    resolveOptimization = resolve;
+  });
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    anchors: false,
+    initialText: "旧会话提示词",
+    optimizeResult,
+  });
+  await flush();
+  const button = env.getElementById("codey-prompt-optimize-button");
+
+  button.dispatchEvent({
+    type: "click",
+    preventDefault() {},
+    stopPropagation() {},
+  });
+
+  env.setLocationHref("codex://conversation/2");
+  env.textarea.visible = false;
+  const nextInput = new FakeElement("div");
+  nextInput.setAttribute("contenteditable", "true");
+  nextInput.setAttribute("role", "textbox");
+  nextInput.innerText = "新会话提示词";
+  env.scope.appendChild(nextInput);
+  env.setFallbackInputs([env.textarea, nextInput]);
+  env.emitMutation([
+    {
+      type: "childList",
+      target: env.scope,
+      addedNodes: [nextInput],
+      removedNodes: [],
+    },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+
+  resolveOptimization({ optimized: "旧会话优化结果" });
+  await flush();
+
+  assert.equal(nextInput.innerText, "新会话提示词");
+  assert.equal(env.textarea.value, "旧会话提示词");
+  assert.equal(button.dataset.busy, "false");
+
+  env.setLocationHref("codex://conversation/1");
+  nextInput.visible = false;
+  env.textarea.visible = true;
+  env.setFallbackInputs([nextInput, env.textarea]);
+  env.emitMutation([
+    {
+      type: "childList",
+      target: env.scope,
+      addedNodes: [],
+      removedNodes: [],
+    },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+
+  assert.equal(env.textarea.value, "旧会话优化结果");
+  assert.equal(nextInput.innerText, "新会话提示词");
+});
+
+test("restores a pending optimization when the original conversation reuses a composer", async () => {
+  let resolveOptimization;
+  const optimizeResult = new Promise((resolve) => {
+    resolveOptimization = resolve;
+  });
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    initialText: "相同提示词",
+    optimizeResult,
+  });
+  await flush();
+  const button = env.getElementById("codey-prompt-optimize-button");
+
+  button.dispatchEvent({
+    type: "click",
+    preventDefault() {},
+    stopPropagation() {},
+  });
+  env.anchor.setAttribute(
+    "data-above-composer-conversation-id",
+    "conversation-2",
+  );
+
+  resolveOptimization({ optimized: "旧会话优化结果" });
+  await flush();
+
+  assert.equal(env.textarea.value, "相同提示词");
+  assert.equal(button.dataset.busy, "false");
+
+  env.anchor.setAttribute(
+    "data-above-composer-conversation-id",
+    "conversation-1",
+  );
+  env.emitMutation([
+    {
+      type: "attributes",
+      target: env.anchor,
+      attributeName: "data-above-composer-conversation-id",
+    },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+
+  assert.equal(env.textarea.value, "旧会话优化结果");
 });
 
 test("failed optimization keeps the original text and uses the global toast", async () => {
