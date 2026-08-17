@@ -1,18 +1,30 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 const APP_STATE_DIR: &str = ".codex-session-delete";
+const APP_STATE_DIR_ENV: &str = "CODEY_APP_STATE_DIR";
 const SETTINGS_FILE: &str = "settings.json";
 const LATEST_STATUS_FILE: &str = "latest-status.json";
 const DIAGNOSTIC_LOG_FILE: &str = "codey.log";
 const PENDING_PROVIDER_IMPORT_FILE: &str = "pending-provider-import.json";
 
 pub fn default_app_state_dir() -> PathBuf {
+    if let Some(path) = app_state_dir_from_env_value(std::env::var_os(APP_STATE_DIR_ENV)) {
+        return path;
+    }
+
     if let Some(home_dir) = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()) {
         return home_dir.join(APP_STATE_DIR);
     }
 
     PathBuf::from(APP_STATE_DIR)
+}
+
+fn app_state_dir_from_env_value(value: Option<OsString>) -> Option<PathBuf> {
+    value
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
 }
 
 pub fn default_settings_path() -> PathBuf {
@@ -55,6 +67,17 @@ pub fn set_settings_path_for_tests(path: Option<PathBuf>) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_state_dir_env_override_accepts_non_empty_paths() {
+        let state_dir = PathBuf::from("/tmp/codey-state");
+
+        assert_eq!(
+            app_state_dir_from_env_value(Some(state_dir.clone().into_os_string())),
+            Some(state_dir)
+        );
+        assert_eq!(app_state_dir_from_env_value(Some(OsString::new())), None);
+    }
 
     #[test]
     fn default_settings_path_uses_app_state_directory() {

@@ -17,6 +17,7 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
     let local = home.join("local-app-data");
     let runtime = home.join("runtime");
     let temp_files = home.join("tmp");
+    let app_state = home.join(".codex-session-delete");
     for directory in [&home, &workspace, &local, &runtime, &temp_files] {
         std::fs::create_dir_all(directory).unwrap();
     }
@@ -33,6 +34,7 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
         .env("TMPDIR", &temp_files)
         .env("TMP", &temp_files)
         .env("TEMP", &temp_files)
+        .env("CODEY_APP_STATE_DIR", &app_state)
         .env("FASTCTX_TEST_RUNTIME_EVENT_LOG", &event_log)
         .env("FASTCTX_TEST_RUNTIME_IDLE_MS", "60000")
         .env("FASTCTX_NO_PARENT_WATCH", "1")
@@ -94,7 +96,7 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
     terminate_process(first_host, true);
     let hosts = wait_for_host_starts(&event_log, 2);
     assert_ne!(hosts[0], hosts[1]);
-    let recovery = wait_for_error_record(&home.join(".codex-session-delete/codey-errors.log"));
+    let recovery = wait_for_error_record(&app_state.join("codey-errors.log"));
     assert_eq!(recovery["event"], "fastctx_transport_closed");
     assert_eq!(recovery["operation"], "run_fastctx_mcp_worker");
     assert_eq!(recovery["stage"], "runtime.fastctx_mcp_worker");
