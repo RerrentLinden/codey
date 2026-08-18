@@ -309,12 +309,32 @@ fn effective_instruction(instruction: &str) -> &str {
     }
 }
 
+fn responses_user_input(text: &str) -> Value {
+    json!([{
+        "type": "message",
+        "role": "user",
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
+    }])
+}
+
 fn responses_payload(model: &str, instruction: &str, text: &str) -> Value {
     json!({
         "model": model.trim(),
         "instructions": effective_instruction(instruction),
-        "input": text,
+        "input": responses_user_input(text),
         "max_output_tokens": MAX_TOKENS,
+        "stream": false,
+    })
+}
+
+fn configuration_test_payload(model: &str) -> Value {
+    json!({
+        "model": model,
+        "input": responses_user_input("hi"),
+        "max_output_tokens": 16,
         "stream": false,
     })
 }
@@ -421,12 +441,7 @@ pub async fn test_configuration_resolved(
     if model.is_empty() {
         return Err("请先配置优化模型".to_string());
     }
-    let request = json!({
-        "model": model,
-        "input": "hi",
-        "max_output_tokens": 16,
-        "stream": false,
-    });
+    let request = configuration_test_payload(model);
     let payload = upstream_request_payload(&request, config.protocol)?;
     let response = post_optimization_request(client, &endpoint, config, &payload).await?;
     let status = response.status().as_u16();
@@ -1025,10 +1040,26 @@ mod tests {
         config.protocol = RelayProtocol::Responses;
         let payload = optimizer_payload(&config, "你好");
         assert_eq!(payload["instructions"], "简短回复");
-        assert_eq!(payload["input"], "你好");
+        assert_eq!(payload["input"][0]["type"], "message");
+        assert_eq!(payload["input"][0]["role"], "user");
+        assert_eq!(payload["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(payload["input"][0]["content"][0]["text"], "你好");
         assert_eq!(payload["max_output_tokens"], MAX_TOKENS);
         assert_eq!(payload["stream"], false);
         assert!(payload.get("messages").is_none());
+    }
+
+    #[test]
+    fn configuration_test_payload_uses_a_responses_input_list() {
+        let payload = configuration_test_payload("gpt-test");
+        assert!(payload["input"].is_array());
+        assert_eq!(payload["input"][0]["role"], "user");
+        assert_eq!(payload["input"][0]["content"][0]["text"], "hi");
+
+        let chat_payload =
+            upstream_request_payload(&payload, RelayProtocol::ChatCompletions).unwrap();
+        assert_eq!(chat_payload["messages"][0]["role"], "user");
+        assert_eq!(chat_payload["messages"][0]["content"], "hi");
     }
 
     #[test]
@@ -1328,7 +1359,10 @@ mod tests {
                 request.contains(r#""instructions":"保持原意""#),
                 "{request}"
             );
-            assert!(request.contains(r#""input":"写个博客""#), "{request}");
+            let (_, body) = request.split_once("\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert!(body["input"].is_array(), "{body}");
+            assert_eq!(body["input"][0]["content"][0]["text"], "写个博客");
 
             let body = r#"{"output":[{"content":[{"type":"output_text","text":"优化后的响应"}]}]}"#;
             let response = format!(
