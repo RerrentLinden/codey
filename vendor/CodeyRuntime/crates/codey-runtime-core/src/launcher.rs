@@ -1061,6 +1061,12 @@ async fn handle_helper_connection(
     handle_helper_connection_with_settings(stream, remote_addr, None).await
 }
 
+#[derive(Clone, Copy)]
+struct ForwardedProxyHeaders<'a> {
+    user_agent: Option<&'a str>,
+    installation_id: Option<&'a str>,
+}
+
 async fn handle_helper_connection_with_settings(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
@@ -1080,6 +1086,10 @@ async fn handle_helper_connection_with_settings(
     let request_body = http_request_body(&request);
     let request_user_agent = header_value_from_request(&request, "user-agent");
     let request_installation_id = header_value_from_request(&request, "x-codex-installation-id");
+    let forwarded_headers = ForwardedProxyHeaders {
+        user_agent: request_user_agent.as_deref(),
+        installation_id: request_installation_id.as_deref(),
+    };
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
 
     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -1097,8 +1107,7 @@ async fn handle_helper_connection_with_settings(
         return handle_protocol_proxy_connection(
             &mut stream,
             request_body,
-            request_user_agent.as_deref(),
-            request_installation_id.as_deref(),
+            forwarded_headers,
             method,
             path,
             remote_addr_text,
@@ -1110,8 +1119,7 @@ async fn handle_helper_connection_with_settings(
         return handle_chat_completions_proxy_connection(
             &mut stream,
             request_body,
-            request_user_agent.as_deref(),
-            request_installation_id.as_deref(),
+            forwarded_headers,
             method,
             path,
             remote_addr_text,
@@ -1121,8 +1129,7 @@ async fn handle_helper_connection_with_settings(
     if crate::protocol_proxy::is_models_proxy_path(path) && matches!(method, "GET" | "OPTIONS") {
         return handle_models_proxy_connection(
             &mut stream,
-            request_user_agent.as_deref(),
-            request_installation_id.as_deref(),
+            forwarded_headers,
             method,
             path,
             remote_addr_text,
@@ -1292,8 +1299,7 @@ fn overlay_image_content_type(path: &Path) -> Option<&'static str> {
 
 async fn handle_models_proxy_connection(
     stream: &mut tokio::net::TcpStream,
-    request_user_agent: Option<&str>,
-    request_installation_id: Option<&str>,
+    forwarded_headers: ForwardedProxyHeaders<'_>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
@@ -1310,8 +1316,8 @@ async fn handle_models_proxy_connection(
         return Ok(());
     }
     let upstream = match crate::protocol_proxy::open_models_proxy_request_with_headers(
-        request_user_agent,
-        request_installation_id,
+        forwarded_headers.user_agent,
+        forwarded_headers.installation_id,
     )
     .await
     {
@@ -1364,8 +1370,7 @@ async fn handle_models_proxy_connection(
 async fn handle_protocol_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
-    request_user_agent: Option<&str>,
-    request_installation_id: Option<&str>,
+    forwarded_headers: ForwardedProxyHeaders<'_>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
@@ -1379,15 +1384,15 @@ async fn handle_protocol_proxy_connection(
                 crate::protocol_proxy::open_responses_proxy_request_value_with_settings_and_headers(
                     &request_json,
                     settings.clone(),
-                    request_user_agent,
-                    request_installation_id,
+                    forwarded_headers.user_agent,
+                    forwarded_headers.installation_id,
                 )
                 .await
             } else {
                 crate::protocol_proxy::open_responses_proxy_request_value_with_headers(
                     &request_json,
-                    request_user_agent,
-                    request_installation_id,
+                    forwarded_headers.user_agent,
+                    forwarded_headers.installation_id,
                 )
                 .await
             };
@@ -1562,16 +1567,15 @@ async fn handle_protocol_proxy_connection(
 async fn handle_chat_completions_proxy_connection(
     stream: &mut tokio::net::TcpStream,
     request_body: &str,
-    request_user_agent: Option<&str>,
-    request_installation_id: Option<&str>,
+    forwarded_headers: ForwardedProxyHeaders<'_>,
     method: &str,
     path: &str,
     remote_addr_text: Option<String>,
 ) -> anyhow::Result<()> {
     let upstream = match crate::protocol_proxy::open_chat_completions_proxy_request_with_headers(
         request_body,
-        request_user_agent,
-        request_installation_id,
+        forwarded_headers.user_agent,
+        forwarded_headers.installation_id,
     )
     .await
     {
