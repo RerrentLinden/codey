@@ -1412,7 +1412,7 @@ command = "echo preserve-user-hook"
     assert_eq!(post_tool_use.len(), 1);
     assert_eq!(
         post_tool_use.get(0).unwrap()["matcher"].as_str(),
-        Some(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER)
+        Some(crate::subagent_gate::AGENT_STATUS_HOOK_MATCHER)
     );
     for event in ["SubagentStart", "SubagentStop", "Stop", "SessionEnd"] {
         assert_eq!(
@@ -3835,7 +3835,7 @@ wire_api = "responses"
     }
     assert_eq!(
         hooks["hooks"]["PostToolUse"][0]["matcher"].as_str(),
-        Some(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER)
+        Some(crate::subagent_gate::AGENT_STATUS_HOOK_MATCHER)
     );
     let constraints_dir = state_dir.join(CODEY_CONSTRAINTS_DIR);
     assert_eq!(

@@ -109,6 +109,8 @@ test("per-task subagent files are composed at startup and hot-refreshed after sa
   assert.match(configSource, /pub fn refresh_runtime_subagent_roles/);
   assert.match(configSource, /verify_runtime_agent_files/);
   assert.match(configSource, /restore_runtime_agent_files_and_lease/);
+  assert.match(configSource, /atomic_write\(runtime_path, rendered\.as_bytes\(\)\)/);
+  assert.doesNotMatch(configSource, /write_private_file\(runtime_path, rendered\.as_bytes\(\)\)/);
   assert.match(launcherSource, /subagent_roles: Some\(&subagent_roles\)/);
   assert.match(launcherSource, /supports_subagent_config_hot_reload/);
   assert.doesNotMatch(rendererSource, /__codeyApplySubagentDefaults/);
@@ -129,11 +131,11 @@ test("subagent optimization installs root waiting and nested-spawn runtime gates
   assert.match(configSource, /toml_event: "PostToolUse"/);
   assert.match(
     configSource,
-    /matcher: Some\(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER\)/,
+    /matcher: Some\(crate::subagent_gate::AGENT_STATUS_HOOK_MATCHER\)/,
   );
   assert.match(
     gateSource,
-    /WAIT_AGENT_HOOK_MATCHER: &str = "\.\*wait_agent\$\|\^functions\(__\|\[\.\/:_\]\)wait\$"/,
+    /AGENT_STATUS_HOOK_MATCHER: &str =\s*"\.\*\(wait_agent\|list_agents\)\$\|\^functions\(__\|\[\.\/:_\]\)wait\$"/,
   );
   assert.match(configSource, /toml_event: "SubagentStart"/);
   assert.match(configSource, /toml_event: "SubagentStop"/);

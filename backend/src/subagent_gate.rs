@@ -4,17 +4,25 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 pub(crate) const HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook";
 pub(crate) const RUNTIME_ACTIVE_ENV: &str = "CODEY_SUBAGENT_GATE_ACTIVE";
+pub(crate) const RUNTIME_ID_ENV: &str = "CODEY_SUBAGENT_GATE_RUNTIME_ID";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
 pub(crate) const SESSION_END_HOOK_TIMEOUT_SECONDS: u64 = 3;
-pub(crate) const WAIT_AGENT_HOOK_MATCHER: &str = ".*wait_agent$|^functions(__|[./:_])wait$";
+pub(crate) const AGENT_STATUS_HOOK_MATCHER: &str =
+    ".*(wait_agent|list_agents)$|^functions(__|[./:_])wait$";
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 const STATE_DIRECTORY: &str = "codey-subagent-gate-v2";
+const ACTIVE_MARKER_SCHEMA_VERSION: u32 = 1;
+const LEGACY_RUNTIME_ID: &str = "legacy-runtime";
+const PENDING_INIT_GRACE_MILLIS: u64 = 10 * 60 * 1000;
+const STOP_STALL_GRACE_MILLIS: u64 = 10 * 60 * 1000;
+const PENDING_INIT_OBSERVED_FILE: &str = "pending-init-observed.state";
+const STOP_BLOCKED_SINCE_FILE: &str = "stop-blocked-since.state";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HookCommands {
@@ -31,7 +39,16 @@ struct HookInput {
     #[serde(default)]
     tool_name: Option<String>,
     #[serde(default)]
+    tool_input: Option<Value>,
+    #[serde(default)]
     tool_response: Option<Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ActiveMarker {
+    schema_version: u32,
+    runtime_id_hash: String,
+    started_at_ms: u64,
 }
 
 pub fn run_hook_if_requested() -> Result<bool> {
@@ -54,16 +71,26 @@ pub fn run_hook_if_requested() -> Result<bool> {
     let input: HookInput =
         serde_json::from_slice(&raw).context("解析 Codex 子代理门禁 Hook 输入失败")?;
     let state_root = std::env::temp_dir().join(STATE_DIRECTORY);
-    let output = handle_hook(&input, &state_root).unwrap_or_else(|error| {
-        eprintln!("Codey 子代理门禁 Hook 失败：{error:#}");
-        fail_closed_output(&input, &error)
-    });
+    let runtime_id = current_runtime_id();
+    let output =
+        handle_hook_for_runtime(&input, &state_root, &runtime_id).unwrap_or_else(|error| {
+            eprintln!("Codey 子代理门禁 Hook 失败：{error:#}");
+            fail_closed_output(&input, &error)
+        });
     write_hook_output(&output)?;
     Ok(true)
 }
 
 fn runtime_gate_is_active(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
+}
+
+fn current_runtime_id() -> String {
+    std::env::var(RUNTIME_ID_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| LEGACY_RUNTIME_ID.to_string())
 }
 
 fn write_hook_output(output: &Value) -> Result<()> {
@@ -119,32 +146,53 @@ pub(crate) fn hook_trust_hash(
     format!("sha256:{digest:x}")
 }
 
+#[cfg(test)]
 fn handle_hook(input: &HookInput, state_root: &Path) -> Result<Value> {
+    handle_hook_for_runtime(input, state_root, &current_runtime_id())
+}
+
+fn handle_hook_for_runtime(
+    input: &HookInput,
+    state_root: &Path,
+    runtime_id: &str,
+) -> Result<Value> {
+    handle_hook_for_runtime_at(input, state_root, runtime_id, current_timestamp_millis())
+}
+
+fn handle_hook_for_runtime_at(
+    input: &HookInput,
+    state_root: &Path,
+    runtime_id: &str,
+    now_ms: u64,
+) -> Result<Value> {
     match input.hook_event_name.as_str() {
         "SubagentStart" => {
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
-                create_active_marker(state_root, &input.session_id, agent_id)?;
+                create_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
             }
             Ok(json!({}))
         }
         "SubagentStop" => {
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
-                remove_active_marker(state_root, &input.session_id, agent_id)?;
+                remove_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
+                if active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)? == 0 {
+                    remove_session_state(state_root, runtime_id, &input.session_id)?;
+                }
             }
             Ok(json!({}))
         }
         "SessionEnd" => {
-            remove_session_state(state_root, &input.session_id)?;
+            remove_session_state(state_root, runtime_id, &input.session_id)?;
             Ok(json!({}))
         }
-        "PreToolUse" => pre_tool_use_output(input, state_root),
-        "PostToolUse" => post_tool_use_output(input, state_root),
-        "Stop" => stop_output(input, state_root),
+        "PreToolUse" => pre_tool_use_output(input, state_root, runtime_id),
+        "PostToolUse" => post_tool_use_output(input, state_root, runtime_id, now_ms),
+        "Stop" => stop_output(input, state_root, runtime_id, now_ms),
         _ => Ok(json!({})),
     }
 }
 
-fn pre_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
+fn pre_tool_use_output(input: &HookInput, state_root: &Path, runtime_id: &str) -> Result<Value> {
     if nonempty(input.agent_id.as_deref()).is_some() {
         if input.tool_name.as_deref().is_some_and(is_spawn_agent_tool) {
             return Ok(subagent_spawn_denial());
@@ -158,41 +206,99 @@ fn pre_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
     {
         return Ok(json!({}));
     }
-    let active = active_agent_count(state_root, &input.session_id)?;
+    let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
     if active == 0 {
         return Ok(json!({}));
     }
     Ok(pre_tool_denial(active))
 }
 
-fn post_tool_use_output(input: &HookInput, state_root: &Path) -> Result<Value> {
-    if nonempty(input.agent_id.as_deref()).is_some()
-        || !input.tool_name.as_deref().is_some_and(is_wait_agent_tool)
-    {
-        return Ok(json!({}));
-    }
-    if wait_was_interrupted_by_user(input.tool_response.as_ref()) {
-        remove_session_state(state_root, &input.session_id)?;
-        return Ok(json!({}));
-    }
-    remove_completed_agents_from_wait_response(
-        state_root,
-        &input.session_id,
-        input.tool_response.as_ref(),
-    )?;
-    let active = active_agent_count(state_root, &input.session_id)?;
-    if active == 0 {
-        return Ok(json!({}));
-    }
-    Ok(post_wait_continuation(active, input.tool_response.as_ref()))
-}
-
-fn stop_output(input: &HookInput, state_root: &Path) -> Result<Value> {
+fn post_tool_use_output(
+    input: &HookInput,
+    state_root: &Path,
+    runtime_id: &str,
+    now_ms: u64,
+) -> Result<Value> {
     if nonempty(input.agent_id.as_deref()).is_some() {
         return Ok(json!({}));
     }
-    let active = active_agent_count(state_root, &input.session_id)?;
+    let Some(tool_name) = input.tool_name.as_deref() else {
+        return Ok(json!({}));
+    };
+    if !is_agent_status_tool(tool_name) {
+        return Ok(json!({}));
+    }
+
+    let response_is_usable = if is_wait_agent_tool(tool_name) {
+        wait_agent_response_is_usable(input.tool_response.as_ref())
+    } else {
+        summarize_list_agents_response(input.tool_response.as_ref())
+            != AgentListSnapshotState::Unknown
+    };
+    if response_is_usable {
+        remove_session_auxiliary_file(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            STOP_BLOCKED_SINCE_FILE,
+        )?;
+    }
+    if is_wait_agent_tool(tool_name) {
+        if wait_was_interrupted_by_user(input.tool_response.as_ref()) {
+            remove_session_state(state_root, runtime_id, &input.session_id)?;
+            return Ok(json!({}));
+        }
+        remove_completed_agents_from_wait_response(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_response.as_ref(),
+        )?;
+    } else if reconcile_list_agents_response(input, state_root, runtime_id, now_ms)? {
+        return Ok(json!({}));
+    }
+
+    let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
     if active == 0 {
+        remove_session_state(state_root, runtime_id, &input.session_id)?;
+        return Ok(json!({}));
+    }
+    if is_wait_agent_tool(tool_name) {
+        Ok(post_wait_continuation(active, input.tool_response.as_ref()))
+    } else {
+        Ok(post_list_continuation(active, input.tool_response.as_ref()))
+    }
+}
+
+fn stop_output(
+    input: &HookInput,
+    state_root: &Path,
+    runtime_id: &str,
+    now_ms: u64,
+) -> Result<Value> {
+    if nonempty(input.agent_id.as_deref()).is_some() {
+        return Ok(json!({}));
+    }
+    let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+    if active == 0 {
+        return Ok(json!({}));
+    }
+    if observation_elapsed_if_present(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        PENDING_INIT_OBSERVED_FILE,
+        now_ms,
+        PENDING_INIT_GRACE_MILLIS,
+    )? || observe_and_check_elapsed(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        STOP_BLOCKED_SINCE_FILE,
+        now_ms,
+        STOP_STALL_GRACE_MILLIS,
+    )? {
+        remove_session_state(state_root, runtime_id, &input.session_id)?;
         return Ok(json!({}));
     }
     Ok(stop_continuation(active))
@@ -212,7 +318,7 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
         }),
         "PostToolUse"
             if nonempty(input.agent_id.as_deref()).is_none()
-                && input.tool_name.as_deref().is_some_and(is_wait_agent_tool) =>
+                && input.tool_name.as_deref().is_some_and(is_agent_status_tool) =>
         {
             json!({
                 "decision": "block",
@@ -233,7 +339,7 @@ fn pre_tool_denial(active: usize) -> Value {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": format!(
-                "Codey 子代理门禁：仍有 {active} 个子代理在运行。现在只可调用 agents.* 协作工具做必要的查看、转向或停止，随后调用 agents.wait_agent；请持续等待到每个子代理都返回 FINAL_ANSWER 或 task_complete。"
+                "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态。现在只可调用 agents.* 协作工具；请先调用 agents.list_agents 核对 running、pending_init、completed、errored、shutdown 等状态，再对仍在运行的代理调用 agents.wait_agent。"
             ),
         }
     })
@@ -250,11 +356,21 @@ fn subagent_spawn_denial() -> Value {
 }
 
 fn post_wait_continuation(active: usize, tool_response: Option<&Value>) -> Value {
-    let returned_update = render_wait_result(tool_response);
+    let returned_update = render_tool_result(tool_response, "wait_agent");
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回了局部更新，仍有 {active} 个子代理在运行。保留下方内容；可读取它并仅使用 agents.send_message、agents.followup_task、agents.interrupt_agent 或 agents.list_agents 做必要协调，随后继续调用 agents.wait_agent。在每个已派生子代理都返回 FINAL_ANSWER 或 task_complete 前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可读取它并仅使用 agents.send_message、agents.followup_task、agents.interrupt_agent 或 agents.list_agents 做必要协调，并请先调用 agents.list_agents 对账。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待或协调。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+        ),
+    })
+}
+
+fn post_list_continuation(active: usize, tool_response: Option<&Value>) -> Value {
+    let returned_update = render_tool_result(tool_response, "list_agents");
+    json!({
+        "decision": "block",
+        "reason": format!(
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。只对 running、pending_init 或 interrupted 的代理继续等待、转向或停止；completed、errored、shutdown 和 not_found 不再阻塞。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态，避免无限循环。\n\n本次 list_agents 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -263,17 +379,17 @@ fn stop_continuation(active: usize) -> Value {
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理门禁：仍有 {active} 个子代理在运行，当前任务不能结束。请调用 agents.wait_agent，并持续等待到所有子代理返回 FINAL_ANSWER 或 task_complete。"
+            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用 agents.list_agents 对账，再对 running、pending_init 或 interrupted 的代理调用 agents.wait_agent。若协作工具已经不可用，门禁会在持续 10 分钟无法进展后释放遗留状态，避免无限循环。"
         ),
     })
 }
 
-fn render_wait_result(tool_response: Option<&Value>) -> String {
+fn render_tool_result(tool_response: Option<&Value>, tool_name: &str) -> String {
     match tool_response {
         Some(Value::String(response)) => response.clone(),
         Some(response) => serde_json::to_string(response)
-            .unwrap_or_else(|_| "（wait_agent 返回内容无法序列化）".to_string()),
-        None => "（wait_agent 未提供返回内容）".to_string(),
+            .unwrap_or_else(|_| format!("（{tool_name} 返回内容无法序列化）")),
+        None => format!("（{tool_name} 未提供返回内容）"),
     }
 }
 
@@ -281,8 +397,181 @@ fn wait_was_interrupted_by_user(tool_response: Option<&Value>) -> bool {
     tool_response.is_some_and(value_reports_user_interrupt)
 }
 
+fn wait_agent_response_is_usable(tool_response: Option<&Value>) -> bool {
+    let Some(tool_response) = tool_response else {
+        return false;
+    };
+    match tool_response {
+        Value::Object(values) => {
+            object_value(values, "timedout").is_some_and(Value::is_boolean)
+                && (object_value(values, "message").is_some_and(Value::is_string)
+                    || object_value(values, "status").is_some_and(Value::is_object))
+        }
+        Value::String(value) => serde_json::from_str::<Value>(value)
+            .ok()
+            .as_ref()
+            .is_some_and(|value| wait_agent_response_is_usable(Some(value))),
+        _ => false,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentListSnapshotState {
+    AllChildrenTerminal,
+    OnlyPendingInit,
+    HasLiveChildren,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObservedAgentState {
+    PendingInit,
+    Live,
+    Terminal,
+    Unknown,
+}
+
+fn reconcile_list_agents_response(
+    input: &HookInput,
+    state_root: &Path,
+    runtime_id: &str,
+    now_ms: u64,
+) -> Result<bool> {
+    if !list_agents_query_is_full(input.tool_input.as_ref()) {
+        return Ok(false);
+    }
+    match summarize_list_agents_response(input.tool_response.as_ref()) {
+        AgentListSnapshotState::AllChildrenTerminal => {
+            remove_session_state(state_root, runtime_id, &input.session_id)?;
+            Ok(true)
+        }
+        AgentListSnapshotState::OnlyPendingInit => {
+            if observe_and_check_elapsed(
+                state_root,
+                runtime_id,
+                &input.session_id,
+                PENDING_INIT_OBSERVED_FILE,
+                now_ms,
+                PENDING_INIT_GRACE_MILLIS,
+            )? {
+                remove_session_state(state_root, runtime_id, &input.session_id)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+        AgentListSnapshotState::HasLiveChildren => {
+            remove_session_auxiliary_file(
+                state_root,
+                runtime_id,
+                &input.session_id,
+                PENDING_INIT_OBSERVED_FILE,
+            )?;
+            Ok(false)
+        }
+        AgentListSnapshotState::Unknown => Ok(false),
+    }
+}
+
+fn list_agents_query_is_full(tool_input: Option<&Value>) -> bool {
+    match tool_input {
+        None | Some(Value::Null) => true,
+        Some(Value::Object(values)) => values.iter().all(|(key, value)| {
+            normalized_ascii_identifier(key) != "pathprefix"
+                || matches!(value, Value::Null)
+                || value.as_str().is_some_and(|value| value.trim().is_empty())
+        }),
+        Some(Value::String(value)) => serde_json::from_str::<Value>(value)
+            .ok()
+            .as_ref()
+            .is_some_and(|value| list_agents_query_is_full(Some(value))),
+        Some(_) => false,
+    }
+}
+
+fn summarize_list_agents_response(tool_response: Option<&Value>) -> AgentListSnapshotState {
+    let Some(agents) = tool_response.and_then(find_agents_array) else {
+        return AgentListSnapshotState::Unknown;
+    };
+    let mut pending_init = 0;
+    let mut live = 0;
+    let mut unknown = 0;
+    for agent in agents {
+        let Value::Object(agent) = agent else {
+            unknown += 1;
+            continue;
+        };
+        let agent_name = object_value(&agent, "agentname").and_then(Value::as_str);
+        if agent_name.is_some_and(is_root_agent_name) {
+            continue;
+        }
+        let Some(status) = object_value(&agent, "agentstatus") else {
+            unknown += 1;
+            continue;
+        };
+        match classify_agent_status(status) {
+            ObservedAgentState::PendingInit => pending_init += 1,
+            ObservedAgentState::Live => live += 1,
+            ObservedAgentState::Terminal => {}
+            ObservedAgentState::Unknown => unknown += 1,
+        }
+    }
+    if unknown > 0 {
+        AgentListSnapshotState::Unknown
+    } else if pending_init == 0 && live == 0 {
+        AgentListSnapshotState::AllChildrenTerminal
+    } else if pending_init > 0 && live == 0 {
+        AgentListSnapshotState::OnlyPendingInit
+    } else {
+        AgentListSnapshotState::HasLiveChildren
+    }
+}
+
+fn find_agents_array(value: &Value) -> Option<Vec<Value>> {
+    match value {
+        Value::Object(values) => {
+            if let Some(Value::Array(agents)) = object_value(values, "agents") {
+                return Some(agents.clone());
+            }
+            values.values().find_map(find_agents_array)
+        }
+        Value::Array(values) => values.iter().find_map(find_agents_array),
+        Value::String(value) => {
+            let parsed = serde_json::from_str::<Value>(value).ok()?;
+            find_agents_array(&parsed)
+        }
+        _ => None,
+    }
+}
+
+fn object_value<'a>(values: &'a Map<String, Value>, normalized_key: &str) -> Option<&'a Value> {
+    values.iter().find_map(|(key, value)| {
+        (normalized_ascii_identifier(key) == normalized_key).then_some(value)
+    })
+}
+
+fn is_root_agent_name(value: &str) -> bool {
+    matches!(value.trim().trim_end_matches('/'), "root" | "/root")
+}
+
+fn classify_agent_status(value: &Value) -> ObservedAgentState {
+    match value {
+        Value::String(value) => match normalized_ascii_identifier(value).as_str() {
+            "pending" | "pendinginit" => ObservedAgentState::PendingInit,
+            "running" | "live" | "interrupted" => ObservedAgentState::Live,
+            value if is_agent_completion_value(value) => ObservedAgentState::Terminal,
+            _ => ObservedAgentState::Unknown,
+        },
+        Value::Object(values) if object_status_reports_agent_completion(values) => {
+            ObservedAgentState::Terminal
+        }
+        _ => ObservedAgentState::Unknown,
+    }
+}
+
 fn remove_completed_agents_from_wait_response(
     state_root: &Path,
+    runtime_id: &str,
     session_id: &str,
     tool_response: Option<&Value>,
 ) -> Result<()> {
@@ -294,7 +583,7 @@ fn remove_completed_agents_from_wait_response(
     completed_agent_ids.sort();
     completed_agent_ids.dedup();
     for agent_id in completed_agent_ids {
-        remove_active_marker(state_root, session_id, &agent_id)?;
+        remove_active_marker(state_root, runtime_id, session_id, &agent_id)?;
     }
     Ok(())
 }
@@ -329,52 +618,132 @@ fn object_agent_id(values: &Map<String, Value>) -> Option<&str> {
 }
 
 fn object_reports_agent_completion(values: &Map<String, Value>) -> bool {
+    values
+        .iter()
+        .any(|(key, value)| is_agent_completion_field(key) && value_reports_agent_completion(value))
+}
+
+fn value_reports_agent_completion(value: &Value) -> bool {
+    match value {
+        Value::String(value) => is_agent_completion_value(value),
+        Value::Object(values) => object_status_reports_agent_completion(values),
+        _ => false,
+    }
+}
+
+fn object_status_reports_agent_completion(values: &Map<String, Value>) -> bool {
     values.iter().any(|(key, value)| {
-        is_agent_completion_field(key) && value.as_str().is_some_and(is_agent_completion_value)
+        let normalized_key = normalized_ascii_identifier(key);
+        (is_agent_completion_value(&normalized_key) && value != &Value::Bool(false))
+            || (is_agent_completion_field(&normalized_key) && value_reports_agent_completion(value))
     })
 }
 
 fn is_agent_completion_field(key: &str) -> bool {
     matches!(
         normalized_ascii_identifier(key).as_str(),
-        "status" | "type" | "kind" | "event" | "messagetype" | "messagekind" | "eventname"
+        "status"
+            | "state"
+            | "agentstatus"
+            | "type"
+            | "kind"
+            | "event"
+            | "messagetype"
+            | "messagekind"
+            | "eventname"
     )
 }
 
 fn is_agent_completion_value(value: &str) -> bool {
     matches!(
         normalized_ascii_identifier(value).as_str(),
-        "finalanswer" | "taskcomplete"
+        "finalanswer"
+            | "taskcomplete"
+            | "completed"
+            | "errored"
+            | "error"
+            | "failed"
+            | "shutdown"
+            | "notfound"
     )
 }
 
 fn value_reports_user_interrupt(value: &Value) -> bool {
     match value {
-        Value::String(value) => text_reports_user_interrupt(value),
-        Value::Array(values) => values.iter().any(value_reports_user_interrupt),
-        Value::Object(values) => values.iter().any(|(key, value)| {
-            let normalized_key = normalized_ascii_identifier(key);
-            (matches!(
-                normalized_key.as_str(),
-                "interruptedbynewinput"
-                    | "interruptedbyuserinput"
-                    | "interruptedbyuser"
-                    | "cancelledbyuser"
-                    | "canceledbyuser"
-                    | "abortedbyuser"
-                    | "stoppedbyuser"
-                    | "usercancelled"
-                    | "usercanceled"
-                    | "useraborted"
-                    | "userstopped"
-                    | "newuserinput"
-                    | "steeredinput"
-                    | "steereduserinput"
-            ) && !matches!(value, Value::Bool(false) | Value::Null))
-                || value_reports_user_interrupt(value)
-        }),
+        Value::String(value) => is_wait_interrupt_text(value),
+        Value::Object(values) => object_reports_user_interrupt(values),
         _ => false,
     }
+}
+
+fn object_reports_user_interrupt(values: &Map<String, Value>) -> bool {
+    values.iter().any(|(key, value)| {
+        let normalized_key = normalized_ascii_identifier(key);
+        is_user_interrupt_flag(&normalized_key) && value == &Value::Bool(true)
+    }) || values.iter().any(|(key, value)| {
+        let normalized_key = normalized_ascii_identifier(key);
+        is_user_interrupt_discriminator(&normalized_key)
+            && value
+                .as_str()
+                .is_some_and(is_user_interrupt_discriminator_value)
+    }) || values.iter().any(|(key, value)| {
+        let normalized_key = normalized_ascii_identifier(key);
+        is_user_interrupt_text_field(&normalized_key)
+            && value.as_str().is_some_and(is_wait_interrupt_text)
+    }) || values.iter().any(|(key, value)| {
+        let normalized_key = normalized_ascii_identifier(key);
+        is_wait_response_envelope(&normalized_key)
+            && !value.is_string()
+            && value_reports_user_interrupt(value)
+    })
+}
+
+fn is_user_interrupt_flag(key: &str) -> bool {
+    matches!(
+        key,
+        "interruptedbynewinput"
+            | "interruptedbyuserinput"
+            | "interruptedbyuser"
+            | "cancelledbyuser"
+            | "canceledbyuser"
+            | "abortedbyuser"
+            | "stoppedbyuser"
+            | "usercancelled"
+            | "usercanceled"
+            | "useraborted"
+            | "userstopped"
+    )
+}
+
+fn is_user_interrupt_discriminator(key: &str) -> bool {
+    matches!(key, "kind" | "type" | "status" | "event" | "eventname")
+}
+
+fn is_user_interrupt_discriminator_value(value: &str) -> bool {
+    matches!(
+        normalized_ascii_identifier(value).as_str(),
+        "interruptedbynewinput"
+            | "interruptedbyuserinput"
+            | "interruptedbyuser"
+            | "cancelledbyuser"
+            | "canceledbyuser"
+            | "abortedbyuser"
+            | "stoppedbyuser"
+            | "newuserinput"
+            | "steeredinput"
+            | "steereduserinput"
+    )
+}
+
+fn is_user_interrupt_text_field(key: &str) -> bool {
+    matches!(key, "message" | "output" | "reason")
+}
+
+fn is_wait_response_envelope(key: &str) -> bool {
+    matches!(
+        key,
+        "data" | "output" | "response" | "result" | "toolresponse"
+    )
 }
 
 fn normalized_ascii_identifier(value: &str) -> String {
@@ -385,33 +754,18 @@ fn normalized_ascii_identifier(value: &str) -> String {
         .collect()
 }
 
-fn text_reports_user_interrupt(value: &str) -> bool {
-    let normalized = value.to_ascii_lowercase();
-    let interrupted = normalized.contains("interrupt")
-        || normalized.contains("steer")
-        || normalized.contains("cancel")
-        || normalized.contains("abort")
-        || normalized.contains("stop");
-    let user_action = [
-        "new input",
-        "new_input",
-        "user input",
-        "user_input",
-        "steered input",
-        "steered_input",
-        "user message",
-        "user_message",
-        "new message",
-        "new_message",
-        "by user",
-        "manual",
-        "user cancel",
-        "user abort",
-        "user stop",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle));
-    interrupted && user_action
+fn is_wait_interrupt_text(value: &str) -> bool {
+    matches!(
+        normalized_ascii_identifier(value).as_str(),
+        "waitinterruptedbynewinput"
+            | "waitinterruptedbynewuserinput"
+            | "waitinterruptedbyuserinput"
+            | "waitcancelledbyuser"
+            | "waitcanceledbyuser"
+            | "waitabortedbyuser"
+            | "waitstoppedbyuser"
+            | "waitmanuallystopped"
+    )
 }
 
 fn is_collaboration_tool(tool_name: &str) -> bool {
@@ -429,6 +783,14 @@ fn is_collaboration_tool(tool_name: &str) -> bool {
 
 fn is_wait_agent_tool(tool_name: &str) -> bool {
     normalized_collaboration_tool(tool_name) == "wait_agent"
+}
+
+fn is_list_agents_tool(tool_name: &str) -> bool {
+    normalized_collaboration_tool(tool_name) == "list_agents"
+}
+
+fn is_agent_status_tool(tool_name: &str) -> bool {
+    is_wait_agent_tool(tool_name) || is_list_agents_tool(tool_name)
 }
 
 fn is_spawn_agent_tool(tool_name: &str) -> bool {
@@ -466,7 +828,95 @@ fn is_functions_wait_alias(normalized_tool_name: &str) -> bool {
         .any(|separator| remainder.strip_prefix(separator) == Some("wait"))
 }
 
-fn create_active_marker(state_root: &Path, session_id: &str, agent_id: &str) -> Result<()> {
+fn current_timestamp_millis() -> u64 {
+    u64::try_from(crate::fs_util::timestamp_millis()).unwrap_or(u64::MAX)
+}
+
+fn observe_and_check_elapsed(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    file_name: &str,
+    now_ms: u64,
+    grace_ms: u64,
+) -> Result<bool> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let path = session_auxiliary_path(&session_dir, runtime_id, file_name);
+    match read_observation_timestamp(&path)? {
+        Some(observed_at_ms) => Ok(now_ms.saturating_sub(observed_at_ms) >= grace_ms),
+        None => {
+            write_observation_timestamp(&session_dir, &path, now_ms)?;
+            Ok(false)
+        }
+    }
+}
+
+fn observation_elapsed_if_present(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    file_name: &str,
+    now_ms: u64,
+    grace_ms: u64,
+) -> Result<bool> {
+    let path = session_auxiliary_path(
+        &session_state_dir(state_root, session_id),
+        runtime_id,
+        file_name,
+    );
+    Ok(read_observation_timestamp(&path)?
+        .is_some_and(|observed_at_ms| now_ms.saturating_sub(observed_at_ms) >= grace_ms))
+}
+
+fn read_observation_timestamp(path: &Path) -> Result<Option<u64>> {
+    match fs::read_to_string(path) {
+        Ok(value) => value
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .with_context(|| format!("解析 Codex 子代理门禁观察时间失败：{}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error)
+            .with_context(|| format!("读取 Codex 子代理门禁观察时间失败：{}", path.display())),
+    }
+}
+
+fn write_observation_timestamp(session_dir: &Path, path: &Path, now_ms: u64) -> Result<()> {
+    fs::create_dir_all(session_dir).with_context(|| {
+        format!(
+            "创建 Codex 子代理门禁状态目录失败：{}",
+            session_dir.display()
+        )
+    })?;
+    let temp = crate::fs_util::unique_temp_path(path);
+    fs::write(&temp, format!("{now_ms}\n"))
+        .with_context(|| format!("写入 Codex 子代理门禁临时观察状态失败：{}", temp.display()))?;
+    crate::fs_util::persist_temp_file(&temp, path)
+        .with_context(|| format!("替换 Codex 子代理门禁观察状态失败：{}", path.display()))
+}
+
+fn remove_session_auxiliary_file(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    file_name: &str,
+) -> Result<()> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let path = session_auxiliary_path(&session_dir, runtime_id, file_name);
+    match fs::remove_file(&path) {
+        Ok(()) => remove_empty_session_dir(&session_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("移除 Codex 子代理门禁辅助状态失败：{}", path.display())),
+    }
+}
+
+fn create_active_marker(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    agent_id: &str,
+) -> Result<()> {
     let session_dir = session_state_dir(state_root, session_id);
     fs::create_dir_all(&session_dir).with_context(|| {
         format!(
@@ -474,14 +924,29 @@ fn create_active_marker(state_root: &Path, session_id: &str, agent_id: &str) -> 
             session_dir.display()
         )
     })?;
-    let marker = agent_marker_path(&session_dir, agent_id);
-    fs::write(&marker, b"active\n")
-        .with_context(|| format!("写入 Codex 子代理门禁状态失败：{}", marker.display()))
+    let marker = agent_marker_path(&session_dir, runtime_id, agent_id);
+    let runtime_id_hash = hash_component(runtime_id);
+    let state = ActiveMarker {
+        schema_version: ACTIVE_MARKER_SCHEMA_VERSION,
+        runtime_id_hash,
+        started_at_ms: current_timestamp_millis(),
+    };
+    let bytes = serde_json::to_vec(&state).context("序列化 Codex 子代理门禁状态失败")?;
+    let temp = crate::fs_util::unique_temp_path(&marker);
+    fs::write(&temp, bytes)
+        .with_context(|| format!("写入 Codex 子代理门禁临时状态失败：{}", temp.display()))?;
+    crate::fs_util::persist_temp_file(&temp, &marker)
+        .with_context(|| format!("替换 Codex 子代理门禁状态失败：{}", marker.display()))
 }
 
-fn remove_active_marker(state_root: &Path, session_id: &str, agent_id: &str) -> Result<()> {
+fn remove_active_marker(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    agent_id: &str,
+) -> Result<()> {
     let session_dir = session_state_dir(state_root, session_id);
-    let marker = agent_marker_path(&session_dir, agent_id);
+    let marker = agent_marker_path(&session_dir, runtime_id, agent_id);
     match fs::remove_file(&marker) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -490,7 +955,11 @@ fn remove_active_marker(state_root: &Path, session_id: &str, agent_id: &str) -> 
                 .with_context(|| format!("移除 Codex 子代理门禁状态失败：{}", marker.display()));
         }
     }
-    match fs::remove_dir(&session_dir) {
+    remove_empty_session_dir(&session_dir)
+}
+
+fn remove_empty_session_dir(session_dir: &Path) -> Result<()> {
+    match fs::remove_dir(session_dir) {
         Ok(()) => {}
         Err(error)
             if matches!(
@@ -509,21 +978,45 @@ fn remove_active_marker(state_root: &Path, session_id: &str, agent_id: &str) -> 
     Ok(())
 }
 
-fn remove_session_state(state_root: &Path, session_id: &str) -> Result<()> {
+fn remove_session_state(state_root: &Path, runtime_id: &str, session_id: &str) -> Result<()> {
     let session_dir = session_state_dir(state_root, session_id);
-    match fs::remove_dir_all(&session_dir) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| {
-            format!(
-                "清理 Codex 子代理门禁会话状态失败：{}",
-                session_dir.display()
-            )
-        }),
+    let entries = match fs::read_dir(&session_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "读取 Codex 子代理门禁会话状态失败：{}",
+                    session_dir.display()
+                )
+            });
+        }
+    };
+    let prefix = runtime_marker_prefix(runtime_id);
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && runtime_file_has_prefix(&entry.path(), &prefix) {
+            fs::remove_file(entry.path()).with_context(|| {
+                format!(
+                    "清理 Codex 子代理门禁会话状态失败：{}",
+                    entry.path().display()
+                )
+            })?;
+        }
     }
+    remove_empty_session_dir(&session_dir)
 }
 
+#[cfg(test)]
 fn active_agent_count(state_root: &Path, session_id: &str) -> Result<usize> {
+    active_agent_count_for_runtime(state_root, &current_runtime_id(), session_id)
+}
+
+fn active_agent_count_for_runtime(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+) -> Result<usize> {
     let session_dir = session_state_dir(state_root, session_id);
     let entries = match fs::read_dir(&session_dir) {
         Ok(entries) => entries,
@@ -534,14 +1027,30 @@ fn active_agent_count(state_root: &Path, session_id: &str) -> Result<usize> {
             });
         }
     };
+    let expected_runtime_id_hash = hash_component(runtime_id);
+    let prefix = runtime_marker_prefix(runtime_id);
     let mut count = 0;
     for entry in entries {
         let entry = entry?;
-        if entry.file_type()?.is_file()
-            && entry.path().extension().and_then(OsStr::to_str) == Some("active")
-        {
-            count += 1;
+        if !entry.file_type()?.is_file() || !marker_name_has_prefix(&entry.path(), &prefix) {
+            continue;
         }
+        let path = entry.path();
+        let bytes = fs::read(&path)
+            .with_context(|| format!("读取 Codex 子代理门禁状态失败：{}", path.display()))?;
+        let marker = serde_json::from_slice::<ActiveMarker>(&bytes)
+            .with_context(|| format!("解析 Codex 子代理门禁状态失败：{}", path.display()))?;
+        anyhow::ensure!(
+            marker.schema_version == ACTIVE_MARKER_SCHEMA_VERSION,
+            "Codex 子代理门禁状态版本不受支持：{}",
+            path.display()
+        );
+        anyhow::ensure!(
+            marker.runtime_id_hash == expected_runtime_id_hash,
+            "Codex 子代理门禁状态代次不一致：{}",
+            path.display()
+        );
+        count += 1;
     }
     Ok(count)
 }
@@ -550,8 +1059,31 @@ fn session_state_dir(state_root: &Path, session_id: &str) -> PathBuf {
     state_root.join(hash_component(session_id))
 }
 
-fn agent_marker_path(session_dir: &Path, agent_id: &str) -> PathBuf {
-    session_dir.join(format!("{}.active", hash_component(agent_id)))
+fn agent_marker_path(session_dir: &Path, runtime_id: &str, agent_id: &str) -> PathBuf {
+    session_dir.join(format!(
+        "{}{}.active",
+        runtime_marker_prefix(runtime_id),
+        hash_component(agent_id)
+    ))
+}
+
+fn session_auxiliary_path(session_dir: &Path, runtime_id: &str, file_name: &str) -> PathBuf {
+    session_dir.join(format!("{}{file_name}", runtime_marker_prefix(runtime_id)))
+}
+
+fn runtime_marker_prefix(runtime_id: &str) -> String {
+    format!("{}-", hash_component(runtime_id))
+}
+
+fn marker_name_has_prefix(path: &Path, prefix: &str) -> bool {
+    path.extension().and_then(OsStr::to_str) == Some("active")
+        && runtime_file_has_prefix(path, prefix)
+}
+
+fn runtime_file_has_prefix(path: &Path, prefix: &str) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.starts_with(prefix))
 }
 
 fn hash_component(value: &str) -> String {
@@ -619,6 +1151,7 @@ mod tests {
             session_id: session.to_string(),
             agent_id: None,
             tool_name: None,
+            tool_input: None,
             tool_response: None,
         }
     }
@@ -823,6 +1356,180 @@ mod tests {
     }
 
     #[test]
+    fn errored_and_other_terminal_wait_statuses_release_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for agent_id in ["agent-a", "agent-b", "agent-c", "agent-d"] {
+            let mut start = input("SubagentStart", "session-a");
+            start.agent_id = Some(agent_id.to_string());
+            handle_hook(&start, root).unwrap();
+        }
+
+        let mut terminal_wait = input("PostToolUse", "session-a");
+        terminal_wait.tool_name = Some("agents.wait_agent".to_string());
+        terminal_wait.tool_response = Some(json!({
+            "updates": [
+                { "agent_id": "agent-a", "status": "completed" },
+                { "agent_id": "agent-b", "state": "errored" },
+                { "agent_id": "agent-c", "agent_status": { "errored": "429 Too Many Requests" } },
+                { "agent_id": "agent-d", "status": "shutdown" }
+            ]
+        }));
+
+        assert_eq!(handle_hook(&terminal_wait, root).unwrap(), json!({}));
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 0);
+    }
+
+    #[test]
+    fn full_agent_list_snapshot_reconciles_terminal_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for agent_id in ["agent-a", "agent-b"] {
+            let mut start = input("SubagentStart", "session-a");
+            start.agent_id = Some(agent_id.to_string());
+            handle_hook(&start, root).unwrap();
+        }
+
+        let mut list = input("PostToolUse", "session-a");
+        list.tool_name = Some("agents.list_agents".to_string());
+        list.tool_input = Some(json!({}));
+        list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "agent_status": "running" },
+                { "agent_name": "/root/agent-a", "agent_status": { "completed": "done" } },
+                { "agent_name": "/root/agent-b", "agent_status": { "errored": "503 Service Unavailable" } }
+            ]
+        }));
+
+        assert_eq!(handle_hook(&list, root).unwrap(), json!({}));
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 0);
+    }
+
+    #[test]
+    fn filtered_or_mixed_agent_lists_do_not_clear_live_markers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        for agent_id in ["agent-a", "agent-b"] {
+            let mut start = input("SubagentStart", "session-a");
+            start.agent_id = Some(agent_id.to_string());
+            handle_hook(&start, root).unwrap();
+        }
+
+        let mut filtered = input("PostToolUse", "session-a");
+        filtered.tool_name = Some("agents.list_agents".to_string());
+        filtered.tool_input = Some(json!({ "path_prefix": "/root/agent-a" }));
+        filtered.tool_response = Some(json!({
+            "agents": [{
+                "agent_name": "/root/agent-a",
+                "agent_status": { "errored": "429 Too Many Requests" }
+            }]
+        }));
+        assert_eq!(
+            handle_hook(&filtered, root).unwrap()["decision"].as_str(),
+            Some("block")
+        );
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 2);
+
+        let mut mixed = input("PostToolUse", "session-a");
+        mixed.tool_name = Some("agents.list_agents".to_string());
+        mixed.tool_input = Some(json!({}));
+        mixed.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "agent_status": "running" },
+                { "agent_name": "/root/agent-a", "agent_status": { "errored": "429 Too Many Requests" } },
+                { "agent_name": "/root/agent-b", "agent_status": "running" }
+            ]
+        }));
+        assert_eq!(
+            handle_hook(&mixed, root).unwrap()["decision"].as_str(),
+            Some("block")
+        );
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 2);
+    }
+
+    #[test]
+    fn stale_pending_init_and_unusable_collaboration_paths_release_after_grace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+
+        let mut start = input("SubagentStart", "pending-session");
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
+        let mut list = input("PostToolUse", "pending-session");
+        list.tool_name = Some("agents.list_agents".to_string());
+        list.tool_input = Some(json!({}));
+        list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "agent_status": "running" },
+                { "agent_name": "/root/agent-a", "agent_status": "pending_init" }
+            ]
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&list, root, runtime_id, 1_000).unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+        assert_eq!(
+            handle_hook_for_runtime_at(
+                &input("Stop", "pending-session"),
+                root,
+                runtime_id,
+                1_000 + PENDING_INIT_GRACE_MILLIS - 1,
+            )
+            .unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+        assert_eq!(
+            handle_hook_for_runtime_at(
+                &input("Stop", "pending-session"),
+                root,
+                runtime_id,
+                1_000 + PENDING_INIT_GRACE_MILLIS,
+            )
+            .unwrap(),
+            json!({})
+        );
+
+        let mut stalled_start = input("SubagentStart", "stalled-session");
+        stalled_start.agent_id = Some("agent-b".to_string());
+        handle_hook_for_runtime_at(&stalled_start, root, runtime_id, 2_000).unwrap();
+        assert_eq!(
+            handle_hook_for_runtime_at(&input("Stop", "stalled-session"), root, runtime_id, 2_000,)
+                .unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+        let mut unavailable_wait = input("PostToolUse", "stalled-session");
+        unavailable_wait.tool_name = Some("agents.wait_agent".to_string());
+        unavailable_wait.tool_response = Some(Value::String(
+            "该工具未在当前线程注册，无法执行 agents.wait_agent".to_string(),
+        ));
+        assert_eq!(
+            handle_hook_for_runtime_at(
+                &unavailable_wait,
+                root,
+                runtime_id,
+                2_000 + STOP_STALL_GRACE_MILLIS - 1,
+            )
+            .unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+        assert_eq!(
+            handle_hook_for_runtime_at(
+                &input("Stop", "stalled-session"),
+                root,
+                runtime_id,
+                2_000 + STOP_STALL_GRACE_MILLIS,
+            )
+            .unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
     fn non_terminal_or_unattributed_wait_updates_do_not_release_markers() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -867,6 +1574,7 @@ mod tests {
             json!({ "kind": "steered_input" }),
             json!({ "interrupted_by_user_input": true }),
             json!({ "canceled_by_user": true }),
+            json!({ "result": { "interrupted_by_user": true } }),
         ]
         .into_iter()
         .enumerate()
@@ -904,6 +1612,102 @@ mod tests {
         assert_eq!(
             handle_hook(&completed_wait, root).unwrap()["decision"].as_str(),
             Some("block")
+        );
+    }
+
+    #[test]
+    fn ordinary_agent_messages_cannot_clear_the_session_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let mut start = input("SubagentStart", "session-a");
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime(&start, root, runtime_id).unwrap();
+
+        let mut wait = input("PostToolUse", "session-a");
+        wait.tool_name = Some("agents.wait_agent".to_string());
+        wait.tool_response = Some(json!({
+            "updates": [{
+                "agent_id": "agent-a",
+                "type": "MESSAGE",
+                "message": "Document the manual stop procedure before continuing",
+                "details": { "interrupted_by_user_input": true }
+            }]
+        }));
+
+        let blocked = handle_hook_for_runtime(&wait, root, runtime_id).unwrap();
+        assert_eq!(blocked["decision"].as_str(), Some("block"));
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, "session-a").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn runtime_generations_fence_stale_markers_and_late_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut start = input("SubagentStart", "session-a");
+        start.agent_id = Some("agent-a".to_string());
+
+        handle_hook_for_runtime(&start, root, "runtime-old").unwrap();
+        assert_eq!(
+            active_agent_count_for_runtime(root, "runtime-old", "session-a").unwrap(),
+            1
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, "runtime-new", "session-a").unwrap(),
+            0
+        );
+
+        handle_hook_for_runtime(&start, root, "runtime-new").unwrap();
+        let session_dir = session_state_dir(root, "session-a");
+        let marker_path = agent_marker_path(&session_dir, "runtime-new", "agent-a");
+        let marker: ActiveMarker =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(marker.schema_version, ACTIVE_MARKER_SCHEMA_VERSION);
+        assert_eq!(marker.runtime_id_hash, hash_component("runtime-new"));
+        assert!(marker.started_at_ms > 0);
+
+        let mut late_old_stop = input("SubagentStop", "session-a");
+        late_old_stop.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime(&late_old_stop, root, "runtime-old").unwrap();
+        assert_eq!(
+            active_agent_count_for_runtime(root, "runtime-new", "session-a").unwrap(),
+            1
+        );
+
+        handle_hook_for_runtime(&input("SessionEnd", "session-a"), root, "runtime-old").unwrap();
+        assert_eq!(
+            active_agent_count_for_runtime(root, "runtime-new", "session-a").unwrap(),
+            1
+        );
+
+        let mut root_patch = input("PreToolUse", "session-a");
+        root_patch.tool_name = Some("apply_patch".to_string());
+        assert_eq!(
+            handle_hook_for_runtime(&root_patch, root, "runtime-new").unwrap()
+                ["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+    }
+
+    #[test]
+    fn unverifiable_legacy_markers_do_not_block_a_versioned_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let session_dir = session_state_dir(root, "session-a");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join(format!("{}.active", hash_component("agent-a"))),
+            b"active\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            active_agent_count_for_runtime(root, "runtime-new", "session-a").unwrap(),
+            0
         );
     }
 

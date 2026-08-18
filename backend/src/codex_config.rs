@@ -756,7 +756,7 @@ fn write_runtime_agent(
     if let Some(parent) = runtime_path.parent() {
         create_private_dir_all(parent)?;
     }
-    write_private_file(runtime_path, rendered.as_bytes())?;
+    atomic_write(runtime_path, rendered.as_bytes())?;
     Ok(description)
 }
 
@@ -1896,7 +1896,7 @@ const SUBAGENT_GATE_HOOKS: [CodeyHookSpec; 6] = [
     CodeyHookSpec {
         toml_event: "PostToolUse",
         event_key: "post_tool_use",
-        matcher: Some(crate::subagent_gate::WAIT_AGENT_HOOK_MATCHER),
+        matcher: Some(crate::subagent_gate::AGENT_STATUS_HOOK_MATCHER),
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
     CodeyHookSpec {

@@ -168,7 +168,7 @@ denies non-collaboration local tools, and prevents the root turn from finishing;
 blocked tool, wait for the agents instead. The `functions.exec` tool world is a separate route and does \
 not contain collaboration tools.";
 
-pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V5: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
 commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
 agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
@@ -179,6 +179,21 @@ or another partial update needs action, use only the relevant `agents.send_messa
 and continue until every spawned agent is done. While spawned subagents are active, Codey's runtime gate \
 denies non-collaboration local tools and prevents the root turn from finishing. The `functions.exec` tool \
 world is a separate route and does not contain collaboration tools.";
+
+pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
+commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
+agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
+non-collaboration work. Use `timeout_ms <= 120000`; a mailbox update is not completion. If a `MESSAGE` \
+or another partial update needs action, use only the relevant `agents.send_message`, \
+`agents.followup_task`, `agents.interrupt_agent`, or `agents.list_agents` tool, then return to \
+`agents.wait_agent`. Treat `FINAL_ANSWER`, `task_complete`, `completed`, `errored`, `shutdown`, and \
+`not_found` as terminal; `pending_init`, `running`, and `interrupted` remain nonterminal. If a wait result \
+lacks per-agent terminal details, call unfiltered `agents.list_agents` to reconcile the full batch. If a \
+collaboration tool is unavailable, do not loop on an unregistered tool; Codey's runtime gate has bounded \
+stale-state recovery. Continue until every spawned agent is terminal. While spawned subagents are active, \
+Codey's runtime gate denies non-collaboration local tools and prevents the root turn from finishing. The \
+`functions.exec` tool world is a separate route and does not contain collaboration tools.";
 
 pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V3: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
@@ -208,6 +223,7 @@ route and does not contain collaboration tools.";
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V5,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V4,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V3,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V2,
@@ -785,6 +801,11 @@ mod tests {
         assert!(combined.contains("`agents.send_message`"));
         assert!(combined.contains("`FINAL_ANSWER`"));
         assert!(combined.contains("`task_complete`"));
+        assert!(combined.contains("`errored`"));
+        assert!(combined.contains("`shutdown`"));
+        assert!(combined.contains("`not_found`"));
+        assert!(combined.contains("unfiltered `agents.list_agents`"));
+        assert!(combined.contains("do not loop on an unregistered tool"));
         assert!(combined.contains("`functions.exec` tool world is a separate route"));
         assert!(!combined.contains("Write-Output"));
         assert!(!combined.contains("Write-Error"));
@@ -803,6 +824,7 @@ mod tests {
     #[test]
     fn root_agent_usage_hint_migrates_only_complete_owned_paragraphs() {
         for previous in [
+            PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V5,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V4,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V3,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V2,
