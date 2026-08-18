@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::fs_util::timestamp_millis;
+use crate::fs_util::{atomic_write_preserving_permissions as atomic_write, timestamp_millis};
 use crate::sqlite_util::table_columns;
 
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
@@ -595,19 +595,6 @@ fn prune_backups(home: &Path) -> Result<()> {
     for path in managed.into_iter().skip(BACKUP_KEEP_COUNT) {
         let _ = fs::remove_dir_all(path);
     }
-    Ok(())
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp = crate::fs_util::unique_temp_path(path);
-    fs::write(&temp, bytes)?;
-    if let Ok(metadata) = fs::metadata(path)
-        && let Err(error) = fs::set_permissions(&temp, metadata.permissions())
-    {
-        let _ = fs::remove_file(&temp);
-        return Err(error.into());
-    }
-    crate::fs_util::persist_temp_file(&temp, path)?;
     Ok(())
 }
 

@@ -26,8 +26,10 @@ pub fn configure(codex_home: &Path, slim_enabled: bool) -> Result<PetSlimReport>
     if changed || !state_path.exists() {
         state.insert(PET_OPEN_KEY.to_string(), Value::Bool(desired_open_state));
         let bytes = serde_json::to_vec(&Value::Object(state))?;
-        atomic_write(&state_path, &bytes)?;
-        atomic_write(&backup_path, &bytes)?;
+        crate::fs_util::atomic_write_private(&state_path, &bytes)
+            .with_context(|| format!("更新 Codex 宠物状态失败：{}", state_path.display()))?;
+        crate::fs_util::atomic_write_private(&backup_path, &bytes)
+            .with_context(|| format!("更新 Codex 宠物备份状态失败：{}", backup_path.display()))?;
     }
 
     Ok(PetSlimReport {
@@ -64,19 +66,6 @@ fn read_state_file(path: &Path) -> Result<Option<Map<String, Value>>> {
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Codex 全局状态不是 JSON 对象：{}", path.display()))
         .map(Some)
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let temp = crate::fs_util::unique_temp_path(path);
-    fs::write(&temp, bytes)
-        .with_context(|| format!("写入 Codex 宠物精简临时状态失败：{}", temp.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
-    }
-    crate::fs_util::persist_temp_file(&temp, path)
-        .with_context(|| format!("更新 Codex 宠物状态失败：{}", path.display()))
 }
 
 #[cfg(test)]

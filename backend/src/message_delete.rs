@@ -212,13 +212,8 @@ fn record_resolved_tail_aliases_unlocked(
                 anyhow::bail!("消息删除尾部别名哈希冲突：{}", path.display());
             }
         }
-        let temp = crate::fs_util::unique_temp_path(&path);
         let bytes = serde_json::to_vec(&tombstone)?;
-        if let Err(error) = write_private_file(&temp, &bytes) {
-            let _ = fs::remove_file(&temp);
-            return Err(error);
-        }
-        crate::fs_util::persist_temp_file(&temp, &path)
+        crate::fs_util::atomic_write_private(&path, &bytes)
             .with_context(|| format!("保存消息删除尾部别名失败：{}", path.display()))?;
     }
     sync_directory(&directory)

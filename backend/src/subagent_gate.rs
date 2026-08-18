@@ -1265,10 +1265,7 @@ fn write_observation_timestamp(session_dir: &Path, path: &Path, now_ms: u64) -> 
             session_dir.display()
         )
     })?;
-    let temp = crate::fs_util::unique_temp_path(path);
-    fs::write(&temp, format!("{now_ms}\n"))
-        .with_context(|| format!("写入 Codex 子代理门禁临时观察状态失败：{}", temp.display()))?;
-    crate::fs_util::persist_temp_file(&temp, path)
+    crate::fs_util::atomic_write(path, format!("{now_ms}\n").as_bytes())
         .with_context(|| format!("替换 Codex 子代理门禁观察状态失败：{}", path.display()))
 }
 
@@ -1404,10 +1401,7 @@ fn write_protocol_health(session_dir: &Path, path: &Path, health: &ProtocolHealt
         )
     })?;
     let bytes = serde_json::to_vec(health).context("序列化 Codex Hook 协议诊断状态失败")?;
-    let temp = crate::fs_util::unique_temp_path(path);
-    fs::write(&temp, bytes)
-        .with_context(|| format!("写入 Codex Hook 协议诊断临时状态失败：{}", temp.display()))?;
-    crate::fs_util::persist_temp_file(&temp, path)
+    crate::fs_util::atomic_write(path, &bytes)
         .with_context(|| format!("替换 Codex Hook 协议诊断状态失败：{}", path.display()))
 }
 
@@ -1448,10 +1442,7 @@ fn create_active_marker(
         started_at_ms: current_timestamp_millis(),
     };
     let bytes = serde_json::to_vec(&state).context("序列化 Codex 子代理门禁状态失败")?;
-    let temp = crate::fs_util::unique_temp_path(&marker);
-    fs::write(&temp, bytes)
-        .with_context(|| format!("写入 Codex 子代理门禁临时状态失败：{}", temp.display()))?;
-    crate::fs_util::persist_temp_file(&temp, &marker)
+    crate::fs_util::atomic_write(&marker, &bytes)
         .with_context(|| format!("替换 Codex 子代理门禁状态失败：{}", marker.display()))
 }
 

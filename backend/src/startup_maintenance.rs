@@ -160,9 +160,7 @@ fn write_marker(path: &Path, target_provider: &str) -> Result<()> {
         target_provider: target_provider.to_string(),
         validated_at_ms: timestamp_millis(),
     };
-    let temp = crate::fs_util::unique_temp_path(path);
-    fs::write(&temp, serde_json::to_vec_pretty(&marker)?)?;
-    crate::fs_util::persist_temp_file(&temp, path)?;
+    crate::fs_util::atomic_write(path, &serde_json::to_vec_pretty(&marker)?)?;
     Ok(())
 }
 
@@ -409,9 +407,7 @@ fn write_rollout_header_cache(path: &Path, cache: &RolloutHeaderCache) -> Result
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Provider 会话头缓存路径没有父目录"))?;
     fs::create_dir_all(parent)?;
-    let temp = crate::fs_util::unique_temp_path(path);
-    fs::write(&temp, serde_json::to_vec_pretty(cache)?)?;
-    crate::fs_util::persist_temp_file(&temp, path)?;
+    crate::fs_util::atomic_write(path, &serde_json::to_vec_pretty(cache)?)?;
     Ok(())
 }
 

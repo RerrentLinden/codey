@@ -9,6 +9,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+pub(super) use crate::fs_util::atomic_write_private_with_parent as atomic_write;
+
 pub(super) fn create_private_dir_all(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -30,17 +32,6 @@ pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     #[cfg(not(unix))]
     fs::write(path, bytes)?;
-    Ok(())
-}
-
-pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("路径没有父目录：{}", path.display()))?;
-    fs::create_dir_all(parent)?;
-    let temp = crate::fs_util::unique_temp_path(path);
-    write_private_file(&temp, bytes)?;
-    crate::fs_util::persist_temp_file(&temp, path)?;
     Ok(())
 }
 

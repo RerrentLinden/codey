@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -129,8 +130,11 @@ struct RuntimeConfigLease {
     original_hooks_file_exists: bool,
 }
 
-pub fn codex_home() -> PathBuf {
-    codey_runtime_core::relay_config::default_codex_home_dir()
+pub fn codex_home() -> &'static Path {
+    static CODEX_HOME: OnceLock<PathBuf> = OnceLock::new();
+    CODEX_HOME
+        .get_or_init(codey_runtime_core::relay_config::default_codex_home_dir)
+        .as_path()
 }
 
 fn lease_marker_path() -> PathBuf {

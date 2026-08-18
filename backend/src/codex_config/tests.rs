@@ -8,6 +8,11 @@ use crate::codex_config_guidance::{
 const GLOBAL_PROVIDER_ID: &str = "codey_global";
 
 #[test]
+fn codex_home_is_resolved_once_per_process() {
+    assert!(std::ptr::eq(codex_home(), codex_home()));
+}
+
+#[test]
 fn runtime_input_guard_detects_concurrent_file_changes() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("config.toml");

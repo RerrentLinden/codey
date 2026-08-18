@@ -435,16 +435,8 @@ fn save_waiting_notification_ledger(
     fs::create_dir_all(parent).map_err(|error| format!("创建消息通知记录目录失败：{error}"))?;
     let bytes = serde_json::to_vec_pretty(&WaitingNotificationLedger { notification_keys })
         .map_err(|error| format!("序列化消息通知记录失败：{error}"))?;
-    let temp = crate::fs_util::unique_temp_path(path);
-    fs::write(&temp, bytes).map_err(|error| format!("写入消息通知记录失败：{error}"))?;
-    crate::fs_util::persist_temp_file(&temp, path)
+    crate::fs_util::atomic_write_private(path, &bytes)
         .map_err(|error| format!("替换消息通知记录失败：{error}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("保护消息通知记录失败：{error}"))?;
-    }
     Ok(())
 }
 
@@ -792,7 +784,9 @@ async fn webhook_session_name(state: &Arc<AppState>, payload: &Value, session_id
     let fallback_title = cached_title.clone();
     let home = codex_home();
     let session_id = session_id.to_string();
-    match super::resolve_session_name_cached(state, home, session_id, cached_title).await {
+    match super::resolve_session_name_cached(state, home.to_path_buf(), session_id, cached_title)
+        .await
+    {
         Ok(session_name) => session_name,
         Err(error) => {
             eprintln!("读取通知会话名称任务异常退出：{error}");

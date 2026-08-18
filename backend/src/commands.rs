@@ -407,7 +407,7 @@ impl AppState {
             }
             "/plugins/list" => {
                 let home = codex_home();
-                let plugins_home = home.clone();
+                let plugins_home = home;
                 match tokio::task::spawn_blocking(move || {
                     plugin_marketplace::list_plugins(&plugins_home)
                 })
@@ -889,7 +889,7 @@ async fn save_codey_config_locked(
         None
     };
     if trace_guard_changed {
-        let home = codex_home();
+        let home = codex_home().to_path_buf();
         let disable_writes = config.disable_trace_log_writes;
         let result = configure_trace_log_guard(home.clone(), disable_writes).await;
         if let Err(error) = result {
@@ -910,7 +910,7 @@ async fn save_codey_config_locked(
     if let Err(error) = save_config_to_store(state, &config).await {
         if trace_guard_changed {
             return Err(rollback_trace_log_guard(
-                codex_home(),
+                codex_home().to_path_buf(),
                 previous.disable_trace_log_writes,
                 error,
             )

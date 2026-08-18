@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::fs_util::atomic_write_private_with_parent as atomic_write;
 use crate::model_id;
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
@@ -1000,27 +1001,6 @@ fn read_runtime_catalog_models(home: &Path) -> Result<Vec<Value>> {
         bail!("Codey 运行时模型目录缺少 Codex 必需字段");
     }
     Ok(models)
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Codey 模型目录路径没有父目录"))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("创建 Codey 模型目录失败：{}", parent.display()))?;
-    let temp_path = crate::fs_util::unique_temp_path(path);
-    if let Err(error) = fs::write(&temp_path, bytes) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error)
-            .with_context(|| format!("写入临时模型目录失败：{}", temp_path.display()));
-    }
-    if let Err(error) = protect_catalog_file(&temp_path) {
-        let _ = fs::remove_file(&temp_path);
-        return Err(error);
-    }
-    crate::fs_util::persist_temp_file(&temp_path, path)
-        .with_context(|| format!("替换模型目录失败：{}", path.display()))?;
-    protect_catalog_file(path)
 }
 
 fn protect_catalog_file(path: &Path) -> Result<()> {

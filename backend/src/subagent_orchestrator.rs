@@ -234,11 +234,7 @@ impl LedgerStore {
         ledger.revision = ledger.revision.saturating_add(1);
         ledger.updated_at_ms = now_ms;
         let bytes = serde_json::to_vec(ledger).context("序列化 Codey 子代理预算账本失败")?;
-        let temp = crate::fs_util::unique_temp_path(&self.ledger_path);
-        fs::write(&temp, bytes).with_context(|| {
-            format!("写入 Codey 子代理预算账本临时文件失败：{}", temp.display())
-        })?;
-        crate::fs_util::persist_temp_file(&temp, &self.ledger_path).with_context(|| {
+        crate::fs_util::atomic_write(&self.ledger_path, &bytes).with_context(|| {
             format!(
                 "原子替换 Codey 子代理预算账本失败：{}",
                 self.ledger_path.display()
