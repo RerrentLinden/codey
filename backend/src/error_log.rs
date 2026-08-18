@@ -64,7 +64,7 @@ struct ErrorRecord {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum ErrorHelperInput {
-    Record(ErrorRecord),
+    Record(Box<ErrorRecord>),
     Batch(Vec<ErrorRecord>),
 }
 
@@ -437,7 +437,7 @@ fn parse_helper_records(input: &str) -> anyhow::Result<Vec<ErrorRecord>> {
     let input: ErrorHelperInput =
         serde_json::from_str(input).context("解析 Codey 错误日志 helper 输入失败")?;
     let mut records = match input {
-        ErrorHelperInput::Record(record) => vec![record],
+        ErrorHelperInput::Record(record) => vec![*record],
         ErrorHelperInput::Batch(records) => records,
     };
     anyhow::ensure!(!records.is_empty(), "Codey 错误日志 helper 批次为空");
