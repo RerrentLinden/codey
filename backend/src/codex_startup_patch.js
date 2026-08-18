@@ -1002,9 +1002,14 @@
     ...nativeRuntimeConfigOverrides,
   ];
   const subagentGateRuntimeEnv = "CODEY_SUBAGENT_GATE_ACTIVE";
+  const subagentGateRuntimeIdEnv = "CODEY_SUBAGENT_GATE_RUNTIME_ID";
   const subagentGateRuntimeActive =
     typeof __SUBAGENT_GATE_ACTIVE__ === "boolean" &&
     __SUBAGENT_GATE_ACTIVE__;
+  const randomUuid = process.getBuiltinModule("crypto")?.randomUUID;
+  const subagentGateRuntimeId = typeof randomUuid === "function"
+    ? randomUuid()
+    : `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const rewriteTomlWindowsPathsForWsl = (config) => {
     if (typeof config !== "string") return config;
     return config.replace(/"(?:\\.|[^"\\])*"/g, (literal) => {
@@ -1164,10 +1169,14 @@
       );
     }
     let commandPrefix = command.slice(0, execCommandOffset);
-    if (subagentGateRuntimeActive) {
+    if (
+      subagentGateRuntimeActive &&
+      !commandPrefix.includes(`${subagentGateRuntimeEnv}=1 `)
+    ) {
       const execKeywordIndex = commandPrefix.lastIndexOf("exec");
       commandPrefix =
         commandPrefix.slice(0, execKeywordIndex) +
+        `${subagentGateRuntimeIdEnv}=${shellQuote(subagentGateRuntimeId)} ` +
         `${subagentGateRuntimeEnv}=1 ` +
         commandPrefix.slice(execKeywordIndex);
     }
@@ -1235,6 +1244,7 @@
           env: {
             ...process.env,
             [subagentGateRuntimeEnv]: "1",
+            [subagentGateRuntimeIdEnv]: subagentGateRuntimeId,
           },
         }];
       }
@@ -1245,6 +1255,7 @@
         env: {
           ...inheritedEnvironment,
           [subagentGateRuntimeEnv]: "1",
+          [subagentGateRuntimeIdEnv]: subagentGateRuntimeId,
         },
       }, ...rest.slice(1)];
     };
@@ -1778,6 +1789,181 @@
     }
   }
 
+  const executionProcessEvidence = {
+    version: 1,
+    snapshotWorkerConfigured: false,
+    snapshots: 0,
+    snapshotFailures: 0,
+    terminationAttempts: 0,
+    terminated: 0,
+    lastError: "",
+  };
+  let executionProcessSnapshotWorkerPath = "";
+  const normalizeExecutionProcessSnapshot = (processes) => {
+    if (!Array.isArray(processes)) return [];
+    const observedAtMs = Date.now();
+    const normalizedInput = processes.flatMap((processInfo) => {
+      const pid = Number(processInfo?.pid);
+      const parentPid = Number(processInfo?.parentPid);
+      if (
+        !Number.isSafeInteger(pid) || pid <= 1 ||
+        !Number.isSafeInteger(parentPid) || parentPid < 0
+      ) return [];
+      const ageSeconds = Number.isFinite(processInfo?.ageSeconds)
+        ? Math.max(0, Number(processInfo.ageSeconds))
+        : null;
+      const providedStartedAtMs = Number(processInfo?.startedAtMs);
+      const startedAtMs = Number.isFinite(providedStartedAtMs)
+        ? providedStartedAtMs
+        : ageSeconds == null
+          ? null
+          : observedAtMs - ageSeconds * 1000;
+      return [{
+        ...processInfo,
+        ageSeconds,
+        command: String(processInfo?.command ?? "").trim(),
+        parentPid,
+        pid,
+        startedAtMs,
+      }];
+    });
+    const byPid = new Map(
+      normalizedInput.map((processInfo) => [processInfo.pid, processInfo]),
+    );
+    const normalized = [];
+    for (const processInfo of normalizedInput) {
+      let cursor = processInfo;
+      let rootChild = processInfo;
+      let relativeDepth = 1;
+      const visited = new Set([processInfo.pid]);
+      while (true) {
+        const parent = byPid.get(cursor.parentPid);
+        if (parent == null || visited.has(parent.pid)) break;
+        if (parent.kind === "app_server") {
+          normalized.push({
+            ...processInfo,
+            appServerPid: parent.pid,
+            depth: relativeDepth,
+            rootChildPid: rootChild.pid,
+          });
+          break;
+        }
+        visited.add(parent.pid);
+        cursor = parent;
+        rootChild = parent;
+        relativeDepth += 1;
+      }
+    }
+    return normalized;
+  };
+  const configureExecutionProcessSnapshotWorker = (mainBundleFilename) => {
+    const path = process.getBuiltinModule("path");
+    executionProcessSnapshotWorkerPath = path.join(
+      path.dirname(mainBundleFilename),
+      "child-process-snapshot-worker.js",
+    );
+    executionProcessEvidence.snapshotWorkerConfigured = true;
+  };
+  const snapshotExecutionProcesses = () => {
+    executionProcessEvidence.snapshots += 1;
+    return new Promise((resolve, reject) => {
+      if (!executionProcessSnapshotWorkerPath) {
+        const error = new Error("Codey execution snapshot worker is not configured");
+        executionProcessEvidence.snapshotFailures += 1;
+        executionProcessEvidence.lastError = error.message;
+        reject(error);
+        return;
+      }
+      let settled = false;
+      let worker = null;
+      let timer = null;
+      const finish = (error, processes) => {
+        if (settled) return;
+        settled = true;
+        if (timer != null) clearTimeout(timer);
+        if (worker != null) {
+          try { Promise.resolve(worker.terminate()).catch(() => {}); } catch {}
+        }
+        if (error != null) {
+          executionProcessEvidence.snapshotFailures += 1;
+          executionProcessEvidence.lastError =
+            error instanceof Error ? error.message.slice(0, 240) : String(error);
+          reject(error);
+          return;
+        }
+        executionProcessEvidence.lastError = "";
+        resolve(normalizeExecutionProcessSnapshot(processes));
+      };
+      try {
+        worker = new NativeWorker(executionProcessSnapshotWorkerPath, {
+          name: "codey-execution-process-reaper",
+          workerData: process.pid,
+        });
+        worker.once("message", (message) => {
+          if (message?.type === "ok" && Array.isArray(message.value)) {
+            finish(null, message.value);
+          } else {
+            finish(new Error(
+              message?.error?.message || "Codey execution snapshot worker failed",
+            ));
+          }
+        });
+        worker.once("error", (error) => finish(error));
+        worker.once("exit", (code) => {
+          if (!settled) {
+            finish(new Error(`Codey execution snapshot worker exited with ${code}`));
+          }
+        });
+        worker.unref?.();
+        timer = setTimeout(() => {
+          finish(new Error("Codey execution snapshot worker timed out"));
+        }, 10 * 1000);
+        timer.unref?.();
+      } catch (error) {
+        finish(error);
+      }
+    });
+  };
+  const terminateExecutionProcess = async (pid, expectedProcess) => {
+    const normalizedPid = Number(pid);
+    const appServerPid = Number(expectedProcess?.appServerPid);
+    if (
+      !Number.isSafeInteger(normalizedPid) || normalizedPid <= 1 ||
+      normalizedPid === process.pid ||
+      expectedProcess?.pid !== normalizedPid ||
+      !Number.isSafeInteger(appServerPid) || appServerPid <= 1 ||
+      normalizedPid === appServerPid
+    ) return false;
+    executionProcessEvidence.terminationAttempts += 1;
+    try {
+      process.kill(normalizedPid, "SIGTERM");
+      executionProcessEvidence.terminated += 1;
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        executionProcessEvidence.terminated += 1;
+        return true;
+      }
+      executionProcessEvidence.lastError =
+        error instanceof Error ? error.message.slice(0, 240) : String(error);
+      return false;
+    }
+  };
+  const executionProcessLifecycle = Object.freeze({
+    configure: configureExecutionProcessSnapshotWorker,
+    normalizeSnapshot: normalizeExecutionProcessSnapshot,
+    snapshot: snapshotExecutionProcesses,
+    terminate: terminateExecutionProcess,
+    get status() {
+      return { ...executionProcessEvidence };
+    },
+  });
+  Object.defineProperty(globalThis, "__CODEY_EXECUTION_PROCESS_LIFECYCLE__", {
+    configurable: false,
+    value: executionProcessLifecycle,
+    writable: false,
+  });
+
   const temporaryWebViews = new WeakMap();
   const temporaryWebViewLifecycle = Object.freeze({
     close(owner, partition) {
@@ -1813,9 +1999,14 @@
     kill,
     snapshot,
     completionGraceMs: configuredCompletionGraceMs,
+    mcpDuplicateGraceMs: configuredMcpDuplicateGraceMs,
   }) => {
     const activeTurns = new Map();
-    const completionGraceMs = configuredCompletionGraceMs ?? 1000;
+    const completionGraceMs = Math.max(0, configuredCompletionGraceMs ?? 1000);
+    const mcpDuplicateGraceMs = Math.max(
+      0,
+      configuredMcpDuplicateGraceMs ?? 30 * 1000,
+    );
     const reclaimRetryMs = 60 * 1000;
     const terminalTurnStates = new Set([
       "completed",
@@ -1842,12 +2033,87 @@
     let lastTurnActivityAt = Date.now();
     let turnStateVersion = 0;
 
-    const isReclaimable = (processInfo) => {
+    const isNodeRepl = (processInfo) => {
       const command = String(processInfo?.command ?? "");
-      // Configured MCP servers belong to the app-server session, not to one
-      // turn. Killing them here forces Codex to reconnect and repeat capability
-      // discovery (including resources/list) after every completed turn.
       return /(?:^|[/\\])node_repl(?:\.exe)?(?:\s|$)/i.test(command);
+    };
+    const mcpCommandIdentity = (processInfo) => {
+      let command = String(processInfo?.command ?? "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (process.platform === "win32") command = command.toLowerCase();
+      return command;
+    };
+    const sameProcessIdentity = (left, right) => {
+      if (
+        left?.pid !== right?.pid ||
+        left?.parentPid !== right?.parentPid ||
+        String(left?.command ?? "") !== String(right?.command ?? "")
+      ) return false;
+      if (
+        Number.isFinite(left?.startedAtMs) &&
+        Number.isFinite(right?.startedAtMs) &&
+        Math.abs(left.startedAtMs - right.startedAtMs) > 2500
+      ) return false;
+      return true;
+    };
+    const selectReclaimCandidates = (processes) => {
+      const candidates = new Map();
+      const addCandidate = (processInfo, reclaimClass) => {
+        const pid = Number(processInfo?.pid);
+        if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) return;
+        const previous = candidates.get(pid);
+        if (previous?.reclaimClass === "mcp-duplicate") return;
+        candidates.set(pid, { processInfo, reclaimClass });
+      };
+      for (const processInfo of processes) {
+        if (isNodeRepl(processInfo)) addCandidate(processInfo, "node-repl");
+      }
+
+      const rootsByIdentity = new Map();
+      for (const processInfo of processes) {
+        const pid = Number(processInfo?.pid);
+        const rootChildPid = Number(processInfo?.rootChildPid);
+        const appServerPid = Number(processInfo?.appServerPid);
+        const commandIdentity = mcpCommandIdentity(processInfo);
+        if (
+          processInfo?.kind !== "mcp" ||
+          !Number.isSafeInteger(pid) || pid !== rootChildPid ||
+          !Number.isSafeInteger(appServerPid) || !commandIdentity
+        ) continue;
+        const identity = `${appServerPid}\u0000${commandIdentity}`;
+        const roots = rootsByIdentity.get(identity) ?? [];
+        roots.push(processInfo);
+        rootsByIdentity.set(identity, roots);
+      }
+      for (const roots of rootsByIdentity.values()) {
+        if (roots.length < 2) continue;
+        roots.sort((left, right) => {
+          const leftAge = Number.isFinite(left?.ageSeconds)
+            ? left.ageSeconds
+            : Number.POSITIVE_INFINITY;
+          const rightAge = Number.isFinite(right?.ageSeconds)
+            ? right.ageSeconds
+            : Number.POSITIVE_INFINITY;
+          return leftAge - rightAge || right.pid - left.pid;
+        });
+        for (const staleRoot of roots.slice(1)) {
+          if (
+            !Number.isFinite(staleRoot?.ageSeconds) ||
+            staleRoot.ageSeconds * 1000 < mcpDuplicateGraceMs
+          ) continue;
+          for (const processInfo of processes) {
+            if (
+              processInfo?.appServerPid === staleRoot.appServerPid &&
+              processInfo?.rootChildPid === staleRoot.pid
+            ) addCandidate(processInfo, "mcp-duplicate");
+          }
+        }
+      }
+      return Array.from(candidates.values()).sort(
+        (left, right) =>
+          (right.processInfo?.depth ?? 0) - (left.processInfo?.depth ?? 0),
+      );
     };
 
     const clearReclaimTimer = () => {
@@ -1925,18 +2191,30 @@
           if (!await waitForReclaimBarrier(expectedVersion, completionGraceMs)) {
             return { reason, reclaimed: 0 };
           }
-          const candidates = processes
-            .filter(isReclaimable)
-            .sort((left, right) => (right.depth ?? 0) - (left.depth ?? 0));
+          let candidates = selectReclaimCandidates(processes);
+          if (candidates.some(({ reclaimClass }) => reclaimClass === "mcp-duplicate")) {
+            const originalCandidates = new Map(
+              candidates.map((candidate) => [candidate.processInfo.pid, candidate]),
+            );
+            const freshProcesses = await snapshot();
+            if (!isReclaimSafe(expectedVersion)) {
+              return { reason, reclaimed: 0 };
+            }
+            candidates = selectReclaimCandidates(freshProcesses).filter((candidate) => {
+              const original = originalCandidates.get(candidate.processInfo.pid);
+              return original?.reclaimClass === candidate.reclaimClass &&
+                sameProcessIdentity(original.processInfo, candidate.processInfo);
+            });
+          }
           let reclaimed = 0;
           let allKillsSucceeded = true;
-          for (const processInfo of candidates) {
+          for (const { processInfo } of candidates) {
             // Yield once more immediately before each irreversible operation.
             if (!await waitForReclaimBarrier(expectedVersion, 0)) {
               break;
             }
             try {
-              if (await kill(processInfo.pid) !== false) reclaimed += 1;
+              if (await kill(processInfo.pid, processInfo) !== false) reclaimed += 1;
               else allKillsSucceeded = false;
             } catch {
               allKillsSucceeded = false;
@@ -2111,6 +2389,7 @@
       try {
       const fs = process.getBuiltinModule("fs");
       let source = fs.readFileSync(filename, "utf8");
+      executionProcessLifecycle.configure(filename);
       source = applyOptionalMainBundlePatch(
         "desktopCesAnalytics",
         patchCodexMainDesktopAnalytics,
@@ -2198,20 +2477,13 @@
       if (!reaperAnchor) {
         throw new Error("Codey execution reaper completion anchor not found");
       }
-      const reaperTail = source.slice(reaperAnchor.index, reaperAnchor.index + 5000);
-      const processManagerReference =
-        /new [$A-Z_a-z][$\w]*\(([$A-Z_a-z][$\w]*)\.getBrowserSessionRegistry\(\)\)/.exec(reaperTail);
-      if (!processManagerReference) {
-        throw new Error("Codey execution process manager anchor not found");
-      }
       const disposerName = reaperAnchor[1];
       const connectionFactoryName = reaperAnchor[3];
-      const processManagerName = processManagerReference[1];
       const reaperInstall =
         `${disposerName}.add(globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({` +
         `connection:${connectionFactoryName}(),` +
-        `snapshot:()=>${processManagerName}.listProcessManagerSnapshot(),` +
-        `kill:async pid=>(await ${processManagerName}.handlers["child-process-kill"]({pid})).killed` +
+        `snapshot:()=>globalThis.__CODEY_EXECUTION_PROCESS_LIFECYCLE__.snapshot(),` +
+        `kill:(pid,processInfo)=>globalThis.__CODEY_EXECUTION_PROCESS_LIFECYCLE__.terminate(pid,processInfo)` +
         `}));`;
       const reaperOffset = reaperAnchor.index + reaperAnchor[0].length;
       source = source.slice(0, reaperOffset) + reaperInstall + source.slice(reaperOffset);
@@ -2392,6 +2664,9 @@
       return optionalMainBundlePatchFailures.map((failure) => ({ ...failure }));
     },
     reclaimExecutionEnvironments: true,
+    get executionResourceCleanup() {
+      return executionProcessLifecycle.status;
+    },
     restoreNativeModelAndSpeedControls: true,
     destroyTemporaryWebViews: true,
     disableWindowsWmiSampler,
@@ -2405,5 +2680,5 @@
   setImmediate(() => {
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v22";
+  return "codey-startup-patch-installed-v23";
 })()

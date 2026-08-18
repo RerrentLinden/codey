@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-const PATCH_RESULT: &str = "codey-startup-patch-installed-v22";
+const PATCH_RESULT: &str = "codey-startup-patch-installed-v23";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn patch_result_is_stable_for_launch_status_validation() {
-        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v22");
+        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v23");
     }
 
     #[test]
@@ -313,6 +313,7 @@ mod tests {
         assert!(expression.contains("get mainGitRequestGuard()"));
         assert!(expression.contains("module._compile(source, filename)"));
         assert!(expression.contains("const fastCodexStartup = true"));
+        assert!(expression.contains("CODEY_SUBAGENT_GATE_RUNTIME_ID"));
         assert!(expression.contains("Codey Statsig bootstrap timeout"));
         assert!(expression.contains("statsigBootstrapTimeoutMs = 1500"));
         assert!(expression.contains("default Chinese locale"));
@@ -383,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_lifecycle_patch_preserves_mcp_and_reclaims_execution_helpers() {
+    fn automatic_lifecycle_patch_bounds_duplicate_mcp_and_reclaims_execution_helpers() {
         let expression = patch_expression(PatchOptions {
             disable_pet: false,
             fast_codex_startup: true,
@@ -401,11 +402,17 @@ mod tests {
         assert!(expression.contains("waitForReclaimBarrier"));
         assert!(!expression.contains("evictStaleTurns"));
         assert!(expression.contains("turnStateVersion"));
-        assert!(!expression.contains("processInfo?.kind === \"mcp\""));
+        assert!(expression.contains("__CODEY_EXECUTION_PROCESS_LIFECYCLE__"));
+        assert!(expression.contains("child-process-snapshot-worker.js"));
+        assert!(expression.contains("mcpDuplicateGraceMs"));
+        assert!(expression.contains("rootChildPid"));
+        assert!(expression.contains("mcp-duplicate"));
+        assert!(expression.contains("process.kill(normalizedPid, \"SIGTERM\")"));
         assert!(!expression.contains("codegraph\\.js\\s+serve"));
         assert!(!expression.contains("mcp[/\\\\]server"));
         assert!(expression.contains("node_repl"));
-        assert!(expression.contains("handlers[\"child-process-kill\"]"));
+        assert!(!expression.contains("handlers[\"child-process-kill\"]"));
+        assert!(!expression.contains("listProcessManagerSnapshot"));
     }
 
     #[tokio::test]

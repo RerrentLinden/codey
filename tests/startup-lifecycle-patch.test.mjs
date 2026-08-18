@@ -56,7 +56,7 @@ test("startup patch preserves native child processes and ordinary BrowserWindows
   try {
     assert.equal(
       (0, eval)(await loadStartupPatchExpression()),
-      "codey-startup-patch-installed-v22",
+      "codey-startup-patch-installed-v23",
     );
 
     const childProcess = Module._load("node:child_process", undefined, false);
@@ -96,7 +96,30 @@ test("startup patch preserves native child processes and ordinary BrowserWindows
   }
 });
 
-test("startup lifecycle patch preserves MCP servers and waits for all turns before cleanup", async () => {
+test("execution snapshot normalizes app-server ownership and root process trees", () => {
+  const lifecycle = globalThis.__CODEY_EXECUTION_PROCESS_LIFECYCLE__;
+  const normalized = lifecycle.normalizeSnapshot([
+    { command: "codex app-server", depth: 1, kind: "app_server", parentPid: 9, pid: 10 },
+    { command: "node fastctx.js --mcp", depth: 2, kind: "mcp", parentPid: 10, pid: 11 },
+    { command: "node fastctx-worker.js", depth: 3, kind: "other", parentPid: 11, pid: 12 },
+    { command: "unrelated", depth: 1, kind: "other", parentPid: 9, pid: 13 },
+  ]);
+
+  assert.deepEqual(
+    normalized.map(({ appServerPid, depth, pid, rootChildPid }) => ({
+      appServerPid,
+      depth,
+      pid,
+      rootChildPid,
+    })),
+    [
+      { appServerPid: 10, depth: 1, pid: 11, rootChildPid: 11 },
+      { appServerPid: 10, depth: 2, pid: 12, rootChildPid: 11 },
+    ],
+  );
+});
+
+test("startup lifecycle patch preserves unique MCP servers and waits for all turns before cleanup", async () => {
   const lifecycle = globalThis.__CODEY_TEMP_WEBVIEW_LIFECYCLE__;
   const owner = {};
   let destroyedListener = null;
@@ -140,6 +163,185 @@ test("startup lifecycle patch preserves MCP servers and waits for all turns befo
   notificationHandler({ method: "turn/completed", params: { threadId: "b", turn: { id: "2" } } });
   await waitFor(() => killed.length === 1);
   assert.deepEqual(killed, [42]);
+  dispose();
+});
+
+test("execution reaper removes only stale duplicate MCP trees", async () => {
+  let notificationHandler = null;
+  let snapshotCalls = 0;
+  const killed = [];
+  const processes = [
+    {
+      ageSeconds: 120,
+      appServerPid: 10,
+      command: "node fastctx.js --mcp",
+      depth: 1,
+      kind: "mcp",
+      parentPid: 10,
+      pid: 101,
+      rootChildPid: 101,
+      startedAtMs: 1000,
+    },
+    {
+      ageSeconds: 120,
+      appServerPid: 10,
+      command: "node fastctx-worker.js",
+      depth: 2,
+      kind: "other",
+      parentPid: 101,
+      pid: 102,
+      rootChildPid: 101,
+      startedAtMs: 1000,
+    },
+    {
+      ageSeconds: 5,
+      appServerPid: 10,
+      command: "node fastctx.js --mcp",
+      depth: 1,
+      kind: "mcp",
+      parentPid: 10,
+      pid: 103,
+      rootChildPid: 103,
+      startedAtMs: 116000,
+    },
+    {
+      ageSeconds: 5,
+      appServerPid: 10,
+      command: "node fastctx-worker.js",
+      depth: 2,
+      kind: "other",
+      parentPid: 103,
+      pid: 104,
+      rootChildPid: 103,
+      startedAtMs: 116000,
+    },
+    {
+      ageSeconds: 90,
+      appServerPid: 10,
+      command: "node unique-mcp.js --stdio",
+      depth: 1,
+      kind: "mcp",
+      parentPid: 10,
+      pid: 105,
+      rootChildPid: 105,
+      startedAtMs: 31000,
+    },
+    {
+      ageSeconds: 30,
+      appServerPid: 10,
+      command: "/Codex/Resources/cua_node/bin/node_repl",
+      depth: 1,
+      kind: "other",
+      parentPid: 10,
+      pid: 106,
+      rootChildPid: 106,
+      startedAtMs: 91000,
+    },
+  ];
+  const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
+    connection: {
+      registerInternalNotificationHandler(handler) {
+        notificationHandler = handler;
+        return () => { notificationHandler = null; };
+      },
+    },
+    kill: async (pid) => { killed.push(pid); },
+    snapshot: async () => {
+      snapshotCalls += 1;
+      return processes;
+    },
+    completionGraceMs: 5,
+    mcpDuplicateGraceMs: 0,
+  });
+
+  notificationHandler({
+    method: "turn/started",
+    params: { threadId: "mcp-dedup", turn: { id: "first" } },
+  });
+  notificationHandler({
+    method: "turn/completed",
+    params: { threadId: "mcp-dedup", turn: { id: "first" } },
+  });
+  await waitFor(() => killed.length === 3);
+
+  assert.equal(snapshotCalls, 2);
+  assert.deepEqual([...killed].sort((left, right) => left - right), [101, 102, 106]);
+  dispose();
+});
+
+test("execution reaper rejects a duplicate whose process identity changed", async () => {
+  let notificationHandler = null;
+  let snapshotCalls = 0;
+  const killed = [];
+  const sharedProcesses = [
+    {
+      ageSeconds: 5,
+      appServerPid: 10,
+      command: "node fastctx.js --mcp",
+      depth: 1,
+      kind: "mcp",
+      parentPid: 10,
+      pid: 202,
+      rootChildPid: 202,
+      startedAtMs: 116000,
+    },
+    {
+      ageSeconds: 30,
+      appServerPid: 10,
+      command: "/Codex/Resources/cua_node/bin/node_repl",
+      depth: 1,
+      kind: "other",
+      parentPid: 10,
+      pid: 203,
+      rootChildPid: 203,
+      startedAtMs: 91000,
+    },
+  ];
+  const staleProcess = {
+    ageSeconds: 120,
+    appServerPid: 10,
+    command: "node fastctx.js --mcp",
+    depth: 1,
+    kind: "mcp",
+    parentPid: 10,
+    pid: 201,
+    rootChildPid: 201,
+    startedAtMs: 1000,
+  };
+  const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
+    connection: {
+      registerInternalNotificationHandler(handler) {
+        notificationHandler = handler;
+        return () => { notificationHandler = null; };
+      },
+    },
+    kill: async (pid) => { killed.push(pid); },
+    snapshot: async () => {
+      snapshotCalls += 1;
+      return [
+        {
+          ...staleProcess,
+          startedAtMs: snapshotCalls === 1 ? 1000 : 9000,
+        },
+        ...sharedProcesses,
+      ];
+    },
+    completionGraceMs: 5,
+    mcpDuplicateGraceMs: 0,
+  });
+
+  notificationHandler({
+    method: "turn/started",
+    params: { threadId: "mcp-pid-reuse", turn: { id: "first" } },
+  });
+  notificationHandler({
+    method: "turn/completed",
+    params: { threadId: "mcp-pid-reuse", turn: { id: "first" } },
+  });
+  await waitFor(() => killed.length === 1);
+
+  assert.equal(snapshotCalls, 2);
+  assert.deepEqual(killed, [203]);
   dispose();
 });
 

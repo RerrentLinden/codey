@@ -75,7 +75,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       (config) => !config.startsWith("__CODEY_WSL_ONLY__:"),
     );
     const expression = await loadPatchExpression(runtimeConfigOverrides);
-    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v22");
+    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v23");
 
     const patchedElectron = Module._load("electron");
     const passthroughGitHandler = () => "git-handler";
@@ -240,12 +240,19 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       spawnCalls.at(-1)[2].env.CODEY_SUBAGENT_GATE_ACTIVE,
       "1",
     );
+    const subagentGateRuntimeId =
+      spawnCalls.at(-1)[2].env.CODEY_SUBAGENT_GATE_RUNTIME_ID;
+    assert.match(subagentGateRuntimeId, /^[A-Za-z0-9-]+$/);
     const alreadyPatchedDirectArgs = spawnCalls.at(-1)[1];
     childProcess.spawn("codex", alreadyPatchedDirectArgs);
     assert.equal(spawnCalls.at(-1)[1], alreadyPatchedDirectArgs);
     assert.equal(
       spawnCalls.at(-1)[2].env.CODEY_SUBAGENT_GATE_ACTIVE,
       "1",
+    );
+    assert.equal(
+      spawnCalls.at(-1)[2].env.CODEY_SUBAGENT_GATE_RUNTIME_ID,
+      subagentGateRuntimeId,
     );
 
     const configuredArgs = [
@@ -289,6 +296,13 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.match(
       patchedShellCommand,
       /CODEY_SUBAGENT_GATE_ACTIVE=1 exec \/usr\/bin\/codex/,
+    );
+    assert.match(
+      patchedShellCommand,
+      new RegExp(
+        `CODEY_SUBAGENT_GATE_RUNTIME_ID='${subagentGateRuntimeId}' ` +
+          "CODEY_SUBAGENT_GATE_ACTIVE=1",
+      ),
     );
     assert.match(
       patchedShellCommand,
