@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   IconCheck,
+  IconCircleArrowUp,
   IconDeviceFloppy as Save,
   IconGitBranch as GitBranch,
   IconLoader2 as LoaderCircle,
@@ -12,11 +13,11 @@ import { invoke } from "./api";
 import { TraceLogModule } from "./TraceLogModule";
 import { ModelPickerDialog } from "./AppDialogs";
 import {
-  AppUpdateCard,
   FeaturePolicyCard,
   ModelSection,
   OperationsPanel,
   PromptOptimizationCard,
+  SubagentPolicyCard,
 } from "./AppSections";
 import { NotificationChannelsCard } from "./notifications";
 import type { NotificationChannel } from "./notifications";
@@ -47,7 +48,7 @@ import type {
   PluginMarketplaceStatus,
   TraceLogCleanup,
 } from "./App.types";
-import { Badge, Button, Button as SaveButton } from "./components/semi";
+import { Badge, Button, Button as SaveButton, Tooltip } from "./components/semi";
 
 const Check = IconCheck;
 const X = IconX;
@@ -702,6 +703,22 @@ export function App({
     );
   }
 
+  const hasUpdate =
+    updateCheck?.updateAvailable === true &&
+    Boolean(updateCheck.selectedAsset);
+  const isCheckingUpdate = busy === "check-update";
+  const isDownloadingUpdate = busy === "download-update";
+  const isInstallingUpdate = busy === "install-update";
+  const updateTooltipText = downloadedUpdate
+    ? `新版本 v${downloadedUpdate.latestVersion} 已下载，点击安装并重启`
+    : hasUpdate
+      ? `发现新版本 v${updateCheck?.latestVersion}，点击下载更新`
+      : isCheckingUpdate
+        ? "正在检查更新…"
+        : updateResult?.text
+          ? `${updateResult.text}（点击再次检查）`
+          : "检查 Codey 在线更新";
+
   const configHeaderContent = (
     <div className="config-header-inner">
       <div className="config-brand">
@@ -712,6 +729,61 @@ export function App({
             <span className="app-version-tag">
               v{status.appVersion || "0.2.0"}
             </span>
+
+            <Tooltip content={updateTooltipText} position="bottom">
+              <span className="header-update-btn-wrap">
+                <button
+                  type="button"
+                  className={`header-update-icon-btn ${
+                    hasUpdate
+                      ? "has-update"
+                      : downloadedUpdate
+                        ? "has-downloaded"
+                        : ""
+                  }`}
+                  disabled={isBusy}
+                  aria-label={updateTooltipText}
+                  onClick={() => {
+                    if (downloadedUpdate) {
+                      handleInstallDownloadedUpdate();
+                    } else if (hasUpdate) {
+                      handleDownloadUpdate();
+                    } else {
+                      handleCheckForUpdates();
+                    }
+                  }}
+                >
+                  {isCheckingUpdate ? (
+                    <LoaderCircle className="spinner" size={13} aria-hidden="true" />
+                  ) : isDownloadingUpdate ? (
+                    <LoaderCircle className="spinner" size={13} aria-hidden="true" />
+                  ) : isInstallingUpdate ? (
+                    <LoaderCircle className="spinner" size={13} aria-hidden="true" />
+                  ) : downloadedUpdate ? (
+                    <IconCheck size={14} aria-hidden="true" />
+                  ) : hasUpdate ? (
+                    <>
+                      <IconCircleArrowUp size={15} aria-hidden="true" />
+                      <span className="update-pulse-dot" aria-hidden="true" />
+                    </>
+                  ) : (
+                    <IconCircleArrowUp size={14} aria-hidden="true" />
+                  )}
+                </button>
+              </span>
+            </Tooltip>
+
+            {hasUpdate && (
+              <Badge
+                variant="warning"
+                className="header-update-badge"
+                onClick={handleDownloadUpdate}
+                title={`点击下载 Codey v${updateCheck?.latestVersion}`}
+              >
+                可升级至 v{updateCheck?.latestVersion}
+              </Badge>
+            )}
+
             {dirty && (
               <Badge variant="warning" className="unsaved-badge">
                 未保存更改
@@ -845,7 +917,7 @@ export function App({
 
       <div className="page-scroll">
         <div className="page" id="codey-settings-content">
-          {/* 最上方：运行状态 (Codex 运行与维护，含 Codex 应用路径) */}
+          {/* 最上方：运行状态 (Codex 运行与维护) */}
           <OperationsPanel
             config={config}
             status={operationsStatus}
@@ -857,68 +929,7 @@ export function App({
             showRestartAction={!embedded}
           />
 
-          {/* 中间区域：分左右两栏 (左侧: 应用更新; 右侧: 消息通知与功能策略) */}
-          <div className="upper-dashboard-grid">
-            {/* 左侧栏：应用更新 */}
-            <div className="dashboard-column upper-left-column">
-              <AppUpdateCard
-                appVersion={status.appVersion}
-                updateResult={updateResult}
-                updateCheck={updateCheck}
-                downloadedUpdate={downloadedUpdate}
-                busy={busy}
-                isBusy={isBusy}
-                onCheckUpdates={handleCheckForUpdates}
-                onDownloadUpdate={handleDownloadUpdate}
-                onInstallUpdate={handleInstallDownloadedUpdate}
-              />
-            </div>
-
-            {/* 右侧栏：消息通知 */}
-            <div className="dashboard-column upper-right-column">
-              <NotificationChannelsCard
-                config={config}
-                container={portalContainer}
-                popupContainer={popupContainer}
-                isBusy={isBusy}
-                onAddChannel={handleAddNotificationChannel}
-                onChannelChange={handleNotificationChannelChange}
-                onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
-              />
-            </div>
-          </div>
-
-          {/* Codey 功能策略：整行独占排布 */}
-          <div className="full-row-section feature-full-section">
-            <FeaturePolicyCard
-              config={config}
-              fastContextToolsStatus={fastContextToolsStatus}
-              isMacClient={status.clientPlatform === "macos"}
-              popupContainer={popupContainer}
-              tooltipContainer={portalContainer}
-              isBusy={isBusy}
-              subagentModelOptions={subagentModelOptions}
-              onConfigChange={handleConfigChange}
-              onSubagentOptimizationChange={handleSubagentOptimizationChange}
-            />
-          </div>
-
-          {/* 提示词优化：整行独占排布 */}
-          <div className="full-row-section prompt-optimization-full-section">
-            <PromptOptimizationCard
-              config={config}
-              provider={provider}
-              busy={busy}
-              isBusy={isBusy}
-              popupContainer={popupContainer}
-              onConfigChange={handleConfigChange}
-              onSyncCurrentProvider={
-                handleSyncPromptOptimizationCurrentProvider
-              }
-            />
-          </div>
-
-          {/* 线路与模型：整行独占排布 */}
+          {/* 线路与模型：单独一行展示 */}
           <div className="full-row-section model-full-section">
             <ModelSection
               provider={provider}
@@ -936,6 +947,66 @@ export function App({
                 handleShowAccountUsageInHeaderChange
               }
             />
+          </div>
+
+          {/* 提示词优化 与 Codey 子代理角色与调度增强：放在一行 */}
+          <div className="prompt-subagent-grid">
+            {/* 左侧：提示词优化 */}
+            <div className="prompt-column">
+              <PromptOptimizationCard
+                config={config}
+                provider={provider}
+                busy={busy}
+                isBusy={isBusy}
+                popupContainer={popupContainer}
+                onConfigChange={handleConfigChange}
+                onSyncCurrentProvider={
+                  handleSyncPromptOptimizationCurrentProvider
+                }
+              />
+            </div>
+
+            {/* 右侧：Codey 子代理角色与调度增强 */}
+            <div className="subagent-column">
+              <SubagentPolicyCard
+                config={config}
+                popupContainer={popupContainer}
+                tooltipContainer={portalContainer}
+                isBusy={isBusy}
+                subagentModelOptions={subagentModelOptions}
+                onConfigChange={handleConfigChange}
+                onSubagentOptimizationChange={handleSubagentOptimizationChange}
+              />
+            </div>
+          </div>
+
+          {/* 功能策略（GPU 渲染模式占左侧整体全宽） 与 消息通知 */}
+          <div className="feature-notification-grid">
+            {/* 左侧：Codex 功能策略（GPU 渲染模式用左侧整体宽度，下方为各项开关） */}
+            <div className="feature-column">
+              <FeaturePolicyCard
+                config={config}
+                fastContextToolsStatus={fastContextToolsStatus}
+                isMacClient={status.clientPlatform === "macos"}
+                popupContainer={popupContainer}
+                tooltipContainer={portalContainer}
+                isBusy={isBusy}
+                onConfigChange={handleConfigChange}
+              />
+            </div>
+
+            {/* 右侧：消息通知 */}
+            <div className="notification-column">
+              <NotificationChannelsCard
+                config={config}
+                container={portalContainer}
+                popupContainer={popupContainer}
+                isBusy={isBusy}
+                onAddChannel={handleAddNotificationChannel}
+                onChannelChange={handleNotificationChannelChange}
+                onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
+              />
+            </div>
           </div>
 
           {/* 诊断存储保护：整行独占排布 */}

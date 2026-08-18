@@ -43,30 +43,37 @@ const buttonSize = {
   "icon-sm": "small",
 } as const;
 
-export function Button({
-  className,
-  variant = "default",
-  size = "default",
-  type = "button",
-  ...props
-}: ButtonProps) {
-  const appearance = buttonAppearance[variant];
-  return (
-    <SemiButton
-      {...props}
-      className={classNames(
-        "codey-button",
-        `codey-button--${variant}`,
-        `codey-button--size-${size}`,
-        className,
-      )}
-      htmlType={type}
-      size={buttonSize[size]}
-      theme={appearance.theme}
-      type={appearance.type}
-    />
-  );
-}
+export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
+  function Button(
+    {
+      className,
+      variant = "default",
+      size = "default",
+      type = "button",
+      ...props
+    }: ButtonProps,
+    ref,
+  ) {
+    const appearance = buttonAppearance[variant];
+    return (
+      <SemiButton
+        {...props}
+        ref={ref as any}
+        className={classNames(
+          "codey-button",
+          `codey-button--${variant}`,
+          `codey-button--size-${size}`,
+          className,
+        )}
+        htmlType={type}
+        size={buttonSize[size]}
+        theme={appearance.theme}
+        type={appearance.type}
+      />
+    );
+  },
+);
+Button.displayName = "Button";
 
 type BadgeVariant =
   | "default"

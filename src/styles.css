@@ -251,6 +251,102 @@ input:focus-visible,
   border-radius: 999px;
 }
 
+.header-update-btn-wrap {
+  display: inline-flex;
+  align-items: center;
+}
+
+.header-update-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.09);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.85);
+  color: #8e8e93;
+  cursor: pointer;
+  transition: all 160ms ease;
+}
+
+.header-update-icon-btn:hover:not(:disabled) {
+  background: #ffffff;
+  color: var(--mac-blue);
+  border-color: rgba(0, 122, 255, 0.35);
+  box-shadow: 0 1px 3px rgba(0, 122, 255, 0.15);
+}
+
+.header-update-icon-btn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+/* 醒目的更新状态标识 */
+.header-update-icon-btn.has-update {
+  background: rgba(255, 149, 0, 0.12);
+  border-color: rgba(255, 149, 0, 0.45);
+  color: #ff9500;
+  box-shadow: 0 0 0 2px rgba(255, 149, 0, 0.16);
+  animation: update-button-pulse 2s infinite ease-in-out;
+}
+
+.header-update-icon-btn.has-update:hover {
+  background: #ff9500;
+  color: #ffffff;
+  border-color: #ff9500;
+}
+
+.header-update-icon-btn.has-downloaded {
+  background: rgba(52, 199, 89, 0.15);
+  border-color: rgba(52, 199, 89, 0.45);
+  color: #34c759;
+}
+
+.update-pulse-dot {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #ff3b30;
+  border: 1.5px solid #ffffff;
+  box-shadow: 0 0 4px rgba(255, 59, 48, 0.6);
+  animation: pulse-dot-anim 1.5s infinite ease-in-out;
+}
+
+@keyframes pulse-dot-anim {
+  0% {
+    transform: scale(0.9);
+    opacity: 0.9;
+  }
+  50% {
+    transform: scale(1.25);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(0.9);
+    opacity: 0.9;
+  }
+}
+
+@keyframes update-button-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(255, 149, 0, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(255, 149, 0, 0.15);
+  }
+}
+
+.header-update-badge {
+  cursor: pointer;
+  animation: update-button-pulse 2s infinite ease-in-out;
+}
+
 .macos-titlebar-right {
   display: flex;
   align-items: center;

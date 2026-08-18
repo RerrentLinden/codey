@@ -58,6 +58,208 @@ const SUBAGENT_TASK_TYPES = [
   description: string;
 }>;
 
+export type SubagentPolicyCardProps = {
+  config: Config;
+  popupContainer: HTMLElement | null;
+  tooltipContainer: HTMLElement | null;
+  isBusy: boolean;
+  subagentModelOptions: SubagentModelOption[];
+  onConfigChange: (config: Config) => void;
+  onSubagentOptimizationChange: (checked: boolean) => void;
+};
+
+export function SubagentPolicyCardComponent({
+  config,
+  popupContainer,
+  tooltipContainer,
+  isBusy,
+  subagentModelOptions,
+  onConfigChange,
+  onSubagentOptimizationChange,
+}: SubagentPolicyCardProps) {
+  const subagentPolicyControlsDisabled = isBusy;
+  const subagentModelSelectOptions = subagentModelOptions.map((option) => ({
+    label: option.label,
+    value: option.value,
+  }));
+
+  return (
+    <section className="secondary-section subagent-section" aria-labelledby="subagent-title">
+      <div className="section-title compact">
+        <div>
+          <h2 id="subagent-title">Codey 子代理角色与调度增强</h2>
+          <p>基于 Codex 原生子代理的多角色调度与模型配置。</p>
+        </div>
+      </div>
+      <Card className="secondary-card subagent-card">
+        <div className={`feature-card subagent-toggle-card ${config.subagentOptimization ? "active" : ""}`}>
+          <div className="feature-card-header">
+            <div className="feature-card-title">
+              <strong>启用 Codey 子代理角色与调度增强</strong>
+              <Badge variant="warning">基于 Codex 原生子代理</Badge>
+            </div>
+            <Switch
+              checked={config.subagentOptimization}
+              disabled={isBusy}
+              onCheckedChange={(checked) =>
+                onSubagentOptimizationChange(checked)
+              }
+              aria-label="启用 Codey 子代理角色与调度增强"
+            />
+          </div>
+        </div>
+        <div className="subagent-policy-body">
+            {config.subagentOptimization ? (
+              <>
+                <div className="subagent-policy-columns" aria-hidden="true">
+                  <span>任务类型</span>
+                  <span>模型</span>
+                  <span>思考深度</span>
+                </div>
+                <div className="subagent-policy-rows">
+                  {SUBAGENT_TASK_TYPES.map((task) => {
+                    const selection = config.subagentRoles[task.id] ?? {
+                      model: config.subagentModel,
+                      reasoningEffort: config.subagentReasoningEffort,
+                    };
+                    const selectedModel = subagentModelOptions.find(
+                      (option) =>
+                        option.value.trim().toLowerCase() ===
+                        selection.model.trim().toLowerCase(),
+                    );
+                    const reasoningEfforts =
+                      selectedModel?.supportedReasoningEfforts ?? [];
+                    const reasoningOptions = reasoningEfforts.map((effort) => ({
+                      label: REASONING_EFFORT_LABELS[effort] ?? effort,
+                      value: effort,
+                    }));
+                    const updateRole = (
+                      model: string,
+                      reasoningEffort: string,
+                    ) => {
+                      onConfigChange({
+                        ...config,
+                        subagentRoles: {
+                          ...config.subagentRoles,
+                          [task.id]: { model, reasoningEffort },
+                        },
+                      });
+                    };
+
+                    return (
+                      <div className="subagent-policy-row" key={task.id}>
+                        <div className="subagent-task-name">
+                          <span>{task.name}</span>
+                          <Tooltip
+                            content={task.description}
+                            getPopupContainer={() =>
+                              popupContainer ?? tooltipContainer ?? document.body
+                            }
+                            position="top"
+                            zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                          >
+                            <button
+                              type="button"
+                              className="subagent-task-help"
+                              aria-label={`${task.name}：${task.description}`}
+                            >
+                              <IconInfoCircle size={15} aria-hidden="true" />
+                            </button>
+                          </Tooltip>
+                        </div>
+                        <label>
+                          <span id={`${task.id}-model-label`} className="sr-only">
+                            {task.name}模型
+                          </span>
+                          <span className="subagent-mobile-field-label">模型</span>
+                          <Select
+                            className="subagent-policy-select"
+                            aria-labelledby={`${task.id}-model-label`}
+                            value={selectedModel?.value}
+                            placeholder={
+                              subagentModelOptions.length === 0
+                                ? "当前线路暂无模型"
+                                : "请选择模型"
+                            }
+                            disabled={
+                              subagentPolicyControlsDisabled ||
+                              subagentModelOptions.length === 0
+                            }
+                            optionList={subagentModelSelectOptions}
+                            dropdownClassName="subagent-policy-dropdown"
+                            showClear={false}
+                            filter={false}
+                            getPopupContainer={() => popupContainer ?? document.body}
+                            zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                            onChange={(value) => {
+                              const option = subagentModelOptions.find(
+                                (candidate) =>
+                                  candidate.value === String(value ?? ""),
+                              );
+                              if (!option) return;
+                              const reasoningEffort =
+                                option.supportedReasoningEfforts.includes(
+                                  selection.reasoningEffort,
+                                )
+                                  ? selection.reasoningEffort
+                                  : option.defaultReasoningEffort;
+                              updateRole(option.value, reasoningEffort);
+                            }}
+                          />
+                        </label>
+                        <label>
+                          <span id={`${task.id}-effort-label`} className="sr-only">
+                            {task.name}思考深度
+                          </span>
+                          <span className="subagent-mobile-field-label">思考深度</span>
+                          <Select
+                            className="subagent-policy-select"
+                            aria-labelledby={`${task.id}-effort-label`}
+                            value={
+                              reasoningEfforts.includes(selection.reasoningEffort)
+                                ? selection.reasoningEffort
+                                : undefined
+                            }
+                            placeholder="暂无可选深度"
+                            disabled={
+                              subagentPolicyControlsDisabled ||
+                              reasoningEfforts.length === 0
+                            }
+                            optionList={reasoningOptions}
+                            dropdownClassName="subagent-policy-dropdown"
+                            showClear={false}
+                            filter={false}
+                            getPopupContainer={() => popupContainer ?? document.body}
+                            zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                            onChange={(value) =>
+                              updateRole(
+                                selection.model,
+                                String(value ?? ""),
+                              )
+                            }
+                          />
+                        </label>
+                      </div>
+                    );
+                  })}
+                </div>
+                <small>
+                  {subagentModelOptions.length === 0
+                    ? "请先在模型管理中添加当前线路可用模型"
+                    : "首次开启需重启；模型或思考深度保存后对下一次派生生效。角色权限是默认值，实际受父任务权限模式约束"}
+                </small>
+              </>
+            ) : (
+              <small>开启后仅在宽范围、可并行或需要专门证据时选择性委派，并提供五类专用角色与汇合门禁；不会扩大父任务权限</small>
+            )}
+          </div>
+      </Card>
+    </section>
+  );
+}
+
+export const SubagentPolicyCard = memo(SubagentPolicyCardComponent);
+
 type FeaturePolicyCardProps = {
   config: Config;
   fastContextToolsStatus: FastContextToolsStatus;
@@ -65,9 +267,9 @@ type FeaturePolicyCardProps = {
   popupContainer: HTMLElement | null;
   tooltipContainer: HTMLElement | null;
   isBusy: boolean;
-  subagentModelOptions: SubagentModelOption[];
   onConfigChange: (config: Config) => void;
-  onSubagentOptimizationChange: (checked: boolean) => void;
+  subagentModelOptions?: SubagentModelOption[];
+  onSubagentOptimizationChange?: (checked: boolean) => void;
 };
 
 function FeaturePolicyCardComponent({
@@ -77,9 +279,7 @@ function FeaturePolicyCardComponent({
   popupContainer,
   tooltipContainer,
   isBusy,
-  subagentModelOptions,
   onConfigChange,
-  onSubagentOptimizationChange,
 }: FeaturePolicyCardProps) {
   const configuredGpuLaunchModeIndex = GPU_LAUNCH_MODES.findIndex(
     ({ value }) => value === config.gpuLaunchMode,
@@ -91,11 +291,6 @@ function FeaturePolicyCardComponent({
   const gpuLaunchModeStyle = {
     "--gpu-mode-offset": `${gpuLaunchModeIndex * 100}%`,
   } as CSSProperties;
-  const subagentPolicyControlsDisabled = isBusy;
-  const subagentModelSelectOptions = subagentModelOptions.map((option) => ({
-    label: option.label,
-    value: option.value,
-  }));
   const fastctxStatusBlocksEmbedded =
     fastContextToolsStatus.userConfigured ||
     fastContextToolsStatus.detectionFailed;
@@ -131,8 +326,9 @@ function FeaturePolicyCardComponent({
       </div>
       <Card className="secondary-card runtime-card">
         <div className="feature-grid">
+          {/* GPU 渲染模式：占满左侧整行全宽 */}
           <div
-            className={`feature-card gpu-mode-card ${!isMacClient && gpuLaunchMode.value !== "off" ? "active" : ""}`}
+            className={`feature-card gpu-mode-card full-width-card ${!isMacClient && gpuLaunchMode.value !== "off" ? "active" : ""}`}
           >
             <div className="feature-card-header">
               <div className="feature-card-title">
@@ -182,170 +378,6 @@ function FeaturePolicyCardComponent({
                       ? "启动 Codex 时附加 --disable-gpu-rasterization；仅将栅格化移到 CPU"
                       : "保持 Codex 默认 GPU 渲染，不附加诊断参数"}
               </small>
-            </div>
-          </div>
-
-          <div
-            className={`feature-card subagent-policy-card ${config.subagentOptimization ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <div className="feature-card-title">
-                <strong>Codey 子代理角色与调度增强</strong>
-                <Badge variant="warning">基于 Codex 原生子代理</Badge>
-              </div>
-              <Switch
-                checked={config.subagentOptimization}
-                disabled={isBusy}
-                onCheckedChange={(checked) =>
-                  onSubagentOptimizationChange(checked)
-                }
-                aria-label="启用 Codey 子代理角色与调度增强"
-              />
-            </div>
-            <div className="feature-card-body subagent-policy-body">
-              {config.subagentOptimization ? (
-                <>
-                  <div className="subagent-policy-columns" aria-hidden="true">
-                    <span>任务类型</span>
-                    <span>模型</span>
-                    <span>思考深度</span>
-                  </div>
-                  <div className="subagent-policy-rows">
-                    {SUBAGENT_TASK_TYPES.map((task) => {
-                      const selection = config.subagentRoles[task.id] ?? {
-                        model: config.subagentModel,
-                        reasoningEffort: config.subagentReasoningEffort,
-                      };
-                      const selectedModel = subagentModelOptions.find(
-                        (option) =>
-                          option.value.trim().toLowerCase() ===
-                          selection.model.trim().toLowerCase(),
-                      );
-                      const reasoningEfforts =
-                        selectedModel?.supportedReasoningEfforts ?? [];
-                      const reasoningOptions = reasoningEfforts.map((effort) => ({
-                        label: REASONING_EFFORT_LABELS[effort] ?? effort,
-                        value: effort,
-                      }));
-                      const updateRole = (
-                        model: string,
-                        reasoningEffort: string,
-                      ) => {
-                        onConfigChange({
-                          ...config,
-                          subagentRoles: {
-                            ...config.subagentRoles,
-                            [task.id]: { model, reasoningEffort },
-                          },
-                        });
-                      };
-
-                      return (
-                        <div className="subagent-policy-row" key={task.id}>
-                          <div className="subagent-task-name">
-                            <span>{task.name}</span>
-                            <Tooltip
-                              content={task.description}
-                              getPopupContainer={() =>
-                                popupContainer ?? tooltipContainer ?? document.body
-                              }
-                              position="top"
-                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                            >
-                              <button
-                                type="button"
-                                className="subagent-task-help"
-                                aria-label={`${task.name}：${task.description}`}
-                              >
-                                <IconInfoCircle size={15} aria-hidden="true" />
-                              </button>
-                            </Tooltip>
-                          </div>
-                          <label>
-                            <span id={`${task.id}-model-label`} className="sr-only">
-                              {task.name}模型
-                            </span>
-                            <span className="subagent-mobile-field-label">模型</span>
-                            <Select
-                              className="subagent-policy-select"
-                              aria-labelledby={`${task.id}-model-label`}
-                              value={selectedModel?.value}
-                              placeholder={
-                                subagentModelOptions.length === 0
-                                  ? "当前线路暂无模型"
-                                  : "请选择模型"
-                              }
-                              disabled={
-                                subagentPolicyControlsDisabled ||
-                                subagentModelOptions.length === 0
-                              }
-                              optionList={subagentModelSelectOptions}
-                              dropdownClassName="subagent-policy-dropdown"
-                              showClear={false}
-                              filter={false}
-                              getPopupContainer={() => popupContainer ?? document.body}
-                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                              onChange={(value) => {
-                                const option = subagentModelOptions.find(
-                                  (candidate) =>
-                                    candidate.value === String(value ?? ""),
-                                );
-                                if (!option) return;
-                                const reasoningEffort =
-                                  option.supportedReasoningEfforts.includes(
-                                    selection.reasoningEffort,
-                                  )
-                                    ? selection.reasoningEffort
-                                    : option.defaultReasoningEffort;
-                                updateRole(option.value, reasoningEffort);
-                              }}
-                            />
-                          </label>
-                          <label>
-                            <span id={`${task.id}-effort-label`} className="sr-only">
-                              {task.name}思考深度
-                            </span>
-                            <span className="subagent-mobile-field-label">思考深度</span>
-                            <Select
-                              className="subagent-policy-select"
-                              aria-labelledby={`${task.id}-effort-label`}
-                              value={
-                                reasoningEfforts.includes(selection.reasoningEffort)
-                                  ? selection.reasoningEffort
-                                  : undefined
-                              }
-                              placeholder="暂无可选深度"
-                              disabled={
-                                subagentPolicyControlsDisabled ||
-                                reasoningEfforts.length === 0
-                              }
-                              optionList={reasoningOptions}
-                              dropdownClassName="subagent-policy-dropdown"
-                              showClear={false}
-                              filter={false}
-                              getPopupContainer={() => popupContainer ?? document.body}
-                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                              onChange={(value) =>
-                                updateRole(
-                                  selection.model,
-                                  String(value ?? ""),
-                                )
-                              }
-                            />
-                          </label>
-                        </div>
-                      );
-                    })}
-                  </div>
-                  <small>
-                    {subagentModelOptions.length === 0
-                      ? "请先在模型管理中添加当前线路可用模型"
-                      : "首次开启需重启；模型或思考深度保存后对下一次派生生效。角色权限是默认值，实际受父任务权限模式约束"}
-                  </small>
-                </>
-              ) : (
-                <small>开启后仅在宽范围、可并行或需要专门证据时选择性委派，并提供五类专用角色与汇合门禁；不会扩大父任务权限</small>
-              )}
             </div>
           </div>
 

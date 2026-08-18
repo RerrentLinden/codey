@@ -98,6 +98,12 @@
   background: #ffffff;
 }
 
+.gpu-mode-card,
+.feature-card.gpu-mode-card {
+  grid-column: 1 / -1;
+  width: 100%;
+}
+
 @media (max-width: 860px) {
   .feature-grid {
     grid-template-columns: 1fr;
@@ -145,11 +151,15 @@
   outline-offset: 3px;
 }
 
+.subagent-toggle-card {
+  margin-bottom: 12px;
+}
+
 .subagent-policy-body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  margin-top: 10px;
+  margin-top: 0;
 }
 
 .subagent-policy-card {
@@ -159,9 +169,9 @@
 .subagent-policy-columns,
 .subagent-policy-row {
   display: grid;
-  grid-template-columns: minmax(130px, 0.8fr) minmax(220px, 1.6fr) minmax(130px, 0.75fr);
+  grid-template-columns: minmax(110px, 0.8fr) minmax(160px, 1.5fr) minmax(110px, 0.8fr);
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 
 .subagent-policy-columns {
@@ -818,24 +828,43 @@
 }
 
 .prompt-optimization-config-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 12px 14px;
-  align-items: start;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: stretch;
 }
 
 .prompt-optimization-fields .field {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
   min-width: 0;
 }
 
 .prompt-optimization-fields .field > label,
 .prompt-optimization-fields .field > span {
   color: #6e6e73;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
+  white-space: nowrap;
+  text-align: right;
+  padding-right: 2px;
+}
+
+.prompt-optimization-fields .field.prompt-optimization-instruction-field {
+  align-items: start;
+}
+
+.prompt-optimization-fields .field.prompt-optimization-instruction-field > span {
+  margin-top: 8px;
+}
+
+.prompt-optimization-model-wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
 }
 
 .prompt-optimization-instruction {

@@ -2,7 +2,16 @@
    Responsive Adaptations
    ========================================================================== */
 
+@media (max-width: 980px) {
+  .settings-dashboard-grid,
+  .prompt-subagent-grid,
+  .feature-notification-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 900px) {
+  .auxiliary-dashboard-grid,
   .upper-dashboard-grid,
   .provider-summary {
     grid-template-columns: 1fr;

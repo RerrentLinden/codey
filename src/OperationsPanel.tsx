@@ -464,20 +464,22 @@ function OperationsPanelComponent({
                     getPopupContainer={getTooltipContainer}
                     position="top"
                   >
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      className={`operations-icon-badge tone-${item.tone}${isExpanded ? " active" : ""}`}
-                      onClick={() => toggleCard(item.title)}
-                      aria-expanded={isExpanded}
-                      aria-label={`${item.title}（${item.label}），点击${isExpanded ? "收起" : "展开"}`}
-                    >
-                      <StatusIcon size={16} aria-hidden="true" />
-                      <span
-                        className="operations-icon-dot"
-                        aria-hidden="true"
-                      />
-                    </Button>
+                    <span className="operations-status-icon-wrap">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className={`operations-icon-badge tone-${item.tone}${isExpanded ? " active" : ""}`}
+                        onClick={() => toggleCard(item.title)}
+                        aria-expanded={isExpanded}
+                        aria-label={`${item.title}（${item.label}），点击${isExpanded ? "收起" : "展开"}`}
+                      >
+                        <StatusIcon size={16} aria-hidden="true" />
+                        <span
+                          className="operations-icon-dot"
+                          aria-hidden="true"
+                        />
+                      </Button>
+                    </span>
                   </Tooltip>
                 );
               })}

@@ -457,87 +457,89 @@ function PromptOptimizationCardComponent({
 
               <div className="field prompt-optimization-model-field">
                 <label htmlFor={modelInputId}>模型</label>
-                <div className="prompt-optimization-model-control">
-                  <div className="prompt-optimization-model-picker">
-                    <div className="input-shell prompt-optimization-model-row">
-                      <IconRobot size={15} aria-hidden="true" />
-                      <Select
-                        key={modelSelectKey}
-                        id={modelInputId}
-                        className="prompt-optimization-model-select"
-                        value={optimization.model || undefined}
-                        disabled={isBusy || fetchingModels}
-                        aria-label="提示词优化模型"
-                        optionList={modelSelectOptions}
-                        placeholder="gpt-4o-mini"
-                        dropdownClassName="prompt-optimization-model-dropdown"
-                        emptyContent={
-                          cloudModels.length > 0
-                            ? "没有匹配模型"
-                            : "暂无模型列表，可输入后回车创建"
-                        }
-                        showClear={false}
-                        filter
-                        allowCreate
-                        searchPosition="trigger"
-                        getPopupContainer={() => popupContainer ?? document.body}
-                        zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                        renderCreateItem={(inputValue, focused, style) =>
-                          inputValue ? (
-                            <div
-                              className={`prompt-optimization-model-create-option${focused ? " focused" : ""}`}
-                              style={style}
-                            >
-                              <IconPlus size={14} aria-hidden="true" />
-                              <span className="prompt-optimization-model-create-label">
-                                使用
-                              </span>
-                              <span className="prompt-optimization-model-create-value">
-                                {String(inputValue)}
-                              </span>
-                            </div>
-                          ) : null
-                        }
-                        onChange={(value) => updateModel(String(value ?? ""))}
-                        onCreate={(option) =>
-                          updateModel(String(option.value ?? ""))
-                        }
-                      />
+                <div className="prompt-optimization-model-wrapper">
+                  <div className="prompt-optimization-model-control">
+                    <div className="prompt-optimization-model-picker">
+                      <div className="input-shell prompt-optimization-model-row">
+                        <IconRobot size={15} aria-hidden="true" />
+                        <Select
+                          key={modelSelectKey}
+                          id={modelInputId}
+                          className="prompt-optimization-model-select"
+                          value={optimization.model || undefined}
+                          disabled={isBusy || fetchingModels}
+                          aria-label="提示词优化模型"
+                          optionList={modelSelectOptions}
+                          placeholder="gpt-4o-mini"
+                          dropdownClassName="prompt-optimization-model-dropdown"
+                          emptyContent={
+                            cloudModels.length > 0
+                              ? "没有匹配模型"
+                              : "暂无模型列表，可输入后回车创建"
+                          }
+                          showClear={false}
+                          filter
+                          allowCreate
+                          searchPosition="trigger"
+                          getPopupContainer={() => popupContainer ?? document.body}
+                          zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                          renderCreateItem={(inputValue, focused, style) =>
+                            inputValue ? (
+                              <div
+                                className={`prompt-optimization-model-create-option${focused ? " focused" : ""}`}
+                                style={style}
+                              >
+                                <IconPlus size={14} aria-hidden="true" />
+                                <span className="prompt-optimization-model-create-label">
+                                  使用
+                                </span>
+                                <span className="prompt-optimization-model-create-value">
+                                  {String(inputValue)}
+                                </span>
+                              </div>
+                            ) : null
+                          }
+                          onChange={(value) => updateModel(String(value ?? ""))}
+                          onCreate={(option) =>
+                            updateModel(String(option.value ?? ""))
+                          }
+                        />
+                      </div>
                     </div>
+                    <Button
+                      variant="secondary"
+                      size="xs"
+                      disabled={isBusy || fetchingModels || testing}
+                      onClick={() => void runFetchModels()}
+                    >
+                      {fetchingModels ? "获取中…" : "获取列表"}
+                    </Button>
                   </div>
-                  <Button
-                    variant="secondary"
-                    size="xs"
-                    disabled={isBusy || fetchingModels || testing}
-                    onClick={() => void runFetchModels()}
-                  >
-                    {fetchingModels ? "获取中…" : "获取列表"}
-                  </Button>
+                  {modelsResult.text ? (
+                    <span className={`inline-result ${modelsResult.tone}`}>
+                      {modelsResult.text}
+                    </span>
+                  ) : null}
                 </div>
-                {modelsResult.text ? (
-                  <span className={`inline-result ${modelsResult.tone}`}>
-                    {modelsResult.text}
-                  </span>
-                ) : null}
               </div>
-            </div>
 
-            <label className="field">
-              <span>优化指令</span>
-              <textarea
-                className="prompt-optimization-instruction"
-                value={
-                  optimization.instruction || DEFAULT_OPTIMIZER_INSTRUCTION
-                }
-                disabled={isBusy}
-                onChange={(event) =>
-                  updateOptimization({ instruction: event.target.value })
-                }
-                rows={3}
-                placeholder="自定义优化指令…"
-                spellCheck={false}
-              />
-            </label>
+              <label className="field prompt-optimization-instruction-field">
+                <span>优化指令</span>
+                <textarea
+                  className="prompt-optimization-instruction"
+                  value={
+                    optimization.instruction || DEFAULT_OPTIMIZER_INSTRUCTION
+                  }
+                  disabled={isBusy}
+                  onChange={(event) =>
+                    updateOptimization({ instruction: event.target.value })
+                  }
+                  rows={3}
+                  placeholder="自定义优化指令…"
+                  spellCheck={false}
+                />
+              </label>
+            </div>
           </div>
         ) : null}
       </Card>
