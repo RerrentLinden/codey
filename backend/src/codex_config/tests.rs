@@ -1432,6 +1432,88 @@ command = "echo preserve-user-hook"
 }
 
 #[test]
+fn subagent_and_fastctx_share_one_pre_tool_hook() {
+    let config_path = Path::new("/tmp/codey-codex/config.toml");
+    let result = patch_config_with_fastctx_mode_and_proxy(
+        "",
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        ProviderPatchOptions {
+            config_path,
+            model_catalog_path: relative_model_catalog_path(),
+            default_model: None,
+            fastctx_command: Some(Path::new("/tmp/codey-fastctx")),
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol",
+            subagent_reasoning_effort: "high",
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+        },
+    )
+    .unwrap();
+    let document = result.parse::<DocumentMut>().unwrap();
+    let pre_tool_use = document["hooks"]["PreToolUse"]
+        .as_array_of_tables()
+        .unwrap();
+    assert_eq!(pre_tool_use.len(), 1);
+    assert_eq!(pre_tool_use.get(0).unwrap()["matcher"].as_str(), Some("*"));
+    let handler = pre_tool_use.get(0).unwrap()["hooks"]
+        .as_array_of_tables()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert!(
+        handler["command"]
+            .as_str()
+            .unwrap()
+            .contains(crate::subagent_gate::COMBINED_HOOK_ARGUMENT)
+    );
+    assert!(
+        !handler["command"]
+            .as_str()
+            .unwrap()
+            .contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
+    );
+    for event in [
+        "PostToolUse",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "SessionEnd",
+    ] {
+        assert_eq!(
+            document["hooks"][event].as_array_of_tables().unwrap().len(),
+            1,
+            "{event}"
+        );
+    }
+    assert_eq!(
+        document["hooks"]["state"].as_table().unwrap().len(),
+        SUBAGENT_GATE_HOOKS.len()
+    );
+
+    let combined_commands =
+        crate::subagent_gate::hook_commands_for(crate::subagent_gate::COMBINED_HOOK_ARGUMENT)
+            .unwrap();
+    let selected_command = if cfg!(windows) {
+        combined_commands.command_windows.as_str()
+    } else {
+        combined_commands.command.as_str()
+    };
+    let expected_hash = crate::subagent_gate::hook_trust_hash(
+        "pre_tool_use",
+        Some("*"),
+        selected_command,
+        crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
+    );
+    let state_key = format!("{}:pre_tool_use:0:0", config_path.display());
+    assert_eq!(
+        document["hooks"]["state"][&state_key]["trusted_hash"].as_str(),
+        Some(expected_hash.as_str())
+    );
+}
+
+#[test]
 fn subagent_optimization_keeps_explicit_agents_concurrency_over_legacy_max_threads() {
     let existing = r#"
 [agents]
@@ -1494,6 +1576,48 @@ default_subagent_reasoning_effort = "low"
             .get("default_subagent_reasoning_effort")
             .is_none()
     );
+}
+
+#[test]
+fn subagent_optimization_defaults_concurrency_for_new_or_invalid_configs() {
+    for existing in [
+        "",
+        "[agents]\nmax_threads = \"invalid\"\n",
+        "[agents]\nmax_threads = 0\n",
+        "[agents]\nmax_concurrent_threads_per_session = \"invalid\"\n",
+        "[agents]\nmax_concurrent_threads_per_session = 0\n",
+    ] {
+        let result = patch_config_with_fastctx_mode_and_proxy(
+            existing,
+            &official_profile(),
+            GLOBAL_PROVIDER_ID,
+            ProviderPatchOptions {
+                config_path: Path::new("/tmp/codey-codex/config.toml"),
+                model_catalog_path: relative_model_catalog_path(),
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: true,
+                subagent_model: "gpt-5.6-sol",
+                subagent_reasoning_effort: "high",
+                preserve_provider_route: false,
+                protocol_proxy_base_url: None,
+            },
+        )
+        .unwrap();
+        let document = result.parse::<DocumentMut>().unwrap();
+
+        assert_eq!(
+            document["agents"]["max_concurrent_threads_per_session"].as_integer(),
+            Some(DEFAULT_SUBAGENT_MAX_CONCURRENCY)
+        );
+        assert!(
+            document["agents"]
+                .as_table()
+                .unwrap()
+                .get("max_threads")
+                .is_none()
+        );
+    }
 }
 
 #[test]
@@ -3647,12 +3771,10 @@ wire_api = "responses"
             .iter()
             .any(|entry| entry == "agents.enabled=true")
     );
-    assert!(
-        applied
-            .runtime_config_overrides
-            .iter()
-            .any(|entry| entry == "agents.max_concurrent_threads_per_session=7")
-    );
+    assert!(applied.runtime_config_overrides.iter().any(|entry| entry
+        == &format!(
+            "agents.max_concurrent_threads_per_session={DEFAULT_SUBAGENT_MAX_CONCURRENCY}"
+        )));
     assert!(
         applied
             .runtime_config_overrides
@@ -3682,7 +3804,9 @@ wire_api = "responses"
         "hooks.state.{}.trusted_hash=",
         toml_string_literal(&pre_tool_state_key)
     );
-    let hook_commands = crate::subagent_gate::hook_commands().unwrap();
+    let hook_commands =
+        crate::subagent_gate::hook_commands_for(crate::subagent_gate::COMBINED_HOOK_ARGUMENT)
+            .unwrap();
     let selected_command = if cfg!(windows) {
         hook_commands.command_windows.as_str()
     } else {
@@ -3696,27 +3820,6 @@ wire_api = "responses"
     );
     assert!(applied.runtime_config_overrides.iter().any(|entry| {
         entry.starts_with(&pre_tool_prefix) && entry.contains(&expected_pre_tool_hash)
-    }));
-    let fastctx_state_key = format!("{}:pre_tool_use:2:0", home.join("hooks.json").display());
-    let fastctx_state_prefix = format!(
-        "hooks.state.{}.trusted_hash=",
-        toml_string_literal(&fastctx_state_key)
-    );
-    let fastctx_hook_commands =
-        crate::subagent_gate::hook_commands_for(crate::fastctx_route_gate::HOOK_ARGUMENT).unwrap();
-    let selected_fastctx_command = if cfg!(windows) {
-        fastctx_hook_commands.command_windows.as_str()
-    } else {
-        fastctx_hook_commands.command.as_str()
-    };
-    let expected_fastctx_hash = crate::subagent_gate::hook_trust_hash(
-        "pre_tool_use",
-        Some(crate::fastctx_route_gate::HOOK_MATCHER),
-        selected_fastctx_command,
-        crate::fastctx_route_gate::HOOK_TIMEOUT_SECONDS,
-    );
-    assert!(applied.runtime_config_overrides.iter().any(|entry| {
-        entry.starts_with(&fastctx_state_prefix) && entry.contains(&expected_fastctx_hash)
     }));
     assert!(
         applied
@@ -3767,7 +3870,7 @@ wire_api = "responses"
             .iter()
             .filter(|entry| entry.starts_with("hooks.state."))
             .count(),
-        SUBAGENT_GATE_HOOKS.len() + FASTCTX_ROUTE_HOOKS.len()
+        SUBAGENT_GATE_HOOKS.len()
     );
     assert_eq!(
         applied
@@ -3776,7 +3879,7 @@ wire_api = "responses"
             .filter(|entry| entry.starts_with(CODEY_WSL_ONLY_OVERRIDE_PREFIX))
             .count(),
         if cfg!(windows) {
-            SUBAGENT_GATE_HOOKS.len() + FASTCTX_ROUTE_HOOKS.len()
+            SUBAGENT_GATE_HOOKS.len()
         } else {
             0
         }
@@ -3794,32 +3897,26 @@ wire_api = "responses"
 
     let hooks: serde_json::Value =
         serde_json::from_slice(&fs::read(home.join("hooks.json")).unwrap()).unwrap();
-    assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
+    assert_eq!(hooks["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
     assert_eq!(
         hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str(),
         Some("/usr/bin/true")
     );
     assert_eq!(
-        hooks["hooks"]["PreToolUse"][2]["matcher"].as_str(),
-        Some(crate::fastctx_route_gate::HOOK_MATCHER)
+        hooks["hooks"]["PreToolUse"][1]["matcher"].as_str(),
+        Some("*")
     );
     assert!(
-        hooks["hooks"]["PreToolUse"][2]["hooks"][0]["command"]
+        hooks["hooks"]["PreToolUse"][1]["hooks"][0]["command"]
             .as_str()
             .unwrap()
-            .contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
+            .contains(crate::subagent_gate::COMBINED_HOOK_ARGUMENT)
     );
-    for (group_index, hook_argument) in [
-        (1, crate::subagent_gate::HOOK_ARGUMENT),
-        (2, crate::fastctx_route_gate::HOOK_ARGUMENT),
-    ] {
-        let windows_command =
-            hooks["hooks"]["PreToolUse"][group_index]["hooks"][0]["commandWindows"]
-                .as_str()
-                .unwrap();
-        assert!(windows_command.starts_with("& '"), "{windows_command}");
-        assert!(windows_command.contains(hook_argument));
-    }
+    let windows_command = hooks["hooks"]["PreToolUse"][1]["hooks"][0]["commandWindows"]
+        .as_str()
+        .unwrap();
+    assert!(windows_command.starts_with("& '"), "{windows_command}");
+    assert!(windows_command.contains(crate::subagent_gate::COMBINED_HOOK_ARGUMENT));
     for event in [
         "PostToolUse",
         "SubagentStart",

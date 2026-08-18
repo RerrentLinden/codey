@@ -416,34 +416,57 @@ fn resolve_persistent_message_ids(
     session_id: &str,
     message_ids: &BTreeSet<String>,
 ) -> Result<ResolvedPersistentMessageIds> {
-    let tail_message_ids = message_ids
+    let mut tail_message_ids = message_ids
         .iter()
         .filter_map(|message_id| tail_message_index(message_id).map(|index| (message_id, index)))
         .collect::<Vec<_>>();
     if tail_message_ids.is_empty() {
         return Ok((message_ids.clone(), Vec::new()));
     }
-    if tail_message_ids.len() != 1 || tail_message_ids[0].1 != 0 {
-        anyhow::bail!("无法安全解析多个或非当前页面尾部轮次");
+    tail_message_ids.sort_by_key(|(_, index)| *index);
+    if tail_message_ids
+        .iter()
+        .enumerate()
+        .any(|(expected, (_, index))| expected != *index)
+    {
+        anyhow::bail!("只能安全解析从当前页面末轮开始连续选择的尾部轮次");
     }
 
-    let tail_message_id = tail_message_ids[0].0;
-    let stable_turn_id = if let Some(message_id) =
-        read_resolved_tail_alias_unlocked(home, session_id, tail_message_id)?
-    {
-        message_id
-    } else {
+    let mut stable_turn_ids = vec![None; tail_message_ids.len()];
+    for (tail_message_id, index) in &tail_message_ids {
+        stable_turn_ids[*index] =
+            read_resolved_tail_alias_unlocked(home, session_id, tail_message_id)?;
+    }
+    if stable_turn_ids.iter().any(Option::is_none) {
         let rollout_path =
             find_rollout_path(home, session_id)?.context("找不到页面尾部轮次对应的会话记录")?;
         let canonical_rollout = canonical_rollout_path(home, &rollout_path)?;
         let original = fs::read_to_string(&canonical_rollout)
             .with_context(|| format!("读取会话记录失败：{}", canonical_rollout.display()))?;
-        last_stable_rollout_turn_id(&original).context("页面尾部轮次尚未稳定写入会话记录")?
-    };
+        let rollout_tail_ids = stable_rollout_tail_turn_ids(&original, tail_message_ids.len())
+            .context("所选页面尾部轮次尚未稳定写入完整会话记录")?;
+        for (index, stable_turn_id) in stable_turn_ids.iter_mut().enumerate() {
+            match stable_turn_id {
+                Some(existing) if existing != &rollout_tail_ids[index] => {
+                    anyhow::bail!("页面尾部轮次别名与当前会话尾部不一致，已拒绝重新解析");
+                }
+                None => *stable_turn_id = Some(rollout_tail_ids[index].clone()),
+                Some(_) => {}
+            }
+        }
+    }
+
     let mut resolved = message_ids.clone();
-    resolved.remove(tail_message_id);
-    resolved.insert(stable_turn_id.clone());
-    Ok((resolved, vec![(tail_message_id.clone(), stable_turn_id)]))
+    let mut aliases = Vec::with_capacity(tail_message_ids.len());
+    for (tail_message_id, index) in tail_message_ids {
+        let stable_turn_id = stable_turn_ids[index]
+            .take()
+            .context("页面尾部轮次缺少稳定会话标识")?;
+        resolved.remove(tail_message_id);
+        resolved.insert(stable_turn_id.clone());
+        aliases.push((tail_message_id.clone(), stable_turn_id));
+    }
+    Ok((resolved, aliases))
 }
 
 fn find_rollout_path(home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
@@ -535,21 +558,31 @@ fn canonical_rollout_path(home: &Path, rollout_path: &Path) -> Result<PathBuf> {
     Ok(canonical_rollout)
 }
 
-fn last_stable_rollout_turn_id(rollout: &str) -> Option<String> {
-    let mut last_boundary = None;
-    let mut last_terminal = None;
+fn stable_rollout_tail_turn_ids(rollout: &str, count: usize) -> Option<Vec<String>> {
+    let mut turns = Vec::<(String, bool)>::new();
     for line in rollout.lines() {
-        if let Some(turn_id) = turn_boundary_id(line) {
-            last_boundary = Some(turn_id);
+        if let Some(turn_id) = turn_boundary_id(line)
+            && turns.last().is_none_or(|(current, _)| current != &turn_id)
+        {
+            turns.push((turn_id, false));
         }
-        if let Some(turn_id) = terminal_turn_id(line) {
-            last_terminal = Some(turn_id);
+        if let Some(turn_id) = terminal_turn_id(line)
+            && let Some((current, terminal)) = turns.last_mut()
+            && current == &turn_id
+        {
+            *terminal = true;
         }
     }
-    match (last_boundary, last_terminal) {
-        (Some(boundary), Some(terminal)) if boundary == terminal => Some(boundary),
-        _ => None,
+    if count > turns.len() {
+        return None;
     }
+    let tail = &turns[turns.len() - count..];
+    tail.iter().all(|(_, terminal)| *terminal).then(|| {
+        tail.iter()
+            .rev()
+            .map(|(turn_id, _)| turn_id.clone())
+            .collect()
+    })
 }
 
 fn terminal_turn_id(line: &str) -> Option<String> {
@@ -831,6 +864,152 @@ mod tests {
         let remaining = fs::read_to_string(&rollout).unwrap();
         assert!(remaining.contains("t1"));
         assert!(remaining.contains("keep"));
+    }
+
+    #[test]
+    fn resolves_consecutive_tail_keys_before_deleting_multiple_last_turns() {
+        let home = tempdir().unwrap();
+        let rollout_dir = home.path().join("sessions/2026/08/18");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-multiple-tail-keys.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"keep\"}]}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t2\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t2\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"remove older tail\"}]}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"turn_aborted\",\"turn_id\":\"t2\"}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t3\"}}\n",
+                "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t3\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"remove newest tail\"}]}}\n",
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t3\"}}\n",
+            ),
+        )
+        .unwrap();
+        let db = home.path().join("state_5.sqlite");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                params!["s1", rollout.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let newest_tail_key = "history-content:tail:0:local:newest-temporary-id";
+        let older_tail_key = "history-content:tail:1:local:older-temporary-id";
+        let result = delete_messages_persistently(
+            home.path(),
+            "s1",
+            &[older_tail_key.into(), newest_tail_key.into()],
+        )
+        .unwrap();
+
+        assert_eq!(result.deleted, 2);
+        assert_eq!(result.resolved_message_ids, ["t2", "t3"]);
+        for (selector, expected) in [(newest_tail_key, "t3"), (older_tail_key, "t2")] {
+            let alias: MessageDeleteTombstone = serde_json::from_slice(
+                &fs::read(tombstone_path(
+                    &tombstone_directory(home.path()),
+                    "s1",
+                    selector,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(alias.message_id, expected);
+        }
+        let remaining = fs::read_to_string(&rollout).unwrap();
+        assert!(remaining.contains("t1"));
+        assert!(remaining.contains("keep"));
+        assert!(!remaining.contains("t2"));
+        assert!(!remaining.contains("remove older tail"));
+        assert!(!remaining.contains("t3"));
+        assert!(!remaining.contains("remove newest tail"));
+
+        let repeated = delete_messages_persistently(
+            home.path(),
+            "s1",
+            &[older_tail_key.into(), newest_tail_key.into()],
+        )
+        .unwrap();
+
+        assert_eq!(repeated.deleted, 0);
+        assert_eq!(repeated.resolved_message_ids, ["t2", "t3"]);
+    }
+
+    #[test]
+    fn refuses_non_consecutive_tail_keys() {
+        let home = tempdir().unwrap();
+        let tail_key = "history-content:tail:1:local:temporary-id";
+
+        let error =
+            delete_messages_persistently(home.path(), "s1", &[tail_key.into()]).unwrap_err();
+
+        assert!(error.to_string().contains("从当前页面末轮开始连续选择"));
+        assert!(!tombstone_path(&tombstone_directory(home.path()), "s1", tail_key).exists());
+    }
+
+    #[test]
+    fn refuses_to_mix_a_stale_tail_alias_with_an_unresolved_tail_key() {
+        let home = tempdir().unwrap();
+        let rollout_dir = home.path().join("sessions/2026/08/18");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-stale-tail-alias.jsonl");
+        let original = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"s1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t2\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t2\"}}\n",
+        );
+        fs::write(&rollout, original).unwrap();
+        let db = home.path().join("state_5.sqlite");
+        let connection = Connection::open(&db).unwrap();
+        connection
+            .execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO threads (id, rollout_path) VALUES (?1, ?2)",
+                params!["s1", rollout.to_string_lossy().to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let stale_tail_key = "history-content:tail:0:local:stale-temporary-id";
+        let unresolved_tail_key = "history-content:tail:1:local:new-temporary-id";
+        record_resolved_tail_aliases_unlocked(
+            home.path(),
+            "s1",
+            &[(stale_tail_key.into(), "deleted-t3".into())],
+        )
+        .unwrap();
+
+        let error = delete_messages_persistently(
+            home.path(),
+            "s1",
+            &[stale_tail_key.into(), unresolved_tail_key.into()],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("别名与当前会话尾部不一致"));
+        assert_eq!(fs::read_to_string(&rollout).unwrap(), original);
+        assert!(!tombstone_path(&tombstone_directory(home.path()), "s1", "t1").exists());
+        assert!(!tombstone_path(&tombstone_directory(home.path()), "s1", "t2").exists());
     }
 
     #[test]

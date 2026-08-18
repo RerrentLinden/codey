@@ -859,9 +859,8 @@ fn current_renderer_model_catalog(config: &CodeyConfig) -> Result<Value, String>
 }
 
 pub(super) async fn current_renderer_model_catalog_async(
-    config: &CodeyConfig,
+    config: CodeyConfig,
 ) -> Result<Value, String> {
-    let config = config.clone();
     tokio::task::spawn_blocking(move || current_renderer_model_catalog(&config))
         .await
         .map_err(|error| format!("读取渲染进程模型目录的任务异常退出：{error}"))?

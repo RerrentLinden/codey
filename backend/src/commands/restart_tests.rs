@@ -245,9 +245,12 @@ fn restart_sensitive_config_changes_are_detected() {
 async fn shutdown_cancels_a_restart_waiting_for_the_runtime_lock() {
     let state = Arc::new(AppState::default());
     let _operation = state.runtime_operation.lock().await;
+    let restart_pending = state.restart_operation_pending.notified();
     let response = schedule_restart_codey_runtime(&state).await.unwrap();
     assert_eq!(response["status"], "restarting");
-    tokio::time::sleep(Duration::from_millis(275)).await;
+    tokio::time::timeout(Duration::from_secs(1), restart_pending)
+        .await
+        .expect("restart did not reach the runtime operation lock");
 
     tokio::time::timeout(Duration::from_secs(1), begin_shutdown(&state))
         .await

@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
 pub(crate) const HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook";
+pub(crate) const COMBINED_HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook-with-fastctx";
 pub(crate) const RUNTIME_ACTIVE_ENV: &str = "CODEY_SUBAGENT_GATE_ACTIVE";
 pub(crate) const RUNTIME_ID_ENV: &str = "CODEY_SUBAGENT_GATE_RUNTIME_ID";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
@@ -16,6 +17,7 @@ pub(crate) const SESSION_END_HOOK_TIMEOUT_SECONDS: u64 = 3;
 pub(crate) const AGENT_STATUS_HOOK_MATCHER: &str =
     ".*(wait_agent|list_agents)$|^functions(__|[./:_])wait$";
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
+const MAX_RENDERED_TOOL_RESULT_CHARS: usize = 8 * 1024;
 const STATE_DIRECTORY: &str = "codey-subagent-gate-v2";
 const ACTIVE_MARKER_SCHEMA_VERSION: u32 = 1;
 const LEGACY_RUNTIME_ID: &str = "legacy-runtime";
@@ -23,6 +25,7 @@ const PENDING_INIT_GRACE_MILLIS: u64 = 10 * 60 * 1000;
 const STOP_STALL_GRACE_MILLIS: u64 = 10 * 60 * 1000;
 const PENDING_INIT_OBSERVED_FILE: &str = "pending-init-observed.state";
 const STOP_BLOCKED_SINCE_FILE: &str = "stop-blocked-since.state";
+const STATE_ERROR_SINCE_FILE: &str = "state-error-since.state";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HookCommands {
@@ -51,11 +54,20 @@ struct ActiveMarker {
     started_at_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HookMode {
+    SubagentOnly,
+    WithFastctx,
+}
+
 pub fn run_hook_if_requested() -> Result<bool> {
-    if std::env::args_os().nth(1).as_deref() != Some(OsStr::new(HOOK_ARGUMENT)) {
-        return Ok(false);
-    }
-    if !runtime_gate_is_active(std::env::var_os(RUNTIME_ACTIVE_ENV).as_deref()) {
+    let mode = match std::env::args_os().nth(1).as_deref() {
+        Some(argument) if argument == OsStr::new(HOOK_ARGUMENT) => HookMode::SubagentOnly,
+        Some(argument) if argument == OsStr::new(COMBINED_HOOK_ARGUMENT) => HookMode::WithFastctx,
+        _ => return Ok(false),
+    };
+    let gate_active = runtime_gate_is_active(std::env::var_os(RUNTIME_ACTIVE_ENV).as_deref());
+    if mode == HookMode::SubagentOnly && !gate_active {
         write_hook_output(&json!({}))?;
         return Ok(true);
     }
@@ -72,11 +84,16 @@ pub fn run_hook_if_requested() -> Result<bool> {
         serde_json::from_slice(&raw).context("解析 Codex 子代理门禁 Hook 输入失败")?;
     let state_root = std::env::temp_dir().join(STATE_DIRECTORY);
     let runtime_id = current_runtime_id();
-    let output =
-        handle_hook_for_runtime(&input, &state_root, &runtime_id).unwrap_or_else(|error| {
-            eprintln!("Codey 子代理门禁 Hook 失败：{error:#}");
-            fail_closed_output(&input, &error)
-        });
+    let output = match mode {
+        HookMode::SubagentOnly => handle_hook_for_runtime(&input, &state_root, &runtime_id),
+        HookMode::WithFastctx => {
+            combined_hook_output_for_runtime(&input, &state_root, &runtime_id, gate_active)
+        }
+    }
+    .unwrap_or_else(|error| {
+        eprintln!("Codey 子代理门禁 Hook 失败：{error:#}");
+        fail_closed_output(&input, &error)
+    });
     write_hook_output(&output)?;
     Ok(true)
 }
@@ -157,6 +174,27 @@ fn handle_hook_for_runtime(
     runtime_id: &str,
 ) -> Result<Value> {
     handle_hook_for_runtime_at(input, state_root, runtime_id, current_timestamp_millis())
+}
+
+fn combined_hook_output_for_runtime(
+    input: &HookInput,
+    state_root: &Path,
+    runtime_id: &str,
+    gate_active: bool,
+) -> Result<Value> {
+    let gate_output = if gate_active {
+        handle_hook_for_runtime(input, state_root, runtime_id)?
+    } else {
+        json!({})
+    };
+    if !gate_output.as_object().is_some_and(Map::is_empty) {
+        return Ok(gate_output);
+    }
+    Ok(crate::fastctx_route_gate::hook_output(
+        &input.hook_event_name,
+        input.tool_name.as_deref(),
+        input.tool_input.as_ref(),
+    ))
 }
 
 fn handle_hook_for_runtime_at(
@@ -258,7 +296,15 @@ fn post_tool_use_output(
         return Ok(json!({}));
     }
 
-    let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+    let Some(active) = active_agent_count_or_recover_corrupt_state(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        now_ms,
+    )?
+    else {
+        return Ok(json!({}));
+    };
     if active == 0 {
         remove_session_state(state_root, runtime_id, &input.session_id)?;
         return Ok(json!({}));
@@ -279,7 +325,15 @@ fn stop_output(
     if nonempty(input.agent_id.as_deref()).is_some() {
         return Ok(json!({}));
     }
-    let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+    let Some(active) = active_agent_count_or_recover_corrupt_state(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        now_ms,
+    )?
+    else {
+        return Ok(json!({}));
+    };
     if active == 0 {
         return Ok(json!({}));
     }
@@ -304,9 +358,43 @@ fn stop_output(
     Ok(stop_continuation(active))
 }
 
+fn active_agent_count_or_recover_corrupt_state(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<Option<usize>> {
+    match active_agent_count_for_runtime(state_root, runtime_id, session_id) {
+        Ok(active) => {
+            remove_session_auxiliary_file(
+                state_root,
+                runtime_id,
+                session_id,
+                STATE_ERROR_SINCE_FILE,
+            )?;
+            Ok(Some(active))
+        }
+        Err(error) => {
+            if observe_and_check_elapsed(
+                state_root,
+                runtime_id,
+                session_id,
+                STATE_ERROR_SINCE_FILE,
+                now_ms,
+                STOP_STALL_GRACE_MILLIS,
+            )? {
+                remove_session_state(state_root, runtime_id, session_id)?;
+                Ok(None)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
 fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
     let reason = format!(
-        "Codey 无法确认子代理运行状态，已暂停主代理继续操作：{error:#}。请调用 agents.wait_agent 或 agents.list_agents 核对状态。"
+        "Codey 无法确认子代理运行状态，已暂停主代理继续操作：{error:#}。请调用 agents.wait_agent 或 agents.list_agents 核对状态。若状态存储持续损坏，Stop 路径会在持续 10 分钟后回收当前运行代次；期间不得绕过门禁。"
     );
     match input.hook_event_name.as_str() {
         "PreToolUse" if nonempty(input.agent_id.as_deref()).is_none() => json!({
@@ -360,7 +448,7 @@ fn post_wait_continuation(active: usize, tool_response: Option<&Value>) -> Value
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可读取它并仅使用 agents.send_message、agents.followup_task、agents.interrupt_agent 或 agents.list_agents 做必要协调，并请先调用 agents.list_agents 对账。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待或协调。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可读取它并仅使用 agents.send_message、agents.followup_task、agents.interrupt_agent 或 agents.list_agents 做必要协调，并请先调用不带筛选的 agents.list_agents 对账。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待或协调。累计 10 分钟仍无终态时只中断一次对应代理，再继续等待终态；不得无限 wait 或自动重派。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -370,7 +458,7 @@ fn post_list_continuation(active: usize, tool_response: Option<&Value>) -> Value
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。只对 running、pending_init 或 interrupted 的代理继续等待、转向或停止；completed、errored、shutdown 和 not_found 不再阻塞。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态，避免无限循环。\n\n本次 list_agents 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。只对 running、pending_init 或 interrupted 的代理继续等待、转向或停止；completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理，再等待其进入终态；不得无限 wait 或自动重派。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。\n\n本次 list_agents 已返回内容：\n{returned_update}"
         ),
     })
 }
@@ -379,18 +467,27 @@ fn stop_continuation(active: usize) -> Value {
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用 agents.list_agents 对账，再对 running、pending_init 或 interrupted 的代理调用 agents.wait_agent。若协作工具已经不可用，门禁会在持续 10 分钟无法进展后释放遗留状态，避免无限循环。"
+            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用不带筛选的 agents.list_agents 对账，再对 running、pending_init 或 interrupted 的代理调用 agents.wait_agent；累计 10 分钟仍无终态时只中断一次对应代理并继续等待，不得无限重试或自动重派。若协作工具已经不可用，门禁会在持续 10 分钟无法进展后释放遗留状态。"
         ),
     })
 }
 
 fn render_tool_result(tool_response: Option<&Value>, tool_name: &str) -> String {
-    match tool_response {
+    let rendered = match tool_response {
         Some(Value::String(response)) => response.clone(),
         Some(response) => serde_json::to_string(response)
             .unwrap_or_else(|_| format!("（{tool_name} 返回内容无法序列化）")),
         None => format!("（{tool_name} 未提供返回内容）"),
-    }
+    };
+    let Some((cut_at, _)) = rendered.char_indices().nth(MAX_RENDERED_TOOL_RESULT_CHARS) else {
+        return rendered;
+    };
+    let mut bounded = rendered;
+    bounded.truncate(cut_at);
+    bounded.push_str(
+        "\n…（协作工具返回内容已截断；请调用不带筛选的 agents.list_agents 获取紧凑状态）",
+    );
+    bounded
 }
 
 fn wait_was_interrupted_by_user(tool_response: Option<&Value>) -> bool {
@@ -1200,6 +1297,43 @@ mod tests {
     }
 
     #[test]
+    fn combined_hook_keeps_fastctx_active_and_prioritizes_the_subagent_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let mut root_bash = input("PreToolUse", "session-a");
+        root_bash.tool_name = Some("Bash".to_string());
+        root_bash.tool_input = Some(json!({ "command": "rg -n needle src" }));
+
+        let routed = combined_hook_output_for_runtime(&root_bash, root, runtime_id, false).unwrap();
+        assert!(
+            routed["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("Codey FastCtx"))
+        );
+
+        let mut start = input("SubagentStart", "session-a");
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime(&start, root, runtime_id).unwrap();
+        let gated = combined_hook_output_for_runtime(&root_bash, root, runtime_id, true).unwrap();
+        assert!(
+            gated["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("子代理门禁"))
+        );
+
+        let mut child_bash = root_bash;
+        child_bash.agent_id = Some("agent-a".to_string());
+        let child_routed =
+            combined_hook_output_for_runtime(&child_bash, root, runtime_id, true).unwrap();
+        assert!(
+            child_routed["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("Codey FastCtx"))
+        );
+    }
+
+    #[test]
     fn child_cannot_spawn_nested_subagents_through_any_supported_alias() {
         let temp = tempfile::tempdir().unwrap();
         for tool in [
@@ -1526,6 +1660,82 @@ mod tests {
             )
             .unwrap(),
             json!({})
+        );
+    }
+
+    #[test]
+    fn collaboration_tool_output_is_bounded_on_unicode_boundaries() {
+        let payload = "界".repeat(MAX_RENDERED_TOOL_RESULT_CHARS + 32);
+        let rendered = render_tool_result(Some(&Value::String(payload)), "wait_agent");
+        let (body, suffix) = rendered.split_once('\n').unwrap();
+
+        assert_eq!(body.chars().count(), MAX_RENDERED_TOOL_RESULT_CHARS);
+        assert!(body.chars().all(|character| character == '界'));
+        assert!(suffix.contains("协作工具返回内容已截断"));
+        assert!(suffix.contains("agents.list_agents"));
+    }
+
+    #[test]
+    fn corrupted_active_state_fails_closed_then_recovers_after_grace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "corrupt-session";
+        let mut start = input("SubagentStart", session_id);
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
+
+        let session_dir = session_state_dir(root, session_id);
+        let marker = agent_marker_path(&session_dir, runtime_id, "agent-a");
+        fs::write(&marker, b"{").unwrap();
+
+        let first_error =
+            handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 2_000)
+                .unwrap_err();
+        assert!(format!("{first_error:#}").contains("解析 Codex 子代理门禁状态失败"));
+
+        let observed = session_auxiliary_path(&session_dir, runtime_id, STATE_ERROR_SINCE_FILE);
+        assert_eq!(fs::read_to_string(&observed).unwrap(), "2000\n");
+        assert!(marker.exists());
+
+        let recovered = handle_hook_for_runtime_at(
+            &input("Stop", session_id),
+            root,
+            runtime_id,
+            2_000 + STOP_STALL_GRACE_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(recovered, json!({}));
+        assert!(!marker.exists());
+        assert!(!observed.exists());
+    }
+
+    #[test]
+    fn healthy_active_state_clears_a_stale_corruption_observation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "healthy-session";
+        let mut start = input("SubagentStart", session_id);
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
+
+        let session_dir = session_state_dir(root, session_id);
+        let observed = session_auxiliary_path(&session_dir, runtime_id, STATE_ERROR_SINCE_FILE);
+        write_observation_timestamp(&session_dir, &observed, 1_000).unwrap();
+
+        let blocked = handle_hook_for_runtime_at(
+            &input("Stop", session_id),
+            root,
+            runtime_id,
+            1_000 + STOP_STALL_GRACE_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(blocked["decision"].as_str(), Some("block"));
+        assert!(!observed.exists());
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
         );
     }
 

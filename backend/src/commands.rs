@@ -130,6 +130,8 @@ pub struct AppState {
     runtime_generation: AtomicU64,
     session_titles: RwLock<HashMap<String, String>>,
     session_metadata_cache: BlockingMutex<session_metadata::SessionMetadataCache>,
+    #[cfg(test)]
+    session_metadata_cache_contended: Notify,
     webhook_notifications: Mutex<WebhookNotificationState>,
     persisted_waiting_notifications: Mutex<WaitingLedgerState>,
     recent_session_event_cache: Mutex<Option<pending_approval::RecentSessionEventCache>>,
@@ -138,6 +140,8 @@ pub struct AppState {
     waiting_watcher_sync: Mutex<()>,
     session_scan_wake: Notify,
     restart_settled: Notify,
+    #[cfg(test)]
+    restart_operation_pending: Notify,
     shutdown_reason: watch::Sender<Option<AppShutdownReason>>,
 }
 
@@ -202,6 +206,8 @@ impl Default for AppState {
             session_metadata_cache: BlockingMutex::new(
                 session_metadata::SessionMetadataCache::default(),
             ),
+            #[cfg(test)]
+            session_metadata_cache_contended: Notify::new(),
             webhook_notifications: Mutex::new(WebhookNotificationState::from_settled(
                 persisted_waiting_notifications.iter().cloned(),
             )),
@@ -214,6 +220,8 @@ impl Default for AppState {
             waiting_watcher_sync: Mutex::new(()),
             session_scan_wake: Notify::new(),
             restart_settled: Notify::new(),
+            #[cfg(test)]
+            restart_operation_pending: Notify::new(),
             shutdown_reason,
         }
     }
@@ -280,12 +288,13 @@ impl AppState {
             "/codex-model-catalog" => {
                 let current_config = self.config.read().await.clone();
                 let runtime = self.runtime.lock().await.clone();
-                let catalog_config = model_catalog_config_for_runtime(
-                    &current_config,
-                    runtime.as_ref().map(|runtime| &runtime.applied_config),
-                )
-                .clone();
-                current_renderer_model_catalog_async(&catalog_config)
+                let catalog_config = runtime
+                    .as_ref()
+                    .map(|runtime| &runtime.applied_config)
+                    .filter(|applied| provider_route_requires_restart(applied, &current_config))
+                    .cloned()
+                    .unwrap_or(current_config);
+                current_renderer_model_catalog_async(catalog_config)
                     .await
                     .unwrap_or_else(api_error_message)
             }
@@ -454,6 +463,19 @@ where
 {
     let state = Arc::clone(state);
     tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let mut cache = match state.session_metadata_cache.try_lock() {
+            Ok(cache) => cache,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                state.session_metadata_cache_contended.notify_one();
+                state
+                    .session_metadata_cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        #[cfg(not(test))]
         let mut cache = state
             .session_metadata_cache
             .lock()
@@ -1229,6 +1251,7 @@ fn config_requires_restart(
             && applied_subagent != &RuntimeSubagentConfig::from_config(current))
 }
 
+#[cfg(test)]
 fn model_catalog_config_for_runtime<'a>(
     current: &'a CodeyConfig,
     runtime_applied: Option<&'a CodeyConfig>,

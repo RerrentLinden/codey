@@ -439,6 +439,8 @@ async fn run_scheduled_restart(
         return;
     }
 
+    #[cfg(test)]
+    restart_state.restart_operation_pending.notify_one();
     let _operation = tokio::select! {
         operation = restart_state.runtime_operation.lock() => operation,
         _ = &mut cancel => return,

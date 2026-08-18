@@ -26,7 +26,6 @@ test("subagent optimization exposes per-task model and reasoning controls", asyn
     "codey_visual_analysis",
     "codey_worker",
     "codey_visual_worker",
-    "default",
   ]) {
     assert.match(uiSource, new RegExp(`id: "${role}"`));
   }
@@ -36,10 +35,13 @@ test("subagent optimization exposes per-task model and reasoning controls", asyn
     "视觉分析",
     "代码实施",
     "视觉实施",
-    "通用兜底",
   ]) {
     assert.match(uiSource, new RegExp(`name: "${label}"`));
   }
+  assert.doesNotMatch(uiSource, /id: "default"/);
+  assert.doesNotMatch(uiSource, /name: "通用兜底"/);
+  assert.match(uiSource, /选择性委派/);
+  assert.match(uiSource, /五类专用角色/);
   assert.match(uiSource, /config\.subagentOptimization \? \(/);
   assert.match(uiSource, /className="subagent-task-help"/);
   assert.match(uiSource, /content=\{task\.description\}/);
@@ -126,7 +128,14 @@ test("subagent optimization installs root waiting and nested-spawn runtime gates
   ]);
 
   assert.match(mainSource, /run_subagent_gate_hook_if_requested/);
-  assert.match(configSource, /enable_subagent_gate_hooks\(doc, config_path\)/);
+  assert.match(
+    configSource,
+    /enable_subagent_gate_hooks\(doc, config_path, fastctx_namespace\.is_some\(\)\)/,
+  );
+  assert.match(configSource, /COMBINED_HOOK_ARGUMENT/);
+  assert.match(configSource, /&SUBAGENT_GATE_HOOKS\[\.\.1\]/);
+  assert.match(configSource, /&SUBAGENT_GATE_HOOKS\[1\.\.\]/);
+  assert.match(configSource, /if !subagent_optimization/);
   assert.match(configSource, /toml_event: "PreToolUse"/);
   assert.match(configSource, /toml_event: "PostToolUse"/);
   assert.match(
@@ -151,5 +160,9 @@ test("subagent optimization installs root waiting and nested-spawn runtime gates
   assert.match(gateSource, /post_wait_continuation/);
   assert.match(gateSource, /可读取它并仅使用 agents\.send_message/);
   assert.match(gateSource, /不得恢复非协作本地工作/);
+  assert.match(gateSource, /MAX_RENDERED_TOOL_RESULT_CHARS/);
+  assert.match(gateSource, /STATE_ERROR_SINCE_FILE/);
+  assert.match(gateSource, /active_agent_count_or_recover_corrupt_state/);
+  assert.match(gateSource, /协作工具返回内容已截断/);
   assert.match(gateSource, /SubagentStop/);
 });

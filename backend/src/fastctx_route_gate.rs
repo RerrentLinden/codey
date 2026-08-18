@@ -87,19 +87,29 @@ fn write_hook_output(output: &Value) -> Result<()> {
 }
 
 fn handle_hook(input: &HookInput) -> Value {
-    if input.hook_event_name != "PreToolUse" {
+    hook_output(
+        &input.hook_event_name,
+        input.tool_name.as_deref(),
+        input.tool_input.as_ref(),
+    )
+}
+
+pub(crate) fn hook_output(
+    hook_event_name: &str,
+    tool_name: Option<&str>,
+    tool_input: Option<&Value>,
+) -> Value {
+    if hook_event_name != "PreToolUse" {
         return json!({});
     }
-    let Some(tool_name) = input.tool_name.as_deref() else {
+    let Some(tool_name) = tool_name else {
         return json!({});
     };
 
     if !tool_name.eq_ignore_ascii_case("Bash") {
-        return handle_resource_tool(tool_name, input.tool_input.as_ref());
+        return handle_resource_tool(tool_name, tool_input);
     }
-    let Some(command) = input
-        .tool_input
-        .as_ref()
+    let Some(command) = tool_input
         .and_then(|tool_input| tool_input.get("command"))
         .and_then(Value::as_str)
     else {

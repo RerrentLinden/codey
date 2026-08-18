@@ -49,7 +49,6 @@ fn user_fastctx_prevents_enabling_the_embedded_tools() {
 async fn session_metadata_cache_operations_are_serialized_in_blocking_workers() {
     let state = Arc::new(AppState::default());
     let first_started = Arc::new(AtomicBool::new(false));
-    let second_submitted = Arc::new(AtomicBool::new(false));
     let second_started = Arc::new(AtomicBool::new(false));
     let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
 
@@ -81,12 +80,11 @@ async fn session_metadata_cache_operations_are_serialized_in_blocking_workers() 
     .await
     .expect("the first cache operation should start");
 
+    let second_contended = state.session_metadata_cache_contended.notified();
     let second = tokio::spawn({
         let state = Arc::clone(&state);
-        let second_submitted = Arc::clone(&second_submitted);
         let second_started = Arc::clone(&second_started);
         async move {
-            second_submitted.store(true, Ordering::Release);
             with_session_metadata_cache(&state, "second cache operation", move |_| {
                 second_started.store(true, Ordering::Release);
                 2
@@ -94,14 +92,9 @@ async fn session_metadata_cache_operations_are_serialized_in_blocking_workers() 
             .await
         }
     });
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !second_submitted.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the second cache operation should be submitted");
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(1), second_contended)
+        .await
+        .expect("the second cache operation did not contend for exclusive ownership");
     assert!(
         !second_started.load(Ordering::Acquire),
         "the second operation must wait for exclusive cache ownership"

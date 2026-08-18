@@ -40,7 +40,7 @@ const SUBAGENT_TASK_TYPES = [
   {
     id: "codey_visual_analysis",
     name: "视觉分析",
-    description: "默认只读；用于截图、页面、GUI、PDF 等视觉证据分析，以及复杂探索和独立核验。",
+    description: "默认只读；仅用于必须读取截图、页面、GUI、PDF 或渲染结果的视觉证据分析。",
   },
   {
     id: "codey_worker",
@@ -51,11 +51,6 @@ const SUBAGENT_TASK_TYPES = [
     id: "codey_visual_worker",
     name: "视觉实施",
     description: "默认可写；用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
-  },
-  {
-    id: "default",
-    name: "通用兜底",
-    description: "默认只读；任务不符合专用类型时使用，负责一般探索、检索和核验，不承担实施。",
   },
 ] as const satisfies ReadonlyArray<{
   id: SubagentRoleId;
@@ -236,16 +231,8 @@ function FeaturePolicyCardComponent({
                         model: string,
                         reasoningEffort: string,
                       ) => {
-                        const legacyFallback =
-                          task.id === "default"
-                            ? {
-                                subagentModel: model,
-                                subagentReasoningEffort: reasoningEffort,
-                              }
-                            : {};
                         onConfigChange({
                           ...config,
-                          ...legacyFallback,
                           subagentRoles: {
                             ...config.subagentRoles,
                             [task.id]: { model, reasoningEffort },
@@ -357,7 +344,7 @@ function FeaturePolicyCardComponent({
                   </small>
                 </>
               ) : (
-                <small>开启后为 Codex 原生子代理增加主动委派、六类角色和汇合门禁；不会扩大父任务权限</small>
+                <small>开启后仅在宽范围、可并行或需要专门证据时选择性委派，并提供五类专用角色与汇合门禁；不会扩大父任务权限</small>
               )}
             </div>
           </div>

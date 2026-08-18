@@ -59,6 +59,7 @@ const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_ARG_MARKER: &str = "--codey-fastctx-mcp";
 const CODEY_FASTCTX_TOKEN_BUDGET: &str = "8500";
 const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 15;
+const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 2;
 const APPLIED_CONFIG_FILE: &str = "applied-config.toml";
 const APPLIED_AGENTS_MD_FILE: &str = "applied-AGENTS.md";
 const APPLIED_DEFAULT_AGENT_FILE: &str = "agents/applied-default.toml";
@@ -503,8 +504,12 @@ fn apply_isolated_cc_switch_runtime_config(
     let subagent_hook_commands = subagent_optimization
         .then(crate::subagent_gate::hook_commands)
         .transpose()?;
-    let fastctx_hook_commands = fastctx_namespace
-        .is_some()
+    let combined_hook_commands = (subagent_optimization && fastctx_namespace.is_some())
+        .then(|| {
+            crate::subagent_gate::hook_commands_for(crate::subagent_gate::COMBINED_HOOK_ARGUMENT)
+        })
+        .transpose()?;
+    let fastctx_hook_commands = (fastctx_namespace.is_some() && !subagent_optimization)
         .then(|| crate::subagent_gate::hook_commands_for(crate::fastctx_route_gate::HOOK_ARGUMENT))
         .transpose()?;
     let (updated_hooks, hook_trust_entries) = if runtime_hooks_enabled {
@@ -516,6 +521,7 @@ fn apply_isolated_cc_switch_runtime_config(
             &hooks_path,
             subagent_hook_commands.as_ref(),
             fastctx_hook_commands.as_ref(),
+            combined_hook_commands.as_ref(),
         )?;
         (Some(contents), trust_entries)
     } else {
@@ -1771,7 +1777,9 @@ fn patch_config_with_fastctx_mode_and_proxy(
     }
     if fastctx_namespace.is_some() {
         enable_hooks_feature(&mut doc)?;
-        enable_fastctx_route_hook(&mut doc, config_path)?;
+        if !subagent_optimization {
+            enable_fastctx_route_hook(&mut doc, config_path)?;
+        }
     }
     document_string(&doc)
 }
@@ -1801,16 +1809,18 @@ fn enable_subagent_optimization(
     let legacy_max_threads = agents.remove("max_threads");
     agents.remove("max_depth");
     agents["enabled"] = value(true);
-    if agents.get("max_concurrent_threads_per_session").is_none() {
-        if let Some(legacy_max_threads) = legacy_max_threads {
-            if legacy_max_threads.as_integer().is_some() {
-                agents["max_concurrent_threads_per_session"] = legacy_max_threads;
-            } else {
-                agents["max_concurrent_threads_per_session"] = value(7);
-            }
-        } else {
-            agents["max_concurrent_threads_per_session"] = value(7);
-        }
+    let has_valid_concurrency = agents
+        .get("max_concurrent_threads_per_session")
+        .and_then(Item::as_integer)
+        .is_some_and(|concurrency| concurrency > 0);
+    if !has_valid_concurrency {
+        agents["max_concurrent_threads_per_session"] = legacy_max_threads
+            .filter(|legacy| {
+                legacy
+                    .as_integer()
+                    .is_some_and(|concurrency| concurrency > 0)
+            })
+            .unwrap_or_else(|| value(DEFAULT_SUBAGENT_MAX_CONCURRENCY));
     }
     agents["default_subagent_model"] = value(subagent_model);
     agents["default_subagent_reasoning_effort"] = value(subagent_reasoning_effort);
@@ -1863,7 +1873,7 @@ fn enable_subagent_optimization(
         )?;
     }
     features["hooks"] = value(true);
-    enable_subagent_gate_hooks(doc, config_path)?;
+    enable_subagent_gate_hooks(doc, config_path, fastctx_namespace.is_some())?;
     Ok(())
 }
 
@@ -1946,6 +1956,7 @@ fn build_runtime_hooks_file(
     hooks_path: &Path,
     subagent_commands: Option<&crate::subagent_gate::HookCommands>,
     fastctx_commands: Option<&crate::subagent_gate::HookCommands>,
+    combined_commands: Option<&crate::subagent_gate::HookCommands>,
 ) -> Result<RuntimeHooksFile> {
     let mut root = match existing {
         Some(existing) => serde_json::from_slice::<serde_json::Value>(existing)
@@ -1971,17 +1982,21 @@ fn build_runtime_hooks_file(
         }
     }
 
-    let mut trust_entries = Vec::with_capacity(
-        subagent_commands.map_or(0, |_| SUBAGENT_GATE_HOOKS.len())
-            + fastctx_commands.map_or(0, |_| FASTCTX_ROUTE_HOOKS.len()),
-    );
-    for (specs, commands) in [
-        (&SUBAGENT_GATE_HOOKS[..], subagent_commands),
-        (&FASTCTX_ROUTE_HOOKS[..], fastctx_commands),
-    ] {
-        let Some(commands) = commands else {
-            continue;
-        };
+    let mut hook_plans = Vec::with_capacity(3);
+    if let Some(subagent_commands) = subagent_commands {
+        if let Some(combined_commands) = combined_commands {
+            hook_plans.push((&SUBAGENT_GATE_HOOKS[..1], combined_commands));
+            hook_plans.push((&SUBAGENT_GATE_HOOKS[1..], subagent_commands));
+        } else {
+            hook_plans.push((&SUBAGENT_GATE_HOOKS[..], subagent_commands));
+        }
+    }
+    if let Some(fastctx_commands) = fastctx_commands {
+        hook_plans.push((&FASTCTX_ROUTE_HOOKS[..], fastctx_commands));
+    }
+    let mut trust_entries =
+        Vec::with_capacity(hook_plans.iter().map(|(specs, _)| specs.len()).sum());
+    for (specs, commands) in hook_plans {
         let selected_command = if cfg!(windows) {
             commands.command_windows.as_str()
         } else {
@@ -2250,10 +2265,10 @@ fn build_isolated_runtime_overrides(
             "features.hooks",
         )?;
         let expected_hook_count = if runtime_agents.is_empty() {
-            0
+            usize::from(fastctx_namespace.is_some())
         } else {
             SUBAGENT_GATE_HOOKS.len()
-        } + usize::from(fastctx_namespace.is_some());
+        };
         anyhow::ensure!(
             hook_trust_entries.len() == expected_hook_count,
             "Codey Hook 信任项不完整"
@@ -2346,9 +2361,24 @@ fn append_constraint_text(existing: &str, addition: &str) -> String {
     }
 }
 
-fn enable_subagent_gate_hooks(doc: &mut DocumentMut, config_path: &Path) -> Result<()> {
+fn enable_subagent_gate_hooks(
+    doc: &mut DocumentMut,
+    config_path: &Path,
+    include_fastctx: bool,
+) -> Result<()> {
     let commands = crate::subagent_gate::hook_commands()?;
-    enable_codey_hooks(doc, config_path, &SUBAGENT_GATE_HOOKS, &commands)
+    if !include_fastctx {
+        return enable_codey_hooks(doc, config_path, &SUBAGENT_GATE_HOOKS, &commands);
+    }
+    let combined_commands =
+        crate::subagent_gate::hook_commands_for(crate::subagent_gate::COMBINED_HOOK_ARGUMENT)?;
+    enable_codey_hooks(
+        doc,
+        config_path,
+        &SUBAGENT_GATE_HOOKS[..1],
+        &combined_commands,
+    )?;
+    enable_codey_hooks(doc, config_path, &SUBAGENT_GATE_HOOKS[1..], &commands)
 }
 
 fn enable_hooks_feature(doc: &mut DocumentMut) -> Result<()> {

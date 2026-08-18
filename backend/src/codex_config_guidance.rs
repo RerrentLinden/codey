@@ -109,7 +109,7 @@ pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V3: &str = r#"## 子代理使用
 - 派发后立即等待全部子代理完成，再继续分析、命令或修改。子代理累计运行 10 分钟仍未完成时，检查状态并终止异常任务，必要时拆成更小任务重新派发。
 "#;
 
-pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V4: &str = r#"## 子代理使用
 
 本 AGENTS.md 明确要求主代理在适用任务中主动使用子代理；无需等待用户逐次点名。子代理用于把宽而重的检索、独立核验或边界清晰的实现从主线程中拆出，减少上下文污染、提高并行度并提供独立证据。
 
@@ -148,8 +148,60 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 本轮计划的子代理全部派发后，在继续非协作分析、命令或修改前进入等待。等待返回 `MESSAGE` 或其他局部更新时，只可使用 `agents.*` 协作工具做必要的查看、转向或停止，然后继续等待；所有已派发子代理完成前不得恢复本地工作或结束任务。子代理累计运行 10 分钟仍未完成时，检查状态并终止异常任务，必要时拆成更小任务重新派发。
 "#;
 
+pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+
+子代理用于隔离宽而重的上下文、并行处理真正独立的工作，或取得有价值的独立证据。默认由主代理直接处理；只有预计收益明确高于派发、等待和复核成本时才使用子代理。不要为了形式上的分工而派生。
+
+### 选择性委派
+
+以下任务直接处理，不派子代理：
+
+- 回答、解释、状态汇报、单一事实或一次精确查询；
+- 用户已经给出文件、符号或确切代码位置，预计只涉及不超过 2 个小文件和 3 次本地工具调用；
+- 即将修改的确切代码、奠基性文档，以及步骤彼此依赖、无法真正并行的任务；
+- 派发、等待和抽查的成本不明显低于主代理直接完成的任务。
+
+仅在符合以下至少一种情况，且任务不命中上述直接处理条件时派生：
+
+- 至少有 2 个互不依赖的分支，每个分支预计需要至少 3 次实质工具调用，合计预计不少于 7 次；
+- 实现位置未知，预计需要跨至少 2 个目录或检查至少 5 个候选文件，并且需要归纳而非一次搜索即可回答；
+- 需要读取或比较大量日志、文档、页面等外围材料，预计会明显污染主线程上下文；
+- 存在不在主代理关键路径上的独立实现，预计需要至少 6 次工具调用或较长时间，并且能给出互斥的文件 ownership；
+- 高风险结论缺少确定性检查，需要一条真正独立的证据线；简单或已有确定性测试的任务不额外派 verifier。
+
+不确定是否达到阈值时，直接处理。不得仅因为“可回滚、可测试”或“实现位置暂时未知”就派生。`codey_quick_scan` 只用于至少需要 3 次独立检索的定位任务；一两次搜索可完成的查询由主代理自己处理。默认最多派生 2 个子代理。超过 2 个必须同时满足：运行时已经显式配置更高并发；并且用户明确要求大规模并行，或存在 3 个以上均达到上述阈值的独立分支。
+
+### 任务类型路由
+
+派生时必须按任务性质显式选择下列 `agent_type`，不要用模型名代替任务类型：
+
+- `codey_quick_scan`：只读的多点快速定位、重复性检查和低风险事实检索。
+- `codey_deep_research`：只读的跨文件、日志、代码或文档宽范围检索、归纳和架构探索。
+- `codey_visual_analysis`：只读的截图、页面、GUI、PDF 等视觉证据分析；普通复杂检索仍使用深度检索。
+- `codey_worker`：可写的低到中等复杂度、边界清晰、可回滚且可测试的非视觉实现。
+- `codey_visual_worker`：可写的页面、GUI、PDF 或其他依赖视觉证据与渲染验证的实现。
+
+`default` 只作为旧配置和遗漏类型的内部只读兼容兜底，主代理不得主动选择。除 `codey_worker` 和 `codey_visual_worker` 外，子代理默认只做探索、检索和核验，不改动文件。可写角色也只处理被明确授权且 ownership 互斥的实现；方案取舍、关键代码复核和最终验证仍由主代理负责。角色文件中的沙箱是默认值，实际权限仍受父任务当前权限模式约束。
+
+### 任务胶囊与结果契约
+
+- 派发消息只携带完成子任务必需的目标、范围、允许操作和输出契约，不复制整段对话。派生时显式使用 `fork_turns = "none"`。
+- 要求子代理以 `status: completed | partial | blocked` 开头，只返回会影响决策的结论、最多 5 条关键证据以及明确的 gaps；精度重要时证据必须包含 `file:line`、符号名或可复核链接。
+- 子代理结果只是压缩后的线索。主代理沿出处抽查关键部分；即将修改的确切代码和奠基性文档仍由主代理亲自完整读取。
+- 准确性优先使用测试、类型检查、渲染结果等确定性验收。多代理意见冲突时比较证据，不按多数票决定；只有高风险且无法确定性验证时才追加一条独立核验线。
+
+### 汇合、异常与接管
+
+- 本轮计划的独立子代理必须先在同一批全部派发，再进入等待；有活动子代理时只使用 `agents.*` 做必要协调，直至每个代理进入终态。
+- 每个子代理只用一轮，不复用、不追派，也不得继续派生。某分支失败后默认由主代理接管；只有缩小或改变范围后仍独立满足委派阈值，才允许最多重派一次。
+- 收到 `MESSAGE` 或不完整结果时只保存可用证据并继续等待，不把局部更新当完成。出现 `errored`、`failed`、`shutdown` 或 `not_found` 时保留可核验证据，随后由主代理接管未完成部分。
+- `pending_init` 长时间无进展，或运行累计 10 分钟仍无终态时，先调用一次不带筛选的 `agents.list_agents` 对账；仍非终态则对对应代理调用一次 `agents.interrupt_agent`，随后继续等待其进入终态。禁止无限 wait、无限重试或静默启动替代代理。
+- 用户新输入导致等待中断时，将原批次视为可能过时：先中断仍活动的代理并完成对账，忽略迟到的旧结果，再按新请求决定是否继续。协作工具不可用时不要循环调用不存在的工具，等待 Codey 的有界遗留状态恢复。
+"#;
+
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     SUBAGENT_GUIDANCE,
+    PREVIOUS_SUBAGENT_GUIDANCE_V4,
     PREVIOUS_SUBAGENT_GUIDANCE_V3,
     PREVIOUS_SUBAGENT_GUIDANCE_V2,
     PREVIOUS_SUBAGENT_GUIDANCE,
@@ -249,6 +301,7 @@ developer_instructions = """
 - 你只有一轮、任务是自包含的：没有追问的机会，别反问；用这一轮把任务范围查到位、尽力答全。
 - 答不全就如实交代「查到了什么、还有什么没覆盖、哪里存疑或者矛盾」。宁可显式报「没查到 / 没覆盖」，也别用含糊的话糊弄过去——你悄悄漏掉的，主代理无从复核。
 - 每次工具调用都必须推进任务本身。进度、道歉、自我提醒和纠错写在回复中；发现工具用错时直接改用正确工具，不要为此额外执行诊断或播报命令。
+- 首行写 `status: completed | partial | blocked`；只保留会影响决策的结论、最多 5 条关键证据和明确 gaps。
 """
 
 [features]
@@ -268,6 +321,7 @@ developer_instructions = """
 你是快速定位子代理。只做只读、范围明确、低风险的定位与事实检索，不修改任何文件，不做方案取舍，也不派生其他子代理。
 优先返回最短可核验证据：确切路径、`file:line`、符号名、匹配数量和必要的关键原文。任务超出小范围快速检索时，明确说明应改派深度检索或视觉分析角色。
 你的回复直接供主代理使用：密而不水，区分事实与推断，不寒暄、不复述过程。
+首行写 `status: completed | partial | blocked`；最多保留 5 条会影响决策的关键证据，并明确未覆盖范围。
 """
 
 [features]
@@ -283,6 +337,7 @@ developer_instructions = """
 你是深度检索子代理。负责跨文件、跨目录的代码、日志和文档检索、归纳与架构探索；不修改任何文件，不做最终方案取舍，也不派生其他子代理。
 覆盖任务给定范围，返回符号关系、关键路径、`file:line` 和必要原文。把已确认事实、推断、缺口与矛盾分开，保留足够证据供主代理低成本抽查。
 你的输出直接喂给主代理：结构紧凑、信息密集，不写面向最终用户的包装文字。
+首行写 `status: completed | partial | blocked`；只返回会影响决策的结论、最多 5 条关键证据和明确 gaps。
 """
 
 [features]
@@ -298,6 +353,7 @@ developer_instructions = """
 你是视觉分析子代理。负责截图、页面、GUI、PDF 和渲染结果的只读观察，也可承担需要视觉证据的复杂探索与独立核验；不修改文件，不做最终方案取舍，也不派生其他子代理。
 先读取或捕获必要视觉证据，再报告可见事实、位置关系、状态差异和可复核出处；推断必须单独标注。不要仅凭文件名或代码猜测视觉结果。
 你的输出直接供主代理决策，保持精炼、具体、可核验。
+首行写 `status: completed | partial | blocked`；只返回会影响决策的可见事实、最多 5 条关键证据和明确 gaps。
 """
 
 [features]
@@ -313,6 +369,7 @@ developer_instructions = """
 你是代码实施子代理。只处理主代理明确授权、边界清晰、可回滚且可测试的低到中等复杂度非视觉实现；不要扩大范围，不做跨模块架构取舍，也不派生其他子代理。
 修改前读取将要编辑的确切代码，保留并适配其他人的并行改动。完成后运行与改动风险相称的最小验证，并返回修改文件、关键位置、测试结果和仍存风险。
 遇到需要产品选择、破坏性操作或范围不明确时停止修改，把阻塞点交回主代理。
+首行写 `status: completed | partial | blocked`；紧凑列出改动、确定性验证结果和未完成项，不回传冗长日志。
 """
 
 [features]
@@ -328,6 +385,7 @@ developer_instructions = """
 你是视觉实施子代理。只处理主代理明确授权、边界清晰且需要截图、页面、GUI、PDF 或渲染证据的低到中等复杂度实现；不要扩大范围，不做架构取舍，也不派生其他子代理。
 修改前读取确切代码与视觉基线，修改后必须通过实际渲染或截图核验结果，并报告修改文件、关键位置、视觉验证证据、测试结果和仍存风险。
 保留并适配其他人的并行改动；遇到需要产品选择、破坏性操作或范围不明确时停止并交回主代理。
+首行写 `status: completed | partial | blocked`；紧凑列出改动、视觉与确定性验证结果和未完成项，不回传冗长日志。
 """
 
 [features]
@@ -852,6 +910,7 @@ mod tests {
     #[test]
     fn subagent_guidance_migrates_the_previous_owned_block() {
         for previous in [
+            PREVIOUS_SUBAGENT_GUIDANCE_V4,
             PREVIOUS_SUBAGENT_GUIDANCE_V3,
             PREVIOUS_SUBAGENT_GUIDANCE_V2,
             PREVIOUS_SUBAGENT_GUIDANCE,
@@ -872,14 +931,19 @@ mod tests {
     }
 
     #[test]
-    fn subagent_guidance_explicitly_requests_proactive_delegation() {
-        assert!(SUBAGENT_GUIDANCE.contains("明确要求主代理在适用任务中主动使用子代理"));
-        assert!(SUBAGENT_GUIDANCE.contains("无需等待用户逐次点名"));
-        assert!(SUBAGENT_GUIDANCE.contains("必须派发至少一个合适的子代理"));
-        assert!(SUBAGENT_GUIDANCE.contains("跨多个文件、目录、日志或文档检索"));
-        assert!(SUBAGENT_GUIDANCE.contains("若任务只命中这些例外，不要为了满足数量而形式化派发"));
-        assert!(SUBAGENT_GUIDANCE.contains("先完成同一批次的全部派发，再进入等待"));
-        assert!(SUBAGENT_GUIDANCE.contains("只可使用 `agents.*` 协作工具"));
+    fn subagent_guidance_prefers_direct_work_until_delegation_has_clear_value() {
+        assert!(SUBAGENT_GUIDANCE.contains("默认由主代理直接处理"));
+        assert!(SUBAGENT_GUIDANCE.contains("不超过 2 个小文件和 3 次本地工具调用"));
+        assert!(SUBAGENT_GUIDANCE.contains("至少有 2 个互不依赖的分支"));
+        assert!(SUBAGENT_GUIDANCE.contains("不确定是否达到阈值时，直接处理"));
+        assert!(SUBAGENT_GUIDANCE.contains("默认最多派生 2 个子代理"));
+        assert!(SUBAGENT_GUIDANCE.contains("主代理不得主动选择"));
+        assert!(SUBAGENT_GUIDANCE.contains("status: completed | partial | blocked"));
+        assert!(SUBAGENT_GUIDANCE.contains("多代理意见冲突时比较证据"));
+        assert!(SUBAGENT_GUIDANCE.contains("调用一次 `agents.interrupt_agent`"));
+        assert!(SUBAGENT_GUIDANCE.contains("只有缩小或改变范围后仍独立满足委派阈值"));
+        assert!(SUBAGENT_GUIDANCE.contains("同一批全部派发，再进入等待"));
+        assert!(SUBAGENT_GUIDANCE.contains("只使用 `agents.*` 做必要协调"));
         assert!(SUBAGENT_GUIDANCE.contains("实际权限仍受父任务当前权限模式约束"));
     }
 
