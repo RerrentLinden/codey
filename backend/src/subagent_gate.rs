@@ -1484,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_gate_rejects_small_delegations_before_spawn() {
+    fn runtime_gate_allows_small_delegations_with_a_valid_role_contract() {
         let temp = tempfile::tempdir().unwrap();
         let mut spawn = input("PreToolUse", "small-session");
         spawn.tool_name = Some("agents.spawn_agent".to_string());
@@ -1504,17 +1504,7 @@ mod tests {
                 "checks": []
             }))
         }));
-        let denied = handle_hook(&spawn, temp.path()).unwrap();
-        assert_eq!(
-            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
-            Some("deny")
-        );
-        assert!(
-            denied["hookSpecificOutput"]["permissionDecisionReason"]
-                .as_str()
-                .unwrap()
-                .contains("规模阈值")
-        );
+        assert_eq!(handle_hook(&spawn, temp.path()).unwrap(), json!({}));
     }
 
     #[test]

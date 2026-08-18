@@ -30,18 +30,8 @@ struct DelegationContract {
     id: String,
     #[serde(rename = "why")]
     reason: String,
-    #[serde(default, rename = "calls")]
-    estimated_calls: u16,
     #[serde(default)]
     branch_calls: Vec<u16>,
-    #[serde(default, rename = "files")]
-    candidate_files: u16,
-    #[serde(default, rename = "dirs")]
-    candidate_dirs: u16,
-    #[serde(default, rename = "large")]
-    large_context: bool,
-    #[serde(default, rename = "risk")]
-    high_risk: bool,
     #[serde(default)]
     visual: bool,
     #[serde(default, rename = "root")]
@@ -806,7 +796,7 @@ fn prepare_contract(tool_input: Option<&Value>) -> std::result::Result<PreparedC
     if contract.id != task_name {
         return Err(contract_error("契约 id 必须与 task_name 完全一致"));
     }
-    validate_delegation_reason(&contract, role)?;
+    validate_delegation_reason_role(&contract.reason, role)?;
     if contract.visual != policy.visual {
         return Err(contract_error(if policy.visual {
             "视觉角色的契约必须设置 visual=true"
@@ -878,7 +868,7 @@ fn prepare_contract(tool_input: Option<&Value>) -> std::result::Result<PreparedC
 
 fn contract_error(detail: &str) -> String {
     format!(
-        "Codey 自适应委派门禁：{detail}。请在 message 最后一行追加紧凑契约，例如：{CONTRACT_PREFIX}{{\"id\":\"scan_auth\",\"why\":\"breadth\",\"calls\":4,\"files\":5,\"dirs\":2,\"visual\":false,\"read\":[],\"write\":[],\"checks\":[]}}"
+        "Codey 自适应委派门禁：{detail}。请在 message 最后一行追加紧凑契约，例如：{CONTRACT_PREFIX}{{\"id\":\"scan_auth\",\"why\":\"breadth\",\"calls\":3,\"files\":4,\"dirs\":2,\"visual\":false,\"read\":[],\"write\":[],\"checks\":[]}}"
     )
 }
 
@@ -896,57 +886,33 @@ fn validate_task_id(value: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn validate_delegation_reason(
-    contract: &DelegationContract,
-    role: &str,
-) -> std::result::Result<(), String> {
+fn validate_delegation_reason_role(reason: &str, role: &str) -> std::result::Result<(), String> {
     use crate::config::{
         SUBAGENT_ROLE_DEEP_RESEARCH, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_QUICK_SCAN,
         SUBAGENT_ROLE_VISUAL_ANALYSIS, SUBAGENT_ROLE_VISUAL_WORKER, SUBAGENT_ROLE_WORKER,
     };
 
-    let valid = match contract.reason.as_str() {
-        "multi_lookup" => contract.estimated_calls >= 3 && role == SUBAGENT_ROLE_QUICK_SCAN,
-        "parallel" => {
-            contract.branch_calls.len() >= 2
-                && contract.branch_calls.iter().all(|calls| *calls >= 3)
-                && contract
-                    .branch_calls
-                    .iter()
-                    .copied()
-                    .map(u32::from)
-                    .sum::<u32>()
-                    >= 7
-        }
-        "breadth" => {
-            (contract.candidate_dirs >= 2 || contract.candidate_files >= 5)
-                && matches!(
-                    role,
-                    SUBAGENT_ROLE_DEEP_RESEARCH | SUBAGENT_ROLE_VISUAL_ANALYSIS
-                )
-        }
-        "context" => {
-            contract.large_context
-                && matches!(
-                    role,
-                    SUBAGENT_ROLE_DEEP_RESEARCH
-                        | SUBAGENT_ROLE_VISUAL_ANALYSIS
-                        | SUBAGENT_ROLE_DEFAULT
-                )
-        }
+    let role_compatible = match reason {
+        "multi_lookup" => role == SUBAGENT_ROLE_QUICK_SCAN,
+        "breadth" | "context" => matches!(
+            role,
+            SUBAGENT_ROLE_DEEP_RESEARCH | SUBAGENT_ROLE_VISUAL_ANALYSIS | SUBAGENT_ROLE_DEFAULT
+        ),
         "independent_work" => {
-            contract.estimated_calls >= 6
-                && matches!(role, SUBAGENT_ROLE_WORKER | SUBAGENT_ROLE_VISUAL_WORKER)
+            matches!(role, SUBAGENT_ROLE_WORKER | SUBAGENT_ROLE_VISUAL_WORKER)
         }
-        "high_risk" => contract.high_risk,
-        "user_requested" => true,
-        _ => false,
+        "parallel" | "high_risk" | "user_requested" => true,
+        _ => {
+            return Err(contract_error(
+                "why 无效；允许 multi_lookup/parallel/breadth/context/independent_work/high_risk/user_requested",
+            ));
+        }
     };
-    if valid {
+    if role_compatible {
         Ok(())
     } else {
         Err(contract_error(
-            "why 与角色或规模阈值不匹配；允许 multi_lookup/parallel/breadth/context/independent_work/high_risk/user_requested",
+            "why 与 agent_type 不兼容；calls/files/dirs/branch_calls 只用于软路由和预算提示，不是运行时拒绝条件",
         ))
     }
 }
@@ -1461,19 +1427,33 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_contract_rejects_small_or_mismatched_delegation() {
+    fn adaptive_contract_treats_size_as_soft_but_keeps_role_compatibility() {
         let mut contract = research_contract("tiny");
         contract["files"] = json!(1);
         contract["dirs"] = json!(1);
         let input = contract_input("tiny", "codey_deep_research", contract);
-        let error = prepare_contract(Some(&input)).unwrap_err();
-        assert!(error.contains("why 与角色或规模阈值不匹配"));
+        assert!(prepare_contract(Some(&input)).is_ok());
 
         let quick = contract_input("quick", "codey_quick_scan", research_contract("quick"));
         assert!(
             prepare_contract(Some(&quick))
                 .unwrap_err()
-                .contains("why 与角色")
+                .contains("why 与 agent_type 不兼容")
+        );
+
+        let unknown = contract_input(
+            "unknown",
+            "codey_quick_scan",
+            json!({
+                "id": "unknown",
+                "why": "guess",
+                "visual": false
+            }),
+        );
+        assert!(
+            prepare_contract(Some(&unknown))
+                .unwrap_err()
+                .contains("why 无效")
         );
 
         let huge_parallel = contract_input(
