@@ -34,6 +34,7 @@ mod sqlite_util;
 mod startup_maintenance;
 mod startup_update;
 mod subagent_gate;
+mod subagent_orchestrator;
 mod subagent_policy;
 mod trace_log_guard;
 mod trace_log_stats;

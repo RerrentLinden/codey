@@ -91,6 +91,26 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
             "method": "notifications/initialized"
         }),
     );
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }),
+    );
+    let listed = response_with_id(&responses_rx, 2);
+    let tools = listed["result"]["tools"].as_array().unwrap();
+    let mut names = tools
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["glob", "grep", "inspect_local_file", "replace"]);
+    for tool in tools {
+        assert_portable_tool_schema(&tool["inputSchema"]);
+    }
 
     let first_host = wait_for_host_starts(&event_log, 1)[0];
     terminate_process(first_host, true);
@@ -106,7 +126,7 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
-            "id": 2,
+            "id": 3,
             "method": "tools/call",
             "params": {
                 "name": "glob",
@@ -114,7 +134,7 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
             }
         }),
     );
-    let response = response_with_id(&responses_rx, 2);
+    let response = response_with_id(&responses_rx, 3);
     assert_eq!(response["result"]["isError"], false, "{response}");
 
     drop(stdin);
@@ -122,6 +142,43 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
     let stderr = captured_stderr.lock().unwrap().clone();
     assert!(status.success(), "sidecar failed with {status}: {stderr}");
     terminate_process(hosts[1], false);
+}
+
+fn assert_portable_tool_schema(value: &Value) {
+    let values = value
+        .as_object()
+        .unwrap_or_else(|| panic!("FastCtx schema node must be an object: {value}"));
+    for forbidden in [
+        "$ref",
+        "$defs",
+        "oneOf",
+        "anyOf",
+        "allOf",
+        "const",
+        "$schema",
+        "additionalProperties",
+        "format",
+    ] {
+        assert!(
+            !values.contains_key(forbidden),
+            "FastCtx schema contains unsupported {forbidden}: {value}"
+        );
+    }
+    if let Some(schema_type) = values.get("type") {
+        assert!(
+            schema_type.is_string(),
+            "FastCtx schema type must be a scalar string: {value}"
+        );
+        assert_ne!(schema_type.as_str(), Some("null"), "{value}");
+    }
+    if let Some(properties) = values.get("properties").and_then(Value::as_object) {
+        for property in properties.values() {
+            assert_portable_tool_schema(property);
+        }
+    }
+    if let Some(items) = values.get("items") {
+        assert_portable_tool_schema(items);
+    }
 }
 
 fn send(stdin: &mut impl Write, value: Value) {

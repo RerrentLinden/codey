@@ -57,8 +57,12 @@ const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
 const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_ARG_MARKER: &str = "--codey-fastctx-mcp";
-const CODEY_FASTCTX_TOKEN_BUDGET: &str = "8500";
-const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 15;
+const CODEY_FASTCTX_HOST_TOKEN_LIMIT: i64 = 60_000;
+const CODEY_FASTCTX_TOKEN_BUDGET: usize = 54_000;
+const CODEY_FASTCTX_GREP_TOKEN_BUDGET: usize = 10_800;
+const CODEY_FASTCTX_GLOB_TOKEN_BUDGET: usize = 5_400;
+const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 120;
+const CODEY_FASTCTX_TOOL_TIMEOUT_SECONDS: i64 = 300;
 const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 2;
 const APPLIED_CONFIG_FILE: &str = "applied-config.toml";
 const APPLIED_AGENTS_MD_FILE: &str = "applied-AGENTS.md";
@@ -1906,7 +1910,7 @@ const SUBAGENT_GATE_HOOKS: [CodeyHookSpec; 6] = [
     CodeyHookSpec {
         toml_event: "PostToolUse",
         event_key: "post_tool_use",
-        matcher: Some(crate::subagent_gate::AGENT_STATUS_HOOK_MATCHER),
+        matcher: Some(crate::subagent_orchestrator::POST_TOOL_HOOK_MATCHER),
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
     CodeyHookSpec {
@@ -2145,6 +2149,24 @@ fn build_isolated_runtime_overrides(
                     "FASTCTX_TOKEN_BUDGET",
                 ][..],
                 "mcp_servers.codey_fastctx.env.FASTCTX_TOKEN_BUDGET",
+            ),
+            (
+                &[
+                    "mcp_servers",
+                    CODEY_FASTCTX_SERVER_ID,
+                    "env",
+                    "FASTCTX_GREP_TOKEN_BUDGET",
+                ][..],
+                "mcp_servers.codey_fastctx.env.FASTCTX_GREP_TOKEN_BUDGET",
+            ),
+            (
+                &[
+                    "mcp_servers",
+                    CODEY_FASTCTX_SERVER_ID,
+                    "env",
+                    "FASTCTX_GLOB_TOKEN_BUDGET",
+                ][..],
+                "mcp_servers.codey_fastctx.env.FASTCTX_GLOB_TOKEN_BUDGET",
             ),
             (&["tool_output_token_limit"][..], "tool_output_token_limit"),
         ] {

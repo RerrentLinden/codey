@@ -14,11 +14,9 @@ pub(crate) const RUNTIME_ACTIVE_ENV: &str = "CODEY_SUBAGENT_GATE_ACTIVE";
 pub(crate) const RUNTIME_ID_ENV: &str = "CODEY_SUBAGENT_GATE_RUNTIME_ID";
 pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
 pub(crate) const SESSION_END_HOOK_TIMEOUT_SECONDS: u64 = 3;
-pub(crate) const AGENT_STATUS_HOOK_MATCHER: &str =
-    ".*(wait_agent|list_agents)$|^functions(__|[./:_])wait$";
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_RENDERED_TOOL_RESULT_CHARS: usize = 8 * 1024;
-const STATE_DIRECTORY: &str = "codey-subagent-gate-v2";
+const STATE_DIRECTORY: &str = "codey-subagent-gate-v3";
 const ACTIVE_MARKER_SCHEMA_VERSION: u32 = 1;
 const LEGACY_RUNTIME_ID: &str = "legacy-runtime";
 const PENDING_INIT_GRACE_MILLIS: u64 = 10 * 60 * 1000;
@@ -82,7 +80,7 @@ pub fn run_hook_if_requested() -> Result<bool> {
     }
     let input: HookInput =
         serde_json::from_slice(&raw).context("解析 Codex 子代理门禁 Hook 输入失败")?;
-    let state_root = std::env::temp_dir().join(STATE_DIRECTORY);
+    let state_root = crate::codex_config::codex_home().join(STATE_DIRECTORY);
     let runtime_id = current_runtime_id();
     let output = match mode {
         HookMode::SubagentOnly => handle_hook_for_runtime(&input, &state_root, &runtime_id),
@@ -207,11 +205,25 @@ fn handle_hook_for_runtime_at(
         "SubagentStart" => {
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
                 create_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
+                crate::subagent_orchestrator::subagent_started(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    agent_id,
+                    now_ms,
+                )?;
             }
             Ok(json!({}))
         }
         "SubagentStop" => {
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
+                crate::subagent_orchestrator::subagent_stopped(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    agent_id,
+                    now_ms,
+                )?;
                 remove_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
                 if active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)? == 0 {
                     remove_session_state(state_root, runtime_id, &input.session_id)?;
@@ -220,20 +232,58 @@ fn handle_hook_for_runtime_at(
             Ok(json!({}))
         }
         "SessionEnd" => {
+            crate::subagent_orchestrator::end_session(state_root, &input.session_id)?;
             remove_session_state(state_root, runtime_id, &input.session_id)?;
             Ok(json!({}))
         }
-        "PreToolUse" => pre_tool_use_output(input, state_root, runtime_id),
+        "PreToolUse" => pre_tool_use_output(input, state_root, runtime_id, now_ms),
         "PostToolUse" => post_tool_use_output(input, state_root, runtime_id, now_ms),
         "Stop" => stop_output(input, state_root, runtime_id, now_ms),
         _ => Ok(json!({})),
     }
 }
 
-fn pre_tool_use_output(input: &HookInput, state_root: &Path, runtime_id: &str) -> Result<Value> {
+fn pre_tool_use_output(
+    input: &HookInput,
+    state_root: &Path,
+    runtime_id: &str,
+    now_ms: u64,
+) -> Result<Value> {
     if nonempty(input.agent_id.as_deref()).is_some() {
         if input.tool_name.as_deref().is_some_and(is_spawn_agent_tool) {
             return Ok(subagent_spawn_denial());
+        }
+        if let (Some(agent_id), Some(tool_name)) =
+            (input.agent_id.as_deref(), input.tool_name.as_deref())
+            && let Some(reason) = crate::subagent_orchestrator::authorize_child_tool(
+                state_root,
+                runtime_id,
+                &input.session_id,
+                agent_id,
+                tool_name,
+                input.tool_input.as_ref(),
+                now_ms,
+            )?
+        {
+            return Ok(pre_tool_reason_denial(reason));
+        }
+        return Ok(json!({}));
+    }
+    if input
+        .tool_name
+        .as_deref()
+        .is_some_and(is_contract_spawn_tool)
+    {
+        let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+        if let Some(reason) = crate::subagent_orchestrator::pre_spawn(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            active,
+            now_ms,
+        )? {
+            return Ok(pre_tool_reason_denial(reason));
         }
         return Ok(json!({}));
     }
@@ -246,6 +296,15 @@ fn pre_tool_use_output(input: &HookInput, state_root: &Path, runtime_id: &str) -
     }
     let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
     if active == 0 {
+        if let Some(reason) = crate::subagent_orchestrator::pre_root_tool(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            now_ms,
+        )? {
+            return Ok(pre_tool_reason_denial(reason));
+        }
         return Ok(json!({}));
     }
     Ok(pre_tool_denial(active))
@@ -263,6 +322,25 @@ fn post_tool_use_output(
     let Some(tool_name) = input.tool_name.as_deref() else {
         return Ok(json!({}));
     };
+    if is_contract_spawn_tool(tool_name) {
+        crate::subagent_orchestrator::post_spawn(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            input.tool_response.as_ref(),
+            now_ms,
+        )?;
+        return Ok(json!({}));
+    }
+    crate::subagent_orchestrator::post_root_tool(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        input.tool_input.as_ref(),
+        input.tool_response.as_ref(),
+        now_ms,
+    )?;
     if !is_agent_status_tool(tool_name) {
         return Ok(json!({}));
     }
@@ -284,6 +362,14 @@ fn post_tool_use_output(
     if is_wait_agent_tool(tool_name) {
         if wait_was_interrupted_by_user(input.tool_response.as_ref()) {
             remove_session_state(state_root, runtime_id, &input.session_id)?;
+            crate::subagent_orchestrator::observe_status_response(
+                state_root,
+                runtime_id,
+                &input.session_id,
+                input.tool_response.as_ref(),
+                true,
+                now_ms,
+            )?;
             return Ok(json!({}));
         }
         remove_completed_agents_from_wait_response(
@@ -293,6 +379,14 @@ fn post_tool_use_output(
             input.tool_response.as_ref(),
         )?;
     } else if reconcile_list_agents_response(input, state_root, runtime_id, now_ms)? {
+        crate::subagent_orchestrator::observe_status_response(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_response.as_ref(),
+            true,
+            now_ms,
+        )?;
         return Ok(json!({}));
     }
 
@@ -307,8 +401,24 @@ fn post_tool_use_output(
     };
     if active == 0 {
         remove_session_state(state_root, runtime_id, &input.session_id)?;
+        crate::subagent_orchestrator::observe_status_response(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_response.as_ref(),
+            true,
+            now_ms,
+        )?;
         return Ok(json!({}));
     }
+    crate::subagent_orchestrator::observe_status_response(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        input.tool_response.as_ref(),
+        false,
+        now_ms,
+    )?;
     if is_wait_agent_tool(tool_name) {
         Ok(post_wait_continuation(active, input.tool_response.as_ref()))
     } else {
@@ -335,7 +445,7 @@ fn stop_output(
         return Ok(json!({}));
     };
     if active == 0 {
-        return Ok(json!({}));
+        return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
     }
     if observation_elapsed_if_present(
         state_root,
@@ -353,9 +463,27 @@ fn stop_output(
         STOP_STALL_GRACE_MILLIS,
     )? {
         remove_session_state(state_root, runtime_id, &input.session_id)?;
-        return Ok(json!({}));
+        return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
     }
     Ok(stop_continuation(active))
+}
+
+fn finalize_root_turn(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<Value> {
+    if let Some(reason) = crate::subagent_orchestrator::pending_acceptance_reason(
+        state_root, runtime_id, session_id, now_ms,
+    )? {
+        return Ok(json!({
+            "decision": "block",
+            "reason": reason,
+        }));
+    }
+    crate::subagent_orchestrator::settle_turn(state_root, runtime_id, session_id, now_ms)?;
+    Ok(json!({}))
 }
 
 fn active_agent_count_or_recover_corrupt_state(
@@ -429,6 +557,16 @@ fn pre_tool_denial(active: usize) -> Value {
             "permissionDecisionReason": format!(
                 "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态。现在只可调用 agents.* 协作工具；请先调用 agents.list_agents 核对 running、pending_init、completed、errored、shutdown 等状态，再对仍在运行的代理调用 agents.wait_agent。"
             ),
+        }
+    })
+}
+
+fn pre_tool_reason_denial(reason: String) -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
         }
     })
 }
@@ -897,6 +1035,10 @@ fn is_spawn_agent_tool(tool_name: &str) -> bool {
     )
 }
 
+fn is_contract_spawn_tool(tool_name: &str) -> bool {
+    normalized_collaboration_tool(tool_name) == "spawn_agent"
+}
+
 fn normalized_collaboration_tool(tool_name: &str) -> String {
     let normalized = tool_name.trim().to_ascii_lowercase();
     if is_functions_wait_alias(&normalized) {
@@ -1251,6 +1393,128 @@ mod tests {
             tool_input: None,
             tool_response: None,
         }
+    }
+
+    fn delegation_message(contract: Value) -> String {
+        format!(
+            "Do the bounded task.\n{}{}",
+            crate::subagent_orchestrator::CONTRACT_PREFIX,
+            serde_json::to_string(&contract).unwrap()
+        )
+    }
+
+    #[test]
+    fn runtime_gate_enforces_contract_ownership_and_mechanical_acceptance() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let mut spawn = input("PreToolUse", "contract-session");
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "worker_a",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "worker_a",
+                "why": "independent_work",
+                "calls": 6,
+                "visual": false,
+                "root": "/repo",
+                "read": [],
+                "write": ["backend/src"],
+                "checks": [{ "id": "tests", "cmd": "cargo test -p codey --lib" }]
+            }))
+        }));
+        assert_eq!(handle_hook(&spawn, root).unwrap(), json!({}));
+
+        let mut spawned = input("PostToolUse", "contract-session");
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "agent_id": "agent-a" }));
+        assert_eq!(handle_hook(&spawned, root).unwrap(), json!({}));
+
+        let mut started = input("SubagentStart", "contract-session");
+        started.agent_id = Some("agent-a".to_string());
+        handle_hook(&started, root).unwrap();
+
+        let mut owned_patch = input("PreToolUse", "contract-session");
+        owned_patch.agent_id = Some("agent-a".to_string());
+        owned_patch.tool_name = Some("apply_patch".to_string());
+        owned_patch.tool_input = Some(json!({
+            "patch": "*** Begin Patch\n*** Update File: backend/src/lib.rs\n*** End Patch"
+        }));
+        assert_eq!(handle_hook(&owned_patch, root).unwrap(), json!({}));
+
+        let mut escaped_patch = owned_patch;
+        escaped_patch.tool_input = Some(json!({
+            "patch": "*** Begin Patch\n*** Update File: README.md\n*** End Patch"
+        }));
+        assert_eq!(
+            handle_hook(&escaped_patch, root).unwrap()["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+
+        let mut stopped = input("SubagentStop", "contract-session");
+        stopped.agent_id = Some("agent-a".to_string());
+        handle_hook(&stopped, root).unwrap();
+        let blocked = handle_hook(&input("Stop", "contract-session"), root).unwrap();
+        assert_eq!(blocked["decision"].as_str(), Some("block"));
+        assert!(
+            blocked["reason"]
+                .as_str()
+                .unwrap()
+                .contains("codey-accept:worker_a:tests")
+        );
+
+        let acceptance_command = "# codey-accept:worker_a:tests\ncargo test -p codey --lib";
+        let mut pre_acceptance = input("PreToolUse", "contract-session");
+        pre_acceptance.tool_name = Some("Bash".to_string());
+        pre_acceptance.tool_input = Some(json!({ "command": acceptance_command }));
+        assert_eq!(handle_hook(&pre_acceptance, root).unwrap(), json!({}));
+
+        let mut post_acceptance = input("PostToolUse", "contract-session");
+        post_acceptance.tool_name = pre_acceptance.tool_name;
+        post_acceptance.tool_input = pre_acceptance.tool_input;
+        post_acceptance.tool_response = Some(json!({ "exit_code": 0, "output": "ok" }));
+        assert_eq!(handle_hook(&post_acceptance, root).unwrap(), json!({}));
+        assert_eq!(
+            handle_hook(&input("Stop", "contract-session"), root).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn runtime_gate_rejects_small_delegations_before_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut spawn = input("PreToolUse", "small-session");
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "tiny_scan",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "tiny_scan",
+                "why": "breadth",
+                "calls": 1,
+                "files": 1,
+                "dirs": 1,
+                "visual": false,
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        let denied = handle_hook(&spawn, temp.path()).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("规模阈值")
+        );
     }
 
     #[test]

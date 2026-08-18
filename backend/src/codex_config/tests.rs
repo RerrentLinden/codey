@@ -716,8 +716,28 @@ mcp_servers = { codey_fastctx = { command = "/old/codey", args = ["--codey-fastc
     assert_eq!(server["command"].as_str(), Some("/new/codey-fastctx"));
     assert_eq!(server["env"]["CUSTOM"].as_str(), Some("preserve"));
     assert_eq!(
-        server["env"]["FASTCTX_TOKEN_BUDGET"].as_str(),
-        Some(CODEY_FASTCTX_TOKEN_BUDGET)
+        server["env"]["FASTCTX_TOKEN_BUDGET"]
+            .as_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap(),
+        CODEY_FASTCTX_TOKEN_BUDGET
+    );
+    assert_eq!(
+        server["env"]["FASTCTX_GREP_TOKEN_BUDGET"]
+            .as_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap(),
+        CODEY_FASTCTX_GREP_TOKEN_BUDGET
+    );
+    assert_eq!(
+        server["env"]["FASTCTX_GLOB_TOKEN_BUDGET"]
+            .as_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap(),
+        CODEY_FASTCTX_GLOB_TOKEN_BUDGET
     );
     assert_eq!(
         fast_context_tools_status_from_document(&document),
@@ -828,11 +848,54 @@ CONCURRENT = "preserve"
         server["startup_timeout_sec"].as_integer(),
         Some(CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS)
     );
+    assert_eq!(
+        server["tool_timeout_sec"].as_integer(),
+        Some(CODEY_FASTCTX_TOOL_TIMEOUT_SECONDS)
+    );
     assert_eq!(server["runtime_note"].as_str(), Some("preserve"));
     assert_eq!(server["env"]["CONCURRENT"].as_str(), Some("preserve"));
     assert_eq!(
+        server["env"]["FASTCTX_TOKEN_BUDGET"]
+            .as_str()
+            .unwrap()
+            .parse::<usize>()
+            .unwrap(),
+        CODEY_FASTCTX_TOKEN_BUDGET
+    );
+}
+
+#[test]
+fn fast_context_tools_scale_budgets_down_for_a_smaller_user_host_limit() {
+    let result = patch_config_with_fastctx(
+        "tool_output_token_limit = 16000\n",
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        relative_model_catalog_path(),
+        None,
+        Some(Path::new("/tmp/codey-fastctx")),
+        false,
+    )
+    .unwrap();
+    let document = parse_document(&result).unwrap();
+    let server = document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]
+        .as_table()
+        .unwrap();
+
+    assert_eq!(
+        document["tool_output_token_limit"].as_integer(),
+        Some(16_000)
+    );
+    assert_eq!(
         server["env"]["FASTCTX_TOKEN_BUDGET"].as_str(),
-        Some(CODEY_FASTCTX_TOKEN_BUDGET)
+        Some("14400")
+    );
+    assert_eq!(
+        server["env"]["FASTCTX_GREP_TOKEN_BUDGET"].as_str(),
+        Some("10800")
+    );
+    assert_eq!(
+        server["env"]["FASTCTX_GLOB_TOKEN_BUDGET"].as_str(),
+        Some("5400")
     );
 }
 
@@ -1186,15 +1249,16 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
     assert_eq!(first.matches(CODEY_FASTCTX_GUIDANCE).count(), 1);
     let document = first.parse::<DocumentMut>().unwrap();
     let guidance = document["developer_instructions"].as_str().unwrap();
-    assert!(guidance.contains("tools.mcp__codey_fastctx__inspect_local_file"));
-    assert!(guidance.contains("Route local workspace tool use by task"));
-    assert!(guidance.contains("takes precedence over generic `rg`"));
+    assert!(guidance.contains("`mcp__codey_fastctx__inspect_local_file`"));
+    assert!(guidance.contains("`mcp__codey_fastctx__grep`"));
+    assert!(guidance.contains("`mcp__codey_fastctx__glob`"));
+    assert!(guidance.contains("`mcp__codey_fastctx__replace`"));
     assert!(guidance.contains("Use CodeGraph only for semantic code understanding"));
-    assert!(guidance.contains("inspect `ALL_TOOLS`"));
-    assert!(guidance.contains("drive-letter path such as `E:/repo/file.ts`"));
-    assert!(guidance.contains("FastCtx publishes only the four exact callable functions"));
-    assert!(guidance.contains("do not discover or invent a substitute server"));
-    assert!(guidance.contains("use `tool_search` to load them"));
+    assert!(guidance.contains("Batch 2-32 already-known text files"));
+    assert!(guidance.contains("Start broad searches with grep's `files_with_matches`"));
+    assert!(guidance.contains("FastCtx is a direct-only tool namespace"));
+    assert!(guidance.contains("never transparently retry a write"));
+    assert!(guidance.contains("using `tool_search` when a direct tool is deferred"));
     assert!(!guidance.contains("list_mcp_resources"));
     assert!(!guidance.contains("read_mcp_resource"));
     assert!(!guidance.contains("Write-Output"));
@@ -1208,11 +1272,11 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>(),
-        vec!["mcp__existing"]
+        vec!["mcp__existing", "mcp__codey_fastctx"]
     );
     assert_eq!(
         document["tool_output_token_limit"].as_integer(),
-        Some(10_000)
+        Some(CODEY_FASTCTX_HOST_TOKEN_LIMIT)
     );
     assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
     let route_hooks = document["hooks"]["PreToolUse"]
@@ -1228,7 +1292,7 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
 }
 
 #[test]
-fn fast_context_tools_remove_direct_only_namespace_from_inline_tables() {
+fn fast_context_tools_normalize_and_keep_direct_only_namespace_in_inline_tables() {
     for existing in [
         r#"
 features = { code_mode = { direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx"] }, user_flag = true }
@@ -1257,7 +1321,7 @@ user_flag = true
                 .iter()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>(),
-            vec!["mcp__existing"]
+            vec!["mcp__existing", "mcp__codey_fastctx"]
         );
         assert_eq!(
             document["features"]["user_flag"].as_bool(),
@@ -1412,7 +1476,7 @@ command = "echo preserve-user-hook"
     assert_eq!(post_tool_use.len(), 1);
     assert_eq!(
         post_tool_use.get(0).unwrap()["matcher"].as_str(),
-        Some(crate::subagent_gate::AGENT_STATUS_HOOK_MATCHER)
+        Some(crate::subagent_orchestrator::POST_TOOL_HOOK_MATCHER)
     );
     for event in ["SubagentStart", "SubagentStop", "Stop", "SessionEnd"] {
         assert_eq!(
@@ -1935,21 +1999,21 @@ developer_instructions = {}
             .unwrap();
     for guidance in [temporary_root_guidance, temporary_subagent_guidance] {
         assert!(guidance.contains(CODEY_FASTCTX_GUIDANCE));
-        assert!(guidance.contains("takes precedence over generic `rg`"));
+        assert!(guidance.contains("Batch 2-32 already-known text files"));
         assert!(guidance.contains("Use CodeGraph only for semantic code understanding"));
-        assert!(guidance.contains("inspect `ALL_TOOLS`"));
-        assert!(guidance.contains("FastCtx publishes only the four exact callable functions"));
-        assert!(guidance.contains("use `tool_search` to load them"));
+        assert!(guidance.contains("a direct-only tool namespace"));
+        assert!(guidance.contains("using `tool_search`"));
+        assert!(!guidance.contains("inspect `ALL_TOOLS`"));
         assert!(!guidance.contains("list_mcp_resources"));
         assert!(!guidance.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
     }
     let temporary_default = fs::read_to_string(home.join("agents/default.toml")).unwrap();
     assert!(temporary_default.contains(CODEY_FASTCTX_GUIDANCE));
-    assert!(temporary_default.contains("takes precedence over generic `rg`"));
+    assert!(temporary_default.contains("Batch 2-32 already-known text files"));
     assert!(temporary_default.contains("Use CodeGraph only for semantic code understanding"));
-    assert!(temporary_default.contains("inspect `ALL_TOOLS`"));
-    assert!(temporary_default.contains("FastCtx publishes only the four exact callable functions"));
-    assert!(temporary_default.contains("use `tool_search` to load them"));
+    assert!(temporary_default.contains("a direct-only tool namespace"));
+    assert!(temporary_default.contains("using `tool_search`"));
+    assert!(!temporary_default.contains("inspect `ALL_TOOLS`"));
     assert!(!temporary_default.contains("list_mcp_resources"));
     assert!(!temporary_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
 
@@ -2998,7 +3062,7 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx"]
     assert!(
         applied_namespaces
             .iter()
-            .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE))
+            .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
     );
     assert!(
         applied_namespaces
@@ -3837,6 +3901,8 @@ wire_api = "responses"
         "mcp_servers.codey_fastctx.startup_timeout_sec",
         "mcp_servers.codey_fastctx.tool_timeout_sec",
         "mcp_servers.codey_fastctx.env.FASTCTX_TOKEN_BUDGET",
+        "mcp_servers.codey_fastctx.env.FASTCTX_GREP_TOKEN_BUDGET",
+        "mcp_servers.codey_fastctx.env.FASTCTX_GLOB_TOKEN_BUDGET",
         "tool_output_token_limit",
         "agents.enabled",
         "agents.max_concurrent_threads_per_session",
@@ -3932,7 +3998,7 @@ wire_api = "responses"
     }
     assert_eq!(
         hooks["hooks"]["PostToolUse"][0]["matcher"].as_str(),
-        Some(crate::subagent_gate::AGENT_STATUS_HOOK_MATCHER)
+        Some(crate::subagent_orchestrator::POST_TOOL_HOOK_MATCHER)
     );
     let constraints_dir = state_dir.join(CODEY_CONSTRAINTS_DIR);
     assert_eq!(

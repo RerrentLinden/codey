@@ -233,10 +233,9 @@ fn route_for_command(command: &str) -> Option<FastctxRoute> {
         return None;
     }
     let segments = split_shell_segments(command)?;
-    let compound = segments.len() > 1;
     let mut route = None;
     for segment in segments {
-        match classify_segment(&segment, compound) {
+        match classify_segment(&segment) {
             SegmentClass::Unknown => return None,
             SegmentClass::Harmless => {}
             SegmentClass::Routed(candidate) => {
@@ -329,7 +328,7 @@ fn push_segment(segments: &mut Vec<String>, current: &mut String) {
     current.clear();
 }
 
-fn classify_segment(segment: &str, compound: bool) -> SegmentClass {
+fn classify_segment(segment: &str) -> SegmentClass {
     let Some(words) = shell_words(segment) else {
         return SegmentClass::Unknown;
     };
@@ -354,32 +353,8 @@ fn classify_segment(segment: &str, compound: bool) -> SegmentClass {
         "rg" | "ripgrep" if safe_ripgrep(&args) && !args.is_empty() => {
             SegmentClass::Routed(FastctxRoute::Search)
         }
-        "grep" | "egrep" | "fgrep" | "findstr" | "select-string" | "sls"
-            if args.len() >= 2 || compound && !args.is_empty() =>
-        {
-            SegmentClass::Routed(FastctxRoute::Search)
-        }
-        "cat" | "bat" | "batcat" | "get-content" | "gc" if has_file_operand(&args) => {
+        "cat" | "get-content" | "gc" if simple_file_inspection(&command, &args) => {
             SegmentClass::Routed(FastctxRoute::Inspect)
-        }
-        "cat" | "bat" | "batcat" | "get-content" | "gc" if !args.is_empty() => {
-            SegmentClass::Harmless
-        }
-        "head" | "tail" | "nl" | "wc" if has_file_operand(&args) => {
-            SegmentClass::Routed(FastctxRoute::Inspect)
-        }
-        "head" | "tail" | "nl" | "wc" if !args.is_empty() => SegmentClass::Harmless,
-        "sed" if safe_read_only_sed(&args) => SegmentClass::Routed(FastctxRoute::Inspect),
-        "sed" if safe_stdin_sed(&args) => SegmentClass::Harmless,
-        "find" if safe_file_find(&args) => SegmentClass::Routed(FastctxRoute::Discover),
-        "fd" | "fdfind" if requests_files_only(&args) => {
-            SegmentClass::Routed(FastctxRoute::Discover)
-        }
-        "get-childitem" | "gci" if args.contains(&"-file") => {
-            SegmentClass::Routed(FastctxRoute::Discover)
-        }
-        "ls" if !args.iter().any(|argument| argument.starts_with("--dired")) => {
-            SegmentClass::Routed(FastctxRoute::Discover)
         }
         _ => SegmentClass::Unknown,
     }
@@ -493,68 +468,71 @@ fn has_file_operand(arguments: &[&str]) -> bool {
         .any(|argument| argument.contains(['/', '\\']) || argument.contains('.'))
 }
 
-fn safe_read_only_sed(arguments: &[&str]) -> bool {
-    safe_stdin_sed(arguments) && arguments.len() >= 3 && has_file_operand(arguments)
+fn simple_file_inspection(command: &str, arguments: &[&str]) -> bool {
+    has_file_operand(arguments)
+        && arguments
+            .iter()
+            .all(|argument| !argument.starts_with('-') || command == "cat" && *argument == "--")
 }
 
 fn safe_ripgrep(arguments: &[&str]) -> bool {
     !arguments.iter().any(|argument| {
-        matches!(*argument, "-r" | "--replace" | "--pre" | "--pre-glob")
-            || argument.starts_with("--replace=")
+        matches!(
+            *argument,
+            "-r" | "--replace"
+                | "--pre"
+                | "--pre-glob"
+                | "-p"
+                | "--pcre2"
+                | "-u"
+                | "-uu"
+                | "-uuu"
+                | "--unrestricted"
+                | "--no-ignore"
+                | "--no-ignore-vcs"
+                | "--no-ignore-parent"
+                | "--no-ignore-global"
+                | "--hidden"
+                | "--follow"
+                | "-a"
+                | "--text"
+                | "--binary"
+                | "-z"
+                | "--search-zip"
+                | "--json"
+                | "--vimgrep"
+                | "--pretty"
+                | "--stats"
+                | "--debug"
+                | "--trace"
+                | "-f"
+                | "--fixed-strings"
+                | "-v"
+                | "--invert-match"
+                | "-c"
+                | "--count"
+                | "--count-matches"
+                | "--column"
+                | "--byte-offset"
+                | "--passthru"
+                | "--files-without-match"
+                | "--type-list"
+                | "--engine"
+                | "--encoding"
+                | "--sort"
+                | "--sortr"
+                | "--max-count"
+                | "--max-filesize"
+        ) || argument.starts_with("--replace=")
             || argument.starts_with("--pre=")
+            || argument.starts_with("--pre-glob=")
+            || argument.starts_with("--engine=")
+            || argument.starts_with("--encoding=")
+            || argument.starts_with("--sort=")
+            || argument.starts_with("--sortr=")
+            || argument.starts_with("--max-count=")
+            || argument.starts_with("--max-filesize=")
     })
-}
-
-fn safe_stdin_sed(arguments: &[&str]) -> bool {
-    arguments.contains(&"-n")
-        && !arguments
-            .iter()
-            .any(|argument| *argument == "-i" || argument.starts_with("--in-place"))
-        && arguments.len() >= 2
-}
-
-fn safe_file_find(arguments: &[&str]) -> bool {
-    if arguments.iter().any(|argument| {
-        matches!(
-            *argument,
-            "-delete"
-                | "-exec"
-                | "-execdir"
-                | "-ok"
-                | "-okdir"
-                | "-fls"
-                | "-fprint"
-                | "-fprint0"
-                | "-fprintf"
-                | "-printf"
-                | "-ls"
-        )
-    }) {
-        return false;
-    }
-    arguments
-        .windows(2)
-        .any(|pair| pair[0] == "-type" && pair[1] == "f")
-}
-
-fn requests_files_only(arguments: &[&str]) -> bool {
-    if arguments.iter().any(|argument| {
-        matches!(*argument, "-x" | "-X" | "--exec" | "--exec-batch")
-            || argument.starts_with("--exec=")
-            || argument.starts_with("--exec-batch=")
-    }) {
-        return false;
-    }
-    arguments.iter().any(|argument| {
-        matches!(
-            *argument,
-            "-tf" | "--type=f" | "--type=file" | "--type" | "-t"
-        )
-    }) && (arguments.contains(&"f")
-        || arguments.contains(&"file")
-        || arguments.contains(&"-tf")
-        || arguments.contains(&"--type=f")
-        || arguments.contains(&"--type=file"))
 }
 
 #[cfg(test)]
@@ -584,19 +562,13 @@ mod tests {
     }
 
     #[test]
-    fn routes_common_posix_and_windows_file_commands() {
+    fn routes_only_semantically_portable_file_commands() {
         for (command, expected) in [
             ("rg -n needle src", FastctxRoute::Search),
             ("/usr/bin/rg --files", FastctxRoute::Discover),
             ("cat src/main.rs", FastctxRoute::Inspect),
-            ("nl -ba src/main.rs | sed -n '1,80p'", FastctxRoute::Inspect),
             ("cd C:\\repo && rg --files", FastctxRoute::Discover),
             ("Get-Content .\\src\\main.rs", FastctxRoute::Inspect),
-            (
-                "Get-ChildItem -Recurse -File | Select-String needle",
-                FastctxRoute::Search,
-            ),
-            ("find . -type f -name '*.rs'", FastctxRoute::Discover),
         ] {
             assert_eq!(route_for_command(command), Some(expected), "{command}");
         }
@@ -617,6 +589,22 @@ mod tests {
             "cat input.txt > output.txt",
             "rg needle src && cargo test",
             "powershell -Command Get-Content file.rs",
+            "nl -ba src/main.rs | sed -n '1,80p'",
+            "Get-ChildItem -Recurse -File | Select-String needle",
+            "find . -type f -name '*.rs'",
+            "fd -t f",
+            "ls -la src",
+            "tail -f app.log",
+            "wc -l src/main.rs",
+            "grep -n needle src/main.rs",
+            "bat src/main.rs",
+            "cat -n src/main.rs",
+            "Get-Content -Raw .\\src\\main.rs",
+            "rg -P '(?=needle)' src",
+            "rg -uu needle src",
+            "rg --no-ignore needle src",
+            "rg --encoding=shift_jis needle src",
+            "rg --count needle src",
         ] {
             assert_eq!(route_for_command(command), None, "{command}");
         }

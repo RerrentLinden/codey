@@ -4,8 +4,10 @@ use anyhow::Result;
 use toml_edit::{Array, DocumentMut, Item, Table, TableLike, Value, value};
 
 use super::{
-    CODEY_FASTCTX_ARG_MARKER, CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID,
-    CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS, CODEY_FASTCTX_TOKEN_BUDGET, FastContextToolsStatus,
+    CODEY_FASTCTX_ARG_MARKER, CODEY_FASTCTX_GLOB_TOKEN_BUDGET, CODEY_FASTCTX_GREP_TOKEN_BUDGET,
+    CODEY_FASTCTX_HOST_TOKEN_LIMIT, CODEY_FASTCTX_NAMESPACE, CODEY_FASTCTX_SERVER_ID,
+    CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS, CODEY_FASTCTX_TOKEN_BUDGET,
+    CODEY_FASTCTX_TOOL_TIMEOUT_SECONDS, FastContextToolsStatus, ensure_child_table,
     ensure_root_table, fastctx_table_server_is_codey_owned,
 };
 use crate::codex_config_guidance::{
@@ -21,6 +23,7 @@ pub(super) fn enable_fast_context_tools(
         disable_fast_context_tools(doc);
         return Ok(None);
     }
+    let budgets = output_budgets(doc);
 
     let mcp_servers = ensure_mcp_servers_table(doc)?;
     let server_table = if codey_owned_server {
@@ -43,25 +46,49 @@ pub(super) fn enable_fast_context_tools(
     args.push(CODEY_FASTCTX_ARG_MARKER);
     server["args"] = Item::Value(toml_edit::Value::Array(args));
     server["startup_timeout_sec"] = value(CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS);
-    server["tool_timeout_sec"] = value(120);
+    server["tool_timeout_sec"] = value(CODEY_FASTCTX_TOOL_TIMEOUT_SECONDS);
     let mut env = server
         .get("env")
         .and_then(item_table_clone)
         .unwrap_or_default();
-    env["FASTCTX_TOKEN_BUDGET"] = value(CODEY_FASTCTX_TOKEN_BUDGET);
+    env["FASTCTX_TOKEN_BUDGET"] = value(budgets.global.to_string());
+    env["FASTCTX_GREP_TOKEN_BUDGET"] = value(budgets.grep.to_string());
+    env["FASTCTX_GLOB_TOKEN_BUDGET"] = value(budgets.glob.to_string());
     server["env"] = Item::Table(env);
 
-    // Direct-only namespaces disappear from the nested `tools` object used by
-    // code mode. FastCtx must be available there as well as through direct
-    // calls, otherwise code-mode turns fall back to Codex's generic MCP
-    // Resources helpers and can pass the tool namespace as an invalid server id.
-    remove_direct_only_tool_namespace(doc, CODEY_FASTCTX_NAMESPACE);
-
-    if doc.get("tool_output_token_limit").is_none() {
-        doc["tool_output_token_limit"] = value(10_000);
-    }
+    // FastCtx reserves a terminal Complete/Partial line. Keeping it direct-only
+    // prevents code-mode aggregation from truncating that continuation contract.
+    ensure_direct_only_tool_namespace(doc, CODEY_FASTCTX_NAMESPACE)?;
     apply_fastctx_guidance(doc, CODEY_FASTCTX_NAMESPACE)?;
     Ok(Some(CODEY_FASTCTX_NAMESPACE.to_string()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OutputBudgets {
+    global: usize,
+    grep: usize,
+    glob: usize,
+}
+
+fn output_budgets(doc: &mut DocumentMut) -> OutputBudgets {
+    let host_limit = doc
+        .get("tool_output_token_limit")
+        .and_then(Item::as_integer)
+        .and_then(|limit| usize::try_from(limit).ok())
+        .filter(|limit| *limit > 0)
+        .unwrap_or_else(|| {
+            doc["tool_output_token_limit"] = value(CODEY_FASTCTX_HOST_TOKEN_LIMIT);
+            CODEY_FASTCTX_HOST_TOKEN_LIMIT as usize
+        });
+    let global = host_limit
+        .saturating_mul(9)
+        .saturating_div(10)
+        .clamp(1, CODEY_FASTCTX_TOKEN_BUDGET);
+    OutputBudgets {
+        global,
+        grep: global.min(CODEY_FASTCTX_GREP_TOKEN_BUDGET),
+        glob: global.min(CODEY_FASTCTX_GLOB_TOKEN_BUDGET),
+    }
 }
 
 fn apply_fastctx_guidance(doc: &mut DocumentMut, namespace: &str) -> Result<()> {
@@ -164,6 +191,57 @@ fn remove_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> 
     let original_len = namespaces.len();
     namespaces.retain(|entry| entry.as_str() != Some(namespace));
     namespaces.len() != original_len
+}
+
+fn ensure_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> Result<()> {
+    if matches!(
+        doc.get("features"),
+        Some(Item::Value(Value::InlineTable(_)))
+    ) {
+        let normalized = item_table_clone(doc.get("features").expect("checked features item"))
+            .expect("inline features can be normalized");
+        doc.as_table_mut()
+            .insert("features", Item::Table(normalized));
+    }
+    let features = ensure_root_table(doc, "features")?;
+    if matches!(
+        features.get("code_mode"),
+        Some(Item::Value(Value::InlineTable(_)))
+    ) {
+        let normalized =
+            item_table_clone(features.get("code_mode").expect("checked code_mode item"))
+                .expect("inline code_mode can be normalized");
+        features.insert("code_mode", Item::Table(normalized));
+    }
+    let code_mode = ensure_child_table(features, "code_mode")?;
+    if code_mode.get("direct_only_tool_namespaces").is_none() {
+        code_mode.insert(
+            "direct_only_tool_namespaces",
+            Item::Value(Value::Array(Array::new())),
+        );
+    }
+    let namespaces = code_mode
+        .get_mut("direct_only_tool_namespaces")
+        .and_then(Item::as_array_mut)
+        .ok_or_else(|| {
+            anyhow::anyhow!("features.code_mode.direct_only_tool_namespaces 必须是 TOML array")
+        })?;
+    let mut kept = false;
+    namespaces.retain(|entry| {
+        if entry.as_str() != Some(namespace) {
+            return true;
+        }
+        if kept {
+            false
+        } else {
+            kept = true;
+            true
+        }
+    });
+    if !kept {
+        namespaces.push(namespace);
+    }
+    Ok(())
 }
 
 pub(super) fn direct_only_tool_namespaces(doc: &DocumentMut) -> Option<&Array> {

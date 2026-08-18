@@ -84,8 +84,14 @@ pub(super) fn restore_legacy_owned_config_changes(
             &["command", "args", "startup_timeout_sec", "tool_timeout_sec"],
         );
         if let Some(environment) = server.get("env").and_then(Item::as_table) {
-            let applied_environment =
-                table_with_selected_fields(environment, &["FASTCTX_TOKEN_BUDGET"]);
+            let applied_environment = table_with_selected_fields(
+                environment,
+                &[
+                    "FASTCTX_TOKEN_BUDGET",
+                    "FASTCTX_GREP_TOKEN_BUDGET",
+                    "FASTCTX_GLOB_TOKEN_BUDGET",
+                ],
+            );
             if !applied_environment.is_empty() {
                 applied_server.insert("env", Item::Table(applied_environment));
             }
@@ -121,7 +127,7 @@ pub(super) fn restore_legacy_owned_config_changes(
         && current_document
             .get("tool_output_token_limit")
             .and_then(Item::as_integer)
-            == Some(10_000)
+            .is_some_and(|limit| matches!(limit, 10_000 | CODEY_FASTCTX_HOST_TOKEN_LIMIT))
         && let Some(item) = current_document.get("tool_output_token_limit")
     {
         applied_document

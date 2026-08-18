@@ -120,9 +120,10 @@ test("per-task subagent files are composed at startup and hot-refreshed after sa
   assert.doesNotMatch(vendorRendererSource, /patchAppServerSubagentRequestParams/);
 });
 
-test("subagent optimization installs root waiting and nested-spawn runtime gates", async () => {
-  const [gateSource, configSource, mainSource] = await Promise.all([
+test("subagent optimization installs recoverable orchestration and runtime gates", async () => {
+  const [gateSource, orchestratorSource, configSource, mainSource] = await Promise.all([
     readFile(new URL("backend/src/subagent_gate.rs", root), "utf8"),
+    readFile(new URL("backend/src/subagent_orchestrator.rs", root), "utf8"),
     readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
     readFile(new URL("backend/src/main.rs", root), "utf8"),
   ]);
@@ -140,12 +141,9 @@ test("subagent optimization installs root waiting and nested-spawn runtime gates
   assert.match(configSource, /toml_event: "PostToolUse"/);
   assert.match(
     configSource,
-    /matcher: Some\(crate::subagent_gate::AGENT_STATUS_HOOK_MATCHER\)/,
+    /matcher: Some\(crate::subagent_orchestrator::POST_TOOL_HOOK_MATCHER\)/,
   );
-  assert.match(
-    gateSource,
-    /AGENT_STATUS_HOOK_MATCHER: &str =\s*"\.\*\(wait_agent\|list_agents\)\$\|\^functions\(__\|\[\.\/:_\]\)wait\$"/,
-  );
+  assert.match(orchestratorSource, /spawn_agent\|wait_agent\|list_agents\|exec_command/);
   assert.match(configSource, /toml_event: "SubagentStart"/);
   assert.match(configSource, /toml_event: "SubagentStop"/);
   assert.match(configSource, /toml_event: "Stop"/);
@@ -165,4 +163,12 @@ test("subagent optimization installs root waiting and nested-spawn runtime gates
   assert.match(gateSource, /active_agent_count_or_recover_corrupt_state/);
   assert.match(gateSource, /协作工具返回内容已截断/);
   assert.match(gateSource, /SubagentStop/);
+  assert.match(gateSource, /subagent_orchestrator::pre_spawn/);
+  assert.match(gateSource, /subagent_orchestrator::authorize_child_tool/);
+  assert.match(gateSource, /subagent_orchestrator::pending_acceptance_reason/);
+  assert.match(orchestratorSource, /CODEY_DELEGATION_V1=/);
+  assert.match(orchestratorSource, /struct SessionLedger/);
+  assert.match(orchestratorSource, /lock_exclusive/);
+  assert.match(orchestratorSource, /resource_conflict/);
+  assert.match(orchestratorSource, /response_reports_successful_exit/);
 });

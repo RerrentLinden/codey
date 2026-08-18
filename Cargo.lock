@@ -820,7 +820,7 @@ checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
 [[package]]
 name = "fastctx"
 version = "0.2.5"
-source = "git+https://github.com/yc-duan/fastctx?rev=774704a0173397dfcde46d3276be18bb278fedc3#774704a0173397dfcde46d3276be18bb278fedc3"
+source = "git+https://github.com/yc-duan/fastctx?rev=e9b80dd8d6ed8ce080ce8e3db3828cf9d90fea6f#e9b80dd8d6ed8ce080ce8e3db3828cf9d90fea6f"
 dependencies = [
  "base64",
  "bpe-openai",

@@ -7,6 +7,60 @@ use crate::config::{
 use crate::model_catalog;
 use crate::model_id;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RoleAccess {
+    ReadOnly,
+    Write,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RolePolicy {
+    pub access: RoleAccess,
+    pub visual: bool,
+    pub cost_points: u8,
+}
+
+pub(crate) fn role_policy(role: &str) -> Option<RolePolicy> {
+    use crate::config::{
+        SUBAGENT_ROLE_DEEP_RESEARCH, SUBAGENT_ROLE_QUICK_SCAN, SUBAGENT_ROLE_VISUAL_ANALYSIS,
+        SUBAGENT_ROLE_VISUAL_WORKER, SUBAGENT_ROLE_WORKER,
+    };
+
+    match role {
+        SUBAGENT_ROLE_QUICK_SCAN => Some(RolePolicy {
+            access: RoleAccess::ReadOnly,
+            visual: false,
+            cost_points: 1,
+        }),
+        SUBAGENT_ROLE_DEEP_RESEARCH => Some(RolePolicy {
+            access: RoleAccess::ReadOnly,
+            visual: false,
+            cost_points: 2,
+        }),
+        SUBAGENT_ROLE_VISUAL_ANALYSIS => Some(RolePolicy {
+            access: RoleAccess::ReadOnly,
+            visual: true,
+            cost_points: 2,
+        }),
+        SUBAGENT_ROLE_WORKER => Some(RolePolicy {
+            access: RoleAccess::Write,
+            visual: false,
+            cost_points: 3,
+        }),
+        SUBAGENT_ROLE_VISUAL_WORKER => Some(RolePolicy {
+            access: RoleAccess::Write,
+            visual: true,
+            cost_points: 3,
+        }),
+        SUBAGENT_ROLE_DEFAULT => Some(RolePolicy {
+            access: RoleAccess::ReadOnly,
+            visual: false,
+            cost_points: 1,
+        }),
+        _ => None,
+    }
+}
+
 pub(crate) fn reconcile_for_current_provider(
     config: &mut CodeyConfig,
     codex_home: &Path,
@@ -139,6 +193,35 @@ pub(crate) fn reasoning_effort_for_model(
 mod tests {
     use super::*;
     use crate::config::ProviderProfile;
+
+    #[test]
+    fn role_policies_keep_cost_and_capabilities_small_and_explicit() {
+        assert_eq!(
+            role_policy(crate::config::SUBAGENT_ROLE_QUICK_SCAN),
+            Some(RolePolicy {
+                access: RoleAccess::ReadOnly,
+                visual: false,
+                cost_points: 1,
+            })
+        );
+        assert_eq!(
+            role_policy(crate::config::SUBAGENT_ROLE_WORKER),
+            Some(RolePolicy {
+                access: RoleAccess::Write,
+                visual: false,
+                cost_points: 3,
+            })
+        );
+        assert_eq!(
+            role_policy(crate::config::SUBAGENT_ROLE_VISUAL_WORKER),
+            Some(RolePolicy {
+                access: RoleAccess::Write,
+                visual: true,
+                cost_points: 3,
+            })
+        );
+        assert_eq!(role_policy("unknown"), None);
+    }
 
     fn model_state() -> model_catalog::ModelSelectionState {
         model_catalog::ModelSelectionState {

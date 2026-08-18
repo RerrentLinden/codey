@@ -148,7 +148,7 @@ pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V4: &str = r#"## 子代理使用
 - 本轮计划的子代理全部派发后，在继续非协作分析、命令或修改前进入等待。等待返回 `MESSAGE` 或其他局部更新时，只可使用 `agents.*` 协作工具做必要的查看、转向或停止，然后继续等待；所有已派发子代理完成前不得恢复本地工作或结束任务。子代理累计运行 10 分钟仍未完成时，检查状态并终止异常任务，必要时拆成更小任务重新派发。
 "#;
 
-pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V5: &str = r#"## 子代理使用
 
 子代理用于隔离宽而重的上下文、并行处理真正独立的工作，或取得有价值的独立证据。默认由主代理直接处理；只有预计收益明确高于派发、等待和复核成本时才使用子代理。不要为了形式上的分工而派生。
 
@@ -199,8 +199,53 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 用户新输入导致等待中断时，将原批次视为可能过时：先中断仍活动的代理并完成对账，忽略迟到的旧结果，再按新请求决定是否继续。协作工具不可用时不要循环调用不存在的工具，等待 Codey 的有界遗留状态恢复。
 "#;
 
+pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+
+子代理用于隔离宽而重的上下文、并行处理真正独立的工作，或取得有价值的独立证据。默认由主代理直接处理；只有预计收益明确高于派发、等待和复核成本时才使用子代理。不要为了形式上的分工而派生。
+
+### 自适应委派
+
+以下任务直接处理，不派子代理：
+
+- 回答、解释、状态汇报、单一事实或一次精确查询；
+- 用户已经给出文件、符号或确切代码位置，预计只涉及不超过 2 个小文件和 3 次本地工具调用；
+- 即将修改的确切代码、奠基性文档，以及步骤彼此依赖、无法真正并行的任务；
+- 派发、等待和抽查成本不明显低于直接处理的任务。
+
+仅在任务不命中上述例外，且符合以下至少一种理由时派生：`multi_lookup` 表示快速定位至少需要 3 次独立检索；`parallel` 表示至少 2 个互不依赖的分支、每支至少 3 次实质调用且合计至少 7 次；`breadth` 表示需要归纳至少 2 个目录或 5 个候选文件；`context` 表示大量日志、文档或页面会明显污染主线程；`independent_work` 表示不在主代理关键路径上的独立实现预计至少 6 次调用；`high_risk` 表示高风险结论缺少确定性检查；`user_requested` 仅在用户明确要求子代理或大规模并行时使用。不确定时直接处理。
+
+默认最多派生 2 个子代理。超过 2 个还必须有 3 个以上真正独立的分支，或用户明确要求大规模并行；不要用 verifier 重复已有确定性测试。每轮采用可恢复成本点预算：快速定位和 `default` 为 1 点，深度/视觉分析为 2 点，写入角色为 3 点；普通上限 8 点，明确的大批并行最高 12 点。该账本衡量派生尝试、角色成本和时限，不冒充上游未提供的精确 token 或费用。
+
+### 任务类型与运行时契约
+
+派生时按任务性质显式选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 只作为旧配置兼容兜底，主代理不得主动选择。只读角色不能声明写入；视觉角色必须声明视觉需求；写入角色必须给出互斥的路径 ownership 和机械验收命令。角色沙箱只是默认工作方式，实际权限仍受父任务约束。
+
+每个 `agents.spawn_agent` 必须使用 `fork_turns="none"`，`task_name` 使用小写字母、数字或下划线，并把一行紧凑 JSON 作为 message 的最后一个非空行：
+
+`CODEY_DELEGATION_V1={"id":"task_name","why":"breadth","calls":4,"files":5,"dirs":2,"visual":false,"read":[],"write":[],"checks":[]}`
+
+`id` 必须等于 `task_name`；按实际理由填写 `branch_calls`、`large` 或 `risk`。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径。只声明本任务确实会使用的稳定路径；读取可以留空，写入角色的 `write` 不得为空。写入角色还必须提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。运行时会在派生前校验规模、角色能力、预算以及 read/write 父子路径冲突；重复任务 ID、越权写入和重叠 ownership 会被拒绝。
+
+### 任务胶囊与验收
+
+- 派发消息只携带完成子任务必需的目标、范围、允许操作、ownership 和输出契约，不复制整段对话。
+- 子代理首行必须是 `status: completed | partial | blocked`，只返回会影响决策的结论、最多 5 条关键证据和明确 gaps；关键证据包含 `file:line`、符号名或可复核链接。
+- 子代理结果只是压缩线索。主代理沿出处抽查；即将修改的确切代码和奠基性文档仍由主代理完整读取。
+- 写入型子代理的自报测试结果不算机械验收。所有子代理进入终态后，主代理必须按 Stop 门禁给出的 `# codey-accept:<task>:<check>` 标记逐字重跑契约命令；只有结构化 `exit_code = 0` 才清偿验收债。失败后修复并重跑，不能改写命令绕过。视觉质量仍需主代理查看实际渲染证据。
+- 多代理证据冲突时比较出处，不按多数票决定；只有高风险且无法确定性验证时才追加独立核验线。
+
+### 汇合、异常与接管
+
+- 同一批独立任务先全部派发，再进入等待；有活动子代理时只使用 `agents.*` 协调，直至每个代理进入终态。
+- 每个子代理只用一轮，不复用、不追派，也不得继续派生。失败后默认由主代理接管；只有缩小或改变范围后仍满足委派阈值，才允许使用新任务 ID 最多重派一次。
+- `MESSAGE` 或不完整结果只保存证据并继续等待。`completed`、`errored`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`running`、`pending_init` 和 `interrupted` 不是终态。
+- `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态则只中断一次并继续等待。禁止无限 wait、无限重试或静默重派。
+- 用户新输入使旧批次失效时，先中断活动代理并完成对账，忽略迟到结果。预算账本和未清偿验收债按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
+"#;
+
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     SUBAGENT_GUIDANCE,
+    PREVIOUS_SUBAGENT_GUIDANCE_V5,
     PREVIOUS_SUBAGENT_GUIDANCE_V4,
     PREVIOUS_SUBAGENT_GUIDANCE_V3,
     PREVIOUS_SUBAGENT_GUIDANCE_V2,
@@ -404,7 +449,28 @@ pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
     }
 }
 
-pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled. Route local \
+pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled as direct \
+tools. Route local workspace work by task: use `mcp__codey_fastctx__inspect_local_file` for focused \
+inspection, `mcp__codey_fastctx__grep` for content search, `mcp__codey_fastctx__glob` for path \
+discovery, and `mcp__codey_fastctx__replace` only for deterministic mechanical replacement. Batch \
+2-32 already-known text files or ranges into one `inspect_local_file(files=[...])` call; for large \
+files request only the needed ranges. Pass plain absolute filesystem paths, converting URI-shaped \
+local references and Windows paths to a drive-letter path such as `E:/repo/file.ts`. Start broad \
+searches with grep's `files_with_matches`, then use \
+`content` with the smallest useful context and result limit; use `summary` or `count` only when totals \
+are the requested result. Use glob with `filter_mode=project` and stable path sorting unless ignored \
+files or modification order are explicitly required. Run replace as dry-run first, set \
+`max_replacements`, then inspect or grep the result and run relevant tests; never transparently retry \
+a write after transport failure. Follow every Complete or Partial continuation exactly and do not \
+speculatively request later pages in parallel. FastCtx is a direct-only tool namespace, not an MCP \
+Resources server and not a code-mode aggregate; call the tools directly, using `tool_search` when a \
+direct tool is deferred. Use terminal commands for builds, tests, Git, package managers, metadata or \
+streaming operations, advanced shell semantics, or after the applicable FastCtx tool is unavailable \
+or fails. Use CodeGraph only for semantic code understanding such as symbols, callers, callees, and \
+call paths. Every tool call must advance the requested task; put progress and corrections in \
+commentary.";
+
+pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE_V7: &str = "Codey FastCtx context tools are enabled. Route local \
 workspace tool use by task: use `mcp__codey_fastctx__inspect_local_file` for file inspection, \
 `mcp__codey_fastctx__grep` for content search, `mcp__codey_fastctx__glob` for file discovery, and \
 `mcp__codey_fastctx__replace` for deterministic replacement. This FastCtx route takes precedence over \
@@ -536,6 +602,7 @@ follow every Complete or Partial pagination note exactly.";
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     CODEY_FASTCTX_GUIDANCE,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V7,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V6,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4,
@@ -757,42 +824,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fastctx_guidance_routes_uri_shaped_local_files_through_the_inspection_tool() {
+    fn fastctx_guidance_encodes_the_direct_and_cost_efficient_tool_contract() {
         assert_eq!(
             codey_fastctx_guidance_for_namespace("mcp__codey_fastctx"),
             CODEY_FASTCTX_GUIDANCE
         );
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("Route local workspace tool use by task"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains(
-            "This FastCtx route takes precedence over generic `rg`, `grep`, `find`, `sed`, or shell-first guidance"
-        ));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("enabled as direct tools"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Batch 2-32 already-known text files"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("grep's `files_with_matches`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("`filter_mode=project`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Run replace as dry-run first"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("never transparently retry a write"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Complete or Partial continuation"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains(
             "Use CodeGraph only for semantic code understanding such as symbols, callers, callees, and call paths"
         ));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains(
-            "CodeGraph does not replace FastCtx for ordinary file inspection, content search, or file discovery"
-        ));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("Call the tools directly when visible"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("tools.mcp__codey_fastctx__inspect_local_file"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("Inside a code-mode program"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("inspect `ALL_TOOLS`"));
-        assert!(
-            CODEY_FASTCTX_GUIDANCE
-                .contains("do not fall back to shell before trying the applicable discovery route")
-        );
-        assert!(!CODEY_FASTCTX_GUIDANCE.contains("reused FastCtx server"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("including when a local reference is URI-shaped"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("equivalent plain absolute filesystem path"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("call the tools directly"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("a direct-only tool namespace"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("using `tool_search`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("URI-shaped local references"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("plain absolute filesystem paths"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("drive-letter path such as `E:/repo/file.ts`"));
-        assert!(
-            CODEY_FASTCTX_GUIDANCE
-                .contains("FastCtx publishes only the four exact callable functions listed above")
-        );
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("use `tool_search` to load them"));
-        assert!(
-            CODEY_FASTCTX_GUIDANCE
-                .contains("do not discover or invent a substitute server for local workspace work")
-        );
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("inspect `ALL_TOOLS`"));
+        assert!(!CODEY_FASTCTX_GUIDANCE.contains("functions.exec"));
         for resource_helper in [
             "list_mcp_resources",
             "list_mcp_resource_templates",
@@ -812,15 +866,15 @@ mod tests {
     fn default_agent_config_can_include_the_fastctx_namespace_guidance() {
         let config = default_agent_config_with_fastctx_guidance(Some("mcp__fastctx"));
 
-        assert!(config.contains("tools.mcp__fastctx__inspect_local_file"));
-        assert!(config.contains("Route local workspace tool use by task"));
-        assert!(config.contains("takes precedence over generic `rg`"));
+        assert!(config.contains("`mcp__fastctx__inspect_local_file`"));
+        assert!(config.contains("`mcp__fastctx__grep`"));
+        assert!(config.contains("`mcp__fastctx__glob`"));
+        assert!(config.contains("`mcp__fastctx__replace`"));
+        assert!(config.contains("Batch 2-32 already-known text files"));
         assert!(config.contains("Use CodeGraph only for semantic code understanding"));
-        assert!(config.contains("inspect `ALL_TOOLS`"));
-        assert!(config.contains("Call the tools directly when visible"));
-        assert!(config.contains("FastCtx publishes only the four exact callable functions"));
-        assert!(config.contains("use `tool_search` to load them"));
-        assert!(config.contains("do not discover or invent a substitute server"));
+        assert!(config.contains("a direct-only tool namespace"));
+        assert!(config.contains("using `tool_search`"));
+        assert!(!config.contains("inspect `ALL_TOOLS`"));
         assert!(!config.contains("list_mcp_resources"));
         assert!(!config.contains("read_mcp_resource"));
         assert!(config.contains("put progress and corrections in commentary"));
@@ -910,6 +964,7 @@ mod tests {
     #[test]
     fn subagent_guidance_migrates_the_previous_owned_block() {
         for previous in [
+            PREVIOUS_SUBAGENT_GUIDANCE_V5,
             PREVIOUS_SUBAGENT_GUIDANCE_V4,
             PREVIOUS_SUBAGENT_GUIDANCE_V3,
             PREVIOUS_SUBAGENT_GUIDANCE_V2,
@@ -934,17 +989,21 @@ mod tests {
     fn subagent_guidance_prefers_direct_work_until_delegation_has_clear_value() {
         assert!(SUBAGENT_GUIDANCE.contains("默认由主代理直接处理"));
         assert!(SUBAGENT_GUIDANCE.contains("不超过 2 个小文件和 3 次本地工具调用"));
-        assert!(SUBAGENT_GUIDANCE.contains("至少有 2 个互不依赖的分支"));
-        assert!(SUBAGENT_GUIDANCE.contains("不确定是否达到阈值时，直接处理"));
+        assert!(SUBAGENT_GUIDANCE.contains("`parallel` 表示至少 2 个互不依赖的分支"));
+        assert!(SUBAGENT_GUIDANCE.contains("不确定时直接处理"));
         assert!(SUBAGENT_GUIDANCE.contains("默认最多派生 2 个子代理"));
         assert!(SUBAGENT_GUIDANCE.contains("主代理不得主动选择"));
         assert!(SUBAGENT_GUIDANCE.contains("status: completed | partial | blocked"));
-        assert!(SUBAGENT_GUIDANCE.contains("多代理意见冲突时比较证据"));
-        assert!(SUBAGENT_GUIDANCE.contains("调用一次 `agents.interrupt_agent`"));
-        assert!(SUBAGENT_GUIDANCE.contains("只有缩小或改变范围后仍独立满足委派阈值"));
-        assert!(SUBAGENT_GUIDANCE.contains("同一批全部派发，再进入等待"));
-        assert!(SUBAGENT_GUIDANCE.contains("只使用 `agents.*` 做必要协调"));
-        assert!(SUBAGENT_GUIDANCE.contains("实际权限仍受父任务当前权限模式约束"));
+        assert!(SUBAGENT_GUIDANCE.contains("多代理证据冲突时比较出处"));
+        assert!(SUBAGENT_GUIDANCE.contains("只中断一次并继续等待"));
+        assert!(SUBAGENT_GUIDANCE.contains("只有缩小或改变范围后仍满足委派阈值"));
+        assert!(SUBAGENT_GUIDANCE.contains("同一批独立任务先全部派发，再进入等待"));
+        assert!(SUBAGENT_GUIDANCE.contains("只使用 `agents.*` 协调"));
+        assert!(SUBAGENT_GUIDANCE.contains("实际权限仍受父任务约束"));
+        assert!(SUBAGENT_GUIDANCE.contains("CODEY_DELEGATION_V1="));
+        assert!(SUBAGENT_GUIDANCE.contains("可恢复成本点预算"));
+        assert!(SUBAGENT_GUIDANCE.contains("# codey-accept:<task>:<check>"));
+        assert!(SUBAGENT_GUIDANCE.contains("结构化 `exit_code = 0`"));
     }
 
     #[test]
