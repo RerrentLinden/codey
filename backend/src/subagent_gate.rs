@@ -24,6 +24,9 @@ const STOP_STALL_GRACE_MILLIS: u64 = 10 * 60 * 1000;
 const PENDING_INIT_OBSERVED_FILE: &str = "pending-init-observed.state";
 const STOP_BLOCKED_SINCE_FILE: &str = "stop-blocked-since.state";
 const STATE_ERROR_SINCE_FILE: &str = "state-error-since.state";
+const PROTOCOL_HEALTH_FILE: &str = "protocol-health.json";
+const PROTOCOL_HEALTH_SCHEMA_VERSION: u32 = 1;
+const MISSING_AGENT_ID_MARKER: &str = "__codey_missing_agent_id__";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct HookCommands {
@@ -33,16 +36,27 @@ pub(crate) struct HookCommands {
 
 #[derive(Debug, Deserialize)]
 struct HookInput {
+    #[serde(alias = "hookEventName")]
     hook_event_name: String,
+    #[serde(alias = "sessionId")]
     session_id: String,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "agentId",
+        alias = "agent_name",
+        alias = "agentName",
+        alias = "subagent_id",
+        alias = "subagentId"
+    )]
     agent_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "toolName")]
     tool_name: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "toolInput")]
     tool_input: Option<Value>,
-    #[serde(default)]
+    #[serde(default, alias = "toolResponse")]
     tool_response: Option<Value>,
+    #[serde(default, alias = "working_dir", alias = "workingDirectory")]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -50,6 +64,25 @@ struct ActiveMarker {
     schema_version: u32,
     runtime_id_hash: String,
     started_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ProtocolHealth {
+    schema_version: u32,
+    runtime_id_hash: String,
+    first_issue_at_ms: u64,
+    last_issue_at_ms: u64,
+    #[serde(default)]
+    missing_agent_id_events: u16,
+    #[serde(default)]
+    unknown_status_responses: u16,
+    last_issue: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProtocolIssueKind {
+    MissingAgentId,
+    UnknownStatusResponse,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -212,6 +245,21 @@ fn handle_hook_for_runtime_at(
                     agent_id,
                     now_ms,
                 )?;
+            } else {
+                record_protocol_issue(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    ProtocolIssueKind::MissingAgentId,
+                    "SubagentStart 载荷缺少 agent_id，无法可靠区分父子代理",
+                    now_ms,
+                )?;
+                create_active_marker(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    MISSING_AGENT_ID_MARKER,
+                )?;
             }
             Ok(json!({}))
         }
@@ -228,6 +276,15 @@ fn handle_hook_for_runtime_at(
                 if active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)? == 0 {
                     remove_session_state(state_root, runtime_id, &input.session_id)?;
                 }
+            } else {
+                record_protocol_issue(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    ProtocolIssueKind::MissingAgentId,
+                    "SubagentStop 载荷缺少 agent_id，无法安全清理对应活跃代理",
+                    now_ms,
+                )?;
             }
             Ok(json!({}))
         }
@@ -275,11 +332,23 @@ fn pre_tool_use_output(
         .is_some_and(is_contract_spawn_tool)
     {
         let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
-        if let Some(reason) = crate::subagent_orchestrator::pre_spawn(
+        if active > 0
+            && let Some(reason) = protocol_issue_reason(state_root, runtime_id, &input.session_id)?
+        {
+            return Ok(pre_tool_reason_denial(format!(
+                "Codey Hook 协议兼容性门禁：{reason}。当前无法可靠区分根代理和子代理，已停止继续派生；请先调用不带筛选的 agents.list_agents 对账。"
+            )));
+        }
+        let process_cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let workspace_root = nonempty(input.cwd.as_deref()).or(process_cwd.as_deref());
+        if let Some(reason) = crate::subagent_orchestrator::pre_spawn_with_workspace(
             state_root,
             runtime_id,
             &input.session_id,
             input.tool_input.as_ref(),
+            workspace_root,
             active,
             now_ms,
         )? {
@@ -307,7 +376,8 @@ fn pre_tool_use_output(
         }
         return Ok(json!({}));
     }
-    Ok(pre_tool_denial(active))
+    let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
+    Ok(pre_tool_denial(active, protocol_issue.as_deref()))
 }
 
 fn post_tool_use_output(
@@ -357,6 +427,20 @@ fn post_tool_use_output(
             runtime_id,
             &input.session_id,
             STOP_BLOCKED_SINCE_FILE,
+        )?;
+        clear_unknown_status_protocol_issue(state_root, runtime_id, &input.session_id, now_ms)?;
+    } else {
+        record_protocol_issue(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            ProtocolIssueKind::UnknownStatusResponse,
+            if is_wait_agent_tool(tool_name) {
+                "wait_agent 响应结构无法识别"
+            } else {
+                "list_agents 响应结构无法识别"
+            },
+            now_ms,
         )?;
     }
     if is_wait_agent_tool(tool_name) {
@@ -419,10 +503,19 @@ fn post_tool_use_output(
         false,
         now_ms,
     )?;
+    let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
     if is_wait_agent_tool(tool_name) {
-        Ok(post_wait_continuation(active, input.tool_response.as_ref()))
+        Ok(post_wait_continuation(
+            active,
+            input.tool_response.as_ref(),
+            protocol_issue.as_deref(),
+        ))
     } else {
-        Ok(post_list_continuation(active, input.tool_response.as_ref()))
+        Ok(post_list_continuation(
+            active,
+            input.tool_response.as_ref(),
+            protocol_issue.as_deref(),
+        ))
     }
 }
 
@@ -465,7 +558,8 @@ fn stop_output(
         remove_session_state(state_root, runtime_id, &input.session_id)?;
         return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
     }
-    Ok(stop_continuation(active))
+    let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
+    Ok(stop_continuation(active, protocol_issue.as_deref()))
 }
 
 fn finalize_root_turn(
@@ -549,13 +643,19 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
     }
 }
 
-fn pre_tool_denial(active: usize) -> Value {
+fn pre_tool_denial(active: usize, protocol_issue: Option<&str>) -> Value {
+    let compatibility = protocol_issue
+        .map(|issue| format!(" 检测到 Hook 协议兼容性异常：{issue}。"))
+        .unwrap_or_else(|| {
+            " 如果这次调用实际来自子代理，说明上游 Hook 载荷缺少 agent_id，请重新验证当前 Codex 版本兼容性。"
+                .to_string()
+        });
     json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": format!(
-                "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态。现在只可调用 agents.* 协作工具；请先调用 agents.list_agents 核对 running、pending_init、completed、errored、shutdown 等状态，再对仍在运行的代理调用 agents.wait_agent。"
+                "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态。现在只可调用 agents.* 协作工具；请先调用 agents.list_agents 核对 running、pending_init、completed、errored、shutdown 等状态，再对仍在运行的代理调用 agents.wait_agent。{compatibility}"
             ),
         }
     })
@@ -581,31 +681,52 @@ fn subagent_spawn_denial() -> Value {
     })
 }
 
-fn post_wait_continuation(active: usize, tool_response: Option<&Value>) -> Value {
+fn post_wait_continuation(
+    active: usize,
+    tool_response: Option<&Value>,
+    protocol_issue: Option<&str>,
+) -> Value {
     let returned_update = render_tool_result(tool_response, "wait_agent");
+    let compatibility = protocol_issue
+        .map(|issue| format!("\n\nHook 协议兼容性诊断：{issue}。"))
+        .unwrap_or_default();
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可读取它并仅使用 agents.send_message、agents.followup_task、agents.interrupt_agent 或 agents.list_agents 做必要协调，并请先调用不带筛选的 agents.list_agents 对账。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待或协调。累计 10 分钟仍无终态时只中断一次对应代理，再继续等待终态；不得无限 wait 或自动重派。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可读取它并仅使用 agents.send_message、agents.followup_task、agents.interrupt_agent 或 agents.list_agents 做必要协调，并请先调用不带筛选的 agents.list_agents 对账。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待或协调。累计 10 分钟仍无终态时只中断一次对应代理，再继续等待终态；不得无限 wait 或自动重派。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}{compatibility}"
         ),
     })
 }
 
-fn post_list_continuation(active: usize, tool_response: Option<&Value>) -> Value {
+fn post_list_continuation(
+    active: usize,
+    tool_response: Option<&Value>,
+    protocol_issue: Option<&str>,
+) -> Value {
     let returned_update = render_tool_result(tool_response, "list_agents");
+    let compatibility = protocol_issue
+        .map(|issue| format!("\n\nHook 协议兼容性诊断：{issue}。"))
+        .unwrap_or_default();
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。只对 running、pending_init 或 interrupted 的代理继续等待、转向或停止；completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理，再等待其进入终态；不得无限 wait 或自动重派。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。\n\n本次 list_agents 已返回内容：\n{returned_update}"
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。只对 running、pending_init 或 interrupted 的代理继续等待、转向或停止；completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理，再等待其进入终态；不得无限 wait 或自动重派。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。\n\n本次 list_agents 已返回内容：\n{returned_update}{compatibility}"
         ),
     })
 }
 
-fn stop_continuation(active: usize) -> Value {
+fn stop_continuation(active: usize, protocol_issue: Option<&str>) -> Value {
+    let compatibility = protocol_issue
+        .map(|issue| {
+            format!(
+                " 检测到 Hook 协议兼容性异常：{issue}；请优先使用不带筛选的 agents.list_agents 对账。"
+            )
+        })
+        .unwrap_or_default();
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用不带筛选的 agents.list_agents 对账，再对 running、pending_init 或 interrupted 的代理调用 agents.wait_agent；累计 10 分钟仍无终态时只中断一次对应代理并继续等待，不得无限重试或自动重派。若协作工具已经不可用，门禁会在持续 10 分钟无法进展后释放遗留状态。"
+            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用不带筛选的 agents.list_agents 对账，再对 running、pending_init 或 interrupted 的代理调用 agents.wait_agent；累计 10 分钟仍无终态时只中断一次对应代理并继续等待，不得无限重试或自动重派。若协作工具已经不可用，门禁会在持续 10 分钟无法进展后释放遗留状态。{compatibility}"
         ),
     })
 }
@@ -638,9 +759,14 @@ fn wait_agent_response_is_usable(tool_response: Option<&Value>) -> bool {
     };
     match tool_response {
         Value::Object(values) => {
-            object_value(values, "timedout").is_some_and(Value::is_boolean)
+            (object_value(values, "timedout").is_some_and(Value::is_boolean)
                 && (object_value(values, "message").is_some_and(Value::is_string)
-                    || object_value(values, "status").is_some_and(Value::is_object))
+                    || object_value(values, "status").is_some()))
+                || object_value(values, "updates").is_some_and(Value::is_array)
+                || object_value(values, "status").is_some_and(|status| {
+                    classify_agent_status(status) != ObservedAgentState::Unknown
+                })
+                || object_reports_agent_completion(values)
         }
         Value::String(value) => serde_json::from_str::<Value>(value)
             .ok()
@@ -736,11 +862,12 @@ fn summarize_list_agents_response(tool_response: Option<&Value>) -> AgentListSna
             unknown += 1;
             continue;
         };
-        let agent_name = object_value(&agent, "agentname").and_then(Value::as_str);
+        let agent_name =
+            object_value_any(&agent, &["agentname", "taskname", "name"]).and_then(Value::as_str);
         if agent_name.is_some_and(is_root_agent_name) {
             continue;
         }
-        let Some(status) = object_value(&agent, "agentstatus") else {
+        let Some(status) = object_value_any(&agent, &["agentstatus", "status", "state"]) else {
             unknown += 1;
             continue;
         };
@@ -765,7 +892,9 @@ fn summarize_list_agents_response(tool_response: Option<&Value>) -> AgentListSna
 fn find_agents_array(value: &Value) -> Option<Vec<Value>> {
     match value {
         Value::Object(values) => {
-            if let Some(Value::Array(agents)) = object_value(values, "agents") {
+            if let Some(Value::Array(agents)) =
+                object_value_any(values, &["agents", "subagents", "children"])
+            {
                 return Some(agents.clone());
             }
             values.values().find_map(find_agents_array)
@@ -783,6 +912,15 @@ fn object_value<'a>(values: &'a Map<String, Value>, normalized_key: &str) -> Opt
     values.iter().find_map(|(key, value)| {
         (normalized_ascii_identifier(key) == normalized_key).then_some(value)
     })
+}
+
+fn object_value_any<'a>(
+    values: &'a Map<String, Value>,
+    normalized_keys: &[&str],
+) -> Option<&'a Value> {
+    normalized_keys
+        .iter()
+        .find_map(|key| object_value(values, key))
 }
 
 fn is_root_agent_name(value: &str) -> bool {
@@ -1134,6 +1272,145 @@ fn write_observation_timestamp(session_dir: &Path, path: &Path, now_ms: u64) -> 
         .with_context(|| format!("替换 Codex 子代理门禁观察状态失败：{}", path.display()))
 }
 
+fn record_protocol_issue(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    kind: ProtocolIssueKind,
+    detail: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let path = session_auxiliary_path(&session_dir, runtime_id, PROTOCOL_HEALTH_FILE);
+    let runtime_id_hash = hash_component(runtime_id);
+    let mut health = read_protocol_health(&path)?.unwrap_or_else(|| ProtocolHealth {
+        schema_version: PROTOCOL_HEALTH_SCHEMA_VERSION,
+        runtime_id_hash: runtime_id_hash.clone(),
+        first_issue_at_ms: now_ms,
+        last_issue_at_ms: now_ms,
+        missing_agent_id_events: 0,
+        unknown_status_responses: 0,
+        last_issue: detail.to_string(),
+    });
+    validate_protocol_health(&health, runtime_id)?;
+    match kind {
+        ProtocolIssueKind::MissingAgentId => {
+            health.missing_agent_id_events = health.missing_agent_id_events.saturating_add(1);
+        }
+        ProtocolIssueKind::UnknownStatusResponse => {
+            health.unknown_status_responses = health.unknown_status_responses.saturating_add(1);
+        }
+    }
+    health.last_issue_at_ms = now_ms;
+    health.last_issue = detail.to_string();
+    write_protocol_health(&session_dir, &path, &health)
+}
+
+fn clear_unknown_status_protocol_issue(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let path = session_auxiliary_path(&session_dir, runtime_id, PROTOCOL_HEALTH_FILE);
+    let Some(mut health) = read_protocol_health(&path)? else {
+        return Ok(());
+    };
+    validate_protocol_health(&health, runtime_id)?;
+    if health.unknown_status_responses == 0 {
+        return Ok(());
+    }
+    health.unknown_status_responses = 0;
+    health.last_issue_at_ms = now_ms;
+    if health.missing_agent_id_events == 0 {
+        return remove_session_auxiliary_file(
+            state_root,
+            runtime_id,
+            session_id,
+            PROTOCOL_HEALTH_FILE,
+        );
+    }
+    health.last_issue = "子代理事件曾缺少 agent_id".to_string();
+    write_protocol_health(&session_dir, &path, &health)
+}
+
+fn protocol_issue_reason(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let path = session_auxiliary_path(
+        &session_state_dir(state_root, session_id),
+        runtime_id,
+        PROTOCOL_HEALTH_FILE,
+    );
+    let Some(health) = read_protocol_health(&path)? else {
+        return Ok(None);
+    };
+    validate_protocol_health(&health, runtime_id)?;
+    let mut issues = Vec::new();
+    if health.missing_agent_id_events > 0 {
+        issues.push(format!(
+            "有 {} 个子代理生命周期事件缺少 agent_id",
+            health.missing_agent_id_events
+        ));
+    }
+    if health.unknown_status_responses > 0 {
+        issues.push(format!(
+            "有 {} 个 wait/list 响应结构无法识别",
+            health.unknown_status_responses
+        ));
+    }
+    if issues.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "{}；最近一次：{}",
+            issues.join("，"),
+            health.last_issue
+        )))
+    }
+}
+
+fn read_protocol_health(path: &Path) -> Result<Option<ProtocolHealth>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 Codex Hook 协议诊断状态失败：{}", path.display()));
+        }
+    };
+    let health = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析 Codex Hook 协议诊断状态失败：{}", path.display()))?;
+    Ok(Some(health))
+}
+
+fn validate_protocol_health(health: &ProtocolHealth, runtime_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        health.schema_version == PROTOCOL_HEALTH_SCHEMA_VERSION
+            && health.runtime_id_hash == hash_component(runtime_id),
+        "Codex Hook 协议诊断状态与当前运行代次不兼容"
+    );
+    Ok(())
+}
+
+fn write_protocol_health(session_dir: &Path, path: &Path, health: &ProtocolHealth) -> Result<()> {
+    fs::create_dir_all(session_dir).with_context(|| {
+        format!(
+            "创建 Codex Hook 协议诊断目录失败：{}",
+            session_dir.display()
+        )
+    })?;
+    let bytes = serde_json::to_vec(health).context("序列化 Codex Hook 协议诊断状态失败")?;
+    let temp = crate::fs_util::unique_temp_path(path);
+    fs::write(&temp, bytes)
+        .with_context(|| format!("写入 Codex Hook 协议诊断临时状态失败：{}", temp.display()))?;
+    crate::fs_util::persist_temp_file(&temp, path)
+        .with_context(|| format!("替换 Codex Hook 协议诊断状态失败：{}", path.display()))
+}
+
 fn remove_session_auxiliary_file(
     state_root: &Path,
     runtime_id: &str,
@@ -1392,7 +1669,28 @@ mod tests {
             tool_name: None,
             tool_input: None,
             tool_response: None,
+            cwd: None,
         }
+    }
+
+    #[test]
+    fn hook_input_accepts_common_camel_case_and_subagent_aliases() {
+        let input: HookInput = serde_json::from_value(json!({
+            "hookEventName": "PreToolUse",
+            "sessionId": "session-a",
+            "subagentId": "agent-a",
+            "toolName": "Bash",
+            "toolInput": { "command": "true" },
+            "toolResponse": { "exitCode": 0 },
+            "workingDirectory": "/repo"
+        }))
+        .unwrap();
+
+        assert_eq!(input.hook_event_name, "PreToolUse");
+        assert_eq!(input.session_id, "session-a");
+        assert_eq!(input.agent_id.as_deref(), Some("agent-a"));
+        assert_eq!(input.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(input.cwd.as_deref(), Some("/repo"));
     }
 
     fn delegation_message(contract: Value) -> String {
@@ -1416,7 +1714,6 @@ mod tests {
             "message": delegation_message(json!({
                 "id": "worker_a",
                 "why": "independent_work",
-                "calls": 6,
                 "visual": false,
                 "root": "/repo",
                 "read": [],
@@ -1484,6 +1781,55 @@ mod tests {
     }
 
     #[test]
+    fn runtime_gate_accepts_encrypted_spawn_messages_with_conservative_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path();
+        let workspace = state_root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+
+        let mut spawn = input("PreToolUse", "encrypted-contract-session");
+        spawn.cwd = Some(workspace.clone());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "encrypted_worker",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        }));
+        assert_eq!(handle_hook(&spawn, state_root).unwrap(), json!({}));
+
+        let mut spawned = input("PostToolUse", "encrypted-contract-session");
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "agent_id": "encrypted-worker-agent" }));
+        handle_hook(&spawned, state_root).unwrap();
+
+        let mut started = input("SubagentStart", "encrypted-contract-session");
+        started.agent_id = Some("encrypted-worker-agent".to_string());
+        handle_hook(&started, state_root).unwrap();
+
+        let mut owned_patch = input("PreToolUse", "encrypted-contract-session");
+        owned_patch.agent_id = Some("encrypted-worker-agent".to_string());
+        owned_patch.tool_name = Some("apply_patch".to_string());
+        owned_patch.tool_input = Some(json!({
+            "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n*** End Patch"
+        }));
+        assert_eq!(handle_hook(&owned_patch, state_root).unwrap(), json!({}));
+
+        let mut escaped_patch = owned_patch;
+        escaped_patch.tool_input = Some(json!({
+            "patch": "*** Begin Patch\n*** Update File: /outside/README.md\n*** End Patch"
+        }));
+        assert_eq!(
+            handle_hook(&escaped_patch, state_root).unwrap()["hookSpecificOutput"]
+                ["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+    }
+
+    #[test]
     fn runtime_gate_allows_small_delegations_with_a_valid_role_contract() {
         let temp = tempfile::tempdir().unwrap();
         let mut spawn = input("PreToolUse", "small-session");
@@ -1495,9 +1841,6 @@ mod tests {
             "message": delegation_message(json!({
                 "id": "tiny_scan",
                 "why": "breadth",
-                "calls": 1,
-                "files": 1,
-                "dirs": 1,
                 "visual": false,
                 "read": [],
                 "write": [],
@@ -1615,6 +1958,90 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn missing_agent_id_enters_visible_fail_safe_mode_and_list_reconciles_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "missing-id-session";
+
+        handle_hook_for_runtime_at(&input("SubagentStart", session_id), root, runtime_id, 1_000)
+            .unwrap();
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
+        );
+
+        let mut root_patch = input("PreToolUse", session_id);
+        root_patch.tool_name = Some("apply_patch".to_string());
+        let denied = handle_hook_for_runtime_at(&root_patch, root, runtime_id, 2_000).unwrap();
+        let reason = denied["hookSpecificOutput"]["permissionDecisionReason"]
+            .as_str()
+            .unwrap();
+        assert!(reason.contains("缺少 agent_id"));
+        assert!(reason.contains("兼容性"));
+
+        let mut ambiguous_spawn = input("PreToolUse", session_id);
+        ambiguous_spawn.tool_name = Some("agents.spawn_agent".to_string());
+        ambiguous_spawn.tool_input = Some(json!({}));
+        let denied = handle_hook_for_runtime_at(&ambiguous_spawn, root, runtime_id, 2_500).unwrap();
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("无法可靠区分根代理和子代理")
+        );
+
+        let mut list = input("PostToolUse", session_id);
+        list.tool_name = Some("agents.list_agents".to_string());
+        list.tool_input = Some(json!({}));
+        list.tool_response = Some(json!({
+            "children": [
+                { "name": "/root", "status": "running" },
+                { "name": "/root/agent-a", "status": "completed" }
+            ]
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&list, root, runtime_id, 3_000).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn unknown_wait_shape_is_reported_then_cleared_by_a_known_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "protocol-session";
+        let mut start = input("SubagentStart", session_id);
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
+
+        let mut unknown_wait = input("PostToolUse", session_id);
+        unknown_wait.tool_name = Some("agents.wait_agent".to_string());
+        unknown_wait.tool_response = Some(json!({ "unexpected": "payload" }));
+        let blocked = handle_hook_for_runtime_at(&unknown_wait, root, runtime_id, 2_000).unwrap();
+        assert!(
+            blocked["reason"]
+                .as_str()
+                .unwrap()
+                .contains("响应结构无法识别")
+        );
+
+        let mut known_wait = input("PostToolUse", session_id);
+        known_wait.tool_name = Some("agents.wait_agent".to_string());
+        known_wait.tool_response = Some(json!({
+            "timedOut": true,
+            "message": "still running"
+        }));
+        let blocked = handle_hook_for_runtime_at(&known_wait, root, runtime_id, 3_000).unwrap();
+        assert!(!blocked["reason"].as_str().unwrap().contains("兼容性诊断"));
     }
 
     #[test]

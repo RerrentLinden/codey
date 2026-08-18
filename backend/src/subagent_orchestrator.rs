@@ -10,10 +10,12 @@ use sha2::{Digest, Sha256};
 
 use crate::subagent_policy::{RoleAccess, RolePolicy, role_policy};
 
-pub(crate) const CONTRACT_PREFIX: &str = "CODEY_DELEGATION_V1=";
-pub(crate) const POST_TOOL_HOOK_MATCHER: &str = ".*(spawn_agent|wait_agent|list_agents|exec_command|apply_patch)$|^(Bash|Shell|Agent|functions(__|[./:_])(exec|wait))$";
+pub(crate) const CONTRACT_PREFIX: &str = "CODEY_DELEGATION_V2=";
+const LEGACY_CONTRACT_PREFIX_V1: &str = "CODEY_DELEGATION_V1=";
+pub(crate) const POST_TOOL_HOOK_MATCHER: &str = "*";
 
-const LEDGER_SCHEMA_VERSION: u32 = 1;
+const LEDGER_SCHEMA_VERSION: u32 = 2;
+const MIN_LEDGER_SCHEMA_VERSION: u32 = 1;
 const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
 const DEFAULT_POINT_LIMIT: u16 = 8;
@@ -24,8 +26,12 @@ const MAX_CLAIMS_PER_MODE: usize = 16;
 const MAX_ACCEPTANCE_CHECKS: usize = 3;
 const MAX_ACCEPTANCE_COMMAND_CHARS: usize = 1024;
 const MAX_CONTRACT_LINE_CHARS: usize = 8 * 1024;
+const MAX_ACCEPTANCE_FAILURES: u16 = 3;
+const MAX_UNCHANGED_ACCEPTANCE_STOPS: u16 = 3;
+const ACCEPTANCE_STALL_GRACE_MILLIS: u64 = 10 * 60 * 1000;
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DelegationContract {
     id: String,
     #[serde(rename = "why")]
@@ -45,6 +51,7 @@ struct DelegationContract {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AcceptanceSpec {
     id: String,
     #[serde(rename = "cmd")]
@@ -111,6 +118,16 @@ struct AcceptanceEntry {
     status: AcceptanceStatus,
     attempted_at_ms: Option<u64>,
     evidence_hash: Option<String>,
+    #[serde(default)]
+    failure_count: u16,
+    #[serde(default)]
+    blocked_stop_count: u16,
+    #[serde(default)]
+    blocked_since_ms: Option<u64>,
+    #[serde(default)]
+    release_notice_delivered_at_ms: Option<u64>,
+    #[serde(default)]
+    release_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -119,6 +136,7 @@ enum AcceptanceStatus {
     Pending,
     Passed,
     Failed,
+    Unverifiable,
 }
 
 struct LedgerStore {
@@ -176,10 +194,11 @@ impl LedgerStore {
             )
         })?;
         anyhow::ensure!(
-            ledger.schema_version == LEDGER_SCHEMA_VERSION,
+            (MIN_LEDGER_SCHEMA_VERSION..=LEDGER_SCHEMA_VERSION).contains(&ledger.schema_version),
             "Codey 子代理预算账本版本不受支持：{}",
             ledger.schema_version
         );
+        ledger.schema_version = LEDGER_SCHEMA_VERSION;
         let session_id_hash = hash_component(session_id);
         anyhow::ensure!(
             ledger.session_id_hash == session_id_hash,
@@ -283,6 +302,7 @@ impl SessionLedger {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn pre_spawn(
     state_root: &Path,
     runtime_id: &str,
@@ -291,7 +311,27 @@ pub(crate) fn pre_spawn(
     active_agents: usize,
     now_ms: u64,
 ) -> Result<Option<String>> {
-    let prepared = match prepare_contract(tool_input) {
+    pre_spawn_with_workspace(
+        state_root,
+        runtime_id,
+        session_id,
+        tool_input,
+        None,
+        active_agents,
+        now_ms,
+    )
+}
+
+pub(crate) fn pre_spawn_with_workspace(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    tool_input: Option<&Value>,
+    hook_workspace_root: Option<&str>,
+    active_agents: usize,
+    now_ms: u64,
+) -> Result<Option<String>> {
+    let prepared = match prepare_contract_with_workspace(tool_input, hook_workspace_root) {
         Ok(prepared) => prepared,
         Err(reason) => return Ok(Some(reason)),
     };
@@ -356,6 +396,11 @@ pub(crate) fn pre_spawn(
             status: AcceptanceStatus::Pending,
             attempted_at_ms: None,
             evidence_hash: None,
+            failure_count: 0,
+            blocked_stop_count: 0,
+            blocked_since_ms: None,
+            release_notice_delivered_at_ms: None,
+            release_reason: None,
         })
         .collect();
     ledger.reservations.insert(
@@ -688,11 +733,24 @@ pub(crate) fn post_root_tool(
     }
     check.attempted_at_ms = Some(now_ms);
     check.evidence_hash = tool_response.map(canonical_value_hash);
-    check.status = if tool_response.is_some_and(response_reports_successful_exit) {
-        AcceptanceStatus::Passed
-    } else {
-        AcceptanceStatus::Failed
-    };
+    check.blocked_stop_count = 0;
+    check.blocked_since_ms = Some(now_ms);
+    check.release_notice_delivered_at_ms = None;
+    match classify_acceptance_evidence(tool_response) {
+        AcceptanceEvidence::Passed => {
+            check.status = AcceptanceStatus::Passed;
+            check.release_reason = None;
+        }
+        evidence => {
+            check.failure_count = check.failure_count.saturating_add(1);
+            check.release_reason = Some(evidence.failure_reason().to_string());
+            check.status = if check.failure_count >= MAX_ACCEPTANCE_FAILURES {
+                AcceptanceStatus::Unverifiable
+            } else {
+                AcceptanceStatus::Failed
+            };
+        }
+    }
     store.save(&mut ledger, now_ms)
 }
 
@@ -707,6 +765,7 @@ pub(crate) fn pending_acceptance_reason(
         return Ok(None);
     };
     let mut commands = Vec::new();
+    let mut release_notices = Vec::new();
     for reservation in ledger.reservations.values_mut() {
         if reservation.write_capable && reservation.state != ReservationState::Failed {
             if !matches!(
@@ -715,24 +774,83 @@ pub(crate) fn pending_acceptance_reason(
             ) {
                 reservation.state = ReservationState::Terminal;
             }
-            for check in &reservation.acceptance {
-                if check.status != AcceptanceStatus::Passed {
-                    commands.push(format!(
-                        "# codey-accept:{}:{}\n{}",
-                        reservation.task_id, check.id, check.command
-                    ));
+            for check in &mut reservation.acceptance {
+                if check.status == AcceptanceStatus::Passed {
+                    continue;
                 }
+                if check.status == AcceptanceStatus::Unverifiable {
+                    if check.release_notice_delivered_at_ms.is_none() {
+                        check.release_notice_delivered_at_ms = Some(now_ms);
+                        release_notices.push(format!(
+                            "- `{}:{}`：{}（失败 {} 次）",
+                            reservation.task_id,
+                            check.id,
+                            check
+                                .release_reason
+                                .as_deref()
+                                .unwrap_or("无法取得可信的验收证据"),
+                            check.failure_count
+                        ));
+                    }
+                    continue;
+                }
+
+                let blocked_since_ms = *check.blocked_since_ms.get_or_insert(now_ms);
+                check.blocked_stop_count = check.blocked_stop_count.saturating_add(1);
+                let stalled = check.blocked_stop_count >= MAX_UNCHANGED_ACCEPTANCE_STOPS
+                    || now_ms.saturating_sub(blocked_since_ms) >= ACCEPTANCE_STALL_GRACE_MILLIS;
+                if stalled {
+                    check.status = AcceptanceStatus::Unverifiable;
+                    check.release_reason = Some(
+                        if check.blocked_stop_count >= MAX_UNCHANGED_ACCEPTANCE_STOPS {
+                            format!(
+                                "验收债连续 {} 次 Stop 未取得新证据",
+                                check.blocked_stop_count
+                            )
+                        } else {
+                            "验收债持续 10 分钟未取得新证据".to_string()
+                        },
+                    );
+                    check.release_notice_delivered_at_ms = Some(now_ms);
+                    release_notices.push(format!(
+                        "- `{}:{}`：{}（失败 {} 次）",
+                        reservation.task_id,
+                        check.id,
+                        check.release_reason.as_deref().unwrap_or_default(),
+                        check.failure_count
+                    ));
+                    continue;
+                }
+
+                commands.push(format!(
+                    "# codey-accept:{}:{}\n{}",
+                    reservation.task_id, check.id, check.command
+                ));
             }
         }
     }
-    if commands.is_empty() {
+    if commands.is_empty() && release_notices.is_empty() {
         return Ok(None);
     }
     store.save(&mut ledger, now_ms)?;
+    let mut sections = Vec::new();
+    if !release_notices.is_empty() {
+        sections.push(format!(
+            "以下 {} 项验收已经达到失败或停滞上限，没有被标记为通过。门禁将在本次提示后释放这些项目；主代理必须停止自动重试，并在最终答复中明确报告未完成的验收及原因：\n{}",
+            release_notices.len(),
+            release_notices.join("\n")
+        ));
+    }
+    if !commands.is_empty() {
+        sections.push(format!(
+            "写入型子代理还有 {} 项可继续清偿的验收债。主代理必须逐项原样执行下列命令，并由可信的退出状态 `0` 清偿；子代理自报通过或改写后的命令不计入验收：\n\n{}",
+            commands.len(),
+            commands.join("\n\n")
+        ));
+    }
     Ok(Some(format!(
-        "Codey 机械验收门禁：写入型子代理还有 {} 项验收债。主代理必须逐项原样执行下列命令，并由结构化 `exit_code = 0` 清偿；子代理自报通过、普通文本或改写后的命令不计入验收。\n\n{}",
-        commands.len(),
-        commands.join("\n\n")
+        "Codey 机械验收门禁：{}",
+        sections.join("\n\n")
     )))
 }
 
@@ -760,7 +878,15 @@ pub(crate) fn end_session(state_root: &Path, session_id: &str) -> Result<()> {
     LedgerStore::open(state_root, session_id)?.remove()
 }
 
+#[cfg(test)]
 fn prepare_contract(tool_input: Option<&Value>) -> std::result::Result<PreparedContract, String> {
+    prepare_contract_with_workspace(tool_input, None)
+}
+
+fn prepare_contract_with_workspace(
+    tool_input: Option<&Value>,
+    hook_workspace_root: Option<&str>,
+) -> std::result::Result<PreparedContract, String> {
     let input = tool_input
         .and_then(Value::as_object)
         .ok_or_else(|| contract_error("spawn 输入不是 JSON object"))?;
@@ -778,19 +904,38 @@ fn prepare_contract(tool_input: Option<&Value>) -> std::result::Result<PreparedC
     }
     let policy = role_policy(role)
         .ok_or_else(|| contract_error(&format!("未知或不允许的 agent_type `{role}`")))?;
+    if is_opaque_encrypted_message(message) {
+        return prepare_opaque_contract(task_name, role, policy, hook_workspace_root);
+    }
     let line = message
         .lines()
         .rev()
         .find(|line| !line.trim().is_empty())
         .map(str::trim)
         .ok_or_else(|| contract_error("message 为空"))?;
-    let payload = line
-        .strip_prefix(CONTRACT_PREFIX)
-        .ok_or_else(|| contract_error("message 最后一行缺少 CODEY_DELEGATION_V1 契约"))?;
+    let (payload, legacy_v1) = if let Some(payload) = line.strip_prefix(CONTRACT_PREFIX) {
+        (payload, false)
+    } else if let Some(payload) = line.strip_prefix(LEGACY_CONTRACT_PREFIX_V1) {
+        (payload, true)
+    } else {
+        return Err(contract_error(
+            "message 最后一行缺少 CODEY_DELEGATION_V2 契约",
+        ));
+    };
     if payload.chars().count() > MAX_CONTRACT_LINE_CHARS {
         return Err(contract_error("契约行超过 8K 字符"));
     }
-    let contract: DelegationContract = serde_json::from_str(payload)
+    let mut contract_value: Value = serde_json::from_str(payload)
+        .map_err(|error| contract_error(&format!("契约 JSON 无效：{error}")))?;
+    if legacy_v1 {
+        let values = contract_value
+            .as_object_mut()
+            .ok_or_else(|| contract_error("V1 契约 JSON 必须是 object"))?;
+        for retired in ["calls", "files", "dirs", "large", "risk"] {
+            values.remove(retired);
+        }
+    }
+    let contract: DelegationContract = serde_json::from_value(contract_value)
         .map_err(|error| contract_error(&format!("契约 JSON 无效：{error}")))?;
     validate_task_id(&contract.id)?;
     if contract.id != task_name {
@@ -866,9 +1011,59 @@ fn prepare_contract(tool_input: Option<&Value>) -> std::result::Result<PreparedC
     })
 }
 
+fn is_opaque_encrypted_message(message: &str) -> bool {
+    let message = message.trim();
+    message.len() >= 128
+        && message.starts_with("gAAAAA")
+        && message
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'='))
+}
+
+fn prepare_opaque_contract(
+    task_name: &str,
+    role: &str,
+    policy: RolePolicy,
+    hook_workspace_root: Option<&str>,
+) -> std::result::Result<PreparedContract, String> {
+    validate_task_id(task_name)?;
+    let workspace_root = hook_workspace_root
+        .map(normalize_absolute_path)
+        .transpose()
+        .map_err(|error| contract_error(&format!("Hook 工作目录无效：{error}")))?;
+    if policy.access == RoleAccess::Write && workspace_root.is_none() {
+        return Err(contract_error(
+            "message 已由上游加密，且 Hook 未提供绝对工作目录，无法为写入角色建立保守 ownership",
+        ));
+    }
+    let workspace_claims = workspace_root.iter().cloned().collect::<Vec<_>>();
+    let (read_paths, write_paths) = match policy.access {
+        RoleAccess::ReadOnly => (workspace_claims, Vec::new()),
+        RoleAccess::Write => (Vec::new(), workspace_claims),
+    };
+    let contract = DelegationContract {
+        id: task_name.to_string(),
+        reason: "encrypted_message".to_string(),
+        branch_calls: Vec::new(),
+        visual: policy.visual,
+        workspace_root: workspace_root.clone(),
+        read_paths: read_paths.clone(),
+        write_paths: write_paths.clone(),
+        acceptance: Vec::new(),
+    };
+    Ok(PreparedContract {
+        contract,
+        role: role.to_string(),
+        policy,
+        workspace_root,
+        read_paths,
+        write_paths,
+    })
+}
+
 fn contract_error(detail: &str) -> String {
     format!(
-        "Codey 自适应委派门禁：{detail}。请在 message 最后一行追加紧凑契约，例如：{CONTRACT_PREFIX}{{\"id\":\"scan_auth\",\"why\":\"breadth\",\"calls\":3,\"files\":4,\"dirs\":2,\"visual\":false,\"read\":[],\"write\":[],\"checks\":[]}}"
+        "Codey 自适应委派门禁：{detail}。请在 message 最后一行追加紧凑契约，例如：{CONTRACT_PREFIX}{{\"id\":\"scan_auth\",\"why\":\"breadth\",\"visual\":false,\"read\":[],\"write\":[],\"checks\":[]}}"
     )
 }
 
@@ -912,25 +1107,21 @@ fn validate_delegation_reason_role(reason: &str, role: &str) -> std::result::Res
         Ok(())
     } else {
         Err(contract_error(
-            "why 与 agent_type 不兼容；calls/files/dirs/branch_calls 只用于软路由和预算提示，不是运行时拒绝条件",
+            "why 与 agent_type 不兼容；parallel 的 branch_calls 只用于自适应预算提示，不是任务规模硬门槛",
         ))
     }
 }
 
 fn adaptive_limits(contract: &DelegationContract) -> (u16, u16) {
     let branches = u16::try_from(contract.branch_calls.len()).unwrap_or(u16::MAX);
-    let point_limit = if contract.reason == "user_requested" {
-        MAX_POINT_LIMIT
-    } else if contract.reason == "parallel" {
+    let point_limit = if contract.reason == "parallel" {
         DEFAULT_POINT_LIMIT
             .max(branches.saturating_mul(3))
             .min(MAX_POINT_LIMIT)
     } else {
         DEFAULT_POINT_LIMIT
     };
-    let attempt_limit = if contract.reason == "user_requested" {
-        MAX_ATTEMPT_LIMIT
-    } else if contract.reason == "parallel" {
+    let attempt_limit = if contract.reason == "parallel" {
         DEFAULT_ATTEMPT_LIMIT
             .max(branches.saturating_add(1))
             .min(MAX_ATTEMPT_LIMIT)
@@ -1201,21 +1392,53 @@ fn parse_acceptance_marker(command: &str) -> Option<(&str, &str, &str)> {
     Some((task_id, check_id, &command[body_offset..]))
 }
 
-fn response_reports_successful_exit(value: &Value) -> bool {
-    let mut exit_codes = Vec::new();
-    let mut error = false;
-    collect_exit_status(value, &mut exit_codes, &mut error, 0);
-    !error && !exit_codes.is_empty() && exit_codes.iter().all(|exit_code| *exit_code == 0)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptanceEvidence {
+    Passed,
+    CommandFailed,
+    MissingExitStatus,
 }
 
-fn collect_exit_status(value: &Value, exit_codes: &mut Vec<i64>, error: &mut bool, depth: usize) {
+impl AcceptanceEvidence {
+    fn failure_reason(self) -> &'static str {
+        match self {
+            Self::Passed => "验收已通过",
+            Self::CommandFailed => "验收命令返回失败状态",
+            Self::MissingExitStatus => "上游工具响应缺少可识别的退出状态",
+        }
+    }
+}
+
+fn classify_acceptance_evidence(value: Option<&Value>) -> AcceptanceEvidence {
+    let Some(value) = value else {
+        return AcceptanceEvidence::MissingExitStatus;
+    };
+    let mut exit_codes = Vec::new();
+    let mut error = false;
+    collect_exit_status(value, &mut exit_codes, &mut error, 0, true);
+    if error || exit_codes.iter().any(|exit_code| *exit_code != 0) {
+        AcceptanceEvidence::CommandFailed
+    } else if exit_codes.is_empty() {
+        AcceptanceEvidence::MissingExitStatus
+    } else {
+        AcceptanceEvidence::Passed
+    }
+}
+
+fn collect_exit_status(
+    value: &Value,
+    exit_codes: &mut Vec<i64>,
+    error: &mut bool,
+    depth: usize,
+    allow_plain_text_status: bool,
+) {
     if depth > 12 {
         return;
     }
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_exit_status(value, exit_codes, error, depth + 1);
+                collect_exit_status(value, exit_codes, error, depth + 1, false);
             }
         }
         Value::Object(values) => {
@@ -1229,20 +1452,62 @@ fn collect_exit_status(value: &Value, exit_codes: &mut Vec<i64>, error: &mut boo
                         exit_codes.push(code);
                     }
                 } else if (key == "iserror" && value.as_bool() == Some(true))
-                    || (key == "error" && !value.is_null())
+                    || (key == "error" && value_reports_nonempty_error(value))
                 {
                     *error = true;
                 }
-                collect_exit_status(value, exit_codes, error, depth + 1);
+                collect_exit_status(value, exit_codes, error, depth + 1, false);
             }
         }
-        Value::String(value) if value.len() <= 64 * 1024 => {
+        Value::String(value) if allow_plain_text_status && value.len() <= 64 * 1024 => {
             if let Ok(parsed) = serde_json::from_str::<Value>(value) {
-                collect_exit_status(&parsed, exit_codes, error, depth + 1);
+                collect_exit_status(&parsed, exit_codes, error, depth + 1, false);
+            } else if let Some(exit_code) = parse_plain_text_exit_code(value) {
+                exit_codes.push(exit_code);
             }
         }
         _ => {}
     }
+}
+
+fn value_reports_nonempty_error(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(false) => false,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        Value::Number(value) => value.as_f64() != Some(0.0),
+        Value::Bool(true) => true,
+    }
+}
+
+fn parse_plain_text_exit_code(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 1024 {
+        return None;
+    }
+    let first_line = trimmed.lines().next()?.trim().to_ascii_lowercase();
+    for prefix in [
+        "exit_code",
+        "exit code",
+        "exitcode",
+        "process exited with code",
+        "command exited with code",
+        "script exited with code",
+        "command finished with exit code",
+    ] {
+        if let Some(remainder) = first_line.strip_prefix(prefix) {
+            let token = remainder
+                .trim_start_matches(|character: char| {
+                    character.is_ascii_whitespace() || matches!(character, ':' | '=')
+                })
+                .split_whitespace()
+                .next()?;
+            let token = token.trim_end_matches(|character: char| !character.is_ascii_digit());
+            return token.parse::<i64>().ok();
+        }
+    }
+    None
 }
 
 fn response_is_explicit_failure(value: &Value) -> bool {
@@ -1259,7 +1524,14 @@ fn response_is_explicit_failure(value: &Value) -> bool {
 fn extract_agent_identifier(value: &Value) -> Option<&str> {
     match value {
         Value::Object(values) => {
-            for key in ["agent_id", "agentId", "agent_name", "agentName"] {
+            for key in [
+                "agent_id",
+                "agentId",
+                "agent_name",
+                "agentName",
+                "subagent_id",
+                "subagentId",
+            ] {
                 if let Some(value) = values.get(key).and_then(Value::as_str) {
                     return Some(value);
                 }
@@ -1286,7 +1558,7 @@ fn collect_terminal_task_ids(
             let terminal = values.iter().any(|(key, value)| {
                 matches!(
                     normalized_identifier(key).as_str(),
-                    "status" | "agentstatus"
+                    "status" | "agentstatus" | "state"
                 ) && value_reports_terminal(value)
             });
             if terminal {
@@ -1297,6 +1569,8 @@ fn collect_terminal_task_ids(
                     "agentName",
                     "agent_id",
                     "agentId",
+                    "subagent_id",
+                    "subagentId",
                 ] {
                     if let Some(identifier) = values.get(key).and_then(Value::as_str)
                         && let Some(task_id) = ledger
@@ -1355,10 +1629,15 @@ fn string_field<'a>(values: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a
 }
 
 fn reservation_has_pending_acceptance(reservation: &Reservation) -> bool {
-    reservation
-        .acceptance
-        .iter()
-        .any(|check| check.status != AcceptanceStatus::Passed)
+    reservation.acceptance.iter().any(acceptance_blocks_turn)
+}
+
+fn acceptance_blocks_turn(check: &AcceptanceEntry) -> bool {
+    match check.status {
+        AcceptanceStatus::Passed => false,
+        AcceptanceStatus::Pending | AcceptanceStatus::Failed => true,
+        AcceptanceStatus::Unverifiable => check.release_notice_delivered_at_ms.is_none(),
+    }
 }
 
 fn identifier_mentions_task(identifier: &str, task_id: &str) -> bool {
@@ -1403,9 +1682,6 @@ mod tests {
         json!({
             "id": task,
             "why": "breadth",
-            "calls": 4,
-            "files": 5,
-            "dirs": 2,
             "visual": false,
             "read": [],
             "write": [],
@@ -1417,7 +1693,6 @@ mod tests {
         json!({
             "id": task,
             "why": "independent_work",
-            "calls": 6,
             "visual": false,
             "root": "/repo",
             "read": [],
@@ -1427,11 +1702,8 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_contract_treats_size_as_soft_but_keeps_role_compatibility() {
-        let mut contract = research_contract("tiny");
-        contract["files"] = json!(1);
-        contract["dirs"] = json!(1);
-        let input = contract_input("tiny", "codey_deep_research", contract);
+    fn adaptive_contract_keeps_role_compatibility_without_dead_size_fields() {
+        let input = contract_input("tiny", "codey_deep_research", research_contract("tiny"));
         assert!(prepare_contract(Some(&input)).is_ok());
 
         let quick = contract_input("quick", "codey_quick_scan", research_contract("quick"));
@@ -1470,6 +1742,102 @@ mod tests {
             }),
         );
         assert!(prepare_contract(Some(&huge_parallel)).is_ok());
+
+        let user_requested = contract_input(
+            "explicit",
+            "codey_deep_research",
+            json!({
+                "id": "explicit",
+                "why": "user_requested",
+                "branch_calls": [10, 10, 10, 10],
+                "visual": false,
+                "read": [],
+                "write": [],
+                "checks": []
+            }),
+        );
+        let prepared = prepare_contract(Some(&user_requested)).unwrap();
+        assert_eq!(
+            adaptive_limits(&prepared.contract),
+            (DEFAULT_POINT_LIMIT, DEFAULT_ATTEMPT_LIMIT)
+        );
+
+        let stale_size_fields = contract_input(
+            "stale",
+            "codey_deep_research",
+            json!({
+                "id": "stale",
+                "why": "breadth",
+                "calls": 4,
+                "files": 5,
+                "visual": false,
+                "read": [],
+                "write": [],
+                "checks": []
+            }),
+        );
+        assert!(
+            prepare_contract(Some(&stale_size_fields))
+                .unwrap_err()
+                .contains("unknown field")
+        );
+
+        let legacy_contract = json!({
+            "id": "legacy",
+            "why": "breadth",
+            "calls": 4,
+            "files": 5,
+            "dirs": 2,
+            "large": false,
+            "risk": false,
+            "visual": false,
+            "read": [],
+            "write": [],
+            "checks": []
+        });
+        let legacy_input = json!({
+            "task_name": "legacy",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": format!(
+                "Do the task.\n{LEGACY_CONTRACT_PREFIX_V1}{}",
+                serde_json::to_string(&legacy_contract).unwrap()
+            )
+        });
+        assert!(prepare_contract(Some(&legacy_input)).is_ok());
+    }
+
+    #[test]
+    fn encrypted_message_uses_conservative_workspace_contract() {
+        let encrypted_input = json!({
+            "task_name": "encrypted_worker",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        let prepared =
+            prepare_contract_with_workspace(Some(&encrypted_input), Some("/repo")).unwrap();
+        assert_eq!(prepared.contract.id, "encrypted_worker");
+        assert_eq!(prepared.contract.reason, "encrypted_message");
+        assert_eq!(prepared.workspace_root.as_deref(), Some("/repo"));
+        assert_eq!(prepared.write_paths, ["/repo"]);
+        assert!(prepared.read_paths.is_empty());
+        assert!(prepared.contract.acceptance.is_empty());
+
+        let error = prepare_contract_with_workspace(Some(&encrypted_input), None).unwrap_err();
+        assert!(error.contains("Hook 未提供绝对工作目录"));
+
+        let missing_contract = json!({
+            "task_name": "plain_worker",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": "Plain text without a delegation contract"
+        });
+        assert!(
+            prepare_contract_with_workspace(Some(&missing_contract), Some("/repo"))
+                .unwrap_err()
+                .contains("最后一行缺少 CODEY_DELEGATION_V2")
+        );
     }
 
     #[test]
@@ -1783,6 +2151,138 @@ mod tests {
             pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 90)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn acceptance_evidence_supports_safe_text_fallback_and_empty_error_fields() {
+        assert_eq!(POST_TOOL_HOOK_MATCHER, "*");
+        assert_eq!(
+            classify_acceptance_evidence(Some(&json!({
+                "exit_code": 0,
+                "error": "",
+                "output": "ok"
+            }))),
+            AcceptanceEvidence::Passed
+        );
+        assert_eq!(
+            classify_acceptance_evidence(Some(&Value::String("exit code: 0".to_string()))),
+            AcceptanceEvidence::Passed
+        );
+        assert_eq!(
+            classify_acceptance_evidence(Some(&json!({ "output": "exit_code = 0" }))),
+            AcceptanceEvidence::MissingExitStatus
+        );
+        assert_eq!(
+            classify_acceptance_evidence(Some(&json!({
+                "output": "{\"exit_code\":0}"
+            }))),
+            AcceptanceEvidence::MissingExitStatus
+        );
+        assert_eq!(
+            classify_acceptance_evidence(Some(&Value::String(
+                "test output\nexit code: 0".to_string()
+            ))),
+            AcceptanceEvidence::MissingExitStatus
+        );
+    }
+
+    #[test]
+    fn acceptance_debt_releases_after_three_failures_with_an_explicit_notice() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = contract_input(
+            "worker_a",
+            "codey_worker",
+            worker_contract("worker_a", "backend/src"),
+        );
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        let command = json!({
+            "command": "# codey-accept:worker_a:tests\ncargo test -p codey --lib"
+        });
+        for now_ms in [20, 30, 40] {
+            post_root_tool(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&command),
+                Some(&json!({ "exit_code": 1, "output": "failed" })),
+                now_ms,
+            )
+            .unwrap();
+        }
+
+        let notice = pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 50)
+            .unwrap()
+            .unwrap();
+        assert!(notice.contains("没有被标记为通过"));
+        assert!(notice.contains("失败 3 次"));
+        assert_eq!(
+            pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 60).unwrap(),
+            None
+        );
+        settle_turn(temp.path(), "runtime-a", "session-a", 70).unwrap();
+    }
+
+    #[test]
+    fn unchanged_acceptance_debt_releases_after_three_stop_observations() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = contract_input(
+            "worker_a",
+            "codey_worker",
+            worker_contract("worker_a", "backend/src"),
+        );
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+
+        for now_ms in [20, 30] {
+            let reason = pending_acceptance_reason(temp.path(), "runtime-a", "session-a", now_ms)
+                .unwrap()
+                .unwrap();
+            assert!(reason.contains("codey-accept:worker_a:tests"));
+        }
+        let notice = pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 40)
+            .unwrap()
+            .unwrap();
+        assert!(notice.contains("连续 3 次 Stop 未取得新证据"));
+        assert_eq!(
+            pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 50).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn acceptance_debt_releases_after_the_stall_grace_even_before_three_stops() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = contract_input(
+            "worker_a",
+            "codey_worker",
+            worker_contract("worker_a", "backend/src"),
+        );
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+
+        assert!(
+            pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 20)
+                .unwrap()
+                .unwrap()
+                .contains("codey-accept:worker_a:tests")
+        );
+        let notice = pending_acceptance_reason(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            20 + ACCEPTANCE_STALL_GRACE_MILLIS,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(notice.contains("持续 10 分钟未取得新证据"));
+        assert_eq!(
+            pending_acceptance_reason(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                21 + ACCEPTANCE_STALL_GRACE_MILLIS,
+            )
+            .unwrap(),
+            None
         );
     }
 
