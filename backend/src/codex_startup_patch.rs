@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-const PATCH_RESULT: &str = "codey-startup-patch-installed-v23";
+const PATCH_RESULT: &str = "codey-startup-patch-installed-v24";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn patch_result_is_stable_for_launch_status_validation() {
-        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v23");
+        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v24");
     }
 
     #[test]
@@ -319,6 +319,8 @@ mod tests {
         assert!(expression.contains("default Chinese locale"));
         assert!(expression.contains("__CODEY_DEFAULT_CHINESE_LOCALE_RENDERER_PATCH__"));
         assert!(expression.contains("spawnSync"));
+        assert!(expression.contains("writeCodeyPatchFailuresAsync"));
+        assert!(expression.contains("optionalPatchFailureQueue"));
         assert!(expression.contains("--codey-record-error"));
         assert!(!expression.contains("\"__CODEY_ERROR_LOGGER_EXECUTABLE__\""));
     }

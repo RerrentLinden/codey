@@ -76,6 +76,8 @@ test("error log is minimal, failure-only, daily, and crash-aware", async () => {
   assert.doesNotMatch(lib, /"auto_launch_codey_runtime"/);
   assert.match(startupPatch, /recordCodeyPatchFailure/);
   assert.match(startupPatch, /spawnSync/);
+  assert.match(startupPatch, /writeCodeyPatchFailuresAsync/);
+  assert.match(startupPatch, /optionalPatchFailureQueue/);
   assert.match(startupPatch, /startup\.renderer_asset_patch/);
   assert.match(startupPatch, /versions:\s*\{/);
   assert.match(startupPatch, /electron:\s*process\.versions/);

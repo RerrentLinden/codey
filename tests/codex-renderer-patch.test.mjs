@@ -4,7 +4,10 @@ import test from "node:test";
 
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
-async function loadStartupPatchExpression(disablePet = true) {
+async function loadStartupPatchExpression(
+  disablePet = true,
+  errorLoggerExecutable = null,
+) {
   const template = normalizeLineEndings(
     await readFile(
       new URL("../backend/src/codex_startup_patch.js", import.meta.url),
@@ -12,9 +15,15 @@ async function loadStartupPatchExpression(disablePet = true) {
     ),
   );
   assert.ok(template);
-  return template
+  const expression = template
     .replaceAll("__DISABLE_PET__", disablePet ? "true" : "false")
     .replaceAll("__FAST_CODEX_STARTUP__", "true");
+  return errorLoggerExecutable == null
+    ? expression
+    : expression.replaceAll(
+        '"__CODEY_ERROR_LOGGER_EXECUTABLE__"',
+        JSON.stringify(errorLoggerExecutable),
+      );
 }
 
 test("an incompatible optional renderer patch never blocks the Codex module response", async () => {
@@ -123,6 +132,30 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
   };
 
   const nativeConsoleError = console.error;
+  const childProcess = process.getBuiltinModule("child_process");
+  const nativeSpawn = childProcess.spawn;
+  const nativeSpawnSync = childProcess.spawnSync;
+  const asyncLogSpawns = [];
+  const syncLogSpawns = [];
+  childProcess.spawn = (command, args, options) => {
+    const child = new FakeEmitter();
+    const stdin = new FakeEmitter();
+    const call = { command, args, options, input: null, encoding: null };
+    stdin.end = (input, encoding) => {
+      call.input = input;
+      call.encoding = encoding;
+      queueMicrotask(() => child.emit("exit", 0));
+    };
+    child.stdin = stdin;
+    child.kill = () => true;
+    child.unref = () => child;
+    asyncLogSpawns.push(call);
+    return child;
+  };
+  childProcess.spawnSync = (command, args, options) => {
+    syncLogSpawns.push({ command, args, options });
+    return { status: 0, stderr: "" };
+  };
   const patchErrors = [];
   console.error = (...args) => {
     patchErrors.push(args);
@@ -130,8 +163,8 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
 
   try {
     assert.equal(
-      (0, eval)(await loadStartupPatchExpression()),
-      "codey-startup-patch-installed-v23",
+      (0, eval)(await loadStartupPatchExpression(true, "C:\\Codey\\codey.exe")),
+      "codey-startup-patch-installed-v24",
     );
     const electron = Module._load("electron", undefined, false);
     const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
@@ -221,6 +254,55 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     for (const [message] of patchErrors) {
       assert.match(String(message), /incompatible Codex renderer patch/);
     }
+    assert.equal(syncLogSpawns.length, 0);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(asyncLogSpawns.length, 1);
+    assert.deepEqual(
+      JSON.parse(asyncLogSpawns[0].input).map(({ operation }) => operation),
+      [
+        "renderer_patch:model allowlist",
+        "renderer_patch:model visibility",
+      ],
+    );
+
+    const currentRendererSource = [
+      "const includeUltraReasoningEffort=!0,isServiceTierAllowed=!0;",
+      "function currentModelFilter({additionalAvailableModels:e,authMethod:t,availableModels:n,isCustomModelProvider:r,model:i,useHiddenModels:a}){",
+      "return e?.has(i.model)===!0||i.model!==`codex-auto-review`&&",
+      "(a&&!r&&t!==`amazonBedrock`?n.has(i.model):!i.hidden)}",
+      "function currentComposer(){",
+      "let w=!1,F=!0,K=!1,xe=`fast`,M={availableOptions:[{value:`fast`}]};",
+      "let Ee=!w&&F&&M.availableOptions.length>1;",
+      "let Re=!w&&F&&!K&&xe!=null,ze={enabled:Re};",
+      "OQ(`composer.toggleFastMode`,()=>{},ze);",
+      "let de=!0,r=!1,pe=de&&!r,Se=`fast`,V=()=>{},H=()=>{},U=()=>{},z=!1,B={},te=[];",
+      "let Ze=pe?{labelCandidates:te,onBlur:V,onPointerDown:H,onPointerLeave:U,",
+      "selectedServiceTierIconKind:Se,showFastServiceTierIndicator:!0,tooltipOpen:z,triggerRef:B}:void 0;",
+      "let view={modelPickerTriggerConfig:Ze,selectedServiceTierIconKind:Se};",
+      "if(de&&Ze!=null)view.ready=!0;return {Ee,Re,pe,view}}",
+      "`composer.intelligenceDropdown.model.title`;",
+      "`composer.intelligenceDropdown.model.rowLabel`;",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(currentRendererSource),
+    );
+    const currentRendererResponse = await installedHandler({
+      url: "app://-/assets/app-initial-current-codex-build.js",
+    });
+    const patchedCurrentRendererSource = await currentRendererResponse.text();
+    assert.match(
+      patchedCurrentRendererSource,
+      /Ee=!w&&M\.availableOptions\.length>1/,
+    );
+    assert.match(patchedCurrentRendererSource, /Re=!w&&!K&&xe!=null/);
+    assert.match(patchedCurrentRendererSource, /pe=!r/);
+    assert.match(patchedCurrentRendererSource, /if\(Ze!=null\)/);
+    assert.equal(
+      patchErrors.length,
+      2,
+      "native-compatible model access and current Fast controls must not log skips",
+    );
 
     const petSettingsSource = [
       "import{AvatarPreview as P,builtInPets as L}",
@@ -685,8 +767,40 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     // anchors were present but whose shapes did not match. The statsig and
     // interaction bundles patched cleanly, so no further skips were logged.
     assert.equal(patchErrors.length, 2);
+
+    const productionRendererAsset = process.env.CODEY_RENDERER_ASSET;
+    if (productionRendererAsset) {
+      const productionSource = await readFile(productionRendererAsset, "utf8");
+      const previousErrorCount = patchErrors.length;
+      electron.protocol.handle("app", async () => new Response(productionSource));
+      const productionResponse = await installedHandler({
+        url: "app://-/assets/app-initial-production-build.js",
+      });
+      const patchedProductionSource = await productionResponse.text();
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.notEqual(
+        patchedProductionSource,
+        productionSource,
+        "the production renderer asset should receive compatible Codey gates",
+      );
+      const currentGateFailures = patchErrors
+        .slice(previousErrorCount)
+        .map(([message]) => String(message))
+        .filter((message) =>
+          /model allowlist|model visibility|model-aware service tier control|model-aware Fast toggle|fast model trigger availability/.test(
+            message,
+          ),
+        );
+      assert.deepEqual(
+        currentGateFailures,
+        [],
+        "the current production renderer shapes must not log known compatibility failures",
+      );
+    }
   } finally {
     console.error = nativeConsoleError;
+    childProcess.spawn = nativeSpawn;
+    childProcess.spawnSync = nativeSpawnSync;
     Module._load = nativeLoad;
     Module._extensions[".js"] = nativeJsExtension;
   }

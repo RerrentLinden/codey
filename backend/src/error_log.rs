@@ -14,6 +14,7 @@ use serde_json::Value;
 const ERROR_LOG_FILE: &str = "codey-errors.log";
 const ERROR_LOG_HELPER_ARGUMENT: &str = "--codey-record-error";
 const MAX_HELPER_INPUT_BYTES: u64 = 1024 * 1024;
+const MAX_HELPER_RECORDS: usize = 64;
 const BEIJING_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 static ERROR_LOG_WRITER: OnceLock<Mutex<ErrorLogWriter>> = OnceLock::new();
 static PANIC_LOG_HOOK: OnceLock<()> = OnceLock::new();
@@ -58,6 +59,13 @@ struct ErrorRecord {
     recoverable: Option<bool>,
     #[serde(default, skip_serializing_if = "is_empty_context")]
     context: Value,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ErrorHelperInput {
+    Record(ErrorRecord),
+    Batch(Vec<ErrorRecord>),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -419,27 +427,55 @@ pub fn run_helper_if_requested() -> anyhow::Result<bool> {
         u64::try_from(input.len()).unwrap_or(u64::MAX) <= MAX_HELPER_INPUT_BYTES,
         "Codey 错误日志 helper 输入过大"
     );
-    let mut record: ErrorRecord =
-        serde_json::from_str(&input).context("解析 Codey 错误日志 helper 输入失败")?;
-    anyhow::ensure!(
-        !record.event.trim().is_empty()
-            && !record.operation.trim().is_empty()
-            && !record.error.trim().is_empty(),
-        "Codey 错误日志 helper 缺少失败信息"
-    );
-    normalize_record(&mut record);
-    append_record(&record, beijing_now().date_naive()).context("Codey 错误日志 helper 写入失败")?;
+    let records = parse_helper_records(&input)?;
+    append_records(&records, beijing_now().date_naive())
+        .context("Codey 错误日志 helper 写入失败")?;
     Ok(true)
 }
 
+fn parse_helper_records(input: &str) -> anyhow::Result<Vec<ErrorRecord>> {
+    let input: ErrorHelperInput =
+        serde_json::from_str(input).context("解析 Codey 错误日志 helper 输入失败")?;
+    let mut records = match input {
+        ErrorHelperInput::Record(record) => vec![record],
+        ErrorHelperInput::Batch(records) => records,
+    };
+    anyhow::ensure!(!records.is_empty(), "Codey 错误日志 helper 批次为空");
+    anyhow::ensure!(
+        records.len() <= MAX_HELPER_RECORDS,
+        "Codey 错误日志 helper 批次过大"
+    );
+    for (index, record) in records.iter_mut().enumerate() {
+        anyhow::ensure!(
+            !record.event.trim().is_empty()
+                && !record.operation.trim().is_empty()
+                && !record.error.trim().is_empty(),
+            "Codey 错误日志 helper 第 {} 条记录缺少失败信息",
+            index + 1
+        );
+        normalize_record(record);
+    }
+    Ok(records)
+}
+
 fn append_record(record: &ErrorRecord, today: NaiveDate) -> anyhow::Result<()> {
-    let line = serde_json::to_string(record).context("序列化 Codey 错误日志失败")?;
+    append_records(std::slice::from_ref(record), today)
+}
+
+fn append_records(records: &[ErrorRecord], today: NaiveDate) -> anyhow::Result<()> {
+    anyhow::ensure!(!records.is_empty(), "Codey 错误日志批次为空");
+    let lines = records
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .context("序列化 Codey 错误日志失败")?
+        .join("\n");
     let path = error_log_path();
     let writer = ERROR_LOG_WRITER.get_or_init(|| Mutex::new(ErrorLogWriter));
     writer
         .lock()
         .map_err(|_| anyhow::anyhow!("Codey error log lock is poisoned"))?
-        .append(&path, today, &line)
+        .append(&path, today, &lines)
         .map_err(anyhow::Error::from)
 }
 
@@ -508,6 +544,51 @@ mod tests {
         assert!(value.get("durationMs").is_none());
         assert!(value.get("attempts").is_none());
         assert!(value.get("timeoutMs").is_none());
+    }
+
+    #[test]
+    fn helper_accepts_and_normalizes_a_failure_batch() {
+        let records = parse_helper_records(
+            &serde_json::json!([
+                {
+                    "timestamp": "2026-08-18T09:36:53Z",
+                    "platform": "windows",
+                    "event": "patch_failed",
+                    "operation": "renderer_patch:model allowlist",
+                    "error": "gate matched 0 times"
+                },
+                {
+                    "timestamp": "2026-08-18T09:36:54Z",
+                    "platform": "windows",
+                    "event": "patch_failed",
+                    "operation": "renderer_patch:model visibility",
+                    "error": "gate matched 0 times"
+                }
+            ])
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].timestamp, "2026-08-18T17:36:53+08:00");
+        assert_eq!(
+            records[1].versions.codey.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn helper_rejects_empty_and_oversized_batches() {
+        assert!(parse_helper_records("[]").is_err());
+        let record = serde_json::json!({
+            "timestamp": "2026-08-18T09:36:53Z",
+            "platform": "windows",
+            "event": "patch_failed",
+            "operation": "renderer_patch:test",
+            "error": "gate matched 0 times"
+        });
+        let oversized = Value::Array(vec![record; MAX_HELPER_RECORDS + 1]).to_string();
+        assert!(parse_helper_records(&oversized).is_err());
     }
 
     #[test]

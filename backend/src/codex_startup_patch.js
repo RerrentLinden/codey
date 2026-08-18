@@ -2,6 +2,80 @@
   const disablePet = __DISABLE_PET__;
   const fastCodexStartup = __FAST_CODEX_STARTUP__;
   const codeyErrorLoggerExecutable = "__CODEY_ERROR_LOGGER_EXECUTABLE__";
+  const maxOptionalPatchFailureBatchSize = 64;
+  const optionalPatchFailureQueue = [];
+  let optionalPatchFailureFlushScheduled = false;
+  const reportPatchLogError = (error) => {
+    try {
+      console.error("[Codey] failed to write patch error log", error);
+    } catch {}
+  };
+  const writeCodeyPatchFailureSync = (record) => {
+    const result = process.getBuiltinModule("child_process").spawnSync(
+      codeyErrorLoggerExecutable,
+      ["--codey-record-error"],
+      {
+        input: JSON.stringify(record),
+        encoding: "utf8",
+        maxBuffer: 64 * 1024,
+        timeout: 2000,
+        windowsHide: true,
+      },
+    );
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(
+        `Codey error log helper exited with ${result.status}: ${String(result.stderr || "").trim()}`,
+      );
+    }
+  };
+  const writeCodeyPatchFailuresAsync = (records) => {
+    try {
+      const child = process.getBuiltinModule("child_process").spawn(
+        codeyErrorLoggerExecutable,
+        ["--codey-record-error"],
+        {
+          stdio: ["pipe", "ignore", "ignore"],
+          windowsHide: true,
+        },
+      );
+      const timeout = setTimeout(() => {
+        try {
+          child.kill();
+        } catch {}
+      }, 2000);
+      timeout.unref?.();
+      const clearKillTimeout = () => clearTimeout(timeout);
+      child.once("exit", clearKillTimeout);
+      child.once("error", (error) => {
+        clearKillTimeout();
+        reportPatchLogError(error);
+      });
+      child.stdin?.once("error", reportPatchLogError);
+      child.stdin?.end(JSON.stringify(records), "utf8");
+      child.unref();
+    } catch (error) {
+      reportPatchLogError(error);
+    }
+  };
+  const scheduleOptionalPatchFailureFlush = () => {
+    if (optionalPatchFailureFlushScheduled) return;
+    optionalPatchFailureFlushScheduled = true;
+    setImmediate(() => {
+      optionalPatchFailureFlushScheduled = false;
+      const records = optionalPatchFailureQueue.splice(
+        0,
+        maxOptionalPatchFailureBatchSize,
+      );
+      if (records.length) writeCodeyPatchFailuresAsync(records);
+      if (optionalPatchFailureQueue.length) scheduleOptionalPatchFailureFlush();
+    });
+  };
+  const queueOptionalPatchFailure = (record) => {
+    if (optionalPatchFailureQueue.length >= maxOptionalPatchFailureBatchSize) return;
+    optionalPatchFailureQueue.push(record);
+    scheduleOptionalPatchFailureFlush();
+  };
   const recordCodeyPatchFailure = (operation, error, context = {}) => {
     const unresolvedExecutable =
       ["__CODEY", "ERROR_LOGGER_EXECUTABLE__"].join("_");
@@ -22,47 +96,33 @@
             : process.platform;
       const optionalPatch =
         operation.startsWith("renderer_patch:") ||
-        operation.startsWith("optional_main_bundle_patch:");
-      const stage = operation.startsWith("renderer_patch:")
+        operation.startsWith("optional_main_bundle_patch:") ||
+        operation === "patch_codex_renderer_asset";
+      const stage = operation.startsWith("renderer_patch:") ||
+        operation === "patch_codex_renderer_asset"
         ? "startup.renderer_asset_patch"
         : operation.startsWith("optional_main_bundle_patch:")
           ? "startup.optional_main_bundle_patch"
           : "startup.main_process_patch";
-      const result = process.getBuiltinModule("child_process").spawnSync(
-        codeyErrorLoggerExecutable,
-        ["--codey-record-error"],
-        {
-          input: JSON.stringify({
-            timestamp: now.toISOString(),
-            platform,
-            versions: {
-              electron: process.versions?.electron || undefined,
-              chrome: process.versions?.chrome || undefined,
-              node: process.versions?.node || undefined,
-            },
-            event: "patch_failed",
-            operation,
-            error: message,
-            stage,
-            recoverable: optionalPatch,
-            context,
-          }),
-          encoding: "utf8",
-          maxBuffer: 64 * 1024,
-          timeout: 2000,
-          windowsHide: true,
+      const record = {
+        timestamp: now.toISOString(),
+        platform,
+        versions: {
+          electron: process.versions?.electron || undefined,
+          chrome: process.versions?.chrome || undefined,
+          node: process.versions?.node || undefined,
         },
-      );
-      if (result.error) throw result.error;
-      if (result.status !== 0) {
-        throw new Error(
-          `Codey error log helper exited with ${result.status}: ${String(result.stderr || "").trim()}`,
-        );
-      }
+        event: "patch_failed",
+        operation,
+        error: message,
+        stage,
+        recoverable: optionalPatch,
+        context,
+      };
+      if (optionalPatch) queueOptionalPatchFailure(record);
+      else writeCodeyPatchFailureSync(record);
     } catch (logError) {
-      try {
-        console.error("[Codey] failed to write patch error log", logError);
-      } catch {}
+      reportPatchLogError(logError);
     }
   };
   const statsigBootstrapTimeoutMs = 1500;
@@ -524,6 +584,10 @@
     }
     return patched;
   };
+  const rendererHasNativeCustomProviderModelAccess = (source) =>
+    /function\s+[$A-Z_a-z][$\w]*\(\{[^}]*isCustomModelProvider\s*:\s*([$A-Z_a-z][$\w]*)[^}]*model\s*:\s*([$A-Z_a-z][$\w]*)[^}]*useHiddenModels\s*:\s*([$A-Z_a-z][$\w]*)[^}]*\}\)\s*\{\s*return[\s\S]{0,512}?\3\s*&&\s*!\s*\1\s*&&[\s\S]{0,256}?\?\s*[$A-Z_a-z][$\w]*\.has\(\s*\2\.model\s*\)\s*:\s*!\s*\2\.hidden\s*\)*\s*\}/.test(
+      source,
+    );
   const replacePetRendererImportWithStubs = (match, importClause) => {
     if (typeof importClause !== "string" || importClause.trim() === "") {
       return "";
@@ -599,6 +663,7 @@
     ].join("");
   const patchCodexRendererAsset = (source) => {
     let patched = source;
+    let nativeCustomProviderModelAccess = false;
     if (
       disablePet
       && /settings\.(?:(?:appearance|personalization)\.)?pets(?:[."`]|$)/.test(source)
@@ -671,18 +736,26 @@
       source.includes("includeUltraReasoningEffort") &&
       source.includes("amazonBedrock")
     ) {
-      patched = replaceUniqueRendererGate(
-        patched,
-        /if\s*\(\s*\(*\s*(?:[$A-Z_a-z][$\w]*\s*(?:\?\.|\.)\s*has\(\s*[$A-Z_a-z][$\w]*\.model\s*\)\s*(?:===\s*!0)?\s*\|\|\s*)?\(?\s*([$A-Z_a-z][$\w]*)\s*\?\s*([$A-Z_a-z][$\w]*)\.has\(\s*([$A-Z_a-z][$\w]*)\.model\s*\)\s*:\s*(?:!\s*\3\.hidden|\3\.hidden\s*!==\s*!0|\3\.hidden\s*===\s*!1)\s*\)?\s*\)*\s*\)/g,
-        (_match, useAllowlistName, allowlistName, modelName) =>
-          `if(${useAllowlistName}?(${allowlistName}.has(${modelName}.model)||!${modelName}.hidden):!${modelName}.hidden)`,
-        "model allowlist",
-      );
+      // Newer Codex builds already bypass the native allowlist for custom
+      // providers and fall back to the model's own visibility bit. Recognize
+      // that semantic shape as compatible instead of logging a false failure.
+      nativeCustomProviderModelAccess =
+        rendererHasNativeCustomProviderModelAccess(source);
+      if (!nativeCustomProviderModelAccess) {
+        patched = replaceUniqueRendererGate(
+          patched,
+          /if\s*\(\s*\(*\s*(?:[$A-Z_a-z][$\w]*\s*(?:\?\.|\.)\s*has\(\s*[$A-Z_a-z][$\w]*\.model\s*\)\s*(?:===\s*!0)?\s*\|\|\s*)?\(?\s*([$A-Z_a-z][$\w]*)\s*\?\s*([$A-Z_a-z][$\w]*)\.has\(\s*([$A-Z_a-z][$\w]*)\.model\s*\)\s*:\s*(?:!\s*\3\.hidden|\3\.hidden\s*!==\s*!0|\3\.hidden\s*===\s*!1)\s*\)?\s*\)*\s*\)/g,
+          (_match, useAllowlistName, allowlistName, modelName) =>
+            `if(${useAllowlistName}?(${allowlistName}.has(${modelName}.model)||!${modelName}.hidden):!${modelName}.hidden)`,
+          "model allowlist",
+        );
+      }
     }
     if (
       source.includes("useHiddenModels:") &&
       source.includes("includeUltraReasoningEffort") &&
-      source.includes("amazonBedrock")
+      source.includes("amazonBedrock") &&
+      !nativeCustomProviderModelAccess
     ) {
       patched = replaceUniqueRendererGate(
         patched,
@@ -747,16 +820,47 @@
       // The current model's options decide whether the speed control exists.
       patched = replaceUniqueRendererGate(
         patched,
-        /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
-        (_match, assignment, _resultName, settingsName) =>
-          `${assignment}${settingsName}.availableOptions.length>1`,
+        [
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            replacement: (_match, assignment, _resultName, settingsName) =>
+              `${assignment}${settingsName}.availableOptions.length>1`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            replacement: (
+              _match,
+              preservedPrefix,
+              _resultName,
+              _draftName,
+              settingsName,
+            ) => `${preservedPrefix}${settingsName}.availableOptions.length>1`,
+          },
+        ],
+        undefined,
         "model-aware service tier control",
       );
       patched = replaceUniqueRendererGate(
         patched,
-        /(`composer\.toggleFastMode`[\s\S]{0,512}?\{\s*enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null/g,
-        (_match, prefix, loadingName, fastOptionName) =>
-          `${prefix}!${loadingName}&&${fastOptionName}!=null`,
+        [
+          {
+            pattern: /(`composer\.toggleFastMode`[\s\S]{0,512}?\{\s*enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null/g,
+            replacement: (_match, prefix, loadingName, fastOptionName) =>
+              `${prefix}!${loadingName}&&${fastOptionName}!=null`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null(?=\s*[,;][\s\S]{0,512}?\{\s*enabled\s*:\s*\2\s*\}[\s\S]{0,512}?`composer\.toggleFastMode`)/g,
+            replacement: (
+              _match,
+              preservedPrefix,
+              _resultName,
+              _draftName,
+              loadingName,
+              fastOptionName,
+            ) => `${preservedPrefix}!${loadingName}&&${fastOptionName}!=null`,
+          },
+        ],
+        undefined,
         "model-aware Fast toggle",
       );
     }
@@ -825,13 +929,27 @@
       // indicator and avoids falling back to the legacy outlined model icon.
       patched = replaceUniqueRendererGate(
         patched,
-        /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*,[\s\S]{0,8192}?modelPickerTriggerConfig\s*:\s*\2\s*\?)/g,
-        (
-          _match,
-          assignment,
-          _triggerConfigName,
-          hideLabelName,
-        ) => `${assignment}!${hideLabelName}`,
+        [
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*,[\s\S]{0,8192}?modelPickerTriggerConfig\s*:\s*\2\s*\?)/g,
+            replacement: (
+              _match,
+              assignment,
+              _triggerConfigName,
+              hideLabelName,
+            ) => `${assignment}!${hideLabelName}`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*,[\s\S]{0,4096}?\b([$A-Z_a-z][$\w]*)\s*=\s*\2\s*\?\s*\{[\s\S]{0,1024}?selectedServiceTierIconKind\s*:[\s\S]{0,1024}?showFastServiceTierIndicator\s*:[\s\S]{0,8192}?modelPickerTriggerConfig\s*:\s*\4\b)/g,
+            replacement: (
+              _match,
+              assignment,
+              _triggerConfigName,
+              hideLabelName,
+            ) => `${assignment}!${hideLabelName}`,
+          },
+        ],
+        undefined,
         "fast model trigger availability",
       );
       // Preserve Codex's native Fast indicators. Its own model/tier support
@@ -2680,5 +2798,5 @@
   setImmediate(() => {
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v23";
+  return "codey-startup-patch-installed-v24";
 })()
