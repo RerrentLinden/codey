@@ -1,7 +1,9 @@
 use std::sync::{Arc, OnceLock};
+use std::{fs, path::Path};
 
 use reqwest::Client;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use super::AppState;
 use crate::cc_switch;
@@ -11,6 +13,8 @@ use crate::error_log;
 use crate::prompt_optimization;
 
 static OPTIMIZER_CLIENT: OnceLock<Client> = OnceLock::new();
+const CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
+const CODEX_INSTALLATION_ID_FILE: &str = "installation_id";
 
 fn optimizer_client() -> Result<&'static Client, String> {
     if let Some(client) = OPTIMIZER_CLIENT.get() {
@@ -41,10 +45,31 @@ async fn current_provider_request_profile(config: &CodeyConfig) -> Result<Provid
 fn resolve_request_config(
     optimization: &PromptOptimizationConfig,
 ) -> Result<prompt_optimization::ResolvedPromptOptimizationConfig, String> {
+    resolve_request_config_at(optimization, &codex_home())
+}
+
+fn resolve_request_config_at(
+    optimization: &PromptOptimizationConfig,
+    codex_home: &Path,
+) -> Result<prompt_optimization::ResolvedPromptOptimizationConfig, String> {
     if optimization.api_key.trim().is_empty() {
         return Err("请先配置 API Key".to_string());
     }
-    Ok(prompt_optimization::ResolvedPromptOptimizationConfig::from_custom(optimization))
+    let mut resolved =
+        prompt_optimization::ResolvedPromptOptimizationConfig::from_custom(optimization);
+    if let Some(installation_id) = read_codex_installation_id(codex_home) {
+        resolved
+            .request_headers
+            .insert(CODEX_INSTALLATION_ID_HEADER.to_string(), installation_id);
+    }
+    Ok(resolved)
+}
+
+fn read_codex_installation_id(codex_home: &Path) -> Option<String> {
+    let value = fs::read_to_string(codex_home.join(CODEX_INSTALLATION_ID_FILE)).ok()?;
+    Uuid::parse_str(value.trim())
+        .ok()
+        .map(|installation_id| installation_id.to_string())
 }
 
 fn apply_current_provider_to_prompt_optimization(
@@ -139,8 +164,9 @@ pub async fn fetch_prompt_optimization_models_command(
     let mut optimization = draft.unwrap_or_else(|| config.prompt_optimization.clone());
     optimization.merge_redacted_secrets(&config.prompt_optimization);
     optimization.validate()?;
+    let request_config = resolve_request_config(&optimization)?;
     let client = optimizer_client()?;
-    let models = prompt_optimization::fetch_models(client, &optimization).await;
+    let models = prompt_optimization::fetch_models_resolved(client, &request_config).await;
     match models {
         Ok(models) => Ok(json!({"models": models})),
         Err(error) => {
@@ -193,6 +219,52 @@ mod tests {
     use codey_runtime_core::settings::RelayProtocol;
 
     use super::*;
+
+    #[test]
+    fn resolved_prompt_optimization_uses_codex_installation_id_header() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(CODEX_INSTALLATION_ID_FILE),
+            " 49A95816-9EAD-4F14-B008-1D0CBAA3C328\n",
+        )
+        .unwrap();
+        let optimization = PromptOptimizationConfig {
+            api_key: "sk-test".to_string(),
+            ..PromptOptimizationConfig::default()
+        };
+
+        let resolved = resolve_request_config_at(&optimization, directory.path()).unwrap();
+
+        assert_eq!(
+            resolved
+                .request_headers
+                .get(CODEX_INSTALLATION_ID_HEADER)
+                .map(String::as_str),
+            Some("49a95816-9ead-4f14-b008-1d0cbaa3c328")
+        );
+    }
+
+    #[test]
+    fn invalid_codex_installation_id_is_not_forwarded() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(CODEX_INSTALLATION_ID_FILE),
+            "not-an-installation-id",
+        )
+        .unwrap();
+        let optimization = PromptOptimizationConfig {
+            api_key: "sk-test".to_string(),
+            ..PromptOptimizationConfig::default()
+        };
+
+        let resolved = resolve_request_config_at(&optimization, directory.path()).unwrap();
+
+        assert!(
+            !resolved
+                .request_headers
+                .contains_key(CODEX_INSTALLATION_ID_HEADER)
+        );
+    }
 
     #[test]
     fn current_provider_sync_copies_endpoint_key_protocol_and_default_model() {

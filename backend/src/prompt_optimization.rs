@@ -178,6 +178,7 @@ fn models_endpoints_from_base(base_url: &str) -> Result<Vec<String>, String> {
 /// service (`GET /models`), with the same `/v1` retry and error sanitization
 /// as the completion requests. The result keeps upstream order, is deduped
 /// and bounded so a misbehaving service cannot balloon the console.
+#[cfg(test)]
 pub async fn fetch_models(
     client: &Client,
     config: &PromptOptimizationConfig,
@@ -1354,6 +1355,11 @@ mod tests {
                 request_lower.contains("authorization: custom provider token"),
                 "{request}"
             );
+            assert!(
+                request_lower
+                    .contains("x-codex-installation-id: 49a95816-9ead-4f14-b008-1d0cbaa3c328"),
+                "{request}"
+            );
             assert!(!request_lower.contains("bearer ignored-key"), "{request}");
             assert!(
                 request.contains(r#""instructions":"保持原意""#),
@@ -1377,6 +1383,10 @@ mod tests {
         request_headers.insert(
             "Authorization".to_string(),
             "Custom Provider Token".to_string(),
+        );
+        request_headers.insert(
+            "x-codex-installation-id".to_string(),
+            "49a95816-9ead-4f14-b008-1d0cbaa3c328".to_string(),
         );
         let config = ResolvedPromptOptimizationConfig {
             base_url: format!("http://{address}/v1"),
