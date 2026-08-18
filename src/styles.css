@@ -84,7 +84,7 @@ input:focus-visible,
   min-height: 0;
   flex-direction: column;
   overflow: hidden;
-  background: var(--background);
+  background: linear-gradient(180deg, #fafafc 0%, #f2f2f5 100%);
   color: var(--foreground);
   isolation: isolate;
 }
@@ -251,100 +251,88 @@ input:focus-visible,
   border-radius: 999px;
 }
 
+.app-version-text {
+  font-size: 11px;
+  font-weight: 500;
+  color: #8e8e93;
+  letter-spacing: 0.01em;
+}
+
 .header-update-btn-wrap {
   display: inline-flex;
   align-items: center;
 }
 
-.header-update-icon-btn {
+.header-update-pill {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  gap: 5px;
   position: relative;
-  width: 22px;
   height: 22px;
-  padding: 0;
+  padding: 0 7px;
   border: 1px solid rgba(0, 0, 0, 0.09);
-  border-radius: 6px;
+  border-radius: 999px;
   background: rgba(255, 255, 255, 0.85);
   color: #8e8e93;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
   cursor: pointer;
   transition: all 160ms ease;
 }
 
-.header-update-icon-btn:hover:not(:disabled) {
+.header-update-pill:hover:not(:disabled) {
   background: #ffffff;
   color: var(--mac-blue);
   border-color: rgba(0, 122, 255, 0.35);
   box-shadow: 0 1px 3px rgba(0, 122, 255, 0.15);
 }
 
-.header-update-icon-btn:disabled {
+.header-update-pill:disabled {
   opacity: 0.65;
   cursor: not-allowed;
 }
 
-/* 醒目的更新状态标识 */
-.header-update-icon-btn.has-update {
-  background: rgba(255, 149, 0, 0.12);
-  border-color: rgba(255, 149, 0, 0.45);
-  color: #ff9500;
-  box-shadow: 0 0 0 2px rgba(255, 149, 0, 0.16);
-  animation: update-button-pulse 2s infinite ease-in-out;
+.header-update-pill-label {
+  letter-spacing: 0.01em;
 }
 
-.header-update-icon-btn.has-update:hover {
-  background: #ff9500;
+/* 有可升级版本：蓝色 pill + 轻微呼吸，全页唯一强调位 */
+.header-update-pill.has-update {
+  background: rgba(0, 122, 255, 0.09);
+  border-color: rgba(0, 122, 255, 0.32);
+  color: #0068d9;
+  animation: update-pill-pulse 2.4s infinite ease-in-out;
+}
+
+.header-update-pill.has-update:hover {
+  background: var(--mac-blue);
+  border-color: var(--mac-blue);
   color: #ffffff;
-  border-color: #ff9500;
+  animation: none;
 }
 
-.header-update-icon-btn.has-downloaded {
-  background: rgba(52, 199, 89, 0.15);
-  border-color: rgba(52, 199, 89, 0.45);
-  color: #34c759;
+.header-update-pill.has-downloaded {
+  background: rgba(52, 199, 89, 0.13);
+  border-color: rgba(52, 199, 89, 0.42);
+  color: #248a3d;
 }
 
-.update-pulse-dot {
-  position: absolute;
-  top: -3px;
-  right: -3px;
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: #ff3b30;
-  border: 1.5px solid #ffffff;
-  box-shadow: 0 0 4px rgba(255, 59, 48, 0.6);
-  animation: pulse-dot-anim 1.5s infinite ease-in-out;
+.header-update-pill.has-downloaded:hover {
+  background: var(--mac-green);
+  border-color: var(--mac-green);
+  color: #ffffff;
 }
 
-@keyframes pulse-dot-anim {
-  0% {
-    transform: scale(0.9);
-    opacity: 0.9;
-  }
-  50% {
-    transform: scale(1.25);
-    opacity: 1;
-  }
-  100% {
-    transform: scale(0.9);
-    opacity: 0.9;
-  }
-}
-
-@keyframes update-button-pulse {
+@keyframes update-pill-pulse {
   0%, 100% {
-    box-shadow: 0 0 0 0 rgba(255, 149, 0, 0.35);
+    box-shadow: 0 0 0 0 rgba(0, 122, 255, 0.22);
   }
   50% {
-    box-shadow: 0 0 0 4px rgba(255, 149, 0, 0.15);
+    box-shadow: 0 0 0 4px rgba(0, 122, 255, 0.08);
   }
-}
-
-.header-update-badge {
-  cursor: pointer;
-  animation: update-button-pulse 2s infinite ease-in-out;
 }
 
 .macos-titlebar-right {
@@ -379,12 +367,15 @@ input:focus-visible,
 }
 
 .config-brand-mark {
-  width: 36px;
-  height: 36px;
+  width: 38px;
+  height: 38px;
   display: block;
-  border-radius: 9px;
+  border-radius: 10px;
   object-fit: cover;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.15);
+  color: #007aff;
+  box-shadow:
+    0 1px 2px rgba(0, 122, 255, 0.12),
+    0 4px 12px rgba(0, 122, 255, 0.14);
 }
 
 .config-brand-copy {
@@ -542,17 +533,6 @@ input:focus-visible,
   padding: 24px 28px 48px;
 }
 
-.section-kicker {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  color: #8e8e93;
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-}
-
 .section-title {
   display: flex;
   align-items: flex-end;
@@ -563,6 +543,24 @@ input:focus-visible,
 
 .section-title.compact {
   align-items: center;
+}
+
+.section-heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.section-icon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 8px;
+  background: rgba(0, 122, 255, 0.09);
+  color: var(--mac-blue);
 }
 
 .section-title h1,

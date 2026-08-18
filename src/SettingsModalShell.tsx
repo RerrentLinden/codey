@@ -21,7 +21,26 @@ export function CodeyBrandMark() {
       aria-hidden="true"
       focusable="false"
     >
-      <rect x="0" y="0" width="350" height="350" rx="34" fill="#fff" />
+      <defs>
+        <linearGradient
+          id="codey-brand-mark-gradient"
+          x1="0"
+          x2="1"
+          y1="0"
+          y2="1"
+        >
+          <stop offset="0%" stopColor="#ffffff" />
+          <stop offset="100%" stopColor="#e3efff" />
+        </linearGradient>
+      </defs>
+      <rect
+        x="0"
+        y="0"
+        width="350"
+        height="350"
+        rx="34"
+        fill="url(#codey-brand-mark-gradient)"
+      />
       <path
         d="M70 301c-16 0-24-18-13-30l73-77c8-8 8-20 0-28L65 101C50 86 57 61 78 57c9-2 18 1 25 8l91 91c18 18 18 46 0 64l-66 66c-6 6-2 15 7 15h183"
         fill="none"

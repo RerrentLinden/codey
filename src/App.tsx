@@ -726,7 +726,7 @@ export function App({
         <div className="config-brand-copy">
           <div className="config-brand-title-row">
             <h1 id={embedded ? "semi-modal-title" : undefined}>Codey 控制台</h1>
-            <span className="app-version-tag">
+            <span className="app-version-text">
               v{status.appVersion || "0.2.0"}
             </span>
 
@@ -734,7 +734,7 @@ export function App({
               <span className="header-update-btn-wrap">
                 <button
                   type="button"
-                  className={`header-update-icon-btn ${
+                  className={`header-update-pill ${
                     hasUpdate
                       ? "has-update"
                       : downloadedUpdate
@@ -753,36 +753,25 @@ export function App({
                     }
                   }}
                 >
-                  {isCheckingUpdate ? (
-                    <LoaderCircle className="spinner" size={13} aria-hidden="true" />
-                  ) : isDownloadingUpdate ? (
-                    <LoaderCircle className="spinner" size={13} aria-hidden="true" />
-                  ) : isInstallingUpdate ? (
-                    <LoaderCircle className="spinner" size={13} aria-hidden="true" />
+                  {isCheckingUpdate || isDownloadingUpdate || isInstallingUpdate ? (
+                    <LoaderCircle className="spinner" size={12} aria-hidden="true" />
                   ) : downloadedUpdate ? (
-                    <IconCheck size={14} aria-hidden="true" />
-                  ) : hasUpdate ? (
-                    <>
-                      <IconCircleArrowUp size={15} aria-hidden="true" />
-                      <span className="update-pulse-dot" aria-hidden="true" />
-                    </>
+                    <IconCheck size={12} aria-hidden="true" />
                   ) : (
-                    <IconCircleArrowUp size={14} aria-hidden="true" />
+                    <IconCircleArrowUp size={13} aria-hidden="true" />
                   )}
+                  {downloadedUpdate ? (
+                    <span className="header-update-pill-label">
+                      v{downloadedUpdate.latestVersion} 已下载
+                    </span>
+                  ) : hasUpdate ? (
+                    <span className="header-update-pill-label">
+                      v{updateCheck?.latestVersion} 可更新
+                    </span>
+                  ) : null}
                 </button>
               </span>
             </Tooltip>
-
-            {hasUpdate && (
-              <Badge
-                variant="warning"
-                className="header-update-badge"
-                onClick={handleDownloadUpdate}
-                title={`点击下载 Codey v${updateCheck?.latestVersion}`}
-              >
-                可升级至 v{updateCheck?.latestVersion}
-              </Badge>
-            )}
 
             {dirty && (
               <Badge variant="warning" className="unsaved-badge">
@@ -980,33 +969,31 @@ export function App({
             </div>
           </div>
 
-          {/* 功能策略（GPU 渲染模式占左侧整体全宽） 与 消息通知 */}
-          <div className="feature-notification-grid">
-            {/* 左侧：Codex 功能策略（GPU 渲染模式用左侧整体宽度，下方为各项开关） */}
-            <div className="feature-column">
-              <FeaturePolicyCard
-                config={config}
-                fastContextToolsStatus={fastContextToolsStatus}
-                isMacClient={status.clientPlatform === "macos"}
-                popupContainer={popupContainer}
-                tooltipContainer={portalContainer}
-                isBusy={isBusy}
-                onConfigChange={handleConfigChange}
-              />
-            </div>
+          {/* Codex 功能策略：整行排列 */}
+          <div className="full-row-section feature-full-section">
+            <FeaturePolicyCard
+              config={config}
+              fastContextToolsStatus={fastContextToolsStatus}
+              isMacClient={status.clientPlatform === "macos"}
+              isWindowsClient={status.clientPlatform === "windows"}
+              popupContainer={popupContainer}
+              tooltipContainer={portalContainer}
+              isBusy={isBusy}
+              onConfigChange={handleConfigChange}
+            />
+          </div>
 
-            {/* 右侧：消息通知 */}
-            <div className="notification-column">
-              <NotificationChannelsCard
-                config={config}
-                container={portalContainer}
-                popupContainer={popupContainer}
-                isBusy={isBusy}
-                onAddChannel={handleAddNotificationChannel}
-                onChannelChange={handleNotificationChannelChange}
-                onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
-              />
-            </div>
+          {/* 消息通知：整行排列，每个渠道 item 占一半 */}
+          <div className="full-row-section notification-full-section">
+            <NotificationChannelsCard
+              config={config}
+              container={portalContainer}
+              popupContainer={popupContainer}
+              isBusy={isBusy}
+              onAddChannel={handleAddNotificationChannel}
+              onChannelChange={handleNotificationChannelChange}
+              onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
+            />
           </div>
 
           {/* 诊断存储保护：整行独占排布 */}

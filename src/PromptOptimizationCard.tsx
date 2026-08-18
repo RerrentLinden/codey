@@ -292,13 +292,20 @@ function PromptOptimizationCardComponent({
       aria-labelledby="prompt-optimization-title"
     >
       <div className="section-title compact">
-        <div>
-          <h2 id="prompt-optimization-title">提示词优化</h2>
-          <p>在 Codex 输入框旁一键重写与优化提示词。</p>
+        <div className="section-heading">
+          <span className="section-icon" aria-hidden="true">
+            <IconSparkles size={15} />
+          </span>
+          <div>
+            <h2 id="prompt-optimization-title">提示词优化</h2>
+            <p>在 Codex 输入框旁一键重写与优化提示词。</p>
+          </div>
         </div>
       </div>
       <Card className="secondary-card prompt-optimization-card">
-        <div className="feature-card prompt-optimization-toggle">
+        <div
+          className={`feature-card prompt-optimization-toggle${optimization.enabled ? " active" : ""}`}
+        >
           <div className="feature-card-header">
             <div className="feature-card-title">
               <IconSparkles size={16} aria-hidden="true" />

@@ -22,6 +22,12 @@
   }
 }
 
+@media (max-width: 768px) {
+  .notification-channel-list {
+    grid-template-columns: 1fr;
+  }
+}
+
 @media (max-width: 680px) {
   .prompt-optimization-config-grid {
     grid-template-columns: 1fr;
@@ -76,8 +82,9 @@
     flex-wrap: wrap;
   }
 
-  .operations-status-icons {
+  .operations-status-chips {
     margin-right: auto;
+    flex-wrap: wrap;
   }
 
   .model-groups {

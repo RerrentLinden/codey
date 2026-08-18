@@ -1,5 +1,5 @@
 import { memo, type CSSProperties } from "react";
-import { IconInfoCircle } from "@tabler/icons-react";
+import { IconAdjustmentsHorizontal, IconInfoCircle, IconUsersGroup } from "@tabler/icons-react";
 
 import type {
   Config,
@@ -86,9 +86,14 @@ export function SubagentPolicyCardComponent({
   return (
     <section className="secondary-section subagent-section" aria-labelledby="subagent-title">
       <div className="section-title compact">
-        <div>
-          <h2 id="subagent-title">Codey 子代理角色与调度增强</h2>
-          <p>基于 Codex 原生子代理的多角色调度与模型配置。</p>
+        <div className="section-heading">
+          <span className="section-icon" aria-hidden="true">
+            <IconUsersGroup size={15} />
+          </span>
+          <div>
+            <h2 id="subagent-title">Codey 子代理角色与调度增强</h2>
+            <p>基于 Codex 原生子代理的多角色调度与模型配置。</p>
+          </div>
         </div>
       </div>
       <Card className="secondary-card subagent-card">
@@ -96,7 +101,6 @@ export function SubagentPolicyCardComponent({
           <div className="feature-card-header">
             <div className="feature-card-title">
               <strong>启用 Codey 子代理角色与调度增强</strong>
-              <Badge variant="warning">基于 Codex 原生子代理</Badge>
             </div>
             <Switch
               checked={config.subagentOptimization}
@@ -264,6 +268,7 @@ type FeaturePolicyCardProps = {
   config: Config;
   fastContextToolsStatus: FastContextToolsStatus;
   isMacClient: boolean;
+  isWindowsClient: boolean;
   popupContainer: HTMLElement | null;
   tooltipContainer: HTMLElement | null;
   isBusy: boolean;
@@ -276,6 +281,7 @@ function FeaturePolicyCardComponent({
   config,
   fastContextToolsStatus,
   isMacClient,
+  isWindowsClient,
   popupContainer,
   tooltipContainer,
   isBusy,
@@ -284,9 +290,7 @@ function FeaturePolicyCardComponent({
   const configuredGpuLaunchModeIndex = GPU_LAUNCH_MODES.findIndex(
     ({ value }) => value === config.gpuLaunchMode,
   );
-  const gpuLaunchModeIndex = isMacClient
-    ? 0
-    : Math.max(configuredGpuLaunchModeIndex, 0);
+  const gpuLaunchModeIndex = Math.max(configuredGpuLaunchModeIndex, 0);
   const gpuLaunchMode = GPU_LAUNCH_MODES[gpuLaunchModeIndex];
   const gpuLaunchModeStyle = {
     "--gpu-mode-offset": `${gpuLaunchModeIndex * 100}%`,
@@ -319,67 +323,70 @@ function FeaturePolicyCardComponent({
   return (
     <section className="secondary-section" aria-labelledby="runtime-title">
       <div className="section-title compact">
-        <div>
-          <h2 id="runtime-title">Codex 功能策略</h2>
-          <p>按需精简客户端模块和界面行为。</p>
+        <div className="section-heading">
+          <span className="section-icon" aria-hidden="true">
+            <IconAdjustmentsHorizontal size={15} />
+          </span>
+          <div>
+            <h2 id="runtime-title">Codex 功能策略</h2>
+            <p>按需精简客户端模块和界面行为。</p>
+          </div>
         </div>
       </div>
       <Card className="secondary-card runtime-card">
         <div className="feature-grid">
-          {/* GPU 渲染模式：占满左侧整行全宽 */}
-          <div
-            className={`feature-card gpu-mode-card full-width-card ${!isMacClient && gpuLaunchMode.value !== "off" ? "active" : ""}`}
-          >
-            <div className="feature-card-header">
-              <div className="feature-card-title">
-                <strong>GPU 渲染模式</strong>
-                <Badge variant={isMacClient ? "secondary" : "warning"}>
-                  {isMacClient ? "macOS 不可用" : "实验性"}
-                </Badge>
-              </div>
-            </div>
-            <div className="feature-card-body gpu-mode-card-body">
-              <fieldset
-                className="gpu-mode-fieldset"
-                disabled={isMacClient || isBusy}
-                aria-describedby="gpu-launch-mode-description"
-              >
-                <legend className="sr-only">Codex GPU 启动模式</legend>
-                <div className="gpu-mode-slider" style={gpuLaunchModeStyle}>
-                  <span className="gpu-mode-slider-thumb" aria-hidden="true" />
-                  {GPU_LAUNCH_MODES.map((mode) => (
-                    <label
-                      key={mode.value}
-                      className={`gpu-mode-option ${gpuLaunchMode.value === mode.value ? "selected" : ""}`}
-                    >
-                      <input
-                        type="radio"
-                        name="codey-gpu-launch-mode"
-                        value={mode.value}
-                        checked={gpuLaunchMode.value === mode.value}
-                        onChange={() =>
-                          onConfigChange({
-                            ...config,
-                            gpuLaunchMode: mode.value,
-                          })
-                        }
-                      />
-                      <span>{mode.label}</span>
-                    </label>
-                  ))}
+          {/* GPU 渲染模式：占满整行全宽，仅 Windows 客户端展示 */}
+          {isWindowsClient && (
+            <div
+              className={`feature-card gpu-mode-card full-width-card ${gpuLaunchMode.value !== "off" ? "active" : ""}`}
+            >
+              <div className="feature-card-header">
+                <div className="feature-card-title">
+                  <strong>GPU 渲染模式</strong>
+                  <Badge variant="warning">实验性</Badge>
                 </div>
-              </fieldset>
-              <small id="gpu-launch-mode-description" aria-live="polite">
-                {isMacClient
-                  ? "macOS 下已禁用，不会向 Codex 传递 GPU 诊断参数"
-                  : gpuLaunchMode.value === "disableGpu"
+              </div>
+              <div className="feature-card-body gpu-mode-card-body">
+                <fieldset
+                  className="gpu-mode-fieldset"
+                  disabled={isBusy}
+                  aria-describedby="gpu-launch-mode-description"
+                >
+                  <legend className="sr-only">Codex GPU 启动模式</legend>
+                  <div className="gpu-mode-slider" style={gpuLaunchModeStyle}>
+                    <span className="gpu-mode-slider-thumb" aria-hidden="true" />
+                    {GPU_LAUNCH_MODES.map((mode) => (
+                      <label
+                        key={mode.value}
+                        className={`gpu-mode-option ${gpuLaunchMode.value === mode.value ? "selected" : ""}`}
+                      >
+                        <input
+                          type="radio"
+                          name="codey-gpu-launch-mode"
+                          value={mode.value}
+                          checked={gpuLaunchMode.value === mode.value}
+                          onChange={() =>
+                            onConfigChange({
+                              ...config,
+                              gpuLaunchMode: mode.value,
+                            })
+                          }
+                        />
+                        <span>{mode.label}</span>
+                      </label>
+                    ))}
+                  </div>
+                </fieldset>
+                <small id="gpu-launch-mode-description" aria-live="polite">
+                  {gpuLaunchMode.value === "disableGpu"
                     ? "启动 Codex 时附加 --disable-gpu；可能增加 CPU 占用"
                     : gpuLaunchMode.value === "disableGpuRasterization"
                       ? "启动 Codex 时附加 --disable-gpu-rasterization；仅将栅格化移到 CPU"
                       : "保持 Codex 默认 GPU 渲染，不附加诊断参数"}
-              </small>
+                </small>
+              </div>
             </div>
-          </div>
+          )}
 
           <div
             className={`feature-card ${config.slimCodexPet ? "active" : ""}`}

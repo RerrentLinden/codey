@@ -71,9 +71,14 @@ function NotificationChannelsCardComponent({
     <>
       <section className="secondary-section" aria-labelledby="notification-title">
         <div className="section-title compact">
-          <div>
-            <h2 id="notification-title">消息通知</h2>
-            <p>已配置渠道会同时接收完成、失败和等待提醒。</p>
+          <div className="section-heading">
+            <span className="section-icon" aria-hidden="true">
+              <IconBell size={15} />
+            </span>
+            <div>
+              <h2 id="notification-title">消息通知</h2>
+              <p>已配置渠道会同时接收完成、失败和等待提醒。</p>
+            </div>
           </div>
           <div className="notification-add-actions">
             <Button

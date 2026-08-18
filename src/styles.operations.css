@@ -10,10 +10,12 @@
 .route-card,
 .secondary-card,
 .trace-card {
-  border: 1px solid rgba(0, 0, 0, 0.08);
+  border: 1px solid rgba(0, 0, 0, 0.06);
   border-radius: 14px;
   background: var(--mac-card-bg);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+  box-shadow:
+    0 1px 2px rgba(16, 24, 40, 0.04),
+    0 12px 28px -18px rgba(16, 24, 40, 0.14);
   transition: border-color 180ms ease, box-shadow 180ms ease;
   overflow: hidden;
 }
@@ -22,8 +24,10 @@
 .route-card:hover,
 .secondary-card:hover,
 .trace-card:hover {
-  border-color: rgba(0, 0, 0, 0.12);
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.06);
+  border-color: rgba(0, 0, 0, 0.1);
+  box-shadow:
+    0 2px 4px rgba(16, 24, 40, 0.05),
+    0 18px 40px -18px rgba(16, 24, 40, 0.18);
 }
 
 .operations-header {
@@ -185,7 +189,7 @@
   margin-right: 4px;
 }
 
-.operations-status-icons {
+.operations-status-chips {
   display: flex;
   flex-direction: row;
   align-items: center;
@@ -197,10 +201,90 @@
   flex-wrap: nowrap;
 }
 
-.operations-icon-badge.active {
+.operations-status-chip {
+  --chip-tone: #6e6e73;
+  --chip-tone-bg: rgba(0, 0, 0, 0.05);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 5px;
+  border: 1px solid rgba(0, 0, 0, 0.07);
+  border-radius: 9px;
+  background: #f7f7f9;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color 160ms ease,
+    background-color 160ms ease,
+    box-shadow 160ms ease,
+    transform 160ms ease;
+}
+
+.operations-status-chip:hover {
+  border-color: rgba(0, 0, 0, 0.12);
   background: #ffffff;
-  border-color: #007aff;
-  box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.25);
+  box-shadow: 0 2px 6px rgba(16, 24, 40, 0.06);
+  transform: translateY(-1px);
+}
+
+.operations-status-chip.active {
+  border-color: rgba(0, 122, 255, 0.42);
+  background: #ffffff;
+  box-shadow: 0 0 0 2px rgba(0, 122, 255, 0.14);
+}
+
+.operations-status-chip.tone-success {
+  --chip-tone: #248a3d;
+  --chip-tone-bg: rgba(52, 199, 89, 0.13);
+}
+
+.operations-status-chip.tone-warning {
+  --chip-tone: #c26d00;
+  --chip-tone-bg: rgba(255, 149, 0, 0.13);
+}
+
+.operations-status-chip.tone-destructive {
+  --chip-tone: #d70015;
+  --chip-tone-bg: rgba(255, 59, 48, 0.11);
+}
+
+.operations-status-chip.tone-info {
+  --chip-tone: #007aff;
+  --chip-tone-bg: rgba(0, 122, 255, 0.11);
+}
+
+.operations-status-chip-icon {
+  display: grid;
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 6px;
+  background: var(--chip-tone-bg);
+  color: var(--chip-tone);
+}
+
+.operations-status-chip-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 1px;
+  line-height: 1.2;
+}
+
+.operations-status-chip-copy strong {
+  color: #3a3a3c;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.operations-status-chip-copy small {
+  color: var(--chip-tone);
+  font-size: 10px;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .operations-expanded-grid {
@@ -486,55 +570,6 @@
   padding-top: 4px;
 }
 
-.operations-icon-badge {
-  position: relative;
-  display: grid;
-  width: 32px;
-  height: 32px;
-  place-items: center;
-  border-radius: 8px;
-  border: 1px solid transparent;
-  background: #f2f2f7;
-  color: #3a3a3c;
-  cursor: pointer;
-  padding: 0;
-  transition: all 160ms ease;
-}
-
-.operations-icon-badge:hover {
-  transform: translateY(-1px);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
-}
-
-.operations-icon-badge.tone-success {
-  background: rgba(52, 199, 89, 0.12);
-  color: #248a3d;
-  border-color: rgba(52, 199, 89, 0.25);
-}
-
-.operations-icon-badge.tone-warning {
-  background: rgba(255, 149, 0, 0.12);
-  color: #c26d00;
-  border-color: rgba(255, 149, 0, 0.25);
-}
-
-.operations-icon-badge.tone-destructive {
-  background: rgba(255, 59, 48, 0.12);
-  color: #d70015;
-  border-color: rgba(255, 59, 48, 0.25);
-}
-
-.operations-icon-dot {
-  position: absolute;
-  top: 4px;
-  right: 4px;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-  box-shadow: 0 0 0 1.5px #ffffff;
-}
-
 .path-display {
   display: flex;
   align-items: center;
@@ -613,7 +648,7 @@
 }
 
 .operations-update-btn-wrap,
-.operations-status-icon-wrap {
+.operations-status-chip-wrap {
   display: inline-flex;
   align-items: center;
 }

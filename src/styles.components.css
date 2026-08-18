@@ -109,20 +109,6 @@
   background: #27c93f !important;
 }
 
-.app-shell .operations-icon-badge.codey-button {
-  display: grid;
-  width: 32px;
-  min-width: 32px;
-  height: 32px;
-  padding: 0;
-  place-items: center;
-}
-
-.app-shell .operations-icon-badge.codey-button .semi-button-content {
-  display: grid;
-  place-items: center;
-}
-
 .app-shell .prompt-optimization-icon-button.codey-button {
   width: 28px;
   min-width: 28px;

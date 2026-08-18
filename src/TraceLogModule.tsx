@@ -101,14 +101,18 @@ function TraceLogModuleComponent({
   return (
     <section className="trace-section" aria-labelledby="trace-title">
       <div className="section-title compact trace-section-title">
-        <div>
-          <span className="section-kicker">Diagnostics</span>
-          <h2 id="trace-title">诊断存储保护</h2>
-          <p>
-            {crashpadSupported
-              ? "Trace 数据库 · Crashpad 待处理报告"
-              : "Trace 数据库写盘与占用分析"}
-          </p>
+        <div className="section-heading">
+          <span className="section-icon" aria-hidden="true">
+            <Archive size={15} />
+          </span>
+          <div>
+            <h2 id="trace-title">诊断存储保护</h2>
+            <p>
+              {crashpadSupported
+                ? "Trace 数据库 · Crashpad 待处理报告"
+                : "Trace 数据库写盘与占用分析"}
+            </p>
+          </div>
         </div>
         <div className="trace-module-actions">
           <Badge

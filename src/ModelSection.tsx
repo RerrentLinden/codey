@@ -70,9 +70,14 @@ function ModelSectionComponent({
   return (
     <section className="route-section" aria-labelledby="route-title">
       <div className="section-title">
-        <div>
-          <h2 id="route-title">线路与模型</h2>
-          <p>Codex 当前配置</p>
+        <div className="section-heading">
+          <span className="section-icon" aria-hidden="true">
+            <Server size={15} />
+          </span>
+          <div>
+            <h2 id="route-title">线路与模型</h2>
+            <p>Codex 当前配置</p>
+          </div>
         </div>
         <div className="route-heading-actions">
           {provider.official && (

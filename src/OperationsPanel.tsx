@@ -446,7 +446,7 @@ function OperationsPanelComponent({
 
           <div className="operations-actions">
             <div
-              className="operations-status-icons"
+              className="operations-status-chips"
               role="list"
               aria-label="核心服务状态"
             >
@@ -464,21 +464,25 @@ function OperationsPanelComponent({
                     getPopupContainer={getTooltipContainer}
                     position="top"
                   >
-                    <span className="operations-status-icon-wrap">
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className={`operations-icon-badge tone-${item.tone}${isExpanded ? " active" : ""}`}
+                    <span className="operations-status-chip-wrap" role="listitem">
+                      <button
+                        type="button"
+                        className={`operations-status-chip tone-${item.tone}${isExpanded ? " active" : ""}`}
                         onClick={() => toggleCard(item.title)}
                         aria-expanded={isExpanded}
                         aria-label={`${item.title}（${item.label}），点击${isExpanded ? "收起" : "展开"}`}
                       >
-                        <StatusIcon size={16} aria-hidden="true" />
                         <span
-                          className="operations-icon-dot"
+                          className="operations-status-chip-icon"
                           aria-hidden="true"
-                        />
-                      </Button>
+                        >
+                          <StatusIcon size={14} />
+                        </span>
+                        <span className="operations-status-chip-copy">
+                          <strong>{item.title}</strong>
+                          <small>{item.label}</small>
+                        </span>
+                      </button>
                     </span>
                   </Tooltip>
                 );
