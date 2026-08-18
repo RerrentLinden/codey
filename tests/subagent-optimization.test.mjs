@@ -143,7 +143,10 @@ test("subagent optimization installs recoverable orchestration and runtime gates
     configSource,
     /matcher: Some\(crate::subagent_orchestrator::POST_TOOL_HOOK_MATCHER\)/,
   );
-  assert.match(orchestratorSource, /spawn_agent\|wait_agent\|list_agents\|exec_command/);
+  assert.match(
+    orchestratorSource,
+    /pub\(crate\) const POST_TOOL_HOOK_MATCHER: &str = "\*"/,
+  );
   assert.match(configSource, /toml_event: "SubagentStart"/);
   assert.match(configSource, /toml_event: "SubagentStop"/);
   assert.match(configSource, /toml_event: "Stop"/);
@@ -166,9 +169,11 @@ test("subagent optimization installs recoverable orchestration and runtime gates
   assert.match(gateSource, /subagent_orchestrator::pre_spawn/);
   assert.match(gateSource, /subagent_orchestrator::authorize_child_tool/);
   assert.match(gateSource, /subagent_orchestrator::pending_acceptance_reason/);
+  assert.match(orchestratorSource, /CODEY_DELEGATION_V2=/);
   assert.match(orchestratorSource, /CODEY_DELEGATION_V1=/);
   assert.match(orchestratorSource, /struct SessionLedger/);
   assert.match(orchestratorSource, /lock_exclusive/);
   assert.match(orchestratorSource, /resource_conflict/);
-  assert.match(orchestratorSource, /response_reports_successful_exit/);
+  assert.match(orchestratorSource, /classify_acceptance_evidence/);
+  assert.match(orchestratorSource, /enum AcceptanceEvidence/);
 });

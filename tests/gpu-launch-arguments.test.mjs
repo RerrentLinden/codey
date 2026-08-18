@@ -6,7 +6,7 @@ import { readAppStyles } from "./helpers/read-app-styles.mjs";
 
 const root = new URL("../", import.meta.url);
 
-test("three-position GPU slider is accessible and disabled on macOS", async () => {
+test("three-position GPU slider is accessible and available only on Windows", async () => {
   const [sectionsSource, stylesSource, appSource, previewSource] = await Promise.all([
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
     readAppStyles(root),
@@ -14,7 +14,7 @@ test("three-position GPU slider is accessible and disabled on macOS", async () =
     readFile(new URL("src/main.tsx", root), "utf8"),
   ]);
 
-  assert.match(sectionsSource, /isMacClient: boolean/);
+  assert.match(sectionsSource, /isWindowsClient: boolean/);
   assert.match(sectionsSource, /\{ value: "off", label: "关闭" \}/);
   assert.match(sectionsSource, /\{ value: "disableGpu", label: "禁用 GPU" \}/);
   assert.match(
@@ -23,20 +23,19 @@ test("three-position GPU slider is accessible and disabled on macOS", async () =
   );
   assert.match(
     sectionsSource,
-    /<fieldset[\s\S]{0,150}disabled=\{isMacClient \|\| isBusy\}/,
+    /\{isWindowsClient && \([\s\S]{0,500}<fieldset[\s\S]{0,150}disabled=\{isBusy\}/,
   );
   assert.match(sectionsSource, /type="radio"/);
   assert.match(sectionsSource, /checked=\{gpuLaunchMode\.value === mode\.value\}/);
   assert.match(sectionsSource, /gpuLaunchMode: mode\.value/);
   assert.match(sectionsSource, /<legend className="sr-only">Codex GPU 启动模式<\/legend>/);
   assert.match(sectionsSource, /aria-describedby="gpu-launch-mode-description"/);
-  assert.match(sectionsSource, /macOS 下已禁用，不会向 Codex 传递 GPU 诊断参数/);
   assert.match(stylesSource, /\.gpu-mode-slider-thumb/);
   assert.match(stylesSource, /transform: translateX\(var\(--gpu-mode-offset\)\)/);
   assert.match(stylesSource, /@media \(prefers-reduced-motion: reduce\)/);
   assert.match(
     appSource,
-    /<FeaturePolicyCard[\s\S]{0,200}isMacClient=\{status\.clientPlatform === "macos"\}/,
+    /<FeaturePolicyCard[\s\S]{0,200}isWindowsClient=\{status\.clientPlatform === "windows"\}/,
   );
   assert.match(previewSource, /gpuLaunchMode: "off" as const/);
 });

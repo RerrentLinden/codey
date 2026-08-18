@@ -68,8 +68,9 @@ test("all editable feature controls are locked while an operation is active", as
 
   assert.match(
     source,
-    /className="gpu-mode-fieldset"\s*disabled=\{isMacClient \|\| isBusy\}/,
+    /className="gpu-mode-fieldset"\s*disabled=\{isBusy\}/,
   );
+  assert.match(source, /\{isWindowsClient && \(/);
   for (const setting of [
     "slimCodexPet",
     "fastCodexStartup",
