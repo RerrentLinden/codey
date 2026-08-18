@@ -2079,10 +2079,7 @@ fn json_hook_group_is_codey_owned(group: &serde_json::Value) -> bool {
                 ["command", "commandWindows", "command_windows"]
                     .into_iter()
                     .filter_map(|key| handler.get(key).and_then(serde_json::Value::as_str))
-                    .any(|command| {
-                        command.contains(crate::subagent_gate::HOOK_ARGUMENT)
-                            || command.contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
-                    })
+                    .any(hook_command_is_codey_owned)
             })
         })
 }
@@ -2392,6 +2389,7 @@ fn enable_subagent_gate_hooks(
     config_path: &Path,
     include_fastctx: bool,
 ) -> Result<()> {
+    remove_codey_hooks(doc, config_path, &CODEY_HOOK_EVENTS)?;
     let commands = crate::subagent_gate::hook_commands()?;
     if !include_fastctx {
         return enable_codey_hooks(doc, config_path, &SUBAGENT_GATE_HOOKS, &commands);
@@ -2420,9 +2418,180 @@ fn enable_hooks_feature(doc: &mut DocumentMut) -> Result<()> {
 }
 
 fn enable_fastctx_route_hook(doc: &mut DocumentMut, config_path: &Path) -> Result<()> {
+    remove_codey_hooks(doc, config_path, &["PreToolUse"])?;
     let commands =
         crate::subagent_gate::hook_commands_for(crate::fastctx_route_gate::HOOK_ARGUMENT)?;
     enable_codey_hooks(doc, config_path, &FASTCTX_ROUTE_HOOKS, &commands)
+}
+
+fn remove_codey_hooks(
+    doc: &mut DocumentMut,
+    config_path: &Path,
+    replacement_events: &[&str],
+) -> Result<()> {
+    let Some(hooks) = doc.get_mut("hooks") else {
+        return Ok(());
+    };
+    let hooks = hooks
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("hooks 必须是 TOML table"))?;
+
+    for (toml_event, event_key) in [
+        ("PreToolUse", "pre_tool_use"),
+        ("PostToolUse", "post_tool_use"),
+        ("SubagentStart", "subagent_start"),
+        ("SubagentStop", "subagent_stop"),
+        ("Stop", "stop"),
+        ("SessionEnd", "session_end"),
+    ] {
+        let Some((index_map, remove_event)) = hooks
+            .get_mut(toml_event)
+            .map(remove_codey_hook_groups)
+            .transpose()?
+            .flatten()
+        else {
+            continue;
+        };
+        if remove_event && !replacement_events.contains(&toml_event) {
+            hooks.remove(toml_event);
+        }
+        if let Some(state) = hooks.get_mut("state").and_then(Item::as_table_mut) {
+            remap_hook_state_entries(state, config_path, event_key, &index_map);
+        }
+    }
+    Ok(())
+}
+
+fn remove_codey_hook_groups(event: &mut Item) -> Result<Option<(Vec<Option<usize>>, bool)>> {
+    let (owned, group_count) = match event {
+        Item::ArrayOfTables(groups) => (
+            groups
+                .iter()
+                .map(table_hook_group_is_codey_owned)
+                .collect::<Vec<_>>(),
+            groups.len(),
+        ),
+        Item::Value(Value::Array(groups)) => (
+            groups
+                .iter()
+                .map(value_hook_group_is_codey_owned)
+                .collect::<Vec<_>>(),
+            groups.len(),
+        ),
+        _ => bail!("Hook 事件必须是配置数组"),
+    };
+    if !owned.iter().any(|owned| *owned) {
+        return Ok(None);
+    }
+
+    let mut next_index = 0;
+    let index_map = owned
+        .iter()
+        .map(|owned| {
+            if *owned {
+                None
+            } else {
+                let index = next_index;
+                next_index += 1;
+                Some(index)
+            }
+        })
+        .collect::<Vec<_>>();
+    for index in (0..group_count).rev() {
+        if !owned[index] {
+            continue;
+        }
+        match event {
+            Item::ArrayOfTables(groups) => {
+                groups.remove(index);
+            }
+            Item::Value(Value::Array(groups)) => {
+                groups.remove(index);
+            }
+            _ => unreachable!("Hook event shape was validated"),
+        }
+    }
+    Ok(Some((index_map, next_index == 0)))
+}
+
+fn table_hook_group_is_codey_owned(group: &Table) -> bool {
+    group
+        .get("hooks")
+        .is_some_and(hook_handlers_item_is_codey_owned)
+}
+
+fn value_hook_group_is_codey_owned(group: &Value) -> bool {
+    group
+        .as_inline_table()
+        .and_then(|group| group.get("hooks"))
+        .and_then(Value::as_array)
+        .is_some_and(|handlers| handlers.iter().any(value_hook_handler_is_codey_owned))
+}
+
+fn hook_handlers_item_is_codey_owned(handlers: &Item) -> bool {
+    match handlers {
+        Item::ArrayOfTables(handlers) => handlers.iter().any(table_hook_handler_is_codey_owned),
+        Item::Value(Value::Array(handlers)) => {
+            handlers.iter().any(value_hook_handler_is_codey_owned)
+        }
+        _ => false,
+    }
+}
+
+fn table_hook_handler_is_codey_owned(handler: &Table) -> bool {
+    ["command", "commandWindows", "command_windows"]
+        .into_iter()
+        .filter_map(|key| handler.get(key).and_then(Item::as_str))
+        .any(hook_command_is_codey_owned)
+}
+
+fn value_hook_handler_is_codey_owned(handler: &Value) -> bool {
+    handler.as_inline_table().is_some_and(|handler| {
+        ["command", "commandWindows", "command_windows"]
+            .into_iter()
+            .filter_map(|key| handler.get(key).and_then(Value::as_str))
+            .any(hook_command_is_codey_owned)
+    })
+}
+
+fn hook_command_is_codey_owned(command: &str) -> bool {
+    command.contains(crate::subagent_gate::HOOK_ARGUMENT)
+        || command.contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
+}
+
+fn remap_hook_state_entries(
+    state: &mut Table,
+    config_path: &Path,
+    event_key: &str,
+    index_map: &[Option<usize>],
+) {
+    let prefix = format!("{}:{event_key}:", config_path.display());
+    let keys = state
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .map(|(key, _)| key.to_string())
+        .collect::<Vec<_>>();
+    let mut retained = Vec::new();
+    for key in keys {
+        let Some((group_index, handler_index)) = key[prefix.len()..].split_once(':') else {
+            continue;
+        };
+        let Ok(group_index) = group_index.parse::<usize>() else {
+            continue;
+        };
+        let Some(new_group_index) = index_map.get(group_index) else {
+            continue;
+        };
+        let Some(entry) = state.remove(&key) else {
+            continue;
+        };
+        if let Some(new_group_index) = new_group_index {
+            retained.push((format!("{prefix}{new_group_index}:{handler_index}"), entry));
+        }
+    }
+    for (key, entry) in retained {
+        state.insert(&key, entry);
+    }
 }
 
 fn enable_codey_hooks(

@@ -1583,6 +1583,131 @@ fn subagent_and_fastctx_share_one_pre_tool_hook() {
 }
 
 #[test]
+fn subagent_hook_upgrade_replaces_legacy_codey_groups_and_preserves_user_hook_state() {
+    let config_path = Path::new("/tmp/codey-codex/config.toml");
+    let existing = format!(
+        r#"
+[hooks.state."{config_path}:pre_tool_use:0:0"]
+trusted_hash = "sha256:legacy-codey-one"
+
+[hooks.state."{config_path}:pre_tool_use:1:0"]
+trusted_hash = "sha256:legacy-codey-two"
+
+[hooks.state."{config_path}:pre_tool_use:2:0"]
+trusted_hash = "sha256:user-hook"
+
+[[hooks.PreToolUse]]
+matcher = "*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "'/old/codey' {hook_argument}"
+commandWindows = '"C:\\old\\codey.exe" {hook_argument}'
+timeout = 5
+
+[[hooks.PreToolUse]]
+matcher = "*"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "'/second/codey' {hook_argument}"
+commandWindows = '"C:\\second\\codey.exe" {hook_argument}'
+timeout = 5
+
+[[hooks.PreToolUse]]
+matcher = "Bash"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "echo preserve-user-hook"
+timeout = 2
+"#,
+        config_path = config_path.display(),
+        hook_argument = crate::subagent_gate::HOOK_ARGUMENT,
+    );
+    let result = patch_config_with_fastctx_mode_and_proxy(
+        &existing,
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        ProviderPatchOptions {
+            config_path,
+            model_catalog_path: relative_model_catalog_path(),
+            default_model: None,
+            fastctx_command: Some(Path::new("/tmp/codey-fastctx")),
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol",
+            subagent_reasoning_effort: "high",
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+        },
+    )
+    .unwrap();
+    let document = result.parse::<DocumentMut>().unwrap();
+    let pre_tool_use = document["hooks"]["PreToolUse"]
+        .as_array_of_tables()
+        .unwrap();
+    assert_eq!(pre_tool_use.len(), 2);
+    assert_eq!(
+        pre_tool_use.get(0).unwrap()["matcher"].as_str(),
+        Some("Bash")
+    );
+    assert_eq!(
+        pre_tool_use.get(0).unwrap()["hooks"]
+            .as_array_of_tables()
+            .unwrap()
+            .get(0)
+            .unwrap()["command"]
+            .as_str(),
+        Some("echo preserve-user-hook")
+    );
+    let gate_command = pre_tool_use.get(1).unwrap()["hooks"]
+        .as_array_of_tables()
+        .unwrap()
+        .get(0)
+        .unwrap()["command"]
+        .as_str()
+        .unwrap();
+    assert!(gate_command.contains(crate::subagent_gate::COMBINED_HOOK_ARGUMENT));
+    assert!(!result.contains("/old/codey"));
+    assert!(!result.contains("/second/codey"));
+
+    let state = document["hooks"]["state"].as_table().unwrap();
+    assert_eq!(
+        state[&format!("{}:pre_tool_use:0:0", config_path.display())]["trusted_hash"].as_str(),
+        Some("sha256:user-hook")
+    );
+    assert!(
+        state[&format!("{}:pre_tool_use:1:0", config_path.display())]["trusted_hash"]
+            .as_str()
+            .is_some_and(|hash| hash.starts_with("sha256:"))
+    );
+    assert!(
+        state
+            .get(&format!("{}:pre_tool_use:2:0", config_path.display()))
+            .is_none()
+    );
+
+    let repeated = patch_config_with_fastctx_mode_and_proxy(
+        &result,
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        ProviderPatchOptions {
+            config_path,
+            model_catalog_path: relative_model_catalog_path(),
+            default_model: None,
+            fastctx_command: Some(Path::new("/tmp/codey-fastctx")),
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol",
+            subagent_reasoning_effort: "high",
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(repeated, result);
+}
+
+#[test]
 fn subagent_optimization_keeps_explicit_agents_concurrency_over_legacy_max_threads() {
     let existing = r#"
 [agents]
