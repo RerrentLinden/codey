@@ -51,12 +51,20 @@ import { Badge, Button, Button as SaveButton } from "./components/semi";
 
 const Check = IconCheck;
 const X = IconX;
-const FEEDBACK_GROUP_QR_URL =
+const FEEDBACK_GROUP_QR_BASE_URL =
   "https://pub-2d17a6a8bc22426a92e297a59f55ccc3.r2.dev/qr.png";
 const UNKNOWN_FAST_CONTEXT_TOOLS_STATUS: FastContextToolsStatus = {
   userConfigured: false,
   detectionFailed: true,
 };
+
+function localDateCacheKey(date: Date) {
+  return [
+    date.getFullYear(),
+    String(date.getMonth() + 1).padStart(2, "0"),
+    String(date.getDate()).padStart(2, "0"),
+  ].join("");
+}
 
 function configWithoutPromptOptimization(config: Config): Partial<Config> {
   const comparable: Partial<Config> = { ...config };
@@ -82,6 +90,8 @@ export function App({
   onAfterClose,
   onClose,
 }: AppProps) {
+  const feedbackGroupQrUrl =
+    `${FEEDBACK_GROUP_QR_BASE_URL}?date=${localDateCacheKey(new Date())}`;
   const [config, setConfig] = useState<Config | null>(null);
   const persistedConfigRef = useRef<Config | null>(null);
   const { status, setStatus, refreshStatusForLoad } = useRuntimeStatus({
@@ -725,7 +735,7 @@ export function App({
             <span className="feedback-group-label">问题反馈群</span>
           </Button>
           <div className="feedback-qr-popover" role="tooltip">
-            <img src={FEEDBACK_GROUP_QR_URL} alt="问题反馈群二维码" />
+            <img src={feedbackGroupQrUrl} alt="问题反馈群二维码" />
             <span id="codey-feedback-qr-description">扫码加入问题反馈群</span>
           </div>
         </div>
