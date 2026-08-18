@@ -14,8 +14,8 @@ pub(super) async fn clear_codex_trace_logs(state: &Arc<AppState>) -> Result<Valu
     let home = codex_home();
     let disable_writes = state.config.read().await.disable_trace_log_writes;
     let result = tokio::task::spawn_blocking(move || {
-        trace_log_guard::configure(&home, disable_writes)?;
-        trace_log_guard::clear(&home)
+        trace_log_guard::configure(home, disable_writes)?;
+        trace_log_guard::clear(home)
     })
     .await
     .map_err(|error| format!("Trace 日志库清理任务异常退出：{error}"))
@@ -50,9 +50,9 @@ pub(super) async fn clear_diagnostic_storage(state: &Arc<AppState>) -> Result<Va
 
     let trace_home = codex_home();
     let trace_task = tokio::task::spawn_blocking(move || {
-        let cleanup = trace_log_guard::configure(&trace_home, disable_trace_writes)
-            .and_then(|_| trace_log_guard::clear(&trace_home));
-        let snapshot = trace_log_stats::snapshot(&trace_home);
+        let cleanup = trace_log_guard::configure(trace_home, disable_trace_writes)
+            .and_then(|_| trace_log_guard::clear(trace_home));
+        let snapshot = trace_log_stats::snapshot(trace_home);
         (cleanup, snapshot)
     });
     let crashpad_task = tokio::task::spawn_blocking(move || {
@@ -165,7 +165,7 @@ pub(super) async fn refresh_diagnostic_storage_stats(
         .begin_refresh(protect_crashpad_pending);
 
     let trace_home = codex_home();
-    let trace_task = tokio::task::spawn_blocking(move || trace_log_stats::snapshot(&trace_home));
+    let trace_task = tokio::task::spawn_blocking(move || trace_log_stats::snapshot(trace_home));
     let crashpad_task = tokio::task::spawn_blocking(move || {
         crashpad_pending_guard::snapshot_system(protect_crashpad_pending)
     });
@@ -212,7 +212,7 @@ pub(super) async fn refresh_trace_log_stats(state: &Arc<AppState>) -> Result<Val
     }
 
     let home = codex_home();
-    let snapshot = match tokio::task::spawn_blocking(move || trace_log_stats::snapshot(&home)).await
+    let snapshot = match tokio::task::spawn_blocking(move || trace_log_stats::snapshot(home)).await
     {
         Ok(snapshot) => snapshot,
         Err(error) => {

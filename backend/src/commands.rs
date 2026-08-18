@@ -322,7 +322,7 @@ impl AppState {
                 let session_id = bridge_string(&payload, "sessionId");
                 let home = codex_home();
                 blocking_value("准备会话导出", move || {
-                    session_transfer::start_export_transfer(&home, &session_id)
+                    session_transfer::start_export_transfer(home, &session_id)
                 })
                 .await
             }
@@ -333,7 +333,7 @@ impl AppState {
                 };
                 let home = codex_home();
                 blocking_value("读取会话导出分块", move || {
-                    session_transfer::read_export_transfer_chunk(&home, &transfer_id, offset)
+                    session_transfer::read_export_transfer_chunk(home, &transfer_id, offset)
                 })
                 .await
             }
@@ -341,7 +341,7 @@ impl AppState {
                 let transfer_id = bridge_string(&payload, "transferId");
                 let home = codex_home();
                 blocking_value("清理会话导出", move || {
-                    session_transfer::finish_export_transfer(&home, &transfer_id)?;
+                    session_transfer::finish_export_transfer(home, &transfer_id)?;
                     Ok(json!({"status": "ok"}))
                 })
                 .await
@@ -349,7 +349,7 @@ impl AppState {
             "/session/import/start" => {
                 let home = codex_home();
                 blocking_value("准备会话导入", move || {
-                    session_transfer::start_import_transfer(&home)
+                    session_transfer::start_import_transfer(home)
                 })
                 .await
             }
@@ -362,7 +362,7 @@ impl AppState {
                 let home = codex_home();
                 blocking_value("写入会话导入分块", move || {
                     session_transfer::append_import_transfer_chunk(
-                        &home,
+                        home,
                         &transfer_id,
                         offset,
                         &data,
@@ -375,7 +375,7 @@ impl AppState {
                 let project_path = bridge_string(&payload, "projectPath");
                 let home = codex_home();
                 blocking_value("完成会话导入", move || {
-                    session_transfer::finish_import_transfer(&home, &project_path, &transfer_id)
+                    session_transfer::finish_import_transfer(home, &project_path, &transfer_id)
                 })
                 .await
             }
@@ -383,7 +383,7 @@ impl AppState {
                 let transfer_id = bridge_string(&payload, "transferId");
                 let home = codex_home();
                 blocking_value("清理会话导入", move || {
-                    session_transfer::abort_import_transfer(&home, &transfer_id)?;
+                    session_transfer::abort_import_transfer(home, &transfer_id)?;
                     Ok(json!({"status": "ok"}))
                 })
                 .await
@@ -409,7 +409,7 @@ impl AppState {
                 let home = codex_home();
                 let plugins_home = home;
                 match tokio::task::spawn_blocking(move || {
-                    plugin_marketplace::list_plugins(&plugins_home)
+                    plugin_marketplace::list_plugins(plugins_home)
                 })
                 .await
                 {
@@ -928,7 +928,7 @@ async fn save_codey_config_locked(
 }
 
 fn current_fast_context_tools_status() -> FastContextToolsStatus {
-    fast_context_tools_status_or_blocked(fast_context_tools_status(&codex_home()))
+    fast_context_tools_status_or_blocked(fast_context_tools_status(codex_home()))
 }
 
 fn fast_context_tools_status_or_blocked<E>(
@@ -1217,7 +1217,7 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
 
     let home = codex_home();
     let mut cache = state.account_usage_cache.lock().await;
-    match cache.fetch(&home).await {
+    match cache.fetch(home).await {
         Ok(snapshot) => {
             let mut value = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
             if let Some(object) = value.as_object_mut() {
@@ -1313,7 +1313,7 @@ pub async fn delete_selected_messages(
 ) -> Result<Value, String> {
     let home = codex_home();
     let result = tokio::task::spawn_blocking(move || {
-        delete_messages_persistently(&home, &session_id, &message_ids)
+        delete_messages_persistently(home, &session_id, &message_ids)
     })
     .await
     .map_err(|error| format!("消息删除任务异常退出：{error}"))?
@@ -1328,7 +1328,7 @@ pub async fn delete_session_record(
 ) -> Result<Value, String> {
     let home = codex_home();
     let result = tokio::task::spawn_blocking(move || {
-        session_delete::delete_session(&home, &session_id, &title)
+        session_delete::delete_session(home, &session_id, &title)
     })
     .await
     .map_err(|error| format!("会话删除任务异常退出：{error}"))?

@@ -74,8 +74,8 @@ pub async fn sync_cc_switch_state(
     let home = codex_home();
     let mut status = sync_cc_switch_state_with(state, move |config| {
         let (mut next, mut status) =
-            cc_switch::sync_current_provider(&config, &home).map_err(|error| error.to_string())?;
-        subagent_policy::reconcile_for_current_provider(&mut next, &home, status.provider.official);
+            cc_switch::sync_current_provider(&config, home).map_err(|error| error.to_string())?;
+        subagent_policy::reconcile_for_current_provider(&mut next, home, status.provider.official);
         next = next.normalize();
         status.changed = next != config;
         Ok((next, status))
@@ -276,7 +276,7 @@ async fn fetch_provider_models(
 ) -> anyhow::Result<Vec<String>> {
     let home = codex_home();
     let fetch_profile = tokio::task::spawn_blocking(move || {
-        cc_switch::provider_model_fetch_profile(&profile, &home)
+        cc_switch::provider_model_fetch_profile(&profile, home)
     })
     .await
     .map_err(|error| anyhow::anyhow!("解析模型源 API 配置任务异常退出：{error}"))??;
@@ -373,7 +373,7 @@ pub(super) async fn sync_provider_models_for_launch(state: &Arc<AppState>) -> Co
         return latest;
     }
     let persistence_base = (!synced).then(|| latest.clone());
-    let next = config_with_current_provider_model_sync(&latest, models, synced, &codex_home());
+    let next = config_with_current_provider_model_sync(&latest, models, synced, codex_home());
     let committed = commit_startup_model_sync(state, latest, next, synced).await;
     drop(_config_write_guard);
     reconcile_current_subagent_defaults(state, persistence_base.as_ref())
@@ -427,7 +427,7 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
         &latest,
         fetched_models.clone(),
         true,
-        &codex_home(),
+        codex_home(),
     );
     let (catalog_refresh, model_state) = refreshed_model_state_async(&next, true).await?;
     subagent_policy::reconcile_with_model_state(&mut next, Some(&model_state));
@@ -834,7 +834,7 @@ pub(super) fn current_model_state(
         .find(|profile| profile.id == config.active_profile_id)
         .is_none_or(|profile| profile.cc_switch_read_only);
     model_catalog::selection_state_with_manual_models(
-        &codex_home(),
+        codex_home(),
         official,
         config.upstream_models_snapshot(),
         config.selected_models(),
@@ -946,8 +946,8 @@ struct ModelCatalogRefresh {
 
 fn refresh_model_catalog_or_fallback(config: &CodeyConfig) -> Result<ModelCatalogRefresh, String> {
     let home = codex_home();
-    let snapshot = model_catalog::snapshot(&home).map_err(|error| error.to_string())?;
-    let result = model_catalog_fallback(try_refresh_model_catalog(config), &home);
+    let snapshot = model_catalog::snapshot(home).map_err(|error| error.to_string())?;
+    let result = model_catalog_fallback(try_refresh_model_catalog(config), home);
     match result {
         Ok(fallback) => Ok(ModelCatalogRefresh { fallback, snapshot }),
         Err(error) => Err(rollback_model_catalog_snapshot(snapshot, error)),
@@ -1079,7 +1079,7 @@ fn try_refresh_model_catalog(config: &CodeyConfig) -> anyhow::Result<()> {
         .find(|profile| profile.id == config.active_profile_id)
         .is_none_or(|profile| profile.cc_switch_read_only);
     model_catalog::refresh_for_provider(
-        &codex_home(),
+        codex_home(),
         official,
         config.upstream_models_snapshot(),
         config.selected_models(),

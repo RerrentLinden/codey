@@ -10,7 +10,7 @@ pub(super) async fn plugin_marketplace_status() -> Result<Value, String> {
     let home = codex_home();
     let marketplace_home = home;
     let result = tokio::task::spawn_blocking(move || {
-        plugin_marketplace::marketplaces_status(&marketplace_home)
+        plugin_marketplace::marketplaces_status(marketplace_home)
     })
     .await
     .map_err(|error| format!("插件市场状态任务异常退出：{error}"));
@@ -28,7 +28,7 @@ pub(super) async fn plugin_marketplace_status() -> Result<Value, String> {
             return Err(error);
         }
     };
-    decorate_plugin_marketplace_status(&home, &mut status);
+    decorate_plugin_marketplace_status(home, &mut status);
     Ok(status)
 }
 
@@ -36,7 +36,7 @@ pub(super) async fn repair_plugin_marketplace() -> Result<Value, String> {
     let home = codex_home();
     let marketplace_home = home;
     let result = tokio::task::spawn_blocking(move || {
-        plugin_marketplace::ensure_marketplaces(&marketplace_home)
+        plugin_marketplace::ensure_marketplaces(marketplace_home)
     })
     .await
     .map_err(|error| format!("插件市场修复任务异常退出：{error}"))
@@ -55,7 +55,7 @@ pub(super) async fn repair_plugin_marketplace() -> Result<Value, String> {
             return Err(error);
         }
     };
-    let mut status = plugin_marketplace::marketplaces_status(&home);
+    let mut status = plugin_marketplace::marketplaces_status(home);
     if let Some(object) = status.as_object_mut() {
         for key in ["initializedRemote", "configuredRemote", "configChanged"] {
             if let Some(value) = repair.get(key) {
@@ -63,7 +63,7 @@ pub(super) async fn repair_plugin_marketplace() -> Result<Value, String> {
             }
         }
     }
-    decorate_plugin_marketplace_status(&home, &mut status);
+    decorate_plugin_marketplace_status(home, &mut status);
     Ok(status)
 }
 

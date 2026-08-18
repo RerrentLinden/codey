@@ -1457,10 +1457,10 @@ impl CodeyRuntime {
             config.hide_full_access_warning,
             &config.user_scripts,
         );
-        let initial_storage_guards = spawn_initial_storage_guards(&home, config);
-        let route = resolve_startup_route_context(&home, config).await?;
+        let initial_storage_guards = spawn_initial_storage_guards(home, config);
+        let route = resolve_startup_route_context(home, config).await?;
         let storage = prepare_startup_storage(
-            &home,
+            home,
             config,
             &route.original_provider,
             initial_storage_guards,
@@ -1472,10 +1472,9 @@ impl CodeyRuntime {
             applied_route_files,
             runtime_config,
             runtime_config_overrides,
-        } = prepare_runtime_provider_state(&home, config, &route).await?;
+        } = prepare_runtime_provider_state(home, config, &route).await?;
         let patch =
-            prepare_startup_patches_and_overlay(&home, config, applied_route_files.as_ref())
-                .await?;
+            prepare_startup_patches_and_overlay(home, config, applied_route_files.as_ref()).await?;
         let SpawnedRenderer {
             app_dir,
             spawned,
@@ -1483,7 +1482,7 @@ impl CodeyRuntime {
             maintenance,
             injected_target,
         } = spawn_and_inject_runtime(
-            &home,
+            home,
             config,
             &handler,
             &injection_scripts,
@@ -1492,7 +1491,7 @@ impl CodeyRuntime {
             &runtime_config_overrides,
         )
         .await?;
-        restore_cc_switch_provider_after_startup(&home, &route).await;
+        restore_cc_switch_provider_after_startup(home, &route).await;
         #[cfg(target_os = "macos")]
         let inspector_argument = spawned.inspector_argument.clone();
         let process_id = spawned.process_id;
@@ -1602,7 +1601,7 @@ impl CodeyRuntime {
         } else {
             Ok(())
         };
-        let config_restore = restore_runtime_config(&codex_home()).await;
+        let config_restore = restore_runtime_config(codex_home()).await;
         if let Err(error) = &process_stop {
             error_log::record_failure(
                 "cleanup_failed",

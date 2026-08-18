@@ -35,7 +35,7 @@ async fn current_provider_request_profile(config: &CodeyConfig) -> Result<Provid
     }
     let home = codex_home();
     tokio::task::spawn_blocking(move || {
-        cc_switch::provider_model_fetch_profile(&profile, &home)
+        cc_switch::provider_model_fetch_profile(&profile, home)
             .map_err(|error| format!("读取当前 GPT API 配置失败：{error:#}"))
     })
     .await
@@ -45,7 +45,7 @@ async fn current_provider_request_profile(config: &CodeyConfig) -> Result<Provid
 fn resolve_request_config(
     optimization: &PromptOptimizationConfig,
 ) -> Result<prompt_optimization::ResolvedPromptOptimizationConfig, String> {
-    resolve_request_config_at(optimization, &codex_home())
+    resolve_request_config_at(optimization, codex_home())
 }
 
 fn resolve_request_config_at(

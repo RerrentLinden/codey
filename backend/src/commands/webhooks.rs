@@ -670,7 +670,7 @@ pub(super) fn start_recent_session_scan(
 ) -> RecentSessionScanTask {
     let home = codex_home();
     tokio::task::spawn_blocking(move || {
-        let events = cache.refresh(&home);
+        let events = cache.refresh(home);
         (cache, events)
     })
 }
