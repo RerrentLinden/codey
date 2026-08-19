@@ -51,7 +51,7 @@
   const sidebarTitleCache = new Map();
   let watcherWakeTimer = 0;
   let deletePopoverCleanup = null;
-  let codexSignalDispatcherPromise = null;
+  let codexSessionControllerPromise = null;
   let sidebarActionTooltipTimer = 0;
   let sidebarActionTooltipAnchor = null;
   let threadUpdatedAtFetchTimer = 0;
@@ -1502,15 +1502,72 @@
     scheduleThreadUpdatedAtFetch();
   };
 
-  const codexAppAssetUrls = () => [...new Set([
-    ...Array.from(document.scripts || []).map((script) => script.src),
-    ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
-    ...(
-      typeof performance?.getEntriesByType === "function"
-        ? performance.getEntriesByType("resource").map((entry) => entry.name)
-        : []
-    ),
-  ].filter((url) => url && url.includes("/assets/") && url.split("?")[0].endsWith(".js")))];
+  const codexAppAssetUrls = () => {
+    const performanceUrls = (
+      typeof performance !== "undefined"
+      && typeof performance.getEntriesByType === "function"
+    )
+      ? performance.getEntriesByType("resource").map((entry) => entry.name)
+      : [];
+    return [...new Set([
+      ...Array.from(document.scripts || []).map((script) => script.src),
+      ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
+      ...performanceUrls,
+    ].filter((url) => (
+      url
+      && url.includes("/assets/")
+      && url.split("?")[0].endsWith(".js")
+    )))];
+  };
+
+  const codexAssetReferencesFromSource = (source, baseUrl) => {
+    const references = [];
+    const pattern = /["']((?:\.\/(?:assets\/)?|\/assets\/)(?:app-initial|app-server-manager-signals)(?:-[^"'?#/]+)?\.js(?:\?[^"']*)?)["']/g;
+    for (const match of String(source || "").matchAll(pattern)) {
+      try {
+        const resolved = new URL(match[1], baseUrl).href;
+        if (!references.includes(resolved)) references.push(resolved);
+      } catch {
+        continue;
+      }
+    }
+    return references;
+  };
+  window.__codeyCodexAssetReferencesFromSource = codexAssetReferencesFromSource;
+
+  const discoverCodexAppAssetUrls = async () => {
+    const loadedUrls = codexAppAssetUrls();
+    const discoveredUrls = loadedUrls.filter((url) => (
+      url.includes("app-server-manager-signals-")
+      || url.includes("app-initial-")
+    ));
+    const fetchAsset = typeof window.fetch === "function"
+      ? window.fetch.bind(window)
+      : (typeof fetch === "function" ? fetch : null);
+    if (!fetchAsset) return discoveredUrls;
+
+    const scriptUrls = [...new Set([
+      ...Array.from(document.scripts || []).map((script) => script.src),
+      ...loadedUrls,
+    ])].filter((url) => (
+      url
+      && !url.includes("app-server-manager-signals-")
+      && !url.includes("app-initial-")
+    )).slice(0, 6);
+    for (const scriptUrl of scriptUrls) {
+      try {
+        const response = await fetchAsset(scriptUrl);
+        if (!response?.ok || typeof response.text !== "function") continue;
+        const source = await response.text();
+        for (const assetUrl of codexAssetReferencesFromSource(source, scriptUrl)) {
+          if (!discoveredUrls.includes(assetUrl)) discoveredUrls.push(assetUrl);
+        }
+      } catch {
+        continue;
+      }
+    }
+    return discoveredUrls;
+  };
 
   const signalDispatcherFromModule = (module, namedSignalAsset) => {
     const preferred = namedSignalAsset ? [module?.rn, module?.O] : [module?.O, module?.rn];
@@ -1539,52 +1596,247 @@
   };
   window.__codeySignalDispatcherFromModule = signalDispatcherFromModule;
 
-  const loadCodexSignalDispatcher = async () => {
+  const appServerManagerResolverFromModule = (module) => {
+    const candidates = [...new Set(Object.values(module || {}).filter((candidate) => (
+      typeof candidate === "function"
+    )))];
+    const matches = candidates.filter((candidate) => {
+      let source = "";
+      try {
+        source = Function.prototype.toString.call(candidate);
+      } catch {
+        return false;
+      }
+      return (
+        candidate.length >= 2
+        && candidate.length <= 3
+        && /AppServerManager RPC is not connected/.test(source)
+        && /\.get\(/.test(source)
+        && /\.forHost\(/.test(source)
+      );
+    });
+    return matches.length === 1 ? matches[0] : null;
+  };
+  window.__codeyAppServerManagerResolverFromModule = appServerManagerResolverFromModule;
+
+  const reactFiberFromElement = (element) => {
+    if (!(element instanceof HTMLElement)) return null;
+    const key = Object.keys(element).find((candidate) => (
+      candidate.startsWith("__reactFiber$")
+      || candidate.startsWith("__reactInternalInstance$")
+    ));
+    return key ? element[key] : null;
+  };
+
+  const collectAppServerScopeCandidates = (root, candidates, seen) => {
+    const queue = [{ depth: 0, value: root }];
+    let cursor = 0;
+    let inspected = 0;
+    while (cursor < queue.length && inspected < 600 && candidates.length < 48) {
+      const { depth, value } = queue[cursor];
+      cursor += 1;
+      if (
+        !value
+        || (typeof value !== "object" && typeof value !== "function")
+        || seen.has(value)
+      ) continue;
+      seen.add(value);
+      inspected += 1;
+      let descriptors;
+      try {
+        descriptors = Object.getOwnPropertyDescriptors(value);
+      } catch {
+        continue;
+      }
+      const hasFunction = (name) => {
+        if (typeof descriptors[name]?.value === "function") return true;
+        try {
+          return typeof value[name] === "function";
+        } catch {
+          return false;
+        }
+      };
+      if (
+        hasFunction("get")
+        && hasFunction("set")
+        && hasFunction("watch")
+        && hasFunction("when")
+        && Object.prototype.hasOwnProperty.call(descriptors, "query")
+      ) {
+        candidates.push(value);
+      }
+      if (depth >= 6) continue;
+      for (const [key, descriptor] of Object.entries(descriptors)) {
+        if (
+          !Object.prototype.hasOwnProperty.call(descriptor, "value")
+          || ["return", "child", "sibling", "alternate", "stateNode", "_owner"].includes(key)
+        ) continue;
+        const nested = descriptor.value;
+        if (nested && (typeof nested === "object" || typeof nested === "function")) {
+          queue.push({ depth: depth + 1, value: nested });
+        }
+      }
+    }
+  };
+
+  const appServerManagerFromReact = (resolver) => {
+    const elements = [...new Set([
+      ...Array.from(document.querySelectorAll("[data-app-action-sidebar-thread-row]") || []),
+      ...Array.from(document.querySelectorAll("[data-turn-key]") || []),
+      document.querySelector("[data-app-action-sidebar-section]"),
+      document.querySelector("[data-app-action-sidebar-project-row]"),
+      document.querySelector("#root"),
+      document.body,
+    ].filter((element) => element instanceof HTMLElement))].slice(0, 32);
+    const seenScopes = new WeakSet();
+    for (const element of elements) {
+      let fiber = reactFiberFromElement(element);
+      for (let depth = 0; fiber && depth < 24; depth += 1, fiber = fiber.return) {
+        const candidates = [];
+        const seenValues = new WeakSet();
+        collectAppServerScopeCandidates(fiber.memoizedState, candidates, seenValues);
+        collectAppServerScopeCandidates(fiber.memoizedProps, candidates, seenValues);
+        collectAppServerScopeCandidates(fiber.dependencies, candidates, seenValues);
+        collectAppServerScopeCandidates(fiber.updateQueue, candidates, seenValues);
+        for (const scope of candidates) {
+          if (seenScopes.has(scope)) continue;
+          seenScopes.add(scope);
+          try {
+            const manager = resolver(scope, "local");
+            if (
+              manager
+              && typeof manager.discardConversationFromCache === "function"
+              && typeof manager.handleThreadDeletion === "function"
+              && typeof manager.refreshRecentConversations === "function"
+              && typeof manager.resumeConversation === "function"
+            ) return manager;
+          } catch {
+            continue;
+          }
+        }
+      }
+    }
+    return null;
+  };
+  window.__codeyAppServerManagerFromReact = appServerManagerFromReact;
+
+  const legacySessionController = (dispatcher) => ({
+    kind: "signals",
+    dispatcher,
+    discardConversation: (sessionId) => dispatcher("unsubscribe-thread-for-host", {
+      hostId: "local",
+      threadId: sessionId,
+    }),
+    notifyConversationDeleted: (sessionId) => dispatcher(
+      "handle-app-server-notification-for-host",
+      {
+        hostId: "local",
+        notification: {
+          method: "thread/deleted",
+          params: { threadId: sessionId },
+        },
+      },
+    ),
+    refreshRecentConversations: () => dispatcher("refresh-recent-conversations-for-host", {
+      hostId: "local",
+    }),
+    resumeConversation: (payload) => {
+      const {
+        showThreadGoalResumeConfirmation: _showThreadGoalResumeConfirmation,
+        ...legacyPayload
+      } = payload;
+      return dispatcher("maybe-resume-conversation", {
+        hostId: "local",
+        ...legacyPayload,
+      });
+    },
+  });
+
+  const managerSessionController = (manager) => ({
+    kind: "manager",
+    manager,
+    discardConversation: (sessionId) => manager.discardConversationFromCache(sessionId),
+    notifyConversationDeleted: (sessionId) => manager.handleThreadDeletion([sessionId]),
+    refreshRecentConversations: () => manager.refreshRecentConversations(),
+    resumeConversation: (payload) => manager.resumeConversation(payload),
+  });
+
+  const sessionControllerLooksUsable = (controller) => (
+    controller
+    && typeof controller.discardConversation === "function"
+    && typeof controller.notifyConversationDeleted === "function"
+    && typeof controller.refreshRecentConversations === "function"
+    && typeof controller.resumeConversation === "function"
+  );
+
+  const loadCodexSessionController = async () => {
+    if (sessionControllerLooksUsable(window.__codeyCodexSessionController)) {
+      return window.__codeyCodexSessionController;
+    }
     if (typeof window.__codeyCodexSignalDispatcher === "function") {
-      return window.__codeyCodexSignalDispatcher;
+      const controller = legacySessionController(window.__codeyCodexSignalDispatcher);
+      window.__codeyCodexSessionController = controller;
+      return controller;
     }
     const signalAssetPriority = (url) => (
       url.includes("app-server-manager-signals-")
         ? 2
         : Number(url.includes("app-initial-"))
     );
-    const urls = codexAppAssetUrls()
-      .filter((url) => (
-        url.includes("app-server-manager-signals-")
-        || url.includes("app-initial-")
-      ))
+    const urls = (await discoverCodexAppAssetUrls())
       .sort((left, right) => signalAssetPriority(right) - signalAssetPriority(left));
     for (const url of urls) {
       const namedSignalAsset = url.includes("app-server-manager-signals-");
       try {
-        const module = await import(url);
+        const module = typeof window.__codeyImportCodexAsset === "function"
+          ? await window.__codeyImportCodexAsset(url)
+          : await import(url);
         const dispatcher = signalDispatcherFromModule(module, namedSignalAsset);
         if (dispatcher) {
           window.__codeyCodexSignalDispatcher = dispatcher;
-          return dispatcher;
+          const controller = legacySessionController(dispatcher);
+          window.__codeyCodexSessionController = controller;
+          return controller;
+        }
+        const resolver = appServerManagerResolverFromModule(module);
+        const manager = resolver ? appServerManagerFromReact(resolver) : null;
+        if (manager) {
+          const controller = managerSessionController(manager);
+          window.__codeyCodexSessionController = controller;
+          return controller;
         }
       } catch {
         continue;
       }
     }
-    throw new Error("Codex 会话刷新接口不可用");
+    throw new Error("Codex 会话管理接口不可用");
+  };
+  window.__codeyLoadCodexSessionController = loadCodexSessionController;
+
+  const loadCodexSignalDispatcher = async () => {
+    const controller = await loadCodexSessionController();
+    if (controller.kind === "signals" && typeof controller.dispatcher === "function") {
+      return controller.dispatcher;
+    }
+    throw new Error("当前 Codex 使用 AppServerManager 会话接口");
   };
   window.__codeyLoadCodexSignalDispatcher = loadCodexSignalDispatcher;
 
-  const getCodexSignalDispatcher = async () => {
-    codexSignalDispatcherPromise ||= loadCodexSignalDispatcher().catch((error) => {
-      codexSignalDispatcherPromise = null;
+  const getCodexSessionController = async () => {
+    if (sessionControllerLooksUsable(window.__codeyCodexSessionController)) {
+      return window.__codeyCodexSessionController;
+    }
+    codexSessionControllerPromise ||= loadCodexSessionController().catch((error) => {
+      codexSessionControllerPromise = null;
       throw error;
     });
-    return codexSignalDispatcherPromise;
+    return codexSessionControllerPromise;
   };
 
   const refreshRecentLocalSessions = async () => {
     try {
-      const dispatcher = await getCodexSignalDispatcher();
-      await dispatcher("refresh-recent-conversations-for-host", {
-        hostId: "local",
-      });
+      const controller = await getCodexSessionController();
+      await controller.refreshRecentConversations();
       return true;
     } catch {
       return false;
@@ -1595,11 +1847,8 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return false;
     try {
-      const dispatcher = await getCodexSignalDispatcher();
-      await dispatcher("unsubscribe-thread-for-host", {
-        hostId: "local",
-        threadId: normalizedSessionId,
-      });
+      const controller = await getCodexSessionController();
+      await controller.discardConversation(normalizedSessionId);
       return true;
     } catch {
       return false;
@@ -1610,14 +1859,8 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return false;
     try {
-      const dispatcher = await getCodexSignalDispatcher();
-      await dispatcher("handle-app-server-notification-for-host", {
-        hostId: "local",
-        notification: {
-          method: "thread/deleted",
-          params: { threadId: normalizedSessionId },
-        },
-      });
+      const controller = await getCodexSessionController();
+      await controller.notifyConversationDeleted(normalizedSessionId);
       return true;
     } catch {
       return false;
@@ -1627,14 +1870,12 @@
   const reloadConversationAfterHardDelete = async (sessionId, messageIds) => {
     const normalizedSessionId = String(sessionId || "").replace(/^local:/, "").trim();
     if (!normalizedSessionId || !messageIds.length) throw new Error("缺少会话或轮次 ID");
-    const dispatcher = await getCodexSignalDispatcher();
+    const controller = await getCodexSessionController();
 
-    // This native path unsubscribes app-server memory while preserving the
-    // active route and marking the React conversation as needing a resume.
-    await dispatcher("unsubscribe-thread-for-host", {
-      hostId: "local",
-      threadId: normalizedSessionId,
-    });
+    // Current Codex exposes AppServerManager through its renderer scope. Its
+    // discard path unsubscribes app-server and evicts React's conversation
+    // snapshot; older builds keep using the equivalent native signal.
+    await controller.discardConversation(normalizedSessionId);
 
     // Closing a loaded thread may flush a final record. Reapply the hard delete
     // only after unsubscribe has completed so stale memory cannot restore it.
@@ -1645,18 +1886,16 @@
     if (cleanup?.status === "failed") {
       throw new Error(cleanup.message || "卸载会话后的持久化清理失败");
     }
-    await dispatcher("maybe-resume-conversation", {
-      hostId: "local",
+    await controller.resumeConversation({
       conversationId: normalizedSessionId,
       model: null,
       serviceTier: null,
       reasoningEffort: null,
       workspaceRoots: [],
       collaborationMode: null,
+      showThreadGoalResumeConfirmation: false,
     });
-    await dispatcher("refresh-recent-conversations-for-host", {
-      hostId: "local",
-    });
+    await controller.refreshRecentConversations();
   };
 
   const importSessionFile = async (projectPath, file, button) => {

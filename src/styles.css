@@ -296,7 +296,15 @@ input:focus-visible,
 }
 
 .header-update-pill-label {
+  color: inherit;
   letter-spacing: 0.01em;
+  opacity: 1;
+}
+
+.header-update-pill > svg {
+  color: inherit;
+  opacity: 1;
+  stroke: currentColor;
 }
 
 /* 有可升级版本：蓝色 pill + 轻微呼吸，全页唯一强调位 */
@@ -308,10 +316,10 @@ input:focus-visible,
 }
 
 .header-update-pill.has-update:hover:not(:disabled) {
-  background: var(--mac-blue);
+  background: rgba(0, 122, 255, 0.16);
   border-color: var(--mac-blue);
-  color: #ffffff;
-  box-shadow: 0 2px 6px rgba(0, 122, 255, 0.35);
+  color: #0057b8;
+  box-shadow: 0 2px 6px rgba(0, 122, 255, 0.22);
   animation: none;
 }
 
@@ -329,10 +337,10 @@ input:focus-visible,
 
 .header-update-pill.has-downloaded:hover:not(:disabled),
 .header-update-pill.has-downloaded:hover {
-  background: var(--mac-green);
+  background: rgba(52, 199, 89, 0.2);
   border-color: var(--mac-green);
-  color: #ffffff;
-  box-shadow: 0 2px 6px rgba(52, 199, 89, 0.35);
+  color: #176c2e;
+  box-shadow: 0 2px 6px rgba(52, 199, 89, 0.22);
 }
 
 .header-update-pill.has-downloaded:active:not(:disabled) {

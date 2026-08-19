@@ -16,10 +16,10 @@ use crate::codex_config_guidance::PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT;
 use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, DEFAULT_AGENT_CONFIG,
     ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
-    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, append_root_agent_collaboration_usage_hint,
-    codey_fastctx_guidance_blocks, previous_default_agent_config_without_sandbox,
-    remove_codey_fastctx_guidance, remove_previous_codey_fastctx_guidance,
-    remove_subagent_guidance, subagent_source_config,
+    ROOT_AGENT_MULTI_AGENT_MODE_HINT, SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS,
+    append_root_agent_collaboration_usage_hint, codey_fastctx_guidance_blocks,
+    previous_default_agent_config_without_sandbox, remove_codey_fastctx_guidance,
+    remove_previous_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, ProviderProfile, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT,
@@ -2029,6 +2029,7 @@ fn enable_subagent_optimization(
     multi_agent["root_agent_usage_hint_text"] = value(append_root_agent_collaboration_usage_hint(
         existing_root_usage_hint,
     ));
+    multi_agent["multi_agent_mode_hint_text"] = value(ROOT_AGENT_MULTI_AGENT_MODE_HINT);
     if let Some(namespace) = fastctx_namespace {
         if multi_agent.get("subagent_developer_instructions").is_none() {
             multi_agent["subagent_developer_instructions"] =
@@ -2412,6 +2413,10 @@ fn build_isolated_runtime_overrides(
             (
                 &["features", "multi_agent_v2", "root_agent_usage_hint_text"][..],
                 "features.multi_agent_v2.root_agent_usage_hint_text",
+            ),
+            (
+                &["features", "multi_agent_v2", "multi_agent_mode_hint_text"][..],
+                "features.multi_agent_v2.multi_agent_mode_hint_text",
             ),
         ] {
             push_required_document_override(&mut overrides, effective, path, key)?;

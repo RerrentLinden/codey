@@ -78,6 +78,7 @@ function loadInjection({
   turnIds = ["turn-1"],
   sessionTitle = "排查飞书通知",
   bridgeHandler = null,
+  codexSessionController = null,
   codexSignalDispatcher = null,
   selectedTurnIds = [],
 } = {}) {
@@ -143,6 +144,7 @@ function loadInjection({
       if (bridgeHandler) return bridgeHandler(path, payload);
       return { status: "ok" };
     },
+    __codeyCodexSessionController: codexSessionController,
     __codeyCodexSignalDispatcher: codexSignalDispatcher,
     addEventListener: () => {},
     alert: (message) => alerts.push(String(message)),
@@ -274,6 +276,68 @@ test("unloads Codex memory without discarding the active conversation", async ()
     sessionId: "session-1",
     messageIds: ["turn-deleted"],
   });
+});
+
+test("uses the current AppServerManager flow to evict, clean, resume, and refresh", async () => {
+  const events = [];
+  const managerCalls = [];
+  const runtime = loadInjection({
+    initialRunning: false,
+    codexSessionController: {
+      kind: "manager",
+      async discardConversation(sessionId) {
+        managerCalls.push({ method: "discardConversation", sessionId });
+        events.push("manager:discard");
+      },
+      async notifyConversationDeleted(sessionId) {
+        managerCalls.push({ method: "notifyConversationDeleted", sessionId });
+      },
+      async refreshRecentConversations() {
+        managerCalls.push({ method: "refreshRecentConversations" });
+        events.push("manager:refresh");
+      },
+      async resumeConversation(payload) {
+        managerCalls.push({ method: "resumeConversation", payload });
+        events.push("manager:resume");
+      },
+    },
+    bridgeHandler: async (path) => {
+      events.push(`bridge:${path}`);
+      return path === "/session/delete-messages"
+        ? { status: "ok", deleted: 0 }
+        : { status: "ok" };
+    },
+  });
+  events.length = 0;
+
+  await runtime.window.__codeyReloadConversationAfterHardDelete(
+    "local:session-1",
+    ["turn-deleted"],
+  );
+
+  assert.deepEqual(events, [
+    "manager:discard",
+    "bridge:/session/delete-messages",
+    "manager:resume",
+    "manager:refresh",
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(managerCalls)), [{
+    method: "discardConversation",
+    sessionId: "session-1",
+  }, {
+    method: "resumeConversation",
+    payload: {
+      collaborationMode: null,
+      conversationId: "session-1",
+      model: null,
+      reasoningEffort: null,
+      serviceTier: null,
+      showThreadGoalResumeConfirmation: false,
+      workspaceRoots: [],
+    },
+  }, {
+    method: "refreshRecentConversations",
+  }]);
 });
 
 test("removes a hard-deleted turn and rejects a stale React rerender", async () => {

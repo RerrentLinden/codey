@@ -114,7 +114,10 @@ class FakeElement {
 
 function loadInjection({
   advanceTimeoutClock = false,
+  assetModules = new Map(),
   bridgeHandler,
+  entryScriptUrls = [],
+  fetchHandler,
   now,
   rows = [],
   signalDispatcher,
@@ -137,6 +140,7 @@ function loadInjection({
   const document = {
     body: new FakeElement("body"),
     documentElement: new FakeElement("html"),
+    scripts: entryScriptUrls.map((src) => ({ src })),
     visibilityState: "visible",
     addEventListener() {},
     createElement: (tagName) => new FakeElement(tagName),
@@ -152,6 +156,7 @@ function loadInjection({
   const window = {
     __codexSessionDeleteBridge: bridgeHandler,
     __codeyCodexSignalDispatcher: signalDispatcher,
+    __codeyImportCodexAsset: async (url) => assetModules.get(url),
     addEventListener() {},
     clearTimeout(timeoutId) {
       canceledTimeouts.add(timeoutId);
@@ -177,6 +182,7 @@ function loadInjection({
       return timeoutId;
     },
   };
+  if (fetchHandler) window.fetch = fetchHandler;
   window.window = window;
   const context = {
     console,
@@ -189,6 +195,8 @@ function loadInjection({
       }
       observe() {}
     },
+    performance: { getEntriesByType: () => [] },
+    URL,
     URLSearchParams,
     window,
   };
@@ -1306,6 +1314,74 @@ test("accepts only a unique direct app-server request wrapper", () => {
       O: direct,
       another: secondDirect,
     }, false),
+    null,
+  );
+});
+
+test("discovers the current app-initial asset and resolves AppServerManager from React scope", async () => {
+  const entryUrl = "app://-/assets/index-BZNttYfb.js";
+  const appInitialUrl = "app://-/assets/app-initial-BCLYDefw.js";
+  const manager = {
+    discardConversationFromCache() {},
+    handleThreadDeletion() {},
+    refreshRecentConversations() {},
+    resumeConversation() {},
+    sendRequest() {},
+  };
+  const AppServerManagerRpc = Symbol("AppServerManagerRpc");
+  const managerRpc = { forHost: (hostId) => (hostId === "local" ? manager : null) };
+  const scope = {
+    get: () => managerRpc,
+    query: {},
+    set() {},
+    watch() {},
+    when() {},
+  };
+  const row = new FakeElement();
+  row.__reactFiber$codeyTest = {
+    memoizedState: { current: scope },
+    return: null,
+  };
+  const resolver = function appServerManagerForHost(runtimeScope, hostId) {
+    const rpc = runtimeScope.get(AppServerManagerRpc);
+    if (rpc == null) throw new Error("AppServerManager RPC is not connected");
+    return rpc.forHost(hostId);
+  };
+  const { window } = loadInjection({
+    assetModules: new Map([[appInitialUrl, { arbitraryExport: resolver }]]),
+    entryScriptUrls: [entryUrl],
+    fetchHandler: async (url) => ({
+      ok: url === entryUrl,
+      text: async () => 'import "./app-initial-BCLYDefw.js";',
+    }),
+    rows: [row],
+  });
+
+  const controller = await window.__codeyLoadCodexSessionController();
+
+  assert.equal(controller.kind, "manager");
+  assert.equal(controller.manager, manager);
+});
+
+test("accepts only a unique semantic AppServerManager resolver", () => {
+  const { window } = loadInjection();
+  const direct = function appServerManagerForHost(scope, hostId) {
+    const rpc = scope.get(AppServerManagerRpc);
+    if (rpc == null) throw new Error("AppServerManager RPC is not connected");
+    return rpc.forHost(hostId);
+  };
+  const second = function anotherAppServerManagerForHost(scope, hostId) {
+    const rpc = scope.get(AnotherAppServerManagerRpc);
+    if (rpc == null) throw new Error("AppServerManager RPC is not connected");
+    return rpc.forHost(hostId);
+  };
+
+  assert.equal(
+    window.__codeyAppServerManagerResolverFromModule({ arbitrary: direct }),
+    direct,
+  );
+  assert.equal(
+    window.__codeyAppServerManagerResolverFromModule({ direct, second }),
     null,
   );
 });

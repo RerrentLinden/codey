@@ -130,21 +130,16 @@ test("settings notice toast is scoped to the settings page", async () => {
   );
 });
 
-test("operations tooltips stay inside the settings overlay", async () => {
-  const appSectionsSource = await readFile(
-    new URL("src/OperationsPanel.tsx", root),
-    "utf8",
+test("header update tooltip stays inside the settings overlay", async () => {
+  const appSource = await readFile(new URL("src/App.tsx", root), "utf8");
+  assert.match(
+    appSource,
+    /getTooltipContainer = useCallback\(\s*\(\) => popupContainer \?\? portalContainer \?\? document\.body/,
   );
   assert.match(
-    appSectionsSource,
-    /const operationsHubRef = useRef<HTMLElement>\(null\)/,
+    appSource,
+    /<Tooltip[\s\S]*getPopupContainer=\{getTooltipContainer\}/,
   );
-  assert.match(
-    appSectionsSource,
-    /operationsHubRef\.current\?\s*\.closest<HTMLElement>\("\.app-shell"\)\s*\?\?\s*document\.body/,
-  );
-  assert.match(appSectionsSource, /ref=\{operationsHubRef\}/);
-  assert.match(appSectionsSource, /getPopupContainer=\{getTooltipContainer\}/);
 });
 
 test("settings select popups stay inside the settings overlay", async () => {

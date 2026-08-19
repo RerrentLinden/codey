@@ -144,6 +144,7 @@ class FakeElement {
 
 function loadInjection({
   bridge,
+  sessionController,
   dispatcher,
   now = () => Date.now(),
   tasksSectionHeading = "Tasks",
@@ -277,6 +278,7 @@ function loadInjection({
       return 1;
     },
   };
+  if (sessionController) window.__codeyCodexSessionController = sessionController;
   if (dispatcher) {
     window.__codeyCodexSignalDispatcher = async (signal, payload) => {
       dispatcherCalls.push({ signal, payload });
@@ -423,6 +425,44 @@ test("matches native sidebar actions and deletes after popover confirmation", as
   );
   assert.equal(runtime.thread.parentElement, runtime.document.body);
   assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
+});
+
+test("uses AppServerManager cache eviction and deletion notification on current Codex", async () => {
+  const events = [];
+  const runtime = loadInjection({
+    bridge: async (path) => {
+      events.push(`bridge:${path}`);
+      if (path === "/session/delete") return { status: "ok", deleted: true };
+      return { status: "ok" };
+    },
+    sessionController: {
+      kind: "manager",
+      async discardConversation(sessionId) {
+        events.push(`manager:discard:${sessionId}`);
+      },
+      async notifyConversationDeleted(sessionId) {
+        events.push(`manager:deleted:${sessionId}`);
+      },
+      async refreshRecentConversations() {
+        events.push("manager:refresh");
+      },
+      async resumeConversation() {},
+    },
+  });
+  events.length = 0;
+
+  runtime.thread.querySelector("[data-codey-session-delete]").click();
+  runtime.document.body
+    .querySelector("[data-codey-session-delete-confirm]")
+    .click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(events, [
+    "manager:discard:thread-1",
+    "bridge:/session/delete",
+    "manager:deleted:thread-1",
+    "manager:refresh",
+  ]);
 });
 
 test("keeps permanently deleted virtualized sidebar rows hidden for the renderer lifetime", async () => {

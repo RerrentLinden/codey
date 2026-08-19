@@ -22,7 +22,7 @@ import {
 } from "@tabler/icons-react";
 
 import type { PluginMarketplaceStatus, RuntimeStatus } from "./App.types";
-import { Badge, Button, Card, Tooltip } from "./components/semi";
+import { Badge, Button, Card } from "./components/semi";
 
 const Cpu = IconCpu;
 const FolderOpen = IconFolderOpen;
@@ -71,10 +71,6 @@ function OperationsPanelComponent({
 }: OperationsPanelProps) {
   const operationsHubRef = useRef<HTMLElement>(null);
   const [activeCardTitle, setActiveCardTitle] = useState<string | null>(null);
-
-  const getTooltipContainer = () =>
-    operationsHubRef.current?.closest<HTMLElement>(".app-shell") ??
-    document.body;
 
   const toggleCard = (title: string) => {
     setActiveCardTitle((prev) => (prev === title ? null : title));
@@ -458,37 +454,30 @@ function OperationsPanelComponent({
                 const StatusIcon = item.icon;
                 const isExpanded = activeCardTitle === item.title;
                 return (
-                  <Tooltip
+                  <span
                     key={item.title}
-                    content={
-                      isExpanded
-                        ? `收起“${item.title}”`
-                        : `点击展开“${item.title}”详情`
-                    }
-                    getPopupContainer={getTooltipContainer}
-                    position="top"
+                    className="operations-status-chip-wrap"
+                    role="listitem"
                   >
-                    <span className="operations-status-chip-wrap" role="listitem">
-                      <button
-                        type="button"
-                        className={`operations-status-chip tone-${item.tone}${isExpanded ? " active" : ""}`}
-                        onClick={() => toggleCard(item.title)}
-                        aria-expanded={isExpanded}
-                        aria-label={`${item.title}（${item.label}），点击${isExpanded ? "收起" : "展开"}`}
+                    <button
+                      type="button"
+                      className={`operations-status-chip tone-${item.tone}${isExpanded ? " active" : ""}`}
+                      onClick={() => toggleCard(item.title)}
+                      aria-expanded={isExpanded}
+                      aria-label={`${item.title}（${item.label}），点击${isExpanded ? "收起" : "展开"}`}
+                    >
+                      <span
+                        className="operations-status-chip-icon"
+                        aria-hidden="true"
                       >
-                        <span
-                          className="operations-status-chip-icon"
-                          aria-hidden="true"
-                        >
-                          <StatusIcon size={14} />
-                        </span>
-                        <span className="operations-status-chip-copy">
-                          <strong>{item.title}</strong>
-                          <small>{item.label}</small>
-                        </span>
-                      </button>
-                    </span>
-                  </Tooltip>
+                        <StatusIcon size={14} />
+                      </span>
+                      <span className="operations-status-chip-copy">
+                        <strong>{item.title}</strong>
+                        <small>{item.label}</small>
+                      </span>
+                    </button>
+                  </span>
                 );
               })}
             </div>

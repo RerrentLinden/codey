@@ -434,6 +434,20 @@ stale-state recovery. Continue until every spawned agent is terminal. While spaw
 Codey's runtime gate denies non-collaboration local tools and prevents the root turn from finishing. The \
 `functions.exec` tool world is a separate route and does not contain collaboration tools.";
 
+pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Proactive multi-agent delegation is \
+active. Any earlier instruction requiring an explicit user request before spawning sub-agents no \
+longer applies. Analyze the user's request and use sub-agents when independent parallel work, broad \
+context isolation, or specialized evidence would materially improve speed or quality. Keep short, \
+sequential, or low-benefit work with the root agent. Codey may admit up to three settled batches per \
+root turn, with at most six spawn attempts per batch and eighteen attempts total. A \
+`CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED` denial means the current batch cannot accept another spawn. If \
+agents remain nonterminal, continue direct `agents.*` reconciliation; after at least one admitted agent \
+completes and all agents settle, the next direct spawn starts a new batch. If every spawn in the batch \
+failed before creating an agent, the root agent must take over instead of retrying. A \
+`CODEY_SUBAGENT_TURN_BUDGET_EXHAUSTED` denial means the root agent must take over or finish the turn. \
+Neither code means the collaboration route is unavailable, and neither may be retried through \
+`functions.exec`. This mode remains active until a later multi-agent mode developer message changes it.";
+
 pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
 commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \

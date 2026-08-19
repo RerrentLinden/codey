@@ -134,6 +134,8 @@ test("subagent optimization installs recoverable orchestration and runtime gates
     /enable_subagent_gate_hooks\(doc, config_path, fastctx_namespace\.is_some\(\)\)/,
   );
   assert.match(configSource, /COMBINED_HOOK_ARGUMENT/);
+  assert.match(configSource, /multi_agent_mode_hint_text/);
+  assert.match(configSource, /ROOT_AGENT_MULTI_AGENT_MODE_HINT/);
   assert.match(configSource, /&SUBAGENT_GATE_HOOKS\[\.\.1\]/);
   assert.match(configSource, /&SUBAGENT_GATE_HOOKS\[1\.\.\]/);
   assert.match(configSource, /if !subagent_optimization/);
@@ -172,6 +174,13 @@ test("subagent optimization installs recoverable orchestration and runtime gates
   assert.match(orchestratorSource, /CODEY_DELEGATION_V2=/);
   assert.match(orchestratorSource, /CODEY_DELEGATION_V1=/);
   assert.match(orchestratorSource, /struct SessionLedger/);
+  assert.match(orchestratorSource, /const LEDGER_SCHEMA_VERSION: u32 = 3/);
+  assert.match(orchestratorSource, /MAX_BATCHES_PER_TURN: u16 = 3/);
+  assert.match(orchestratorSource, /MAX_TOTAL_ATTEMPTS_PER_TURN/);
+  assert.match(orchestratorSource, /CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED/);
+  assert.match(orchestratorSource, /CODEY_SUBAGENT_TURN_BUDGET_EXHAUSTED/);
+  assert.match(orchestratorSource, /advance_batch_if_settled/);
+  assert.match(orchestratorSource, /issued_task_ids/);
   assert.match(orchestratorSource, /lock_exclusive/);
   assert.match(orchestratorSource, /resource_conflict/);
   assert.match(orchestratorSource, /classify_acceptance_evidence/);

@@ -720,11 +720,13 @@
 }
 
 .notification-channel-kind-select .semi-select-prefix {
+  margin-left: 10px;
   margin-right: 8px;
 }
 
 .notification-channel-kind-select .semi-select-arrow {
   color: #8e8e93;
+  margin-right: 10px;
 }
 
 .notification-channel-select-dropdown {
@@ -736,7 +738,7 @@
   align-items: center;
   gap: 8px;
   min-height: 34px;
-  padding: 0 8px;
+  padding: 0 10px;
   border: 0;
   border-radius: 6px;
   background: transparent;

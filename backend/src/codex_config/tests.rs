@@ -1422,6 +1422,7 @@ default_subagent_reasoning_effort = "low"
 custom_setting = "preserved"
 subagent_developer_instructions = "Preserve my subagent guidance."
 root_agent_usage_hint_text = "Preserve my root usage hint."
+multi_agent_mode_hint_text = "Require explicit requests."
 
 [[hooks.PreToolUse]]
 matcher = "Bash"
@@ -1511,6 +1512,10 @@ command = "echo preserve-user-hook"
     let root_usage_hint = multi_agent["root_agent_usage_hint_text"].as_str().unwrap();
     assert!(root_usage_hint.contains("Preserve my root usage hint."));
     assert!(root_usage_hint.contains(ROOT_AGENT_COLLABORATION_USAGE_HINT));
+    assert_eq!(
+        multi_agent["multi_agent_mode_hint_text"].as_str(),
+        Some(ROOT_AGENT_MULTI_AGENT_MODE_HINT)
+    );
 
     let pre_tool_use = document["hooks"]["PreToolUse"]
         .as_array_of_tables()
@@ -4304,6 +4309,7 @@ wire_api = "responses"
         "features.multi_agent_v2.default_wait_timeout_ms",
         "features.multi_agent_v2.max_wait_timeout_ms",
         "features.multi_agent_v2.root_agent_usage_hint_text",
+        "features.multi_agent_v2.multi_agent_mode_hint_text",
         "features.multi_agent_v2.subagent_developer_instructions",
         "features.hooks",
     ] {
