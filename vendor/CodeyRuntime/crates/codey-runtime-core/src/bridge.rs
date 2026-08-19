@@ -108,17 +108,23 @@ fn build_bridge_script_for_session(binding_name: &str, session_token: &str) -> S
 }
 
 pub fn bridge_health_check_script() -> &'static str {
+    // Tri-state probe: "busy" means the bridge is installed but the page could
+    // not round-trip within the in-page budget, which must not be confused
+    // with a missing bridge — reinjecting into a busy renderer adds more work
+    // to an already stalled page.
     r#"
 (() => {
   const bridge = window.__codexSessionDeleteBridge;
-  if (typeof bridge !== "function") return false;
+  if (typeof bridge !== "function") return "missing";
   try {
     return Promise.race([
-      Promise.resolve(bridge("/backend/status", {})).then((result) => !!result && result.status === "ok"),
-      new Promise((resolve) => setTimeout(() => resolve(false), 2000)),
+      Promise.resolve(bridge("/backend/health", {})).then((result) => (
+        !!result && result.status === "ok" ? "healthy" : "unhealthy"
+      )),
+      new Promise((resolve) => setTimeout(() => resolve("busy"), 2000)),
     ]);
   } catch (error) {
-    return false;
+    return "missing";
   }
 })()
 "#
@@ -515,6 +521,7 @@ fn bridge_path_can_run_concurrently(path: &str) -> bool {
         "/settings/get"
             | "/codex-model-catalog"
             | "/backend/status"
+            | "/backend/health"
             | "/account/usage"
             | "/api/check_for_updates"
             | "/session/wake-watcher"

@@ -1000,9 +1000,14 @@ fn bridge_health_check_script_uses_real_backend_round_trip() {
     let script = bridge::bridge_health_check_script();
 
     assert!(script.contains("__codexSessionDeleteBridge"));
-    assert!(script.contains("/backend/status"));
+    assert!(script.contains("/backend/health"));
     assert!(script.contains("Promise.race"));
     assert!(script.contains("setTimeout"));
+    // The probe must distinguish a busy-but-installed bridge from a missing
+    // one so the watchdog never reinjects into a stalled renderer.
+    assert!(script.contains(r#"return "missing""#));
+    assert!(script.contains(r#"resolve("busy")"#));
+    assert!(script.contains(r#""healthy" : "unhealthy""#));
 }
 
 #[test]

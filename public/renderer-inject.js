@@ -1124,8 +1124,16 @@
     headerMountDirty = false;
   };
 
+  const finishSessionToolsLoad = () => {
+    if (window.__codeySessionToolsInjectLoaded !== true) return false;
+    disarmSessionToolsInteraction();
+    bootstrapObserver?.disconnect();
+    bootstrapObserver = null;
+    return true;
+  };
+
   const loadSessionTools = () => {
-    if (window.__codeySessionToolsInjectLoaded === true) return Promise.resolve(true);
+    if (finishSessionToolsLoad()) return Promise.resolve(true);
     if (sessionToolsLoadPromise) return sessionToolsLoadPromise;
     sessionToolsLoadPromise = Promise.resolve(callBridge(sessionToolsLoadPath, {}))
       .then((result) => {
@@ -1135,12 +1143,14 @@
         if (window.__codeySessionToolsInjectLoaded !== true) {
           throw new Error(window.__codeySessionToolsError || "会话工具未完成初始化");
         }
-        disarmSessionToolsInteraction();
-        bootstrapObserver?.disconnect();
-        bootstrapObserver = null;
-        return true;
+        return finishSessionToolsLoad();
       })
       .catch((error) => {
+        // Runtime.evaluate can time out while the renderer keeps executing the
+        // already-started script. If initialization completed before the bridge
+        // rejection reached this page, treat it as success and always release
+        // the bootstrap observer/listeners.
+        if (finishSessionToolsLoad()) return true;
         sessionToolsLoadPromise = null;
         console.warn("[Codey] session tools lazy load failed", error);
         return false;

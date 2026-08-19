@@ -167,6 +167,17 @@ async fn settings_bridge_matches_the_redacted_config_contract() {
 }
 
 #[tokio::test]
+async fn backend_health_bridge_avoids_runtime_status_collection() {
+    let state = Arc::new(AppState::default());
+
+    let actual = state
+        .bridge_request("/backend/health".to_string(), json!({}))
+        .await;
+
+    assert_eq!(actual, json!({"status": "ok"}));
+}
+
+#[tokio::test]
 async fn explicit_notification_channel_reveal_returns_only_the_selected_channel() {
     let state = Arc::new(AppState::default());
     state.config.write().await.webhook.channels.extend([

@@ -158,6 +158,10 @@ function loadInjection({
     },
     dispatchEvent() {},
     localStorage: { length: 0, key: () => null, getItem: () => null, setItem() {} },
+    requestIdleCallback(callback) {
+      callback({ didTimeout: false, timeRemaining: () => 50 });
+      return 1;
+    },
     setInterval: (callback) => {
       intervalCallbacks.push(callback);
       return intervalCallbacks.length;

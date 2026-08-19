@@ -33,6 +33,7 @@ async fn bridge_routes_cover_all_current_paths() {
         ("/user-scripts/reload", json!({})),
         ("/devtools/open", json!({})),
         ("/manager/open", json!({})),
+        ("/backend/health", json!({})),
         ("/backend/status", json!({})),
         ("/codex-model-catalog", json!({})),
         ("/codex-config-model", json!({})),
@@ -357,6 +358,10 @@ async fn runtime_status_devtools_repair_routes_are_dispatched() {
     assert_eq!(
         handle_bridge_request(ctx.clone(), "/manager/open", json!({})).await,
         json!({"status": "ok", "opened": "manager"})
+    );
+    assert_eq!(
+        handle_bridge_request(ctx.clone(), "/backend/health", json!({})).await,
+        json!({"status": "ok"})
     );
     assert_eq!(
         handle_bridge_request(ctx.clone(), "/backend/status", json!({})).await,

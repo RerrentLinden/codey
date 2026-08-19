@@ -552,6 +552,40 @@
   });
   const isInspectorArgument = (argument) =>
     typeof argument === "string" && /^--inspect(?:-brk)?(?:=|$)/.test(argument);
+  const maxRendererPatchFingerprints = 64;
+  const rendererPatchFailuresByFingerprint = new Map();
+  let activeRendererPatchFailures = null;
+  const rendererPatchFingerprint = (source) => {
+    try {
+      return process
+        .getBuiltinModule("crypto")
+        .createHash("sha256")
+        .update(source)
+        .digest("base64url");
+    } catch {
+      // Fingerprinting is only an optimization. If crypto is unavailable, keep
+      // the existing compatibility behavior instead of risking a false cache hit.
+      return null;
+    }
+  };
+  const rendererPatchFailuresForSource = (source) => {
+    const fingerprint = rendererPatchFingerprint(source);
+    if (fingerprint == null) return null;
+    const existing = rendererPatchFailuresByFingerprint.get(fingerprint);
+    if (existing) {
+      // Refresh insertion order so the bounded map behaves as an LRU.
+      rendererPatchFailuresByFingerprint.delete(fingerprint);
+      rendererPatchFailuresByFingerprint.set(fingerprint, existing);
+      return existing;
+    }
+    const failures = new Set();
+    rendererPatchFailuresByFingerprint.set(fingerprint, failures);
+    while (rendererPatchFailuresByFingerprint.size > maxRendererPatchFingerprints) {
+      const oldest = rendererPatchFailuresByFingerprint.keys().next().value;
+      rendererPatchFailuresByFingerprint.delete(oldest);
+    }
+    return failures;
+  };
   // Each renderer gate is optional and independent. Codex bundles are minified
   // and reshape between releases, so a single drifted anchor must skip only its
   // own gate — never discard the sibling gates that are still compatible. That
@@ -559,6 +593,11 @@
   // where one unrelated anchor moved: an exception here aborted every gate on
   // the asset. Log and return the source unchanged so the rest still apply.
   const replaceUniqueRendererGate = (source, pattern, replacement, name) => {
+    // app:// assets can be requested repeatedly during reloads or renderer
+    // recovery. A gate already known to be incompatible with the exact same
+    // source must remain skipped without rerunning its full-bundle regexes or
+    // spawning another error-log helper.
+    if (activeRendererPatchFailures?.has(name)) return source;
     const gates = Array.isArray(pattern) ? pattern : [{ pattern, replacement }];
     let matchCount = 0;
     let patched = source;
@@ -574,6 +613,7 @@
       matchCount += gateCount;
     }
     if (matchCount !== 1) {
+      activeRendererPatchFailures?.add(name);
       const message =
         `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${matchCount} times`;
       recordCodeyPatchFailure(`renderer_patch:${name}`, message, { matchCount });
@@ -1060,6 +1100,8 @@
     if (!isCodexRendererAssetRequest(request) || response?.ok !== true) return response;
     const source = await response.clone().text();
     let patched;
+    const previousRendererPatchFailures = activeRendererPatchFailures;
+    activeRendererPatchFailures = rendererPatchFailuresForSource(source);
     try {
       patched = patchCodexRendererAsset(source);
     } catch (error) {
@@ -1074,6 +1116,8 @@
         console.error("Codey skipped an incompatible Codex renderer patch", error);
       } catch {}
       return response;
+    } finally {
+      activeRendererPatchFailures = previousRendererPatchFailures;
     }
     if (patched === source) return response;
     const headers = new Headers(response.headers);

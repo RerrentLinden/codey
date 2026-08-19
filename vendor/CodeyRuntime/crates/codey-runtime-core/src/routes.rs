@@ -160,6 +160,7 @@ pub async fn handle_bridge_request(
         "/user-scripts/reload" => ctx.runtime.reload_user_scripts().await,
         "/devtools/open" => ctx.runtime.open_devtools().await,
         "/manager/open" => ctx.runtime.open_manager().await,
+        "/backend/health" => Ok(json!({"status": "ok"})),
         "/backend/status" => ctx.runtime.backend_status().await,
         "/codex-model-catalog" | "/codex-config-model" => ctx.runtime.codex_model_catalog().await,
         "/diagnostics/log" => diagnostic_log_value(payload.clone()),

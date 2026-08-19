@@ -1023,6 +1023,8 @@ fn session_tools_load_script(script: &str) -> String {
       ? `${{error.name}}: ${{error.message}}${{error.stack ? `\n${{error.stack}}` : ""}}`
       : String(error);
     window.__codeySessionToolsError = message;
+    window.__codeySessionToolsInjectLoading = false;
+    window.__codeySessionToolsInjectLoaded = false;
     console.error("[Codey] session tools failed to load", error);
   }}
   return window.__codeySessionToolsInjectLoaded === true
@@ -1063,7 +1065,22 @@ fn runtime_value(response: &serde_json::Value) -> Option<&serde_json::Value> {
         .and_then(|value| value.get("value"))
 }
 
-pub async fn is_target_healthy(websocket_url: &str) -> Result<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetHealth {
+    Healthy,
+    Unhealthy,
+    Busy,
+}
+
+fn target_health_from_evaluate_response(response: &serde_json::Value) -> TargetHealth {
+    match runtime_value(response).and_then(serde_json::Value::as_str) {
+        Some("healthy") => TargetHealth::Healthy,
+        Some("busy") => TargetHealth::Busy,
+        _ => TargetHealth::Unhealthy,
+    }
+}
+
+pub async fn is_target_healthy(websocket_url: &str) -> Result<TargetHealth> {
     let result = codey_runtime_core::bridge::evaluate_script_with_await_promise(
         websocket_url,
         bridge_health_check_script(),
@@ -1071,12 +1088,7 @@ pub async fn is_target_healthy(websocket_url: &str) -> Result<bool> {
     )
     .await
     .context("检查 Codey bridge 健康状态失败")?;
-    Ok(result
-        .get("result")
-        .and_then(|value| value.get("result"))
-        .and_then(|value| value.get("value"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false))
+    Ok(target_health_from_evaluate_response(&result))
 }
 
 pub fn bridge_handler<F, Fut>(handler: F) -> BridgeHandler
@@ -1112,6 +1124,39 @@ mod tests {
             "result": { "result": { "type": "boolean", "value": true } }
         });
         assert_eq!(runtime_value(&response), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn target_health_parses_tri_state_probe_results() {
+        let response = |value: serde_json::Value| {
+            serde_json::json!({
+                "result": { "result": { "type": "string", "value": value } }
+            })
+        };
+        assert_eq!(
+            target_health_from_evaluate_response(&response(serde_json::json!("healthy"))),
+            TargetHealth::Healthy
+        );
+        assert_eq!(
+            target_health_from_evaluate_response(&response(serde_json::json!("busy"))),
+            TargetHealth::Busy
+        );
+        for value in ["missing", "unhealthy"] {
+            assert_eq!(
+                target_health_from_evaluate_response(&response(serde_json::json!(value))),
+                TargetHealth::Unhealthy
+            );
+        }
+        // Legacy boolean and missing values degrade to unhealthy, never busy,
+        // so a genuinely absent bridge still triggers reinjection.
+        assert_eq!(
+            target_health_from_evaluate_response(&response(serde_json::json!(false))),
+            TargetHealth::Unhealthy
+        );
+        assert_eq!(
+            target_health_from_evaluate_response(&serde_json::json!({})),
+            TargetHealth::Unhealthy
+        );
     }
 
     #[test]
@@ -1226,6 +1271,9 @@ mod tests {
         );
         let session_tools_load_script = prepared_session_tools_load_script();
         assert!(session_tools_load_script.contains("window.__codeySessionToolsInjectLoaded"));
+        assert!(
+            session_tools_load_script.contains("window.__codeySessionToolsInjectLoading = false")
+        );
         // 压缩会改写内部标识符，锚点必须用不会被改名的 window 属性。
         assert!(session_tools_load_script.contains("__codeyDeleteSelectedMessages"));
     }

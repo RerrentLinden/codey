@@ -3,8 +3,8 @@
 // testing entry point.
 (() => {
   if (window.__codeySessionToolsInjectLoaded) return;
-  window.__codeySessionToolsInjectLoaded = true;
-  window.__codeyRendererInjectLoaded = true;
+  if (window.__codeySessionToolsInjectLoading) return;
+  window.__codeySessionToolsInjectLoading = true;
   const rendererSettingsButtonSelector = "#codey-settings-button";
   const toolbarId = "codey-message-toolbar";
   const toastId = "codey-runtime-toast";
@@ -1053,7 +1053,7 @@
         scheduleThreadRunningRecheck(cacheKey, remainingMs);
         return;
       }
-      installThreadUpdatedTimes(document);
+      refreshTrackedThreadUpdatedTimes();
       const current = threadRunningStateByCacheKey.get(cacheKey);
       if (current === state && current?.missingSince === state.missingSince) {
         threadRunningStateByCacheKey.delete(cacheKey);
@@ -1667,23 +1667,19 @@
     scheduleThreadUpdatedAtFetch();
   };
 
-  const refreshTrackedThreadUpdatedTimes = () => {
+  const refreshTrackedThreadUpdatedTimes = (forceRefresh = false) => {
     const now = Date.now();
-    // The mutation observer and initial install already register visible rows.
-    // A minute tick only needs those rows; a full document query is reserved
-    // for focus/pageshow recovery where missed host mutations are possible.
+    // The mutation observer and deferred initial scan register visible rows.
+    // Periodic and focus/page recovery only revisit those tracked rows, keeping
+    // full-document work away from interaction-sensitive renderer events.
     forEachTrackedThreadRow((row) => {
-      refreshThreadUpdatedAtRow(row, now, false);
+      refreshThreadUpdatedAtRow(row, now, forceRefresh);
     });
     scheduleThreadUpdatedAtFetch();
   };
 
   const refreshThreadUpdatedTimes = (forceRefresh = false) => {
-    if (forceRefresh) {
-      installThreadUpdatedTimes(document, true);
-      return;
-    }
-    refreshTrackedThreadUpdatedTimes();
+    refreshTrackedThreadUpdatedTimes(forceRefresh);
   };
 
   const codexAppAssetUrls = () => [...new Set([
@@ -2554,7 +2550,6 @@
   window.__codeyReloadConversationAfterHardDelete = reloadConversationAfterHardDelete;
   window.__codeyInstallMessageSelection = installMessageSelection;
   addStyle();
-  scan();
 
   const codeyOwnedSelector = [
     rendererSettingsButtonSelector,
@@ -2605,7 +2600,9 @@
   );
   const nearestScanRoot = (element) => {
     if (!(element instanceof HTMLElement)) return null;
-    return element.closest?.(scanBoundarySelector) || element;
+    return element.closest?.(scanBoundarySelector)
+      || element.querySelector?.(scanBoundarySelector)
+      || null;
   };
   const threadClassMutationMayAffectStatus = (target, threadRow, oldClassName) => (
     target === threadRow
@@ -2614,17 +2611,15 @@
   );
   const addPendingScanRoot = (root) => {
     if (!(root instanceof HTMLElement)) return;
-    if (
-      pendingScanRoots.size >= maxPendingScanRoots
-      && document.documentElement instanceof HTMLElement
-    ) {
-      pendingScanRoots.clear();
-      pendingScanRoots.add(document.documentElement);
-      return;
-    }
+    // Header mounts must stay fresh even while the root budget is saturated,
+    // otherwise the settings button can go stale for a whole mutation storm.
     if (root.matches?.("header, nav")) {
       window.__codeyRendererInvalidateHeaderMount?.(root);
     }
+    // Unknown/new Codex DOM shapes must degrade by skipping optional controls,
+    // not by turning a burst of virtualized rows into a synchronous full-page
+    // scan on the renderer thread.
+    if (pendingScanRoots.size >= maxPendingScanRoots) return;
     for (const pendingRoot of pendingScanRoots) {
       if (pendingRoot === root || pendingRoot.contains?.(root)) return;
       if (root.contains?.(pendingRoot)) pendingScanRoots.delete(pendingRoot);
@@ -2652,6 +2647,26 @@
     const delay = Math.max(0, Math.min(scanDebounceMs, scanDeadline - now));
     window.clearTimeout(scanTimer);
     scanTimer = window.setTimeout(flushIncrementalScans, delay);
+  };
+  const scheduleInitialScan = () => {
+    const run = () => {
+      try {
+        scan();
+      } catch (error) {
+        window.__codeySessionToolsError = error instanceof Error
+          ? `${error.name}: ${error.message}`
+          : String(error);
+        console.error("[Codey] deferred session tools scan failed", error);
+      }
+    };
+    if (typeof window.requestIdleCallback === "function") {
+      // Do not force this optional full-page discovery through a timeout: on a
+      // continuously scrolling/animating renderer that would move the same
+      // synchronous work back onto a latency-sensitive frame.
+      window.requestIdleCallback(run);
+    } else {
+      window.setTimeout(run, 0);
+    }
   };
 
   new MutationObserver((mutations) => {
@@ -2771,4 +2786,8 @@
       refreshThreadUpdatedTimes(false);
     }, threadTimestampRefreshIntervalMs);
   }
+  window.__codeyRendererInjectLoaded = true;
+  window.__codeySessionToolsInjectLoaded = true;
+  window.__codeySessionToolsInjectLoading = false;
+  scheduleInitialScan();
 })();

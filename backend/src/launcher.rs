@@ -55,6 +55,13 @@ use route_overlay::{RouteFilesSnapshot, read_route_files, spawn_route_overlay_wa
 
 const CDP_WATCHDOG_INTERVAL: Duration = Duration::from_secs(30);
 const CDP_WATCHDOG_FAILURE_THRESHOLD: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InjectionHealth {
+    Healthy,
+    Unhealthy,
+    Inconclusive,
+}
 pub const CODEX_APP_NOT_FOUND_ERROR: &str = "找不到 Codex 桌面应用";
 pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效或指向了 Codex CLI；请选择 Codex 桌面 App，不要选择 codex.exe 命令行程序";
 const DISABLE_GPU_ARGUMENT: &str = "--disable-gpu";
@@ -886,12 +893,20 @@ fn spawn_injection_watchdog(
                 _ = &mut shutdown_rx => break,
                 _ = interval.tick() => {}
             }
-            let healthy = tokio::select! {
+            let health = tokio::select! {
                 biased;
                 _ = &mut shutdown_rx => break 'watchdog,
                 result = cdp::is_target_healthy(target.websocket_url()) => {
                     match result {
-                        Ok(healthy) => healthy,
+                        Ok(cdp::TargetHealth::Healthy) => InjectionHealth::Healthy,
+                        Ok(cdp::TargetHealth::Unhealthy) => InjectionHealth::Unhealthy,
+                        Ok(cdp::TargetHealth::Busy) => {
+                            // The renderer answered CDP but the in-page bridge
+                            // round-trip missed its budget: the bridge is still
+                            // installed, the page is just busy. Reinjecting
+                            // would pile more script work onto a stalled page.
+                            InjectionHealth::Inconclusive
+                        }
                         Err(error) => {
                             error_log::record_failure_async(
                                 "injection_health_check_failed",
@@ -902,12 +917,17 @@ fn spawn_injection_watchdog(
                                 }),
                             )
                             .await;
-                            false
+                            // A busy renderer can miss the diagnostic deadline
+                            // while its bridge remains installed. Reinjecting in
+                            // that state adds more CDP/script work to an already
+                            // stalled page, so only an explicit false result may
+                            // advance the reinjection threshold.
+                            InjectionHealth::Inconclusive
                         }
                     }
                 }
             };
-            if !watchdog_should_reinject(&mut consecutive_failures, healthy) {
+            if !watchdog_should_reinject(&mut consecutive_failures, health) {
                 continue;
             }
             let reinjection = tokio::select! {
@@ -1741,13 +1761,17 @@ fn spawn_crashpad_guard_watcher(
     (shutdown_tx, task)
 }
 
-fn watchdog_should_reinject(consecutive_failures: &mut u8, healthy: bool) -> bool {
-    if healthy {
-        *consecutive_failures = 0;
-        return false;
+fn watchdog_should_reinject(consecutive_failures: &mut u8, health: InjectionHealth) -> bool {
+    match health {
+        InjectionHealth::Healthy | InjectionHealth::Inconclusive => {
+            *consecutive_failures = 0;
+            false
+        }
+        InjectionHealth::Unhealthy => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            *consecutive_failures >= CDP_WATCHDOG_FAILURE_THRESHOLD
+        }
     }
-    *consecutive_failures = consecutive_failures.saturating_add(1);
-    *consecutive_failures >= CDP_WATCHDOG_FAILURE_THRESHOLD
 }
 
 fn session_maintenance_summary(

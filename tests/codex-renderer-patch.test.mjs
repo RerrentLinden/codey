@@ -265,6 +265,22 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       ],
     );
 
+    const repeatedResponse = await installedHandler({
+      url: "app://-/assets/app-initial-new-codex-build.js",
+    });
+    assert.match(await repeatedResponse.text(), /useHiddenModels:/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      patchErrors.length,
+      2,
+      "the same incompatible source must not rerun failed renderer gates",
+    );
+    assert.equal(
+      asyncLogSpawns.length,
+      1,
+      "the same incompatible source must not spawn another patch logger",
+    );
+
     const currentRendererSource = [
       "const includeUltraReasoningEffort=!0,isServiceTierAllowed=!0;",
       "function currentModelFilter({additionalAvailableModels:e,authMethod:t,availableModels:n,isCustomModelProvider:r,model:i,useHiddenModels:a}){",

@@ -305,6 +305,7 @@ impl AppState {
                 }
                 value
             }
+            "/backend/health" => json!({"status":"ok"}),
             "/account/usage" => account_usage_snapshot(self).await,
             "/session/wake-watcher" => {
                 self.session_scan_wake.notify_one();

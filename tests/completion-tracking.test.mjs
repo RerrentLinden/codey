@@ -150,6 +150,10 @@ function loadInjection({
     confirm: () => true,
     dispatchEvent: () => true,
     getComputedStyle: () => ({ display: "block", visibility: "visible" }),
+    requestIdleCallback: (callback) => {
+      callback({ didTimeout: false, timeRemaining: () => 50 });
+      return 1;
+    },
     setTimeout: (callback) => {
       timers.push(callback);
       return timers.length;

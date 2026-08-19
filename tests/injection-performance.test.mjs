@@ -64,6 +64,26 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(sessionTools, /window\.__codeyRendererInvalidateHeaderMount\?\.\(root\)/);
   assert.doesNotMatch(sessionTools, /headerMountDirty/);
   assert.match(sessionTools, /const threadUpdatedAtRows = new Set\(\)/);
+  assert.match(sessionTools, /window\.__codeySessionToolsInjectLoading = true/);
+  assert.match(sessionTools, /if \(window\.__codeySessionToolsInjectLoading\) return/);
+  assert.match(sessionTools, /const scheduleInitialScan = \(\) =>/);
+  assert.match(sessionTools, /window\.requestIdleCallback\(run\)/);
+  assert.match(
+    sessionTools,
+    /window\.__codeySessionToolsInjectLoaded = true;\s*window\.__codeySessionToolsInjectLoading = false;\s*scheduleInitialScan\(\)/,
+  );
+  assert.doesNotMatch(sessionTools, /addStyle\(\);\s*scan\(\)/);
+  assert.doesNotMatch(sessionTools, /installThreadUpdatedTimes\(document(?:, true)?\)/);
+  assert.doesNotMatch(sessionTools, /pendingScanRoots\.add\(document\.documentElement\)/);
+  const addPendingScanRootBody = sessionTools.match(
+    /const addPendingScanRoot = \(root\) => \{([\s\S]*?)\n  \};/,
+  )?.[1] ?? "";
+  assert.ok(addPendingScanRootBody.length > 0);
+  assert.ok(
+    addPendingScanRootBody.indexOf("__codeyRendererInvalidateHeaderMount")
+      < addPendingScanRootBody.indexOf("maxPendingScanRoots"),
+    "header mount invalidation must run before the pending-root budget check",
+  );
   const sessionObserverFilter = sessionTools.match(
     /attributeFilter:\s*\[([\s\S]*?)\],\s*childList:\s*true/,
   )?.[1] ?? "";
