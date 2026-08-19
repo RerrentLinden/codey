@@ -1091,6 +1091,17 @@ pub async fn is_target_healthy(websocket_url: &str) -> Result<TargetHealth> {
     Ok(target_health_from_evaluate_response(&result))
 }
 
+pub fn target_health_error_requires_rediscovery(error: &anyhow::Error) -> bool {
+    // Renderer command deadlines are deliberately inconclusive: injecting more
+    // work into a busy page can make it less responsive. A Tungstenite error,
+    // however, means the saved page endpoint could not carry the probe at all
+    // (including HTTP upgrade failures from a replaced CDP target), so the
+    // watchdog must rediscover `/json` instead of retrying the stale URL.
+    error
+        .downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+        .is_some()
+}
+
 pub fn bridge_handler<F, Fut>(handler: F) -> BridgeHandler
 where
     F: Fn(String, serde_json::Value) -> Fut + Send + Sync + 'static,
@@ -1157,6 +1168,21 @@ mod tests {
             target_health_from_evaluate_response(&serde_json::json!({})),
             TargetHealth::Unhealthy
         );
+    }
+
+    #[test]
+    fn websocket_upgrade_errors_require_target_rediscovery_but_timeouts_do_not() {
+        let response = tokio_tungstenite::tungstenite::http::Response::builder()
+            .status(tokio_tungstenite::tungstenite::http::StatusCode::INTERNAL_SERVER_ERROR)
+            .body(Some(Vec::new()))
+            .unwrap();
+        let websocket_error =
+            anyhow::Error::new(tokio_tungstenite::tungstenite::Error::Http(response))
+                .context("failed to connect CDP websocket");
+        assert!(target_health_error_requires_rediscovery(&websocket_error));
+
+        let renderer_timeout = anyhow::anyhow!("timed out waiting for CDP command");
+        assert!(!target_health_error_requires_rediscovery(&renderer_timeout));
     }
 
     #[test]

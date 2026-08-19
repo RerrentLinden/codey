@@ -231,3 +231,14 @@ fn cdp_watchdog_does_not_reinject_after_renderer_timeouts() {
     ));
     assert_eq!(failures, 0);
 }
+
+#[test]
+fn cdp_watchdog_immediately_rediscovers_an_unavailable_target() {
+    let mut failures = 1;
+
+    assert!(watchdog_should_reinject(
+        &mut failures,
+        InjectionHealth::TargetUnavailable
+    ));
+    assert_eq!(failures, 0);
+}

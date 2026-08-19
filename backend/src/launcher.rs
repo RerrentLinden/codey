@@ -61,6 +61,7 @@ enum InjectionHealth {
     Healthy,
     Unhealthy,
     Inconclusive,
+    TargetUnavailable,
 }
 pub const CODEX_APP_NOT_FOUND_ERROR: &str = "找不到 Codex 桌面应用";
 pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效或指向了 Codex CLI；请选择 Codex 桌面 App，不要选择 codex.exe 命令行程序";
@@ -908,21 +909,31 @@ fn spawn_injection_watchdog(
                             InjectionHealth::Inconclusive
                         }
                         Err(error) => {
+                            let requires_rediscovery =
+                                cdp::target_health_error_requires_rediscovery(&error);
                             error_log::record_failure_async(
                                 "injection_health_check_failed",
                                 "check_cdp_bridge_health",
                                 format!("{error:#}"),
                                 serde_json::json!({
                                     "websocketUrl": target.websocket_url(),
+                                    "requiresTargetRediscovery": requires_rediscovery,
                                 }),
                             )
                             .await;
-                            // A busy renderer can miss the diagnostic deadline
-                            // while its bridge remains installed. Reinjecting in
-                            // that state adds more CDP/script work to an already
-                            // stalled page, so only an explicit false result may
-                            // advance the reinjection threshold.
-                            InjectionHealth::Inconclusive
+                            if requires_rediscovery {
+                                // The saved /devtools/page endpoint no longer
+                                // accepts CDP traffic. Rediscover immediately;
+                                // retrying this URL cannot repair a replaced
+                                // Windows renderer target.
+                                InjectionHealth::TargetUnavailable
+                            } else {
+                                // A busy renderer can miss the diagnostic
+                                // deadline while its bridge remains installed.
+                                // Reinjecting in that state adds more CDP/script
+                                // work to an already stalled page.
+                                InjectionHealth::Inconclusive
+                            }
                         }
                     }
                 }
@@ -1770,6 +1781,10 @@ fn watchdog_should_reinject(consecutive_failures: &mut u8, health: InjectionHeal
         InjectionHealth::Unhealthy => {
             *consecutive_failures = consecutive_failures.saturating_add(1);
             *consecutive_failures >= CDP_WATCHDOG_FAILURE_THRESHOLD
+        }
+        InjectionHealth::TargetUnavailable => {
+            *consecutive_failures = 0;
+            true
         }
     }
 }

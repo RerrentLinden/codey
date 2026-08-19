@@ -46,6 +46,18 @@ struct CleanupPlan {
     candidates: Vec<CleanupCandidate>,
 }
 
+#[derive(Debug, Default)]
+struct LiveThreadScan {
+    ids: HashSet<String>,
+    authoritative_sources: usize,
+}
+
+#[derive(Debug, Default)]
+struct SqliteThreadScan {
+    ids: HashSet<String>,
+    has_reference_schema: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct IndexSignature {
@@ -131,7 +143,19 @@ pub fn cleanup(home: &Path) -> Result<SessionIndexCleanupReport> {
         .iter()
         .map(|candidate| candidate.id.clone())
         .collect::<HashSet<_>>();
-    let live_thread_ids = collect_live_thread_ids(home, &candidate_ids)?;
+    let live_thread_scan = collect_live_thread_ids(home, &candidate_ids)?;
+    // An empty result is only authoritative when at least one rollout or
+    // session-aware SQLite database was actually available. During Windows
+    // packaged-app startup these sources can be temporarily absent; treating
+    // "not discovered" as "confirmed orphan" would erase the complete index
+    // before Codex gets a chance to hydrate it.
+    if live_thread_scan.authoritative_sources == 0 {
+        return Ok(SessionIndexCleanupReport {
+            scanned_entries: plan.scanned_entries,
+            ..SessionIndexCleanupReport::default()
+        });
+    }
+    let live_thread_ids = live_thread_scan.ids;
     let plan = CleanupPlan {
         candidates: plan
             .candidates
@@ -222,20 +246,18 @@ fn apply_cleanup_plan(
     })
 }
 
-fn collect_live_thread_ids(
-    home: &Path,
-    candidate_ids: &HashSet<String>,
-) -> Result<HashSet<String>> {
-    let mut ids = HashSet::new();
+fn collect_live_thread_ids(home: &Path, candidate_ids: &HashSet<String>) -> Result<LiveThreadScan> {
+    let mut scan = LiveThreadScan::default();
     'rollouts: for path in rollout_files(home)? {
+        scan.authoritative_sources += 1;
         if let Some(id) = path
             .file_name()
             .and_then(|name| name.to_str())
             .and_then(rollout_thread_id_from_filename)
         {
             if candidate_ids.contains(&id) {
-                ids.insert(id);
-                if ids.len() == candidate_ids.len() {
+                scan.ids.insert(id);
+                if scan.ids.len() == candidate_ids.len() {
                     break 'rollouts;
                 }
             }
@@ -263,24 +285,28 @@ fn collect_live_thread_ids(
                 .filter(|id| !id.is_empty())
                 .filter(|id| candidate_ids.contains(*id))
             {
-                ids.insert(id.to_string());
-                if ids.len() == candidate_ids.len() {
+                scan.ids.insert(id.to_string());
+                if scan.ids.len() == candidate_ids.len() {
                     break 'rollouts;
                 }
             }
         }
     }
     for path in sqlite_paths(home)? {
-        if ids.len() == candidate_ids.len() {
+        if scan.ids.len() == candidate_ids.len() {
             break;
         }
         let remaining = candidate_ids
-            .difference(&ids)
+            .difference(&scan.ids)
             .cloned()
             .collect::<HashSet<_>>();
-        ids.extend(sqlite_thread_ids(&path, &remaining)?);
+        let sqlite_scan = sqlite_thread_ids(&path, &remaining)?;
+        if sqlite_scan.has_reference_schema {
+            scan.authoritative_sources += 1;
+        }
+        scan.ids.extend(sqlite_scan.ids);
     }
-    Ok(ids)
+    Ok(scan)
 }
 
 fn rollout_files(home: &Path) -> Result<Vec<PathBuf>> {
@@ -356,14 +382,14 @@ fn sqlite_paths(home: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
-fn sqlite_thread_ids(path: &Path, candidate_ids: &HashSet<String>) -> Result<HashSet<String>> {
+fn sqlite_thread_ids(path: &Path, candidate_ids: &HashSet<String>) -> Result<SqliteThreadScan> {
     if candidate_ids.is_empty() {
-        return Ok(HashSet::new());
+        return Ok(SqliteThreadScan::default());
     }
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("只读打开 Codex 数据库失败：{}", path.display()))?;
     db.busy_timeout(Duration::from_secs(5))?;
-    let mut ids = HashSet::new();
+    let mut scan = SqliteThreadScan::default();
     let mut candidates = candidate_ids.iter().collect::<Vec<_>>();
     candidates.sort();
     for (table, column) in [
@@ -383,6 +409,7 @@ fn sqlite_thread_ids(path: &Path, candidate_ids: &HashSet<String>) -> Result<Has
         if !table_columns(&db, table)?.contains(column) {
             continue;
         }
+        scan.has_reference_schema = true;
         for chunk in candidates.chunks(SQLITE_ID_QUERY_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -390,7 +417,7 @@ fn sqlite_thread_ids(path: &Path, candidate_ids: &HashSet<String>) -> Result<Has
             let mut statement = db.prepare(&format!(
                 "SELECT DISTINCT {column} FROM {table} WHERE {column} IN ({placeholders})"
             ))?;
-            ids.extend(
+            scan.ids.extend(
                 statement
                     .query_map(params_from_iter(chunk.iter().copied()), |row| {
                         row.get::<_, String>(0)
@@ -399,7 +426,7 @@ fn sqlite_thread_ids(path: &Path, candidate_ids: &HashSet<String>) -> Result<Has
             );
         }
     }
-    Ok(ids)
+    Ok(scan)
 }
 
 fn cleanup_marker_path(home: &Path) -> PathBuf {
@@ -747,6 +774,12 @@ mod tests {
     fn cleanup_prunes_all_exact_duplicate_orphans() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path();
+        let sqlite = home.join("sqlite");
+        fs::create_dir_all(&sqlite).unwrap();
+        Connection::open(sqlite.join("codex.db"))
+            .unwrap()
+            .execute("CREATE TABLE local_thread_catalog (thread_id TEXT)", [])
+            .unwrap();
         fs::write(
             home.join("session_index.jsonl"),
             format!(
@@ -765,6 +798,29 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn cleanup_defers_when_no_authoritative_sources_are_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        fs::create_dir_all(home.join("sqlite")).unwrap();
+        let original = format!(
+            "{}\n{}\n",
+            index_line("history-one", "first"),
+            index_line("history-two", "second")
+        );
+        let index_path = home.join("session_index.jsonl");
+        fs::write(&index_path, &original).unwrap();
+
+        let report = cleanup(home).unwrap();
+
+        assert_eq!(report.scanned_entries, 2);
+        assert_eq!(report.pruned_entries, 0);
+        assert!(report.backup_dir.is_none());
+        assert_eq!(fs::read_to_string(index_path).unwrap(), original);
+        assert!(!cleanup_marker_path(home).exists());
     }
 
     #[test]
@@ -810,7 +866,9 @@ mod tests {
 
         assert_eq!(cleanup(home).unwrap().pruned_entries, 0);
         assert!(cleanup_marker_path(home).exists());
-        fs::remove_file(database).unwrap();
+        let db = Connection::open(&database).unwrap();
+        db.execute("DELETE FROM local_thread_catalog", []).unwrap();
+        drop(db);
 
         // The accepted gate semantics intentionally defer external-reference
         // changes while the legacy index itself is unchanged.
@@ -843,8 +901,9 @@ mod tests {
             .map(|index| format!("candidate-{index}"))
             .collect::<HashSet<_>>();
 
-        let ids = sqlite_thread_ids(&path, &candidates).unwrap();
+        let scan = sqlite_thread_ids(&path, &candidates).unwrap();
 
-        assert_eq!(ids, HashSet::from(["candidate-1001".to_string()]));
+        assert!(scan.has_reference_schema);
+        assert_eq!(scan.ids, HashSet::from(["candidate-1001".to_string()]));
     }
 }
