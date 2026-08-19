@@ -112,6 +112,10 @@ export function App({
     null,
   );
   const popupContainer = modalContainer ?? null;
+  const getTooltipContainer = useCallback(
+    () => popupContainer ?? portalContainer ?? document.body,
+    [popupContainer, portalContainer],
+  );
   const [traceSnapshotStale, setTraceSnapshotStale] = useState(false);
   const noticeController = useAppNoticeController();
   const confirmationController = useConfirmationController();
@@ -730,7 +734,11 @@ export function App({
               v{status.appVersion || "0.2.0"}
             </span>
 
-            <Tooltip content={updateTooltipText} position="bottom">
+            <Tooltip
+              content={updateTooltipText}
+              getPopupContainer={getTooltipContainer}
+              position="bottom"
+            >
               <span className="header-update-btn-wrap">
                 <button
                   type="button"

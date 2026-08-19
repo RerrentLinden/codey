@@ -8,9 +8,16 @@ import SemiInput from "@douyinfe/semi-ui/lib/es/input";
 import Modal from "@douyinfe/semi-ui/lib/es/modal";
 import SemiSelect from "@douyinfe/semi-ui/lib/es/select";
 import SemiSwitch from "@douyinfe/semi-ui/lib/es/switch";
-import Tooltip from "@douyinfe/semi-ui/lib/es/tooltip";
+import SemiTooltip from "@douyinfe/semi-ui/lib/es/tooltip";
 
-export { Tooltip };
+export type TooltipProps = React.ComponentProps<typeof SemiTooltip>;
+
+export function Tooltip({
+  arrowPointAtCenter = true,
+  ...props
+}: TooltipProps) {
+  return <SemiTooltip arrowPointAtCenter={arrowPointAtCenter} {...props} />;
+}
 
 type ButtonVariant = "default" | "warning" | "destructive" | "outline" | "secondary" | "ghost";
 type ButtonSize = "default" | "sm" | "xs" | "lg" | "icon" | "icon-sm";
