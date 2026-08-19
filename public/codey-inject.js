@@ -66,7 +66,10 @@
   const threadUpdatedAtRequestedAt = new Map();
   const pendingThreadUpdatedAtRefs = new Map();
   const threadUpdatedAtRows = new Set();
-  const deletedSidebarSessionIds = new Map();
+  // A permanently deleted thread ID cannot become valid again unless an
+  // import explicitly restores it. Keep the tombstone for this renderer's
+  // lifetime so a stale native/virtualized row cannot reappear later.
+  const deletedSidebarSessionIds = new Set();
   const pendingSidebarSessionDeleteIds = new Set();
   const hardDeletedMessageKeys = new Set();
   const messageSelectButtons = new WeakMap();
@@ -98,7 +101,6 @@
   const sidebarProjectListSelector = "[data-app-action-sidebar-project-list-id]";
   const sidebarProjectShowAllAttribute = "data-app-action-sidebar-project-show-all";
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
-  const deletedSidebarSessionTtlMs = 10 * 60 * 1000;
   const threadRunningLossGraceMs = 2_000;
   const threadTimestampRefreshIntervalMs = 60_000;
   const threadTimestampBridgePath = "/session/timestamps";
@@ -121,11 +123,6 @@
     while (set.size > limit) {
       set.delete(set.values().next().value);
     }
-  };
-  const pruneExpiredDeletedSidebarSessions = (now = Date.now()) => {
-    deletedSidebarSessionIds.forEach((expiresAt, sessionId) => {
-      if (expiresAt <= now) deletedSidebarSessionIds.delete(sessionId);
-    });
   };
   const queryWithin = (root, selector) => {
     const matches = [];
@@ -749,10 +746,10 @@
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
     if (!normalizedSessionId || normalizedSessionId.startsWith("client-new-thread:")) return "";
     pendingSidebarSessionDeleteIds.delete(normalizedSessionId);
-    rememberBoundedMapValue(
+    rememberBoundedSetValue(
       deletedSidebarSessionIds,
       normalizedSessionId,
-      Date.now() + deletedSidebarSessionTtlMs,
+      maxSessionCacheEntries,
     );
     sidebarTitleCache.delete(normalizedSessionId);
     [...threadUpdatedAtCache.keys()].forEach((key) => {
@@ -774,13 +771,7 @@
 
   const isDeletedSidebarSession = (sessionId) => {
     const normalizedSessionId = normalizeThreadSessionId(sessionId);
-    const expiresAt = deletedSidebarSessionIds.get(normalizedSessionId);
-    if (!expiresAt) return false;
-    if (expiresAt <= Date.now()) {
-      deletedSidebarSessionIds.delete(normalizedSessionId);
-      return false;
-    }
-    return true;
+    return deletedSidebarSessionIds.has(normalizedSessionId);
   };
 
   const isDeletedSidebarThread = (row) => {
@@ -2324,7 +2315,6 @@
   };
 
   const scan = (root = document, syncTitles = true) => {
-    pruneExpiredDeletedSidebarSessions();
     if (shouldIgnoreDeletedSidebarSessionRoot(root)) return;
     // Streaming output makes conversation turns by far the most frequent scan
     // root. Sidebar controls can never live inside a turn, so running their

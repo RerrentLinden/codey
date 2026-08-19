@@ -145,6 +145,7 @@ class FakeElement {
 function loadInjection({
   bridge,
   dispatcher,
+  now = () => Date.now(),
   tasksSectionHeading = "Tasks",
   tasksSectionLabel = "",
   tasksOptionsLabel = "任务侧边栏选项",
@@ -292,10 +293,16 @@ function loadInjection({
       this.detail = init?.detail;
     }
   }
+  class FakeDate extends Date {
+    static now() {
+      return now();
+    }
+  }
 
   vm.runInNewContext(source, {
     Blob,
     CustomEvent,
+    Date: FakeDate,
     Error,
     HTMLElement: FakeElement,
     MutationObserver,
@@ -415,6 +422,23 @@ test("matches native sidebar actions and deletes after popover confirmation", as
     "已删除会话“待删除会话”",
   );
   assert.equal(runtime.thread.parentElement, runtime.document.body);
+  assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
+});
+
+test("keeps permanently deleted virtualized sidebar rows hidden for the renderer lifetime", async () => {
+  let nowMs = 1_000;
+  const runtime = loadInjection({ now: () => nowMs });
+
+  runtime.thread.querySelector("[data-codey-session-delete]").click();
+  runtime.document.body
+    .querySelector("[data-codey-session-delete-confirm]")
+    .click();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  nowMs += 24 * 60 * 60 * 1000;
+  runtime.thread.removeAttribute("data-codey-session-delete-state");
+
+  assert.equal(runtime.window.__codeyPruneDeletedSidebarSessions(runtime.thread), true);
   assert.equal(runtime.thread.getAttribute("data-codey-session-delete-state"), "deleted");
 });
 
