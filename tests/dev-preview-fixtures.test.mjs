@@ -17,4 +17,8 @@ test("development preview fixtures cannot be mistaken for live credentials", () 
     source,
     /open\.feishu\.cn\/open-apis\/bot\/v2\/hook\/[A-Za-z0-9-]+/,
   );
+  assert.doesNotMatch(
+    source,
+    /qyapi\.weixin\.qq\.com\/cgi-bin\/webhook\/send\?key=[A-Za-z0-9-]+/,
+  );
 });

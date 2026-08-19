@@ -516,6 +516,7 @@
 }
 
 .notification-title span.feishu,
+.notification-title span.wecom,
 .notification-title span.telegram {
   background: #ffffff;
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.06);
@@ -523,6 +524,7 @@
 }
 
 .notification-title span.feishu svg,
+.notification-title span.wecom svg,
 .notification-title span.telegram svg {
   display: block;
 }

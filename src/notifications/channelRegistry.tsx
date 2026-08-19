@@ -1,7 +1,9 @@
 import { useId, type ComponentType, type SVGProps } from "react";
+import { IconBrandWechat } from "@tabler/icons-react";
 
 import { FeishuChannelEditor } from "./FeishuChannelEditor";
 import { TelegramChannelEditor } from "./TelegramChannelEditor";
+import { WecomChannelEditor } from "./WecomChannelEditor";
 import type {
   NotificationChannel,
   NotificationChannelEditorProps,
@@ -82,6 +84,10 @@ function TelegramIcon({
   );
 }
 
+function WecomIcon(props: NotificationChannelIconProps) {
+  return <IconBrandWechat {...props} color="#07c160" />;
+}
+
 const CHANNEL_DEFINITIONS: Record<
   NotificationChannelKind,
   NotificationChannelDefinition
@@ -95,6 +101,18 @@ const CHANNEL_DEFINITIONS: Record<
     iconClassName: "feishu",
     Icon: FeishuIcon,
     Editor: FeishuChannelEditor,
+    isConfigured: (channel) =>
+      Boolean(channel.url.trim() || channel.urlConfigured),
+  },
+  wecom: {
+    kind: "wecom",
+    addLabel: "企业微信",
+    displayName: "企业微信机器人",
+    title: "企业微信机器人 Webhook",
+    description: "发送完成、失败和等待介入提醒",
+    iconClassName: "wecom",
+    Icon: WecomIcon,
+    Editor: WecomChannelEditor,
     isConfigured: (channel) =>
       Boolean(channel.url.trim() || channel.urlConfigured),
   },

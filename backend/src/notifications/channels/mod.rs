@@ -1,5 +1,6 @@
 mod feishu;
 mod telegram;
+mod wecom;
 
 use anyhow::Result;
 use reqwest::{Client, RequestBuilder};
@@ -29,6 +30,7 @@ pub(super) fn adapter_for(
 ) -> Box<dyn NotificationChannelAdapter + '_> {
     match config.kind {
         NotificationChannelKind::Feishu => Box::new(feishu::FeishuChannel::new(config)),
+        NotificationChannelKind::Wecom => Box::new(wecom::WecomChannel::new(config)),
         NotificationChannelKind::Telegram => Box::new(telegram::TelegramChannel::new(config)),
     }
 }

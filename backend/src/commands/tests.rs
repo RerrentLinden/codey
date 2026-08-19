@@ -135,6 +135,12 @@ fn renderer_settings_clear_provider_and_notification_secrets() {
         chat_id: "-100123".to_string(),
         ..NotificationChannelConfig::default()
     });
+    config.webhook.channels.push(NotificationChannelConfig {
+        id: "wecom-1".to_string(),
+        kind: crate::notifications::NotificationChannelKind::Wecom,
+        url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=wecom-secret".to_string(),
+        ..NotificationChannelConfig::default()
+    });
 
     let public = serde_json::to_value(redacted_config(&config)).unwrap();
 
@@ -145,8 +151,11 @@ fn renderer_settings_clear_provider_and_notification_secrets() {
     assert_eq!(public["webhook"]["channels"][0]["urlConfigured"], true);
     assert_eq!(public["webhook"]["channels"][1]["botToken"], "");
     assert_eq!(public["webhook"]["channels"][1]["botTokenConfigured"], true);
+    assert_eq!(public["webhook"]["channels"][2]["url"], "");
+    assert_eq!(public["webhook"]["channels"][2]["urlConfigured"], true);
     assert!(!public.to_string().contains("renderer-secret"));
     assert!(!public.to_string().contains("telegram-secret"));
+    assert!(!public.to_string().contains("wecom-secret"));
     assert!(!public.to_string().contains("legacy-secret"));
 }
 

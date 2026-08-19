@@ -33,6 +33,7 @@ if (import.meta.env.DEV) {
       primary: "https://primary.example.invalid/v1",
       backup: "https://backup.example.invalid/v1",
       feishu: "https://webhook.example.invalid/feishu/preview-only",
+      wecom: "https://webhook.example.invalid/wecom/preview-only?key=preview",
     } as const;
     const previewApiKey = "preview-only-not-a-secret";
     let previewConfig = {
@@ -65,6 +66,20 @@ if (import.meta.env.DEV) {
             kind: "feishu" as const,
             enabled: true,
             url: previewEndpoints.feishu,
+            urlConfigured: true,
+            clearUrl: false,
+            botToken: "",
+            botTokenConfigured: false,
+            clearBotToken: false,
+            chatId: "",
+          },
+          {
+            id: "preview-wecom",
+            kind: "wecom" as const,
+            enabled: true,
+            url: previewEndpoints.wecom,
+            urlConfigured: true,
+            clearUrl: false,
             botToken: "",
             botTokenConfigured: false,
             clearBotToken: false,
@@ -75,6 +90,8 @@ if (import.meta.env.DEV) {
             kind: "telegram" as const,
             enabled: false,
             url: "",
+            urlConfigured: false,
+            clearUrl: false,
             botToken: "",
             botTokenConfigured: true,
             clearBotToken: false,

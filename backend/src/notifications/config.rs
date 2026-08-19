@@ -10,6 +10,7 @@ pub const MAX_NOTIFICATION_CHANNELS: usize = 32;
 pub enum NotificationChannelKind {
     #[default]
     Feishu,
+    Wecom,
     Telegram,
 }
 
@@ -64,6 +65,7 @@ impl NotificationChannelConfig {
     pub fn is_configured(&self) -> bool {
         match self.kind {
             NotificationChannelKind::Feishu => !self.url.trim().is_empty(),
+            NotificationChannelKind::Wecom => !self.url.trim().is_empty(),
             NotificationChannelKind::Telegram => {
                 !self.bot_token.trim().is_empty() && !self.chat_id.trim().is_empty()
             }
@@ -94,6 +96,33 @@ impl NotificationChannelConfig {
             || url.query().is_some()
             || url.fragment().is_some()
             || hook.is_none()
+        {
+            return Err(INVALID_URL);
+        }
+        Ok(url)
+    }
+
+    pub(crate) fn wecom_webhook_url(&self) -> Result<reqwest::Url, &'static str> {
+        const INVALID_URL: &str = "企业微信机器人 Webhook 必须使用 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=... 地址";
+        let value = self.url.trim();
+        if value.is_empty() {
+            return Err("请先填写企业微信机器人 Webhook 地址");
+        }
+        let url = reqwest::Url::parse(value).map_err(|_| INVALID_URL)?;
+        #[cfg(test)]
+        if self.allow_insecure_test_url {
+            return Ok(url);
+        }
+        let query = url.query_pairs().collect::<Vec<_>>();
+        let valid_key = query.len() == 1 && query[0].0 == "key" && !query[0].1.trim().is_empty();
+        if url.scheme() != "https"
+            || url.host_str() != Some("qyapi.weixin.qq.com")
+            || url.port_or_known_default() != Some(443)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.path() != "/cgi-bin/webhook/send"
+            || url.fragment().is_some()
+            || !valid_key
         {
             return Err(INVALID_URL);
         }
@@ -162,8 +191,17 @@ impl WebhookConfig {
             ));
         }
         for channel in &self.channels {
-            if channel.kind == NotificationChannelKind::Feishu && !channel.url.trim().is_empty() {
-                channel.feishu_webhook_url().map_err(ToString::to_string)?;
+            if channel.url.trim().is_empty() {
+                continue;
+            }
+            match channel.kind {
+                NotificationChannelKind::Feishu => {
+                    channel.feishu_webhook_url().map_err(ToString::to_string)?;
+                }
+                NotificationChannelKind::Wecom => {
+                    channel.wecom_webhook_url().map_err(ToString::to_string)?;
+                }
+                NotificationChannelKind::Telegram => {}
             }
         }
         Ok(())
@@ -172,7 +210,8 @@ impl WebhookConfig {
     pub fn merge_redacted_secrets(&mut self, previous: &Self) {
         for channel in &mut self.channels {
             match channel.kind {
-                NotificationChannelKind::Feishu => {
+                NotificationChannelKind::Feishu | NotificationChannelKind::Wecom => {
+                    let kind = channel.kind;
                     if channel.clear_url {
                         channel.url.clear();
                         channel.url_configured = false;
@@ -181,10 +220,11 @@ impl WebhookConfig {
                     if !channel.url.trim().is_empty() || !channel.url_configured {
                         continue;
                     }
-                    if let Some(existing) = previous.channels.iter().find(|existing| {
-                        existing.id == channel.id
-                            && existing.kind == NotificationChannelKind::Feishu
-                    }) {
+                    if let Some(existing) = previous
+                        .channels
+                        .iter()
+                        .find(|existing| existing.id == channel.id && existing.kind == kind)
+                    {
                         channel.url = existing.url.clone();
                     }
                 }
@@ -223,6 +263,7 @@ mod tests {
             r#"{
                 "channels":[
                     {"id":"feishu-1","kind":"feishu","enabled":true,"url":"https://open.feishu.cn/example"},
+                    {"id":"wecom-1","kind":"wecom","enabled":true,"url":"https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=preview"},
                     {"id":"telegram-1","kind":"telegram","enabled":true,"botToken":"123:token","chatId":"-100123"}
                 ]
             }"#,
@@ -230,11 +271,13 @@ mod tests {
         .unwrap();
         config.normalize();
 
-        assert_eq!(config.channels.len(), 2);
+        assert_eq!(config.channels.len(), 3);
         assert!(config.has_enabled_channel());
         assert!(config.channels[0].url_configured);
-        assert_eq!(config.channels[1].kind, NotificationChannelKind::Telegram);
-        assert!(config.channels[1].bot_token_configured);
+        assert_eq!(config.channels[1].kind, NotificationChannelKind::Wecom);
+        assert!(config.channels[1].url_configured);
+        assert_eq!(config.channels[2].kind, NotificationChannelKind::Telegram);
+        assert!(config.channels[2].bot_token_configured);
     }
 
     #[test]
@@ -279,6 +322,39 @@ mod tests {
                 ..NotificationChannelConfig::default()
             };
             assert!(config.feishu_webhook_url().is_err(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn wecom_webhooks_require_the_official_robot_endpoint() {
+        for accepted in [
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret",
+            "https://qyapi.weixin.qq.com:443/cgi-bin/webhook/send?key=secret-value",
+        ] {
+            let config = NotificationChannelConfig {
+                kind: NotificationChannelKind::Wecom,
+                url: accepted.to_string(),
+                ..NotificationChannelConfig::default()
+            };
+            assert!(config.wecom_webhook_url().is_ok(), "{accepted}");
+        }
+
+        for rejected in [
+            "http://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret",
+            "https://qyapi.weixin.qq.com:8443/cgi-bin/webhook/send?key=secret",
+            "https://example.com/cgi-bin/webhook/send?key=secret",
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/upload_media?key=secret",
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send",
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=",
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret&debug=1",
+            "https://user@qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret",
+        ] {
+            let config = NotificationChannelConfig {
+                kind: NotificationChannelKind::Wecom,
+                url: rejected.to_string(),
+                ..NotificationChannelConfig::default()
+            };
+            assert!(config.wecom_webhook_url().is_err(), "{rejected}");
         }
     }
 
@@ -329,6 +405,30 @@ mod tests {
                 .get("clearUrl")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn redacted_wecom_url_is_restored_unless_explicitly_cleared() {
+        let previous = WebhookConfig {
+            channels: vec![NotificationChannelConfig {
+                id: "wecom-1".to_string(),
+                kind: NotificationChannelKind::Wecom,
+                url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=secret".to_string(),
+                url_configured: true,
+                ..NotificationChannelConfig::default()
+            }],
+            ..WebhookConfig::default()
+        };
+        let mut incoming = previous.clone();
+        incoming.channels[0].url.clear();
+        incoming.merge_redacted_secrets(&previous);
+        assert_eq!(incoming.channels[0].url, previous.channels[0].url);
+
+        incoming.channels[0].url.clear();
+        incoming.channels[0].clear_url = true;
+        incoming.merge_redacted_secrets(&previous);
+        assert!(incoming.channels[0].url.is_empty());
+        assert!(!incoming.channels[0].url_configured);
     }
 
     #[test]

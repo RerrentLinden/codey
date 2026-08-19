@@ -19,7 +19,10 @@ import {
   PromptOptimizationCard,
   SubagentPolicyCard,
 } from "./AppSections";
-import { NotificationChannelsCard } from "./notifications";
+import {
+  getNotificationChannelDefinition,
+  NotificationChannelsCard,
+} from "./notifications";
 import type { NotificationChannel } from "./notifications";
 import { errorText, withTimeout } from "./appUtils";
 import { formatBytes } from "./formatters";
@@ -504,7 +507,7 @@ export function App({
   }
 
   function askRemoveNotificationChannel(channel: NotificationChannel) {
-    const channelName = channel.kind === "telegram" ? "Telegram" : "飞书";
+    const channelName = getNotificationChannelDefinition(channel.kind).addLabel;
     setConfirmation({
       action: "delete-notification-channel",
       title: `删除${channelName}通知渠道？`,
