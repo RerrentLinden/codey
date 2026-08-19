@@ -26,6 +26,7 @@ const PENDING_INIT_OBSERVED_FILE: &str = "pending-init-observed.state";
 const STOP_BLOCKED_SINCE_FILE: &str = "stop-blocked-since.state";
 const STOP_ABSOLUTE_SINCE_FILE: &str = "stop-absolute-since.state";
 const STATE_ERROR_SINCE_FILE: &str = "state-error-since.state";
+const SUBAGENT_CONTEXT_OBSERVED_FILE: &str = "subagent-context-observed.state";
 const PROTOCOL_HEALTH_FILE: &str = "protocol-health.json";
 const PROTOCOL_HEALTH_SCHEMA_VERSION: u32 = 1;
 const MISSING_AGENT_ID_MARKER: &str = "__codey_missing_agent_id__";
@@ -51,6 +52,13 @@ struct HookInput {
         alias = "subagentId"
     )]
     agent_id: Option<String>,
+    #[serde(
+        default,
+        alias = "agentType",
+        alias = "subagent_type",
+        alias = "subagentType"
+    )]
+    agent_type: Option<String>,
     #[serde(default, alias = "toolName")]
     tool_name: Option<String>,
     #[serde(default, alias = "toolInput")]
@@ -281,6 +289,14 @@ fn handle_hook_for_runtime_at(
                     now_ms,
                 )?;
             } else {
+                if nonempty(input.agent_type.as_deref()).is_some() {
+                    record_subagent_context_observed(
+                        state_root,
+                        runtime_id,
+                        &input.session_id,
+                        now_ms,
+                    )?;
+                }
                 record_protocol_issue(
                     state_root,
                     runtime_id,
@@ -312,6 +328,14 @@ fn handle_hook_for_runtime_at(
                     remove_session_state(state_root, runtime_id, &input.session_id)?;
                 }
             } else {
+                if nonempty(input.agent_type.as_deref()).is_some() {
+                    record_subagent_context_observed(
+                        state_root,
+                        runtime_id,
+                        &input.session_id,
+                        now_ms,
+                    )?;
+                }
                 record_protocol_issue(
                     state_root,
                     runtime_id,
@@ -341,13 +365,16 @@ fn pre_tool_use_output(
     runtime_id: &str,
     now_ms: u64,
 ) -> Result<Value> {
-    if nonempty(input.agent_id.as_deref()).is_some() {
-        if input.tool_name.as_deref().is_some_and(is_spawn_agent_tool) {
+    let child_agent_id = nonempty(input.agent_id.as_deref());
+    if input_has_subagent_context(input) {
+        let Some(tool_name) = input.tool_name.as_deref() else {
+            return Ok(json!({}));
+        };
+        if is_spawn_agent_tool(tool_name) {
             return Ok(subagent_spawn_denial());
         }
-        if let (Some(agent_id), Some(tool_name)) =
-            (input.agent_id.as_deref(), input.tool_name.as_deref())
-            && let Some(reason) = crate::subagent_orchestrator::authorize_child_tool(
+        if let Some(agent_id) = child_agent_id {
+            if let Some(reason) = crate::subagent_orchestrator::authorize_child_tool(
                 state_root,
                 runtime_id,
                 &input.session_id,
@@ -355,11 +382,15 @@ fn pre_tool_use_output(
                 tool_name,
                 input.tool_input.as_ref(),
                 now_ms,
-            )?
-        {
-            return Ok(pre_tool_reason_denial(reason));
+            )? {
+                return Ok(pre_tool_reason_denial(reason));
+            }
+            return Ok(json!({}));
         }
-        return Ok(json!({}));
+        if crate::subagent_orchestrator::known_read_only_tool(tool_name) {
+            return Ok(json!({}));
+        }
+        return Ok(subagent_identity_missing_denial());
     }
     if input
         .tool_name
@@ -369,6 +400,11 @@ fn pre_tool_use_output(
         let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
         if active > 0
             && let Some(reason) = protocol_issue_reason(state_root, runtime_id, &input.session_id)?
+            && !missing_agent_id_has_classified_subagent_context(
+                state_root,
+                runtime_id,
+                &input.session_id,
+            )?
         {
             return Ok(pre_tool_reason_denial(format!(
                 "Codey Hook 协议兼容性门禁：{reason}。当前无法可靠区分根代理和子代理，已停止继续派生；请先调用不带筛选的 agents.list_agents 对账。"
@@ -421,7 +457,7 @@ fn post_tool_use_output(
     runtime_id: &str,
     now_ms: u64,
 ) -> Result<Value> {
-    if nonempty(input.agent_id.as_deref()).is_some() {
+    if input_has_subagent_context(input) {
         return Ok(json!({}));
     }
     let Some(tool_name) = input.tool_name.as_deref() else {
@@ -560,7 +596,7 @@ fn stop_output(
     runtime_id: &str,
     now_ms: u64,
 ) -> Result<Value> {
-    if nonempty(input.agent_id.as_deref()).is_some() {
+    if input_has_subagent_context(input) {
         return Ok(json!({}));
     }
     let Some(active) = active_agent_count_or_recover_corrupt_state(
@@ -676,7 +712,7 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
         "Codey 无法确认子代理运行状态，已暂停主代理继续操作：{error:#}。请调用 agents.wait_agent 或 agents.list_agents 核对状态。若状态存储持续损坏，Stop 路径会在持续 10 分钟后回收当前运行代次；期间不得绕过门禁。"
     );
     match input.hook_event_name.as_str() {
-        "PreToolUse" if nonempty(input.agent_id.as_deref()).is_none() => json!({
+        "PreToolUse" if !input_has_subagent_context(input) => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
@@ -701,7 +737,7 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
             }
         }),
         "PostToolUse"
-            if nonempty(input.agent_id.as_deref()).is_none()
+            if !input_has_subagent_context(input)
                 && input.tool_name.as_deref().is_some_and(is_agent_status_tool) =>
         {
             json!({
@@ -709,7 +745,7 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
                 "reason": reason,
             })
         }
-        "Stop" if nonempty(input.agent_id.as_deref()).is_none() => json!({
+        "Stop" if !input_has_subagent_context(input) => json!({
             "decision": "block",
             "reason": reason,
         }),
@@ -751,6 +787,16 @@ fn subagent_spawn_denial() -> Value {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
             "permissionDecisionReason": "Codey 子代理门禁：子代理不能继续派生子代理。请停止调用 Agent 或 agents.spawn_agent；如需进一步拆分，请把建议返回给主代理。",
+        }
+    })
+}
+
+fn subagent_identity_missing_denial() -> Value {
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Codey 子代理门禁：当前调用已确认来自子代理，但 Hook 载荷缺少 agent_id，无法校验 ownership。为避免越界写入，只允许明确只读工具；请停止本次写入或命令调用，并把兼容性诊断返回主代理。",
         }
     })
 }
@@ -1281,6 +1327,42 @@ fn current_timestamp_millis() -> u64 {
     u64::try_from(crate::fs_util::timestamp_millis()).unwrap_or(u64::MAX)
 }
 
+fn input_has_subagent_context(input: &HookInput) -> bool {
+    nonempty(input.agent_id.as_deref()).is_some() || nonempty(input.agent_type.as_deref()).is_some()
+}
+
+fn record_subagent_context_observed(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let path = session_auxiliary_path(&session_dir, runtime_id, SUBAGENT_CONTEXT_OBSERVED_FILE);
+    write_observation_timestamp(&session_dir, &path, now_ms)
+}
+
+fn missing_agent_id_has_classified_subagent_context(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+) -> Result<bool> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let context_path =
+        session_auxiliary_path(&session_dir, runtime_id, SUBAGENT_CONTEXT_OBSERVED_FILE);
+    if read_observation_timestamp(&context_path)?.is_none() {
+        return Ok(false);
+    }
+    let health_path = session_auxiliary_path(&session_dir, runtime_id, PROTOCOL_HEALTH_FILE);
+    let Some(health) = read_protocol_health(&health_path)? else {
+        return Ok(false);
+    };
+    validate_protocol_health(&health, runtime_id)?;
+    Ok(health.missing_agent_id_events > 0
+        && health.unknown_status_responses == 0
+        && health.absolute_stop_timeouts == 0)
+}
+
 fn observe_and_check_elapsed(
     state_root: &Path,
     runtime_id: &str,
@@ -1741,6 +1823,7 @@ mod tests {
             hook_event_name: event.to_string(),
             session_id: session.to_string(),
             agent_id: None,
+            agent_type: None,
             tool_name: None,
             tool_input: None,
             tool_response: None,
@@ -1754,6 +1837,7 @@ mod tests {
             "hookEventName": "PreToolUse",
             "sessionId": "session-a",
             "subagentId": "agent-a",
+            "agentType": "codey_quick_scan",
             "toolName": "Bash",
             "toolInput": { "command": "true" },
             "toolResponse": { "exitCode": 0 },
@@ -1764,6 +1848,7 @@ mod tests {
         assert_eq!(input.hook_event_name, "PreToolUse");
         assert_eq!(input.session_id, "session-a");
         assert_eq!(input.agent_id.as_deref(), Some("agent-a"));
+        assert_eq!(input.agent_type.as_deref(), Some("codey_quick_scan"));
         assert_eq!(input.tool_name.as_deref(), Some("Bash"));
         assert_eq!(input.cwd.as_deref(), Some("/repo"));
     }
@@ -2034,6 +2119,97 @@ mod tests {
                 "{tool}"
             );
         }
+    }
+
+    #[test]
+    fn typed_missing_id_context_keeps_root_batch_dispatch_open_and_child_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "typed-missing-id-session";
+
+        let mut start = input("SubagentStart", session_id);
+        start.agent_type = Some("codey_quick_scan".to_string());
+        handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
+        );
+
+        let mut child_spawn = input("PreToolUse", session_id);
+        child_spawn.agent_type = Some("codey_quick_scan".to_string());
+        child_spawn.tool_name = Some("agents.spawn_agent".to_string());
+        let denied = handle_hook_for_runtime_at(&child_spawn, root, runtime_id, 1_500).unwrap();
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("子代理不能继续派生子代理"))
+        );
+
+        let mut child_command = input("PreToolUse", session_id);
+        child_command.agent_type = Some("codey_quick_scan".to_string());
+        child_command.tool_name = Some("Bash".to_string());
+        let denied = handle_hook_for_runtime_at(&child_command, root, runtime_id, 1_600).unwrap();
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("缺少 agent_id"))
+        );
+
+        let mut child_read = input("PreToolUse", session_id);
+        child_read.agent_type = Some("codey_quick_scan".to_string());
+        child_read.tool_name = Some("mcp__codey_fastctx__grep".to_string());
+        assert_eq!(
+            handle_hook_for_runtime_at(&child_read, root, runtime_id, 1_700).unwrap(),
+            json!({})
+        );
+
+        let mut child_stop = input("Stop", session_id);
+        child_stop.agent_type = Some("codey_quick_scan".to_string());
+        assert_eq!(
+            handle_hook_for_runtime_at(&child_stop, root, runtime_id, 1_800).unwrap(),
+            json!({})
+        );
+
+        let mut root_spawn = input("PreToolUse", session_id);
+        root_spawn.tool_name = Some("agents.spawn_agent".to_string());
+        root_spawn.tool_input = Some(json!({
+            "task_name": "second_scan",
+            "agent_type": "codey_quick_scan",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "second_scan",
+                "why": "multi_lookup",
+                "visual": false,
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&root_spawn, root, runtime_id, 2_000).unwrap(),
+            json!({})
+        );
+
+        let mut unknown_wait = input("PostToolUse", session_id);
+        unknown_wait.tool_name = Some("agents.wait_agent".to_string());
+        unknown_wait.tool_response = Some(json!({ "unexpected": "payload" }));
+        let blocked = handle_hook_for_runtime_at(&unknown_wait, root, runtime_id, 2_100).unwrap();
+        assert!(
+            blocked["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("响应结构无法识别"))
+        );
+
+        let mut third_root_spawn = input("PreToolUse", session_id);
+        third_root_spawn.tool_name = Some("agents.spawn_agent".to_string());
+        let denied =
+            handle_hook_for_runtime_at(&third_root_spawn, root, runtime_id, 2_200).unwrap();
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("无法可靠区分根代理和子代理"))
+        );
     }
 
     #[test]

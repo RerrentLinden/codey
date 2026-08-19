@@ -24,6 +24,7 @@ const DEFAULT_ATTEMPT_LIMIT: u16 = 4;
 const MAX_ATTEMPT_LIMIT: u16 = 6;
 const MAX_BATCHES_PER_TURN: u16 = 3;
 const MAX_TOTAL_ATTEMPTS_PER_TURN: u16 = MAX_ATTEMPT_LIMIT * MAX_BATCHES_PER_TURN;
+const DUPLICATE_TASK_ID_ERROR_CODE: &str = "CODEY_SUBAGENT_DUPLICATE_TASK_ID";
 const BATCH_BUDGET_ERROR_CODE: &str = "CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED";
 const TURN_BUDGET_ERROR_CODE: &str = "CODEY_SUBAGENT_TURN_BUDGET_EXHAUSTED";
 const MAX_CLAIMS_PER_MODE: usize = 16;
@@ -513,9 +514,9 @@ pub(crate) fn pre_spawn_with_workspace(
         ));
     }
     if ledger.issued_task_ids.contains(&prepared.contract.id) {
-        return Ok(Some(format!(
-            "Codey 自适应委派门禁：任务 ID `{}` 已在本轮预算账本中，禁止重复派生；失败重试必须使用新的任务 ID。",
-            prepared.contract.id
+        return Ok(Some(duplicate_task_id_denial(
+            &ledger,
+            &prepared.contract.id,
         )));
     }
     if let Some(conflict) = resource_conflict(&prepared, &ledger) {
@@ -633,14 +634,43 @@ pub(crate) fn post_spawn(
         reservation.state = ReservationState::Failed;
         reservation.updated_at_ms = now_ms;
         ledger.points_spent = ledger.points_spent.saturating_sub(cost);
-    } else {
+    } else if let Some(agent_id) = tool_response.and_then(extract_agent_identifier) {
         reservation.state = ReservationState::Running;
         reservation.updated_at_ms = now_ms;
-        if let Some(agent_id) = tool_response.and_then(extract_agent_identifier) {
-            reservation.agent_id_hash = Some(hash_component(agent_id));
-        }
+        reservation.agent_id_hash = Some(hash_component(agent_id));
+    } else {
+        // 没有明确失败，也没有可绑定的代理 ID，只能确认工具调用已经返回，不能确认
+        // 子代理是否真正创建。保留 Pending，等待生命周期事件或完整状态快照对账。
+        reservation.updated_at_ms = now_ms;
     }
     store.save(&mut ledger, now_ms)
+}
+
+fn duplicate_task_id_denial(ledger: &SessionLedger, task_id: &str) -> String {
+    let prefix = format!(
+        "{DUPLICATE_TASK_ID_ERROR_CODE}: Codey 自适应委派门禁：任务 ID `{task_id}` 已在本轮预算账本中，禁止重复派生。"
+    );
+    match ledger
+        .reservations
+        .get(task_id)
+        .map(|reservation| reservation.state)
+    {
+        Some(ReservationState::Pending) => format!(
+            "{prefix} 账本状态为 `pending`，上次派生结果尚未确认。不要重发旧 ID，也不要把本次拒绝当作完成后立即 Stop；先调用一次不带筛选的 `agents.list_agents` 对账。若找到对应代理，等待其进入终态或消费已有终态结果；若明确没有匹配代理，默认由主代理接管。只有任务范围确实缩小或改变且仍值得委派时，才可用全新的 `task_name` 最多重试一次，并把 `CODEY_DELEGATION_V2.id` 同步改为完全相同的新值。禁止改走 `functions.exec` 重试派生。"
+        ),
+        Some(ReservationState::Running) => format!(
+            "{prefix} 账本状态为 `running`，原派生已经建立。不要重发旧 ID，也不要直接 Stop；先调用一次不带筛选的 `agents.list_agents` 对账。若代理仍为 `running`、`pending_init` 或 `interrupted`，继续等待或必要协调；若已终态，消费已有结果；若快照明确没有匹配代理，由主代理接管。禁止改走 `functions.exec` 重试派生。"
+        ),
+        Some(ReservationState::Failed) => format!(
+            "{prefix} 账本状态为 `failed`，上次派生已明确失败，成本点虽已退还但尝试次数仍计入。不要再次使用旧 ID，也不要把本次拒绝当作完成后立即 Stop；默认由主代理接管。只有任务范围确实缩小或改变且仍值得委派时，才可用全新的 `task_name` 最多重试一次，并把 `CODEY_DELEGATION_V2.id` 同步改为完全相同的新值。禁止改走 `functions.exec` 重试派生。"
+        ),
+        Some(ReservationState::Terminal | ReservationState::Recovered) => format!(
+            "{prefix} 原任务已经进入终态或恢复态，不得重新派生；请先消费已有结果并完成仍需执行的机械验收，不要把本次拒绝当作新结果后立即 Stop。"
+        ),
+        None => format!(
+            "{prefix} 当前无法从兼容账本恢复原 reservation。不要重发旧 ID，也不要立即 Stop；先调用一次不带筛选的 `agents.list_agents` 对账。若找到对应代理，等待或消费其结果；若明确没有匹配代理，默认由主代理接管。只有任务范围确实改变且仍值得委派时，才可用全新的 `task_name` 最多重试一次，并同步更新 `CODEY_DELEGATION_V2.id`。"
+        ),
+    }
 }
 
 pub(crate) fn subagent_started(
@@ -2616,7 +2646,90 @@ mod tests {
         let denial = pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 40)
             .unwrap()
             .unwrap();
+        assert!(denial.contains(DUPLICATE_TASK_ID_ERROR_CODE));
         assert!(denial.contains("任务 ID `worker_a` 已在本轮预算账本中"));
+        assert!(denial.contains("账本状态为 `failed`"));
+        assert!(denial.contains("默认由主代理接管"));
+        assert!(denial.contains("`CODEY_DELEGATION_V2.id`"));
+        assert!(denial.contains("不要把本次拒绝当作完成后立即 Stop"));
+    }
+
+    #[test]
+    fn duplicate_denial_requires_reconciliation_for_pending_and_running_spawns() {
+        for (index, response, expected_state, state_label) in [
+            (0, None, ReservationState::Pending, "`pending`"),
+            (
+                1,
+                Some(json!({ "agent_id": "agent-running" })),
+                ReservationState::Running,
+                "`running`",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let task = format!("research_{index}");
+            let input = contract_input(&task, "codey_deep_research", research_contract(&task));
+            pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+            post_spawn(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&input),
+                response.as_ref(),
+                20,
+            )
+            .unwrap();
+
+            let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+            let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
+            assert_eq!(ledger.reservations[&task].state, expected_state);
+            drop(ledger);
+            drop(store);
+
+            let denial = pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 1, 40)
+                .unwrap()
+                .unwrap();
+            assert!(denial.contains(DUPLICATE_TASK_ID_ERROR_CODE));
+            assert!(denial.contains(state_label));
+            assert!(denial.contains("不带筛选的 `agents.list_agents` 对账"));
+            assert!(denial.contains("不要重发旧 ID"));
+            assert!(denial.contains("Stop"));
+        }
+    }
+
+    #[test]
+    fn duplicate_terminal_task_consumes_the_existing_result_instead_of_respawning() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = contract_input(
+            "research_a",
+            "codey_deep_research",
+            research_contract("research_a"),
+        );
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({ "agent_id": "/root/research_a" })),
+            20,
+        )
+        .unwrap();
+        subagent_stopped(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            "/root/research_a",
+            30,
+        )
+        .unwrap();
+
+        let denial = pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 40)
+            .unwrap()
+            .unwrap();
+        assert!(denial.contains(DUPLICATE_TASK_ID_ERROR_CODE));
+        assert!(denial.contains("进入终态或恢复态"));
+        assert!(denial.contains("消费已有结果"));
+        assert!(denial.contains("不得重新派生"));
     }
 
     #[test]
@@ -2814,34 +2927,52 @@ mod tests {
     }
 
     #[test]
-    fn nested_error_without_agent_id_does_not_rollback_the_spawn() {
-        let temp = tempfile::tempdir().unwrap();
-        let input = contract_input(
-            "worker_a",
-            "codey_worker",
-            worker_contract("worker_a", "backend/a.rs"),
-        );
-        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
-        post_spawn(
-            temp.path(),
-            "runtime-a",
-            "session-a",
-            Some(&input),
-            Some(&json!({
+    fn spawn_response_without_agent_id_remains_pending_until_lifecycle_confirmation() {
+        for (index, response) in [
+            None,
+            Some(json!({
                 "result": { "error": "deeply nested diagnostics" }
             })),
-            20,
-        )
-        .unwrap();
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let task = format!("worker_{index}");
+            let input = contract_input(
+                &task,
+                "codey_worker",
+                worker_contract(&task, "backend/a.rs"),
+            );
+            pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+            post_spawn(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&input),
+                response.as_ref(),
+                20,
+            )
+            .unwrap();
 
-        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
-        let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
-        assert_eq!(ledger.spawn_attempts, 1);
-        assert_eq!(ledger.points_spent, 3);
-        assert_eq!(
-            ledger.reservations["worker_a"].state,
-            ReservationState::Running
-        );
+            let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+            let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
+            assert_eq!(ledger.spawn_attempts, 1);
+            assert_eq!(ledger.points_spent, 3);
+            assert_eq!(ledger.reservations[&task].state, ReservationState::Pending);
+            drop(ledger);
+            drop(store);
+
+            let agent_id = format!("/root/{task}");
+            subagent_started(temp.path(), "runtime-a", "session-a", &agent_id, 40).unwrap();
+            let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+            let ledger = store.load("runtime-a", "session-a", 50).unwrap().unwrap();
+            assert_eq!(ledger.reservations[&task].state, ReservationState::Running);
+            assert_eq!(
+                ledger.reservations[&task].agent_id_hash.as_deref(),
+                Some(hash_component(&agent_id).as_str())
+            );
+        }
     }
 
     #[test]

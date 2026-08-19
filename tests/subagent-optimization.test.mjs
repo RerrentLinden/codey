@@ -121,10 +121,11 @@ test("per-task subagent files are composed at startup and hot-refreshed after sa
 });
 
 test("subagent optimization installs recoverable orchestration and runtime gates", async () => {
-  const [gateSource, orchestratorSource, configSource, mainSource] = await Promise.all([
+  const [gateSource, orchestratorSource, configSource, guidanceSource, mainSource] = await Promise.all([
     readFile(new URL("backend/src/subagent_gate.rs", root), "utf8"),
     readFile(new URL("backend/src/subagent_orchestrator.rs", root), "utf8"),
     readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
+    readFile(new URL("backend/src/codex_config_guidance.rs", root), "utf8"),
     readFile(new URL("backend/src/main.rs", root), "utf8"),
   ]);
 
@@ -154,6 +155,9 @@ test("subagent optimization installs recoverable orchestration and runtime gates
   assert.match(configSource, /toml_event: "Stop"/);
   assert.match(configSource, /trusted_hash/);
   assert.match(gateSource, /nonempty\(input\.agent_id\.as_deref\(\)\)\.is_some\(\)/);
+  assert.match(gateSource, /input_has_subagent_context/);
+  assert.match(gateSource, /SUBAGENT_CONTEXT_OBSERVED_FILE/);
+  assert.match(gateSource, /missing_agent_id_has_classified_subagent_context/);
   assert.match(gateSource, /permissionDecision": "deny"/);
   assert.match(gateSource, /"decision": "block"/);
   assert.match(gateSource, /is_collaboration_tool/);
@@ -179,6 +183,12 @@ test("subagent optimization installs recoverable orchestration and runtime gates
   assert.match(orchestratorSource, /MAX_TOTAL_ATTEMPTS_PER_TURN/);
   assert.match(orchestratorSource, /CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED/);
   assert.match(orchestratorSource, /CODEY_SUBAGENT_TURN_BUDGET_EXHAUSTED/);
+  assert.match(orchestratorSource, /CODEY_SUBAGENT_DUPLICATE_TASK_ID/);
+  assert.match(orchestratorSource, /duplicate_task_id_denial/);
+  assert.match(orchestratorSource, /不带筛选的 `agents\.list_agents` 对账/);
+  assert.match(guidanceSource, /A `CODEY_SUBAGENT_DUPLICATE_TASK_ID` denial is a recovery event/);
+  assert.match(guidanceSource, /never retry the old `task_name` or Stop immediately/);
+  assert.match(guidanceSource, /an exactly matching `CODEY_DELEGATION_V2\.id`/);
   assert.match(orchestratorSource, /advance_batch_if_settled/);
   assert.match(orchestratorSource, /issued_task_ids/);
   assert.match(orchestratorSource, /lock_exclusive/);
