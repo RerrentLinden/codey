@@ -13,9 +13,16 @@ export type TooltipProps = React.ComponentProps<typeof SemiTooltip>;
 
 export function Tooltip({
   arrowPointAtCenter = true,
+  autoAdjustOverflow = false,
   ...props
 }: TooltipProps) {
-  return <SemiTooltip arrowPointAtCenter={arrowPointAtCenter} {...props} />;
+  return (
+    <SemiTooltip
+      arrowPointAtCenter={arrowPointAtCenter}
+      autoAdjustOverflow={autoAdjustOverflow}
+      {...props}
+    />
+  );
 }
 
 type ButtonVariant = "default" | "warning" | "destructive" | "outline" | "secondary" | "ghost";

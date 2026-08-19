@@ -106,6 +106,7 @@ use crate::trace_log_guard;
 use crate::trace_log_stats::TraceLogStatsHandle;
 
 const STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_VISIBLE_SESSION_TIMESTAMPS: usize = 200;
 
 pub struct AppState {
     pub store: ConfigStore,
@@ -239,6 +240,20 @@ fn bridge_u64(payload: &Value, name: &str) -> Option<u64> {
     payload.get(name).and_then(Value::as_u64)
 }
 
+fn bridge_string_array(payload: &Value, name: &str, limit: usize) -> Vec<String> {
+    payload
+        .get(name)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .take(limit)
+        .map(ToString::to_string)
+        .collect()
+}
+
 impl AppState {
     pub fn request_shutdown(&self) {
         self.request_shutdown_with_reason(AppShutdownReason::CodexExited);
@@ -312,6 +327,21 @@ impl AppState {
                 json!({"status":"ok"})
             }
             "/session/titles" => cache_session_titles(self, &payload).await,
+            "/session/timestamps" => {
+                let session_ids =
+                    bridge_string_array(&payload, "sessionIds", MAX_VISIBLE_SESSION_TIMESTAMPS);
+                let home = codex_home();
+                match with_session_metadata_cache(
+                    self,
+                    "读取侧边栏会话时间",
+                    move |cache| cache.resolve_session_timestamps(&home, &session_ids),
+                )
+                .await
+                {
+                    Ok(timestamps) => json!({"status":"ok", "timestamps": timestamps}),
+                    Err(error) => api_error_message(error),
+                }
+            }
             "/session/delete" => {
                 let session_id = bridge_string(&payload, "sessionId");
                 let title = bridge_string(&payload, "title");

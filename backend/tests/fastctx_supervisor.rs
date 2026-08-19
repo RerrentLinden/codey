@@ -293,10 +293,7 @@ fn supervisor_forwards_large_worker_lines_without_losing_bytes() {
     assert!(text.bytes().all(|byte| byte == b'A'));
     let prefix = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"text\":\"";
     let suffix = "\"}}";
-    assert_eq!(
-        text.len(),
-        RESPONSE_BYTES - prefix.len() - suffix.len() - 1
-    );
+    assert_eq!(text.len(), RESPONSE_BYTES - prefix.len() - suffix.len() - 1);
 
     send(
         &mut stdin,
@@ -333,7 +330,11 @@ fn supervisor_stops_recovering_after_repeated_worker_disconnects() {
             }),
         );
         let interrupted = response_with_id(&responses_rx, exit_id);
-        assert_eq!(interrupted["error"]["code"].as_i64(), Some(-32001), "{interrupted}");
+        assert_eq!(
+            interrupted["error"]["code"].as_i64(),
+            Some(-32001),
+            "{interrupted}"
+        );
         assert_eq!(
             interrupted["error"]["data"]["recoverable"].as_bool(),
             Some(true),
@@ -364,7 +365,11 @@ fn supervisor_stops_recovering_after_repeated_worker_disconnects() {
         }),
     );
     let interrupted = response_with_id(&responses_rx, 30);
-    assert_eq!(interrupted["error"]["code"].as_i64(), Some(-32001), "{interrupted}");
+    assert_eq!(
+        interrupted["error"]["code"].as_i64(),
+        Some(-32001),
+        "{interrupted}"
+    );
 
     let status = wait_for_child(&mut child);
     assert!(

@@ -910,9 +910,7 @@ fn ledger_has_outstanding(ledger: &SessionLedger) -> bool {
     ledger.reservations.values().any(|reservation| {
         !matches!(
             reservation.state,
-            ReservationState::Terminal
-                | ReservationState::Failed
-                | ReservationState::Recovered
+            ReservationState::Terminal | ReservationState::Failed | ReservationState::Recovered
         ) || reservation_has_pending_acceptance(reservation)
     })
 }
@@ -2090,8 +2088,11 @@ mod tests {
 
         assert!(prepare_contract_with_workspace(Some(&read_only("/repo", &[])), None).is_ok());
         assert!(
-            prepare_contract_with_workspace(Some(&read_only("/repo", &["/repo/docs"])), Some("/repo"))
-                .is_ok()
+            prepare_contract_with_workspace(
+                Some(&read_only("/repo", &["/repo/docs"])),
+                Some("/repo")
+            )
+            .is_ok()
         );
         assert!(
             prepare_contract_with_workspace(Some(&read_only("/other", &[])), Some("/repo"))
@@ -2451,10 +2452,7 @@ mod tests {
             let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
             assert_eq!(ledger.spawn_attempts, 1);
             assert_eq!(ledger.points_spent, 3);
-            assert_eq!(
-                ledger.reservations[&task].state,
-                ReservationState::Running
-            );
+            assert_eq!(ledger.reservations[&task].state, ReservationState::Running);
         }
     }
 

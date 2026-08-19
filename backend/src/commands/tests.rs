@@ -7,6 +7,7 @@ fn bridge_field_helpers_preserve_existing_payload_semantics() {
         "offset": 42,
         "wrongText": 7,
         "wrongOffset": "42",
+        "items": [" first ", 7, "", "second", "third"],
     });
 
     assert_eq!(bridge_string(&payload, "text"), "  value  ");
@@ -15,6 +16,11 @@ fn bridge_field_helpers_preserve_existing_payload_semantics() {
     assert_eq!(bridge_u64(&payload, "offset"), Some(42));
     assert_eq!(bridge_u64(&payload, "missing"), None);
     assert_eq!(bridge_u64(&payload, "wrongOffset"), None);
+    assert_eq!(
+        bridge_string_array(&payload, "items", 2),
+        vec!["first".to_string(), "second".to_string()]
+    );
+    assert!(bridge_string_array(&payload, "missing", 2).is_empty());
 }
 
 #[test]

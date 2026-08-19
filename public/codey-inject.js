@@ -56,8 +56,6 @@
   let sidebarActionTooltipAnchor = null;
   let threadUpdatedAtFetchTimer = 0;
   let threadUpdatedAtFetchInFlight = false;
-  let threadUpdatedAtFetchRetryCount = 0;
-  const threadUpdatedAtReadRetryCounts = new Map();
   const threadUpdatedAtCache = new Map();
   const threadWorkStateByRow = new WeakMap();
   // React can briefly detach the native status rail or replace a virtualized
@@ -103,11 +101,7 @@
   const deletedSidebarSessionTtlMs = 10 * 60 * 1000;
   const threadRunningLossGraceMs = 2_000;
   const threadTimestampRefreshIntervalMs = 60_000;
-  const threadTimestampListPageSize = 100;
-  const maxThreadTimestampListPages = 5;
-  const threadTimestampReadBatchSize = 32;
-  const threadTimestampReadConcurrency = 4;
-  const maxThreadTimestampFetchRetries = 5;
+  const threadTimestampBridgePath = "/session/timestamps";
   const maxPendingThreadTimestampRefs = 200;
   const fallbackSessionExportMaxBytes = 64 * 1024 * 1024;
   const maxSessionCacheEntries = 2_048;
@@ -770,11 +764,6 @@
     [...pendingThreadUpdatedAtRefs.keys()].forEach((key) => {
       if (key.endsWith(`\u0000${normalizedSessionId}`)) pendingThreadUpdatedAtRefs.delete(key);
     });
-    [...threadUpdatedAtReadRetryCounts.keys()].forEach((key) => {
-      if (key.endsWith(`\u0000${normalizedSessionId}`)) {
-        threadUpdatedAtReadRetryCounts.delete(key);
-      }
-    });
     [...threadRunningStateByCacheKey.keys()].forEach((key) => {
       if (!key.endsWith(`\u0000${normalizedSessionId}`)) return;
       threadRunningStateByCacheKey.delete(key);
@@ -1177,7 +1166,6 @@
     if (state.kind !== "remote") return false;
     pendingThreadUpdatedAtRefs.delete(state.cacheKey);
     threadUpdatedAtRequestedAt.delete(state.cacheKey);
-    threadUpdatedAtReadRetryCounts.delete(state.cacheKey);
     const task = remoteThreadTaskFromRow(row, state.sessionId);
     if (!task) return true;
     const timestamp = threadTimestampMsFromPayload(task);
@@ -1413,161 +1401,23 @@
     const refs = [...pendingThreadUpdatedAtRefs.values()].slice(0, maxPendingThreadTimestampRefs);
     refs.forEach(({ cacheKey }) => pendingThreadUpdatedAtRefs.delete(cacheKey));
     threadUpdatedAtFetchInFlight = true;
-    let retryDelayMs = 40;
     try {
-      const dispatcher = await getCodexSignalDispatcher();
-      const refsByHost = new Map();
-      refs.forEach((ref) => {
-        const hostRefs = refsByHost.get(ref.hostId) || [];
-        hostRefs.push(ref);
-        refsByHost.set(ref.hostId, hostRefs);
-      });
-      const refreshedCacheKeys = new Set();
-      for (const [hostId, hostRefs] of refsByHost) {
-        const remainingSessionIds = new Set(hostRefs.map(({ sessionId }) => sessionId));
-        let cursor = null;
-        let pageCount = 0;
-        const seenCursors = new Set();
-        const listRefs = hostRefs.filter(({ exactReadOnly }) => !exactReadOnly);
-        if (listRefs.length) {
-          const listSessionIds = new Set(listRefs.map(({ sessionId }) => sessionId));
-          do {
-            const result = await dispatcher("send-cli-request-for-host", {
-              hostId,
-              method: "thread/list",
-              params: {
-                archived: false,
-                cursor,
-                limit: threadTimestampListPageSize,
-                modelProviders: null,
-                useStateDbOnly: true,
-              },
-              priority: "background",
-              source: "thread_list",
-            });
-            if (!Array.isArray(result?.data)) {
-              throw new Error("Codex thread/list response is unavailable");
-            }
-            pageCount += 1;
-            result.data.forEach((item) => {
-              const payload = item?.thread && typeof item.thread === "object" ? item.thread : item;
-              const sessionId = normalizeThreadSessionId(
-                payload?.id
-                ?? payload?.thread_id
-                ?? payload?.threadId
-                ?? payload?.conversation_id
-                ?? payload?.conversationId,
-              );
-              if (!listSessionIds.has(sessionId) || !remainingSessionIds.has(sessionId)) return;
-              const timestamp = threadTimestampMsFromPayload(payload);
-              const cacheKey = threadTimestampCacheKey(hostId, sessionId);
-              if (isDeletedSidebarSession(sessionId) || !timestamp) {
-                threadUpdatedAtCache.delete(cacheKey);
-              } else {
-                rememberBoundedMapValue(threadUpdatedAtCache, cacheKey, timestamp);
-              }
-              remainingSessionIds.delete(sessionId);
-              threadUpdatedAtReadRetryCounts.delete(cacheKey);
-              refreshedCacheKeys.add(cacheKey);
-            });
-            const nextCursor = result?.nextCursor ?? null;
-            if (![...listSessionIds].some((sessionId) => remainingSessionIds.has(sessionId))) {
-              break;
-            }
-            if (
-              nextCursor == null
-              || seenCursors.has(nextCursor)
-              || pageCount >= maxThreadTimestampListPages
-            ) break;
-            seenCursors.add(nextCursor);
-            cursor = nextCursor;
-          } while (true);
-        }
-
-        const fallbackRefs = hostRefs
-          .filter(({ sessionId }) => remainingSessionIds.has(sessionId));
-        for (
-          let chunkIndex = 0;
-          chunkIndex < fallbackRefs.length;
-          chunkIndex += threadTimestampReadBatchSize
-        ) {
-          const chunk = fallbackRefs.slice(
-            chunkIndex,
-            chunkIndex + threadTimestampReadBatchSize,
-          );
-          for (
-            let index = 0;
-            index < chunk.length;
-            index += threadTimestampReadConcurrency
-          ) {
-            const batch = chunk.slice(index, index + threadTimestampReadConcurrency);
-            const results = await Promise.all(batch.map(async (ref) => {
-              try {
-                const result = await dispatcher("send-cli-request-for-host", {
-                  hostId,
-                  method: "thread/read",
-                  params: {
-                    includeTurns: false,
-                    threadId: ref.sessionId,
-                  },
-                  priority: "background",
-                  source: "thread_list",
-                });
-                const payload = result?.thread && typeof result.thread === "object"
-                  ? result.thread
-                  : result;
-                return { failed: false, payload, ref };
-              } catch {
-                return { failed: true, payload: null, ref };
-              }
-            }));
-            results.forEach(({ failed, payload, ref }) => {
-              if (failed) {
-                if (isDeletedSidebarSession(ref.sessionId)) {
-                  threadUpdatedAtReadRetryCounts.delete(ref.cacheKey);
-                  threadUpdatedAtRequestedAt.delete(ref.cacheKey);
-                  return;
-                }
-                const retryCount = (threadUpdatedAtReadRetryCounts.get(ref.cacheKey) || 0) + 1;
-                if (retryCount <= maxThreadTimestampFetchRetries) {
-                  threadUpdatedAtReadRetryCounts.set(ref.cacheKey, retryCount);
-                  threadUpdatedAtRequestedAt.delete(ref.cacheKey);
-                  pendingThreadUpdatedAtRefs.set(ref.cacheKey, {
-                    ...ref,
-                    exactReadOnly: true,
-                  });
-                  retryDelayMs = Math.max(
-                    retryDelayMs,
-                    Math.min(30_000, 500 * (2 ** (retryCount - 1))),
-                  );
-                } else {
-                  threadUpdatedAtReadRetryCounts.delete(ref.cacheKey);
-                  rememberBoundedMapValue(
-                    threadUpdatedAtRequestedAt,
-                    ref.cacheKey,
-                    Date.now(),
-                  );
-                }
-                return;
-              }
-              const timestamp = threadTimestampMsFromPayload(payload);
-              if (isDeletedSidebarSession(ref.sessionId) || !timestamp) {
-                threadUpdatedAtCache.delete(ref.cacheKey);
-              } else {
-                rememberBoundedMapValue(threadUpdatedAtCache, ref.cacheKey, timestamp);
-              }
-              remainingSessionIds.delete(ref.sessionId);
-              threadUpdatedAtReadRetryCounts.delete(ref.cacheKey);
-              rememberBoundedMapValue(
-                threadUpdatedAtRequestedAt,
-                ref.cacheKey,
-                Date.now(),
-              );
-              refreshedCacheKeys.add(ref.cacheKey);
-            });
-          }
-        }
+      const sessionIds = [...new Set(refs.map(({ sessionId }) => sessionId))];
+      const result = await callBridge(threadTimestampBridgePath, { sessionIds });
+      if (result?.status !== "ok" || !result.timestamps || typeof result.timestamps !== "object") {
+        throw new Error(result?.message || "Codey thread timestamp bridge is unavailable");
       }
+      const refreshedCacheKeys = new Set();
+      refs.forEach((ref) => {
+        const timestamp = threadTimestampValueToMs(result.timestamps[ref.sessionId]);
+        if (isDeletedSidebarSession(ref.sessionId) || !timestamp) {
+          threadUpdatedAtCache.delete(ref.cacheKey);
+        } else {
+          rememberBoundedMapValue(threadUpdatedAtCache, ref.cacheKey, timestamp);
+        }
+        rememberBoundedMapValue(threadUpdatedAtRequestedAt, ref.cacheKey, Date.now());
+        refreshedCacheKeys.add(ref.cacheKey);
+      });
       forEachTrackedThreadRow((row) => {
         const identity = threadIdentityNode(row);
         const sessionId = identity instanceof HTMLElement
@@ -1579,38 +1429,21 @@
           && !isDeletedSidebarSession(sessionId)
         ) renderCachedThreadUpdatedAt(row);
       });
-      threadUpdatedAtFetchRetryCount = 0;
     } catch {
-      refs.forEach((ref) => {
-        threadUpdatedAtRequestedAt.delete(ref.cacheKey);
-        if (!isDeletedSidebarSession(ref.sessionId)) {
-          const pendingRef = pendingThreadUpdatedAtRefs.get(ref.cacheKey);
-          pendingThreadUpdatedAtRefs.set(
-            ref.cacheKey,
-            pendingRef?.exactReadOnly ? pendingRef : ref,
-          );
+      // A failed read keeps the previous label and waits for the ordinary
+      // one-minute refresh. Never retry in a tight loop on the renderer thread.
+      refs.forEach(({ cacheKey, sessionId }) => {
+        if (!isDeletedSidebarSession(sessionId)) {
+          rememberBoundedMapValue(threadUpdatedAtRequestedAt, cacheKey, Date.now());
         }
       });
-      threadUpdatedAtFetchRetryCount += 1;
-      if (threadUpdatedAtFetchRetryCount <= maxThreadTimestampFetchRetries) {
-        retryDelayMs = Math.min(30_000, 500 * (2 ** (threadUpdatedAtFetchRetryCount - 1)));
-      } else {
-        refs.forEach(({ cacheKey, sessionId }) => {
-          pendingThreadUpdatedAtRefs.delete(cacheKey);
-          threadUpdatedAtReadRetryCounts.delete(cacheKey);
-          if (!isDeletedSidebarSession(sessionId)) {
-            rememberBoundedMapValue(threadUpdatedAtRequestedAt, cacheKey, Date.now());
-          }
-        });
-        threadUpdatedAtFetchRetryCount = 0;
-      }
     } finally {
       threadUpdatedAtFetchInFlight = false;
       if (pendingThreadUpdatedAtRefs.size) {
         threadUpdatedAtFetchTimer = window.setTimeout(() => {
           threadUpdatedAtFetchTimer = 0;
           void flushThreadUpdatedAtFetch();
-        }, retryDelayMs);
+        }, 40);
       }
     }
   };
@@ -1724,22 +1557,14 @@
         ? 2
         : Number(url.includes("app-initial-"))
     );
-    const urls = codexAppAssetUrls().sort((
-      left,
-      right,
-    ) => signalAssetPriority(right) - signalAssetPriority(left));
+    const urls = codexAppAssetUrls()
+      .filter((url) => (
+        url.includes("app-server-manager-signals-")
+        || url.includes("app-initial-")
+      ))
+      .sort((left, right) => signalAssetPriority(right) - signalAssetPriority(left));
     for (const url of urls) {
       const namedSignalAsset = url.includes("app-server-manager-signals-");
-      const appInitialAsset = url.includes("app-initial-");
-      if (!namedSignalAsset && !appInitialAsset) {
-        let source = "";
-        try {
-          source = await fetch(url).then((response) => (response.ok ? response.text() : ""));
-        } catch {
-          continue;
-        }
-        if (!source.includes("Missing AppServer request message handler")) continue;
-      }
       try {
         const module = await import(url);
         const dispatcher = signalDispatcherFromModule(module, namedSignalAsset);

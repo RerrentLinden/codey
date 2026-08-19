@@ -205,6 +205,16 @@ function loadInjection({
   };
 }
 
+function timestampBridge(handler) {
+  return async (path, payload) => {
+    if (path !== "/session/timestamps") return { status: "ok" };
+    return {
+      status: "ok",
+      timestamps: await handler(payload),
+    };
+  };
+}
+
 function sidebarThreadEntry({ running = false, sessionId = "" } = {}) {
   const list = new FakeElement();
   list.setAttribute("role", "list");
@@ -635,18 +645,12 @@ test("refreshes the official timestamp when a running thread completes", async (
   const { window } = loadInjection({
     advanceTimeoutClock: true,
     rows: [running.row],
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async () => {
       dispatcherCalls += 1;
       return {
-        data: [{
-          id: "thread-running",
-          recencyAt: (
-            dispatcherCalls === 1 ? firstTimestamp : completedTimestamp
-          ) / 1_000,
-        }],
-        nextCursor: null,
+        "thread-running": dispatcherCalls === 1 ? firstTimestamp : completedTimestamp,
       };
-    },
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -683,13 +687,10 @@ test("coalesces sidebar mutations before recomputing React status", async () => 
   });
   const { notifyMutations } = loadInjection({
     rows: [entry.row],
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async () => {
       dispatcherCalls += 1;
-      return {
-        data: [{ id: "thread-1", updatedAt: 60 }],
-        nextCursor: null,
-      };
-    },
+      return { "thread-1": 60_000 };
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(dispatcherCalls, 1);
@@ -797,10 +798,7 @@ test("keeps an existing thread time when a native completion marker appears", as
   const { window } = loadInjection({
     advanceTimeoutClock: true,
     rows: [row],
-    signalDispatcher: async () => ({
-      data: [{ id: "thread-1", recencyAt: timestamp / 1_000 }],
-      nextCursor: null,
-    }),
+    bridgeHandler: timestampBridge(async () => ({ "thread-1": timestamp })),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
@@ -886,7 +884,7 @@ test("moves a previously appended time before the native trailing rail", () => {
   assert.equal(duplicateLabel.parentElement, null);
 });
 
-test("loads visible thread timestamps through the official app-server list", async () => {
+test("loads visible thread timestamps through the Codey bridge", async () => {
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
   row.setAttribute("data-app-action-sidebar-thread-id", "local:thread-1");
@@ -899,34 +897,16 @@ test("loads visible thread timestamps through the official app-server list", asy
 
   const { document } = loadInjection({
     rows: [row],
-    signalDispatcher: async (signal, request) => {
-      calls.push({ signal, request });
-      return {
-        data: [{
-          id: "thread-1",
-          recencyAt: timestamp / 1_000,
-          updatedAt: Date.now() / 1_000,
-        }],
-        nextCursor: null,
-      };
-    },
+    bridgeHandler: timestampBridge(async (payload) => {
+      calls.push(payload);
+      return { "thread-1": timestamp };
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(calls.length, 1);
-  assert.equal(calls[0].signal, "send-cli-request-for-host");
-  assert.deepEqual(JSON.parse(JSON.stringify(calls[0].request)), {
-    hostId: "local",
-    method: "thread/list",
-    params: {
-      archived: false,
-      cursor: null,
-      limit: 100,
-      modelProviders: null,
-      useStateDbOnly: true,
-    },
-    priority: "background",
-    source: "thread_list",
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0])), {
+    sessionIds: ["thread-1"],
   });
   assert.equal(
     content.querySelector("[data-codey-thread-updated-at]")?.textContent,
@@ -935,7 +915,7 @@ test("loads visible thread timestamps through the official app-server list", asy
   assert.equal(document.threadRowQueries, 1);
 });
 
-test("reads a remote task timestamp from the official React row without a local request", async () => {
+test("reads a remote task timestamp from the official React row without a bridge request", async () => {
   const now = Date.UTC(2026, 7, 10, 12);
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
@@ -961,9 +941,9 @@ test("reads a remote task timestamp from the official React row without a local 
   loadInjection({
     now,
     rows: [row],
-    signalDispatcher: async () => {
+    bridgeHandler: async () => {
       dispatcherCalls += 1;
-      throw new Error("remote tasks must not use the local app-server");
+      throw new Error("remote tasks must not use the local timestamp bridge");
     },
   });
   await new Promise((resolve) => setImmediate(resolve));
@@ -975,7 +955,7 @@ test("reads a remote task timestamp from the official React row without a local 
   );
 });
 
-test("refreshes official metadata on the visible one-minute tick", async () => {
+test("refreshes bridge metadata on the visible one-minute tick", async () => {
   const now = Date.UTC(2026, 7, 10, 12);
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
@@ -988,13 +968,10 @@ test("refreshes official metadata on the visible one-minute tick", async () => {
   const fixture = loadInjection({
     now,
     rows: [row],
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async () => {
       listCalls += 1;
-      return {
-        data: [{ id: "thread-refresh", recencyAt: timestamp / 1_000 }],
-        nextCursor: null,
-      };
-    },
+      return { "thread-refresh": timestamp };
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(listCalls, 1);
@@ -1030,16 +1007,10 @@ test("tracks virtualized sidebar rows discovered after the initial scan", async 
   const fixture = loadInjection({
     now,
     rows,
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async ({ sessionIds }) => {
       listCalls += 1;
-      return {
-        data: rows.map((row) => {
-          const id = row.getAttribute("data-app-action-sidebar-thread-id");
-          return { id, recencyAt: timestamps.get(id) / 1_000 };
-        }),
-        nextCursor: null,
-      };
-    },
+      return Object.fromEntries(sessionIds.map((id) => [id, timestamps.get(id)]));
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(listCalls, 1);
@@ -1074,42 +1045,33 @@ test("tracks virtualized sidebar rows discovered after the initial scan", async 
   assert.equal(fixture.document.threadRowQueries, fullScanQueries);
 });
 
-test("follows official thread list cursors until a visible thread is found", async () => {
+test("requests only the visible thread ids from the timestamp bridge", async () => {
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
   row.setAttribute("data-app-action-sidebar-thread-id", "thread-older");
   const content = new FakeElement();
   content.className = "flex h-full w-full items-center";
   row.appendChild(content);
-  const cursors = [];
+  const requests = [];
   const timestamp = Date.now() - 4 * 60 * 60_000;
 
   loadInjection({
     rows: [row],
-    signalDispatcher: async (_signal, request) => {
-      cursors.push(request.params.cursor);
-      if (request.params.cursor == null) {
-        return {
-          data: [{ id: "thread-newer", recencyAt: Date.now() / 1_000 }],
-          nextCursor: "page-2",
-        };
-      }
-      return {
-        data: [{ id: "thread-older", recencyAt: timestamp / 1_000 }],
-        nextCursor: null,
-      };
-    },
+    bridgeHandler: timestampBridge(async (payload) => {
+      requests.push(payload);
+      return { "thread-older": timestamp };
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.deepEqual(cursors, [null, "page-2"]);
+  assert.deepEqual(JSON.parse(JSON.stringify(requests)), [{ sessionIds: ["thread-older"] }]);
   assert.equal(
     content.querySelector("[data-codey-thread-updated-at]")?.textContent,
     "4 小时",
   );
 });
 
-test("bounds thread list pagination and falls back to an exact thread read", async () => {
+test("resolves a visible timestamp with one bounded bridge request", async () => {
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
   row.setAttribute("data-app-action-sidebar-thread-id", "thread-manual");
@@ -1117,39 +1079,25 @@ test("bounds thread list pagination and falls back to an exact thread read", asy
   content.className = "flex h-full w-full items-center";
   row.appendChild(content);
   const timestamp = Date.now() - 5 * 60 * 60_000;
-  let listCalls = 0;
-  let readCalls = 0;
+  let bridgeCalls = 0;
 
   loadInjection({
     rows: [row],
-    signalDispatcher: async (_signal, request) => {
-      if (request.method === "thread/read") {
-        readCalls += 1;
-        return {
-          thread: {
-            id: "thread-manual",
-            recencyAt: timestamp / 1_000,
-          },
-        };
-      }
-      listCalls += 1;
-      return {
-        data: [{ id: `unrelated-${listCalls}`, recencyAt: Date.now() / 1_000 }],
-        nextCursor: `page-${listCalls + 1}`,
-      };
-    },
+    bridgeHandler: timestampBridge(async () => {
+      bridgeCalls += 1;
+      return { "thread-manual": timestamp };
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(listCalls, 5);
-  assert.equal(readCalls, 1);
+  assert.equal(bridgeCalls, 1);
   assert.equal(
     content.querySelector("[data-codey-thread-updated-at]")?.textContent,
     "5 小时",
   );
 });
 
-test("drains exact timestamp reads beyond the 32-item batch size", async () => {
+test("loads forty visible timestamps in one bridge batch", async () => {
   const now = Date.UTC(2026, 7, 10, 12);
   const entries = Array.from({ length: 40 }, (_, index) => {
     const row = new FakeElement();
@@ -1160,33 +1108,21 @@ test("drains exact timestamp reads beyond the 32-item batch size", async () => {
     row.appendChild(content);
     return { content, row };
   });
-  let listCalls = 0;
-  let readCalls = 0;
+  const requestSizes = [];
 
   loadInjection({
     now,
     rows: entries.map(({ row }) => row),
-    signalDispatcher: async (_signal, request) => {
-      if (request.method === "thread/read") {
-        readCalls += 1;
-        return {
-          thread: {
-            id: request.params.threadId,
-            recencyAt: (now - 9 * 60_000) / 1_000,
-          },
-        };
-      }
-      listCalls += 1;
-      return {
-        data: [{ id: `unrelated-${listCalls}`, recencyAt: now / 1_000 }],
-        nextCursor: `page-${listCalls + 1}`,
-      };
-    },
+    bridgeHandler: timestampBridge(async ({ sessionIds }) => {
+      requestSizes.push(sessionIds.length);
+      return Object.fromEntries(sessionIds.map((sessionId) => (
+        [sessionId, now - 9 * 60_000]
+      )));
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(listCalls, 5);
-  assert.equal(readCalls, 40);
+  assert.deepEqual(requestSizes, [40]);
   entries.forEach(({ content }) => {
     assert.equal(
       content.querySelector("[data-codey-thread-updated-at]")?.textContent,
@@ -1206,25 +1142,21 @@ test("continues timestamp work after the first 200 visible refs", async () => {
     row.appendChild(content);
     return { content, row };
   });
-  let listCalls = 0;
+  const requestSizes = [];
 
   loadInjection({
     now,
     rows: entries.map(({ row }) => row),
-    signalDispatcher: async () => {
-      listCalls += 1;
-      return {
-        data: entries.map((_, index) => ({
-          id: `thread-${index}`,
-          recencyAt: (now - 11 * 60_000) / 1_000,
-        })),
-        nextCursor: null,
-      };
-    },
+    bridgeHandler: timestampBridge(async ({ sessionIds }) => {
+      requestSizes.push(sessionIds.length);
+      return Object.fromEntries(sessionIds.map((sessionId) => (
+        [sessionId, now - 11 * 60_000]
+      )));
+    }),
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(listCalls, 2);
+  assert.deepEqual(requestSizes, [200, 1]);
   entries.forEach(({ content }) => {
     assert.equal(
       content.querySelector("[data-codey-thread-updated-at]")?.textContent,
@@ -1233,7 +1165,7 @@ test("continues timestamp work after the first 200 visible refs", async () => {
   });
 });
 
-test("retries only a failed exact timestamp read", async () => {
+test("does not tight-loop retry a failed timestamp bridge request", async () => {
   const now = Date.UTC(2026, 7, 10, 12);
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
@@ -1241,41 +1173,41 @@ test("retries only a failed exact timestamp read", async () => {
   const content = new FakeElement();
   content.className = "flex h-full w-full items-center";
   row.appendChild(content);
-  let listCalls = 0;
-  let readCalls = 0;
+  let bridgeCalls = 0;
+  let dispatcherCalls = 0;
 
-  loadInjection({
+  const fixture = loadInjection({
     now,
     rows: [row],
-    signalDispatcher: async (_signal, request) => {
-      if (request.method === "thread/read") {
-        readCalls += 1;
-        if (readCalls === 1) throw new Error("temporary exact-read failure");
-        return {
-          thread: {
-            id: "thread-read-retry",
-            recencyAt: (now - 13 * 60_000) / 1_000,
-          },
-        };
-      }
-      listCalls += 1;
-      return {
-        data: [],
-        nextCursor: null,
-      };
+    bridgeHandler: timestampBridge(async () => {
+      bridgeCalls += 1;
+      if (bridgeCalls === 1) throw new Error("temporary bridge failure");
+      return { "thread-read-retry": now - 13 * 60_000 };
+    }),
+    signalDispatcher: async () => {
+      dispatcherCalls += 1;
+      throw new Error("timestamp reads must not discover Codex internals");
     },
   });
   await new Promise((resolve) => setImmediate(resolve));
 
-  assert.equal(listCalls, 1);
-  assert.equal(readCalls, 2);
+  assert.equal(bridgeCalls, 1);
+  assert.equal(dispatcherCalls, 0);
+  assert.equal(content.querySelector("[data-codey-thread-updated-at]"), null);
+
+  fixture.advanceTime(60_000);
+  fixture.runIntervals();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(bridgeCalls, 2);
+  assert.equal(dispatcherCalls, 0);
   assert.equal(
     content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-    "13 分",
+    "14 分",
   );
 });
 
-test("retries a transient official timestamp request failure", async () => {
+test("keeps the cached time when a forced bridge refresh fails", async () => {
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
   row.setAttribute("data-app-action-sidebar-thread-id", "thread-retry");
@@ -1285,17 +1217,23 @@ test("retries a transient official timestamp request failure", async () => {
   const timestamp = Date.now() - 7 * 60_000;
   let calls = 0;
 
-  loadInjection({
+  const { window } = loadInjection({
     rows: [row],
-    signalDispatcher: async () => {
+    bridgeHandler: timestampBridge(async () => {
       calls += 1;
-      if (calls === 1) throw new Error("temporary failure");
-      return {
-        data: [{ id: "thread-retry", recencyAt: timestamp / 1_000 }],
-        nextCursor: null,
-      };
-    },
+      if (calls > 1) throw new Error("temporary failure");
+      return { "thread-retry": timestamp };
+    }),
   });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(calls, 1);
+  assert.equal(
+    content.querySelector("[data-codey-thread-updated-at]")?.textContent,
+    "7 分",
+  );
+
+  window.__codeyInstallThreadUpdatedTimes(row, true);
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(calls, 2);
@@ -1305,7 +1243,7 @@ test("retries a transient official timestamp request failure", async () => {
   );
 });
 
-test("clears a cached timestamp when official metadata no longer has one", async () => {
+test("clears a cached timestamp when bridge metadata no longer has one", async () => {
   const row = new FakeElement();
   row.setAttribute("data-app-action-sidebar-thread-row", "");
   row.setAttribute("data-app-action-sidebar-thread-id", "thread-cleared");
@@ -1317,15 +1255,9 @@ test("clears a cached timestamp when official metadata no longer has one", async
 
   const { window } = loadInjection({
     rows: [row],
-    signalDispatcher: async () => ({
-      data: [{
-        id: "thread-cleared",
-        recencyAt: includeTimestamp ? timestamp / 1_000 : null,
-        updatedAt: null,
-        createdAt: null,
-      }],
-      nextCursor: null,
-    }),
+    bridgeHandler: timestampBridge(async () => (
+      includeTimestamp ? { "thread-cleared": timestamp } : {}
+    )),
   });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(
@@ -1391,12 +1323,13 @@ test("injects time styles that coexist with native statuses and yield to sidebar
   assert.match(source, /updateThreadRunningPriority\(row, workInProgress\)/);
   assert.doesNotMatch(source, /sortKey:\s*"updated_at"/);
   assert.match(source, /threadTimestampRefreshIntervalMs = 60_000/);
-  assert.match(source, /threadTimestampReadBatchSize = 32/);
-  assert.match(source, /dispatcher\("send-cli-request-for-host"/);
-  assert.match(source, /method: "thread\/list"/);
+  assert.match(source, /threadTimestampBridgePath = "\/session\/timestamps"/);
+  assert.match(source, /callBridge\(threadTimestampBridgePath, \{ sessionIds \}\)/);
+  assert.doesNotMatch(source, /method: "thread\/(?:list|read)"/);
+  assert.doesNotMatch(source, /fetch\(url\)/);
   assert.match(source, /refreshTrackedThreadUpdatedTimes\(false\)/);
   assert.match(source, /"data-app-action-sidebar-thread-kind"/);
-  assert.match(source, /isDeletedSidebarSession\(sessionId\) \|\| !timestamp/);
+  assert.match(source, /isDeletedSidebarSession\(ref\.sessionId\) \|\| !timestamp/);
   assert.match(source, /font-variant-numeric: tabular-nums/);
   assert.match(source, /placeThreadUpdatedAt\(row, label\)/);
   assert.match(source, /mount\.insertBefore\(label, before\)/);

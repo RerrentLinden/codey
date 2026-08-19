@@ -2606,12 +2606,7 @@ mod tests {
             Some("deny")
         );
         assert_eq!(denied["decision"].as_str(), Some("block"));
-        assert!(
-            denied["reason"]
-                .as_str()
-                .unwrap()
-                .contains("1 MiB")
-        );
+        assert!(denied["reason"].as_str().unwrap().contains("1 MiB"));
         assert_eq!(
             denied["hookSpecificOutput"]["permissionDecisionReason"].as_str(),
             denied["reason"].as_str()
@@ -2623,12 +2618,7 @@ mod tests {
             Some("deny")
         );
         assert_eq!(denied["decision"].as_str(), Some("block"));
-        assert!(
-            denied["reason"]
-                .as_str()
-                .unwrap()
-                .contains("JSON 解析失败")
-        );
+        assert!(denied["reason"].as_str().unwrap().contains("JSON 解析失败"));
 
         let parsed = parse_hook_input(br#"{"hookEventName":"Stop","sessionId":"s"}"#).unwrap();
         assert_eq!(parsed.hook_event_name, "Stop");

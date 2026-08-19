@@ -105,6 +105,51 @@ impl SessionMetadataCache {
         FALLBACK_SESSION_NAME.to_string()
     }
 
+    pub(crate) fn resolve_session_timestamps(
+        &mut self,
+        home: &Path,
+        session_ids: &[String],
+    ) -> HashMap<String, u64> {
+        let session_ids = session_ids
+            .iter()
+            .map(|session_id| normalize_session_id(session_id).to_string())
+            .filter(|session_id| !session_id.is_empty())
+            .collect::<HashSet<_>>();
+        if session_ids.is_empty() {
+            return HashMap::new();
+        }
+
+        let mut timestamps = HashMap::new();
+        for path in self.active_database_paths(home) {
+            if !self.ensure_connection(&path) {
+                continue;
+            }
+            let unresolved = session_ids
+                .iter()
+                .filter(|session_id| !timestamps.contains_key(*session_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            if unresolved.is_empty() {
+                break;
+            }
+            let rows = {
+                let connection = &self
+                    .connections
+                    .get(&path)
+                    .expect("connection was inserted above")
+                    .connection;
+                session_timestamp_rows(connection, &unresolved)
+            };
+            match rows {
+                Ok(rows) => timestamps.extend(rows),
+                Err(_) => {
+                    self.connections.remove(&path);
+                }
+            }
+        }
+        timestamps
+    }
+
     fn active_database_paths(&mut self, home: &Path) -> Vec<PathBuf> {
         let paths = codex_session_db_paths_from_home(home)
             .into_iter()
@@ -219,6 +264,53 @@ fn session_name_row(connection: &Connection, session_id: &str) -> Result<Option<
             },
         )
         .optional()?)
+}
+
+fn session_timestamp_rows(
+    connection: &Connection,
+    session_ids: &[String],
+) -> Result<HashMap<String, u64>> {
+    let columns = table_columns(connection, "threads")?;
+    if !columns.contains("id") {
+        return Ok(HashMap::new());
+    }
+    let mut timestamp_candidates = Vec::new();
+    for (column, multiplier) in [
+        ("recency_at_ms", 1),
+        ("recency_at", 1_000),
+        ("updated_at_ms", 1),
+        ("updated_at", 1_000),
+        ("created_at_ms", 1),
+        ("created_at", 1_000),
+    ] {
+        if columns.contains(column) {
+            timestamp_candidates.push(format!(
+                "NULLIF(CAST({column} AS INTEGER) * {multiplier}, 0)"
+            ));
+        }
+    }
+    if timestamp_candidates.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let sql = format!(
+        "SELECT COALESCE({}) FROM threads WHERE id=?1 LIMIT 1",
+        timestamp_candidates.join(", ")
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut timestamps = HashMap::new();
+    for session_id in session_ids {
+        let timestamp = statement
+            .query_row(params![session_id], |row| row.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten()
+            .and_then(|timestamp| u64::try_from(timestamp).ok())
+            .filter(|timestamp| *timestamp > 0);
+        if let Some(timestamp) = timestamp {
+            timestamps.insert(session_id.clone(), timestamp);
+        }
+    }
+    Ok(timestamps)
 }
 
 fn is_placeholder_title(title: &str, first_user_message: &str, preview: &str) -> bool {
@@ -385,5 +477,71 @@ mod tests {
             resolve_session_name_with_preferred(home.path(), "thread-4", Some("帮我处理这个问题")),
             FALLBACK_SESSION_NAME
         );
+    }
+
+    #[test]
+    fn resolves_visible_thread_timestamps_in_one_cached_read() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("state_5.sqlite");
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    updated_at_ms INTEGER,
+                    recency_at INTEGER NOT NULL DEFAULT 0,
+                    recency_at_ms INTEGER NOT NULL DEFAULT 0
+                );
+                INSERT INTO threads VALUES
+                    ('thread-recency-ms', 10, 20, 20000, 30, 30001),
+                    ('thread-recency', 11, 21, 21000, 31, 0),
+                    ('thread-updated-ms', 12, 22, 22001, 0, 0),
+                    ('thread-updated', 13, 23, NULL, 0, 0);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut cache = SessionMetadataCache::default();
+        let timestamps = cache.resolve_session_timestamps(
+            home.path(),
+            &[
+                "local:thread-recency-ms".to_string(),
+                "thread-recency".to_string(),
+                "thread-updated-ms".to_string(),
+                "thread-updated".to_string(),
+                "missing".to_string(),
+            ],
+        );
+
+        assert_eq!(timestamps["thread-recency-ms"], 30_001);
+        assert_eq!(timestamps["thread-recency"], 31_000);
+        assert_eq!(timestamps["thread-updated-ms"], 22_001);
+        assert_eq!(timestamps["thread-updated"], 23_000);
+        assert!(!timestamps.contains_key("missing"));
+    }
+
+    #[test]
+    fn supports_legacy_thread_timestamp_columns() {
+        let home = tempdir().unwrap();
+        let path = home.path().join("state_5.sqlite");
+        let connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL
+                );
+                INSERT INTO threads VALUES ('legacy-thread', 14, 24);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let timestamps = SessionMetadataCache::default()
+            .resolve_session_timestamps(home.path(), &["legacy-thread".to_string()]);
+
+        assert_eq!(timestamps["legacy-thread"], 24_000);
     }
 }

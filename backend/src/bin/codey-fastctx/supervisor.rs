@@ -100,8 +100,7 @@ pub async fn run(worker_argument: &str) -> Result<()> {
             {
                 bail!("读取 FastCtx worker stdout 失败：{error}");
             }
-            Event::WorkerOutput(Some(WorkerOutput::ReadError(_)))
-            | Event::WorkerOutput(None) => {
+            Event::WorkerOutput(Some(WorkerOutput::ReadError(_))) | Event::WorkerOutput(None) => {
                 let status = worker
                     .child
                     .wait()
