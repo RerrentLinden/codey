@@ -334,7 +334,7 @@ impl AppState {
                 match with_session_metadata_cache(
                     self,
                     "读取侧边栏会话时间",
-                    move |cache| cache.resolve_session_timestamps(&home, &session_ids),
+                    move |cache| cache.resolve_session_timestamps(home, &session_ids),
                 )
                 .await
                 {
