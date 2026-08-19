@@ -359,7 +359,9 @@ pub(crate) fn pre_spawn_with_workspace(
         return Ok(Some(conflict));
     }
 
-    let (desired_points, desired_attempts) = adaptive_limits(&prepared.contract);
+    let observed_task_count = ledger.reservations.len().saturating_add(1);
+    let (desired_points, desired_attempts) =
+        adaptive_limits(&prepared.contract, observed_task_count);
     ledger.point_limit = ledger.point_limit.max(desired_points).min(MAX_POINT_LIMIT);
     ledger.attempt_limit = ledger
         .attempt_limit
@@ -1108,16 +1110,28 @@ fn validate_delegation_reason_role(reason: &str, role: &str) -> std::result::Res
     }
 }
 
-fn adaptive_limits(contract: &DelegationContract) -> (u16, u16) {
-    let branches = u16::try_from(contract.branch_calls.len()).unwrap_or(u16::MAX);
-    let point_limit = if contract.reason == "parallel" {
+fn adaptive_limits(contract: &DelegationContract, observed_task_count: usize) -> (u16, u16) {
+    // Recent Codex runtimes can encrypt the complete spawn message before the
+    // hook observes it. In that mode branch_calls is intentionally opaque, so
+    // derive a conservative branch count from distinct reservations that this
+    // ledger has actually admitted. Failed spawns are removed from the map and
+    // therefore cannot inflate the budget through retries.
+    let branches = if contract.reason == "parallel" {
+        u16::try_from(contract.branch_calls.len()).unwrap_or(u16::MAX)
+    } else if contract.reason == "encrypted_message" {
+        u16::try_from(observed_task_count).unwrap_or(u16::MAX)
+    } else {
+        0
+    };
+    let adaptive = matches!(contract.reason.as_str(), "parallel" | "encrypted_message");
+    let point_limit = if adaptive {
         DEFAULT_POINT_LIMIT
             .max(branches.saturating_mul(3))
             .min(MAX_POINT_LIMIT)
     } else {
         DEFAULT_POINT_LIMIT
     };
-    let attempt_limit = if contract.reason == "parallel" {
+    let attempt_limit = if adaptive {
         DEFAULT_ATTEMPT_LIMIT
             .max(branches.saturating_add(1))
             .min(MAX_ATTEMPT_LIMIT)
@@ -1507,11 +1521,42 @@ fn parse_plain_text_exit_code(value: &str) -> Option<i64> {
 }
 
 fn response_is_explicit_failure(value: &Value) -> bool {
+    response_has_structured_failure(value)
+        || (extract_agent_identifier(value).is_none() && response_has_textual_spawn_failure(value))
+}
+
+fn response_has_structured_failure(value: &Value) -> bool {
     match value {
         Value::Object(values) => {
             values.get("isError").and_then(Value::as_bool) == Some(true)
                 || values.get("is_error").and_then(Value::as_bool) == Some(true)
                 || values.get("error").is_some_and(|error| !error.is_null())
+                || values.values().any(response_has_structured_failure)
+        }
+        Value::Array(values) => values.iter().any(response_has_structured_failure),
+        _ => false,
+    }
+}
+
+fn response_has_textual_spawn_failure(value: &Value) -> bool {
+    match value {
+        Value::Object(values) => ["content", "message", "output", "result", "text"]
+            .iter()
+            .filter_map(|key| values.get(*key))
+            .any(response_has_textual_spawn_failure),
+        Value::Array(values) => values.iter().any(response_has_textual_spawn_failure),
+        Value::String(value) => {
+            let normalized = value.trim().to_ascii_lowercase();
+            [
+                "collab spawn failed",
+                "agent spawn failed",
+                "spawn agent failed",
+                "spawn_agent failed",
+                "failed to spawn agent",
+                "failed to spawn subagent",
+            ]
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix))
         }
         _ => false,
     }
@@ -1754,7 +1799,7 @@ mod tests {
         );
         let prepared = prepare_contract(Some(&user_requested)).unwrap();
         assert_eq!(
-            adaptive_limits(&prepared.contract),
+            adaptive_limits(&prepared.contract, 1),
             (DEFAULT_POINT_LIMIT, DEFAULT_ATTEMPT_LIMIT)
         );
 
@@ -1819,6 +1864,18 @@ mod tests {
         assert_eq!(prepared.write_paths, ["/repo"]);
         assert!(prepared.read_paths.is_empty());
         assert!(prepared.contract.acceptance.is_empty());
+        assert_eq!(
+            adaptive_limits(&prepared.contract, 1),
+            (DEFAULT_POINT_LIMIT, DEFAULT_ATTEMPT_LIMIT)
+        );
+        assert_eq!(
+            adaptive_limits(&prepared.contract, 3),
+            (9, DEFAULT_ATTEMPT_LIMIT)
+        );
+        assert_eq!(
+            adaptive_limits(&prepared.contract, 5),
+            (MAX_POINT_LIMIT, MAX_ATTEMPT_LIMIT)
+        );
 
         let error = prepare_contract_with_workspace(Some(&encrypted_input), None).unwrap_err();
         assert!(error.contains("Hook 未提供绝对工作目录"));
@@ -1834,6 +1891,103 @@ mod tests {
                 .unwrap_err()
                 .contains("最后一行缺少 CODEY_DELEGATION_V2")
         );
+    }
+
+    #[test]
+    fn encrypted_spawn_budget_allows_the_bounded_maximum_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..MAX_ATTEMPT_LIMIT {
+            let input = json!({
+                "task_name": format!("opaque_{index}"),
+                "agent_type": "codey_quick_scan",
+                "fork_turns": "none",
+                "message": format!("gAAAAA{}", "A".repeat(160))
+            });
+            assert_eq!(
+                pre_spawn(
+                    temp.path(),
+                    "runtime-a",
+                    "session-a",
+                    Some(&input),
+                    0,
+                    u64::from(index),
+                )
+                .unwrap(),
+                None
+            );
+        }
+
+        let overflow = json!({
+            "task_name": "opaque_overflow",
+            "agent_type": "codey_quick_scan",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        let denial = pre_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&overflow),
+            0,
+            100,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("达到上限 6"));
+    }
+
+    #[test]
+    fn failed_encrypted_spawns_do_not_inflate_the_adaptive_budget() {
+        let temp = tempfile::tempdir().unwrap();
+        for index in 0..DEFAULT_ATTEMPT_LIMIT {
+            let input = json!({
+                "task_name": format!("failed_opaque_{index}"),
+                "agent_type": "codey_quick_scan",
+                "fork_turns": "none",
+                "message": format!("gAAAAA{}", "A".repeat(160))
+            });
+            assert_eq!(
+                pre_spawn(
+                    temp.path(),
+                    "runtime-a",
+                    "session-a",
+                    Some(&input),
+                    0,
+                    u64::from(index) * 10,
+                )
+                .unwrap(),
+                None
+            );
+            post_spawn(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&input),
+                Some(&Value::String(
+                    "collab spawn failed: agent thread limit reached".to_string(),
+                )),
+                u64::from(index) * 10 + 1,
+            )
+            .unwrap();
+        }
+
+        let retry = json!({
+            "task_name": "failed_opaque_retry",
+            "agent_type": "codey_quick_scan",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        let denial = pre_spawn(temp.path(), "runtime-a", "session-a", Some(&retry), 0, 100)
+            .unwrap()
+            .unwrap();
+        assert!(denial.contains("达到上限 4"));
+
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let ledger = store.load("runtime-a", "session-a", 110).unwrap().unwrap();
+        assert_eq!(ledger.point_limit, DEFAULT_POINT_LIMIT);
+        assert_eq!(ledger.attempt_limit, DEFAULT_ATTEMPT_LIMIT);
+        assert_eq!(ledger.points_spent, 0);
+        assert!(ledger.reservations.is_empty());
     }
 
     #[test]
@@ -1999,6 +2153,83 @@ mod tests {
         assert_eq!(ledger.spawn_attempts, 1);
         assert_eq!(ledger.points_spent, 0);
         assert!(ledger.reservations.is_empty());
+    }
+
+    #[test]
+    fn textual_failed_spawn_releases_the_reservation() {
+        for (index, response) in [
+            Value::String("collab spawn failed: agent thread limit reached".to_string()),
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": "collab spawn failed: agent thread limit reached"
+                }]
+            }),
+            json!({
+                "agent_id": "agent-a",
+                "isError": true,
+                "error": "capacity"
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let task = format!("worker_{index}");
+            let input = contract_input(
+                &task,
+                "codey_worker",
+                worker_contract(&task, "backend/a.rs"),
+            );
+            pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+            post_spawn(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&input),
+                Some(&response),
+                20,
+            )
+            .unwrap();
+
+            let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+            let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
+            assert_eq!(ledger.spawn_attempts, 1);
+            assert_eq!(ledger.points_spent, 0);
+            assert!(ledger.reservations.is_empty());
+        }
+    }
+
+    #[test]
+    fn successful_spawn_identifier_wins_over_failure_like_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = contract_input(
+            "worker_a",
+            "codey_worker",
+            worker_contract("worker_a", "backend/a.rs"),
+        );
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({
+                "agent_id": "agent-a",
+                "message": "failed to spawn agent in a previous attempt"
+            })),
+            20,
+        )
+        .unwrap();
+
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
+        assert_eq!(ledger.spawn_attempts, 1);
+        assert_eq!(ledger.points_spent, 3);
+        assert_eq!(
+            ledger.reservations["worker_a"].state,
+            ReservationState::Running
+        );
     }
 
     #[test]

@@ -11,17 +11,15 @@ use codey_runtime_core::settings::RelayProtocol;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
-use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE, PREVIOUS_SUBAGENT_GUIDANCE_V2,
-    ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
-    SUBAGENT_GUIDANCE, append_root_agent_collaboration_usage_hint, append_subagent_guidance,
-    codey_fastctx_guidance_blocks, default_agent_config_with_fastctx_guidance,
-    previous_default_agent_config_without_sandbox, remove_codey_fastctx_guidance,
-    remove_previous_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
-};
 #[cfg(test)]
+use crate::codex_config_guidance::PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT;
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE_VERSIONS, PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, DEFAULT_AGENT_CONFIG,
+    ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
+    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, append_root_agent_collaboration_usage_hint,
+    codey_fastctx_guidance_blocks, previous_default_agent_config_without_sandbox,
+    remove_codey_fastctx_guidance, remove_previous_codey_fastctx_guidance,
+    remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, ProviderProfile, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT,
@@ -124,6 +122,8 @@ struct RuntimeConfigLease {
     applied_base_url: Option<String>,
     #[serde(default)]
     isolated_runtime_constraints: bool,
+    #[serde(default)]
+    independent_prompt_sources: bool,
     #[serde(default)]
     runtime_hooks_applied: bool,
     #[serde(default)]
@@ -302,9 +302,18 @@ pub(crate) fn apply_runtime_provider_config(
     )?;
     let config_contents =
         fs::read(backup_dir.join(APPLIED_CONFIG_FILE)).context("读取 Codey 已应用配置快照失败")?;
+    let constraints_dir = marker
+        .parent()
+        .unwrap_or_else(|| Path::new(".codey"))
+        .join(CODEY_CONSTRAINTS_DIR);
+    let runtime_config_overrides = build_independent_prompt_runtime_overrides(
+        &config_contents,
+        &constraints_dir,
+        options.subagent_optimization,
+    )?;
     Ok(AppliedRuntimeProviderConfig {
         config_contents,
-        runtime_config_overrides: Vec::new(),
+        runtime_config_overrides,
     })
 }
 
@@ -404,6 +413,27 @@ fn migrate_previous_fastctx_guidance(
     document_string(&document).map(Some)
 }
 
+fn persist_embedded_config_prompt_migration(
+    path: &Path,
+    original: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    let existing = str::from_utf8(&original).context("Codex config.toml 不是 UTF-8")?;
+    let mut document = parse_document(existing).context("解析 Codex config.toml 失败")?;
+    if !remove_embedded_codey_prompt_sources(&mut document) {
+        return Ok(Some(original));
+    }
+    let migrated = document_string(&document)?;
+    if read_optional(path)?.as_deref() != Some(original.as_slice()) {
+        bail!("Codex config.toml 在 Codey 规则迁移期间发生变化；已取消本次启动");
+    }
+    atomic_write(path, migrated.as_bytes())
+        .context("迁移 Codex config.toml 中的旧版 Codey 规则失败")?;
+    Ok(Some(migrated.into_bytes()))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_isolated_cc_switch_runtime_config(
     home: &Path,
@@ -463,9 +493,10 @@ fn apply_isolated_cc_switch_runtime_config(
         .join(CODEY_CONSTRAINTS_DIR);
     create_private_dir_all(&constraints_dir)?;
     let fastctx_instructions = if fastctx_namespace.is_some() {
-        Some(read_or_create_constraint_file(
+        Some(read_or_create_constraint_file_with_exact_migration(
             &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
             CODEY_FASTCTX_GUIDANCE,
+            &CODEY_FASTCTX_GUIDANCE_VERSIONS[1..],
         )?)
     } else {
         None
@@ -475,11 +506,12 @@ fn apply_isolated_cc_switch_runtime_config(
         let root_instructions = read_or_create_constraint_file_with_exact_migration(
             &root_path,
             SUBAGENT_GUIDANCE,
-            &[PREVIOUS_SUBAGENT_GUIDANCE_V2, PREVIOUS_SUBAGENT_GUIDANCE],
+            &SUBAGENT_GUIDANCE_VERSIONS[1..],
         )?;
-        let collaboration_hint = read_or_create_constraint_file(
+        let collaboration_hint = read_or_create_constraint_file_with_exact_migration(
             &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
+            &ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS[1..],
         )?;
         let runtime_roles =
             runtime_subagent_roles(subagent_roles, subagent_model, subagent_reasoning_effort);
@@ -587,6 +619,7 @@ fn apply_isolated_cc_switch_runtime_config(
         provider_id: Some(provider_id.clone()),
         applied_base_url: protocol_proxy_base_url.map(str::to_string),
         isolated_runtime_constraints: true,
+        independent_prompt_sources: true,
         runtime_hooks_applied: updated_hooks.is_some(),
         original_hooks_file_exists: original_hooks.is_some(),
     };
@@ -646,6 +679,56 @@ fn read_or_create_constraint_file_with_exact_migration(
         return Ok(default_contents.to_string());
     }
     Ok(existing)
+}
+
+fn persist_embedded_subagent_guidance_migration(
+    path: &Path,
+    original: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    let existing = str::from_utf8(&original).context("Codex AGENTS.md 不是 UTF-8")?;
+    let Some(migrated) = remove_subagent_guidance(existing) else {
+        return Ok(Some(original));
+    };
+    if read_optional(path)?.as_deref() != Some(original.as_slice()) {
+        bail!("Codex AGENTS.md 在 Codey 规则迁移期间发生变化；已取消本次启动");
+    }
+    if migrated.trim().is_empty() {
+        remove_optional(path)?;
+        return Ok(None);
+    }
+    atomic_write(path, migrated.as_bytes())
+        .context("迁移 Codex AGENTS.md 中的旧版 Codey 规则失败")?;
+    Ok(Some(migrated.into_bytes()))
+}
+
+fn persist_legacy_default_agent_migration(
+    path: &Path,
+    original: Option<Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    let existing = str::from_utf8(&original).context("Codex agents/default.toml 不是 UTF-8")?;
+    let migrated = remove_codey_fastctx_guidance(existing).unwrap_or_else(|| existing.to_string());
+    let previous_default = previous_default_agent_config_without_sandbox();
+    let codey_owned =
+        [DEFAULT_AGENT_CONFIG, previous_default.as_str()].contains(&migrated.as_str());
+    if !codey_owned && migrated == existing {
+        return Ok(Some(original));
+    }
+    if read_optional(path)?.as_deref() != Some(original.as_slice()) {
+        bail!("Codex agents/default.toml 在 Codey 规则迁移期间发生变化；已取消本次启动");
+    }
+    if codey_owned {
+        remove_optional(path)?;
+        return Ok(None);
+    }
+    atomic_write(path, migrated.as_bytes())
+        .context("迁移 Codex agents/default.toml 中的旧版 Codey 规则失败")?;
+    Ok(Some(migrated.into_bytes()))
 }
 
 fn runtime_subagent_roles(
@@ -806,6 +889,11 @@ fn apply_isolated_prompt_sources(
         "developer_instructions",
         remove_codey_fastctx_guidance,
     );
+    remove_guidance_from_table(
+        document.as_table_mut(),
+        "developer_instructions",
+        remove_subagent_guidance,
+    );
     if let Some(instructions) = fastctx_instructions {
         append_table_constraint_text(
             document.as_table_mut(),
@@ -836,6 +924,11 @@ fn apply_isolated_prompt_sources(
         "subagent_developer_instructions",
         remove_codey_fastctx_guidance,
     );
+    remove_guidance_from_table(
+        multi_agent,
+        "subagent_developer_instructions",
+        remove_subagent_guidance,
+    );
     if let Some(instructions) = fastctx_instructions {
         append_table_constraint_text(
             multi_agent,
@@ -860,6 +953,125 @@ fn apply_isolated_prompt_sources(
         );
     }
     Ok(())
+}
+
+fn remove_embedded_codey_prompt_sources(document: &mut DocumentMut) -> bool {
+    let mut changed = remove_guidance_from_table(
+        document.as_table_mut(),
+        "developer_instructions",
+        remove_codey_fastctx_guidance,
+    );
+    changed |= remove_guidance_from_table(
+        document.as_table_mut(),
+        "developer_instructions",
+        remove_subagent_guidance,
+    );
+
+    let Some(multi_agent) = document
+        .get_mut("features")
+        .and_then(Item::as_table_like_mut)
+        .and_then(|features| features.get_mut("multi_agent_v2"))
+        .and_then(Item::as_table_like_mut)
+    else {
+        return changed;
+    };
+    changed |= remove_guidance_from_table(
+        multi_agent,
+        "subagent_developer_instructions",
+        remove_codey_fastctx_guidance,
+    );
+    changed |= remove_guidance_from_table(
+        multi_agent,
+        "subagent_developer_instructions",
+        remove_subagent_guidance,
+    );
+    let Some(existing) = multi_agent
+        .get("root_agent_usage_hint_text")
+        .and_then(Item::as_str)
+        .map(str::to_string)
+    else {
+        return changed;
+    };
+    let cleaned = ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS
+        .iter()
+        .fold(existing.clone(), |current, guidance| {
+            remove_constraint_text(&current, guidance)
+        });
+    if cleaned == existing {
+        return changed;
+    }
+    if cleaned.trim().is_empty() {
+        multi_agent.remove("root_agent_usage_hint_text");
+    } else {
+        multi_agent.insert("root_agent_usage_hint_text", value(cleaned));
+    }
+    true
+}
+
+fn build_independent_prompt_runtime_overrides(
+    config_contents: &[u8],
+    constraints_dir: &Path,
+    subagent_optimization: bool,
+) -> Result<Vec<String>> {
+    let config = str::from_utf8(config_contents).context("Codex config.toml 不是 UTF-8")?;
+    let mut effective = parse_document(config).context("解析 Codey 独立规则运行时配置失败")?;
+    let fastctx_enabled = effective
+        .get("mcp_servers")
+        .and_then(Item::as_table)
+        .and_then(|servers| servers.get(CODEY_FASTCTX_SERVER_ID))
+        .and_then(Item::as_table)
+        .is_some_and(fastctx_table_server_is_codey_owned);
+    let read_source = |name: &str| -> Result<String> {
+        let path = constraints_dir.join(name);
+        fs::read_to_string(&path)
+            .with_context(|| format!("读取 Codey 独立规则文件失败：{}", path.display()))
+    };
+    let fastctx_instructions = fastctx_enabled
+        .then(|| read_source(CODEY_FASTCTX_INSTRUCTIONS_FILE))
+        .transpose()?;
+    let root_instructions = subagent_optimization
+        .then(|| read_source(CODEY_ROOT_INSTRUCTIONS_FILE))
+        .transpose()?;
+    let collaboration_hint = subagent_optimization
+        .then(|| read_source(CODEY_COLLABORATION_HINT_FILE))
+        .transpose()?;
+    apply_isolated_prompt_sources(
+        &mut effective,
+        root_instructions.as_deref(),
+        fastctx_instructions.as_deref(),
+        collaboration_hint.as_deref(),
+    )?;
+
+    let mut overrides = Vec::new();
+    if fastctx_enabled || subagent_optimization {
+        push_required_document_override(
+            &mut overrides,
+            &effective,
+            &["developer_instructions"],
+            "developer_instructions",
+        )?;
+    }
+    if subagent_optimization {
+        push_required_document_override(
+            &mut overrides,
+            &effective,
+            &["features", "multi_agent_v2", "root_agent_usage_hint_text"],
+            "features.multi_agent_v2.root_agent_usage_hint_text",
+        )?;
+    }
+    if fastctx_enabled && subagent_optimization {
+        push_required_document_override(
+            &mut overrides,
+            &effective,
+            &[
+                "features",
+                "multi_agent_v2",
+                "subagent_developer_instructions",
+            ],
+            "features.multi_agent_v2.subagent_developer_instructions",
+        )?;
+    }
+    Ok(overrides)
 }
 
 fn append_table_constraint_text(
@@ -938,25 +1150,24 @@ fn apply_runtime_provider_config_at_mode(
         bail!("CC Switch Live 配置在启动准备期间发生变化；已取消本次启动以避免混用线路");
     }
     let original_agents_dir_exists = agents_dir.is_dir();
-    let original_config = persist_previous_fastctx_guidance_migration(
-        &config_path,
-        original_config_on_disk,
-        true,
-        "Codex config.toml",
-    )?;
-    let migrated_default_agent = persist_previous_fastctx_guidance_migration(
-        &default_agent_path,
-        read_optional(&default_agent_path)?,
-        false,
-        "Codex agents/default.toml",
-    )?;
+    let original_config =
+        persist_embedded_config_prompt_migration(&config_path, original_config_on_disk)?;
     let original_agents_md = if subagent_optimization {
-        read_optional(&agents_md_path)?
+        persist_embedded_subagent_guidance_migration(
+            &agents_md_path,
+            read_optional(&agents_md_path)?,
+        )?
     } else {
         None
     };
     let original_default_agent = if subagent_optimization {
-        migrated_default_agent
+        let migrated_default_agent = persist_previous_fastctx_guidance_migration(
+            &default_agent_path,
+            read_optional(&default_agent_path)?,
+            false,
+            "Codex agents/default.toml",
+        )?;
+        persist_legacy_default_agent_migration(&default_agent_path, migrated_default_agent)?
     } else {
         None
     };
@@ -970,13 +1181,6 @@ fn apply_runtime_provider_config_at_mode(
 
     let existing = str::from_utf8(original_config.as_deref().unwrap_or_default())
         .context("Codex config.toml 不是 UTF-8")?;
-    let updated_agents_md = if subagent_optimization {
-        let existing_agents_md = str::from_utf8(original_agents_md.as_deref().unwrap_or_default())
-            .context("Codex AGENTS.md 不是 UTF-8")?;
-        Some(append_subagent_guidance(existing_agents_md))
-    } else {
-        None
-    };
     let provider_id = validated_provider_id(provider_id)?;
     // Codex resolves this path from the app-server working directory, which is
     // `/` for the packaged macOS app, rather than from CODEX_HOME.
@@ -1006,20 +1210,33 @@ fn apply_runtime_provider_config_at_mode(
         .and_then(Item::as_table)
         .is_some_and(fastctx_table_server_is_codey_owned)
         .then_some(CODEY_FASTCTX_NAMESPACE);
-    if subagent_optimization {
-        let constraints_dir = marker
-            .parent()
-            .unwrap_or_else(|| Path::new(".codey"))
-            .join(CODEY_CONSTRAINTS_DIR);
+    let constraints_dir = marker
+        .parent()
+        .unwrap_or_else(|| Path::new(".codey"))
+        .join(CODEY_CONSTRAINTS_DIR);
+    if fastctx_namespace.is_some() || subagent_optimization {
         create_private_dir_all(&constraints_dir)?;
-        let fastctx_instructions = if fastctx_namespace.is_some() {
-            Some(read_or_create_constraint_file(
-                &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
-                CODEY_FASTCTX_GUIDANCE,
-            )?)
-        } else {
-            None
-        };
+    }
+    let fastctx_instructions = if fastctx_namespace.is_some() {
+        Some(read_or_create_constraint_file_with_exact_migration(
+            &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
+            CODEY_FASTCTX_GUIDANCE,
+            &CODEY_FASTCTX_GUIDANCE_VERSIONS[1..],
+        )?)
+    } else {
+        None
+    };
+    if subagent_optimization {
+        read_or_create_constraint_file_with_exact_migration(
+            &constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE),
+            SUBAGENT_GUIDANCE,
+            &SUBAGENT_GUIDANCE_VERSIONS[1..],
+        )?;
+        read_or_create_constraint_file_with_exact_migration(
+            &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
+            ROOT_AGENT_COLLABORATION_USAGE_HINT,
+            &ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS[1..],
+        )?;
         let runtime_roles =
             runtime_subagent_roles(subagent_roles, subagent_model, subagent_reasoning_effort);
         let runtime_agents = prepare_runtime_agent_files(
@@ -1028,44 +1245,15 @@ fn apply_runtime_provider_config_at_mode(
             fastctx_instructions.as_deref(),
         )?;
         register_runtime_agents(&mut updated_document, &runtime_agents)?;
-        updated = document_string(&updated_document)?;
     }
+    remove_embedded_codey_prompt_sources(&mut updated_document);
+    updated = document_string(&updated_document)?;
     let applied_base_url = provider_base_url(&updated, &provider_id);
-    let updated_default_agent = if subagent_optimization {
-        Some(default_agent_config_with_fastctx_guidance(
-            fastctx_namespace,
-        ))
-    } else {
-        None
-    };
     if let Err(error) =
         write_private_file(&backup_dir.join(APPLIED_CONFIG_FILE), updated.as_bytes())
     {
         let _ = fs::remove_dir_all(&backup_dir);
         return Err(error).context("保存 Codey 已应用配置快照失败");
-    }
-    if subagent_optimization {
-        if let Some(bytes) = original_agents_md.as_deref() {
-            write_private_file(&backup_dir.join("AGENTS.md"), bytes)?;
-        }
-        create_private_dir_all(&backup_dir.join("agents"))?;
-        if let Some(bytes) = original_default_agent.as_deref() {
-            write_private_file(&backup_dir.join("agents/default.toml"), bytes)?;
-        }
-        write_private_file(
-            &backup_dir.join(APPLIED_AGENTS_MD_FILE),
-            updated_agents_md
-                .as_deref()
-                .expect("subagent guidance was prepared")
-                .as_bytes(),
-        )?;
-        write_private_file(
-            &backup_dir.join(APPLIED_DEFAULT_AGENT_FILE),
-            updated_default_agent
-                .as_deref()
-                .expect("default agent config was prepared")
-                .as_bytes(),
-        )?;
     }
     let state = RuntimeConfigLease {
         backup_dir: backup_dir.clone(),
@@ -1088,6 +1276,7 @@ fn apply_runtime_provider_config_at_mode(
         provider_id: Some(provider_id),
         applied_base_url,
         isolated_runtime_constraints: false,
+        independent_prompt_sources: true,
         runtime_hooks_applied: false,
         original_hooks_file_exists: false,
     };
@@ -1107,21 +1296,7 @@ fn apply_runtime_provider_config_at_mode(
         bail!("Codex 配置在 Codey 保存运行时快照后发生变化；已取消本次启动");
     }
 
-    let write_result = (|| -> Result<()> {
-        atomic_write(&config_path, updated.as_bytes())?;
-        if let Some(updated_agents_md) = updated_agents_md.as_deref() {
-            atomic_write(&agents_md_path, updated_agents_md.as_bytes())?;
-            create_private_dir_all(&agents_dir)?;
-            atomic_write(
-                &default_agent_path,
-                updated_default_agent
-                    .as_deref()
-                    .expect("default agent config was prepared")
-                    .as_bytes(),
-            )?;
-        }
-        Ok(())
-    })();
+    let write_result = atomic_write(&config_path, updated.as_bytes());
     if let Err(write_error) = write_result {
         match restore_runtime_provider_config_at(home, marker) {
             Ok(_) => {
@@ -1459,7 +1634,10 @@ fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool
 }
 
 fn restore_runtime_subagent_files(home: &Path, state: &RuntimeConfigLease) -> Result<()> {
-    if !state.subagent_optimization_applied || state.isolated_runtime_constraints {
+    if !state.subagent_optimization_applied
+        || state.isolated_runtime_constraints
+        || state.independent_prompt_sources
+    {
         return Ok(());
     }
 

@@ -172,6 +172,7 @@ fn write_legacy_runtime_lease(
             provider_id: Some(provider_id.to_string()),
             applied_base_url: Some(applied_base_url.to_string()),
             isolated_runtime_constraints: false,
+            independent_prompt_sources: false,
             runtime_hooks_applied: false,
             original_hooks_file_exists: false,
         },
@@ -1860,7 +1861,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
 }
 
 #[test]
-fn subagent_lease_applies_and_restores_all_owned_files() {
+fn subagent_lease_keeps_prompt_rules_in_independent_files() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
     let marker = temp.path().join("codey/codex-lease.json");
@@ -1919,9 +1920,12 @@ fn subagent_lease_applies_and_restores_all_owned_files() {
         document["features"]["multi_agent_v2"]["wait_agent_enabled"].as_bool(),
         Some(true)
     );
-    assert_eq!(
-        document["features"]["multi_agent_v2"]["root_agent_usage_hint_text"].as_str(),
-        Some(ROOT_AGENT_COLLABORATION_USAGE_HINT)
+    assert!(
+        document["features"]["multi_agent_v2"]
+            .as_table()
+            .unwrap()
+            .get("root_agent_usage_hint_text")
+            .is_none()
     );
     assert_eq!(document["features"]["hooks"].as_bool(), Some(true));
     for role in SUBAGENT_ROLE_IDS {
@@ -1959,15 +1963,38 @@ fn subagent_lease_applies_and_restores_all_owned_files() {
         document["hooks"]["state"].as_table().unwrap().len(),
         SUBAGENT_GATE_HOOKS.len()
     );
-    assert!(
-        fs::read_to_string(home.join("AGENTS.md"))
-            .unwrap()
-            .contains(SUBAGENT_GUIDANCE)
+    assert!(!temporary_config.contains(SUBAGENT_GUIDANCE));
+    assert!(!temporary_config.contains(ROOT_AGENT_COLLABORATION_USAGE_HINT));
+    assert_eq!(
+        fs::read(home.join("AGENTS.md")).unwrap(),
+        original_agents_md
     );
     assert_eq!(
-        fs::read_to_string(home.join("agents/default.toml")).unwrap(),
-        DEFAULT_AGENT_CONFIG
+        fs::read(home.join("agents/default.toml")).unwrap(),
+        original_default_agent
     );
+    let constraints_dir = marker.parent().unwrap().join(CODEY_CONSTRAINTS_DIR);
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE)).unwrap(),
+        SUBAGENT_GUIDANCE
+    );
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_COLLABORATION_HINT_FILE)).unwrap(),
+        ROOT_AGENT_COLLABORATION_USAGE_HINT
+    );
+    let overrides = build_independent_prompt_runtime_overrides(
+        temporary_config.as_bytes(),
+        &constraints_dir,
+        true,
+    )
+    .unwrap();
+    assert!(overrides.iter().any(|entry| {
+        entry.starts_with("developer_instructions=") && entry.contains("## 子代理使用")
+    }));
+    assert!(overrides.iter().any(|entry| {
+        entry.starts_with("features.multi_agent_v2.root_agent_usage_hint_text=")
+            && entry.contains("agents.spawn_agent")
+    }));
 
     assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
@@ -1980,6 +2007,77 @@ fn subagent_lease_applies_and_restores_all_owned_files() {
         original_default_agent
     );
     assert!(!marker.exists());
+}
+
+#[test]
+fn subagent_lease_migrates_recognized_embedded_rule_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey/codex-lease.json");
+    let backup_root = temp.path().join("codey/codex-backups");
+    fs::create_dir_all(home.join("agents")).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "model_provider = \"codey_global\"\n\
+             developer_instructions = {}\n\
+             \n\
+             [features.multi_agent_v2]\n\
+             root_agent_usage_hint_text = {}\n\
+             subagent_developer_instructions = {}\n",
+            Value::from(format!("User root rule.\n\n{CODEY_FASTCTX_GUIDANCE}")),
+            Value::from(ROOT_AGENT_COLLABORATION_USAGE_HINT),
+            Value::from(CODEY_FASTCTX_GUIDANCE),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("AGENTS.md"),
+        format!("# User guidance\n\n{PREVIOUS_SUBAGENT_GUIDANCE_V2}\n"),
+    )
+    .unwrap();
+    fs::write(home.join("agents/default.toml"), DEFAULT_AGENT_CONFIG).unwrap();
+
+    apply_runtime_provider_config_at_mode(
+        &home,
+        &direct_profile(RelayProtocol::Responses),
+        GLOBAL_PROVIDER_ID,
+        ProviderApplyOptions {
+            subagent_optimization: true,
+            ..ProviderApplyOptions::for_test(&marker, &backup_root)
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(home.join("AGENTS.md")).unwrap(),
+        "# User guidance\n"
+    );
+    assert!(!home.join("agents/default.toml").exists());
+    let applied_config = fs::read_to_string(home.join("config.toml")).unwrap();
+    let applied_document = parse_document(&applied_config).unwrap();
+    assert_eq!(
+        applied_document["developer_instructions"].as_str(),
+        Some("User root rule.")
+    );
+    assert!(!applied_config.contains(CODEY_FASTCTX_GUIDANCE));
+    assert!(!applied_config.contains(ROOT_AGENT_COLLABORATION_USAGE_HINT));
+    let constraints_dir = marker.parent().unwrap().join(CODEY_CONSTRAINTS_DIR);
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE)).unwrap(),
+        SUBAGENT_GUIDANCE
+    );
+
+    assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+    assert_eq!(
+        fs::read_to_string(home.join("AGENTS.md")).unwrap(),
+        "# User guidance\n"
+    );
+    assert!(!home.join("agents/default.toml").exists());
+    let restored_config = fs::read_to_string(home.join("config.toml")).unwrap();
+    assert!(restored_config.contains("User root rule."));
+    assert!(!restored_config.contains(CODEY_FASTCTX_GUIDANCE));
+    assert!(!restored_config.contains(ROOT_AGENT_COLLABORATION_USAGE_HINT));
 }
 
 #[test]
@@ -2021,7 +2119,10 @@ args = ["serve"]
             .get(CODEY_FASTCTX_SERVER_ID)
             .is_none()
     );
-    let default_agent = fs::read_to_string(home.join("agents/default.toml")).unwrap();
+    assert!(!home.join("agents/default.toml").exists());
+    let constraints_dir = marker.parent().unwrap().join(CODEY_CONSTRAINTS_DIR);
+    let default_agent =
+        fs::read_to_string(constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE)).unwrap();
     assert_eq!(default_agent, DEFAULT_AGENT_CONFIG);
     assert!(default_agent.contains("每次工具调用都必须推进任务本身"));
     assert!(document.get("developer_instructions").is_none());
@@ -2127,25 +2228,22 @@ developer_instructions = {}
         temporary_document["features"]["multi_agent_v2"]["subagent_developer_instructions"]
             .as_str()
             .unwrap();
-    for guidance in [temporary_root_guidance, temporary_subagent_guidance] {
-        assert!(guidance.contains(CODEY_FASTCTX_GUIDANCE));
-        assert!(guidance.contains("Batch 2-32 already-known text files"));
-        assert!(guidance.contains("Use CodeGraph only for semantic code understanding"));
-        assert!(guidance.contains("a direct-only tool namespace"));
-        assert!(guidance.contains("using `tool_search`"));
-        assert!(!guidance.contains("inspect `ALL_TOOLS`"));
-        assert!(!guidance.contains("list_mcp_resources"));
-        assert!(!guidance.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
-    }
+    assert_eq!(temporary_root_guidance, "Root user guidance.");
+    assert_eq!(temporary_subagent_guidance, "Subagent user guidance.");
+    assert!(!temporary_config.contains(CODEY_FASTCTX_GUIDANCE));
+    assert!(!temporary_config.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
     let temporary_default = fs::read_to_string(home.join("agents/default.toml")).unwrap();
-    assert!(temporary_default.contains(CODEY_FASTCTX_GUIDANCE));
-    assert!(temporary_default.contains("Batch 2-32 already-known text files"));
-    assert!(temporary_default.contains("Use CodeGraph only for semantic code understanding"));
-    assert!(temporary_default.contains("a direct-only tool namespace"));
-    assert!(temporary_default.contains("using `tool_search`"));
-    assert!(!temporary_default.contains("inspect `ALL_TOOLS`"));
-    assert!(!temporary_default.contains("list_mcp_resources"));
+    assert!(temporary_default.contains("Default user guidance."));
+    assert!(!temporary_default.contains(CODEY_FASTCTX_GUIDANCE));
     assert!(!temporary_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
+    let constraints_dir = marker.parent().unwrap().join(CODEY_CONSTRAINTS_DIR);
+    let fastctx_source =
+        fs::read_to_string(constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE)).unwrap();
+    assert_eq!(fastctx_source, CODEY_FASTCTX_GUIDANCE);
+    let runtime_default =
+        fs::read_to_string(constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)).unwrap();
+    assert!(runtime_default.contains(CODEY_FASTCTX_GUIDANCE));
+    assert!(!runtime_default.contains(PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5));
 
     assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
     let restored_config = fs::read_to_string(home.join("config.toml")).unwrap();
@@ -2298,6 +2396,7 @@ fn subagent_lease_preserves_concurrent_user_file_changes() {
     let mut concurrent_agents_md = fs::read_to_string(home.join("AGENTS.md")).unwrap();
     concurrent_agents_md.push_str("\n## User addition\nKeep this too.\n");
     fs::write(home.join("AGENTS.md"), concurrent_agents_md).unwrap();
+    fs::create_dir_all(home.join("agents")).unwrap();
     fs::write(
         home.join("agents/default.toml"),
         "name = \"user-replacement\"\n",
@@ -2338,13 +2437,17 @@ fn subagent_lease_removes_runtime_only_files_on_restore() {
         },
     )
     .unwrap();
-    assert!(home.join("AGENTS.md").exists());
-    assert!(home.join("agents/default.toml").exists());
+    assert!(!home.join("AGENTS.md").exists());
+    assert!(!home.join("agents/default.toml").exists());
+    let constraints_dir = marker.parent().unwrap().join(CODEY_CONSTRAINTS_DIR);
+    assert!(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE).exists());
+    assert!(constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE).exists());
 
     assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
     assert!(!home.join("AGENTS.md").exists());
     assert!(!home.join("agents/default.toml").exists());
     assert!(!home.join("agents").exists());
+    assert!(constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE).exists());
 }
 
 #[test]
@@ -3201,10 +3304,7 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx"]
     );
     current["model"] = value("gpt-new");
     current["service_tier"] = value("fast");
-    current["developer_instructions"] = value(format!(
-        "{}\n\nKeep concurrent guidance.",
-        current["developer_instructions"].as_str().unwrap()
-    ));
+    current["developer_instructions"] = value("Keep concurrent guidance.");
     current["features"]["code_mode"]["direct_only_tool_namespaces"]
         .as_array_mut()
         .unwrap()
@@ -3919,6 +4019,16 @@ wire_api = "responses"
         PREVIOUS_SUBAGENT_GUIDANCE_V2,
     )
     .unwrap();
+    fs::write(
+        seeded_constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
+        PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5,
+    )
+    .unwrap();
+    fs::write(
+        seeded_constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
+        PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    )
+    .unwrap();
     let profile = direct_profile(RelayProtocol::Responses);
 
     let applied = apply_isolated_cc_switch_runtime_config(
@@ -4141,7 +4251,14 @@ wire_api = "responses"
             .join(CODEY_FASTCTX_INSTRUCTIONS_FILE)
             .exists()
     );
-    assert!(constraints_dir.join(CODEY_COLLABORATION_HINT_FILE).exists());
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE)).unwrap(),
+        CODEY_FASTCTX_GUIDANCE
+    );
+    assert_eq!(
+        fs::read_to_string(constraints_dir.join(CODEY_COLLABORATION_HINT_FILE)).unwrap(),
+        ROOT_AGENT_COLLABORATION_USAGE_HINT
+    );
     assert!(constraints_dir.join(CODEY_SUBAGENT_SOURCE_FILE).exists());
     assert!(
         constraints_dir

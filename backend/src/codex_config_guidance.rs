@@ -724,6 +724,7 @@ pub(crate) fn codey_fastctx_guidance_for_namespace(namespace: &str) -> String {
     CODEY_FASTCTX_GUIDANCE.replace(DEFAULT_FASTCTX_TOOL_NAMESPACE, namespace)
 }
 
+#[cfg(test)]
 pub(crate) fn default_agent_config_with_fastctx_guidance(namespace: Option<&str>) -> String {
     let Some(namespace) = namespace else {
         return DEFAULT_AGENT_CONFIG.to_string();
@@ -792,6 +793,7 @@ fn dynamic_codey_fastctx_guidance_at(
     current[start..].starts_with(&guidance).then_some(guidance)
 }
 
+#[cfg(test)]
 pub(crate) fn append_subagent_guidance(existing: &str) -> String {
     let current_is_present = existing.contains(SUBAGENT_GUIDANCE);
     let mut updated = existing.to_string();
