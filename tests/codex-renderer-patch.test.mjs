@@ -320,6 +320,29 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "native-compatible model access and current Fast controls must not log skips",
     );
 
+    const hookStatsSource = [
+      "const hookLabel=`assistantMessage.hookStats.label`;",
+      "const hookTitle=`assistantMessage.hookStats.title`;",
+      "function renderHookStats(r,l,d){",
+      "return (0,R.jsx)(r,{tooltipContent:l,tooltipClassName:`px-3 py-2`,",
+      "tooltipMaxWidth:`min(32rem, var(--radix-tooltip-content-available-width), calc(100vw - 16px))`,",
+      "children:d})}",
+    ].join("");
+    electron.protocol.handle("app", async () => new Response(hookStatsSource));
+    const hookStatsResponse = await installedHandler({
+      url: "app://-/assets/subagent-activity-chip-group-current-build.js",
+    });
+    const patchedHookStatsSource = await hookStatsResponse.text();
+    assert.match(
+      patchedHookStatsSource,
+      /\{interactive:!0,tooltipContent:l,tooltipClassName:`px-3 py-2`/,
+    );
+    assert.equal(
+      patchErrors.length,
+      2,
+      "the compatible hook tooltip patch must not log a skipped renderer gate",
+    );
+
     const petSettingsSource = [
       "import{AvatarPreview as P,builtInPets as L}",
       "from\"./codex-avatar-BpKnWN_W.js\";",

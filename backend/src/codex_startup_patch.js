@@ -771,6 +771,22 @@
       );
     }
     if (
+      source.includes("assistantMessage.hookStats.label")
+      && source.includes("assistantMessage.hookStats.title")
+      && source.includes("tooltipMaxWidth:")
+    ) {
+      // Hook details can exceed the collision-limited tooltip height. Opt this
+      // one rich tooltip into Codex's native hover handoff so the pointer can
+      // enter its scrollable content without closing it on trigger leave.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(\{\s*)(tooltipContent\s*:\s*[$A-Z_a-z][$\w]*\s*,\s*tooltipClassName\s*:\s*`px-3 py-2`\s*,\s*tooltipMaxWidth\s*:\s*`min\(32rem,\s*var\(--radix-tooltip-content-available-width\),\s*calc\(100vw - 16px\)\)`)/g,
+        (_match, objectStart, tooltipProps) =>
+          `${objectStart}interactive:!0,${tooltipProps}`,
+        "hook details interactivity",
+      );
+    }
+    if (
       source.includes("useHiddenModels:") &&
       source.includes("availableModels:") &&
       source.includes("includeUltraReasoningEffort") &&
@@ -1081,7 +1097,7 @@
         url.protocol === "app:" &&
         url.pathname.includes("/assets/") &&
         (
-          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request)(?:[~-][^/]*)?)\.js$/i.test(
+          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.js$/i.test(
             url.pathname,
           )
           || (
