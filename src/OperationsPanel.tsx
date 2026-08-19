@@ -21,7 +21,7 @@ import {
   IconBolt as Zap,
 } from "@tabler/icons-react";
 
-import type { Config, PluginMarketplaceStatus, RuntimeStatus } from "./App.types";
+import type { PluginMarketplaceStatus, RuntimeStatus } from "./App.types";
 import { Badge, Button, Card, Tooltip } from "./components/semi";
 
 const Cpu = IconCpu;
@@ -45,7 +45,9 @@ type OperationsRuntimeStatus = Pick<
 >;
 
 type OperationsPanelProps = {
-  config: Config;
+  codexAppPath: string;
+  fastContextTools: boolean;
+  slimCodexPet: boolean;
   status: OperationsRuntimeStatus;
   busy: string | null;
   isBusy: boolean;
@@ -56,7 +58,9 @@ type OperationsPanelProps = {
 };
 
 function OperationsPanelComponent({
-  config,
+  codexAppPath,
+  fastContextTools,
+  slimCodexPet,
   status,
   busy,
   isBusy,
@@ -213,18 +217,18 @@ function OperationsPanelComponent({
       {
         id: "opt-fastctx",
         icon: Zap,
-        tooltip: config.fastContextTools
+        tooltip: fastContextTools
           ? "FastCtx 上下文加速：已按当前配置启用"
           : "FastCtx 上下文加速：未启用",
-        tone: config.fastContextTools ? "success" : "info",
+        tone: fastContextTools ? "success" : "info",
       },
       {
         id: "opt-slim",
         icon: IconAdjustmentsHorizontal,
-        tooltip: config.slimCodexPet
+        tooltip: slimCodexPet
           ? "客户端精简：已开启宠物精简"
           : "客户端精简：保留完整宠物功能",
-        tone: config.slimCodexPet ? "success" : "info",
+        tone: slimCodexPet ? "success" : "info",
       },
       {
         id: "opt-patch",
@@ -260,8 +264,8 @@ function OperationsPanelComponent({
       },
     ],
     [
-      config.fastContextTools,
-      config.slimCodexPet,
+      fastContextTools,
+      slimCodexPet,
       effectiveScriptCount,
       failedInjectionScriptCount,
       injectionError,
@@ -439,7 +443,7 @@ function OperationsPanelComponent({
                 aria-label="Codex 应用路径"
               >
                 <FolderOpen size={14} aria-hidden="true" />
-                <code>{config.codexAppPath || resolvedCodexPath}</code>
+                <code>{codexAppPath || resolvedCodexPath}</code>
               </div>
             </div>
           </div>

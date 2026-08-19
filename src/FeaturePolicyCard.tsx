@@ -1,4 +1,4 @@
-import { memo, type CSSProperties } from "react";
+import { memo, useMemo, type CSSProperties } from "react";
 import { IconAdjustmentsHorizontal, IconInfoCircle, IconUsersGroup } from "@tabler/icons-react";
 
 import type {
@@ -78,10 +78,14 @@ export function SubagentPolicyCardComponent({
   onSubagentOptimizationChange,
 }: SubagentPolicyCardProps) {
   const subagentPolicyControlsDisabled = isBusy;
-  const subagentModelSelectOptions = subagentModelOptions.map((option) => ({
-    label: option.label,
-    value: option.value,
-  }));
+  const subagentModelSelectOptions = useMemo(
+    () =>
+      subagentModelOptions.map((option) => ({
+        label: option.label,
+        value: option.value,
+      })),
+    [subagentModelOptions],
+  );
 
   return (
     <section className="secondary-section subagent-section" aria-labelledby="subagent-title">
@@ -273,8 +277,6 @@ type FeaturePolicyCardProps = {
   tooltipContainer: HTMLElement | null;
   isBusy: boolean;
   onConfigChange: (config: Config) => void;
-  subagentModelOptions?: SubagentModelOption[];
-  onSubagentOptimizationChange?: (checked: boolean) => void;
 };
 
 function FeaturePolicyCardComponent({

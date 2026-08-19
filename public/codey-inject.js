@@ -71,7 +71,7 @@
   const deletedSidebarSessionIds = new Map();
   const pendingSidebarSessionDeleteIds = new Set();
   const hardDeletedMessageKeys = new Set();
-  const messageSelectButtons = typeof WeakMap === "function" ? new WeakMap() : null;
+  const messageSelectButtons = new WeakMap();
   const conversationTurnSelector = [
     "[data-turn-key]",
     "[data-message-author-role]",
@@ -1678,10 +1678,6 @@
     scheduleThreadUpdatedAtFetch();
   };
 
-  const refreshThreadUpdatedTimes = (forceRefresh = false) => {
-    refreshTrackedThreadUpdatedTimes(forceRefresh);
-  };
-
   const codexAppAssetUrls = () => [...new Set([
     ...Array.from(document.scripts || []).map((script) => script.src),
     ...Array.from(document.querySelectorAll("link[href]") || []).map((link) => link.href),
@@ -2466,14 +2462,14 @@
       // The select button is appended last, so querySelector walks nearly the
       // whole turn subtree. Remember it per row and only fall back to the walk
       // when the cached button is gone or React re-parented it.
-      const cachedButton = messageSelectButtons?.get(row);
+      const cachedButton = messageSelectButtons.get(row);
       const existingButton = cachedButton
         && cachedButton.isConnected !== false
         && cachedButton.parentElement === row
         ? cachedButton
         : row.querySelector("[data-codey-message-select]");
       if (existingButton) {
-        messageSelectButtons?.set(row, existingButton);
+        messageSelectButtons.set(row, existingButton);
         return;
       }
       row.dataset.codeyMessageId = messageId;
@@ -2493,7 +2489,7 @@
       // Codex 自己定位过的行不受影响；避免在安装循环里读取布局。
       row.dataset.codeyMessageRow = "true";
       row.appendChild(button);
-      messageSelectButtons?.set(row, button);
+      messageSelectButtons.set(row, button);
       installed = true;
     });
     if (installed) {
@@ -2764,7 +2760,7 @@
     const now = Date.now();
     if (now - lastForcedThreadTimeRefresh < forcedThreadTimeRefreshIntervalMs) return;
     lastForcedThreadTimeRefresh = now;
-    refreshThreadUpdatedTimes(true);
+    refreshTrackedThreadUpdatedTimes(true);
   };
   if (typeof document.addEventListener === "function") {
     document.addEventListener("visibilitychange", wakeSessionWatcher);
@@ -2783,7 +2779,7 @@
   if (typeof window.setInterval === "function") {
     window.setInterval(() => {
       if (document.visibilityState === "hidden") return;
-      refreshThreadUpdatedTimes(false);
+      refreshTrackedThreadUpdatedTimes(false);
     }, threadTimestampRefreshIntervalMs);
   }
   window.__codeyRendererInjectLoaded = true;

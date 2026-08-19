@@ -62,8 +62,7 @@ pub struct AccountUsageCache {
     snapshot: Option<AccountUsageSnapshot>,
     expires_at: Option<Instant>,
     consecutive_failures: u32,
-    retry_at: Option<Instant>,
-    last_error: Option<String>,
+    retry: Option<(Instant, String)>,
 }
 
 impl AccountUsageCache {
@@ -99,10 +98,10 @@ impl AccountUsageCache {
         if self.expires_at.is_some_and(|expires_at| now < expires_at) {
             return self.snapshot.clone().map(Ok);
         }
-        if self.retry_at.is_some_and(|retry_at| now < retry_at) {
-            return Some(Err(self.last_error.clone().unwrap_or_else(|| {
-                "官方额度暂时无法更新，稍后自动重试".to_string()
-            })));
+        if let Some((retry_at, error)) = &self.retry
+            && now < *retry_at
+        {
+            return Some(Err(error.clone()));
         }
         None
     }
@@ -111,14 +110,15 @@ impl AccountUsageCache {
         self.snapshot = Some(snapshot);
         self.expires_at = Some(now + ACCOUNT_USAGE_CACHE_TTL);
         self.consecutive_failures = 0;
-        self.retry_at = None;
-        self.last_error = None;
+        self.retry = None;
     }
 
     fn record_failure(&mut self, error: String, now: Instant) {
         self.consecutive_failures = self.consecutive_failures.saturating_add(1);
-        self.retry_at = Some(now + account_usage_failure_backoff(self.consecutive_failures));
-        self.last_error = Some(error);
+        self.retry = Some((
+            now + account_usage_failure_backoff(self.consecutive_failures),
+            error,
+        ));
     }
 }
 
@@ -411,7 +411,7 @@ mod tests {
         for expected_seconds in [60, 120, 240, 300, 300] {
             cache.record_failure("offline".to_string(), attempt_at);
             assert_eq!(
-                cache.retry_at.unwrap().duration_since(attempt_at),
+                cache.retry.as_ref().unwrap().0.duration_since(attempt_at),
                 Duration::from_secs(expected_seconds)
             );
             assert_eq!(
@@ -426,8 +426,7 @@ mod tests {
 
         cache.record_success(sample_snapshot(), attempt_at);
         assert_eq!(cache.consecutive_failures, 0);
-        assert!(cache.retry_at.is_none());
-        assert!(cache.last_error.is_none());
+        assert!(cache.retry.is_none());
     }
 
     #[test]

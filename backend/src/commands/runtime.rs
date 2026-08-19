@@ -123,7 +123,7 @@ pub(super) async fn runtime_status_with_options(
     {
         object.insert(
             "availableUpdate".into(),
-            serde_json::to_value(update).unwrap_or(Value::Null),
+            serde_json::to_value(update).expect("update metadata must be JSON-serializable"),
         );
     }
     if let Some(runtime) = runtime.as_ref()
@@ -135,7 +135,8 @@ pub(super) async fn runtime_status_with_options(
         );
         object.insert(
             "maintenance".into(),
-            serde_json::to_value(&runtime.maintenance).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(&runtime.maintenance)
+                .expect("maintenance status must be JSON-serializable"),
         );
         let injection_statuses = if refresh_injection_status {
             runtime.refresh_injection_statuses().await
@@ -145,17 +146,20 @@ pub(super) async fn runtime_status_with_options(
         let injection_statuses = runtime.injection_statuses_for_display(injection_statuses);
         object.insert(
             "injectionScripts".into(),
-            serde_json::to_value(injection_statuses.as_ref()).unwrap_or_else(|_| json!([])),
+            serde_json::to_value(injection_statuses.as_ref())
+                .expect("injection statuses must be JSON-serializable"),
         );
     }
     if let Some(object) = status.as_object_mut() {
         object.insert(
             "traceLogStats".into(),
-            serde_json::to_value(&state.trace_log_stats).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(&state.trace_log_stats)
+                .expect("trace log stats must be JSON-serializable"),
         );
         object.insert(
             "crashpadPendingStats".into(),
-            serde_json::to_value(&state.crashpad_pending_stats).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(&state.crashpad_pending_stats)
+                .expect("Crashpad stats must be JSON-serializable"),
         );
     }
     Ok(status)

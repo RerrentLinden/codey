@@ -307,8 +307,7 @@ input:focus-visible,
   animation: update-pill-pulse 2.4s infinite ease-in-out;
 }
 
-.header-update-pill.has-update:hover:not(:disabled),
-.header-update-pill.has-update:hover {
+.header-update-pill.has-update:hover:not(:disabled) {
   background: var(--mac-blue);
   border-color: var(--mac-blue);
   color: #ffffff;

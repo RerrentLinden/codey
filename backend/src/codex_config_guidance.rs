@@ -330,6 +330,52 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 - 同一批独立任务先全部派发，再进入等待；有活动子代理时只使用 `agents.*` 协调，直至每个代理进入终态。
 - 每个子代理只用一轮，不复用、不追派，也不得继续派生。失败后默认由主代理接管；只有缩小或改变范围后仍值得独立委派，才允许使用新任务 ID 最多重派一次。
+- `MESSAGE` 或不完整结果只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`running`、`pending_init` 和 `interrupted` 不是终态。
+- `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态则只中断一次并继续等待。禁止无限 wait、无限重试或静默重派。
+- 用户新输入使旧批次失效时，先中断活动代理并完成对账，忽略迟到结果。预算账本和未清偿验收债按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
+"#;
+
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V8: &str = r#"## 子代理使用
+
+子代理用于隔离较宽的上下文、并行处理真正独立的工作，或取得有价值的独立证据。默认由主代理直接处理短而明确的工作；当只读检索可以减少主线程上下文、或并行收益清晰时，应主动考虑子代理，不要为了形式分工而派生。
+
+### 自适应委派
+
+以下任务直接处理，不派子代理：
+
+- 回答、解释、状态汇报、单一事实或一次精确查询；
+- 用户已经给出文件、符号或确切代码位置，预计只涉及不超过 2 个小文件和 3 次本地工具调用；
+- 即将修改的确切代码、奠基性文档，以及步骤彼此依赖、无法真正并行的任务；
+- 派发、等待和抽查成本不明显低于直接处理的任务。
+
+任务命中以下形状时应积极考虑委派：`multi_lookup` 表示至少 2 次彼此独立的定位或事实检索，优先使用快速只读角色；`parallel` 表示至少 2 个互不依赖的分支、每支预计至少 2 次实质调用且合计至少 5 次；`breadth` 表示需要归纳至少 2 个目录或 4 个候选文件；`context` 表示大量日志、文档或页面会明显污染主线程；`independent_work` 表示不在主代理关键路径上的独立写入实现预计至少 6 次调用；`high_risk` 表示高风险结论缺少确定性检查；`user_requested` 仅在用户明确要求子代理或大规模并行时使用。
+
+这些数量只是软路由参考，不是运行时硬门槛。有明确的上下文隔离价值或并行收益时，略低于参考值也可以委派；收益不清晰时直接处理。只读探索应比写入实现更积极，写入型子代理仍保持较高门槛。默认最多派生 2 个子代理；超过 2 个还必须有 3 个以上真正独立的分支，或用户明确要求大规模并行。不要用 verifier 重复已有确定性测试。
+
+每轮采用可恢复成本点预算：快速定位和 `default` 为 1 点，深度/视觉分析为 2 点，写入角色为 3 点；普通上限 8 点。只有 `why: "parallel"` 且提供真实的 `branch_calls` 时，才按独立分支数自适应提高预算，最高 12 点；`user_requested` 只表达用户确实要求委派，不会自行放大预算。该账本衡量派生尝试、角色成本和时限，不冒充上游未提供的精确 token 或费用。
+
+### 任务类型与运行时契约
+
+派生时按任务性质显式选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 只作为旧配置兼容兜底，主代理不得主动选择。只读角色不能声明写入；视觉角色必须声明视觉需求；写入角色必须给出互斥的路径 ownership 和机械验收命令。角色沙箱只是默认工作方式，实际权限仍受父任务约束。
+
+每个 `agents.spawn_agent` 必须使用 `fork_turns="none"`，`task_name` 使用小写字母、数字或下划线，并把一行紧凑 JSON 作为 message 的最后一个非空行：
+
+`CODEY_DELEGATION_V2={"id":"task_name","why":"breadth","visual":false,"read":[],"write":[],"checks":[]}`
+
+`id` 必须等于 `task_name`。只有 `why: "parallel"` 时才填写 `branch_calls`，用数组记录各独立分支预计的实质调用数，例如 `"branch_calls":[3,3]`；其他路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径。只声明本任务确实会使用的稳定路径；读取可以留空，写入角色的 `write` 不得为空。写入角色还必须提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。运行时会校验理由与角色兼容性、角色能力、预算以及 read/write 父子路径冲突；重复任务 ID、越权写入和重叠 ownership 仍会被拒绝。
+
+### 任务胶囊与验收
+
+- 派发消息只携带完成子任务必需的目标、范围、允许操作、ownership 和输出契约，不复制整段对话。
+- 子代理首行必须是 `status: completed | partial | blocked`，只返回会影响决策的结论、最多 5 条关键证据和明确 gaps；关键证据包含 `file:line`、符号名或可复核链接。
+- 子代理结果只是压缩线索。主代理沿出处抽查；即将修改的确切代码和奠基性文档仍由主代理完整读取。
+- 写入型子代理的自报测试结果不算机械验收。所有子代理进入终态后，主代理必须按 Stop 门禁给出的 `# codey-accept:<task>:<check>` 标记逐字重跑契约命令；只有可信的退出状态 `0` 才清偿验收债。失败后修复并重跑，不能改写命令绕过。连续 3 次失败、连续 3 次 Stop 没有新证据，或持续 10 分钟无法验证时，门禁会把该项标记为“未验证”并在一次明确提示后释放；主代理必须向用户报告失败事实，不得声称验收通过。视觉质量仍需主代理查看实际渲染证据。
+- 多代理证据冲突时比较出处，不按多数票决定；只有高风险且无法确定性验证时才追加独立核验线。
+
+### 汇合、异常与接管
+
+- 同一批独立任务先全部派发，再进入等待；有活动子代理时只使用 `agents.*` 协调，直至每个代理进入终态。
+- 每个子代理只用一轮，不复用、不追派，也不得继续派生。失败后默认由主代理接管；只有缩小或改变范围后仍值得独立委派，才允许使用新任务 ID 最多重派一次。
 - `MESSAGE` 或不完整结果只保存证据并继续等待。`completed`、`errored`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`running`、`pending_init` 和 `interrupted` 不是终态。
 - `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态则只中断一次并继续等待。禁止无限 wait、无限重试或静默重派。
 - 用户新输入使旧批次失效时，先中断活动代理并完成对账，忽略迟到结果。预算账本和未清偿验收债按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
@@ -337,6 +383,7 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     SUBAGENT_GUIDANCE,
+    PREVIOUS_SUBAGENT_GUIDANCE_V8,
     PREVIOUS_SUBAGENT_GUIDANCE_V7,
     PREVIOUS_SUBAGENT_GUIDANCE_V6,
     PREVIOUS_SUBAGENT_GUIDANCE_V5,
@@ -372,6 +419,22 @@ denies non-collaboration local tools and prevents the root turn from finishing. 
 world is a separate route and does not contain collaboration tools.";
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
+commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
+agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
+non-collaboration work. Use `timeout_ms <= 120000`; a mailbox update is not completion. If a `MESSAGE` \
+or another partial update needs action, use only the relevant `agents.send_message`, \
+`agents.followup_task`, `agents.interrupt_agent`, or `agents.list_agents` tool, then return to \
+`agents.wait_agent`. Treat `FINAL_ANSWER`, `task_complete`, `completed`, `errored`, `error`, `failed`, \
+`shutdown`, and `not_found` as terminal; `pending_init`, `running`, and `interrupted` remain \
+nonterminal. If a wait result \
+lacks per-agent terminal details, call unfiltered `agents.list_agents` to reconcile the full batch. If a \
+collaboration tool is unavailable, do not loop on an unregistered tool; Codey's runtime gate has bounded \
+stale-state recovery. Continue until every spawned agent is terminal. While spawned subagents are active, \
+Codey's runtime gate denies non-collaboration local tools and prevents the root turn from finishing. The \
+`functions.exec` tool world is a separate route and does not contain collaboration tools.";
+
+pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
 commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
 agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
@@ -414,6 +477,7 @@ route and does not contain collaboration tools.";
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V5,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V4,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V3,
@@ -1010,6 +1074,8 @@ mod tests {
         assert!(combined.contains("`FINAL_ANSWER`"));
         assert!(combined.contains("`task_complete`"));
         assert!(combined.contains("`errored`"));
+        assert!(combined.contains("`error`"));
+        assert!(combined.contains("`failed`"));
         assert!(combined.contains("`shutdown`"));
         assert!(combined.contains("`not_found`"));
         assert!(combined.contains("unfiltered `agents.list_agents`"));
@@ -1032,6 +1098,7 @@ mod tests {
     #[test]
     fn root_agent_usage_hint_migrates_only_complete_owned_paragraphs() {
         for previous in [
+            PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V5,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V4,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V3,
@@ -1060,6 +1127,7 @@ mod tests {
     #[test]
     fn subagent_guidance_migrates_the_previous_owned_block() {
         for previous in [
+            PREVIOUS_SUBAGENT_GUIDANCE_V8,
             PREVIOUS_SUBAGENT_GUIDANCE_V7,
             PREVIOUS_SUBAGENT_GUIDANCE_V6,
             PREVIOUS_SUBAGENT_GUIDANCE_V5,
@@ -1109,6 +1177,7 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("# codey-accept:<task>:<check>"));
         assert!(SUBAGENT_GUIDANCE.contains("可信的退出状态 `0`"));
         assert!(SUBAGENT_GUIDANCE.contains("连续 3 次失败"));
+        assert!(SUBAGENT_GUIDANCE.contains("`completed`、`errored`、`error`、`failed`"));
     }
 
     #[test]

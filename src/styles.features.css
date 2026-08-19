@@ -168,10 +168,6 @@
   margin-top: 0;
 }
 
-.subagent-policy-card {
-  grid-column: 1 / -1;
-}
-
 .subagent-policy-columns,
 .subagent-policy-row {
   display: grid;

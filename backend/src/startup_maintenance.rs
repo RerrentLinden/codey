@@ -106,24 +106,15 @@ pub fn cached_provider_sync_result(target_provider: &str) -> ProviderSyncResult 
 }
 
 fn marker_path() -> PathBuf {
-    default_config_path()
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join(MARKER_FILE)
+    default_config_path().with_file_name(MARKER_FILE)
 }
 
 fn rollout_header_cache_path() -> PathBuf {
-    marker_path()
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join(ROLLOUT_HEADER_CACHE_FILE)
+    marker_path().with_file_name(ROLLOUT_HEADER_CACHE_FILE)
 }
 
 fn rollout_header_cache_path_for_marker(marker: &Path) -> PathBuf {
-    marker
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join(ROLLOUT_HEADER_CACHE_FILE)
+    marker.with_file_name(ROLLOUT_HEADER_CACHE_FILE)
 }
 
 fn provider_sync_plan_at(

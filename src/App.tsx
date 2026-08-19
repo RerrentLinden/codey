@@ -916,7 +916,9 @@ export function App({
         <div className="page" id="codey-settings-content">
           {/* 最上方：运行状态 (Codex 运行与维护) */}
           <OperationsPanel
-            config={config}
+            codexAppPath={config.codexAppPath}
+            fastContextTools={config.fastContextTools}
+            slimCodexPet={config.slimCodexPet}
             status={operationsStatus}
             busy={busy}
             isBusy={isBusy}
@@ -927,7 +929,7 @@ export function App({
           />
 
           {/* 线路与模型：单独一行展示 */}
-          <div className="full-row-section model-full-section">
+          <div className="full-row-section">
             <ModelSection
               provider={provider}
               modelState={modelState}
@@ -978,7 +980,7 @@ export function App({
           </div>
 
           {/* Codex 功能策略：整行排列 */}
-          <div className="full-row-section feature-full-section">
+          <div className="full-row-section">
             <FeaturePolicyCard
               config={config}
               fastContextToolsStatus={fastContextToolsStatus}
@@ -992,7 +994,7 @@ export function App({
           </div>
 
           {/* 消息通知：整行排列，每个渠道 item 占一半 */}
-          <div className="full-row-section notification-full-section">
+          <div className="full-row-section">
             <NotificationChannelsCard
               config={config}
               container={portalContainer}
@@ -1005,7 +1007,7 @@ export function App({
           </div>
 
           {/* 诊断存储保护：整行独占排布 */}
-          <div className="full-row-section trace-full-section">
+          <div className="full-row-section">
             <TraceLogModule
               stats={status.traceLogStats}
               crashpadStats={status.crashpadPendingStats}
@@ -1024,7 +1026,7 @@ export function App({
       </div>
 
       <NoticeToast
-        autoDismissEnabled={Boolean(config && provider)}
+        autoDismissEnabled
         controller={noticeController}
       />
 

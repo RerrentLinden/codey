@@ -8,11 +8,19 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
+
 pub(crate) fn timestamp_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+/// 小写十六进制 SHA-256。此前 subagent_gate、subagent_orchestrator、
+/// session_index_cleanup 各有一份逐字节相同的实现。
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// 与目标同目录的一次性临时文件名。随机 UUID 保证同一进程、同一毫秒内的

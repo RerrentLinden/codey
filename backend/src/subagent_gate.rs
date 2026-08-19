@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -21,8 +21,10 @@ const ACTIVE_MARKER_SCHEMA_VERSION: u32 = 1;
 const LEGACY_RUNTIME_ID: &str = "legacy-runtime";
 const PENDING_INIT_GRACE_MILLIS: u64 = 10 * 60 * 1000;
 const STOP_STALL_GRACE_MILLIS: u64 = 10 * 60 * 1000;
+const STOP_ABSOLUTE_GRACE_MILLIS: u64 = 60 * 60 * 1000;
 const PENDING_INIT_OBSERVED_FILE: &str = "pending-init-observed.state";
 const STOP_BLOCKED_SINCE_FILE: &str = "stop-blocked-since.state";
+const STOP_ABSOLUTE_SINCE_FILE: &str = "stop-absolute-since.state";
 const STATE_ERROR_SINCE_FILE: &str = "state-error-since.state";
 const PROTOCOL_HEALTH_FILE: &str = "protocol-health.json";
 const PROTOCOL_HEALTH_SCHEMA_VERSION: u32 = 1;
@@ -76,6 +78,8 @@ struct ProtocolHealth {
     missing_agent_id_events: u16,
     #[serde(default)]
     unknown_status_responses: u16,
+    #[serde(default)]
+    absolute_stop_timeouts: u16,
     last_issue: String,
 }
 
@@ -83,6 +87,7 @@ struct ProtocolHealth {
 enum ProtocolIssueKind {
     MissingAgentId,
     UnknownStatusResponse,
+    AbsoluteStopTimeout,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,11 +113,13 @@ pub fn run_hook_if_requested() -> Result<bool> {
         .take(MAX_HOOK_INPUT_BYTES + 1)
         .read_to_end(&mut raw)
         .context("读取 Codex 子代理门禁 Hook 输入失败")?;
-    if raw.len() as u64 > MAX_HOOK_INPUT_BYTES {
-        bail!("Codex 子代理门禁 Hook 输入超过 1 MiB 上限");
-    }
-    let input: HookInput =
-        serde_json::from_slice(&raw).context("解析 Codex 子代理门禁 Hook 输入失败")?;
+    let input = match parse_hook_input(&raw) {
+        Ok(input) => input,
+        Err(output) => {
+            write_hook_output(&output)?;
+            return Ok(true);
+        }
+    };
     let state_root = crate::codex_config::codex_home().join(STATE_DIRECTORY);
     let runtime_id = current_runtime_id();
     let output = match mode {
@@ -127,6 +134,33 @@ pub fn run_hook_if_requested() -> Result<bool> {
     });
     write_hook_output(&output)?;
     Ok(true)
+}
+
+fn parse_hook_input(raw: &[u8]) -> std::result::Result<HookInput, Value> {
+    if raw.len() as u64 > MAX_HOOK_INPUT_BYTES {
+        return Err(undetermined_event_denial(
+            "Hook 输入超过 1 MiB 上限，无法确认子代理状态；请缩小单次工具输入",
+        ));
+    }
+    serde_json::from_slice(raw).map_err(|error| {
+        undetermined_event_denial(&format!(
+            "Hook 输入 JSON 解析失败（{error}），无法确认子代理状态"
+        ))
+    })
+}
+
+// 输入本身不可用时事件名未知，两种 Hook 输出形状都带上，确保 Codex 按拒绝处理。
+fn undetermined_event_denial(detail: &str) -> Value {
+    let reason = format!("Codey 子代理门禁 fail-closed：{detail}，已拒绝本次操作。");
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason.clone(),
+        },
+        "decision": "block",
+        "reason": reason,
+    })
 }
 
 fn runtime_gate_is_active(value: Option<&OsStr>) -> bool {
@@ -189,7 +223,8 @@ pub(crate) fn hook_trust_hash(
         identity.insert("matcher".to_string(), Value::String(matcher.to_string()));
     }
     let canonical = canonical_json(&Value::Object(identity));
-    let serialized = serde_json::to_vec(&canonical).unwrap_or_default();
+    let serialized =
+        serde_json::to_vec(&canonical).expect("canonical JSON values must be serializable");
     let digest = Sha256::digest(serialized);
     format!("sha256:{digest:x}")
 }
@@ -289,7 +324,7 @@ fn handle_hook_for_runtime_at(
             Ok(json!({}))
         }
         "SessionEnd" => {
-            crate::subagent_orchestrator::end_session(state_root, &input.session_id)?;
+            crate::subagent_orchestrator::end_session(state_root, runtime_id, &input.session_id)?;
             remove_session_state(state_root, runtime_id, &input.session_id)?;
             Ok(json!({}))
         }
@@ -540,6 +575,8 @@ fn stop_output(
     if active == 0 {
         return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
     }
+    // 先检查可重置的停滞窗口，确保绝对放行后如果协作路径不再推进，遗留
+    // 活跃标记仍能在后续 10 分钟内回收，而不会被已到期的绝对计时永久短路。
     if observation_elapsed_if_present(
         state_root,
         runtime_id,
@@ -556,6 +593,26 @@ fn stop_output(
         STOP_STALL_GRACE_MILLIS,
     )? {
         remove_session_state(state_root, runtime_id, &input.session_id)?;
+        return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
+    }
+    // 绝对上限自首次受阻起算，不被有效 wait/list 响应重置；放行时不清理账本，
+    // 遗留状态仍由上面的 10 分钟停滞窗口与代次机制兜底。
+    if observe_and_check_elapsed(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        STOP_ABSOLUTE_SINCE_FILE,
+        now_ms,
+        STOP_ABSOLUTE_GRACE_MILLIS,
+    )? {
+        record_protocol_issue(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            ProtocolIssueKind::AbsoluteStopTimeout,
+            "根代理 Stop 受阻累计超过 60 分钟，已按绝对上限放行",
+            now_ms,
+        )?;
         return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
     }
     let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
@@ -624,6 +681,23 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
                 "permissionDecisionReason": reason,
+            }
+        }),
+        "PreToolUse"
+            if input
+                .tool_name
+                .as_deref()
+                .is_some_and(crate::subagent_orchestrator::known_read_only_tool) =>
+        {
+            json!({})
+        }
+        "PreToolUse" => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": format!(
+                    "Codey 无法读取子代理 ownership 账本：{error:#}。已按 fail-closed 暂停子代理的写入与命令工具；只读工具不受影响。请停止写入，并把已完成证据返回主代理。"
+                ),
             }
         }),
         "PostToolUse"
@@ -734,8 +808,9 @@ fn stop_continuation(active: usize, protocol_issue: Option<&str>) -> Value {
 fn render_tool_result(tool_response: Option<&Value>, tool_name: &str) -> String {
     let rendered = match tool_response {
         Some(Value::String(response)) => response.clone(),
-        Some(response) => serde_json::to_string(response)
-            .unwrap_or_else(|_| format!("（{tool_name} 返回内容无法序列化）")),
+        Some(response) => {
+            serde_json::to_string(response).expect("serde_json::Value must always be serializable")
+        }
         None => format!("（{tool_name} 未提供返回内容）"),
     };
     let Some((cut_at, _)) = rendered.char_indices().nth(MAX_RENDERED_TOOL_RESULT_CHARS) else {
@@ -1183,12 +1258,9 @@ fn normalized_collaboration_tool(tool_name: &str) -> String {
         return "wait_agent".to_string();
     }
     let leaf = normalized
-        .rsplit(['.', '/', ':'])
-        .next()
-        .unwrap_or(normalized.as_str())
-        .rsplit("__")
-        .next()
-        .unwrap_or(normalized.as_str());
+        .rsplit_once(['.', '/', ':'])
+        .map_or(normalized.as_str(), |(_, leaf)| leaf);
+    let leaf = leaf.rsplit_once("__").map_or(leaf, |(_, leaf)| leaf);
     let flattened_leaf = normalized
         .strip_prefix("agents")
         .map(|name| name.trim_start_matches(['.', '/', ':', '_']))
@@ -1287,6 +1359,7 @@ fn record_protocol_issue(
         last_issue_at_ms: now_ms,
         missing_agent_id_events: 0,
         unknown_status_responses: 0,
+        absolute_stop_timeouts: 0,
         last_issue: detail.to_string(),
     });
     validate_protocol_health(&health, runtime_id)?;
@@ -1296,6 +1369,9 @@ fn record_protocol_issue(
         }
         ProtocolIssueKind::UnknownStatusResponse => {
             health.unknown_status_responses = health.unknown_status_responses.saturating_add(1);
+        }
+        ProtocolIssueKind::AbsoluteStopTimeout => {
+            health.absolute_stop_timeouts = health.absolute_stop_timeouts.saturating_add(1);
         }
     }
     health.last_issue_at_ms = now_ms;
@@ -1320,7 +1396,7 @@ fn clear_unknown_status_protocol_issue(
     }
     health.unknown_status_responses = 0;
     health.last_issue_at_ms = now_ms;
-    if health.missing_agent_id_events == 0 {
+    if health.missing_agent_id_events == 0 && health.absolute_stop_timeouts == 0 {
         return remove_session_auxiliary_file(
             state_root,
             runtime_id,
@@ -1328,7 +1404,9 @@ fn clear_unknown_status_protocol_issue(
             PROTOCOL_HEALTH_FILE,
         );
     }
-    health.last_issue = "子代理事件曾缺少 agent_id".to_string();
+    if health.missing_agent_id_events > 0 {
+        health.last_issue = "子代理事件曾缺少 agent_id".to_string();
+    }
     write_protocol_health(&session_dir, &path, &health)
 }
 
@@ -1357,6 +1435,12 @@ fn protocol_issue_reason(
         issues.push(format!(
             "有 {} 个 wait/list 响应结构无法识别",
             health.unknown_status_responses
+        ));
+    }
+    if health.absolute_stop_timeouts > 0 {
+        issues.push(format!(
+            "有 {} 次根代理 Stop 按 60 分钟绝对上限放行",
+            health.absolute_stop_timeouts
         ));
     }
     if issues.is_empty() {
@@ -1594,7 +1678,7 @@ fn runtime_file_has_prefix(path: &Path, prefix: &str) -> bool {
 }
 
 fn hash_component(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    crate::fs_util::sha256_hex(value.as_bytes())
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -1697,6 +1781,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let mut spawn = input("PreToolUse", "contract-session");
+        spawn.cwd = Some("/repo".to_string());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
             "task_name": "worker_a",
@@ -2409,6 +2494,145 @@ mod tests {
             active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn stop_absolute_release_still_allows_later_stall_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "absolute-stop-session";
+        let mut start = input("SubagentStart", session_id);
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
+
+        let first_blocked =
+            handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 2_000)
+                .unwrap();
+        assert_eq!(first_blocked["decision"].as_str(), Some("block"));
+        let session_dir = session_state_dir(root, session_id);
+        let absolute = session_auxiliary_path(&session_dir, runtime_id, STOP_ABSOLUTE_SINCE_FILE);
+        assert_eq!(fs::read_to_string(&absolute).unwrap(), "2000\n");
+
+        // 结构有效的 wait 响应只重置 10 分钟停滞计时，绝对计时保持不变。
+        let mut wait = input("PostToolUse", session_id);
+        wait.tool_name = Some("agents.wait_agent".to_string());
+        wait.tool_response = Some(json!({ "timedout": true, "message": "still running" }));
+        handle_hook_for_runtime_at(&wait, root, runtime_id, 3_000).unwrap();
+        assert_eq!(fs::read_to_string(&absolute).unwrap(), "2000\n");
+
+        // 持续到绝对上限前仍有有效等待结果，避免 10 分钟停滞窗口提前回收。
+        let absolute_deadline = 2_000 + STOP_ABSOLUTE_GRACE_MILLIS;
+        handle_hook_for_runtime_at(&wait, root, runtime_id, absolute_deadline - 1).unwrap();
+
+        let released = handle_hook_for_runtime_at(
+            &input("Stop", session_id),
+            root,
+            runtime_id,
+            absolute_deadline,
+        )
+        .unwrap();
+        assert_eq!(released, json!({}));
+        // 绝对放行不清理活跃标记，遗留状态仍由 10 分钟停滞与代次机制兜底。
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
+        );
+        let issue = protocol_issue_reason(root, runtime_id, session_id)
+            .unwrap()
+            .unwrap();
+        assert!(issue.contains("绝对上限"), "{issue}");
+
+        // 绝对放行后不再有有效 wait/list 推进时，新建立的停滞窗口必须仍可
+        // 到期并清理遗留标记；否则同一会话的后续工具会永久被门禁拒绝。
+        let recovered = handle_hook_for_runtime_at(
+            &input("Stop", session_id),
+            root,
+            runtime_id,
+            absolute_deadline + STOP_STALL_GRACE_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(recovered, json!({}));
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            0
+        );
+        assert!(!absolute.exists());
+    }
+
+    #[test]
+    fn fail_closed_denies_child_write_tools_but_allows_known_read_only_tools() {
+        let error = anyhow::anyhow!("账本损坏");
+
+        for tool in ["apply_patch", "mcp__codey_fastctx__replace", "Bash"] {
+            let mut child_write = input("PreToolUse", "session-a");
+            child_write.agent_id = Some("agent-a".to_string());
+            child_write.tool_name = Some(tool.to_string());
+            let denied = fail_closed_output(&child_write, &error);
+            assert_eq!(
+                denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+                Some("deny"),
+                "{tool}"
+            );
+        }
+
+        for tool in [
+            "read_file",
+            "mcp__codey_fastctx__inspect_local_file",
+            "agents.wait_agent",
+            "agents.list_agents",
+        ] {
+            let mut child_read = input("PreToolUse", "session-a");
+            child_read.agent_id = Some("agent-a".to_string());
+            child_read.tool_name = Some(tool.to_string());
+            assert_eq!(fail_closed_output(&child_read, &error), json!({}), "{tool}");
+        }
+
+        let mut root_bash = input("PreToolUse", "session-a");
+        root_bash.tool_name = Some("Bash".to_string());
+        assert_eq!(
+            fail_closed_output(&root_bash, &error)["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+    }
+
+    #[test]
+    fn unparsable_or_oversized_hook_input_is_denied_in_both_output_shapes() {
+        let oversized = vec![b' '; (MAX_HOOK_INPUT_BYTES + 1) as usize];
+        let denied = parse_hook_input(&oversized).unwrap_err();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert_eq!(denied["decision"].as_str(), Some("block"));
+        assert!(
+            denied["reason"]
+                .as_str()
+                .unwrap()
+                .contains("1 MiB")
+        );
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"].as_str(),
+            denied["reason"].as_str()
+        );
+
+        let denied = parse_hook_input(b"{not-json").unwrap_err();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert_eq!(denied["decision"].as_str(), Some("block"));
+        assert!(
+            denied["reason"]
+                .as_str()
+                .unwrap()
+                .contains("JSON 解析失败")
+        );
+
+        let parsed = parse_hook_input(br#"{"hookEventName":"Stop","sessionId":"s"}"#).unwrap();
+        assert_eq!(parsed.hook_event_name, "Stop");
+        assert_eq!(parsed.session_id, "s");
     }
 
     #[test]

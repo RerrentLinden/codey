@@ -79,8 +79,7 @@
   flex-wrap: wrap;
 }
 
-.codex-version-tag,
-.codey-version-tag {
+.codex-version-tag {
   display: inline-flex;
   align-items: center;
   max-width: 220px;
@@ -96,12 +95,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.codey-version-tag {
-  background: rgba(0, 122, 255, 0.08);
-  border-color: rgba(0, 122, 255, 0.15);
-  color: var(--mac-blue);
 }
 
 .operations-heading p {
@@ -590,28 +583,6 @@
   white-space: nowrap;
 }
 
-/* Dashboard Layout Grid */
-.settings-dashboard-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(360px, 0.95fr);
-  gap: 24px;
-  align-items: start;
-  margin-bottom: 24px;
-}
-
-.dashboard-main-column,
-.dashboard-side-column {
-  display: flex;
-  flex-direction: column;
-  gap: 24px;
-  min-width: 0;
-}
-
-.dashboard-card-section {
-  width: 100%;
-  min-width: 0;
-}
-
 /* Prompt Optimization + Subagent Policy Matrix Row: 各占一半 (50% / 50%) */
 .prompt-subagent-grid {
   display: grid;
@@ -622,51 +593,15 @@
 }
 
 .prompt-column,
-.subagent-column,
-.feature-column,
-.notification-column {
+.subagent-column {
   min-width: 0;
   display: flex;
   flex-direction: column;
 }
 
-/* Feature Policy (with full-width GPU mode) + Notification Channels Row: 各占一半 (50% / 50%) */
-.feature-notification-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 24px;
-  align-items: start;
-  margin-bottom: 24px;
-}
-
-/* Integrated Operations Update Widget */
-.operations-update-widget {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-}
-
-.operations-update-btn-wrap,
 .operations-status-chip-wrap {
   display: inline-flex;
   align-items: center;
-}
-
-.operations-update-btn {
-  white-space: nowrap;
-}
-
-.operations-update-btn.has-downloaded {
-  background: var(--mac-green) !important;
-  border-color: var(--mac-green) !important;
-  color: #ffffff !important;
-}
-
-.operations-update-btn.has-update {
-  background: var(--mac-blue) !important;
-  border-color: var(--mac-blue) !important;
-  color: #ffffff !important;
 }
 
 .full-row-section {

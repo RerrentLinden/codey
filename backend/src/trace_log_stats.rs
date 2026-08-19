@@ -122,7 +122,7 @@ pub fn snapshot(home: &Path) -> TraceLogStatsSnapshot {
                 "{}: {error:#}",
                 path.file_name()
                     .map(|name| name.to_string_lossy())
-                    .unwrap_or_default()
+                    .expect("discovered log database paths must include a file name")
             )),
         }
     }

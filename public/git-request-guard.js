@@ -67,6 +67,10 @@
   let bridgeRetryTimer = 0;
   let bridgeRetryDelay = 50;
   let bridgeRetryDeadline = Date.now() + 30_000;
+  // 慢速重试（30s 周期）封顶：桥长期缺席时不再无限期探测。
+  // requestInstall 会重置计数并重新打开 30s 快速窗口。
+  const MAX_SLOW_BRIDGE_RETRIES = 20;
+  let bridgeSlowRetries = 0;
   let mainProcessProtected = false;
   let mainProcessProbePending = null;
   let mainProcessProbeAttempts = 0;
@@ -75,7 +79,7 @@
   let mainProcessProbeTransport = "";
 
   const now = () => {
-    const value = Number(Date.now());
+    const value = Date.now();
     return Number.isFinite(value) ? value : 0;
   };
 
@@ -475,7 +479,7 @@
       `codey-git-guard-${Date.now()}-${mainProcessProbeAttempts}`;
     let responseListener = null;
     let responseTimer = 0;
-    let finishResponseWait = null;
+    let finishResponseWait;
     const responseWait = new Promise((resolve) => {
       let settled = false;
       finishResponseWait = (value) => {
@@ -543,7 +547,7 @@
         ).slice(0, 160);
       })
       .finally(() => {
-        finishResponseWait?.(null);
+        finishResponseWait(null);
         if (mainProcessProbePending === request) {
           mainProcessProbePending = null;
         }
@@ -566,6 +570,7 @@
     if (mainProcessProtected || bridgePatched) {
       if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
       bridgeRetryTimer = 0;
+      bridgeSlowRetries = 0;
       markEffective();
       return true;
     }
@@ -607,7 +612,12 @@
 
   const scheduleBridgeRetry = () => {
     if (bridgeRetryTimer || typeof window.setTimeout !== "function") return;
-    const delay = now() < bridgeRetryDeadline ? bridgeRetryDelay : 30_000;
+    const fastRetry = now() < bridgeRetryDeadline;
+    if (!fastRetry) {
+      if (bridgeSlowRetries >= MAX_SLOW_BRIDGE_RETRIES) return;
+      bridgeSlowRetries += 1;
+    }
+    const delay = fastRetry ? bridgeRetryDelay : 30_000;
     bridgeRetryTimer = window.setTimeout(retryInstall, delay);
   };
 
@@ -621,6 +631,7 @@
   const requestInstall = () => {
     bridgeRetryDeadline = now() + 30_000;
     bridgeRetryDelay = 50;
+    bridgeSlowRetries = 0;
     if (bridgeRetryTimer) window.clearTimeout(bridgeRetryTimer);
     bridgeRetryTimer = 0;
     return ensureInstalled();

@@ -38,10 +38,7 @@ struct LegacyThreadProvider {
 }
 
 fn legacy_marker_path() -> PathBuf {
-    default_config_path()
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join("session-provider-lease-v1.json")
+    default_config_path().with_file_name("session-provider-lease-v1.json")
 }
 
 /// Restores a provider lease left by an older Codey build before migration to

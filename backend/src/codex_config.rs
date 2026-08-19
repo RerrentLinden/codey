@@ -138,10 +138,7 @@ pub fn codex_home() -> &'static Path {
 }
 
 fn lease_marker_path() -> PathBuf {
-    default_config_path()
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join("codex-lease.json")
+    default_config_path().with_file_name("codex-lease.json")
 }
 
 struct RuntimeConfigLock {
@@ -150,7 +147,9 @@ struct RuntimeConfigLock {
 
 impl RuntimeConfigLock {
     fn acquire(marker: &Path) -> Result<Self> {
-        let parent = marker.parent().unwrap_or_else(|| Path::new(".codey"));
+        let parent = marker
+            .parent()
+            .expect("runtime config marker paths must include a file name");
         create_private_dir_all(parent)?;
         let lock_path = parent.join(CODEY_RUNTIME_CONFIG_LOCK_FILE);
         let mut options = OpenOptions::new();
@@ -256,10 +255,7 @@ pub(crate) fn apply_runtime_provider_config(
 ) -> Result<AppliedRuntimeProviderConfig> {
     let marker = lease_marker_path();
     let _runtime_config_lock = RuntimeConfigLock::acquire(&marker)?;
-    let backup_root = marker
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join("codex-backups");
+    let backup_root = marker.with_file_name("codex-backups");
     let fastctx_command = resolve_fastctx_command(options.fast_context_tools);
     let use_official_catalog = !options.preserve_provider_route && options.use_official_catalog;
     let default_model = (!options.preserve_provider_route)
@@ -302,10 +298,7 @@ pub(crate) fn apply_runtime_provider_config(
     )?;
     let config_contents =
         fs::read(backup_dir.join(APPLIED_CONFIG_FILE)).context("读取 Codey 已应用配置快照失败")?;
-    let constraints_dir = marker
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join(CODEY_CONSTRAINTS_DIR);
+    let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     let runtime_config_overrides = build_independent_prompt_runtime_overrides(
         &config_contents,
         &constraints_dir,
@@ -487,10 +480,7 @@ fn apply_isolated_cc_switch_runtime_config(
         .is_some_and(fastctx_table_server_is_codey_owned)
         .then_some(CODEY_FASTCTX_NAMESPACE);
 
-    let constraints_dir = marker
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join(CODEY_CONSTRAINTS_DIR);
+    let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     create_private_dir_all(&constraints_dir)?;
     let fastctx_instructions = if fastctx_namespace.is_some() {
         Some(read_or_create_constraint_file_with_exact_migration(
@@ -1210,10 +1200,7 @@ fn apply_runtime_provider_config_at_mode(
         .and_then(Item::as_table)
         .is_some_and(fastctx_table_server_is_codey_owned)
         .then_some(CODEY_FASTCTX_NAMESPACE);
-    let constraints_dir = marker
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join(CODEY_CONSTRAINTS_DIR);
+    let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     if fastctx_namespace.is_some() || subagent_optimization {
         create_private_dir_all(&constraints_dir)?;
     }
@@ -1388,17 +1375,14 @@ fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &Path) -> Res
         "当前 Codex 运行时未注册 Codey 子代理任务类型，需要重启 Codex"
     );
 
-    let constraints_dir = marker
-        .parent()
-        .unwrap_or_else(|| Path::new(".codey"))
-        .join(CODEY_CONSTRAINTS_DIR);
+    let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     create_private_dir_all(&constraints_dir)?;
     let runtime_roles = runtime_subagent_roles(
         Some(&config.subagent_roles),
         &config.subagent_model,
         &config.subagent_reasoning_effort,
     );
-    let fastctx_instructions = if config.fast_context_tools {
+    let fastctx_instructions = if state.fastctx_command.is_some() {
         Some(read_or_create_constraint_file(
             &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
             CODEY_FASTCTX_GUIDANCE,
@@ -1985,12 +1969,11 @@ fn enable_subagent_optimization(
     if !SUBAGENT_REASONING_EFFORTS.contains(&subagent_reasoning_effort.as_str()) {
         bail!("子代理思考深度无效：{subagent_reasoning_effort}");
     }
-    let inherited_developer_instructions = fastctx_namespace.map(|_| {
-        doc.get("developer_instructions")
-            .and_then(Item::as_str)
-            .unwrap_or_default()
-            .to_string()
-    });
+    let inherited_developer_instructions = doc
+        .get("developer_instructions")
+        .and_then(Item::as_str)
+        .unwrap_or_default()
+        .to_string();
     let agents = ensure_root_table(doc, "agents")?;
     let legacy_max_threads = agents.remove("max_threads");
     agents.remove("max_depth");
@@ -2049,7 +2032,7 @@ fn enable_subagent_optimization(
     if let Some(namespace) = fastctx_namespace {
         if multi_agent.get("subagent_developer_instructions").is_none() {
             multi_agent["subagent_developer_instructions"] =
-                value(inherited_developer_instructions.unwrap_or_default());
+                value(inherited_developer_instructions);
         }
         apply_fastctx_guidance_to_table(
             multi_agent,

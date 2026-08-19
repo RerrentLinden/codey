@@ -260,6 +260,203 @@ fn wait_for_child(child: &mut Child) -> std::process::ExitStatus {
     }
 }
 
+#[test]
+fn supervisor_forwards_large_worker_lines_without_losing_bytes() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, mut stdin, responses_rx) = spawn_supervisor_with_test_worker(&temp);
+    initialize_test_worker_session(&mut stdin, &responses_rx);
+
+    const RESPONSE_BYTES: usize = 256 * 1024;
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "test/large_response",
+            "params": {"bytes": RESPONSE_BYTES}
+        }),
+    );
+    // 大行写入期间并发 client 消息：select! 若直接对 worker 管道 read_until，
+    // 取消分支时会丢弃已读入的半行字节。
+    for _ in 0..5 {
+        send(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/cancelled",
+                "params": {"id": 2, "reason": "test"}
+            }),
+        );
+    }
+    let large = response_with_id(&responses_rx, 2);
+    let text = large["result"]["text"].as_str().unwrap();
+    assert!(text.bytes().all(|byte| byte == b'A'));
+    let prefix = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"text\":\"";
+    let suffix = "\"}}";
+    assert_eq!(
+        text.len(),
+        RESPONSE_BYTES - prefix.len() - suffix.len() - 1
+    );
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "test/large_response",
+            "params": {"bytes": 64}
+        }),
+    );
+    let small = response_with_id(&responses_rx, 3);
+    assert!(small.get("result").is_some(), "{small}");
+
+    drop(stdin);
+    let status = wait_for_child(&mut child);
+    assert!(status.success(), "supervisor failed with {status}");
+}
+
+#[test]
+fn supervisor_stops_recovering_after_repeated_worker_disconnects() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, mut stdin, responses_rx) = spawn_supervisor_with_test_worker(&temp);
+    initialize_test_worker_session(&mut stdin, &responses_rx);
+
+    // 前两次断开后恢复：在途请求获得可恢复错误，后续请求由新 worker 正常服务。
+    for (exit_id, probe_id) in [(10, 11), (20, 21)] {
+        send(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": exit_id,
+                "method": "test/exit",
+                "params": {"code": 75}
+            }),
+        );
+        let interrupted = response_with_id(&responses_rx, exit_id);
+        assert_eq!(interrupted["error"]["code"].as_i64(), Some(-32001), "{interrupted}");
+        assert_eq!(
+            interrupted["error"]["data"]["recoverable"].as_bool(),
+            Some(true),
+            "{interrupted}"
+        );
+
+        send(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": probe_id,
+                "method": "test/large_response",
+                "params": {"bytes": 64}
+            }),
+        );
+        let probe = response_with_id(&responses_rx, probe_id);
+        assert!(probe.get("result").is_some(), "{probe}");
+    }
+
+    // 窗口内第三次断开：错误仍返回给在途请求，但监督器不再拉起新 worker。
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 30,
+            "method": "test/exit",
+            "params": {"code": 75}
+        }),
+    );
+    let interrupted = response_with_id(&responses_rx, 30);
+    assert_eq!(interrupted["error"]["code"].as_i64(), Some(-32001), "{interrupted}");
+
+    let status = wait_for_child(&mut child);
+    assert!(
+        !status.success(),
+        "supervisor must bail after repeated recoveries"
+    );
+}
+
+fn spawn_supervisor_with_test_worker(
+    temp: &tempfile::TempDir,
+) -> (
+    Child,
+    std::process::ChildStdin,
+    mpsc::Receiver<std::io::Result<String>>,
+) {
+    let home = temp.path().join("home");
+    let workspace = temp.path().join("workspace");
+    let local = home.join("local-app-data");
+    let runtime = home.join("runtime");
+    let temp_files = home.join("tmp");
+    let app_state = home.join(".codex-session-delete");
+    for directory in [&home, &workspace, &local, &runtime, &temp_files] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_codey-fastctx"));
+    command
+        .arg("--codey-fastctx-mcp")
+        .current_dir(&workspace)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("LOCALAPPDATA", &local)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("TMPDIR", &temp_files)
+        .env("TMP", &temp_files)
+        .env("TEMP", &temp_files)
+        .env("CODEY_APP_STATE_DIR", &app_state)
+        .env(
+            "CODEY_FASTCTX_TEST_WORKER_ARGUMENT",
+            "--codey-fastctx-mcp-test-worker",
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command.spawn().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (responses_tx, responses_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if responses_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    (child, stdin, responses_rx)
+}
+
+fn initialize_test_worker_session(
+    stdin: &mut impl Write,
+    responses_rx: &mpsc::Receiver<std::io::Result<String>>,
+) {
+    send(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "codey-supervisor-test", "version": "1"}
+            }
+        }),
+    );
+    let initialized = response_with_id(responses_rx, 1);
+    assert!(initialized.get("result").is_some(), "{initialized}");
+    send(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+    );
+}
+
 #[cfg(unix)]
 fn terminate_process(pid: u32, required: bool) {
     let result = unsafe { libc::kill(pid as i32, libc::SIGKILL) };

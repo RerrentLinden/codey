@@ -90,11 +90,7 @@ impl WebhookNotificationState {
 }
 
 fn waiting_notification_ledger_path(store: &ConfigStore) -> PathBuf {
-    store
-        .path()
-        .parent()
-        .map(|parent| parent.join("webhook-notifications.json"))
-        .unwrap_or_else(|| PathBuf::from("webhook-notifications.json"))
+    store.path().with_file_name("webhook-notifications.json")
 }
 
 /// Persisted "waiting" reservation keys in insertion order so the ledger stays

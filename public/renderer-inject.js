@@ -1001,9 +1001,13 @@
 
     const startedAt = Date.now();
     const scanStatsigUntilReady = () => {
-      patchStatsigClients();
+      // The fast-startup shield patches the same clients on a faster cadence
+      // while it is active; skip the duplicate patch work until it stands
+      // down, then run one final pass to cover the handoff.
+      const shieldActive = window.__codeyFastStartupShield?.active === true;
+      if (!shieldActive) patchStatsigClients();
       const elapsed = Date.now() - startedAt;
-      if (elapsed >= 15000) return;
+      if (elapsed >= 15000 && !shieldActive) return;
       window.setTimeout?.(scanStatsigUntilReady, elapsed < 1000 ? 50 : 250);
     };
     window.setTimeout?.(scanStatsigUntilReady, 50);

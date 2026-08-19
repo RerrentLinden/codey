@@ -566,16 +566,17 @@ fn is_loopback_url(url: &str) -> bool {
         .split_once("://")
         .map_or(url.trim(), |(_, rest)| rest);
     let authority = authority_and_path
-        .split('/')
-        .next()
-        .unwrap_or_default()
-        .rsplit('@')
-        .next()
-        .unwrap_or_default();
+        .split_once('/')
+        .map_or(authority_and_path, |(authority, _)| authority);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, authority)| authority);
     let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split(']').next().unwrap_or_default()
+        rest.split_once(']').map_or(rest, |(host, _)| host)
     } else {
-        authority.split(':').next().unwrap_or_default()
+        authority
+            .split_once(':')
+            .map_or(authority, |(host, _)| host)
     };
     host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
 }

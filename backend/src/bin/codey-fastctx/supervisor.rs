@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::process::{ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map, Value, json};
@@ -10,32 +10,37 @@ use tokio::sync::mpsc;
 
 pub const RECOVERABLE_WORKER_EXIT_CODE: i32 = 75;
 const RECOVERY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const RECOVERY_WINDOW: Duration = Duration::from_secs(60);
+const MAX_RECOVERIES_IN_WINDOW: usize = 3;
 
-pub async fn run(worker_argument: &'static str) -> Result<()> {
+pub async fn run(worker_argument: &str) -> Result<()> {
     let (client_tx, mut client_rx) = mpsc::channel(32);
     tokio::spawn(read_client_input(client_tx));
 
     let mut worker = Worker::spawn(worker_argument).await?;
     let mut state = ProtocolState::default();
+    let mut recoveries = RecoveryBudget::default();
     let mut client_open = true;
     let mut stdout = tokio::io::stdout();
 
     loop {
         enum Event {
             Client(Option<ClientInput>),
-            WorkerOutput(std::io::Result<Option<Vec<u8>>>),
+            WorkerOutput(Option<WorkerOutput>),
             WorkerExit(std::io::Result<ExitStatus>),
         }
 
+        // worker stdout 由独立 reader task 经 channel 送达：若在此处直接对管道
+        // `read_until`，select! 取消该分支时会丢弃已读入的半行字节。
         let event = {
             let Worker {
                 child,
                 stdin: _,
-                stdout,
+                output_rx,
             } = &mut worker;
             tokio::select! {
                 input = client_rx.recv(), if client_open => Event::Client(input),
-                output = read_protocol_line(stdout) => Event::WorkerOutput(output),
+                output = output_rx.recv() => Event::WorkerOutput(output),
                 status = child.wait() => Event::WorkerExit(status),
             }
         };
@@ -59,6 +64,7 @@ pub async fn run(worker_argument: &'static str) -> Result<()> {
                         status,
                         client_open,
                         worker_argument,
+                        &mut recoveries,
                         &mut worker,
                         &mut state,
                         &mut stdout,
@@ -81,7 +87,7 @@ pub async fn run(worker_argument: &'static str) -> Result<()> {
                         .context("关闭 FastCtx worker stdin 失败")?;
                 }
             }
-            Event::WorkerOutput(Ok(Some(line))) => {
+            Event::WorkerOutput(Some(WorkerOutput::Line(line))) => {
                 state.observe_server(&line);
                 stdout
                     .write_all(&line)
@@ -89,28 +95,13 @@ pub async fn run(worker_argument: &'static str) -> Result<()> {
                     .context("转发 FastCtx MCP 响应失败")?;
                 stdout.flush().await.context("刷新 MCP stdout 失败")?;
             }
-            Event::WorkerOutput(Ok(None)) => {
-                let status = worker
-                    .child
-                    .wait()
-                    .await
-                    .context("等待 FastCtx worker 退出失败")?;
-                if !recover_or_finish(
-                    status,
-                    client_open,
-                    worker_argument,
-                    &mut worker,
-                    &mut state,
-                    &mut stdout,
-                )
-                .await?
-                {
-                    return Ok(());
-                }
-            }
-            Event::WorkerOutput(Err(error))
-                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            Event::WorkerOutput(Some(WorkerOutput::ReadError(error)))
+                if error.kind() != std::io::ErrorKind::UnexpectedEof =>
             {
+                bail!("读取 FastCtx worker stdout 失败：{error}");
+            }
+            Event::WorkerOutput(Some(WorkerOutput::ReadError(_)))
+            | Event::WorkerOutput(None) => {
                 let status = worker
                     .child
                     .wait()
@@ -120,6 +111,7 @@ pub async fn run(worker_argument: &'static str) -> Result<()> {
                     status,
                     client_open,
                     worker_argument,
+                    &mut recoveries,
                     &mut worker,
                     &mut state,
                     &mut stdout,
@@ -128,9 +120,6 @@ pub async fn run(worker_argument: &'static str) -> Result<()> {
                 {
                     return Ok(());
                 }
-            }
-            Event::WorkerOutput(Err(error)) => {
-                bail!("读取 FastCtx worker stdout 失败：{error}");
             }
             Event::WorkerExit(Ok(status)) => {
                 drain_worker_output(&mut worker, &mut state, &mut stdout).await?;
@@ -138,6 +127,7 @@ pub async fn run(worker_argument: &'static str) -> Result<()> {
                     status,
                     client_open,
                     worker_argument,
+                    &mut recoveries,
                     &mut worker,
                     &mut state,
                     &mut stdout,
@@ -161,17 +151,23 @@ where
     W: AsyncWrite + Unpin,
 {
     loop {
-        match read_protocol_line(&mut worker.stdout).await {
-            Ok(Some(line)) => {
+        match worker.output_rx.recv().await {
+            Some(WorkerOutput::Line(line)) => {
                 state.observe_server(&line);
                 stdout
                     .write_all(&line)
                     .await
                     .context("转发 FastCtx worker 退出前的 MCP 响应失败")?;
             }
-            Ok(None) => break,
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
-            Err(error) => bail!("读取 FastCtx worker 退出前的 stdout 失败：{error}"),
+            Some(WorkerOutput::ReadError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Some(WorkerOutput::ReadError(error)) => {
+                bail!("读取 FastCtx worker 退出前的 stdout 失败：{error}")
+            }
+            None => break,
         }
     }
     stdout
@@ -184,7 +180,8 @@ where
 async fn recover_or_finish<W>(
     status: ExitStatus,
     client_open: bool,
-    worker_argument: &'static str,
+    worker_argument: &str,
+    recoveries: &mut RecoveryBudget,
     worker: &mut Worker,
     state: &mut ProtocolState,
     stdout: &mut W,
@@ -202,6 +199,7 @@ where
         bail!("FastCtx worker 在 MCP 初始化完成前断开，无法恢复会话");
     }
 
+    let recovery_allowed = recoveries.begin_recovery(Instant::now());
     for error in state.take_pending_errors() {
         stdout
             .write_all(&error)
@@ -212,12 +210,43 @@ where
         .flush()
         .await
         .context("刷新 FastCtx transport 恢复错误失败")?;
+    if !recovery_allowed {
+        bail!(
+            "FastCtx worker 在 {} 秒内第 {MAX_RECOVERIES_IN_WINDOW} 次断开，停止自动恢复并让宿主处理 MCP 失败",
+            RECOVERY_WINDOW.as_secs()
+        );
+    }
 
     *worker = recover_worker(worker_argument, state).await?;
     Ok(true)
 }
 
-async fn recover_worker(worker_argument: &'static str, state: &ProtocolState) -> Result<Worker> {
+/// 60 秒滑动窗口内的恢复预算：worker 反复以可恢复状态码退出时，宿主永远
+/// 观测不到 MCP 失败、自身退避策略也无从介入；预算耗尽后由调用方把明确错误
+/// 返回给在途请求并整体退出。
+#[derive(Default)]
+struct RecoveryBudget {
+    attempts: VecDeque<Instant>,
+}
+
+impl RecoveryBudget {
+    fn begin_recovery(&mut self, now: Instant) -> bool {
+        while self
+            .attempts
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= RECOVERY_WINDOW)
+        {
+            self.attempts.pop_front();
+        }
+        if self.attempts.len() + 1 >= MAX_RECOVERIES_IN_WINDOW {
+            return false;
+        }
+        self.attempts.push_back(now);
+        true
+    }
+}
+
+async fn recover_worker(worker_argument: &str, state: &ProtocolState) -> Result<Worker> {
     let mut worker = Worker::spawn(worker_argument).await?;
     let recovery = tokio::time::timeout(
         RECOVERY_HANDSHAKE_TIMEOUT,
@@ -257,16 +286,19 @@ async fn replay_initialization(worker: &mut Worker, state: &ProtocolState) -> Re
     .context("向恢复后的 FastCtx worker 重放 initialize 失败")?;
 
     loop {
-        let Some(line) = read_protocol_line(&mut worker.stdout)
-            .await
-            .context("读取恢复后的 FastCtx initialize 响应失败")?
-        else {
-            let status = worker
-                .child
-                .wait()
-                .await
-                .context("等待恢复后的 FastCtx worker 退出失败")?;
-            bail!("恢复后的 FastCtx worker 在 initialize 响应前退出：{status}");
+        let line = match worker.output_rx.recv().await {
+            Some(WorkerOutput::Line(line)) => line,
+            Some(WorkerOutput::ReadError(error)) => {
+                bail!("读取恢复后的 FastCtx initialize 响应失败：{error}")
+            }
+            None => {
+                let status = worker
+                    .child
+                    .wait()
+                    .await
+                    .context("等待恢复后的 FastCtx worker 退出失败")?;
+                bail!("恢复后的 FastCtx worker 在 initialize 响应前退出：{status}");
+            }
         };
         let value: Value =
             serde_json::from_slice(&line).context("恢复后的 FastCtx worker 返回了无效 JSON")?;
@@ -299,11 +331,34 @@ async fn replay_initialization(worker: &mut Worker, state: &ProtocolState) -> Re
 struct Worker {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    output_rx: mpsc::Receiver<WorkerOutput>,
+}
+
+enum WorkerOutput {
+    Line(Vec<u8>),
+    ReadError(std::io::Error),
+}
+
+async fn read_worker_output(stdout: ChildStdout, sender: mpsc::Sender<WorkerOutput>) {
+    let mut reader = BufReader::new(stdout);
+    loop {
+        match read_protocol_line(&mut reader).await {
+            Ok(Some(line)) => {
+                if sender.send(WorkerOutput::Line(line)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(None) => return,
+            Err(error) => {
+                let _ = sender.send(WorkerOutput::ReadError(error)).await;
+                return;
+            }
+        }
+    }
 }
 
 impl Worker {
-    async fn spawn(worker_argument: &'static str) -> Result<Self> {
+    async fn spawn(worker_argument: &str) -> Result<Self> {
         let executable = std::env::current_exe().context("定位 Codey FastCtx worker 失败")?;
         let mut command = Command::new(executable);
         command
@@ -319,10 +374,12 @@ impl Worker {
         let mut child = command.spawn().context("启动 Codey FastCtx worker 失败")?;
         let stdin = child.stdin.take().context("FastCtx worker 缺少 stdin")?;
         let stdout = child.stdout.take().context("FastCtx worker 缺少 stdout")?;
+        let (output_tx, output_rx) = mpsc::channel(32);
+        tokio::spawn(read_worker_output(stdout, output_tx));
         Ok(Self {
             child,
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            output_rx,
         })
     }
 
@@ -400,6 +457,24 @@ struct ProtocolState {
 struct PendingRequest {
     id: Value,
     label: String,
+    kind: PendingKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingKind {
+    ReadOnly,
+    Write,
+    Other,
+}
+
+impl PendingKind {
+    fn for_tool_call(tool_name: Option<&str>) -> Self {
+        match tool_name {
+            Some("replace") => Self::Write,
+            Some("grep" | "glob" | "inspect_local_file") => Self::ReadOnly,
+            _ => Self::Other,
+        }
+    }
 }
 
 impl ProtocolState {
@@ -430,18 +505,20 @@ impl ProtocolState {
             let Some(key) = value_key(&id) else {
                 return;
             };
-            let label = if method == "tools/call" {
-                object
+            let (label, kind) = if method == "tools/call" {
+                let tool_name = object
                     .get("params")
                     .and_then(Value::as_object)
                     .and_then(|params| params.get("name"))
-                    .and_then(Value::as_str)
+                    .and_then(Value::as_str);
+                let label = tool_name
                     .map(|name| format!("tools/call ({name})"))
-                    .unwrap_or_else(|| method.to_string())
+                    .unwrap_or_else(|| method.to_string());
+                (label, PendingKind::for_tool_call(tool_name))
             } else {
-                method.to_string()
+                (method.to_string(), PendingKind::Other)
             };
-            self.pending.insert(key, PendingRequest { id, label });
+            self.pending.insert(key, PendingRequest { id, label, kind });
         });
     }
 
@@ -466,15 +543,26 @@ impl ProtocolState {
         pending
             .into_values()
             .map(|request| {
+                let message = match request.kind {
+                    PendingKind::Write => format!(
+                        "FastCtx 已在控制中心连接中断后恢复；运行中的 {} 请求未被重放，以免重复修改文件。请确认当前文件状态后重试。",
+                        request.label
+                    ),
+                    PendingKind::ReadOnly => format!(
+                        "FastCtx 已在控制中心连接中断后恢复；运行中的 {} 请求未被重放；只读请求无副作用，可直接重试。",
+                        request.label
+                    ),
+                    PendingKind::Other => format!(
+                        "FastCtx 已在控制中心连接中断后恢复；运行中的 {} 请求未被重放。请确认状态后重试。",
+                        request.label
+                    ),
+                };
                 let mut line = serde_json::to_vec(&json!({
                     "jsonrpc": "2.0",
                     "id": request.id,
                     "error": {
                         "code": -32001,
-                        "message": format!(
-                            "FastCtx 已在控制中心连接中断后恢复；运行中的 {} 请求未被重放，以免重复修改文件。请确认当前文件状态后重试。",
-                            request.label
-                        ),
+                        "message": message,
                         "data": {
                             "recoverable": true,
                             "requestReplayed": false
@@ -588,6 +676,12 @@ mod tests {
                 .unwrap()
                 .contains("tools/call (replace)")
         );
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("以免重复修改文件")
+        );
         assert!(state.pending.is_empty());
     }
 
@@ -607,5 +701,50 @@ mod tests {
         })));
 
         assert!(state.take_pending_errors().is_empty());
+    }
+
+    #[test]
+    fn interrupted_read_only_requests_do_not_warn_about_file_modification() {
+        let mut state = ProtocolState::default();
+        state.observe_client(&line(json!({
+            "jsonrpc": "2.0",
+            "id": "grep-3",
+            "method": "tools/call",
+            "params": {"name": "grep", "arguments": {}}
+        })));
+        state.observe_client(&line(json!({
+            "jsonrpc": "2.0",
+            "id": "read-4",
+            "method": "resources/read",
+            "params": {}
+        })));
+
+        let errors = state.take_pending_errors();
+        assert_eq!(errors.len(), 2);
+        let grep: Value = serde_json::from_slice(&errors[0]).unwrap();
+        let grep_message = grep["error"]["message"].as_str().unwrap();
+        assert!(grep_message.contains("tools/call (grep)"));
+        assert!(grep_message.contains("可直接重试"));
+        assert!(!grep_message.contains("修改文件"));
+        let other: Value = serde_json::from_slice(&errors[1]).unwrap();
+        let other_message = other["error"]["message"].as_str().unwrap();
+        assert!(other_message.contains("resources/read"));
+        assert!(!other_message.contains("修改文件"));
+    }
+
+    #[test]
+    fn recovery_budget_refuses_the_third_recovery_inside_one_window() {
+        let mut budget = RecoveryBudget::default();
+        let start = Instant::now();
+
+        assert!(budget.begin_recovery(start));
+        assert!(budget.begin_recovery(start + Duration::from_secs(10)));
+        assert!(!budget.begin_recovery(start + Duration::from_secs(20)));
+        // 前两次尝试仍在窗口内时，后续恢复继续被拒绝。
+        assert!(!budget.begin_recovery(start + Duration::from_secs(59)));
+        // 最早一次滑出窗口后恢复名额释放。
+        assert!(budget.begin_recovery(start + Duration::from_secs(61)));
+        assert!(budget.begin_recovery(start + Duration::from_secs(70)));
+        assert!(!budget.begin_recovery(start + Duration::from_secs(71)));
     }
 }

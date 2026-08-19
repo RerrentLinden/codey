@@ -1,4 +1,3 @@
-export { AppUpdateCard } from "./AppUpdateCard";
 export { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
 export { ModelSection } from "./ModelSection";
 export { OperationsPanel } from "./OperationsPanel";

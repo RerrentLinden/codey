@@ -326,13 +326,16 @@ fn selected_update_asset(assets: &[UpdateManifestAsset]) -> Option<UpdateManifes
     let arch = current_update_arch();
     assets
         .iter()
-        .filter(|asset| {
-            asset.platform.eq_ignore_ascii_case(platform)
-                && asset.arch.eq_ignore_ascii_case(arch)
-                && installable_package_priority(asset).is_some()
+        .filter_map(|asset| {
+            if !asset.platform.eq_ignore_ascii_case(platform)
+                || !asset.arch.eq_ignore_ascii_case(arch)
+            {
+                return None;
+            }
+            installable_package_priority(asset).map(|priority| (priority, asset))
         })
-        .min_by_key(|asset| installable_package_priority(asset).unwrap_or(u8::MAX))
-        .cloned()
+        .min_by_key(|(priority, _)| *priority)
+        .map(|(_, asset)| asset.clone())
 }
 
 fn asset_info(asset: &UpdateManifestAsset) -> UpdateAssetInfo {

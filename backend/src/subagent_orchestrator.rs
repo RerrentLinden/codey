@@ -272,6 +272,34 @@ impl LedgerStore {
         }
         Ok(())
     }
+
+    // SessionEnd 不带 runtime 归属信息；代次不一致且仍有未清偿预留/验收债时
+    // 保留账本，交给所属代次或恢复逻辑处理，其余情况照常删除。
+    fn remove_for_session_end(&self, runtime_id: &str, session_id: &str) -> Result<()> {
+        let bytes = match fs::read(&self.ledger_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return self.remove(),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "读取 Codey 子代理预算账本失败：{}",
+                        self.ledger_path.display()
+                    )
+                });
+            }
+        };
+        let foreign_with_outstanding = serde_json::from_slice::<SessionLedger>(&bytes)
+            .ok()
+            .is_some_and(|ledger| {
+                ledger.session_id_hash == hash_component(session_id)
+                    && ledger.runtime_id_hash != hash_component(runtime_id)
+                    && ledger_has_outstanding(&ledger)
+            });
+        if foreign_with_outstanding {
+            return Ok(());
+        }
+        self.remove()
+    }
 }
 
 impl Drop for LedgerStore {
@@ -307,12 +335,14 @@ pub(crate) fn pre_spawn(
     active_agents: usize,
     now_ms: u64,
 ) -> Result<Option<String>> {
+    // 测试契约统一声明 root "/repo"，这里模拟 Hook 提供同等工作目录；
+    // 需要覆盖 cwd 缺失场景的测试请直接调用 pre_spawn_with_workspace。
     pre_spawn_with_workspace(
         state_root,
         runtime_id,
         session_id,
         tool_input,
-        None,
+        Some("/repo"),
         active_agents,
         now_ms,
     )
@@ -872,8 +902,19 @@ pub(crate) fn settle_turn(
     store.remove()
 }
 
-pub(crate) fn end_session(state_root: &Path, session_id: &str) -> Result<()> {
-    LedgerStore::open(state_root, session_id)?.remove()
+pub(crate) fn end_session(state_root: &Path, runtime_id: &str, session_id: &str) -> Result<()> {
+    LedgerStore::open(state_root, session_id)?.remove_for_session_end(runtime_id, session_id)
+}
+
+fn ledger_has_outstanding(ledger: &SessionLedger) -> bool {
+    ledger.reservations.values().any(|reservation| {
+        !matches!(
+            reservation.state,
+            ReservationState::Terminal
+                | ReservationState::Failed
+                | ReservationState::Recovered
+        ) || reservation_has_pending_acceptance(reservation)
+    })
 }
 
 #[cfg(test)]
@@ -978,6 +1019,38 @@ fn prepare_contract_with_workspace(
             }
             if workspace_root.is_none() {
                 return Err(contract_error("写入角色必须声明绝对 root"));
+            }
+        }
+    }
+    let hook_root = match hook_workspace_root {
+        Some(raw) => match normalize_absolute_path(raw) {
+            Ok(root) => Some(root),
+            Err(error) if policy.access == RoleAccess::Write => {
+                return Err(contract_error(&format!("Hook 工作目录无效：{error}")));
+            }
+            Err(_) => None,
+        },
+        None => None,
+    };
+    if let Some(root) = workspace_root.as_deref() {
+        match hook_root.as_deref() {
+            Some(hook_root) if !path_is_within(root, hook_root) => {
+                return Err(contract_error(&format!(
+                    "契约 root `{root}` 必须等于 Hook 工作目录 `{hook_root}` 或位于其子目录内"
+                )));
+            }
+            None if policy.access == RoleAccess::Write => {
+                return Err(contract_error(
+                    "Hook 未提供绝对工作目录，无法校验写入角色的契约 root",
+                ));
+            }
+            _ => {}
+        }
+        for claim in read_paths.iter().chain(write_paths.iter()) {
+            if !path_is_within(claim, root) {
+                return Err(contract_error(&format!(
+                    "资源路径 `{claim}` 必须位于契约 root `{root}` 内"
+                )));
             }
         }
     }
@@ -1288,11 +1361,34 @@ fn known_write_tool(tool_name: &str) -> bool {
     )
 }
 
+pub(crate) fn known_read_only_tool(tool_name: &str) -> bool {
+    let leaf = normalized_tool_name(tool_name);
+    let leaf = leaf
+        .rsplit_once("__")
+        .map_or(leaf.as_str(), |(_, leaf)| leaf);
+    matches!(
+        leaf,
+        "read_file"
+            | "inspect_local_file"
+            | "grep"
+            | "glob"
+            | "tool_search"
+            | "list_agents"
+            | "wait_agent"
+            | "agent_status"
+            | "send_message"
+            | "followup_task"
+            | "interrupt_agent"
+            | "web_search"
+            | "websearch"
+            | "view_image"
+    )
+}
+
 fn normalized_tool_name(tool_name: &str) -> String {
     tool_name
-        .split(['.', '/', ':'])
-        .next_back()
-        .unwrap_or(tool_name)
+        .rsplit_once(['.', '/', ':'])
+        .map_or(tool_name, |(_, leaf)| leaf)
         .trim_start_matches('_')
         .to_ascii_lowercase()
 }
@@ -1521,21 +1617,21 @@ fn parse_plain_text_exit_code(value: &str) -> Option<i64> {
 }
 
 fn response_is_explicit_failure(value: &Value) -> bool {
-    response_has_structured_failure(value)
-        || (extract_agent_identifier(value).is_none() && response_has_textual_spawn_failure(value))
+    // 带明确代理 ID 的响应一律按成功处理；只有无法定位代理 ID 时才采信失败信号，
+    // 避免子代理返回内容里嵌套的 error 字段误触发回滚。
+    if extract_agent_identifier(value).is_some() {
+        return false;
+    }
+    response_has_structured_failure(value) || response_has_textual_spawn_failure(value)
 }
 
 fn response_has_structured_failure(value: &Value) -> bool {
-    match value {
-        Value::Object(values) => {
-            values.get("isError").and_then(Value::as_bool) == Some(true)
-                || values.get("is_error").and_then(Value::as_bool) == Some(true)
-                || values.get("error").is_some_and(|error| !error.is_null())
-                || values.values().any(response_has_structured_failure)
-        }
-        Value::Array(values) => values.iter().any(response_has_structured_failure),
-        _ => false,
-    }
+    let Value::Object(values) = value else {
+        return false;
+    };
+    values.get("isError").and_then(Value::as_bool) == Some(true)
+        || values.get("is_error").and_then(Value::as_bool) == Some(true)
+        || values.get("error").is_some_and(|error| !error.is_null())
 }
 
 fn response_has_textual_spawn_failure(value: &Value) -> bool {
@@ -1697,12 +1793,12 @@ fn normalized_identifier(value: &str) -> String {
 }
 
 fn canonical_value_hash(value: &Value) -> String {
-    let bytes = serde_json::to_vec(value).unwrap_or_default();
+    let bytes = serde_json::to_vec(value).expect("serde_json::Value must always be serializable");
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
 fn hash_component(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    crate::fs_util::sha256_hex(value.as_bytes())
 }
 
 #[cfg(test)]
@@ -1890,6 +1986,125 @@ mod tests {
             prepare_contract_with_workspace(Some(&missing_contract), Some("/repo"))
                 .unwrap_err()
                 .contains("最后一行缺少 CODEY_DELEGATION_V2")
+        );
+    }
+
+    #[test]
+    fn plaintext_contract_root_must_stay_within_the_hook_workspace() {
+        let temp = tempfile::tempdir().unwrap();
+        let write = contract_input(
+            "worker_a",
+            "codey_worker",
+            worker_contract("worker_a", "backend/src"),
+        );
+
+        let denial = pre_spawn_with_workspace(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&write),
+            None,
+            0,
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("Hook 未提供绝对工作目录"));
+
+        let denial = pre_spawn_with_workspace(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&write),
+            Some("/other"),
+            0,
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("必须等于 Hook 工作目录"));
+
+        let nested_root = contract_input(
+            "worker_b",
+            "codey_worker",
+            json!({
+                "id": "worker_b",
+                "why": "independent_work",
+                "visual": false,
+                "root": "/repo/sub",
+                "read": [],
+                "write": ["backend/src"],
+                "checks": [{ "id": "tests", "cmd": "cargo test -p codey --lib" }]
+            }),
+        );
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&nested_root),
+                Some("/repo"),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+
+        let outside_root = contract_input(
+            "worker_c",
+            "codey_worker",
+            worker_contract("worker_c", "/etc/passwd"),
+        );
+        let denial = pre_spawn_with_workspace(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&outside_root),
+            Some("/repo"),
+            0,
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("必须位于契约 root"));
+    }
+
+    #[test]
+    fn read_only_contract_root_is_checked_only_when_the_hook_workspace_exists() {
+        let read_only = |root: &str, read: &[&str]| {
+            contract_input(
+                "research_a",
+                "codey_deep_research",
+                json!({
+                    "id": "research_a",
+                    "why": "breadth",
+                    "visual": false,
+                    "root": root,
+                    "read": read,
+                    "write": [],
+                    "checks": []
+                }),
+            )
+        };
+
+        assert!(prepare_contract_with_workspace(Some(&read_only("/repo", &[])), None).is_ok());
+        assert!(
+            prepare_contract_with_workspace(Some(&read_only("/repo", &["/repo/docs"])), Some("/repo"))
+                .is_ok()
+        );
+        assert!(
+            prepare_contract_with_workspace(Some(&read_only("/other", &[])), Some("/repo"))
+                .unwrap_err()
+                .contains("必须等于 Hook 工作目录")
+        );
+        assert!(
+            prepare_contract_with_workspace(
+                Some(&read_only("/repo", &["/outside"])),
+                Some("/repo")
+            )
+            .unwrap_err()
+            .contains("必须位于契约 root")
         );
     }
 
@@ -2165,11 +2380,7 @@ mod tests {
                     "text": "collab spawn failed: agent thread limit reached"
                 }]
             }),
-            json!({
-                "agent_id": "agent-a",
-                "isError": true,
-                "error": "capacity"
-            }),
+            json!({ "isError": true, "error": "capacity" }),
         ]
         .into_iter()
         .enumerate()
@@ -2198,6 +2409,84 @@ mod tests {
             assert_eq!(ledger.points_spent, 0);
             assert!(ledger.reservations.is_empty());
         }
+    }
+
+    #[test]
+    fn spawn_response_with_agent_id_ignores_error_fields() {
+        for (index, response) in [
+            json!({
+                "agent_id": "agent-a",
+                "isError": true,
+                "error": "capacity"
+            }),
+            json!({
+                "result": {
+                    "agent_id": "agent-a",
+                    "error": "subagent payload reports a handled failure"
+                }
+            }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let task = format!("worker_{index}");
+            let input = contract_input(
+                &task,
+                "codey_worker",
+                worker_contract(&task, "backend/a.rs"),
+            );
+            pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+            post_spawn(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&input),
+                Some(&response),
+                20,
+            )
+            .unwrap();
+
+            let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+            let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
+            assert_eq!(ledger.spawn_attempts, 1);
+            assert_eq!(ledger.points_spent, 3);
+            assert_eq!(
+                ledger.reservations[&task].state,
+                ReservationState::Running
+            );
+        }
+    }
+
+    #[test]
+    fn nested_error_without_agent_id_does_not_rollback_the_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = contract_input(
+            "worker_a",
+            "codey_worker",
+            worker_contract("worker_a", "backend/a.rs"),
+        );
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({
+                "result": { "error": "deeply nested diagnostics" }
+            })),
+            20,
+        )
+        .unwrap();
+
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
+        assert_eq!(ledger.spawn_attempts, 1);
+        assert_eq!(ledger.points_spent, 3);
+        assert_eq!(
+            ledger.reservations["worker_a"].state,
+            ReservationState::Running
+        );
     }
 
     #[test]
@@ -2561,5 +2850,100 @@ mod tests {
             ledger.reservations["worker_a"].state,
             ReservationState::Recovered
         );
+    }
+
+    #[test]
+    fn session_end_removes_ledgers_owned_by_the_current_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = contract_input(
+            "worker_a",
+            "codey_worker",
+            worker_contract("worker_a", "backend/src"),
+        );
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        let ledger_path = temp
+            .path()
+            .join(hash_component("session-a"))
+            .join(LEDGER_FILE);
+        assert!(ledger_path.exists());
+
+        end_session(temp.path(), "runtime-a", "session-a").unwrap();
+        assert!(!ledger_path.exists());
+    }
+
+    #[test]
+    fn session_end_keeps_foreign_runtime_ledgers_with_outstanding_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let write = contract_input(
+            "worker_a",
+            "codey_worker",
+            worker_contract("worker_a", "backend/src"),
+        );
+        let ledger_path = temp
+            .path()
+            .join(hash_component("session-a"))
+            .join(LEDGER_FILE);
+
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&write), 0, 10).unwrap();
+        end_session(temp.path(), "runtime-b", "session-a").unwrap();
+        assert!(ledger_path.exists());
+
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&write),
+            Some(&json!({ "agent_id": "agent-a" })),
+            20,
+        )
+        .unwrap();
+        observe_status_response(temp.path(), "runtime-a", "session-a", None, true, 30).unwrap();
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let ledger = store.load("runtime-a", "session-a", 40).unwrap().unwrap();
+        assert_eq!(
+            ledger.reservations["worker_a"].state,
+            ReservationState::Terminal
+        );
+        drop(ledger);
+        drop(store);
+
+        // 写入角色的机械验收债仍未清偿，即使代次不一致也不能删除账本。
+        end_session(temp.path(), "runtime-b", "session-a").unwrap();
+        assert!(ledger_path.exists());
+    }
+
+    #[test]
+    fn session_end_removes_foreign_runtime_ledgers_without_outstanding_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let read = contract_input(
+            "research_a",
+            "codey_deep_research",
+            research_contract("research_a"),
+        );
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&read), 0, 10).unwrap();
+        observe_status_response(temp.path(), "runtime-a", "session-a", None, true, 20).unwrap();
+        let ledger_path = temp
+            .path()
+            .join(hash_component("session-a"))
+            .join(LEDGER_FILE);
+        assert!(ledger_path.exists());
+
+        end_session(temp.path(), "runtime-b", "session-a").unwrap();
+        assert!(!ledger_path.exists());
+    }
+
+    #[test]
+    fn session_end_removes_missing_or_unreadable_ledgers() {
+        let temp = tempfile::tempdir().unwrap();
+        end_session(temp.path(), "runtime-a", "session-a").unwrap();
+
+        let ledger_path = temp
+            .path()
+            .join(hash_component("session-a"))
+            .join(LEDGER_FILE);
+        std::fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
+        std::fs::write(&ledger_path, b"{not-valid-json").unwrap();
+        end_session(temp.path(), "runtime-a", "session-a").unwrap();
+        assert!(!ledger_path.exists());
     }
 }

@@ -22,7 +22,6 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     Promise.all(
       [
         "OperationsPanel.tsx",
-        "AppUpdateCard.tsx",
         "ModelSection.tsx",
         "FeaturePolicyCard.tsx",
       ].map((file) => readFile(new URL(`src/${file}`, root), "utf8")),
@@ -66,7 +65,6 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
 
   for (const component of [
     "OperationsPanel",
-    "AppUpdateCard",
     "ModelSection",
     "FeaturePolicyCard",
   ]) {

@@ -1,6 +1,5 @@
 import * as React from "react";
 import { IconX } from "@tabler/icons-react";
-import SemiAutoComplete from "@douyinfe/semi-ui/lib/es/autoComplete";
 import SemiButton from "@douyinfe/semi-ui/lib/es/button";
 import SemiCard from "@douyinfe/semi-ui/lib/es/card";
 import SemiCheckbox from "@douyinfe/semi-ui/lib/es/checkbox";
@@ -156,21 +155,6 @@ export const Input = React.forwardRef<HTMLInputElement, InputProps>(
   ),
 );
 Input.displayName = "Input";
-
-type SemiAutoCompleteProps = React.ComponentProps<typeof SemiAutoComplete>;
-
-export type AutoCompleteProps = SemiAutoCompleteProps;
-
-/** Free-text input with cloud suggestions; the selected value stays in the
- * input so providers without a model-list endpoint keep working. */
-export function AutoComplete({ className, ...props }: AutoCompleteProps) {
-  return (
-    <SemiAutoComplete
-      {...props}
-      className={classNames("codey-autocomplete", className)}
-    />
-  );
-}
 
 type SemiSelectProps = React.ComponentProps<typeof SemiSelect>;
 type SemiSelectInstance = React.ComponentRef<typeof SemiSelect>;

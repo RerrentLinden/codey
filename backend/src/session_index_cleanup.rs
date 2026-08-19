@@ -8,7 +8,6 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params_from_iter};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 use crate::fs_util::{atomic_write_preserving_permissions as atomic_write, timestamp_millis};
 use crate::sqlite_util::table_columns;
@@ -484,7 +483,7 @@ fn plan_cleanup_matching(
     }
     Ok(Some(CleanupPlan {
         path: path.to_path_buf(),
-        snapshot_sha256: sha256_hex(&original_bytes),
+        snapshot_sha256: crate::fs_util::sha256_hex(&original_bytes),
         original_bytes,
         original_text,
         scanned_entries,
@@ -606,10 +605,6 @@ fn split_line_ending(segment: &str) -> (&str, &str) {
     } else {
         (segment, "")
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
 }
 
 #[cfg(test)]

@@ -1394,7 +1394,7 @@ test("injects time styles that coexist with native statuses and yield to sidebar
   assert.match(source, /threadTimestampReadBatchSize = 32/);
   assert.match(source, /dispatcher\("send-cli-request-for-host"/);
   assert.match(source, /method: "thread\/list"/);
-  assert.match(source, /refreshThreadUpdatedTimes\(false\)/);
+  assert.match(source, /refreshTrackedThreadUpdatedTimes\(false\)/);
   assert.match(source, /"data-app-action-sidebar-thread-kind"/);
   assert.match(source, /isDeletedSidebarSession\(sessionId\) \|\| !timestamp/);
   assert.match(source, /font-variant-numeric: tabular-nums/);

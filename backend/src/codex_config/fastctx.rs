@@ -51,10 +51,26 @@ pub(super) fn enable_fast_context_tools(
         .get("env")
         .and_then(item_table_clone)
         .unwrap_or_default();
-    env["FASTCTX_TOKEN_BUDGET"] = value(budgets.global.to_string());
-    env["FASTCTX_GREP_TOKEN_BUDGET"] = value(budgets.grep.to_string());
-    env["FASTCTX_GLOB_TOKEN_BUDGET"] = value(budgets.glob.to_string());
-    server["env"] = Item::Table(env);
+    if let Some(budgets) = budgets {
+        env["FASTCTX_TOKEN_BUDGET"] = value(budgets.global.to_string());
+        env["FASTCTX_GREP_TOKEN_BUDGET"] = value(budgets.grep.to_string());
+        env["FASTCTX_GLOB_TOKEN_BUDGET"] = value(budgets.glob.to_string());
+        server["env"] = Item::Table(env);
+    } else {
+        // 用户显式 tool_output_token_limit = 0：不再派生预算，并移除 Codey
+        // 此前写入的预算键，避免残留预算与用户显式值相互矛盾。
+        let had_env = server.get("env").is_some();
+        for key in [
+            "FASTCTX_TOKEN_BUDGET",
+            "FASTCTX_GREP_TOKEN_BUDGET",
+            "FASTCTX_GLOB_TOKEN_BUDGET",
+        ] {
+            env.remove(key);
+        }
+        if had_env {
+            server["env"] = Item::Table(env);
+        }
+    }
 
     // FastCtx reserves a terminal Complete/Partial line. Keeping it direct-only
     // prevents code-mode aggregation from truncating that continuation contract.
@@ -70,7 +86,15 @@ struct OutputBudgets {
     glob: usize,
 }
 
-fn output_budgets(doc: &mut DocumentMut) -> OutputBudgets {
+fn output_budgets(doc: &mut DocumentMut) -> Option<OutputBudgets> {
+    if matches!(
+        doc.get("tool_output_token_limit")
+            .and_then(Item::as_integer),
+        Some(0)
+    ) {
+        // 显式 0 是用户的有效配置而非缺失：保留原值，预算交由用户自行管理。
+        return None;
+    }
     let host_limit = doc
         .get("tool_output_token_limit")
         .and_then(Item::as_integer)
@@ -84,11 +108,11 @@ fn output_budgets(doc: &mut DocumentMut) -> OutputBudgets {
         .saturating_mul(9)
         .saturating_div(10)
         .clamp(1, CODEY_FASTCTX_TOKEN_BUDGET);
-    OutputBudgets {
+    Some(OutputBudgets {
         global,
         grep: global.min(CODEY_FASTCTX_GREP_TOKEN_BUDGET),
         glob: global.min(CODEY_FASTCTX_GLOB_TOKEN_BUDGET),
-    }
+    })
 }
 
 fn apply_fastctx_guidance(doc: &mut DocumentMut, namespace: &str) -> Result<()> {
@@ -136,7 +160,7 @@ pub(super) fn apply_fastctx_guidance_to_table(
 }
 
 pub(super) fn disable_fast_context_tools(doc: &mut DocumentMut) {
-    let codey_owned_server_removed = match doc.get_mut("mcp_servers") {
+    match doc.get_mut("mcp_servers") {
         Some(Item::Table(mcp_servers)) => {
             let codey_owned_server = mcp_servers
                 .get(CODEY_FASTCTX_SERVER_ID)
@@ -144,7 +168,6 @@ pub(super) fn disable_fast_context_tools(doc: &mut DocumentMut) {
             if codey_owned_server {
                 mcp_servers.remove(CODEY_FASTCTX_SERVER_ID);
             }
-            codey_owned_server
         }
         Some(Item::Value(Value::InlineTable(mcp_servers))) => {
             let codey_owned_server = mcp_servers
@@ -153,17 +176,16 @@ pub(super) fn disable_fast_context_tools(doc: &mut DocumentMut) {
             if codey_owned_server {
                 mcp_servers.remove(CODEY_FASTCTX_SERVER_ID);
             }
-            codey_owned_server
         }
-        _ => false,
-    };
+        _ => {}
+    }
 
-    let codey_guidance_removed = remove_guidance_from_table(
+    remove_guidance_from_table(
         doc.as_table_mut(),
         "developer_instructions",
         remove_codey_fastctx_guidance,
     );
-    let subagent_guidance_removed = doc
+    let _ = doc
         .get_mut("features")
         .and_then(Item::as_table_like_mut)
         .and_then(|features| features.get_mut("multi_agent_v2"))
@@ -176,10 +198,9 @@ pub(super) fn disable_fast_context_tools(doc: &mut DocumentMut) {
             )
         });
 
-    let reserved_server_remains = mcp_server_exists(doc, CODEY_FASTCTX_SERVER_ID);
-    if (codey_owned_server_removed || codey_guidance_removed || subagent_guidance_removed)
-        && !reserved_server_remains
-    {
+    // `mcp__codey_fastctx` 命名空间本身即可确认归属：只要保留 ID 未被用户
+    // server 占用，残留条目就一并清掉，不要求同次调用恰好移除了其他构件。
+    if !mcp_server_exists(doc, CODEY_FASTCTX_SERVER_ID) {
         remove_direct_only_tool_namespace(doc, CODEY_FASTCTX_NAMESPACE);
     }
 }

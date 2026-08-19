@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -63,8 +63,11 @@ pub fn run_hook_if_requested() -> Result<bool> {
         .take(MAX_HOOK_INPUT_BYTES + 1)
         .read_to_end(&mut raw)
         .context("读取 Codex FastCtx 路由 Hook 输入失败")?;
+    // 路由改道只是上下文优化,不是安全边界:输入超限或解析失败时显式放行原命令,
+    // 与未安装本 Hook 的行为一致,避免非零退出在 Codex 中被反复报告为 Hook 错误。
     if raw.len() as u64 > MAX_HOOK_INPUT_BYTES {
-        bail!("Codex FastCtx 路由 Hook 输入超过 1 MiB 上限");
+        eprintln!("Codey FastCtx 路由 Hook 输入超过 1 MiB 上限，已放行");
+        return write_hook_output(&json!({})).map(|()| true);
     }
     let output = match serde_json::from_slice::<HookInput>(&raw) {
         Ok(input) => handle_hook(&input),
@@ -377,9 +380,8 @@ fn command_and_arguments(words: &[String]) -> Option<(&str, &[String])> {
 
 fn normalized_command(command: &str) -> String {
     let basename = command
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or(command)
+        .rsplit_once(['/', '\\'])
+        .map_or(command, |(_, basename)| basename)
         .to_ascii_lowercase();
     basename
         .strip_suffix(".exe")

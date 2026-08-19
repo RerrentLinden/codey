@@ -283,7 +283,7 @@ impl AppState {
             "/settings/get" => {
                 let config = self.config.read().await;
                 serde_json::to_value(redacted_config(&config))
-                    .unwrap_or_else(|_| json!({"status":"failed"}))
+                    .expect("CodeyConfig must be JSON-serializable")
             }
             "/codex-model-catalog" => {
                 let current_config = self.config.read().await.clone();
@@ -1220,7 +1220,8 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
     let mut cache = state.account_usage_cache.lock().await;
     match cache.fetch(home).await {
         Ok(snapshot) => {
-            let mut value = serde_json::to_value(snapshot).unwrap_or_else(|_| json!({}));
+            let mut value = serde_json::to_value(snapshot)
+                .expect("account usage snapshots must be JSON-serializable");
             if let Some(object) = value.as_object_mut() {
                 object.insert("status".into(), Value::String("ok".into()));
             }

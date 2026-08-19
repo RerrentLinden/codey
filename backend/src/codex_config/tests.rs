@@ -906,6 +906,74 @@ fn fast_context_tools_scale_budgets_down_for_a_smaller_user_host_limit() {
 }
 
 #[test]
+fn fast_context_tools_keep_an_explicit_zero_host_output_limit() {
+    let result = patch_config_with_fastctx(
+        "tool_output_token_limit = 0\n",
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        relative_model_catalog_path(),
+        None,
+        Some(Path::new("/tmp/codey-fastctx")),
+        false,
+    )
+    .unwrap();
+    let document = parse_document(&result).unwrap();
+    let server = document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]
+        .as_table()
+        .unwrap();
+
+    assert_eq!(document["tool_output_token_limit"].as_integer(), Some(0));
+    assert!(
+        server.get("env").is_none(),
+        "显式 0 且此前无 env 时不应派生预算环境变量"
+    );
+}
+
+#[test]
+fn fast_context_tools_drop_stale_budget_keys_under_an_explicit_zero_limit() {
+    let existing = r#"tool_output_token_limit = 0
+
+[mcp_servers.codey_fastctx]
+command = "/old/codey-fastctx"
+args = ["--codey-fastctx-mcp"]
+
+[mcp_servers.codey_fastctx.env]
+FASTCTX_TOKEN_BUDGET = "54000"
+FASTCTX_GREP_TOKEN_BUDGET = "10800"
+FASTCTX_GLOB_TOKEN_BUDGET = "5400"
+USER_KEY = "preserve"
+"#;
+    let result = patch_config_with_fastctx(
+        existing,
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        relative_model_catalog_path(),
+        None,
+        Some(Path::new("/tmp/codey-fastctx")),
+        false,
+    )
+    .unwrap();
+    let document = parse_document(&result).unwrap();
+    let server = document["mcp_servers"][CODEY_FASTCTX_SERVER_ID]
+        .as_table()
+        .unwrap();
+
+    assert_eq!(document["tool_output_token_limit"].as_integer(), Some(0));
+    let env = server
+        .get("env")
+        .and_then(|env| env.as_table())
+        .expect("已有 env 中的用户键应保留");
+    assert_eq!(env["USER_KEY"].as_str(), Some("preserve"));
+    for key in [
+        "FASTCTX_TOKEN_BUDGET",
+        "FASTCTX_GREP_TOKEN_BUDGET",
+        "FASTCTX_GLOB_TOKEN_BUDGET",
+    ] {
+        assert!(env.get(key).is_none(), "应清掉残留的 {key}");
+    }
+}
+
+#[test]
 fn fast_context_tools_detect_fastctx_invoked_by_another_server_id() {
     let existing = r#"
 [mcp_servers.context_tools]
@@ -1151,7 +1219,7 @@ direct_only_tool_namespaces = ["mcp__codey_fastctx"]
 }
 
 #[test]
-fn disabling_fast_context_tools_preserves_an_unproven_user_namespace() {
+fn disabling_fast_context_tools_cleans_an_orphan_reserved_namespace() {
     let existing = r#"
 [features.code_mode]
 direct_only_tool_namespaces = ["mcp__codey_fastctx", "mcp__user"]
@@ -1176,7 +1244,7 @@ direct_only_tool_namespaces = ["mcp__codey_fastctx", "mcp__user"]
             .iter()
             .filter_map(Value::as_str)
             .collect::<Vec<_>>(),
-        vec!["mcp__codey_fastctx", "mcp__user"]
+        vec!["mcp__user"]
     );
 }
 
@@ -2366,6 +2434,83 @@ fn runtime_subagent_roles_refresh_in_place_for_the_next_spawn() {
     assert_eq!(fs::read(&marker).unwrap(), original_lease);
     for (path, contents) in original_runtime_files {
         assert_eq!(fs::read(path).unwrap(), contents);
+    }
+}
+
+#[test]
+fn runtime_subagent_roles_refresh_follows_the_leased_fastctx_registration() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey/codex-lease.json");
+    let backup_root = temp.path().join("codey/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "model_provider = \"codey_global\"\n",
+    )
+    .unwrap();
+
+    apply_runtime_provider_config_at_mode(
+        &home,
+        &direct_profile(RelayProtocol::Responses),
+        GLOBAL_PROVIDER_ID,
+        ProviderApplyOptions {
+            subagent_optimization: true,
+            fastctx_command: Some(Path::new("/tmp/codey-fastctx")),
+            ..ProviderApplyOptions::for_test(&marker, &backup_root)
+        },
+    )
+    .unwrap();
+
+    // 配置开关关闭但租约记录了本次已注册内置 server：热更新仍注入指引，
+    // 与启动路径按实际注册判定的语义一致。
+    let config = CodeyConfig {
+        subagent_optimization: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    assert!(!config.fast_context_tools);
+    refresh_runtime_subagent_roles_at(&config, &marker).unwrap();
+
+    let constraints_dir = marker.parent().unwrap().join(CODEY_CONSTRAINTS_DIR);
+    for role in SUBAGENT_ROLE_IDS {
+        let document = fs::read_to_string(runtime_agent_path(&constraints_dir, role))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let instructions = document["developer_instructions"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            instructions.contains(CODEY_FASTCTX_GUIDANCE),
+            "租约已注册 fastctx 时角色 {role} 应携带指引"
+        );
+    }
+
+    // 租约未记录 fastctx（用户自备 server 或从未启用）时，即使配置开关开启，
+    // 热更新也不注入指引。
+    let mut lease =
+        serde_json::from_str::<RuntimeConfigLease>(&fs::read_to_string(&marker).unwrap()).unwrap();
+    lease.fastctx_command = None;
+    write_lease(&marker, &lease).unwrap();
+    let config = CodeyConfig {
+        fast_context_tools: true,
+        ..config
+    };
+    refresh_runtime_subagent_roles_at(&config, &marker).unwrap();
+
+    for role in SUBAGENT_ROLE_IDS {
+        let document = fs::read_to_string(runtime_agent_path(&constraints_dir, role))
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        let instructions = document["developer_instructions"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !instructions.contains(CODEY_FASTCTX_GUIDANCE),
+            "租约未注册 fastctx 时角色 {role} 不应携带指引"
+        );
     }
 }
 

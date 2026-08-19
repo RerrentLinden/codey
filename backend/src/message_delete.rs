@@ -514,7 +514,11 @@ fn delete_turns_from_rollout(
     let mut found = HashSet::new();
     for line in original.split_inclusive('\n') {
         let json_line = line.trim_end_matches(['\r', '\n']);
-        if let Some(turn_id) = turn_boundary_id(json_line) {
+        // 先做子串预筛：边界行必然携带 "turn_context"/"task_started" 字面量，
+        // 不满足的行绝不可能是边界，避免对每行做完整 serde_json::Value 解析。
+        if (json_line.contains("\"turn_context\"") || json_line.contains("\"task_started\""))
+            && let Some(turn_id) = turn_boundary_id(json_line)
+        {
             removing_turn = selected.contains(&turn_id);
             if removing_turn {
                 selected_turn_seen = true;
@@ -524,7 +528,10 @@ fn delete_turns_from_rollout(
         // A later compaction snapshot may contain the deleted turn inside its
         // encrypted summary.  It cannot be edited safely, so discard the
         // snapshot and let Codex rebuild history from the remaining rollout.
-        if selected_turn_seen && is_compacted_summary(json_line) {
+        if selected_turn_seen
+            && json_line.contains("\"compacted\"")
+            && is_compacted_summary(json_line)
+        {
             continue;
         }
         if !removing_turn {

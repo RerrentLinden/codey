@@ -2,22 +2,19 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct NativeUpdateUi {
-    platform: Option<Arc<platform::PlatformUi>>,
-    initialization_error: Option<Arc<str>>,
+    platform: Result<Arc<platform::PlatformUi>, Arc<str>>,
 }
 
 impl NativeUpdateUi {
     pub fn start() -> Self {
         match platform::PlatformUi::start() {
             Ok(platform) => Self {
-                platform: Some(Arc::new(platform)),
-                initialization_error: None,
+                platform: Ok(Arc::new(platform)),
             },
             Err(error) => {
                 eprintln!("{error}");
                 Self {
-                    platform: None,
-                    initialization_error: Some(Arc::from(error)),
+                    platform: Err(Arc::from(error)),
                 }
             }
         }
@@ -25,19 +22,15 @@ impl NativeUpdateUi {
 
     pub fn show_status(&self, message: &str) -> Result<(), String> {
         match &self.platform {
-            Some(platform) => platform.show_status(message),
-            None => Err(self
-                .initialization_error
-                .as_deref()
-                .unwrap_or("原生更新状态界面不可用")
-                .to_string()),
+            Ok(platform) => platform.show_status(message),
+            Err(error) => Err(error.to_string()),
         }
     }
 
     pub fn hide_status(&self) -> Result<(), String> {
         match &self.platform {
-            Some(platform) => platform.hide_status(),
-            None => Ok(()),
+            Ok(platform) => platform.hide_status(),
+            Err(_) => Ok(()),
         }
     }
 
@@ -68,7 +61,7 @@ impl NativeUpdateUi {
     }
 
     pub fn shutdown(&self) {
-        if let Some(platform) = &self.platform {
+        if let Ok(platform) = &self.platform {
             platform.shutdown();
         }
     }
@@ -372,8 +365,7 @@ mod platform {
 
     struct MacUiState {
         app: Retained<NSApplication>,
-        status: Option<MacStatusWindow>,
-        status_error: Option<String>,
+        status: Result<MacStatusWindow, String>,
     }
 
     pub struct PlatformUi {
@@ -406,21 +398,17 @@ mod platform {
                 NSPoint::new(24.0, 22.0),
                 NSSize::new(332.0, 48.0),
             ));
-            let (status, status_error) = match panel.contentView() {
+            let status = match panel.contentView() {
                 Some(content) => {
                     content.addSubview(&label);
-                    (Some(MacStatusWindow { panel, label }), None)
+                    Ok(MacStatusWindow { panel, label })
                 }
-                None => (None, Some("macOS 更新提示窗缺少内容视图".to_string())),
+                None => Err("macOS 更新提示窗缺少内容视图".to_string()),
             };
 
             Ok(Self {
                 state: Arc::new(MainThreadBound::new(
-                    RefCell::new(MacUiState {
-                        app,
-                        status,
-                        status_error,
-                    }),
+                    RefCell::new(MacUiState { app, status }),
                     mtm,
                 )),
             })
@@ -430,12 +418,7 @@ mod platform {
             let message = message.to_string();
             self.state.get_on_main(|state| -> Result<(), String> {
                 let state = state.borrow();
-                let status = state.status.as_ref().ok_or_else(|| {
-                    state
-                        .status_error
-                        .clone()
-                        .unwrap_or_else(|| "macOS 更新状态界面不可用".to_string())
-                })?;
+                let status = state.status.as_ref().map_err(Clone::clone)?;
                 status.label.setStringValue(&NSString::from_str(&message));
                 status.panel.center();
                 status.panel.orderFrontRegardless();
@@ -445,7 +428,7 @@ mod platform {
 
         pub fn hide_status(&self) -> Result<(), String> {
             self.state.get_on_main(|state| {
-                if let Some(status) = &state.borrow().status {
+                if let Ok(status) = &state.borrow().status {
                     status.panel.orderOut(None);
                 }
             });
@@ -455,7 +438,7 @@ mod platform {
         pub fn shutdown(&self) {
             self.state.get_on_main(|state| {
                 let state = state.borrow();
-                if let Some(status) = &state.status {
+                if let Ok(status) = &state.status {
                     status.panel.orderOut(None);
                 }
                 state.app.stop(None);

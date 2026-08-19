@@ -250,6 +250,10 @@
   let bridgeRetryTimer = 0;
   let bridgeRetryDelay = 50;
   let bridgeRetryDeadline = Date.now() + 30_000;
+  // 慢速重试（30s 周期）封顶：桥长期缺席时不再无限期探测。
+  // __codeyEnsurePluginBridge 会重置计数并重新打开 30s 快速窗口。
+  const MAX_SLOW_BRIDGE_RETRIES = 20;
+  let bridgeSlowRetries = 0;
   const markPluginBridgeEffective = () => {
     const entry = window.__codeyInjectionStatus?.["plugin-marketplace-compatibility"];
     if (!entry || entry.status === "failed") return;
@@ -306,6 +310,10 @@
     bridgeRetryTimer = 0;
     if (patchElectronBridge()) return;
     const fastRetry = Date.now() < bridgeRetryDeadline;
+    if (!fastRetry) {
+      if (bridgeSlowRetries >= MAX_SLOW_BRIDGE_RETRIES) return;
+      bridgeSlowRetries += 1;
+    }
     const delay = fastRetry ? bridgeRetryDelay : 30_000;
     if (fastRetry) bridgeRetryDelay = Math.min(bridgeRetryDelay * 2, 2_000);
     bridgeRetryTimer = window.setTimeout(retryPatchElectronBridge, delay);
@@ -313,6 +321,7 @@
   window.__codeyEnsurePluginBridge = () => {
     bridgeRetryDeadline = Date.now() + 30_000;
     bridgeRetryDelay = 50;
+    bridgeSlowRetries = 0;
     if (patchElectronBridge()) return;
     window.clearTimeout(bridgeRetryTimer);
     bridgeRetryTimer = window.setTimeout(retryPatchElectronBridge, bridgeRetryDelay);

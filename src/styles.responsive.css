@@ -3,9 +3,7 @@
    ========================================================================== */
 
 @media (max-width: 980px) {
-  .settings-dashboard-grid,
-  .prompt-subagent-grid,
-  .feature-notification-grid {
+  .prompt-subagent-grid {
     grid-template-columns: 1fr;
   }
 }

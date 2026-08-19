@@ -157,7 +157,7 @@
       `codey-wmi-guard-${Date.now()}-${probeAttempts}`;
     let responseListener = null;
     let responseTimer = 0;
-    let finishResponseWait = null;
+    let finishResponseWait;
     const responseWait = new Promise((resolve) => {
       let settled = false;
       finishResponseWait = (value) => {
@@ -215,7 +215,7 @@
         ).slice(0, 160);
       })
       .finally(() => {
-        finishResponseWait?.(null);
+        finishResponseWait(null);
         if (probePending === request) probePending = null;
         updateInjectionEntry();
       });
