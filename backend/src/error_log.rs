@@ -1,7 +1,9 @@
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -16,8 +18,11 @@ const ERROR_LOG_HELPER_ARGUMENT: &str = "--codey-record-error";
 const MAX_HELPER_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_HELPER_RECORDS: usize = 64;
 const BEIJING_OFFSET_SECONDS: i32 = 8 * 60 * 60;
+const FAILURE_DEDUP_WINDOW: Duration = Duration::from_secs(600);
+const FAILURE_DEDUP_MAX_KEYS: usize = 64;
 static ERROR_LOG_WRITER: OnceLock<Mutex<ErrorLogWriter>> = OnceLock::new();
 static PANIC_LOG_HOOK: OnceLock<()> = OnceLock::new();
+static FAILURE_DEDUP: OnceLock<Mutex<FailureDedupCache>> = OnceLock::new();
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -72,6 +77,75 @@ enum ErrorHelperInput {
 pub struct FailureMetadata {
     pub stage: Option<String>,
     pub recoverable: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct FailureDedupKey {
+    event: String,
+    operation: String,
+    error: String,
+}
+
+#[derive(Debug)]
+struct FailureDedupEntry {
+    last_emitted: Instant,
+    suppressed: u64,
+}
+
+#[derive(Debug, Default)]
+struct FailureDedupCache {
+    entries: HashMap<FailureDedupKey, FailureDedupEntry>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FailureDedupDecision {
+    Emit { suppressed: u64 },
+    Suppress,
+}
+
+impl FailureDedupCache {
+    // A watchdog on a stuck renderer otherwise appends the identical record
+    // every cycle for the whole session. Repeats inside the window are counted
+    // and folded into the next emitted record as `suppressedRepeats`.
+    fn decide(&mut self, key: FailureDedupKey, now: Instant) -> FailureDedupDecision {
+        if let Some(entry) = self.entries.get_mut(&key) {
+            if now.duration_since(entry.last_emitted) < FAILURE_DEDUP_WINDOW {
+                entry.suppressed = entry.suppressed.saturating_add(1);
+                return FailureDedupDecision::Suppress;
+            }
+            let suppressed = entry.suppressed;
+            entry.last_emitted = now;
+            entry.suppressed = 0;
+            return FailureDedupDecision::Emit { suppressed };
+        }
+        if self.entries.len() >= FAILURE_DEDUP_MAX_KEYS {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_emitted)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            key,
+            FailureDedupEntry {
+                last_emitted: now,
+                suppressed: 0,
+            },
+        );
+        FailureDedupDecision::Emit { suppressed: 0 }
+    }
+}
+
+fn failure_dedup_decide(key: FailureDedupKey) -> FailureDedupDecision {
+    FAILURE_DEDUP
+        .get_or_init(|| Mutex::new(FailureDedupCache::default()))
+        .lock()
+        .map(|mut cache| cache.decide(key, Instant::now()))
+        // Logging must never be lost just because the dedup lock is poisoned.
+        .unwrap_or(FailureDedupDecision::Emit { suppressed: 0 })
 }
 
 fn beijing_offset() -> FixedOffset {
@@ -278,18 +352,35 @@ pub fn record_failure_with_metadata(
     context: impl Serialize,
 ) {
     let now = beijing_now();
-    let context = serde_json::to_value(context).unwrap_or_else(|serialization_error| {
+    let event = event.into();
+    let operation = operation.into();
+    let error = error.into();
+    let mut context = serde_json::to_value(context).unwrap_or_else(|serialization_error| {
         serde_json::json!({
             "contextSerializationError": serialization_error.to_string(),
         })
     });
+    match failure_dedup_decide(FailureDedupKey {
+        event: event.clone(),
+        operation: operation.clone(),
+        error: error.clone(),
+    }) {
+        FailureDedupDecision::Suppress => return,
+        FailureDedupDecision::Emit { suppressed } => {
+            if suppressed > 0
+                && let Some(values) = context.as_object_mut()
+            {
+                values.insert("suppressedRepeats".to_string(), Value::from(suppressed));
+            }
+        }
+    }
     let record = ErrorRecord {
         timestamp: format_beijing_timestamp(now),
         platform: std::env::consts::OS.to_string(),
         versions: ErrorVersions::current(),
-        event: event.into(),
-        operation: operation.into(),
-        error: error.into(),
+        event,
+        operation,
+        error,
         stage: metadata.stage,
         recoverable: metadata.recoverable,
         context,
@@ -499,6 +590,72 @@ fn file_is_from_different_day(path: &Path, today: NaiveDate) -> std::io::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_failures_are_suppressed_within_the_dedup_window() {
+        let mut cache = FailureDedupCache::default();
+        let key = || FailureDedupKey {
+            event: "injection_health_check_failed".to_string(),
+            operation: "check_cdp_bridge_health".to_string(),
+            error: "timed out waiting for CDP command".to_string(),
+        };
+        let start = Instant::now();
+
+        assert_eq!(
+            cache.decide(key(), start),
+            FailureDedupDecision::Emit { suppressed: 0 }
+        );
+        for step in 1..=3_u64 {
+            assert_eq!(
+                cache.decide(key(), start + Duration::from_secs(35 * step)),
+                FailureDedupDecision::Suppress
+            );
+        }
+        assert_eq!(
+            cache.decide(key(), start + FAILURE_DEDUP_WINDOW + Duration::from_secs(1)),
+            FailureDedupDecision::Emit { suppressed: 3 }
+        );
+        // The counter resets after an emit, so the cadence stays one record
+        // per window no matter how long the renderer stays stuck.
+        assert_eq!(
+            cache.decide(key(), start + FAILURE_DEDUP_WINDOW + Duration::from_secs(2)),
+            FailureDedupDecision::Suppress
+        );
+    }
+
+    #[test]
+    fn dedup_cache_evicts_the_oldest_key_when_full() {
+        let mut cache = FailureDedupCache::default();
+        let start = Instant::now();
+        for index in 0..FAILURE_DEDUP_MAX_KEYS {
+            let key = FailureDedupKey {
+                event: format!("event-{index}"),
+                operation: "op".to_string(),
+                error: "err".to_string(),
+            };
+            assert_eq!(
+                cache.decide(key, start + Duration::from_secs(index as u64)),
+                FailureDedupDecision::Emit { suppressed: 0 }
+            );
+        }
+
+        let extra = FailureDedupKey {
+            event: "extra".to_string(),
+            operation: "op".to_string(),
+            error: "err".to_string(),
+        };
+        assert_eq!(
+            cache.decide(extra, start + Duration::from_secs(999)),
+            FailureDedupDecision::Emit { suppressed: 0 }
+        );
+        assert_eq!(cache.entries.len(), FAILURE_DEDUP_MAX_KEYS);
+        let evicted = FailureDedupKey {
+            event: "event-0".to_string(),
+            operation: "op".to_string(),
+            error: "err".to_string(),
+        };
+        assert!(!cache.entries.contains_key(&evicted));
+    }
 
     #[test]
     fn path_uses_codey_state_directory() {

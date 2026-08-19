@@ -476,6 +476,10 @@ fn simple_file_inspection(command: &str, arguments: &[&str]) -> bool {
 }
 
 fn safe_ripgrep(arguments: &[&str]) -> bool {
+    // 参数在比较前已统一转为小写,因此短形式 `-f` 同时覆盖 `-f`(--file)
+    // 与 `-F`(--fixed-strings),`-m` 同时覆盖 `-m`(--max-count)与
+    // `-M`(--max-columns),`-u` 同时覆盖 `-u`(--unrestricted)与 `-U`(--multiline);
+    // 长形式则必须逐一列出。这些 flag 的语义 FastCtx grep 无法等价表达,一律放行到 shell。
     !arguments.iter().any(|argument| {
         matches!(
             *argument,
@@ -507,6 +511,7 @@ fn safe_ripgrep(arguments: &[&str]) -> bool {
                 | "--trace"
                 | "-f"
                 | "--fixed-strings"
+                | "--file"
                 | "-v"
                 | "--invert-match"
                 | "-c"
@@ -523,6 +528,12 @@ fn safe_ripgrep(arguments: &[&str]) -> bool {
                 | "--sortr"
                 | "--max-count"
                 | "--max-filesize"
+                | "-m"
+                | "--max-columns"
+                | "-q"
+                | "--quiet"
+                | "-0"
+                | "--null"
         ) || argument.starts_with("--replace=")
             || argument.starts_with("--pre=")
             || argument.starts_with("--pre-glob=")
@@ -532,6 +543,9 @@ fn safe_ripgrep(arguments: &[&str]) -> bool {
             || argument.starts_with("--sortr=")
             || argument.starts_with("--max-count=")
             || argument.starts_with("--max-filesize=")
+            || argument.starts_with("--file=")
+            || argument.starts_with("--max-columns=")
+            || argument.starts_with("--multiline")
     })
 }
 
@@ -605,6 +619,19 @@ mod tests {
             "rg --no-ignore needle src",
             "rg --encoding=shift_jis needle src",
             "rg --count needle src",
+            "rg -F a.b src",
+            "rg --fixed-strings a.b src",
+            "rg -f patterns.txt src",
+            "rg --file patterns.txt src",
+            "rg --file=patterns.txt src",
+            "rg -m 5 needle src",
+            "rg -M 80 needle src",
+            "rg --max-columns 80 needle src",
+            "rg -q needle src",
+            "rg --null -l needle src",
+            "rg -U 'a\\nb' src",
+            "rg --multiline 'a\\nb' src",
+            "rg --multiline-dotall 'a.*b' src",
         ] {
             assert_eq!(route_for_command(command), None, "{command}");
         }
