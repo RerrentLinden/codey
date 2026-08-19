@@ -181,7 +181,7 @@ fn write_legacy_runtime_lease(
 }
 
 #[test]
-fn official_patch_uses_the_official_endpoint_and_catalog() {
+fn official_patch_uses_the_official_endpoint_without_a_custom_catalog() {
     let result = patch_config(
         "model = \"gpt\"\nmodel_catalog_json = \"old.json\"\n",
         &official_profile(),
@@ -191,10 +191,7 @@ fn official_patch_uses_the_official_endpoint_and_catalog() {
     .unwrap();
     assert!(result.contains("base_url = \"https://chatgpt.com/backend-api/codex\""));
     assert!(!result.contains("experimental_bearer_token"));
-    assert_eq!(
-        root_key_string(&result, "model_catalog_json").as_deref(),
-        Some("model-catalogs/codey-official.json")
-    );
+    assert_eq!(root_key_string(&result, "model_catalog_json"), None);
     assert_eq!(root_key_string(&result, "model"), None);
     assert_eq!(
         root_key_string(&result, "service_tier").as_deref(),
@@ -231,10 +228,7 @@ fn official_patch_keeps_builtin_openai_without_a_configured_provider_table() {
             .and_then(Item::as_table)
             .is_none_or(|providers| providers.get(BUILTIN_OPENAI_PROVIDER_ID).is_none())
     );
-    assert_eq!(
-        document["model_catalog_json"].as_str(),
-        Some("model-catalogs/codey-official.json")
-    );
+    assert!(document.get("model_catalog_json").is_none());
 }
 
 #[test]
@@ -329,6 +323,22 @@ fn direct_patch_configures_a_responses_provider_without_a_loopback_endpoint() {
     assert_eq!(
         root_key_string(&result, "model_provider").as_deref(),
         Some("relay")
+    );
+}
+
+#[test]
+fn direct_patch_installs_the_codey_model_catalog_when_requested() {
+    let result = patch_config(
+        "model_catalog_json = \"old.json\"\n",
+        &direct_profile(RelayProtocol::Responses),
+        "relay",
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(
+        root_key_string(&result, "model_catalog_json").as_deref(),
+        Some("model-catalogs/codey-official.json")
     );
 }
 

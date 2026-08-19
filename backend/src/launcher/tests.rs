@@ -1,6 +1,18 @@
 use super::*;
 
 #[test]
+fn official_provider_inherits_the_codex_builtin_model_catalog() {
+    assert!(!should_install_codey_model_catalog(true, true));
+    assert!(!should_install_codey_model_catalog(true, false));
+}
+
+#[test]
+fn third_party_provider_installs_the_codey_model_catalog_when_available() {
+    assert!(should_install_codey_model_catalog(false, true));
+    assert!(!should_install_codey_model_catalog(false, false));
+}
+
+#[test]
 fn chat_provider_builds_an_explicit_protocol_proxy_snapshot() {
     let mut config = CodeyConfig::default();
     let mut profile = crate::config::ProviderProfile::new("DeepSeek");

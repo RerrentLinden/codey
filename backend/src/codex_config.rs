@@ -1875,6 +1875,13 @@ fn patch_config_with_fastctx_mode_and_proxy(
         preserve_provider_route,
         protocol_proxy_base_url,
     } = options;
+    // Official OpenAI routes use Codex's built-in model metadata. In
+    // particular, do not let Codey's generated catalog override the official
+    // context window or automatic-compaction defaults. Third-party routes keep
+    // using the generated catalog for filtering and synthetic model entries.
+    let model_catalog_path = (!profile.cc_switch_read_only)
+        .then_some(model_catalog_path)
+        .flatten();
     if !preserve_provider_route {
         ensure_supported_provider_protocol(profile.protocol, protocol_proxy_base_url)?;
     }

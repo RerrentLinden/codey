@@ -427,6 +427,10 @@ struct PreparedCodexStartupState {
     runtime_config_overrides: Vec<String>,
 }
 
+fn should_install_codey_model_catalog(official_provider: bool, catalog_available: bool) -> bool {
+    !official_provider && catalog_available
+}
+
 async fn prepare_startup_model_catalog(
     config: &CodeyConfig,
     current_profile: &ProviderProfile,
@@ -480,7 +484,7 @@ async fn prepare_startup_model_catalog(
             error
         })?;
 
-    let use_official_catalog = match refresh_result {
+    let catalog_available_for_runtime = match refresh_result {
         Ok(_) => true,
         Err(error) if model_catalog::is_runtime_model_cache_unavailable(&error) => {
             if catalog_available {
@@ -517,6 +521,12 @@ async fn prepare_startup_model_catalog(
             false
         }
     };
+    // Official OpenAI routes should inherit Codex's built-in model metadata,
+    // including its context window and automatic-compaction defaults. Codey's
+    // generated catalog remains necessary for third-party model filtering and
+    // synthetic model entries.
+    let use_official_catalog =
+        should_install_codey_model_catalog(official_provider, catalog_available_for_runtime);
     let model_state = match selection_result {
         Ok(state) => state,
         Err(error) => {
