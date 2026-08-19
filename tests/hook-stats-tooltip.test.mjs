@@ -4,10 +4,10 @@ import test from "node:test";
 
 const source = readFileSync(new URL("../public/codey-inject.js", import.meta.url), "utf8");
 
-test("oversized conversation detail tooltips cannot cover their trigger", () => {
+test("oversized conversation detail tooltips stay inside their scrollable surface", () => {
   assert.match(
     source,
-    /const conversationRichTooltipSelector = conversationTurnSelector[\s\S]*span\[tabindex="0"\]\[aria-describedby\]/,
+    /const conversationRichTooltipSelector = conversationTurnSelector[\s\S]*:is\(button, \[role="button"\], span\[tabindex="0"\]\)\[aria-describedby\]/,
   );
 
   const rule = source.match(/\$\{conversationRichTooltipSelector\} \{([^}]*)\}/)?.[1] || "";

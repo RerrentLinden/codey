@@ -82,11 +82,12 @@
   // Rich conversation tooltips (notably Hooks details) can be taller than the
   // collision-limited tooltip box. Clip the overflowing children inside that
   // box so they cannot cover their trigger and create a pointer enter/leave
-  // loop. aria-describedby is present only while the native tooltip is open.
+  // loop. Codex has shipped both native button and focusable-span triggers;
+  // aria-describedby is present only while the native tooltip is open.
   const conversationRichTooltipSelector = conversationTurnSelector
     .split(", ")
     .map((turnSelector) => (
-      `body:has(${turnSelector} span[tabindex="0"][aria-describedby]) [role="tooltip"]`
+      `body:has(${turnSelector} :is(button, [role="button"], span[tabindex="0"])[aria-describedby]) [role="tooltip"]`
     ))
     .join(", ");
   const sidebarScanRootSelector = [
