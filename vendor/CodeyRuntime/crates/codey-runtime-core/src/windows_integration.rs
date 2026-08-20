@@ -312,6 +312,27 @@ pub fn terminate_process_if_matches(
 }
 
 #[cfg(windows)]
+pub fn terminate_process_if_creation_matches(process_id: u32, expected_creation_time: u64) -> bool {
+    let Ok(handle) = (unsafe {
+        OpenProcess(
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            process_id,
+        )
+    }) else {
+        return false;
+    };
+    if handle.is_invalid() {
+        return false;
+    }
+    let _guard = HandleGuard(handle);
+    if query_process_creation_time_from_handle(handle) != Some(expected_creation_time) {
+        return false;
+    }
+    unsafe { TerminateProcess(handle, 0) }.is_ok()
+}
+
+#[cfg(windows)]
 pub fn process_paths_equal(left: &Path, right: &Path) -> bool {
     normalize_process_path(left).eq_ignore_ascii_case(&normalize_process_path(right))
 }

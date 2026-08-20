@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -7,7 +8,7 @@ use anyhow::{Context, Result};
 use codey_runtime_core::bridge::{
     BridgeHandler, BridgePumpHandle, bridge_health_check_script, install_bridge,
 };
-use codey_runtime_core::cdp::{list_targets, pick_injectable_codex_page_target};
+use codey_runtime_core::cdp::{CdpTarget, list_targets, pick_injectable_codex_page_target};
 use serde::{Deserialize, Serialize};
 
 use crate::error_log;
@@ -16,6 +17,8 @@ const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load"
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
 const FAST_STARTUP_STATSIG_TIMEOUT_MS: u64 = 1500;
 const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
+const INJECTION_STATUS_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const INJECTION_DEADLINE_MARGIN: Duration = Duration::from_millis(100);
 const FAST_STARTUP_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/fast-startup-shield.js");
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
@@ -39,6 +42,38 @@ const PROMPT_OPTIMIZE_SCRIPT: &str = include_str!("../../dist-overlay/inject/pro
 const MAX_INJECTION_ERROR_CHARS: usize = 500;
 static SETTINGS_OVERLAY_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
 static SESSION_TOOLS_LOAD_SCRIPT: OnceLock<Arc<str>> = OnceLock::new();
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum InjectionPhase {
+    DiscoverTargets,
+    SelectTarget,
+    InstallBridge,
+    VerifyOverlay,
+    ReadStatuses,
+}
+
+impl InjectionPhase {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            value if value == Self::SelectTarget as u8 => Self::SelectTarget,
+            value if value == Self::InstallBridge as u8 => Self::InstallBridge,
+            value if value == Self::VerifyOverlay as u8 => Self::VerifyOverlay,
+            value if value == Self::ReadStatuses as u8 => Self::ReadStatuses,
+            _ => Self::DiscoverTargets,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DiscoverTargets => "枚举 CDP 页面",
+            Self::SelectTarget => "选择 Codex renderer",
+            Self::InstallBridge => "安装 CDP bridge 与注入脚本",
+            Self::VerifyOverlay => "验证 Codey 浮层",
+            Self::ReadStatuses => "读取注入状态",
+        }
+    }
+}
 
 #[derive(Clone)]
 struct InjectionScriptDescriptor {
@@ -465,25 +500,41 @@ pub async fn retry_inject_with_scripts(
     // hard startup deadline.
     let deadline = tokio::time::Instant::now() + CDP_INJECTION_TIMEOUT;
     let mut delay = Duration::from_millis(100);
+    let phase = Arc::new(AtomicU8::new(InjectionPhase::DiscoverTargets as u8));
+    let mut previous_error = None;
     let last_error = loop {
+        phase.store(InjectionPhase::DiscoverTargets as u8, Ordering::Release);
         match tokio::time::timeout_at(
             deadline,
-            inject_with_scripts(debug_port, handler.clone(), scripts),
+            inject_with_scripts(debug_port, handler.clone(), scripts, &phase, deadline),
         )
         .await
         {
             Ok(Ok(target)) => return Ok(target),
             Ok(Err(error)) => {
+                let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
                 if tokio::time::Instant::now() + delay > deadline {
-                    break error;
+                    break anyhow::anyhow!(
+                        "Codex CDP bridge 注入失败（阶段：{}；{}）",
+                        current_phase.label(),
+                        safe_injection_error_summary(&error)
+                    );
                 }
+                previous_error = Some(safe_injection_error_summary(&error));
                 tokio::time::sleep(delay).await;
                 delay = (delay * 2).min(Duration::from_secs(2));
             }
             Err(_) => {
+                let current_phase = InjectionPhase::from_raw(phase.load(Ordering::Acquire));
+                let previous_error = previous_error
+                    .as_deref()
+                    .map(|error| format!("；最近一次失败：{error}"))
+                    .unwrap_or_default();
                 break anyhow::anyhow!(
-                    "等待 Codex CDP bridge 注入超时（{} ms）",
-                    CDP_INJECTION_TIMEOUT.as_millis()
+                    "等待 Codex CDP bridge 注入超时（{} ms，阶段：{}{}）",
+                    CDP_INJECTION_TIMEOUT.as_millis(),
+                    current_phase.label(),
+                    previous_error
                 );
             }
         }
@@ -491,13 +542,106 @@ pub async fn retry_inject_with_scripts(
     Err(InjectionRetryFailure { error: last_error })
 }
 
+fn summarize_cdp_targets(targets: &[CdpTarget]) -> String {
+    if targets.is_empty() {
+        return "[]".to_string();
+    }
+    let visible = targets
+        .iter()
+        .take(6)
+        .map(|target| {
+            format!(
+                "{{type:{},url:{:?},ws:{}}}",
+                truncate_chars(target.target_type.clone(), 20),
+                safe_target_url_shape(&target.url),
+                target.web_socket_debugger_url.is_some()
+            )
+        })
+        .collect::<Vec<_>>();
+    let omitted = targets.len().saturating_sub(visible.len());
+    if omitted == 0 {
+        format!("[{}]", visible.join(","))
+    } else {
+        format!("[{},+{omitted}]", visible.join(","))
+    }
+}
+
+fn safe_target_url_shape(url: &str) -> String {
+    let trimmed = url.trim();
+    if trimmed.to_ascii_lowercase().starts_with("app://") {
+        let end = trimmed
+            .char_indices()
+            .find_map(|(index, character)| matches!(character, '?' | '#').then_some(index))
+            .unwrap_or(trimmed.len());
+        return truncate_chars(trimmed[..end].to_string(), 100);
+    }
+    trimmed
+        .split_once(':')
+        .filter(|(scheme, _)| {
+            !scheme.is_empty()
+                && scheme.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '+' | '-' | '.')
+                })
+        })
+        .map(|(scheme, _)| format!("{}:", scheme.to_ascii_lowercase()))
+        .unwrap_or_else(|| "<unknown>".to_string())
+}
+
+fn safe_injection_error_summary(error: &anyhow::Error) -> String {
+    let message = format!("{error:#}");
+    if let Some((_, targets)) = message.split_once("CDP targets=") {
+        let targets = targets
+            .split_once(']')
+            .map(|(targets, _)| format!("{targets}]"))
+            .unwrap_or_else(|| "[]".to_string());
+        return truncate_chars(
+            format!("未发现匹配的 Codex renderer；CDP targets={targets}"),
+            MAX_INJECTION_ERROR_CHARS,
+        );
+    }
+    let normalized = message.to_ascii_lowercase();
+    if normalized.contains("failed to query cdp targets")
+        || normalized.contains("枚举 codex cdp 页面失败")
+    {
+        "CDP 页面列表尚不可用".to_string()
+    } else if normalized.contains("timed out connecting cdp websocket")
+        || normalized.contains("failed to connect")
+    {
+        "CDP WebSocket 连接失败".to_string()
+    } else if normalized.contains("timed out waiting for cdp command") {
+        "CDP 命令未在单次响应预算内完成".to_string()
+    } else if normalized.contains("codey 内嵌配置面板注入失败") {
+        "Codey 浮层未就绪".to_string()
+    } else {
+        "内部注入尝试失败".to_string()
+    }
+}
+
+fn injection_status_read_budget(remaining: Duration) -> Option<Duration> {
+    let budget = remaining
+        .saturating_sub(INJECTION_DEADLINE_MARGIN)
+        .min(INJECTION_STATUS_READ_TIMEOUT);
+    (!budget.is_zero()).then_some(budget)
+}
+
 async fn inject_with_scripts(
     debug_port: u16,
     handler: BridgeHandler,
     scripts: &PreparedInjectionScripts,
+    phase: &AtomicU8,
+    deadline: tokio::time::Instant,
 ) -> Result<InjectedTarget> {
-    let targets = list_targets(debug_port).await?;
-    let target = pick_injectable_codex_page_target(&targets)?;
+    phase.store(InjectionPhase::DiscoverTargets as u8, Ordering::Release);
+    let targets = list_targets(debug_port)
+        .await
+        .context("枚举 Codex CDP 页面失败")?;
+    phase.store(InjectionPhase::SelectTarget as u8, Ordering::Release);
+    let target = pick_injectable_codex_page_target(&targets).with_context(|| {
+        format!(
+            "没有找到可注入的 Codex renderer；CDP targets={}",
+            summarize_cdp_targets(&targets)
+        )
+    })?;
     let websocket_url: Arc<str> = Arc::from(
         target
             .web_socket_debugger_url
@@ -505,19 +649,34 @@ async fn inject_with_scripts(
             .ok_or_else(|| anyhow::anyhow!("Codex 页面没有 CDP WebSocket 地址"))?,
     );
     let handler = with_lazy_loaders(handler, websocket_url.clone());
+    phase.store(InjectionPhase::InstallBridge as u8, Ordering::Release);
     let pump = install_bridge(
         &websocket_url,
         codey_runtime_core::bridge::BRIDGE_BINDING_NAME,
         handler,
         &scripts.scripts,
     )
-    .await?;
-    ensure_settings_overlay_ready(&websocket_url).await?;
-    let injection_statuses = read_injection_statuses(&websocket_url, scripts)
+    .await
+    .with_context(|| format!("向 Codex renderer {} 安装 CDP bridge 失败", target.id))?;
+    phase.store(InjectionPhase::VerifyOverlay as u8, Ordering::Release);
+    ensure_settings_overlay_ready(&websocket_url)
         .await
-        .unwrap_or_else(|error| {
-            scripts.statuses_with_error(format!("读取注入状态失败：{error:#}"))
-        });
+        .with_context(|| format!("验证 Codex renderer {} 的 Codey 浮层失败", target.id))?;
+    phase.store(InjectionPhase::ReadStatuses as u8, Ordering::Release);
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let injection_statuses = match injection_status_read_budget(remaining) {
+        Some(status_budget) => match tokio::time::timeout(
+            status_budget,
+            read_injection_statuses(&websocket_url, scripts),
+        )
+        .await
+        {
+            Ok(Ok(statuses)) => statuses,
+            Ok(Err(_)) => scripts.statuses_with_error("读取注入状态失败，将在运行期复核"),
+            Err(_) => scripts.statuses_with_error("读取注入状态超时，将在运行期复核"),
+        },
+        None => scripts.statuses_with_error("启动预算即将结束，注入状态将在运行期复核"),
+    };
     Ok(InjectedTarget {
         websocket_url,
         pump,
@@ -1120,6 +1279,61 @@ mod tests {
     #[test]
     fn injection_deadline_leaves_time_for_slow_windows_renderer_startup() {
         assert_eq!(CDP_INJECTION_TIMEOUT, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn nonessential_status_read_never_consumes_the_injection_deadline() {
+        assert_eq!(
+            injection_status_read_budget(Duration::from_secs(5)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            injection_status_read_budget(Duration::from_millis(150)),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            injection_status_read_budget(Duration::from_millis(100)),
+            None
+        );
+    }
+
+    #[test]
+    fn cdp_target_summary_keeps_shape_but_redacts_query_and_fragment() {
+        let targets = vec![CdpTarget {
+            id: "page-1".to_string(),
+            target_type: "page".to_string(),
+            title: "private task title".to_string(),
+            url: "app://-/index.html?token=secret#private".to_string(),
+            web_socket_debugger_url: Some("ws://127.0.0.1/devtools/page/1".to_string()),
+        }];
+
+        let summary = summarize_cdp_targets(&targets);
+
+        assert!(summary.contains("app://-/index.html"));
+        assert!(summary.contains("ws:true"));
+        assert!(!summary.contains("secret"));
+        assert!(!summary.contains("private"));
+        assert!(!summary.contains("task title"));
+        assert!(!summary.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn injection_error_summary_does_not_persist_renderer_or_script_secrets() {
+        let target_error = anyhow::anyhow!(
+            "没有找到 renderer；CDP targets=[{{type:page,url:\"app://-/index.html\",ws:true}}]: secret title"
+        );
+        let script_error = anyhow::anyhow!(
+            "timed out waiting for CDP command Runtime.evaluate: token=secret stack=/private/path"
+        );
+
+        let target_summary = safe_injection_error_summary(&target_error);
+        let script_summary = safe_injection_error_summary(&script_error);
+
+        assert!(target_summary.contains("app://-/index.html"));
+        assert!(!target_summary.contains("secret title"));
+        assert_eq!(script_summary, "CDP 命令未在单次响应预算内完成");
+        assert!(!script_summary.contains("secret"));
+        assert!(!script_summary.contains("private"));
     }
 
     #[test]

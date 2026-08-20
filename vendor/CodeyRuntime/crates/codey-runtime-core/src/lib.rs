@@ -80,3 +80,11 @@ pub fn windows_terminate_process_if_matches(
         expected_creation_time,
     )
 }
+
+#[cfg(windows)]
+pub fn windows_terminate_process_if_creation_matches(
+    process_id: u32,
+    expected_creation_time: u64,
+) -> bool {
+    windows_integration::terminate_process_if_creation_matches(process_id, expected_creation_time)
+}

@@ -114,7 +114,9 @@ pub fn is_codex_page_target(target: &CdpTarget) -> bool {
         return false;
     }
     let haystack = format!("{} {}", target.title, target.url).to_lowercase();
-    haystack.contains("codex") || is_chatgpt_desktop_page(&target.title, &target.url)
+    haystack.contains("codex")
+        || is_chatgpt_desktop_page(&target.title, &target.url)
+        || is_packaged_codex_page(&target.url)
 }
 
 pub fn is_primary_codex_page_target(target: &CdpTarget) -> bool {
@@ -140,6 +142,13 @@ fn is_chatgpt_desktop_page(title: &str, url: &str) -> bool {
             || url == "https://chat.openai.com"
             || url.starts_with("https://chat.openai.com/")
             || url.starts_with("data:text/html"))
+}
+
+fn is_packaged_codex_page(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    url == "app://-/index.html"
+        || url.starts_with("app://-/index.html?")
+        || url.starts_with("app://-/index.html#")
 }
 
 #[cfg(test)]

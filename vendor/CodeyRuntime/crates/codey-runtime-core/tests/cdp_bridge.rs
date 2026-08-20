@@ -1234,6 +1234,64 @@ fn primary_target_selection_skips_v1_and_v2_overlay_candidates() {
 }
 
 #[test]
+fn packaged_codex_main_target_does_not_require_a_ready_title() {
+    let targets = vec![target(
+        "main",
+        "page",
+        "",
+        "app://-/index.html",
+        Some("ws://main"),
+    )];
+
+    let selected = pick_injectable_codex_page_target(&targets).unwrap();
+
+    assert_eq!(selected.id, "main");
+}
+
+#[test]
+fn blank_packaged_avatar_overlay_is_still_excluded() {
+    let targets = vec![
+        target(
+            "overlay",
+            "page",
+            "",
+            "app://-/index.html?initialRoute=%2Favatar-overlay",
+            Some("ws://overlay"),
+        ),
+        target(
+            "main",
+            "page",
+            "",
+            "app://-/index.html#main",
+            Some("ws://main"),
+        ),
+    ];
+
+    let selected = pick_injectable_codex_page_target(&targets).unwrap();
+
+    assert_eq!(selected.id, "main");
+}
+
+#[test]
+fn unrelated_blank_app_page_is_not_a_codex_target() {
+    let targets = vec![target(
+        "other",
+        "page",
+        "",
+        "app://other/index.html",
+        Some("ws://other"),
+    )];
+
+    let error = pick_injectable_codex_page_target(&targets).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("No injectable Codex page target")
+    );
+}
+
+#[test]
 fn pick_injectable_codex_page_target_requires_websocket() {
     let targets = vec![target("codex", "page", "Codex", "https://codex.test", None)];
 

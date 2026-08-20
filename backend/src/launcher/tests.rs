@@ -1,6 +1,28 @@
 use super::*;
 
 #[test]
+fn packaged_activation_detects_a_reused_process_id() {
+    let existing_process_ids = HashSet::from([41_u32, 42_u32]);
+
+    assert!(activation_reused_existing_process(
+        &existing_process_ids,
+        42
+    ));
+    assert!(!activation_reused_existing_process(
+        &existing_process_ids,
+        43
+    ));
+}
+
+#[test]
+fn process_creation_identity_rejects_pid_reuse_when_timestamps_are_available() {
+    assert!(process_creation_identity_matches(Some(100), Some(100)));
+    assert!(!process_creation_identity_matches(Some(100), Some(101)));
+    assert!(process_creation_identity_matches(Some(100), None));
+    assert!(process_creation_identity_matches(None, Some(101)));
+}
+
+#[test]
 fn official_provider_inherits_the_codex_builtin_model_catalog() {
     assert!(!should_install_codey_model_catalog(true, true));
     assert!(!should_install_codey_model_catalog(true, false));
