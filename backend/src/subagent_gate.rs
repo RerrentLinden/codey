@@ -420,6 +420,7 @@ fn pre_tool_use_output(
                     agent_id,
                     agent_type: nonempty(input.agent_type.as_deref()),
                     transcript_path: nonempty(input.transcript_path.as_deref()),
+                    cwd: nonempty(input.cwd.as_deref()),
                     tool_name,
                     tool_input: input.tool_input.as_ref(),
                 },
@@ -1900,9 +1901,12 @@ mod tests {
         std::fs::create_dir_all(&state_root).unwrap();
         let workspace = temp.path().join("workspace");
         let scope = workspace.join("scope");
+        let sibling_worktree = workspace.join(".worktrees/sibling");
         std::fs::create_dir_all(&scope).unwrap();
+        std::fs::create_dir_all(sibling_worktree.join("scope")).unwrap();
         let workspace = workspace.to_string_lossy().into_owned();
         let scope = scope.to_string_lossy().into_owned();
+        let sibling_worktree = sibling_worktree.to_string_lossy().into_owned();
         let session_id = "task-receipt-session";
 
         let mut spawn = input("PreToolUse", session_id);
@@ -1917,8 +1921,8 @@ mod tests {
                 "id": "receipt_reader",
                 "why": "independent_review",
                 "visual": false,
-                "root": workspace,
-                "read": [scope],
+                "root": workspace.clone(),
+                "read": [scope.clone()],
                 "write": [],
                 "checks": []
             }))
@@ -1980,9 +1984,23 @@ mod tests {
         first_read.agent_id = Some(agent_id.to_string());
         first_read.agent_type = Some("codey_quick_scan".to_string());
         first_read.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        first_read.cwd = Some(workspace);
         first_read.tool_name = Some("mcp__codey_fastctx__glob".to_string());
-        first_read.tool_input = Some(json!({ "path": scope, "pattern": ["**/*.rs"] }));
+        first_read.tool_input = Some(json!({ "path": "scope", "pattern": ["**/*.rs"] }));
         assert_eq!(handle_hook(&first_read, &state_root).unwrap(), json!({}));
+
+        let mut sibling_read = first_read;
+        sibling_read.cwd = Some(sibling_worktree);
+        let denied = handle_hook(&sibling_read, &state_root).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("把派生契约 root 指向该 worktree"))
+        );
     }
 
     #[test]
@@ -2123,6 +2141,7 @@ mod tests {
 
         let mut owned_patch = input("PreToolUse", "contract-session");
         owned_patch.agent_id = Some("agent-a".to_string());
+        owned_patch.cwd = Some("/repo".to_string());
         owned_patch.tool_name = Some("apply_patch".to_string());
         owned_patch.tool_input = Some(json!({
             "patch": "*** Begin Patch\n*** Update File: backend/src/lib.rs\n*** End Patch"
@@ -2383,6 +2402,7 @@ mod tests {
 
         let mut owned_patch = input("PreToolUse", "encrypted-contract-session");
         owned_patch.agent_id = Some("/root/encrypted_reader".to_string());
+        owned_patch.cwd = Some(workspace);
         owned_patch.tool_name = Some("apply_patch".to_string());
         owned_patch.tool_input = Some(json!({
             "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n*** End Patch"

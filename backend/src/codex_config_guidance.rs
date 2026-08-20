@@ -318,6 +318,8 @@ Codey 不再按角色成本点、每批尝试次数、批次数或根回合累�
 
 `id` 必须等于 `task_name`；路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径。只声明本任务确实会读取和写入的稳定路径；省略 `root` 时采用 Hook 工作目录，空 `read` 对只读角色表示该 root、对写入角色表示其 `write` 范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 只有额外声明 `command.execute` 且 `write` 覆盖完整 root 时才能运行通用 shell。子代理网络能力不开放，契约不能自行声明或放宽。路径读取和写入都会按解析现存祖先后的物理路径校验；未绑定 attempt 不获得数据或副作用权限。运行时还会校验工具的完整可信名称、理由、角色能力、角色感知并发上限及 read/write 冲突；重复任务 ID、越权访问和重叠 ownership 会被拒绝。
 
+`root` 必须是子代理实际执行任务的工作树根。目标位于 `.worktrees/<name>` 或其他隔离 worktree 时，必须把该 worktree 的绝对路径写入 `root`，并让相对 `read`/`write` 以它为基准；不得用主 checkout 的 root 代替。路径工具的相对目标会按 child `cwd` 解析后再与契约比较；缺少可信 `cwd` 时相对访问按 fail-closed 拒绝。读取被门禁拒绝后，子代理应立即向根代理回报，由根代理使用新任务 ID 和正确契约重新派发或直接接管；不得改用 Bash 绕过，验证命令仍由根代理执行。
+
 ### 任务胶囊与验收
 
 - 派发消息只携带完成子任务必需的目标、范围、允许操作、ownership 和输出契约，不复制整段对话。
@@ -1376,6 +1378,9 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("CODEY_DELEGATION_V2="));
         assert!(SUBAGENT_GUIDANCE.contains("\"capabilities\":[\"files.read\"]"));
         assert!(SUBAGENT_GUIDANCE.contains("写入角色还必须声明 `workspace.write`"));
+        assert!(SUBAGENT_GUIDANCE.contains("`root` 必须是子代理实际执行任务的工作树根"));
+        assert!(SUBAGENT_GUIDANCE.contains("不得用主 checkout 的 root 代替"));
+        assert!(SUBAGENT_GUIDANCE.contains("不得改用 Bash 绕过"));
         assert!(SUBAGENT_GUIDANCE.contains("该批次只能以 `blocked` 结算"));
         assert!(SUBAGENT_GUIDANCE.contains("不再按角色成本点"));
         assert!(SUBAGENT_GUIDANCE.contains("不限制后续批次或累计派发次数"));
