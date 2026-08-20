@@ -249,7 +249,7 @@ fn app_paths_finds_the_runtime_bundled_with_each_desktop_layout() {
 
 #[cfg(unix)]
 #[test]
-fn app_paths_reads_the_runtime_version_from_the_desktop_bundle() {
+fn app_paths_retries_runtime_version_after_a_transient_bundle_launch_failure() {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir().unwrap();
@@ -258,7 +258,12 @@ fn app_paths_reads_the_runtime_version_from_the_desktop_bundle() {
     std::fs::create_dir_all(runtime.parent().unwrap()).unwrap();
     std::fs::write(
         &runtime,
-        "#!/bin/sh\nprintf 'codex-cli 0.147.0-alpha.8\\n'\n",
+        "#!/bin/sh\nmarker=\"$0.started\"\n\
+         if [ ! -e \"$marker\" ]; then\n\
+           : > \"$marker\"\n\
+           exit 1\n\
+         fi\n\
+         printf 'codex-cli 0.147.0-alpha.8\\n'\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&runtime).unwrap().permissions();

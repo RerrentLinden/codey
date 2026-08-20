@@ -576,6 +576,7 @@ fn spawn_test_supervisor_process(temp: &tempfile::TempDir, extra_env: &[(&str, &
     command.spawn().unwrap()
 }
 
+#[cfg(unix)]
 fn wait_for_test_worker_start(root: &Path, count: usize) -> Vec<u32> {
     let path = root.join("test-worker-pids.log");
     let deadline = Instant::now() + PROCESS_TIMEOUT;
