@@ -289,7 +289,7 @@ pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V7: &str = r#"## 子代理使用
 - 用户新输入使旧批次失效时，先中断活动代理并完成对账，忽略迟到结果。预算账本和未清偿验收债按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
 "#;
 
-pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V11: &str = r#"## 子代理使用
 
 子代理用于隔离较宽的上下文、并行处理真正独立的工作，或取得有价值的独立证据。默认由主代理直接处理短而明确的工作；当只读检索可以减少主线程上下文、或并行收益清晰时，应主动考虑子代理，不要为了形式分工而派生。
 
@@ -317,6 +317,55 @@ Codey 不再按角色成本点、每批尝试次数、批次数或根回合累�
 `CODEY_DELEGATION_V2={"id":"task_name","why":"breadth","visual":false,"root":"/absolute/workspace","read":["relevant/path"],"write":[],"capabilities":["files.read"],"checks":[]}`
 
 `id` 必须等于 `task_name`；路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径；绝对 claim 可以位于 `root` 之外，跨多个工作树时分别声明即可。`root`、`read` 和 `write` 是冲突协调、ownership 与审计元数据，应尽量准确描述预计范围，但不是 Codey 的运行时文件路径 ACL。省略 `root` 时采用有效的 Hook 工作目录；Hook 目录缺失或无效但 claim 已是绝对路径时仍可派发。空 `read` 会对只读角色以 root、对写入角色以其 `write` 作为默认协调 claim，但不会收窄 Codex 原生可访问范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 额外声明 `command.execute` 后可以运行通用 shell，不要求 `write` 覆盖完整 root。子代理网络能力不开放，契约不能自行声明或放宽。未绑定 attempt 不获得数据或副作用权限；只读角色即使出现异常或旧账本也不能取得写能力。运行时还会校验工具的完整可信名称、理由、角色能力、角色感知并发上限及 read/write 冲突；重复任务 ID 和重叠 ownership 会被拒绝。
+
+Codey 在 attempt 身份和角色 capability 校验通过后，不再解析、比较或拒绝读取、写入和命令中的目标路径，也不要求 child `cwd` 与契约 `root` 相同。子代理实际能访问哪些工作树、兄弟目录或外部路径，完全由其继承的 Codex sandbox、approval policy、permission profile 和 writable roots 决定；原生权限拒绝时按 Codex 的正常流程处理，不应通过修改 Codey 契约冒充权限提升。验证命令仍由根代理执行机械验收。
+
+### 任务胶囊与验收
+
+- 派发消息只携带完成子任务必需的目标、范围、允许操作、ownership 和输出契约，不复制整段对话。
+- 子代理首行必须是 `status: completed | partial | blocked`，只返回会影响决策的结论、最多 5 条关键证据和明确 gaps；关键证据包含 `file:line`、符号名或可复核链接。
+- 子代理结果只是压缩线索。主代理沿出处抽查；即将修改的确切代码和奠基性文档仍由主代理完整读取。
+- 写入型子代理的自报测试结果不算机械验收。所有子代理进入终态后，主代理必须按 Stop 门禁给出的 `# codey-accept:<task>:<check>` 标记逐字重跑契约命令；只有可信的退出状态 `0` 才清偿验收债。失败后修复并重跑，不能改写命令绕过。连续 3 次失败、连续 3 次 Stop 没有新证据，或持续 10 分钟无法验证时，门禁会把该项标记为“未验证”并在一次明确提示后释放；该批次只能以 `blocked` 结算，结算回执会持久保存未验证项，主代理必须向用户报告失败事实，不得声称验收通过。视觉质量仍需主代理查看实际渲染证据。
+- 多代理证据冲突时比较出处，不按多数票决定；只有高风险且无法确定性验证时才追加独立核验线。
+
+### 汇合、异常与接管
+
+- 同一批独立任务先全部派发，再进入等待。Hook 会把本批首个根派生调用的可信 `turn_id` 绑定为编排主体；同一根 turn 可继续完成本批派发与必要协调，child turn 或缺失/不匹配的 turn 只能使用 `agents.wait_agent` 和无筛选的 `agents.list_agents` 对账，不能派生、追派、中断或操纵批次。所有代理进入终态前不得恢复普通本地工作。
+- 每个子代理只用一轮，不复用、不追派，也不得继续派生。失败后默认由主代理接管；只有缩小或改变范围后仍值得独立委派，才允许使用新任务 ID 最多重派一次。
+- 收到 `CODEY_SUBAGENT_DUPLICATE_TASK_ID` 时，不得重复旧 ID，也不得把拒绝当作完成后立即 Stop。先调用一次无筛选的 `agents.list_agents` 对账：原代理存在时等待其终态或消费已有终态结果，明确不存在时由主代理接管；只有任务范围确实改变且仍值得委派时，才可使用全新的 `task_name` 最多重试一次，并把 `CODEY_DELEGATION_V2.id` 同步改为完全相同的新值。
+- `MESSAGE` 或不完整结果只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`running`、`pending_init` 和 `interrupted` 不是终态。
+- `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态且根 turn 绑定有效时只中断一次。成功的 `agents.interrupt_agent` 表示根代理永久放弃该 attempt，Codey 会立即 fence 并核销本地活动状态；不要再等待或追派该 target，直接接管。中断失败或目标无法唯一匹配时才继续对账，并依赖 Stop 的受控恢复路径。禁止无限 wait、无限重试或静默重派。
+- 用户新输入使旧批次失效时，先完成对账；只有可信根 turn 绑定仍有效时才中断活动代理。中断成功后立即接管并忽略迟到结果，不再等待上游把 `interrupted` 另行改成终态；否则让受控恢复路径接管。编排账本、未清偿验收债和未验证结算证据按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
+"#;
+
+pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+
+子代理用于隔离较宽的上下文、并行处理真正独立的工作，或取得有价值的独立证据。默认由主代理直接处理短而明确的工作；当只读检索可以减少主线程上下文、或并行收益清晰时，应主动考虑子代理，不要为了形式分工而派生。
+
+### 自适应委派
+
+以下任务直接处理，不派子代理：
+
+- 回答、解释、状态汇报、单一事实或一次精确查询；
+- 用户已经给出文件、符号或确切代码位置，预计只涉及不超过 2 个小文件和 3 次本地工具调用；
+- 即将修改的确切代码、奠基性文档，以及步骤彼此依赖、无法真正并行的任务；
+- 派发、等待和抽查成本不明显低于直接处理的任务。
+
+任务命中以下形状时应积极考虑委派：`multi_lookup` 表示至少 2 次彼此独立的定位或事实检索，优先使用快速只读角色；`parallel` 表示至少 2 个互不依赖的分支、每支预计至少 2 次实质调用且合计至少 5 次；`breadth` 表示需要归纳至少 2 个目录或 4 个候选文件；`context` 表示大量日志、文档或页面会明显污染主线程；`independent_work` 表示不在主代理关键路径上的独立写入实现预计至少 6 次调用；`high_risk` 表示高风险结论缺少确定性检查；`user_requested` 仅在用户明确要求子代理或大规模并行时使用。
+
+这些数量只是软路由参考，不是运行时硬门槛。有明确的上下文隔离价值或并行收益时，略低于参考值也可以委派；收益不清晰时直接处理。只读探索应比写入实现更积极，写入型子代理仍保持较高门槛。已确认的纯只读批次最多同时运行 3 个子代理；批次包含写入型或身份未确认的代理时，最多同时运行 2 个。不要用 verifier 重复已有确定性测试。
+
+Codey 不再按角色成本点、每批尝试次数、批次数或根回合累计尝试数设置派发预算上限。编排账本只记录生命周期、批次决策、验收债和恢复所需元数据；并发限制只约束同时运行数量，不限制后续批次或累计派发次数，长期 Goal 任务也可以在同一根回合继续多个批次。
+
+### 任务类型与运行时契约
+
+派生时按任务性质显式选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 只作为旧配置兼容兜底，主代理不得主动选择。只读角色不能声明写入；视觉角色必须声明视觉需求；写入角色必须给出互斥的路径 ownership 和机械验收命令。角色沙箱只是默认工作方式，实际权限仍受父任务约束。
+
+每个 `agents.spawn_agent` 必须使用 `fork_turns="none"`，`task_name` 使用小写字母、数字或下划线，并把一行紧凑 JSON 作为 message 的最后一个非空行：
+
+`CODEY_DELEGATION_V2={"id":"task_name","why":"breadth","visual":false,"root":"/absolute/workspace","read":["relevant/path"],"write":[],"capabilities":["files.read"],"checks":[]}`
+
+`id` 必须等于 `task_name`；路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径；绝对 claim 可以位于 `root` 之外，跨多个工作树时分别声明即可。`root`、`read` 和 `write` 是冲突协调、ownership 与审计元数据，应尽量准确描述预计范围，但不是 Codey 的运行时文件路径 ACL。省略 `root` 时采用有效的 Hook 工作目录；Hook 目录缺失或无效但 claim 已是绝对路径时仍可派发。空 `read` 会对只读角色以 root、对写入角色以其 `write` 作为默认协调 claim，但不会收窄 Codex 原生可访问范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 额外声明 `command.execute` 后可以运行通用 shell，不要求 `write` 覆盖完整 root。网络访问与文件读写角色独立：任务确实需要远程资料时显式声明 `network.access`，未声明时继续拒绝；该 capability 只放行受信任的 Network 类读取工具，不授予 shell 或本地写入，最终仍受 Codex 原生网络与审批设置约束。未绑定 attempt 不获得数据或副作用权限；只读角色即使出现异常或旧账本也不能取得写能力。运行时还会校验工具的完整可信名称、理由、角色能力、角色感知并发上限及 read/write 冲突；重复任务 ID 和重叠 ownership 会被拒绝。
 
 Codey 在 attempt 身份和角色 capability 校验通过后，不再解析、比较或拒绝读取、写入和命令中的目标路径，也不要求 child `cwd` 与契约 `root` 相同。子代理实际能访问哪些工作树、兄弟目录或外部路径，完全由其继承的 Codex sandbox、approval policy、permission profile 和 writable roots 决定；原生权限拒绝时按 Codex 的正常流程处理，不应通过修改 Codey 契约冒充权限提升。验证命令仍由根代理执行机械验收。
 
@@ -479,6 +528,7 @@ pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V8: &str = r#"## 子代理使用
 
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     SUBAGENT_GUIDANCE,
+    PREVIOUS_SUBAGENT_GUIDANCE_V11,
     PREVIOUS_SUBAGENT_GUIDANCE_V10,
     PREVIOUS_SUBAGENT_GUIDANCE_V9,
     PREVIOUS_SUBAGENT_GUIDANCE_V8,
@@ -1328,6 +1378,7 @@ mod tests {
     #[test]
     fn subagent_guidance_migrates_the_previous_owned_block() {
         for previous in [
+            PREVIOUS_SUBAGENT_GUIDANCE_V11,
             PREVIOUS_SUBAGENT_GUIDANCE_V10,
             PREVIOUS_SUBAGENT_GUIDANCE_V9,
             PREVIOUS_SUBAGENT_GUIDANCE_V8,
@@ -1383,6 +1434,9 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("CODEY_DELEGATION_V2="));
         assert!(SUBAGENT_GUIDANCE.contains("\"capabilities\":[\"files.read\"]"));
         assert!(SUBAGENT_GUIDANCE.contains("写入角色还必须声明 `workspace.write`"));
+        assert!(SUBAGENT_GUIDANCE.contains("网络访问与文件读写角色独立"));
+        assert!(SUBAGENT_GUIDANCE.contains("显式声明 `network.access`"));
+        assert!(SUBAGENT_GUIDANCE.contains("不授予 shell 或本地写入"));
         assert!(SUBAGENT_GUIDANCE.contains("不是 Codey 的运行时文件路径 ACL"));
         assert!(SUBAGENT_GUIDANCE.contains("不再解析、比较或拒绝读取、写入和命令中的目标路径"));
         assert!(SUBAGENT_GUIDANCE.contains("完全由其继承的 Codex sandbox"));

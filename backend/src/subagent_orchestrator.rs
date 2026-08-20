@@ -2518,9 +2518,24 @@ pub(crate) fn authorize_child_tool_with_context(
             )),
             Some(_) => None,
         },
-        ToolClass::Network => Some(format!(
-            "Codey 网络门禁：子代理基线不开放网络工具 `{tool_name}`；契约 capability 不能放宽该边界。"
-        )),
+        ToolClass::Network => match bound_reservation {
+            None => Some(format!(
+                "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 网络门禁：当前 child 未绑定有效 attempt，禁止执行网络工具 `{tool_name}`。请停止本次调用并把错误码返回主代理。"
+            )),
+            Some(reservation)
+                if !reservation.state.is_active() || reservation.fenced_at_ms.is_some() =>
+            {
+                Some(format!(
+                    "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 网络门禁：attempt `{}` 已终态、过期或被 fence，禁止继续访问网络。",
+                    reservation.attempt_id
+                ))
+            }
+            Some(reservation) if !reservation_declares_network(reservation) => Some(format!(
+                "Codey 网络门禁：attempt `{}` 未声明 `network.access` capability，禁止网络工具 `{tool_name}`。应由根代理使用新的任务契约显式授权，或由根代理直接取得远程证据。",
+                reservation.attempt_id
+            )),
+            Some(_) => None,
+        },
         ToolClass::Write => match bound_reservation {
             None => Some(format!(
                 "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 能力/资源门禁：当前 child 未绑定有效 attempt，禁止执行写入工具。不要重试写入或等待门禁自行恢复；请立即把该错误码返回主代理，由主代理使用全新的 task_name 重新派生或直接接管。"
@@ -2958,6 +2973,13 @@ fn reservation_declares_read(reservation: &Reservation) -> bool {
         .any(|capability| capability == "files.read")
 }
 
+fn reservation_declares_network(reservation: &Reservation) -> bool {
+    reservation
+        .capabilities
+        .iter()
+        .any(|capability| capability == "network.access")
+}
+
 fn reservation_declares_write(reservation: &Reservation) -> bool {
     reservation.write_capable
         && reservation
@@ -3095,10 +3117,10 @@ fn prepare_contract_with_rules(
         }
         if !matches!(
             capability.as_str(),
-            "files.read" | "workspace.write" | "command.execute"
+            "files.read" | "workspace.write" | "command.execute" | "network.access"
         ) {
             return Err(contract_error(&format!(
-                "未知 capability `{capability}`；仅支持 files.read、workspace.write、command.execute"
+                "未知 capability `{capability}`；仅支持 files.read、workspace.write、command.execute、network.access"
             )));
         }
     }
@@ -4398,10 +4420,18 @@ mod tests {
                 serde_json::to_string(&network_contract).unwrap()
             )
         });
+        assert_eq!(
+            prepare_contract(Some(&network)).unwrap().capabilities,
+            ["files.read", "network.access"]
+        );
+
+        let mut unknown_contract = network_contract;
+        unknown_contract["capabilities"] = json!(["files.read", "network.write"]);
+        let unknown = contract_input("reader", "codey_deep_research", unknown_contract);
         assert!(
-            prepare_contract(Some(&network))
+            prepare_contract(Some(&unknown))
                 .unwrap_err()
-                .contains("未知 capability `network.access`")
+                .contains("未知 capability `network.write`")
         );
 
         let mut command_contract = research_contract("reader_command");
@@ -6754,6 +6784,83 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(denial.contains("不是可写角色"));
+    }
+
+    #[test]
+    fn child_network_access_is_explicit_and_independent_of_write_role() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let without_network = contract_input(
+            "research_offline",
+            "codey_deep_research",
+            research_contract("research_offline"),
+        );
+        pre_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&without_network),
+            0,
+            10,
+        )
+        .unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&without_network),
+            Some(&json!({ "agent_id": "agent-offline" })),
+            20,
+        )
+        .unwrap();
+        let denial = authorize_child_tool(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            "agent-offline",
+            "web.run",
+            Some(&json!({ "search_query": [{ "q": "build log" }] })),
+            30,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("network.access"));
+
+        let mut network_contract = research_contract("research_online");
+        network_contract["capabilities"] = json!(["files.read", "network.access"]);
+        let with_network =
+            contract_input("research_online", "codey_deep_research", network_contract);
+        pre_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&with_network),
+            0,
+            40,
+        )
+        .unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&with_network),
+            Some(&json!({ "agent_id": "agent-online" })),
+            50,
+        )
+        .unwrap();
+        assert_eq!(
+            authorize_child_tool(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                "agent-online",
+                "web__run",
+                Some(&json!({ "open": [{ "ref_id": "https://example.com" }] })),
+                60,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

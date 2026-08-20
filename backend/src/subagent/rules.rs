@@ -581,7 +581,7 @@ pub(crate) fn classify_tool(tool_name: &str) -> ToolClass {
         ToolClass::Write
     } else if matches!(
         normalized.as_str(),
-        "web_search" | "websearch" | "open" | "find" | "screenshot"
+        "web_search" | "websearch" | "web_run" | "open" | "find" | "screenshot"
     ) {
         ToolClass::Network
     } else if matches!(
@@ -667,6 +667,7 @@ pub(crate) fn normalize_tool_name(tool_name: &str) -> String {
         "read_thread_terminal" | "codex_app__read_thread_terminal" => Some("read_thread_terminal"),
         "web_search" => Some("web_search"),
         "websearch" => Some("websearch"),
+        "web.run" | "web/run" | "web::run" | "web__run" | "web_run" | "webrun" => Some("web_run"),
         "open" => Some("open"),
         "find" => Some("find"),
         "screenshot" => Some("screenshot"),
@@ -700,7 +701,6 @@ mod tests {
             (None, "functions.exec", ToolClass::Command),
             (None, "read_file", ToolClass::Read),
             (None, "wait_agent", ToolClass::Collaboration),
-            (Some("codey_quick_scan"), "web_search", ToolClass::Network),
         ] {
             let decision = rules.evaluate(&RuleContext {
                 actor: RuleActor::Child,
@@ -721,6 +721,20 @@ mod tests {
                 .effect,
             RuleEffect::Allow
         );
+        for role in ["codey_quick_scan", "codey_worker"] {
+            assert_eq!(
+                rules
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some(role),
+                        tool_name: "web.run",
+                        tool_class: ToolClass::Network,
+                    })
+                    .effect,
+                RuleEffect::Allow,
+                "{role}"
+            );
+        }
     }
 
     #[test]
@@ -892,5 +906,7 @@ mod tests {
         );
         assert_eq!(classify_tool("agentsspawn_agent"), ToolClass::Spawn);
         assert_eq!(classify_tool("web_search"), ToolClass::Network);
+        assert_eq!(classify_tool("web.run"), ToolClass::Network);
+        assert_eq!(classify_tool("web__run"), ToolClass::Network);
     }
 }
