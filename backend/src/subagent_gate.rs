@@ -27,6 +27,7 @@ const STOP_ABSOLUTE_GRACE_MILLIS: u64 = 60 * 60 * 1000;
 const PENDING_INIT_OBSERVED_FILE: &str = "pending-init-observed.state";
 const STOP_BLOCKED_SINCE_FILE: &str = "stop-blocked-since.state";
 const STOP_ABSOLUTE_SINCE_FILE: &str = "stop-absolute-since.state";
+const STATUS_PROGRESS_FINGERPRINT_FILE: &str = "status-progress.state";
 const STATE_ERROR_SINCE_FILE: &str = "state-error-since.state";
 const SUBAGENT_CONTEXT_OBSERVED_FILE: &str = "subagent-context-observed.state";
 const PROTOCOL_HEALTH_FILE: &str = "protocol-health.json";
@@ -420,7 +421,6 @@ fn pre_tool_use_output(
                     agent_id,
                     agent_type: nonempty(input.agent_type.as_deref()),
                     transcript_path: nonempty(input.transcript_path.as_deref()),
-                    cwd: nonempty(input.cwd.as_deref()),
                     tool_name,
                     tool_input: input.tool_input.as_ref(),
                 },
@@ -592,6 +592,42 @@ fn post_tool_use_output(
         }
         return Ok(json!({}));
     }
+    if is_interrupt_agent_tool(tool_name) {
+        if input
+            .tool_response
+            .as_ref()
+            .is_some_and(protocol::interrupt_response_succeeded)
+            && let Some(abandoned) = crate::subagent_orchestrator::abandon_interrupted_reservation(
+                state_root,
+                runtime_id,
+                &input.session_id,
+                input.tool_input.as_ref(),
+                now_ms,
+            )?
+        {
+            if let Some(agent_id_hash) = abandoned.agent_id_hash.as_deref() {
+                remove_active_marker_by_hash(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    agent_id_hash,
+                )?;
+            }
+            let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+            if active == 0
+                && let Some(reason) = crate::subagent_orchestrator::open_batch_decision_if_settled(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    0,
+                    now_ms,
+                )?
+            {
+                return Ok(json!({ "decision": "block", "reason": reason }));
+            }
+        }
+        return Ok(json!({}));
+    }
     crate::subagent_orchestrator::post_root_tool(
         state_root,
         runtime_id,
@@ -611,12 +647,20 @@ fn post_tool_use_output(
             != AgentListSnapshotState::Unknown
     };
     if response_is_usable {
-        remove_session_auxiliary_file(
+        if record_status_progress(
             state_root,
             runtime_id,
             &input.session_id,
-            STOP_BLOCKED_SINCE_FILE,
-        )?;
+            tool_name,
+            input.tool_response.as_ref(),
+        )? {
+            remove_session_auxiliary_file(
+                state_root,
+                runtime_id,
+                &input.session_id,
+                STOP_BLOCKED_SINCE_FILE,
+            )?;
+        }
         clear_unknown_status_protocol_issue(state_root, runtime_id, &input.session_id, now_ms)?;
     } else {
         record_protocol_issue(
@@ -1048,6 +1092,133 @@ fn wait_agent_response_is_usable(tool_response: Option<&Value>) -> bool {
     }
 }
 
+/// Records semantic collaboration progress instead of treating every usable
+/// poll as progress. Repeated `interrupted` or timeout snapshots therefore do
+/// not postpone the bounded Stop recovery window indefinitely.
+fn record_status_progress(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    tool_name: &str,
+    tool_response: Option<&Value>,
+) -> Result<bool> {
+    let Some(fingerprint) = status_progress_fingerprint(tool_name, tool_response) else {
+        return Ok(false);
+    };
+    let session_dir = session_state_dir(state_root, session_id);
+    fs::create_dir_all(&session_dir).with_context(|| {
+        format!(
+            "创建 Codex 子代理状态进展目录失败：{}",
+            session_dir.display()
+        )
+    })?;
+    let path = session_auxiliary_path(&session_dir, runtime_id, STATUS_PROGRESS_FINGERPRINT_FILE);
+    match fs::read_to_string(&path) {
+        Ok(previous) if previous.trim() == fingerprint => Ok(false),
+        Ok(_) => {
+            crate::fs_util::atomic_write(&path, format!("{fingerprint}\n").as_bytes())
+                .with_context(|| {
+                    format!("写入 Codex 子代理状态进展指纹失败：{}", path.display())
+                })?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::fs_util::atomic_write(&path, format!("{fingerprint}\n").as_bytes())
+                .with_context(|| {
+                    format!("写入 Codex 子代理状态进展指纹失败：{}", path.display())
+                })?;
+            Ok(true)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("读取 Codex 子代理状态进展指纹失败：{}", path.display())),
+    }
+}
+
+fn status_progress_fingerprint(tool_name: &str, tool_response: Option<&Value>) -> Option<String> {
+    let response = tool_response?;
+    let decoded;
+    let response = if let Value::String(encoded) = response {
+        decoded = serde_json::from_str::<Value>(encoded).ok();
+        decoded.as_ref().unwrap_or(response)
+    } else {
+        response
+    };
+    let mut tokens = Vec::new();
+    collect_status_progress_tokens(response, &mut tokens, 0);
+    tokens.sort();
+    tokens.dedup();
+    let encoded = serde_json::to_string(&tokens).ok()?;
+    Some(hash_component(&format!(
+        "{}|{encoded}",
+        normalized_collaboration_tool(tool_name)
+    )))
+}
+
+fn collect_status_progress_tokens(value: &Value, tokens: &mut Vec<String>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_status_progress_tokens(value, tokens, depth + 1);
+            }
+        }
+        Value::Object(values) => {
+            let identifier = object_value_any(
+                values,
+                &["agentid", "agentname", "subagentid", "taskname", "name"],
+            )
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(normalized_ascii_identifier)
+            .unwrap_or_else(|| "_".to_string());
+            let status = object_value_any(
+                values,
+                &["previousstatus", "agentstatus", "status", "state"],
+            )
+            .and_then(Value::as_str)
+            .map(normalized_ascii_identifier);
+            if let Some(status) = status.as_deref() {
+                tokens.push(format!("state:{identifier}:{status}"));
+                if matches!(status, "message" | "partial")
+                    && let Some(message) = object_value_any(values, &["message", "output", "text"])
+                {
+                    tokens.push(format!(
+                        "message:{identifier}:{}",
+                        hash_component(&canonical_json(message).to_string())
+                    ));
+                }
+            }
+            if object_value(values, "timedout").and_then(Value::as_bool) == Some(true) {
+                tokens.push("timeout".to_string());
+            }
+            for (key, value) in values {
+                let key = normalized_ascii_identifier(key);
+                if matches!(
+                    key.as_str(),
+                    "completed" | "errored" | "failed" | "shutdown" | "notfound"
+                ) && !matches!(value, Value::Bool(false) | Value::Null)
+                {
+                    tokens.push(format!("terminal:{identifier}:{key}"));
+                }
+                if protocol::is_agent_collection_field(&key)
+                    || protocol::is_provider_envelope_field(&key)
+                {
+                    collect_status_progress_tokens(value, tokens, depth + 1);
+                }
+            }
+        }
+        Value::String(encoded) => {
+            if let Ok(decoded) = serde_json::from_str::<Value>(encoded) {
+                collect_status_progress_tokens(&decoded, tokens, depth + 1);
+            }
+        }
+        _ => {}
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AgentListSnapshotState {
     AllChildrenTerminal,
@@ -1261,6 +1432,10 @@ fn is_wait_agent_tool(tool_name: &str) -> bool {
 
 fn is_list_agents_tool(tool_name: &str) -> bool {
     normalized_collaboration_tool(tool_name) == "list_agents"
+}
+
+fn is_interrupt_agent_tool(tool_name: &str) -> bool {
+    normalized_collaboration_tool(tool_name) == "interrupt_agent"
 }
 
 fn is_agent_status_tool(tool_name: &str) -> bool {
@@ -1652,6 +1827,26 @@ fn remove_active_marker(
     remove_empty_session_dir(&session_dir)
 }
 
+fn remove_active_marker_by_hash(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    agent_id_hash: &str,
+) -> Result<()> {
+    let session_dir = session_state_dir(state_root, session_id);
+    let marker = agent_marker_path_from_hash(&session_dir, runtime_id, agent_id_hash);
+    match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("按哈希移除 Codex 子代理门禁状态失败：{}", marker.display())
+            });
+        }
+    }
+    remove_empty_session_dir(&session_dir)
+}
+
 fn remove_empty_session_dir(session_dir: &Path) -> Result<()> {
     match fs::remove_dir(session_dir) {
         Ok(()) => {}
@@ -1762,10 +1957,17 @@ fn session_state_dir(state_root: &Path, session_id: &str) -> PathBuf {
 }
 
 fn agent_marker_path(session_dir: &Path, runtime_id: &str, agent_id: &str) -> PathBuf {
+    agent_marker_path_from_hash(session_dir, runtime_id, &hash_component(agent_id))
+}
+
+fn agent_marker_path_from_hash(
+    session_dir: &Path,
+    runtime_id: &str,
+    agent_id_hash: &str,
+) -> PathBuf {
     session_dir.join(format!(
-        "{}{}.active",
-        runtime_marker_prefix(runtime_id),
-        hash_component(agent_id)
+        "{}{agent_id_hash}.active",
+        runtime_marker_prefix(runtime_id)
     ))
 }
 
@@ -1928,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn spawn_task_receipt_binds_child_before_its_first_read() {
+    fn spawn_task_receipt_binds_child_while_codex_controls_read_paths() {
         let temp = tempfile::tempdir().unwrap();
         let state_root = temp.path().join("codey-subagent-gate-v3");
         std::fs::create_dir_all(&state_root).unwrap();
@@ -2024,16 +2226,7 @@ mod tests {
 
         let mut sibling_read = first_read;
         sibling_read.cwd = Some(sibling_worktree);
-        let denied = handle_hook(&sibling_read, &state_root).unwrap();
-        assert_eq!(
-            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
-            Some("deny")
-        );
-        assert!(
-            denied["hookSpecificOutput"]["permissionDecisionReason"]
-                .as_str()
-                .is_some_and(|reason| reason.contains("read scope"))
-        );
+        assert_eq!(handle_hook(&sibling_read, &state_root).unwrap(), json!({}));
     }
 
     #[test]
@@ -2140,7 +2333,7 @@ mod tests {
     }
 
     #[test]
-    fn runtime_gate_enforces_contract_ownership_and_mechanical_acceptance() {
+    fn runtime_gate_enforces_capabilities_and_mechanical_acceptance() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let mut spawn = input("PreToolUse", "contract-session");
@@ -2185,11 +2378,7 @@ mod tests {
         escaped_patch.tool_input = Some(json!({
             "patch": "*** Begin Patch\n*** Update File: README.md\n*** End Patch"
         }));
-        assert_eq!(
-            handle_hook(&escaped_patch, root).unwrap()["hookSpecificOutput"]["permissionDecision"]
-                .as_str(),
-            Some("deny")
-        );
+        assert_eq!(handle_hook(&escaped_patch, root).unwrap(), json!({}));
 
         let mut stopped = input("SubagentStop", "contract-session");
         stopped.agent_id = Some("agent-a".to_string());
@@ -2384,6 +2573,161 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("CODEY_SUBAGENT_UNBOUND_ATTEMPT")
                     && reason.contains("立即把该错误码返回主代理"))
+        );
+    }
+
+    #[test]
+    fn successful_root_interrupt_fences_the_attempt_and_releases_the_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "interrupt-abandon-session";
+        let target = "/root/interrupt_reader";
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.cwd = Some("/repo".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "interrupt_reader",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "interrupt_reader",
+                "why": "independent_review",
+                "visual": false,
+                "root": "/repo",
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&spawn, root, runtime_id, 10).unwrap(),
+            json!({})
+        );
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "agent_id": target }));
+        handle_hook_for_runtime_at(&spawned, root, runtime_id, 20).unwrap();
+        let mut started = input("SubagentStart", session_id);
+        started.agent_id = Some(target.to_string());
+        handle_hook_for_runtime_at(&started, root, runtime_id, 25).unwrap();
+        let marker = agent_marker_path(&session_state_dir(root, session_id), runtime_id, target);
+        assert!(marker.exists());
+
+        let mut interrupt = input("PreToolUse", session_id);
+        interrupt.turn_id = Some("root-turn-a".to_string());
+        interrupt.tool_name = Some("agents.interrupt_agent".to_string());
+        interrupt.tool_input = Some(json!({ "target": target }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&interrupt, root, runtime_id, 30).unwrap(),
+            json!({})
+        );
+        interrupt.hook_event_name = "PostToolUse".to_string();
+        interrupt.tool_response = Some(json!({ "previous_status": "interrupted" }));
+        let settled = handle_hook_for_runtime_at(&interrupt, root, runtime_id, 31).unwrap();
+        assert_eq!(settled["decision"].as_str(), Some("block"));
+        assert!(
+            settled["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("resolve_batch"))
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            0
+        );
+        assert!(!marker.exists());
+
+        let mut followup = input("PreToolUse", session_id);
+        followup.turn_id = Some("root-turn-a".to_string());
+        followup.tool_name = Some("agents.followup_task".to_string());
+        followup.tool_input = Some(json!({ "target": target, "message": "resume" }));
+        assert!(
+            handle_hook_for_runtime_at(&followup, root, runtime_id, 32).unwrap()
+                ["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| {
+                    reason.contains("CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT")
+                })
+        );
+
+        let mut late_stop = input("SubagentStop", session_id);
+        late_stop.agent_id = Some(target.to_string());
+        assert_eq!(
+            handle_hook_for_runtime_at(&late_stop, root, runtime_id, 33).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            handle_hook_for_runtime_at(&late_stop, root, runtime_id, 34).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_or_unmatched_interrupt_does_not_release_an_active_attempt() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "failed-interrupt-session";
+        let target = "/root/active_reader";
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.cwd = Some("/repo".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "active_reader",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "active_reader",
+                "why": "independent_review",
+                "visual": false,
+                "root": "/repo",
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        handle_hook_for_runtime_at(&spawn, root, runtime_id, 10).unwrap();
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "agent_id": target }));
+        handle_hook_for_runtime_at(&spawned, root, runtime_id, 20).unwrap();
+
+        let mut interrupt = input("PostToolUse", session_id);
+        interrupt.tool_name = Some("agents.interrupt_agent".to_string());
+        interrupt.tool_input = Some(json!({ "target": target }));
+        interrupt.tool_response = Some(json!({
+            "isError": true,
+            "error": "interrupt transport failed",
+            "previous_status": "running"
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&interrupt, root, runtime_id, 30).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
+        );
+
+        interrupt.tool_input = Some(json!({ "target": "/root/unknown_reader" }));
+        interrupt.tool_response = Some(json!({ "previous_status": "interrupted" }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&interrupt, root, runtime_id, 31).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
         );
     }
 
@@ -3359,6 +3703,60 @@ mod tests {
         assert_eq!(
             active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
             1
+        );
+    }
+
+    #[test]
+    fn repeated_interrupted_snapshots_do_not_extend_the_stall_grace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "unchanged-interrupt-session";
+        let mut start = input("SubagentStart", session_id);
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime_at(&start, root, runtime_id, 1_000).unwrap();
+
+        assert_eq!(
+            handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 2_000)
+                .unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+        let session_dir = session_state_dir(root, session_id);
+        let stalled = session_auxiliary_path(&session_dir, runtime_id, STOP_BLOCKED_SINCE_FILE);
+        assert_eq!(fs::read_to_string(&stalled).unwrap(), "2000\n");
+
+        let mut wait = input("PostToolUse", session_id);
+        wait.tool_name = Some("agents.wait_agent".to_string());
+        wait.tool_response = Some(json!({
+            "updates": [{ "agent_id": "agent-a", "status": "interrupted" }]
+        }));
+        handle_hook_for_runtime_at(&wait, root, runtime_id, 3_000).unwrap();
+        assert!(!stalled.exists());
+
+        handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 4_000).unwrap();
+        assert_eq!(fs::read_to_string(&stalled).unwrap(), "4000\n");
+        handle_hook_for_runtime_at(&wait, root, runtime_id, 5_000).unwrap();
+        assert_eq!(fs::read_to_string(&stalled).unwrap(), "4000\n");
+
+        wait.tool_response = Some(json!({
+            "updates": [{ "agent_id": "agent-a", "status": "running" }]
+        }));
+        handle_hook_for_runtime_at(&wait, root, runtime_id, 6_000).unwrap();
+        assert!(!stalled.exists());
+        handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 7_000).unwrap();
+        handle_hook_for_runtime_at(&wait, root, runtime_id, 8_000).unwrap();
+        assert_eq!(fs::read_to_string(&stalled).unwrap(), "7000\n");
+
+        assert_eq!(
+            handle_hook_for_runtime_at(
+                &input("Stop", session_id),
+                root,
+                runtime_id,
+                7_000 + STOP_STALL_GRACE_MILLIS,
+            )
+            .unwrap(),
+            json!({})
         );
     }
 

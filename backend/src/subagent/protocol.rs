@@ -320,6 +320,68 @@ pub(crate) fn response_is_explicit_spawn_failure(value: &Value) -> bool {
     response_has_structured_failure(value) || response_has_textual_spawn_failure(value)
 }
 
+/// Accepts only a provider-owned, structured acknowledgement that an
+/// `interrupt_agent` call reached its target. A free-form message is not enough
+/// to release Codey's local lifecycle fence because it may itself be an error
+/// string returned by the collaboration transport.
+pub(crate) fn interrupt_response_succeeded(value: &Value) -> bool {
+    let decoded = decode_json_encoded_response(value);
+    let value = decoded.as_ref().unwrap_or(value);
+    interrupt_response_succeeded_in_envelope(value, 0)
+}
+
+fn interrupt_response_succeeded_in_envelope(value: &Value, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match value {
+        Value::Array(values) => values
+            .iter()
+            .any(|value| interrupt_response_succeeded_in_envelope(value, depth + 1)),
+        Value::Object(values) => {
+            if response_has_structured_failure(value) {
+                return false;
+            }
+            let explicitly_interrupted = values.iter().any(|(key, value)| {
+                matches!(
+                    normalize_identifier(key).as_str(),
+                    "interrupted" | "wasinterrupted"
+                ) && value.as_bool() == Some(true)
+            });
+            let acknowledged_status = values.iter().any(|(key, value)| {
+                let key = normalize_identifier(key);
+                match key.as_str() {
+                    // These fields describe the target's state before/after the
+                    // interrupt, so every recognized lifecycle state is an ack.
+                    "previousstatus" | "agentstatus" => {
+                        classify_agent_status(value) != AgentState::Unknown
+                    }
+                    // Generic status fields can instead describe the tool call.
+                    // Do not interpret `failed`/`not_found` as a successful ack.
+                    "status" | "state" => {
+                        matches!(
+                            classify_agent_status(value),
+                            AgentState::PendingInit | AgentState::Live
+                        ) || terminal_outcome_from_value(value) == Some(TerminalOutcome::Succeeded)
+                    }
+                    _ => false,
+                }
+            });
+            explicitly_interrupted
+                || acknowledged_status
+                || values.iter().any(|(key, value)| {
+                    is_provider_envelope_field(key)
+                        && interrupt_response_succeeded_in_envelope(value, depth + 1)
+                })
+        }
+        Value::String(value) => serde_json::from_str::<Value>(value)
+            .ok()
+            .as_ref()
+            .is_some_and(|value| interrupt_response_succeeded_in_envelope(value, depth + 1)),
+        _ => false,
+    }
+}
+
 fn response_has_structured_failure(value: &Value) -> bool {
     let Value::Object(values) = value else {
         return false;
@@ -461,6 +523,30 @@ mod tests {
             classify_agent_status(&json!("interrupted")),
             AgentState::Live
         );
+    }
+
+    #[test]
+    fn interrupt_acknowledgement_requires_a_structured_non_error_status() {
+        for response in [
+            json!({ "previous_status": "running" }),
+            json!({ "agent_status": "interrupted" }),
+            json!({ "structuredContent": { "interrupted": true } }),
+            Value::String(serde_json::to_string(&json!({ "status": "completed" })).unwrap()),
+        ] {
+            assert!(interrupt_response_succeeded(&response), "{response}");
+        }
+
+        for response in [
+            json!({ "isError": true, "previous_status": "running" }),
+            json!({ "error": "agent not found", "status": "interrupted" }),
+            json!({ "status": "failed" }),
+            json!({ "state": "not_found" }),
+            json!({ "status": "unknown" }),
+            json!("Interrupted agent /root/worker"),
+            json!({ "result": { "message": "interrupt failed" } }),
+        ] {
+            assert!(!interrupt_response_succeeded(&response), "{response}");
+        }
     }
 
     #[test]

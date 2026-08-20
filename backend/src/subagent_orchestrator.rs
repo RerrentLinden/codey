@@ -1862,6 +1862,82 @@ pub(crate) fn recover_active_reservations(
     Ok(recovered)
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AbandonedReservation {
+    /// Hash used by the legacy active-marker filename. The ledger remains the
+    /// source of truth, but returning it lets the gate remove the migration
+    /// fallback without retaining a raw provider identifier.
+    pub(crate) agent_id_hash: Option<String>,
+    pub(crate) changed: bool,
+}
+
+/// Permanently abandons exactly the reservation named by a successful root
+/// `interrupt_agent` call. The upstream interrupted state is intentionally
+/// resumable; Codey's root-level interrupt means this task is no longer wanted,
+/// so the local attempt is fenced before root work is allowed to continue.
+pub(crate) fn abandon_interrupted_reservation(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    tool_input: Option<&Value>,
+    now_ms: u64,
+) -> Result<Option<AbandonedReservation>> {
+    let Some(target) = interrupt_task_target(tool_input) else {
+        return Ok(None);
+    };
+    let store = LedgerStore::open(state_root, session_id)?;
+    let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
+        return Ok(None);
+    };
+    let Some(task_id) = unique_task_for_identifier(&ledger, &target)? else {
+        return Ok(None);
+    };
+    let reservation = ledger
+        .reservations
+        .get_mut(&task_id)
+        .expect("resolved reservation must exist");
+    let agent_id_hash = reservation.agent_id_hash.clone();
+    if !reservation.state.is_active() {
+        return Ok(Some(AbandonedReservation {
+            agent_id_hash,
+            changed: false,
+        }));
+    }
+
+    let trace = reservation_trace(reservation);
+    let role = reservation.role.clone();
+    reservation.state = ReservationState::Recovered;
+    reservation.outcome = ExecutionOutcome::Lost;
+    reservation.agent_id_hash = None;
+    reservation.updated_at_ms = now_ms;
+    reservation.completed_at_ms = Some(now_ms);
+    reservation.fenced_at_ms = Some(now_ms);
+    reservation.error_message =
+        Some("root successfully interrupted and permanently abandoned this task".to_string());
+    store.save(&mut ledger, now_ms)?;
+
+    let mut event = SubagentTraceEvent::new(
+        now_ms,
+        &trace,
+        TraceEventKind::Recovered,
+        ExecutionStatus::Recovered,
+        runtime_id,
+        session_id,
+        &task_id,
+        Some(&target),
+        Some(&role),
+    );
+    event.error_code = Some("root_interrupt_abandoned".into());
+    event.error_message =
+        Some("root successfully interrupted and permanently abandoned this task".to_string());
+    TraceRecorder::new(state_root).record_best_effort(&event);
+
+    Ok(Some(AbandonedReservation {
+        agent_id_hash,
+        changed: true,
+    }))
+}
+
 pub(crate) fn open_batch_decision_if_settled(
     state_root: &Path,
     runtime_id: &str,
@@ -2268,7 +2344,6 @@ pub(crate) fn authorize_child_tool(
             agent_id,
             agent_type: None,
             transcript_path: None,
-            cwd: Some("/repo"),
             tool_name,
             tool_input,
         },
@@ -2280,7 +2355,6 @@ pub(crate) struct ChildToolContext<'a> {
     pub(crate) agent_id: &'a str,
     pub(crate) agent_type: Option<&'a str>,
     pub(crate) transcript_path: Option<&'a str>,
-    pub(crate) cwd: Option<&'a str>,
     pub(crate) tool_name: &'a str,
     pub(crate) tool_input: Option<&'a Value>,
 }
@@ -2296,7 +2370,6 @@ pub(crate) fn authorize_child_tool_with_context(
         agent_id,
         agent_type,
         transcript_path,
-        cwd,
         tool_name,
         tool_input,
     } = context;
@@ -2407,7 +2480,7 @@ pub(crate) fn authorize_child_tool_with_context(
     let capability_denial = match tool_class {
         ToolClass::Read => match bound_reservation {
             None => Some(format!(
-                "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 资源门禁：当前 child 无法通过派生回执或生命周期 transcript 与有效活动 attempt 安全关联，禁止执行路径读取。请停止本次调用并把错误码返回主代理；不要通过扩大 read scope 或猜测 task 归属绕过。"
+                "{UNBOUND_ATTEMPT_ERROR_CODE}: Codey 资源门禁：当前 child 无法通过派生回执或生命周期 transcript 与有效活动 attempt 安全关联，禁止执行读取工具。请停止本次调用并把错误码返回主代理；不要猜测 task 归属绕过身份绑定。"
             )),
             Some(reservation)
                 if !reservation.state.is_active() || reservation.fenced_at_ms.is_some() =>
@@ -2439,17 +2512,8 @@ pub(crate) fn authorize_child_tool_with_context(
                 "Codey 能力门禁：attempt `{}` 未声明 command.execute capability，禁止工具 `{tool_name}`。读取被拒绝时不得用 Bash 回退；应由根代理修正契约或直接接管。",
                 reservation.attempt_id
             )),
-            Some(reservation)
-                if reservation.write_capable
-                    && !reservation_command_covers_workspace(reservation) =>
-            {
-                Some(format!(
-                    "Codey 能力/资源门禁：attempt `{}` 的 shell 命令可能写入整个工作区，只有 write ownership 覆盖完整 root 时才能启用 command.execute；请使用受路径约束的写入工具，并由主代理执行机械验收。",
-                    reservation.attempt_id
-                ))
-            }
             Some(reservation) if !reservation_declares_write(reservation) => Some(format!(
-                "Codey 能力门禁：attempt `{}` 未声明 `workspace.write` capability，禁止写入工具 `{tool_name}`。",
+                "Codey 能力门禁：attempt `{}` 不是可写角色或未声明 `workspace.write` capability，禁止写入工具 `{tool_name}`。",
                 reservation.attempt_id
             )),
             Some(_) => None,
@@ -2470,7 +2534,7 @@ pub(crate) fn authorize_child_tool_with_context(
                 ))
             }
             Some(reservation) if !reservation_declares_write(reservation) => Some(format!(
-                "Codey 能力门禁：attempt `{}` 未声明 `workspace.write` capability，禁止写入工具 `{tool_name}`。",
+                "Codey 能力门禁：attempt `{}` 不是可写角色或未声明 `workspace.write` capability，禁止写入工具 `{tool_name}`。",
                 reservation.attempt_id
             )),
             Some(_) => None,
@@ -2561,55 +2625,6 @@ pub(crate) fn authorize_child_tool_with_context(
         return Ok(Some(format!(
             "Codey 规则门禁：规则 `{}`（优先级 {}）拒绝工具 `{tool_name}`：{}",
             decision.rule_id, decision.priority, decision.explanation
-        )));
-    }
-    if tool_class == ToolClass::Read {
-        if !read_tool_is_path_scoped(tool_name) {
-            return Ok(None);
-        }
-        let mut observed_paths = extract_read_paths(tool_input);
-        if observed_paths.is_empty()
-            && let Some(child_cwd) = cwd
-        {
-            observed_paths.push(child_cwd.to_string());
-        }
-        if observed_paths.is_empty() {
-            return Ok(Some(format!(
-                "Codey 资源门禁：无法从读取工具 `{tool_name}` 的输入或可信 child cwd 确定读取范围。相对读取必须携带 child cwd。"
-            )));
-        }
-        let covered = bound_reservation.is_some_and(|reservation| {
-            reservation.native_read_scope
-                || observed_paths
-                    .iter()
-                    .all(|path| reservation_covers_read_path(reservation, path, cwd))
-        });
-        if !covered {
-            return Ok(Some(format!(
-                "Codey 资源门禁：子代理 `{agent_id}` 的读取目标不在已声明 read scope 内。相对路径按 child cwd 解析；外部 worktree 必须由派生契约显式授权，实际访问继续受 Codex 原生沙箱与审批控制，禁止用 Bash 绕过。"
-            )));
-        }
-        return Ok(None);
-    }
-    if tool_class != ToolClass::Write {
-        return Ok(None);
-    }
-
-    let observed_paths = extract_write_paths(tool_name, tool_input);
-    if observed_paths.is_empty() {
-        return Ok(Some(format!(
-            "Codey 能力/资源门禁：无法从写入工具 `{tool_name}` 的输入中确定目标路径；请改用能显式报告路径的 apply_patch/FastCtx replace，或把任务交回主代理。"
-        )));
-    }
-    let covered = bound_reservation.is_some_and(|reservation| {
-        reservation.write_capable
-            && observed_paths
-                .iter()
-                .all(|path| reservation_covers_path(reservation, path, cwd))
-    });
-    if !covered {
-        return Ok(Some(format!(
-            "Codey 能力/资源门禁：子代理 `{agent_id}` 对目标路径没有已绑定且有效的写入 ownership；相对路径按 child cwd 解析。外部 worktree 必须由派生契约显式授权，实际访问继续受 Codex 原生沙箱与审批控制，禁止越界修改。"
         )));
     }
     Ok(None)
@@ -2944,17 +2959,11 @@ fn reservation_declares_read(reservation: &Reservation) -> bool {
 }
 
 fn reservation_declares_write(reservation: &Reservation) -> bool {
-    reservation
-        .capabilities
-        .iter()
-        .any(|capability| capability == "workspace.write")
-}
-
-fn reservation_command_covers_workspace(reservation: &Reservation) -> bool {
-    reservation
-        .workspace_root
-        .as_ref()
-        .is_some_and(|root| reservation.write_paths.iter().any(|claim| claim == root))
+    reservation.write_capable
+        && reservation
+            .capabilities
+            .iter()
+            .any(|capability| capability == "workspace.write")
 }
 
 fn reservation_trace(reservation: &Reservation) -> TraceContext {
@@ -3112,13 +3121,14 @@ fn prepare_contract_with_rules(
     let trace =
         TraceContext::normalized(contract.trace_id.as_deref(), contract.parent_id.as_deref())
             .map_err(|error| contract_error(&error))?;
-    let workspace_root = contract
-        .workspace_root
-        .as_deref()
-        .or(hook_workspace_root)
-        .map(normalize_authorized_path)
-        .transpose()
-        .map_err(|error| contract_error(&format!("root 无效：{error}")))?;
+    let workspace_root = if let Some(root) = contract.workspace_root.as_deref() {
+        Some(
+            normalize_coordination_path(root)
+                .map_err(|error| contract_error(&format!("root 无效：{error}")))?,
+        )
+    } else {
+        hook_workspace_root.and_then(|root| normalize_coordination_path(root).ok())
+    };
     let mut read_paths = normalize_claims(&contract.read_paths, workspace_root.as_deref())?;
     let write_paths = normalize_claims(&contract.write_paths, workspace_root.as_deref())?;
     if read_paths.is_empty() {
@@ -3148,9 +3158,6 @@ fn prepare_contract_with_rules(
             if contract.acceptance.is_empty() {
                 return Err(contract_error("写入角色必须声明至少一个机械 checks"));
             }
-            if workspace_root.is_none() {
-                return Err(contract_error("写入角色必须声明绝对 root"));
-            }
             if !capabilities
                 .iter()
                 .any(|capability| capability == "workspace.write")
@@ -3168,37 +3175,6 @@ fn prepare_contract_with_rules(
         return Err(contract_error(
             "所有可执行契约都必须显式声明 files.read capability",
         ));
-    }
-    let hook_root = match hook_workspace_root {
-        Some(raw) => match normalize_authorized_path(raw) {
-            Ok(root) => Some(root),
-            Err(error) if policy.access == RoleAccess::Write => {
-                return Err(contract_error(&format!("Hook 工作目录无效：{error}")));
-            }
-            Err(_) => None,
-        },
-        None => None,
-    };
-    if let Some(root) = workspace_root.as_deref() {
-        // `cwd` is not Codex's complete filesystem allowlist. Hooks do not expose
-        // the live sandbox mode, extra writable roots, or one-off approvals, so
-        // Codey only validates the explicit delegation scope here and leaves the
-        // actual access decision to Codex's inherited sandbox/approval layer.
-        match hook_root.as_deref() {
-            None if policy.access == RoleAccess::Write => {
-                return Err(contract_error(
-                    "Hook 未提供绝对工作目录，无法校验写入角色的契约 root",
-                ));
-            }
-            _ => {}
-        }
-        for claim in read_paths.iter().chain(write_paths.iter()) {
-            if !path_is_within(claim, root) {
-                return Err(contract_error(&format!(
-                    "资源路径 `{claim}` 必须位于契约 root `{root}` 内"
-                )));
-            }
-        }
     }
     let mut check_ids = BTreeSet::new();
     let mut total_check_chars = 0_usize;
@@ -3258,10 +3234,8 @@ fn prepare_opaque_contract(
             "message 已由上游加密，无法验证 write ownership 与机械 checks；写入角色必须使用可验证的明文或签名 sidecar 契约",
         ));
     }
-    let workspace_root = hook_workspace_root
-        .map(normalize_authorized_path)
-        .transpose()
-        .map_err(|error| contract_error(&format!("Hook 工作目录无效：{error}")))?;
+    let workspace_root =
+        hook_workspace_root.and_then(|root| normalize_coordination_path(root).ok());
     let workspace_claims = workspace_root.iter().cloned().collect::<Vec<_>>();
     let read_paths = workspace_claims;
     let write_paths = Vec::new();
@@ -3436,9 +3410,9 @@ fn normalize_claims(
     let mut normalized = BTreeSet::new();
     for claim in claims {
         let path = if is_absolute_path(claim) {
-            normalize_authorized_path(claim)
+            normalize_coordination_path(claim)
         } else if let Some(root) = workspace_root {
-            normalize_authorized_path(&format!("{}/{}", root.trim_end_matches('/'), claim))
+            normalize_coordination_path(&format!("{}/{}", root.trim_end_matches('/'), claim))
         } else {
             Err("相对资源路径需要绝对 root".to_string())
         }
@@ -3448,12 +3422,11 @@ fn normalize_claims(
     Ok(normalized.into_iter().collect())
 }
 
-/// Resolve every existing ancestor before comparing authorization scopes. For
-/// a not-yet-created target, the nearest existing ancestor is canonicalized and
-/// the missing suffix is appended. This closes ordinary symlink/junction
-/// escapes; the actual executor remains responsible for race-free openat-style
-/// enforcement between authorization and file creation.
-fn normalize_authorized_path(value: &str) -> std::result::Result<String, String> {
+/// Canonicalize existing ancestors when possible so coordination claims for
+/// obvious aliases overlap. These paths are scheduling metadata, not a file
+/// ACL: metadata/canonicalization failures fall back to the lexical absolute
+/// path, while the Codex executor remains the only filesystem authority.
+fn normalize_coordination_path(value: &str) -> std::result::Result<String, String> {
     let lexical = normalize_absolute_path(value)?;
     let path = PathBuf::from(&lexical);
     if !path.is_absolute() {
@@ -3468,22 +3441,24 @@ fn normalize_authorized_path(value: &str) -> std::result::Result<String, String>
             Ok(_) => break,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let Some(name) = ancestor.file_name() else {
-                    return Err(format!("找不到可解析的现存路径祖先：{lexical}"));
+                    return Ok(lexical);
                 };
                 missing.push(name.to_os_string());
-                ancestor = ancestor
-                    .parent()
-                    .ok_or_else(|| format!("找不到可解析的现存路径祖先：{lexical}"))?;
+                let Some(parent) = ancestor.parent() else {
+                    return Ok(lexical);
+                };
+                ancestor = parent;
             }
-            Err(error) => return Err(format!("读取路径元数据失败：{error}")),
+            Err(_) => return Ok(lexical),
         }
     }
-    let mut resolved = fs::canonicalize(ancestor)
-        .map_err(|error| format!("解析路径祖先 `{}` 失败：{error}", ancestor.display()))?;
+    let Ok(mut resolved) = fs::canonicalize(ancestor) else {
+        return Ok(lexical);
+    };
     for component in missing.iter().rev() {
         resolved.push(component);
     }
-    normalize_absolute_path(&resolved.to_string_lossy())
+    Ok(normalize_absolute_path(&resolved.to_string_lossy()).unwrap_or(lexical))
 }
 
 fn normalize_absolute_path(value: &str) -> std::result::Result<String, String> {
@@ -3613,40 +3588,6 @@ fn path_is_within(path: &str, parent: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn reservation_covers_path(
-    reservation: &Reservation,
-    observed: &str,
-    child_cwd: Option<&str>,
-) -> bool {
-    reservation_covers_claimed_path(observed, child_cwd, &reservation.write_paths)
-}
-
-fn reservation_covers_read_path(
-    reservation: &Reservation,
-    observed: &str,
-    child_cwd: Option<&str>,
-) -> bool {
-    reservation_covers_claimed_path(observed, child_cwd, &reservation.read_paths)
-}
-
-fn reservation_covers_claimed_path(
-    observed: &str,
-    child_cwd: Option<&str>,
-    claims: &[String],
-) -> bool {
-    let normalized = if is_absolute_path(observed) {
-        normalize_authorized_path(observed).ok()
-    } else {
-        child_cwd.and_then(|cwd| {
-            normalize_authorized_path(cwd).ok().and_then(|cwd| {
-                normalize_authorized_path(&format!("{}/{}", cwd.trim_end_matches('/'), observed))
-                    .ok()
-            })
-        })
-    };
-    normalized.is_some_and(|path| claims.iter().any(|claim| path_is_within(&path, claim)))
-}
-
 pub(crate) fn safe_child_reporting_tool(tool_name: &str, tool_input: Option<&Value>) -> bool {
     if rules::normalize_tool_name(tool_name) != "send_message" {
         return false;
@@ -3659,105 +3600,6 @@ pub(crate) fn safe_child_reporting_tool(tool_name: &str, tool_input: Option<&Val
         })
     });
     target.is_some_and(|target| matches!(target.trim_end_matches('/'), "root" | "/root"))
-}
-
-fn extract_write_paths(tool_name: &str, tool_input: Option<&Value>) -> Vec<String> {
-    let Some(input) = tool_input else {
-        return Vec::new();
-    };
-    let mut paths = BTreeSet::new();
-    if rules::normalize_tool_name(tool_name) == "apply_patch" {
-        collect_patch_paths(input, &mut paths);
-    } else {
-        collect_path_fields(input, &mut paths);
-    }
-    paths.into_iter().collect()
-}
-
-fn read_tool_is_path_scoped(tool_name: &str) -> bool {
-    let normalized = rules::normalize_tool_name(tool_name);
-    let leaf = normalized
-        .rsplit_once("__")
-        .map_or(normalized.as_str(), |(_, leaf)| leaf);
-    matches!(
-        leaf,
-        "read_file" | "inspect_local_file" | "grep" | "glob" | "view_image"
-    )
-}
-
-fn extract_read_paths(tool_input: Option<&Value>) -> Vec<String> {
-    let Some(input) = tool_input else {
-        return Vec::new();
-    };
-    let mut paths = BTreeSet::new();
-    collect_path_fields(input, &mut paths);
-    paths.into_iter().collect()
-}
-
-fn collect_patch_paths(value: &Value, paths: &mut BTreeSet<String>) {
-    match value {
-        Value::String(patch) => {
-            for line in patch.lines() {
-                for prefix in [
-                    "*** Add File: ",
-                    "*** Update File: ",
-                    "*** Delete File: ",
-                    "*** Move to: ",
-                ] {
-                    if let Some(path) = line.strip_prefix(prefix) {
-                        let path = path.trim();
-                        if !path.is_empty() {
-                            paths.insert(path.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_patch_paths(value, paths);
-            }
-        }
-        Value::Object(values) => {
-            for value in values.values() {
-                collect_patch_paths(value, paths);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn collect_path_fields(value: &Value, paths: &mut BTreeSet<String>) {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                collect_path_fields(value, paths);
-            }
-        }
-        Value::Object(values) => {
-            for (key, value) in values {
-                let key = normalized_identifier(key);
-                if matches!(key.as_str(), "path" | "filepath" | "targetpath") {
-                    if let Some(path) = value.as_str() {
-                        paths.insert(path.to_string());
-                    }
-                } else if matches!(key.as_str(), "paths" | "files") {
-                    if let Some(values) = value.as_array() {
-                        for value in values {
-                            if let Some(path) = value.as_str() {
-                                paths.insert(path.to_string());
-                            } else {
-                                collect_path_fields(value, paths);
-                            }
-                        }
-                    }
-                } else {
-                    collect_path_fields(value, paths);
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 fn extract_command(value: Option<&Value>) -> Option<&str> {
@@ -4038,6 +3880,20 @@ fn followup_task_target(tool_input: Option<&Value>) -> Option<&str> {
     string_field(input, &["target"])
         .map(str::trim)
         .filter(|target| !target.is_empty())
+}
+
+fn interrupt_task_target(tool_input: Option<&Value>) -> Option<String> {
+    match tool_input? {
+        Value::Object(input) => string_field(input, &["target"])
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(ToOwned::to_owned),
+        Value::String(encoded) if encoded.len() <= MAX_SPAWN_RESPONSE_JSON_BYTES => {
+            let decoded = serde_json::from_str::<Value>(encoded).ok()?;
+            interrupt_task_target(Some(&decoded))
+        }
+        _ => None,
+    }
 }
 
 fn string_field<'a>(values: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a str> {
@@ -4782,7 +4638,7 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_contract_requires_a_valid_root_and_contained_claims() {
+    fn plaintext_contract_claims_may_span_roots_without_hook_cwd() {
         let temp = tempfile::tempdir().unwrap();
         let write = contract_input(
             "worker_a",
@@ -4790,18 +4646,40 @@ mod tests {
             worker_contract("worker_a", "backend/src"),
         );
 
-        let denial = pre_spawn_with_workspace(
-            temp.path(),
-            "runtime-a",
-            "session-a",
-            Some(&write),
-            None,
-            0,
-            10,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denial.contains("Hook 未提供绝对工作目录"));
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&write),
+                None,
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+
+        let mut absolute_without_root = worker_contract("worker_absolute", "/external/src");
+        absolute_without_root
+            .as_object_mut()
+            .unwrap()
+            .remove("root");
+        let absolute_without_root =
+            contract_input("worker_absolute", "codey_worker", absolute_without_root);
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-absolute-without-root",
+                Some(&absolute_without_root),
+                Some("relative-hook-cwd"),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
 
         assert_eq!(
             pre_spawn_with_workspace(
@@ -4849,18 +4727,19 @@ mod tests {
             "codey_worker",
             worker_contract("worker_c", "/etc/passwd"),
         );
-        let denial = pre_spawn_with_workspace(
-            temp.path(),
-            "runtime-a",
-            "session-outside-claim",
-            Some(&outside_root),
-            Some("/repo"),
-            0,
-            10,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denial.contains("必须位于契约 root"));
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-outside-claim",
+                Some(&outside_root),
+                Some("/repo"),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -4915,8 +4794,7 @@ mod tests {
                 Some(&read_only("/repo", &["/outside"])),
                 Some("/repo")
             )
-            .unwrap_err()
-            .contains("必须位于契约 root")
+            .is_ok()
         );
     }
 
@@ -5745,6 +5623,94 @@ mod tests {
         .unwrap();
         assert!(pending.contains("仍为 pending"));
         assert!(pending.contains("`agents.list_agents`"));
+    }
+
+    #[test]
+    fn root_interrupt_abandons_only_the_target_and_cannot_be_reactivated() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "interrupt-session";
+        for (index, task_id) in ["reader_a", "reader_b"].into_iter().enumerate() {
+            let spawn = contract_input(task_id, "codey_deep_research", research_contract(task_id));
+            pre_spawn(
+                temp.path(),
+                "runtime-a",
+                session_id,
+                Some(&spawn),
+                index,
+                10 + index as u64,
+            )
+            .unwrap();
+            post_spawn(
+                temp.path(),
+                "runtime-a",
+                session_id,
+                Some(&spawn),
+                Some(&json!({ "agent_id": format!("agent-{task_id}") })),
+                20 + index as u64,
+            )
+            .unwrap();
+        }
+
+        let interrupt = json!({ "target": "/root/reader_a" });
+        let abandoned = abandon_interrupted_reservation(
+            temp.path(),
+            "runtime-a",
+            session_id,
+            Some(&interrupt),
+            30,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(abandoned.changed);
+        assert_eq!(
+            abandoned.agent_id_hash.as_deref(),
+            Some(hash_component("agent-reader_a").as_str())
+        );
+
+        let followup_a = json!({ "target": "/root/reader_a" });
+        let followup_b = json!({ "target": "agent-reader_b" });
+        assert!(
+            pre_followup_task(temp.path(), "runtime-a", session_id, Some(&followup_a), 31,)
+                .unwrap()
+                .unwrap()
+                .contains(FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE)
+        );
+        assert_eq!(
+            pre_followup_task(temp.path(), "runtime-a", session_id, Some(&followup_b), 32,)
+                .unwrap(),
+            None
+        );
+
+        let duplicate = Value::String(serde_json::to_string(&interrupt).unwrap());
+        assert!(
+            !abandon_interrupted_reservation(
+                temp.path(),
+                "runtime-a",
+                session_id,
+                Some(&duplicate),
+                33,
+            )
+            .unwrap()
+            .unwrap()
+            .changed
+        );
+        subagent_stopped(temp.path(), "runtime-a", session_id, "agent-reader_a", 34).unwrap();
+
+        let store = LedgerStore::open(temp.path(), session_id).unwrap();
+        let ledger = store.load("runtime-a", session_id, 35).unwrap().unwrap();
+        let abandoned = &ledger.reservations["reader_a"];
+        assert_eq!(abandoned.state, ReservationState::Recovered);
+        assert_eq!(abandoned.outcome, ExecutionOutcome::Lost);
+        assert!(
+            abandoned
+                .error_message
+                .as_deref()
+                .is_some_and(|reason| reason.contains("permanently abandoned"))
+        );
+        assert_eq!(
+            ledger.reservations["reader_b"].state,
+            ReservationState::Running
+        );
     }
 
     #[test]
@@ -6578,7 +6544,7 @@ mod tests {
     }
 
     #[test]
-    fn child_write_tool_must_stay_inside_declared_ownership() {
+    fn child_write_paths_and_commands_defer_to_codex_after_capability_check() {
         let temp = tempfile::tempdir().unwrap();
         let input = contract_input(
             "worker_a",
@@ -6611,36 +6577,49 @@ mod tests {
             .unwrap(),
             None
         );
-        let denied_patch = json!({
+        let outside_declared_claim = json!({
             "patch": "*** Begin Patch\n*** Update File: README.md\n*** End Patch"
         });
-        assert!(
+        assert_eq!(
             authorize_child_tool(
                 temp.path(),
                 "runtime-a",
                 "session-a",
                 "agent-a",
                 "apply_patch",
-                Some(&denied_patch),
+                Some(&outside_declared_claim),
                 30,
             )
-            .unwrap()
-            .unwrap()
-            .contains("ownership")
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            authorize_child_tool(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                "agent-a",
+                "mcp__codey_fastctx__replace",
+                Some(&json!({ "opaque_target": "provider-specific" })),
+                35,
+            )
+            .unwrap(),
+            None
         );
 
-        let command_denial = authorize_child_tool(
-            temp.path(),
-            "runtime-a",
-            "session-a",
-            "agent-a",
-            "Bash",
-            Some(&json!({ "command": "cargo test --lib" })),
-            40,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(command_denial.contains("完整 root"));
+        assert_eq!(
+            authorize_child_tool(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                "agent-a",
+                "Bash",
+                Some(&json!({ "command": "cargo test --lib" })),
+                40,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -6705,7 +6684,7 @@ mod tests {
     }
 
     #[test]
-    fn child_read_tool_must_stay_inside_declared_scope() {
+    fn child_read_paths_defer_to_codex_after_capability_check() {
         let temp = tempfile::tempdir().unwrap();
         let mut contract = research_contract("research_scoped");
         contract["root"] = json!("/repo");
@@ -6735,22 +6714,50 @@ mod tests {
             .unwrap(),
             None
         );
+        assert_eq!(
+            authorize_child_tool(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                "agent-reader",
+                "mcp__codey_fastctx__inspect_local_file",
+                Some(&json!({ "file_path": "/another-repo/README.md" })),
+                40,
+            )
+            .unwrap(),
+            None
+        );
+
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let mut ledger = store.load("runtime-a", "session-a", 45).unwrap().unwrap();
+        ledger
+            .reservations
+            .get_mut("research_scoped")
+            .unwrap()
+            .capabilities
+            .push("workspace.write".to_string());
+        store.save(&mut ledger, 46).unwrap();
+        drop(ledger);
+        drop(store);
+
         let denial = authorize_child_tool(
             temp.path(),
             "runtime-a",
             "session-a",
             "agent-reader",
-            "mcp__codey_fastctx__inspect_local_file",
-            Some(&json!({ "file_path": "README.md" })),
-            40,
+            "apply_patch",
+            Some(&json!({
+                "patch": "*** Begin Patch\n*** Update File: README.md\n*** End Patch"
+            })),
+            50,
         )
         .unwrap()
         .unwrap();
-        assert!(denial.contains("read scope"));
+        assert!(denial.contains("不是可写角色"));
     }
 
     #[test]
-    fn explicit_external_child_paths_are_checked_against_contract_claims() {
+    fn explicit_external_claims_are_coordination_metadata_not_runtime_acls() {
         let temp = tempfile::tempdir().unwrap();
         let mut contract = research_contract("external_reader");
         contract["root"] = json!("/external-repo");
@@ -6789,7 +6796,6 @@ mod tests {
                     agent_id: "agent-external-reader",
                     agent_type: None,
                     transcript_path: None,
-                    cwd: Some("/repo"),
                     tool_name: "mcp__codey_fastctx__inspect_local_file",
                     tool_input: Some(&read),
                 },
@@ -6799,23 +6805,23 @@ mod tests {
             None
         );
         let undeclared_read = json!({ "file_path": "/another-repo/secret.txt" });
-        let denial = authorize_child_tool_with_context(
-            temp.path(),
-            "runtime-a",
-            "external-read-session",
-            ChildToolContext {
-                agent_id: "agent-external-reader",
-                agent_type: None,
-                transcript_path: None,
-                cwd: Some("/repo"),
-                tool_name: "mcp__codey_fastctx__inspect_local_file",
-                tool_input: Some(&undeclared_read),
-            },
-            35,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denial.contains("read scope"));
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "external-read-session",
+                ChildToolContext {
+                    agent_id: "agent-external-reader",
+                    agent_type: None,
+                    transcript_path: None,
+                    tool_name: "mcp__codey_fastctx__inspect_local_file",
+                    tool_input: Some(&undeclared_read),
+                },
+                35,
+            )
+            .unwrap(),
+            None
+        );
 
         let mut write_contract = worker_contract("external_worker", ".");
         write_contract["root"] = json!("/external-repo");
@@ -6852,7 +6858,6 @@ mod tests {
                     agent_id: "agent-external-worker",
                     agent_type: None,
                     transcript_path: None,
-                    cwd: Some("/repo"),
                     tool_name: "mcp__codey_fastctx__replace",
                     tool_input: Some(&replace),
                 },
@@ -6864,7 +6869,7 @@ mod tests {
     }
 
     #[test]
-    fn child_relative_paths_use_the_actual_worktree_cwd() {
+    fn child_read_paths_do_not_depend_on_contract_root() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let worktree_a = workspace.join(".worktrees/a");
@@ -6909,7 +6914,6 @@ mod tests {
                     agent_id: "agent-worktree",
                     agent_type: None,
                     transcript_path: None,
-                    cwd: Some(&worktree_a),
                     tool_name: "mcp__codey_fastctx__grep",
                     tool_input: Some(&relative_read),
                 },
@@ -6931,7 +6935,6 @@ mod tests {
                     agent_id: "agent-worktree",
                     agent_type: None,
                     transcript_path: None,
-                    cwd: Some(&worktree_a),
                     tool_name: "mcp__codey_fastctx__inspect_local_file",
                     tool_input: Some(&absolute_read),
                 },
@@ -6941,66 +6944,66 @@ mod tests {
             None
         );
 
-        let sibling_denial = authorize_child_tool_with_context(
-            temp.path(),
-            "runtime-a",
-            "worktree-session",
-            ChildToolContext {
-                agent_id: "agent-worktree",
-                agent_type: None,
-                transcript_path: None,
-                cwd: Some(&worktree_b),
-                tool_name: "mcp__codey_fastctx__grep",
-                tool_input: Some(&relative_read),
-            },
-            40,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(sibling_denial.contains("read scope"));
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "worktree-session",
+                ChildToolContext {
+                    agent_id: "agent-worktree",
+                    agent_type: None,
+                    transcript_path: None,
+                    tool_name: "mcp__codey_fastctx__grep",
+                    tool_input: Some(&relative_read),
+                },
+                40,
+            )
+            .unwrap(),
+            None
+        );
 
         let sibling_absolute_read = json!({
             "file_path": format!("{worktree_b}/backend/src/lib.rs")
         });
-        let sibling_absolute_denial = authorize_child_tool_with_context(
-            temp.path(),
-            "runtime-a",
-            "worktree-session",
-            ChildToolContext {
-                agent_id: "agent-worktree",
-                agent_type: None,
-                transcript_path: None,
-                cwd: Some(&worktree_a),
-                tool_name: "mcp__codey_fastctx__inspect_local_file",
-                tool_input: Some(&sibling_absolute_read),
-            },
-            45,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(sibling_absolute_denial.contains("read scope"));
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "worktree-session",
+                ChildToolContext {
+                    agent_id: "agent-worktree",
+                    agent_type: None,
+                    transcript_path: None,
+                    tool_name: "mcp__codey_fastctx__inspect_local_file",
+                    tool_input: Some(&sibling_absolute_read),
+                },
+                45,
+            )
+            .unwrap(),
+            None
+        );
 
-        let missing_cwd_denial = authorize_child_tool_with_context(
-            temp.path(),
-            "runtime-a",
-            "worktree-session",
-            ChildToolContext {
-                agent_id: "agent-worktree",
-                agent_type: None,
-                transcript_path: None,
-                cwd: None,
-                tool_name: "mcp__codey_fastctx__grep",
-                tool_input: Some(&relative_read),
-            },
-            50,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(missing_cwd_denial.contains("read scope"));
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "worktree-session",
+                ChildToolContext {
+                    agent_id: "agent-worktree",
+                    agent_type: None,
+                    transcript_path: None,
+                    tool_name: "mcp__codey_fastctx__grep",
+                    tool_input: Some(&relative_read),
+                },
+                50,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn parent_checkout_scope_does_not_cover_a_child_worktree() {
+    fn parent_checkout_claim_does_not_block_a_child_worktree_read() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let worktree = workspace.join(".worktrees/child");
@@ -7034,48 +7037,48 @@ mod tests {
         .unwrap();
 
         let relative_read = json!({ "path": "backend/src", "pattern": "needle" });
-        let denial = authorize_child_tool_with_context(
-            temp.path(),
-            "runtime-a",
-            "misrooted-session",
-            ChildToolContext {
-                agent_id: "agent-misrooted",
-                agent_type: None,
-                transcript_path: None,
-                cwd: Some(&worktree),
-                tool_name: "mcp__codey_fastctx__grep",
-                tool_input: Some(&relative_read),
-            },
-            30,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denial.contains("read scope"));
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "misrooted-session",
+                ChildToolContext {
+                    agent_id: "agent-misrooted",
+                    agent_type: None,
+                    transcript_path: None,
+                    tool_name: "mcp__codey_fastctx__grep",
+                    tool_input: Some(&relative_read),
+                },
+                30,
+            )
+            .unwrap(),
+            None
+        );
 
         let absolute_read = json!({
             "file_path": format!("{worktree}/backend/src/lib.rs")
         });
-        let absolute_denial = authorize_child_tool_with_context(
-            temp.path(),
-            "runtime-a",
-            "misrooted-session",
-            ChildToolContext {
-                agent_id: "agent-misrooted",
-                agent_type: None,
-                transcript_path: None,
-                cwd: Some(&worktree),
-                tool_name: "mcp__codey_fastctx__inspect_local_file",
-                tool_input: Some(&absolute_read),
-            },
-            40,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(absolute_denial.contains("read scope"));
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "misrooted-session",
+                ChildToolContext {
+                    agent_id: "agent-misrooted",
+                    agent_type: None,
+                    transcript_path: None,
+                    tool_name: "mcp__codey_fastctx__inspect_local_file",
+                    tool_input: Some(&absolute_read),
+                },
+                40,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
-    fn explicit_contract_can_scope_a_child_to_a_sibling_worktree() {
+    fn explicit_contract_records_sibling_worktree_claims() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
         let checkout = workspace.join("checkout");
@@ -7124,7 +7127,6 @@ mod tests {
                     agent_id: "agent-sibling-worktree",
                     agent_type: None,
                     transcript_path: None,
-                    cwd: Some(&checkout),
                     tool_name: "mcp__codey_fastctx__inspect_local_file",
                     tool_input: Some(&read),
                 },
@@ -7161,7 +7163,6 @@ mod tests {
                 agent_id: "opaque-agent",
                 agent_type: Some("codey_deep_research"),
                 transcript_path: None,
-                cwd: Some("/repo"),
                 tool_name: "mcp__codey_fastctx__grep",
                 tool_input: Some(&json!({ "path": "backend/a", "pattern": "needle" })),
             },
@@ -7195,7 +7196,6 @@ mod tests {
                     agent_id: agent,
                     agent_type: Some("codey_deep_research"),
                     transcript_path: None,
-                    cwd: Some("/repo"),
                     tool_name: "mcp__codey_fastctx__grep",
                     tool_input: Some(&json!({ "path": "backend/shared", "pattern": "needle" })),
                 },
@@ -7233,7 +7233,6 @@ mod tests {
                 agent_id: "/root/research_a",
                 agent_type: Some("codey_worker"),
                 transcript_path: None,
-                cwd: Some("/repo"),
                 tool_name: "mcp__codey_fastctx__grep",
                 tool_input: Some(&json!({ "path": ".", "pattern": "needle" })),
             },
@@ -7268,7 +7267,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn physical_path_resolution_rejects_symlink_ownership_escape() {
+    fn runtime_path_authorization_defers_symlink_resolution_to_codex() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
@@ -7305,23 +7304,23 @@ mod tests {
         let patch = json!({
             "patch": "*** Begin Patch\n*** Add File: owned/escape.rs\n+outside\n*** End Patch"
         });
-        let denial = authorize_child_tool_with_context(
-            temp.path(),
-            "runtime-a",
-            "session-a",
-            ChildToolContext {
-                agent_id: "agent-symlink",
-                agent_type: None,
-                transcript_path: None,
-                cwd: Some(&workspace_text),
-                tool_name: "apply_patch",
-                tool_input: Some(&patch),
-            },
-            30,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denial.contains("ownership"));
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                ChildToolContext {
+                    agent_id: "agent-symlink",
+                    agent_type: None,
+                    transcript_path: None,
+                    tool_name: "apply_patch",
+                    tool_input: Some(&patch),
+                },
+                30,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

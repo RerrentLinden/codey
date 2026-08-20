@@ -316,9 +316,9 @@ Codey 不再按角色成本点、每批尝试次数、批次数或根回合累�
 
 `CODEY_DELEGATION_V2={"id":"task_name","why":"breadth","visual":false,"root":"/absolute/workspace","read":["relevant/path"],"write":[],"capabilities":["files.read"],"checks":[]}`
 
-`id` 必须等于 `task_name`；路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径。只声明本任务确实会读取和写入的稳定路径；省略 `root` 时采用 Hook 工作目录，空 `read` 对只读角色表示该 root、对写入角色表示其 `write` 范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 只有额外声明 `command.execute` 且 `write` 覆盖完整 root 时才能运行通用 shell。子代理网络能力不开放，契约不能自行声明或放宽。路径读取和写入都会按解析现存祖先后的物理路径校验；未绑定 attempt 不获得数据或副作用权限。运行时还会校验工具的完整可信名称、理由、角色能力、角色感知并发上限及 read/write 冲突；重复任务 ID、越权访问和重叠 ownership 会被拒绝。
+`id` 必须等于 `task_name`；路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径；绝对 claim 可以位于 `root` 之外，跨多个工作树时分别声明即可。`root`、`read` 和 `write` 是冲突协调、ownership 与审计元数据，应尽量准确描述预计范围，但不是 Codey 的运行时文件路径 ACL。省略 `root` 时采用有效的 Hook 工作目录；Hook 目录缺失或无效但 claim 已是绝对路径时仍可派发。空 `read` 会对只读角色以 root、对写入角色以其 `write` 作为默认协调 claim，但不会收窄 Codex 原生可访问范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 额外声明 `command.execute` 后可以运行通用 shell，不要求 `write` 覆盖完整 root。子代理网络能力不开放，契约不能自行声明或放宽。未绑定 attempt 不获得数据或副作用权限；只读角色即使出现异常或旧账本也不能取得写能力。运行时还会校验工具的完整可信名称、理由、角色能力、角色感知并发上限及 read/write 冲突；重复任务 ID 和重叠 ownership 会被拒绝。
 
-`root` 必须是子代理实际执行任务的工作树根。目标位于 `.worktrees/<name>` 或其他隔离 worktree 时，必须把该 worktree 的绝对路径写入 `root`，并让相对 `read`/`write` 以它为基准；不得用主 checkout 的 root 代替。路径工具的相对目标会按 child `cwd` 解析后再与契约比较；缺少可信 `cwd` 时相对访问按 fail-closed 拒绝。读取被门禁拒绝后，子代理应立即向根代理回报，由根代理使用新任务 ID 和正确契约重新派发或直接接管；不得改用 Bash 绕过，验证命令仍由根代理执行。
+Codey 在 attempt 身份和角色 capability 校验通过后，不再解析、比较或拒绝读取、写入和命令中的目标路径，也不要求 child `cwd` 与契约 `root` 相同。子代理实际能访问哪些工作树、兄弟目录或外部路径，完全由其继承的 Codex sandbox、approval policy、permission profile 和 writable roots 决定；原生权限拒绝时按 Codex 的正常流程处理，不应通过修改 Codey 契约冒充权限提升。验证命令仍由根代理执行机械验收。
 
 ### 任务胶囊与验收
 
@@ -334,8 +334,8 @@ Codey 不再按角色成本点、每批尝试次数、批次数或根回合累�
 - 每个子代理只用一轮，不复用、不追派，也不得继续派生。失败后默认由主代理接管；只有缩小或改变范围后仍值得独立委派，才允许使用新任务 ID 最多重派一次。
 - 收到 `CODEY_SUBAGENT_DUPLICATE_TASK_ID` 时，不得重复旧 ID，也不得把拒绝当作完成后立即 Stop。先调用一次无筛选的 `agents.list_agents` 对账：原代理存在时等待其终态或消费已有终态结果，明确不存在时由主代理接管；只有任务范围确实改变且仍值得委派时，才可使用全新的 `task_name` 最多重试一次，并把 `CODEY_DELEGATION_V2.id` 同步改为完全相同的新值。
 - `MESSAGE` 或不完整结果只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`running`、`pending_init` 和 `interrupted` 不是终态。
-- `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态且根 turn 绑定有效时只中断一次并继续等待，否则依赖 Stop 的受控恢复路径 fence 遗留 attempt。禁止无限 wait、无限重试或静默重派。
-- 用户新输入使旧批次失效时，先完成对账；只有可信根 turn 绑定仍有效时才中断活动代理，否则让受控恢复路径接管并忽略迟到结果。编排账本、未清偿验收债和未验证结算证据按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
+- `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态且根 turn 绑定有效时只中断一次。成功的 `agents.interrupt_agent` 表示根代理永久放弃该 attempt，Codey 会立即 fence 并核销本地活动状态；不要再等待或追派该 target，直接接管。中断失败或目标无法唯一匹配时才继续对账，并依赖 Stop 的受控恢复路径。禁止无限 wait、无限重试或静默重派。
+- 用户新输入使旧批次失效时，先完成对账；只有可信根 turn 绑定仍有效时才中断活动代理。中断成功后立即接管并忽略迟到结果，不再等待上游把 `interrupted` 另行改成终态；否则让受控恢复路径接管。编排账本、未清偿验收债和未验证结算证据按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
 "#;
 
 pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V10: &str = r#"## 子代理使用
@@ -565,8 +565,10 @@ bound; never use it to reactivate a terminal, failed, shutdown, not_found, or pr
 or wait for that canonical task to recover; use a fresh `task_name` with the same fresh \
 `CODEY_DELEGATION_V2.id` through `agents.spawn_agent`, or let the root take over. Treat `FINAL_ANSWER`, \
 `task_complete`, `completed`, `errored`, `error`, `failed`, `shutdown`, and `not_found` as terminal; \
-`pending_init`, `running`, and `interrupted` remain nonterminal. If a wait result lacks per-agent terminal \
-details, call unfiltered `agents.list_agents` to reconcile the full batch. Continue until every spawned \
+`pending_init`, `running`, and `interrupted` remain nonterminal until the root successfully calls \
+`agents.interrupt_agent`. A successful root interrupt permanently abandons and fences that attempt in \
+Codey; do not wait for or follow up that target, and take over its unfinished work. If a wait result lacks \
+per-agent terminal details, call unfiltered `agents.list_agents` to reconcile the full batch. Continue until every spawned \
 agent is terminal. Once the batch settles, call `mcp__codey_subagent_control__resolve_batch` with the \
 reported batch number, a unique decision_id, and a short reason. Choose exactly one of \
 `spawn_next_batch`, `continue_root`, `complete`, or `blocked`; `spawn_next_batch` must be followed by \
@@ -744,7 +746,7 @@ sandbox_mode = "workspace-write"
 
 developer_instructions = """
 你是代码实施子代理。只处理主代理明确授权、边界清晰、可回滚且可测试的低到中等复杂度非视觉实现；不要扩大范围，不做跨模块架构取舍，也不派生其他子代理。
-修改前读取将要编辑的确切代码，保留并适配其他人的并行改动。仅当契约显式授予 `command.execute` 且 write ownership 覆盖完整 root 时运行命令验证；否则列出需要主代理执行的检查。返回修改文件、关键位置、已取得的验证证据和仍存风险。
+修改前读取将要编辑的确切代码，保留并适配其他人的并行改动。仅当契约显式授予 `command.execute` 时运行命令验证；实际文件与命令访问继续受继承的 Codex 原生权限约束。否则列出需要主代理执行的检查。返回修改文件、关键位置、已取得的验证证据和仍存风险。
 遇到需要产品选择、破坏性操作或范围不明确时停止修改，把阻塞点交回主代理。
 首行写 `status: completed | partial | blocked`；紧凑列出改动、确定性验证结果和未完成项，不回传冗长日志。
 """
@@ -760,7 +762,7 @@ sandbox_mode = "workspace-write"
 
 developer_instructions = """
 你是视觉实施子代理。只处理主代理明确授权、边界清晰且需要截图、页面、GUI、PDF 或渲染证据的低到中等复杂度实现；不要扩大范围，不做架构取舍，也不派生其他子代理。
-修改前读取确切代码与视觉基线，修改后通过已授权的渲染/截图工具核验；仅当契约显式授予 `command.execute` 且 write ownership 覆盖完整 root 时运行通用命令。报告修改文件、关键位置、视觉证据、验证结果和仍存风险。
+修改前读取确切代码与视觉基线，修改后通过已授权的渲染/截图工具核验；仅当契约显式授予 `command.execute` 时运行通用命令，实际文件与命令访问继续受继承的 Codex 原生权限约束。报告修改文件、关键位置、视觉证据、验证结果和仍存风险。
 保留并适配其他人的并行改动；遇到需要产品选择、破坏性操作或范围不明确时停止并交回主代理。
 首行写 `status: completed | partial | blocked`；紧凑列出改动、视觉与确定性验证结果和未完成项，不回传冗长日志。
 """
@@ -1255,6 +1257,8 @@ mod tests {
         assert!(combined.contains("`failed`"));
         assert!(combined.contains("`shutdown`"));
         assert!(combined.contains("`not_found`"));
+        assert!(combined.contains("successful root interrupt permanently abandons and fences"));
+        assert!(combined.contains("do not wait for or follow up that target"));
         assert!(combined.contains("unfiltered `agents.list_agents`"));
         assert!(combined.contains("do not loop on an unregistered tool"));
         assert!(combined.contains("`functions.exec` tool world is a separate route"));
@@ -1369,7 +1373,8 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("主代理不得主动选择"));
         assert!(SUBAGENT_GUIDANCE.contains("status: completed | partial | blocked"));
         assert!(SUBAGENT_GUIDANCE.contains("多代理证据冲突时比较出处"));
-        assert!(SUBAGENT_GUIDANCE.contains("只中断一次并继续等待"));
+        assert!(SUBAGENT_GUIDANCE.contains("成功的 `agents.interrupt_agent` 表示根代理永久放弃"));
+        assert!(SUBAGENT_GUIDANCE.contains("不要再等待或追派该 target"));
         assert!(SUBAGENT_GUIDANCE.contains("只有缩小或改变范围后仍值得独立委派"));
         assert!(SUBAGENT_GUIDANCE.contains("同一批独立任务先全部派发，再进入等待"));
         assert!(SUBAGENT_GUIDANCE.contains("本批首个根派生调用的可信 `turn_id`"));
@@ -1378,9 +1383,10 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("CODEY_DELEGATION_V2="));
         assert!(SUBAGENT_GUIDANCE.contains("\"capabilities\":[\"files.read\"]"));
         assert!(SUBAGENT_GUIDANCE.contains("写入角色还必须声明 `workspace.write`"));
-        assert!(SUBAGENT_GUIDANCE.contains("`root` 必须是子代理实际执行任务的工作树根"));
-        assert!(SUBAGENT_GUIDANCE.contains("不得用主 checkout 的 root 代替"));
-        assert!(SUBAGENT_GUIDANCE.contains("不得改用 Bash 绕过"));
+        assert!(SUBAGENT_GUIDANCE.contains("不是 Codey 的运行时文件路径 ACL"));
+        assert!(SUBAGENT_GUIDANCE.contains("不再解析、比较或拒绝读取、写入和命令中的目标路径"));
+        assert!(SUBAGENT_GUIDANCE.contains("完全由其继承的 Codex sandbox"));
+        assert!(SUBAGENT_GUIDANCE.contains("不要求 `write` 覆盖完整 root"));
         assert!(SUBAGENT_GUIDANCE.contains("该批次只能以 `blocked` 结算"));
         assert!(SUBAGENT_GUIDANCE.contains("不再按角色成本点"));
         assert!(SUBAGENT_GUIDANCE.contains("不限制后续批次或累计派发次数"));
