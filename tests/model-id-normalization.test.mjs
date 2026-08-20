@@ -1,20 +1,12 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
-import ts from "typescript";
+
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 
 async function loadModelIdHelpers() {
-  const source = await readFile(
+  return loadTypeScriptModule(
     new URL("../src/modelIds.ts", import.meta.url),
-    "utf8",
   );
-  const compiled = ts.transpileModule(source, {
-    compilerOptions: {
-      module: ts.ModuleKind.ESNext,
-      target: ts.ScriptTarget.ES2020,
-    },
-  }).outputText;
-  return import(`data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`);
 }
 
 test("model IDs compare case-insensitively while preserving first spelling", async () => {

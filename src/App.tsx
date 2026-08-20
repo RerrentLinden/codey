@@ -12,13 +12,10 @@ import {
 import { invoke } from "./api";
 import { TraceLogModule } from "./TraceLogModule";
 import { ModelPickerDialog } from "./AppDialogs";
-import {
-  FeaturePolicyCard,
-  ModelSection,
-  OperationsPanel,
-  PromptOptimizationCard,
-  SubagentPolicyCard,
-} from "./AppSections";
+import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
+import { ModelSection } from "./ModelSection";
+import { OperationsPanel } from "./OperationsPanel";
+import { PromptOptimizationCard } from "./PromptOptimizationCard";
 import {
   getNotificationChannelDefinition,
   NotificationChannelsCard,

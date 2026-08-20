@@ -3,24 +3,17 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const source = readFileSync(
   new URL("../public/prompt-optimize.js", import.meta.url),
   "utf8",
 );
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(tagName = "div", { visible = true, rect = null } = {}) {
-    this.tagName = tagName.toUpperCase();
-    this.children = [];
-    this.dataset = {};
-    this.id = "";
-    this.parentElement = null;
-    this.style = {};
-    this.textContent = "";
-    this.attributes = new Map();
-    this.listeners = new Map();
+    super(tagName);
     this.visible = visible;
-    this.isConnected = false;
     this.value = "";
     this.innerText = "";
     this.disabled = false;
@@ -28,49 +21,6 @@ class FakeElement {
     this.readOnly = false;
     this.offsetWidth = 0;
     this.rect = rect;
-  }
-
-  addEventListener(type, handler) {
-    if (typeof handler !== "function") return;
-    const handlers = this.listeners.get(type) || [];
-    handlers.push(handler);
-    this.listeners.set(type, handlers);
-  }
-
-  dispatchEvent(event) {
-    if (!event?.type) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
-    for (const handler of [...(this.listeners.get(event.type) || [])]) {
-      handler.call(this, event);
-    }
-    return true;
-  }
-
-  appendChild(child) {
-    child.remove();
-    child.parentElement = this;
-    child.isConnected = true;
-    this.children.push(child);
-    return child;
-  }
-
-  insertBefore(child, reference) {
-    child.remove();
-    const index = this.children.indexOf(reference);
-    if (index < 0) return this.appendChild(child);
-    child.parentElement = this;
-    child.isConnected = true;
-    this.children.splice(index, 0, child);
-    return child;
-  }
-
-  remove() {
-    if (!this.parentElement) return;
-    const index = this.parentElement.children.indexOf(this);
-    if (index >= 0) this.parentElement.children.splice(index, 1);
-    this.parentElement = null;
-    this.isConnected = false;
   }
 
   closest(selector) {
@@ -101,11 +51,6 @@ class FakeElement {
     return null;
   }
 
-  contains(node) {
-    if (node === this) return true;
-    return this.children.some((child) => child.contains(node));
-  }
-
   querySelectorAll() {
     return [];
   }
@@ -124,13 +69,8 @@ class FakeElement {
       : { bottom: 0, height: 0, left: 0, right: 0, top: 0, width: 0 };
   }
 
-  getAttribute(name) {
-    return this.attributes.has(name) ? this.attributes.get(name) : null;
-  }
-
   setAttribute(name, value) {
-    this.attributes.set(name, String(value));
-    if (name === "id") this.id = String(value);
+    super.setAttribute(name, value);
     if (name === "contenteditable") {
       this.isContentEditable = String(value) === "true";
     }

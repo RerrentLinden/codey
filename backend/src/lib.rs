@@ -224,6 +224,7 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
                     &error,
                     cleanup.as_ref().err().map(String::as_str),
                 );
+                #[cfg(windows)]
                 show_initial_startup_failure(&error).await;
                 return Err(anyhow::Error::msg(error));
             }
@@ -314,9 +315,6 @@ async fn show_initial_startup_failure(error: &str) {
         eprintln!("Codey 启动失败提示框显示异常：{dialog_error}");
     }
 }
-
-#[cfg(not(windows))]
-async fn show_initial_startup_failure(_error: &str) {}
 
 async fn shutdown_signal() {
     #[cfg(unix)]

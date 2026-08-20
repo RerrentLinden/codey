@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const template = readFileSync(
   new URL("../public/pet-control-shield.js", import.meta.url),
   "utf8",
@@ -12,30 +14,16 @@ const bridgeTemplate = readFileSync(
   "utf8",
 );
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(text = "", isControl = true, children = []) {
+    super();
+    delete this.isConnected;
     this.textContent = text;
-    this.attributes = new Map();
     this.children = children;
-    this.disabled = false;
     this.isControl = isControl;
-    this.parentElement = null;
-    this.style = {
-      setProperty: (name, value, priority) => {
-        this.style[name] = `${value}:${priority}`;
-      },
-    };
     children.forEach((child) => {
       child.parentElement = this;
     });
-  }
-
-  getAttribute(name) {
-    return this.attributes.get(name) ?? null;
-  }
-
-  setAttribute(name, value) {
-    this.attributes.set(name, String(value));
   }
 
   closest() {

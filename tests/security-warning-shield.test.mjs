@@ -3,41 +3,23 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const root = new URL("../", import.meta.url);
 const [bridgeSource, source] = await Promise.all([
   readFile(new URL("public/codey-bridge.js", root), "utf8"),
   readFile(new URL("public/security-warning-shield.js", root), "utf8"),
 ]);
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(tagName = "div", text = "") {
-    this.attributes = new Map();
-    this.children = [];
-    this.disabled = false;
-    this.isConnected = true;
-    this.parentElement = null;
-    this.style = {
-      setProperty: (name, value, priority) => {
-        this.style[name] = `${value}:${priority}`;
-      },
-    };
-    this.tagName = tagName.toUpperCase();
+    super(tagName, { connected: true });
     this.textContent = text;
     this.clicks = 0;
   }
 
-  appendChild(child) {
-    child.parentElement = this;
-    this.children.push(child);
-    return child;
-  }
-
   click() {
     this.clicks += 1;
-  }
-
-  getAttribute(name) {
-    return this.attributes.get(name) ?? null;
   }
 
   matches(selector) {
@@ -56,19 +38,6 @@ class FakeElement {
     };
     visit(this);
     return matches;
-  }
-
-  closest(selector) {
-    let node = this;
-    while (node) {
-      if (node.matches(selector)) return node;
-      node = node.parentElement;
-    }
-    return null;
-  }
-
-  setAttribute(name, value) {
-    this.attributes.set(name, String(value));
   }
 }
 

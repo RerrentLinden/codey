@@ -4,16 +4,14 @@ import test from "node:test";
 import { TextEncoder } from "node:util";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const source = readFileSync(new URL("../public/codey-inject.js", import.meta.url), "utf8");
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(attributes = {}) {
-    this.attributes = new Map(Object.entries(attributes));
-    this.dataset = {};
-    this.disabled = false;
-    this.parentElement = null;
+    super("div", { attributes });
     this.removed = false;
-    this.textContent = "";
     this.querySelectorAllCalls = [];
     const classes = new Set();
     this.classList = {
@@ -24,18 +22,6 @@ class FakeElement {
         classes.has(className) ? (classes.delete(className), false) : (classes.add(className), true)
       ),
     };
-  }
-
-  getAttribute(name) {
-    return this.attributes.get(name) ?? null;
-  }
-
-  setAttribute(name, value) {
-    this.attributes.set(name, String(value));
-  }
-
-  hasAttribute(name) {
-    return this.attributes.has(name);
   }
 
   querySelector(selector) {

@@ -3,7 +3,7 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 
 use super::{NotificationChannelAdapter, bounded_remote_message};
-use crate::notifications::formatting::{format_duration, format_timestamp, plain_text_value};
+use crate::notifications::formatting::{format_duration, format_timestamp, markdown_text_value};
 use crate::notifications::{NotificationChannelConfig, NotificationEvent};
 
 pub(super) struct WecomChannel<'a> {
@@ -76,33 +76,14 @@ fn wecom_markdown(event: &NotificationEvent) -> String {
         "codey.test" => ("🔔", "Codey 通知测试", "info"),
         _ => ("🔔", "Codex 会话通知", "comment"),
     };
-    let session_name = wecom_markdown_value(&event.session_name, "未命名会话");
-    let model = wecom_markdown_value(&event.model, "Codex");
-    let reasoning_effort = wecom_markdown_value(&event.reasoning_effort, "默认");
-    let sent_at = wecom_markdown_value(&format_timestamp(&event.timestamp), "未知");
+    let session_name = markdown_text_value(&event.session_name, "未命名会话");
+    let model = markdown_text_value(&event.model, "Codex");
+    let reasoning_effort = markdown_text_value(&event.reasoning_effort, "默认");
+    let sent_at = markdown_text_value(&format_timestamp(&event.timestamp), "未知");
     format!(
         "{icon} **{title}**\n>会话标题：<font color=\"{color}\">{session_name}</font>\n>使用模型：{model}\n>推理深度：{reasoning_effort}\n>发送时间：{sent_at}\n>耗时：{}",
         format_duration(event.duration_ms)
     )
-}
-
-fn wecom_markdown_value(value: &str, fallback: &str) -> String {
-    let normalized = plain_text_value(value, fallback);
-    let mut escaped = String::with_capacity(normalized.len());
-    for character in normalized.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '*' => escaped.push_str("\\*"),
-            '_' => escaped.push_str("\\_"),
-            '`' => escaped.push_str("\\`"),
-            '[' => escaped.push_str("\\["),
-            ']' => escaped.push_str("\\]"),
-            '<' => escaped.push('＜'),
-            '>' => escaped.push('＞'),
-            other => escaped.push(other),
-        }
-    }
-    escaped
 }
 
 fn validate_wecom_response(body: &str) -> std::result::Result<(), String> {

@@ -53,6 +53,25 @@ pub(crate) fn plain_text_value(value: &str, fallback: &str) -> String {
     }
 }
 
+pub(crate) fn markdown_text_value(value: &str, fallback: &str) -> String {
+    let normalized = plain_text_value(value, fallback);
+    let mut escaped = String::with_capacity(normalized.len());
+    for character in normalized.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '*' => escaped.push_str("\\*"),
+            '_' => escaped.push_str("\\_"),
+            '`' => escaped.push_str("\\`"),
+            '[' => escaped.push_str("\\["),
+            ']' => escaped.push_str("\\]"),
+            '<' => escaped.push('＜'),
+            '>' => escaped.push('＞'),
+            other => escaped.push(other),
+        }
+    }
+    escaped
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,5 +92,17 @@ mod tests {
         assert_eq!(&legacy[4..5], "-");
         assert_eq!(&legacy[7..8], "-");
         assert_eq!(&legacy[10..11], " ");
+    }
+
+    #[test]
+    fn markdown_text_is_normalized_and_escaped() {
+        assert_eq!(
+            markdown_text_value(
+                "  release <@all> **Codey** [docs] `now` \\ _ok_  ",
+                "fallback"
+            ),
+            "release ＜@all＞ \\*\\*Codey\\*\\* \\[docs\\] \\`now\\` \\\\ \\_ok\\_"
+        );
+        assert_eq!(markdown_text_value("  ", "fallback"), "fallback");
     }
 }

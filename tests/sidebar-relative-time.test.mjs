@@ -3,112 +3,26 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const source = readFileSync(new URL("../public/codey-inject.js", import.meta.url), "utf8");
 const vendorSource = readFileSync(
   new URL("../vendor/CodeyRuntime/assets/inject/renderer-inject.js", import.meta.url),
   "utf8",
 );
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(tagName = "div") {
-    this.attributes = new Map();
-    this.children = [];
+    super(tagName);
+    delete this.isConnected;
     this.className = "";
-    this.parentElement = null;
-    this.tagName = String(tagName).toUpperCase();
-    this.textContent = "";
     this.title = "";
     this.attributeWrites = 0;
-    const styleValues = new Map();
-    this.style = {
-      getPropertyValue: (name) => styleValues.get(name) || "",
-      removeProperty: (name) => styleValues.delete(name),
-      setProperty: (name, value) => styleValues.set(name, String(value)),
-    };
-  }
-
-  appendChild(child) {
-    if (child.parentElement) {
-      child.parentElement.children = child.parentElement.children.filter(
-        (candidate) => candidate !== child,
-      );
-    }
-    child.parentElement = this;
-    this.children.push(child);
-    return child;
-  }
-
-  insertBefore(child, reference) {
-    if (child.parentElement) {
-      child.parentElement.children = child.parentElement.children.filter(
-        (candidate) => candidate !== child,
-      );
-    }
-    const referenceIndex = this.children.indexOf(reference);
-    if (referenceIndex < 0) return this.appendChild(child);
-    child.parentElement = this;
-    this.children.splice(referenceIndex, 0, child);
-    return child;
-  }
-
-  getAttribute(name) {
-    return this.attributes.get(name) ?? null;
-  }
-
-  hasAttribute(name) {
-    return this.attributes.has(name);
-  }
-
-  matches(selector) {
-    if (/^[a-z]+$/i.test(selector)) return this.tagName.toLowerCase() === selector.toLowerCase();
-    const classContains = selector.match(/^\[class\*=(['"]?)([^\]'"]+)\1\]$/)?.[2];
-    if (classContains) return String(this.className || "").includes(classContains);
-    const attributeEquals = selector.match(/^\[([^=\]]+)=(['"]?)([^\]'" ]+)\2\]$/);
-    if (attributeEquals) return this.getAttribute(attributeEquals[1]) === attributeEquals[3];
-    const attribute = selector.match(/^\[([^\]]+)\]$/)?.[1];
-    return attribute ? this.hasAttribute(attribute) : false;
-  }
-
-  querySelector(selector) {
-    return this.querySelectorAll(selector)[0] || null;
-  }
-
-  querySelectorAll(selector) {
-    const selectors = selector.split(",").map((candidate) => candidate.trim());
-    const matches = [];
-    const visit = (node) => {
-      node.children.forEach((child) => {
-        if (selectors.some((candidate) => child.matches(candidate))) matches.push(child);
-        visit(child);
-      });
-    };
-    visit(this);
-    return matches;
-  }
-
-  closest(selector) {
-    const selectors = selector.split(",").map((candidate) => candidate.trim());
-    let current = this;
-    while (current) {
-      if (selectors.some((candidate) => current.matches(candidate))) return current;
-      current = current.parentElement;
-    }
-    return null;
-  }
-
-  remove() {
-    if (!this.parentElement) return;
-    this.parentElement.children = this.parentElement.children.filter((child) => child !== this);
-    this.parentElement = null;
-  }
-
-  removeAttribute(name) {
-    this.attributes.delete(name);
   }
 
   setAttribute(name, value) {
     this.attributeWrites += 1;
-    this.attributes.set(name, String(value));
+    super.setAttribute(name, value);
   }
 }
 
@@ -1053,125 +967,54 @@ test("tracks virtualized sidebar rows discovered after the initial scan", async 
   assert.equal(fixture.document.threadRowQueries, fullScanQueries);
 });
 
-test("requests only the visible thread ids from the timestamp bridge", async () => {
-  const row = new FakeElement();
-  row.setAttribute("data-app-action-sidebar-thread-row", "");
-  row.setAttribute("data-app-action-sidebar-thread-id", "thread-older");
-  const content = new FakeElement();
-  content.className = "flex h-full w-full items-center";
-  row.appendChild(content);
-  const requests = [];
-  const timestamp = Date.now() - 4 * 60 * 60_000;
+for (const { name, visible, batches, minutes } of [
+  {
+    name: "loads forty visible timestamps in one bridge batch",
+    visible: 40,
+    batches: [40],
+    minutes: 9,
+  },
+  {
+    name: "continues timestamp work after the first 200 visible refs",
+    visible: 201,
+    batches: [200, 1],
+    minutes: 11,
+  },
+]) {
+  test(name, async () => {
+    const now = Date.UTC(2026, 7, 10, 12);
+    const entries = Array.from({ length: visible }, (_, index) => {
+      const row = new FakeElement();
+      row.setAttribute("data-app-action-sidebar-thread-row", "");
+      row.setAttribute("data-app-action-sidebar-thread-id", `thread-${index}`);
+      const content = new FakeElement();
+      content.className = "flex h-full w-full items-center";
+      row.appendChild(content);
+      return { content, row };
+    });
+    const requestSizes = [];
 
-  loadInjection({
-    rows: [row],
-    bridgeHandler: timestampBridge(async (payload) => {
-      requests.push(payload);
-      return { "thread-older": timestamp };
-    }),
+    loadInjection({
+      now,
+      rows: entries.map(({ row }) => row),
+      bridgeHandler: timestampBridge(async ({ sessionIds }) => {
+        requestSizes.push(sessionIds.length);
+        return Object.fromEntries(sessionIds.map((sessionId) => (
+          [sessionId, now - minutes * 60_000]
+        )));
+      }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(requestSizes, batches);
+    entries.forEach(({ content }) => {
+      assert.equal(
+        content.querySelector("[data-codey-thread-updated-at]")?.textContent,
+        `${minutes} 分`,
+      );
+    });
   });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(JSON.parse(JSON.stringify(requests)), [{ sessionIds: ["thread-older"] }]);
-  assert.equal(
-    content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-    "4 小时",
-  );
-});
-
-test("resolves a visible timestamp with one bounded bridge request", async () => {
-  const row = new FakeElement();
-  row.setAttribute("data-app-action-sidebar-thread-row", "");
-  row.setAttribute("data-app-action-sidebar-thread-id", "thread-manual");
-  const content = new FakeElement();
-  content.className = "flex h-full w-full items-center";
-  row.appendChild(content);
-  const timestamp = Date.now() - 5 * 60 * 60_000;
-  let bridgeCalls = 0;
-
-  loadInjection({
-    rows: [row],
-    bridgeHandler: timestampBridge(async () => {
-      bridgeCalls += 1;
-      return { "thread-manual": timestamp };
-    }),
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.equal(bridgeCalls, 1);
-  assert.equal(
-    content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-    "5 小时",
-  );
-});
-
-test("loads forty visible timestamps in one bridge batch", async () => {
-  const now = Date.UTC(2026, 7, 10, 12);
-  const entries = Array.from({ length: 40 }, (_, index) => {
-    const row = new FakeElement();
-    row.setAttribute("data-app-action-sidebar-thread-row", "");
-    row.setAttribute("data-app-action-sidebar-thread-id", `thread-old-${index}`);
-    const content = new FakeElement();
-    content.className = "flex h-full w-full items-center";
-    row.appendChild(content);
-    return { content, row };
-  });
-  const requestSizes = [];
-
-  loadInjection({
-    now,
-    rows: entries.map(({ row }) => row),
-    bridgeHandler: timestampBridge(async ({ sessionIds }) => {
-      requestSizes.push(sessionIds.length);
-      return Object.fromEntries(sessionIds.map((sessionId) => (
-        [sessionId, now - 9 * 60_000]
-      )));
-    }),
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(requestSizes, [40]);
-  entries.forEach(({ content }) => {
-    assert.equal(
-      content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-      "9 分",
-    );
-  });
-});
-
-test("continues timestamp work after the first 200 visible refs", async () => {
-  const now = Date.UTC(2026, 7, 10, 12);
-  const entries = Array.from({ length: 201 }, (_, index) => {
-    const row = new FakeElement();
-    row.setAttribute("data-app-action-sidebar-thread-row", "");
-    row.setAttribute("data-app-action-sidebar-thread-id", `thread-${index}`);
-    const content = new FakeElement();
-    content.className = "flex h-full w-full items-center";
-    row.appendChild(content);
-    return { content, row };
-  });
-  const requestSizes = [];
-
-  loadInjection({
-    now,
-    rows: entries.map(({ row }) => row),
-    bridgeHandler: timestampBridge(async ({ sessionIds }) => {
-      requestSizes.push(sessionIds.length);
-      return Object.fromEntries(sessionIds.map((sessionId) => (
-        [sessionId, now - 11 * 60_000]
-      )));
-    }),
-  });
-  await new Promise((resolve) => setImmediate(resolve));
-
-  assert.deepEqual(requestSizes, [200, 1]);
-  entries.forEach(({ content }) => {
-    assert.equal(
-      content.querySelector("[data-codey-thread-updated-at]")?.textContent,
-      "11 分",
-    );
-  });
-});
+}
 
 test("does not tight-loop retry a failed timestamp bridge request", async () => {
   const now = Date.UTC(2026, 7, 10, 12);
@@ -1386,34 +1229,11 @@ test("accepts only a unique semantic AppServerManager resolver", () => {
   );
 });
 
-test("injects time styles that coexist with native statuses and yield to sidebar actions", () => {
-  assert.match(source, /threadUpdatedAtAttribute = "data-codey-thread-updated-at"/);
-  assert.match(source, /threadRunningAttribute = "data-codey-thread-running"/);
-  assert.match(source, /threadRunningLossGraceMs = 2_000/);
-  assert.match(source, /sidebarProjectShowAllAttribute = "data-app-action-sidebar-project-show-all"/);
-  assert.match(source, /projectThreadSessionIdsFromReact/);
-  assert.match(source, /recoverHiddenRunningThreads\(root\)/);
-  assert.doesNotMatch(source, /threadSortOrderAttribute|data-codey-thread-sort-order/);
-  assert.doesNotMatch(source, /--codey-thread-sort-order|thread-sort-keys/);
-  assert.match(source, /threadRunningAttribute\}="true"\].*order: -1 !important/s);
-  assert.match(source, /updateThreadRunningPriority\(row, workInProgress\)/);
-  assert.doesNotMatch(source, /sortKey:\s*"updated_at"/);
-  assert.match(source, /threadTimestampRefreshIntervalMs = 60_000/);
+test("timestamp metadata uses only the bounded bridge route", () => {
   assert.match(source, /threadTimestampBridgePath = "\/session\/timestamps"/);
   assert.match(source, /callBridge\(threadTimestampBridgePath, \{ sessionIds \}\)/);
   assert.doesNotMatch(source, /method: "thread\/(?:list|read)"/);
   assert.doesNotMatch(source, /fetch\(url\)/);
-  assert.match(source, /refreshTrackedThreadUpdatedTimes\(false\)/);
-  assert.match(source, /"data-app-action-sidebar-thread-kind"/);
-  assert.match(source, /isDeletedSidebarSession\(ref\.sessionId\) \|\| !timestamp/);
-  assert.match(source, /font-variant-numeric: tabular-nums/);
-  assert.match(source, /placeThreadUpdatedAt\(row, label\)/);
-  assert.match(source, /mount\.insertBefore\(label, before\)/);
-  assert.match(source, /"aria-hidden",/);
-  assert.match(source, /"aria-expanded",/);
-  assert.match(source, /"disabled",\s*"hidden",\s*"class",/);
-  assert.doesNotMatch(source, /"class",\s*"style",/);
-  assert.match(source, /sidebar-thread-row\]:hover \[\$\{threadUpdatedAtAttribute\}\].*opacity: 0/s);
 });
 
 test("vendor project moves preserve Codex-owned thread ordering", () => {

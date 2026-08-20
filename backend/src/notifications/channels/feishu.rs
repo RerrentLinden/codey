@@ -3,7 +3,7 @@ use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 
 use super::{NotificationChannelAdapter, bounded_remote_message};
-use crate::notifications::formatting::{format_duration, format_timestamp, plain_text_value};
+use crate::notifications::formatting::{format_duration, format_timestamp, markdown_text_value};
 use crate::notifications::{NotificationChannelConfig, NotificationEvent};
 
 pub(super) struct FeishuChannel<'a> {
@@ -62,10 +62,10 @@ fn feishu_body(event: &NotificationEvent) -> Result<Value> {
         "session.waiting" | "codey.test" => ("Codex会话等待介入", "orange"),
         _ => ("Codex会话等待介入", "orange"),
     };
-    let session_name = feishu_markdown_value(&event.session_name, "未命名会话");
-    let model = feishu_markdown_value(&event.model, "Codex");
-    let reasoning_effort = feishu_markdown_value(&event.reasoning_effort, "默认");
-    let sent_at = feishu_markdown_value(&format_timestamp(&event.timestamp), "未知");
+    let session_name = markdown_text_value(&event.session_name, "未命名会话");
+    let model = markdown_text_value(&event.model, "Codex");
+    let reasoning_effort = markdown_text_value(&event.reasoning_effort, "默认");
+    let sent_at = markdown_text_value(&format_timestamp(&event.timestamp), "未知");
     let body = json!({
         "msg_type": "interactive",
         "card": {
@@ -120,25 +120,6 @@ fn feishu_body(event: &NotificationEvent) -> Result<Value> {
         },
     });
     Ok(body)
-}
-
-fn feishu_markdown_value(value: &str, fallback: &str) -> String {
-    let normalized = plain_text_value(value, fallback);
-    let mut escaped = String::with_capacity(normalized.len());
-    for character in normalized.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '*' => escaped.push_str("\\*"),
-            '_' => escaped.push_str("\\_"),
-            '`' => escaped.push_str("\\`"),
-            '[' => escaped.push_str("\\["),
-            ']' => escaped.push_str("\\]"),
-            '<' => escaped.push('＜'),
-            '>' => escaped.push('＞'),
-            other => escaped.push(other),
-        }
-    }
-    escaped
 }
 
 fn validate_feishu_response(body: &str) -> std::result::Result<(), String> {

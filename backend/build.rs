@@ -22,6 +22,7 @@ fn main() {
         .expect("无法运行 npm 构建 Codey Web 配置页");
     assert!(status.success(), "Codey Web 配置页构建失败");
 
+    #[cfg(windows)]
     embed_windows_icon();
 }
 
@@ -47,6 +48,3 @@ fn embed_windows_icon() {
     );
     resource.compile().expect("无法嵌入 Codey Windows 图标");
 }
-
-#[cfg(not(windows))]
-fn embed_windows_icon() {}

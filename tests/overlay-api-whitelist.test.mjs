@@ -2,18 +2,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 
-import ts from "typescript";
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 
-const apiSource = fs.readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
-const apiJavaScript = ts.transpileModule(apiSource, {
-  compilerOptions: {
-    module: ts.ModuleKind.ESNext,
-    target: ts.ScriptTarget.ES2020,
-  },
-}).outputText;
-const api = await import(
-  `data:text/javascript;base64,${Buffer.from(apiJavaScript).toString("base64")}`
-);
+const api = await loadTypeScriptModule(new URL("../src/api.ts", import.meta.url));
 
 test("overlay API paths reject commands outside the backend whitelist", () => {
   assert.equal(api.codeyApiPath("save_codey_config"), "/api/save_codey_config");

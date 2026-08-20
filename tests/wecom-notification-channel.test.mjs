@@ -14,12 +14,16 @@ const editorSource = readFileSync(
   new URL("../src/notifications/WecomChannelEditor.tsx", import.meta.url),
   "utf8",
 );
+const sharedEditorSource = readFileSync(
+  new URL("../src/notifications/WebhookChannelEditor.tsx", import.meta.url),
+  "utf8",
+);
 
 test("enterprise wechat webhook is registered as a protected notification channel", () => {
   assert.match(typesSource, /"feishu" \| "wecom" \| "telegram"/);
   assert.match(registrySource, /wecom:\s*\{[\s\S]*?Editor: WecomChannelEditor/);
   assert.match(registrySource, /displayName: "企业微信机器人"/);
-  assert.match(editorSource, /type=\{revealSecrets \? "text" : "password"\}/);
-  assert.match(editorSource, /clearUrl: true/);
+  assert.match(sharedEditorSource, /type=\{revealSecrets \? "text" : "password"\}/);
+  assert.match(sharedEditorSource, /clearUrl: true/);
   assert.match(editorSource, /qyapi\.weixin\.qq\.com\/cgi-bin\/webhook\/send\?key=/);
 });

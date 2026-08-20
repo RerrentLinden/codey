@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const source = readFileSync(new URL("../public/renderer-inject.js", import.meta.url), "utf8");
 const bridgeSource = readFileSync(new URL("../public/codey-bridge.js", import.meta.url), "utf8");
 
@@ -12,60 +14,15 @@ const runRenderer = (sandbox) => {
   vm.runInContext(source, context);
 };
 
-class FakeElement {
+class FakeElement extends FakeElementCore {
   constructor(tagName = "div", { visible = true, right = 100, width = right, height = 46, top = 0 } = {}) {
-    this.tagName = tagName.toUpperCase();
-    this.children = [];
-    this.dataset = {};
-    this.id = "";
-    this.parentElement = null;
+    super(tagName);
     this.right = right;
     this.width = width;
     this.height = height;
     this.top = top;
-    this.style = {};
-    this.textContent = "";
-    this.attributes = new Map();
-    this.listeners = new Map();
     this.visible = visible;
-    this.isConnected = false;
     this.rectReads = 0;
-  }
-
-  addEventListener(type, handler) {
-    if (typeof handler !== "function") return;
-    const handlers = this.listeners.get(type) || [];
-    handlers.push(handler);
-    this.listeners.set(type, handlers);
-  }
-
-  removeEventListener(type, handler) {
-    const handlers = this.listeners.get(type) || [];
-    this.listeners.set(type, handlers.filter((candidate) => candidate !== handler));
-  }
-
-  dispatchEvent(event) {
-    if (!event?.type) return true;
-    if (!event.target) event.target = this;
-    event.currentTarget = this;
-    for (const handler of [...(this.listeners.get(event.type) || [])]) {
-      handler.call(this, event);
-    }
-    return true;
-  }
-
-  get nextElementSibling() {
-    if (!this.parentElement) return null;
-    const index = this.parentElement.children.indexOf(this);
-    return index >= 0 ? this.parentElement.children[index + 1] || null : null;
-  }
-
-  appendChild(child) {
-    child.remove();
-    child.parentElement = this;
-    child.isConnected = true;
-    this.children.push(child);
-    return child;
   }
 
   insertBefore(child, before) {
@@ -123,26 +80,6 @@ class FakeElement {
       .some((part) => part.trim().toUpperCase() === this.tagName);
   }
 
-  remove() {
-    if (!this.parentElement) return;
-    const index = this.parentElement.children.indexOf(this);
-    if (index >= 0) this.parentElement.children.splice(index, 1);
-    this.parentElement = null;
-    this.isConnected = false;
-  }
-
-  getAttribute(name) {
-    return this.attributes.has(name) ? this.attributes.get(name) : null;
-  }
-
-  removeAttribute(name) {
-    this.attributes.delete(name);
-  }
-
-  setAttribute(name, value) {
-    this.attributes.set(name, String(value));
-    if (name === "id") this.id = String(value);
-  }
 }
 
 test("moves the Codey button beside the visible header's trailing action region", () => {
