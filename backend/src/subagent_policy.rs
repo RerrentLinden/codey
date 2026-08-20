@@ -6,59 +6,12 @@ use crate::config::{
 };
 use crate::model_catalog;
 use crate::model_id;
+#[cfg(test)]
+use crate::subagent::rules::{RoleAccess, RolePolicy};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RoleAccess {
-    ReadOnly,
-    Write,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RolePolicy {
-    pub access: RoleAccess,
-    pub visual: bool,
-    pub cost_points: u8,
-}
-
+#[cfg(test)]
 pub(crate) fn role_policy(role: &str) -> Option<RolePolicy> {
-    use crate::config::{
-        SUBAGENT_ROLE_DEEP_RESEARCH, SUBAGENT_ROLE_QUICK_SCAN, SUBAGENT_ROLE_VISUAL_ANALYSIS,
-        SUBAGENT_ROLE_VISUAL_WORKER, SUBAGENT_ROLE_WORKER,
-    };
-
-    match role {
-        SUBAGENT_ROLE_QUICK_SCAN => Some(RolePolicy {
-            access: RoleAccess::ReadOnly,
-            visual: false,
-            cost_points: 1,
-        }),
-        SUBAGENT_ROLE_DEEP_RESEARCH => Some(RolePolicy {
-            access: RoleAccess::ReadOnly,
-            visual: false,
-            cost_points: 2,
-        }),
-        SUBAGENT_ROLE_VISUAL_ANALYSIS => Some(RolePolicy {
-            access: RoleAccess::ReadOnly,
-            visual: true,
-            cost_points: 2,
-        }),
-        SUBAGENT_ROLE_WORKER => Some(RolePolicy {
-            access: RoleAccess::Write,
-            visual: false,
-            cost_points: 3,
-        }),
-        SUBAGENT_ROLE_VISUAL_WORKER => Some(RolePolicy {
-            access: RoleAccess::Write,
-            visual: true,
-            cost_points: 3,
-        }),
-        SUBAGENT_ROLE_DEFAULT => Some(RolePolicy {
-            access: RoleAccess::ReadOnly,
-            visual: false,
-            cost_points: 1,
-        }),
-        _ => None,
-    }
+    crate::subagent::rules::embedded().role_policy(role)
 }
 
 pub(crate) fn reconcile_for_current_provider(
@@ -86,6 +39,7 @@ pub(crate) fn reconcile_with_model_state(
     prepare_subagent_roles(config);
     let Some(state) = state else {
         sync_legacy_default(config);
+        config.remember_current_subagent_config();
         return;
     };
     for selection in config.subagent_roles.values_mut() {
@@ -104,6 +58,7 @@ pub(crate) fn reconcile_with_model_state(
         selection.model = model;
     }
     sync_legacy_default(config);
+    config.remember_current_subagent_config();
 }
 
 fn prepare_subagent_roles(config: &mut CodeyConfig) {
@@ -384,6 +339,43 @@ mod tests {
         assert!(config.subagent_optimization);
         assert_eq!(config.subagent_model, "gpt-5.6-sol");
         assert_eq!(config.subagent_reasoning_effort, "high");
+    }
+
+    #[test]
+    fn incompatible_provider_fallback_does_not_overwrite_another_provider() {
+        let mut provider_a = ProviderProfile::new("A");
+        provider_a.id = "route-a".into();
+        let mut provider_b = ProviderProfile::new("B");
+        provider_b.id = "route-b".into();
+        let mut config = CodeyConfig {
+            active_profile_id: provider_a.id.clone(),
+            profiles: vec![provider_a, provider_b],
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-luna".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: uniform_subagent_roles("gpt-5.6-luna", "high"),
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        config.active_profile_id = "route-b".into();
+        config.restore_current_subagent_config();
+        let mut route_b_models = model_state();
+        route_b_models
+            .official_models
+            .retain(|model| model.slug == DEFAULT_SUBAGENT_MODEL);
+        route_b_models.default_model = DEFAULT_SUBAGENT_MODEL.into();
+        reconcile_with_model_state(&mut config, Some(&route_b_models));
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
+
+        config.active_profile_id = "route-a".into();
+        config.restore_current_subagent_config();
+        assert_eq!(config.subagent_model, "gpt-5.6-luna");
+        assert_eq!(config.subagent_reasoning_effort, "high");
+
+        config.active_profile_id = "route-b".into();
+        config.restore_current_subagent_config();
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
     }
 
     #[test]

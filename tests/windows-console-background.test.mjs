@@ -84,12 +84,13 @@ test("Windows background helpers never create console windows", async () => {
     ).then(normalizeLineEndings),
   ]);
 
-  assert.equal(
+  const backgroundCommands = launcherPlatform.match(/Command::new\(/g) ?? [];
+  const hiddenBackgroundCommands =
     launcherPlatform.match(
       /creation_flags\(codey_runtime_core::windows_create_no_window\(\)\)/g,
-    )?.length,
-    2,
-  );
+    ) ?? [];
+  assert.ok(backgroundCommands.length > 0);
+  assert.equal(hiddenBackgroundCommands.length, backgroundCommands.length);
   assert.doesNotMatch(processCleanup, /Command::new\("taskkill"\)/);
   assert.match(
     processCleanup,

@@ -378,6 +378,97 @@ fn supervisor_stops_recovering_after_repeated_worker_disconnects() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn supervisor_reaps_worker_after_client_stdin_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, mut stdin, responses_rx) = spawn_supervisor_with_test_worker(&temp);
+    initialize_test_worker_session(&mut stdin, &responses_rx);
+    let worker_pid = wait_for_test_worker_start(temp.path(), 1)[0];
+
+    stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":99").unwrap();
+    stdin.flush().unwrap();
+    drop(stdin);
+
+    let status = wait_for_child(&mut child);
+    assert!(
+        !status.success(),
+        "truncated stdin must fail the supervisor"
+    );
+    wait_for_process_gone(worker_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn supervisor_reaps_worker_after_worker_stdout_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, mut stdin, responses_rx) =
+        spawn_supervisor_with_test_worker_env(&temp, &[("CODEY_FASTCTX_MAX_FRAME_BYTES", "65536")]);
+    initialize_test_worker_session(&mut stdin, &responses_rx);
+    let worker_pid = wait_for_test_worker_start(temp.path(), 1)[0];
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "test/large_response",
+            "params": {"bytes": 128 * 1024}
+        }),
+    );
+    drop(stdin);
+
+    let status = wait_for_child(&mut child);
+    assert!(
+        !status.success(),
+        "oversized worker stdout must fail the supervisor"
+    );
+    wait_for_process_gone(worker_pid);
+}
+
+#[cfg(unix)]
+#[test]
+fn supervisor_reaps_worker_after_forwarding_stdout_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, mut stdin, responses_rx, close_stdout, stdout_closed) =
+        spawn_supervisor_with_closeable_stdout(&temp);
+    initialize_test_worker_session(&mut stdin, &responses_rx);
+    let worker_pid = wait_for_test_worker_start(temp.path(), 1)[0];
+
+    close_stdout.send(()).unwrap();
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 98,
+            "method": "test/large_response",
+            "params": {"bytes": 64}
+        }),
+    );
+    let response = response_with_id(&responses_rx, 98);
+    assert!(response.get("result").is_some(), "{response}");
+    stdout_closed
+        .recv_timeout(PROCESS_TIMEOUT)
+        .expect("supervisor stdout reader did not close");
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "test/large_response",
+            "params": {"bytes": 64}
+        }),
+    );
+    drop(stdin);
+
+    let status = wait_for_child(&mut child);
+    assert!(
+        !status.success(),
+        "closed supervisor stdout must fail response forwarding"
+    );
+    wait_for_process_gone(worker_pid);
+}
+
 fn spawn_supervisor_with_test_worker(
     temp: &tempfile::TempDir,
 ) -> (
@@ -385,6 +476,61 @@ fn spawn_supervisor_with_test_worker(
     std::process::ChildStdin,
     mpsc::Receiver<std::io::Result<String>>,
 ) {
+    spawn_supervisor_with_test_worker_env(temp, &[])
+}
+
+fn spawn_supervisor_with_test_worker_env(
+    temp: &tempfile::TempDir,
+    extra_env: &[(&str, &str)],
+) -> (
+    Child,
+    std::process::ChildStdin,
+    mpsc::Receiver<std::io::Result<String>>,
+) {
+    let mut child = spawn_test_supervisor_process(temp, extra_env);
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (responses_tx, responses_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if responses_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    (child, stdin, responses_rx)
+}
+
+#[cfg(unix)]
+fn spawn_supervisor_with_closeable_stdout(
+    temp: &tempfile::TempDir,
+) -> (
+    Child,
+    std::process::ChildStdin,
+    mpsc::Receiver<std::io::Result<String>>,
+    mpsc::Sender<()>,
+    mpsc::Receiver<()>,
+) {
+    let mut child = spawn_test_supervisor_process(temp, &[]);
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (responses_tx, responses_rx) = mpsc::channel();
+    let (close_tx, close_rx) = mpsc::channel();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Some(line) = lines.next() {
+            if responses_tx.send(line).is_err() || close_rx.try_recv().is_ok() {
+                drop(lines);
+                let _ = closed_tx.send(());
+                return;
+            }
+        }
+    });
+    (child, stdin, responses_rx, close_tx, closed_rx)
+}
+
+fn spawn_test_supervisor_process(temp: &tempfile::TempDir, extra_env: &[(&str, &str)]) -> Child {
     let home = temp.path().join("home");
     let workspace = temp.path().join("workspace");
     let local = home.join("local-app-data");
@@ -411,27 +557,61 @@ fn spawn_supervisor_with_test_worker(
             "CODEY_FASTCTX_TEST_WORKER_ARGUMENT",
             "--codey-fastctx-mcp-test-worker",
         )
+        .env(
+            "CODEY_FASTCTX_TEST_WORKER_PID_LOG",
+            temp.path().join("test-worker-pids.log"),
+        )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let mut child = command.spawn().unwrap();
-    let stdin = child.stdin.take().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let (responses_tx, responses_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines() {
-            if responses_tx.send(line).is_err() {
-                return;
-            }
+    command.spawn().unwrap()
+}
+
+fn wait_for_test_worker_start(root: &Path, count: usize) -> Vec<u32> {
+    let path = root.join("test-worker-pids.log");
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    loop {
+        let pids = std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.strip_prefix("START ")?.parse::<u32>().ok())
+            .collect::<Vec<_>>();
+        if pids.len() >= count {
+            return pids;
         }
-    });
-    (child, stdin, responses_rx)
+        assert!(
+            Instant::now() < deadline,
+            "only {} FastCtx test worker starts observed in {}",
+            pids.len(),
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_process_gone(pid: u32) {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    loop {
+        let result = unsafe { libc::kill(pid as i32, 0) };
+        if result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "FastCtx worker {pid} survived supervisor shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn initialize_test_worker_session(

@@ -896,6 +896,7 @@ async fn save_codey_config_locked(
     }
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
+    config.remember_current_subagent_config();
     let mut config = config.normalize();
     if config.subagent_optimization
         && let Ok(model_state) = current_model_state_async(&config).await

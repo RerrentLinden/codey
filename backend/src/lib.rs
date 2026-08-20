@@ -8,6 +8,7 @@ mod commands;
 mod config;
 mod crashpad_pending_guard;
 mod error_log;
+pub mod fastctx;
 mod fastctx_route_gate;
 mod fs_util;
 mod launcher;
@@ -33,6 +34,8 @@ mod session_transfer;
 mod sqlite_util;
 mod startup_maintenance;
 mod startup_update;
+mod subagent;
+mod subagent_control_mcp;
 mod subagent_gate;
 mod subagent_orchestrator;
 mod subagent_policy;
@@ -96,6 +99,10 @@ pub fn record_process_failure_with_recoverability(
 
 pub fn run_subagent_gate_hook_if_requested() -> Result<bool> {
     subagent_gate::run_hook_if_requested()
+}
+
+pub fn run_subagent_control_mcp_if_requested() -> Result<bool> {
+    subagent_control_mcp::run_if_requested()
 }
 
 pub fn run_fastctx_route_hook_if_requested() -> Result<bool> {

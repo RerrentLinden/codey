@@ -16,6 +16,7 @@ const CODEY_FASTCTX_MCP_WORKER_ARGUMENT: &str = "--codey-fastctx-mcp-worker";
 // MCP 桩，以确定性构造大行输出与可恢复退出。真实宿主不会传入此参数。
 const CODEY_FASTCTX_TEST_WORKER_ARGUMENT: &str = "--codey-fastctx-mcp-test-worker";
 const TEST_WORKER_ARGUMENT_ENV: &str = "CODEY_FASTCTX_TEST_WORKER_ARGUMENT";
+const TEST_WORKER_PID_LOG_ENV: &str = "CODEY_FASTCTX_TEST_WORKER_PID_LOG";
 
 fn main() {
     let mode = FastCtxMode::from_arguments(std::env::args_os());
@@ -84,9 +85,20 @@ fn run(mode: FastCtxMode) -> anyhow::Result<()> {
 /// - `test/exit`（参数 `code`）：以指定状态码退出，模拟 transport 断开；
 /// - 其他方法（含 `notifications/cancelled`）：忽略。
 fn run_test_worker() -> anyhow::Result<()> {
+    use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader, Write};
 
     use anyhow::Context;
+
+    if let Some(path) = std::env::var_os(TEST_WORKER_PID_LOG_ENV) {
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("打开测试 worker PID 日志失败：{}", path.to_string_lossy()))?;
+        writeln!(log, "START {}", std::process::id())?;
+        log.flush()?;
+    }
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();

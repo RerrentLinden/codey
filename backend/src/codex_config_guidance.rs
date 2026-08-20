@@ -314,26 +314,26 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 每个 `agents.spawn_agent` 必须使用 `fork_turns="none"`，`task_name` 使用小写字母、数字或下划线，并把一行紧凑 JSON 作为 message 的最后一个非空行：
 
-`CODEY_DELEGATION_V2={"id":"task_name","why":"breadth","visual":false,"read":[],"write":[],"checks":[]}`
+`CODEY_DELEGATION_V2={"id":"task_name","why":"breadth","visual":false,"root":"/absolute/workspace","read":["relevant/path"],"write":[],"capabilities":["files.read"],"checks":[]}`
 
-`id` 必须等于 `task_name`。只有 `why: "parallel"` 时才填写 `branch_calls`，用数组记录各独立分支预计的实质调用数，例如 `"branch_calls":[3,3]`；其他路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径。只声明本任务确实会使用的稳定路径；读取可以留空，写入角色的 `write` 不得为空。写入角色还必须提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。运行时会校验理由与角色兼容性、角色能力、预算以及 read/write 父子路径冲突；重复任务 ID、越权写入和重叠 ownership 仍会被拒绝。
+`id` 必须等于 `task_name`。只有 `why: "parallel"` 时才填写 `branch_calls`，用数组记录各独立分支预计的实质调用数，例如 `"branch_calls":[3,3]`；其他路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径。只声明本任务确实会读取和写入的稳定路径；省略 `root` 时采用 Hook 工作目录，空 `read` 对只读角色表示该 root、对写入角色表示其 `write` 范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 只有额外声明 `command.execute` 且 `write` 覆盖完整 root 时才能运行通用 shell。子代理网络能力不开放，契约不能自行声明或放宽。路径读取和写入都会按解析现存祖先后的物理路径校验；未绑定 attempt 不获得数据或副作用权限。运行时还会校验工具的完整可信名称、理由、角色、能力、预算及 read/write 冲突；重复任务 ID、越权访问和重叠 ownership 会被拒绝。
 
 ### 任务胶囊与验收
 
 - 派发消息只携带完成子任务必需的目标、范围、允许操作、ownership 和输出契约，不复制整段对话。
 - 子代理首行必须是 `status: completed | partial | blocked`，只返回会影响决策的结论、最多 5 条关键证据和明确 gaps；关键证据包含 `file:line`、符号名或可复核链接。
 - 子代理结果只是压缩线索。主代理沿出处抽查；即将修改的确切代码和奠基性文档仍由主代理完整读取。
-- 写入型子代理的自报测试结果不算机械验收。所有子代理进入终态后，主代理必须按 Stop 门禁给出的 `# codey-accept:<task>:<check>` 标记逐字重跑契约命令；只有可信的退出状态 `0` 才清偿验收债。失败后修复并重跑，不能改写命令绕过。连续 3 次失败、连续 3 次 Stop 没有新证据，或持续 10 分钟无法验证时，门禁会把该项标记为“未验证”并在一次明确提示后释放；主代理必须向用户报告失败事实，不得声称验收通过。视觉质量仍需主代理查看实际渲染证据。
+- 写入型子代理的自报测试结果不算机械验收。所有子代理进入终态后，主代理必须按 Stop 门禁给出的 `# codey-accept:<task>:<check>` 标记逐字重跑契约命令；只有可信的退出状态 `0` 才清偿验收债。失败后修复并重跑，不能改写命令绕过。连续 3 次失败、连续 3 次 Stop 没有新证据，或持续 10 分钟无法验证时，门禁会把该项标记为“未验证”并在一次明确提示后释放；该批次只能以 `blocked` 结算，结算回执会持久保存未验证项，主代理必须向用户报告失败事实，不得声称验收通过。视觉质量仍需主代理查看实际渲染证据。
 - 多代理证据冲突时比较出处，不按多数票决定；只有高风险且无法确定性验证时才追加独立核验线。
 
 ### 汇合、异常与接管
 
-- 同一批独立任务先全部派发，再进入等待；有活动子代理时只使用 `agents.*` 协调，直至每个代理进入终态。
+- 同一批独立任务先全部派发，再进入等待。Hook 会把本批首个根派生调用的可信 `turn_id` 绑定为编排主体；同一根 turn 可继续完成本批派发与必要协调，child turn 或缺失/不匹配的 turn 只能使用 `agents.wait_agent` 和无筛选的 `agents.list_agents` 对账，不能派生、追派、中断或操纵批次。所有代理进入终态前不得恢复普通本地工作。
 - 每个子代理只用一轮，不复用、不追派，也不得继续派生。失败后默认由主代理接管；只有缩小或改变范围后仍值得独立委派，才允许使用新任务 ID 最多重派一次。
 - 收到 `CODEY_SUBAGENT_DUPLICATE_TASK_ID` 时，不得重复旧 ID，也不得把拒绝当作完成后立即 Stop。先调用一次无筛选的 `agents.list_agents` 对账：原代理存在时等待其终态或消费已有终态结果，明确不存在时由主代理接管；只有任务范围确实改变且仍值得委派时，才可使用全新的 `task_name` 最多重试一次，并把 `CODEY_DELEGATION_V2.id` 同步改为完全相同的新值。
 - `MESSAGE` 或不完整结果只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`running`、`pending_init` 和 `interrupted` 不是终态。
-- `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态则只中断一次并继续等待。禁止无限 wait、无限重试或静默重派。
-- 用户新输入使旧批次失效时，先中断活动代理并完成对账，忽略迟到结果。预算账本和未清偿验收债按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
+- `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态且根 turn 绑定有效时只中断一次并继续等待，否则依赖 Stop 的受控恢复路径 fence 遗留 attempt。禁止无限 wait、无限重试或静默重派。
+- 用户新输入使旧批次失效时，先完成对账；只有可信根 turn 绑定仍有效时才中断活动代理，否则让受控恢复路径接管并忽略迟到结果。预算账本、未清偿验收债和未验证结算证据按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
 "#;
 
 pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V9: &str = r#"## 子代理使用
@@ -466,7 +466,7 @@ and continue until every spawned agent is done. While spawned subagents are acti
 denies non-collaboration local tools and prevents the root turn from finishing. The `functions.exec` tool \
 world is a separate route and does not contain collaboration tools.";
 
-pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V7: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
 commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
 agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
@@ -482,6 +482,51 @@ stale-state recovery. Continue until every spawned agent is terminal. While spaw
 Codey's runtime gate denies non-collaboration local tools and prevents the root turn from finishing. The \
 `functions.exec` tool world is a separate route and does not contain collaboration tools.";
 
+pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V8: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
+commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
+agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
+non-collaboration work. Use `timeout_ms <= 120000`; a mailbox update is not completion. If a `MESSAGE` \
+or another partial update needs action, use only the relevant `agents.send_message`, \
+`agents.followup_task`, `agents.interrupt_agent`, or `agents.list_agents` tool, then return to \
+`agents.wait_agent`. Treat `FINAL_ANSWER`, `task_complete`, `completed`, `errored`, `error`, `failed`, \
+`shutdown`, and `not_found` as terminal; `pending_init`, `running`, and `interrupted` remain \
+nonterminal. If a wait result lacks per-agent terminal details, call unfiltered `agents.list_agents` to \
+reconcile the full batch. Continue until every spawned agent is terminal. Once the batch settles, call \
+`mcp__codey_subagent_control__resolve_batch` with the reported batch number, a unique decision_id, and a \
+short reason. Choose exactly one of `spawn_next_batch`, `continue_root`, `complete`, or `blocked`; \
+`spawn_next_batch` must be followed by direct `agents.spawn_agent` calls in the same response, while \
+`continue_root` must later be replaced by `complete`, `blocked`, or `spawn_next_batch` before Stop. If a \
+collaboration tool is unavailable, do not loop on an unregistered tool; Codey's runtime gate has bounded \
+stale-state recovery. While spawned subagents are active, Codey's runtime gate denies non-collaboration \
+local tools and prevents the root turn from finishing. The `functions.exec` tool world is a separate route \
+and does not contain collaboration tools.";
+
+pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
+commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
+agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
+non-collaboration work. Use `timeout_ms <= 120000`; a mailbox update is not completion. If a `MESSAGE` \
+or another partial update needs action, use only the relevant `agents.send_message`, \
+`agents.followup_task`, `agents.interrupt_agent`, or `agents.list_agents` tool, then return to \
+`agents.wait_agent`. Use `followup_task` only while the target's current attempt is still nonterminal and \
+bound; never use it to reactivate a terminal, failed, shutdown, not_found, or prior-turn agent. A \
+`CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT` denial happens before the child is woken: do not retry \
+or wait for that canonical task to recover; use a fresh `task_name` with the same fresh \
+`CODEY_DELEGATION_V2.id` through `agents.spawn_agent`, or let the root take over. Treat `FINAL_ANSWER`, \
+`task_complete`, `completed`, `errored`, `error`, `failed`, `shutdown`, and `not_found` as terminal; \
+`pending_init`, `running`, and `interrupted` remain nonterminal. If a wait result lacks per-agent terminal \
+details, call unfiltered `agents.list_agents` to reconcile the full batch. Continue until every spawned \
+agent is terminal. Once the batch settles, call `mcp__codey_subagent_control__resolve_batch` with the \
+reported batch number, a unique decision_id, and a short reason. Choose exactly one of \
+`spawn_next_batch`, `continue_root`, `complete`, or `blocked`; `spawn_next_batch` must be followed by \
+direct `agents.spawn_agent` calls in the same response, while `continue_root` must later be replaced by \
+`complete`, `blocked`, or `spawn_next_batch` before Stop. If a collaboration tool is unavailable, do not \
+loop on an unregistered tool; Codey's runtime gate has bounded stale-state recovery. While spawned \
+subagents are active, Codey's runtime gate denies non-collaboration local tools and prevents the root turn \
+from finishing. The `functions.exec` tool world is a separate route and does not contain collaboration \
+tools.";
+
 pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Proactive multi-agent delegation is \
 active. Any earlier instruction requiring an explicit user request before spawning sub-agents no \
 longer applies. Analyze the user's request and use sub-agents when independent parallel work, broad \
@@ -489,17 +534,23 @@ context isolation, or specialized evidence would materially improve speed or qua
 sequential, or low-benefit work with the root agent. Codey may admit up to three settled batches per \
 root turn, with at most six spawn attempts per batch and eighteen attempts total. A \
 `CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED` denial means the current batch cannot accept another spawn. If \
-agents remain nonterminal, continue direct `agents.*` reconciliation; after at least one admitted agent \
-completes and all agents settle, the next direct spawn starts a new batch. If every spawn in the batch \
-failed before creating an agent, the root agent must take over instead of retrying. A \
+agents remain nonterminal, continue direct `agents.*` reconciliation. After at least one admitted agent \
+completes and all agents settle, submit the required structured batch decision; only \
+`spawn_next_batch` authorizes the next direct spawn and starts a new batch in the same response. Use \
+`continue_root` before direct root work, then submit `complete`, `blocked`, or `spawn_next_batch` before \
+Stop. If every spawn in the batch failed before creating an agent, the root agent must take over instead \
+of retrying. A \
 `CODEY_SUBAGENT_TURN_BUDGET_EXHAUSTED` denial means the root agent must take over or finish the turn. \
 Neither code means the collaboration route is unavailable, and neither may be retried through \
 `functions.exec`. A `CODEY_SUBAGENT_DUPLICATE_TASK_ID` denial is a recovery event, not task completion: \
 never retry the old `task_name` or Stop immediately. Call unfiltered `agents.list_agents` once. If the \
 original agent exists, wait for its terminal state or consume its terminal result; if it does not exist, \
 the root agent takes over. Only a materially changed task that still merits delegation may retry once \
-with a fresh `task_name` and an exactly matching `CODEY_DELEGATION_V2.id`. This mode remains active until \
-a later multi-agent mode developer message changes it.";
+with a fresh `task_name` and an exactly matching `CODEY_DELEGATION_V2.id`. `followup_task` may only \
+continue a currently bound nonterminal attempt. A `CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT` \
+denial means no child was woken; do not retry it or wait for the old target. Use a fresh `task_name` via \
+`spawn_agent` when a new independent attempt is still justified, otherwise take over directly. This mode \
+remains active until a later multi-agent mode developer message changes it.";
 
 pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
@@ -544,6 +595,8 @@ route and does not contain collaboration tools.";
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V8,
+    PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V7,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V5,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V4,
@@ -637,7 +690,7 @@ sandbox_mode = "workspace-write"
 
 developer_instructions = """
 你是代码实施子代理。只处理主代理明确授权、边界清晰、可回滚且可测试的低到中等复杂度非视觉实现；不要扩大范围，不做跨模块架构取舍，也不派生其他子代理。
-修改前读取将要编辑的确切代码，保留并适配其他人的并行改动。完成后运行与改动风险相称的最小验证，并返回修改文件、关键位置、测试结果和仍存风险。
+修改前读取将要编辑的确切代码，保留并适配其他人的并行改动。仅当契约显式授予 `command.execute` 且 write ownership 覆盖完整 root 时运行命令验证；否则列出需要主代理执行的检查。返回修改文件、关键位置、已取得的验证证据和仍存风险。
 遇到需要产品选择、破坏性操作或范围不明确时停止修改，把阻塞点交回主代理。
 首行写 `status: completed | partial | blocked`；紧凑列出改动、确定性验证结果和未完成项，不回传冗长日志。
 """
@@ -653,7 +706,7 @@ sandbox_mode = "workspace-write"
 
 developer_instructions = """
 你是视觉实施子代理。只处理主代理明确授权、边界清晰且需要截图、页面、GUI、PDF 或渲染证据的低到中等复杂度实现；不要扩大范围，不做架构取舍，也不派生其他子代理。
-修改前读取确切代码与视觉基线，修改后必须通过实际渲染或截图核验结果，并报告修改文件、关键位置、视觉验证证据、测试结果和仍存风险。
+修改前读取确切代码与视觉基线，修改后通过已授权的渲染/截图工具核验；仅当契约显式授予 `command.execute` 且 write ownership 覆盖完整 root 时运行通用命令。报告修改文件、关键位置、视觉证据、验证结果和仍存风险。
 保留并适配其他人的并行改动；遇到需要产品选择、破坏性操作或范围不明确时停止并交回主代理。
 首行写 `status: completed | partial | blocked`；紧凑列出改动、视觉与确定性验证结果和未完成项，不回传冗长日志。
 """
@@ -1138,6 +1191,9 @@ mod tests {
             combined.contains("Dispatch every independent agent planned for the current batch")
         );
         assert!(combined.contains("`agents.send_message`"));
+        assert!(combined.contains("`followup_task` only while"));
+        assert!(combined.contains("`CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT`"));
+        assert!(combined.contains("use a fresh `task_name`"));
         assert!(combined.contains("`FINAL_ANSWER`"));
         assert!(combined.contains("`task_complete`"));
         assert!(combined.contains("`errored`"));
@@ -1165,6 +1221,8 @@ mod tests {
     #[test]
     fn root_agent_usage_hint_migrates_only_complete_owned_paragraphs() {
         for previous in [
+            PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V8,
+            PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V7,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V5,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V4,
@@ -1237,9 +1295,13 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("只中断一次并继续等待"));
         assert!(SUBAGENT_GUIDANCE.contains("只有缩小或改变范围后仍值得独立委派"));
         assert!(SUBAGENT_GUIDANCE.contains("同一批独立任务先全部派发，再进入等待"));
-        assert!(SUBAGENT_GUIDANCE.contains("只使用 `agents.*` 协调"));
+        assert!(SUBAGENT_GUIDANCE.contains("本批首个根派生调用的可信 `turn_id`"));
+        assert!(SUBAGENT_GUIDANCE.contains("只能使用 `agents.wait_agent` 和无筛选的"));
         assert!(SUBAGENT_GUIDANCE.contains("实际权限仍受父任务约束"));
         assert!(SUBAGENT_GUIDANCE.contains("CODEY_DELEGATION_V2="));
+        assert!(SUBAGENT_GUIDANCE.contains("\"capabilities\":[\"files.read\"]"));
+        assert!(SUBAGENT_GUIDANCE.contains("写入角色还必须声明 `workspace.write`"));
+        assert!(SUBAGENT_GUIDANCE.contains("该批次只能以 `blocked` 结算"));
         assert!(SUBAGENT_GUIDANCE.contains("可恢复成本点预算"));
         assert!(SUBAGENT_GUIDANCE.contains("# codey-accept:<task>:<check>"));
         assert!(SUBAGENT_GUIDANCE.contains("可信的退出状态 `0`"));

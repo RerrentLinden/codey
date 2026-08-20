@@ -1526,6 +1526,28 @@ command = "echo preserve-user-hook"
         multi_agent["multi_agent_mode_hint_text"].as_str(),
         Some(ROOT_AGENT_MULTI_AGENT_MODE_HINT)
     );
+    let control_server = document["mcp_servers"][crate::subagent_control_mcp::SERVER_ID]
+        .as_table()
+        .unwrap();
+    assert!(
+        control_server["command"]
+            .as_str()
+            .is_some_and(|command| !command.is_empty())
+    );
+    assert_eq!(
+        control_server["args"]
+            .as_array()
+            .and_then(|args| args.get(0))
+            .and_then(Value::as_str),
+        Some(crate::subagent_control_mcp::ARGUMENT)
+    );
+    assert!(
+        document["features"]["code_mode"]["direct_only_tool_namespaces"]
+            .as_array()
+            .is_some_and(|namespaces| namespaces.iter().any(|namespace| {
+                namespace.as_str() == Some(crate::subagent_control_mcp::NAMESPACE)
+            }))
+    );
 
     let pre_tool_use = document["hooks"]["PreToolUse"]
         .as_array_of_tables()
@@ -3572,6 +3594,70 @@ note = "user replacement"
 }
 
 #[test]
+fn restore_reconciles_the_owned_subagent_control_server_and_namespace() {
+    let applied = r#"
+[mcp_servers.codey_subagent_control]
+command = "/Applications/Codey.app/Contents/MacOS/codey"
+args = ["--codey-subagent-control-mcp"]
+startup_timeout_sec = 30
+tool_timeout_sec = 30
+
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__codey_subagent_control"]
+"#;
+    let current = r#"
+[mcp_servers.codey_subagent_control]
+command = "/Applications/Codey.app/Contents/MacOS/codey"
+args = ["--codey-subagent-control-mcp"]
+startup_timeout_sec = 30
+tool_timeout_sec = 30
+runtime_note = "temporary"
+
+[features.code_mode]
+direct_only_tool_namespaces = ["mcp__codey_subagent_control", "mcp__user"]
+"#;
+
+    let restored = restore_owned_config_changes("", applied, current)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert!(
+        restored
+            .get("mcp_servers")
+            .and_then(Item::as_table)
+            .is_none_or(|servers| {
+                !servers.contains_key(crate::subagent_control_mcp::SERVER_ID)
+            })
+    );
+    let namespaces = direct_only_tool_namespaces(&restored).unwrap();
+    assert!(
+        namespaces
+            .iter()
+            .all(|entry| entry.as_str() != Some(crate::subagent_control_mcp::NAMESPACE))
+    );
+    assert!(
+        namespaces
+            .iter()
+            .any(|entry| entry.as_str() == Some("mcp__user"))
+    );
+
+    let replacement = r#"
+[mcp_servers.codey_subagent_control]
+command = "/custom/control"
+args = ["serve"]
+note = "user replacement"
+"#;
+    let restored = restore_owned_config_changes("", applied, replacement)
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        restored["mcp_servers"][crate::subagent_control_mcp::SERVER_ID]["command"].as_str(),
+        Some("/custom/control")
+    );
+}
+
+#[test]
 fn restore_removes_only_codey_gate_hooks_after_concurrent_hook_edits() {
     let original = r#"
 [[hooks.PreToolUse]]
@@ -4303,6 +4389,13 @@ wire_api = "responses"
         "mcp_servers.codey_fastctx.env.FASTCTX_TOKEN_BUDGET",
         "mcp_servers.codey_fastctx.env.FASTCTX_GREP_TOKEN_BUDGET",
         "mcp_servers.codey_fastctx.env.FASTCTX_GLOB_TOKEN_BUDGET",
+        "mcp_servers.codey_subagent_control.command",
+        "mcp_servers.codey_subagent_control.args",
+        "mcp_servers.codey_subagent_control.startup_timeout_sec",
+        "mcp_servers.codey_subagent_control.tool_timeout_sec",
+        "mcp_servers.codey_subagent_control.enabled_tools",
+        "mcp_servers.codey_subagent_control.disabled_tools",
+        "mcp_servers.codey_subagent_control.tools.resolve_batch.approval_mode",
         "tool_output_token_limit",
         "agents.enabled",
         "agents.max_concurrent_threads_per_session",
@@ -4321,6 +4414,7 @@ wire_api = "responses"
         "features.multi_agent_v2.root_agent_usage_hint_text",
         "features.multi_agent_v2.multi_agent_mode_hint_text",
         "features.multi_agent_v2.subagent_developer_instructions",
+        "features.code_mode.direct_only_tool_namespaces",
         "features.hooks",
     ] {
         assert!(

@@ -33,6 +33,7 @@ use crate::provider_lease::CODEY_PROVIDER_ID;
 mod fastctx;
 mod fs_io;
 mod legacy_restore;
+mod subagent_control;
 mod toml_restore;
 
 use fastctx::{
@@ -46,6 +47,7 @@ use fs_io::{
     atomic_write, create_private_dir_all, read_optional, remove_optional, write_private_file,
 };
 use legacy_restore::restore_legacy_owned_config_changes;
+use subagent_control::{disable_subagent_control_mcp, enable_subagent_control_mcp};
 #[cfg(test)]
 use toml_restore::{items_semantically_equal, tables_semantically_equal};
 use toml_restore::{restore_owned_config_changes, restore_owned_model_provider_changes};
@@ -1944,6 +1946,7 @@ fn patch_config_with_fastctx_mode_and_proxy(
         None
     };
     if subagent_optimization {
+        enable_subagent_control_mcp(&mut doc)?;
         enable_subagent_optimization(
             &mut doc,
             config_path,
@@ -1951,6 +1954,8 @@ fn patch_config_with_fastctx_mode_and_proxy(
             subagent_reasoning_effort,
             fastctx_namespace.as_deref(),
         )?;
+    } else {
+        disable_subagent_control_mcp(&mut doc);
     }
     if fastctx_namespace.is_some() {
         enable_hooks_feature(&mut doc)?;
@@ -2360,6 +2365,76 @@ fn build_isolated_runtime_overrides(
     }
 
     if !runtime_agents.is_empty() {
+        for (path, key) in [
+            (
+                &[
+                    "mcp_servers",
+                    crate::subagent_control_mcp::SERVER_ID,
+                    "command",
+                ][..],
+                "mcp_servers.codey_subagent_control.command",
+            ),
+            (
+                &[
+                    "mcp_servers",
+                    crate::subagent_control_mcp::SERVER_ID,
+                    "args",
+                ][..],
+                "mcp_servers.codey_subagent_control.args",
+            ),
+            (
+                &[
+                    "mcp_servers",
+                    crate::subagent_control_mcp::SERVER_ID,
+                    "startup_timeout_sec",
+                ][..],
+                "mcp_servers.codey_subagent_control.startup_timeout_sec",
+            ),
+            (
+                &[
+                    "mcp_servers",
+                    crate::subagent_control_mcp::SERVER_ID,
+                    "tool_timeout_sec",
+                ][..],
+                "mcp_servers.codey_subagent_control.tool_timeout_sec",
+            ),
+            (
+                &[
+                    "mcp_servers",
+                    crate::subagent_control_mcp::SERVER_ID,
+                    "enabled_tools",
+                ][..],
+                "mcp_servers.codey_subagent_control.enabled_tools",
+            ),
+            (
+                &[
+                    "mcp_servers",
+                    crate::subagent_control_mcp::SERVER_ID,
+                    "disabled_tools",
+                ][..],
+                "mcp_servers.codey_subagent_control.disabled_tools",
+            ),
+            (
+                &[
+                    "mcp_servers",
+                    crate::subagent_control_mcp::SERVER_ID,
+                    "tools",
+                    crate::subagent_control_mcp::TOOL_NAME,
+                    "approval_mode",
+                ][..],
+                "mcp_servers.codey_subagent_control.tools.resolve_batch.approval_mode",
+            ),
+        ] {
+            push_required_document_override(&mut overrides, effective, path, key)?;
+        }
+        if fastctx_namespace.is_none() {
+            push_document_override(
+                &mut overrides,
+                effective,
+                &["features", "code_mode", "direct_only_tool_namespaces"],
+                "features.code_mode.direct_only_tool_namespaces",
+            )?;
+        }
         if let Some(model_catalog_path) = model_catalog_path {
             push_runtime_override_value(
                 &mut overrides,

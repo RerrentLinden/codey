@@ -149,6 +149,9 @@ fn guard_resource_read(tool_input: Option<&Value>) -> Value {
     if server.is_some_and(is_codey_fastctx_resource_alias) {
         return deny(fastctx_resource_reason());
     }
+    if uri.is_some_and(is_local_file_uri) {
+        return deny(local_resource_bypass_reason());
+    }
     if uri.is_some_and(|uri| is_plain_local_path(uri) || !has_uri_scheme(uri)) {
         return deny(invalid_resource_read_reason());
     }
@@ -209,12 +212,21 @@ fn has_uri_scheme(uri: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
 }
 
+fn is_local_file_uri(uri: &str) -> bool {
+    uri.split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+}
+
 fn invalid_resource_read_reason() -> String {
     "MCP 资源读取已停止：`server` 和 `uri` 必须原样使用成功资源发现返回的真实值，不能填写 `x`、`none`、本地路径或其他占位内容。本地工作区文件请直接调用 `mcp__codey_fastctx__inspect_local_file`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位。".to_string()
 }
 
 fn fastctx_resource_reason() -> String {
     "Codey FastCtx 只提供直接调用的文件工具，不能作为资源服务器使用。本地文件请调用 `mcp__codey_fastctx__inspect_local_file`，搜索与发现请分别调用 `mcp__codey_fastctx__grep` 和 `mcp__codey_fastctx__glob`；若工具尚未暴露，先用 `tool_search`，或在 code mode 中从 `ALL_TOOLS` 定位。".to_string()
+}
+
+fn local_resource_bypass_reason() -> String {
+    "本地 `file://` MCP 资源读取已停止：本地工作区文件必须通过 Codey FastCtx 直接文件工具访问，不能经外部 filesystem 资源服务器绕过 direct-only 边界。请调用 `mcp__codey_fastctx__inspect_local_file`；搜索与发现请分别调用 `mcp__codey_fastctx__grep` 和 `mcp__codey_fastctx__glob`。".to_string()
 }
 
 fn deny(reason: String) -> Value {
@@ -706,13 +718,23 @@ mod tests {
             )),
             json!({})
         );
-        assert_eq!(
-            handle_hook(&tool_hook_input(
+    }
+
+    #[test]
+    fn blocks_file_uri_resource_reads_instead_of_bypassing_direct_fastctx_tools() {
+        for (server, uri) in [
+            ("filesystem", "file:///workspace/src/main.rs"),
+            ("filesystem", "FILE:///workspace/src/main.rs"),
+            ("another-local-server", "file:///workspace/src/main.rs"),
+        ] {
+            let output = handle_hook(&tool_hook_input(
                 "read_mcp_resource",
-                json!({ "server": "filesystem", "uri": "file:///workspace/src/main.rs" }),
-            )),
-            json!({})
-        );
+                json!({ "server": server, "uri": uri }),
+            ));
+            let reason = assert_denied(&output);
+            assert!(reason.contains("direct-only 边界"), "{reason}");
+            assert!(reason.contains("mcp__codey_fastctx__inspect_local_file"));
+        }
     }
 
     #[test]

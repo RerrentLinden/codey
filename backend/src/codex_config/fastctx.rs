@@ -205,7 +205,7 @@ pub(super) fn disable_fast_context_tools(doc: &mut DocumentMut) {
     }
 }
 
-fn remove_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> bool {
+pub(super) fn remove_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> bool {
     let Some(namespaces) = direct_only_tool_namespaces_mut(doc) else {
         return false;
     };
@@ -214,7 +214,10 @@ fn remove_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> 
     namespaces.len() != original_len
 }
 
-fn ensure_direct_only_tool_namespace(doc: &mut DocumentMut, namespace: &str) -> Result<()> {
+pub(super) fn ensure_direct_only_tool_namespace(
+    doc: &mut DocumentMut,
+    namespace: &str,
+) -> Result<()> {
     if matches!(
         doc.get("features"),
         Some(Item::Value(Value::InlineTable(_)))

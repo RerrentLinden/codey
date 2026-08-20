@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::subagent::protocol::{self, AgentState as ObservedAgentState};
+
 pub(crate) const HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook";
 pub(crate) const COMBINED_HOOK_ARGUMENT: &str = "--codey-subagent-gate-hook-with-fastctx";
 pub(crate) const RUNTIME_ACTIVE_ENV: &str = "CODEY_SUBAGENT_GATE_ACTIVE";
@@ -29,6 +31,8 @@ const STATE_ERROR_SINCE_FILE: &str = "state-error-since.state";
 const SUBAGENT_CONTEXT_OBSERVED_FILE: &str = "subagent-context-observed.state";
 const PROTOCOL_HEALTH_FILE: &str = "protocol-health.json";
 const PROTOCOL_HEALTH_SCHEMA_VERSION: u32 = 1;
+const ROOT_TURN_BINDING_FILE: &str = "root-turn-binding.json";
+const ROOT_TURN_BINDING_SCHEMA_VERSION: u32 = 1;
 const MISSING_AGENT_ID_MARKER: &str = "__codey_missing_agent_id__";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -65,6 +69,12 @@ struct HookInput {
     tool_input: Option<Value>,
     #[serde(default, alias = "toolResponse")]
     tool_response: Option<Value>,
+    #[serde(default, alias = "turnId")]
+    turn_id: Option<String>,
+    #[serde(default, alias = "transcriptPath")]
+    transcript_path: Option<String>,
+    #[serde(default, alias = "agentTranscriptPath")]
+    agent_transcript_path: Option<String>,
     #[serde(default, alias = "working_dir", alias = "workingDirectory")]
     cwd: Option<String>,
 }
@@ -89,6 +99,14 @@ struct ProtocolHealth {
     #[serde(default)]
     absolute_stop_timeouts: u16,
     last_issue: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RootTurnBinding {
+    schema_version: u32,
+    runtime_id_hash: String,
+    turn_id_hash: String,
+    bound_at_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,13 +279,15 @@ fn combined_hook_output_for_runtime(
     } else {
         json!({})
     };
-    if !gate_output.as_object().is_some_and(Map::is_empty) {
-        return Ok(gate_output);
-    }
-    Ok(crate::fastctx_route_gate::hook_output(
-        &input.hook_event_name,
-        input.tool_name.as_deref(),
-        input.tool_input.as_ref(),
+    Ok(crate::subagent::hook_composer::first_decision(
+        gate_output,
+        || {
+            crate::fastctx_route_gate::hook_output(
+                &input.hook_event_name,
+                input.tool_name.as_deref(),
+                input.tool_input.as_ref(),
+            )
+        },
     ))
 }
 
@@ -281,11 +301,13 @@ fn handle_hook_for_runtime_at(
         "SubagentStart" => {
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
                 create_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
-                crate::subagent_orchestrator::subagent_started(
+                crate::subagent_orchestrator::subagent_started_with_context(
                     state_root,
                     runtime_id,
                     &input.session_id,
                     agent_id,
+                    nonempty(input.agent_type.as_deref()),
+                    nonempty(input.transcript_path.as_deref()),
                     now_ms,
                 )?;
             } else {
@@ -316,15 +338,24 @@ fn handle_hook_for_runtime_at(
         }
         "SubagentStop" => {
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
-                crate::subagent_orchestrator::subagent_stopped(
+                crate::subagent_orchestrator::subagent_stopped_with_context(
                     state_root,
                     runtime_id,
                     &input.session_id,
                     agent_id,
+                    nonempty(input.agent_type.as_deref()),
+                    nonempty(input.agent_transcript_path.as_deref()),
                     now_ms,
                 )?;
                 remove_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
                 if active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)? == 0 {
+                    let _ = crate::subagent_orchestrator::open_batch_decision_if_settled(
+                        state_root,
+                        runtime_id,
+                        &input.session_id,
+                        0,
+                        now_ms,
+                    )?;
                     remove_session_state(state_root, runtime_id, &input.session_id)?;
                 }
             } else {
@@ -348,7 +379,12 @@ fn handle_hook_for_runtime_at(
             Ok(json!({}))
         }
         "SessionEnd" => {
-            crate::subagent_orchestrator::end_session(state_root, runtime_id, &input.session_id)?;
+            crate::subagent_orchestrator::end_session(
+                state_root,
+                runtime_id,
+                &input.session_id,
+                now_ms,
+            )?;
             remove_session_state(state_root, runtime_id, &input.session_id)?;
             Ok(json!({}))
         }
@@ -370,34 +406,95 @@ fn pre_tool_use_output(
         let Some(tool_name) = input.tool_name.as_deref() else {
             return Ok(json!({}));
         };
-        if is_spawn_agent_tool(tool_name) {
-            return Ok(subagent_spawn_denial());
+        if is_batch_decision_tool(tool_name) {
+            return Ok(pre_tool_reason_denial(
+                "Codey 批次决策门禁：只有根代理可以提交批次决策。".to_string(),
+            ));
         }
         if let Some(agent_id) = child_agent_id {
-            if let Some(reason) = crate::subagent_orchestrator::authorize_child_tool(
+            if let Some(reason) = crate::subagent_orchestrator::authorize_child_tool_with_context(
                 state_root,
                 runtime_id,
                 &input.session_id,
-                agent_id,
-                tool_name,
-                input.tool_input.as_ref(),
+                crate::subagent_orchestrator::ChildToolContext {
+                    agent_id,
+                    agent_type: nonempty(input.agent_type.as_deref()),
+                    transcript_path: nonempty(input.transcript_path.as_deref()),
+                    tool_name,
+                    tool_input: input.tool_input.as_ref(),
+                },
                 now_ms,
             )? {
                 return Ok(pre_tool_reason_denial(reason));
             }
             return Ok(json!({}));
         }
-        if crate::subagent_orchestrator::known_read_only_tool(tool_name) {
+        if crate::subagent_orchestrator::safe_child_reporting_tool(
+            tool_name,
+            input.tool_input.as_ref(),
+        ) {
             return Ok(json!({}));
         }
         return Ok(subagent_identity_missing_denial());
+    }
+    let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+    let trusted_root_turn = root_turn_matches(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        nonempty(input.turn_id.as_deref()),
+    )?;
+    if active > 0 && !trusted_root_turn {
+        let Some(tool_name) = input.tool_name.as_deref() else {
+            return Ok(pre_tool_denial(active, None));
+        };
+        if is_anonymous_reconciliation_tool(tool_name, input.tool_input.as_ref()) {
+            return Ok(json!({}));
+        }
+        if is_collaboration_tool(tool_name) || is_batch_decision_tool(tool_name) {
+            return Ok(pre_tool_reason_denial(format!(
+                "Codey 主体身份门禁：仍有 {active} 个活动子代理，但当前 PreToolUse 载荷既没有可信的 child 身份，也没有匹配本批首个根派生调用的 turn_id，无法证明调用者是根代理。为防止匿名 child 派生、追派、中断或操纵批次，当前仅允许 agents.wait_agent 与不带筛选的 agents.list_agents 对账；其余编排调用已按 fail-closed 拒绝。"
+            )));
+        }
+    }
+    if input
+        .tool_name
+        .as_deref()
+        .is_some_and(is_batch_decision_tool)
+    {
+        if let Some(reason) = crate::subagent_orchestrator::prepare_batch_decision(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            active,
+            now_ms,
+        )? {
+            return Ok(pre_tool_reason_denial(reason));
+        }
+        return Ok(json!({}));
+    }
+    if input
+        .tool_name
+        .as_deref()
+        .is_some_and(is_followup_task_tool)
+    {
+        if let Some(reason) = crate::subagent_orchestrator::pre_followup_task(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            now_ms,
+        )? {
+            return Ok(pre_tool_reason_denial(reason));
+        }
+        return Ok(json!({}));
     }
     if input
         .tool_name
         .as_deref()
         .is_some_and(is_contract_spawn_tool)
     {
-        let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
         if active > 0
             && let Some(reason) = protocol_issue_reason(state_root, runtime_id, &input.session_id)?
             && !missing_agent_id_has_classified_subagent_context(
@@ -425,6 +522,11 @@ fn pre_tool_use_output(
         )? {
             return Ok(pre_tool_reason_denial(reason));
         }
+        if active == 0
+            && let Some(turn_id) = nonempty(input.turn_id.as_deref())
+        {
+            bind_root_turn(state_root, runtime_id, &input.session_id, turn_id, now_ms)?;
+        }
         return Ok(json!({}));
     }
     if input
@@ -434,7 +536,6 @@ fn pre_tool_use_output(
     {
         return Ok(json!({}));
     }
-    let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
     if active == 0 {
         if let Some(reason) = crate::subagent_orchestrator::pre_root_tool(
             state_root,
@@ -472,6 +573,22 @@ fn post_tool_use_output(
             input.tool_response.as_ref(),
             now_ms,
         )?;
+        return Ok(json!({}));
+    }
+    if is_batch_decision_tool(tool_name) {
+        if let Some(reason) = crate::subagent_orchestrator::post_batch_decision(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            input.tool_response.as_ref(),
+            now_ms,
+        )? {
+            return Ok(json!({
+                "decision": "block",
+                "reason": reason,
+            }));
+        }
         return Ok(json!({}));
     }
     crate::subagent_orchestrator::post_root_tool(
@@ -515,18 +632,6 @@ fn post_tool_use_output(
         )?;
     }
     if is_wait_agent_tool(tool_name) {
-        if wait_was_interrupted_by_user(input.tool_response.as_ref()) {
-            remove_session_state(state_root, runtime_id, &input.session_id)?;
-            crate::subagent_orchestrator::observe_status_response(
-                state_root,
-                runtime_id,
-                &input.session_id,
-                input.tool_response.as_ref(),
-                true,
-                now_ms,
-            )?;
-            return Ok(json!({}));
-        }
         remove_completed_agents_from_wait_response(
             state_root,
             runtime_id,
@@ -542,6 +647,15 @@ fn post_tool_use_output(
             true,
             now_ms,
         )?;
+        if let Some(reason) = crate::subagent_orchestrator::open_batch_decision_if_settled(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            0,
+            now_ms,
+        )? {
+            return Ok(json!({ "decision": "block", "reason": reason }));
+        }
         return Ok(json!({}));
     }
 
@@ -564,6 +678,15 @@ fn post_tool_use_output(
             true,
             now_ms,
         )?;
+        if let Some(reason) = crate::subagent_orchestrator::open_batch_decision_if_settled(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            0,
+            now_ms,
+        )? {
+            return Ok(json!({ "decision": "block", "reason": reason }));
+        }
         return Ok(json!({}));
     }
     crate::subagent_orchestrator::observe_status_response(
@@ -628,6 +751,13 @@ fn stop_output(
         now_ms,
         STOP_STALL_GRACE_MILLIS,
     )? {
+        crate::subagent_orchestrator::recover_active_reservations(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            "gate recovery grace elapsed before an authoritative terminal outcome",
+            now_ms,
+        )?;
         remove_session_state(state_root, runtime_id, &input.session_id)?;
         return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
     }
@@ -641,12 +771,20 @@ fn stop_output(
         now_ms,
         STOP_ABSOLUTE_GRACE_MILLIS,
     )? {
+        crate::subagent_orchestrator::recover_active_reservations(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            "absolute Stop grace elapsed before an authoritative terminal outcome",
+            now_ms,
+        )?;
+        remove_session_state(state_root, runtime_id, &input.session_id)?;
         record_protocol_issue(
             state_root,
             runtime_id,
             &input.session_id,
             ProtocolIssueKind::AbsoluteStopTimeout,
-            "根代理 Stop 受阻累计超过 60 分钟，已按绝对上限放行",
+            "根代理 Stop 受阻累计超过 60 分钟，已 fence 活动 attempt 并按绝对上限放行",
             now_ms,
         )?;
         return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
@@ -662,6 +800,14 @@ fn finalize_root_turn(
     now_ms: u64,
 ) -> Result<Value> {
     if let Some(reason) = crate::subagent_orchestrator::pending_acceptance_reason(
+        state_root, runtime_id, session_id, now_ms,
+    )? {
+        return Ok(json!({
+            "decision": "block",
+            "reason": reason,
+        }));
+    }
+    if let Some(reason) = crate::subagent_orchestrator::batch_decision_stop_reason(
         state_root, runtime_id, session_id, now_ms,
     )? {
         return Ok(json!({
@@ -712,6 +858,14 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
         "Codey 无法确认子代理运行状态，已暂停主代理继续操作：{error:#}。请调用 agents.wait_agent 或 agents.list_agents 核对状态。若状态存储持续损坏，Stop 路径会在持续 10 分钟后回收当前运行代次；期间不得绕过门禁。"
     );
     match input.hook_event_name.as_str() {
+        "PreToolUse"
+            if !input_has_subagent_context(input)
+                && input.tool_name.as_deref().is_some_and(|tool_name| {
+                    is_anonymous_reconciliation_tool(tool_name, input.tool_input.as_ref())
+                }) =>
+        {
+            json!({})
+        }
         "PreToolUse" if !input_has_subagent_context(input) => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -720,10 +874,12 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
             }
         }),
         "PreToolUse"
-            if input
-                .tool_name
-                .as_deref()
-                .is_some_and(crate::subagent_orchestrator::known_read_only_tool) =>
+            if input.tool_name.as_deref().is_some_and(|tool_name| {
+                crate::subagent_orchestrator::safe_child_reporting_tool(
+                    tool_name,
+                    input.tool_input.as_ref(),
+                )
+            }) =>
         {
             json!({})
         }
@@ -732,7 +888,7 @@ fn fail_closed_output(input: &HookInput, error: &anyhow::Error) -> Value {
                 "hookEventName": "PreToolUse",
                 "permissionDecision": "deny",
                 "permissionDecisionReason": format!(
-                    "Codey 无法读取子代理 ownership 账本：{error:#}。已按 fail-closed 暂停子代理的写入与命令工具；只读工具不受影响。请停止写入，并把已完成证据返回主代理。"
+                    "Codey 无法读取子代理 ownership 账本：{error:#}。已按 fail-closed 暂停子代理的数据、副作用与编排工具；只保留向 `/root` 定向发送消息用于回报。"
                 ),
             }
         }),
@@ -781,22 +937,12 @@ fn pre_tool_reason_denial(reason: String) -> Value {
     })
 }
 
-fn subagent_spawn_denial() -> Value {
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": "Codey 子代理门禁：子代理不能继续派生子代理。请停止调用 Agent 或 agents.spawn_agent；如需进一步拆分，请把建议返回给主代理。",
-        }
-    })
-}
-
 fn subagent_identity_missing_denial() -> Value {
     json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason": "Codey 子代理门禁：当前调用已确认来自子代理，但 Hook 载荷缺少 agent_id，无法校验 ownership。为避免越界写入，只允许明确只读工具；请停止本次写入或命令调用，并把兼容性诊断返回主代理。",
+            "permissionDecisionReason": "Codey 子代理门禁：当前调用已确认来自子代理，但 Hook 载荷缺少 agent_id，无法校验 ownership。数据、副作用与编排工具全部拒绝；只可使用 agents.send_message 向 `/root` 回报兼容性诊断。",
         }
     })
 }
@@ -813,7 +959,7 @@ fn post_wait_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可读取它并仅使用 agents.send_message、agents.followup_task、agents.interrupt_agent 或 agents.list_agents 做必要协调，并请先调用不带筛选的 agents.list_agents 对账。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待或协调。累计 10 分钟仍无终态时只中断一次对应代理，再继续等待终态；不得无限 wait 或自动重派。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}{compatibility}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待。不得自动重派；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}{compatibility}"
         ),
     })
 }
@@ -870,10 +1016,6 @@ fn render_tool_result(tool_response: Option<&Value>, tool_name: &str) -> String 
     bounded
 }
 
-fn wait_was_interrupted_by_user(tool_response: Option<&Value>) -> bool {
-    tool_response.is_some_and(value_reports_user_interrupt)
-}
-
 fn wait_agent_response_is_usable(tool_response: Option<&Value>) -> bool {
     let Some(tool_response) = tool_response else {
         return false;
@@ -902,14 +1044,6 @@ enum AgentListSnapshotState {
     AllChildrenTerminal,
     OnlyPendingInit,
     HasLiveChildren,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ObservedAgentState {
-    PendingInit,
-    Live,
-    Terminal,
     Unknown,
 }
 
@@ -958,11 +1092,13 @@ fn reconcile_list_agents_response(
 fn list_agents_query_is_full(tool_input: Option<&Value>) -> bool {
     match tool_input {
         None | Some(Value::Null) => true,
-        Some(Value::Object(values)) => values.iter().all(|(key, value)| {
-            normalized_ascii_identifier(key) != "pathprefix"
-                || matches!(value, Value::Null)
-                || value.as_str().is_some_and(|value| value.trim().is_empty())
+        Some(Value::Object(values)) if values.is_empty() => true,
+        Some(Value::Object(values)) if values.len() == 1 => values.iter().all(|(key, value)| {
+            normalized_ascii_identifier(key) == "pathprefix"
+                && (matches!(value, Value::Null)
+                    || value.as_str().is_some_and(|value| value.trim().is_empty()))
         }),
+        Some(Value::Object(_)) => false,
         Some(Value::String(value)) => serde_json::from_str::<Value>(value)
             .ok()
             .as_ref()
@@ -972,9 +1108,35 @@ fn list_agents_query_is_full(tool_input: Option<&Value>) -> bool {
 }
 
 fn summarize_list_agents_response(tool_response: Option<&Value>) -> AgentListSnapshotState {
-    let Some(agents) = tool_response.and_then(find_agents_array) else {
-        return AgentListSnapshotState::Unknown;
-    };
+    tool_response
+        .and_then(summarize_agents_response_value)
+        .unwrap_or(AgentListSnapshotState::Unknown)
+}
+
+fn summarize_agents_response_value(value: &Value) -> Option<AgentListSnapshotState> {
+    match value {
+        Value::Object(values) => {
+            if let Some(Value::Array(agents)) =
+                object_value_any(values, &["agents", "subagents", "children"])
+            {
+                return Some(summarize_agents(agents));
+            }
+            values.iter().find_map(|(key, value)| {
+                protocol::is_provider_envelope_field(key)
+                    .then(|| summarize_agents_response_value(value))
+                    .flatten()
+            })
+        }
+        Value::Array(values) => Some(summarize_agents(values)),
+        Value::String(value) => {
+            let parsed = serde_json::from_str::<Value>(value).ok()?;
+            summarize_agents_response_value(&parsed)
+        }
+        _ => None,
+    }
+}
+
+fn summarize_agents(agents: &[Value]) -> AgentListSnapshotState {
     let mut pending_init = 0;
     let mut live = 0;
     let mut unknown = 0;
@@ -984,11 +1146,11 @@ fn summarize_list_agents_response(tool_response: Option<&Value>) -> AgentListSna
             continue;
         };
         let agent_name =
-            object_value_any(&agent, &["agentname", "taskname", "name"]).and_then(Value::as_str);
+            object_value_any(agent, &["agentname", "taskname", "name"]).and_then(Value::as_str);
         if agent_name.is_some_and(is_root_agent_name) {
             continue;
         }
-        let Some(status) = object_value_any(&agent, &["agentstatus", "status", "state"]) else {
+        let Some(status) = object_value_any(agent, &["agentstatus", "status", "state"]) else {
             unknown += 1;
             continue;
         };
@@ -1007,25 +1169,6 @@ fn summarize_list_agents_response(tool_response: Option<&Value>) -> AgentListSna
         AgentListSnapshotState::OnlyPendingInit
     } else {
         AgentListSnapshotState::HasLiveChildren
-    }
-}
-
-fn find_agents_array(value: &Value) -> Option<Vec<Value>> {
-    match value {
-        Value::Object(values) => {
-            if let Some(Value::Array(agents)) =
-                object_value_any(values, &["agents", "subagents", "children"])
-            {
-                return Some(agents.clone());
-            }
-            values.values().find_map(find_agents_array)
-        }
-        Value::Array(values) => values.iter().find_map(find_agents_array),
-        Value::String(value) => {
-            let parsed = serde_json::from_str::<Value>(value).ok()?;
-            find_agents_array(&parsed)
-        }
-        _ => None,
     }
 }
 
@@ -1049,18 +1192,7 @@ fn is_root_agent_name(value: &str) -> bool {
 }
 
 fn classify_agent_status(value: &Value) -> ObservedAgentState {
-    match value {
-        Value::String(value) => match normalized_ascii_identifier(value).as_str() {
-            "pending" | "pendinginit" => ObservedAgentState::PendingInit,
-            "running" | "live" | "interrupted" => ObservedAgentState::Live,
-            value if is_agent_completion_value(value) => ObservedAgentState::Terminal,
-            _ => ObservedAgentState::Unknown,
-        },
-        Value::Object(values) if object_status_reports_agent_completion(values) => {
-            ObservedAgentState::Terminal
-        }
-        _ => ObservedAgentState::Unknown,
-    }
+    protocol::classify_agent_status(value)
 }
 
 fn remove_completed_agents_from_wait_response(
@@ -1083,183 +1215,15 @@ fn remove_completed_agents_from_wait_response(
 }
 
 fn collect_completed_agent_ids(value: &Value, completed_agent_ids: &mut Vec<String>) {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                collect_completed_agent_ids(value, completed_agent_ids);
-            }
-        }
-        Value::Object(values) => {
-            if let Some(agent_id) = object_agent_id(values)
-                && object_reports_agent_completion(values)
-            {
-                completed_agent_ids.push(agent_id.to_string());
-            }
-            for value in values.values() {
-                collect_completed_agent_ids(value, completed_agent_ids);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn object_agent_id(values: &Map<String, Value>) -> Option<&str> {
-    values.iter().find_map(|(key, value)| {
-        (normalized_ascii_identifier(key) == "agentid")
-            .then(|| nonempty(value.as_str()))
-            .flatten()
-    })
+    protocol::collect_terminal_agent_ids(value, completed_agent_ids);
 }
 
 fn object_reports_agent_completion(values: &Map<String, Value>) -> bool {
-    values
-        .iter()
-        .any(|(key, value)| is_agent_completion_field(key) && value_reports_agent_completion(value))
-}
-
-fn value_reports_agent_completion(value: &Value) -> bool {
-    match value {
-        Value::String(value) => is_agent_completion_value(value),
-        Value::Object(values) => object_status_reports_agent_completion(values),
-        _ => false,
-    }
-}
-
-fn object_status_reports_agent_completion(values: &Map<String, Value>) -> bool {
-    values.iter().any(|(key, value)| {
-        let normalized_key = normalized_ascii_identifier(key);
-        (is_agent_completion_value(&normalized_key) && value != &Value::Bool(false))
-            || (is_agent_completion_field(&normalized_key) && value_reports_agent_completion(value))
-    })
-}
-
-fn is_agent_completion_field(key: &str) -> bool {
-    matches!(
-        normalized_ascii_identifier(key).as_str(),
-        "status"
-            | "state"
-            | "agentstatus"
-            | "type"
-            | "kind"
-            | "event"
-            | "messagetype"
-            | "messagekind"
-            | "eventname"
-    )
-}
-
-fn is_agent_completion_value(value: &str) -> bool {
-    matches!(
-        normalized_ascii_identifier(value).as_str(),
-        "finalanswer"
-            | "taskcomplete"
-            | "completed"
-            | "errored"
-            | "error"
-            | "failed"
-            | "shutdown"
-            | "notfound"
-    )
-}
-
-fn value_reports_user_interrupt(value: &Value) -> bool {
-    match value {
-        Value::String(value) => is_wait_interrupt_text(value),
-        Value::Object(values) => object_reports_user_interrupt(values),
-        _ => false,
-    }
-}
-
-fn object_reports_user_interrupt(values: &Map<String, Value>) -> bool {
-    values.iter().any(|(key, value)| {
-        let normalized_key = normalized_ascii_identifier(key);
-        is_user_interrupt_flag(&normalized_key) && value == &Value::Bool(true)
-    }) || values.iter().any(|(key, value)| {
-        let normalized_key = normalized_ascii_identifier(key);
-        is_user_interrupt_discriminator(&normalized_key)
-            && value
-                .as_str()
-                .is_some_and(is_user_interrupt_discriminator_value)
-    }) || values.iter().any(|(key, value)| {
-        let normalized_key = normalized_ascii_identifier(key);
-        is_user_interrupt_text_field(&normalized_key)
-            && value.as_str().is_some_and(is_wait_interrupt_text)
-    }) || values.iter().any(|(key, value)| {
-        let normalized_key = normalized_ascii_identifier(key);
-        is_wait_response_envelope(&normalized_key)
-            && !value.is_string()
-            && value_reports_user_interrupt(value)
-    })
-}
-
-fn is_user_interrupt_flag(key: &str) -> bool {
-    matches!(
-        key,
-        "interruptedbynewinput"
-            | "interruptedbyuserinput"
-            | "interruptedbyuser"
-            | "cancelledbyuser"
-            | "canceledbyuser"
-            | "abortedbyuser"
-            | "stoppedbyuser"
-            | "usercancelled"
-            | "usercanceled"
-            | "useraborted"
-            | "userstopped"
-    )
-}
-
-fn is_user_interrupt_discriminator(key: &str) -> bool {
-    matches!(key, "kind" | "type" | "status" | "event" | "eventname")
-}
-
-fn is_user_interrupt_discriminator_value(value: &str) -> bool {
-    matches!(
-        normalized_ascii_identifier(value).as_str(),
-        "interruptedbynewinput"
-            | "interruptedbyuserinput"
-            | "interruptedbyuser"
-            | "cancelledbyuser"
-            | "canceledbyuser"
-            | "abortedbyuser"
-            | "stoppedbyuser"
-            | "newuserinput"
-            | "steeredinput"
-            | "steereduserinput"
-    )
-}
-
-fn is_user_interrupt_text_field(key: &str) -> bool {
-    matches!(key, "message" | "output" | "reason")
-}
-
-fn is_wait_response_envelope(key: &str) -> bool {
-    matches!(
-        key,
-        "data" | "output" | "response" | "result" | "toolresponse"
-    )
+    protocol::object_has_terminal_status(values)
 }
 
 fn normalized_ascii_identifier(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn is_wait_interrupt_text(value: &str) -> bool {
-    matches!(
-        normalized_ascii_identifier(value).as_str(),
-        "waitinterruptedbynewinput"
-            | "waitinterruptedbynewuserinput"
-            | "waitinterruptedbyuserinput"
-            | "waitcancelledbyuser"
-            | "waitcanceledbyuser"
-            | "waitabortedbyuser"
-            | "waitstoppedbyuser"
-            | "waitmanuallystopped"
-    )
+    protocol::normalize_identifier(value)
 }
 
 fn is_collaboration_tool(tool_name: &str) -> bool {
@@ -1275,6 +1239,13 @@ fn is_collaboration_tool(tool_name: &str) -> bool {
     )
 }
 
+fn is_batch_decision_tool(tool_name: &str) -> bool {
+    let normalized = tool_name.trim().to_ascii_lowercase();
+    normalized == crate::subagent_control_mcp::QUALIFIED_TOOL_NAME
+        || normalized == "codey_subagent_control.resolve_batch"
+        || normalized == "codey_subagent_control/resolve_batch"
+}
+
 fn is_wait_agent_tool(tool_name: &str) -> bool {
     normalized_collaboration_tool(tool_name) == "wait_agent"
 }
@@ -1287,40 +1258,21 @@ fn is_agent_status_tool(tool_name: &str) -> bool {
     is_wait_agent_tool(tool_name) || is_list_agents_tool(tool_name)
 }
 
-fn is_spawn_agent_tool(tool_name: &str) -> bool {
-    matches!(
-        normalized_collaboration_tool(tool_name).as_str(),
-        "agent" | "spawn_agent"
-    )
+fn is_anonymous_reconciliation_tool(tool_name: &str, tool_input: Option<&Value>) -> bool {
+    is_wait_agent_tool(tool_name)
+        || (is_list_agents_tool(tool_name) && list_agents_query_is_full(tool_input))
 }
 
 fn is_contract_spawn_tool(tool_name: &str) -> bool {
     normalized_collaboration_tool(tool_name) == "spawn_agent"
 }
 
-fn normalized_collaboration_tool(tool_name: &str) -> String {
-    let normalized = tool_name.trim().to_ascii_lowercase();
-    if is_functions_wait_alias(&normalized) {
-        return "wait_agent".to_string();
-    }
-    let leaf = normalized
-        .rsplit_once(['.', '/', ':'])
-        .map_or(normalized.as_str(), |(_, leaf)| leaf);
-    let leaf = leaf.rsplit_once("__").map_or(leaf, |(_, leaf)| leaf);
-    let flattened_leaf = normalized
-        .strip_prefix("agents")
-        .map(|name| name.trim_start_matches(['.', '/', ':', '_']))
-        .unwrap_or(leaf);
-    flattened_leaf.to_string()
+fn is_followup_task_tool(tool_name: &str) -> bool {
+    normalized_collaboration_tool(tool_name) == "followup_task"
 }
 
-fn is_functions_wait_alias(normalized_tool_name: &str) -> bool {
-    let Some(remainder) = normalized_tool_name.strip_prefix("functions") else {
-        return false;
-    };
-    ["__", ".", "/", ":", "_"]
-        .iter()
-        .any(|separator| remainder.strip_prefix(separator) == Some("wait"))
+fn normalized_collaboration_tool(tool_name: &str) -> String {
+    crate::subagent::rules::normalize_tool_name(tool_name)
 }
 
 fn current_timestamp_millis() -> u64 {
@@ -1571,6 +1523,66 @@ fn write_protocol_health(session_dir: &Path, path: &Path, health: &ProtocolHealt
         .with_context(|| format!("替换 Codex Hook 协议诊断状态失败：{}", path.display()))
 }
 
+fn bind_root_turn(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let session_dir = session_state_dir(state_root, session_id);
+    fs::create_dir_all(&session_dir).with_context(|| {
+        format!(
+            "创建 Codex 根代理 turn 绑定目录失败：{}",
+            session_dir.display()
+        )
+    })?;
+    let path = session_auxiliary_path(&session_dir, runtime_id, ROOT_TURN_BINDING_FILE);
+    let binding = RootTurnBinding {
+        schema_version: ROOT_TURN_BINDING_SCHEMA_VERSION,
+        runtime_id_hash: hash_component(runtime_id),
+        turn_id_hash: hash_component(turn_id),
+        bound_at_ms: now_ms,
+    };
+    let bytes = serde_json::to_vec(&binding).context("序列化 Codex 根代理 turn 绑定失败")?;
+    crate::fs_util::atomic_write(&path, &bytes)
+        .with_context(|| format!("写入 Codex 根代理 turn 绑定失败：{}", path.display()))
+}
+
+fn root_turn_matches(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    turn_id: Option<&str>,
+) -> Result<bool> {
+    let Some(turn_id) = turn_id else {
+        return Ok(false);
+    };
+    let session_dir = session_state_dir(state_root, session_id);
+    let path = session_auxiliary_path(&session_dir, runtime_id, ROOT_TURN_BINDING_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取 Codex 根代理 turn 绑定失败：{}", path.display()));
+        }
+    };
+    let binding: RootTurnBinding = serde_json::from_slice(&bytes)
+        .with_context(|| format!("解析 Codex 根代理 turn 绑定失败：{}", path.display()))?;
+    anyhow::ensure!(
+        binding.schema_version == ROOT_TURN_BINDING_SCHEMA_VERSION,
+        "Codex 根代理 turn 绑定版本不受支持：{}",
+        path.display()
+    );
+    anyhow::ensure!(
+        binding.runtime_id_hash == hash_component(runtime_id),
+        "Codex 根代理 turn 绑定代次不一致：{}",
+        path.display()
+    );
+    Ok(binding.turn_id_hash == hash_component(turn_id))
+}
+
 fn remove_session_auxiliary_file(
     state_root: &Path,
     runtime_id: &str,
@@ -1690,6 +1702,14 @@ fn active_agent_count_for_runtime(
     runtime_id: &str,
     session_id: &str,
 ) -> Result<usize> {
+    if let Some(active) = crate::subagent_orchestrator::active_reservation_count(
+        state_root,
+        runtime_id,
+        session_id,
+        current_timestamp_millis(),
+    )? {
+        return Ok(active);
+    }
     let session_dir = session_state_dir(state_root, session_id);
     let entries = match fs::read_dir(&session_dir) {
         Ok(entries) => entries,
@@ -1827,6 +1847,9 @@ mod tests {
             tool_name: None,
             tool_input: None,
             tool_response: None,
+            turn_id: None,
+            transcript_path: None,
+            agent_transcript_path: None,
             cwd: None,
         }
     }
@@ -1841,6 +1864,9 @@ mod tests {
             "toolName": "Bash",
             "toolInput": { "command": "true" },
             "toolResponse": { "exitCode": 0 },
+            "turnId": "turn-root-a",
+            "transcriptPath": "/tmp/root.jsonl",
+            "agentTranscriptPath": "/tmp/child.jsonl",
             "workingDirectory": "/repo"
         }))
         .unwrap();
@@ -1850,10 +1876,203 @@ mod tests {
         assert_eq!(input.agent_id.as_deref(), Some("agent-a"));
         assert_eq!(input.agent_type.as_deref(), Some("codey_quick_scan"));
         assert_eq!(input.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(input.turn_id.as_deref(), Some("turn-root-a"));
+        assert_eq!(input.transcript_path.as_deref(), Some("/tmp/root.jsonl"));
+        assert_eq!(
+            input.agent_transcript_path.as_deref(),
+            Some("/tmp/child.jsonl")
+        );
         assert_eq!(input.cwd.as_deref(), Some("/repo"));
     }
 
-    fn delegation_message(contract: Value) -> String {
+    #[test]
+    fn spawn_task_receipt_binds_child_before_its_first_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("codey-subagent-gate-v3");
+        std::fs::create_dir_all(&state_root).unwrap();
+        let workspace = temp.path().join("workspace");
+        let scope = workspace.join("scope");
+        std::fs::create_dir_all(&scope).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let scope = scope.to_string_lossy().into_owned();
+        let session_id = "task-receipt-session";
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.cwd = Some(workspace.clone());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "receipt_reader",
+            "agent_type": "codey_quick_scan",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "receipt_reader",
+                "why": "independent_review",
+                "visual": false,
+                "root": workspace,
+                "read": [scope],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        assert_eq!(handle_hook(&spawn, &state_root).unwrap(), json!({}));
+
+        let task_path = "/root/receipt_reader";
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(Value::String(
+            serde_json::to_string(&json!({ "task_name": task_path })).unwrap(),
+        ));
+        assert_eq!(handle_hook(&spawned, &state_root).unwrap(), json!({}));
+
+        let agent_id = "01a01d5b-1d06-7383-b333-80e54467508e";
+        let transcript = temp
+            .path()
+            .join("sessions/2026/08/20")
+            .join(format!("rollout-probe-{agent_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": agent_id,
+                        "parent_thread_id": session_id,
+                        "agent_path": task_path,
+                        "agent_role": "codey_quick_scan",
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "parent_thread_id": session_id,
+                                    "agent_path": task_path,
+                                    "agent_role": "codey_quick_scan"
+                                }
+                            }
+                        }
+                    }
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let mut started = input("SubagentStart", session_id);
+        started.agent_id = Some(agent_id.to_string());
+        started.agent_type = Some("codey_quick_scan".to_string());
+        started.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        assert_eq!(handle_hook(&started, &state_root).unwrap(), json!({}));
+
+        // Codex returns the canonical task path from spawn, but exposes the
+        // opaque child thread id to lifecycle/tool hooks. The child transcript
+        // metadata is the provider-owned bridge between those identities.
+        let mut first_read = input("PreToolUse", session_id);
+        first_read.agent_id = Some(agent_id.to_string());
+        first_read.agent_type = Some("codey_quick_scan".to_string());
+        first_read.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        first_read.tool_name = Some("mcp__codey_fastctx__glob".to_string());
+        first_read.tool_input = Some(json!({ "path": scope, "pattern": ["**/*.rs"] }));
+        assert_eq!(handle_hook(&first_read, &state_root).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn transcript_identity_correlation_rejects_a_wrong_parent_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("codey-subagent-gate-v3");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let session_id = "expected-parent-session";
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some(workspace.clone());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "spoof_reader",
+            "agent_type": "codey_quick_scan",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "spoof_reader",
+                "why": "independent_review",
+                "visual": false,
+                "root": workspace,
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        assert_eq!(handle_hook(&spawn, &state_root).unwrap(), json!({}));
+
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(Value::String(
+            r#"{"task_name":"/root/spoof_reader"}"#.to_string(),
+        ));
+        assert_eq!(handle_hook(&spawned, &state_root).unwrap(), json!({}));
+
+        let agent_id = "01a01d5b-dead-beef-baad-000000000001";
+        let transcript = temp
+            .path()
+            .join("sessions/2026/08/20")
+            .join(format!("rollout-probe-{agent_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "type": "session_meta",
+                    "payload": {
+                        "id": agent_id,
+                        "parent_thread_id": "different-parent-session",
+                        "agent_path": "/root/spoof_reader",
+                        "agent_role": "codey_quick_scan"
+                    }
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        let mut first_read = input("PreToolUse", session_id);
+        first_read.agent_id = Some(agent_id.to_string());
+        first_read.agent_type = Some("codey_quick_scan".to_string());
+        first_read.transcript_path = Some(transcript.to_string_lossy().into_owned());
+        first_read.tool_name = Some("mcp__codey_fastctx__glob".to_string());
+        first_read.tool_input = Some(json!({ "path": workspace, "pattern": ["**/*.rs"] }));
+        let denied = handle_hook(&first_read, &state_root).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("CODEY_SUBAGENT_UNBOUND_ATTEMPT"))
+        );
+    }
+
+    fn delegation_message(mut contract: Value) -> String {
+        if let Some(values) = contract.as_object_mut()
+            && !values.contains_key("capabilities")
+        {
+            let write_capable = values
+                .get("write")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| !paths.is_empty());
+            values.insert(
+                "capabilities".to_string(),
+                if write_capable {
+                    json!(["files.read", "workspace.write"])
+                } else {
+                    json!(["files.read"])
+                },
+            );
+        }
         format!(
             "Do the bounded task.\n{}{}",
             crate::subagent_orchestrator::CONTRACT_PREFIX,
@@ -1935,6 +2154,39 @@ mod tests {
         post_acceptance.tool_input = pre_acceptance.tool_input;
         post_acceptance.tool_response = Some(json!({ "exit_code": 0, "output": "ok" }));
         assert_eq!(handle_hook(&post_acceptance, root).unwrap(), json!({}));
+        let decision_block = handle_hook(&input("Stop", "contract-session"), root).unwrap();
+        assert_eq!(decision_block["decision"].as_str(), Some("block"));
+        assert!(
+            decision_block["reason"]
+                .as_str()
+                .unwrap()
+                .contains(crate::subagent_control_mcp::QUALIFIED_TOOL_NAME)
+        );
+
+        let decision_input = json!({
+            "decision": "complete",
+            "batch_number": 1,
+            "decision_id": "contract-session-complete",
+            "reason": "implementation and acceptance are complete"
+        });
+        let mut pre_decision = input("PreToolUse", "contract-session");
+        pre_decision.tool_name = Some(crate::subagent_control_mcp::QUALIFIED_TOOL_NAME.to_string());
+        pre_decision.tool_input = Some(decision_input.clone());
+        assert_eq!(handle_hook(&pre_decision, root).unwrap(), json!({}));
+
+        let mut post_decision = input("PostToolUse", "contract-session");
+        post_decision.tool_name = pre_decision.tool_name;
+        post_decision.tool_input = Some(decision_input.clone());
+        post_decision.tool_response = Some(json!({
+            "structuredContent": {
+                "accepted": true,
+                "decision": "complete",
+                "batch_number": 1,
+                "decision_id": "contract-session-complete",
+                "reason": "implementation and acceptance are complete"
+            }
+        }));
+        assert_eq!(handle_hook(&post_decision, root).unwrap(), json!({}));
         assert_eq!(
             handle_hook(&input("Stop", "contract-session"), root).unwrap(),
             json!({})
@@ -1942,7 +2194,141 @@ mod tests {
     }
 
     #[test]
-    fn runtime_gate_accepts_encrypted_spawn_messages_with_conservative_ownership() {
+    fn runtime_gate_bounds_missing_batch_control_tool_stop_retries() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let session_id = "missing-control-tool-session";
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some("/repo".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "research_a",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "research_a",
+                "why": "breadth",
+                "visual": false,
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        assert_eq!(handle_hook(&spawn, root).unwrap(), json!({}));
+
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "agent_id": "agent-a" }));
+        assert_eq!(handle_hook(&spawned, root).unwrap(), json!({}));
+
+        let mut stopped = input("SubagentStop", session_id);
+        stopped.agent_id = Some("agent-a".to_string());
+        assert_eq!(handle_hook(&stopped, root).unwrap(), json!({}));
+
+        for _ in 0..2 {
+            let blocked = handle_hook(&input("Stop", session_id), root).unwrap();
+            assert_eq!(blocked["decision"].as_str(), Some("block"));
+            assert!(
+                blocked["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("resolve_batch"))
+            );
+        }
+        assert_eq!(
+            handle_hook(&input("Stop", session_id), root).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
+    fn followup_task_rejects_unbound_or_terminal_targets_before_reactivation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let session_id = "followup-session";
+        let mut followup = input("PreToolUse", session_id);
+        followup.turn_id = Some("root-turn-a".to_string());
+        followup.tool_name = Some("agents.followup_task".to_string());
+        followup.tool_input = Some(json!({
+            "target": "/root/followup_worker",
+            "message": "continue the write task"
+        }));
+
+        let missing = handle_hook(&followup, root).unwrap();
+        assert_eq!(
+            missing["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            missing["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(
+                    |reason| reason.contains("CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT")
+                )
+        );
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.cwd = Some("/repo".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "followup_worker",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "followup_worker",
+                "why": "independent_work",
+                "visual": false,
+                "root": "/repo",
+                "read": [],
+                "write": ["backend/src"],
+                "checks": [{ "id": "tests", "cmd": "cargo test -p codey --lib" }]
+            }))
+        }));
+        assert_eq!(handle_hook(&spawn, root).unwrap(), json!({}));
+
+        let agent_id = "/root/followup_worker";
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "task_name": agent_id }));
+        assert_eq!(handle_hook(&spawned, root).unwrap(), json!({}));
+        let mut started = input("SubagentStart", session_id);
+        started.agent_id = Some(agent_id.to_string());
+        started.agent_type = Some("codey_worker".to_string());
+        assert_eq!(handle_hook(&started, root).unwrap(), json!({}));
+        assert_eq!(handle_hook(&followup, root).unwrap(), json!({}));
+
+        let mut stopped = input("SubagentStop", session_id);
+        stopped.agent_id = Some(agent_id.to_string());
+        handle_hook(&stopped, root).unwrap();
+        let terminal = handle_hook(&followup, root).unwrap();
+        assert_eq!(
+            terminal["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            terminal["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("不要等待旧 canonical task 自行恢复"))
+        );
+
+        let mut unbound_write = input("PreToolUse", "unbound-child-session");
+        unbound_write.agent_id = Some("/root/legacy-worker".to_string());
+        unbound_write.agent_type = Some("codey_worker".to_string());
+        unbound_write.tool_name = Some("apply_patch".to_string());
+        unbound_write.tool_input = Some(json!({ "patch": "*** Begin Patch\n*** End Patch" }));
+        let denied_write = handle_hook(&unbound_write, root).unwrap();
+        assert!(
+            denied_write["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("CODEY_SUBAGENT_UNBOUND_ATTEMPT")
+                    && reason.contains("立即把该错误码返回主代理"))
+        );
+    }
+
+    #[test]
+    fn runtime_gate_keeps_encrypted_spawns_read_only() {
         let temp = tempfile::tempdir().unwrap();
         let state_root = temp.path();
         let workspace = state_root.join("workspace");
@@ -1958,36 +2344,52 @@ mod tests {
             "fork_turns": "none",
             "message": format!("gAAAAA{}", "A".repeat(160))
         }));
+        let denied = handle_hook(&spawn, state_root).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("无法验证 write ownership"))
+        );
+
+        spawn.tool_input = Some(json!({
+            "task_name": "encrypted_reader",
+            "agent_type": "codey_quick_scan",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        }));
         assert_eq!(handle_hook(&spawn, state_root).unwrap(), json!({}));
 
         let mut spawned = input("PostToolUse", "encrypted-contract-session");
         spawned.tool_name = spawn.tool_name.clone();
         spawned.tool_input = spawn.tool_input.clone();
-        spawned.tool_response = Some(json!({ "agent_id": "encrypted-worker-agent" }));
+        spawned.tool_response = Some(json!({ "task_name": "/root/encrypted_reader" }));
         handle_hook(&spawned, state_root).unwrap();
 
         let mut started = input("SubagentStart", "encrypted-contract-session");
-        started.agent_id = Some("encrypted-worker-agent".to_string());
+        started.agent_id = Some("/root/encrypted_reader".to_string());
         handle_hook(&started, state_root).unwrap();
 
         let mut owned_patch = input("PreToolUse", "encrypted-contract-session");
-        owned_patch.agent_id = Some("encrypted-worker-agent".to_string());
+        owned_patch.agent_id = Some("/root/encrypted_reader".to_string());
         owned_patch.tool_name = Some("apply_patch".to_string());
         owned_patch.tool_input = Some(json!({
             "patch": "*** Begin Patch\n*** Update File: src/lib.rs\n*** End Patch"
         }));
-        assert_eq!(handle_hook(&owned_patch, state_root).unwrap(), json!({}));
-
-        let mut escaped_patch = owned_patch;
-        escaped_patch.tool_input = Some(json!({
-            "patch": "*** Begin Patch\n*** Update File: /outside/README.md\n*** End Patch"
-        }));
         assert_eq!(
-            handle_hook(&escaped_patch, state_root).unwrap()["hookSpecificOutput"]
+            handle_hook(&owned_patch, state_root).unwrap()["hookSpecificOutput"]
                 ["permissionDecision"]
                 .as_str(),
             Some("deny")
         );
+
+        let mut local_read = owned_patch;
+        local_read.tool_name = Some("mcp__codey_fastctx__grep".to_string());
+        local_read.tool_input = Some(json!({ "path": "src" }));
+        assert_eq!(handle_hook(&local_read, state_root).unwrap(), json!({}));
     }
 
     #[test]
@@ -2012,7 +2414,7 @@ mod tests {
     }
 
     #[test]
-    fn active_subagent_blocks_only_root_non_collaboration_tools() {
+    fn anonymous_actor_with_active_subagent_is_limited_to_reconciliation() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let mut start = input("SubagentStart", "session-a");
@@ -2027,10 +2429,35 @@ mod tests {
             Some("deny")
         );
 
+        let mut root_read = input("PreToolUse", "session-a");
+        root_read.tool_name = Some("mcp__codey_fastctx__grep".to_string());
+        assert_eq!(
+            handle_hook(&root_read, root).unwrap()["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+
+        let mut root_network = input("PreToolUse", "session-a");
+        root_network.tool_name = Some("web_search".to_string());
+        assert_eq!(
+            handle_hook(&root_network, root).unwrap()["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+
         let mut child_bash = input("PreToolUse", "session-a");
         child_bash.agent_id = Some("agent-a".to_string());
         child_bash.tool_name = Some("Bash".to_string());
-        assert_eq!(handle_hook(&child_bash, root).unwrap(), json!({}));
+        let child_denied = handle_hook(&child_bash, root).unwrap();
+        assert_eq!(
+            child_denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            child_denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("有效 attempt"))
+        );
 
         for tool in [
             "agents.wait_agent",
@@ -2045,6 +2472,41 @@ mod tests {
             assert_eq!(handle_hook(&wait, root).unwrap(), json!({}), "{tool}");
         }
 
+        let mut full_list = input("PreToolUse", "session-a");
+        full_list.tool_name = Some("agents.list_agents".to_string());
+        full_list.tool_input = Some(json!({}));
+        assert_eq!(handle_hook(&full_list, root).unwrap(), json!({}));
+
+        for (tool, tool_input) in [
+            ("agents.spawn_agent", json!({})),
+            ("agents.followup_task", json!({ "target": "/root/agent-a" })),
+            (
+                "agents.interrupt_agent",
+                json!({ "target": "/root/agent-a" }),
+            ),
+            ("agents.send_message", json!({ "target": "/root/agent-a" })),
+            (
+                "agents.list_agents",
+                json!({ "path_prefix": "/root/agent-a" }),
+            ),
+        ] {
+            let mut orchestration = input("PreToolUse", "session-a");
+            orchestration.tool_name = Some(tool.to_string());
+            orchestration.tool_input = Some(tool_input);
+            let denied = handle_hook(&orchestration, root).unwrap();
+            assert_eq!(
+                denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+                Some("deny"),
+                "{tool}"
+            );
+            assert!(
+                denied["hookSpecificOutput"]["permissionDecisionReason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("主体身份")),
+                "{tool}"
+            );
+        }
+
         let mut functions_exec = input("PreToolUse", "session-a");
         functions_exec.tool_name = Some("functions.exec".to_string());
         assert_eq!(
@@ -2052,6 +2514,57 @@ mod tests {
                 .as_str(),
             Some("deny")
         );
+    }
+
+    #[test]
+    fn bound_root_turn_can_finish_batch_dispatch_while_other_turns_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let spawn_input = |task: &str, turn: &str| {
+            let mut spawn = input("PreToolUse", "turn-bound-session");
+            spawn.turn_id = Some(turn.to_string());
+            spawn.tool_name = Some("agents.spawn_agent".to_string());
+            spawn.tool_input = Some(json!({
+                "task_name": task,
+                "agent_type": "codey_deep_research",
+                "fork_turns": "none",
+                "message": delegation_message(json!({
+                    "id": task,
+                    "why": "breadth",
+                    "visual": false,
+                    "read": [],
+                    "write": [],
+                    "checks": []
+                }))
+            }));
+            spawn
+        };
+
+        let first = spawn_input("research_first", "root-turn-a");
+        assert_eq!(handle_hook(&first, root).unwrap(), json!({}));
+        let second = spawn_input("research_second", "root-turn-a");
+        assert_eq!(handle_hook(&second, root).unwrap(), json!({}));
+
+        let wrong_turn = spawn_input("research_third", "child-turn-b");
+        let denied = handle_hook(&wrong_turn, root).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("turn_id"))
+        );
+
+        let mut root_message = input("PreToolUse", "turn-bound-session");
+        root_message.turn_id = Some("root-turn-a".to_string());
+        root_message.tool_name = Some("agents.send_message".to_string());
+        root_message.tool_input = Some(json!({
+            "target": "/root/research_first",
+            "message": "status?"
+        }));
+        assert_eq!(handle_hook(&root_message, root).unwrap(), json!({}));
     }
 
     #[test]
@@ -2087,7 +2600,7 @@ mod tests {
         assert!(
             child_routed["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("Codey FastCtx"))
+                .is_some_and(|reason| reason.contains("有效 attempt"))
         );
     }
 
@@ -2122,7 +2635,43 @@ mod tests {
     }
 
     #[test]
-    fn typed_missing_id_context_keeps_root_batch_dispatch_open_and_child_fail_closed() {
+    fn child_can_only_send_collaboration_reports_to_root() {
+        let temp = tempfile::tempdir().unwrap();
+        for tool in [
+            "agents.wait_agent",
+            "agents.list_agents",
+            "agents.interrupt_agent",
+            "agents.followup_task",
+        ] {
+            let mut child_tool = input("PreToolUse", "session-a");
+            child_tool.agent_id = Some("agent-a".to_string());
+            child_tool.tool_name = Some(tool.to_string());
+            let denied = handle_hook(&child_tool, temp.path()).unwrap();
+            assert_eq!(
+                denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+                Some("deny"),
+                "{tool}"
+            );
+        }
+
+        let mut sibling_message = input("PreToolUse", "session-a");
+        sibling_message.agent_id = Some("agent-a".to_string());
+        sibling_message.tool_name = Some("agents.send_message".to_string());
+        sibling_message.tool_input = Some(json!({ "target": "/root/sibling", "message": "x" }));
+        assert_eq!(
+            handle_hook(&sibling_message, temp.path()).unwrap()
+                ["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+
+        let mut root_message = sibling_message;
+        root_message.tool_input = Some(json!({ "target": "/root", "message": "status" }));
+        assert_eq!(handle_hook(&root_message, temp.path()).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn typed_missing_id_context_keeps_all_anonymous_dispatch_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let runtime_id = "runtime-a";
@@ -2143,7 +2692,7 @@ mod tests {
         assert!(
             denied["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("子代理不能继续派生子代理"))
+                .is_some_and(|reason| reason.contains("缺少 agent_id"))
         );
 
         let mut child_command = input("PreToolUse", session_id);
@@ -2160,8 +2709,10 @@ mod tests {
         child_read.agent_type = Some("codey_quick_scan".to_string());
         child_read.tool_name = Some("mcp__codey_fastctx__grep".to_string());
         assert_eq!(
-            handle_hook_for_runtime_at(&child_read, root, runtime_id, 1_700).unwrap(),
-            json!({})
+            handle_hook_for_runtime_at(&child_read, root, runtime_id, 1_700).unwrap()
+                ["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
         );
 
         let mut child_stop = input("Stop", session_id);
@@ -2186,9 +2737,11 @@ mod tests {
                 "checks": []
             }))
         }));
-        assert_eq!(
-            handle_hook_for_runtime_at(&root_spawn, root, runtime_id, 2_000).unwrap(),
-            json!({})
+        let root_denied = handle_hook_for_runtime_at(&root_spawn, root, runtime_id, 2_000).unwrap();
+        assert!(
+            root_denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("主体身份"))
         );
 
         let mut unknown_wait = input("PostToolUse", session_id);
@@ -2208,7 +2761,7 @@ mod tests {
         assert!(
             denied["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("无法可靠区分根代理和子代理"))
+                .is_some_and(|reason| reason.contains("主体身份"))
         );
     }
 
@@ -2243,7 +2796,7 @@ mod tests {
             denied["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
                 .unwrap()
-                .contains("无法可靠区分根代理和子代理")
+                .contains("主体身份")
         );
 
         let mut list = input("PostToolUse", session_id);
@@ -2342,12 +2895,16 @@ mod tests {
         let first_reason = blocked_after_first["reason"].as_str().unwrap();
         assert!(first_reason.contains("仍有 2 个子代理"));
         assert!(first_reason.contains("first result"));
-        assert!(first_reason.contains("可读取它并仅使用 agents.send_message"));
+        assert!(first_reason.contains("可继续使用 agents.wait_agent"));
         assert!(first_reason.contains("不得恢复非协作本地工作"));
 
         let mut root_steer = input("PreToolUse", "session-a");
         root_steer.tool_name = Some("agents.send_message".to_string());
-        assert_eq!(handle_hook(&root_steer, root).unwrap(), json!({}));
+        assert_eq!(
+            handle_hook(&root_steer, root).unwrap()["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
 
         let mut root_patch = input("PreToolUse", "session-a");
         root_patch.tool_name = Some("apply_patch".to_string());
@@ -2403,10 +2960,8 @@ mod tests {
                     "message": "done"
                 },
                 {
-                    "nested": {
-                        "agent_id": "agent-b",
-                        "kind": "task-complete"
-                    }
+                    "agent_id": "agent-b",
+                    "kind": "task-complete"
                 }
             ]
         }));
@@ -2490,6 +3045,16 @@ mod tests {
                 "agent_name": "/root/agent-a",
                 "agent_status": { "errored": "429 Too Many Requests" }
             }]
+        }));
+        assert_eq!(
+            handle_hook(&filtered, root).unwrap()["decision"].as_str(),
+            Some("block")
+        );
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 2);
+
+        filtered.tool_input = Some(json!({
+            "path_prefix": "",
+            "future_filter": "terminal_only"
         }));
         assert_eq!(
             handle_hook(&filtered, root).unwrap()["decision"].as_str(),
@@ -2593,6 +3158,63 @@ mod tests {
             )
             .unwrap(),
             json!({})
+        );
+    }
+
+    #[test]
+    fn ledger_backed_stale_attempt_is_fenced_before_stop_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "ledger-stale-session";
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.cwd = Some("/repo".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "stale_reader",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "stale_reader",
+                "why": "breadth",
+                "visual": false,
+                "root": "/repo",
+                "read": ["backend/src"],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&spawn, root, runtime_id, 1_000).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
+        );
+        assert_eq!(
+            handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 2_000,)
+                .unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+
+        let recovered = handle_hook_for_runtime_at(
+            &input("Stop", session_id),
+            root,
+            runtime_id,
+            2_000 + STOP_STALL_GRACE_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(recovered["decision"].as_str(), Some("block"));
+        assert!(
+            recovered["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("resolve_batch"))
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            0
         );
     }
 
@@ -2709,18 +3331,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(released, json!({}));
-        // 绝对放行不清理活跃标记，遗留状态仍由 10 分钟停滞与代次机制兜底。
+        // 绝对放行先在账本中 fence 活动 attempt，再清理旧 marker，避免
+        // ledger-backed active count 在后续 Stop 中反复复活。
         assert_eq!(
             active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
-            1
+            0
         );
         let issue = protocol_issue_reason(root, runtime_id, session_id)
             .unwrap()
             .unwrap();
         assert!(issue.contains("绝对上限"), "{issue}");
 
-        // 绝对放行后不再有有效 wait/list 推进时，新建立的停滞窗口必须仍可
-        // 到期并清理遗留标记；否则同一会话的后续工具会永久被门禁拒绝。
+        // 后续 Stop 保持幂等，不会重新建立停滞窗口或恢复旧 attempt。
         let recovered = handle_hook_for_runtime_at(
             &input("Stop", session_id),
             root,
@@ -2737,7 +3359,7 @@ mod tests {
     }
 
     #[test]
-    fn fail_closed_denies_child_write_tools_but_allows_known_read_only_tools() {
+    fn fail_closed_denies_child_data_and_orchestration_but_allows_root_reporting() {
         let error = anyhow::anyhow!("账本损坏");
 
         for tool in ["apply_patch", "mcp__codey_fastctx__replace", "Bash"] {
@@ -2752,16 +3374,62 @@ mod tests {
             );
         }
 
-        for tool in [
-            "read_file",
-            "mcp__codey_fastctx__inspect_local_file",
-            "agents.wait_agent",
-            "agents.list_agents",
-        ] {
+        for tool in ["read_file", "mcp__codey_fastctx__inspect_local_file"] {
             let mut child_read = input("PreToolUse", "session-a");
             child_read.agent_id = Some("agent-a".to_string());
             child_read.tool_name = Some(tool.to_string());
-            assert_eq!(fail_closed_output(&child_read, &error), json!({}), "{tool}");
+            assert_eq!(
+                fail_closed_output(&child_read, &error)["hookSpecificOutput"]["permissionDecision"]
+                    .as_str(),
+                Some("deny"),
+                "{tool}"
+            );
+        }
+
+        for tool in ["agents.wait_agent", "agents.list_agents"] {
+            let mut child_collaboration = input("PreToolUse", "session-a");
+            child_collaboration.agent_id = Some("agent-a".to_string());
+            child_collaboration.tool_name = Some(tool.to_string());
+            assert_eq!(
+                fail_closed_output(&child_collaboration, &error)["hookSpecificOutput"]
+                    ["permissionDecision"]
+                    .as_str(),
+                Some("deny"),
+                "{tool}"
+            );
+        }
+
+        let mut report = input("PreToolUse", "session-a");
+        report.agent_id = Some("agent-a".to_string());
+        report.tool_name = Some("agents.send_message".to_string());
+        report.tool_input = Some(json!({ "target": "/root", "message": "ledger error" }));
+        assert_eq!(fail_closed_output(&report, &error), json!({}));
+
+        for tool in ["agents.wait_agent", "agents.list_agents"] {
+            let mut root_recovery = input("PreToolUse", "session-a");
+            root_recovery.tool_name = Some(tool.to_string());
+            assert_eq!(
+                fail_closed_output(&root_recovery, &error),
+                json!({}),
+                "{tool}"
+            );
+        }
+        for tool in [
+            "agents.spawn_agent",
+            "agents.followup_task",
+            "agents.interrupt_agent",
+            "agents.send_message",
+            "read_file",
+        ] {
+            let mut root_denied = input("PreToolUse", "session-a");
+            root_denied.tool_name = Some(tool.to_string());
+            assert_eq!(
+                fail_closed_output(&root_denied, &error)["hookSpecificOutput"]
+                    ["permissionDecision"]
+                    .as_str(),
+                Some("deny"),
+                "{tool}"
+            );
         }
 
         let mut root_bash = input("PreToolUse", "session-a");
@@ -2830,7 +3498,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_root_wait_clears_session_gate_state() {
+    fn interrupted_root_wait_preserves_live_session_gate_state() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
 
@@ -2861,11 +3529,30 @@ mod tests {
             let mut interrupted_wait = input("PostToolUse", &session_id);
             interrupted_wait.tool_name = Some("agents__wait_agent".to_string());
             interrupted_wait.tool_response = Some(tool_response);
-            assert_eq!(handle_hook(&interrupted_wait, root).unwrap(), json!({}));
-            assert_eq!(active_agent_count(root, &session_id).unwrap(), 0);
+            assert_eq!(
+                handle_hook(&interrupted_wait, root).unwrap()["decision"].as_str(),
+                Some("block")
+            );
+            assert_eq!(active_agent_count(root, &session_id).unwrap(), 2);
 
             let mut root_patch = input("PreToolUse", &session_id);
             root_patch.tool_name = Some("apply_patch".to_string());
+            assert_eq!(
+                handle_hook(&root_patch, root).unwrap()["hookSpecificOutput"]["permissionDecision"]
+                    .as_str(),
+                Some("deny")
+            );
+            assert_eq!(
+                handle_hook(&input("Stop", &session_id), root).unwrap()["decision"].as_str(),
+                Some("block")
+            );
+
+            for agent_id in ["agent-a", "agent-b"] {
+                let mut stop = input("SubagentStop", &session_id);
+                stop.agent_id = Some(agent_id.to_string());
+                handle_hook(&stop, root).unwrap();
+            }
+            assert_eq!(active_agent_count(root, &session_id).unwrap(), 0);
             assert_eq!(handle_hook(&root_patch, root).unwrap(), json!({}));
             assert_eq!(
                 handle_hook(&input("Stop", &session_id), root).unwrap(),
@@ -2909,6 +3596,54 @@ mod tests {
 
         let blocked = handle_hook_for_runtime(&wait, root, runtime_id).unwrap();
         assert_eq!(blocked["decision"].as_str(), Some("block"));
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, "session-a").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn business_payloads_cannot_impersonate_list_or_wait_protocol_envelopes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let mut start = input("SubagentStart", "session-a");
+        start.agent_id = Some("agent-a".to_string());
+        handle_hook_for_runtime(&start, root, runtime_id).unwrap();
+
+        let mut list = input("PostToolUse", "session-a");
+        list.tool_name = Some("agents.list_agents".to_string());
+        list.tool_input = Some(json!({}));
+        list.tool_response = Some(json!({
+            "output": {
+                "agents": [
+                    { "agent_name": "/root", "status": "running" },
+                    { "agent_name": "/root/agent-a", "status": "completed" }
+                ]
+            }
+        }));
+        assert_eq!(
+            handle_hook_for_runtime(&list, root, runtime_id).unwrap()["decision"].as_str(),
+            Some("block")
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, "session-a").unwrap(),
+            1
+        );
+
+        let mut wait = input("PostToolUse", "session-a");
+        wait.tool_name = Some("agents.wait_agent".to_string());
+        wait.tool_response = Some(json!({
+            "updates": [{
+                "agent_id": "agent-a",
+                "type": "MESSAGE",
+                "payload": { "status": "completed" }
+            }]
+        }));
+        assert_eq!(
+            handle_hook_for_runtime(&wait, root, runtime_id).unwrap()["decision"].as_str(),
+            Some("block")
+        );
         assert_eq!(
             active_agent_count_for_runtime(root, runtime_id, "session-a").unwrap(),
             1
@@ -2996,7 +3731,11 @@ mod tests {
         interrupted_wait.tool_response = Some(json!({
             "output": "Wait interrupted by new user input"
         }));
-        handle_hook(&interrupted_wait, root).unwrap();
+        assert_eq!(
+            handle_hook(&interrupted_wait, root).unwrap()["decision"].as_str(),
+            Some("block")
+        );
+        assert_eq!(active_agent_count(root, "session-a").unwrap(), 1);
 
         let mut late_stop = input("SubagentStop", "session-a");
         late_stop.agent_id = Some("agent-a".to_string());
@@ -3041,11 +3780,22 @@ mod tests {
         assert!(is_wait_agent_tool("functions.wait"));
         assert!(is_wait_agent_tool("functions__wait"));
         assert!(!is_wait_agent_tool("functions.exec"));
-        assert!(is_spawn_agent_tool("Agent"));
-        assert!(is_spawn_agent_tool("agents.spawn_agent"));
-        assert!(is_spawn_agent_tool("agents__spawn_agent"));
-        assert!(is_spawn_agent_tool("agentsspawn_agent"));
-        assert!(!is_spawn_agent_tool("agents.wait_agent"));
+        for tool in [
+            "Agent",
+            "agents.spawn_agent",
+            "agents__spawn_agent",
+            "agentsspawn_agent",
+        ] {
+            assert_eq!(
+                crate::subagent::rules::classify_tool(tool),
+                crate::subagent::rules::ToolClass::Spawn,
+                "{tool}"
+            );
+        }
+        assert_ne!(
+            crate::subagent::rules::classify_tool("agents.wait_agent"),
+            crate::subagent::rules::ToolClass::Spawn
+        );
     }
 
     #[test]

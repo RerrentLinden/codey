@@ -26,7 +26,7 @@ pub(super) fn restore_owned_config_changes(
         current.as_table_mut(),
     );
     restore_codey_hooks(&original, &applied, &mut current);
-    restore_fastctx_direct_only_namespace(&original, &applied, &mut current);
+    restore_codey_direct_only_namespaces(&original, &applied, &mut current);
     if current.as_table().is_empty() {
         Ok(String::new())
     } else {
@@ -280,40 +280,43 @@ pub(super) fn restore_owned_model_provider_changes(
     }
 }
 
-fn restore_fastctx_direct_only_namespace(
+fn restore_codey_direct_only_namespaces(
     original: &toml_edit::DocumentMut,
     applied: &toml_edit::DocumentMut,
     current: &mut toml_edit::DocumentMut,
 ) {
-    let contains_fastctx = |entries: Option<&toml_edit::Array>| {
-        entries.is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-        })
-    };
-    let original_has_namespace = contains_fastctx(direct_only_tool_namespaces(original));
-    let applied_has_namespace = contains_fastctx(direct_only_tool_namespaces(applied));
-    if original_has_namespace == applied_has_namespace {
-        return;
-    }
-
-    let Some(current_namespaces) = direct_only_tool_namespaces_mut(current) else {
-        return;
-    };
-    if applied_has_namespace {
-        let fastctx_index = current_namespaces
-            .iter()
-            .position(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE));
-        if let Some(index) = fastctx_index {
-            current_namespaces.remove(index);
+    for namespace in [
+        CODEY_FASTCTX_NAMESPACE,
+        crate::subagent_control_mcp::NAMESPACE,
+    ] {
+        let contains_namespace = |entries: Option<&toml_edit::Array>| {
+            entries.is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.as_str() == Some(namespace))
+            })
+        };
+        let original_has_namespace = contains_namespace(direct_only_tool_namespaces(original));
+        let applied_has_namespace = contains_namespace(direct_only_tool_namespaces(applied));
+        if original_has_namespace == applied_has_namespace {
+            continue;
         }
-    } else {
-        let namespace_is_missing = current_namespaces
+
+        let Some(current_namespaces) = direct_only_tool_namespaces_mut(current) else {
+            continue;
+        };
+        if applied_has_namespace {
+            let namespace_index = current_namespaces
+                .iter()
+                .position(|entry| entry.as_str() == Some(namespace));
+            if let Some(index) = namespace_index {
+                current_namespaces.remove(index);
+            }
+        } else if current_namespaces
             .iter()
-            .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE));
-        if namespace_is_missing {
-            current_namespaces.push(CODEY_FASTCTX_NAMESPACE);
+            .all(|entry| entry.as_str() != Some(namespace))
+        {
+            current_namespaces.push(namespace);
         }
     }
 }
@@ -345,7 +348,13 @@ fn restore_table_changes(original: &Table, applied: &Table, current: &mut Table)
             continue;
         }
 
-        if key == CODEY_FASTCTX_SERVER_ID && original_item.is_none() {
+        if [
+            CODEY_FASTCTX_SERVER_ID,
+            crate::subagent_control_mcp::SERVER_ID,
+        ]
+        .contains(&key.as_str())
+            && original_item.is_none()
+        {
             let still_codey_owned = applied_item
                 .and_then(Item::as_table)
                 .zip(current.get(&key).and_then(Item::as_table))
@@ -404,40 +413,41 @@ fn restore_owned_value(
 ) -> bool {
     match key {
         "direct_only_tool_namespaces" => {
-            let original_has_namespace = original.and_then(Item::as_array).is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-            });
-            let applied_has_namespace = applied.and_then(Item::as_array).is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-            });
-            if original_has_namespace == applied_has_namespace {
-                return false;
-            }
             let Some(entries) = current.and_then(Item::as_array_mut) else {
                 return false;
             };
-            if applied_has_namespace {
-                let Some(index) = entries
+            let mut changed = false;
+            for namespace in [
+                CODEY_FASTCTX_NAMESPACE,
+                crate::subagent_control_mcp::NAMESPACE,
+            ] {
+                let original_has_namespace =
+                    original.and_then(Item::as_array).is_some_and(|items| {
+                        items.iter().any(|entry| entry.as_str() == Some(namespace))
+                    });
+                let applied_has_namespace = applied.and_then(Item::as_array).is_some_and(|items| {
+                    items.iter().any(|entry| entry.as_str() == Some(namespace))
+                });
+                if original_has_namespace == applied_has_namespace {
+                    continue;
+                }
+                if applied_has_namespace {
+                    let namespace_index = entries
+                        .iter()
+                        .position(|entry| entry.as_str() == Some(namespace));
+                    if let Some(index) = namespace_index {
+                        entries.remove(index);
+                        changed = true;
+                    }
+                } else if entries
                     .iter()
-                    .position(|entry| entry.as_str() == Some(CODEY_FASTCTX_NAMESPACE))
-                else {
-                    return false;
-                };
-                entries.remove(index);
-                true
-            } else if entries
-                .iter()
-                .all(|entry| entry.as_str() != Some(CODEY_FASTCTX_NAMESPACE))
-            {
-                entries.push(CODEY_FASTCTX_NAMESPACE);
-                true
-            } else {
-                false
+                    .all(|entry| entry.as_str() != Some(namespace))
+                {
+                    entries.push(namespace);
+                    changed = true;
+                }
             }
+            changed
         }
         "developer_instructions" | "subagent_developer_instructions" => {
             let Some(current) = current else {

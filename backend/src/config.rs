@@ -168,6 +168,33 @@ impl SubagentRoleConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct SubagentProviderConfig {
+    #[serde(default = "default_subagent_model")]
+    pub model: String,
+    #[serde(default = "default_subagent_reasoning_effort")]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub roles: BTreeMap<String, SubagentRoleConfig>,
+}
+
+impl Default for SubagentProviderConfig {
+    fn default() -> Self {
+        Self {
+            model: default_subagent_model(),
+            reasoning_effort: default_subagent_reasoning_effort(),
+            roles: default_subagent_roles(),
+        }
+    }
+}
+
+impl SubagentProviderConfig {
+    fn normalize(&mut self) {
+        normalize_subagent_config(&mut self.model, &mut self.reasoning_effort, &mut self.roles);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct CodeyConfig {
     #[serde(default)]
     pub settings_revision: u64,
@@ -240,6 +267,10 @@ pub struct CodeyConfig {
     /// `default` role so older Codey stores and Codex builds remain readable.
     #[serde(default)]
     pub subagent_roles: BTreeMap<String, SubagentRoleConfig>,
+    /// Per-provider subagent selections. The scalar and role fields above are
+    /// the active provider's compatibility representation.
+    #[serde(default)]
+    pub subagent_config_by_provider: BTreeMap<String, SubagentProviderConfig>,
     /// Automatically dismisses Codex's full-access safety notice in the
     /// renderer. Opt-in so the native warning remains visible by default.
     #[serde(default)]
@@ -284,6 +315,7 @@ impl Default for CodeyConfig {
             subagent_model: default_subagent_model(),
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
             subagent_roles: default_subagent_roles(),
+            subagent_config_by_provider: BTreeMap::new(),
             hide_full_access_warning: false,
             show_account_usage_in_header: true,
             update_manifest_url: default_update_manifest_url(),
@@ -318,39 +350,21 @@ impl CodeyConfig {
         normalize_model_lists(&mut self.declared_official_models_by_provider);
         normalize_upstream_model_lists(&mut self.upstream_models_by_provider);
         normalize_model_map(&mut self.default_model_by_provider);
-        normalize_subagent_selection(
+        normalize_subagent_config(
             &mut self.subagent_model,
             &mut self.subagent_reasoning_effort,
+            &mut self.subagent_roles,
         );
-        self.subagent_roles
-            .retain(|role, _| SUBAGENT_ROLE_IDS.contains(&role.as_str()));
-        if self.subagent_roles.is_empty() {
-            self.subagent_roles =
-                uniform_subagent_roles(&self.subagent_model, &self.subagent_reasoning_effort);
-        } else {
-            let fallback = self
-                .subagent_roles
-                .get(SUBAGENT_ROLE_DEFAULT)
-                .cloned()
-                .unwrap_or_else(|| {
-                    SubagentRoleConfig::new(
-                        self.subagent_model.clone(),
-                        self.subagent_reasoning_effort.clone(),
-                    )
-                });
-            for role in SUBAGENT_ROLE_IDS {
-                self.subagent_roles
-                    .entry(role.to_string())
-                    .or_insert_with(|| fallback.clone());
-            }
-            for selection in self.subagent_roles.values_mut() {
-                normalize_subagent_selection(&mut selection.model, &mut selection.reasoning_effort);
-            }
-        }
-        if let Some(default_role) = self.subagent_roles.get(SUBAGENT_ROLE_DEFAULT) {
-            self.subagent_model.clone_from(&default_role.model);
-            self.subagent_reasoning_effort
-                .clone_from(&default_role.reasoning_effort);
+        self.subagent_config_by_provider
+            .retain(|provider_id, selection| {
+                selection.normalize();
+                !provider_id.trim().is_empty()
+            });
+        if let Some(provider_id) = self.current_provider_id().map(ToString::to_string) {
+            let active = self.active_subagent_config();
+            self.subagent_config_by_provider
+                .entry(provider_id)
+                .or_insert(active);
         }
         self.webhook.normalize();
         self.prompt_optimization.normalize();
@@ -412,6 +426,37 @@ impl CodeyConfig {
         self.current_provider_id()
             .and_then(|provider_id| self.default_model_by_provider.get(provider_id))
             .map(String::as_str)
+    }
+
+    pub(crate) fn remember_current_subagent_config(&mut self) {
+        let Some(provider_id) = self.current_provider_id().map(ToString::to_string) else {
+            return;
+        };
+        let mut active = self.active_subagent_config();
+        active.normalize();
+        self.subagent_config_by_provider.insert(provider_id, active);
+    }
+
+    pub(crate) fn restore_current_subagent_config(&mut self) {
+        let Some(provider_id) = self.current_provider_id().map(ToString::to_string) else {
+            return;
+        };
+        let Some(mut saved) = self.subagent_config_by_provider.get(&provider_id).cloned() else {
+            self.remember_current_subagent_config();
+            return;
+        };
+        saved.normalize();
+        self.subagent_model = saved.model;
+        self.subagent_reasoning_effort = saved.reasoning_effort;
+        self.subagent_roles = saved.roles;
+    }
+
+    fn active_subagent_config(&self) -> SubagentProviderConfig {
+        SubagentProviderConfig {
+            model: self.subagent_model.clone(),
+            reasoning_effort: self.subagent_reasoning_effort.clone(),
+            roles: self.subagent_roles.clone(),
+        }
     }
 }
 
@@ -505,6 +550,35 @@ fn normalize_subagent_selection(model: &mut String, reasoning_effort: &mut Strin
     *reasoning_effort = reasoning_effort.trim().to_ascii_lowercase();
     if !SUBAGENT_REASONING_EFFORTS.contains(&reasoning_effort.as_str()) {
         *reasoning_effort = default_subagent_reasoning_effort();
+    }
+}
+
+fn normalize_subagent_config(
+    model: &mut String,
+    reasoning_effort: &mut String,
+    roles: &mut BTreeMap<String, SubagentRoleConfig>,
+) {
+    normalize_subagent_selection(model, reasoning_effort);
+    roles.retain(|role, _| SUBAGENT_ROLE_IDS.contains(&role.as_str()));
+    if roles.is_empty() {
+        *roles = uniform_subagent_roles(model, reasoning_effort);
+    } else {
+        let fallback = roles
+            .get(SUBAGENT_ROLE_DEFAULT)
+            .cloned()
+            .unwrap_or_else(|| SubagentRoleConfig::new(model.clone(), reasoning_effort.clone()));
+        for role in SUBAGENT_ROLE_IDS {
+            roles
+                .entry(role.to_string())
+                .or_insert_with(|| fallback.clone());
+        }
+        for selection in roles.values_mut() {
+            normalize_subagent_selection(&mut selection.model, &mut selection.reasoning_effort);
+        }
+    }
+    if let Some(default_role) = roles.get(SUBAGENT_ROLE_DEFAULT) {
+        model.clone_from(&default_role.model);
+        reasoning_effort.clone_from(&default_role.reasoning_effort);
     }
 }
 
@@ -966,6 +1040,51 @@ mod tests {
             config.subagent_roles[SUBAGENT_ROLE_WORKER],
             SubagentRoleConfig::new("fallback-model", "high")
         );
+    }
+
+    #[test]
+    fn subagent_config_is_remembered_per_provider_and_new_providers_inherit() {
+        let mut provider_a = ProviderProfile::new("A");
+        provider_a.id = "provider-a".into();
+        let mut provider_b = ProviderProfile::new("B");
+        provider_b.id = "provider-b".into();
+        let mut config = CodeyConfig {
+            active_profile_id: provider_a.id.clone(),
+            profiles: vec![provider_a, provider_b],
+            subagent_model: "model-a".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: uniform_subagent_roles("model-a", "high"),
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        assert_eq!(
+            config.subagent_config_by_provider["provider-a"].model,
+            "model-a"
+        );
+
+        config.active_profile_id = "provider-b".into();
+        config.restore_current_subagent_config();
+        assert_eq!(config.subagent_model, "model-a");
+        assert_eq!(
+            config.subagent_config_by_provider["provider-b"].model,
+            "model-a"
+        );
+
+        config.subagent_model = "model-b".into();
+        config.subagent_reasoning_effort = "medium".into();
+        config.subagent_roles = uniform_subagent_roles("model-b", "medium");
+        config.remember_current_subagent_config();
+
+        config.active_profile_id = "provider-a".into();
+        config.restore_current_subagent_config();
+        assert_eq!(config.subagent_model, "model-a");
+        assert_eq!(config.subagent_reasoning_effort, "high");
+
+        config.active_profile_id = "provider-b".into();
+        config.restore_current_subagent_config();
+        assert_eq!(config.subagent_model, "model-b");
+        assert_eq!(config.subagent_reasoning_effort, "medium");
     }
 
     #[test]

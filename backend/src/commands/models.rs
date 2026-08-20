@@ -73,8 +73,11 @@ pub async fn sync_cc_switch_state(
 ) -> Result<cc_switch::CcSwitchStatus, String> {
     let home = codex_home();
     let mut status = sync_cc_switch_state_with(state, move |config| {
+        let mut source = config.clone();
+        source.remember_current_subagent_config();
         let (mut next, mut status) =
-            cc_switch::sync_current_provider(&config, home).map_err(|error| error.to_string())?;
+            cc_switch::sync_current_provider(&source, home).map_err(|error| error.to_string())?;
+        next.restore_current_subagent_config();
         subagent_policy::reconcile_for_current_provider(&mut next, home, status.provider.official);
         next = next.normalize();
         status.changed = next != config;
@@ -1022,6 +1025,13 @@ fn config_with_reconciled_subagent_defaults(
     persisted
         .subagent_roles
         .clone_from(&reconciled.subagent_roles);
+    if let Some(provider_id) = reconciled.current_provider_id()
+        && let Some(selection) = reconciled.subagent_config_by_provider.get(provider_id)
+    {
+        persisted
+            .subagent_config_by_provider
+            .insert(provider_id.to_string(), selection.clone());
+    }
     persisted.normalize()
 }
 

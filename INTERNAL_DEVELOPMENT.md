@@ -35,8 +35,8 @@ Codey 是一个无界面的 Rust 桌面辅助进程，通过 CDP 连接官方 Co
 - macOS Crashpad 磁盘保护与 Trace 共用诊断存储界面，但保持独立策略和开关。它只检查 `Application Support/Codex/Crashpad/pending` 与旧版 `Application Support/com.openai.codex/web/Crashpad/pending` 两个 allowlist 目录，不递归搜索其他产品数据；只把 UUID 命名的 `.dmp` 与 `_sidecar.json` 识别为同一报告组，跳过符号链接、未知文件、子目录及 Crashpad 的 `new`、`completed`、`attachments` 和设置文件。保护默认开启：启动时执行一次，此后每 5 分钟检查；总占用超过 512 MiB 时按最旧完整报告组回收到 384 MiB，至少保留最近 10 分钟写入。自动收敛不删除孤儿文件；手动清理可额外删除静默超过 24 小时的已识别孤儿。删除前后复核文件长度、修改时间及 Unix inode/device，消失或发生变化按并发竞争跳过。扫描、部分删除或后台任务失败只进入本地错误日志和诊断快照，不阻断 Codex 启动。
 - Windows 默认开启新版卡顿补丁：Codey 在 Codex 主进程执行前通过仅绑定 `127.0.0.1` 的临时 Inspector，把会反复触发原生 DLL 加载失败的 `@worklouder/device-kit-oai` 替换为无设备桩，并断路每 30 秒启动一次的进程快照 Worker。已知 `child-process-snapshot-worker` 文件名或 `name: "child-process-snapshot"` Worker 语义名称会直接识别；文件改名、哈希化、改用 file/data URL 或 eval 且没有语义名称时，则读取有界 Worker 源码，并只在同时命中 PowerShell / pwsh、`Get-CimInstance` / `Get-WmiObject`、`Win32_Process`、`Win32_PerfFormattedData_PerfProc_Process` / RawData 变体及 Worker 通信特征时断路；源码判定缓存以文件 device、inode、长度、mtime 与 ctime 身份为键并采用最多 256 项的 LRU 淘汰，同一路径文件被替换后不会复用旧结论。命中后直接返回合法空快照，不再启动 PowerShell；普通 Worker 和用户主动执行的 PowerShell 不受影响。替换 `worker_threads.Worker` 后还会同步 Node 的 ESM 内建导出，避免新版 Codex 通过 `import { Worker } from "node:worker_threads"` 绕过拦截。主进程保留 Worker 包装状态、ESM 同步状态、观察时长、源码检查与实际阻断计数，并通过现有 IPC 状态桥交给 Renderer 有界复核；界面只有在实际阻断过目标采样时才把该保护标记为已确认。观察窗口内没有匹配到目标 Worker 时仍保持待确认，并明确提示当前 WMI 来源可能尚未被识别。Inspector 随后立即关闭，不修改 Microsoft Store 安装目录。
 - Windows 受控启动额外通过 Chromium feature 参数关闭后台进程 EcoQoS。Chromium 在 Windows 11 会把后台 Renderer 调度到节能核心；Codex 首屏的 `app://` 资源改写和 CDP bridge 恰好运行在该 Renderer 内，窗口尚未前台化时可能因此出现数秒无响应。该参数只应用于 Windows 进程树，不改变 macOS/Linux，也不等同于关闭 GPU。
-- Renderer 模型与 Fast 控件补丁同时支持旧式 gate 和新版 React Compiler 生成的赋值形态。新版模型过滤器若已经通过 `isCustomModelProvider` 原生绕过官方 allowlist，会按语义识别为兼容而不再记录假失败；service-tier 控件、Fast 快捷键和模型触发器仍要求各自唯一命中，避免宽泛改写。协议层除保留已知 chunk 语义名外，还会从 `index.html` 的脚本入口发现最多 128 个哈希化资源路径，未被入口引用的未知资源保持原样且不会克隆；改写响应会清除长度、压缩与实体校验头，避免缓存复用旧实体元数据。兼容门禁使用合成回归 fixture，并在维护时可对本机实际 `app-initial` 资源执行只读验证。
 - Windows packaged-app 启动不再把 `ActivateApplication` 成功等同于“调试参数已落到新进程”：激活前后的 PID 快照若表明 Store 复用了旧单实例，则按启动快照的创建时间复核进程身份后清理并只重试一次，再次复用时立即返回明确错误，不进入 CDP 盲等；安全终止不再把未经创建时间复核的 PID 交给 `taskkill`，避免 PID 复用误杀。Renderer target 选择兼容标题尚未就绪的 `app://-/index.html` 主页面，仍要求 page WebSocket 并排除 Avatar Overlay；注入 deadline 命中时会保留当前阶段和脱敏后的最近失败分类，页面标题、WebSocket 地址、URL 查询参数及脚本异常正文不进入该错误，便于区分页面枚举、target 选择、bridge 安装、浮层验证与状态读取。
+- Renderer 模型与 Fast 控件补丁同时支持旧式 gate 和新版 React Compiler 生成的赋值形态。新版模型过滤器若已经通过 `isCustomModelProvider` 原生绕过官方 allowlist，会按语义识别为兼容而不再记录假失败；service-tier 控件、Fast 快捷键和模型触发器仍要求各自唯一命中，避免宽泛改写。协议层除保留已知 chunk 语义名外，还会从 `index.html` 的脚本入口发现最多 128 个哈希化资源路径，未被入口引用的未知资源保持原样且不会克隆；改写响应会清除长度、压缩与实体校验头，避免缓存复用旧实体元数据。兼容门禁使用合成回归 fixture，并在维护时可对本机实际 `app-initial` 资源执行只读验证。
 - macOS / Windows 启动补丁会从 Codex app-server 的本次进程参数中移除 `--analytics-default-enabled`，追加进程级 `analytics.enabled=false` 覆盖，并在主 bundle 中显式关闭桌面主进程与 worker 的 CES 批量遥测，不改写用户配置。补丁同时移除 Codex 每 30 秒向当前 Renderer 拉取完整 app-state、仅写入调试日志与 Sentry breadcrumb 的诊断 heartbeat，并把每次 `browser-window-focus` 触发的外部插件状态检查合并为 30 秒 leading + trailing 节流，减少频繁切换窗口时对 Chrome profile、插件 marketplace 和本地清单的重复扫描；Renderer 就绪或显式触发的诊断快照仍保留，窗口内发生的插件变化仍会在尾部补做一次检查。每轮任务结束且全部已观察 turn 都进入终态后，执行回收继续清理可安全重建的 `node_repl` helper，并通过 Codex bundle 自带的 `child-process-snapshot-worker` 重新建立 app-server 子进程归属；新版主 bundle 已移除旧的 `listProcessManagerSnapshot` / `child-process-kill` 接口，因此补丁不再依赖该内部 process manager。MCP 回收只处理同一 app-server 下完整命令完全相同、已经并存超过 30 秒的重复根进程：首次快照后等待静默屏障，再用第二份快照按 PID、父 PID、命令和启动时间复核，保留最新根进程，并从最深子进程开始向上发送 `SIGTERM`。唯一 MCP、最新实例、普通 app-server 子进程和活跃任务都不会被终止，也不会为了回收而反复执行 MCP 能力发现；快照和终止计数通过启动补丁状态保留供诊断。
 - Windows Git 请求保护会在 Codex 主进程启动前原位包装 Electron 的 `ipcMain.handle` / `handleOnce` / `on` / `once` 注册方法，并按消息内容识别 Git worker 请求和 Codey 状态探针，不再依赖 Codex 的具体 IPC channel 名；`electron` 与 `electron/main` 两种主进程入口都覆盖。这样 Codex 调整 channel 名或注册方式后，后续 handler 仍会被保护。同一包装层提供 Git 与 WMI 的只读状态握手；针对新版 preload 只等待 `ipcRenderer.invoke`、不再向页面返回结果的行为，主进程还会通过 Renderer 消息通道回传带请求 ID 的状态事件，页面只有收到匹配回执后才确认保护，不能把空返回值当作成功。旧客户端或主进程补丁降级时，Renderer 脚本仍尝试包装 `electronBridge.sendWorkerMessageFromView("git", ...)` 作为兼容回退；若 bridge 晚于注入出现，会使用有界退避重试。直接请求只识别 `git-origins`、`status-summary`、`review-summary` 与 `branch-diff-stats`；`subscribe-live-query` 按订阅语义限流，不再依赖内部只读查询名，也不要求消息重复携带 `workerId`。写操作、未知直接方法、其他 worker 和非 Windows 平台完全透传。首批请求使用容量为 3 的令牌桶通过，持续速率补充为每秒 1 个，同一仓库与查询键至少间隔 2 秒；等待队列总量封顶 48、单键封顶 6，最长等待 15 秒。尚未发送的请求收到原生 cancel 时会从队列移除。Renderer 回退还能对传输或可观察的 worker 响应失败执行最高 15 秒退避；两层都不伪造 Git 结果，也不缓存或合并不同 request ID，避免让 Codex worker 的 pending 请求失去对应响应。
 - macOS / Windows 默认开启兼容型宠物精简：Codey 先把 Codex 自带的 `electron-avatar-overlay-open` 启动状态设为关闭，使宠物默认保持收起；Codex 设置页的 Pets 入口会在激活前按宠物专属语义 ID 屏蔽，设置 chunk 对 `codex-avatar` 的静态依赖替换成无资源桩，避免设置页预先载入宠物预览和内置精灵图，个人菜单和命令菜单中的宠物控件也继续屏蔽。主 bundle 中 Avatar Overlay manager 的启动预热会变成 no-op，普通启动不再提前创建长期隐藏的 `BrowserWindow`；同时匹配透明、无边框、不可聚焦、置顶和任务栏隐藏语义的 Overlay 会在隐藏时强制恢复后台节流，重新显示时再恢复上游显式关闭节流的设置。manager、`initialRoute=/avatar-overlay`、专用 preload 与原生 `avatar-overlay.node` 仍保留，用户主动使用官方语音时可通过原生 presentation 路径按需创建。不得按窗口尺寸、`Pet Surface` 标题或 Avatar Overlay 通用 ID 全局拦截普通窗口。关闭开关后会在下一次由 Codey 启动 Codex 时恢复宠物、控件及原生预热，不改写 `app.asar`。
@@ -133,27 +133,276 @@ Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周�
 - 提示词优化：`promptOptimization.enabled` 默认为 `false`，打开后即时生效且不要求重启。配置使用脱敏保存的 `baseUrl`、`apiKey`、`protocol`、`model` 和可编辑 `instruction`；界面直接展示内置默认指令，空持久化值仍由后端回落到同一默认值。第三方线路可调用独立命令一次性读取活动 profile、Codex 本地配置与 CC Switch 当前源，复制真实 URL、Key、协议和默认模型并立即持久化；官方登录线路不展示同步按钮，后端也会拒绝同步。同步返回 renderer 前仍清空 Key，只保留 `apiKeyConfigured`；依赖额外请求头但没有标准 API Key 的线路要求手动配置独立接口。测试和模型列表命令可使用未保存草稿并回填被脱敏的 Key，请求按保存的 Chat Completions 或 Responses 协议发送，Responses 结果兼容 `output_text` 与标准 `output[].content[].text`。`optimize_prompt` 只从 renderer 接收待优化文本；输入最多 32K 字符，优化结果最多 8192 字符。响应与错误预览使用流式有界读取，非成功 HTTP 状态按失败返回，404 自动补 `/v1` 重试后以重试响应作为最终诊断。前端同步、测试和模型列表操作互斥，前端兜底超时长于后端请求时限；composer 观察器在输入控件尚未找到、已经断开、导航事件或与 composer 相关的 DOM 变化时重新扫描，无关页面 mutation 不触发全局查询与布局检查。
 - Codey 子代理角色与调度增强：`subagentOptimization` 默认为 `false`。关闭时设置页只显示开关与说明；开启后显示“快速定位、深度检索、视觉分析、代码实施、视觉实施”五类用户可配置的专用任务，每类都有用途提示、独立模型和推理档位。`default` 仍作为只读的内部兼容角色注册并保留旧配置，但不再展示给用户，也不允许根提示主动选择。候选由受支持的 `officialModels` 与全部 `thirdPartyModels` 组成；新版 Codex 将其中不具备协调器标记的模型作为 leaf model 使用，因此不再设置静态 V2 白名单。线路切换、启动和手动刷新模型目录时逐角色校验，已保存模型仍可用时保留，否则依次尝试线路默认模型、Terra 和首个可用模型，推理档位仅在目标模型不支持时回退。旧版单一 `subagentModel` / `subagentReasoningEffort` 配置首次加载时会无损扩展到六个运行角色，`default` 角色继续同步这两个兼容字段。已启用运行时保存角色配置或模型选择导致角色回退时，会逐个原子替换六个运行文件，再校验整组并更新 applied snapshot；任一步失败都按租约快照恢复旧文件和旧状态。成功后清除这部分 `restartRequired`，失败则保留旧运行文件并返回热更新错误。首次启用、关闭或其他运行边界变化仍要求重启。角色 TOML 中的 `sandbox_mode` 只定义默认权限；Codex 会重新应用父任务当前的实时 sandbox / approval 覆盖，因此界面和文档不得把角色名描述为独立安全边界。
 - 子代理约束文件与路由：可编辑规则正文全部位于 `codex-constraints/`，根代理规则、FastCtx 指引和协作提示分别使用 `root-instructions.md`、`fastctx-instructions.md` 与 `collaboration-hint.md`，子代理源文件使用 `subagent.toml` 和 `agents/<role>.toml`。Codey 只对内容仍精确等于历史内置模板的独立文件执行一次性迁移；用户修改过的指令不会再靠全文检索替换。开启增强时还会通过 `features.multi_agent_v2.multi_agent_mode_hint_text` 注入主动委派模式，覆盖 Codex 默认的“仅显式请求才派生”限制，使根代理重新按任务收益决定是否使用子代理；关闭增强或退出租约后恢复用户基线。根约束采用 direct-first 但更积极使用只读探索：回答、单一事实、已知位置且不超过两个小文件/三次本地工具调用、即将修改的确切代码、奠基性文档和顺序依赖任务直接处理；至少两次独立定位、两个并行分支且每支约两次调用并合计约五次、跨至少两个目录或四个候选文件的归纳，以及大量外围材料都应考虑只读委派。独立写入实现仍以约六次调用和互斥 ownership 为较高参考门槛。上述数量只用于提示层软路由，不再写入运行时契约；只有并行任务的 `branch_calls` 用于可恢复预算，且不会把任务规模变成“小任务禁止派生”的硬条件。没有清晰收益时仍由主代理直接处理。新配置和无效并发配置的中央并发默认值为 2，合法的旧 `max_threads` 或用户显式 `max_concurrent_threads_per_session` 原样保留。根提示默认最多派生两个子代理；超过两个还要求运行时已显式配置更高并发，并且用户明确要求大规模并行或至少三个真正独立的分支。任务胶囊不复制父对话，结果以 `completed/partial/blocked` 状态、最多五条关键证据和 gaps 返回；确定性测试优先于额外 verifier，证据冲突不按多数票裁决。每次启动会把子代理源文件、当前 FastCtx 指引和设置页选择的模型/档位合成为 Codey-owned `codex-constraints/runtime/` 副本，用户只编辑源文件，不直接编辑运行时副本；角色设置热更新复用同一合成和校验流程，并保持注册路径不变；热更新是否注入 FastCtx 指引按租约记录的 `fastctx_command` 判定（本次运行已注册内置 server 才注入），与启动路径按实际注册判定的语义一致，而不是读取当前配置开关。普通模式在临时 `config.toml` 中仅注册六个 `[agents.<role>]` 的 description 与 `config_file` 路径，根规则、FastCtx 指引、协作提示和主动委派模式通过进程级 `-c` 覆盖注入；CC Switch Live 隔离模式连这些角色注册也全部使用进程级覆盖，并在目录可用时用绝对路径覆盖 `model_catalog_json`。两种模式都不把 Codey 规则正文写入用户 `config.toml`、`AGENTS.md` 或 `agents/default.toml`。该目录保留官方协调器标记并让第三方合成模型保持未标记 leaf 状态，所以切换线路不会覆盖 Codey 约束、污染 CC Switch 配置或夸大模型能力。根代理路由提示按任务选择 `agent_type`，模型与推理档位由对应角色 TOML 固定。
-- 子代理等待门禁与 Hook：Codey 显式开启 `features.multi_agent_v2.wait_agent_enabled`，并把等待上限设为 120 秒。根代理先完成同一批独立任务的派发，再调用 `agents.wait_agent`；mailbox 的 `MESSAGE` 或其他局部更新可用于 `agents.send_message`、`agents.followup_task`、`agents.interrupt_agent`、`agents.list_agents` 等必要协调，随后继续等待。在每个已派生代理进入终态前，仍禁止非协作本地工具和根任务结束；终态包括 `FINAL_ANSWER`、`task_complete`、`completed`、`errored`、`error`、`failed`、`shutdown` 和 `not_found`，`running`、`pending_init` 与 `interrupted` 仍视为非终态。Codey 注册 `PreToolUse`、`PostToolUse`、`SubagentStart`、`SubagentStop`、`Stop` 与 `SessionEnd` 六类同步 command hook；`PostToolUse` 使用 `*` matcher，并在进程内先检查工具输入，只有派生、状态对账或带精确验收标记的命令才访问对应账本。归属到明确 `agent_id` 的终态响应会直接移除对应标记；Hook 输入同时接受 snake_case、camelCase、`agent_name` 和 `subagent_id` 常见别名。生命周期事件缺少代理 ID 时会写入协议诊断状态并建立保守的匿名活动标记，未知 wait/list 形状也会显示兼容性原因；后续完整 `list_agents` 快照可对账释放，持续无法恢复时仍受 10 分钟 Stop 兜底约束，不会静默把子代理当成根代理继续执行。V2 `wait_agent` 只返回 mailbox 摘要且不带子线程 ID 时，门禁会提示根代理调用不带 `path_prefix` 的完整 `list_agents` 对账。状态解析兼容 `agents/subagents/children` 容器与 `agent_status/status/state` 字段；快照只要确认除根代理外已经没有非终态子代理，就清理当前运行代次的整组标记，筛选快照、未知状态或混合终态/运行态不会整体解锁。普通模式把 Hook 定义及精确信任哈希放入临时租约，CC Switch Live 模式则把 Hook 合并到独立 `~/.codex/hooks.json`，仅把稳定路径计算的信任哈希作为进程覆盖项。已有用户 Hook 保持原顺序与内容，Codey 只增删带自身命令标记的 group。运行状态按 Codey 运行代次、`session_id` 和 `agent_id` 隔离；活动记录使用版本化 JSON 和同目录原子替换，旧运行崩溃遗留的标记不会阻塞新运行，旧代次迟到的 Stop/SessionEnd 也不能删除新代次状态。子代理不能继续派生，根代理有活动子代理时只能调用 `agents.*` 协作工具，`PostToolUse` 与 `Stop` 会在尚未汇合时维持门禁。完整快照只剩 `pending_init` 时会记录首次观察时间；持续 10 分钟仍无进展即回收该运行代次的遗留状态。若协作工具未注册或返回不可识别错误，第一个受阻的根 `Stop` 会启动同样的 10 分钟兜底计时；结构有效的 `wait_agent` 或 `list_agents` 响应会重置该计时，避免正常长任务按绝对 TTL 被误删。该重置只影响 10 分钟停滞计时；根 `Stop` 自首次受阻起另有 60 分钟绝对上限，超时即放行并写入协议诊断，但不清理账本，遗留状态仍由停滞与代次机制兜底。根代理的 `wait_agent` 被用户输入或手动停止中断时，Hook 只接受结构化中断字段、事件判别值或精确的顶层等待中断短语，再清理当前运行代次与该 `session_id` 的活动标记；普通子代理消息正文不会触发解锁，随后迟到的 `SubagentStop` 按幂等事件处理。升级前遗留且无法验证的旧格式活动标记不会继续阻塞会话。Hook 状态读取失败时对根代理 fail-closed，子代理的写入与命令工具同样拒绝、仅放行明确只读的已知工具；Hook 输入超过 1 MiB 或 JSON 解析失败时输出同时携带 `permissionDecision=deny` 与 `decision=block` 的拒绝，不再静默非零退出。旧 `[agents]` 迁移把合法的正整数 `max_threads` 原样转成 `max_concurrent_threads_per_session`，无效并发值回落到 2，移除 `max_depth` 并保留 `interrupt_message`；`features.multi_agent_v2.expose_spawn_agent_model_overrides` 保持关闭，防止派生调用绕过逐角色模型配置。
-- 子代理 Hook 来源兼容：`HookInput` 同时读取官方 `agent_id` / `agent_type` 的 snake_case、camelCase 与现有子代理别名。生命周期事件缺少 ID、但仍携带非空子代理类型时，当前运行代次会写入独立的来源能力观察标记；后续无子代理上下文的根 `agents.spawn_agent` 可在仅存在 MissingAgentId 诊断时继续进入预算与 ownership 门禁，不再被匿名活动标记误判为嵌套派生。带 ID 或类型的调用始终按子代理处理：所有派生别名继续拒绝，只有 ID 可用时才执行 ownership 校验；仅有类型时只放行已知只读工具，写入和命令工具 fail-closed。ID 与类型同时缺失、wait/list 结构异常或已触发绝对 Stop 诊断时仍保持原有保守拒绝，完整 `list_agents` 继续负责匿名标记对账。
+- 子代理等待门禁与 Hook：Codey 显式开启 `features.multi_agent_v2.wait_agent_enabled`，等待上限为 120 秒。根代理先完成同批派发，再用 `agents.wait_agent`/`agents.list_agents` 汇合；每个已派生代理终态前，根代理只允许 `agents.*` 协作，本地读取、网络、命令、写入和根任务结束全部阻断；child 仅可用 `agents.send_message` 定向 `/root` 回报，不能查看、等待、中断或追派其他代理。终态为 `FINAL_ANSWER`、`task_complete`、`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`；`running`、`pending_init`、`interrupted` 仍是活动状态。Codey 注册 `PreToolUse`、`PostToolUse`、`SubagentStart`、`SubagentStop`、`Stop`、`SessionEnd` 六类同步 Hook；`PostToolUse` 暂用 `*` matcher，但进程内只对派生、状态对账、批次决策和精确验收命令访问账本。Hook 输入兼容常见 ID/type 别名，完整无筛选 `list_agents` 负责最终对账。状态以 ledger 为主、marker 仅为旧版回退；10 分钟停滞或 60 分钟绝对 Stop 上限到达时，先在 ledger 中原子把活动 attempt 转为 `recovered/lost` 并 fence，再清理 marker，避免下一次 Stop 重新复活。绝对上限仍保留协议诊断和未清偿写验收债。Hook 状态损坏时根和子代理的数据工具全部 fail-closed；root 只保留状态对账，child 只保留向 `/root` 定向回报。输入超过 1 MiB 或 JSON 无法解析时同时返回兼容 deny/block。运行代次、session 和 fencing 隔离迟到事件；旧 `[agents]` 并发迁移与模型覆盖限制保持不变。
+- 子代理 Hook 来源兼容：`HookInput` 同时读取官方 `agent_id` / `agent_type`、`turn_id`、`transcript_path` / `agent_transcript_path` 的 snake_case、camelCase 及现有别名。带 child ID 或类型的调用按子代理处理；活动批次中缺少 child 身份时，只允许与首个根派生调用完全相同的 `turn_id` 继续批内编排，其他匿名调用仅可等待或执行无筛选 `list_agents` 对账。`PostToolUse` 只把顶层或已知 provider envelope 中与本次 spawn 输入精确相等的 `/root/<task_id>` 记为 provisional task 关联；Codex 生命周期/工具 Hook 暴露的不透明 child UUID 还必须通过 child transcript 首行 `session_meta` 完成第二阶段绑定。该桥接要求 transcript 是 `~/.codex/sessions` 下的非 symlink JSONL、文件名后缀与 UUID 一致，且 metadata 中的 `id`、父 session、精确 `/root/<task_id>`、角色以及 direct/nested 重复字段全部一致；`SubagentStart` 未及时完成时，child 首次 `PreToolUse` 使用相同规则补绑。任意任务输出、父路径分量、唯一 pending、权限面相同候选或冲突别名都不能触发绑定；格式漂移或缺少可信关联时，child 的读取、命令、网络和写入全部 fail-closed。
 - 子代理异常接管策略：局部 `MESSAGE`、部分结果和未知状态不视为完成；明确终态失败会保留可核验证据并由主代理接管，不自动重派。重复任务 ID 返回稳定的 `CODEY_SUBAGENT_DUPLICATE_TASK_ID`，并按 reservation 的 `pending`、`running`、`failed`、终态/恢复态给出恢复动作；没有明确失败且缺少可绑定代理 ID 的 PostTool 响应继续保留为 `pending`，等待生命周期事件或完整快照确认，不再伪装为 `running`。根代理收到该错误后先执行一次完整 `list_agents` 对账：命中原代理时等待或消费结果，明确无匹配时由主代理接管；仅当任务范围实质改变且仍值得委派时，才使用新的 `task_name` 最多重试一次并同步更新 V2 契约 ID，禁止重复旧 ID、立即 Stop 或改走本地命令路由。`pending_init` 长时间无进展或代理累计运行 10 分钟无终态时，根约束要求先执行一次完整 `list_agents` 对账，再对对应代理执行一次 `interrupt_agent` 并继续等待终态；只有缩小或改变后的任务仍独立达到选择性委派阈值时才允许最多重派一次。用户新输入会使当前批次过时，根代理先中断并对账，迟到结果不得驱动新请求。运行时门禁继续负责 fail-closed（含子代理写工具）、代次隔离、10 分钟遗留状态兜底和 60 分钟 Stop 绝对上限；提示词层的接管规则不宣称能够替代 Codex 调度器的强制取消。
+- `followup_task` 生命周期门禁：该工具只允许根代理命中当前会话账本中 `running`、已绑定 `agent_id_hash`、未 fence 且派生成功的 reservation；child 的 `wait/list/interrupt/followup` 全部拒绝，只允许 `agents.send_message` 定向 `/root`。`pending`、终态、恢复态、账本缺失或 target 无法匹配时，`PreToolUse` 在真正唤醒子线程前返回 `CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT`。pending 分支只允许根代理先做一次完整 `list_agents` 对账；其他分支禁止重试旧 canonical task。读取、命令或写入无法安全绑定时统一返回 `CODEY_SUBAGENT_UNBOUND_ATTEMPT`。
 - Codex App 路径：留空时使用 CodeyRuntime 的平台发现逻辑。Windows 自动发现失败或已保存路径失效时，会在启动阶段打开原生目录选择器并持久化规范化后的应用目录，因此自定义盘符不依赖尚未启动的 Codex 页面；配置页只展示当前解析结果，不提供无法在首次启动失败时触达的恢复弹窗。目录解析兼容安装根目录下的 `app`、`bin`、`current` 与 `versions/current` 布局。
 - CDP 默认端口：`9229`，如 Windows 端口被占用会按 core 的逻辑选择可用回环端口。
 
 - FastCtx 路由 Hook 会对每个命中的 `PreToolUse` 独立执行；拒绝原因只保留目标函数与显式回退标记，完整的工具发现、code mode 和 Windows 路径规则由运行时 FastCtx 指引统一提供，避免连续读取时在 Codex 钩子面板重复刷出整段说明。
 
+### 子代理批次决策控制面
+
+开启增强时注册 direct-only 的 `mcp__codey_subagent_control__resolve_batch` 本地 STDIO MCP，并在普通临时配置和 CC Switch Live 隔离覆盖中同步写入 command、args、启动/工具超时与 namespace。该 Codey-owned server 强制 `enabled_tools = ["resolve_batch"]`、清空残留 `disabled_tools`，并只对 `tools.resolve_batch.approval_mode = "approve"` 设置工具级放行；不设置 server-wide `default_tools_approval_mode`，因此 `approval_policy = "never"` 下也能执行内部决策，但不会扩大其他 MCP 工具的权限。上述 allow/deny 列表与嵌套 approval scalar 都进入进程级运行时覆盖，避免 CC Switch Live 隔离路径漏配。工具只做严格 schema 校验并回显 `spawn_next_batch`、`continue_root`、`complete` 或 `blocked`；真正授权由 Hook 两阶段提交：`PreToolUse` 在会话账本准备决策，`PostToolUse` 只在响应包含完全匹配的 `accepted` 回执后提交。每个 decision ID 在根回合内唯一且有界，reason 只持久化哈希。
+
+批次终态后普通根工具和 Stop 都会要求显式决策：`continue_root` 放行直接工作但不能结束，`spawn_next_batch` 只授权一次真实 `agents.spawn_agent`，`complete`/`blocked` 允许机械验收和 Stop。提交在账本删除或下一批授权被消费前可用新的 ID 显式改写，工具失败不会误放行，也不会盲目自动派发。账本 schema v7 记录控制面连续失败次数与首个失败时间；无匹配回执或 Stop 无进展累计 3 次，或自首个失败起超过 10 分钟时，状态转为独立的 `ControlPlaneFailed` 终局。该状态不会伪造 `blocked` 决策，也不授权普通根工具或新批次，只允许机械验收与最终 Stop/账本清理，并返回稳定错误码 `CODEY_SUBAGENT_CONTROL_PLANE_FAILED`；这样控制工具未注册、启动失败或持续返回错误时仍 fail-closed，但不会形成无限 Hook 循环。有效 accepted 回执、运行代次切换和下一批启动都会清零计数。全批都在创建阶段失败时仍不自动换批，避免容量故障形成重试风暴。
+
 ### 子代理编排内核
 
-- 根代理调用 `agents.spawn_agent` 时，明文 `message` 的最后一个非空行必须携带 `CODEY_DELEGATION_V2=<compact-json>`，且 `fork_turns` 固定为 `none`。V2 契约只记录任务 ID、委派原因、角色视觉能力、工作区根目录、读写 ownership、最多三条机械检查，以及并行任务可选的 `branch_calls`；任务 ID 必须与 `task_name` 一致。V2 严格拒绝 `calls/files/dirs/large/risk` 等未知旧字段，避免提示词继续生成不会被消费的规模数据；升级期间仍兼容读取 V1，并在解析后丢弃这些旧规模字段。新版 Codex 可能在 `PreToolUse` 前把整个 `message` 替换为不透明的 Fernet 风格密文；门禁不尝试解密，而是用仍可见的 `task_name`、`agent_type` 和 Hook `cwd` 建立工作区级保守契约。普通明文缺少契约仍会被拒绝，只有满足密文形状检查的单段 URL-safe token 才进入兼容路径。任务规模只在派发前的软路由判断中使用，不作为“小任务禁止派生”的硬条件。
-- 预算采用可解释的成本点与派生尝试数，而不是伪造实际 token：快速定位和兼容只读角色为 1 点，深度检索和视觉分析为 2 点，代码与视觉实施为 3 点；每批默认 8 点/4 次，`why: "parallel"` 的真实独立分支可通过 `branch_calls` 自适应扩到最多 12 点/6 次，自报 `user_requested` 不放大预算。当前批至少有一个代理实际完成、全部 reservation 进入终态、活动计数归零且写入验收债已清偿后，下一次合法 `spawn_agent` 会自动开启新批并重置批内点数/尝试数；单个根回合最多三批、累计 18 次。上游加密整个 `message` 时，Hook 无法读取已声明的 `branch_calls`，因此密文兼容契约从 8 点/4 次开始，并用当前批已接受且未明确失败的不同任务数加当前候选任务推导观察分支数，随真实规模渐进扩到同一组 12 点/6 次硬上限。`PreToolUse` 先原子预留；`PostToolUse` 只在响应缺少明确代理 ID 时才采信失败信号：顶层结构化错误（`isError`/`is_error`/`error`）或 `collab spawn failed` 文本错误会把 reservation 标记为 `failed`、退还成本点但保留批内/累计尝试数和已用任务 ID；全批都在创建阶段失败时不自动换批，避免容量故障形成重试风暴。响应任意位置带明确代理 ID 时一律按成功处理，深层嵌套的 `error` 字段不再误触发回滚。批内和根回合上限分别返回 `CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED` 与 `CODEY_SUBAGENT_TURN_BUDGET_EXHAUSTED`；两者都明确表示协作路由仍可用，根提示禁止改走 `functions.exec` 重试派生。Codex Hook 未提供稳定的逐子代理 token、价格和模型 usage 时，不把该账本描述为计费数据。
-- 账本位于 Codey 状态目录的 `codey-subagent-gate-v3/<session-hash>/orchestrator-ledger-v1.json`，只保存运行代次、会话与代理标识的哈希。schema v3 新增当前批次、累计尝试和跨批任务 ID 集合；读取 v1/v2 时在持锁状态下补齐可恢复字段并原子升级，旧账本已删除的历史失败 ID 无法逆向重建，因此跨批唯一性从迁移完成后保证。所有 Hook 进程通过同一跨进程文件锁串行读改写，并使用同目录临时文件原子替换；损坏、版本不符、批次/累计计数越界或会话不一致时 fail-closed，不静默覆盖证据。新运行代次只恢复尚未清偿的写入验收债，丢弃旧只读预留并从恢复集合重算当前批与累计预算；正常 `Stop` 清债后会删除账本，`SessionEnd` 只删除属于当前代次或已无未清偿预留与验收债的账本，代次不一致且仍有未清偿内容时保留给所属代次或恢复逻辑。
-- 资源门禁按规范化后的 Unix、UNC 或盘符绝对路径判断父子重叠：新写入会与活动读/写冲突，新读取会与活动写冲突；写任务进入终态后，在验收通过前仍保留 ownership。明文契约中的只读角色不能声明写入或检查，写入角色必须声明绝对根目录、至少一个写入范围和至少一项检查；明文契约的绝对 `read`/`write` 必须位于声明的 `root` 内，`root` 必须等于 Hook 工作目录或位于其子目录，Hook 缺少绝对工作目录时同样拒绝明文写入角色，只读角色可放行。密文兼容契约把 Hook 工作目录作为完整读范围或写范围，因此只允许只读任务彼此并发，任何涉及写入的密文任务都会与同工作区的其他活动任务串行；Hook 缺少绝对工作目录时拒绝密文写入角色。子代理使用 `apply_patch`、FastCtx `replace` 或其他能显式报告目标路径的已知写工具时，目标必须唯一落在其 ownership 内；无法可靠提取路径时拒绝该写工具。根代理不得把预算拒绝改走 `functions.exec` 重试 `agents.spawn_agent`，该限制由稳定错误码和不可编辑的运行时主动委派提示共同声明；子代理原有的 Bash/FastCtx 路由与根代理带精确 `# codey-accept` 标记的命令验收通道保持不变。
-- 带可见检查项的写入型子代理进入终态后，根代理 `Stop` 会列出精确命令，格式为首行 `# codey-accept:<task_id>:<check_id>` 加契约中的原始命令。`PreToolUse` 校验命令体哈希；`PostToolUse` 接收全部工具事件后先在进程内快速筛掉非验收调用，避免工具改名造成证据丢失。验收接受结构化且全部为零的 `exit_code`，以及整个响应为短小、受控退出状态文本的兼容格式；嵌套在普通输出中的“exit code 0”、改写命令或子代理自报结果仍不能清债，空的 `error` 字段不再误判失败。每项验收记录失败数、Stop 无变化次数和首次阻塞时间：连续 3 次失败、连续 3 次 Stop 无新证据或持续 10 分钟无法验证时转为 `unverifiable`，先阻塞一次明确告知主代理“未通过及原因”，随后释放 ownership 和 Stop 门禁；该状态绝不转写为通过，主代理必须在最终答复中报告。密文兼容路径无法读取检查命令，因此不创建伪造的验收债，主代理仍需根据子代理结果和任务风险完成必要验证。
+- 根代理调用 `agents.spawn_agent` 时，明文 `message` 的最后一个非空行必须携带 `CODEY_DELEGATION_V2=<compact-json>`。`fork_turns` 缺省时按 `none` 处理，任何非 `none` 值仍拒绝，避免隐式复制不必要上下文。V2 契约记录任务 ID、1–128 字符审计原因、角色视觉能力、工作区根目录、读写 ownership、最多 8 条机械检查（单条最多 1024 字符、合计最多 4096 字符）、可选 `budget_class`/`branch_calls`，并可携带 `sync`/`async`/`stream` 调用模式、`trace_id`、`parent_id`、能力列表、deadline 及输入/输出 JSON schema；每份 schema 序列化后最多 4096 字节、嵌套最多 16 层，并随 reservation 持久化，trace 只记录其哈希。任务 ID 必须与 `task_name` 一致。V2 严格拒绝 `calls/files/dirs/large/risk` 等未知旧字段；升级期间仍兼容读取 V1，并在解析后丢弃这些旧规模字段。新版 Codex 可能在 `PreToolUse` 前把整个 `message` 替换为不透明的 Fernet 风格密文；门禁不尝试解密，只允许它形成工作区级只读契约，写入角色必须改用可验证明文/签名 sidecar 契约或交回主代理。普通明文缺少契约仍会被拒绝，只有满足密文形状检查的单段 URL-safe token 才进入兼容路径。任务规模只在派发前的软路由判断中使用，不作为“小任务禁止派生”的硬条件。
+- 预算采用可解释的成本点与派生尝试数，而不是伪造实际 token：快速定位/兼容只读角色 1 点，深度/视觉分析 2 点，代码/视觉实施 3 点；每批默认 8 点/4 次，真实 `parallel` 分支最多扩到 12 点/6 次，单个根回合最多三批/18 次。当前批至少有一个代理实际创建、全部 reservation 终态且活动计数归零后进入显式决策窗口。`PreToolUse` 原子预留；`PostToolUse` 优先接受已知 provider envelope 中的 `agent_id`/`agent_name`/`subagent_id`，兼容回执只有 canonical `task_name` 时则要求它精确等于 task ID 或 `/root/<task_id>`，并只建立 provisional 关联。后续 `SubagentStart` 或 child 首次 `PreToolUse` 再以受限 transcript metadata 把该关联重绑到不透明 UUID。解析不会进入任意 `output`/业务载荷，也不会接受任意前缀/父路径分量、唯一 pending 或等价权限面猜测。没有可信关联时保持 pending；顶层结构化失败或受控 spawn-failure 文本才会标记 failed、退还成本点但保留尝试数和任务 ID，任务输出内部的普通 `error` 字段不触发终态或退款。批内/根回合预算错误仍禁止改走 `functions.exec` 重试；账本不作为计费数据。
+- 账本位于 Codey 状态目录的 `codey-subagent-gate-v3/<session-hash>/orchestrator-ledger-v1.json`，只保存运行代次、会话与代理标识的哈希。schema v7 在既有 execution phase/outcome、deadline、attempt/fencing、规则 revision 和 schema 元数据上记录 `decision_required`、`batch_decision` 与有界 `used_decision_ids`；决策 reason 只保存哈希。读取 v1-v6 时在持锁状态下补齐可恢复字段并原子升级，既有进行中账本保持 legacy 行为，第一次新 spawn 后再进入显式决策协议，避免升级中途死锁；旧终态因无法判断成功或失败，迁移为 `unknown` 而非伪造成功。同一会话的 Hook 进程通过带 session hash 的跨进程文件锁串行读改写，不同会话不争用全局锁；取锁最多等待 250 ms，超时 fail-closed。账本使用同目录临时文件原子替换；损坏、版本不符、计数越界、决策 ID 超限或会话不一致时不覆盖证据，`SessionEnd` 会把损坏账本改名隔离后再结束会话。新运行代次只恢复尚未清偿的写入验收债，丢弃旧只读预留与旧决策授权并重算预算；正常 `Stop` 只有在验收清偿且提交 `complete`/`blocked` 后删除账本，外来代次仍有未清偿内容时继续保留。
+- 资源门禁先做 Unix/UNC/盘符词法规范化，再 canonicalize 最近现存祖先并拼回尚未创建的后缀；因此 contract-time 和 tool-time 的普通 symlink/junction 越界都会落到物理路径后被拒绝。新写入与活动 read/write 冲突，新读取与活动 write 冲突；写任务终态后在验收通过前继续占有 ownership。省略 `root` 时采用 Hook 工作目录；空 `read` 对只读角色表示 root，对写入角色表示其 write 范围。路径型 read 与 write 都必须由活动绑定覆盖，无法提取目标时拒绝；未绑定 child 只可用 `agents.send_message` 定向 `/root` 回报。通用 shell 只有在 attempt 活动、显式声明 `command.execute`、且写角色 ownership 覆盖完整 root 时允许，窄 ownership 的 worker 使用路径工具并由根代理执行验收。根代理等待活动子代理时也只可使用 `agents.*`。Hook 到真实文件打开之间仍存在跨进程 TOCTOU，不能把本层 canonicalize 宣传为等价于 executor 内的 `openat/O_NOFOLLOW`；最终 OS sandbox 仍是必要边界。
+- 带可见检查项的写入型子代理进入终态后，根代理 `Stop` 会列出精确命令，格式为首行 `# codey-accept:<task_id>:<check_id>` 加契约中的原始命令。`PreToolUse` 同时验证 reservation 已为 `terminal/recovered` 和命令体哈希；`PostToolUse` 再做同一终态防御，防止子代理仍在写入时把旧工作区测试结果记为通过。验收接受结构化且全部为零的 `exit_code`，以及整个响应为短小、受控退出状态文本的兼容格式；嵌套在普通输出中的“exit code 0”、改写命令或子代理自报结果仍不能清债，空的 `error` 字段不再误判失败。每项验收记录失败数、Stop 无变化次数和首次阻塞时间：连续 3 次失败、连续 3 次 Stop 无新证据或持续 10 分钟无法验证时转为 `unverifiable`，门禁先明确告知原因并停止自动重试，再释放该项的循环阻塞；它绝不转写为通过，也不能提交 `complete`，终局只能选择 `blocked`（控制面自身已失败时除外）。结算会先写入包含验收哈希、失败次数、原因和终局决策的确定性摘要回执，再删除活动账本；`SessionEnd` 在未完成该结算时仍保留债务证据。密文兼容路径无法读取检查命令，因此不创建伪造的验收债，主代理仍需根据子代理结果和任务风险完成必要验证。
+
+### 子代理与 FastCtx 模块化架构（2026-08）
+
+#### 1. 现状分析与问题清单
+
+重构前的关键问题不是某一个慢函数，而是边界不清：子代理活动 marker 与 orchestrator ledger 同时表达生命周期，终态与失败响应在 gate/orchestrator 各解析一次，角色规则分散在 Rust `match` 与提示配置中，组合 Hook 直接知道 FastCtx 路由细节；FastCtx supervisor 以“消息条数”而非字节数做背压，对每个大响应构建完整 `serde_json::Value`，在途表和单帧没有硬上限，恢复时还会一次构造所有错误响应。结果是状态可能分叉、规则难以解释或热更新、大响应产生不必要分配，未知工具也缺少统一的 fail-closed 分类。
+
+本次治理后的单一原则如下：生命周期以 ledger 为主投影，活动 marker 只保留迁移兜底；协作响应只经过一个兼容解析器；角色与工具授权只由规则层裁决；FastCtx 只传输有界 JSON-RPC 帧并保存恢复所需的最小元数据；旧入口继续作为兼容适配器，不再承载新增领域规则。
+
+#### 2. 目标架构与接口
+
+```mermaid
+flowchart LR
+    H[Codex Hook / agents.*] --> A[兼容适配器\nsubagent_gate / orchestrator]
+    A --> C[Invocation Contract\nsync / async / stream]
+    C --> R[Rule Layer\npriority + deny-wins + fallback]
+    R --> L[Lifecycle Ledger\npending → running → terminal]
+    L --> X[Codex Sub-Agent Runtime]
+    X --> P[共享响应协议解析与结果聚合]
+    P --> L
+    R --> T[JSONL Trace]
+    L --> T
+    F[FastCtx STDIO] --> B[Protocol Boundary\nframe limit + byte backpressure]
+    B --> S[Supervisor / Worker]
+    S --> B
+    D[(动态规则 / last-known-good)] --> R
+```
+
+模块职责：
+
+| 模块 | 责任 | 不负责 |
+| --- | --- | --- |
+| `subagent/api.rs` | 调用模式、trace context 与 token usage 共享值对象 | 调度策略和重复的影子传输 DTO |
+| `subagent/lifecycle.rs` | 幂等状态机，禁止终态回退到运行态 | Hook 格式兼容 |
+| `subagent/rules.rs` | 角色发现、工具分类、优先级、冲突、fallback、热加载 | ownership 路径解析 |
+| `subagent/protocol.rs` | 统一解析 agent ID、终态、派生失败与通用错误值 | 业务预算 |
+| `subagent/telemetry.rs` | 结构化 trace、usage、latency、错误与轮换 | 原始提示词/工具正文采集 |
+| `subagent_control_mcp.rs` | 严格批次决策 schema、STDIO JSON-RPC 回执 | 账本授权与派生执行 |
+| `fastctx/protocol.rs` | 帧读取、字节背压、借用式解析、在途状态和安全恢复 | FastCtx 搜索业务 |
+| 旧 gate/orchestrator | Codex Hook 适配、账本持久化、预算、ownership、验收 | 新的协议或规则定义 |
+
+外部可执行调用契约以 `CODEY_DELEGATION_V2=` 后的紧凑 JSON 为唯一事实源；内部不再维护一套未被生产代码消费的 `InvocationRequest/Event/Result` 影子 DTO：
+
+```json
+{
+  "id": "scan_auth",
+  "why": "并行审计认证路径",
+  "visual": false,
+  "root": "/workspace",
+  "read": ["backend/src/auth"],
+  "write": [],
+  "checks": [],
+  "mode": "async",
+  "trace_id": "root_01",
+  "parent_id": "turn_01",
+  "capabilities": ["files.read"],
+  "deadline_ms": 5000,
+  "input_schema": { "type": "object" },
+  "output_schema": { "type": "object" }
+}
+```
+
+`mode` 支持 `sync`、`async`、`stream`，并随 trace、capability 与输入/输出 schema 一起校验和持久化；具体同步、异步或流式传输由 Codex `agents.*` 执行面负责，Codey 不复制第二套事件协议。当前 Hook 只拿到调度和状态载荷，无法取得可信的完整结果正文，因此 `output_schema` 在此层是可审计契约，不伪装成已执行的结果校验；输出实例校验应由 `agents.*` 执行面或契约中的机械检查完成。角色注册来自运行时 agents 配置，角色发现来自当前规则集的 `roles`；调用进入账本即 `scheduled/pending`，拿到 agent ID 后 `running`，终态、失败恢复与优雅退出分别由状态响应、恢复迁移、`Stop`/`SessionEnd` 驱动。结果聚合使用统一终态解析器，局部 `MESSAGE` 或根等待被新输入打断只表示等待调用结束，不会把仍在运行的子代理结算为终态。
+
+#### 3. 核心实现与最小权限
+
+子代理权限由三层共同收敛：规则层先按 actor、role、工具名和工具类别做能力裁决；路径型读取和写入随后必须解析出明确目标、解析最近现存祖先的物理路径，并命中契约 read/write 范围；实际执行继续受父任务 sandbox/approval 约束。通用 shell 只对显式拥有 `command.execute` 且 write ownership 覆盖完整 root 的写角色开放。子代理派生默认拒绝，未知工具默认拒绝，只读角色拒绝写入，写入角色也不能越过契约路径。契约字段、trace ID、schema 大小和 deadline 都有验证；不透明上游消息只能进入工作区级保守契约，不能据此扩大权限。
+
+账本是新任务的生命周期事实源，会话级文件锁保护跨 Hook 的读改写；execution phase 与 outcome 分开记录，状态机拒绝已结算 attempt 回退到活动态，也不会把“收到 Stop”误写成成功。失败派生退还成本点但不退还尝试数；恢复不重放未知副作用；根退出前仍需完成结果收拢和机械验收。trace 写入先在锁外编码完整 JSONL，再用独立跨进程锁完成容量判断、可回滚归档替换和单次追加；记录 `traceId`、`spanId`、`parentId`、状态、latency、token usage、规则 ID/优先级/冲突和稳定错误码，runtime/session/task/agent 只落哈希。轮换在“当前大小 + 待写事件”超过 8 MiB 前发生，单条超大事件允许独占新文件，避免循环轮换。
+
+#### 4. 规则配置与热更新
+
+内置最小权限基线位于 `backend/resources/subagent-rules.default.json`。运行时可在 `CODEX_HOME/codey-subagent-gate-v3/subagent-rules-v1.json` 放置同 schema JSON；每次决策检查 live 与 last-known-good 文件指纹，指纹包含长度、修改/创建时间，并在 Unix 上加入 device/inode/ctime，能识别同长度的原子替换。长驻进程最多缓存 32 份已验证规则；首次 live 加载写入 last-known-good 后直接按加载后的稳定指纹入缓存，不再无谓解析第二次。规则文件上限 256 KiB；live 无效时依次回退 `subagent-rules-v1.last-good.json` 和编译内置规则，并分别保留 live/LKG 错误链。live 规则只能收紧、不能削弱内置安全基线：fallback 必须为 deny，角色集合及 access/visual 属性固定，costPoints 不得降低；校验器按 actor、role、tool class、代表工具及两侧所有显式工具名比较决策分区，内置 deny 不能变为 allow。未绑定 child 只能向 `/root` 发送消息，所有 child 继续拒绝嵌套派生、查看/等待/中断/追派其他代理和未知工具。只有完整通过单调性基线、schema、角色引用、唯一 ID 和优先级范围校验的 live 规则才写入 last-known-good。
+
+```json
+{
+  "schemaVersion": 1,
+  "revision": 2,
+  "conflictResolution": "highest_priority_deny_wins",
+  "fallback": "deny",
+  "roles": {
+    "codey_worker": { "access": "write", "visual": false, "costPoints": 3 }
+  },
+  "rules": [
+    {
+      "id": "deny-nested-spawn",
+      "priority": 1000,
+      "effect": "deny",
+      "actors": ["child"],
+      "toolClasses": ["spawn"],
+      "explanation": "子代理不能继续派生。"
+    }
+  ]
+}
+```
+
+裁决顺序为最高优先级优先；同优先级冲突时 deny 胜出；无匹配项执行顶层 fallback。热路径单次扫描规则集，只保留当前最高优先级候选，再按 ID 排序以保持审计输出稳定；工具名比较不再为每条规则分配小写字符串。每次裁决把选中规则、冲突规则、规则 revision、来源和解释写入审计 trace。不要依赖数组顺序表达优先级，也不要把 fallback 设为 allow。
+
+#### 5. FastCtx 使用规范
+
+- 只进入 FastCtx 边界的数据：一行一个 UTF-8 JSON-RPC 帧、初始化安全重放副本、在途请求的 ID/有界方法标签/副作用类别。搜索结果、用户上下文和完整响应不得缓存到 supervisor 状态。
+- 默认单帧上限 8 MiB、排队字节预算 16 MiB、在途请求 1024 条；可分别通过 `CODEY_FASTCTX_MAX_FRAME_BYTES`、`CODEY_FASTCTX_MAX_QUEUED_BYTES`、`CODEY_FASTCTX_MAX_PENDING_REQUESTS` 调整，但仍受 64 KiB–64 MiB、单帧–128 MiB、16–16384 的硬边界约束。
+- 序列化固定为换行分隔 JSON-RPC。对象与 batch 都允许合法 JSON 前导空白；响应热路径借用 `RawValue` 并用 `IgnoredAny` 跳过 result/error 正文，不再构建完整 Value。batch 先做无分配语法校验，再通过 sequence visitor 逐条观察，不构建 `Vec<ProtocolEnvelope>`；只有最多 256 字节的 ID 会规范化为 owned key。
+- 帧缓冲池最多保留 4 个、单个容量不超过 512 KiB；大帧用完直接释放，避免把偶发峰值常驻在分配器。字节 semaphore 的 permit 绑定帧生命周期，消费者 drop 后自动归还。
+- 收到响应立即清理在途项；worker 恢复时以 iterator 逐条产生错误，不构造 `Vec<Vec<u8>>`。初始化可安全重放，任何运行中的写请求都明确返回 `requestReplayed=false`，绝不自动重放。
+- 禁止把 FastCtx 句柄或大 payload 隐式塞入其他领域对象；调用方只持有协议边界和小型契约。超限、截断、在途表满、单帧大于队列总预算或恢复预算耗尽都快速失败并让宿主执行其退避策略，不得等待一个永远无法满足的 semaphore permit。恢复握手必须收到匹配 ID、含 `result` 且不含 `error` 的响应；匹配 ID 但缺少结果不再被当作初始化成功。
+- 单条或同一 batch 内的重复 JSON-RPC ID 在写入在途表前整体拒绝；batch 使用“预检—暂存—原子提交”，任一项非法时不会留下半批 pending。`file://` MCP Resource 路径默认拒绝，调用方必须先规范化为普通绝对路径，再走 FastCtx 的直接文件工具。
+- supervisor 所有成功、错误、EOF 和恢复耗尽出口统一进入 finalizer：关闭 stdin、终止并等待 worker、回收 reader task、关闭并排空 channel。60 秒窗口内最多容忍两次恢复，第 3 次可恢复断开使 supervisor 整体失败，避免无限重启和孤儿进程。
+
+#### 6. 测试、覆盖率与 benchmark
+
+验证命令为 `cargo test --workspace --locked --no-fail-fast`、`cargo test -p codey --test fastctx_supervisor --locked`、`cargo clippy --workspace --all-targets --locked -- -D warnings` 和 `cargo bench --bench fastctx_protocol -- <legacy|optimized>`。2026-08-20 本机复核中，codey lib 673 项、codey-fastctx bin 8 项、FastCtx supervisor 6 项集成测试全部通过，Node 调度回归 4 项通过，全工作区测试、格式检查、diff 检查与 Clippy 均通过。
+
+覆盖率用 Rust `-C instrument-coverage`、`llvm-profdata` 与 `llvm-cov export` 的 lib 测试统计。本次直接审查范围（`subagent/*`、gate、orchestrator 与 `fastctx/protocol.rs`）加权行覆盖率为 91.92%（7203/7836）；其中子代理范围为 91.27%（6469/7088），FastCtx 协议为 98.13%（734/748），均超过 80% 门槛。整个历史 lib 的既有低覆盖主要来自本次范围外的 GUI/平台启动适配器；不得把子系统覆盖率冒充全仓覆盖率，后续全仓门槛需单独治理这些平台边界。
+
+FastCtx benchmark 使用 release 构建，同一 1 MiB JSON-RPC 成功响应连续解析 4000 次，每个模式运行五个独立进程并取中位数。legacy 与 optimized 都校验响应 ID、`result` 存在且 `error` 缺失，并对可观察布尔结果执行 `black_box`；不再比较“完整 Value”与“没有对应 pending、状态恒为零”的非等价工作：
+
+| 指标 | 旧：完整 `Value` | 新：借用式协议扫描 | 改善 |
+| --- | ---: | ---: | ---: |
+| 每次响应延迟 | 87.709 µs | 55.195 µs | -37.07%，1.59× throughput |
+| 峰值 RSS | 9,371,648 B | 8,273,920 B | -11.71% |
+
+该 microbenchmark 隔离的是本次实际替换的解析关键路径，不包含编译时间、网络、磁盘搜索或集成测试中的人为分块等待。不同机器的绝对值不可横向比较，合并前应以同机、同 release profile、同 payload 复测，验收条件是 latency 与 peak RSS 均严格优于 legacy。
+
+#### 7. 迁移计划与风险
+
+当前兼容期：ledger schema v1-v6 读取后在持锁状态下原子升级到 v7；旧 active marker 仍可读取，但新状态查询优先 ledger；V1 只读委派契约仍可读并在内存中补齐 `files.read`，V2 必须显式声明能力，旧写契约不会被隐式提权；动态规则缺失时行为等同内置基线。已完成删除/合并项包括 supervisor 内重复 `ProtocolState` 与无界读行、gate/orchestrator 两套终态/失败解析、重复的硬编码嵌套派生限制、硬编码角色授权、组合 Hook 中的 FastCtx 决策拼接、未被生产路径消费的 `InvocationRequest/Event/Result` 影子 DTO、只用于把根 wait 中断误判为全部终态的用户中断解析分支，以及两份工具名规范化/非空错误判断。
+
+后续两阶段迁移：下一次 minor release 将 `subagent_gate.rs`、`subagent_orchestrator.rs` 进一步瘦身为纯 Hook adapter，并把剩余账本/ownership/验收代码移动到 `subagent/`；`subagent_policy.rs` 只保留模型选择后重命名为 `subagent_model_policy.rs`。至少保留两个 minor release 的读兼容和迁移指标后，才删除 active marker 主动写入、V1 契约解析和旧响应别名；last-known-good 与 ledger v1-v4 的只读迁移再保留一个 major 周期。任何删除前都必须先证明旧格式观测为零，并提供降级版本可读取的备份。
+
+主要风险与控制：规则误配由 deny fallback、schema 校验和 last-known-good 控制；文件指纹 TOCTOU 通过“解析前后强指纹稳定才缓存”控制；Hook 并发由会话级 ledger 锁、独立 trace 锁和原子替换控制；根 wait 被用户输入打断只结束等待，不清理 reservation；只有带唯一身份的终态事件或无未知筛选字段的完整 list 快照才结算。终态解析可先解码一层有界的完整 JSON 字符串，随后只进入 `updates/agents/subagents/children` 与 `result/structuredContent/data` 协议包络，不递归业务 `output/payload/details`。同一 agent ID 只能绑定一个 reservation；任何冲突都会 fence 全部相关 attempt。FastCtx 大帧/OOM 由单帧、排队字节、在途数、batch 流式观察和池容量控制；恢复重复写由永不重放写请求控制；trace 泄密由标识哈希、固定错误摘要和禁止保存 payload 控制。剩余风险是上游 Hook schema 或终态枚举新增，表现为 fail-closed 与兼容诊断，不会静默放权。字节 semaphore 约束的是已交付/排队帧；reader 在申请 permit 前最多还持有一个受 `max_frame_bytes` 限制的当前帧，不应把该预算宣传为整个 sidecar 的绝对 RSS 上限。
+
+Codex 官方 Hook 契约中，`SubagentStart` 必带 `agent_id`，child 的 `PreToolUse` 也可携带 `agent_id` / `agent_type` 与当前 child `transcript_path`，而根调用可能没有这些可选字段；因此不能把“PreToolUse 没有 agent_id”直接等同于根代理。当前实现以本批首个根派生的可信 `turn_id` 建立根编排绑定：同一 turn 可完成该批派发与协调，其他或缺失 turn 只可 wait/完整 list 对账。官方同时明确 Hook 是 guardrail 而不是完整安全边界；本层通过完整工具名 allowlist、能力/路径双重检查和物理祖先校验降低风险，但授权后到执行器打开路径之间的 symlink/rename TOCTOU 仍需执行器使用 `openat`/`O_NOFOLLOW` 或 OS sandbox 才能彻底关闭，不能在文档中宣称 Hook 已单独解决。参见 [Codex Hooks](https://learn.chatgpt.com/docs/hooks)。
+
+#### 8. 行为保持型审查增量（2026-08-20）
+
+| 原问题 | 修改内容 | 预期收益 |
+| --- | --- | --- |
+| 根 `wait_agent` 被新输入打断时直接把全部代理结算 | 保留 marker/ledger，继续要求带归属终态或完整 `list_agents` 对账 | 消除活跃代理仍在写入时根代理恢复写入或提前结束的竞态 |
+| 写代理完成前可运行并通过机械验收 | `PreToolUse` 与 `PostToolUse` 都要求 reservation 为 `terminal/recovered` | 防止旧工作区测试结果覆盖子代理后续修改 |
+| 未知 `list_agents` 过滤字段仍被当作完整快照 | 只接受无参、空对象或唯一空 `path_prefix` | API 扩展时保持 fail-closed，不误清账 |
+| 所有会话争用同一账本文件锁 | 锁名加入 session hash，同会话串行、不同会话并行 | 降低无关 Hook 尾延迟和 5 秒 Hook 超时风险 |
+| 空 `error` 被当作 spawn 失败 | 统一非空错误语义，保留 `isError=true` 与真实错误 | 避免误退款、失去对真实子代理的追踪 |
+| 规则匹配先收集全部命中项并全量排序 | 单次扫描只保留最高优先级候选，稳定排序 tie；工具名比较零额外小写分配 | 从 `O(M log M)` 降为 `O(N + K log K)`，其中 K 仅为最高优先级冲突数 |
+| 首次 live 规则因写 LKG 改变指纹而必然再解析 | 按规则来源判断稳定性并缓存加载后指纹；增强原子替换身份 | 减少一次文件读取/JSON 解析，并降低同尺寸热更新漏检 |
+| trace 在持锁期间序列化，且跨阈值事件延后一条才轮换 | 锁外编码完整 JSONL，按 current+incoming 预轮换，归档替换可回滚 | 缩短跨进程锁临界区，避免正常事件无界突破 8 MiB 边界 |
+| agent list 总结深拷贝整个 `Vec<Value>` | 在原响应上借用切片并就地总结 | 大状态快照不再产生整棵数组副本 |
+| FastCtx batch 先物化 `Vec<ProtocolEnvelope>` | 无分配校验后用 serde sequence visitor 逐条观察 | 辅助内存从 `O(batch entries)` 收敛为 `O(1)`（不含必要的 pending 状态） |
+| 合法 JSON 前导空白绕过状态观察 | 对对象和 batch 做零分配 JSON whitespace 左裁剪 | 初始化、pending 和恢复状态与实际转发消息保持一致 |
+| 单帧大于总队列预算时永久等待 permit | 读完受限帧后同步返回 `InvalidInput` | 把不可满足等待改为快速失败，避免 supervisor 卡死 |
+| 恢复握手接受匹配 ID 但无 `result` 的响应，并完整构建 `Value` | 复用借用式响应分类，仅 `result && !error` 成功 | 修复无效恢复，同时避免大 initialize result 的完整物化 |
+| 长标签扫描 Unicode 两遍；行尾处理流程重复 | 单 iterator 截断并简化 CRLF 去除 | 对攻击性长 method/tool name 减少一次 `O(n)` 扫描 |
+| benchmark 两侧工作语义不同 | 两侧统一校验 ID/result/error 并 black-box 结果，五次取中位数 | 性能结论可复现，避免编译器消除与空状态造成的虚高 |
+| 一个终态字段同时表示“停止”和“成功” | schema v5 拆分 execution phase 与 `succeeded/failed/timed_out/lost/unknown` outcome | 失败、崩溃和未知终态不再被聚合为成功 |
+| spawn 回执只返回 canonical `task_name`，而生命周期/工具 Hook 使用不透明 UUID，导致合法 child 首次读取被当作未绑定 | 将精确 task 回执只记为 provisional；再校验 sessions 根、文件后缀、首行 metadata 的 UUID、父 session、精确 task path、角色与重复字段一致性后重绑 UUID | 兼容真实 provider 时序，同时拒绝任意业务输出、父路径分量、伪造父会话、“唯一候选”或等价权限面冒充运行时身份 |
+| collaboration `tool_response` 以 JSON 编码字符串返回时，状态/失败解析只识别外层字符串 | 对完整且有界的 JSON 字符串执行一次解码，再复用同一 provider-envelope 解析器；普通业务文本仍不递归 | 真实 spawn 失败、wait/list 终态和 marker 清理不再因 wire shape 丢失 |
+| `SubagentStop` 先写入 `terminal/unknown` 后，权威状态无法补充成功或失败 | 只允许后到的带归属权威状态细化 `terminal/unknown`；其他已结算 outcome 仍不可改写 | 保持迟到事件 fencing，同时让审计与聚合结果反映真实终态 |
+| 缺少 ID 的生命周期事件会任意猜测任务 | 删除唯一 pending/授权面相同回退，只接受明确哈希、精确 `/root/<task_id>` 或上述 transcript 桥接；多候选、角色/父会话/重复 metadata 不一致均拒绝或 fence | 迟到/乱序 Hook 不会把高权限 attempt 绑定到错误代理，等价权限任务也不互换身份 |
+| 声明 deadline 但执行路径不消费 | 每次加载账本先终止过期 attempt，写入 `timed_out` 并 fence | 超时任务不再无限占用 ownership，迟到事件也不能复活 |
+| 未绑定子代理可读取文件，窄 ownership worker 可借通用命令越界 | 读取要求活动绑定并命中 read 范围；命令还要求 `command.execute` 且 write 覆盖完整 root | 关闭身份缺失的数据泄露面与 shell 绕过路径 ownership 的通道 |
+| 密文兼容契约无法证明写入范围却仍可能选择写角色 | 密文路径限定为只读；写任务必须使用可验证契约或交回主代理 | 消除无法审计 ownership/check 的隐式放权 |
+| 网络工具沿用 read 类别；嵌套派生同时受硬编码与规则拒绝 | 新增独立 Network 类别，删除 gate 重复派生判断，仅由规则层裁决 | 权限语义更准确，拒绝原因和热更新来源唯一 |
+| FastCtx 重复 JSON-RPC ID 覆盖 pending，非法 batch 留下半批状态 | 重复 ID 快速拒绝，batch 预检后原子提交 | 防止响应错配、悬挂 pending 和恢复状态污染 |
+| supervisor 部分异常出口遗留 worker 或 reader task | 所有出口走统一 finalizer，并对 kill/wait/channel 回收做集成测试 | 杜绝孤儿进程、句柄和队列泄漏 |
+| macOS 集成测试依赖 Linux `ps -P` | 测试 worker 通过专用 PID 日志报告启动 | 6 项 supervisor 测试可跨平台稳定执行 |
+| PreToolUse 缺少 child 身份时被默认当作 root | 首个根 spawn 绑定官方 `turn_id`；活动批次只信任同 turn 编排，其他匿名 turn 仅可 wait/完整 list | 保留同批并行派发，同时阻断无身份 child 的嵌套派生、追派和中断 |
+| 工具按叶名称分类，任意 MCP namespace 可伪装 `grep/replace/bash` | 规范化改为有限的完整可信名称映射；未知 namespace 固定进入 Unknown/deny | 工具能力绑定到来源，不再把同名第三方工具继承为可信工具 |
+| 只有命令检查 capability，读写能力声明形同元数据 | V2 派发前要求 `files.read`，写角色再要求 `workspace.write`；授权时再次校验 | capability 成为可执行边界而非提示性字段；V1 只读兼容不隐式产生写权 |
+| `SessionEnd` 删除当前运行代次的活动账本 | 有 outstanding 时先 fence 活动 attempt 并保留 ledger；外来代次有债也保留 | idle/archive/delete 不再抹掉运行中 ownership、验收债与取证状态 |
+| 未验证验收在提示一次后可用 complete 清账 | `complete` 被拒绝，只能 blocked；结算前写不可变摘要回执再移除 ledger | 未通过与无法验证不会消失或被误报为成功，SessionEnd 也保留未验证债 |
+
+#### 9. 子代理异常中断恢复矩阵
+
+恢复成功的统一判定是：当前 attempt 有权威 `succeeded` 结果；写任务的全部机械检查通过；活动绑定、ownership 和验收债均已释放；旧 fencing token 无法再获得命令或写权限。彻底失败的统一判定是：attempt 已为 `failed`、`timed_out`、`lost` 或 `unknown` 且没有安全重放条件，或恢复/验收预算耗尽。彻底失败保留 trace 与稳定错误码，由主代理接管或明确报告人工介入，不把“进程结束”当成“业务成功”。
+
+| 场景 | 触发条件与影响范围 | 检测方式 | 处理策略 | 验收标准 |
+| --- | --- | --- | --- | --- |
+| 派生失败、限流、资源不足 | spawn 返回 `isError=true`、非空错误或稳定预算错误；只影响当前 reservation | 统一协议解析器 + reservation 状态 | 创建阶段失败记 `failed` 并退还成本点、不退尝试数；预算错误交回主代理，不旁路重试 | 无 agent 绑定、无活动 ownership；同一任务 ID 仍去重；错误码可审计 |
+| 子代理进程崩溃、`shutdown`、`not_found` | 运行 attempt 丢失，可能有未知副作用 | 带归属终态、完整 `list_agents` 快照或新代次恢复 | 记 `lost/failed` 并 fence；写任务不自动重放，主代理核对工作区后接管；只有任务实质变化才允许新 ID | 旧 attempt 的迟到事件不能复活，命令/写入被拒绝；新 attempt 独立验收 |
+| 执行超时 | `now >= deadline_at_ms`，任务可能仍在后台运行 | 每次账本加载和决策前检查 deadline | 原子转为 `terminal + timed_out`、清 agent 绑定并设置 fence；主代理继续执行一次中断和完整对账 | 超时只结算一次；迟到 Start/Stop 不改变 outcome；Hook 授权有界释放，但不把 fence 冒充执行器已停止 |
+| 网络分区或协作返回不完整 | wait/list 只返回局部 `MESSAGE`、未知状态或缺少 ID | 响应形状校验、协议诊断、完整无筛选 `list_agents` | 保持 pending/running，不猜成功；继续等待或完整对账，持续停滞后有界中断 | 未获得权威终态前根代理不能结束或写入；对账后状态唯一 |
+| 主代理强制终止、用户新输入 | wait 被中断或当前批次语义过时 | 结构化中断字段、运行代次与 session 隔离 | `interrupted` 仍视为活动；先中断并对账旧代理，迟到结果不得驱动新请求 | 新请求不继承旧批结果；旧代次事件不能删除新代次状态 |
+| 依赖服务失效或任务级联失败 | 代理返回 failed/error，依赖结果不可用 | outcome 聚合、稳定错误码与检查失败 | 不自动重放可能有副作用的下游任务；主代理降级为局部结果、替代实现或人工介入 | 每个依赖 attempt 都有独立 outcome；最终答复明确缺失范围，不伪造完整成功 |
+| Codey/Codex 进程重启 | 旧运行代次留下 ledger/marker | runtime ID、session hash、schema migration | 新代次只恢复未清偿的写入验收债；旧只读 reservation 转 `lost`，旧 marker 不阻塞新运行 | 新旧代次互不删状态；待验收写入仍需检查，旧只读任务不自动续跑 |
+| 账本损坏或锁争用 | JSON 损坏、版本/计数不合法，或锁超过 250 ms | 严格反序列化/不变量检查、限时文件锁 | 决策 fail-closed；不覆盖原证据；`SessionEnd` 隔离损坏文件后收尾 | 250 ms 左右有界失败；损坏文件可取证；没有无锁并发写 |
+| FastCtx worker 崩溃或 transport 断开 | sidecar 专用退出码、EOF、读写错误 | supervisor 退出状态、在途表和恢复握手 | 60 秒内最多恢复两次；只重放 initialize；读请求返回可重试错误，写请求明确 `requestReplayed=false`；第 3 次整体退出 | 无孤儿 worker/reader task；全部 pending 获得确定错误；写操作最多执行一次 |
+
+#### 10. 其他边界条件
+
+| 边界 | 触发与检测 | 处理流程与兜底 | 验收标准 |
+| --- | --- | --- | --- |
+| 空输入、缺字段、未知字段 | V2 契约为空、ID 不一致、schema 非对象或出现旧规模字段 | 派发前拒绝并返回稳定契约错误；不创建 reservation | 账本、预算和 ownership 均无变化 |
+| 重复调用/重复 task ID | `issued_task_ids` 命中，或重复 Post/Stop | 返回 `CODEY_SUBAGENT_DUPLICATE_TASK_ID`；生命周期事件幂等；主代理仅做一次完整对账 | 无第二个 reservation、无重复扣费或重复清债 |
+| 循环依赖/子代理继续派生 | child actor 调用任一 spawn 别名 | 规则层最高优先级 deny；未知别名走 fallback deny | 无新增子代理，审计 trace 含命中规则与解释 |
+| 并发读写冲突 | 规范化路径存在 write↔read/write 父子重叠 | 派发前拒绝；完成但未验收的写 ownership 继续保留 | 不存在两个可同时写同一范围的活动契约 |
+| 队列积压、超大返回、内存压力 | 帧 >8 MiB、排队 >16 MiB、pending >1024 或 batch 非法 | 有界缓冲、字节 semaphore、4 个小帧池；不可满足的请求快速失败 | 无永久等待，峰值内存不随历史大帧持续增长 |
+| Hook 乱序、迟到或重复 | Start/Stop/Post 顺序异常，opaque UUID 与 task path 分离，缺少代理 ID，旧代次事件到达 | attempt/fencing/runtime 三重匹配；只允许明确哈希、精确 canonical task path 或完整 transcript metadata 桥接，多候选/重复 agent ID 全部 fence | 已结算状态不可回退，不以任意前缀、父路径分量、唯一或等价候选猜测主体，不跨权限范围误绑定其他任务 |
+| 权限失效、身份未绑定 | child 缺 ID/role，V2 契约无 capability，工具来源未知 | 已确认 child 仅可 `agents.send_message` 到 `/root`；完全匿名且有活动代理时只可 wait/完整 list，除非 `turn_id` 命中根绑定；文件、网络、命令、写入及未知工具全部 fail-closed | 未绑定身份既不能读取数据、产生副作用，也不能派生或干预其他代理；拒绝原因可解释 |
+| schema/check/返回值超限 | schema >4096 B/深度 >16，checks >8/单项 >1024/总计 >4096，Hook >1 MiB | 调度前拒绝；Hook 解析失败同时返回两种兼容 deny 字段 | 不写入超限状态，不发生静默非零退出 |
+| 配置热更新不一致或试图放宽权限 | live 文件写到一半、同尺寸替换、内容非法，或削弱 fallback/角色/child deny 基线 | 强指纹前后复核；完整校验且不弱于内置基线才接受；否则依次回退 LKG、内置 deny 基线 | 决策始终带 revision/source；坏配置和弱化配置都不覆盖 LKG |
+| JSON-RPC ID 冲突/Resource 绕路 | 单条或 batch ID 重复，或 `file://` 进入通用 Resource handler | 整批原子拒绝；本地 URI 先转绝对路径并调用直接工具 | pending 不被覆盖；通用 Resource 不触达本地文件 |
+| 资源泄漏与异常退出 | client EOF、stdout 写失败、恢复耗尽、worker 不退出 | 统一 finalizer；5 秒有界 wait 后 kill；关闭并排空 channel | 集成测试确认 worker PID 消失且 supervisor 退出 |
+
+#### 11. Hook 限制精简、风险与迁移
+
+| 原限制及目的 | 精简后 | 风险与补偿 | 迁移路径 |
+| --- | --- | --- | --- |
+| gate 硬编码 + 规则层重复拒绝嵌套派生，用于限制深度 | 删除硬编码分支，只保留最高优先级 `deny-nested-spawn` | 规则误删可能放宽；顶层 fallback 固定 deny，live 失败回退 LKG/内置 | 自定义规则必须保留等价 deny；从 trace 确认命中后再原子替换 live 文件 |
+| 活动子代理期间根代理除 `agents.*` 外全部禁止，用于防并发和状态越序 | 保留该单一规则；全部终态并完成批次决策后才恢复根本地工具 | 等待阶段不能并行做本地只读；以更清晰的调用链和无快照竞态换取确定性 | 无配置迁移；若未来执行面提供只读快照隔离，再评估放宽 |
+| 只读/未绑定子代理可因工具名被归为 Command 而放行 | 命令要求活动绑定、未 fence、显式 `command.execute`，且 write ownership 覆盖完整 root | 窄 ownership worker 不能自行运行通用测试；由根代理验收，或未来接入 OS 级路径 sandbox | 写角色仅在确需 shell 时声明全 root；密文路径保持只读 |
+| Network 复用 Read 类别，简化早期工具表 | 独立 Network 类，契约不接受网络 capability，基线固定 deny | 自定义规则此前的 Read allow 不再隐式放行网络 | 网络任务由根代理执行；未来有独立网络 sandbox 时另做版本化能力设计 |
+| `why` 兼作少量枚举和预算开关 | `why` 改为 1–128 字符审计文本，预算由 `budget_class/branch_calls` 单独表达 | 自报并行可能滥用预算；仍受 12 点/6 次、三批/18 次硬上限 | 旧 `why: parallel` 继续兼容；新调用逐步发送独立字段 |
+| checks 最多 3 条，控制 Hook 载荷 | 放宽到 8 条，同时限制单条 1024、总计 4096 字符 | 检查过多增加尾延迟；只允许机械、可重复命令并逐项记账 | 旧契约无需修改；新增检查按稳定 ID 拆分 |
+| 密文兼容契约允许工作区级角色推断 | 密文只允许只读，写入必须可验证 ownership/check | 某些旧写任务不再派生；安全降级为主代理执行 | 保留至少两个 minor 的明确拒绝诊断，再评估签名 sidecar |
+| `fork_turns` 必填且只能为 `none`，用于防上下文复制 | 字段可省略并默认 `none`，非 `none` 仍拒绝 | 无安全边界变化 | 调用方可删除冗余字段；旧调用继续有效 |
+
+热更新迁移顺序固定为：复制当前内置基线 → 在临时文件调整并保留 deny fallback/嵌套派生拒绝 → 原子替换 live 文件 → 从 trace 核对 revision、source、命中规则与冲突 → 观察至少一个发布周期后再删除旧自定义项。任何校验失败都继续使用 last-known-good；不会为了“热更新成功”而放行未知能力。
+
+#### 12. 按优先级排序的改进清单
+
+| 优先级 | 项目 | 状态/验收 |
+| --- | --- | --- |
+| P0 | phase/outcome 分离、deadline、attempt fencing、安全 attempt 绑定、最小读/命令权限 | 已完成；异常、迟到、无 ID、路径越界与恢复测试通过 |
+| P0 | root turn 主体绑定、agent ID 唯一性、严格协议包络、完整工具来源与读写 capability | 已完成；匿名/错 turn、重复身份、业务 JSON 伪终态和 namespace spoof 回归通过 |
+| P0 | FastCtx 重复 ID/原子 batch、写不重放、统一 finalizer、恢复熔断 | 已完成；6 项 supervisor 集成测试通过 |
+| P1 | 规则集中化、Network 分类、deny-wins、热更新/LKG、审计 trace | 已完成；规则与 gate 单元测试通过 |
+| P1 | schema/check 限额、锁超时、损坏账本隔离、跨平台故障测试 | 已完成；直接审查范围行覆盖率 91.92% |
+| P1 | 同机等价 benchmark 与维护者文档/迁移矩阵 | 已完成；延迟和 RSS 均优于 legacy |
+| P2 | 当 Codex 执行面提供可信结果正文时，执行 `output_schema` 实例校验 | 外部接口前置条件；当前明确标为契约元数据，不伪报已校验 |
+| P2 | 可选 OTLP exporter、旧 marker/V1/ledger 迁移代码退役 | 兼容期后实施；以旧格式观测为零为删除门槛 |
+| P2 | 执行器级路径句柄约束（`openat`/`O_NOFOLLOW`）或 OS sandbox | 外部执行面前置条件；Hook 只做授权 guardrail，不宣称消除授权到执行之间的 TOCTOU |
+
+#### 13. 业界实践取舍
+
+- 采用 [OpenAI Agents SDK 的 tracing/usage/handoffs](https://openai.github.io/openai-agents-python/tracing/) 思路：显式 trace/span/parent、usage 与结构化 handoff，而不是把角色交接藏在提示词里；实现保持本地 JSONL，不引入远程遥测依赖。[Agents SDK usage](https://openai.github.io/openai-agents-python/usage/) 和 [handoffs](https://openai.github.io/openai-agents-python/handoffs/) 分别作为用量与委派契约参考。
+- 采用 [LangGraph subgraphs](https://docs.langchain.com/oss/python/langgraph/use-subgraphs) 的状态隔离和 [persistence](https://docs.langchain.com/oss/python/langgraph/persistence) 的可恢复检查点思想；同时遵循其 [functional API](https://docs.langchain.com/oss/python/langgraph/functional-api) 对可重放任务幂等性的要求，因此写操作恢复只报错、不重放。
+- 采用 AutoGen 的 [typed messages](https://microsoft.github.io/autogen/stable/user-guide/core-user-guide/framework/message-and-communication.html)、[distributed runtime](https://microsoft.github.io/autogen/stable/user-guide/core-user-guide/framework/distributed-agent-runtime.html) 与 [tracing](https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/tracing.html) 分层思路，但不引入第二套运行时；Codex `agents.*` 仍是执行面，Codey 只做策略、状态与观测面。
+- CrewAI 的 [agents](https://docs.crewai.com/en/concepts/agents) 与 [flows](https://docs.crewai.com/en/concepts/flows) 用于区分自治角色与确定性流程；预算、ownership、验收和退出属于确定性流程，不交给模型自由决定。
+- trace 字段命名贴近 [OpenTelemetry Trace API](https://opentelemetry.io/docs/specs/otel/trace/api/) 和 [GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/registry/attributes/gen-ai/)，便于以后接入 OTLP；当前仍保持零外发。
+- 不继续以 Assistants API 作为目标抽象：官方文档已标记其 deprecated，并注明 2026-08-26 shutdown；新设计对齐 Responses/Agents 路线，避免刚完成迁移即再次废弃。参见 [Assistants API 文档](https://platform.openai.com/docs/assistants/deep-dive)。
 
 ### 通知渠道扩展
 
 通知实现按“公共调度 + 渠道适配”拆分。后端 `backend/src/notifications/` 中的配置、事件、格式化和调度器不依赖具体渠道；每个发送渠道放在 `channels/` 的独立文件中，实现 `NotificationChannelAdapter`，并在 `channels/mod.rs` 注册。企业微信适配器使用官方 `qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...` HTTPS 群机器人端点发送 Markdown，并只把响应中的 `errcode = 0` 视为业务成功。新增渠道时需要同时补齐渠道枚举与配置字段、请求构造、明确的成功响应校验、传输与响应错误脱敏及对应单元测试；HTTP 成功但响应损坏或缺少渠道成功字段仍按发送失败处理。
 
 前端 `src/notifications/` 以 `channelRegistry.tsx` 为唯一渠道注册入口，每个渠道使用独立编辑器组件；注册项负责显示信息、默认配置和完整性判断，公共列表只负责展示、编辑和删除，启用状态与测试发送都在渠道编辑弹窗内配置。飞书与企业微信编辑器复用 URL 凭据状态，但保留各自的地址提示与后端校验。新增和编辑必须先完成渠道配置，并经不落盘的 `test_notification_channel` 测试成功后才能保存；每次修改草稿都会要求重新测试。外部配置结构继续使用 `webhook.channels`，既有 `test_webhook` 仍保留以兼容已有渲染层调用和持久化数据。涉及凭据的渠道必须保持普通配置返回渲染层前脱敏、留空保存时回填旧值、显式清除时不回填；仅在用户主动打开某一渠道编辑弹窗时，可经 `reveal_notification_channel` 按需返回该渠道凭据，弹窗关闭后立即清空本地草稿。
+
+- 子代理渠道配置使用 `subagentConfigByProvider` 按稳定 provider ID 保存模型、推理档位和六类角色选择；顶层 `subagentModel`、`subagentReasoningEffort` 与 `subagentRoles` 继续表示当前线路并兼容旧存储与前端。旧存储归一化时会把当前顶层选择迁移为当前 provider 的首份快照。线路同步前先保存旧 provider，目标 provider 已有快照时恢复，没有时继承旧线路活动选择；随后只把模型兼容性回退写入目标 provider，因此 A→B→A 不会让 B 的回退覆盖 A。通用设置保存、模型目录刷新和启动回退都同步更新当前 provider 快照。
 
 ## 启动与恢复
 
@@ -170,8 +419,8 @@ Codey 不改写 `auth.json`，因此 Codex 的账号栏仍会显示原来的官�
 ## 已知限制
 
 - 目标是 Codex Electron 桌面客户端，不覆盖 CLI。
-- 子代理等待门禁建立在 Codex 的本地 command Hook 路径上，可覆盖 shell、`apply_patch`、MCP 和大多数本地 function tools；Codex 托管的 WebSearch 不经过 `PreToolUse` / `PostToolUse`，个别专用工具路径也可能选择退出默认 Hook 路径，因此该门禁是编码流程的确定性本地保护，不是覆盖所有托管能力的安全边界。并发提交到同一批次、且早于 `SubagentStart` 活动标记建立的工具调用仍由根代理 usage hint 约束。
-- 资源 ownership 的机械检查只覆盖输入中能明确提取目标路径的写工具。通用 shell 可以执行构建、测试和其他必要命令，但无法可靠静态证明所有副作用，仍依赖角色 sandbox、父任务权限和任务契约；角色名、成本点、Hook 与账本都不应被宣传成独立安全边界或精确 token/费用计量器。
+- 子代理等待门禁建立在 Codex 的本地 command Hook 路径上，可覆盖 shell、`apply_patch`、MCP 和大多数本地 function tools；Codex 托管的 WebSearch 不经过 `PreToolUse` / `PostToolUse`，个别专用工具路径也可能选择退出默认 Hook 路径，因此该门禁是编码流程的确定性本地保护，不是覆盖所有托管能力的安全边界。spawn 回执提供明确 agent ID 时可直接绑定；只有 canonical `task_name` 时先建立 provisional 关联，再由 `SubagentStart` 或首个 child `PreToolUse` 的 transcript `session_meta` 桥接到 opaque UUID。transcript 是上游兼容输入而非稳定公共 API，格式漂移会 fail-closed；长期最优方案仍是 `agents.spawn_agent` 与 Hook 原生共享不可伪造的 correlation/attempt ID，不能靠候选数量或权限相似度恢复并行度。
+- 资源 ownership 的机械检查只覆盖输入中能明确提取目标路径的工具；Hook 到执行器实际打开文件之间仍有 TOCTOU。通用 shell 只有在显式 `command.execute` 且 write ownership 覆盖完整 root 时开放，窄范围任务由路径工具和根代理验收承担；更强隔离仍需执行器内的 `openat/O_NOFOLLOW` 或 OS sandbox。角色名、成本点、Hook 与账本都不应被宣传成独立安全边界或精确 token/费用计量器。
 - Windows 新版卡顿补丁针对 Codex Micro / Work Louder 设备集成导致的原生模块异常，以及当前客户端的周期性 WMI 遥测采样；Windows 上会自动启用，不会连接 Codex Micro 硬件，命中已知文件名、Worker 语义名称或完整源码特征的遥测 Worker 时也不会启动对应 PowerShell。插件 app-server 在清理旧进程时可能执行的一次性 WMI 查询仍保留，避免产生孤儿进程；它不是 30 秒反复调用的来源。主进程安装 Worker 包装器并同步 ESM 内建导出后会执行一次同步自检：使用私有 Symbol 标记的合成构造参数走同一包装器，并确认返回安全空采样 Worker；该自检不会创建原生线程、子进程、定时器或 PowerShell，也不计入真实阻止次数。自检只确认包装器已安装，必须实际命中目标 Worker 后才确认保护有效；自检失败则明确报告失败，旧主进程没有自检字段时仍保留 45 秒观察窗兼容诊断。状态快照只暴露最近 Worker 的 basename、清洗后的线程名称和源码信号名称，不暴露完整路径或数据值。配置面板仅在旧版兼容待确认状态下做最长 60 秒有界复核，不常驻轮询。Git 请求保护优先在 Codex 主进程的 Git worker IPC handler 上限流，并通过只读 IPC 握手向 Renderer 生效探针报告状态；旧客户端仍保留 Renderer bridge 兼容回退。主进程保护能覆盖所有进入该 Git worker handler 的目标请求与订阅入口，但无法拦截 Git worker 或原生 app-server 已经接受订阅后在内部自行触发的刷新，因此它是降低请求风暴速率的前置保护，不是 Windows 内核资源异常的完整修复。配置面板只在 Git 状态仍为“已执行但未验证”时做最长 30 秒的有界复核，不常驻轮询。兼容型宠物精简与 FastCtx 上下文工具保留用户开关。
 - 当前 Codex 优先按 `threads.rollout_path` 定位 JSONL，并按 `task_started.turn_id` 删除整轮记录；旧版 `messages`、`thread_items`、`items` SQLite schema 作为兼容路径。
 - 内嵌 FastCtx 当前只发布文件读取、搜索、发现与批量替换工具，不发布 MCP Resources 接口及其可选 Bash/后台任务组。Codex 只要初始化了任意 MCP server 就会注册通用 Resources handlers，当前配置 schema 不能按名称隐藏这几个内建工具；Codey 因此通过让内置 FastCtx 同时进入 direct 与 code-mode 工具表，避免 code mode 在看不到正确函数时退回通用 Resources 路径。Codey 注入到根代理和默认子代理的规则只正向说明应调用的 FastCtx 函数，并在直接工具尚未可见时要求先走 `tool_search`；执行前 Hook 负责拦截 FastCtx 资源误路由及占位 URI，避免模型指引反复点名无关工具。URI 形态的本地引用会先规范化为普通绝对路径，再直接交给 FastCtx `inspect_local_file` 工具。PDF 引擎未编入 Codey，PDF 应继续使用 Codex 自带的 PDF 能力。

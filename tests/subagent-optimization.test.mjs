@@ -121,15 +121,20 @@ test("per-task subagent files are composed at startup and hot-refreshed after sa
 });
 
 test("subagent optimization installs recoverable orchestration and runtime gates", async () => {
-  const [gateSource, orchestratorSource, configSource, guidanceSource, mainSource] = await Promise.all([
+  const [gateSource, orchestratorSource, protocolSource, controlSource, controlConfigSource, rulesSource, configSource, guidanceSource, mainSource] = await Promise.all([
     readFile(new URL("backend/src/subagent_gate.rs", root), "utf8"),
     readFile(new URL("backend/src/subagent_orchestrator.rs", root), "utf8"),
+    readFile(new URL("backend/src/subagent/protocol.rs", root), "utf8"),
+    readFile(new URL("backend/src/subagent_control_mcp.rs", root), "utf8"),
+    readFile(new URL("backend/src/codex_config/subagent_control.rs", root), "utf8"),
+    readFile(new URL("backend/resources/subagent-rules.default.json", root), "utf8"),
     readFile(new URL("backend/src/codex_config.rs", root), "utf8"),
     readFile(new URL("backend/src/codex_config_guidance.rs", root), "utf8"),
     readFile(new URL("backend/src/main.rs", root), "utf8"),
   ]);
 
   assert.match(mainSource, /run_subagent_gate_hook_if_requested/);
+  assert.match(mainSource, /run_subagent_control_mcp_if_requested/);
   assert.match(
     configSource,
     /enable_subagent_gate_hooks\(doc, config_path, fastctx_namespace\.is_some\(\)\)/,
@@ -161,35 +166,72 @@ test("subagent optimization installs recoverable orchestration and runtime gates
   assert.match(gateSource, /permissionDecision": "deny"/);
   assert.match(gateSource, /"decision": "block"/);
   assert.match(gateSource, /is_collaboration_tool/);
-  assert.match(gateSource, /is_spawn_agent_tool/);
-  assert.match(gateSource, /subagent_spawn_denial/);
-  assert.match(gateSource, /子代理不能继续派生子代理/);
+  assert.match(rulesSource, /deny-nested-spawn/);
+  assert.doesNotMatch(gateSource, /fn subagent_spawn_denial/);
   assert.match(gateSource, /post_wait_continuation/);
-  assert.match(gateSource, /可读取它并仅使用 agents\.send_message/);
+  assert.match(gateSource, /只可使用 agents\.send_message/);
   assert.match(gateSource, /不得恢复非协作本地工作/);
   assert.match(gateSource, /MAX_RENDERED_TOOL_RESULT_CHARS/);
   assert.match(gateSource, /STATE_ERROR_SINCE_FILE/);
   assert.match(gateSource, /active_agent_count_or_recover_corrupt_state/);
   assert.match(gateSource, /协作工具返回内容已截断/);
   assert.match(gateSource, /SubagentStop/);
+  assert.match(gateSource, /transcript_path: Option<String>/);
+  assert.match(gateSource, /agent_transcript_path: Option<String>/);
+  assert.match(gateSource, /subagent_started_with_context/);
   assert.match(gateSource, /subagent_orchestrator::pre_spawn/);
   assert.match(gateSource, /subagent_orchestrator::authorize_child_tool/);
   assert.match(gateSource, /subagent_orchestrator::pending_acceptance_reason/);
   assert.match(orchestratorSource, /CODEY_DELEGATION_V2=/);
   assert.match(orchestratorSource, /CODEY_DELEGATION_V1=/);
   assert.match(orchestratorSource, /struct SessionLedger/);
-  assert.match(orchestratorSource, /const LEDGER_SCHEMA_VERSION: u32 = 3/);
+  const ledgerSchemaVersion = Number(
+    orchestratorSource.match(/const LEDGER_SCHEMA_VERSION: u32 = (\d+)/)?.[1],
+  );
+  assert.ok(ledgerSchemaVersion >= 6, `unexpected ledger schema ${ledgerSchemaVersion}`);
   assert.match(orchestratorSource, /MAX_BATCHES_PER_TURN: u16 = 3/);
   assert.match(orchestratorSource, /MAX_TOTAL_ATTEMPTS_PER_TURN/);
   assert.match(orchestratorSource, /CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED/);
   assert.match(orchestratorSource, /CODEY_SUBAGENT_TURN_BUDGET_EXHAUSTED/);
   assert.match(orchestratorSource, /CODEY_SUBAGENT_DUPLICATE_TASK_ID/);
   assert.match(orchestratorSource, /duplicate_task_id_denial/);
+  assert.match(orchestratorSource, /CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT/);
+  assert.match(orchestratorSource, /CODEY_SUBAGENT_UNBOUND_ATTEMPT/);
+  assert.match(orchestratorSource, /task_id_from_subagent_transcript/);
+  assert.match(orchestratorSource, /MAX_TRANSCRIPT_METADATA_LINE_BYTES/);
+  assert.match(orchestratorSource, /parse_json_encoded_spawn_response/);
+  assert.match(protocolSource, /decode_json_encoded_response/);
+  assert.match(orchestratorSource, /pub\(crate\) fn pre_followup_task/);
+  assert.match(gateSource, /is_followup_task_tool/);
+  assert.match(gateSource, /subagent_orchestrator::pre_followup_task/);
   assert.match(orchestratorSource, /不带筛选的 `agents\.list_agents` 对账/);
   assert.match(guidanceSource, /A `CODEY_SUBAGENT_DUPLICATE_TASK_ID` denial is a recovery event/);
   assert.match(guidanceSource, /never retry the old `task_name` or Stop immediately/);
   assert.match(guidanceSource, /an exactly matching `CODEY_DELEGATION_V2\.id`/);
+  assert.match(guidanceSource, /`followup_task` only while/);
   assert.match(orchestratorSource, /advance_batch_if_settled/);
+  assert.match(orchestratorSource, /enum RootBatchDecision/);
+  assert.match(orchestratorSource, /enum BatchDecisionState/);
+  assert.match(orchestratorSource, /prepare_batch_decision/);
+  assert.match(orchestratorSource, /post_batch_decision/);
+  assert.match(orchestratorSource, /decision_receipt_matches/);
+  assert.match(gateSource, /is_batch_decision_tool/);
+  assert.match(gateSource, /batch_decision_stop_reason/);
+  assert.match(controlSource, /pub\(crate\) const TOOL_NAME: &str = "resolve_batch"/);
+  assert.match(controlSource, /"spawn_next_batch", "continue_root", "complete", "blocked"/);
+  assert.match(controlConfigSource, /server\["enabled_tools"\]/);
+  assert.match(controlConfigSource, /server\["disabled_tools"\]/);
+  assert.match(controlConfigSource, /resolve_batch\["approval_mode"\] = value\("approve"\)/);
+  assert.doesNotMatch(
+    controlConfigSource,
+    /server\["default_tools_approval_mode"\]\s*=/,
+  );
+  assert.match(configSource, /enable_subagent_control_mcp/);
+  assert.match(configSource, /mcp_servers\.codey_subagent_control\.tools\.resolve_batch\.approval_mode/);
+  assert.match(guidanceSource, /mcp__codey_subagent_control__resolve_batch/);
+  assert.match(orchestratorSource, /CODEY_SUBAGENT_CONTROL_PLANE_FAILED/);
+  assert.match(orchestratorSource, /MAX_BATCH_DECISION_CONTROL_FAILURES: u16 = 3/);
+  assert.match(orchestratorSource, /ControlPlaneFailed/);
   assert.match(orchestratorSource, /issued_task_ids/);
   assert.match(orchestratorSource, /lock_exclusive/);
   assert.match(orchestratorSource, /resource_conflict/);
