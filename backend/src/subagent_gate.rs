@@ -953,13 +953,21 @@ fn post_wait_continuation(
     protocol_issue: Option<&str>,
 ) -> Value {
     let returned_update = render_tool_result(tool_response, "wait_agent");
+    let decryption_recovery = tool_response
+        .filter(|response| {
+            crate::subagent::protocol::response_reports_task_body_decryption_failure(response)
+        })
+        .map(|_| {
+            "\n\n检测到活动子代理报告任务正文解密失败。不要中断该代理，也不要立即重派；请使用 `agents.send_message` 向对应活动 target 只重述一次自包含的任务目标、输入、范围、约束和验收上下文，然后立即回到 `agents.wait_agent`。若重述无法送达、再次解密失败或代理已进入终态，由主代理接管，禁止循环重试。"
+        })
+        .unwrap_or_default();
     let compatibility = protocol_issue
         .map(|issue| format!("\n\nHook 协议兼容性诊断：{issue}。"))
         .unwrap_or_default();
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待。不得自动重派；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}{compatibility}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待。不得自动重派；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}{decryption_recovery}{compatibility}"
         ),
     })
 }
@@ -3596,6 +3604,38 @@ mod tests {
 
         let blocked = handle_hook_for_runtime(&wait, root, runtime_id).unwrap();
         assert_eq!(blocked["decision"].as_str(), Some("block"));
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, "session-a").unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn task_body_decryption_message_requests_one_active_restatement() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let mut start = input("SubagentStart", "session-a");
+        start.agent_id = Some("visual-a".to_string());
+        handle_hook_for_runtime(&start, root, runtime_id).unwrap();
+
+        let mut wait = input("PostToolUse", "session-a");
+        wait.tool_name = Some("agents.wait_agent".to_string());
+        wait.tool_response = Some(json!({
+            "updates": [{
+                "agent_id": "visual-a",
+                "status": "MESSAGE",
+                "message": "任务正文未能解密，无法开始视觉核验。"
+            }]
+        }));
+
+        let blocked = handle_hook_for_runtime(&wait, root, runtime_id).unwrap();
+        assert_eq!(blocked["decision"].as_str(), Some("block"));
+        let reason = blocked["reason"].as_str().unwrap();
+        assert!(reason.contains("`agents.send_message`"));
+        assert!(reason.contains("只重述一次"));
+        assert!(reason.contains("不要中断该代理"));
+        assert!(reason.contains("禁止循环重试"));
         assert_eq!(
             active_agent_count_for_runtime(root, runtime_id, "session-a").unwrap(),
             1

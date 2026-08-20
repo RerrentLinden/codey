@@ -90,12 +90,100 @@ pub(crate) fn collect_terminal_observations(value: &Value, target: &mut Vec<Term
     collect_terminal_observations_in_envelope(value, target, 0, true);
 }
 
+/// Detects the provider-owned collaboration update emitted when a child could
+/// not open the encrypted NEW_TASK payload. Codey intentionally does not try to
+/// decrypt that payload locally; the safe recovery is for the root to restate
+/// the task once through the collaboration channel while the child is active.
+pub(crate) fn response_reports_task_body_decryption_failure(value: &Value) -> bool {
+    let decoded = decode_json_encoded_response(value);
+    let value = decoded.as_ref().unwrap_or(value);
+    response_contains_task_body_decryption_failure(value, 0, true)
+}
+
 fn decode_json_encoded_response(value: &Value) -> Option<Value> {
     let encoded = value.as_str()?.trim();
     if encoded.is_empty() || encoded.len() > MAX_JSON_ENCODED_RESPONSE_BYTES {
         return None;
     }
     serde_json::from_str(encoded).ok()
+}
+
+fn response_contains_task_body_decryption_failure(
+    value: &Value,
+    depth: usize,
+    entry_allowed: bool,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match value {
+        Value::String(value) => entry_allowed && text_reports_task_body_decryption_failure(value),
+        Value::Array(values) if entry_allowed => values
+            .iter()
+            .any(|value| response_contains_task_body_decryption_failure(value, depth + 1, true)),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            let normalized_key = normalize_identifier(key);
+            let text_field = matches!(
+                normalized_key.as_str(),
+                "message" | "text" | "content" | "output" | "reason" | "error"
+            );
+            (entry_allowed
+                && text_field
+                && nested_text_reports_task_body_decryption_failure(value, depth + 1))
+                || ((is_agent_collection_field(key) || is_provider_envelope_field(key))
+                    && response_contains_task_body_decryption_failure(value, depth + 1, true))
+        }),
+        _ => false,
+    }
+}
+
+fn nested_text_reports_task_body_decryption_failure(value: &Value, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    match value {
+        Value::String(value) => text_reports_task_body_decryption_failure(value),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| nested_text_reports_task_body_decryption_failure(value, depth + 1)),
+        Value::Object(values) => values.iter().any(|(key, value)| {
+            matches!(
+                normalize_identifier(key).as_str(),
+                "message" | "text" | "content" | "output" | "reason" | "error"
+            ) && nested_text_reports_task_body_decryption_failure(value, depth + 1)
+        }),
+        _ => false,
+    }
+}
+
+fn text_reports_task_body_decryption_failure(value: &str) -> bool {
+    if [
+        "任务正文未能解密",
+        "任务正文无法解密",
+        "无法解密任务正文",
+        "任务内容未能解密",
+        "任务内容无法解密",
+    ]
+    .iter()
+    .any(|pattern| value.contains(pattern))
+    {
+        return true;
+    }
+    let normalized = value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    [
+        "task body could not be decrypted",
+        "task body couldn't be decrypted",
+        "unable to decrypt the task body",
+        "unable to decrypt task body",
+        "failed to decrypt the task body",
+        "failed to decrypt task body",
+    ]
+    .iter()
+    .any(|pattern| normalized.contains(pattern))
 }
 
 fn collect_terminal_observations_in_envelope(
@@ -448,6 +536,43 @@ mod tests {
         let mut identifiers = Vec::new();
         collect_terminal_agent_ids(&encoded, &mut identifiers);
         assert_eq!(identifiers, ["done", "bad"]);
+    }
+
+    #[test]
+    fn task_body_decryption_failures_are_detected_only_in_collaboration_envelopes() {
+        let direct = json!({
+            "updates": [{
+                "agent_id": "visual-a",
+                "status": "MESSAGE",
+                "message": "任务正文未能解密，无法开始视觉核验。"
+            }]
+        });
+        assert!(response_reports_task_body_decryption_failure(&direct));
+
+        let encoded = Value::String(
+            serde_json::to_string(&json!({
+                "result": {
+                    "structuredContent": {
+                        "message": "Unable to decrypt the task body; please restate it."
+                    }
+                }
+            }))
+            .unwrap(),
+        );
+        assert!(response_reports_task_body_decryption_failure(&encoded));
+
+        assert!(!response_reports_task_body_decryption_failure(&json!({
+            "updates": [{
+                "agent_id": "visual-a",
+                "status": "MESSAGE",
+                "message": "The encrypted cache was refreshed successfully."
+            }]
+        })));
+        assert!(!response_reports_task_body_decryption_failure(&json!({
+            "output": {
+                "details": "任务正文未能解密"
+            }
+        })));
     }
 
     #[test]

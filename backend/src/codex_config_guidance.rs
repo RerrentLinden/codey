@@ -584,7 +584,11 @@ budget. It admits up to three concurrent agents only when the candidate and ever
 verified read-only; any write-capable or unverified mix is limited to two. A \
 `CODEY_SUBAGENT_CONCURRENCY_LIMIT` denial only means all safe concurrent slots are occupied: wait for an \
 active agent to become terminal, then continue normally. If agents remain nonterminal, continue direct \
-`agents.*` reconciliation. After at least one admitted agent \
+`agents.*` reconciliation. If a nonterminal child reports that its task body could not be decrypted, use \
+`agents.send_message` exactly once to restate the self-contained objective, inputs, scope, constraints, \
+and acceptance context to that active child; do not interrupt or respawn it, then return to \
+`agents.wait_agent`. If the restatement cannot be delivered, also fails, or the child is already terminal, \
+the root takes over instead of retrying in a loop. After at least one admitted agent \
 completes and all agents settle, submit the required structured batch decision; only \
 `spawn_next_batch` authorizes the next direct spawn and starts a new batch in the same response. Use \
 `continue_root` before direct root work, then submit `complete`, `blocked`, or `spawn_next_batch` before \
@@ -1275,6 +1279,9 @@ mod tests {
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("up to three concurrent agents"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("limited to two"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("`CODEY_SUBAGENT_CONCURRENCY_LIMIT`"));
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("task body could not be decrypted"));
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("`agents.send_message` exactly once"));
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("do not interrupt or respawn it"));
         assert!(
             !ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED")
         );
