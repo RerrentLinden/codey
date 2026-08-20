@@ -491,6 +491,51 @@ enabled = true
 }
 
 #[test]
+fn route_preserving_patch_keeps_the_code_switch_r_18100_endpoint() {
+    let existing = r#"
+model_provider = "code-switch-r"
+model = "route-model"
+
+[model_providers.code-switch-r]
+name = "code-switch-r"
+base_url = "http://127.0.0.1:18100"
+wire_api = "responses"
+experimental_bearer_token = "code-switch-r"
+"#;
+    let result = patch_config_with_fastctx_mode_and_proxy(
+        existing,
+        &direct_profile(RelayProtocol::Responses),
+        GLOBAL_PROVIDER_ID,
+        ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
+            model_catalog_path: None,
+            default_model: Some("codey-model"),
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            preserve_provider_route: true,
+            protocol_proxy_base_url: None,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        root_key_string(&result, "model_provider").as_deref(),
+        Some("code-switch-r")
+    );
+    assert_eq!(
+        root_key_string(&result, "model").as_deref(),
+        Some("route-model")
+    );
+    assert_eq!(
+        provider_base_url(&result, "code-switch-r").as_deref(),
+        Some("http://127.0.0.1:18100")
+    );
+    assert!(result.contains("experimental_bearer_token = \"code-switch-r\""));
+}
+
+#[test]
 fn route_preserving_chat_patch_requires_the_local_protocol_proxy() {
     let existing = r#"
 model_provider = "cc-switch-live"

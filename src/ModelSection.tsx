@@ -122,11 +122,15 @@ function ModelSectionComponent({
             <div>
               <span>类型</span>
               <strong>
-                {provider.official ? "OpenAI 官方" : "第三方 API"}
+                {provider.localRoute
+                  ? "本地路由"
+                  : provider.official
+                    ? "OpenAI 官方"
+                    : "第三方 API"}
               </strong>
             </div>
             <div className="provider-endpoint">
-              <span>地址</span>
+              <span>{provider.localRoute ? "路由入口" : "地址"}</span>
               <strong>
                 {provider.official ? "ChatGPT 登录" : provider.baseUrl}
               </strong>

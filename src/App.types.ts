@@ -144,6 +144,7 @@ export type CcSwitchStatus = {
     name: string;
     official: boolean;
     baseUrl: string;
+    localRoute: boolean;
     protocol: "responses" | "chatCompletions";
   };
 };

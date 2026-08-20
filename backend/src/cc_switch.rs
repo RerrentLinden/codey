@@ -21,6 +21,8 @@ const OFFICIAL_PROVIDER_ID: &str = "codex-official";
 const LOCAL_OFFICIAL_PROVIDER_ID: &str = "local-official";
 const PROXY_MANAGED_TOKEN: &str = "PROXY_MANAGED";
 const PROXY_OFFICIAL_PROVIDER_ID: &str = "cc-switch-official";
+const CODE_SWITCH_R_PROVIDER_IDS: &[&str] = &["code-switch-r", "code-switch"];
+const CODE_SWITCH_R_TOKEN: &str = "code-switch-r";
 const CC_SWITCH_APP_ID: &str = "com.ccswitch.desktop";
 const CC_SWITCH_PATH_STORE: &str = "app_paths.json";
 const CC_SWITCH_CONFIG_DIR_KEY: &str = "app_config_dir_override";
@@ -115,6 +117,7 @@ pub struct CurrentProvider {
     pub official: bool,
     pub supports_remote_compaction: bool,
     pub base_url: String,
+    pub local_route: bool,
     pub protocol: RelayProtocol,
 }
 
@@ -543,7 +546,7 @@ fn document_uses_proxy_route(document: &DocumentMut) -> bool {
         .and_then(Item::as_table_like)
         .and_then(|providers| providers.get(provider_id))
         .and_then(Item::as_table_like);
-    let managed_token = provider
+    let route_token = provider
         .and_then(|provider| provider.get("experimental_bearer_token"))
         .and_then(Item::as_str)
         .or_else(|| {
@@ -551,13 +554,22 @@ fn document_uses_proxy_route(document: &DocumentMut) -> bool {
                 .get("experimental_bearer_token")
                 .and_then(Item::as_str)
         })
-        .is_some_and(|token| token.trim() == PROXY_MANAGED_TOKEN);
-    let official_loopback = provider_id == PROXY_OFFICIAL_PROVIDER_ID
-        && provider
-            .and_then(|provider| provider.get("base_url"))
-            .and_then(Item::as_str)
-            .is_some_and(is_loopback_url);
-    managed_token || official_loopback
+        .map(str::trim);
+    let loopback = provider
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+        .is_some_and(is_loopback_url);
+    let cc_switch_route = route_token == Some(PROXY_MANAGED_TOKEN)
+        || (provider_id == PROXY_OFFICIAL_PROVIDER_ID && loopback);
+    // Code Switch R owns a fixed provider ID and points it at its loopback
+    // router. Its placeholder is intentionally different from CC Switch's
+    // PROXY_MANAGED marker, so provider identity plus loopback is the stable
+    // ownership signal (including its preserve-official-auth mode).
+    let code_switch_r_route = loopback
+        && CODE_SWITCH_R_PROVIDER_IDS
+            .iter()
+            .any(|candidate| provider_id.eq_ignore_ascii_case(candidate));
+    cc_switch_route || code_switch_r_route
 }
 
 fn is_loopback_url(url: &str) -> bool {
@@ -870,6 +882,7 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
             official: profile.cc_switch_read_only,
             supports_remote_compaction: profile.supports_remote_compaction,
             base_url: profile.base_url.clone(),
+            local_route: profile_uses_local_route(profile),
             protocol: profile.protocol,
         })
         .unwrap_or_else(|| CurrentProvider {
@@ -878,12 +891,26 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
             official: true,
             supports_remote_compaction: true,
             base_url: String::new(),
+            local_route: false,
             protocol: RelayProtocol::Responses,
         });
     CcSwitchStatus {
         changed: false,
         provider,
     }
+}
+
+fn profile_uses_local_route(profile: &ProviderProfile) -> bool {
+    if !is_loopback_url(&profile.base_url) {
+        return false;
+    }
+    let api_key = profile.api_key.trim();
+    api_key == PROXY_MANAGED_TOKEN
+        || api_key == CODE_SWITCH_R_TOKEN
+        || profile.id == PROXY_OFFICIAL_PROVIDER_ID
+        || CODE_SWITCH_R_PROVIDER_IDS
+            .iter()
+            .any(|candidate| profile.id.eq_ignore_ascii_case(candidate))
 }
 
 fn profile_from_provider(provider: &CurrentProvider, api_key: String) -> ProviderProfile {
@@ -984,6 +1011,7 @@ fn validated_live_route_snapshot(
         },
         official,
         supports_remote_compaction: official || name == "OpenAI",
+        local_route: is_loopback_url(&base_url),
         base_url,
         protocol: protocol_from_wire_api(wire_api),
     };
@@ -1076,6 +1104,9 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
     if !official && base_url.is_empty() {
         base_url = "https://api.openai.com/v1".to_string();
     }
+    let local_route = is_loopback_url(&base_url)
+        && (document_uses_proxy_route(&document)
+            || auth.as_ref().is_some_and(auth_uses_proxy_route));
     let provider = CurrentProvider {
         id: if official && provider_id == LOCAL_OFFICIAL_PROVIDER_ID {
             LOCAL_OFFICIAL_PROVIDER_ID.to_string()
@@ -1092,6 +1123,7 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         official,
         supports_remote_compaction: official || name == "OpenAI",
         base_url,
+        local_route,
         protocol: protocol_from_wire_api(wire_api),
     };
     Ok((provider, if official { String::new() } else { api_key }))
@@ -1826,6 +1858,26 @@ experimental_bearer_token = "sk-relay"
     }
 
     #[test]
+    fn status_from_config_marks_a_saved_code_switch_r_endpoint_as_a_local_route() {
+        let mut profile = saved_route_profile("code-switch-r");
+        profile.base_url = "http://127.0.0.1:18100".into();
+        profile.api_key = CODE_SWITCH_R_TOKEN.into();
+        let config = CodeyConfig {
+            active_profile_id: profile.id.clone(),
+            profiles: vec![profile],
+            ..CodeyConfig::default()
+        };
+
+        let status = status_from_config(&config);
+
+        assert!(status.provider.local_route);
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["provider"]["localRoute"],
+            true
+        );
+    }
+
+    #[test]
     fn local_api_route_uses_provider_token_while_preserving_chatgpt_login() {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("codex-home");
@@ -2200,6 +2252,44 @@ wire_api = "responses"
                 managed: true,
                 live: true,
             }
+        );
+    }
+
+    #[test]
+    fn route_takeover_recognizes_code_switch_r_loopback_without_a_cc_switch_database_marker() {
+        for provider_id in CODE_SWITCH_R_PROVIDER_IDS {
+            let (_directory, path, home) = fixture();
+            write_live_route(&home, provider_id, "http://127.0.0.1:18100", "");
+
+            let state = startup_route_state_from_paths(&path, &home).unwrap();
+            let snapshot = state.live_route.unwrap();
+
+            assert_eq!(
+                state.takeover,
+                RouteTakeoverState {
+                    managed: false,
+                    live: true,
+                }
+            );
+            assert_eq!(snapshot.provider_id(), *provider_id);
+            assert!(snapshot.provider.local_route);
+            assert_eq!(snapshot.profile().base_url, "http://127.0.0.1:18100");
+        }
+    }
+
+    #[test]
+    fn code_switch_r_provider_id_requires_a_loopback_endpoint() {
+        let (_directory, path, home) = fixture();
+        write_live_route(
+            &home,
+            "code-switch-r",
+            "https://relay.example/v1",
+            "sk-direct",
+        );
+
+        assert_eq!(
+            route_takeover_state_from_paths(&path, &home).unwrap(),
+            RouteTakeoverState::default()
         );
     }
 
