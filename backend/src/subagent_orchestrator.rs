@@ -107,6 +107,7 @@ struct PreparedContract {
     policy: RolePolicy,
     workspace_root: Option<String>,
     read_paths: Vec<String>,
+    native_read_scope: bool,
     write_paths: Vec<String>,
     trace: TraceContext,
     invocation_mode: InvocationMode,
@@ -206,6 +207,8 @@ struct Reservation {
     visual: bool,
     workspace_root: Option<String>,
     read_paths: Vec<String>,
+    #[serde(default)]
+    native_read_scope: bool,
     write_paths: Vec<String>,
     state: ReservationState,
     #[serde(default)]
@@ -1182,6 +1185,7 @@ pub(crate) fn pre_spawn_with_workspace(
             visual: prepared.policy.visual,
             workspace_root: prepared.workspace_root,
             read_paths: prepared.read_paths,
+            native_read_scope: prepared.native_read_scope,
             write_paths: prepared.write_paths,
             state: ReservationState::Pending,
             outcome: ExecutionOutcome::Unknown,
@@ -2575,13 +2579,14 @@ pub(crate) fn authorize_child_tool_with_context(
             )));
         }
         let covered = bound_reservation.is_some_and(|reservation| {
-            observed_paths
-                .iter()
-                .all(|path| reservation_covers_read_path(reservation, path, cwd))
+            reservation.native_read_scope
+                || observed_paths
+                    .iter()
+                    .all(|path| reservation_covers_read_path(reservation, path, cwd))
         });
         if !covered {
             return Ok(Some(format!(
-                "Codey 资源门禁：子代理 `{agent_id}` 的读取目标不在已声明 read scope 内。相对路径按 child cwd 解析；若任务运行在 worktree，请把派生契约 root 指向该 worktree 并据此声明 read，禁止用 Bash 绕过。"
+                "Codey 资源门禁：子代理 `{agent_id}` 的读取目标不在已声明 read scope 内。相对路径按 child cwd 解析；外部 worktree 必须由派生契约显式授权，实际访问继续受 Codex 原生沙箱与审批控制，禁止用 Bash 绕过。"
             )));
         }
         return Ok(None);
@@ -2604,7 +2609,7 @@ pub(crate) fn authorize_child_tool_with_context(
     });
     if !covered {
         return Ok(Some(format!(
-            "Codey 能力/资源门禁：子代理 `{agent_id}` 对目标路径没有已绑定且有效的写入 ownership；相对路径按 child cwd 解析。worktree 任务必须把契约 root 指向实际 worktree，禁止越界修改。"
+            "Codey 能力/资源门禁：子代理 `{agent_id}` 对目标路径没有已绑定且有效的写入 ownership；相对路径按 child cwd 解析。外部 worktree 必须由派生契约显式授权，实际访问继续受 Codex 原生沙箱与审批控制，禁止越界修改。"
         )));
     }
     Ok(None)
@@ -3175,12 +3180,11 @@ fn prepare_contract_with_rules(
         None => None,
     };
     if let Some(root) = workspace_root.as_deref() {
+        // `cwd` is not Codex's complete filesystem allowlist. Hooks do not expose
+        // the live sandbox mode, extra writable roots, or one-off approvals, so
+        // Codey only validates the explicit delegation scope here and leaves the
+        // actual access decision to Codex's inherited sandbox/approval layer.
         match hook_root.as_deref() {
-            Some(hook_root) if !path_is_within(root, hook_root) => {
-                return Err(contract_error(&format!(
-                    "契约 root `{root}` 必须等于 Hook 工作目录 `{hook_root}` 或位于其子目录内"
-                )));
-            }
             None if policy.access == RoleAccess::Write => {
                 return Err(contract_error(
                     "Hook 未提供绝对工作目录，无法校验写入角色的契约 root",
@@ -3228,6 +3232,7 @@ fn prepare_contract_with_rules(
         policy,
         workspace_root,
         read_paths,
+        native_read_scope: false,
         write_paths,
     })
 }
@@ -3285,6 +3290,7 @@ fn prepare_opaque_contract(
         policy,
         workspace_root,
         read_paths,
+        native_read_scope: true,
         write_paths,
     })
 }
@@ -3554,6 +3560,18 @@ fn resource_conflict(prepared: &PreparedContract, ledger: &SessionLedger) -> Opt
             && (reservation.state != ReservationState::Terminal
                 || reservation_has_pending_acceptance(reservation))
     }) {
+        if prepared.native_read_scope && !existing.write_paths.is_empty() {
+            return Some(format!(
+                "Codey 能力/资源冲突门禁：密文只读任务 `{}` 的具体 read scope 对 Hook 不可见，不能与活动写任务 `{}` 并行；请等待写任务结束后再派发。",
+                prepared.contract.id, existing.task_id
+            ));
+        }
+        if existing.native_read_scope && !prepared.write_paths.is_empty() {
+            return Some(format!(
+                "Codey 能力/资源冲突门禁：写任务 `{}` 不能与活动密文只读任务 `{}` 并行，因为后者的具体 read scope 对 Hook 不可见；请先等待只读任务结束。",
+                prepared.contract.id, existing.task_id
+            ));
+        }
         for new_write in &prepared.write_paths {
             if let Some(existing_path) = existing
                 .write_paths
@@ -4679,6 +4697,7 @@ mod tests {
         assert_eq!(prepared.workspace_root.as_deref(), Some("/repo"));
         assert!(prepared.write_paths.is_empty());
         assert_eq!(prepared.read_paths, ["/repo"]);
+        assert!(prepared.native_read_scope);
         assert!(prepared.contract.acceptance.is_empty());
 
         assert!(prepare_contract_with_workspace(Some(&encrypted_read), None).is_ok());
@@ -4697,7 +4716,73 @@ mod tests {
     }
 
     #[test]
-    fn plaintext_contract_root_must_stay_within_the_hook_workspace() {
+    fn opaque_native_read_scope_is_serialized_against_all_writers() {
+        let temp = tempfile::tempdir().unwrap();
+        let encrypted_read = json!({
+            "task_name": "encrypted_reader",
+            "agent_type": "codey_quick_scan",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "reader-first-session",
+                Some(&encrypted_read),
+                Some("/repo"),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+
+        let mut external_worker = worker_contract("external_worker", ".");
+        external_worker["root"] = json!("/external-repo");
+        let external_worker = contract_input("external_worker", "codey_worker", external_worker);
+        let denial = pre_spawn_with_workspace(
+            temp.path(),
+            "runtime-a",
+            "reader-first-session",
+            Some(&external_worker),
+            Some("/repo"),
+            1,
+            20,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("具体 read scope 对 Hook 不可见"));
+
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "writer-first-session",
+                Some(&external_worker),
+                Some("/repo"),
+                0,
+                30,
+            )
+            .unwrap(),
+            None
+        );
+        let denial = pre_spawn_with_workspace(
+            temp.path(),
+            "runtime-a",
+            "writer-first-session",
+            Some(&encrypted_read),
+            Some("/repo"),
+            1,
+            40,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("具体 read scope 对 Hook 不可见"));
+    }
+
+    #[test]
+    fn plaintext_contract_requires_a_valid_root_and_contained_claims() {
         let temp = tempfile::tempdir().unwrap();
         let write = contract_input(
             "worker_a",
@@ -4718,18 +4803,19 @@ mod tests {
         .unwrap();
         assert!(denial.contains("Hook 未提供绝对工作目录"));
 
-        let denial = pre_spawn_with_workspace(
-            temp.path(),
-            "runtime-a",
-            "session-a",
-            Some(&write),
-            Some("/other"),
-            0,
-            10,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denial.contains("必须等于 Hook 工作目录"));
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "session-external-root",
+                Some(&write),
+                Some("/other"),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
 
         let nested_root = contract_input(
             "worker_b",
@@ -4748,7 +4834,7 @@ mod tests {
             pre_spawn_with_workspace(
                 temp.path(),
                 "runtime-a",
-                "session-a",
+                "session-nested-root",
                 Some(&nested_root),
                 Some("/repo"),
                 0,
@@ -4766,7 +4852,7 @@ mod tests {
         let denial = pre_spawn_with_workspace(
             temp.path(),
             "runtime-a",
-            "session-a",
+            "session-outside-claim",
             Some(&outside_root),
             Some("/repo"),
             0,
@@ -4778,7 +4864,25 @@ mod tests {
     }
 
     #[test]
-    fn read_only_contract_root_is_checked_only_when_the_hook_workspace_exists() {
+    fn explicit_external_root_is_not_confused_with_hook_cwd() {
+        let mut read_contract = research_contract("external_reader");
+        read_contract["root"] = json!("/external-repo");
+        read_contract["read"] = json!(["docs"]);
+        let read_input = contract_input("external_reader", "codey_deep_research", read_contract);
+        let prepared = prepare_contract_with_workspace(Some(&read_input), Some("/repo")).unwrap();
+        assert_eq!(prepared.workspace_root.as_deref(), Some("/external-repo"));
+        assert_eq!(prepared.read_paths, vec!["/external-repo/docs"]);
+
+        let mut write_contract = worker_contract("external_worker", ".");
+        write_contract["root"] = json!("/external-repo");
+        let write_input = contract_input("external_worker", "codey_worker", write_contract);
+        let prepared = prepare_contract_with_workspace(Some(&write_input), Some("/repo")).unwrap();
+        assert_eq!(prepared.workspace_root.as_deref(), Some("/external-repo"));
+        assert_eq!(prepared.write_paths, vec!["/external-repo"]);
+    }
+
+    #[test]
+    fn read_only_contract_root_is_independent_from_the_hook_workspace() {
         let read_only = |root: &str, read: &[&str]| {
             contract_input(
                 "research_a",
@@ -4804,9 +4908,7 @@ mod tests {
             .is_ok()
         );
         assert!(
-            prepare_contract_with_workspace(Some(&read_only("/other", &[])), Some("/repo"))
-                .unwrap_err()
-                .contains("必须等于 Hook 工作目录")
+            prepare_contract_with_workspace(Some(&read_only("/other", &[])), Some("/repo")).is_ok()
         );
         assert!(
             prepare_contract_with_workspace(
@@ -6648,6 +6750,120 @@ mod tests {
     }
 
     #[test]
+    fn explicit_external_child_paths_are_checked_against_contract_claims() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut contract = research_contract("external_reader");
+        contract["root"] = json!("/external-repo");
+        contract["read"] = json!(["docs"]);
+        let input = contract_input("external_reader", "codey_deep_research", contract);
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "external-read-session",
+                Some(&input),
+                Some("/repo"),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "external-read-session",
+            Some(&input),
+            Some(&json!({ "agent_id": "agent-external-reader" })),
+            20,
+        )
+        .unwrap();
+
+        let read = json!({ "file_path": "/external-repo/docs/guide.md" });
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "external-read-session",
+                ChildToolContext {
+                    agent_id: "agent-external-reader",
+                    agent_type: None,
+                    transcript_path: None,
+                    cwd: Some("/repo"),
+                    tool_name: "mcp__codey_fastctx__inspect_local_file",
+                    tool_input: Some(&read),
+                },
+                30,
+            )
+            .unwrap(),
+            None
+        );
+        let undeclared_read = json!({ "file_path": "/another-repo/secret.txt" });
+        let denial = authorize_child_tool_with_context(
+            temp.path(),
+            "runtime-a",
+            "external-read-session",
+            ChildToolContext {
+                agent_id: "agent-external-reader",
+                agent_type: None,
+                transcript_path: None,
+                cwd: Some("/repo"),
+                tool_name: "mcp__codey_fastctx__inspect_local_file",
+                tool_input: Some(&undeclared_read),
+            },
+            35,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("read scope"));
+
+        let mut write_contract = worker_contract("external_worker", ".");
+        write_contract["root"] = json!("/external-repo");
+        let write_input = contract_input("external_worker", "codey_worker", write_contract);
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "external-write-session",
+                Some(&write_input),
+                Some("/repo"),
+                0,
+                40,
+            )
+            .unwrap(),
+            None
+        );
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "external-write-session",
+            Some(&write_input),
+            Some(&json!({ "agent_id": "agent-external-worker" })),
+            50,
+        )
+        .unwrap();
+        let replace = json!({ "path": "/external-repo/src/lib.rs", "pattern": "old" });
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "external-write-session",
+                ChildToolContext {
+                    agent_id: "agent-external-worker",
+                    agent_type: None,
+                    transcript_path: None,
+                    cwd: Some("/repo"),
+                    tool_name: "mcp__codey_fastctx__replace",
+                    tool_input: Some(&replace),
+                },
+                60,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn child_relative_paths_use_the_actual_worktree_cwd() {
         let temp = tempfile::tempdir().unwrap();
         let workspace = temp.path().join("workspace");
@@ -6834,7 +7050,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(denial.contains("把派生契约 root 指向该 worktree"));
+        assert!(denial.contains("read scope"));
 
         let absolute_read = json!({
             "file_path": format!("{worktree}/backend/src/lib.rs")
@@ -6855,7 +7071,68 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(absolute_denial.contains("把派生契约 root 指向该 worktree"));
+        assert!(absolute_denial.contains("read scope"));
+    }
+
+    #[test]
+    fn explicit_contract_can_scope_a_child_to_a_sibling_worktree() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let checkout = workspace.join("checkout");
+        let worktree = workspace.join(".worktrees/child");
+        fs::create_dir_all(checkout.join("backend/src")).unwrap();
+        fs::create_dir_all(worktree.join("backend/src")).unwrap();
+        let checkout = checkout.to_string_lossy().into_owned();
+        let worktree = worktree.to_string_lossy().into_owned();
+
+        let mut contract = research_contract("sibling_worktree_reader");
+        contract["root"] = json!(worktree);
+        contract["read"] = json!(["backend/src"]);
+        let input = contract_input("sibling_worktree_reader", "codey_deep_research", contract);
+        assert_eq!(
+            pre_spawn_with_workspace(
+                temp.path(),
+                "runtime-a",
+                "sibling-worktree-session",
+                Some(&input),
+                Some(&checkout),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "sibling-worktree-session",
+            Some(&input),
+            Some(&json!({ "agent_id": "agent-sibling-worktree" })),
+            20,
+        )
+        .unwrap();
+
+        let read = json!({
+            "file_path": format!("{worktree}/backend/src/lib.rs")
+        });
+        assert_eq!(
+            authorize_child_tool_with_context(
+                temp.path(),
+                "runtime-a",
+                "sibling-worktree-session",
+                ChildToolContext {
+                    agent_id: "agent-sibling-worktree",
+                    agent_type: None,
+                    transcript_path: None,
+                    cwd: Some(&checkout),
+                    tool_name: "mcp__codey_fastctx__inspect_local_file",
+                    tool_input: Some(&read),
+                },
+                30,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

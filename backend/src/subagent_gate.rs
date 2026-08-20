@@ -1895,6 +1895,39 @@ mod tests {
     }
 
     #[test]
+    fn spawn_hook_does_not_treat_cwd_as_codex_permission_allowlist() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("codey-subagent-gate-v3");
+        let workspace = temp.path().join("current-workspace");
+        let sibling_worktree = temp.path().join("sibling-worktree");
+        std::fs::create_dir_all(&state_root).unwrap();
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(sibling_worktree.join("backend/src")).unwrap();
+
+        let mut spawn = input("PreToolUse", "external-worktree-session");
+        spawn.cwd = Some(workspace.to_string_lossy().into_owned());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "sibling_reader",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "sibling_reader",
+                "why": "inspect_sibling_worktree",
+                "visual": false,
+                "root": sibling_worktree.to_string_lossy(),
+                "read": ["backend/src"],
+                "write": [],
+                "checks": []
+            }))
+        }));
+
+        // Codey validates the explicit contract. Codex's inherited sandbox and
+        // approval layer remains responsible for the actual filesystem access.
+        assert_eq!(handle_hook(&spawn, &state_root).unwrap(), json!({}));
+    }
+
+    #[test]
     fn spawn_task_receipt_binds_child_before_its_first_read() {
         let temp = tempfile::tempdir().unwrap();
         let state_root = temp.path().join("codey-subagent-gate-v3");
@@ -1999,7 +2032,7 @@ mod tests {
         assert!(
             denied["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("把派生契约 root 指向该 worktree"))
+                .is_some_and(|reason| reason.contains("read scope"))
         );
     }
 
@@ -2418,6 +2451,13 @@ mod tests {
         local_read.tool_name = Some("mcp__codey_fastctx__grep".to_string());
         local_read.tool_input = Some(json!({ "path": "src" }));
         assert_eq!(handle_hook(&local_read, state_root).unwrap(), json!({}));
+
+        let mut external_read = local_read;
+        external_read.tool_name = Some("mcp__codey_fastctx__inspect_local_file".to_string());
+        external_read.tool_input = Some(json!({
+            "file_path": state_root.join("sibling-worktree/backend/src/lib.rs")
+        }));
+        assert_eq!(handle_hook(&external_read, state_root).unwrap(), json!({}));
     }
 
     #[test]
