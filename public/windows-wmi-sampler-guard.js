@@ -3,7 +3,7 @@
 
   const guardKey = "__codeyWindowsWmiSamplerGuard";
   const scriptId = "windows-wmi-sampler";
-  const version = 2;
+  const version = 3;
   const statusRequestType = "codey-windows-wmi-sampler-status";
   const statusResponseType = "codey-windows-wmi-sampler-status-response";
   const probeTimeoutMs = 1_000;
@@ -44,7 +44,7 @@
       version,
       enabled,
       installed,
-      confirmed: !enabled || (installed && (selfTestPassed || blocked > 0)),
+      confirmed: !enabled || (installed && blocked > 0),
       blocked,
       selfTestPassed,
       observationMs,
@@ -86,15 +86,6 @@
           : matchReason === "worker-option-name"
             ? "（通过 Worker 语义名称识别）"
             : "");
-    } else if (current.selfTestPassed) {
-      status = "effective";
-      const workersObserved =
-        Number(current.mainProcessSnapshot?.workersObserved) || 0;
-      detail =
-        "WMI 周期采样保护一次性自检通过" +
-        (workersObserved > 0
-          ? `；已观察 ${workersObserved} 个其他 Worker，实际目标采样尚未触发`
-          : "；实际目标采样尚未触发");
     } else if (current.mainProcessSnapshot?.selfTestError) {
       status = "failed";
       detail = `WMI 周期采样保护自检失败：${current.mainProcessSnapshot.selfTestError}`;
@@ -112,9 +103,10 @@
           "尚未命中完整 WMI 周期采样特征；若 WMI 仍高占用，当前来源尚未被识别"
         : "WMI 周期采样保护已安装，但观察窗内未匹配到可识别的目标 Worker";
     } else if (current.installed) {
-      detail =
-        `WMI 周期采样保护已安装，等待首次采样确认` +
-        `（已观察 ${Math.floor(current.observationMs / 1_000)} 秒）`;
+      detail = current.selfTestPassed
+        ? "WMI Worker 拦截器自检通过，等待实际目标采样确认"
+        : `WMI 周期采样保护已安装，等待首次采样确认` +
+          `（已观察 ${Math.floor(current.observationMs / 1_000)} 秒）`;
     } else {
       detail = probeError
         ? `WMI 周期采样保护待确认：${probeError}`

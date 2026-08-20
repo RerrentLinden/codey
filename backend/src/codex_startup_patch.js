@@ -223,12 +223,14 @@
     };
     const stringPart = (value) =>
       typeof value === "string" ? value.slice(0, 2048) : "";
-    const requestInfo = (message) => {
+    const requestInfo = (message, channel = "") => {
       if (
         !message ||
         typeof message !== "object" ||
         message.type !== "worker-request" ||
-        message.workerId !== "git"
+        (message.workerId != null && message.workerId !== "git") ||
+        (message.workerId == null &&
+          !/(?:^|[:/_-])git(?:$|[:/_-])/i.test(channel))
       ) {
         return null;
       }
@@ -255,7 +257,7 @@
         query && typeof query.method === "string"
           ? query.method
           : workerMethod;
-      if (!targetMethods.has(method)) return null;
+      if (!targetMethods.has(method) && query == null) return null;
       const params =
         query?.params && typeof query.params === "object"
           ? query.params
@@ -445,7 +447,7 @@
       tokenRefillMs,
       perKeyIntervalMs,
     });
-    const wrapGitHandler = (handler) => {
+    const wrapGitHandler = (handler, channel = "") => {
       if (typeof handler !== "function") return handler;
       if (handler.__codeyMainGitRequestGuardOwner === api) {
         gitHandlerPatched = true;
@@ -457,7 +459,9 @@
         const message = args[1];
         if (
           message?.type === "worker-request-cancel" &&
-          message.workerId === "git"
+          (message.workerId === "git" ||
+            (message.workerId == null &&
+              /(?:^|[:/_-])git(?:$|[:/_-])/i.test(channel)))
         ) {
           const queued = queuedByRequestId.get(message.id);
           if (queued) {
@@ -468,7 +472,7 @@
             return Promise.resolve(undefined);
           }
         }
-        const info = requestInfo(message);
+        const info = requestInfo(message, channel);
         if (!info) return Reflect.apply(handler, this, args);
         return sendGuarded(handler, this, args, info);
       };
@@ -520,7 +524,7 @@
     const wrapIpcHandler = (handler, channel = "") => {
       if (typeof handler !== "function") return handler;
       if (handler.__codeyMainIpcGuardOwner === api) return handler;
-      const wrapped = wrapStatusHandler(wrapGitHandler(handler));
+      const wrapped = wrapStatusHandler(wrapGitHandler(handler, channel));
       Object.defineProperty(wrapped, "__codeyMainIpcGuardOwner", {
         value: api,
       });
@@ -1090,6 +1094,41 @@
     }
     return patched;
   };
+  const discoveredCodexRendererAssets = new Set();
+  const maximumDiscoveredCodexRendererAssets = 128;
+  const rememberCodexRendererAsset = (baseUrl, specifier) => {
+    try {
+      const url = new URL(specifier, baseUrl);
+      if (
+        url.protocol !== "app:" ||
+        !url.pathname.includes("/assets/") ||
+        !/\.(?:c|m)?js$/i.test(url.pathname)
+      ) return;
+      discoveredCodexRendererAssets.delete(url.pathname);
+      discoveredCodexRendererAssets.add(url.pathname);
+      while (
+        discoveredCodexRendererAssets.size >
+        maximumDiscoveredCodexRendererAssets
+      ) {
+        const oldest = discoveredCodexRendererAssets.keys().next().value;
+        if (oldest === undefined) break;
+        discoveredCodexRendererAssets.delete(oldest);
+      }
+    } catch {}
+  };
+  const discoverCodexRendererAssets = (baseUrl, source) => {
+    for (const match of source.matchAll(
+      /\bsrc\s*=\s*(["'])([^"']+\.(?:c|m)?js(?:[?#][^"']*)?)\1/gi,
+    )) rememberCodexRendererAsset(baseUrl, match[2]);
+  };
+  const isCodexRendererBootstrapRequest = (request) => {
+    try {
+      const url = new URL(request?.url);
+      return url.protocol === "app:" && /\/index\.html$/i.test(url.pathname);
+    } catch {
+      return false;
+    }
+  };
   const isCodexRendererAssetRequest = (request) => {
     try {
       const url = new URL(request?.url);
@@ -1097,15 +1136,16 @@
         url.protocol === "app:" &&
         url.pathname.includes("/assets/") &&
         (
-          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.js$/i.test(
+          /\/(?:(?:app-initial|codex-composer-adapter|general-settings|model-list-filter|windows-model-controls|use-service-tier-settings|read-service-tier-for-request|subagent-activity-chip-group)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
             url.pathname,
-          )
-          || (
-            disablePet
-            && /\/(?:(?:appearance-settings|pet-settings|pets-settings)(?:[~-][^/]*)?)\.js$/i.test(
+          ) ||
+          (
+            disablePet &&
+            /\/(?:(?:appearance-settings|pet-settings|pets-settings)(?:[~-][^/]*)?)\.(?:c|m)?js$/i.test(
               url.pathname,
             )
-          )
+          ) ||
+          discoveredCodexRendererAssets.has(url.pathname)
         )
       );
     } catch {
@@ -1113,8 +1153,27 @@
     }
   };
   const patchCodexRendererResponse = async (request, response) => {
-    if (!isCodexRendererAssetRequest(request) || response?.ok !== true) return response;
-    const source = await response.clone().text();
+    if (response?.ok !== true) return response;
+    if (isCodexRendererBootstrapRequest(request)) {
+      try {
+        discoverCodexRendererAssets(request.url, await response.clone().text());
+      } catch (error) {
+        recordCodeyPatchFailure("renderer_patch:asset discovery", error, {
+          requestUrl: request?.url,
+        });
+      }
+      return response;
+    }
+    if (!isCodexRendererAssetRequest(request)) return response;
+    let source;
+    try {
+      source = await response.clone().text();
+    } catch (error) {
+      recordCodeyPatchFailure("renderer_patch:asset read", error, {
+        requestUrl: request?.url,
+      });
+      return response;
+    }
     let patched;
     const previousRendererPatchFailures = activeRendererPatchFailures;
     activeRendererPatchFailures = rendererPatchFailuresForSource(source);
@@ -1137,7 +1196,14 @@
     }
     if (patched === source) return response;
     const headers = new Headers(response.headers);
-    headers.delete("content-length");
+    for (const header of [
+      "content-encoding",
+      "content-length",
+      "content-md5",
+      "digest",
+      "etag",
+      "last-modified",
+    ]) headers.delete(header);
     return new Response(patched, {
       headers,
       status: response.status,
@@ -1742,7 +1808,7 @@
       win32Process: /\bWin32_Process\b/i.test(source),
       perfProcess:
         /\bWin32_Perf(?:Formatted|Raw)Data_PerfProc_Process\b/i.test(source),
-      powershell: /powershell(?:\.exe)?/i.test(source),
+      powershell: /\b(?:powershell|pwsh)(?:\.exe)?\b/i.test(source),
       workerMessaging:
         /(?:worker_threads|parentPort|postMessage|workerData)/.test(source),
     });
@@ -1775,11 +1841,11 @@
       }
       return specifier.replace(/[?#].*$/, "");
     };
-    const readWorkerSource = (filename, options) => {
+    const describeWorkerSource = (filename, options) => {
       if (options?.eval === true) {
         return {
           cacheKey: null,
-          source: String(filename ?? "").slice(
+          load: () => String(filename ?? "").slice(
             0,
             maximumWmiWorkerSourceBytes,
           ),
@@ -1789,15 +1855,23 @@
       if (/^data:/i.test(specifier)) {
         return {
           cacheKey: null,
-          source: decodeDataWorkerSource(specifier),
+          load: () => decodeDataWorkerSource(specifier),
         };
       }
       const path = workerFilePath(filename);
       if (!path) return null;
+      const fs = process.getBuiltinModule("fs");
+      const stats = fs.statSync(path, { bigint: true });
       return {
-        cacheKey: path,
-        source: process
-          .getBuiltinModule("fs")
+        cacheKey: [
+          path,
+          stats.dev,
+          stats.ino,
+          stats.size,
+          stats.mtimeNs,
+          stats.ctimeNs,
+        ].join("\0"),
+        load: () => fs
           .readFileSync(path, "utf8")
           .slice(0, maximumWmiWorkerSourceBytes),
       };
@@ -1820,44 +1894,39 @@
         return { reason: "worker-option-name", workerName };
       }
 
-      const specifier = workerSpecifierText(filename);
-      const cacheKey =
-        options?.eval === true || /^data:/i.test(specifier)
-          ? null
-          : specifier;
-      if (cacheKey && workerSourceMatchCache.has(cacheKey)) {
-        const cached = workerSourceMatchCache.get(cacheKey);
-        return cached ? { ...cached, workerName } : null;
-      }
-
       try {
-        const loaded = readWorkerSource(filename, options);
-        if (!loaded) {
-          rememberWorkerSourceMatch(cacheKey, null);
-          return null;
+        const descriptor = describeWorkerSource(filename, options);
+        if (!descriptor) return null;
+        if (
+          descriptor.cacheKey &&
+          workerSourceMatchCache.has(descriptor.cacheKey)
+        ) {
+          const cached = workerSourceMatchCache.get(descriptor.cacheKey);
+          windowsWmiSamplerEvidence.lastObservedSourceSignals =
+            cached?.sourceSignals ?? [];
+          return cached ? { ...cached, workerName } : null;
         }
         windowsWmiSamplerEvidence.sourceInspections += 1;
-        const sourceSignals = wmiSnapshotSourceSignals(loaded.source);
-        windowsWmiSamplerEvidence.lastObservedSourceSignals = Object.entries(
+        const sourceSignals = wmiSnapshotSourceSignals(descriptor.load());
+        const matchedSourceSignals = Object.entries(
           sourceSignals,
         )
           .filter(([, matched]) => matched)
           .map(([signal]) => signal);
+        windowsWmiSamplerEvidence.lastObservedSourceSignals =
+          matchedSourceSignals;
         const matched = hasWmiSnapshotSourceSignature(sourceSignals);
         if (matched) {
           windowsWmiSamplerEvidence.sourceSignatureMatches += 1;
-          const match = { reason: "source-signature", workerName };
-          rememberWorkerSourceMatch(loaded.cacheKey, match);
-          if (cacheKey && cacheKey !== loaded.cacheKey) {
-            rememberWorkerSourceMatch(cacheKey, match);
-          }
-          return match;
+          const match = {
+            reason: "source-signature",
+            sourceSignals: matchedSourceSignals,
+          };
+          rememberWorkerSourceMatch(descriptor.cacheKey, match);
+          return { ...match, workerName };
         }
         windowsWmiSamplerEvidence.sourceSignatureMisses += 1;
-        rememberWorkerSourceMatch(loaded.cacheKey, null);
-        if (cacheKey && cacheKey !== loaded.cacheKey) {
-          rememberWorkerSourceMatch(cacheKey, null);
-        }
+        rememberWorkerSourceMatch(descriptor.cacheKey, null);
       } catch {
         windowsWmiSamplerEvidence.sourceReadFailures += 1;
       }
@@ -2511,6 +2580,9 @@
   });
 
   const optionalMainBundlePatchFailures = [];
+  let mainBundleSourcePatchAttempted = false;
+  let mainBundleSourcePatched = false;
+  let mainBundleFilename = "";
   const hasOptionalMainBundlePatchFailure = (name) =>
     optionalMainBundlePatchFailures.some((failure) => failure.name === name);
   const applyOptionalMainBundlePatch = (name, patch, source) => {
@@ -2558,15 +2630,27 @@
   {
     const originalJsExtension = Module._extensions[".js"];
     Module._extensions[".js"] = function codeyMainBundleCompileHook(module, filename) {
-      const isCodexMainBundle =
-        /[\\/]\.vite[\\/]build[\\/]main-[^\\/]+\.js$/i.test(filename);
-      if (!isCodexMainBundle) {
+      const isCodexBuildScript =
+        /[\\/]\.vite[\\/]build[\\/][^\\/]+\.(?:cjs|js)$/i.test(filename);
+      if (!isCodexBuildScript) {
         return Reflect.apply(originalJsExtension, this, arguments);
       }
 
-      try {
       const fs = process.getBuiltinModule("fs");
       let source = fs.readFileSync(filename, "utf8");
+      const hasMainBundleName =
+        /[\\/]\.vite[\\/]build[\\/]main(?:[-.][^\\/]*)?\.(?:cjs|js)$/i.test(filename);
+      const hasMainBundleSignature =
+        source.includes("checkout-webview-presentation-changed") &&
+        source.includes("will-attach-webview") &&
+        source.includes("did-attach-webview");
+      if (!hasMainBundleName && !hasMainBundleSignature) {
+        return Reflect.apply(originalJsExtension, this, arguments);
+      }
+
+      mainBundleSourcePatchAttempted = true;
+      mainBundleFilename = filename.split(/[\\/]/).at(-1)?.slice(0, 160) ?? "";
+      try {
       executionProcessLifecycle.configure(filename);
       source = applyOptionalMainBundlePatch(
         "desktopCesAnalytics",
@@ -2674,6 +2758,7 @@
         !hasOptionalMainBundlePatchFailure("desktopCesAnalytics");
       globalThis.__CODEY_APP_STATE_HEARTBEAT_SOURCE_PATCHED__ =
         !hasOptionalMainBundlePatchFailure("appStateHeartbeat");
+      mainBundleSourcePatched = true;
       module._compile(source, filename);
       } catch (error) {
         recordCodeyPatchFailure("patch_codex_main_bundle", error, { filename });
@@ -2711,24 +2796,12 @@
   let electronProxy = null;
   let electronProtocolProxy = null;
   let electronIpcMainProxy = null;
+  let electronBrowserWindowProxy = null;
   const electronMainRequests = new Set(["electron", "electron/main"]);
   const installNativeIpcMainGuards = (ipcMain) => {
     if (!ipcMain) return false;
     let installed = false;
-    for (const property of ["handle", "handleOnce"]) {
-      const original = ipcMain[property];
-      if (typeof original !== "function") continue;
-      if (original.__codeyMainIpcRegistrationGuard === true) {
-        installed = true;
-        continue;
-      }
-      const guarded = function (channel, handler, ...rest) {
-        return Reflect.apply(original, ipcMain, [
-          channel,
-          mainGitRequestGuard.wrapIpcHandler(handler, channel),
-          ...rest,
-        ]);
-      };
+    const installRegistrationGuard = (property, guarded) => {
       Object.defineProperty(guarded, "__codeyMainIpcRegistrationGuard", {
         value: true,
       });
@@ -2745,6 +2818,80 @@
         } catch {}
       }
       installed ||= ipcMain[property] === guarded;
+    };
+    for (const property of ["handle", "handleOnce"]) {
+      const original = ipcMain[property];
+      if (typeof original !== "function") continue;
+      if (original.__codeyMainIpcRegistrationGuard === true) {
+        installed = true;
+        continue;
+      }
+      const guarded = function (channel, handler, ...rest) {
+        return Reflect.apply(original, ipcMain, [
+          channel,
+          mainGitRequestGuard.wrapIpcHandler(handler, channel),
+          ...rest,
+        ]);
+      };
+      installRegistrationGuard(property, guarded);
+    }
+
+    const eventRegistrations = new Map(
+      ["on", "addListener", "once"].map((property) => [
+        property,
+        ipcMain[property],
+      ]),
+    );
+    const originalOn =
+      eventRegistrations.get("on") ?? eventRegistrations.get("addListener");
+    for (const property of ["on", "addListener"]) {
+      const original = eventRegistrations.get(property);
+      if (typeof original !== "function") continue;
+      if (original.__codeyMainIpcRegistrationGuard === true) {
+        installed = true;
+        continue;
+      }
+      const guarded = function (channel, handler, ...rest) {
+        const effectiveHandler =
+          mainGitRequestGuard.wrapIpcHandler(handler, channel);
+        if (effectiveHandler !== handler) {
+          Object.defineProperty(effectiveHandler, "listener", {
+            configurable: true,
+            value: handler,
+          });
+        }
+        return Reflect.apply(original, ipcMain, [
+          channel,
+          effectiveHandler,
+          ...rest,
+        ]);
+      };
+      installRegistrationGuard(property, guarded);
+    }
+    const originalOnce = eventRegistrations.get("once");
+    if (
+      typeof originalOnce === "function" &&
+      typeof originalOn === "function" &&
+      originalOnce.__codeyMainIpcRegistrationGuard !== true
+    ) {
+      const guardedOnce = function (channel, handler, ...rest) {
+        const effectiveHandler =
+          mainGitRequestGuard.wrapIpcHandler(handler, channel);
+        const onceHandler = function (...args) {
+          ipcMain.removeListener?.(channel, onceHandler);
+          return Reflect.apply(effectiveHandler, this, args);
+        };
+        Object.defineProperty(onceHandler, "listener", {
+          configurable: true,
+          value: handler,
+        });
+        return Reflect.apply(originalOn, ipcMain, [
+          channel,
+          onceHandler,
+          ...rest,
+        ]);
+      };
+      installRegistrationGuard("once", guardedOnce);
     }
     return installed;
   };
@@ -2798,10 +2945,52 @@
             },
           });
     }
+    if (disablePet && typeof loaded.BrowserWindow === "function") {
+      electronBrowserWindowProxy = new Proxy(loaded.BrowserWindow, {
+        construct(target, args, newTarget) {
+          const [options, ...rest] = args;
+          const isHiddenAvatarOverlay =
+            options?.alwaysOnTop === true &&
+            options?.transparent === true &&
+            options?.focusable === false &&
+            options?.frame === false &&
+            options?.skipTaskbar === true &&
+            options?.show === false;
+          const restoreVisibleFrameRate =
+            options?.webPreferences?.backgroundThrottling === false;
+          const effectiveOptions = isHiddenAvatarOverlay
+            ? {
+                ...options,
+                webPreferences: {
+                  ...options.webPreferences,
+                  backgroundThrottling: true,
+                },
+              }
+            : options;
+          const window = Reflect.construct(
+            target,
+            [effectiveOptions, ...rest],
+            newTarget,
+          );
+          if (isHiddenAvatarOverlay && restoreVisibleFrameRate) {
+            window.on?.("show", () => {
+              window.webContents?.setBackgroundThrottling?.(false);
+            });
+            window.on?.("hide", () => {
+              window.webContents?.setBackgroundThrottling?.(true);
+            });
+          }
+          return window;
+        },
+      });
+    }
     electronProxy = new Proxy(loaded, {
       get(target, property, receiver) {
         if (property === "protocol" && electronProtocolProxy) return electronProtocolProxy;
         if (property === "ipcMain" && electronIpcMainProxy) return electronIpcMainProxy;
+        if (property === "BrowserWindow" && electronBrowserWindowProxy) {
+          return electronBrowserWindowProxy;
+        }
         return Reflect.get(target, property, receiver);
       },
     });
@@ -2841,12 +3030,20 @@
     get optionalMainBundlePatchFailures() {
       return optionalMainBundlePatchFailures.map((failure) => ({ ...failure }));
     },
+    get mainBundleSourcePatch() {
+      return {
+        attempted: mainBundleSourcePatchAttempted,
+        filename: mainBundleFilename,
+        patched: mainBundleSourcePatched,
+      };
+    },
     reclaimExecutionEnvironments: true,
     get executionResourceCleanup() {
       return executionProcessLifecycle.status;
     },
     restoreNativeModelAndSpeedControls: true,
     destroyTemporaryWebViews: true,
+    throttleHiddenAvatarOverlay: disablePet,
     disableWindowsWmiSampler,
     get windowsWmiSampler() {
       return windowsWmiSamplerSnapshot();

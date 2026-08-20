@@ -231,14 +231,6 @@ pub fn prepare_injection_scripts(
                     : "";
                 return `已阻止 ${snapshot.blocked} 次 WMI 周期进程采样${matchDetail}`;
               }
-              if (snapshot.selfTestPassed === true) {
-                const workersObserved =
-                  Number(snapshot.mainProcessSnapshot?.workersObserved) || 0;
-                return "WMI 周期采样保护一次性自检通过" +
-                  (workersObserved > 0
-                    ? `；已观察 ${workersObserved} 个其他 Worker，实际目标采样尚未触发`
-                    : "；实际目标采样尚未触发");
-              }
               if (snapshot.mainProcessSnapshot?.selfTestError) {
                 return {
                   effective: false,
@@ -258,7 +250,9 @@ pub fn prepare_injection_scripts(
                   ? snapshot.sourceInspections > 0
                     ? `已检查 ${snapshot.sourceInspections} 个 Worker，尚未命中完整 WMI 周期采样特征；若 WMI 仍高占用，当前来源尚未被识别`
                     : "WMI 周期采样保护已安装，但观察窗内未匹配到可识别的目标 Worker"
-                  : `WMI 周期采样保护已安装，等待首次采样确认（已观察 ${Math.floor(snapshot.observationMs / 1000)} 秒）`;
+                  : snapshot.selfTestPassed === true
+                    ? "WMI Worker 拦截器自检通过，等待实际目标采样确认"
+                    : `WMI 周期采样保护已安装，等待首次采样确认（已观察 ${Math.floor(snapshot.observationMs / 1000)} 秒）`;
                 return {
                   effective: false,
                   detail,

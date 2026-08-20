@@ -37,7 +37,7 @@ test("Windows startup patch failure cleans the paused process before compatible 
   assert.match(windowsSpawn, /fallback\.performance_status = "degraded"/);
   assert.match(
     windowsSpawn,
-    /启动补丁未能安装，已自动以兼容模式启动；启动优化将在下次启动时重试/,
+    /本次会话的 Windows Git、WMI 与隐藏宠物窗口优化未生效/,
   );
   assert.doesNotMatch(windowsSpawn, /宠物精简启动补丁未能确认生效/);
   assert.doesNotMatch(windowsSpawn, /petSlimRequested/);

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
@@ -44,13 +45,13 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       },
     },
   };
+  const fakeIpcMain = new EventEmitter();
+  fakeIpcMain.handle = (channel, handler) => {
+    ipcHandlers.set(channel, handler);
+  };
   const fakeElectron = {
     BrowserWindow: class BrowserWindow {},
-    ipcMain: {
-      handle(channel, handler) {
-        ipcHandlers.set(channel, handler);
-      },
-    },
+    ipcMain: fakeIpcMain,
   };
   Module._load = function testElectronLoader(request) {
     if (request === "electron") return fakeElectron;
@@ -157,6 +158,32 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       renamedMessageChannel,
     );
     assert.equal(renamedChannelStatus.guard.ipcHandlersWrapped, 3);
+
+    const eventGitChannel = "codex_desktop:worker:git:event";
+    let eventGitCalls = 0;
+    const eventGitHandler = () => {
+      eventGitCalls += 1;
+    };
+    patchedElectron.ipcMain.on(eventGitChannel, eventGitHandler);
+    assert.notEqual(
+      patchedElectron.ipcMain.rawListeners(eventGitChannel)[0],
+      eventGitHandler,
+    );
+    patchedElectron.ipcMain.emit(eventGitChannel, null, { type: "noop" });
+    patchedElectron.ipcMain.removeListener(eventGitChannel, eventGitHandler);
+    patchedElectron.ipcMain.emit(eventGitChannel, null, { type: "noop" });
+    assert.equal(eventGitCalls, 1);
+    assert.equal(
+      globalThis.__CODEY_MAIN_GIT_REQUEST_GUARD__.snapshot().ipcHandlersWrapped,
+      4,
+    );
+    let onceGitCalls = 0;
+    patchedElectron.ipcMain.once(eventGitChannel, () => {
+      onceGitCalls += 1;
+    });
+    patchedElectron.ipcMain.emit(eventGitChannel, null, { type: "noop" });
+    patchedElectron.ipcMain.emit(eventGitChannel, null, { type: "noop" });
+    assert.equal(onceGitCalls, 1);
 
     let gitGuardTime = 10_000;
     let nextGitGuardTimer = 0;

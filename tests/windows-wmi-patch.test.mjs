@@ -29,6 +29,8 @@ test("Windows worker source signature cache is bounded", async () => {
     /workerSourceMatchCache\.size > maximumWmiWorkerSourceCacheEntries/,
   );
   assert.match(source, /workerSourceMatchCache\.delete\(oldestKey\)/);
+  assert.match(source, /stats\.mtimeNs/);
+  assert.match(source, /stats\.ctimeNs/);
 });
 
 async function withWindowsPlatform(run) {
@@ -128,6 +130,26 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
         value: [],
       });
 
+      const pwshWorkerPath = join(
+        temporaryDirectory,
+        "process-telemetry-pwsh.mjs",
+      );
+      await writeFile(
+        pwshWorkerPath,
+        [
+          'import { parentPort } from "node:worker_threads";',
+          'const executable = "pwsh.exe";',
+          'const command = "Get-CimInstance Win32_Process Win32_PerfRawData_PerfProc_Process";',
+          "parentPort.postMessage({ executable, command });",
+        ].join("\n"),
+      );
+      const pwshBlocked = new workerThreads.Worker(pwshWorkerPath);
+      assert.equal(pwshBlocked.threadId, -1);
+      assert.deepEqual((await once(pwshBlocked, "message"))[0], {
+        type: "ok",
+        value: [],
+      });
+
       const evalBlocked = new workerThreads.Worker(
         [
           'const { parentPort } = require("node:worker_threads");',
@@ -175,6 +197,22 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
       assert.equal((await once(harmless, "message"))[0], "harmless-worker-ran");
       await harmless.terminate();
 
+      await writeFile(
+        harmlessWorkerPath,
+        [
+          'import { parentPort } from "node:worker_threads";',
+          'const executable = "powershell.exe";',
+          'const command = "Get-WmiObject Win32_Process Win32_PerfFormattedData_PerfProc_Process";',
+          "parentPort.postMessage({ executable, command, replaced: true });",
+        ].join("\n"),
+      );
+      const replacedAtSamePath = new workerThreads.Worker(harmlessWorkerPath);
+      assert.equal(replacedAtSamePath.threadId, -1);
+      assert.deepEqual((await once(replacedAtSamePath, "message"))[0], {
+        type: "ok",
+        value: [],
+      });
+
       const normal = new workerThreads.Worker(
         'require("node:worker_threads").parentPort.postMessage("normal-worker-ran")',
         { eval: true, name: "child-process-snapshot-preview" },
@@ -188,8 +226,8 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
       assert.equal(sampler.workerWrapperPatched, true);
       assert.equal(sampler.esmExportsSynchronized, true);
       assert.equal(sampler.selfTestPassed, true);
-      assert.equal(sampler.blocked, 7);
-      assert.equal(sampler.sourceSignatureMatches, 3);
+      assert.equal(sampler.blocked, 9);
+      assert.equal(sampler.sourceSignatureMatches, 5);
       assert.equal(sampler.lastMatchReason, "source-signature");
       assert.equal(sampler.lastObservedWorkerName, "eval-worker");
       assert.equal(

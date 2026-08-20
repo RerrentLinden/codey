@@ -224,7 +224,7 @@ pub(super) async fn spawn_codex(
                     Ok(mut fallback) => {
                         fallback.performance_status = "degraded".to_string();
                         fallback.performance_detail =
-                            "启动补丁未能安装，已自动以兼容模式启动；启动优化将在下次启动时重试"
+                            "启动补丁未能安装，已自动以兼容模式启动；本次会话的 Windows Git、WMI 与隐藏宠物窗口优化未生效，下次启动将重试"
                                 .to_string();
                         error_log::record_failure(
                             "patch_degraded",

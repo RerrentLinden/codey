@@ -101,7 +101,7 @@
       !message ||
       typeof message !== "object" ||
       message.type !== "worker-request" ||
-      message.workerId !== "git"
+      (message.workerId != null && message.workerId !== "git")
     ) {
       return null;
     }
@@ -120,7 +120,7 @@
         ? outerParams.query
         : null;
     const method = query && typeof query.method === "string" ? query.method : workerMethod;
-    if (!targetMethods.has(method)) return null;
+    if (!targetMethods.has(method) && query == null) return null;
 
     const params =
       query?.params && typeof query.params === "object" ? query.params : outerParams;

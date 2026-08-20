@@ -27,6 +27,17 @@ async function loadStartupPatchExpression() {
     .replaceAll("__FAST_CODEX_STARTUP__", "true");
 }
 
+test("main bundle detection accepts renamed CommonJS entry chunks by signature", async () => {
+  const source = await loadStartupPatchExpression();
+
+  assert.match(source, /const hasMainBundleSignature =/);
+  assert.match(source, /source\.includes\("checkout-webview-presentation-changed"\)/);
+  assert.match(source, /source\.includes\("will-attach-webview"\)/);
+  assert.match(source, /source\.includes\("did-attach-webview"\)/);
+  assert.match(source, /\(\?:cjs\|js\)/);
+  assert.match(source, /get mainBundleSourcePatch\(\)/);
+});
+
 test("startup patch preserves native child processes and ordinary BrowserWindows", async () => {
   const Module = process.getBuiltinModule("module");
   const nativeLoad = Module._load;

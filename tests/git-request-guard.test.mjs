@@ -216,6 +216,43 @@ test("Git request guard leaves unknown and mutating worker requests untouched", 
   assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().matched, 0);
 });
 
+test("Git request guard covers renamed live queries without a duplicated worker id", async () => {
+  const runtime = createRuntime();
+  const liveRequest = (id) => ({
+    type: "worker-request",
+    request: {
+      id,
+      method: "subscribe-live-query",
+      params: {
+        query: {
+          method: "worktree-health-v2",
+          params: { cwd: "C:\\repo" },
+        },
+      },
+    },
+  });
+
+  await runtime.window.electronBridge.sendWorkerMessageFromView(
+    "git",
+    liveRequest("live-1"),
+  );
+  const secondDelivery = runtime.window.electronBridge.sendWorkerMessageFromView(
+    "git",
+    liveRequest("live-2"),
+  );
+
+  assert.equal(runtime.nativeCalls.length, 1);
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().matched, 2);
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().queued, 1);
+  await runtime.advance(2_000);
+  await secondDelivery;
+  assert.equal(runtime.nativeCalls.length, 2);
+  assert.equal(
+    runtime.window.__codeyGitRequestGuard.snapshot().lastMethod,
+    "worktree-health-v2",
+  );
+});
+
 test("Git request guard spaces duplicate read requests and cancels queued work", async () => {
   const runtime = createRuntime();
   const first = gitRequest("status-1", "status-summary", {
@@ -264,7 +301,7 @@ test("Git request guard spaces duplicate read requests and cancels queued work",
   assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().sent, 2);
 });
 
-test("Git request guard recognizes protected live-query subscriptions only", async () => {
+test("Git request guard recognizes live-query subscriptions independently of query names", async () => {
   const runtime = createRuntime();
   const protectedSubscription = gitRequest("live-review", "subscribe-live-query", {
     operationSource: "review_model",
@@ -296,8 +333,8 @@ test("Git request guard recognizes protected live-query subscriptions only", asy
   );
 
   assert.equal(runtime.nativeCalls.length, 2);
-  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().matched, 1);
-  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().lastMethod, "review-summary");
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().matched, 2);
+  assert.equal(runtime.window.__codeyGitRequestGuard.snapshot().lastMethod, "branch-commits");
 });
 
 test("Git request guard allows a small burst and caps the sustained global rate", async () => {

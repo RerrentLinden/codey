@@ -121,19 +121,19 @@ test("WMI sampler guard is registered as an independently probed CDP script", ()
   assert.doesNotMatch(source, /setInterval/);
 });
 
-test("WMI sampler guard verifies protection once and reports actual blocks separately", async () => {
+test("WMI sampler guard keeps self-test separate from actual protection", async () => {
   const runtime = createRuntime();
   await runtime.flush();
 
   const entry =
     runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
-  assert.equal(entry.status, "effective");
-  assert.match(entry.detail, /一次性自检通过/);
-  assert.match(entry.detail, /实际目标采样尚未触发/);
+  assert.equal(entry.status, "executed");
+  assert.match(entry.detail, /拦截器自检通过/);
+  assert.match(entry.detail, /等待实际目标采样确认/);
   assert.equal(runtime.requests[0].type, "codey-windows-wmi-sampler-status");
   assert.equal(
     runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
-    true,
+    false,
   );
 
   runtime.setSampler({
@@ -207,7 +207,7 @@ test("WMI sampler guard keeps an unmatched observation window unverified", async
   );
 });
 
-test("WMI sampler self-test is not downgraded by an unrelated observed Worker", async () => {
+test("WMI sampler self-test does not hide an unmatched observation", async () => {
   const runtime = createRuntime({
     sampler: {
       enabled: true,
@@ -228,13 +228,12 @@ test("WMI sampler self-test is not downgraded by an unrelated observed Worker", 
 
   const entry =
     runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
-  assert.equal(entry.status, "effective");
-  assert.match(entry.detail, /一次性自检通过/);
-  assert.match(entry.detail, /已观察 1 个其他 Worker/);
-  assert.match(entry.detail, /实际目标采样尚未触发/);
+  assert.equal(entry.status, "executed");
+  assert.match(entry.detail, /已检查 1 个 Worker/);
+  assert.match(entry.detail, /当前来源尚未被识别/);
   assert.equal(
     runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
-    true,
+    false,
   );
 });
 
@@ -244,7 +243,7 @@ test("WMI sampler guard stays unverified when a Worker source could not be read"
       enabled: true,
       installed: true,
       workerWrapperPatched: true,
-      selfTestPassed: false,
+      selfTestPassed: true,
       blocked: 0,
       observationMs: 60_000,
       sourceReadFailures: 1,

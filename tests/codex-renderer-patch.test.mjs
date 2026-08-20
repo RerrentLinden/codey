@@ -74,6 +74,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       this.currentUrl = "";
       this.loadedUrls = [];
       this.destroyed = false;
+      this.backgroundThrottling = [];
     }
 
     getURL() {
@@ -85,6 +86,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       this.loadedUrls.push(url);
       this.emit("did-start-navigation", {}, url);
       return Promise.resolve();
+    }
+
+    setBackgroundThrottling(enabled) {
+      this.backgroundThrottling.push(enabled);
     }
   }
   class FakeBrowserWindow extends FakeEmitter {
@@ -178,8 +183,20 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       show: false,
       frame: false,
       skipTaskbar: true,
+      webPreferences: { backgroundThrottling: false },
     });
     assert.equal(avatarOverlayWindow.destroyed, false);
+    assert.equal(
+      avatarOverlayWindow.options.webPreferences.backgroundThrottling,
+      true,
+    );
+    avatarOverlayWindow.emit("show");
+    avatarOverlayWindow.emit("hide");
+    assert.deepEqual(
+      avatarOverlayWindow.webContents.backgroundThrottling,
+      [false, true],
+    );
+    assert.equal(petSurface.options.webPreferences, undefined);
     assert.equal(
       Module._load("C:\\Codex\\avatar_overlay.node", undefined, false),
       fakeAvatarOverlayNative,
@@ -403,10 +420,40 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "return i.loadingStatus!==`Ready`&&",
       "i.initializeAsync().catch(n.Log.error).finally(()=>o(!1))}",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(statsigSource));
-    const statsigResponse = await installedHandler({
-      url: "app://-/assets/app-initial-BHB6SClA.js",
+    electron.protocol.handle(
+      "app",
+      async () => new Response(
+        '<!doctype html><script type="module" src="./assets/BHB6SClA.js"></script>',
+      ),
+    );
+    const bootstrapResponse = await installedHandler({
+      url: "app://-/index.html",
     });
+    assert.match(await bootstrapResponse.text(), /BHB6SClA\.js/);
+    electron.protocol.handle(
+      "app",
+      async () => new Response(statsigSource, {
+        headers: {
+          "content-encoding": "identity",
+          "content-length": String(Buffer.byteLength(statsigSource)),
+          "content-md5": "stale",
+          digest: "sha-256=stale",
+          etag: '"stale"',
+          "last-modified": "Wed, 21 Oct 2015 07:28:00 GMT",
+        },
+      }),
+    );
+    const statsigResponse = await installedHandler({
+      url: "app://-/assets/BHB6SClA.js",
+    });
+    for (const header of [
+      "content-encoding",
+      "content-length",
+      "content-md5",
+      "digest",
+      "etag",
+      "last-modified",
+    ]) assert.equal(statsigResponse.headers.get(header), null);
     const patchedStatsigSource = await statsigResponse.text();
     assert.match(
       patchedStatsigSource,
@@ -423,6 +470,10 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       /Codey Statsig async initialization timeout/,
     );
     assert.doesNotMatch(patchedStatsigSource, /i\.initializeAsync\(\)\.catch/);
+    const nonScriptResponse = await installedHandler({
+      url: "app://-/assets/BHB6SClA.css",
+    });
+    assert.match(await nonScriptResponse.text(), /let t=await Ueu\(e\);/);
 
     const localeSource = [
       "function resolveLocale(a,bp,Au){",
