@@ -430,10 +430,24 @@ fn supervisor_reaps_worker_after_worker_stdout_failure() {
 #[test]
 fn supervisor_reaps_worker_after_forwarding_stdout_failure() {
     let temp = tempfile::tempdir().unwrap();
-    let (mut child, mut stdin, responses_rx, close_stdout, stdout_closed) =
-        spawn_supervisor_with_closeable_stdout(&temp);
+    let CloseableStdoutSupervisor {
+        mut child,
+        mut stdin,
+        responses_rx,
+        close_stdout,
+        stdout_closed,
+        stdout_ready,
+    } = spawn_supervisor_with_closeable_stdout(&temp);
     initialize_test_worker_session(&mut stdin, &responses_rx);
     let worker_pid = wait_for_test_worker_start(temp.path(), 1)[0];
+
+    // `response_with_id` can receive the initialize response before the reader
+    // thread has finished its post-line close check. Wait for that boundary so
+    // the close request is deterministically applied after response 98 instead
+    // of occasionally closing the pipe after the initialize response.
+    stdout_ready
+        .recv_timeout(PROCESS_TIMEOUT)
+        .expect("supervisor stdout reader did not reach the next-line boundary");
 
     close_stdout.send(()).unwrap();
     send(
@@ -502,21 +516,24 @@ fn spawn_supervisor_with_test_worker_env(
 }
 
 #[cfg(unix)]
-fn spawn_supervisor_with_closeable_stdout(
-    temp: &tempfile::TempDir,
-) -> (
-    Child,
-    std::process::ChildStdin,
-    mpsc::Receiver<std::io::Result<String>>,
-    mpsc::Sender<()>,
-    mpsc::Receiver<()>,
-) {
+struct CloseableStdoutSupervisor {
+    child: Child,
+    stdin: std::process::ChildStdin,
+    responses_rx: mpsc::Receiver<std::io::Result<String>>,
+    close_stdout: mpsc::Sender<()>,
+    stdout_closed: mpsc::Receiver<()>,
+    stdout_ready: mpsc::Receiver<()>,
+}
+
+#[cfg(unix)]
+fn spawn_supervisor_with_closeable_stdout(temp: &tempfile::TempDir) -> CloseableStdoutSupervisor {
     let mut child = spawn_test_supervisor_process(temp, &[]);
     let stdin = child.stdin.take().unwrap();
     let stdout = child.stdout.take().unwrap();
     let (responses_tx, responses_rx) = mpsc::channel();
     let (close_tx, close_rx) = mpsc::channel();
     let (closed_tx, closed_rx) = mpsc::channel();
+    let (ready_tx, ready_rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut lines = BufReader::new(stdout).lines();
         while let Some(line) = lines.next() {
@@ -525,9 +542,19 @@ fn spawn_supervisor_with_closeable_stdout(
                 let _ = closed_tx.send(());
                 return;
             }
+            if ready_tx.send(()).is_err() {
+                return;
+            }
         }
     });
-    (child, stdin, responses_rx, close_tx, closed_rx)
+    CloseableStdoutSupervisor {
+        child,
+        stdin,
+        responses_rx,
+        close_stdout: close_tx,
+        stdout_closed: closed_rx,
+        stdout_ready: ready_rx,
+    }
 }
 
 fn spawn_test_supervisor_process(temp: &tempfile::TempDir, extra_env: &[(&str, &str)]) -> Child {
