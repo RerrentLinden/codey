@@ -325,6 +325,12 @@ struct LedgerStore {
     ledger_path: PathBuf,
 }
 
+fn ledger_lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        // LockFileEx reports ERROR_LOCK_VIOLATION for an occupied byte range.
+        || (cfg!(windows) && error.raw_os_error() == Some(33))
+}
+
 impl LedgerStore {
     fn open(state_root: &Path, session_id: &str) -> Result<Self> {
         fs::create_dir_all(state_root).with_context(|| {
@@ -346,7 +352,7 @@ impl LedgerStore {
         loop {
             match lock.try_lock_exclusive() {
                 Ok(()) => break,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if ledger_lock_is_contended(&error) => {
                     if lock_started.elapsed() >= Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS) {
                         anyhow::bail!(
                             "获取 Codey 子代理编排账本锁超时（{} ms）：{}",
@@ -3573,7 +3579,17 @@ fn normalize_authorized_path(value: &str) -> std::result::Result<String, String>
 }
 
 fn normalize_absolute_path(value: &str) -> std::result::Result<String, String> {
-    let replaced = value.trim().replace('\\', "/");
+    let mut replaced = value.trim().replace('\\', "/");
+    if let Some(verbatim) = replaced.strip_prefix("//?/") {
+        replaced = if verbatim
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("unc/"))
+        {
+            format!("//{}", &verbatim[4..])
+        } else {
+            verbatim.to_string()
+        };
+    }
     if replaced.is_empty() || replaced.contains(['*', '?', '[', ']']) {
         return Err("必须是无 glob 的绝对路径".to_string());
     }
@@ -6595,6 +6611,14 @@ mod tests {
     }
 
     #[test]
+    fn windows_lock_violation_is_only_treated_as_contention_on_windows() {
+        assert_eq!(
+            ledger_lock_is_contended(&std::io::Error::from_raw_os_error(33)),
+            cfg!(windows)
+        );
+    }
+
+    #[test]
     fn child_write_tool_must_stay_inside_declared_ownership() {
         let temp = tempfile::tempdir().unwrap();
         let input = contract_input(
@@ -6878,6 +6902,20 @@ mod tests {
         assert_eq!(reservation.outcome, ExecutionOutcome::Lost);
         assert!(reservation.agent_id_hash.is_none());
         assert_eq!(reservation.fenced_at_ms, Some(20));
+    }
+
+    #[test]
+    fn verbatim_windows_paths_are_normalized_without_allowing_globs() {
+        let drive = normalize_absolute_path(r"\\?\C:\repo\src").unwrap();
+        let unc = normalize_absolute_path(r"\\?\UNC\server\share\src").unwrap();
+        if cfg!(windows) {
+            assert_eq!(drive, "c:/repo/src");
+            assert_eq!(unc, "//server/share/src");
+        } else {
+            assert_eq!(drive, "C:/repo/src");
+            assert_eq!(unc, "//server/share/src");
+        }
+        assert!(normalize_absolute_path(r"\\?\C:\repo\*.rs").is_err());
     }
 
     #[cfg(unix)]
