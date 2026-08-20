@@ -7,7 +7,6 @@ const PATCH_RESULT: &str = "codey-startup-patch-installed-v24";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
     pub disable_pet: bool,
-    pub fast_codex_startup: bool,
     pub subagent_gate_active: bool,
 }
 
@@ -52,14 +51,6 @@ fn patch_expression_with_runtime_overrides(
         .replace(
             "__DISABLE_PET__",
             if options.disable_pet { "true" } else { "false" },
-        )
-        .replace(
-            "__FAST_CODEX_STARTUP__",
-            if options.fast_codex_startup {
-                "true"
-            } else {
-                "false"
-            },
         )
         .replace(
             "__SUBAGENT_GATE_ACTIVE__",
@@ -277,7 +268,6 @@ mod tests {
     fn patch_expression_keeps_pet_slimming_voice_compatible() {
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
-            fast_codex_startup: true,
             subagent_gate_active: true,
         });
 
@@ -312,10 +302,7 @@ mod tests {
         assert!(expression.contains("codey-git-request-guard-status"));
         assert!(expression.contains("get mainGitRequestGuard()"));
         assert!(expression.contains("module._compile(source, filename)"));
-        assert!(expression.contains("const fastCodexStartup = true"));
         assert!(expression.contains("CODEY_SUBAGENT_GATE_RUNTIME_ID"));
-        assert!(expression.contains("Codey Statsig bootstrap timeout"));
-        assert!(expression.contains("statsigBootstrapTimeoutMs = 1500"));
         assert!(expression.contains("default Chinese locale"));
         assert!(expression.contains("__CODEY_DEFAULT_CHINESE_LOCALE_RENDERER_PATCH__"));
         assert!(expression.contains("spawnSync"));
@@ -334,7 +321,6 @@ mod tests {
         let expression = patch_expression_with_runtime_overrides(
             PatchOptions {
                 disable_pet: false,
-                fast_codex_startup: true,
                 subagent_gate_active: true,
             },
             &overrides,
@@ -350,7 +336,6 @@ mod tests {
     fn windows_lag_patch_only_short_circuits_the_wmi_snapshot_worker() {
         let expression = patch_expression(PatchOptions {
             disable_pet: false,
-            fast_codex_startup: true,
             subagent_gate_active: true,
         });
 
@@ -372,24 +357,9 @@ mod tests {
     }
 
     #[test]
-    fn fast_startup_bootstrap_cap_can_be_disabled() {
-        let expression = patch_expression(PatchOptions {
-            disable_pet: false,
-            fast_codex_startup: false,
-            subagent_gate_active: false,
-        });
-
-        assert!(expression.contains("const fastCodexStartup = false"));
-        assert!(expression.contains("typeof false === \"boolean\""));
-        assert!(!expression.contains("__FAST_CODEX_STARTUP__"));
-        assert!(!expression.contains("__SUBAGENT_GATE_ACTIVE__"));
-    }
-
-    #[test]
     fn automatic_lifecycle_patch_bounds_duplicate_mcp_and_reclaims_execution_helpers() {
         let expression = patch_expression(PatchOptions {
             disable_pet: false,
-            fast_codex_startup: true,
             subagent_gate_active: true,
         });
 
@@ -522,7 +492,6 @@ mod tests {
 
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
-            fast_codex_startup: true,
             subagent_gate_active: true,
         });
         install_over_websocket(&format!("ws://{address}"), &expression)
@@ -583,7 +552,6 @@ mod tests {
 
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
-            fast_codex_startup: true,
             subagent_gate_active: true,
         });
         let error = tokio::time::timeout(

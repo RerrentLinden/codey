@@ -5,7 +5,6 @@ import { transformWithEsbuild } from "vite";
 
 const root = new URL("../", import.meta.url);
 const fixtures = [
-  ["fast-startup-shield.js", "__CODEY_FAST_CODEX_STARTUP__"],
   ["pet-control-shield.js", "__CODEY_SLIM_PET__"],
 ];
 

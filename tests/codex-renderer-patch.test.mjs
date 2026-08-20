@@ -15,9 +15,10 @@ async function loadStartupPatchExpression(
     ),
   );
   assert.ok(template);
-  const expression = template
-    .replaceAll("__DISABLE_PET__", disablePet ? "true" : "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "true");
+  const expression = template.replaceAll(
+    "__DISABLE_PET__",
+    disablePet ? "true" : "false",
+  );
   return errorLoggerExecutable == null
     ? expression
     : expression.replaceAll(
@@ -404,77 +405,6 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       /const petSettingsId=`settings\.pets\.title`/,
     );
 
-    const statsigSource = [
-      "function Ftu(e){",
-      "let m=async e=>{",
-      "let t=await Ueu(e);",
-      "try{let client=new Vtu.StatsigClient(c,t.user,config);return client}",
-      "catch(error){throw new Jeu(",
-      "mb.CODEX_POST_LOGIN_STATSIG_BOOTSTRAP_FAILURE_TYPE_CLIENT_INITIALIZATION_FAILED,",
-      "error)}};",
-      "return m}",
-      "`Statsig: error while bootstrapping post-login client ",
-      "CodexStatsigProvider.sync`;",
-      "`useStatsigInternalClientFactoryAsync`;`_getInstance`;",
-      "function runAsyncStatsigGate(i,n,o){",
-      "return i.loadingStatus!==`Ready`&&",
-      "i.initializeAsync().catch(n.Log.error).finally(()=>o(!1))}",
-    ].join("");
-    electron.protocol.handle(
-      "app",
-      async () => new Response(
-        '<!doctype html><script type="module" src="./assets/BHB6SClA.js"></script>',
-      ),
-    );
-    const bootstrapResponse = await installedHandler({
-      url: "app://-/index.html",
-    });
-    assert.match(await bootstrapResponse.text(), /BHB6SClA\.js/);
-    electron.protocol.handle(
-      "app",
-      async () => new Response(statsigSource, {
-        headers: {
-          "content-encoding": "identity",
-          "content-length": String(Buffer.byteLength(statsigSource)),
-          "content-md5": "stale",
-          digest: "sha-256=stale",
-          etag: '"stale"',
-          "last-modified": "Wed, 21 Oct 2015 07:28:00 GMT",
-        },
-      }),
-    );
-    const statsigResponse = await installedHandler({
-      url: "app://-/assets/BHB6SClA.js",
-    });
-    for (const header of [
-      "content-encoding",
-      "content-length",
-      "content-md5",
-      "digest",
-      "etag",
-      "last-modified",
-    ]) assert.equal(statsigResponse.headers.get(header), null);
-    const patchedStatsigSource = await statsigResponse.text();
-    assert.match(
-      patchedStatsigSource,
-      /let t=await Promise\.race\(\[Ueu\(e\),new Promise/,
-    );
-    assert.match(patchedStatsigSource, /Codey Statsig bootstrap timeout/);
-    assert.doesNotMatch(patchedStatsigSource, /let t=await Ueu\(e\);/);
-    assert.match(
-      patchedStatsigSource,
-      /Promise\.race\(\[i\.initializeAsync\(\),new Promise/,
-    );
-    assert.match(
-      patchedStatsigSource,
-      /Codey Statsig async initialization timeout/,
-    );
-    assert.doesNotMatch(patchedStatsigSource, /i\.initializeAsync\(\)\.catch/);
-    const nonScriptResponse = await installedHandler({
-      url: "app://-/assets/BHB6SClA.css",
-    });
-    assert.match(await nonScriptResponse.text(), /let t=await Ueu\(e\);/);
-
     const localeSource = [
       "function resolveLocale(a,bp,Au){",
       "const dynamicConfigId=`72216192`,enableI18n=`enable_i18n`;",
@@ -735,127 +665,9 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       /function unrelated\(\)\{return beginCpuSampling\(\)\}/,
     );
 
-    let rejectBootstrap;
-    const neverCompletesBootstrap = new Promise((_, reject) => {
-      rejectBootstrap = reject;
-    });
-    const createStatsigSync = Function(
-      "Ueu",
-      "Vtu",
-      "Jeu",
-      "mb",
-      "c",
-      "config",
-      `${patchedStatsigSource};return Ftu()`,
-    );
-    const syncStatsig = createStatsigSync(
-      () => neverCompletesBootstrap,
-      {
-        StatsigClient() {
-          assert.fail(
-            "StatsigClient must not be constructed after bootstrap timeout",
-          );
-        },
-      },
-      class FakeStatsigInitializationError extends Error {},
-      {
-        CODEX_POST_LOGIN_STATSIG_BOOTSTRAP_FAILURE_TYPE_CLIENT_INITIALIZATION_FAILED:
-          "client-initialization-failed",
-      },
-      {},
-      {},
-    );
-    const unhandledRejections = [];
-    const onUnhandledRejection = (reason) => {
-      unhandledRejections.push(reason);
-    };
-    const nativeDateNow = Date.now;
-    const nativeSetTimeout = globalThis.setTimeout;
-    const nativeClearTimeout = globalThis.clearTimeout;
-    let now = 10_000;
-    const scheduledTimers = [];
-    const runNextTimer = () => {
-      const timer = scheduledTimers.find((candidate) => !candidate.cleared);
-      assert.ok(timer, "expected a scheduled timeout");
-      timer.cleared = true;
-      timer.callback(...timer.args);
-      return timer.delay;
-    };
-
-    delete globalThis.__CODEY_STATSIG_STARTUP_DEADLINE_MS__;
-    process.on("unhandledRejection", onUnhandledRejection);
-    let releaseAsyncInitialization;
-    const neverCompletesAsyncInitialization = new Promise((_, reject) => {
-      releaseAsyncInitialization = reject;
-    });
-    const asyncInitializationErrors = [];
-    const asyncGateFinished = [];
-    const runAsyncStatsigGate = Function(
-      `${patchedStatsigSource};return runAsyncStatsigGate`,
-    )();
-    try {
-      Date.now = () => now;
-      globalThis.setTimeout = (callback, delay = 0, ...args) => {
-        const timer = { callback, delay, args, cleared: false };
-        scheduledTimers.push(timer);
-        return timer;
-      };
-      globalThis.clearTimeout = (timer) => {
-        if (timer) timer.cleared = true;
-      };
-
-      const syncStatsigPromise = syncStatsig("input");
-      const syncStatsigAssertion = assert.rejects(
-        syncStatsigPromise,
-        (error) => {
-          assert.match(String(error), /Codey Statsig bootstrap timeout/);
-          return true;
-        },
-      );
-      assert.equal(runNextTimer(), 1500);
-      now += 1500;
-      await syncStatsigAssertion;
-      const asyncGatePromise = runAsyncStatsigGate(
-        {
-          loadingStatus: "Loading",
-          initializeAsync: () => neverCompletesAsyncInitialization,
-        },
-        {
-          Log: {
-            error: (error) => {
-              asyncInitializationErrors.push(error);
-            },
-          },
-        },
-        (loading) => {
-          asyncGateFinished.push(loading);
-        },
-      );
-      assert.equal(runNextTimer(), 0);
-      await asyncGatePromise;
-      assert.equal(asyncInitializationErrors.length, 1);
-      assert.match(
-        String(asyncInitializationErrors[0]),
-        /Codey Statsig async initialization timeout/,
-      );
-      assert.deepEqual(asyncGateFinished, [false]);
-      rejectBootstrap(new Error("late bootstrap failure"));
-      releaseAsyncInitialization(
-        new Error("late async initialization failure"),
-      );
-      await new Promise((resolve) => setImmediate(resolve));
-      assert.deepEqual(unhandledRejections, []);
-    } finally {
-      delete globalThis.__CODEY_STATSIG_STARTUP_DEADLINE_MS__;
-      Date.now = nativeDateNow;
-      globalThis.setTimeout = nativeSetTimeout;
-      globalThis.clearTimeout = nativeClearTimeout;
-      process.off("unhandledRejection", onUnhandledRejection);
-    }
-
     // Only the first (fully incompatible) bundle logged skips — two gates whose
-    // anchors were present but whose shapes did not match. The statsig and
-    // interaction bundles patched cleanly, so no further skips were logged.
+    // anchors were present but whose shapes did not match. The interaction
+    // bundle patched cleanly, so no further skips were logged.
     assert.equal(patchErrors.length, 2);
 
     const productionRendererAsset = process.env.CODEY_RENDERER_ASSET;

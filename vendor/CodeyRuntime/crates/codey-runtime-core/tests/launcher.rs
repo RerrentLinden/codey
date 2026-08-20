@@ -11,8 +11,7 @@ use codey_runtime_core::app_paths::{
 use codey_runtime_core::app_paths::{codex_runtime_version, resolve_codex_runtime_version};
 use codey_runtime_core::launcher::{
     CodexLaunch, DefaultLaunchHooks, LaunchHooks, LaunchOptions, MacosCleanupPolicy,
-    build_codex_arguments, build_codex_arguments_for_settings,
-    build_codex_arguments_with_native_menu_inspector, build_codex_command,
+    build_codex_arguments, build_codex_arguments_with_native_menu_inspector, build_codex_command,
     build_codex_command_with_native_menu_inspector, build_macos_cleanup_command,
     build_macos_open_command, build_macos_open_command_with_native_menu_inspector,
     build_packaged_activation, build_packaged_activation_with_native_menu_inspector,
@@ -564,46 +563,6 @@ fn launcher_appends_extra_codex_arguments_after_debug_arguments() {
     assert_eq!(command[2], "--remote-allow-origins=http://127.0.0.1:9229");
     assert_eq!(command[3], "--force_high_performance_gpu");
     assert_eq!(command[4], "--enable-features=UseOzonePlatform");
-}
-
-#[test]
-fn launcher_fast_startup_adds_statsig_fast_fail_argument_when_enabled() {
-    let settings = BackendSettings {
-        codex_app_fast_startup: true,
-        ..BackendSettings::default()
-    };
-    let args = build_codex_arguments_for_settings(9229, &settings);
-
-    assert!(args.iter().any(|arg| {
-        arg.starts_with("--host-resolver-rules=")
-            && arg.contains("MAP ab.chatgpt.com 127.0.0.1")
-            && arg.contains("MAP featureassets.org 127.0.0.1")
-            && arg.contains("MAP cloudflare-dns.com 127.0.0.1")
-    }));
-
-    let settings = BackendSettings {
-        codex_app_fast_startup: true,
-        codex_extra_args: vec!["--host-resolver-rules=MAP example.test 127.0.0.1".to_string()],
-        ..BackendSettings::default()
-    };
-    let args = build_codex_arguments_for_settings(9229, &settings);
-    assert_eq!(
-        args.iter()
-            .filter(|arg| arg.starts_with("--host-resolver-rules="))
-            .count(),
-        1
-    );
-
-    let settings = BackendSettings {
-        codex_app_fast_startup: false,
-        ..BackendSettings::default()
-    };
-    let args = build_codex_arguments_for_settings(9229, &settings);
-    assert!(
-        !args
-            .iter()
-            .any(|arg| arg.starts_with("--host-resolver-rules="))
-    );
 }
 
 #[test]

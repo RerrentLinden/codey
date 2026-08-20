@@ -190,15 +190,6 @@ fn restart_sensitive_config_changes_are_detected() {
         &account_usage_change
     ));
 
-    let mut fast_startup_change = applied.clone();
-    fast_startup_change.fast_codex_startup = !fast_startup_change.fast_codex_startup;
-    assert!(config_requires_restart(
-        &applied,
-        &applied_models,
-        &applied_subagent,
-        &fast_startup_change
-    ));
-
     let mut disabled_subagent_change = applied.clone();
     disabled_subagent_change.subagent_model = "gpt-5.6-sol".into();
     assert!(!config_requires_restart(

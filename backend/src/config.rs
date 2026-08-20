@@ -248,10 +248,6 @@ pub struct CodeyConfig {
     /// runtime. Disabled by default so existing tool behavior is unchanged.
     #[serde(default)]
     pub fast_context_tools: bool,
-    /// Bounds slow Codex remote feature bootstrap requests in the renderer so
-    /// they cannot hold the initial route behind a long network timeout.
-    #[serde(default = "default_true")]
-    pub fast_codex_startup: bool,
     /// Temporarily enables Codey's opinionated Codex multi-agent V2 setup for
     /// the next runtime. Disabled by default and restored on shutdown.
     #[serde(default)]
@@ -310,7 +306,6 @@ impl Default for CodeyConfig {
             slim_codex_pet: true,
             gpu_launch_mode: GpuLaunchMode::Off,
             fast_context_tools: false,
-            fast_codex_startup: true,
             subagent_optimization: false,
             subagent_model: default_subagent_model(),
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
@@ -953,12 +948,15 @@ mod tests {
     }
 
     #[test]
-    fn fast_codex_startup_defaults_to_enabled_for_existing_configs() {
-        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
-            .unwrap()
-            .normalize();
+    fn retired_fast_startup_setting_is_ignored_and_removed_on_serialize() {
+        let config = serde_json::from_str::<CodeyConfig>(
+            r#"{"activeProfileId":"","profiles":[],"fastCodexStartup":true}"#,
+        )
+        .unwrap()
+        .normalize();
 
-        assert!(config.fast_codex_startup);
+        let serialized = serde_json::to_value(config).unwrap();
+        assert!(serialized.get("fastCodexStartup").is_none());
     }
 
     #[test]

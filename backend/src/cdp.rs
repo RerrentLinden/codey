@@ -15,12 +15,9 @@ use crate::error_log;
 
 const SETTINGS_OVERLAY_LOAD_PATH: &str = "/internal/codey/settings-overlay/load";
 const SESSION_TOOLS_LOAD_PATH: &str = "/internal/codey/session-tools/load";
-const FAST_STARTUP_STATSIG_TIMEOUT_MS: u64 = 1500;
 const CDP_INJECTION_TIMEOUT: Duration = Duration::from_secs(30);
 const INJECTION_STATUS_READ_TIMEOUT: Duration = Duration::from_secs(1);
 const INJECTION_DEADLINE_MARGIN: Duration = Duration::from_millis(100);
-const FAST_STARTUP_SHIELD_SCRIPT: &str =
-    include_str!("../../dist-overlay/inject/fast-startup-shield.js");
 const CODEY_BRIDGE_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-bridge.js");
 const GIT_REQUEST_GUARD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/git-request-guard.js");
@@ -150,7 +147,6 @@ impl InjectedTarget {
 }
 
 pub fn prepare_injection_scripts(
-    fast_codex_startup: bool,
     slim_codex_pet: bool,
     hide_full_access_warning: bool,
     user_scripts: &[String],
@@ -164,22 +160,6 @@ pub fn prepare_injection_scripts(
               && typeof window.__codeyCall === "function"
               ? "桥接函数可调用" : """#
                 .to_string(),
-        ),
-        (
-            "fast-startup-shield",
-            "Codex 快速启动保护",
-            FAST_STARTUP_SHIELD_SCRIPT,
-            format!(
-                r#"(() => {{
-                  const shield = window.__codeyFastStartupShield;
-                  if (!shield || shield.enabled !== {fast_codex_startup}
-                    || typeof shield.snapshot !== "function") return "";
-                  const snapshot = shield.snapshot();
-                  return shield.enabled
-                    ? `慢请求保护已启用（${{snapshot.timeoutMs}}ms，已降级 ${{snapshot.statsigTimeouts}} 次）`
-                    : "慢请求保护已关闭";
-                }})()"#
-            ),
         ),
         (
             "git-request-guard",
@@ -363,8 +343,7 @@ pub fn prepare_injection_scripts(
         ),
     ];
     let mut core_bundle = String::with_capacity(
-        FAST_STARTUP_SHIELD_SCRIPT.len()
-            + CODEY_BRIDGE_SCRIPT.len()
+        CODEY_BRIDGE_SCRIPT.len()
             + GIT_REQUEST_GUARD_SCRIPT.len()
             + WINDOWS_WMI_SAMPLER_GUARD_SCRIPT.len()
             + MODEL_WHITELIST_INJECT_SCRIPT.len()
@@ -383,7 +362,7 @@ pub fn prepare_injection_scripts(
             source: "builtin",
             probe: Some(probe),
         };
-        let prepared = prepare_script(script, fast_codex_startup, slim_codex_pet);
+        let prepared = prepare_script(script, slim_codex_pet);
         append_guarded_script(&mut core_bundle, &descriptor, prepared.as_ref());
         descriptors.push(descriptor);
     }
@@ -412,28 +391,14 @@ pub fn prepare_injection_scripts(
     }
 }
 
-fn prepare_script(script: &str, fast_codex_startup: bool, slim_codex_pet: bool) -> Cow<'_, str> {
-    if !script.contains("__CODEY_FAST_CODEX_STARTUP__")
-        && !script.contains("__CODEY_STATSIG_TIMEOUT_MS__")
-        && !script.contains("__CODEY_SLIM_PET__")
-    {
+fn prepare_script(script: &str, slim_codex_pet: bool) -> Cow<'_, str> {
+    if !script.contains("__CODEY_SLIM_PET__") {
         return Cow::Borrowed(script);
     }
-    Cow::Owned(
-        script
-            .replace(
-                "__CODEY_FAST_CODEX_STARTUP__",
-                if fast_codex_startup { "true" } else { "false" },
-            )
-            .replace(
-                "__CODEY_STATSIG_TIMEOUT_MS__",
-                &FAST_STARTUP_STATSIG_TIMEOUT_MS.to_string(),
-            )
-            .replace(
-                "__CODEY_SLIM_PET__",
-                if slim_codex_pet { "true" } else { "false" },
-            ),
-    )
+    Cow::Owned(script.replace(
+        "__CODEY_SLIM_PET__",
+        if slim_codex_pet { "true" } else { "false" },
+    ))
 }
 
 fn append_guarded_script(
@@ -1448,7 +1413,6 @@ mod tests {
     #[test]
     fn core_scripts_share_one_cdp_document_script_and_user_scripts_stay_isolated() {
         let prepared = prepare_injection_scripts(
-            true,
             false,
             false,
             &["".to_string(), "window.userScriptRan = true;".to_string()],
@@ -1456,15 +1420,12 @@ mod tests {
 
         assert_eq!(prepared.scripts.len(), 2);
         let core = &prepared.scripts[0];
-        assert!(core.contains("window.__codeyFastStartupShield"));
-        assert!(core.contains(r#"["true"][0]==="true""#));
         assert!(core.contains("window.__codeyBridgeHelpersInstalled"));
         assert!(core.contains("__codeyGitRequestGuard"));
         assert!(core.contains("__codeyWindowsWmiSamplerGuard"));
         assert!(core.contains("window.__codeyModelWhitelistPatch"));
         assert!(core.contains("/codex-model-catalog"));
         assert!(core.contains("window.__codeyRendererCoreLoaded"));
-        assert!(core.contains(r#"["true"][0]==="true""#));
         assert!(core.contains(r#"["false"][0]==="true""#));
         assert!(core.contains(SETTINGS_OVERLAY_LOAD_PATH));
         assert!(core.contains(SESSION_TOOLS_LOAD_PATH));
@@ -1477,9 +1438,9 @@ mod tests {
         assert!(prepared.scripts[1].contains("window.userScriptRan = true;"));
         assert!(prepared.scripts[1].contains(r#"status = "executed""#));
         assert!(prepared.scripts[1].contains("用户脚本 1 injection failed"));
-        assert_eq!(prepared.descriptors.len(), 12);
-        assert_eq!(prepared.descriptors[11].id, "user-script-1");
-        assert_eq!(prepared.descriptors[11].source, "user");
+        assert_eq!(prepared.descriptors.len(), 11);
+        assert_eq!(prepared.descriptors[10].id, "user-script-1");
+        assert_eq!(prepared.descriptors[10].source, "user");
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
         assert!(snapshot_script.contains("Windows Git 请求限流已由主进程接管"));
@@ -1514,12 +1475,8 @@ mod tests {
 
     #[test]
     fn injection_statuses_preserve_script_order_and_report_missing_entries() {
-        let prepared = prepare_injection_scripts(
-            false,
-            false,
-            false,
-            &["window.userScriptRan = true;".to_string()],
-        );
+        let prepared =
+            prepare_injection_scripts(false, false, &["window.userScriptRan = true;".to_string()]);
         let reported = vec![
             RuntimeInjectionStatus {
                 id: "user-script-1".to_string(),
@@ -1541,14 +1498,12 @@ mod tests {
         assert_eq!(statuses[0].id, "bridge-helpers");
         assert_eq!(statuses[0].status, "effective");
         assert_eq!(statuses[0].detail.as_deref(), Some("桥接函数可调用"));
-        assert_eq!(statuses[1].id, "fast-startup-shield");
+        assert_eq!(statuses[1].id, "git-request-guard");
         assert_eq!(statuses[1].status, "unknown");
-        assert_eq!(statuses[2].id, "git-request-guard");
+        assert_eq!(statuses[2].id, "windows-wmi-sampler");
         assert_eq!(statuses[2].status, "unknown");
-        assert_eq!(statuses[3].id, "windows-wmi-sampler");
+        assert_eq!(statuses[3].id, "model-whitelist");
         assert_eq!(statuses[3].status, "unknown");
-        assert_eq!(statuses[4].id, "model-whitelist");
-        assert_eq!(statuses[4].status, "unknown");
         assert_eq!(
             statuses.last().map(|status| status.id.as_str()),
             Some("user-script-1")

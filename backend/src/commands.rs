@@ -866,7 +866,6 @@ async fn save_codey_config_locked(
         config_input.fast_context_tools,
         &fast_context_tools_status,
     );
-    config.fast_codex_startup = config_input.fast_codex_startup;
     config.subagent_optimization = config_input.subagent_optimization;
     let default_role_supplied = subagent_roles_present
         && !config_input.subagent_roles.is_empty()
@@ -1277,7 +1276,6 @@ fn config_requires_restart(
         || applied.slim_codex_pet != current.slim_codex_pet
         || applied.gpu_launch_mode != current.gpu_launch_mode
         || applied.fast_context_tools != current.fast_context_tools
-        || applied.fast_codex_startup != current.fast_codex_startup
         || applied.subagent_optimization != current.subagent_optimization
         || applied_models != &RuntimeModelConfig::from_config(current)
         || ((applied.subagent_optimization || current.subagent_optimization)

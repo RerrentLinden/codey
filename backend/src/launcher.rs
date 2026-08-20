@@ -1346,7 +1346,6 @@ async fn spawn_and_inject_runtime(
         &storage.app_dir,
         patch.debug_port,
         config.slim_codex_pet,
-        config.fast_codex_startup,
         config.subagent_optimization,
         config.gpu_launch_mode,
         runtime_config_overrides,
@@ -1493,7 +1492,6 @@ impl CodeyRuntime {
     ) -> Result<(Self, oneshot::Receiver<()>, Option<oneshot::Receiver<()>>)> {
         let home = codex_home();
         let injection_scripts = cdp::prepare_injection_scripts(
-            config.fast_codex_startup,
             config.slim_codex_pet,
             config.hide_full_access_warning,
             &config.user_scripts,

@@ -53,7 +53,6 @@ export type Config = {
   slimCodexPet: boolean;
   gpuLaunchMode: "off" | "disableGpu" | "disableGpuRasterization";
   fastContextTools: boolean;
-  fastCodexStartup: boolean;
   subagentOptimization: boolean;
   subagentModel: string;
   subagentReasoningEffort: string;

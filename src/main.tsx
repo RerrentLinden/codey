@@ -125,7 +125,6 @@ if (import.meta.env.DEV) {
       slimCodexPet: true,
       gpuLaunchMode: "off" as const,
       fastContextTools: false,
-      fastCodexStartup: true,
       subagentOptimization: false,
       subagentModel: "gpt-5.6-terra",
       subagentReasoningEffort: "medium",

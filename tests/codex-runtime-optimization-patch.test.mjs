@@ -20,7 +20,6 @@ async function loadPatchExpression(
       JSON.stringify(runtimeConfigOverrides),
     )
     .replaceAll("__DISABLE_PET__", "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "true")
     .replaceAll(
       "__SUBAGENT_GATE_ACTIVE__",
       subagentGateActive ? "true" : "false",

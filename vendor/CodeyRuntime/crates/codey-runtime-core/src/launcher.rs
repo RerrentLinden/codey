@@ -773,7 +773,7 @@ impl LaunchHooks for DefaultLaunchHooks {
         let native_menu_localization_enabled = settings.codex_app_native_menu_localization;
         let native_menu_inspector_port =
             native_menu_localization_enabled.then(|| select_native_menu_inspector_port(debug_port));
-        let launch_extra_args = codex_extra_args_for_launch(settings, extra_args);
+        let launch_extra_args = normalize_codex_extra_args(extra_args);
         if cfg!(windows) {
             let activation = if let Some(inspector_port) = native_menu_inspector_port {
                 build_packaged_activation_with_native_menu_inspector(
@@ -2038,36 +2038,7 @@ pub fn build_codex_arguments_for_settings(
     debug_port: u16,
     settings: &BackendSettings,
 ) -> Vec<String> {
-    build_codex_arguments(
-        debug_port,
-        &codex_extra_args_for_launch(settings, &settings.codex_extra_args),
-    )
-}
-
-fn codex_extra_args_for_launch(settings: &BackendSettings, extra_args: &[String]) -> Vec<String> {
-    let mut args = Vec::new();
-    if settings.codex_app_fast_startup && !has_host_resolver_rules(extra_args) {
-        args.push(statsig_fast_fail_host_resolver_rule());
-    }
-    args.extend(normalize_codex_extra_args(extra_args));
-    args
-}
-
-fn has_host_resolver_rules(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| arg.trim().starts_with("--host-resolver-rules"))
-}
-
-fn statsig_fast_fail_host_resolver_rule() -> String {
-    [
-        "--host-resolver-rules=MAP ab.chatgpt.com 127.0.0.1",
-        "MAP featureassets.org 127.0.0.1",
-        "MAP prodregistryv2.org 127.0.0.1",
-        "MAP api.statsigcdn.com 127.0.0.1",
-        "MAP statsigapi.net 127.0.0.1",
-        "MAP cloudflare-dns.com 127.0.0.1",
-    ]
-    .join(",")
+    build_codex_arguments(debug_port, &settings.codex_extra_args)
 }
 
 pub fn build_codex_arguments_with_native_menu_inspector(

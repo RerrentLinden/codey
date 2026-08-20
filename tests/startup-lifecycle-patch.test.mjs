@@ -22,9 +22,7 @@ async function loadStartupPatchExpression() {
     "utf8",
   ));
   assert.ok(template);
-  return template
-    .replaceAll("__DISABLE_PET__", "false")
-    .replaceAll("__FAST_CODEX_STARTUP__", "true");
+  return template.replaceAll("__DISABLE_PET__", "false");
 }
 
 test("main bundle detection accepts renamed CommonJS entry chunks by signature", async () => {

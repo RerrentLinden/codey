@@ -143,7 +143,6 @@ pub(super) async fn spawn_codex(
     app_dir: &std::path::Path,
     debug_port: u16,
     disable_codex_pet: bool,
-    fast_codex_startup: bool,
     subagent_gate_active: bool,
     gpu_launch_mode: GpuLaunchMode,
     runtime_config_overrides: &[String],
@@ -151,13 +150,11 @@ pub(super) async fn spawn_codex(
     #[cfg(any(windows, target_os = "macos"))]
     let patch_options = crate::codex_startup_patch::PatchOptions {
         disable_pet: disable_codex_pet,
-        fast_codex_startup,
         subagent_gate_active,
     };
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (
         disable_codex_pet,
-        fast_codex_startup,
         subagent_gate_active,
         runtime_config_overrides,
     );
@@ -206,7 +203,6 @@ pub(super) async fn spawn_codex(
                         "inspectorPort": inspector_port,
                         "processId": spawned.process_id,
                         "disablePet": patch_options.disable_pet,
-                        "fastCodexStartup": patch_options.fast_codex_startup,
                     }),
                 );
                 if let Err(cleanup_error) = stop_windows_spawned_codex(&mut spawned, app_dir).await
@@ -293,7 +289,6 @@ pub(super) async fn spawn_codex(
                         "processId": spawned.process_id,
                         "processGroupId": spawned.process_group_id,
                         "disablePet": patch_options.disable_pet,
-                        "fastCodexStartup": patch_options.fast_codex_startup,
                     }),
                 );
                 if let Err(stop_error) = stop_macos_codex(

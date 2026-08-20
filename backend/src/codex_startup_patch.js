@@ -1,6 +1,5 @@
 (() => {
   const disablePet = __DISABLE_PET__;
-  const fastCodexStartup = __FAST_CODEX_STARTUP__;
   const codeyErrorLoggerExecutable = "__CODEY_ERROR_LOGGER_EXECUTABLE__";
   const maxOptionalPatchFailureBatchSize = 64;
   const optionalPatchFailureQueue = [];
@@ -125,10 +124,7 @@
       reportPatchLogError(logError);
     }
   };
-  const statsigBootstrapTimeoutMs = 1500;
   const threadOwnerDiscoveryTimeoutMs = 150;
-  const statsigStartupRemainingMs =
-    `Math.max(0,(globalThis.__CODEY_STATSIG_STARTUP_DEADLINE_MS__??=Date.now()+${statsigBootstrapTimeoutMs})-Date.now())`;
   const disableWindowsOptimizations = process.platform === "win32";
   const disableMicro = disableWindowsOptimizations;
   const disableWindowsWmiSampler = disableWindowsOptimizations;
@@ -1022,49 +1018,6 @@
             ? "if(modelPickerTriggerConfig!=null)"
             : `${aliasedPrefix}if(${triggerConfigName}!=null)`,
         "fast model trigger fallback",
-      );
-    }
-    if (
-      fastCodexStartup &&
-      source.includes(
-        "CODEX_POST_LOGIN_STATSIG_BOOTSTRAP_FAILURE_TYPE_CLIENT_INITIALIZATION_FAILED",
-      ) &&
-      source.includes("Statsig: error while bootstrapping post-login client") &&
-      source.includes("CodexStatsigProvider.sync")
-    ) {
-      // Keep the bootstrap call outside the inner StatsigClient block. Minified
-      // bundles often reuse the bootstrap argument name for the client binding;
-      // moving both into one block would put the argument in that binding's TDZ.
-      // A timeout still rejects the mutation and enters the provider fallback.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /let\s+([$A-Z_a-z][$\w]*)\s*=\s*await\s+([$A-Z_a-z][$\w]*)\(\s*([$A-Z_a-z][$\w]*)\s*\)\s*;\s*try\s*\{\s*let\s+([$A-Z_a-z][$\w]*)\s*=\s*new\s+([$A-Z_a-z][$\w]*)\.StatsigClient\s*\(/g,
-        (
-          _match,
-          payloadName,
-          bootstrapName,
-          bootstrapInputName,
-          clientName,
-          statsigModuleName,
-        ) =>
-          `let ${payloadName}=await Promise.race([${bootstrapName}(${bootstrapInputName}),new Promise((_,reject)=>globalThis.setTimeout(()=>reject(new Error("Codey Statsig bootstrap timeout")),${statsigStartupRemainingMs}))]);try{let ${clientName}=new ${statsigModuleName}.StatsigClient(`,
-        "post-login Statsig bootstrap timeout",
-      );
-    }
-    if (
-      fastCodexStartup &&
-      source.includes("useStatsigInternalClientFactoryAsync") &&
-      source.includes("_getInstance") &&
-      source.includes("loadingStatus")
-    ) {
-      // The SDK's anonymous-client hook otherwise keeps the entire route tree
-      // behind its loading placeholder until initializeAsync settles.
-      patched = replaceUniqueRendererGate(
-        patched,
-        /([$A-Z_a-z][$\w]*)\.loadingStatus\s*!==\s*`Ready`\s*&&\s*\1\.initializeAsync\(\)\.catch\s*\(/g,
-        (_match, clientName) =>
-          `${clientName}.loadingStatus!==\`Ready\`&&Promise.race([${clientName}.initializeAsync(),new Promise((_,reject)=>globalThis.setTimeout(()=>reject(new Error("Codey Statsig async initialization timeout")),${statsigStartupRemainingMs}))]).catch(`,
-        "Statsig async client initialization timeout",
       );
     }
     if (
@@ -3007,8 +2960,6 @@
     disableWindowsOptimizations,
     disableMicro,
     disablePet,
-    fastCodexStartup,
-    statsigBootstrapTimeoutMs,
     disableAppServerAnalytics: true,
     get disableDesktopCesAnalytics() {
       return !hasOptionalMainBundlePatchFailure("desktopCesAnalytics");
