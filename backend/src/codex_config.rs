@@ -64,7 +64,8 @@ const CODEY_FASTCTX_GREP_TOKEN_BUDGET: usize = 10_800;
 const CODEY_FASTCTX_GLOB_TOKEN_BUDGET: usize = 5_400;
 const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 120;
 const CODEY_FASTCTX_TOOL_TIMEOUT_SECONDS: i64 = 300;
-const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 2;
+const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 3;
+const PREVIOUS_DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 2;
 const APPLIED_CONFIG_FILE: &str = "applied-config.toml";
 const APPLIED_AGENTS_MD_FILE: &str = "applied-AGENTS.md";
 const APPLIED_DEFAULT_AGENT_FILE: &str = "agents/applied-default.toml";
@@ -1986,6 +1987,25 @@ fn enable_subagent_optimization(
         .and_then(Item::as_str)
         .unwrap_or_default()
         .to_string();
+    let migrate_previous_owned_concurrency = doc
+        .get("agents")
+        .and_then(Item::as_table)
+        .is_some_and(|agents| {
+            agents
+                .get("max_concurrent_threads_per_session")
+                .and_then(Item::as_integer)
+                == Some(PREVIOUS_DEFAULT_SUBAGENT_MAX_CONCURRENCY)
+                && agents.get("codey_quick_scan").is_some()
+                && agents.get("codey_worker").is_some()
+        })
+        && doc
+            .get("features")
+            .and_then(Item::as_table)
+            .and_then(|features| features.get("multi_agent_v2"))
+            .and_then(Item::as_table)
+            .and_then(|multi_agent| multi_agent.get("tool_namespace"))
+            .and_then(Item::as_str)
+            == Some("agents");
     let agents = ensure_root_table(doc, "agents")?;
     let legacy_max_threads = agents.remove("max_threads");
     agents.remove("max_depth");
@@ -1994,7 +2014,9 @@ fn enable_subagent_optimization(
         .get("max_concurrent_threads_per_session")
         .and_then(Item::as_integer)
         .is_some_and(|concurrency| concurrency > 0);
-    if !has_valid_concurrency {
+    if migrate_previous_owned_concurrency {
+        agents["max_concurrent_threads_per_session"] = value(DEFAULT_SUBAGENT_MAX_CONCURRENCY);
+    } else if !has_valid_concurrency {
         agents["max_concurrent_threads_per_session"] = legacy_max_threads
             .filter(|legacy| {
                 legacy

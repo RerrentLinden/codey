@@ -33,15 +33,14 @@ const DEFAULT_POINT_LIMIT: u16 = 8;
 const MAX_POINT_LIMIT: u16 = 12;
 const DEFAULT_ATTEMPT_LIMIT: u16 = 4;
 const MAX_ATTEMPT_LIMIT: u16 = 6;
-const MAX_BATCHES_PER_TURN: u16 = 3;
-const MAX_TOTAL_ATTEMPTS_PER_TURN: u16 = MAX_ATTEMPT_LIMIT * MAX_BATCHES_PER_TURN;
+const READ_ONLY_CONCURRENCY_LIMIT: usize = 3;
+const WRITE_OR_MIXED_CONCURRENCY_LIMIT: usize = 2;
 const DUPLICATE_TASK_ID_ERROR_CODE: &str = "CODEY_SUBAGENT_DUPLICATE_TASK_ID";
 const FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE: &str =
     "CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT";
 const UNBOUND_ATTEMPT_ERROR_CODE: &str = "CODEY_SUBAGENT_UNBOUND_ATTEMPT";
 const AGENT_ID_COLLISION_ERROR_CODE: &str = "CODEY_SUBAGENT_AGENT_ID_COLLISION";
-const BATCH_BUDGET_ERROR_CODE: &str = "CODEY_SUBAGENT_BATCH_BUDGET_EXHAUSTED";
-const TURN_BUDGET_ERROR_CODE: &str = "CODEY_SUBAGENT_TURN_BUDGET_EXHAUSTED";
+const CONCURRENCY_LIMIT_ERROR_CODE: &str = "CODEY_SUBAGENT_CONCURRENCY_LIMIT";
 const MAX_CLAIMS_PER_MODE: usize = 16;
 const MAX_ACCEPTANCE_CHECKS: usize = 8;
 const MAX_ACCEPTANCE_COMMAND_CHARS: usize = 1024;
@@ -342,7 +341,7 @@ impl LedgerStore {
             .read(true)
             .write(true)
             .open(&lock_path)
-            .with_context(|| format!("打开 Codey 子代理预算账本锁失败：{}", lock_path.display()))?;
+            .with_context(|| format!("打开 Codey 子代理编排账本锁失败：{}", lock_path.display()))?;
         let lock_started = Instant::now();
         loop {
             match lock.try_lock_exclusive() {
@@ -350,7 +349,7 @@ impl LedgerStore {
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     if lock_started.elapsed() >= Duration::from_millis(LEDGER_LOCK_TIMEOUT_MILLIS) {
                         anyhow::bail!(
-                            "获取 Codey 子代理预算账本锁超时（{} ms）：{}",
+                            "获取 Codey 子代理编排账本锁超时（{} ms）：{}",
                             LEDGER_LOCK_TIMEOUT_MILLIS,
                             lock_path.display()
                         );
@@ -359,7 +358,7 @@ impl LedgerStore {
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!("获取 Codey 子代理预算账本锁失败：{}", lock_path.display())
+                        format!("获取 Codey 子代理编排账本锁失败：{}", lock_path.display())
                     });
                 }
             }
@@ -383,7 +382,7 @@ impl LedgerStore {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "读取 Codey 子代理预算账本失败：{}",
+                        "读取 Codey 子代理编排账本失败：{}",
                         self.ledger_path.display()
                     )
                 });
@@ -391,13 +390,13 @@ impl LedgerStore {
         };
         let mut ledger: SessionLedger = serde_json::from_slice(&bytes).with_context(|| {
             format!(
-                "解析 Codey 子代理预算账本失败：{}",
+                "解析 Codey 子代理编排账本失败：{}",
                 self.ledger_path.display()
             )
         })?;
         anyhow::ensure!(
             (MIN_LEDGER_SCHEMA_VERSION..=LEDGER_SCHEMA_VERSION).contains(&ledger.schema_version),
-            "Codey 子代理预算账本版本不受支持：{}",
+            "Codey 子代理编排账本版本不受支持：{}",
             ledger.schema_version
         );
         let source_schema_version = ledger.schema_version;
@@ -405,7 +404,7 @@ impl LedgerStore {
         let session_id_hash = hash_component(session_id);
         anyhow::ensure!(
             ledger.session_id_hash == session_id_hash,
-            "Codey 子代理预算账本会话标识不一致"
+            "Codey 子代理编排账本会话标识不一致"
         );
         changed |= expire_reservations(&mut ledger, now_ms);
         let runtime_id_hash = hash_component(runtime_id);
@@ -463,15 +462,15 @@ impl LedgerStore {
         let parent = self
             .ledger_path
             .parent()
-            .context("Codey 子代理预算账本缺少父目录")?;
+            .context("Codey 子代理编排账本缺少父目录")?;
         fs::create_dir_all(parent)
-            .with_context(|| format!("创建 Codey 子代理预算账本目录失败：{}", parent.display()))?;
+            .with_context(|| format!("创建 Codey 子代理编排账本目录失败：{}", parent.display()))?;
         ledger.revision = ledger.revision.saturating_add(1);
         ledger.updated_at_ms = now_ms;
-        let bytes = serde_json::to_vec(ledger).context("序列化 Codey 子代理预算账本失败")?;
+        let bytes = serde_json::to_vec(ledger).context("序列化 Codey 子代理编排账本失败")?;
         crate::fs_util::atomic_write(&self.ledger_path, &bytes).with_context(|| {
             format!(
-                "原子替换 Codey 子代理预算账本失败：{}",
+                "原子替换 Codey 子代理编排账本失败：{}",
                 self.ledger_path.display()
             )
         })
@@ -558,7 +557,7 @@ impl LedgerStore {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "删除 Codey 子代理预算账本失败：{}",
+                        "删除 Codey 子代理编排账本失败：{}",
                         self.ledger_path.display()
                     )
                 });
@@ -574,7 +573,7 @@ impl LedgerStore {
                     ) => {}
                 Err(error) => {
                     return Err(error).with_context(|| {
-                        format!("清理 Codey 子代理预算账本目录失败：{}", parent.display())
+                        format!("清理 Codey 子代理编排账本目录失败：{}", parent.display())
                     });
                 }
             }
@@ -596,7 +595,7 @@ impl LedgerStore {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "读取 Codey 子代理预算账本失败：{}",
+                        "读取 Codey 子代理编排账本失败：{}",
                         self.ledger_path.display()
                     )
                 });
@@ -711,12 +710,6 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
         ledger.batch_number = 1;
         changed = true;
     }
-    anyhow::ensure!(
-        ledger.batch_number <= MAX_BATCHES_PER_TURN,
-        "Codey 子代理预算账本批次无效：{}",
-        ledger.batch_number
-    );
-
     if source_schema_version < 3 {
         for reservation in ledger.reservations.values_mut() {
             reservation.batch_number = 1;
@@ -736,16 +729,6 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
             changed = true;
         }
     }
-    anyhow::ensure!(
-        ledger.total_spawn_attempts <= MAX_TOTAL_ATTEMPTS_PER_TURN,
-        "Codey 子代理预算账本总尝试数无效：{}",
-        ledger.total_spawn_attempts
-    );
-    anyhow::ensure!(
-        ledger.spawn_attempts <= MAX_ATTEMPT_LIMIT,
-        "Codey 子代理预算账本当前批尝试数无效：{}",
-        ledger.spawn_attempts
-    );
     if source_schema_version < 4 {
         let session_hash = ledger.session_id_hash.clone();
         for (task_id, reservation) in &mut ledger.reservations {
@@ -847,17 +830,17 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
     }
     anyhow::ensure!(
         ledger.used_decision_ids.len() <= MAX_BATCH_DECISION_IDS,
-        "Codey 子代理预算账本批次决策 ID 数量无效：{}",
+        "Codey 子代理编排账本批次决策 ID 数量无效：{}",
         ledger.used_decision_ids.len()
     );
     for reservation in ledger.reservations.values() {
         anyhow::ensure!(
             reservation.fencing_token > 0 && !reservation.attempt_id.is_empty(),
-            "Codey 子代理预算账本缺少有效 attempt/fencing 元数据"
+            "Codey 子代理编排账本缺少有效 attempt/fencing 元数据"
         );
         anyhow::ensure!(
             reservation.state.is_settled() || reservation.outcome == ExecutionOutcome::Unknown,
-            "Codey 子代理预算账本的活动 phase 带有终态 outcome"
+            "Codey 子代理编排账本的活动 phase 带有终态 outcome"
         );
     }
     if ledger.schema_version != LEDGER_SCHEMA_VERSION {
@@ -939,6 +922,7 @@ fn start_next_batch(ledger: &mut SessionLedger) {
     ledger.points_spent = 0;
     ledger.spawn_attempts = 0;
     ledger.batch_decision = BatchDecisionState::None;
+    ledger.used_decision_ids.clear();
     reset_batch_decision_control_failures(ledger);
 }
 
@@ -1006,11 +990,6 @@ fn advance_batch_if_settled(
         return (false, None);
     }
     if !ledger.decision_required {
-        if ledger.batch_number >= MAX_BATCHES_PER_TURN
-            || ledger.total_spawn_attempts >= MAX_TOTAL_ATTEMPTS_PER_TURN
-        {
-            return (false, Some(turn_budget_denial(ledger)));
-        }
         start_next_batch(ledger);
         return (true, None);
     }
@@ -1021,14 +1000,8 @@ fn advance_batch_if_settled(
             decision: RootBatchDecision::SpawnNextBatch,
             ..
         } => {
-            if ledger.batch_number >= MAX_BATCHES_PER_TURN
-                || ledger.total_spawn_attempts >= MAX_TOTAL_ATTEMPTS_PER_TURN
-            {
-                (opened, Some(turn_budget_denial(ledger)))
-            } else {
-                start_next_batch(ledger);
-                (true, None)
-            }
+            start_next_batch(ledger);
+            (true, None)
         }
         _ => (opened, Some(batch_decision_spawn_denial(ledger))),
     }
@@ -1072,14 +1045,40 @@ fn batch_decision_spawn_denial(ledger: &SessionLedger) -> String {
     )
 }
 
-fn turn_budget_denial(ledger: &SessionLedger) -> String {
-    format!(
-        "{TURN_BUDGET_ERROR_CODE}: Codey 可恢复预算门禁：本根回合已使用 {} 批、累计 {} 次派生尝试，达到上限 {} 批/{} 次。协作路由仍然可用；请由主代理接管剩余工作或结束本次回复，禁止通过 `functions.exec` 重试 `agents.spawn_agent`。",
-        ledger.batch_number,
-        ledger.total_spawn_attempts,
-        MAX_BATCHES_PER_TURN,
-        MAX_TOTAL_ATTEMPTS_PER_TURN
-    )
+fn concurrency_denial(
+    ledger: &SessionLedger,
+    prepared: &PreparedContract,
+    active_agents: usize,
+) -> Option<String> {
+    let tracked_active = ledger
+        .reservations
+        .values()
+        .filter(|reservation| reservation.state.is_active() && !reservation.spawn_failed)
+        .collect::<Vec<_>>();
+    let tracked_active_count = tracked_active.len();
+    let has_untracked_active = active_agents > tracked_active_count;
+    let has_active_write = has_untracked_active
+        || tracked_active
+            .iter()
+            .any(|reservation| reservation.write_capable);
+    let candidate_is_read_only = prepared.policy.access == RoleAccess::ReadOnly;
+    let limit = if candidate_is_read_only && !has_active_write {
+        READ_ONLY_CONCURRENCY_LIMIT
+    } else {
+        WRITE_OR_MIXED_CONCURRENCY_LIMIT
+    };
+    let observed_active = active_agents.max(tracked_active_count);
+    if observed_active < limit {
+        return None;
+    }
+    let mode = if limit == READ_ONLY_CONCURRENCY_LIMIT {
+        "已确认的纯只读批次"
+    } else {
+        "包含写入型或身份未确认代理的批次"
+    };
+    Some(format!(
+        "{CONCURRENCY_LIMIT_ERROR_CODE}: Codey 子代理并发门禁：{mode}当前已有 {observed_active} 个活动代理，达到并发上限 {limit}。请先等待任一活动代理进入终态后再派发；该限制只约束同时运行数量，不限制后续批次或累计派发次数。"
+    ))
 }
 
 #[cfg(test)]
@@ -1158,6 +1157,13 @@ pub(crate) fn pre_spawn_with_workspace(
         return Ok(Some(reason));
     }
 
+    if let Some(reason) = concurrency_denial(&ledger, &prepared, active_agents) {
+        if batch_changed {
+            store.save(&mut ledger, now_ms)?;
+        }
+        return Ok(Some(reason));
+    }
+
     let observed_task_count = ledger
         .reservations
         .values()
@@ -1173,26 +1179,7 @@ pub(crate) fn pre_spawn_with_workspace(
         .attempt_limit
         .max(desired_attempts)
         .min(MAX_ATTEMPT_LIMIT);
-    if ledger.total_spawn_attempts >= MAX_TOTAL_ATTEMPTS_PER_TURN {
-        return Ok(Some(turn_budget_denial(&ledger)));
-    }
-    if ledger.spawn_attempts >= ledger.attempt_limit {
-        return Ok(Some(format!(
-            "{BATCH_BUDGET_ERROR_CODE}: Codey 可恢复预算门禁：第 {} 批已使用 {} 次派生尝试，达到当前上限 {}。这不是协作路由故障；若仍有代理未终态，请继续使用 `agents.wait_agent`/`agents.list_agents` 对账；若本批全部在创建阶段失败，请由主代理接管。禁止改走 `functions.exec` 重试派生。",
-            ledger.batch_number, ledger.spawn_attempts, ledger.attempt_limit
-        )));
-    }
     let cost_points = u16::from(prepared.policy.cost_points);
-    if ledger.points_spent.saturating_add(cost_points) > ledger.point_limit {
-        return Ok(Some(format!(
-            "{BATCH_BUDGET_ERROR_CODE}: Codey 可恢复预算门禁：任务 `{}` 需要 {} 点，第 {} 批当前已用 {}/{} 点；请缩小范围、改用更轻角色或由主代理直接处理。此拒绝不是协作路由故障，禁止改走 `functions.exec` 重试派生。",
-            prepared.contract.id,
-            cost_points,
-            ledger.batch_number,
-            ledger.points_spent,
-            ledger.point_limit
-        )));
-    }
 
     ledger.spawn_attempts = ledger.spawn_attempts.saturating_add(1);
     ledger.total_spawn_attempts = ledger.total_spawn_attempts.saturating_add(1);
@@ -1485,7 +1472,7 @@ fn followup_without_active_attempt_denial(target: &str, detail: &str) -> String 
 
 fn duplicate_task_id_denial(ledger: &SessionLedger, task_id: &str) -> String {
     let prefix = format!(
-        "{DUPLICATE_TASK_ID_ERROR_CODE}: Codey 自适应委派门禁：任务 ID `{task_id}` 已在本轮预算账本中，禁止重复派生。"
+        "{DUPLICATE_TASK_ID_ERROR_CODE}: Codey 自适应委派门禁：任务 ID `{task_id}` 已在本轮编排账本中，禁止重复派生。"
     );
     match ledger.reservations.get(task_id) {
         Some(reservation) if reservation.state == ReservationState::Pending => format!(
@@ -1986,15 +1973,6 @@ pub(crate) fn prepare_batch_decision(
             "Codey 批次决策门禁：输入批次为 {}，当前批次为 {}；请使用门禁提示中的当前批次号。",
             input.batch_number, ledger.batch_number
         )));
-    }
-    if input.decision == RootBatchDecision::SpawnNextBatch
-        && (ledger.batch_number >= MAX_BATCHES_PER_TURN
-            || ledger.total_spawn_attempts >= MAX_TOTAL_ATTEMPTS_PER_TURN)
-    {
-        if opened {
-            store.save(&mut ledger, now_ms)?;
-        }
-        return Ok(Some(turn_budget_denial(&ledger)));
     }
     if batch_decision_state_matches(&ledger.batch_decision, &input) {
         if opened {
@@ -2713,7 +2691,7 @@ pub(crate) fn pre_root_tool(
     };
     let store = LedgerStore::open(state_root, session_id)?;
     let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
-        return Ok(Some("Codey 机械验收门禁：找不到对应预算账本。".to_string()));
+        return Ok(Some("Codey 机械验收门禁：找不到对应编排账本。".to_string()));
     };
     let Some(reservation) = ledger.reservations.get(task_id) else {
         return Ok(Some(format!(
@@ -4922,9 +4900,9 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_spawn_budget_allows_the_bounded_maximum_attempts() {
+    fn concurrency_allows_three_verified_read_only_agents() {
         let temp = tempfile::tempdir().unwrap();
-        for index in 0..MAX_ATTEMPT_LIMIT {
+        for index in 0..READ_ONLY_CONCURRENCY_LIMIT {
             let input = json!({
                 "task_name": format!("opaque_{index}"),
                 "agent_type": "codey_quick_scan",
@@ -4937,16 +4915,16 @@ mod tests {
                     "runtime-a",
                     "session-a",
                     Some(&input),
-                    0,
-                    u64::from(index),
+                    index,
+                    u64::try_from(index).unwrap(),
                 )
                 .unwrap(),
                 None
             );
         }
 
-        let overflow = json!({
-            "task_name": "opaque_overflow",
+        let fourth = json!({
+            "task_name": "opaque_fourth",
             "agent_type": "codey_quick_scan",
             "fork_turns": "none",
             "message": format!("gAAAAA{}", "A".repeat(160))
@@ -4955,44 +4933,83 @@ mod tests {
             temp.path(),
             "runtime-a",
             "session-a",
-            Some(&overflow),
-            0,
+            Some(&fourth),
+            READ_ONLY_CONCURRENCY_LIMIT,
             100,
         )
         .unwrap()
         .unwrap();
-        assert!(denial.contains(BATCH_BUDGET_ERROR_CODE));
-        assert!(denial.contains("达到当前上限 6"));
-        assert!(denial.contains("禁止改走 `functions.exec`"));
+        assert!(denial.contains(CONCURRENCY_LIMIT_ERROR_CODE));
+        assert!(denial.contains("纯只读批次"));
+        assert!(denial.contains("并发上限 3"));
     }
 
     #[test]
-    fn settled_batches_advance_up_to_the_root_turn_limit() {
+    fn write_or_mixed_concurrency_remains_bounded_at_two() {
+        let temp = tempfile::tempdir().unwrap();
+        for (index, path) in ["backend/a.rs", "frontend/b.ts"].into_iter().enumerate() {
+            let task = format!("worker_{index}");
+            let input = contract_input(&task, "codey_worker", worker_contract(&task, path));
+            assert_eq!(
+                pre_spawn(
+                    temp.path(),
+                    "runtime-a",
+                    "session-a",
+                    Some(&input),
+                    index,
+                    u64::try_from(index).unwrap(),
+                )
+                .unwrap(),
+                None
+            );
+        }
+
+        let third = contract_input(
+            "worker_third",
+            "codey_worker",
+            worker_contract("worker_third", "docs/c.md"),
+        );
+        let denial = pre_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&third),
+            WRITE_OR_MIXED_CONCURRENCY_LIMIT,
+            10,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains(CONCURRENCY_LIMIT_ERROR_CODE));
+        assert!(denial.contains("包含写入型或身份未确认代理"));
+        assert!(denial.contains("并发上限 2"));
+    }
+
+    #[test]
+    fn settled_batches_can_continue_beyond_the_legacy_root_turn_budget() {
         let temp = tempfile::tempdir().unwrap();
         let mut now_ms = 0_u64;
+        const BATCHES: u16 = 4;
 
-        for batch_number in 1..=MAX_BATCHES_PER_TURN {
-            for index in 0..MAX_ATTEMPT_LIMIT {
-                now_ms += 1;
-                let input = json!({
-                    "task_name": format!("batch_{batch_number}_task_{index}"),
-                    "agent_type": "codey_quick_scan",
-                    "fork_turns": "none",
-                    "message": format!("gAAAAA{}", "A".repeat(160))
-                });
-                assert_eq!(
-                    pre_spawn(
-                        temp.path(),
-                        "runtime-a",
-                        "session-a",
-                        Some(&input),
-                        0,
-                        now_ms,
-                    )
-                    .unwrap(),
-                    None
-                );
-            }
+        for batch_number in 1..=BATCHES {
+            now_ms += 1;
+            let input = json!({
+                "task_name": format!("batch_{batch_number}_task"),
+                "agent_type": "codey_quick_scan",
+                "fork_turns": "none",
+                "message": format!("gAAAAA{}", "A".repeat(160))
+            });
+            assert_eq!(
+                pre_spawn(
+                    temp.path(),
+                    "runtime-a",
+                    "session-a",
+                    Some(&input),
+                    0,
+                    now_ms,
+                )
+                .unwrap(),
+                None
+            );
 
             let store = LedgerStore::open(temp.path(), "session-a").unwrap();
             let ledger = store
@@ -5000,18 +5017,15 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(ledger.batch_number, batch_number);
-            assert_eq!(ledger.spawn_attempts, MAX_ATTEMPT_LIMIT);
-            assert_eq!(
-                ledger.total_spawn_attempts,
-                batch_number * MAX_ATTEMPT_LIMIT
-            );
+            assert_eq!(ledger.spawn_attempts, 1);
+            assert_eq!(ledger.total_spawn_attempts, batch_number);
             drop(ledger);
             drop(store);
 
             now_ms += 2;
             observe_status_response(temp.path(), "runtime-a", "session-a", None, true, now_ms)
                 .unwrap();
-            if batch_number < MAX_BATCHES_PER_TURN {
+            if batch_number < BATCHES {
                 now_ms += 1;
                 commit_batch_decision_for_test(
                     temp.path(),
@@ -5023,42 +5037,6 @@ mod tests {
                 now_ms += 1;
             }
         }
-
-        let overflow = json!({
-            "task_name": "fourth_batch",
-            "agent_type": "codey_quick_scan",
-            "fork_turns": "none",
-            "message": format!("gAAAAA{}", "A".repeat(160))
-        });
-        let denial = pre_spawn(
-            temp.path(),
-            "runtime-a",
-            "session-a",
-            Some(&overflow),
-            0,
-            now_ms + 1,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denial.contains("批次决策"));
-        let decision = batch_decision_input(
-            MAX_BATCHES_PER_TURN,
-            RootBatchDecision::SpawnNextBatch,
-            "batch-3-overflow",
-        );
-        let denial = prepare_batch_decision(
-            temp.path(),
-            "runtime-a",
-            "session-a",
-            Some(&decision),
-            0,
-            now_ms + 2,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(denial.contains(TURN_BUDGET_ERROR_CODE));
-        assert!(denial.contains("3 批/18 次"));
-        assert!(denial.contains("禁止通过 `functions.exec`"));
     }
 
     #[test]
@@ -5338,9 +5316,10 @@ mod tests {
     }
 
     #[test]
-    fn failed_encrypted_spawns_do_not_inflate_the_adaptive_budget() {
+    fn failed_encrypted_spawns_are_not_capped_by_legacy_attempt_limits() {
         let temp = tempfile::tempdir().unwrap();
-        for index in 0..DEFAULT_ATTEMPT_LIMIT {
+        let attempts = MAX_ATTEMPT_LIMIT.saturating_add(2);
+        for index in 0..attempts {
             let input = json!({
                 "task_name": format!("failed_opaque_{index}"),
                 "agent_type": "codey_quick_scan",
@@ -5372,32 +5351,20 @@ mod tests {
             .unwrap();
         }
 
-        let retry = json!({
-            "task_name": "failed_opaque_retry",
-            "agent_type": "codey_quick_scan",
-            "fork_turns": "none",
-            "message": format!("gAAAAA{}", "A".repeat(160))
-        });
-        let denial = pre_spawn(temp.path(), "runtime-a", "session-a", Some(&retry), 0, 100)
-            .unwrap()
-            .unwrap();
-        assert!(denial.contains(BATCH_BUDGET_ERROR_CODE));
-        assert!(denial.contains("达到当前上限 4"));
-
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 110).unwrap().unwrap();
         assert_eq!(ledger.point_limit, DEFAULT_POINT_LIMIT);
         assert_eq!(ledger.attempt_limit, DEFAULT_ATTEMPT_LIMIT);
         assert_eq!(ledger.points_spent, 0);
-        assert_eq!(ledger.spawn_attempts, DEFAULT_ATTEMPT_LIMIT);
-        assert_eq!(ledger.total_spawn_attempts, DEFAULT_ATTEMPT_LIMIT);
+        assert_eq!(ledger.spawn_attempts, attempts);
+        assert_eq!(ledger.total_spawn_attempts, attempts);
         assert_eq!(
             ledger
                 .reservations
                 .values()
                 .filter(|reservation| reservation.spawn_failed)
                 .count(),
-            usize::from(DEFAULT_ATTEMPT_LIMIT)
+            usize::from(attempts)
         );
     }
 
@@ -5463,43 +5430,34 @@ mod tests {
     }
 
     #[test]
-    fn budget_denies_the_next_task_without_consuming_an_attempt() {
+    fn legacy_cost_point_counter_does_not_block_spawn() {
         let temp = tempfile::tempdir().unwrap();
-        for (task, path, now_ms) in [
-            ("worker_a", "backend/a.rs", 10),
-            ("worker_b", "backend/b.rs", 20),
-        ] {
-            let input = contract_input(task, "codey_worker", worker_contract(task, path));
-            assert_eq!(
-                pre_spawn(
-                    temp.path(),
-                    "runtime-a",
-                    "session-a",
-                    Some(&input),
-                    1,
-                    now_ms
-                )
-                .unwrap(),
-                None
-            );
+        {
+            let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+            let mut ledger = SessionLedger::new("runtime-a", "session-a", 1);
+            ledger.points_spent = DEFAULT_POINT_LIMIT;
+            store.save(&mut ledger, 2).unwrap();
         }
 
-        let third = contract_input(
-            "worker_c",
+        let input = contract_input(
+            "worker_over_legacy_points",
             "codey_worker",
-            worker_contract("worker_c", "backend/c.rs"),
+            worker_contract("worker_over_legacy_points", "backend/c.rs"),
         );
-        let denial = pre_spawn(temp.path(), "runtime-a", "session-a", Some(&third), 2, 30)
-            .unwrap()
-            .unwrap();
-        assert!(denial.contains("需要 3 点"));
-        assert!(denial.contains("6/8 点"));
+        assert_eq!(
+            pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10,).unwrap(),
+            None
+        );
 
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 40).unwrap().unwrap();
-        assert_eq!(ledger.spawn_attempts, 2);
-        assert_eq!(ledger.points_spent, 6);
-        assert!(!ledger.reservations.contains_key("worker_c"));
+        assert_eq!(ledger.spawn_attempts, 1);
+        assert_eq!(ledger.points_spent, DEFAULT_POINT_LIMIT + 3);
+        assert!(
+            ledger
+                .reservations
+                .contains_key("worker_over_legacy_points")
+        );
     }
 
     #[test]
@@ -5614,7 +5572,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(denial.contains(DUPLICATE_TASK_ID_ERROR_CODE));
-        assert!(denial.contains("任务 ID `worker_a` 已在本轮预算账本中"));
+        assert!(denial.contains("任务 ID `worker_a` 已在本轮编排账本中"));
         assert!(denial.contains("账本状态为 `failed`"));
         assert!(denial.contains("默认由主代理接管"));
         assert!(denial.contains("`CODEY_DELEGATION_V2.id`"));
@@ -6009,7 +5967,7 @@ mod tests {
         let denial = pre_spawn(temp.path(), "runtime-a", "session-a", Some(&first), 1, 40)
             .unwrap()
             .unwrap();
-        assert!(denial.contains("任务 ID `research_a` 已在本轮预算账本中"));
+        assert!(denial.contains("任务 ID `research_a` 已在本轮编排账本中"));
 
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 50).unwrap().unwrap();
@@ -7441,7 +7399,7 @@ mod tests {
 
         let error =
             pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap_err();
-        assert!(format!("{error:#}").contains("解析 Codey 子代理预算账本失败"));
+        assert!(format!("{error:#}").contains("解析 Codey 子代理编排账本失败"));
         assert_eq!(std::fs::read(&ledger_path).unwrap(), b"{not-valid-json");
     }
 

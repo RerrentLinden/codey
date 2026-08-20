@@ -1879,6 +1879,76 @@ default_subagent_reasoning_effort = "low"
 }
 
 #[test]
+fn subagent_optimization_migrates_the_previous_codey_owned_concurrency_default() {
+    let existing = r#"
+[agents]
+max_concurrent_threads_per_session = 2
+
+[agents.codey_quick_scan]
+description = "Codey quick scan"
+config_file = "/tmp/codey-quick-scan.toml"
+
+[agents.codey_worker]
+description = "Codey worker"
+config_file = "/tmp/codey-worker.toml"
+
+[features.multi_agent_v2]
+enabled = true
+tool_namespace = "agents"
+"#;
+    let result = patch_config_with_fastctx_mode_and_proxy(
+        existing,
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
+            model_catalog_path: relative_model_catalog_path(),
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol",
+            subagent_reasoning_effort: "high",
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+        },
+    )
+    .unwrap();
+    let document = result.parse::<DocumentMut>().unwrap();
+
+    assert_eq!(
+        document["agents"]["max_concurrent_threads_per_session"].as_integer(),
+        Some(DEFAULT_SUBAGENT_MAX_CONCURRENCY)
+    );
+}
+
+#[test]
+fn subagent_optimization_keeps_a_standalone_explicit_lower_concurrency() {
+    let result = patch_config_with_fastctx_mode_and_proxy(
+        "[agents]\nmax_concurrent_threads_per_session = 2\n",
+        &official_profile(),
+        GLOBAL_PROVIDER_ID,
+        ProviderPatchOptions {
+            config_path: Path::new("/tmp/codey-codex/config.toml"),
+            model_catalog_path: relative_model_catalog_path(),
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: true,
+            subagent_model: "gpt-5.6-sol",
+            subagent_reasoning_effort: "high",
+            preserve_provider_route: false,
+            protocol_proxy_base_url: None,
+        },
+    )
+    .unwrap();
+    let document = result.parse::<DocumentMut>().unwrap();
+
+    assert_eq!(
+        document["agents"]["max_concurrent_threads_per_session"].as_integer(),
+        Some(PREVIOUS_DEFAULT_SUBAGENT_MAX_CONCURRENCY)
+    );
+}
+
+#[test]
 fn subagent_optimization_defaults_concurrency_for_new_or_invalid_configs() {
     for existing in [
         "",
