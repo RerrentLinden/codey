@@ -4,12 +4,12 @@
   "conflictResolution": "highest_priority_deny_wins",
   "fallback": "deny",
   "roles": {
-    "codey_quick_scan": { "access": "read_only", "visual": false, "costPoints": 1 },
-    "codey_deep_research": { "access": "read_only", "visual": false, "costPoints": 2 },
-    "codey_visual_analysis": { "access": "read_only", "visual": true, "costPoints": 2 },
-    "codey_worker": { "access": "write", "visual": false, "costPoints": 3 },
-    "codey_visual_worker": { "access": "write", "visual": true, "costPoints": 3 },
-    "default": { "access": "read_only", "visual": false, "costPoints": 1 }
+    "codey_quick_scan": { "access": "read_only", "visual": false },
+    "codey_deep_research": { "access": "read_only", "visual": false },
+    "codey_visual_analysis": { "access": "read_only", "visual": true },
+    "codey_worker": { "access": "write", "visual": false },
+    "codey_visual_worker": { "access": "write", "visual": true },
+    "default": { "access": "read_only", "visual": false }
   },
   "rules": [
     {

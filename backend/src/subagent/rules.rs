@@ -25,7 +25,6 @@ pub(crate) enum RoleAccess {
 pub(crate) struct RolePolicy {
     pub access: RoleAccess,
     pub visual: bool,
-    pub cost_points: u8,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -163,12 +162,8 @@ impl RuleSet {
         );
 
         let mut ids = BTreeSet::new();
-        for (role, policy) in &self.roles {
+        for role in self.roles.keys() {
             anyhow::ensure!(!role.trim().is_empty(), "子代理规则包含空角色 ID");
-            anyhow::ensure!(
-                (1..=12).contains(&policy.cost_points),
-                "角色 {role} 的 costPoints 必须在 1..=12"
-            );
         }
         for rule in &self.rules {
             anyhow::ensure!(
@@ -280,19 +275,6 @@ impl RuleSet {
     }
 
     fn validate_not_weaker_than(&self, baseline: &Self) -> Result<()> {
-        for (role, baseline_policy) in &baseline.roles {
-            let policy = self
-                .roles
-                .get(role)
-                .with_context(|| format!("子代理规则缺少内置角色 {role}"))?;
-            anyhow::ensure!(
-                policy.cost_points >= baseline_policy.cost_points,
-                "子代理动态规则不能降低角色 {role} 的 costPoints（{} < {}）",
-                policy.cost_points,
-                baseline_policy.cost_points
-            );
-        }
-
         // The rule language matches only finite actors, roles, tool classes and
         // exact tool names. Sampling every explicit name from both rule sets plus
         // one representative per class therefore covers every decision partition.
@@ -822,13 +804,10 @@ mod tests {
 
     #[test]
     fn live_rules_cannot_weaken_the_embedded_security_baseline() {
-        let mutations: [fn(&mut RuleSet); 4] = [
+        let mutations: [fn(&mut RuleSet); 3] = [
             |rules: &mut RuleSet| rules.fallback = RuleEffect::Allow,
             |rules: &mut RuleSet| {
                 rules.roles.get_mut("codey_quick_scan").unwrap().access = RoleAccess::Write;
-            },
-            |rules: &mut RuleSet| {
-                rules.roles.get_mut("codey_worker").unwrap().cost_points = 1;
             },
             |rules: &mut RuleSet| {
                 rules.rules.push(RuleDefinition {

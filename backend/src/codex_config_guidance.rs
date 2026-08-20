@@ -306,7 +306,7 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 这些数量只是软路由参考，不是运行时硬门槛。有明确的上下文隔离价值或并行收益时，略低于参考值也可以委派；收益不清晰时直接处理。只读探索应比写入实现更积极，写入型子代理仍保持较高门槛。已确认的纯只读批次最多同时运行 3 个子代理；批次包含写入型或身份未确认的代理时，最多同时运行 2 个。不要用 verifier 重复已有确定性测试。
 
-Codey 不再按角色成本点、每批尝试次数、批次数或根回合累计尝试数设置派发预算上限。编排账本只记录生命周期、批次决策、兼容诊断计数和验收债；并发限制只约束同时运行数量，不限制后续批次或累计派发次数，长期 Goal 任务也可以在同一根回合继续多个批次。
+Codey 不再按角色成本点、每批尝试次数、批次数或根回合累计尝试数设置派发预算上限。编排账本只记录生命周期、批次决策、验收债和恢复所需元数据；并发限制只约束同时运行数量，不限制后续批次或累计派发次数，长期 Goal 任务也可以在同一根回合继续多个批次。
 
 ### 任务类型与运行时契约
 
@@ -316,7 +316,7 @@ Codey 不再按角色成本点、每批尝试次数、批次数或根回合累�
 
 `CODEY_DELEGATION_V2={"id":"task_name","why":"breadth","visual":false,"root":"/absolute/workspace","read":["relevant/path"],"write":[],"capabilities":["files.read"],"checks":[]}`
 
-`id` 必须等于 `task_name`。只有 `why: "parallel"` 时才填写 `branch_calls`，用数组记录各独立分支预计的实质调用数，例如 `"branch_calls":[3,3]`；其他路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径。只声明本任务确实会读取和写入的稳定路径；省略 `root` 时采用 Hook 工作目录，空 `read` 对只读角色表示该 root、对写入角色表示其 `write` 范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 只有额外声明 `command.execute` 且 `write` 覆盖完整 root 时才能运行通用 shell。子代理网络能力不开放，契约不能自行声明或放宽。路径读取和写入都会按解析现存祖先后的物理路径校验；未绑定 attempt 不获得数据或副作用权限。运行时还会校验工具的完整可信名称、理由、角色能力、角色感知并发上限及 read/write 冲突；重复任务 ID、越权访问和重叠 ownership 会被拒绝。
+`id` 必须等于 `task_name`；路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径。只声明本任务确实会读取和写入的稳定路径；省略 `root` 时采用 Hook 工作目录，空 `read` 对只读角色表示该 root、对写入角色表示其 `write` 范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 只有额外声明 `command.execute` 且 `write` 覆盖完整 root 时才能运行通用 shell。子代理网络能力不开放，契约不能自行声明或放宽。路径读取和写入都会按解析现存祖先后的物理路径校验；未绑定 attempt 不获得数据或副作用权限。运行时还会校验工具的完整可信名称、理由、角色能力、角色感知并发上限及 read/write 冲突；重复任务 ID、越权访问和重叠 ownership 会被拒绝。
 
 ### 任务胶囊与验收
 
@@ -1350,8 +1350,10 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("每支预计至少 2 次实质调用且合计至少 5 次"));
         assert!(SUBAGENT_GUIDANCE.contains("至少 2 个目录或 4 个候选文件"));
         assert!(SUBAGENT_GUIDANCE.contains("这些数量只是软路由参考"));
-        assert!(SUBAGENT_GUIDANCE.contains("其他路由规模只在派发判断中说明"));
+        assert!(SUBAGENT_GUIDANCE.contains("路由规模只在派发判断中说明"));
         assert!(!SUBAGENT_GUIDANCE.contains("\"calls\":"));
+        assert!(!SUBAGENT_GUIDANCE.contains("branch_calls"));
+        assert!(!SUBAGENT_GUIDANCE.contains("budget_class"));
         assert!(SUBAGENT_GUIDANCE.contains("`user_requested` 仅在用户明确要求子代理"));
         assert!(SUBAGENT_GUIDANCE.contains("纯只读批次最多同时运行 3 个子代理"));
         assert!(SUBAGENT_GUIDANCE.contains("最多同时运行 2 个"));

@@ -25,14 +25,10 @@ pub(crate) const CONTRACT_PREFIX: &str = "CODEY_DELEGATION_V2=";
 const LEGACY_CONTRACT_PREFIX_V1: &str = "CODEY_DELEGATION_V1=";
 pub(crate) const POST_TOOL_HOOK_MATCHER: &str = "*";
 
-const LEDGER_SCHEMA_VERSION: u32 = 7;
+const LEDGER_SCHEMA_VERSION: u32 = 8;
 const MIN_LEDGER_SCHEMA_VERSION: u32 = 1;
 const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
-const DEFAULT_POINT_LIMIT: u16 = 8;
-const MAX_POINT_LIMIT: u16 = 12;
-const DEFAULT_ATTEMPT_LIMIT: u16 = 4;
-const MAX_ATTEMPT_LIMIT: u16 = 6;
 const READ_ONLY_CONCURRENCY_LIMIT: usize = 3;
 const WRITE_OR_MIXED_CONCURRENCY_LIMIT: usize = 2;
 const DUPLICATE_TASK_ID_ERROR_CODE: &str = "CODEY_SUBAGENT_DUPLICATE_TASK_ID";
@@ -70,10 +66,6 @@ struct DelegationContract {
     id: String,
     #[serde(rename = "why")]
     reason: String,
-    #[serde(default)]
-    budget_class: Option<String>,
-    #[serde(default)]
-    branch_calls: Vec<u16>,
     #[serde(default)]
     visual: bool,
     #[serde(default, rename = "root")]
@@ -131,12 +123,6 @@ struct SessionLedger {
     updated_at_ms: u64,
     #[serde(default = "default_batch_number")]
     batch_number: u16,
-    point_limit: u16,
-    attempt_limit: u16,
-    points_spent: u16,
-    spawn_attempts: u16,
-    #[serde(default)]
-    total_spawn_attempts: u16,
     #[serde(default)]
     issued_task_ids: BTreeSet<String>,
     #[serde(default = "default_fencing_token")]
@@ -216,7 +202,6 @@ struct Reservation {
     #[serde(default = "default_batch_number")]
     batch_number: u16,
     role: String,
-    cost_points: u16,
     write_capable: bool,
     visual: bool,
     workspace_root: Option<String>,
@@ -437,22 +422,11 @@ impl LedgerStore {
             }
             ledger.runtime_id_hash = runtime_id_hash;
             ledger.batch_number = 1;
-            ledger.points_spent = ledger.reservations.values().fold(0, |total, reservation| {
-                total.saturating_add(reservation.cost_points)
-            });
-            ledger.spawn_attempts = u16::try_from(ledger.reservations.len()).unwrap_or(u16::MAX);
-            ledger.total_spawn_attempts = ledger.spawn_attempts;
             ledger.issued_task_ids = ledger.reservations.keys().cloned().collect();
             ledger.decision_required = false;
             ledger.batch_decision = BatchDecisionState::None;
             ledger.used_decision_ids.clear();
             reset_batch_decision_control_failures(&mut ledger);
-            ledger.point_limit = DEFAULT_POINT_LIMIT
-                .max(ledger.points_spent)
-                .min(MAX_POINT_LIMIT);
-            ledger.attempt_limit = DEFAULT_ATTEMPT_LIMIT
-                .max(ledger.spawn_attempts)
-                .min(MAX_ATTEMPT_LIMIT);
             ledger.updated_at_ms = now_ms;
             changed = true;
         }
@@ -693,11 +667,6 @@ impl SessionLedger {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             batch_number: 1,
-            point_limit: DEFAULT_POINT_LIMIT,
-            attempt_limit: DEFAULT_ATTEMPT_LIMIT,
-            points_spent: 0,
-            spawn_attempts: 0,
-            total_spawn_attempts: 0,
             issued_task_ids: BTreeSet::new(),
             next_fencing_token: 1,
             decision_required: false,
@@ -721,7 +690,6 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
             reservation.batch_number = 1;
         }
         ledger.batch_number = 1;
-        ledger.total_spawn_attempts = ledger.spawn_attempts;
         ledger.issued_task_ids = ledger.reservations.keys().cloned().collect();
         changed = true;
     } else {
@@ -730,10 +698,6 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
             .issued_task_ids
             .extend(ledger.reservations.keys().cloned());
         changed |= ledger.issued_task_ids.len() != before;
-        if ledger.total_spawn_attempts < ledger.spawn_attempts {
-            ledger.total_spawn_attempts = ledger.spawn_attempts;
-            changed = true;
-        }
     }
     if source_schema_version < 4 {
         let session_hash = ledger.session_id_hash.clone();
@@ -923,10 +887,6 @@ fn ensure_awaiting_batch_decision(
 
 fn start_next_batch(ledger: &mut SessionLedger) {
     ledger.batch_number = ledger.batch_number.saturating_add(1);
-    ledger.point_limit = DEFAULT_POINT_LIMIT;
-    ledger.attempt_limit = DEFAULT_ATTEMPT_LIMIT;
-    ledger.points_spent = 0;
-    ledger.spawn_attempts = 0;
     ledger.batch_decision = BatchDecisionState::None;
     ledger.used_decision_ids.clear();
     reset_batch_decision_control_failures(ledger);
@@ -989,7 +949,7 @@ fn advance_batch_if_settled(
     active_agents: usize,
     now_ms: u64,
 ) -> (bool, Option<String>) {
-    if active_agents != 0 || ledger.spawn_attempts == 0 || !current_batch_is_settled(ledger) {
+    if active_agents != 0 || !current_batch_is_settled(ledger) {
         return (false, None);
     }
     if !current_batch_has_admitted_agent(ledger) {
@@ -1170,27 +1130,7 @@ pub(crate) fn pre_spawn_with_workspace(
         return Ok(Some(reason));
     }
 
-    let observed_task_count = ledger
-        .reservations
-        .values()
-        .filter(|reservation| {
-            reservation.batch_number == ledger.batch_number && !reservation.spawn_failed
-        })
-        .count()
-        .saturating_add(1);
-    let (desired_points, desired_attempts) =
-        adaptive_limits(&prepared.contract, observed_task_count);
-    ledger.point_limit = ledger.point_limit.max(desired_points).min(MAX_POINT_LIMIT);
-    ledger.attempt_limit = ledger
-        .attempt_limit
-        .max(desired_attempts)
-        .min(MAX_ATTEMPT_LIMIT);
-    let cost_points = u16::from(prepared.policy.cost_points);
-
-    ledger.spawn_attempts = ledger.spawn_attempts.saturating_add(1);
-    ledger.total_spawn_attempts = ledger.total_spawn_attempts.saturating_add(1);
     ledger.decision_required = true;
-    ledger.points_spent = ledger.points_spent.saturating_add(cost_points);
     ledger.issued_task_ids.insert(prepared.contract.id.clone());
     let acceptance = prepared
         .contract
@@ -1238,7 +1178,6 @@ pub(crate) fn pre_spawn_with_workspace(
             task_id: prepared.contract.id,
             batch_number: ledger.batch_number,
             role: prepared.role,
-            cost_points,
             write_capable: prepared.policy.access == RoleAccess::Write,
             visual: prepared.policy.visual,
             workspace_root: prepared.workspace_root,
@@ -1365,7 +1304,6 @@ pub(crate) fn post_spawn(
     let role = reservation.role.clone();
     let mut trace_event = None;
     if returned_agent_id.is_none() && tool_response.is_some_and(response_is_explicit_failure) {
-        let cost = reservation.cost_points;
         reservation.state = ReservationState::Terminal;
         reservation.outcome = ExecutionOutcome::Failed;
         reservation.spawn_failed = true;
@@ -1374,7 +1312,6 @@ pub(crate) fn post_spawn(
         reservation.completed_at_ms = Some(now_ms);
         reservation.token_usage = telemetry::extract_token_usage(tool_response);
         reservation.error_message = Some("spawn tool reported failure".to_string());
-        ledger.points_spent = ledger.points_spent.saturating_sub(cost);
         let mut event = SubagentTraceEvent::new(
             now_ms,
             &trace,
@@ -3087,7 +3024,15 @@ fn prepare_contract_with_rules(
         let values = contract_value
             .as_object_mut()
             .ok_or_else(|| contract_error("V1 契约 JSON 必须是 object"))?;
-        for retired in ["calls", "files", "dirs", "large", "risk"] {
+        for retired in [
+            "calls",
+            "files",
+            "dirs",
+            "large",
+            "risk",
+            "budget_class",
+            "branch_calls",
+        ] {
             values.remove(retired);
         }
     }
@@ -3098,7 +3043,6 @@ fn prepare_contract_with_rules(
         return Err(contract_error("契约 id 必须与 task_name 完全一致"));
     }
     validate_delegation_reason(&contract.reason)?;
-    validate_budget_class(contract.budget_class.as_deref())?;
     if contract.visual != policy.visual {
         return Err(contract_error(if policy.visual {
             "视觉角色的契约必须设置 visual=true"
@@ -3317,8 +3261,6 @@ fn prepare_opaque_contract(
     let contract = DelegationContract {
         id: task_name.to_string(),
         reason: "encrypted_message".to_string(),
-        budget_class: Some("parallel".to_string()),
-        branch_calls: Vec::new(),
         visual: policy.visual,
         workspace_root: workspace_root.clone(),
         read_paths: read_paths.clone(),
@@ -3376,14 +3318,6 @@ fn validate_delegation_reason(reason: &str) -> std::result::Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn validate_budget_class(value: Option<&str>) -> std::result::Result<(), String> {
-    if value.is_none_or(|value| matches!(value, "default" | "parallel")) {
-        Ok(())
-    } else {
-        Err(contract_error("budget_class 只允许 default 或 parallel"))
-    }
 }
 
 fn validate_contract_schema(name: &str, schema: &Value) -> std::result::Result<(), String> {
@@ -3485,40 +3419,6 @@ fn validate_schema_node(
         }
     }
     Ok(())
-}
-
-fn adaptive_limits(contract: &DelegationContract, observed_task_count: usize) -> (u16, u16) {
-    // Recent Codex runtimes can encrypt the complete spawn message before the
-    // hook observes it. In that mode branch_calls is intentionally opaque, so
-    // derive a conservative branch count from successful reservations admitted
-    // in the current batch. Explicit spawn failures remain in the ledger for
-    // audit and task-id uniqueness, but the caller excludes them from this count.
-    let adaptive_budget = contract.budget_class.as_deref() == Some("parallel")
-        || contract.reason == "parallel"
-        || contract.reason == "encrypted_message";
-    let branches = if contract.reason == "encrypted_message" {
-        u16::try_from(observed_task_count).unwrap_or(u16::MAX)
-    } else if contract.budget_class.as_deref() == Some("parallel") || contract.reason == "parallel"
-    {
-        u16::try_from(contract.branch_calls.len()).unwrap_or(u16::MAX)
-    } else {
-        0
-    };
-    let point_limit = if adaptive_budget {
-        DEFAULT_POINT_LIMIT
-            .max(branches.saturating_mul(3))
-            .min(MAX_POINT_LIMIT)
-    } else {
-        DEFAULT_POINT_LIMIT
-    };
-    let attempt_limit = if adaptive_budget {
-        DEFAULT_ATTEMPT_LIMIT
-            .max(branches.saturating_add(1))
-            .min(MAX_ATTEMPT_LIMIT)
-    } else {
-        DEFAULT_ATTEMPT_LIMIT
-    };
-    (point_limit, attempt_limit)
 }
 
 fn normalize_claims(
@@ -4475,36 +4375,35 @@ mod tests {
                 .contains("审计说明")
         );
 
-        let huge_parallel = contract_input(
-            "huge_parallel",
+        let parallel = contract_input(
+            "parallel",
             "codey_quick_scan",
             json!({
-                "id": "huge_parallel",
+                "id": "parallel",
                 "why": "parallel",
-                "budget_class": "parallel",
-                "branch_calls": [65535, 65535],
                 "visual": false,
                 "read": [],
                 "write": [],
                 "checks": []
             }),
         );
-        assert!(prepare_contract(Some(&huge_parallel)).is_ok());
+        assert!(prepare_contract(Some(&parallel)).is_ok());
 
-        let invalid_budget = contract_input(
-            "invalid_budget",
+        let retired_budget_fields = contract_input(
+            "retired_budget_fields",
             "codey_quick_scan",
             json!({
-                "id": "invalid_budget",
+                "id": "retired_budget_fields",
                 "why": "scan",
-                "budget_class": "unlimited",
+                "budget_class": "parallel",
+                "branch_calls": [3, 3],
                 "visual": false
             }),
         );
         assert!(
-            prepare_contract(Some(&invalid_budget))
+            prepare_contract(Some(&retired_budget_fields))
                 .unwrap_err()
-                .contains("budget_class")
+                .contains("unknown field")
         );
 
         let user_requested = contract_input(
@@ -4513,18 +4412,13 @@ mod tests {
             json!({
                 "id": "explicit",
                 "why": "user_requested",
-                "branch_calls": [10, 10, 10, 10],
                 "visual": false,
                 "read": [],
                 "write": [],
                 "checks": []
             }),
         );
-        let prepared = prepare_contract(Some(&user_requested)).unwrap();
-        assert_eq!(
-            adaptive_limits(&prepared.contract, 1),
-            (DEFAULT_POINT_LIMIT, DEFAULT_ATTEMPT_LIMIT)
-        );
+        assert!(prepare_contract(Some(&user_requested)).is_ok());
 
         let stale_size_fields = contract_input(
             "stale",
@@ -4765,18 +4659,6 @@ mod tests {
         assert!(prepared.write_paths.is_empty());
         assert_eq!(prepared.read_paths, ["/repo"]);
         assert!(prepared.contract.acceptance.is_empty());
-        assert_eq!(
-            adaptive_limits(&prepared.contract, 1),
-            (DEFAULT_POINT_LIMIT, DEFAULT_ATTEMPT_LIMIT)
-        );
-        assert_eq!(
-            adaptive_limits(&prepared.contract, 3),
-            (9, DEFAULT_ATTEMPT_LIMIT)
-        );
-        assert_eq!(
-            adaptive_limits(&prepared.contract, 5),
-            (MAX_POINT_LIMIT, MAX_ATTEMPT_LIMIT)
-        );
 
         assert!(prepare_contract_with_workspace(Some(&encrypted_read), None).is_ok());
 
@@ -5033,8 +4915,14 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(ledger.batch_number, batch_number);
-            assert_eq!(ledger.spawn_attempts, 1);
-            assert_eq!(ledger.total_spawn_attempts, batch_number);
+            assert_eq!(
+                ledger
+                    .reservations
+                    .values()
+                    .filter(|reservation| reservation.batch_number == batch_number)
+                    .count(),
+                1
+            );
             drop(ledger);
             drop(store);
 
@@ -5332,9 +5220,9 @@ mod tests {
     }
 
     #[test]
-    fn failed_encrypted_spawns_are_not_capped_by_legacy_attempt_limits() {
+    fn failed_encrypted_spawns_remain_recorded_without_a_budget_cap() {
         let temp = tempfile::tempdir().unwrap();
-        let attempts = MAX_ATTEMPT_LIMIT.saturating_add(2);
+        let attempts = 8_u16;
         for index in 0..attempts {
             let input = json!({
                 "task_name": format!("failed_opaque_{index}"),
@@ -5369,11 +5257,7 @@ mod tests {
 
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 110).unwrap().unwrap();
-        assert_eq!(ledger.point_limit, DEFAULT_POINT_LIMIT);
-        assert_eq!(ledger.attempt_limit, DEFAULT_ATTEMPT_LIMIT);
-        assert_eq!(ledger.points_spent, 0);
-        assert_eq!(ledger.spawn_attempts, attempts);
-        assert_eq!(ledger.total_spawn_attempts, attempts);
+        assert_eq!(ledger.reservations.len(), usize::from(attempts));
         assert_eq!(
             ledger
                 .reservations
@@ -5408,8 +5292,7 @@ mod tests {
 
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
-        assert_eq!(ledger.spawn_attempts, 1);
-        assert_eq!(ledger.points_spent, 3);
+        assert_eq!(ledger.reservations.len(), 1);
         assert!(ledger.reservations.contains_key("worker_a"));
     }
 
@@ -5446,37 +5329,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cost_point_counter_does_not_block_spawn() {
-        let temp = tempfile::tempdir().unwrap();
-        {
-            let store = LedgerStore::open(temp.path(), "session-a").unwrap();
-            let mut ledger = SessionLedger::new("runtime-a", "session-a", 1);
-            ledger.points_spent = DEFAULT_POINT_LIMIT;
-            store.save(&mut ledger, 2).unwrap();
-        }
-
-        let input = contract_input(
-            "worker_over_legacy_points",
-            "codey_worker",
-            worker_contract("worker_over_legacy_points", "backend/c.rs"),
-        );
-        assert_eq!(
-            pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10,).unwrap(),
-            None
-        );
-
-        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
-        let ledger = store.load("runtime-a", "session-a", 40).unwrap().unwrap();
-        assert_eq!(ledger.spawn_attempts, 1);
-        assert_eq!(ledger.points_spent, DEFAULT_POINT_LIMIT + 3);
-        assert!(
-            ledger
-                .reservations
-                .contains_key("worker_over_legacy_points")
-        );
-    }
-
-    #[test]
     fn concurrent_reservations_are_serialized_without_lost_updates() {
         use std::sync::{Arc, Barrier};
 
@@ -5510,8 +5362,6 @@ mod tests {
 
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
-        assert_eq!(ledger.spawn_attempts, 2);
-        assert_eq!(ledger.points_spent, 6);
         assert_eq!(ledger.reservations.len(), 2);
     }
 
@@ -5549,7 +5399,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_spawn_refunds_points_but_keeps_the_attempt() {
+    fn failed_spawn_keeps_terminal_reservation_and_task_id() {
         let temp = tempfile::tempdir().unwrap();
         let input = contract_input(
             "worker_a",
@@ -5568,9 +5418,6 @@ mod tests {
         .unwrap();
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
-        assert_eq!(ledger.spawn_attempts, 1);
-        assert_eq!(ledger.total_spawn_attempts, 1);
-        assert_eq!(ledger.points_spent, 0);
         assert_eq!(
             ledger.reservations["worker_a"].state,
             ReservationState::Terminal
@@ -5853,9 +5700,7 @@ mod tests {
             ledger.reservations["worker_completed"].state,
             ReservationState::Terminal
         );
-        assert_eq!(ledger.points_spent, 3);
-        assert_eq!(ledger.spawn_attempts, 2);
-        assert_eq!(ledger.total_spawn_attempts, 2);
+        assert_eq!(ledger.reservations.len(), 2);
     }
 
     #[test]
@@ -5908,7 +5753,7 @@ mod tests {
     }
 
     #[test]
-    fn textual_failed_spawn_marks_the_reservation_failed_and_refunds_points() {
+    fn textual_failed_spawn_marks_the_reservation_failed() {
         for (index, response) in [
             Value::String("collab spawn failed: agent thread limit reached".to_string()),
             json!({
@@ -5945,8 +5790,6 @@ mod tests {
 
             let store = LedgerStore::open(temp.path(), "session-a").unwrap();
             let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
-            assert_eq!(ledger.spawn_attempts, 1);
-            assert_eq!(ledger.points_spent, 0);
             assert_eq!(ledger.reservations[&task].state, ReservationState::Terminal);
             assert_eq!(ledger.reservations[&task].outcome, ExecutionOutcome::Failed);
             assert!(ledger.reservations[&task].spawn_failed);
@@ -5988,8 +5831,7 @@ mod tests {
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 50).unwrap().unwrap();
         assert_eq!(ledger.batch_number, 2);
-        assert_eq!(ledger.spawn_attempts, 1);
-        assert_eq!(ledger.total_spawn_attempts, 2);
+        assert_eq!(ledger.reservations.len(), 2);
     }
 
     #[test]
@@ -6030,8 +5872,6 @@ mod tests {
 
             let store = LedgerStore::open(temp.path(), "session-a").unwrap();
             let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
-            assert_eq!(ledger.spawn_attempts, 1);
-            assert_eq!(ledger.points_spent, 3);
             assert_eq!(ledger.reservations[&task].state, ReservationState::Running);
         }
     }
@@ -6067,8 +5907,6 @@ mod tests {
 
             let store = LedgerStore::open(temp.path(), "session-a").unwrap();
             let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
-            assert_eq!(ledger.spawn_attempts, 1);
-            assert_eq!(ledger.points_spent, 3);
             assert_eq!(ledger.reservations[&task].state, ReservationState::Pending);
             drop(ledger);
             drop(store);
@@ -6109,8 +5947,6 @@ mod tests {
 
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 30).unwrap().unwrap();
-        assert_eq!(ledger.spawn_attempts, 1);
-        assert_eq!(ledger.points_spent, 3);
         assert_eq!(
             ledger.reservations["worker_a"].state,
             ReservationState::Running
@@ -7489,13 +7325,18 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
         let object = legacy.as_object_mut().unwrap();
         object.insert("schema_version".to_string(), json!(2));
+        object.insert("point_limit".to_string(), json!(8));
+        object.insert("attempt_limit".to_string(), json!(4));
+        object.insert("points_spent".to_string(), json!(1));
+        object.insert("spawn_attempts".to_string(), json!(1));
+        object.insert("total_spawn_attempts".to_string(), json!(1));
         object.remove("batch_number");
-        object.remove("total_spawn_attempts");
         object.remove("issued_task_ids");
         object.remove("next_fencing_token");
         let reservation = object["reservations"].as_object_mut().unwrap()["research_a"]
             .as_object_mut()
             .unwrap();
+        reservation.insert("cost_points".to_string(), json!(1));
         reservation.remove("batch_number");
         for field in [
             "outcome",
@@ -7516,7 +7357,6 @@ mod tests {
         let ledger = store.load("runtime-a", "session-a", 20).unwrap().unwrap();
         assert_eq!(ledger.schema_version, LEDGER_SCHEMA_VERSION);
         assert_eq!(ledger.batch_number, 1);
-        assert_eq!(ledger.total_spawn_attempts, 1);
         assert!(ledger.issued_task_ids.contains("research_a"));
         assert_eq!(ledger.reservations["research_a"].batch_number, 1);
         assert_eq!(
@@ -7532,8 +7372,21 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&ledger_path).unwrap()).unwrap();
         assert_eq!(migrated["schema_version"], json!(LEDGER_SCHEMA_VERSION));
         assert_eq!(migrated["batch_number"], json!(1));
-        assert_eq!(migrated["total_spawn_attempts"], json!(1));
         assert_eq!(migrated["issued_task_ids"], json!(["research_a"]));
+        for retired in [
+            "point_limit",
+            "attempt_limit",
+            "points_spent",
+            "spawn_attempts",
+            "total_spawn_attempts",
+        ] {
+            assert!(migrated.get(retired).is_none());
+        }
+        assert!(
+            migrated["reservations"]["research_a"]
+                .get("cost_points")
+                .is_none()
+        );
     }
 
     #[test]
@@ -7592,9 +7445,6 @@ mod tests {
         let ledger = store.load("runtime-b", "session-a", 40).unwrap().unwrap();
         assert!(ledger.reservations.is_empty());
         assert!(ledger.issued_task_ids.is_empty());
-        assert_eq!(ledger.points_spent, 0);
-        assert_eq!(ledger.spawn_attempts, 0);
-        assert_eq!(ledger.total_spawn_attempts, 0);
     }
 
     #[test]

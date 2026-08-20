@@ -150,13 +150,12 @@ mod tests {
     use crate::config::ProviderProfile;
 
     #[test]
-    fn role_policies_keep_cost_and_capabilities_small_and_explicit() {
+    fn role_policies_keep_access_and_visual_capabilities_explicit() {
         assert_eq!(
             role_policy(crate::config::SUBAGENT_ROLE_QUICK_SCAN),
             Some(RolePolicy {
                 access: RoleAccess::ReadOnly,
                 visual: false,
-                cost_points: 1,
             })
         );
         assert_eq!(
@@ -164,7 +163,6 @@ mod tests {
             Some(RolePolicy {
                 access: RoleAccess::Write,
                 visual: false,
-                cost_points: 3,
             })
         );
         assert_eq!(
@@ -172,7 +170,6 @@ mod tests {
             Some(RolePolicy {
                 access: RoleAccess::Write,
                 visual: true,
-                cost_points: 3,
             })
         );
         assert_eq!(role_policy("unknown"), None);
