@@ -44,7 +44,7 @@
       "actors": ["child"],
       "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis", "default"],
       "toolClasses": ["read", "network", "collaboration"],
-      "explanation": "只读角色可使用本地只读检索、显式声明 network.access 的网络读取和协作能力；命令必须由显式写入角色声明。"
+      "explanation": "只读角色可使用本地与网络只读检索和协作能力；命令必须由显式写入角色声明。"
     },
     {
       "id": "allow-worker-capabilities",
@@ -53,7 +53,7 @@
       "actors": ["child"],
       "roles": ["codey_worker", "codey_visual_worker"],
       "toolClasses": ["read", "write", "command", "network", "collaboration"],
-      "explanation": "写入角色可使用声明范围内的读写、显式声明 network.access 的网络读取与受沙箱约束的命令能力。"
+      "explanation": "写入角色可使用声明范围内的读写、网络读取与受沙箱约束的命令能力。"
     },
     {
       "id": "allow-unbound-collaboration",

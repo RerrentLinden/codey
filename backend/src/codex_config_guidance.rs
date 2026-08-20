@@ -365,7 +365,7 @@ Codey 不再按角色成本点、每批尝试次数、批次数或根回合累�
 
 `CODEY_DELEGATION_V2={"id":"task_name","why":"breadth","visual":false,"root":"/absolute/workspace","read":["relevant/path"],"write":[],"capabilities":["files.read"],"checks":[]}`
 
-`id` 必须等于 `task_name`；路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径；绝对 claim 可以位于 `root` 之外，跨多个工作树时分别声明即可。`root`、`read` 和 `write` 是冲突协调、ownership 与审计元数据，应尽量准确描述预计范围，但不是 Codey 的运行时文件路径 ACL。省略 `root` 时采用有效的 Hook 工作目录；Hook 目录缺失或无效但 claim 已是绝对路径时仍可派发。空 `read` 会对只读角色以 root、对写入角色以其 `write` 作为默认协调 claim，但不会收窄 Codex 原生可访问范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 额外声明 `command.execute` 后可以运行通用 shell，不要求 `write` 覆盖完整 root。网络访问与文件读写角色独立：任务确实需要远程资料时显式声明 `network.access`，未声明时继续拒绝；该 capability 只放行受信任的 Network 类读取工具，不授予 shell 或本地写入，最终仍受 Codex 原生网络与审批设置约束。未绑定 attempt 不获得数据或副作用权限；只读角色即使出现异常或旧账本也不能取得写能力。运行时还会校验工具的完整可信名称、理由、角色能力、角色感知并发上限及 read/write 冲突；重复任务 ID 和重叠 ownership 会被拒绝。
+`id` 必须等于 `task_name`；路由规模只在派发判断中说明，不写入运行时契约。资源路径使用绝对路径，或者给出绝对 `root` 后使用相对路径；绝对 claim 可以位于 `root` 之外，跨多个工作树时分别声明即可。`root`、`read` 和 `write` 是冲突协调、ownership 与审计元数据，应尽量准确描述预计范围，但不是 Codey 的运行时文件路径 ACL。省略 `root` 时采用有效的 Hook 工作目录；Hook 目录缺失或无效但 claim 已是绝对路径时仍可派发。空 `read` 会对只读角色以 root、对写入角色以其 `write` 作为默认协调 claim，但不会收窄 Codex 原生可访问范围。V2 契约必须显式声明 `files.read`；写入角色还必须声明 `workspace.write`，且 `write` 不得为空，并提供 1–3 个精确检查，例如 `"checks":[{"id":"tests","cmd":"cargo test -p app"}]`。worker 额外声明 `command.execute` 后可以运行通用 shell，不要求 `write` 覆盖完整 root。受信任的 Network 类网页搜索、打开和截图属于只读检索，活动 attempt 声明 `files.read` 即可使用，不要求额外网络 capability，也不会因此获得 shell 或本地写入；实际联网仍受 Codex 原生网络与审批设置约束。未绑定 attempt 不获得数据或副作用权限；只读角色即使出现异常或旧账本也不能取得写能力。运行时还会校验工具的完整可信名称、理由、角色能力、角色感知并发上限及 read/write 冲突；重复任务 ID 和重叠 ownership 会被拒绝。
 
 Codey 在 attempt 身份和角色 capability 校验通过后，不再解析、比较或拒绝读取、写入和命令中的目标路径，也不要求 child `cwd` 与契约 `root` 相同。子代理实际能访问哪些工作树、兄弟目录或外部路径，完全由其继承的 Codex sandbox、approval policy、permission profile 和 writable roots 决定；原生权限拒绝时按 Codex 的正常流程处理，不应通过修改 Codey 契约冒充权限提升。验证命令仍由根代理执行机械验收。
 
@@ -1434,9 +1434,9 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("CODEY_DELEGATION_V2="));
         assert!(SUBAGENT_GUIDANCE.contains("\"capabilities\":[\"files.read\"]"));
         assert!(SUBAGENT_GUIDANCE.contains("写入角色还必须声明 `workspace.write`"));
-        assert!(SUBAGENT_GUIDANCE.contains("网络访问与文件读写角色独立"));
-        assert!(SUBAGENT_GUIDANCE.contains("显式声明 `network.access`"));
-        assert!(SUBAGENT_GUIDANCE.contains("不授予 shell 或本地写入"));
+        assert!(SUBAGENT_GUIDANCE.contains("Network 类网页搜索、打开和截图属于只读检索"));
+        assert!(SUBAGENT_GUIDANCE.contains("声明 `files.read` 即可使用"));
+        assert!(SUBAGENT_GUIDANCE.contains("不要求额外网络 capability"));
         assert!(SUBAGENT_GUIDANCE.contains("不是 Codey 的运行时文件路径 ACL"));
         assert!(SUBAGENT_GUIDANCE.contains("不再解析、比较或拒绝读取、写入和命令中的目标路径"));
         assert!(SUBAGENT_GUIDANCE.contains("完全由其继承的 Codex sandbox"));
