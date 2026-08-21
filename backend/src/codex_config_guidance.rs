@@ -652,7 +652,7 @@ stale-state recovery. While spawned subagents are active, Codey's runtime gate d
 local tools and prevents the root turn from finishing. The `functions.exec` tool world is a separate route \
 and does not contain collaboration tools.";
 
-pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V9: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
 commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
 agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
@@ -678,6 +678,35 @@ loop on an unregistered tool; Codey's runtime gate has bounded stale-state recov
 subagents are active, Codey's runtime gate denies non-collaboration local tools and prevents the root turn \
 from finishing. The `functions.exec` tool world is a separate route and does not contain collaboration \
 tools.";
+
+pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
+commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
+agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
+non-collaboration work. Use `timeout_ms <= 120000`; a mailbox update is not completion. If a `MESSAGE` \
+or another partial update needs action, use only the relevant `agents.send_message`, \
+`agents.followup_task`, `agents.interrupt_agent`, or `agents.list_agents` tool, then return to \
+`agents.wait_agent`. Use `followup_task` only while the target's current attempt is still nonterminal and \
+bound; never use it to reactivate a terminal, failed, shutdown, not_found, or prior-turn agent. A \
+`CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT` denial happens before the child is woken: do not retry \
+or wait for that canonical task to recover; use a fresh `task_name` with the same fresh \
+`CODEY_DELEGATION_V2.id` through `agents.spawn_agent`, or let the root take over. Treat `FINAL_ANSWER`, \
+`task_complete`, `completed`, `errored`, `error`, `failed`, `shutdown`, and `not_found` as terminal; \
+`pending_init`, `running`, and `interrupted` remain nonterminal only while the attempt is still active and \
+bound. A successful root interrupt permanently abandons and fences that attempt in Codey and counts as \
+settled for the batch; do not wait for or follow up that target, and take over its unfinished work. If a \
+provider snapshot still reports that abandoned target as `pending_init`, `running`, or `interrupted`, \
+treat it as lagging state rather than a reason to wait again. If a wait result lacks per-agent terminal \
+details, call unfiltered `agents.list_agents` to reconcile the full batch. Continue until every spawned \
+agent is terminal or has been successfully abandoned and fenced. Once the batch settles, call \
+`mcp__codey_subagent_control__resolve_batch` with the reported batch number, a unique decision_id, and a \
+short reason. Choose exactly one of `spawn_next_batch`, `continue_root`, `complete`, or `blocked`; \
+`spawn_next_batch` must be followed by direct `agents.spawn_agent` calls in the same response, while \
+`continue_root` must later be replaced by `complete`, `blocked`, or `spawn_next_batch` before Stop. If a \
+collaboration tool is unavailable, do not loop on an unregistered tool; Codey's runtime gate has bounded \
+stale-state recovery. While spawned subagents are active, Codey's runtime gate denies non-collaboration \
+local tools and prevents the root turn from finishing. The `functions.exec` tool world is a separate route \
+and does not contain collaboration tools.";
 
 pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Proactive multi-agent delegation is \
 active. Any earlier instruction requiring an explicit user request before spawning sub-agents no \
@@ -751,6 +780,7 @@ route and does not contain collaboration tools.";
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V9,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V8,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V7,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6,
@@ -1358,7 +1388,10 @@ mod tests {
         assert!(combined.contains("`shutdown`"));
         assert!(combined.contains("`not_found`"));
         assert!(combined.contains("successful root interrupt permanently abandons and fences"));
+        assert!(combined.contains("counts as settled for the batch"));
         assert!(combined.contains("do not wait for or follow up that target"));
+        assert!(combined.contains("treat it as lagging state rather than a reason to wait again"));
+        assert!(combined.contains("terminal or has been successfully abandoned and fenced"));
         assert!(combined.contains("unfiltered `agents.list_agents`"));
         assert!(combined.contains("do not loop on an unregistered tool"));
         assert!(combined.contains("`functions.exec` tool world is a separate route"));
@@ -1397,6 +1430,7 @@ mod tests {
     #[test]
     fn root_agent_usage_hint_migrates_only_complete_owned_paragraphs() {
         for previous in [
+            PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V9,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V8,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V7,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6,

@@ -1394,7 +1394,7 @@ fn post_wait_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对 running、pending_init 或 interrupted 的代理继续等待。不得自动重派；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。在确认所有子代理进入终态前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}{decryption_recovery}{compatibility}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理继续等待。根中断获得结构化成功回执后，该 target 即在 Codey 中永久放弃并视为本批已结算；后来仍显示 pending_init、running 或 interrupted 的上游快照不得触发再次等待。不得自动重派；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。在所有子代理进入终态或被根成功中断并 fence 前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}{decryption_recovery}{compatibility}"
         ),
     })
 }
@@ -1411,7 +1411,7 @@ fn post_list_continuation(
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。只对 running、pending_init 或 interrupted 的代理继续等待、转向或停止；completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理，再等待其进入终态；不得无限 wait 或自动重派。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。\n\n本次 list_agents 已返回内容：\n{returned_update}{compatibility}"
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。只对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理继续等待、转向或停止；completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理；中断获得结构化成功回执后立即接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。不得无限 wait 或自动重派。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。\n\n本次 list_agents 已返回内容：\n{returned_update}{compatibility}"
         ),
     })
 }
@@ -1427,7 +1427,7 @@ fn stop_continuation(active: usize, protocol_issue: Option<&str>) -> Value {
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用不带筛选的 agents.list_agents 对账，再对 running、pending_init 或 interrupted 的代理调用 agents.wait_agent；累计 10 分钟仍无终态时只中断一次对应代理并继续等待，不得无限重试或自动重派。若协作工具已经不可用，门禁会在持续 10 分钟无法进展后释放遗留状态。{compatibility}"
+            "Codey 子代理门禁：仍有 {active} 个子代理尚未确认进入终态，当前任务不能结束。请先调用不带筛选的 agents.list_agents 对账，再对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理调用 agents.wait_agent；累计 10 分钟仍无终态时只中断一次对应代理。中断获得结构化成功回执后立即接管，不再等待该 target；只有中断失败或目标无法匹配时才继续对账。不得无限重试或自动重派。若协作工具已经不可用，门禁会在持续 10 分钟无法进展后释放遗留状态。{compatibility}"
         ),
     })
 }
@@ -3133,12 +3133,36 @@ mod tests {
         );
         assert!(!marker.exists());
 
+        // The collaboration provider can publish a lagging snapshot after the
+        // interrupt acknowledgement. It must not resurrect the fenced attempt
+        // or send the root back into an endless wait loop.
+        let mut stale_list = input("PostToolUse", session_id);
+        stale_list.tool_name = Some("agents.list_agents".to_string());
+        stale_list.tool_input = Some(json!({}));
+        stale_list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "status": "running" },
+                { "agent_name": target, "status": "pending_init" }
+            ]
+        }));
+        let stale_snapshot = handle_hook_for_runtime_at(&stale_list, root, runtime_id, 32).unwrap();
+        assert_eq!(stale_snapshot["decision"].as_str(), Some("block"));
+        assert!(
+            stale_snapshot["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("resolve_batch"))
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            0
+        );
+
         let mut followup = input("PreToolUse", session_id);
         followup.turn_id = Some("root-turn-a".to_string());
         followup.tool_name = Some("agents.followup_task".to_string());
         followup.tool_input = Some(json!({ "target": target, "message": "resume" }));
         assert!(
-            handle_hook_for_runtime_at(&followup, root, runtime_id, 32).unwrap()
+            handle_hook_for_runtime_at(&followup, root, runtime_id, 33).unwrap()
                 ["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
                 .is_some_and(|reason| {
@@ -3149,11 +3173,11 @@ mod tests {
         let mut late_stop = input("SubagentStop", session_id);
         late_stop.agent_id = Some(target.to_string());
         assert_eq!(
-            handle_hook_for_runtime_at(&late_stop, root, runtime_id, 33).unwrap(),
+            handle_hook_for_runtime_at(&late_stop, root, runtime_id, 34).unwrap(),
             json!({})
         );
         assert_eq!(
-            handle_hook_for_runtime_at(&late_stop, root, runtime_id, 34).unwrap(),
+            handle_hook_for_runtime_at(&late_stop, root, runtime_id, 35).unwrap(),
             json!({})
         );
         assert_eq!(
