@@ -2512,10 +2512,6 @@ pub(crate) fn authorize_child_tool_with_context(
                 "Codey 能力门禁：attempt `{}` 未声明 command.execute capability，禁止工具 `{tool_name}`。读取被拒绝时不得用 Bash 回退；应由根代理修正契约或直接接管。",
                 reservation.attempt_id
             )),
-            Some(reservation) if !reservation_declares_write(reservation) => Some(format!(
-                "Codey 能力门禁：attempt `{}` 不是可写角色或未声明 `workspace.write` capability，禁止写入工具 `{tool_name}`。",
-                reservation.attempt_id
-            )),
             Some(_) => None,
         },
         ToolClass::Network => match bound_reservation {
@@ -3158,11 +3154,12 @@ fn prepare_contract_with_rules(
             if !write_paths.is_empty() || !contract.acceptance.is_empty() {
                 return Err(contract_error("只读角色不能声明 write 或 checks"));
             }
-            if capabilities.iter().any(|capability| {
-                matches!(capability.as_str(), "workspace.write" | "command.execute")
-            }) {
+            if capabilities
+                .iter()
+                .any(|capability| capability == "workspace.write")
+            {
                 return Err(contract_error(
-                    "只读角色不能声明 workspace.write 或 command.execute capability",
+                    "只读角色不能声明 workspace.write capability",
                 ));
             }
         }
@@ -3265,7 +3262,7 @@ fn prepare_opaque_contract(
         mode: InvocationMode::Async,
         trace_id: None,
         parent_id: None,
-        capabilities: vec!["files.read".to_string()],
+        capabilities: vec!["files.read".to_string(), "command.execute".to_string()],
         deadline_ms: None,
         input_schema: None,
         output_schema: None,
@@ -4423,10 +4420,11 @@ mod tests {
         command_contract["capabilities"] = json!(["files.read", "command.execute"]);
         let command_reader =
             contract_input("reader_command", "codey_deep_research", command_contract);
-        assert!(
+        assert_eq!(
             prepare_contract(Some(&command_reader))
-                .unwrap_err()
-                .contains("只读角色不能声明 workspace.write 或 command.execute")
+                .unwrap()
+                .capabilities,
+            ["command.execute", "files.read"]
         );
     }
 
@@ -4570,6 +4568,7 @@ mod tests {
         assert_eq!(prepared.read_paths, ["/repo"]);
         assert!(prepared.native_read_scope);
         assert!(prepared.contract.acceptance.is_empty());
+        assert_eq!(prepared.capabilities, ["files.read", "command.execute"]);
 
         assert!(prepare_contract_with_workspace(Some(&encrypted_read), None).is_ok());
 
@@ -6828,6 +6827,133 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(denial.contains("files.read"));
+    }
+
+    #[test]
+    fn child_read_only_command_execution_does_not_require_workspace_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut contract = research_contract("git_audit");
+        contract["capabilities"] = json!(["files.read", "command.execute"]);
+        let input = contract_input("git_audit", "codey_deep_research", contract);
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({ "agent_id": "agent-git-audit" })),
+            20,
+        )
+        .unwrap();
+
+        assert_eq!(
+            authorize_child_tool(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                "agent-git-audit",
+                "functions.exec",
+                Some(&json!({ "cmd": "git status --short --branch" })),
+                30,
+            )
+            .unwrap(),
+            None
+        );
+
+        let write_denial = authorize_child_tool(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            "agent-git-audit",
+            "apply_patch",
+            Some(&json!({ "patch": "*** Begin Patch\n*** End Patch" })),
+            40,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(write_denial.contains("不是可写角色"));
+
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let mut ledger = store.load("runtime-a", "session-a", 45).unwrap().unwrap();
+        ledger
+            .reservations
+            .get_mut("git_audit")
+            .unwrap()
+            .capabilities
+            .retain(|capability| capability != "command.execute");
+        store.save(&mut ledger, 46).unwrap();
+        drop(ledger);
+        drop(store);
+
+        let command_denial = authorize_child_tool(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            "agent-git-audit",
+            "functions.exec",
+            Some(&json!({ "cmd": "git diff --stat" })),
+            50,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(command_denial.contains("command.execute"));
+    }
+
+    #[test]
+    fn opaque_read_only_attempt_keeps_command_access_without_write_role() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = json!({
+            "task_name": "opaque_git_audit",
+            "agent_type": "codey_quick_scan",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        pre_spawn_with_workspace(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some("/repo"),
+            0,
+            10,
+        )
+        .unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({ "agent_id": "agent-opaque-git" })),
+            20,
+        )
+        .unwrap();
+
+        assert_eq!(
+            authorize_child_tool(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                "agent-opaque-git",
+                "functions.exec",
+                Some(&json!({ "cmd": "git show --stat HEAD" })),
+                30,
+            )
+            .unwrap(),
+            None
+        );
+
+        let write_denial = authorize_child_tool(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            "agent-opaque-git",
+            "apply_patch",
+            Some(&json!({ "patch": "*** Begin Patch\n*** End Patch" })),
+            40,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(write_denial.contains("不是可写角色"));
     }
 
     #[test]

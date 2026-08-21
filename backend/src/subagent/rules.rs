@@ -693,11 +693,6 @@ mod tests {
         assert_eq!(decision.effect, RuleEffect::Deny);
 
         for (role, tool, class) in [
-            (
-                Some("codey_quick_scan"),
-                "functions.exec",
-                ToolClass::Command,
-            ),
             (None, "functions.exec", ToolClass::Command),
             (None, "read_file", ToolClass::Read),
             (None, "wait_agent", ToolClass::Collaboration),
@@ -729,6 +724,20 @@ mod tests {
                         role: Some(role),
                         tool_name: "web.run",
                         tool_class: ToolClass::Network,
+                    })
+                    .effect,
+                RuleEffect::Allow,
+                "{role}"
+            );
+        }
+        for role in ["codey_quick_scan", "codey_worker"] {
+            assert_eq!(
+                rules
+                    .evaluate(&RuleContext {
+                        actor: RuleActor::Child,
+                        role: Some(role),
+                        tool_name: "functions.exec",
+                        tool_class: ToolClass::Command,
                     })
                     .effect,
                 RuleEffect::Allow,

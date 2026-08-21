@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "revision": 4,
+  "revision": 5,
   "conflictResolution": "highest_priority_deny_wins",
   "fallback": "deny",
   "roles": {
@@ -43,8 +43,8 @@
       "effect": "allow",
       "actors": ["child"],
       "roles": ["codey_quick_scan", "codey_deep_research", "codey_visual_analysis", "default"],
-      "toolClasses": ["read", "network", "collaboration"],
-      "explanation": "只读角色可使用本地与网络只读检索和协作能力；命令必须由显式写入角色声明。"
+      "toolClasses": ["read", "command", "network", "collaboration"],
+      "explanation": "只读角色可使用本地与网络只读检索、显式声明的命令和协作能力；文件写入仍由角色与原生沙箱限制。"
     },
     {
       "id": "allow-worker-capabilities",
