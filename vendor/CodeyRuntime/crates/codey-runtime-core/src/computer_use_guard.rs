@@ -91,12 +91,12 @@ fn ensure_computer_use_config_with_artifacts_windows(
         .with_context(|| format!("failed to read UTF-8 {}", manager.path().display()))?;
     let updated = if let Some(marketplace_path) = artifacts.marketplace_path.as_deref() {
         guard_config_text_with_marketplace(
-            &existing,
+            existing,
             artifacts.notify_exe.as_deref(),
             Some(marketplace_path),
         )?
     } else {
-        guard_config_text(&existing, artifacts.notify_exe.as_deref())?
+        guard_config_text(existing, artifacts.notify_exe.as_deref())?
     };
     let changed = updated.as_bytes() != existing.as_bytes();
     if changed {

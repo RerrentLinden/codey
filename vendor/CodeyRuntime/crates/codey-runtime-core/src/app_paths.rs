@@ -420,7 +420,9 @@ fn windows_version_translations(info: &[u8]) -> Vec<(u16, u16)> {
     let translations =
         unsafe { std::slice::from_raw_parts(translations.cast::<u8>(), translations_len as usize) };
     translations
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pair| {
             (
                 u16::from_le_bytes([pair[0], pair[1]]),
