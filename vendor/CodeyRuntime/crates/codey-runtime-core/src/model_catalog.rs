@@ -221,9 +221,10 @@ fn codex_home_dir() -> PathBuf {
 }
 
 fn load_codex_config(path: &Path) -> (CodexConfig, HashMap<String, String>, Option<String>) {
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+    let manager = crate::config_manager::ConfigManager::new(path);
+    let snapshot = match manager.load() {
+        Ok(snapshot) if snapshot.exists() => snapshot,
+        Ok(_) => {
             return (
                 CodexConfig::default(),
                 HashMap::new(),
@@ -238,7 +239,17 @@ fn load_codex_config(path: &Path) -> (CodexConfig, HashMap<String, String>, Opti
             );
         }
     };
-    let config = parse_codex_config(&contents);
+    let contents = match std::str::from_utf8(snapshot.raw()) {
+        Ok(contents) => contents,
+        Err(error) => {
+            return (
+                CodexConfig::default(),
+                HashMap::new(),
+                Some(error.to_string()),
+            );
+        }
+    };
+    let config = parse_codex_config(contents);
     let mut effective = config.root.clone();
     if let Some(profile) = config.root.get("profile")
         && let Some(profile_values) = config.profiles.get(profile)

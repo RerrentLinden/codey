@@ -5,6 +5,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use codey_runtime_core::config_manager::ConfigManager;
 use codey_runtime_core::settings::RelayProtocol;
 use directories::BaseDirs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -299,16 +300,11 @@ fn local_provider_model_request_extensions(
     profile: &ProviderProfile,
 ) -> Result<Option<ProviderRequestExtensions>> {
     let config_path = codex_home.join("config.toml");
-    let config = match fs::read_to_string(&config_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("读取本地 Codex 配置失败：{}", config_path.display()));
-        }
-    };
-    let document = DocumentMut::from_str(&config)
-        .with_context(|| format!("解析本地 Codex 配置失败：{}", config_path.display()))?;
+    let snapshot = ConfigManager::new(&config_path).load()?;
+    if !snapshot.exists() {
+        return Ok(None);
+    }
+    let document = snapshot.document();
     let provider_id = document
         .get("model_provider")
         .and_then(Item::as_str)
@@ -324,7 +320,7 @@ fn local_provider_model_request_extensions(
         .and_then(|providers| providers.get(provider_id))
         .and_then(Item::as_table_like);
     Ok(provider.map(|provider| ProviderRequestExtensions {
-        api_key: provider_config_api_key(&document, Some(provider)),
+        api_key: provider_config_api_key(document, Some(provider)),
         headers: provider_model_request_headers(provider),
     }))
 }
@@ -367,23 +363,9 @@ fn startup_route_state_from_paths(db_path: &Path, codex_home: &Path) -> Result<S
     let auth_managed = auth.as_ref().is_some_and(auth_uses_proxy_route);
 
     let config_path = codex_home.join("config.toml");
-    let config_contents = match fs::read(&config_path) {
-        Ok(contents) => Some(contents),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("读取 Codex Live 配置失败：{}", config_path.display()));
-        }
-    };
-    let document = config_contents
-        .as_deref()
-        .map(|contents| {
-            let contents = std::str::from_utf8(contents)
-                .with_context(|| format!("Codex Live 配置不是 UTF-8：{}", config_path.display()))?;
-            DocumentMut::from_str(contents)
-                .with_context(|| format!("解析 Codex Live 配置失败：{}", config_path.display()))
-        })
-        .transpose()?;
+    let snapshot = ConfigManager::new(&config_path).load()?;
+    let config_contents = snapshot.exists().then(|| snapshot.raw().to_vec());
+    let document = snapshot.exists().then(|| snapshot.document().clone());
     let config_managed = document.as_ref().is_some_and(document_uses_proxy_route);
     let live = auth_managed || config_managed;
     let takeover = RouteTakeoverState { managed, live };
@@ -519,17 +501,11 @@ fn live_config_uses_proxy_route(codex_home: &Path) -> Result<bool> {
         return Ok(true);
     }
     let config_path = codex_home.join("config.toml");
-    let config = match fs::read_to_string(&config_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("读取 Codex Live 配置失败：{}", config_path.display()));
-        }
-    };
-    let document = DocumentMut::from_str(&config)
-        .with_context(|| format!("解析 Codex Live 配置失败：{}", config_path.display()))?;
-    Ok(document_uses_proxy_route(&document))
+    let snapshot = ConfigManager::new(&config_path).load()?;
+    if !snapshot.exists() {
+        return Ok(false);
+    }
+    Ok(document_uses_proxy_route(snapshot.document()))
 }
 
 fn document_uses_proxy_route(document: &DocumentMut) -> bool {
@@ -1033,16 +1009,8 @@ fn validated_live_route_snapshot(
 
 fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
     let config_path = codex_home.join("config.toml");
-    let config = match fs::read_to_string(&config_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("读取本地 Codex 配置失败：{}", config_path.display()));
-        }
-    };
-    let document = DocumentMut::from_str(&config)
-        .with_context(|| format!("解析本地 Codex 配置失败：{}", config_path.display()))?;
+    let snapshot = ConfigManager::new(&config_path).load()?;
+    let document = snapshot.document();
     let provider_id = document
         .get("model_provider")
         .and_then(Item::as_str)
@@ -1093,7 +1061,7 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let config_api_key = provider_config_api_key(&document, table);
+    let config_api_key = provider_config_api_key(document, table);
     // The provider-scoped token describes the active route and must win over
     // any long-lived auth.json login retained alongside it.
     let api_key = config_api_key
@@ -1105,7 +1073,7 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         base_url = "https://api.openai.com/v1".to_string();
     }
     let local_route = is_loopback_url(&base_url)
-        && (document_uses_proxy_route(&document)
+        && (document_uses_proxy_route(document)
             || auth.as_ref().is_some_and(auth_uses_proxy_route));
     let provider = CurrentProvider {
         id: if official && provider_id == LOCAL_OFFICIAL_PROVIDER_ID {
@@ -1299,7 +1267,7 @@ mod tests {
 
         let error = local_provider(home).unwrap_err();
 
-        assert!(format!("{error:#}").contains("解析本地 Codex 配置失败"));
+        assert!(format!("{error:#}").contains("解析 "));
         assert!(format!("{error:#}").contains("config.toml"));
     }
 

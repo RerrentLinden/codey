@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use toml_edit::{Array, DocumentMut, Item, Table};
 
+#[cfg(windows)]
+use crate::config_manager::ConfigManager;
+
 const BUNDLED_MARKETPLACE: &str = "openai-bundled";
 const BUNDLED_MARKETPLACE_PLUGINS: &[&str] = &["browser", "chrome", "computer-use", "latex"];
 const COMPUTER_USE_PLUGINS: &[&str] = &[
@@ -82,15 +85,10 @@ fn ensure_computer_use_config_with_artifacts_windows(
     home: &Path,
     artifacts: &GuardArtifacts,
 ) -> anyhow::Result<GuardResult> {
-    let config_path = home.join("config.toml");
-    let existing = match std::fs::read(&config_path) {
-        Ok(bytes) => String::from_utf8(bytes)
-            .with_context(|| format!("failed to read UTF-8 {}", config_path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
-        }
-    };
+    let manager = ConfigManager::for_home(home);
+    let snapshot = manager.load()?;
+    let existing = std::str::from_utf8(snapshot.raw())
+        .with_context(|| format!("failed to read UTF-8 {}", manager.path().display()))?;
     let updated = if let Some(marketplace_path) = artifacts.marketplace_path.as_deref() {
         guard_config_text_with_marketplace(
             &existing,
@@ -102,7 +100,12 @@ fn ensure_computer_use_config_with_artifacts_windows(
     };
     let changed = updated.as_bytes() != existing.as_bytes();
     if changed {
-        crate::settings::atomic_write(&config_path, updated.as_bytes())?;
+        manager.replace_text(
+            Some(snapshot.revision()),
+            &updated,
+            "repair computer-use plugin registration",
+            "computer_use_guard.ensure_computer_use_config_with_artifacts_windows",
+        )?;
     }
     let runtime_compat = ensure_computer_use_runtime_exports_compat_windows(
         home,
@@ -512,9 +515,9 @@ pub(crate) fn ensure_openai_bundled_marketplace(home: &Path) -> anyhow::Result<O
 
 #[cfg(windows)]
 fn configured_openai_bundled_marketplace(home: &Path) -> Option<PathBuf> {
-    let config = std::fs::read_to_string(home.join("config.toml")).ok()?;
-    let without_bom = config.trim_start_matches('\u{feff}');
-    let doc = parse_toml_document(without_bom).ok()?;
+    let manager = ConfigManager::for_home(home);
+    let snapshot = manager.load().ok()?;
+    let doc = snapshot.document();
     let source = doc
         .get("marketplaces")?
         .as_table()?

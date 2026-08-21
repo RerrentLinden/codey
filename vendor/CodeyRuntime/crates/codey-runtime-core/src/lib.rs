@@ -6,6 +6,7 @@ pub(crate) mod codex_home;
 pub(crate) mod codex_local_storage;
 pub mod codex_sqlite;
 mod computer_use_guard;
+pub mod config_manager;
 pub mod diagnostic_log;
 pub(crate) mod http_client;
 pub mod install;

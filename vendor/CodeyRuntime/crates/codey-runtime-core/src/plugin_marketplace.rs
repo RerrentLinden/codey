@@ -4,6 +4,8 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::Context;
 use toml_edit::{DocumentMut, Item, Table};
 
+use crate::config_manager::ConfigManager;
+
 const OPENAI_CURATED_MARKETPLACE: &str = "openai-curated";
 const OPENAI_API_CURATED_MARKETPLACE: &str = "openai-api-curated";
 const OPENAI_CURATED_REMOTE_MARKETPLACE: &str = "openai-curated-remote";
@@ -471,15 +473,10 @@ fn ensure_marketplace_configs_with_plugins(
     marketplace_root: &Path,
     plugin_ids: &[String],
 ) -> anyhow::Result<bool> {
-    let config_path = home.join("config.toml");
-    let existing = match std::fs::read(&config_path) {
-        Ok(bytes) => String::from_utf8(bytes)
-            .with_context(|| format!("failed to read UTF-8 {}", config_path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", config_path.display()));
-        }
-    };
+    let manager = ConfigManager::for_home(home);
+    let snapshot = manager.load()?;
+    let existing = std::str::from_utf8(snapshot.raw())
+        .with_context(|| format!("failed to read UTF-8 {}", manager.path().display()))?;
     let without_bom = existing.trim_start_matches('\u{feff}');
     let updated = merge_marketplace_configs_and_plugins_into_text(
         without_bom,
@@ -490,7 +487,12 @@ fn ensure_marketplace_configs_with_plugins(
     if updated.as_bytes() == without_bom.as_bytes() {
         return Ok(false);
     }
-    crate::settings::atomic_write(&config_path, updated.as_bytes())?;
+    manager.replace_text(
+        Some(snapshot.revision()),
+        &updated,
+        "register plugin marketplace without changing provider configuration",
+        "plugin_marketplace.ensure_marketplace_configs_with_plugins",
+    )?;
     Ok(true)
 }
 
@@ -547,12 +549,11 @@ fn merge_marketplace_configs_and_plugins_into_text(
 }
 
 fn marketplace_config_points_to_root(home: &Path, marketplace_name: &str, root: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(home.join("config.toml")) else {
+    let manager = ConfigManager::for_home(home);
+    let Ok(snapshot) = manager.load() else {
         return false;
     };
-    let Ok(doc) = text.trim_start_matches('\u{feff}').parse::<DocumentMut>() else {
-        return false;
-    };
+    let doc = snapshot.document();
     let Some(table) = doc
         .get("marketplaces")
         .and_then(Item::as_table)

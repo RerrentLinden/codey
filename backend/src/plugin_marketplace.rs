@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
-use toml_edit::DocumentMut;
 
 use crate::error_log;
 
@@ -200,14 +199,12 @@ fn merge_manifest(plugin: &mut Map<String, Value>, plugin_root: &Path) {
 }
 
 fn installed_plugins(home: &Path) -> Result<HashSet<String>> {
-    let path = home.join("config.toml");
-    let Ok(text) = fs::read_to_string(path) else {
+    let Ok(snapshot) = codey_runtime_core::config_manager::ConfigManager::for_home(home).load()
+    else {
         return Ok(HashSet::new());
     };
-    let Ok(document) = text.parse::<DocumentMut>() else {
-        return Ok(HashSet::new());
-    };
-    let Some(table) = document
+    let Some(table) = snapshot
+        .document()
         .get("plugins")
         .and_then(|item| item.as_table_like())
     else {

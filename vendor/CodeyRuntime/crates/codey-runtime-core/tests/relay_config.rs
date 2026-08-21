@@ -1157,26 +1157,23 @@ other = true
 }
 
 #[test]
-fn set_codex_goals_feature_tolerates_invalid_existing_toml() {
+fn set_codex_goals_feature_rejects_invalid_existing_toml_without_overwrite() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(
-        temp.path().join("config.toml"),
-        r#"model = "gpt-5"
+    let original = r#"model = "gpt-5"
 
 [marketplaces.openai-bundled]
 last_updated = "2026-05-25T11:52:46Z"
 
 [marketplaces.openai-bundled]
 last_updated = "2026-05-25T11:52:46Z"
-"#,
-    )
-    .unwrap();
+"#;
+    std::fs::write(temp.path().join("config.toml"), original).unwrap();
 
-    set_codex_goals_feature_in_home(temp.path(), true).unwrap();
+    let error = set_codex_goals_feature_in_home(temp.path(), true).unwrap_err();
 
     let config = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(config.contains("[features]"));
-    assert!(config.contains("goals = true"));
+    assert!(error.to_string().contains("解析"));
+    assert_eq!(config, original);
 }
 
 #[test]
@@ -1354,7 +1351,7 @@ fn apply_relay_config_file_switches_config_without_touching_auth_json() {
     let home = temp.path();
     std::fs::write(
         home.join("config.toml"),
-        "model_provider = \"CodeyRuntime\"\nbase_url = \"old\"\n",
+        "model_provider = \"CodeyRuntime\"\nbase_url = \"https://old.example/v1\"\n",
     )
     .unwrap();
     std::fs::write(home.join("auth.json"), "{\"auth_mode\":\"chatgpt\"}\n").unwrap();
@@ -1717,7 +1714,7 @@ command = "npx"
 }
 
 #[test]
-fn backfill_relay_profile_with_common_tolerates_duplicate_live_toml() {
+fn backfill_relay_profile_with_common_rejects_duplicate_live_toml_without_overwrite() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(
         temp.path().join("config.toml"),
@@ -1747,35 +1744,17 @@ enabled = true
 "#
     .to_string();
 
-    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common).unwrap();
+    let original = std::fs::read(temp.path().join("config.toml")).unwrap();
+    let error = backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &common)
+        .unwrap_err();
 
-    assert_eq!(profile.model, "gpt-5.5");
-    assert!(
-        profile
-            .config_contents
-            .contains(r#"model_reasoning_effort = "high""#)
-    );
+    assert!(error.to_string().contains("解析"));
     assert_eq!(
-        profile
-            .config_contents
-            .matches("model_reasoning_effort")
-            .count(),
-        1
+        std::fs::read(temp.path().join("config.toml")).unwrap(),
+        original
     );
-    assert_eq!(
-        profile
-            .config_contents
-            .matches("[marketplaces.openai-bundled]")
-            .count(),
-        1
-    );
-    assert!(
-        !profile
-            .config_contents
-            .contains("[plugins.\"superpowers@openai-curated\"]")
-    );
-    let auth: serde_json::Value = serde_json::from_str(&profile.auth_contents).unwrap();
-    assert_eq!(auth["OPENAI_API_KEY"], "sk-live-token");
+    assert!(profile.config_contents.is_empty());
+    assert!(profile.auth_contents.is_empty());
 }
 
 #[test]

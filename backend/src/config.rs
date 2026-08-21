@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -9,8 +9,8 @@ use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model_id;
 pub use crate::notifications::WebhookConfig;
+use crate::{model_catalog, model_id};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -267,6 +267,10 @@ pub struct CodeyConfig {
     /// the active provider's compatibility representation.
     #[serde(default)]
     pub subagent_config_by_provider: BTreeMap<String, SubagentProviderConfig>,
+    /// Tracks the one-time migration that turns existing non-default role
+    /// selections into provider-scoped official-model declarations.
+    #[serde(default)]
+    pub subagent_role_model_support_migrated: bool,
     /// Automatically dismisses Codex's full-access safety notice in the
     /// renderer. Opt-in so the native warning remains visible by default.
     #[serde(default)]
@@ -311,6 +315,7 @@ impl Default for CodeyConfig {
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
             subagent_roles: default_subagent_roles(),
             subagent_config_by_provider: BTreeMap::new(),
+            subagent_role_model_support_migrated: true,
             hide_full_access_warning: false,
             show_account_usage_in_header: true,
             update_manifest_url: default_update_manifest_url(),
@@ -343,7 +348,16 @@ impl CodeyConfig {
         normalize_model_lists(&mut self.selected_models_by_provider);
         normalize_model_lists(&mut self.manual_third_party_models_by_provider);
         normalize_model_lists(&mut self.declared_official_models_by_provider);
+        migrate_legacy_official_model_selections(
+            &mut self.selected_models_by_provider,
+            &mut self.manual_third_party_models_by_provider,
+            &mut self.declared_official_models_by_provider,
+        );
         normalize_upstream_model_lists(&mut self.upstream_models_by_provider);
+        merge_declared_official_models_into_upstream(
+            &self.declared_official_models_by_provider,
+            &mut self.upstream_models_by_provider,
+        );
         normalize_model_map(&mut self.default_model_by_provider);
         normalize_subagent_config(
             &mut self.subagent_model,
@@ -360,6 +374,10 @@ impl CodeyConfig {
             self.subagent_config_by_provider
                 .entry(provider_id)
                 .or_insert(active);
+        }
+        if !self.subagent_role_model_support_migrated {
+            self.migrate_custom_subagent_role_model_support();
+            self.subagent_role_model_support_migrated = true;
         }
         self.webhook.normalize();
         self.prompt_optimization.normalize();
@@ -446,6 +464,90 @@ impl CodeyConfig {
         self.subagent_roles = saved.roles;
     }
 
+    pub(crate) fn remember_current_provider_official_model_support(
+        &mut self,
+        models: impl IntoIterator<Item = String>,
+    ) {
+        let Some(provider_id) = self.current_provider_id().map(ToString::to_string) else {
+            return;
+        };
+        self.remember_provider_official_model_support(&provider_id, models);
+    }
+
+    fn remember_provider_official_model_support(
+        &mut self,
+        provider_id: &str,
+        models: impl IntoIterator<Item = String>,
+    ) {
+        if provider_id.trim().is_empty() || self.provider_is_official(provider_id) {
+            return;
+        }
+        let official_models_by_key = official_models_by_key();
+        let canonical_models =
+            model_id::dedupe_preserving_first(models.into_iter().filter_map(|model| {
+                official_models_by_key
+                    .get(&model_id::key(&model))
+                    .map(String::as_str)
+            }));
+        if canonical_models.is_empty() {
+            return;
+        }
+
+        let declared_models = self
+            .declared_official_models_by_provider
+            .entry(provider_id.to_string())
+            .or_default();
+        declared_models.extend(canonical_models.iter().cloned());
+        normalize_model_list(declared_models);
+
+        let upstream_models = self
+            .upstream_models_by_provider
+            .entry(provider_id.to_string())
+            .or_default();
+        upstream_models.extend(canonical_models);
+        normalize_model_list(upstream_models);
+    }
+
+    fn migrate_custom_subagent_role_model_support(&mut self) {
+        let defaults = default_subagent_roles();
+        let legacy_uniform_defaults =
+            uniform_subagent_roles(DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT);
+        let migrations = self
+            .subagent_config_by_provider
+            .iter()
+            .filter_map(|(provider_id, config)| {
+                if config.roles == defaults || config.roles == legacy_uniform_defaults {
+                    return None;
+                }
+                let models = config
+                    .roles
+                    .iter()
+                    .filter(|(role, selection)| {
+                        defaults
+                            .get(*role)
+                            .is_none_or(|default| default != *selection)
+                    })
+                    .map(|(_, selection)| selection.model.clone())
+                    .collect::<Vec<_>>();
+                (!models.is_empty()).then(|| (provider_id.clone(), models))
+            })
+            .collect::<Vec<_>>();
+        for (provider_id, models) in migrations {
+            self.remember_provider_official_model_support(&provider_id, models);
+        }
+    }
+
+    fn provider_is_official(&self, provider_id: &str) -> bool {
+        self.profiles.iter().any(|profile| {
+            profile.cc_switch_read_only
+                && profile
+                    .cc_switch_provider_id
+                    .as_deref()
+                    .unwrap_or(profile.id.as_str())
+                    == provider_id
+        })
+    }
+
     fn active_subagent_config(&self) -> SubagentProviderConfig {
         SubagentProviderConfig {
             model: self.subagent_model.clone(),
@@ -471,6 +573,80 @@ fn normalize_upstream_model_lists(lists: &mut BTreeMap<String, Vec<String>>) {
 
 fn normalize_model_list(models: &mut Vec<String>) {
     *models = model_id::dedupe_preserving_first(models.iter().map(String::as_str));
+}
+
+fn official_models_by_key() -> BTreeMap<String, String> {
+    model_catalog::default_official_model_slugs()
+        .into_iter()
+        .map(|model| (model_id::key(&model), model))
+        .collect()
+}
+
+fn migrate_legacy_official_model_selections(
+    selected_models_by_provider: &mut BTreeMap<String, Vec<String>>,
+    manual_third_party_models_by_provider: &mut BTreeMap<String, Vec<String>>,
+    declared_official_models_by_provider: &mut BTreeMap<String, Vec<String>>,
+) {
+    let official_models_by_key = official_models_by_key();
+    let provider_ids = selected_models_by_provider
+        .keys()
+        .chain(manual_third_party_models_by_provider.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for provider_id in provider_ids {
+        let mut migrated_models = Vec::new();
+        if let Some(models) = selected_models_by_provider.get_mut(&provider_id) {
+            take_official_models(models, &official_models_by_key, &mut migrated_models);
+        }
+        if let Some(models) = manual_third_party_models_by_provider.get_mut(&provider_id) {
+            take_official_models(models, &official_models_by_key, &mut migrated_models);
+        }
+        if migrated_models.is_empty() {
+            continue;
+        }
+
+        let declared_models = declared_official_models_by_provider
+            .entry(provider_id)
+            .or_default();
+        declared_models.extend(migrated_models);
+        normalize_model_list(declared_models);
+    }
+
+    selected_models_by_provider.retain(|_, models| !models.is_empty());
+    manual_third_party_models_by_provider.retain(|_, models| !models.is_empty());
+}
+
+fn merge_declared_official_models_into_upstream(
+    declared_official_models_by_provider: &BTreeMap<String, Vec<String>>,
+    upstream_models_by_provider: &mut BTreeMap<String, Vec<String>>,
+) {
+    let official_models_by_key = official_models_by_key();
+    for (provider_id, declared_models) in declared_official_models_by_provider {
+        let upstream_models = upstream_models_by_provider
+            .entry(provider_id.clone())
+            .or_default();
+        upstream_models.extend(
+            declared_models
+                .iter()
+                .filter_map(|model| official_models_by_key.get(&model_id::key(model)).cloned()),
+        );
+        normalize_model_list(upstream_models);
+    }
+}
+
+fn take_official_models(
+    models: &mut Vec<String>,
+    official_models_by_key: &BTreeMap<String, String>,
+    migrated_models: &mut Vec<String>,
+) {
+    models.retain(|model| {
+        let Some(canonical_model) = official_models_by_key.get(&model_id::key(model)) else {
+            return true;
+        };
+        migrated_models.push(canonical_model.clone());
+        false
+    });
 }
 
 fn normalize_model_map(models_by_provider: &mut BTreeMap<String, String>) {
@@ -792,11 +968,71 @@ mod tests {
         );
         assert_eq!(
             normalized.upstream_models_by_provider[&provider_id],
-            ["UPSTREAM-A"]
+            ["UPSTREAM-A", "gpt-5.6-sol"]
         );
         assert_eq!(
             normalized.declared_official_models_by_provider[&provider_id],
             ["GPT-5.6-SOL"]
+        );
+    }
+
+    #[test]
+    fn legacy_official_models_are_reclassified_and_survive_persistence() {
+        let mut config = CodeyConfig::default();
+        let provider_id = config.current_provider_id().unwrap().to_string();
+        config.selected_models_by_provider.insert(
+            provider_id.clone(),
+            vec![
+                "GPT-5.6-Luna".into(),
+                "provider-custom".into(),
+                "gpt-5.6-sol".into(),
+            ],
+        );
+        config.manual_third_party_models_by_provider.insert(
+            provider_id.clone(),
+            vec![
+                "GPT-5.6-Terra".into(),
+                "provider-custom".into(),
+                "manual-only".into(),
+            ],
+        );
+        config
+            .declared_official_models_by_provider
+            .insert(provider_id.clone(), vec!["GPT-5.6-SOL".into()]);
+        config
+            .upstream_models_by_provider
+            .insert(provider_id.clone(), Vec::new());
+
+        let normalized = config.normalize();
+
+        assert_eq!(
+            normalized.selected_models_by_provider[&provider_id],
+            ["provider-custom"]
+        );
+        assert_eq!(
+            normalized.manual_third_party_models_by_provider[&provider_id],
+            ["provider-custom", "manual-only"]
+        );
+        assert_eq!(
+            normalized.declared_official_models_by_provider[&provider_id],
+            ["GPT-5.6-SOL", "gpt-5.6-luna", "gpt-5.6-terra"]
+        );
+        assert_eq!(
+            normalized.upstream_models_by_provider[&provider_id],
+            ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"]
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(directory.path().join("config.json"));
+        store.save(&normalized).unwrap();
+        let reloaded = store.load().unwrap();
+        assert_eq!(
+            reloaded.declared_official_models_by_provider[&provider_id],
+            ["GPT-5.6-SOL", "gpt-5.6-luna", "gpt-5.6-terra"]
+        );
+        assert_eq!(
+            reloaded.upstream_models_by_provider[&provider_id],
+            ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"]
         );
     }
 
@@ -978,6 +1214,112 @@ mod tests {
                 .values()
                 .all(|selection| selection.model == DEFAULT_SUBAGENT_MODEL)
         );
+    }
+
+    #[test]
+    fn fresh_subagent_defaults_keep_the_original_role_preset() {
+        let config = CodeyConfig::default();
+
+        assert!(
+            config
+                .subagent_roles
+                .values()
+                .all(|selection| selection.model == DEFAULT_SUBAGENT_MODEL)
+        );
+        assert_eq!(
+            config.subagent_roles[SUBAGENT_ROLE_WORKER].reasoning_effort,
+            "medium"
+        );
+        assert_eq!(
+            config.subagent_roles[SUBAGENT_ROLE_VISUAL_WORKER].reasoning_effort,
+            "high"
+        );
+    }
+
+    #[test]
+    fn existing_custom_role_models_are_migrated_once_without_changing_defaults() {
+        let mut profile = ProviderProfile::new("Third party");
+        profile.id = "third-party".into();
+        let mut roles = default_subagent_roles();
+        roles.get_mut(SUBAGENT_ROLE_QUICK_SCAN).unwrap().model = "gpt-5.6-luna".into();
+        roles.get_mut(SUBAGENT_ROLE_DEEP_RESEARCH).unwrap().model = "gpt-5.6-luna".into();
+        roles
+            .get_mut(SUBAGENT_ROLE_WORKER)
+            .unwrap()
+            .reasoning_effort = "max".into();
+        roles
+            .get_mut(SUBAGENT_ROLE_VISUAL_WORKER)
+            .unwrap()
+            .reasoning_effort = "max".into();
+        let mut config = CodeyConfig {
+            active_profile_id: profile.id.clone(),
+            profiles: vec![profile],
+            subagent_optimization: true,
+            subagent_roles: roles.clone(),
+            subagent_role_model_support_migrated: false,
+            ..CodeyConfig::default()
+        };
+        config
+            .upstream_models_by_provider
+            .insert("third-party".into(), vec!["provider-custom-model".into()]);
+
+        let normalized = config.normalize();
+
+        assert_eq!(normalized.subagent_roles, roles);
+        assert!(normalized.subagent_role_model_support_migrated);
+        assert_eq!(
+            normalized.declared_official_models_by_provider["third-party"],
+            ["gpt-5.6-luna", "gpt-5.6-terra"]
+        );
+        assert_eq!(
+            normalized.upstream_models_by_provider["third-party"],
+            ["provider-custom-model", "gpt-5.6-luna", "gpt-5.6-terra"]
+        );
+        assert_eq!(
+            default_subagent_roles()[SUBAGENT_ROLE_QUICK_SCAN],
+            SubagentRoleConfig::new(DEFAULT_SUBAGENT_MODEL, "low")
+        );
+
+        let mut after_explicit_removal = normalized;
+        after_explicit_removal
+            .declared_official_models_by_provider
+            .insert("third-party".into(), vec!["gpt-5.6-terra".into()]);
+        after_explicit_removal.upstream_models_by_provider.insert(
+            "third-party".into(),
+            vec!["provider-custom-model".into(), "gpt-5.6-terra".into()],
+        );
+        let after_explicit_removal = after_explicit_removal.normalize();
+
+        assert_eq!(
+            after_explicit_removal.declared_official_models_by_provider["third-party"],
+            ["gpt-5.6-terra"]
+        );
+        assert!(
+            !after_explicit_removal.upstream_models_by_provider["third-party"]
+                .iter()
+                .any(|model| model_id::equal(model, "gpt-5.6-luna"))
+        );
+    }
+
+    #[test]
+    fn custom_roles_do_not_declare_models_for_an_official_provider() {
+        let mut profile = ProviderProfile::new("Official");
+        profile.id = "openai".into();
+        profile.cc_switch_read_only = true;
+        let mut roles = default_subagent_roles();
+        roles.get_mut(SUBAGENT_ROLE_QUICK_SCAN).unwrap().model = "gpt-5.6-luna".into();
+        let config = CodeyConfig {
+            active_profile_id: profile.id.clone(),
+            profiles: vec![profile],
+            subagent_roles: roles.clone(),
+            subagent_role_model_support_migrated: false,
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        assert_eq!(config.subagent_roles, roles);
+        assert!(config.declared_official_models_by_provider.is_empty());
+        assert!(config.upstream_models_by_provider.is_empty());
     }
 
     #[test]

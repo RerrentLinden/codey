@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
+use crate::config_manager::ConfigManager;
 use crate::settings::{RelayContextSelection, RelayProfile, RelayProtocol};
 
 const RELAY_PROVIDER: &str = "custom";
@@ -86,53 +87,32 @@ pub fn default_relay_status() -> RelayStatus {
 }
 
 pub fn set_codex_goals_feature_in_home(home: &Path, enabled: bool) -> anyhow::Result<()> {
-    std::fs::create_dir_all(home)?;
-    let config_path = home.join("config.toml");
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
-    let updated = match parse_toml_document(&existing) {
-        Ok(mut doc) => {
-            if enabled {
-                let features = table_mut_or_insert(&mut doc, "features")?;
-                features["goals"] = toml_edit::value(true);
-            } else if let Some(features) = table_mut_if_exists(&mut doc, "features") {
-                features.remove("goals");
-                if features.is_empty() {
-                    doc.as_table_mut().remove("features");
+    let manager = ConfigManager::for_home(home);
+    let snapshot = manager.load()?;
+    manager.update(
+        Some(snapshot.revision()),
+        if enabled {
+            "enable Codex goals feature"
+        } else {
+            "disable Codex goals feature"
+        },
+        "relay_config.set_codex_goals_feature_in_home",
+        |editor| {
+            editor.edit_document(|doc| {
+                if enabled {
+                    let features = table_mut_or_insert(doc, "features")?;
+                    features["goals"] = toml_edit::value(true);
+                } else if let Some(features) = table_mut_if_exists(doc, "features") {
+                    features.remove("goals");
+                    if features.is_empty() {
+                        doc.as_table_mut().remove("features");
+                    }
                 }
-            }
-            ensure_trailing_newline(doc.to_string())
-        }
-        Err(_) => set_codex_goals_feature_text_fallback(&existing, enabled),
-    };
-    crate::settings::atomic_write(&config_path, updated.as_bytes())
-}
-
-fn set_codex_goals_feature_text_fallback(existing: &str, enabled: bool) -> String {
-    let mut kept = Vec::new();
-    let mut skipping_features = false;
-
-    for line in existing.lines() {
-        let trimmed = line.trim();
-        if trimmed == "[features]" {
-            skipping_features = true;
-            continue;
-        }
-        if skipping_features && trimmed.starts_with('[') && trimmed.ends_with(']') {
-            skipping_features = false;
-        }
-        if !skipping_features {
-            kept.push(line);
-        }
-    }
-
-    let mut updated = kept.join("\n").trim_end().to_string();
-    if enabled {
-        if !updated.is_empty() {
-            updated.push_str("\n\n");
-        }
-        updated.push_str("[features]\ngoals = true");
-    }
-    ensure_trailing_newline(updated)
+                Ok(())
+            })
+        },
+    )?;
+    Ok(())
 }
 
 fn table_mut_or_insert<'a>(doc: &'a mut DocumentMut, key: &str) -> anyhow::Result<&'a mut Table> {
@@ -186,7 +166,11 @@ pub fn chatgpt_auth_status_from_home(home: &Path) -> ChatGptAuthStatus {
 
 pub fn relay_config_status_from_home(home: &Path) -> RelayConfigStatus {
     let config_path = home.join("config.toml");
-    let contents = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let contents = ConfigManager::for_home(home)
+        .load()
+        .ok()
+        .and_then(|snapshot| String::from_utf8(snapshot.raw().to_vec()).ok())
+        .unwrap_or_default();
     let auth_contents = std::fs::read_to_string(home.join("auth.json")).unwrap_or_default();
     let root_provider = root_key_string(&contents, "model_provider");
     let provider = root_provider
@@ -253,8 +237,14 @@ pub fn apply_relay_config_to_home_with_protocol(
     let auth_contents = serde_json::to_string_pretty(&json!({
         "OPENAI_API_KEY": bearer_token
     }))?;
-    let backup_path =
-        write_codex_live_atomic(home, Some(&updated), Some(auth_contents.as_bytes()), false)?;
+    let backup_path = write_codex_live_atomic(
+        home,
+        Some(&updated),
+        Some(auth_contents.as_bytes()),
+        false,
+        "apply relay endpoint and credentials",
+        "relay_config.apply_relay_config_to_home_with_protocol",
+    )?;
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
         config_path: status.config_path,
@@ -301,6 +291,8 @@ pub fn apply_relay_files_to_home_with_computer_use_guard(
         Some(config_contents),
         Some(auth_contents.as_bytes()),
         preserve_computer_use_guard,
+        "apply relay config/auth files",
+        "relay_config.apply_relay_files_to_home_with_computer_use_guard",
     )?;
 
     let status = relay_config_status_from_home(home);
@@ -483,7 +475,14 @@ pub fn apply_relay_config_file_to_home(
     }
     std::fs::create_dir_all(home)?;
 
-    let backup_path = write_codex_live_atomic(home, Some(config_contents), None, false)?;
+    let backup_path = write_codex_live_atomic(
+        home,
+        Some(config_contents),
+        None,
+        false,
+        "apply relay config file",
+        "relay_config.apply_relay_config_file_to_home",
+    )?;
 
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
@@ -533,8 +532,7 @@ pub fn clear_relay_config_to_home_with_auth_and_computer_use_guard(
         Some(contents) if !contents.trim().is_empty() => Some(contents.as_bytes().to_vec()),
         _ => pure_api_auth_json_removed(home)?,
     };
-    let config_path = home.join("config.toml");
-    let existing = std::fs::read_to_string(&config_path).unwrap_or_default();
+    let existing = read_live_config(home)?;
     let mut without_tables = remove_table(&existing, &format!("model_providers.{RELAY_PROVIDER}"));
     for legacy_provider in LEGACY_RELAY_PROVIDERS {
         without_tables = remove_table(
@@ -556,6 +554,8 @@ pub fn clear_relay_config_to_home_with_auth_and_computer_use_guard(
         Some(&updated),
         auth_bytes.as_deref(),
         preserve_computer_use_guard,
+        "clear relay-owned configuration",
+        "relay_config.clear_relay_config_to_home_with_auth_and_computer_use_guard",
     )?;
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
@@ -589,7 +589,7 @@ pub fn backfill_relay_profile_from_home(
     home: &Path,
     profile: &mut RelayProfile,
 ) -> anyhow::Result<()> {
-    profile.config_contents = read_optional_text(&home.join("config.toml"))?;
+    profile.config_contents = read_live_config(home)?;
     profile.auth_contents = read_optional_text(&home.join("auth.json"))?;
     let live_config = profile.config_contents.clone();
     sync_context_limits_from_config(profile, &live_config);
@@ -606,7 +606,7 @@ pub fn backfill_relay_profile_from_home_with_common(
     profile: &mut RelayProfile,
     common_config_contents: &str,
 ) -> anyhow::Result<()> {
-    let live_config = read_optional_text(&home.join("config.toml"))?;
+    let live_config = read_live_config(home)?;
     let template_config = profile.config_contents.clone();
     let template_auth = profile.auth_contents.clone();
     profile.config_contents = if profile.use_common_config {
@@ -791,7 +791,7 @@ fn preserve_unmanaged_live_context_entries(
     config_text: &str,
     managed_context_config: &str,
 ) -> anyhow::Result<String> {
-    let live_config = read_optional_text(&home.join("config.toml"))?;
+    let live_config = read_live_config(home)?;
     if live_config.trim().is_empty() {
         return Ok(ensure_trailing_newline(config_text.to_string()));
     }
@@ -966,6 +966,8 @@ fn write_codex_live_atomic(
     config_text: Option<&str>,
     auth_bytes: Option<&[u8]>,
     preserve_computer_use_guard: bool,
+    reason: &str,
+    caller: &str,
 ) -> anyhow::Result<Option<String>> {
     std::fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
@@ -995,8 +997,12 @@ fn write_codex_live_atomic(
     #[cfg(windows)]
     let config_text = guarded_config_text.as_deref();
 
+    let manager = ConfigManager::for_home(home);
+    let snapshot = manager.load()?;
+    let live_config = std::str::from_utf8(snapshot.raw())
+        .with_context(|| format!("{} 不是 UTF-8", config_path.display()))?;
     let config_text = match config_text {
-        Some(config_text) => Some(preserve_live_marketplace_configs(home, config_text)?),
+        Some(config_text) => Some(preserve_live_marketplace_configs(live_config, config_text)?),
         None => None,
     };
     let config_text = config_text.as_deref();
@@ -1019,7 +1025,7 @@ fn write_codex_live_atomic(
         validate_auth_json(auth_bytes, &auth_path)?;
     }
 
-    let old_config = read_optional_bytes(&config_path)?;
+    let old_config = snapshot.exists().then(|| snapshot.raw().to_vec());
     let old_auth = read_optional_bytes(&auth_path)?;
     let backup_path = create_live_backup(home, old_config.as_deref(), old_auth.as_deref())?;
     let mut auth_written = false;
@@ -1032,26 +1038,33 @@ fn write_codex_live_atomic(
     }
 
     if let Some(config_text) = config_text
-        && let Err(error) = crate::settings::atomic_write(&config_path, config_text.as_bytes())
+        && config_text.as_bytes() != snapshot.raw()
+        && let Err(error) =
+            manager.replace_text(Some(snapshot.revision()), config_text, reason, caller)
     {
-        if auth_written {
-            let _ = restore_optional_file(&auth_path, old_auth.as_deref());
+        if auth_written
+            && let Err(restore_error) = restore_optional_file(&auth_path, old_auth.as_deref())
+        {
+            return Err(error.context(format!(
+                "写入 config.toml 失败，且 auth.json 回滚失败：{restore_error}"
+            )));
         }
-        let _ = restore_optional_file(&config_path, old_config.as_deref());
         return Err(error.context("写入 config.toml 失败"));
     }
 
     Ok(backup_path)
 }
 
-fn preserve_live_marketplace_configs(home: &Path, config_text: &str) -> anyhow::Result<String> {
-    let live_config = read_optional_text(&home.join("config.toml"))?;
+fn preserve_live_marketplace_configs(
+    live_config: &str,
+    config_text: &str,
+) -> anyhow::Result<String> {
     if live_config.trim().is_empty() {
         return Ok(config_text.to_string());
     }
 
     let mut target = parse_toml_document(config_text)?;
-    let live = parse_toml_document(&live_config)?;
+    let live = parse_toml_document(live_config)?;
     let Some(live_marketplaces) = live.get("marketplaces").and_then(Item::as_table_like) else {
         return Ok(ensure_trailing_newline(target.to_string()));
     };
@@ -2196,6 +2209,12 @@ fn read_optional_text(path: &Path) -> anyhow::Result<String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(error.into()),
     }
+}
+
+fn read_live_config(home: &Path) -> anyhow::Result<String> {
+    let snapshot = ConfigManager::for_home(home).load()?;
+    String::from_utf8(snapshot.raw().to_vec())
+        .with_context(|| format!("{} 不是 UTF-8", snapshot.path().display()))
 }
 
 fn read_optional_bytes(path: &Path) -> anyhow::Result<Option<Vec<u8>>> {

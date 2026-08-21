@@ -405,6 +405,73 @@ async fn partial_subagent_role_payload_merges_with_existing_roles() {
     assert_eq!(saved.subagent_roles["codey_worker"].reasoning_effort, "max");
 }
 
+#[tokio::test]
+async fn custom_role_matrix_persists_official_models_for_the_current_provider() {
+    let directory = tempfile::tempdir().unwrap();
+    let initial = CodeyConfig::default();
+    let provider_id = initial.current_provider_id().unwrap().to_string();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(initial.clone()),
+        ..AppState::default()
+    });
+    let mut payload = serde_json::to_value(initial).unwrap();
+    payload["subagentRoles"] = json!({
+        "codey_quick_scan": {
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "low"
+        },
+        "codey_deep_research": {
+            "model": "gpt-5.6-luna",
+            "reasoningEffort": "high"
+        },
+        "codey_visual_analysis": {
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "high"
+        },
+        "codey_worker": {
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "max"
+        },
+        "codey_visual_worker": {
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "max"
+        },
+        "default": {
+            "model": "gpt-5.6-terra",
+            "reasoningEffort": "low"
+        }
+    });
+
+    let result = invoke_api(&state, "save_codey_config", json!({ "config": payload })).await;
+
+    assert_eq!(result["status"], "ok");
+    let saved = state.config.read().await.clone();
+    assert_eq!(
+        saved.subagent_roles["codey_quick_scan"],
+        SubagentRoleConfig::new("gpt-5.6-luna", "low")
+    );
+    assert_eq!(
+        saved.subagent_roles["codey_worker"],
+        SubagentRoleConfig::new("gpt-5.6-terra", "max")
+    );
+    assert_eq!(
+        saved.declared_official_models_by_provider[&provider_id],
+        ["gpt-5.6-luna", "gpt-5.6-terra"]
+    );
+    assert_eq!(
+        saved.upstream_models_by_provider[&provider_id],
+        ["gpt-5.6-luna", "gpt-5.6-terra"]
+    );
+    assert!(!saved.selected_models_by_provider.contains_key(&provider_id));
+    assert!(
+        !saved
+            .manual_third_party_models_by_provider
+            .contains_key(&provider_id)
+    );
+    assert_eq!(state.store.load().unwrap(), saved);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watcher_join_does_not_hold_the_config_write_lock() {
     let directory = tempfile::tempdir().unwrap();

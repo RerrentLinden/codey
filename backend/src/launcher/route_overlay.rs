@@ -226,17 +226,21 @@ async fn read_route_file_stamps(
 pub(super) async fn read_route_files(
     home: &std::path::Path,
 ) -> std::io::Result<Option<RouteFilesSnapshot>> {
-    let config = match tokio::fs::read(home.join("config.toml")).await {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(config) = codey_runtime_core::config_manager::ConfigManager::for_home(home)
+        .read_raw()
+        .map_err(std::io::Error::other)?
+    else {
+        return Ok(None);
     };
     let auth = match tokio::fs::read(home.join("auth.json")).await {
         Ok(contents) => Some(contents),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
-    Ok(Some(RouteFilesSnapshot { config, auth }))
+    Ok(Some(RouteFilesSnapshot {
+        config: config.to_vec(),
+        auth,
+    }))
 }
 
 #[cfg(test)]

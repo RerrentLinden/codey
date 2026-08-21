@@ -316,11 +316,11 @@ fn merge_plugin_manifest(plugin: &mut Map<String, Value>, manifest: Map<String, 
 }
 
 fn installed_plugins_from_config(home: &Path) -> std::collections::BTreeSet<String> {
-    let text = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
-    let doc = text.parse::<toml_edit::DocumentMut>().ok();
+    let manager = crate::config_manager::ConfigManager::for_home(home);
+    let doc = manager.load().ok();
     let Some(plugins) = doc
         .as_ref()
-        .and_then(|doc| doc.get("plugins"))
+        .and_then(|snapshot| snapshot.document().get("plugins"))
         .and_then(toml_edit::Item::as_table)
     else {
         return std::collections::BTreeSet::new();
