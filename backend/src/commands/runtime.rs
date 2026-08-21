@@ -277,6 +277,30 @@ fn spawn_route_change_restart(state: Arc<AppState>, route_changed: oneshot::Rece
     });
 }
 
+async fn forward_codex_exit_to_codey_shutdown(
+    exit_state: Arc<AppState>,
+    codex_exit: oneshot::Receiver<()>,
+    runtime_generation: u64,
+) {
+    if codex_exit.await.is_err() {
+        return;
+    }
+    while exit_state.restart_in_progress.load(Ordering::Acquire) {
+        let settled = exit_state.restart_settled.notified();
+        if !exit_state.restart_in_progress.load(Ordering::Acquire) {
+            break;
+        }
+        // 兜底超时只是防丢通知，正常路径由 RestartInProgressGuard
+        // 的析构即时唤醒。
+        let _ = tokio::time::timeout(Duration::from_millis(250), settled).await;
+    }
+    // 重启期间旧 Codex 的退出不能关闭新一代运行时；只有当前受控
+    // Codex 的自然退出才联动关闭 Codey 主进程。
+    if exit_state.runtime_generation.load(Ordering::Acquire) == runtime_generation {
+        exit_state.request_shutdown();
+    }
+}
+
 async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, String> {
     ensure_runtime_can_start(state)?;
     if state.runtime.lock().await.is_some() {
@@ -333,22 +357,11 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
         spawn_route_change_restart(Arc::clone(state), route_changed);
     }
     let exit_state = Arc::clone(state);
-    tokio::spawn(async move {
-        if codex_exit.await.is_ok() {
-            while exit_state.restart_in_progress.load(Ordering::Acquire) {
-                let settled = exit_state.restart_settled.notified();
-                if !exit_state.restart_in_progress.load(Ordering::Acquire) {
-                    break;
-                }
-                // 兜底超时只是防丢通知，正常路径由 RestartInProgressGuard
-                // 的析构即时唤醒。
-                let _ = tokio::time::timeout(Duration::from_millis(250), settled).await;
-            }
-            if exit_state.runtime_generation.load(Ordering::Acquire) == runtime_generation {
-                exit_state.request_shutdown();
-            }
-        }
-    });
+    tokio::spawn(forward_codex_exit_to_codey_shutdown(
+        exit_state,
+        codex_exit,
+        runtime_generation,
+    ));
     Ok(json!({"status":"running"}))
 }
 
@@ -540,10 +553,59 @@ pub async fn begin_shutdown(state: &Arc<AppState>) {
 
 #[cfg(test)]
 mod route_recovery_tests {
+    use std::sync::{Arc, atomic::Ordering};
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+
     use super::{
-        CC_SWITCH_ROUTE_RECOVERY_STABLE_READS, is_cc_switch_route_recovery_error,
-        observe_route_recovery_readiness,
+        CC_SWITCH_ROUTE_RECOVERY_STABLE_READS, forward_codex_exit_to_codey_shutdown,
+        is_cc_switch_route_recovery_error, observe_route_recovery_readiness,
     };
+    use crate::commands::{AppShutdownReason, AppState};
+
+    #[tokio::test]
+    async fn current_codex_exit_requests_codey_shutdown() {
+        let state = Arc::new(AppState::default());
+        state.runtime_generation.store(7, Ordering::Release);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let watcher = tokio::spawn(forward_codex_exit_to_codey_shutdown(
+            Arc::clone(&state),
+            exit_rx,
+            7,
+        ));
+
+        exit_tx.send(()).expect("signal Codex exit");
+        let reason = tokio::time::timeout(Duration::from_secs(1), state.wait_for_shutdown())
+            .await
+            .expect("Codey shutdown was not requested after Codex exited");
+        watcher.await.expect("Codex exit forwarding task failed");
+
+        assert_eq!(reason, AppShutdownReason::CodexExited);
+        assert!(state.is_shutting_down());
+    }
+
+    #[tokio::test]
+    async fn stale_codex_exit_does_not_shutdown_a_new_runtime_generation() {
+        let state = Arc::new(AppState::default());
+        state.runtime_generation.store(8, Ordering::Release);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let watcher = tokio::spawn(forward_codex_exit_to_codey_shutdown(
+            Arc::clone(&state),
+            exit_rx,
+            7,
+        ));
+
+        exit_tx.send(()).expect("signal stale Codex exit");
+        watcher.await.expect("Codex exit forwarding task failed");
+
+        assert!(!state.is_shutting_down());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), state.wait_for_shutdown())
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn classifies_cc_switch_route_startup_errors_as_recoverable() {

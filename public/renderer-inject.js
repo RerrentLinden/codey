@@ -9,15 +9,21 @@
   const sessionToolsLoadPath = "/internal/codey/session-tools/load";
   const updateCheckPath = "/api/check_for_updates";
   const backendStatusPath = "/backend/status";
+  const backendHealthPath = "/backend/health";
   const accountUsagePath = "/account/usage";
   const buttonId = "codey-settings-button";
   const accountUsageId = "codey-account-usage";
   const accountUsagePositionStorageKey = "codey.accountUsage.position.v1";
   const styleId = "codey-core-injected-style";
   const updateAvailableEvent = "codey-update-availability-changed";
+  const runtimeHealthEvent = "codey-runtime-health-changed";
   const configChangedEvent = "codey:config-changed";
   const updateCheckIntervalMs = 30 * 60 * 1000;
   const updateCheckTimeoutMs = 10_000;
+  const runtimeHealthCheckIntervalMs = 30_000;
+  const runtimeHealthCheckTimeoutMs = 3_000;
+  const runtimeHealthFailureRetryMs = 1_000;
+  const runtimeHealthFailureThreshold = 2;
   const accountUsageRefreshIntervalMs = 60_000;
   const accountUsageTimeoutMs = 8_000;
   const accountUsageViewportMargin = 24;
@@ -44,6 +50,12 @@
   let scanTimer = 0;
   let updateCheckTimer = 0;
   let updateCheckInFlight = false;
+  let runtimeHealthTimer = 0;
+  let runtimeHealthCheckInFlight = false;
+  let runtimeHealthFailures = 0;
+  let runtimeHealthState = "checking";
+  let runtimeHealthMessage = "";
+  let runtimeHealthObservedAt = 0;
   let accountUsageTimer = 0;
   let accountUsageCheckInFlight = false;
   let accountUsagePollingEnabled = true;
@@ -64,11 +76,15 @@
     return matches;
   };
 
-  const callBridge = (path, payload = {}) => {
+  const callBridge = (path, payload = {}, options = {}) => {
     if (typeof window.__codexSessionDeleteBridge === "function") {
-      return window.__codexSessionDeleteBridge(path, payload);
+      return window.__codexSessionDeleteBridge(path, payload, options);
     }
-    return Promise.resolve({ status: "failed", message: "Codey bridge unavailable" });
+    return Promise.resolve({
+      status: "failed",
+      code: "bridge_unavailable",
+      message: "Codey bridge 不可用",
+    });
   };
 
   const addStyle = () => {
@@ -83,9 +99,14 @@
       #${buttonId}:focus-visible { outline: 2px solid rgba(139, 151, 255, .72); outline-offset: 2px; }
       #${buttonId} svg { display: block; width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 22; stroke-linecap: round; stroke-linejoin: round; }
       #${buttonId} .codey-settings-label { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+      #${buttonId} .codey-runtime-badge { position: absolute; top: -2px; right: -2px; display: grid; width: 13px; height: 13px; place-items: center; border: 2px solid Canvas; border-radius: 999px; background: #ff453a; color: #fff; font: 800 9px/1 -apple-system, BlinkMacSystemFont, sans-serif; opacity: 0; transform: scale(.65); transition: opacity .15s ease, transform .15s ease; pointer-events: none; }
+      #${buttonId}[data-codey-runtime-state="unavailable"] { background: rgba(255, 69, 58, .12); color: #ff453a; opacity: 1; }
+      #${buttonId}[data-codey-runtime-state="unavailable"]:hover { background: rgba(255, 69, 58, .2); }
+      #${buttonId}[data-codey-runtime-state="unavailable"] .codey-runtime-badge { opacity: 1; transform: scale(1); }
       #${buttonId}::after { content: ""; position: absolute; top: 5px; right: 5px; width: 7px; height: 7px; border-radius: 999px; background: #ff3b30; box-shadow: 0 0 0 2px Canvas; opacity: 0; transform: scale(.7); transition: opacity .15s ease, transform .15s ease; pointer-events: none; }
       #${buttonId}[data-codey-update-available="true"]::after { opacity: 1; transform: scale(1); }
       #${buttonId}[data-codey-header-actions="true"]::after { top: 4px; right: 4px; }
+      #${buttonId}[data-codey-runtime-state="unavailable"][data-codey-update-available="true"]::after { top: auto; right: 3px; bottom: 3px; width: 5px; height: 5px; }
       #${accountUsageId} { -webkit-app-region: no-drag !important; pointer-events: auto !important; position: fixed; right: ${accountUsageViewportMargin}px; bottom: ${accountUsageViewportMargin}px; z-index: 2147483640; display: flex; width: 176px; max-width: calc(100vw - ${accountUsageViewportMargin * 2}px); max-height: calc(100vh - ${accountUsageViewportMargin * 2}px); flex-direction: column; gap: 6px; overflow: hidden; border: 1px solid color-mix(in srgb, CanvasText 9%, transparent); border-radius: 8px; padding: 8px; background: color-mix(in srgb, Canvas 58%, transparent); box-shadow: 0 7px 20px color-mix(in srgb, CanvasText 9%, transparent), 0 1px 5px color-mix(in srgb, CanvasText 7%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 44%, transparent); color: CanvasText; cursor: grab; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; font-size: 11px; line-height: 1.12; opacity: .66; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); touch-action: none; transition: background .16s ease, border-color .16s ease, box-shadow .16s ease, opacity .16s ease; user-select: none; }
       #${accountUsageId}:hover { border-color: color-mix(in srgb, CanvasText 13%, transparent); background: color-mix(in srgb, Canvas 93%, transparent); box-shadow: 0 10px 28px color-mix(in srgb, CanvasText 14%, transparent), 0 2px 8px color-mix(in srgb, CanvasText 10%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 74%, transparent); opacity: .98; }
       #${accountUsageId}[data-state="stale"] { opacity: .5; }
@@ -111,7 +132,7 @@
         #${accountUsageId} { right: 16px; bottom: 16px; width: 164px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); }
       }
       @media (prefers-reduced-motion: reduce) {
-        #${accountUsageId}, #${accountUsageId} * { animation: none !important; transition: none !important; }
+        #${buttonId}, #${buttonId} *, #${accountUsageId}, #${accountUsageId} * { animation: none !important; transition: none !important; }
       }
     `;
     document.documentElement.appendChild(style);
@@ -132,15 +153,59 @@
 
   const applyUpdateBadge = (button = document.getElementById(buttonId)) => {
     if (!(button instanceof HTMLElement)) return;
+    button.setAttribute("data-codey-runtime-state", runtimeHealthState);
     if (hasDetectedUpdate()) {
       button.setAttribute("data-codey-update-available", "true");
-      button.setAttribute("aria-label", "打开 Codey 配置，有可用更新");
-      button.title = "打开 Codey 配置（发现新版本）";
+    } else {
+      button.removeAttribute?.("data-codey-update-available");
+    }
+    if (runtimeHealthState === "unavailable") {
+      const detail = runtimeHealthMessage || "Codey 后端未响应";
+      const updateLabel = hasDetectedUpdate() ? "，另有可用更新" : "";
+      button.setAttribute(
+        "aria-label",
+        `Codey 进程异常或连接中断，点击查看处理提示${updateLabel}`,
+      );
+      button.title = `Codey 进程异常或连接中断：${detail}（点击查看处理提示）${updateLabel}`;
       return;
     }
-    button.removeAttribute?.("data-codey-update-available");
-    button.setAttribute("aria-label", "打开 Codey 配置");
-    button.title = "打开 Codey 配置";
+    if (hasDetectedUpdate()) {
+      button.setAttribute("aria-label", "打开 Codey 配置，有可用更新");
+      button.title = "打开 Codey 配置（发现新版本）";
+    } else {
+      button.setAttribute("aria-label", "打开 Codey 配置");
+      button.title = "打开 Codey 配置";
+    }
+  };
+
+  const runtimeHealthSnapshot = () => ({
+    state: runtimeHealthState,
+    message: runtimeHealthMessage,
+    observedAt: runtimeHealthObservedAt,
+    consecutiveFailures: runtimeHealthFailures,
+  });
+
+  const setRuntimeHealthState = (state, message = "") => {
+    const nextState = state === "healthy" || state === "unavailable"
+      ? state
+      : "checking";
+    const nextMessage = String(message || "").slice(0, 160);
+    const changed = runtimeHealthState !== nextState || runtimeHealthMessage !== nextMessage;
+    runtimeHealthState = nextState;
+    runtimeHealthMessage = nextMessage;
+    runtimeHealthObservedAt = Date.now();
+    window.__codeyRuntimeHealth = runtimeHealthSnapshot();
+    if (changed) applyUpdateBadge();
+    if (
+      changed
+      && typeof window.dispatchEvent === "function"
+      && typeof CustomEvent === "function"
+    ) {
+      window.dispatchEvent(new CustomEvent(runtimeHealthEvent, {
+        detail: window.__codeyRuntimeHealth,
+      }));
+    }
+    return window.__codeyRuntimeHealth;
   };
 
   const setUpdateAvailability = (result, { dispatch = true } = {}) => {
@@ -176,6 +241,58 @@
     );
   });
 
+  const scheduleRuntimeHealthCheck = (delayMs = runtimeHealthCheckIntervalMs) => {
+    window.clearTimeout(runtimeHealthTimer);
+    runtimeHealthTimer = 0;
+    if (document.visibilityState === "hidden") return;
+    runtimeHealthTimer = window.setTimeout(() => {
+      runtimeHealthTimer = 0;
+      void checkRuntimeHealth();
+    }, delayMs);
+  };
+
+  const checkRuntimeHealth = async () => {
+    if (document.visibilityState === "hidden") {
+      scheduleRuntimeHealthCheck();
+      return runtimeHealthSnapshot();
+    }
+    if (runtimeHealthCheckInFlight) return runtimeHealthSnapshot();
+    runtimeHealthCheckInFlight = true;
+    try {
+      if (typeof window.__codexSessionDeleteBridge !== "function") {
+        runtimeHealthFailures = runtimeHealthFailureThreshold;
+        return setRuntimeHealthState("unavailable", "Codey bridge 不可用");
+      }
+      const result = await withTimeout(
+        callBridge(backendHealthPath, {}, { timeoutMs: runtimeHealthCheckTimeoutMs }),
+        runtimeHealthCheckTimeoutMs + 250,
+        "Codey 后端健康检查超时",
+      );
+      if (result?.status === "ok") {
+        runtimeHealthFailures = 0;
+        return setRuntimeHealthState("healthy");
+      }
+      const error = new Error(result?.message || "Codey 后端未响应");
+      error.code = result?.code || "backend_unavailable";
+      throw error;
+    } catch (error) {
+      runtimeHealthFailures += 1;
+      const immediate = error?.code === "bridge_unavailable";
+      if (immediate) runtimeHealthFailures = runtimeHealthFailureThreshold;
+      if (runtimeHealthFailures >= runtimeHealthFailureThreshold) {
+        return setRuntimeHealthState("unavailable", "Codey 后端未响应");
+      }
+      return setRuntimeHealthState("checking", "正在确认 Codey 进程状态");
+    } finally {
+      runtimeHealthCheckInFlight = false;
+      const nextDelay = runtimeHealthFailures > 0
+        && runtimeHealthFailures < runtimeHealthFailureThreshold
+        ? runtimeHealthFailureRetryMs
+        : runtimeHealthCheckIntervalMs;
+      scheduleRuntimeHealthCheck(nextDelay);
+    }
+  };
+
   const scheduleUpdateCheck = (delayMs = updateCheckIntervalMs) => {
     if (hasDetectedUpdate()) return;
     window.clearTimeout(updateCheckTimer);
@@ -190,7 +307,7 @@
     updateCheckInFlight = true;
     try {
       const result = await withTimeout(
-        callBridge(updateCheckPath, {}),
+        callBridge(updateCheckPath, {}, { timeoutMs: updateCheckTimeoutMs }),
         updateCheckTimeoutMs,
       );
       if (result?.status !== "failed" && result?.updateAvailable === true) {
@@ -208,7 +325,7 @@
   const hydrateUpdateAvailability = async () => {
     try {
       const status = await withTimeout(
-        callBridge(backendStatusPath, {}),
+        callBridge(backendStatusPath, {}, { timeoutMs: updateCheckTimeoutMs }),
         updateCheckTimeoutMs,
         "读取更新状态超时",
       );
@@ -638,7 +755,7 @@
     accountUsageCheckInFlight = true;
     try {
       const result = await withTimeout(
-        callBridge(accountUsagePath, {}),
+        callBridge(accountUsagePath, {}, { timeoutMs: accountUsageTimeoutMs }),
         accountUsageTimeoutMs,
       );
       renderAccountUsage(result);
@@ -662,6 +779,12 @@
   };
 
   const openSettings = () => {
+    if (runtimeHealthState === "unavailable") {
+      window.alert(
+        "Codey 进程异常或已退出，当前配置面板无法连接。请退出 Codex 后重新启动 Codey。",
+      );
+      return;
+    }
     if (window.__codeySettingsOverlay?.toggle) {
       window.__codeySettingsOverlay.toggle();
       return;
@@ -1099,7 +1222,7 @@
       button.id = buttonId;
       button.type = "button";
       button.setAttribute("aria-label", "打开 Codey 配置");
-      button.innerHTML = `${settingsIcon}<span class="codey-settings-label">Codey</span>`;
+      button.innerHTML = `${settingsIcon}<span class="codey-runtime-badge" aria-hidden="true">!</span><span class="codey-settings-label">Codey</span>`;
       button.title = "打开 Codey 配置";
       button.addEventListener("click", (event) => {
         event.preventDefault();
@@ -1135,7 +1258,11 @@
   const loadSessionTools = () => {
     if (finishSessionToolsLoad()) return Promise.resolve(true);
     if (sessionToolsLoadPromise) return sessionToolsLoadPromise;
-    sessionToolsLoadPromise = Promise.resolve(callBridge(sessionToolsLoadPath, {}))
+    sessionToolsLoadPromise = Promise.resolve(callBridge(
+      sessionToolsLoadPath,
+      {},
+      { timeoutMs: updateCheckTimeoutMs },
+    ))
       .then((result) => {
         if (!result || result.status !== "ok") {
           throw new Error(result?.message || "会话工具加载请求失败");
@@ -1230,6 +1357,7 @@
   armSessionToolsInteraction();
   scan();
   void hydrateUpdateAvailability();
+  void checkRuntimeHealth();
   scheduleAccountUsageCheck(250);
 
   const headerNodesChanged = (nodes) => {
@@ -1312,15 +1440,21 @@
   window.__codeyRendererScan = scan;
   window.__codeyRendererInvalidateHeaderMount = invalidateHeaderMount;
   window.__codeyRefreshAccountUsage = checkAccountUsage;
+  window.__codeyRefreshRuntimeHealth = checkRuntimeHealth;
 
   window.addEventListener?.("focus", () => {
     scan();
+    scheduleRuntimeHealthCheck(0);
     scheduleAccountUsageCheck(0);
   });
   document.addEventListener?.("visibilitychange", () => {
+    scheduleRuntimeHealthCheck(0);
     scheduleAccountUsageCheck(0);
   });
-  window.addEventListener?.("pageshow", () => scan());
+  window.addEventListener?.("pageshow", () => {
+    scan();
+    scheduleRuntimeHealthCheck(0);
+  });
   window.addEventListener?.("resize", () => {
     applyAccountUsagePosition(document.getElementById(accountUsageId));
   });

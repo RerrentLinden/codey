@@ -381,12 +381,20 @@ const createStartupUpdateFixture = (bridge) => {
   let nextTimerId = 1;
   const timers = [];
   const events = [];
+  const alerts = [];
+  const documentListeners = new Map();
   const activeTimers = () => timers.filter((timer) => !timer.cleared);
   const visibleButton = () =>
     elementsById.get("codey-settings-button") || null;
   const document = {
     body: new FakeElement("body"),
     documentElement,
+    visibilityState: "visible",
+    addEventListener(type, handler) {
+      const handlers = documentListeners.get(type) || [];
+      handlers.push(handler);
+      documentListeners.set(type, handlers);
+    },
     createElement: (tagName) => {
       const element = new FakeElement(tagName);
       let id = element.id;
@@ -418,8 +426,8 @@ const createStartupUpdateFixture = (bridge) => {
   const window = {
     __codexSessionDeleteBridge: bridge,
     addEventListener() {},
-    alert() {
-      throw new Error("startup update check must use page UI, not alert");
+    alert(message) {
+      alerts.push(String(message));
     },
     clearTimeout(id) {
       const timer = timers.find((entry) => entry.id === id);
@@ -461,7 +469,13 @@ const createStartupUpdateFixture = (bridge) => {
 
   return {
     activeTimers,
+    alerts,
     document,
+    dispatchDocumentEvent(type) {
+      for (const handler of documentListeners.get(type) || []) {
+        handler({ type });
+      }
+    },
     elementsById,
     events,
     timers,
@@ -484,6 +498,7 @@ test("hydrates the passive update badge from startup backend state", async () =>
         },
       };
     }
+    if (path === "/backend/health") return { status: "ok" };
     throw new Error(`unexpected bridge path: ${path}`);
   });
 
@@ -494,8 +509,10 @@ test("hydrates the passive update badge from startup backend state", async () =>
   assert.equal(button.getAttribute("data-codey-update-available"), "true");
   assert.equal(button.getAttribute("aria-label"), "打开 Codey 配置，有可用更新");
   assert.equal(fixture.window.__codeyUpdateAvailability.latestVersion, "0.4.0");
-  assert.equal(fixture.events.length, 1);
-  assert.equal(fixture.events[0].type, "codey-update-availability-changed");
+  const updateEvents = fixture.events.filter(
+    (event) => event.type === "codey-update-availability-changed",
+  );
+  assert.equal(updateEvents.length, 1);
   assert.equal(fixture.document.getElementById("codey-update-check-status"), null);
   assert.equal(fixture.document.getElementById("codey-update-dialog"), null);
   assert.equal(
@@ -504,8 +521,21 @@ test("hydrates the passive update badge from startup backend state", async () =>
   );
   assert.deepEqual(
     bridgeCalls.map(({ path }) => path),
-    ["/backend/status"],
+    ["/backend/status", "/backend/health"],
   );
+  assert.equal(
+    fixture.activeTimers().some((timer) => timer.delay === 30_000),
+    true,
+  );
+
+  let unchangedAttributeWrites = 0;
+  const originalSetAttribute = button.setAttribute.bind(button);
+  button.setAttribute = (...args) => {
+    unchangedAttributeWrites += 1;
+    originalSetAttribute(...args);
+  };
+  await fixture.window.__codeyRefreshRuntimeHealth();
+  assert.equal(unchangedAttributeWrites, 0);
 });
 
 test("falls back to a passive periodic check when backend update state hangs", async () => {
@@ -526,6 +556,103 @@ test("falls back to a passive periodic check when backend update state hangs", a
   assert.equal(fixture.window.__codeyUpdateAvailability, null);
   assert.equal(
     fixture.activeTimers().some((timer) => timer.delay === 30 * 60 * 1000),
+    true,
+  );
+});
+
+test("marks the Codey icon unavailable after consecutive hung health checks and recovers", async () => {
+  let healthMode = "hang";
+  const fixture = createStartupUpdateFixture(async (path) => {
+    if (path === "/backend/status") {
+      return { status: "ok", availableUpdate: null };
+    }
+    if (path === "/backend/health") {
+      return healthMode === "healthy"
+        ? { status: "ok" }
+        : new Promise(() => {});
+    }
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+
+  const fireLatestHealthTimeout = () => {
+    const timer = fixture.activeTimers()
+      .filter((candidate) => candidate.delay === 3_250)
+      .at(-1);
+    assert.ok(timer, "health timeout should be armed");
+    timer.cleared = true;
+    timer.callback();
+  };
+
+  fireLatestHealthTimeout();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const button = fixture.document.getElementById("codey-settings-button");
+  assert.ok(button);
+  assert.equal(button.getAttribute("data-codey-runtime-state"), "checking");
+
+  const retryTimer = fixture.activeTimers().find(
+    (candidate) => candidate.delay === 1_000,
+  );
+  assert.ok(retryTimer, "first health failure should retry after one second");
+  retryTimer.cleared = true;
+  retryTimer.callback();
+  fireLatestHealthTimeout();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(button.getAttribute("data-codey-runtime-state"), "unavailable");
+  assert.match(button.getAttribute("aria-label"), /Codey 进程异常或连接中断/);
+  assert.match(button.title, /Codey 后端未响应/);
+  button.dispatchEvent({
+    type: "click",
+    preventDefault() {},
+    stopPropagation() {},
+  });
+  assert.deepEqual(fixture.alerts, [
+    "Codey 进程异常或已退出，当前配置面板无法连接。请退出 Codex 后重新启动 Codey。",
+  ]);
+
+  healthMode = "healthy";
+  await fixture.window.__codeyRefreshRuntimeHealth();
+
+  assert.equal(button.getAttribute("data-codey-runtime-state"), "healthy");
+  assert.equal(button.getAttribute("aria-label"), "打开 Codey 配置");
+  assert.equal(button.title, "打开 Codey 配置");
+  assert.equal(fixture.window.__codeyRuntimeHealth.consecutiveFailures, 0);
+});
+
+test("pauses Codey health checks while the page is hidden and resumes immediately", async () => {
+  let healthCalls = 0;
+  const fixture = createStartupUpdateFixture(async (path) => {
+    if (path === "/backend/status") return { status: "ok", availableUpdate: null };
+    if (path === "/backend/health") {
+      healthCalls += 1;
+      return { status: "ok" };
+    }
+    throw new Error(`unexpected bridge path: ${path}`);
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(healthCalls, 1);
+
+  fixture.document.visibilityState = "hidden";
+  fixture.dispatchDocumentEvent("visibilitychange");
+  assert.equal(
+    fixture.activeTimers().some((timer) => timer.delay === 30_000),
+    false,
+  );
+  await fixture.window.__codeyRefreshRuntimeHealth();
+  assert.equal(healthCalls, 1);
+
+  fixture.document.visibilityState = "visible";
+  fixture.dispatchDocumentEvent("visibilitychange");
+  const immediateTimer = fixture.activeTimers().find((timer) => timer.delay === 0);
+  assert.ok(immediateTimer);
+  immediateTimer.cleared = true;
+  immediateTimer.callback();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(healthCalls, 2);
+  assert.equal(
+    fixture.activeTimers().some((timer) => timer.delay === 30_000),
     true,
   );
 });

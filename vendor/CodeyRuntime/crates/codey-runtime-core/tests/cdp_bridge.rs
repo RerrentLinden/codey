@@ -40,6 +40,9 @@ fn bridge_script_defines_expected_globals_and_binding() {
     assert!(script.contains("window.__codexSessionDeleteReject"));
     assert!(script.contains("codexSessionDeleteV2"));
     assert!(script.contains("bridgeSession"));
+    assert!(script.contains("options = {}"));
+    assert!(script.contains("bridge_timeout"));
+    assert!(script.contains("takeCallback(id)"));
 }
 
 #[test]
