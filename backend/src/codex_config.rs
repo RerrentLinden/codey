@@ -205,6 +205,11 @@ struct RuntimeConfigLock {
     file: fs::File,
 }
 
+fn runtime_config_lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
 impl RuntimeConfigLock {
     fn acquire(marker: &Path) -> Result<Self> {
         Self::acquire_with_timeout(marker, RUNTIME_CONFIG_LOCK_TIMEOUT)
@@ -227,7 +232,7 @@ impl RuntimeConfigLock {
         loop {
             match fs2::FileExt::try_lock_exclusive(&file) {
                 Ok(()) => return Ok(Self { file }),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(error) if runtime_config_lock_is_contended(&error) => {
                     let elapsed = started.elapsed();
                     if elapsed >= timeout {
                         bail!(
