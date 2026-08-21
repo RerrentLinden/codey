@@ -18,6 +18,12 @@ pub struct TraceLogGuardReport {
     pub changed: usize,
 }
 
+impl TraceLogGuardReport {
+    pub fn protection_active(&self, requested: bool) -> bool {
+        requested && self.log_tables_found > 0
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TraceLogCleanupReport {
@@ -271,6 +277,7 @@ mod tests {
                 changed: 1,
             }
         );
+        assert!(report.protection_active(true));
         let connection = Connection::open(path).unwrap();
         assert_eq!(
             connection
@@ -298,6 +305,7 @@ mod tests {
         assert_eq!(report.databases_found, 1);
         assert_eq!(report.log_tables_found, 1);
         assert_eq!(report.changed, 1);
+        assert!(!report.protection_active(false));
         let connection = Connection::open(path).unwrap();
         assert_eq!(
             connection
@@ -315,6 +323,7 @@ mod tests {
         let report = configure(temp.path(), true).unwrap();
 
         assert_eq!(report, TraceLogGuardReport::default());
+        assert!(!report.protection_active(true));
         assert!(!temp.path().join("logs_2.sqlite").exists());
     }
 

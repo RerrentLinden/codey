@@ -178,10 +178,15 @@ impl WebhookConfig {
         }
     }
 
-    pub fn has_enabled_channel(&self) -> bool {
+    pub fn enabled_channel_count(&self) -> usize {
         self.channels
             .iter()
-            .any(|channel| channel.enabled && channel.is_configured())
+            .filter(|channel| channel.enabled && channel.is_configured())
+            .count()
+    }
+
+    pub fn has_enabled_channel(&self) -> bool {
+        self.enabled_channel_count() > 0
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -272,6 +277,7 @@ mod tests {
         config.normalize();
 
         assert_eq!(config.channels.len(), 3);
+        assert_eq!(config.enabled_channel_count(), 3);
         assert!(config.has_enabled_channel());
         assert!(config.channels[0].url_configured);
         assert_eq!(config.channels[1].kind, NotificationChannelKind::Wecom);

@@ -95,10 +95,11 @@ export function App({
     `${FEEDBACK_GROUP_QR_BASE_URL}?date=${localDateCacheKey(new Date())}`;
   const [config, setConfig] = useState<Config | null>(null);
   const persistedConfigRef = useRef<Config | null>(null);
-  const { status, setStatus, refreshStatusForLoad } = useRuntimeStatus({
-    active: !embedded || modalVisible,
-    embedded,
-  });
+  const { status, setStatus, refreshStatus, refreshStatusForLoad } =
+    useRuntimeStatus({
+      active: !embedded || modalVisible,
+      embedded,
+    });
   const [pluginMarketplaceStatus, setPluginMarketplaceStatus] =
     useState<PluginMarketplaceStatus | null>(null);
   const [ccSwitchStatus, setCcSwitchStatus] = useState<CcSwitchStatus | null>(
@@ -156,11 +157,15 @@ export function App({
       clientPlatform: status.clientPlatform,
       restartRequired: status.restartRequired,
       restartInProgress: status.restartInProgress,
-      startupError: status.startupError,
       codexAppPath: status.codexAppPath,
       maintenance: status.maintenance,
       injectionScripts: status.injectionScripts,
       fastContextToolsActive: status.fastContextToolsActive,
+      subagentOptimizationActive: status.subagentOptimizationActive,
+      notificationChannelsActive: status.notificationChannelsActive,
+      activeNotificationChannelCount: status.activeNotificationChannelCount,
+      traceLogWriteProtectionActive: status.traceLogWriteProtectionActive,
+      crashpadDiskProtectionActive: status.crashpadDiskProtectionActive,
     }),
     [
       status.running,
@@ -168,11 +173,15 @@ export function App({
       status.clientPlatform,
       status.restartRequired,
       status.restartInProgress,
-      status.startupError,
       status.codexAppPath,
       status.maintenance,
       status.injectionScripts,
       status.fastContextToolsActive,
+      status.subagentOptimizationActive,
+      status.notificationChannelsActive,
+      status.activeNotificationChannelCount,
+      status.traceLogWriteProtectionActive,
+      status.crashpadDiskProtectionActive,
     ],
   );
   const {
@@ -319,6 +328,7 @@ export function App({
       }));
     }
     setDirty(false);
+    await refreshStatus().catch(() => undefined);
     return result;
   }
 
@@ -571,6 +581,7 @@ export function App({
         traceCleanup?: TraceLogCleanup;
         crashpadCleanup: CrashpadCleanup;
         traceProtectionEnabled: boolean;
+        traceLogWriteProtectionActive: boolean;
         crashpadProtectionEnabled: boolean;
         errors: string[];
         traceLogStats: TraceLogStats;
@@ -580,6 +591,8 @@ export function App({
         ...current,
         traceLogStats: result.traceLogStats,
         crashpadPendingStats: result.crashpadPendingStats,
+        traceLogWriteProtectionActive:
+          result.traceLogWriteProtectionActive,
       }));
       setTraceSnapshotStale(false);
       const traceCleanup = result.traceCleanup;

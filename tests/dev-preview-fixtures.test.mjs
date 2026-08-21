@@ -33,6 +33,24 @@ test("development preview includes Windows-only injection status only on Windows
 test("development preview follows the current runtime-status contract", () => {
   assert.match(source, /visibility: "internal"/);
   assert.match(source, /visibility: "feature"/);
+  assert.match(
+    source,
+    /id: "renderer-controls"[\s\S]*?visibility: "internal"/,
+  );
   assert.match(source, /fastContextToolsActive: previewConfig\.fastContextTools/);
+  assert.match(
+    source,
+    /subagentOptimizationActive: previewConfig\.subagentOptimization/,
+  );
+  assert.match(source, /notificationChannelsActive: activeNotificationChannelCount > 0/);
+  assert.match(source, /activeNotificationChannelCount,/);
+  assert.match(
+    source,
+    /traceLogWriteProtectionActive: previewConfig\.disableTraceLogWrites/,
+  );
+  assert.match(
+    source,
+    /crashpadDiskProtectionActive:[\s\S]*?previewClientPlatform === "macos"[\s\S]*?previewConfig\.protectCrashpadPending/,
+  );
   assert.doesNotMatch(source, /command === "refresh_injection_status"/);
 });

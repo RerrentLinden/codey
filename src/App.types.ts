@@ -118,6 +118,11 @@ export type RuntimeStatus = {
   maintenance?: Maintenance;
   injectionScripts?: InjectionScriptStatus[];
   fastContextToolsActive?: boolean;
+  subagentOptimizationActive?: boolean;
+  notificationChannelsActive?: boolean;
+  activeNotificationChannelCount?: number;
+  traceLogWriteProtectionActive?: boolean;
+  crashpadDiskProtectionActive?: boolean;
   traceLogStats?: TraceLogStats;
   crashpadPendingStats?: CrashpadPendingStats;
 };

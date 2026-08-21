@@ -645,12 +645,16 @@ async fn prepare_codex_startup_state(
 async fn await_initial_storage_guards(
     initial_trace_guard: tokio::task::JoinHandle<Result<trace_log_guard::TraceLogGuardReport>>,
     disable_trace_log_writes: bool,
+    trace_log_write_protection_active: &AtomicBool,
     initial_crashpad_guard: tokio::task::JoinHandle<crashpad_pending_guard::CrashpadGuardRun>,
     protect_crashpad_pending: bool,
     crashpad_pending_stats: &CrashpadPendingStatsHandle,
 ) -> Result<()> {
     match initial_trace_guard.await {
-        Ok(Ok(_)) => {}
+        Ok(Ok(report)) => trace_log_write_protection_active.store(
+            report.protection_active(disable_trace_log_writes),
+            Ordering::Release,
+        ),
         Ok(Err(error)) => {
             error_log::record_failure(
                 "patch_failed",
@@ -1169,6 +1173,7 @@ async fn prepare_startup_storage(
     config: &CodeyConfig,
     original_provider: &str,
     guards: InitialStorageGuards,
+    trace_log_write_protection_active: &AtomicBool,
     crashpad_pending_stats: &CrashpadPendingStatsHandle,
 ) -> Result<StartupStorageState> {
     let app_dir = resolve_configured_codex_app_dir(config).await?;
@@ -1185,6 +1190,7 @@ async fn prepare_startup_storage(
     await_initial_storage_guards(
         guards.trace,
         config.disable_trace_log_writes,
+        trace_log_write_protection_active,
         guards.crashpad,
         config.protect_crashpad_pending,
         crashpad_pending_stats,
@@ -1462,6 +1468,18 @@ impl CodeyRuntime {
             .store(enabled, Ordering::Release);
     }
 
+    pub async fn crashpad_pending_protection_active(&self) -> bool {
+        if !cfg!(target_os = "macos") || !self.crashpad_guard_enabled.load(Ordering::Acquire) {
+            return false;
+        }
+
+        self.crashpad_guard_task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
     pub async fn refresh_injection_statuses(&self) -> Arc<[cdp::InjectionScriptStatus]> {
         let websocket_url = self.injection_websocket_url.read().await.clone();
         let statuses = cdp::read_injection_statuses(&websocket_url, &self.injection_scripts)
@@ -1480,9 +1498,11 @@ impl CodeyRuntime {
     pub async fn start(
         config: &CodeyConfig,
         handler: codey_runtime_core::bridge::BridgeHandler,
+        trace_log_write_protection_active: &AtomicBool,
         crashpad_pending_stats: CrashpadPendingStatsHandle,
     ) -> Result<(Self, oneshot::Receiver<()>, Option<oneshot::Receiver<()>>)> {
         let home = codex_home();
+        trace_log_write_protection_active.store(false, Ordering::Release);
         let injection_scripts = cdp::prepare_injection_scripts(
             config.slim_codex_pet,
             config.hide_full_access_warning,
@@ -1495,6 +1515,7 @@ impl CodeyRuntime {
             config,
             &route.original_provider,
             initial_storage_guards,
+            trace_log_write_protection_active,
             &crashpad_pending_stats,
         )
         .await?;

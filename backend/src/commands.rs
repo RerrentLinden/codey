@@ -121,6 +121,7 @@ pub struct AppState {
     runtime_operation: Mutex<()>,
     diagnostic_storage_operation: Mutex<()>,
     pub trace_log_stats: TraceLogStatsHandle,
+    trace_log_write_protection_active: AtomicBool,
     pub crashpad_pending_stats: CrashpadPendingStatsHandle,
     pub startup_error: RwLock<Option<String>>,
     available_update: RwLock<Option<updates::UpdateCheck>>,
@@ -195,6 +196,7 @@ impl Default for AppState {
             runtime_operation: Mutex::new(()),
             diagnostic_storage_operation: Mutex::new(()),
             trace_log_stats: TraceLogStatsHandle::idle(),
+            trace_log_write_protection_active: AtomicBool::new(false),
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
             startup_error: RwLock::new(None),
             available_update: RwLock::new(None),
@@ -937,37 +939,54 @@ async fn save_codey_config_locked(
     } else {
         None
     };
-    if trace_guard_changed {
+    let trace_guard_report = if trace_guard_changed {
         let home = codex_home().to_path_buf();
         let disable_writes = config.disable_trace_log_writes;
-        let result = configure_trace_log_guard(home.clone(), disable_writes).await;
-        if let Err(error) = result {
-            let error =
-                rollback_trace_log_guard(home, previous.disable_trace_log_writes, error).await;
-            error_log::record_failure(
-                "patch_failed",
-                "configure_trace_log_guard",
-                error.clone(),
-                json!({
-                    "disabled": disable_writes,
-                    "source": "save_codey_config",
-                }),
-            );
-            return Err(error);
+        match configure_trace_log_guard(home.clone(), disable_writes).await {
+            Ok(report) => Some(report),
+            Err(error) => {
+                let error =
+                    rollback_trace_log_guard(home, previous.disable_trace_log_writes, error).await;
+                state
+                    .trace_log_write_protection_active
+                    .store(false, Ordering::Release);
+                error_log::record_failure(
+                    "patch_failed",
+                    "configure_trace_log_guard",
+                    error.clone(),
+                    json!({
+                        "disabled": disable_writes,
+                        "source": "save_codey_config",
+                    }),
+                );
+                return Err(error);
+            }
         }
-    }
+    } else {
+        None
+    };
     if let Err(error) = save_config_to_store(state, &config).await {
         if trace_guard_changed {
-            return Err(rollback_trace_log_guard(
+            let error = rollback_trace_log_guard(
                 codex_home().to_path_buf(),
                 previous.disable_trace_log_writes,
                 error,
             )
-            .await);
+            .await;
+            state
+                .trace_log_write_protection_active
+                .store(false, Ordering::Release);
+            return Err(error);
         }
         return Err(error);
     }
     *state.config.write().await = config.clone();
+    if let Some(report) = trace_guard_report {
+        state.trace_log_write_protection_active.store(
+            report.protection_active(config.disable_trace_log_writes),
+            Ordering::Release,
+        );
+    }
     Ok(SavedCodeyConfig {
         config,
         restart_required,
@@ -994,11 +1013,13 @@ fn embedded_fast_context_tools_enabled(requested: bool, status: &FastContextTool
     requested && !status.user_configured && !status.detection_failed
 }
 
-async fn configure_trace_log_guard(home: PathBuf, disable_writes: bool) -> Result<(), String> {
+async fn configure_trace_log_guard(
+    home: PathBuf,
+    disable_writes: bool,
+) -> Result<trace_log_guard::TraceLogGuardReport, String> {
     tokio::task::spawn_blocking(move || trace_log_guard::configure(&home, disable_writes))
         .await
         .map_err(|error| format!("Trace 日志保护切换任务异常退出：{error}"))?
-        .map(|_| ())
         .map_err(|error| error.to_string())
 }
 
@@ -1008,7 +1029,7 @@ async fn rollback_trace_log_guard(
     primary_error: String,
 ) -> String {
     match configure_trace_log_guard(home, previous_disable_writes).await {
-        Ok(()) => primary_error,
+        Ok(_) => primary_error,
         Err(rollback_error) => {
             error_log::record_failure(
                 "restore_failed",

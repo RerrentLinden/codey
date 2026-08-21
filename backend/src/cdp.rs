@@ -403,7 +403,7 @@ fn prepare_injection_scripts_for_platform(
                 : "渲染器控制与按需加载 API 可用";
             })()"#
                 .to_string(),
-            Feature,
+            Internal,
             All,
         ),
         (
@@ -1549,6 +1549,11 @@ mod tests {
         assert_eq!(prepared.descriptors[10].source, "user");
         assert_eq!(
             prepared.descriptors[0].visibility,
+            InjectionScriptVisibility::Internal
+        );
+        assert_eq!(prepared.descriptors[7].id, "renderer-controls");
+        assert_eq!(
+            prepared.descriptors[7].visibility,
             InjectionScriptVisibility::Internal
         );
         assert_eq!(

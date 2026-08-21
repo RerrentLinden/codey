@@ -14,15 +14,19 @@ pub(super) async fn clear_codex_trace_logs(state: &Arc<AppState>) -> Result<Valu
     let home = codex_home();
     let disable_writes = state.config.read().await.disable_trace_log_writes;
     let result = tokio::task::spawn_blocking(move || {
-        trace_log_guard::configure(home, disable_writes)?;
-        trace_log_guard::clear(home)
+        let guard = trace_log_guard::configure(home, disable_writes)?;
+        let cleanup = trace_log_guard::clear(home)?;
+        Ok::<_, anyhow::Error>((guard, cleanup))
     })
     .await
     .map_err(|error| format!("Trace 日志库清理任务异常退出：{error}"))
     .and_then(|result| result.map_err(|error| error.to_string()));
-    let report = match result {
+    let (guard_report, report) = match result {
         Ok(report) => report,
         Err(error) => {
+            state
+                .trace_log_write_protection_active
+                .store(false, std::sync::atomic::Ordering::Release);
             error_log::record_failure(
                 "patch_failed",
                 "clear_codex_trace_logs",
@@ -34,10 +38,16 @@ pub(super) async fn clear_codex_trace_logs(state: &Arc<AppState>) -> Result<Valu
             return Err(error);
         }
     };
+    let trace_log_write_protection_active = guard_report.protection_active(disable_writes);
+    state.trace_log_write_protection_active.store(
+        trace_log_write_protection_active,
+        std::sync::atomic::Ordering::Release,
+    );
     Ok(json!({
         "status":"ok",
         "cleanup":report,
         "protectionEnabled":disable_writes,
+        "traceLogWriteProtectionActive":trace_log_write_protection_active,
     }))
 }
 
@@ -50,10 +60,13 @@ pub(super) async fn clear_diagnostic_storage(state: &Arc<AppState>) -> Result<Va
 
     let trace_home = codex_home();
     let trace_task = tokio::task::spawn_blocking(move || {
-        let cleanup = trace_log_guard::configure(trace_home, disable_trace_writes)
-            .and_then(|_| trace_log_guard::clear(trace_home));
+        let guard = trace_log_guard::configure(trace_home, disable_trace_writes);
+        let trace_log_write_protection_active = guard
+            .as_ref()
+            .is_ok_and(|report| report.protection_active(disable_trace_writes));
+        let cleanup = guard.and_then(|_| trace_log_guard::clear(trace_home));
         let snapshot = trace_log_stats::snapshot(trace_home);
-        (cleanup, snapshot)
+        (cleanup, snapshot, trace_log_write_protection_active)
     });
     let crashpad_task = tokio::task::spawn_blocking(move || {
         crashpad_pending_guard::clear_system(protect_crashpad_pending)
@@ -61,9 +74,11 @@ pub(super) async fn clear_diagnostic_storage(state: &Arc<AppState>) -> Result<Va
     let (trace_result, crashpad_result) = tokio::join!(trace_task, crashpad_task);
 
     let mut errors = Vec::new();
-    let (trace_cleanup, trace_snapshot) = match trace_result {
-        Ok((Ok(cleanup), snapshot)) => (Some(cleanup), snapshot),
-        Ok((Err(error), snapshot)) => {
+    let (trace_cleanup, trace_snapshot, trace_log_write_protection_active) = match trace_result {
+        Ok((Ok(cleanup), snapshot, protection_active)) => {
+            (Some(cleanup), snapshot, protection_active)
+        }
+        Ok((Err(error), snapshot, protection_active)) => {
             let error = format!("{error:#}");
             error_log::record_failure(
                 "cleanup_failed",
@@ -74,7 +89,7 @@ pub(super) async fn clear_diagnostic_storage(state: &Arc<AppState>) -> Result<Va
                 }),
             );
             errors.push(error);
-            (None, snapshot)
+            (None, snapshot, protection_active)
         }
         Err(error) => {
             let error = format!("Trace 日志库清理任务异常退出：{error}");
@@ -90,10 +105,14 @@ pub(super) async fn clear_diagnostic_storage(state: &Arc<AppState>) -> Result<Va
             errors.push(error.clone());
             let mut snapshot = TraceLogStatsSnapshot::idle();
             snapshot.errors.push(error);
-            (None, snapshot)
+            (None, snapshot, false)
         }
     };
     state.trace_log_stats.replace(trace_snapshot);
+    state.trace_log_write_protection_active.store(
+        trace_log_write_protection_active,
+        std::sync::atomic::Ordering::Release,
+    );
 
     let (crashpad_cleanup, crashpad_snapshot) = match crashpad_result {
         Ok(run) => {
@@ -141,6 +160,7 @@ pub(super) async fn clear_diagnostic_storage(state: &Arc<AppState>) -> Result<Va
         "traceCleanup": trace_cleanup,
         "crashpadCleanup": crashpad_cleanup,
         "traceProtectionEnabled": disable_trace_writes,
+        "traceLogWriteProtectionActive": trace_log_write_protection_active,
         "crashpadProtectionEnabled": protect_crashpad_pending,
         "errors": errors,
         "traceLogStats": &state.trace_log_stats,

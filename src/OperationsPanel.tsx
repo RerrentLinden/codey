@@ -48,6 +48,11 @@ type OperationsRuntimeStatus = Pick<
   | "maintenance"
   | "injectionScripts"
   | "fastContextToolsActive"
+  | "subagentOptimizationActive"
+  | "notificationChannelsActive"
+  | "activeNotificationChannelCount"
+  | "traceLogWriteProtectionActive"
+  | "crashpadDiskProtectionActive"
 >;
 
 type OperationsPanelProps = {
@@ -116,11 +121,57 @@ function OperationsPanelComponent({
           detail: script.detail,
           sourceLabel: script.source === "user" ? "用户脚本" : "内置",
         }));
+      const appliedFeatures = [...injectedFeatures];
+
+      if (status.subagentOptimizationActive === true) {
+        appliedFeatures.push({
+          id: "subagent-optimization",
+          icon: Cpu,
+          name: "子代理优化",
+          detail: "子代理角色与调度增强已随当前运行实例加载",
+          sourceLabel: "Codey",
+        });
+      }
+
+      const activeNotificationChannelCount =
+        status.activeNotificationChannelCount ?? 0;
+      if (
+        status.notificationChannelsActive === true &&
+        activeNotificationChannelCount > 0
+      ) {
+        appliedFeatures.push({
+          id: "notification-channels",
+          icon: PlugZap,
+          name: "消息通知",
+          detail: `已启用 ${activeNotificationChannelCount} 个通知渠道`,
+          sourceLabel: "Codey",
+        });
+      }
+
+      const traceWriteProtectionActive =
+        status.traceLogWriteProtectionActive === true;
+      const crashpadDiskProtectionActive =
+        status.crashpadDiskProtectionActive === true;
+      if (traceWriteProtectionActive || crashpadDiskProtectionActive) {
+        const protectionDetail =
+          traceWriteProtectionActive && crashpadDiskProtectionActive
+            ? "Codex Trace 日志与 Crashpad 磁盘保护均已生效"
+            : traceWriteProtectionActive
+              ? "Codex Trace 日志写盘保护已生效"
+              : "Codex Crashpad 磁盘保护已生效";
+        appliedFeatures.push({
+          id: "disk-write-protection",
+          icon: IconDatabase,
+          name: "写盘保护",
+          detail: protectionDetail,
+          sourceLabel: "Codey",
+        });
+      }
 
       const fastContextToolsActive =
         status.fastContextToolsActive === true ||
         (status.running && fastContextToolsStatus.userConfigured);
-      if (!fastContextToolsActive) return injectedFeatures;
+      if (!fastContextToolsActive) return appliedFeatures;
 
       const externalFastContextTools = fastContextToolsStatus.userConfigured;
 
@@ -138,14 +189,19 @@ function OperationsPanelComponent({
             : "Codey 内置 FastCtx 已随当前运行实例加载",
           sourceLabel: externalFastContextTools ? "外部配置" : "Codey",
         },
-        ...injectedFeatures,
+        ...appliedFeatures,
       ];
     },
     [
       fastContextToolsStatus.serverId,
       fastContextToolsStatus.userConfigured,
+      status.activeNotificationChannelCount,
+      status.crashpadDiskProtectionActive,
       status.fastContextToolsActive,
+      status.notificationChannelsActive,
       status.running,
+      status.subagentOptimizationActive,
+      status.traceLogWriteProtectionActive,
       userFacingInjectionScripts,
     ],
   );

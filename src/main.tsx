@@ -183,6 +183,14 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "runtime_status") {
+        const activeNotificationChannelCount =
+          previewConfig.webhook.channels.filter(
+            (channel) =>
+              channel.enabled &&
+              (channel.kind === "telegram"
+                ? channel.botTokenConfigured && Boolean(channel.chatId.trim())
+                : channel.urlConfigured),
+          ).length;
         return {
           running: true,
           appVersion: "0.2.0",
@@ -264,7 +272,7 @@ if (import.meta.env.DEV) {
               id: "renderer-controls",
               name: "渲染器控制",
               source: "builtin",
-              visibility: "feature",
+              visibility: "internal",
               status: "effective",
               detail: "渲染器控制与按需加载 API 可用",
             },
@@ -278,6 +286,13 @@ if (import.meta.env.DEV) {
             },
           ],
           fastContextToolsActive: previewConfig.fastContextTools,
+          subagentOptimizationActive: previewConfig.subagentOptimization,
+          notificationChannelsActive: activeNotificationChannelCount > 0,
+          activeNotificationChannelCount,
+          traceLogWriteProtectionActive: previewConfig.disableTraceLogWrites,
+          crashpadDiskProtectionActive:
+            previewClientPlatform === "macos" &&
+            previewConfig.protectCrashpadPending,
           ...(previewTraceStats ? { traceLogStats: previewTraceStats } : {}),
           ...(previewCrashpadStats
             ? { crashpadPendingStats: previewCrashpadStats }
@@ -391,6 +406,7 @@ if (import.meta.env.DEV) {
         return {
           status: "ok",
           traceProtectionEnabled: previewConfig.disableTraceLogWrites,
+          traceLogWriteProtectionActive: previewConfig.disableTraceLogWrites,
           crashpadProtectionEnabled: previewConfig.protectCrashpadPending,
           errors: [],
           traceCleanup: {

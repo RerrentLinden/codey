@@ -35,6 +35,10 @@ test("script injection diagnostics report runtime evidence without continuous po
 
   assert.match(cdp, /window\.__codeyInjectionStatus/);
   assert.match(cdp, /enum InjectionScriptVisibility/);
+  assert.match(
+    cdp,
+    /"renderer-controls"[\s\S]*?Internal,\s*All,/,
+  );
   assert.match(cdp, /visibility: descriptor\.visibility\.as_str\(\)\.to_string\(\)/);
   assert.match(cdp, /MAX_INJECTION_ERROR_CHARS:\s*usize\s*=\s*500/);
   assert.match(cdp, /read_injection_statuses\(&websocket_url, scripts\)/);
@@ -48,6 +52,16 @@ test("script injection diagnostics report runtime evidence without continuous po
     /runtime\.injection_statuses\.read\(\)\.await\.clone\(\)/,
   );
   assert.match(runtimeCommands, /"injectionScripts"/);
+  assert.match(runtimeCommands, /"subagentOptimizationActive"/);
+  assert.match(runtimeCommands, /"notificationChannelsActive"/);
+  assert.match(runtimeCommands, /"activeNotificationChannelCount"/);
+  assert.match(runtimeCommands, /"traceLogWriteProtectionActive"/);
+  assert.match(runtimeCommands, /"crashpadDiskProtectionActive"/);
+  assert.match(runtimeCommands, /waiting_watcher_task[\s\S]*?is_finished/);
+  assert.match(
+    launcher,
+    /crashpad_pending_protection_active[\s\S]*?target_os = "macos"[\s\S]*?crashpad_guard_task[\s\S]*?is_finished/,
+  );
   assert.match(
     commands,
     /"refresh_injection_status"\s*=>\s*refresh_injection_status/,
@@ -103,6 +117,11 @@ test("script injection diagnostics report runtime evidence without continuous po
     types,
     /status:\s*"effective"\s*\|\s*"executed"\s*\|\s*"inactive"\s*\|\s*"failed"\s*\|\s*"unknown"/,
   );
+  assert.match(types, /subagentOptimizationActive\?: boolean/);
+  assert.match(types, /notificationChannelsActive\?: boolean/);
+  assert.match(types, /activeNotificationChannelCount\?: number/);
+  assert.match(types, /traceLogWriteProtectionActive\?: boolean/);
+  assert.match(types, /crashpadDiskProtectionActive\?: boolean/);
   assert.match(sections, /已生效功能/);
   assert.match(
     sections,
@@ -116,6 +135,18 @@ test("script injection diagnostics report runtime evidence without continuous po
   assert.match(sections, /name: "FastCtx 上下文加速"/);
   assert.match(sections, /status\.fastContextToolsActive === true/);
   assert.match(sections, /fastContextToolsStatus\.userConfigured/);
+  assert.match(sections, /name: "子代理优化"/);
+  assert.match(sections, /status\.subagentOptimizationActive === true/);
+  assert.match(sections, /name: "消息通知"/);
+  assert.match(sections, /status\.notificationChannelsActive === true/);
+  assert.match(sections, /activeNotificationChannelCount/);
+  assert.match(sections, /name: "写盘保护"/);
+  assert.match(sections, /status\.traceLogWriteProtectionActive === true/);
+  assert.match(sections, /status\.crashpadDiskProtectionActive === true/);
+  assert.match(sections, /Trace 日志与 Crashpad 磁盘保护均已生效/);
+  assert.doesNotMatch(sections, /渲染器控制/);
+  assert.match(app, /await refreshStatus\(\)\.catch/);
+  assert.match(commands, /trace_log_write_protection_active\.store/);
   assert.match(sections, /enabledOptimizationFeatures\.map/);
   assert.match(
     sections,

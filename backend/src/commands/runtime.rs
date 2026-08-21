@@ -78,8 +78,20 @@ pub(super) async fn runtime_status_with_options(
         Some(runtime) => Some(runtime.applied_subagent_config().await),
         None => None,
     };
+    let crashpad_disk_protection_active = match runtime.as_ref() {
+        Some(runtime) => runtime.crashpad_pending_protection_active().await,
+        None => false,
+    };
     let config = state.config.read().await;
     let profile = config.active_profile();
+    let active_profile_id = profile
+        .as_ref()
+        .map(|profile| profile.id.clone())
+        .unwrap_or_default();
+    let active_profile_name = profile
+        .as_ref()
+        .map(|profile| profile.name.clone())
+        .unwrap_or_default();
     let configured_codex_app_path = config.codex_app_path.clone();
     let runtime_codex_app_path = runtime
         .as_ref()
@@ -100,17 +112,41 @@ pub(super) async fn runtime_status_with_options(
     let fast_context_tools_active = runtime
         .as_ref()
         .is_some_and(|runtime| runtime.applied_config.fast_context_tools);
+    let subagent_optimization_active = runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.applied_config.subagent_optimization);
+    let configured_notification_channel_count = config.webhook.enabled_channel_count();
+    let trace_log_write_protection_active = state
+        .trace_log_write_protection_active
+        .load(Ordering::Acquire);
+    drop(config);
+    let notification_watcher_active = runtime.is_some()
+        && state
+            .waiting_watcher_task
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|task| !task.is_finished());
+    let active_notification_channel_count = if notification_watcher_active {
+        configured_notification_channel_count
+    } else {
+        0
+    };
     let mut status = json!({
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),
         "clientPlatform": current_update_platform(),
-        "activeProfileId": profile.as_ref().map(|profile| profile.id.as_str()).unwrap_or_default(),
-        "activeProfileName": profile.as_ref().map(|profile| profile.name.as_str()).unwrap_or_default(),
+        "activeProfileId": active_profile_id,
+        "activeProfileName": active_profile_name,
         "restartRequired": restart_required,
         "restartInProgress": state.restart_in_progress.load(Ordering::Acquire),
         "fastContextToolsActive": fast_context_tools_active,
+        "subagentOptimizationActive": subagent_optimization_active,
+        "notificationChannelsActive": active_notification_channel_count > 0,
+        "activeNotificationChannelCount": active_notification_channel_count,
+        "traceLogWriteProtectionActive": trace_log_write_protection_active,
+        "crashpadDiskProtectionActive": crashpad_disk_protection_active,
     });
-    drop(config);
     let codex_app_version =
         codex_app_version_for_status(state, runtime_codex_app_path, configured_codex_app_path)
             .await;
@@ -335,14 +371,20 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
         return Err(error);
     }
     let handler = make_bridge_handler(state);
-    let (runtime, codex_exit, route_changed) =
-        match CodeyRuntime::start(&config, handler, state.crashpad_pending_stats.clone()).await {
-            Ok(started) => started,
-            Err(error) => {
-                reclaim_initial_session_scan(state, initial_scan_task).await;
-                return Err(error.to_string());
-            }
-        };
+    let (runtime, codex_exit, route_changed) = match CodeyRuntime::start(
+        &config,
+        handler,
+        &state.trace_log_write_protection_active,
+        state.crashpad_pending_stats.clone(),
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(error) => {
+            reclaim_initial_session_scan(state, initial_scan_task).await;
+            return Err(error.to_string());
+        }
+    };
     if state.is_shutting_down() {
         let stop_error = runtime.stop().await.err();
         reclaim_initial_session_scan(state, initial_scan_task).await;
