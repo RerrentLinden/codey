@@ -170,7 +170,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
   try {
     assert.equal(
       (0, eval)(await loadStartupPatchExpression(true, "C:\\Codey\\codey.exe")),
-      "codey-startup-patch-installed-v25",
+      "codey-startup-patch-installed-v29",
     );
     const electron = Module._load("electron", undefined, false);
     const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
@@ -361,105 +361,286 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "the compatible hook tooltip patch must not log a skipped renderer gate",
     );
 
-    const subagentStatusSource = [
-      "function installSubagentWatcher(h,t,r){",
-      "let refreshCalls=0;",
-      "const c=()=>{refreshCalls+=1;return t.discoverSubagentDescendantSnapshot(r,{reconcile:!0})};",
-      "const l=new Set([`child-1`]);c();",
-      "let v=h.addConversationStateCallback((e,n)=>{",
-      "if(n==null||e===r||!l.has(e))return;",
-      "let i=null;if(i==null)return;let s=!1;s&&c?.()}),",
-      "y=h.addNotificationCallback(`thread/status/changed`,()=>{});",
-      "return{getRefreshCalls:()=>refreshCalls,dispose:()=>{v();y()}}}",
-      "const subagentStatusError=`Failed to load subagent threads`;",
+    const historicalSubagentSource = [
+      "class HistoricalSubagentTopology{",
+      "constructor(store,requestClient,threads){",
+      "this.params={threadStore:store,requestClient};this.threads=threads}",
+      "async readLatestPaginatedDescendantTurn(e){return e}",
+      "async listDescendantThreads(){let t=this.threads;",
+      "let l=await Promise.all(t.map(async e=>{let t=e.id;",
+      "if(e.status.type!==`notLoaded`||e.historyMode!==`paginated`||this.params.threadStore.getConversation(t)!=null)return e;",
+      "try{return await this.readLatestPaginatedDescendantTurn(e)}catch{return e}})),u=!0;",
+      "return{descendantThreads:l,isComplete:u}}",
+      "async discover(parentId){let result=await this.listDescendantThreads();",
+      "return{...result,descendantThreads:this.params.threadStore.reconcileSubagentDescendantSnapshot(parentId,result.descendantThreads)}}}",
+      "const historicalMarkers=`thread/turns/list getThreadRuntimeStatusEvidence reconcileSubagentDescendantSnapshot`;",
     ].join("");
-    electron.protocol.handle("app", async () => new Response(subagentStatusSource));
-    const subagentStatusResponse = await installedHandler({
-      url: "app://-/assets/app-initial-subagent-status-current-build.js",
-    });
-    const patchedSubagentStatusSource = await subagentStatusResponse.text();
-    assert.match(
-      patchedSubagentStatusSource,
-      /__CODEY_SUBAGENT_STATUS_RECONCILER_V1__/,
-    );
-    assert.match(patchedSubagentStatusSource, /\[0,200,800\]/);
-    assert.doesNotMatch(
-      patchedSubagentStatusSource,
-      /if\(n==null\|\|e===r\|\|!l\.has\(e\)\)return;let i=null/,
-    );
-
-    delete globalThis.__CODEY_SUBAGENT_STATUS_RECONCILER_V1__;
-    const installSubagentWatcher = Function(
-      `${patchedSubagentStatusSource};return installSubagentWatcher`,
+    const OriginalHistoricalSubagentTopology = Function(
+      `${historicalSubagentSource};return HistoricalSubagentTopology`,
     )();
-    const statusNativeSetTimeout = globalThis.setTimeout;
-    const statusNativeClearTimeout = globalThis.clearTimeout;
-    const statusTimers = [];
-    let conversationStateCallback = null;
-    globalThis.setTimeout = (callback, delay) => {
-      const timer = { callback, delay, cleared: false };
-      statusTimers.push(timer);
-      return timer;
-    };
-    globalThis.clearTimeout = (timer) => {
-      timer.cleared = true;
-    };
-    try {
-      const watcher = installSubagentWatcher(
-        {
-          addConversationStateCallback(callback) {
-            conversationStateCallback = callback;
-            return () => {};
-          },
-          addNotificationCallback() {
-            return () => {};
-          },
-        },
-        {
-          discoverSubagentDescendantSnapshot() {
-            return null;
-          },
-        },
-        "parent-1",
-      );
-      assert.equal(watcher.getRefreshCalls(), 1);
-      conversationStateCallback("child-1", {
-        turns: [{ status: "inProgress" }],
-      });
-      assert.equal(statusTimers.length, 0);
+    electron.protocol.handle(
+      "app",
+      async () => new Response(historicalSubagentSource),
+    );
+    const historicalSubagentResponse = await installedHandler({
+      url: "app://-/assets/app-initial-subagent-history-current-build.js",
+    });
+    const patchedHistoricalSubagentSource =
+      await historicalSubagentResponse.text();
+    assert.match(
+      patchedHistoricalSubagentSource,
+      /__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__/,
+    );
+    assert.match(patchedHistoricalSubagentSource, /entries\.size<=256/);
+    assert.match(patchedHistoricalSubagentSource, /activeRequests<2/);
+    assert.match(patchedHistoricalSubagentSource, /queryCandidates\.slice\(0,8\)/);
+    assert.match(patchedHistoricalSubagentSource, /inspected<32/);
+    assert.match(patchedHistoricalSubagentSource, /itemsView:`notLoaded`/);
+    assert.match(patchedHistoricalSubagentSource, /limit:1/);
+    assert.match(patchedHistoricalSubagentSource, /expiresAt:Date\.now\(\)\+30000/);
+    assert.doesNotMatch(
+      patchedHistoricalSubagentSource,
+      /__CODEY_SUBAGENT_STATUS_RECONCILER_V1__|\[0,200,800\]/,
+      "the superseded full-discovery retry burst must be absent",
+    );
 
-      conversationStateCallback("child-1", {
-        turns: [{ status: "completed" }],
-      });
-      assert.deepEqual(
-        statusTimers.map(({ delay }) => delay),
-        [0, 200, 800, 1000],
+    const HistoricalSubagentTopology = Function(
+      `${patchedHistoricalSubagentSource};return HistoricalSubagentTopology`,
+    )();
+    const thread = (id, type = "active") => ({
+      id,
+      status: { type },
+      historyMode: "legacy",
+      createdAt: 1,
+      updatedAt: 2,
+    });
+    const createHistoricalStore = ({
+      liveEvidence = new Map(),
+      loadedStatuses = new Map(),
+    } = {}) => {
+      const summaries = new Map();
+      return {
+        getConversation(id) {
+          const status = loadedStatuses.get(id);
+          return status == null ? null : { turns: [{ status }] };
+        },
+        getThreadRuntimeStatusEvidence(id) {
+          return liveEvidence.get(id) ?? null;
+        },
+        reconcileSubagentDescendantSnapshot(_parentId, threads) {
+          return threads.map((current) => {
+            const status = liveEvidence.get(current.id) ?? current.status;
+            summaries.set(current.id, { threadRuntimeStatus: status });
+            return status === current.status
+              ? current
+              : { ...current, status };
+          });
+        },
+        projectedStatus(snapshot, id) {
+          return liveEvidence.get(id)?.type
+            ?? summaries.get(id)?.threadRuntimeStatus?.type
+            ?? snapshot.descendantThreads.find((current) => current.id === id)
+              ?.status.type;
+        },
+      };
+    };
+    const createTurnsClient = ({
+      statuses,
+      liveEvidence,
+      onResponse,
+      sharedConcurrency,
+      wrapped = false,
+    }) => {
+      const requests = [];
+      let inFlight = 0;
+      let maxInFlight = 0;
+      return {
+        requests,
+        getMaxInFlight: () => maxInFlight,
+        async sendRequest(method, params, options) {
+          requests.push({ method, params, options });
+          assert.equal(method, "thread/turns/list");
+          inFlight += 1;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          if (sharedConcurrency) {
+            sharedConcurrency.inFlight += 1;
+            sharedConcurrency.maxInFlight = Math.max(
+              sharedConcurrency.maxInFlight,
+              sharedConcurrency.inFlight,
+            );
+          }
+          await new Promise((resolve) => setImmediate(resolve));
+          inFlight -= 1;
+          if (sharedConcurrency) sharedConcurrency.inFlight -= 1;
+          onResponse?.(params.threadId, liveEvidence);
+          const status = statuses.get(params.threadId);
+          if (status === "throw") throw new Error("latest turn unavailable");
+          const response = { data: status == null ? [] : [{ status }] };
+          return wrapped ? { response } : response;
+        },
+      };
+    };
+
+    // Reproduce the actual failure: the unpatched loader writes the stale active
+    // state into the native summary, so the final projection remains active.
+    const baselineStore = createHistoricalStore();
+    const baselineClient = createTurnsClient({
+      statuses: new Map([["child-baseline", "completed"]]),
+    });
+    const baselineSnapshot = await new OriginalHistoricalSubagentTopology(
+      baselineStore,
+      baselineClient,
+      [thread("child-baseline")],
+    ).discover("parent-baseline");
+    assert.equal(
+      baselineStore.projectedStatus(baselineSnapshot, "child-baseline"),
+      "active",
+    );
+    assert.equal(baselineClient.requests.length, 0);
+
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__;
+    const liveEvidence = new Map([["child-live", { type: "active" }]]);
+    const primaryThreads = [
+      thread("child-completed"),
+      thread("child-failed"),
+      thread("child-interrupted"),
+      thread("child-running"),
+      thread("child-no-turn"),
+      thread("child-error"),
+      thread("child-live"),
+      thread("child-loaded-running"),
+      thread("child-became-live"),
+      thread("child-idle", "idle"),
+    ];
+    const primaryStore = createHistoricalStore({
+      liveEvidence,
+      loadedStatuses: new Map([["child-loaded-running", "inProgress"]]),
+    });
+    const primaryClient = createTurnsClient({
+      statuses: new Map([
+        ["child-completed", "completed"],
+        ["child-failed", "failed"],
+        ["child-interrupted", "interrupted"],
+        ["child-running", "inProgress"],
+        ["child-no-turn", null],
+        ["child-error", "throw"],
+        ["child-became-live", "completed"],
+      ]),
+      liveEvidence,
+      onResponse(id, evidence) {
+        if (id === "child-became-live") evidence.set(id, { type: "active" });
+      },
+      wrapped: true,
+    });
+    const primarySnapshot = await new HistoricalSubagentTopology(
+      primaryStore,
+      primaryClient,
+      primaryThreads,
+    ).discover("parent-primary");
+    assert.equal(primaryClient.getMaxInFlight(), 2);
+    assert.equal(primaryClient.requests.length, 7);
+    assert.ok(primaryClient.requests.every(({ params, options }) =>
+      params.limit === 1
+      && params.sortDirection === "desc"
+      && params.itemsView === "notLoaded"
+      && options.priority === "background"
+    ));
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-completed"), "idle");
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-failed"), "idle");
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-interrupted"), "idle");
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-running"), "active");
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-no-turn"), "active");
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-error"), "active");
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-live"), "active");
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-loaded-running"), "active");
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-became-live"), "active");
+    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-idle"), "idle");
+    assert.deepEqual(
+      globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__.snapshot(),
+      {
+        version: 3,
+        scans: 1,
+        inspected: 9,
+        candidates: 7,
+        requests: 7,
+        cacheHits: 0,
+        peakRequests: 2,
+        corrected: 3,
+        skipped: 3,
+        failures: 1,
+      },
+    );
+
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__;
+    const cappedThreads = Array.from({ length: 9 }, (_value, index) => ({
+      ...thread(`child-cap-${index + 1}`),
+      updatedAt: index === 0 ? 100 : index,
+    }));
+    const cappedStore = createHistoricalStore();
+    const cappedClient = createTurnsClient({
+      statuses: new Map(cappedThreads.map(({ id }) => [id, "completed"])),
+    });
+    const cappedTopology = new HistoricalSubagentTopology(
+      cappedStore,
+      cappedClient,
+      cappedThreads,
+    );
+    const firstCappedSnapshot = await cappedTopology.discover("parent-cap");
+    assert.equal(cappedClient.requests.length, 8);
+    assert.equal(cappedClient.getMaxInFlight(), 2);
+    assert.deepEqual(
+      cappedClient.requests.map(({ params }) => params.threadId),
+      cappedThreads.slice(1).map(({ id }) => id),
+      "the bounded first pass should prioritize older suspicious rows",
+    );
+    assert.equal(
+      firstCappedSnapshot.descendantThreads.filter(({ status }) =>
+        status.type === "idle"
+      ).length,
+      8,
+    );
+    const secondCappedSnapshot = await cappedTopology.discover("parent-cap");
+    assert.equal(cappedClient.requests.length, 9);
+    assert.equal(
+      secondCappedSnapshot.descendantThreads.every(({ status }) =>
+        status.type === "idle"
+      ),
+      true,
+    );
+    assert.equal(
+      globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__.snapshot()
+        .cacheHits,
+      8,
+    );
+
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__;
+    const sharedConcurrency = { inFlight: 0, maxInFlight: 0 };
+    const sharedTopologies = ["a", "b"].map((suffix) => {
+      const threads = Array.from({ length: 4 }, (_value, index) =>
+        thread(`child-shared-${suffix}-${index + 1}`)
       );
-      conversationStateCallback("child-1", {
-        turns: [{ status: "completed" }],
-      });
-      assert.ok(statusTimers.slice(0, 4).every(({ cleared }) => cleared));
-      assert.deepEqual(
-        statusTimers.slice(4).map(({ delay }) => delay),
-        [0, 200, 800, 1000],
+      return new HistoricalSubagentTopology(
+        createHistoricalStore(),
+        createTurnsClient({
+          statuses: new Map(threads.map(({ id }) => [id, "completed"])),
+          sharedConcurrency,
+        }),
+        threads,
       );
-      for (const timer of statusTimers.slice(4, 7)) timer.callback();
-      statusTimers[7].callback();
-      assert.equal(watcher.getRefreshCalls(), 4);
-      assert.deepEqual(
-        globalThis.__CODEY_SUBAGENT_STATUS_RECONCILER_V1__.snapshot(),
-        { version: 1, scheduled: 2, refreshes: 3 },
-      );
-      watcher.dispose();
-    } finally {
-      globalThis.setTimeout = statusNativeSetTimeout;
-      globalThis.clearTimeout = statusNativeClearTimeout;
-      delete globalThis.__CODEY_SUBAGENT_STATUS_RECONCILER_V1__;
-    }
+    });
+    await Promise.all(sharedTopologies.map((topology, index) =>
+      topology.discover(`parent-shared-${index}`)
+    ));
+    assert.equal(
+      sharedConcurrency.maxInFlight,
+      2,
+      "all mounted loaders must share the same native request limit",
+    );
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__;
     assert.equal(
       patchErrors.length,
       2,
-      "the compatible subagent status patch must not log a skipped renderer gate",
+      "the compatible historical status patch must not log a skipped renderer gate",
     );
 
     const petSettingsSource = [
@@ -787,21 +968,22 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         "the production renderer asset should receive compatible Codey gates",
       );
       if (
-        productionSource.includes("discoverSubagentDescendantSnapshot")
-        && productionSource.includes("Failed to load subagent threads")
-        && productionSource.includes("thread/status/changed")
+        productionSource.includes("readLatestPaginatedDescendantTurn")
+        && productionSource.includes("thread/turns/list")
+        && productionSource.includes("getThreadRuntimeStatusEvidence")
+        && productionSource.includes("reconcileSubagentDescendantSnapshot")
       ) {
         assert.match(
           patchedProductionSource,
-          /__CODEY_SUBAGENT_STATUS_RECONCILER_V1__/,
-          "the production subagent callback shape should receive terminal reconciliation",
+          /__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__/,
+          "the production descendant loader should verify stale active rows before reconciliation",
         );
       }
       const currentGateFailures = patchErrors
         .slice(previousErrorCount)
         .map(([message]) => String(message))
         .filter((message) =>
-          /model allowlist|model visibility|model-aware service tier control|model-aware Fast toggle|fast model trigger availability/.test(
+          /model allowlist|model visibility|model-aware service tier control|model-aware Fast toggle|fast model trigger availability|subagent historical active verification/.test(
             message,
           ),
         );

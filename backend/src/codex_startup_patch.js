@@ -701,31 +701,98 @@
       "})()).find(",
       `${coordinationName}.clientCoordination,${hostIdName},${conversationIdName})`,
     ].join("");
-  const subagentStatusReconcileExpression = (
-    conversationStateName,
-    refreshSnapshotName,
-  ) => {
-    const latestTurnStatus = `${conversationStateName}.turns.at(-1)?.status`;
-    return [
-      `if((${latestTurnStatus}===\`completed\`||${latestTurnStatus}===\`failed\`||${latestTurnStatus}===\`interrupted\`)&&typeof ${refreshSnapshotName}===\`function\`){`,
-      "(globalThis.__CODEY_SUBAGENT_STATUS_RECONCILER_V1__??={",
-      "version:1,pending:new WeakMap,scheduled:0,refreshes:0,",
-      "schedule(refresh){",
-      "const previous=this.pending.get(refresh);",
-      "if(previous!=null)for(const timer of previous)globalThis.clearTimeout(timer);",
-      "this.scheduled+=1;",
-      "const timers=[0,200,800].map(delay=>globalThis.setTimeout(()=>{",
-      "this.refreshes+=1;try{refresh()}catch{}",
-      "},delay));",
-      "timers.push(globalThis.setTimeout(()=>{",
-      "if(this.pending.get(refresh)===timers)this.pending.delete(refresh)",
-      "},1000));",
-      "this.pending.set(refresh,timers)",
+  const subagentHistoricalActiveVerifierExpression =
+    (descendantThreadsName) => [
+      `${descendantThreadsName}=await (globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__??={`,
+      "version:3,states:new WeakMap,requestQueue:[],activeRequests:0,peakRequests:0,scans:0,inspected:0,candidates:0,requests:0,cacheHits:0,corrected:0,skipped:0,failures:0,",
+      "terminal(status){return status===`completed`||status===`failed`||status===`interrupted`},",
+      "live(store,id){",
+      "if(store.getThreadRuntimeStatusEvidence?.(id)?.type===`active`)return !0;",
+      "return store.getConversation?.(id)?.turns?.at(-1)?.status===`inProgress`",
       "},",
-      "snapshot(){return{version:this.version,scheduled:this.scheduled,refreshes:this.refreshes}}",
-      `}).schedule(${refreshSnapshotName});return}`,
+      "touch(state,key,value){",
+      "state.entries.delete(key);state.entries.set(key,value);",
+      "if(state.entries.size<=256)return;",
+      "for(const [oldest,entry] of state.entries){",
+      "if(entry.kind===`pending`)continue;",
+      "state.entries.delete(oldest);if(state.entries.size<=256)break",
+      "}",
+      "},",
+      "runLimited(task){return new Promise((resolve,reject)=>{",
+      "this.requestQueue.push({task,resolve,reject});this.pump()",
+      "})},",
+      "pump(){while(this.activeRequests<2&&this.requestQueue.length>0){",
+      "const job=this.requestQueue.shift();this.activeRequests+=1;",
+      "this.peakRequests=Math.max(this.peakRequests,this.activeRequests);",
+      "Promise.resolve().then(job.task).then(job.resolve,job.reject).finally(()=>{",
+      "this.activeRequests-=1;this.pump()",
+      "})",
+      "}},",
+      "check(state,client,id,key){",
+      "const now=Date.now(),existing=state.entries.get(key);",
+      "if(existing?.kind===`terminal`){",
+      "this.cacheHits+=1;this.touch(state,key,existing);return Promise.resolve(!0)",
+      "}",
+      "if(existing?.kind===`pending`)return existing.promise;",
+      "if(existing?.kind===`cooldown`&&existing.expiresAt>now)return Promise.resolve(!1);",
+      "state.entries.delete(key);let pending;",
+      "pending=this.runLimited(async()=>{",
+      "this.requests+=1;",
+      "return client.sendRequest(`thread/turns/list`,{threadId:id,cursor:null,limit:1,sortDirection:`desc`,itemsView:`notLoaded`},{priority:`background`,source:`collab_hydration`})",
+      "}).then(result=>{",
+      "const data=result?.response?.data??result?.data;",
+      "const status=Array.isArray(data)?data[0]?.status:void 0,isTerminal=this.terminal(status);",
+      "if(state.entries.get(key)?.promise===pending){",
+      "this.touch(state,key,isTerminal?{kind:`terminal`}:{kind:`cooldown`,expiresAt:Date.now()+30000})",
+      "}",
+      "return isTerminal",
+      "},()=>{",
+      "this.failures+=1;",
+      "if(state.entries.get(key)?.promise===pending)state.entries.delete(key);",
+      "return !1",
+      "});",
+      "this.touch(state,key,{kind:`pending`,promise:pending});return pending",
+      "},",
+      "async verify(store,client,threads){",
+      "if(!Array.isArray(threads)||store==null||typeof client?.sendRequest!==`function`)return threads;",
+      "this.scans+=1;",
+      "let state=this.states.get(store);",
+      "if(state==null){state={entries:new Map};this.states.set(store,state)}",
+      "let inspected=0;const checks=[],queryCandidates=[];",
+      "for(let index=0;index<threads.length&&inspected<32;index+=1){",
+      "const thread=threads[index];if(thread?.status?.type!==`active`)continue;",
+      "inspected+=1;this.inspected+=1;",
+      "const id=thread?.id;",
+      "if(id==null||this.live(store,id)){this.skipped+=1;continue}",
+      "const key=String(id)+String.fromCharCode(0)+String(thread.updatedAt??thread.createdAt??``);",
+      "const existing=state.entries.get(key);",
+      "if(existing?.kind===`cooldown`&&existing.expiresAt>Date.now()){this.skipped+=1;continue}",
+      "const entry={id,index,key,thread};",
+      "if(existing?.kind===`terminal`||existing?.kind===`pending`)checks.push(entry);",
+      "else queryCandidates.push(entry)",
+      "}",
+      "queryCandidates.sort((a,b)=>{",
+      "const left=Number(a.thread.updatedAt??a.thread.createdAt??0),right=Number(b.thread.updatedAt??b.thread.createdAt??0);",
+      "return (Number.isFinite(left)?left:0)-(Number.isFinite(right)?right:0)||a.index-b.index",
+      "});",
+      "for(const entry of queryCandidates.slice(0,8)){this.candidates+=1;checks.push(entry)}",
+      "if(checks.length===0)return threads;",
+      "for(const entry of checks)entry.promise=this.check(state,client,entry.id,entry.key);",
+      "const terminalEntries=await Promise.all(checks.map(async entry=>(await entry.promise)?entry:null));",
+      "let next=null;",
+      "for(const entry of terminalEntries){",
+      "if(entry==null)continue;",
+      "const current=threads[entry.index];",
+      "if(current!==entry.thread||current?.status?.type!==`active`||this.live(store,entry.id)){",
+      "this.skipped+=1;continue",
+      "}",
+      "next??=threads.slice();next[entry.index]={...current,status:{type:`idle`}};this.corrected+=1",
+      "}",
+      "return next??threads",
+      "},",
+      "snapshot(){return{version:this.version,scans:this.scans,inspected:this.inspected,candidates:this.candidates,requests:this.requests,cacheHits:this.cacheHits,peakRequests:this.peakRequests,corrected:this.corrected,skipped:this.skipped,failures:this.failures}}",
+      `}).verify(this.params.threadStore,this.params.requestClient,${descendantThreadsName})`,
     ].join("");
-  };
   const patchCodexRendererAsset = (source) => {
     let patched = source;
     let nativeCustomProviderModelAccess = false;
@@ -796,39 +863,36 @@
       );
     }
     if (
-      source.includes("discoverSubagentDescendantSnapshot")
-      && source.includes("Failed to load subagent threads")
-      && source.includes("thread/status/changed")
-      && source.includes(".addConversationStateCallback")
+      source.includes("readLatestPaginatedDescendantTurn")
+      && source.includes("thread/turns/list")
+      && source.includes("getThreadRuntimeStatusEvidence")
+      && source.includes("reconcileSubagentDescendantSnapshot")
     ) {
-      // Codex's summary-panel snapshot listens for thread/status/changed, but a
-      // completed child turn can reach the conversation store without a matching
-      // status notification. Opening the child panel performs a full reconcile,
-      // which is why a stale "working" count fixes itself after navigation. When
-      // a known child conversation reaches a terminal turn, schedule a small,
-      // deduplicated reconcile burst to bridge that notification gap. The native
-      // snapshot loader remains the source of truth; no DOM text or local Codey
-      // subagent ledger is used to infer the displayed status.
+      // State-DB descendant rows can remain active after their rollout already
+      // contains a terminal turn. Codex currently resolves only notLoaded rows
+      // before it reconciles the list into threadsById and thread summaries. Fix
+      // the row before that native reconcile so the snapshot and every status
+      // source consumed by the sidebar agree. Inspect at most 32 active rows and
+      // read only the latest turn for the 8 oldest candidates. A renderer-wide FIFO
+      // keeps all watchers at two native requests in flight. Terminal results are
+      // cached by thread revision in a bounded WeakMap-backed LRU; non-terminal
+      // results receive only a short, timer-free cooldown. Live runtime evidence
+      // and an already loaded in-progress turn always win.
       patched = replaceUniqueRendererGate(
         patched,
-        /(\.addConversationStateCallback\(\(\s*([$A-Z_a-z][$\w]*)\s*,\s*([$A-Z_a-z][$\w]*)\s*\)\s*=>\s*\{\s*if\s*\(\s*\3\s*==\s*null\s*\|\|\s*\2\s*===\s*([$A-Z_a-z][$\w]*)\s*\|\|\s*!\s*([$A-Z_a-z][$\w]*)\.has\(\s*\2\s*\)\s*\)\s*return\s*;)([\s\S]{0,4096}?)([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\?\.\(\)\s*(\}\))/g,
+        /(let\s+([$A-Z_a-z][$\w]*)\s*=\s*await\s+Promise\.all\(\s*([$A-Z_a-z][$\w]*)\.map\(\s*async\s+([$A-Z_a-z][$\w]*)\s*=>\s*\{[\s\S]{0,1536}?readLatestPaginatedDescendantTurn\(\s*\4\s*\)[\s\S]{0,512}?\}\s*\)\s*\))(\s*,\s*([$A-Z_a-z][$\w]*)\s*=\s*!0\s*;)/g,
         (
           _match,
-          callbackStart,
-          _conversationIdName,
-          conversationStateName,
-          _parentConversationIdName,
-          _knownDescendantsName,
-          callbackBody,
-          discoveredDescendantsName,
-          refreshSnapshotName,
-          callbackEnd,
+          nativeDescendantLoad,
+          descendantThreadsName,
+          _listedThreadsName,
+          _threadName,
+          nativeCompletenessFlag,
         ) =>
-          `${callbackStart}${subagentStatusReconcileExpression(
-            conversationStateName,
-            refreshSnapshotName,
-          )}${callbackBody}${discoveredDescendantsName}&&${refreshSnapshotName}?.()${callbackEnd}`,
-        "subagent terminal status reconciliation",
+          `${nativeDescendantLoad}${nativeCompletenessFlag}${subagentHistoricalActiveVerifierExpression(
+            descendantThreadsName,
+          )};`,
+        "subagent historical active verification",
       );
     }
     if (
@@ -3067,5 +3131,5 @@
   setImmediate(() => {
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v25";
+  return "codey-startup-patch-installed-v29";
 })()
