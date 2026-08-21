@@ -75,7 +75,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       (config) => !config.startsWith("__CODEY_WSL_ONLY__:"),
     );
     const expression = await loadPatchExpression(runtimeConfigOverrides);
-    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v29");
+    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v30");
 
     const patchedElectron = Module._load("electron");
     const passthroughGitHandler = () => "git-handler";

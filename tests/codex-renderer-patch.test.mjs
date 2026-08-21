@@ -170,7 +170,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
   try {
     assert.equal(
       (0, eval)(await loadStartupPatchExpression(true, "C:\\Codey\\codey.exe")),
-      "codey-startup-patch-installed-v29",
+      "codey-startup-patch-installed-v30",
     );
     const electron = Module._load("electron", undefined, false);
     const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
@@ -371,13 +371,17 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "if(e.status.type!==`notLoaded`||e.historyMode!==`paginated`||this.params.threadStore.getConversation(t)!=null)return e;",
       "try{return await this.readLatestPaginatedDescendantTurn(e)}catch{return e}})),u=!0;",
       "return{descendantThreads:l,isComplete:u}}",
-      "async discover(parentId){let result=await this.listDescendantThreads();",
-      "return{...result,descendantThreads:this.params.threadStore.reconcileSubagentDescendantSnapshot(parentId,result.descendantThreads)}}}",
-      "const historicalMarkers=`thread/turns/list getThreadRuntimeStatusEvidence reconcileSubagentDescendantSnapshot`;",
+      "discover(e,{reconcile:t=!0}={}){let n=this.listDescendantThreads(e);",
+      "return n.then(n=>!t||!n.isComplete?n:{...n,descendantThreads:this.params.threadStore.reconcileSubagentDescendantSnapshot(e,n.descendantThreads)})}}",
+      "function projectHistoricalAgents({cachedConversations:e,conversationTurns:t,getIndexedSubagentItems:n,getIndexedSubagentProgress:r,getThreadRuntimeStatusEvidence:i,parentConversationId:a,sourceLinkedThreads:o,threadSummaries:s=[]}){",
+      "let projected=globalThis.__codeyTestProjectedAgents??[];return projected}",
+      "const historicalMarkers=`thread/turns/list getThreadRuntimeStatusEvidence recordThreadRuntimeStatusEvidence reconcileSubagentDescendantSnapshot`;",
     ].join("");
-    const OriginalHistoricalSubagentTopology = Function(
-      `${historicalSubagentSource};return HistoricalSubagentTopology`,
+    const originalHistoricalExports = Function(
+      `${historicalSubagentSource};return {HistoricalSubagentTopology,projectHistoricalAgents}`,
     )();
+    const OriginalHistoricalSubagentTopology =
+      originalHistoricalExports.HistoricalSubagentTopology;
     electron.protocol.handle(
       "app",
       async () => new Response(historicalSubagentSource),
@@ -389,12 +393,33 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       await historicalSubagentResponse.text();
     assert.match(
       patchedHistoricalSubagentSource,
-      /__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__/,
+      /__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__/,
     );
-    assert.match(patchedHistoricalSubagentSource, /entries\.size<=256/);
+    assert.match(
+      patchedHistoricalSubagentSource,
+      /\.then\(async \w+=>\{if\(!\w+\|\|!\w+\.isComplete\)return/,
+      "verification must run after the native reconcile path has produced the final list",
+    );
+    assert.match(patchedHistoricalSubagentSource, /entries\.size>=256/);
     assert.match(patchedHistoricalSubagentSource, /activeRequests<2/);
     assert.match(patchedHistoricalSubagentSource, /queryCandidates\.slice\(0,8\)/);
     assert.match(patchedHistoricalSubagentSource, /inspected<32/);
+    assert.match(patchedHistoricalSubagentSource, /context\.pending\.size>=32/);
+    assert.match(patchedHistoricalSubagentSource, /requestQueue\.length>=32/);
+    assert.match(patchedHistoricalSubagentSource, /contexts\.size>8/);
+    assert.match(patchedHistoricalSubagentSource, /topologyCursor/);
+    assert.match(patchedHistoricalSubagentSource, /projectionCursor/);
+    assert.match(patchedHistoricalSubagentSource, /visitLimit=Math\.min\(length,128\)/);
+    assert.match(
+      patchedHistoricalSubagentSource,
+      /context\.rows\.get\(String\(entry\.id\)\)/,
+      "a projected request must revalidate the current topology row before publishing idle",
+    );
+    assert.match(
+      patchedHistoricalSubagentSource,
+      /\.observe\(a,o,projected\)/,
+      "the central sidebar projection must expose its exact UI-active set to the verifier",
+    );
     assert.match(patchedHistoricalSubagentSource, /itemsView:`notLoaded`/);
     assert.match(patchedHistoricalSubagentSource, /limit:1/);
     assert.match(patchedHistoricalSubagentSource, /expiresAt:Date\.now\(\)\+30000/);
@@ -404,9 +429,11 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "the superseded full-discovery retry burst must be absent",
     );
 
-    const HistoricalSubagentTopology = Function(
-      `${patchedHistoricalSubagentSource};return HistoricalSubagentTopology`,
+    const historicalExports = Function(
+      `${patchedHistoricalSubagentSource};return {HistoricalSubagentTopology,projectHistoricalAgents}`,
     )();
+    const { HistoricalSubagentTopology, projectHistoricalAgents } =
+      historicalExports;
     const thread = (id, type = "active") => ({
       id,
       status: { type },
@@ -417,18 +444,55 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     const createHistoricalStore = ({
       liveEvidence = new Map(),
       loadedStatuses = new Map(),
+      loadedRuntimeStatuses = new Map(),
+      passiveThreads = [],
     } = {}) => {
       const summaries = new Map();
+      const threadsById = new Map(passiveThreads.map((current) => [current.id, current]));
+      const recordedStatuses = [];
+      const updatedConversations = [];
+      const conversations = new Map();
+      for (const [id, status] of loadedStatuses) {
+        const threadRuntimeStatus = loadedRuntimeStatuses.get(id);
+        conversations.set(id, {
+          turns: [{ status }],
+          ...(threadRuntimeStatus == null ? {} : { threadRuntimeStatus }),
+        });
+      }
       return {
+        recordedStatuses,
+        updatedConversations,
         getConversation(id) {
-          const status = loadedStatuses.get(id);
-          return status == null ? null : { turns: [{ status }] };
+          return conversations.get(id) ?? null;
         },
         getThreadRuntimeStatusEvidence(id) {
           return liveEvidence.get(id) ?? null;
         },
+        recordThreadRuntimeStatusEvidence(id, status) {
+          recordedStatuses.push({ id, status });
+          if (conversations.has(id)) liveEvidence.delete(id);
+          else liveEvidence.set(id, status);
+          const existing = threadsById.get(id);
+          if (existing != null) threadsById.set(id, { ...existing, status });
+          const summary = summaries.get(id);
+          if (summary != null) {
+            summaries.set(id, { ...summary, threadRuntimeStatus: status });
+          }
+        },
+        updateConversationState(id, update) {
+          const conversation = conversations.get(id);
+          if (conversation == null) return;
+          update(conversation);
+          updatedConversations.push(id);
+        },
         reconcileSubagentDescendantSnapshot(_parentId, threads) {
-          return threads.map((current) => {
+          const seen = new Set(threads.map(({ id }) => id));
+          const reconciled = [
+            ...threads,
+            ...passiveThreads.filter(({ id }) => !seen.has(id)),
+          ];
+          return reconciled.map((current) => {
+            threadsById.set(current.id, current);
             const status = liveEvidence.get(current.id) ?? current.status;
             summaries.set(current.id, { threadRuntimeStatus: status });
             return status === current.status
@@ -438,6 +502,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         },
         projectedStatus(snapshot, id) {
           return liveEvidence.get(id)?.type
+            ?? conversations.get(id)?.threadRuntimeStatus?.type
             ?? summaries.get(id)?.threadRuntimeStatus?.type
             ?? snapshot.descendantThreads.find((current) => current.id === id)
               ?.status.type;
@@ -481,16 +546,20 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       };
     };
 
-    // Reproduce the actual failure: the unpatched loader writes the stale active
-    // state into the native summary, so the final projection remains active.
-    const baselineStore = createHistoricalStore();
+    // Reproduce the actual failure: the state-DB list itself contains no active
+    // row, but native reconcile appends a cached active descendant. A verifier
+    // placed before reconcile sees zero candidates while the final UI projection
+    // remains active through the native summary.
+    const baselineStore = createHistoricalStore({
+      passiveThreads: [thread("child-baseline")],
+    });
     const baselineClient = createTurnsClient({
       statuses: new Map([["child-baseline", "completed"]]),
     });
     const baselineSnapshot = await new OriginalHistoricalSubagentTopology(
       baselineStore,
       baselineClient,
-      [thread("child-baseline")],
+      [thread("child-listed-idle", "idle")],
     ).discover("parent-baseline");
     assert.equal(
       baselineStore.projectedStatus(baselineSnapshot, "child-baseline"),
@@ -498,23 +567,30 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     );
     assert.equal(baselineClient.requests.length, 0);
 
-    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__;
-    const liveEvidence = new Map([["child-live", { type: "active" }]]);
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__;
+    const staleEvidence = { type: "active" };
+    const liveEvidence = new Map([["child-stale-evidence", staleEvidence]]);
     const primaryThreads = [
-      thread("child-completed"),
       thread("child-failed"),
       thread("child-interrupted"),
       thread("child-running"),
-      thread("child-no-turn"),
       thread("child-error"),
-      thread("child-live"),
+      thread("child-stale-evidence"),
+      thread("child-loaded-stale"),
       thread("child-loaded-running"),
       thread("child-became-live"),
       thread("child-idle", "idle"),
     ];
     const primaryStore = createHistoricalStore({
       liveEvidence,
-      loadedStatuses: new Map([["child-loaded-running", "inProgress"]]),
+      loadedStatuses: new Map([
+        ["child-loaded-stale", "completed"],
+        ["child-loaded-running", "inProgress"],
+      ]),
+      loadedRuntimeStatuses: new Map([
+        ["child-loaded-stale", { type: "active" }],
+      ]),
+      passiveThreads: [thread("child-completed")],
     });
     const primaryClient = createTurnsClient({
       statuses: new Map([
@@ -522,8 +598,9 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         ["child-failed", "failed"],
         ["child-interrupted", "interrupted"],
         ["child-running", "inProgress"],
-        ["child-no-turn", null],
         ["child-error", "throw"],
+        ["child-stale-evidence", "completed"],
+        ["child-loaded-stale", "completed"],
         ["child-became-live", "completed"],
       ]),
       liveEvidence,
@@ -538,7 +615,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       primaryThreads,
     ).discover("parent-primary");
     assert.equal(primaryClient.getMaxInFlight(), 2);
-    assert.equal(primaryClient.requests.length, 7);
+    assert.equal(primaryClient.requests.length, 8);
     assert.ok(primaryClient.requests.every(({ params, options }) =>
       params.limit === 1
       && params.sortDirection === "desc"
@@ -549,29 +626,65 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-failed"), "idle");
     assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-interrupted"), "idle");
     assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-running"), "active");
-    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-no-turn"), "active");
     assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-error"), "active");
-    assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-live"), "active");
+    assert.equal(
+      primaryStore.projectedStatus(primarySnapshot, "child-stale-evidence"),
+      "idle",
+      "unchanged stale active evidence must not be mistaken for a live turn",
+    );
+    assert.equal(
+      primaryStore.projectedStatus(primarySnapshot, "child-loaded-stale"),
+      "idle",
+      "a loaded conversation's stale runtime status must be corrected too",
+    );
     assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-loaded-running"), "active");
     assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-became-live"), "active");
     assert.equal(primaryStore.projectedStatus(primarySnapshot, "child-idle"), "idle");
     assert.deepEqual(
-      globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__.snapshot(),
+      primaryStore.recordedStatuses.map(({ id }) => id).sort(),
+      [
+        "child-completed",
+        "child-failed",
+        "child-interrupted",
+        "child-loaded-stale",
+        "child-stale-evidence",
+      ],
+      "confirmed terminal rows must update Codex's native runtime status source",
+    );
+    assert.deepEqual(
+      primaryStore.updatedConversations,
+      ["child-loaded-stale"],
+      "only a loaded stale conversation should require a conversation-state update",
+    );
+    assert.equal(
+      primaryStore.getConversation("child-loaded-stale").threadRuntimeStatus.type,
+      "idle",
+    );
+    assert.deepEqual(
+      globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__.snapshot(),
       {
-        version: 3,
+        version: 5,
         scans: 1,
-        inspected: 9,
-        candidates: 7,
-        requests: 7,
+        inspected: 8,
+        candidates: 8,
+        projectionScans: 0,
+        projectionInspected: 0,
+        projectionCandidates: 0,
+        requests: 8,
+        activeRequests: 0,
+        queuedRequests: 0,
         cacheHits: 0,
         peakRequests: 2,
-        corrected: 3,
-        skipped: 3,
+        queuePeak: 6,
+        corrected: 5,
+        skipped: 2,
         failures: 1,
+        deferred: 0,
+        contexts: 1,
       },
     );
 
-    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__;
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__;
     const cappedThreads = Array.from({ length: 9 }, (_value, index) => ({
       ...thread(`child-cap-${index + 1}`),
       updatedAt: index === 0 ? 100 : index,
@@ -608,12 +721,279 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       true,
     );
     assert.equal(
-      globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__.snapshot()
+      globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__.snapshot()
         .cacheHits,
-      8,
+      0,
+      "publishing idle into the native store should avoid cache-only rechecks",
     );
 
-    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__;
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__;
+    const rotatingTopologyThreads = Array.from(
+      { length: 33 },
+      (_value, index) => ({
+        ...thread(`child-rotating-topology-${index + 1}`),
+        updatedAt: index === 32 ? 0 : 100,
+      }),
+    );
+    const rotatingTopologyStore = createHistoricalStore();
+    const rotatingTopologyClient = createTurnsClient({
+      statuses: new Map(rotatingTopologyThreads.map(({ id }, index) => [
+        id,
+        index === 32 ? "completed" : "inProgress",
+      ])),
+    });
+    const rotatingTopology = new HistoricalSubagentTopology(
+      rotatingTopologyStore,
+      rotatingTopologyClient,
+      rotatingTopologyThreads,
+    );
+    const firstRotatingTopology = await rotatingTopology.discover(
+      "parent-rotating-topology",
+    );
+    assert.equal(
+      firstRotatingTopology.descendantThreads[32].status.type,
+      "active",
+    );
+    assert.equal(
+      rotatingTopologyClient.requests.some(({ params }) =>
+        params.threadId === "child-rotating-topology-33"
+      ),
+      false,
+    );
+    const secondRotatingTopology = await rotatingTopology.discover(
+      "parent-rotating-topology",
+    );
+    assert.equal(
+      secondRotatingTopology.descendantThreads[32].status.type,
+      "idle",
+      "the rotating cursor must reach a stale row after 32 long-running predecessors",
+    );
+    assert.equal(
+      rotatingTopologyClient.requests.filter(({ params }) =>
+        params.threadId === "child-rotating-topology-33"
+      ).length,
+      1,
+    );
+
+    // Reproduce the restart-only counterexample from the production renderer:
+    // native topology reports every row as notLoaded/legacy while stale parent
+    // collab state makes the central sidebar projection label 31 of them active.
+    // Only those exact projected rows should receive a bounded latest-turn read.
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__;
+    const projectedActiveIds = Array.from(
+      { length: 31 },
+      (_value, index) => `child-projected-active-${index + 1}`,
+    );
+    const projectedDoneIds = Array.from(
+      { length: 9 },
+      (_value, index) => `child-projected-done-${index + 1}`,
+    );
+    const projectedThreads = [
+      ...projectedActiveIds,
+      ...projectedDoneIds,
+    ].map((id) => thread(id, "notLoaded"));
+    const projectedStore = createHistoricalStore();
+    const projectedClient = createTurnsClient({
+      statuses: new Map(projectedThreads.map(({ id }) => [id, "completed"])),
+    });
+    await new HistoricalSubagentTopology(
+      projectedStore,
+      projectedClient,
+      projectedThreads,
+    ).discover("parent-projected");
+    const projectionProps = {
+      cachedConversations: [],
+      conversationTurns: [],
+      getIndexedSubagentItems: null,
+      getIndexedSubagentProgress: null,
+      getThreadRuntimeStatusEvidence: null,
+      parentConversationId: "parent-projected",
+      sourceLinkedThreads: projectedThreads,
+      threadSummaries: [],
+    };
+    globalThis.__codeyTestProjectedAgents = [
+      ...projectedActiveIds.map((conversationId) => ({
+        conversationId,
+        status: "active",
+      })),
+      ...projectedDoneIds.map((conversationId) => ({
+        conversationId,
+        status: "done",
+      })),
+    ];
+    const firstProjection = projectHistoricalAgents(projectionProps);
+    const duplicatePendingProjection = projectHistoricalAgents(projectionProps);
+    assert.equal(
+      firstProjection.filter(({ status }) => status === "active").length,
+      31,
+    );
+    assert.equal(
+      duplicatePendingProjection.filter(({ status }) => status === "active")
+        .length,
+      31,
+      "selector re-entry before the microtask flush must not duplicate requests",
+    );
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const stats =
+        globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__.snapshot();
+      if (stats.corrected === projectedActiveIds.length) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    const projectedStats =
+      globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__.snapshot();
+    assert.equal(projectedStats.scans, 1);
+    assert.equal(projectedStats.inspected, 0);
+    assert.equal(projectedStats.candidates, 0);
+    assert.equal(projectedStats.projectionCandidates, 31);
+    assert.equal(projectedStats.requests, 31);
+    assert.equal(projectedStats.corrected, 31);
+    assert.equal(projectedStats.peakRequests, 2);
+    assert.ok(projectedStats.queuePeak <= 32);
+    assert.equal(projectedStats.contexts, 1);
+    assert.equal(projectedClient.requests.length, 31);
+    assert.equal(projectedClient.getMaxInFlight(), 2);
+    assert.deepEqual(
+      projectedClient.requests.map(({ params }) => params.threadId).sort(),
+      projectedActiveIds.toSorted(),
+      "already-done projected rows must not be queried",
+    );
+    assert.ok(projectedClient.requests.every(({ params, options }) =>
+      params.limit === 1
+      && params.sortDirection === "desc"
+      && params.itemsView === "notLoaded"
+      && options.priority === "background"
+      && options.source === "collab_hydration"
+    ));
+    assert.deepEqual(
+      projectedStore.recordedStatuses.map(({ id }) => id).sort(),
+      projectedActiveIds.toSorted(),
+    );
+    assert.equal(
+      projectHistoricalAgents(projectionProps).every(({ status }) =>
+        status === "done"
+      ),
+      true,
+      "terminal cache plus native idle evidence must correct the next projection",
+    );
+    delete globalThis.__codeyTestProjectedAgents;
+
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__;
+    const rotatingProjectionThreads = Array.from(
+      { length: 33 },
+      (_value, index) => thread(`child-rotating-projection-${index + 1}`, "notLoaded"),
+    );
+    const rotatingProjectionStore = createHistoricalStore();
+    const rotatingProjectionClient = createTurnsClient({
+      statuses: new Map(rotatingProjectionThreads.map(({ id }, index) => [
+        id,
+        index === 32 ? "completed" : "inProgress",
+      ])),
+    });
+    await new HistoricalSubagentTopology(
+      rotatingProjectionStore,
+      rotatingProjectionClient,
+      rotatingProjectionThreads,
+    ).discover("parent-rotating-projection");
+    const rotatingProjectionProps = {
+      ...projectionProps,
+      parentConversationId: "parent-rotating-projection",
+      sourceLinkedThreads: rotatingProjectionThreads,
+    };
+    globalThis.__codeyTestProjectedAgents = rotatingProjectionThreads.map(({ id }) => ({
+      conversationId: id,
+      status: "active",
+    }));
+    projectHistoricalAgents(rotatingProjectionProps);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const stats =
+        globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__.snapshot();
+      if (
+        stats.requests === 32
+        && stats.activeRequests === 0
+        && stats.queuedRequests === 0
+      ) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(rotatingProjectionClient.requests.length, 32);
+    assert.equal(
+      rotatingProjectionClient.requests.some(({ params }) =>
+        params.threadId === "child-rotating-projection-33"
+      ),
+      false,
+    );
+    projectHistoricalAgents(rotatingProjectionProps);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const stats =
+        globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__.snapshot();
+      if (stats.corrected === 1) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(
+      rotatingProjectionClient.requests.filter(({ params }) =>
+        params.threadId === "child-rotating-projection-33"
+      ).length,
+      1,
+    );
+    assert.equal(
+      projectHistoricalAgents(rotatingProjectionProps).at(-1).status,
+      "done",
+      "the projection cursor must reach a stale row after 32 cooldown entries",
+    );
+    delete globalThis.__codeyTestProjectedAgents;
+
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__;
+    const supersededRow = thread("child-projection-superseded", "notLoaded");
+    const supersededStore = createHistoricalStore();
+    let resolveSupersededRequest;
+    const supersededClient = {
+      requests: [],
+      sendRequest(method, params, options) {
+        this.requests.push({ method, params, options });
+        return new Promise((resolve) => {
+          resolveSupersededRequest = resolve;
+        });
+      },
+    };
+    const supersededTopology = new HistoricalSubagentTopology(
+      supersededStore,
+      supersededClient,
+      [supersededRow],
+    );
+    await supersededTopology.discover("parent-projection-superseded");
+    let supersededSourceThreads = [supersededRow];
+    const supersededProjectionProps = {
+      ...projectionProps,
+      parentConversationId: "parent-projection-superseded",
+      sourceLinkedThreads: supersededSourceThreads,
+    };
+    globalThis.__codeyTestProjectedAgents = [{
+      conversationId: supersededRow.id,
+      status: "active",
+    }];
+    projectHistoricalAgents(supersededProjectionProps);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(typeof resolveSupersededRequest, "function");
+    const replacementRow = { ...supersededRow, updatedAt: 3 };
+    supersededSourceThreads = [replacementRow];
+    supersededTopology.threads = supersededSourceThreads;
+    await supersededTopology.discover("parent-projection-superseded");
+    resolveSupersededRequest({ data: [{ status: "completed" }] });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const stats =
+        globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__.snapshot();
+      if (stats.activeRequests === 0) break;
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    assert.equal(supersededStore.recordedStatuses.length, 0);
+    assert.equal(
+      globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__.snapshot()
+        .corrected,
+      0,
+      "a request for a replaced topology row must not publish stale idle evidence",
+    );
+    delete globalThis.__codeyTestProjectedAgents;
+
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__;
     const sharedConcurrency = { inFlight: 0, maxInFlight: 0 };
     const sharedTopologies = ["a", "b"].map((suffix) => {
       const threads = Array.from({ length: 4 }, (_value, index) =>
@@ -636,7 +1016,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       2,
       "all mounted loaders must share the same native request limit",
     );
-    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__;
+    delete globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__;
     assert.equal(
       patchErrors.length,
       2,
@@ -975,15 +1355,20 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       ) {
         assert.match(
           patchedProductionSource,
-          /__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__/,
-          "the production descendant loader should verify stale active rows before reconciliation",
+          /__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__/,
+          "the production descendant loader should verify the final reconciled active rows",
+        );
+        assert.match(
+          patchedProductionSource,
+          /__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__\?\.observe\(/,
+          "the production sidebar projection should expose its exact UI-active legacy rows",
         );
       }
       const currentGateFailures = patchErrors
         .slice(previousErrorCount)
         .map(([message]) => String(message))
         .filter((message) =>
-          /model allowlist|model visibility|model-aware service tier control|model-aware Fast toggle|fast model trigger availability|subagent historical active verification/.test(
+          /model allowlist|model visibility|model-aware service tier control|model-aware Fast toggle|fast model trigger availability|subagent historical active verification|subagent projected active observation/.test(
             message,
           ),
         );

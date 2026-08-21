@@ -702,25 +702,39 @@
       `${coordinationName}.clientCoordination,${hostIdName},${conversationIdName})`,
     ].join("");
   const subagentHistoricalActiveVerifierExpression =
-    (descendantThreadsName) => [
-      `${descendantThreadsName}=await (globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V3__??={`,
-      "version:3,states:new WeakMap,requestQueue:[],activeRequests:0,peakRequests:0,scans:0,inspected:0,candidates:0,requests:0,cacheHits:0,corrected:0,skipped:0,failures:0,",
+    (descendantThreadsName, ancestorThreadIdName) => [
+      `${descendantThreadsName}=await (globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__??={`,
+      "version:5,states:new WeakMap,contexts:new Map,requestQueue:[],activeRequests:0,peakRequests:0,queuePeak:0,scans:0,inspected:0,candidates:0,projectionScans:0,projectionInspected:0,projectionCandidates:0,requests:0,cacheHits:0,corrected:0,skipped:0,failures:0,deferred:0,",
       "terminal(status){return status===`completed`||status===`failed`||status===`interrupted`},",
-      "live(store,id){",
-      "if(store.getThreadRuntimeStatusEvidence?.(id)?.type===`active`)return !0;",
-      "return store.getConversation?.(id)?.turns?.at(-1)?.status===`inProgress`",
-      "},",
+      "loadedActive(store,id){return store.getConversation?.(id)?.turns?.at(-1)?.status===`inProgress`},",
+      "evidence(store,id){return store.getThreadRuntimeStatusEvidence?.(id)??null},",
+      "conversationStatus(store,id){return store.getConversation?.(id)?.threadRuntimeStatus??null},",
+      "state(store){let state=this.states.get(store);if(state==null){state={entries:new Map};this.states.set(store,state)}return state},",
+      "key(id,thread){return String(id)+String.fromCharCode(0)+String(thread?.updatedAt??thread?.createdAt??``)},",
+      "time(value){if(typeof value===`number`)return Number.isFinite(value)?value:0;const numeric=Number(value);if(value!==``&&Number.isFinite(numeric))return numeric;const parsed=Date.parse(value);return Number.isFinite(parsed)?parsed:0},",
       "touch(state,key,value){",
-      "state.entries.delete(key);state.entries.set(key,value);",
-      "if(state.entries.size<=256)return;",
-      "for(const [oldest,entry] of state.entries){",
-      "if(entry.kind===`pending`)continue;",
-      "state.entries.delete(oldest);if(state.entries.size<=256)break",
+      "state.entries.delete(key);",
+      "while(state.entries.size>=256){",
+      "let removed=!1;for(const [oldest,entry] of state.entries){",
+      "if(entry.kind===`pending`)continue;state.entries.delete(oldest);removed=!0;break",
       "}",
+      "if(!removed)return !1",
+      "}",
+      "state.entries.set(key,value);return !0",
       "},",
-      "runLimited(task){return new Promise((resolve,reject)=>{",
-      "this.requestQueue.push({task,resolve,reject});this.pump()",
-      "})},",
+      "register(store,client,parentId,threads){",
+      "if(parentId==null)return;const key=String(parentId),rows=new Map;",
+      "for(const thread of threads){if(thread?.id!=null)rows.set(String(thread.id),thread)}",
+      "let context=this.contexts.get(key);",
+      "if(context==null||context.store!==store||context.client!==client){context={key,store,client,rows,pending:new Map,scheduled:!1,topologyCursor:0,projectionCursor:0}}else context.rows=rows;",
+      "this.contexts.delete(key);this.contexts.set(key,context);",
+      "while(this.contexts.size>8)this.contexts.delete(this.contexts.keys().next().value);return context",
+      "},",
+      "runLimited(task){",
+      "if(this.activeRequests>=2&&this.requestQueue.length>=32){this.deferred+=1;return null}",
+      "const request=new Promise((resolve,reject)=>{this.requestQueue.push({task,resolve,reject})});",
+      "this.queuePeak=Math.max(this.queuePeak,this.requestQueue.length);this.pump();return request",
+      "},",
       "pump(){while(this.activeRequests<2&&this.requestQueue.length>0){",
       "const job=this.requestQueue.shift();this.activeRequests+=1;",
       "this.peakRequests=Math.max(this.peakRequests,this.activeRequests);",
@@ -736,10 +750,12 @@
       "if(existing?.kind===`pending`)return existing.promise;",
       "if(existing?.kind===`cooldown`&&existing.expiresAt>now)return Promise.resolve(!1);",
       "state.entries.delete(key);let pending;",
-      "pending=this.runLimited(async()=>{",
+      "const request=this.runLimited(async()=>{",
       "this.requests+=1;",
       "return client.sendRequest(`thread/turns/list`,{threadId:id,cursor:null,limit:1,sortDirection:`desc`,itemsView:`notLoaded`},{priority:`background`,source:`collab_hydration`})",
-      "}).then(result=>{",
+      "});",
+      "if(request==null)return Promise.resolve(!1);",
+      "pending=request.then(result=>{",
       "const data=result?.response?.data??result?.data;",
       "const status=Array.isArray(data)?data[0]?.status:void 0,isTerminal=this.terminal(status);",
       "if(state.entries.get(key)?.promise===pending){",
@@ -751,29 +767,44 @@
       "if(state.entries.get(key)?.promise===pending)state.entries.delete(key);",
       "return !1",
       "});",
-      "this.touch(state,key,{kind:`pending`,promise:pending});return pending",
+      "if(!this.touch(state,key,{kind:`pending`,promise:pending})){this.deferred+=1;return Promise.resolve(!1)}",
+      "return pending",
       "},",
-      "async verify(store,client,threads){",
+      "applyIdle(store,entry){",
+      "if(this.loadedActive(store,entry.id)){this.skipped+=1;return !1}",
+      "const evidence=this.evidence(store,entry.id);",
+      "if(evidence?.type===`active`&&evidence!==entry.evidence){this.skipped+=1;return !1}",
+      "const conversationStatus=this.conversationStatus(store,entry.id);",
+      "if(conversationStatus?.type===`active`&&conversationStatus!==entry.conversationStatus){this.skipped+=1;return !1}",
+      "try{",
+      "if(conversationStatus?.type===`active`)store.updateConversationState?.(entry.id,conversation=>{",
+      "if(conversation.threadRuntimeStatus?.type===`active`)conversation.threadRuntimeStatus={type:`idle`}",
+      "});",
+      "if(typeof store.recordThreadRuntimeStatusEvidence!==`function`){this.failures+=1;return !1}",
+      "store.recordThreadRuntimeStatusEvidence(entry.id,{type:`idle`})",
+      "}catch{this.failures+=1;return !1}",
+      "if(this.loadedActive(store,entry.id)||this.evidence(store,entry.id)?.type===`active`||this.conversationStatus(store,entry.id)?.type===`active`){this.skipped+=1;return !1}",
+      "this.corrected+=1;return !0",
+      "},",
+      "async verify(store,client,parentId,threads){",
       "if(!Array.isArray(threads)||store==null||typeof client?.sendRequest!==`function`)return threads;",
-      "this.scans+=1;",
-      "let state=this.states.get(store);",
-      "if(state==null){state={entries:new Map};this.states.set(store,state)}",
-      "let inspected=0;const checks=[],queryCandidates=[];",
-      "for(let index=0;index<threads.length&&inspected<32;index+=1){",
-      "const thread=threads[index];if(thread?.status?.type!==`active`)continue;",
-      "inspected+=1;this.inspected+=1;",
+      "this.scans+=1;const context=this.register(store,client,parentId,threads);",
+      "const state=this.state(store);let inspected=0,visited=0;const checks=[],queryCandidates=[],length=threads.length,start=context?.topologyCursor??0,visitLimit=Math.min(length,128);",
+      "for(;visited<visitLimit&&inspected<32;visited+=1){",
+      "const index=(start+visited)%length,thread=threads[index];if(thread?.status?.type!==`active`)continue;",
       "const id=thread?.id;",
-      "if(id==null||this.live(store,id)){this.skipped+=1;continue}",
-      "const key=String(id)+String.fromCharCode(0)+String(thread.updatedAt??thread.createdAt??``);",
-      "const existing=state.entries.get(key);",
+      "if(id==null||this.loadedActive(store,id)){this.skipped+=1;continue}",
+      "const key=this.key(id,thread),existing=state.entries.get(key);",
       "if(existing?.kind===`cooldown`&&existing.expiresAt>Date.now()){this.skipped+=1;continue}",
-      "const entry={id,index,key,thread};",
+      "inspected+=1;this.inspected+=1;",
+      "const entry={id,index,key,thread,evidence:this.evidence(store,id),conversationStatus:this.conversationStatus(store,id)};",
       "if(existing?.kind===`terminal`||existing?.kind===`pending`)checks.push(entry);",
       "else queryCandidates.push(entry)",
       "}",
+      "if(length>0&&context!=null)context.topologyCursor=(start+Math.max(visited,1))%length;",
       "queryCandidates.sort((a,b)=>{",
-      "const left=Number(a.thread.updatedAt??a.thread.createdAt??0),right=Number(b.thread.updatedAt??b.thread.createdAt??0);",
-      "return (Number.isFinite(left)?left:0)-(Number.isFinite(right)?right:0)||a.index-b.index",
+      "const left=this.time(a.thread.updatedAt??a.thread.createdAt),right=this.time(b.thread.updatedAt??b.thread.createdAt);",
+      "return left-right||a.index-b.index",
       "});",
       "for(const entry of queryCandidates.slice(0,8)){this.candidates+=1;checks.push(entry)}",
       "if(checks.length===0)return threads;",
@@ -781,17 +812,55 @@
       "const terminalEntries=await Promise.all(checks.map(async entry=>(await entry.promise)?entry:null));",
       "let next=null;",
       "for(const entry of terminalEntries){",
-      "if(entry==null)continue;",
-      "const current=threads[entry.index];",
-      "if(current!==entry.thread||current?.status?.type!==`active`||this.live(store,entry.id)){",
-      "this.skipped+=1;continue",
-      "}",
-      "next??=threads.slice();next[entry.index]={...current,status:{type:`idle`}};this.corrected+=1",
+      "if(entry==null)continue;const current=threads[entry.index];",
+      "if(current!==entry.thread||current?.status?.type!==`active`){this.skipped+=1;continue}",
+      "if(!this.applyIdle(store,entry))continue;",
+      "next??=threads.slice();next[entry.index]={...current,status:{type:`idle`}}",
       "}",
       "return next??threads",
       "},",
-      "snapshot(){return{version:this.version,scans:this.scans,inspected:this.inspected,candidates:this.candidates,requests:this.requests,cacheHits:this.cacheHits,peakRequests:this.peakRequests,corrected:this.corrected,skipped:this.skipped,failures:this.failures}}",
-      `}).verify(this.params.threadStore,this.params.requestClient,${descendantThreadsName})`,
+      "observe(parentId,sourceThreads,agents){",
+      "if(parentId==null||!Array.isArray(agents))return agents;this.projectionScans+=1;",
+      "const contextKey=String(parentId),context=this.contexts.get(contextKey);if(context==null)return agents;",
+      "this.contexts.delete(contextKey);this.contexts.set(contextKey,context);",
+      "const sourceIds=Array.isArray(sourceThreads)?new Set(sourceThreads.flatMap(thread=>thread?.id==null?[]:[String(thread.id)])):null;",
+      "const state=this.state(context.store),length=agents.length,start=context.projectionCursor%Math.max(length,1),visitLimit=Math.min(length,128);let next=null,inspected=0,visited=0;",
+      "for(;visited<visitLimit&&inspected<32;visited+=1){",
+      "const index=(start+visited)%length,agent=agents[index];if(agent?.status!==`active`)continue;",
+      "const id=agent?.conversationId,row=id==null?null:context.rows.get(String(id));if(sourceIds!=null&&!sourceIds.has(String(id)))continue;",
+      "if(row?.status?.type!==`notLoaded`||row?.historyMode!==`legacy`)continue;",
+      "const key=this.key(id,row),existing=state.entries.get(key);",
+      "if(existing?.kind===`terminal`&&!this.loadedActive(context.store,id)&&this.evidence(context.store,id)?.type!==`active`&&this.conversationStatus(context.store,id)?.type!==`active`){",
+      "inspected+=1;this.projectionInspected+=1;this.cacheHits+=1;this.touch(state,key,existing);next??=agents.slice();next[index]={...agent,status:`done`};continue",
+      "}",
+      "if(existing?.kind===`pending`||existing?.kind===`terminal`||(existing?.kind===`cooldown`&&existing.expiresAt>Date.now())||context.pending.has(key))continue;",
+      "if(context.pending.size>=32){this.deferred+=1;continue}",
+      "inspected+=1;this.projectionInspected+=1;context.pending.set(key,{id,key,thread:row,evidence:this.evidence(context.store,id),conversationStatus:this.conversationStatus(context.store,id)});this.projectionCandidates+=1",
+      "}",
+      "if(length>0)context.projectionCursor=(start+Math.max(visited,1))%length;",
+      "if(context.pending.size>0&&!context.scheduled){",
+      "context.scheduled=!0;(globalThis.queueMicrotask??(callback=>Promise.resolve().then(callback)))(()=>{",
+      "context.scheduled=!1;const entries=Array.from(context.pending.values());context.pending.clear();void this.verifyProjected(context,entries)",
+      "})",
+      "}",
+      "return next??agents",
+      "},",
+      "async verifyProjected(context,entries){",
+      "if(this.contexts.get(context.key)!==context){this.deferred+=entries.length;return}",
+      "const currentEntries=[];for(const entry of entries){",
+      "const current=context.rows.get(String(entry.id));if(current!==entry.thread||current?.status?.type!==`notLoaded`||current?.historyMode!==`legacy`){this.skipped+=1;continue}currentEntries.push(entry)",
+      "}",
+      "const state=this.state(context.store);",
+      "for(const entry of currentEntries)entry.promise=this.check(state,context.client,entry.id,entry.key);",
+      "const terminalEntries=await Promise.all(currentEntries.map(async entry=>(await entry.promise)?entry:null));",
+      "for(const entry of terminalEntries){",
+      "if(entry==null)continue;const current=this.contexts.get(context.key)===context?context.rows.get(String(entry.id)):null;",
+      "if(current!==entry.thread||current?.status?.type!==`notLoaded`||current?.historyMode!==`legacy`){this.skipped+=1;continue}",
+      "this.applyIdle(context.store,entry)",
+      "}",
+      "},",
+      "snapshot(){return{version:this.version,scans:this.scans,inspected:this.inspected,candidates:this.candidates,projectionScans:this.projectionScans,projectionInspected:this.projectionInspected,projectionCandidates:this.projectionCandidates,requests:this.requests,activeRequests:this.activeRequests,queuedRequests:this.requestQueue.length,cacheHits:this.cacheHits,peakRequests:this.peakRequests,queuePeak:this.queuePeak,corrected:this.corrected,skipped:this.skipped,failures:this.failures,deferred:this.deferred,contexts:this.contexts.size}}",
+      `}).verify(this.params.threadStore,this.params.requestClient,${ancestorThreadIdName},${descendantThreadsName})`,
     ].join("");
   const patchCodexRendererAsset = (source) => {
     let patched = source;
@@ -866,33 +935,64 @@
       source.includes("readLatestPaginatedDescendantTurn")
       && source.includes("thread/turns/list")
       && source.includes("getThreadRuntimeStatusEvidence")
+      && source.includes("recordThreadRuntimeStatusEvidence")
       && source.includes("reconcileSubagentDescendantSnapshot")
     ) {
-      // State-DB descendant rows can remain active after their rollout already
-      // contains a terminal turn. Codex currently resolves only notLoaded rows
-      // before it reconciles the list into threadsById and thread summaries. Fix
-      // the row before that native reconcile so the snapshot and every status
-      // source consumed by the sidebar agree. Inspect at most 32 active rows and
-      // read only the latest turn for the 8 oldest candidates. A renderer-wide FIFO
-      // keeps all watchers at two native requests in flight. Terminal results are
-      // cached by thread revision in a bounded WeakMap-backed LRU; non-terminal
-      // results receive only a short, timer-free cooldown. Live runtime evidence
-      // and an already loaded in-progress turn always win.
+      // State-DB descendant rows and cached thread summaries can remain active
+      // after their rollout already contains a terminal turn. Register the final
+      // reconciled topology by parent so the projection gate below can verify the
+      // exact legacy/notLoaded children that Codex later derives as UI-active from
+      // stale parent agent state. The topology path still verifies native active
+      // rows directly. Both paths read only one latest turn, share a global
+      // concurrency limit of two and publish confirmed idle evidence through the
+      // native thread store. Bounded queues, parent contexts and revision caches
+      // prevent repeated history scans or unbounded retention.
       patched = replaceUniqueRendererGate(
         patched,
-        /(let\s+([$A-Z_a-z][$\w]*)\s*=\s*await\s+Promise\.all\(\s*([$A-Z_a-z][$\w]*)\.map\(\s*async\s+([$A-Z_a-z][$\w]*)\s*=>\s*\{[\s\S]{0,1536}?readLatestPaginatedDescendantTurn\(\s*\4\s*\)[\s\S]{0,512}?\}\s*\)\s*\))(\s*,\s*([$A-Z_a-z][$\w]*)\s*=\s*!0\s*;)/g,
+        /([$A-Z_a-z][$\w]*)\.then\(\s*([$A-Z_a-z][$\w]*)\s*=>\s*!([$A-Z_a-z][$\w]*)\s*\|\|\s*!\2\.isComplete\s*\?\s*\2\s*:\s*\{\s*\.\.\.\2\s*,\s*descendantThreads\s*:\s*this\.params\.threadStore\.reconcileSubagentDescendantSnapshot\(\s*([$A-Z_a-z][$\w]*)\s*,\s*\2\.descendantThreads\s*\)\s*\}\s*\)/g,
         (
           _match,
-          nativeDescendantLoad,
-          descendantThreadsName,
-          _listedThreadsName,
-          _threadName,
-          nativeCompletenessFlag,
-        ) =>
-          `${nativeDescendantLoad}${nativeCompletenessFlag}${subagentHistoricalActiveVerifierExpression(
-            descendantThreadsName,
-          )};`,
+          discoveryPromiseName,
+          snapshotName,
+          reconcileFlagName,
+          ancestorThreadIdName,
+        ) => {
+          const reconciledThreadsName = "__codeyHistoricalDescendants";
+          return [
+            `${discoveryPromiseName}.then(async ${snapshotName}=>{`,
+            `if(!${reconcileFlagName}||!${snapshotName}.isComplete)return ${snapshotName};`,
+            `let ${reconciledThreadsName}=this.params.threadStore.reconcileSubagentDescendantSnapshot(${ancestorThreadIdName},${snapshotName}.descendantThreads);`,
+            `${subagentHistoricalActiveVerifierExpression(
+              reconciledThreadsName,
+              ancestorThreadIdName,
+            )};`,
+            `return{...${snapshotName},descendantThreads:${reconciledThreadsName}}`,
+            "})",
+          ].join("");
+        },
         "subagent historical active verification",
+      );
+    }
+    if (
+      source.includes("cachedConversations")
+      && source.includes("getIndexedSubagentProgress")
+      && source.includes("getThreadRuntimeStatusEvidence")
+      && source.includes("parentConversationId")
+      && source.includes("sourceLinkedThreads")
+      && source.includes("threadSummaries")
+    ) {
+      // The sidebar does not render descendant snapshot status directly. Its
+      // central projection can turn notLoaded/legacy rows back into active agents
+      // from a parent's stale collab state. Observe that already-computed active
+      // set without touching the native store synchronously; bounded verifier
+      // bookkeeping deduplicates a microtask, and native notifications drive the
+      // later rerender after a terminal turn is confirmed.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(function\s+[$A-Z_a-z][$\w]*\(\{cachedConversations:[$A-Z_a-z][$\w]*,[\s\S]{0,512}?parentConversationId:([$A-Z_a-z][$\w]*),\s*sourceLinkedThreads:([$A-Z_a-z][$\w]*),\s*threadSummaries:[$A-Z_a-z][$\w]*\s*=\s*\[\]\}\)\{[\s\S]{0,20000}?\breturn\s+)([$A-Z_a-z][$\w]*)(\})/g,
+        (_match, prefix, parentConversationIdName, sourceLinkedThreadsName, agentsName, suffix) =>
+          `${prefix}(globalThis.__CODEY_SUBAGENT_HISTORICAL_ACTIVE_VERIFIER_V5__?.observe(${parentConversationIdName},${sourceLinkedThreadsName},${agentsName})??${agentsName})${suffix}`,
+        "subagent projected active observation",
       );
     }
     if (
@@ -3131,5 +3231,5 @@
   setImmediate(() => {
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v29";
+  return "codey-startup-patch-installed-v30";
 })()
