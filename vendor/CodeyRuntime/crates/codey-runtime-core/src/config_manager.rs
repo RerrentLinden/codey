@@ -260,9 +260,9 @@ impl ConfigFileSystem for OsConfigFileSystem {
         }
     }
 
-    fn sync_parent(&self, path: &Path) -> io::Result<()> {
+    fn sync_parent(&self, _path: &Path) -> io::Result<()> {
         #[cfg(unix)]
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = _path.parent() {
             File::open(parent)?.sync_all()?;
         }
         Ok(())
