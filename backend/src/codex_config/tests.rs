@@ -4,6 +4,10 @@ use crate::codex_config_guidance::{
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5, PREVIOUS_SUBAGENT_GUIDANCE_V2,
     codey_fastctx_guidance_for_namespace, remove_codey_fastctx_guidance,
 };
+use crate::config::{
+    SUBAGENT_ROLE_DEEP_RESEARCH, SUBAGENT_ROLE_QUICK_SCAN, SUBAGENT_ROLE_VISUAL_WORKER,
+    SUBAGENT_ROLE_WORKER,
+};
 
 const GLOBAL_PROVIDER_ID: &str = "codey_global";
 
@@ -50,6 +54,97 @@ fn runtime_config_lock_serializes_codey_writers() {
 }
 
 #[test]
+fn runtime_config_lock_has_a_bounded_wait() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("codex-lease.json");
+    let _first = RuntimeConfigLock::acquire(&marker).unwrap();
+    let started = std::time::Instant::now();
+
+    let error =
+        RuntimeConfigLock::acquire_with_timeout(&marker, std::time::Duration::from_millis(40))
+            .err()
+            .unwrap();
+
+    assert!(format!("{error:#}").contains("超过 40 毫秒"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn failed_initial_lease_never_publishes_runtime_policy() {
+    for isolated in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey/codex-lease.json");
+        let backup_root = temp.path().join("codey/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        // A directory at the marker path deterministically makes the lease's
+        // final atomic rename fail after all startup input preparation.
+        fs::create_dir_all(&marker).unwrap();
+        let original_config = b"model_provider = \"codey_global\"\n";
+        fs::write(home.join("config.toml"), original_config).unwrap();
+        let profile = direct_profile(RelayProtocol::Responses);
+
+        let result = if isolated {
+            apply_isolated_cc_switch_runtime_config(
+                &home,
+                &profile,
+                GLOBAL_PROVIDER_ID,
+                None,
+                true,
+                DEFAULT_SUBAGENT_MODEL,
+                DEFAULT_SUBAGENT_REASONING_EFFORT,
+                None,
+                None,
+                Some(original_config),
+                &marker,
+                &backup_root,
+            )
+            .map(|_| ())
+        } else {
+            apply_runtime_provider_config_at_mode(
+                &home,
+                &profile,
+                GLOBAL_PROVIDER_ID,
+                ProviderApplyOptions {
+                    subagent_optimization: true,
+                    ..ProviderApplyOptions::for_test(&marker, &backup_root)
+                },
+            )
+            .map(|_| ())
+        };
+
+        assert!(result.is_err());
+        let (policy_path, pending_path) =
+            crate::subagent_gate::runtime_subagent_policy_paths(&home);
+        assert!(!policy_path.exists());
+        assert!(!pending_path.exists());
+        assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
+    }
+}
+
+#[test]
+fn discarding_a_cancelled_startup_clears_active_and_pending_runtime_policy() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey/codex-lease.json");
+    let backup_dir = temp.path().join("codey/codex-backups/current");
+    fs::create_dir_all(&backup_dir).unwrap();
+    fs::write(&marker, b"lease").unwrap();
+    let roles = crate::config::uniform_subagent_roles("provider-model", "high");
+    let hashes = BTreeMap::from([("default".to_string(), "digest".to_string())]);
+    crate::subagent_gate::write_runtime_subagent_policy(&home, &roles, &hashes).unwrap();
+    crate::subagent_gate::begin_runtime_subagent_policy_update(&home, &roles, &hashes).unwrap();
+
+    discard_runtime_lease(&home, &marker, &backup_dir).unwrap();
+
+    let (policy_path, pending_path) = crate::subagent_gate::runtime_subagent_policy_paths(&home);
+    assert!(!policy_path.exists());
+    assert!(!pending_path.exists());
+    assert!(!marker.exists());
+    assert!(!backup_dir.exists());
+}
+
+#[test]
 fn default_agent_source_exactly_migrates_to_read_only() {
     let temp = tempfile::tempdir().unwrap();
     let constraints_dir = temp.path().join("codex-constraints");
@@ -78,13 +173,14 @@ fn default_agent_source_exactly_migrates_to_read_only() {
 #[test]
 fn failed_lease_marker_removal_keeps_the_recovery_backup() {
     let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
     let marker = temp.path().join("codex-lease.json");
     let backup_dir = temp.path().join("codex-backups/active");
     fs::create_dir_all(&marker).unwrap();
     fs::create_dir_all(&backup_dir).unwrap();
     fs::write(backup_dir.join("config.toml"), b"recoverable").unwrap();
 
-    let error = discard_runtime_lease(&marker, &backup_dir)
+    let error = discard_runtime_lease(&home, &marker, &backup_dir)
         .unwrap_err()
         .to_string();
 
@@ -166,6 +262,9 @@ fn write_legacy_runtime_lease(
             subagent_model: String::new(),
             subagent_reasoning_effort: String::new(),
             subagent_roles: BTreeMap::new(),
+            runtime_home: PathBuf::new(),
+            runtime_agent_schema_version: 0,
+            runtime_agent_hashes: BTreeMap::new(),
             original_agents_md_exists: false,
             original_default_agent_exists: false,
             original_agents_dir_exists: false,
@@ -181,9 +280,9 @@ fn write_legacy_runtime_lease(
 }
 
 #[test]
-fn official_patch_uses_the_official_endpoint_without_a_custom_catalog() {
+fn official_patch_uses_the_official_endpoint_and_preserves_a_user_catalog() {
     let result = patch_config(
-        "model = \"gpt\"\nmodel_catalog_json = \"old.json\"\n",
+        "model = \"gpt\"\nmodel_catalog_json = \"/Users/a1-6/.codex/custom-models.json\"\n",
         &official_profile(),
         GLOBAL_PROVIDER_ID,
         true,
@@ -191,7 +290,10 @@ fn official_patch_uses_the_official_endpoint_without_a_custom_catalog() {
     .unwrap();
     assert!(result.contains("base_url = \"https://chatgpt.com/backend-api/codex\""));
     assert!(!result.contains("experimental_bearer_token"));
-    assert_eq!(root_key_string(&result, "model_catalog_json"), None);
+    assert_eq!(
+        root_key_string(&result, "model_catalog_json").as_deref(),
+        Some("/Users/a1-6/.codex/custom-models.json")
+    );
     assert_eq!(root_key_string(&result, "model"), None);
     assert_eq!(
         root_key_string(&result, "service_tier").as_deref(),
@@ -327,7 +429,7 @@ fn direct_patch_configures_a_responses_provider_without_a_loopback_endpoint() {
 }
 
 #[test]
-fn direct_patch_installs_the_codey_model_catalog_when_requested() {
+fn direct_patch_preserves_a_user_model_catalog_when_codey_catalog_is_requested() {
     let result = patch_config(
         "model_catalog_json = \"old.json\"\n",
         &direct_profile(RelayProtocol::Responses),
@@ -338,7 +440,57 @@ fn direct_patch_installs_the_codey_model_catalog_when_requested() {
 
     assert_eq!(
         root_key_string(&result, "model_catalog_json").as_deref(),
+        Some("old.json")
+    );
+}
+
+#[test]
+fn direct_patch_installs_the_codey_model_catalog_when_none_is_configured() {
+    let result = patch_config(
+        "model = \"third-party\"\n",
+        &direct_profile(RelayProtocol::Responses),
+        "relay",
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(
+        root_key_string(&result, "model_catalog_json").as_deref(),
         Some("model-catalogs/codey-official.json")
+    );
+}
+
+#[test]
+fn cc_switch_provider_patch_preserves_unowned_provider_fields() {
+    let mut profile = direct_profile(RelayProtocol::Responses);
+    profile.cc_switch_provider_id = Some("relay".to_string());
+    let result = patch_config(
+        r#"model_provider = "relay"
+
+[model_providers.relay]
+name = "Existing"
+base_url = "https://old.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+request_max_retries = 9
+
+[model_providers.relay.http_headers]
+X-Route = "keep"
+"#,
+        &profile,
+        "relay",
+        false,
+    )
+    .unwrap();
+    let document = result.parse::<DocumentMut>().unwrap();
+    let provider = document["model_providers"]["relay"].as_table().unwrap();
+
+    assert_eq!(provider["request_max_retries"].as_integer(), Some(9));
+    assert_eq!(provider["http_headers"]["X-Route"].as_str(), Some("keep"));
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+    assert_eq!(
+        provider["base_url"].as_str(),
+        Some("https://relay.example/v1")
     );
 }
 
@@ -2582,11 +2734,210 @@ fn runtime_subagent_roles_refresh_in_place_for_the_next_spawn() {
 
     let error = refresh_runtime_subagent_roles_at(&invalid, &marker).unwrap_err();
 
-    assert!(format!("{error:#}").contains("已恢复原配置"));
+    assert!(format!("{error:#}").contains("未写入运行时配置"));
     assert_eq!(fs::read(&marker).unwrap(), original_lease);
     for (path, contents) in original_runtime_files {
         assert_eq!(fs::read(path).unwrap(), contents);
     }
+}
+
+#[test]
+fn runtime_subagent_reconcile_repairs_arbitrary_stale_model_mappings() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey/codex-lease.json");
+    let backup_root = temp.path().join("codey/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "model_provider = \"codey_global\"\n",
+    )
+    .unwrap();
+    apply_runtime_provider_config_at_mode(
+        &home,
+        &direct_profile(RelayProtocol::Responses),
+        GLOBAL_PROVIDER_ID,
+        ProviderApplyOptions {
+            subagent_optimization: true,
+            ..ProviderApplyOptions::for_test(&marker, &backup_root)
+        },
+    )
+    .unwrap();
+
+    let mut config = CodeyConfig {
+        subagent_optimization: true,
+        ..CodeyConfig::default()
+    };
+    config
+        .subagent_roles
+        .get_mut(SUBAGENT_ROLE_QUICK_SCAN)
+        .unwrap()
+        .model = "gpt-5.6-luna".into();
+    config
+        .subagent_roles
+        .get_mut(SUBAGENT_ROLE_DEEP_RESEARCH)
+        .unwrap()
+        .model = "gpt-5.6-luna".into();
+    config
+        .subagent_roles
+        .get_mut(SUBAGENT_ROLE_WORKER)
+        .unwrap()
+        .reasoning_effort = "max".into();
+    config
+        .subagent_roles
+        .get_mut(SUBAGENT_ROLE_VISUAL_WORKER)
+        .unwrap()
+        .reasoning_effort = "max".into();
+    config = config.normalize();
+    refresh_runtime_subagent_roles_at(&config, &marker).unwrap();
+
+    let temporary_config_before = fs::read(home.join("config.toml")).unwrap();
+    fs::create_dir_all(home.join("agents")).unwrap();
+    let user_agent_path = home.join("agents/default.toml");
+    fs::write(
+        &user_agent_path,
+        "model = \"user-owned-model\"\ndeveloper_instructions = \"keep me\"\n",
+    )
+    .unwrap();
+    let user_agent_before = fs::read(&user_agent_path).unwrap();
+
+    let constraints_dir = marker.parent().unwrap().join(CODEY_CONSTRAINTS_DIR);
+    let stale_model = "provider-obsolete-alias-v9";
+    for role in SUBAGENT_ROLE_IDS {
+        let path = runtime_agent_path(&constraints_dir, role);
+        let mut document = fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        document["model"] = value(stale_model);
+        fs::write(path, document.to_string()).unwrap();
+    }
+    let mut stale_lease =
+        serde_json::from_slice::<RuntimeConfigLease>(&fs::read(&marker).unwrap()).unwrap();
+    stale_lease.subagent_model = stale_model.into();
+    stale_lease.subagent_roles = crate::config::uniform_subagent_roles(stale_model, "low");
+    write_lease(&marker, &stale_lease).unwrap();
+
+    assert!(
+        reconcile_runtime_subagent_roles_at(&config, &marker)
+            .unwrap()
+            .repaired
+    );
+
+    for role in SUBAGENT_ROLE_IDS {
+        let path = runtime_agent_path(&constraints_dir, role);
+        let contents = fs::read_to_string(path).unwrap();
+        let document = contents.parse::<DocumentMut>().unwrap();
+        let expected = &config.subagent_roles[role];
+        assert_eq!(document["name"].as_str(), Some(role));
+        assert_eq!(document["model"].as_str(), Some(expected.model.as_str()));
+        assert_eq!(
+            document["model_reasoning_effort"].as_str(),
+            Some(expected.reasoning_effort.as_str())
+        );
+        assert!(!contents.contains(stale_model));
+    }
+    let repaired_lease =
+        serde_json::from_slice::<RuntimeConfigLease>(&fs::read(&marker).unwrap()).unwrap();
+    assert_eq!(repaired_lease.subagent_model, config.subagent_model);
+    assert_eq!(
+        repaired_lease.subagent_reasoning_effort,
+        config.subagent_reasoning_effort
+    );
+    assert_eq!(repaired_lease.subagent_roles, config.subagent_roles);
+    assert_eq!(
+        fs::read(home.join("config.toml")).unwrap(),
+        temporary_config_before
+    );
+    assert_eq!(fs::read(&user_agent_path).unwrap(), user_agent_before);
+
+    let repaired_files = SUBAGENT_ROLE_IDS
+        .into_iter()
+        .map(|role| fs::read(runtime_agent_path(&constraints_dir, role)).unwrap())
+        .collect::<Vec<_>>();
+    let repaired_lease_bytes = fs::read(&marker).unwrap();
+    assert!(
+        !reconcile_runtime_subagent_roles_at(&config, &marker)
+            .unwrap()
+            .repaired
+    );
+    assert_eq!(fs::read(&marker).unwrap(), repaired_lease_bytes);
+    for (role, expected) in SUBAGENT_ROLE_IDS.into_iter().zip(repaired_files) {
+        assert_eq!(
+            fs::read(runtime_agent_path(&constraints_dir, role)).unwrap(),
+            expected
+        );
+    }
+
+    // Full-document validation must catch drift outside the three routing
+    // fields that older implementations inspected.
+    let quick_path = runtime_agent_path(&constraints_dir, SUBAGENT_ROLE_QUICK_SCAN);
+    let expected_quick = fs::read(&quick_path).unwrap();
+    let mut drifted = String::from_utf8(expected_quick.clone())
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    drifted["sandbox_mode"] = value("workspace-write");
+    fs::write(&quick_path, drifted.to_string()).unwrap();
+    let report = reconcile_runtime_subagent_roles_at(&config, &marker).unwrap();
+    assert!(report.repaired);
+    assert!(
+        report
+            .reasons
+            .contains(&RuntimeSubagentRepairReason::GeneratedRoleFiles)
+    );
+    assert_eq!(fs::read(&quick_path).unwrap(), expected_quick);
+
+    // Missing and non-UTF-8 generated files are both repairable drift, not a
+    // reason to mutate the editable source file or user Codex configuration.
+    fs::write(&quick_path, [0xff, 0xfe, 0xfd]).unwrap();
+    assert!(
+        reconcile_runtime_subagent_roles_at(&config, &marker)
+            .unwrap()
+            .repaired
+    );
+    assert_eq!(fs::read(&quick_path).unwrap(), expected_quick);
+    fs::remove_file(&quick_path).unwrap();
+    assert!(
+        reconcile_runtime_subagent_roles_at(&config, &marker)
+            .unwrap()
+            .repaired
+    );
+    assert_eq!(fs::read(&quick_path).unwrap(), expected_quick);
+
+    // A crash marker left before the six-file commit forces a deterministic
+    // replay and is removed only after the lease and attestation policy agree.
+    let healthy_lease =
+        serde_json::from_slice::<RuntimeConfigLease>(&fs::read(&marker).unwrap()).unwrap();
+    crate::subagent_gate::begin_runtime_subagent_policy_update(
+        &home,
+        &healthy_lease.subagent_roles,
+        &healthy_lease.runtime_agent_hashes,
+    )
+    .unwrap();
+    let (_, pending_policy) = crate::subagent_gate::runtime_subagent_policy_paths(&home);
+    assert!(pending_policy.exists());
+    let report = reconcile_runtime_subagent_roles_at(&config, &marker).unwrap();
+    assert!(report.repaired);
+    assert!(
+        report
+            .reasons
+            .contains(&RuntimeSubagentRepairReason::RuntimeAttestationPolicy)
+    );
+    assert!(!pending_policy.exists());
+    assert!(
+        crate::subagent_gate::runtime_subagent_policy_matches(
+            &home,
+            &healthy_lease.subagent_roles,
+            &healthy_lease.runtime_agent_hashes,
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        fs::read(home.join("config.toml")).unwrap(),
+        temporary_config_before
+    );
+    assert_eq!(fs::read(&user_agent_path).unwrap(), user_agent_before);
 }
 
 #[test]

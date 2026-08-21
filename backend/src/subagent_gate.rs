@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -18,8 +19,14 @@ pub(crate) const HOOK_TIMEOUT_SECONDS: u64 = 5;
 pub(crate) const SESSION_END_HOOK_TIMEOUT_SECONDS: u64 = 3;
 const MAX_HOOK_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_RENDERED_TOOL_RESULT_CHARS: usize = 8 * 1024;
-const STATE_DIRECTORY: &str = "codey-subagent-gate-v3";
+pub(crate) const STATE_DIRECTORY: &str = "codey-subagent-gate-v3";
 const ACTIVE_MARKER_SCHEMA_VERSION: u32 = 1;
+const RUNTIME_SUBAGENT_POLICY_FILE: &str = "runtime-subagent-policy.json";
+const RUNTIME_SUBAGENT_POLICY_PENDING_FILE: &str = "runtime-subagent-policy.pending.json";
+const RUNTIME_SUBAGENT_POLICY_SCHEMA_VERSION: u32 = 1;
+const RUNTIME_SUBAGENT_ATTESTATION_SCHEMA_VERSION: u32 = 1;
+const RUNTIME_SUBAGENT_ATTESTATION_PREFIX: &str = "runtime-attestation-";
+const MAX_RUNTIME_ATTESTATION_TRANSCRIPT_BYTES: u64 = 2 * 1024 * 1024;
 const LEGACY_RUNTIME_ID: &str = "legacy-runtime";
 const PENDING_INIT_GRACE_MILLIS: u64 = 10 * 60 * 1000;
 const STOP_STALL_GRACE_MILLIS: u64 = 10 * 60 * 1000;
@@ -85,6 +92,38 @@ struct ActiveMarker {
     schema_version: u32,
     runtime_id_hash: String,
     started_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeSubagentPolicy {
+    schema_version: u32,
+    roles: BTreeMap<String, crate::config::SubagentRoleConfig>,
+    runtime_agent_hashes: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeSubagentPolicyUpdate {
+    schema_version: u32,
+    target_policy_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeSubagentAttestation {
+    schema_version: u32,
+    runtime_id_hash: String,
+    agent_id_hash: String,
+    role: String,
+    model: String,
+    reasoning_effort: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ObservedRuntimeSubagentSelection {
+    model: String,
+    reasoning_effort: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -223,6 +262,112 @@ pub(crate) fn hook_commands_for(argument: &str) -> Result<HookCommands> {
             powershell_executable_invocation(&executable)
         ),
     })
+}
+
+pub(crate) fn runtime_subagent_policy_paths(home: &Path) -> (PathBuf, PathBuf) {
+    let state_root = home.join(STATE_DIRECTORY);
+    (
+        state_root.join(RUNTIME_SUBAGENT_POLICY_FILE),
+        state_root.join(RUNTIME_SUBAGENT_POLICY_PENDING_FILE),
+    )
+}
+
+pub(crate) fn runtime_subagent_policy_bytes(
+    roles: &BTreeMap<String, crate::config::SubagentRoleConfig>,
+    runtime_agent_hashes: &BTreeMap<String, String>,
+) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&RuntimeSubagentPolicy {
+        schema_version: RUNTIME_SUBAGENT_POLICY_SCHEMA_VERSION,
+        roles: roles.clone(),
+        runtime_agent_hashes: runtime_agent_hashes.clone(),
+    })
+    .context("序列化 Codey 子代理运行时策略失败")
+}
+
+pub(crate) fn begin_runtime_subagent_policy_update(
+    home: &Path,
+    roles: &BTreeMap<String, crate::config::SubagentRoleConfig>,
+    runtime_agent_hashes: &BTreeMap<String, String>,
+) -> Result<()> {
+    let (_, pending_path) = runtime_subagent_policy_paths(home);
+    let target = runtime_subagent_policy_bytes(roles, runtime_agent_hashes)?;
+    let pending = serde_json::to_vec_pretty(&RuntimeSubagentPolicyUpdate {
+        schema_version: RUNTIME_SUBAGENT_POLICY_SCHEMA_VERSION,
+        target_policy_sha256: crate::fs_util::sha256_hex(&target),
+    })
+    .context("序列化 Codey 子代理运行时更新标记失败")?;
+    crate::fs_util::atomic_write_private_with_parent(&pending_path, &pending).with_context(|| {
+        format!(
+            "写入 Codey 子代理运行时更新标记失败：{}",
+            pending_path.display()
+        )
+    })
+}
+
+pub(crate) fn commit_runtime_subagent_policy(
+    home: &Path,
+    roles: &BTreeMap<String, crate::config::SubagentRoleConfig>,
+    runtime_agent_hashes: &BTreeMap<String, String>,
+) -> Result<()> {
+    let (policy_path, pending_path) = runtime_subagent_policy_paths(home);
+    let policy = runtime_subagent_policy_bytes(roles, runtime_agent_hashes)?;
+    crate::fs_util::atomic_write_private_with_parent(&policy_path, &policy)
+        .with_context(|| format!("写入 Codey 子代理运行时策略失败：{}", policy_path.display()))?;
+    remove_optional_runtime_policy_file(&pending_path)
+}
+
+pub(crate) fn write_runtime_subagent_policy(
+    home: &Path,
+    roles: &BTreeMap<String, crate::config::SubagentRoleConfig>,
+    runtime_agent_hashes: &BTreeMap<String, String>,
+) -> Result<()> {
+    commit_runtime_subagent_policy(home, roles, runtime_agent_hashes)
+}
+
+pub(crate) fn runtime_subagent_policy_matches(
+    home: &Path,
+    roles: &BTreeMap<String, crate::config::SubagentRoleConfig>,
+    runtime_agent_hashes: &BTreeMap<String, String>,
+) -> Result<bool> {
+    let (policy_path, pending_path) = runtime_subagent_policy_paths(home);
+    if read_optional_runtime_policy_file(&pending_path)?.is_some() {
+        return Ok(false);
+    }
+    let Some(actual) = read_optional_runtime_policy_file(&policy_path)? else {
+        return Ok(false);
+    };
+    Ok(actual == runtime_subagent_policy_bytes(roles, runtime_agent_hashes)?)
+}
+
+pub(crate) fn clear_runtime_subagent_policy(home: &Path) -> Result<()> {
+    let (policy_path, pending_path) = runtime_subagent_policy_paths(home);
+    remove_optional_runtime_policy_file(&pending_path)?;
+    remove_optional_runtime_policy_file(&policy_path)
+}
+
+fn read_optional_runtime_policy_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "Codey 子代理运行时策略状态不是可信普通文件：{}",
+        path.display()
+    );
+    fs::read(path)
+        .map(Some)
+        .with_context(|| format!("读取 Codey 子代理运行时策略状态失败：{}", path.display()))
+}
+
+fn remove_optional_runtime_policy_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("清理 Codey 子代理运行时策略状态失败：{}", path.display())),
+    }
 }
 
 pub(crate) fn hook_trust_hash(
@@ -396,6 +541,240 @@ fn handle_hook_for_runtime_at(
     }
 }
 
+fn runtime_subagent_attestation_denial(
+    input: &HookInput,
+    state_root: &Path,
+    runtime_id: &str,
+) -> Result<Option<String>> {
+    let Some(agent_id) = nonempty(input.agent_id.as_deref()) else {
+        return Ok(None);
+    };
+    let role =
+        nonempty(input.agent_type.as_deref()).unwrap_or(crate::config::SUBAGENT_ROLE_DEFAULT);
+    let session_dir = session_state_dir(state_root, &input.session_id);
+    let attestation_path = runtime_subagent_attestation_path(&session_dir, runtime_id, agent_id);
+    if cached_runtime_subagent_attestation_matches(&attestation_path, runtime_id, agent_id, role)? {
+        // A child that was already attested may finish while a later role-policy
+        // update is pending. The new policy applies only to newly spawned work.
+        return Ok(None);
+    }
+
+    let (policy_path, pending_path) = (
+        state_root.join(RUNTIME_SUBAGENT_POLICY_FILE),
+        state_root.join(RUNTIME_SUBAGENT_POLICY_PENDING_FILE),
+    );
+    if read_optional_runtime_policy_file(&pending_path)?.is_some() {
+        return Ok(Some(
+            "CODEY_SUBAGENT_RUNTIME_UPDATE_IN_PROGRESS: 子代理角色策略正在切换；当前 child 尚未完成运行配置证明，已暂停工具调用。请让根代理等待本次设置保存完成后重新派发。"
+                .to_string(),
+        ));
+    }
+    let Some(policy_bytes) = read_optional_runtime_policy_file(&policy_path)? else {
+        // Backward compatibility for runtimes created before attestation policy
+        // files existed. Every new start/save writes the policy and removes this
+        // compatibility branch naturally.
+        return Ok(None);
+    };
+    let policy = match serde_json::from_slice::<RuntimeSubagentPolicy>(&policy_bytes) {
+        Ok(policy) if policy.schema_version == RUNTIME_SUBAGENT_POLICY_SCHEMA_VERSION => policy,
+        Ok(policy) => {
+            return Ok(Some(format!(
+                "CODEY_SUBAGENT_RUNTIME_POLICY_INVALID: 子代理运行时策略版本不受支持（实际 {}，预期 {}）；已拒绝在未验证配置上执行工具。",
+                policy.schema_version, RUNTIME_SUBAGENT_POLICY_SCHEMA_VERSION
+            )));
+        }
+        Err(error) => {
+            return Ok(Some(format!(
+                "CODEY_SUBAGENT_RUNTIME_POLICY_INVALID: 子代理运行时策略无法解析（{error}）；已拒绝在未验证配置上执行工具。"
+            )));
+        }
+    };
+    let Some(expected) = policy.roles.get(role) else {
+        return Ok(Some(format!(
+            "CODEY_SUBAGENT_RUNTIME_POLICY_INVALID: 运行时策略缺少角色 `{role}`；已拒绝未经映射的子代理工具调用。"
+        )));
+    };
+    let expected_model = expected.model.trim();
+    let expected_effort = expected.reasoning_effort.trim().to_ascii_lowercase();
+    let observed = observed_runtime_subagent_selection(
+        state_root,
+        agent_id,
+        nonempty(input.transcript_path.as_deref()),
+        nonempty(input.turn_id.as_deref()),
+    )?;
+    let Some(observed) = observed else {
+        return Ok(Some(format!(
+            "CODEY_SUBAGENT_RUNTIME_UNVERIFIED: 无法从受信任的 child turn_context 证明角色 `{role}` 实际使用的模型和思考深度；已暂停工具调用。"
+        )));
+    };
+    if observed.model != expected_model || observed.reasoning_effort != expected_effort {
+        return Ok(Some(format!(
+            "CODEY_SUBAGENT_RUNTIME_CONFIG_MISMATCH: 角色 `{role}` 预期 `{expected_model}` / `{expected_effort}`，实际 turn_context 为 `{}` / `{}`；已拒绝在错误模型映射上继续执行。",
+            observed.model, observed.reasoning_effort
+        )));
+    }
+
+    let attestation = RuntimeSubagentAttestation {
+        schema_version: RUNTIME_SUBAGENT_ATTESTATION_SCHEMA_VERSION,
+        runtime_id_hash: hash_component(runtime_id),
+        agent_id_hash: hash_component(agent_id),
+        role: role.to_string(),
+        model: observed.model,
+        reasoning_effort: observed.reasoning_effort,
+    };
+    let bytes = serde_json::to_vec(&attestation).context("序列化子代理运行配置证明失败")?;
+    crate::fs_util::atomic_write_private_with_parent(&attestation_path, &bytes)
+        .with_context(|| format!("保存子代理运行配置证明失败：{}", attestation_path.display()))?;
+    Ok(None)
+}
+
+fn cached_runtime_subagent_attestation_matches(
+    path: &Path,
+    runtime_id: &str,
+    agent_id: &str,
+    role: &str,
+) -> Result<bool> {
+    let Some(bytes) = read_optional_runtime_policy_file(path)? else {
+        return Ok(false);
+    };
+    let Ok(attestation) = serde_json::from_slice::<RuntimeSubagentAttestation>(&bytes) else {
+        return Ok(false);
+    };
+    Ok(
+        attestation.schema_version == RUNTIME_SUBAGENT_ATTESTATION_SCHEMA_VERSION
+            && attestation.runtime_id_hash == hash_component(runtime_id)
+            && attestation.agent_id_hash == hash_component(agent_id)
+            && attestation.role == role,
+    )
+}
+
+fn runtime_subagent_attestation_path(
+    session_dir: &Path,
+    runtime_id: &str,
+    agent_id: &str,
+) -> PathBuf {
+    session_dir.join(format!(
+        "{}{RUNTIME_SUBAGENT_ATTESTATION_PREFIX}{}.json",
+        runtime_marker_prefix(runtime_id),
+        hash_component(agent_id)
+    ))
+}
+
+fn observed_runtime_subagent_selection(
+    state_root: &Path,
+    agent_id: &str,
+    transcript_path: Option<&str>,
+    turn_id: Option<&str>,
+) -> Result<Option<ObservedRuntimeSubagentSelection>> {
+    let Some(transcript_path) = transcript_path.map(Path::new) else {
+        return Ok(None);
+    };
+    if !transcript_path.is_absolute()
+        || transcript_path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+    {
+        return Ok(None);
+    }
+    let metadata = match fs::symlink_metadata(transcript_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Ok(None);
+    }
+    let Some(codex_home) = state_root.parent() else {
+        return Ok(None);
+    };
+    let sessions_root = match fs::canonicalize(codex_home.join("sessions")) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let canonical_transcript = match fs::canonicalize(transcript_path) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if !canonical_transcript.starts_with(&sessions_root)
+        || !canonical_transcript
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|name| name.ends_with(&format!("-{agent_id}.jsonl")))
+    {
+        return Ok(None);
+    }
+
+    let mut file = fs::File::open(&canonical_transcript).with_context(|| {
+        format!(
+            "打开子代理 rollout 以验证运行配置失败：{}",
+            canonical_transcript.display()
+        )
+    })?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(MAX_RUNTIME_ATTESTATION_TRANSCRIPT_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut bytes = Vec::with_capacity((length - start).min(usize::MAX as u64) as usize);
+    file.take(MAX_RUNTIME_ATTESTATION_TRANSCRIPT_BYTES)
+        .read_to_end(&mut bytes)?;
+    let records = if start == 0 {
+        bytes.as_slice()
+    } else if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+        &bytes[newline + 1..]
+    } else {
+        &[]
+    };
+
+    let mut observed = None;
+    for line in records.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        if record.get("type").and_then(Value::as_str) != Some("turn_context") {
+            continue;
+        }
+        let Some(payload) = record.get("payload").and_then(Value::as_object) else {
+            continue;
+        };
+        if let Some(turn_id) = turn_id
+            && payload.get("turn_id").and_then(Value::as_str) != Some(turn_id)
+            && payload.get("turnId").and_then(Value::as_str) != Some(turn_id)
+        {
+            continue;
+        }
+        let Some(model) = json_nonempty_string(payload, &["model"]) else {
+            continue;
+        };
+        let Some(reasoning_effort) = json_nonempty_string(
+            payload,
+            &[
+                "effort",
+                "reasoning_effort",
+                "reasoningEffort",
+                "model_reasoning_effort",
+            ],
+        ) else {
+            continue;
+        };
+        observed = Some(ObservedRuntimeSubagentSelection {
+            model,
+            reasoning_effort: reasoning_effort.to_ascii_lowercase(),
+        });
+    }
+    Ok(observed)
+}
+
+fn json_nonempty_string(payload: &Map<String, Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        payload
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
 fn pre_tool_use_output(
     input: &HookInput,
     state_root: &Path,
@@ -407,6 +786,9 @@ fn pre_tool_use_output(
         let Some(tool_name) = input.tool_name.as_deref() else {
             return Ok(json!({}));
         };
+        if let Some(reason) = runtime_subagent_attestation_denial(input, state_root, runtime_id)? {
+            return Ok(pre_tool_reason_denial(reason));
+        }
         if is_batch_decision_tool(tool_name) {
             return Ok(pre_tool_reason_denial(
                 "Codey 批次决策门禁：只有根代理可以提交批次决策。".to_string(),
@@ -2063,6 +2445,117 @@ mod tests {
             agent_transcript_path: None,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn child_tools_require_turn_context_model_attestation_and_cache_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let state_root = home.join(STATE_DIRECTORY);
+        let sessions = home.join("sessions/2026/08/21");
+        fs::create_dir_all(&sessions).unwrap();
+        let roles = crate::config::default_subagent_roles();
+        let hashes = BTreeMap::new();
+        write_runtime_subagent_policy(home, &roles, &hashes).unwrap();
+        let role = crate::config::SUBAGENT_ROLE_QUICK_SCAN;
+        let expected = roles.get(role).unwrap();
+        let session_id = "attestation-parent";
+        let runtime_id = "runtime-attestation";
+        let turn_id = "child-turn-1";
+
+        let write_transcript = |agent_id: &str, model: Option<&str>, effort: Option<&str>| {
+            let path = sessions.join(format!("rollout-probe-{agent_id}.jsonl"));
+            let mut records = vec![json!({
+                "type": "session_meta",
+                "payload": {"id": agent_id, "parent_thread_id": session_id}
+            })];
+            if let (Some(model), Some(effort)) = (model, effort) {
+                records.push(json!({
+                    "type": "turn_context",
+                    "payload": {"turn_id": turn_id, "model": model, "effort": effort}
+                }));
+            }
+            fs::write(
+                &path,
+                records
+                    .into_iter()
+                    .map(|record| format!("{}\n", serde_json::to_string(&record).unwrap()))
+                    .collect::<String>(),
+            )
+            .unwrap();
+            path
+        };
+        let child_input = |agent_id: &str, transcript: &Path| {
+            let mut child = input("PreToolUse", session_id);
+            child.agent_id = Some(agent_id.to_string());
+            child.agent_type = Some(role.to_string());
+            child.turn_id = Some(turn_id.to_string());
+            child.transcript_path = Some(transcript.to_string_lossy().into_owned());
+            child.tool_name = Some("mcp__codey_fastctx__glob".to_string());
+            child
+        };
+
+        let good_agent = "01a01f94-0000-7000-8000-000000000001";
+        let good_transcript = write_transcript(
+            good_agent,
+            Some(expected.model.as_str()),
+            Some(expected.reasoning_effort.as_str()),
+        );
+        let good = child_input(good_agent, &good_transcript);
+        assert_eq!(
+            runtime_subagent_attestation_denial(&good, &state_root, runtime_id).unwrap(),
+            None
+        );
+
+        begin_runtime_subagent_policy_update(home, &roles, &hashes).unwrap();
+        // Already-attested children may finish their existing turn while new
+        // children are fenced until the pending generation is committed.
+        assert_eq!(
+            runtime_subagent_attestation_denial(&good, &state_root, runtime_id).unwrap(),
+            None
+        );
+        let pending_agent = "01a01f94-0000-7000-8000-000000000002";
+        let pending_transcript = write_transcript(
+            pending_agent,
+            Some(expected.model.as_str()),
+            Some(expected.reasoning_effort.as_str()),
+        );
+        let pending = runtime_subagent_attestation_denial(
+            &child_input(pending_agent, &pending_transcript),
+            &state_root,
+            runtime_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(pending.contains("CODEY_SUBAGENT_RUNTIME_UPDATE_IN_PROGRESS"));
+        commit_runtime_subagent_policy(home, &roles, &hashes).unwrap();
+
+        let wrong_agent = "01a01f94-0000-7000-8000-000000000003";
+        let wrong_transcript = write_transcript(
+            wrong_agent,
+            Some("provider-wrong-model"),
+            Some(expected.reasoning_effort.as_str()),
+        );
+        let mismatch = runtime_subagent_attestation_denial(
+            &child_input(wrong_agent, &wrong_transcript),
+            &state_root,
+            runtime_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(mismatch.contains("CODEY_SUBAGENT_RUNTIME_CONFIG_MISMATCH"));
+        assert!(mismatch.contains("provider-wrong-model"));
+
+        let missing_agent = "01a01f94-0000-7000-8000-000000000004";
+        let missing_transcript = write_transcript(missing_agent, None, None);
+        let unverified = runtime_subagent_attestation_denial(
+            &child_input(missing_agent, &missing_transcript),
+            &state_root,
+            runtime_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(unverified.contains("CODEY_SUBAGENT_RUNTIME_UNVERIFIED"));
     }
 
     #[test]

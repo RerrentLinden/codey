@@ -270,7 +270,7 @@ function ModelPickerDialogComponent({
             {busy === "save-models"
               ? <LoaderCircle className="spinner" aria-hidden="true" />
               : <Check aria-hidden="true" />}
-            保存模型支持情况
+            保存模型声明
           </Button>
         </DialogFooter>
       </DialogContent>}

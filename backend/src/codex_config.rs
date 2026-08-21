@@ -2,11 +2,14 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, bail};
+use codey_runtime_core::config_manager::ConfigManager;
 use codey_runtime_core::settings::RelayProtocol;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
@@ -80,6 +83,9 @@ const CODEY_SUBAGENT_SOURCES_DIR: &str = "agents";
 const CODEY_RUNTIME_AGENTS_DIR: &str = "runtime/agents";
 const CODEY_HOOKS_DESCRIPTION: &str = "Codey runtime routing and coordination hooks.";
 const CODEY_RUNTIME_CONFIG_LOCK_FILE: &str = "codex-runtime-config.lock";
+const RUNTIME_CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const RUNTIME_CONFIG_LOCK_RETRY: Duration = Duration::from_millis(10);
+const RUNTIME_AGENT_SCHEMA_VERSION: u32 = 1;
 const CODEY_WSL_ONLY_OVERRIDE_PREFIX: &str = "__CODEY_WSL_ONLY__:";
 const RESERVED_PROVIDER_IDS: [&str; 6] = [
     "amazon-bedrock",
@@ -114,6 +120,12 @@ struct RuntimeConfigLease {
     #[serde(default)]
     subagent_roles: BTreeMap<String, SubagentRoleConfig>,
     #[serde(default)]
+    runtime_home: PathBuf,
+    #[serde(default)]
+    runtime_agent_schema_version: u32,
+    #[serde(default)]
+    runtime_agent_hashes: BTreeMap<String, String>,
+    #[serde(default)]
     original_agents_md_exists: bool,
     #[serde(default)]
     original_default_agent_exists: bool,
@@ -140,6 +152,51 @@ pub fn codex_home() -> &'static Path {
         .as_path()
 }
 
+fn read_codex_config(path: &Path) -> Result<Option<Vec<u8>>> {
+    let snapshot = ConfigManager::new(path).load()?;
+    Ok(snapshot.exists().then(|| snapshot.raw().to_vec()))
+}
+
+fn codex_config_matches(path: &Path, expected: Option<&[u8]>) -> Result<bool> {
+    Ok(read_codex_config(path)?.as_deref() == expected)
+}
+
+fn write_codex_config(
+    path: &Path,
+    expected: Option<&[u8]>,
+    contents: &[u8],
+    reason: &str,
+    caller: &str,
+) -> Result<()> {
+    let contents = str::from_utf8(contents).context("Codex config.toml 不是 UTF-8")?;
+    let manager = ConfigManager::new(path);
+    let snapshot = manager.load()?;
+    anyhow::ensure!(
+        snapshot.exists() == expected.is_some()
+            && expected.is_none_or(|value| snapshot.raw() == value),
+        "Codex config.toml 已被其他写者修改；请 reload 后重试"
+    );
+    manager.replace_text(Some(snapshot.revision()), contents, reason, caller)?;
+    Ok(())
+}
+
+fn remove_codex_config(
+    path: &Path,
+    expected: Option<&[u8]>,
+    reason: &str,
+    caller: &str,
+) -> Result<()> {
+    let manager = ConfigManager::new(path);
+    let snapshot = manager.load()?;
+    anyhow::ensure!(
+        snapshot.exists() == expected.is_some()
+            && expected.is_none_or(|value| snapshot.raw() == value),
+        "Codex config.toml 已被其他写者修改；请 reload 后重试"
+    );
+    manager.remove(Some(snapshot.revision()), reason, caller)?;
+    Ok(())
+}
+
 fn lease_marker_path() -> PathBuf {
     default_config_path().with_file_name("codex-lease.json")
 }
@@ -150,6 +207,10 @@ struct RuntimeConfigLock {
 
 impl RuntimeConfigLock {
     fn acquire(marker: &Path) -> Result<Self> {
+        Self::acquire_with_timeout(marker, RUNTIME_CONFIG_LOCK_TIMEOUT)
+    }
+
+    fn acquire_with_timeout(marker: &Path, timeout: Duration) -> Result<Self> {
         let parent = marker
             .parent()
             .expect("runtime config marker paths must include a file name");
@@ -162,10 +223,28 @@ impl RuntimeConfigLock {
         let file = options.open(&lock_path).with_context(|| {
             format!("打开 Codey Codex 运行时配置锁失败：{}", lock_path.display())
         })?;
-        fs2::FileExt::lock_exclusive(&file).with_context(|| {
-            format!("获取 Codey Codex 运行时配置锁失败：{}", lock_path.display())
-        })?;
-        Ok(Self { file })
+        let started = Instant::now();
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let elapsed = started.elapsed();
+                    if elapsed >= timeout {
+                        bail!(
+                            "等待 Codey Codex 运行时配置锁超过 {} 毫秒：{}",
+                            timeout.as_millis(),
+                            lock_path.display()
+                        );
+                    }
+                    thread::sleep(RUNTIME_CONFIG_LOCK_RETRY.min(timeout.saturating_sub(elapsed)));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("获取 Codey Codex 运行时配置锁失败：{}", lock_path.display())
+                    });
+                }
+            }
+        }
     }
 }
 
@@ -242,6 +321,13 @@ struct RuntimeAgentRegistration {
     role: String,
     description: String,
     config_file: PathBuf,
+    content_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct RuntimeAgentPlan {
+    registration: RuntimeAgentRegistration,
+    contents: Vec<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -422,11 +508,14 @@ fn persist_embedded_config_prompt_migration(
         return Ok(Some(original));
     }
     let migrated = document_string(&document)?;
-    if read_optional(path)?.as_deref() != Some(original.as_slice()) {
-        bail!("Codex config.toml 在 Codey 规则迁移期间发生变化；已取消本次启动");
-    }
-    atomic_write(path, migrated.as_bytes())
-        .context("迁移 Codex config.toml 中的旧版 Codey 规则失败")?;
+    write_codex_config(
+        path,
+        Some(original.as_slice()),
+        migrated.as_bytes(),
+        "remove obsolete Codey-owned prompt fields",
+        "codex_config.persist_embedded_config_prompt_migration",
+    )
+    .context("迁移 Codex config.toml 中的旧版 Codey 规则失败")?;
     Ok(Some(migrated.into_bytes()))
 }
 
@@ -449,7 +538,7 @@ fn apply_isolated_cc_switch_runtime_config(
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let hooks_path = home.join("hooks.json");
-    let original_config = read_optional(&config_path)?;
+    let original_config = read_codex_config(&config_path)?;
     if let Some(expected_config) = expected_config
         && original_config.as_deref() != Some(expected_config)
     {
@@ -494,6 +583,8 @@ fn apply_isolated_cc_switch_runtime_config(
     } else {
         None
     };
+    let runtime_roles =
+        runtime_subagent_roles(subagent_roles, subagent_model, subagent_reasoning_effort);
     let (root_instructions, collaboration_hint, runtime_agents) = if subagent_optimization {
         let root_path = constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE);
         let root_instructions = read_or_create_constraint_file_with_exact_migration(
@@ -506,8 +597,6 @@ fn apply_isolated_cc_switch_runtime_config(
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
             &ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS[1..],
         )?;
-        let runtime_roles =
-            runtime_subagent_roles(subagent_roles, subagent_model, subagent_reasoning_effort);
         let runtime_agents = prepare_runtime_agent_files(
             &constraints_dir,
             &runtime_roles,
@@ -590,6 +679,7 @@ fn apply_isolated_cc_switch_runtime_config(
     if let Some(bytes) = updated_hooks.as_deref() {
         write_private_file(&backup_dir.join(APPLIED_HOOKS_JSON_FILE), bytes)?;
     }
+    let runtime_agent_hashes = runtime_agent_hashes(&runtime_agents);
 
     let state = RuntimeConfigLease {
         backup_dir: backup_dir.clone(),
@@ -601,11 +691,14 @@ fn apply_isolated_cc_switch_runtime_config(
         subagent_optimization_applied: subagent_optimization,
         subagent_model: subagent_model.to_string(),
         subagent_reasoning_effort: subagent_reasoning_effort.to_string(),
-        subagent_roles: runtime_subagent_roles(
-            subagent_roles,
-            subagent_model,
-            subagent_reasoning_effort,
-        ),
+        subagent_roles: runtime_roles,
+        runtime_home: home.to_path_buf(),
+        runtime_agent_schema_version: if subagent_optimization {
+            RUNTIME_AGENT_SCHEMA_VERSION
+        } else {
+            0
+        },
+        runtime_agent_hashes,
         original_agents_md_exists: false,
         original_default_agent_exists: false,
         original_agents_dir_exists: home.join("agents").is_dir(),
@@ -621,11 +714,11 @@ fn apply_isolated_cc_switch_runtime_config(
         return Err(error);
     }
 
-    let inputs_unchanged = optional_file_matches(&config_path, original_config.as_deref())?
+    let inputs_unchanged = codex_config_matches(&config_path, original_config.as_deref())?
         && (!runtime_hooks_enabled
             || optional_file_matches(&hooks_path, original_hooks.as_deref())?);
     if !inputs_unchanged {
-        discard_runtime_lease(marker, &backup_dir).with_context(|| {
+        discard_runtime_lease(home, marker, &backup_dir).with_context(|| {
             "Codex 配置在 Codey 保存隔离约束快照后发生变化；取消启动时清理租约失败，恢复备份已保留"
         })?;
         bail!("Codex 配置在 Codey 保存隔离约束快照后发生变化；已取消本次启动");
@@ -642,6 +735,30 @@ fn apply_isolated_cc_switch_runtime_config(
             }
             Err(rollback_error) => {
                 anyhow::bail!("{write_error:#}；清理隔离运行时租约也失败：{rollback_error:#}");
+            }
+        }
+    }
+
+    let policy_result = if subagent_optimization {
+        crate::subagent_gate::write_runtime_subagent_policy(
+            home,
+            &state.subagent_roles,
+            &state.runtime_agent_hashes,
+        )
+    } else {
+        crate::subagent_gate::clear_runtime_subagent_policy(home)
+    };
+    if let Err(policy_error) = policy_result {
+        match rollback_isolated_runtime_config(home, marker, &state) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(&backup_dir);
+                return Err(policy_error)
+                    .context("提交 Codey 子代理运行时策略失败，已回滚隔离运行配置");
+            }
+            Err(rollback_error) => {
+                anyhow::bail!(
+                    "提交 Codey 子代理运行时策略失败：{policy_error:#}；清理隔离运行配置也失败：{rollback_error:#}"
+                );
             }
         }
     }
@@ -750,7 +867,24 @@ fn prepare_runtime_agent_files(
     roles: &BTreeMap<String, SubagentRoleConfig>,
     fastctx_instructions: Option<&str>,
 ) -> Result<Vec<RuntimeAgentRegistration>> {
-    let mut registrations = Vec::with_capacity(SUBAGENT_ROLE_IDS.len());
+    let plans = plan_runtime_agent_files(constraints_dir, roles, fastctx_instructions)?;
+    let mut registrations = Vec::with_capacity(plans.len());
+    for plan in plans {
+        if let Some(parent) = plan.registration.config_file.parent() {
+            create_private_dir_all(parent)?;
+        }
+        atomic_write(&plan.registration.config_file, &plan.contents)?;
+        registrations.push(plan.registration);
+    }
+    Ok(registrations)
+}
+
+fn plan_runtime_agent_files(
+    constraints_dir: &Path,
+    roles: &BTreeMap<String, SubagentRoleConfig>,
+    fastctx_instructions: Option<&str>,
+) -> Result<Vec<RuntimeAgentPlan>> {
+    let mut plans = Vec::with_capacity(SUBAGENT_ROLE_IDS.len());
     for role in SUBAGENT_ROLE_IDS {
         let selection = roles
             .get(role)
@@ -778,20 +912,20 @@ fn prepare_runtime_agent_files(
             read_or_create_constraint_file(&source_path, default_source)?
         };
         let runtime_path = runtime_agent_path(constraints_dir, role);
-        let description = write_runtime_agent(
-            &source,
-            role,
-            selection,
-            fastctx_instructions,
-            &runtime_path,
-        )?;
-        registrations.push(RuntimeAgentRegistration {
-            role: role.to_string(),
-            description,
-            config_file: runtime_path,
+        let (contents, description) =
+            render_runtime_agent(&source, role, selection, fastctx_instructions)?;
+        let content_sha256 = crate::fs_util::sha256_hex(&contents);
+        plans.push(RuntimeAgentPlan {
+            registration: RuntimeAgentRegistration {
+                role: role.to_string(),
+                description,
+                config_file: runtime_path,
+                content_sha256,
+            },
+            contents,
         });
     }
-    Ok(registrations)
+    Ok(plans)
 }
 
 fn runtime_agent_path(constraints_dir: &Path, role: &str) -> PathBuf {
@@ -804,13 +938,12 @@ fn runtime_agent_path(constraints_dir: &Path, role: &str) -> PathBuf {
     }
 }
 
-fn write_runtime_agent(
+fn render_runtime_agent(
     source: &str,
     role: &str,
     selection: &SubagentRoleConfig,
     fastctx_instructions: Option<&str>,
-    runtime_path: &Path,
-) -> Result<String> {
+) -> Result<(Vec<u8>, String)> {
     let mut document = parse_document(source).context("解析 Codey 子代理约束文件失败")?;
     let model = selection.model.trim();
     anyhow::ensure!(!model.is_empty(), "子代理任务类型 {role} 的模型不能为空");
@@ -843,11 +976,19 @@ fn write_runtime_agent(
     document["model"] = value(model);
     document["model_reasoning_effort"] = value(&reasoning_effort);
     let rendered = document_string(&document)?;
-    if let Some(parent) = runtime_path.parent() {
-        create_private_dir_all(parent)?;
-    }
-    atomic_write(runtime_path, rendered.as_bytes())?;
-    Ok(description)
+    Ok((rendered.into_bytes(), description))
+}
+
+fn runtime_agent_hashes(registrations: &[RuntimeAgentRegistration]) -> BTreeMap<String, String> {
+    registrations
+        .iter()
+        .map(|registration| {
+            (
+                registration.role.clone(),
+                registration.content_sha256.clone(),
+            )
+        })
+        .collect()
 }
 
 fn register_runtime_agents(
@@ -1136,7 +1277,7 @@ fn apply_runtime_provider_config_at_mode(
     let agents_md_path = home.join("AGENTS.md");
     let agents_dir = home.join("agents");
     let default_agent_path = agents_dir.join("default.toml");
-    let original_config_on_disk = read_optional(&config_path)?;
+    let original_config_on_disk = read_codex_config(&config_path)?;
     if let Some(expected_config) = expected_config
         && original_config_on_disk.as_deref() != Some(expected_config)
     {
@@ -1216,7 +1357,9 @@ fn apply_runtime_provider_config_at_mode(
     } else {
         None
     };
-    if subagent_optimization {
+    let runtime_roles =
+        runtime_subagent_roles(subagent_roles, subagent_model, subagent_reasoning_effort);
+    let runtime_agents = if subagent_optimization {
         read_or_create_constraint_file_with_exact_migration(
             &constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE),
             SUBAGENT_GUIDANCE,
@@ -1227,15 +1370,16 @@ fn apply_runtime_provider_config_at_mode(
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
             &ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS[1..],
         )?;
-        let runtime_roles =
-            runtime_subagent_roles(subagent_roles, subagent_model, subagent_reasoning_effort);
         let runtime_agents = prepare_runtime_agent_files(
             &constraints_dir,
             &runtime_roles,
             fastctx_instructions.as_deref(),
         )?;
         register_runtime_agents(&mut updated_document, &runtime_agents)?;
-    }
+        runtime_agents
+    } else {
+        Vec::new()
+    };
     remove_embedded_codey_prompt_sources(&mut updated_document);
     updated = document_string(&updated_document)?;
     let applied_base_url = provider_base_url(&updated, &provider_id);
@@ -1245,6 +1389,7 @@ fn apply_runtime_provider_config_at_mode(
         let _ = fs::remove_dir_all(&backup_dir);
         return Err(error).context("保存 Codey 已应用配置快照失败");
     }
+    let runtime_agent_hashes = runtime_agent_hashes(&runtime_agents);
     let state = RuntimeConfigLease {
         backup_dir: backup_dir.clone(),
         config_snapshot_dir: None,
@@ -1255,11 +1400,14 @@ fn apply_runtime_provider_config_at_mode(
         subagent_optimization_applied: subagent_optimization,
         subagent_model: subagent_model.to_string(),
         subagent_reasoning_effort: subagent_reasoning_effort.to_string(),
-        subagent_roles: runtime_subagent_roles(
-            subagent_roles,
-            subagent_model,
-            subagent_reasoning_effort,
-        ),
+        subagent_roles: runtime_roles,
+        runtime_home: home.to_path_buf(),
+        runtime_agent_schema_version: if subagent_optimization {
+            RUNTIME_AGENT_SCHEMA_VERSION
+        } else {
+            0
+        },
+        runtime_agent_hashes,
         original_agents_md_exists: original_agents_md.is_some(),
         original_default_agent_exists: original_default_agent.is_some(),
         original_agents_dir_exists,
@@ -1275,18 +1423,28 @@ fn apply_runtime_provider_config_at_mode(
         return Err(error);
     }
 
-    let inputs_unchanged = optional_file_matches(&config_path, original_config.as_deref())?
+    let inputs_unchanged = codex_config_matches(&config_path, original_config.as_deref())?
         && (!subagent_optimization
             || (optional_file_matches(&agents_md_path, original_agents_md.as_deref())?
                 && optional_file_matches(&default_agent_path, original_default_agent.as_deref())?));
     if !inputs_unchanged {
-        discard_runtime_lease(marker, &backup_dir).with_context(|| {
+        discard_runtime_lease(home, marker, &backup_dir).with_context(|| {
             "Codex 配置在 Codey 保存运行时快照后发生变化；取消启动时清理租约失败，恢复备份已保留"
         })?;
         bail!("Codex 配置在 Codey 保存运行时快照后发生变化；已取消本次启动");
     }
 
-    let write_result = atomic_write(&config_path, updated.as_bytes());
+    let write_result = write_codex_config(
+        &config_path,
+        original_config.as_deref(),
+        updated.as_bytes(),
+        if preserve_provider_route {
+            "apply route-mode runtime overlay without replacing route data"
+        } else {
+            "apply non-route provider runtime configuration"
+        },
+        "codex_config.apply_runtime_provider_config_at_mode",
+    );
     if let Err(write_error) = write_result {
         match restore_runtime_provider_config_at(home, marker) {
             Ok(_) => {
@@ -1300,6 +1458,30 @@ fn apply_runtime_provider_config_at_mode(
             }
         }
     }
+
+    let policy_result = if subagent_optimization {
+        crate::subagent_gate::write_runtime_subagent_policy(
+            home,
+            &state.subagent_roles,
+            &state.runtime_agent_hashes,
+        )
+    } else {
+        crate::subagent_gate::clear_runtime_subagent_policy(home)
+    };
+    if let Err(policy_error) = policy_result {
+        match restore_runtime_provider_config_at(home, marker) {
+            Ok(_) => {
+                let _ = fs::remove_dir_all(&backup_dir);
+                return Err(policy_error)
+                    .context("提交 Codey 子代理运行时策略失败，已恢复启动前配置");
+            }
+            Err(rollback_error) => {
+                anyhow::bail!(
+                    "提交 Codey 子代理运行时策略失败：{policy_error:#}；恢复启动前配置也失败：{rollback_error:#}"
+                );
+            }
+        }
+    }
     Ok(backup_dir)
 }
 
@@ -1307,7 +1489,11 @@ fn optional_file_matches(path: &Path, expected: Option<&[u8]>) -> Result<bool> {
     Ok(read_optional(path)?.as_deref() == expected)
 }
 
-fn discard_runtime_lease(marker: &Path, backup_dir: &Path) -> Result<()> {
+fn discard_runtime_lease(home: &Path, marker: &Path, backup_dir: &Path) -> Result<()> {
+    // A cancelled startup must not leave either half of the runtime policy
+    // journal behind. Clear it before dropping the lease so a cleanup failure
+    // preserves the recovery metadata for the next startup.
+    crate::subagent_gate::clear_runtime_subagent_policy(home)?;
     remove_optional(marker)?;
     let _ = fs::remove_dir_all(backup_dir);
     Ok(())
@@ -1319,6 +1505,7 @@ fn rollback_isolated_runtime_config(
     state: &RuntimeConfigLease,
 ) -> Result<()> {
     restore_runtime_hooks_file(home, state)?;
+    crate::subagent_gate::clear_runtime_subagent_policy(home)?;
     remove_optional(marker)
 }
 
@@ -1351,17 +1538,164 @@ fn write_lease(path: &Path, state: &RuntimeConfigLease) -> Result<()> {
     atomic_write(path, &serde_json::to_vec_pretty(state)?)
 }
 
-/// Rebuilds the registered role files used by the active Codex runtime.
-///
-/// Codex keeps each role's `config_file` path in the parent session, but reads
-/// the referenced TOML again for every spawn. Updating those stable files is
-/// therefore sufficient for the next child without reloading the app-server
-/// configuration. The lease and all six files are treated as one recoverable
-/// transaction so a failed save never advertises a partially applied policy.
-pub fn refresh_runtime_subagent_roles(config: &CodeyConfig) -> Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RuntimeSubagentRepairReason {
+    Lease,
+    GeneratedRoleFiles,
+    RuntimeAttestationPolicy,
+}
+
+impl RuntimeSubagentRepairReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Lease => "lease",
+            Self::GeneratedRoleFiles => "generated_role_files",
+            Self::RuntimeAttestationPolicy => "runtime_attestation_policy",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct RuntimeSubagentReconcileReport {
+    pub repaired: bool,
+    pub reasons: Vec<RuntimeSubagentRepairReason>,
+}
+
+/// Verifies the complete Codey-owned generated role documents, their lease
+/// hashes and the child-runtime attestation policy. Any drift is rebuilt from
+/// the current saved role matrix. Editable source constraints and user-owned
+/// Codex files remain outside this repair boundary.
+pub(crate) fn reconcile_runtime_subagent_roles(
+    config: &CodeyConfig,
+) -> Result<RuntimeSubagentReconcileReport> {
     let marker = lease_marker_path();
     let _runtime_config_lock = RuntimeConfigLock::acquire(&marker)?;
-    refresh_runtime_subagent_roles_at(config, &marker)
+    reconcile_runtime_subagent_roles_at(config, &marker)
+}
+
+fn reconcile_runtime_subagent_roles_at(
+    config: &CodeyConfig,
+    marker: &Path,
+) -> Result<RuntimeSubagentReconcileReport> {
+    anyhow::ensure!(
+        config.subagent_optimization,
+        "当前 Codey 配置未启用子代理协作优化"
+    );
+    let state = fs::read(marker)
+        .with_context(|| format!("读取 Codey Codex lease 失败：{}", marker.display()))
+        .and_then(|contents| {
+            serde_json::from_slice::<RuntimeConfigLease>(&contents)
+                .with_context(|| format!("解析 Codey Codex lease 失败：{}", marker.display()))
+        })?;
+    anyhow::ensure!(
+        state.subagent_optimization_applied,
+        "当前 Codex 运行时未注册 Codey 子代理任务类型，需要重启 Codex"
+    );
+
+    let runtime_roles = runtime_subagent_roles(
+        Some(&config.subagent_roles),
+        &config.subagent_model,
+        &config.subagent_reasoning_effort,
+    );
+    let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
+    let fastctx_instructions = runtime_fastctx_instructions(&constraints_dir, &state)?;
+    let plans = plan_runtime_agent_files(
+        &constraints_dir,
+        &runtime_roles,
+        fastctx_instructions.as_deref(),
+    )
+    .context("预检 Codey 子代理运行时配置失败；未写入运行时配置")?;
+    let expected_hashes = runtime_agent_plan_hashes(&plans);
+    let runtime_home = runtime_home_for_lease(&state);
+    let lease_matches = state.subagent_model == config.subagent_model
+        && state.subagent_reasoning_effort == config.subagent_reasoning_effort
+        && state.subagent_roles == runtime_roles
+        && !state.runtime_home.as_os_str().is_empty()
+        && state.runtime_agent_schema_version == RUNTIME_AGENT_SCHEMA_VERSION
+        && state.runtime_agent_hashes == expected_hashes;
+    let generated_files_match = runtime_agent_files_match(&plans)?;
+    let runtime_policy_matches = crate::subagent_gate::runtime_subagent_policy_matches(
+        &runtime_home,
+        &runtime_roles,
+        &expected_hashes,
+    )?;
+    let mut reasons = Vec::new();
+    if !lease_matches {
+        reasons.push(RuntimeSubagentRepairReason::Lease);
+    }
+    if !generated_files_match {
+        reasons.push(RuntimeSubagentRepairReason::GeneratedRoleFiles);
+    }
+    if !runtime_policy_matches {
+        reasons.push(RuntimeSubagentRepairReason::RuntimeAttestationPolicy);
+    }
+    if reasons.is_empty() {
+        return Ok(RuntimeSubagentReconcileReport::default());
+    }
+
+    refresh_runtime_subagent_roles_at(config, marker)?;
+    Ok(RuntimeSubagentReconcileReport {
+        repaired: true,
+        reasons,
+    })
+}
+
+fn runtime_agent_files_match(plans: &[RuntimeAgentPlan]) -> Result<bool> {
+    for plan in plans {
+        let contents = match fs::read(&plan.registration.config_file) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "读取 Codey 子代理运行时文件失败：{}",
+                        plan.registration.config_file.display()
+                    )
+                });
+            }
+        };
+        if contents != plan.contents
+            || crate::fs_util::sha256_hex(&contents) != plan.registration.content_sha256
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn runtime_agent_plan_hashes(plans: &[RuntimeAgentPlan]) -> BTreeMap<String, String> {
+    plans
+        .iter()
+        .map(|plan| {
+            (
+                plan.registration.role.clone(),
+                plan.registration.content_sha256.clone(),
+            )
+        })
+        .collect()
+}
+
+fn runtime_fastctx_instructions(
+    constraints_dir: &Path,
+    state: &RuntimeConfigLease,
+) -> Result<Option<String>> {
+    if state.fastctx_command.is_some() {
+        Ok(Some(read_or_create_constraint_file(
+            &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
+            CODEY_FASTCTX_GUIDANCE,
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn runtime_home_for_lease(state: &RuntimeConfigLease) -> PathBuf {
+    if state.runtime_home.as_os_str().is_empty() {
+        codex_home().to_path_buf()
+    } else {
+        state.runtime_home.clone()
+    }
 }
 
 fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &Path) -> Result<()> {
@@ -1385,29 +1719,53 @@ fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &Path) -> Res
         &config.subagent_model,
         &config.subagent_reasoning_effort,
     );
-    let fastctx_instructions = if state.fastctx_command.is_some() {
-        Some(read_or_create_constraint_file(
-            &constraints_dir.join(CODEY_FASTCTX_INSTRUCTIONS_FILE),
-            CODEY_FASTCTX_GUIDANCE,
-        )?)
-    } else {
-        None
-    };
-    let snapshots = snapshot_runtime_agent_files(&constraints_dir)?;
+    let fastctx_instructions = runtime_fastctx_instructions(&constraints_dir, &state)?;
+    let plans = plan_runtime_agent_files(
+        &constraints_dir,
+        &runtime_roles,
+        fastctx_instructions.as_deref(),
+    )
+    .context("预检 Codey 子代理运行时配置失败；未写入运行时配置")?;
+    let expected_hashes = runtime_agent_plan_hashes(&plans);
+    let runtime_home = runtime_home_for_lease(&state);
+    let mut snapshots = snapshot_runtime_agent_files(&constraints_dir)?;
+    let (runtime_policy_path, runtime_policy_pending_path) =
+        crate::subagent_gate::runtime_subagent_policy_paths(&runtime_home);
+    snapshots.push(RuntimeAgentFileSnapshot {
+        contents: read_optional(&runtime_policy_path)?,
+        path: runtime_policy_path,
+    });
+    snapshots.push(RuntimeAgentFileSnapshot {
+        contents: read_optional(&runtime_policy_pending_path)?,
+        path: runtime_policy_pending_path,
+    });
 
     let update = (|| -> Result<()> {
+        crate::subagent_gate::begin_runtime_subagent_policy_update(
+            &runtime_home,
+            &runtime_roles,
+            &expected_hashes,
+        )?;
         let registrations = prepare_runtime_agent_files(
             &constraints_dir,
             &runtime_roles,
             fastctx_instructions.as_deref(),
         )?;
-        verify_runtime_agent_files(&registrations, &runtime_roles)?;
+        verify_runtime_agent_files(&registrations)?;
         state.subagent_model.clone_from(&config.subagent_model);
         state
             .subagent_reasoning_effort
             .clone_from(&config.subagent_reasoning_effort);
         state.subagent_roles.clone_from(&runtime_roles);
-        write_lease(marker, &state)
+        state.runtime_home.clone_from(&runtime_home);
+        state.runtime_agent_schema_version = RUNTIME_AGENT_SCHEMA_VERSION;
+        state.runtime_agent_hashes.clone_from(&expected_hashes);
+        write_lease(marker, &state)?;
+        crate::subagent_gate::commit_runtime_subagent_policy(
+            &runtime_home,
+            &runtime_roles,
+            &expected_hashes,
+        )
     })();
 
     if let Err(error) = update {
@@ -1434,39 +1792,20 @@ fn snapshot_runtime_agent_files(constraints_dir: &Path) -> Result<Vec<RuntimeAge
         .collect()
 }
 
-fn verify_runtime_agent_files(
-    registrations: &[RuntimeAgentRegistration],
-    roles: &BTreeMap<String, SubagentRoleConfig>,
-) -> Result<()> {
+fn verify_runtime_agent_files(registrations: &[RuntimeAgentRegistration]) -> Result<()> {
     anyhow::ensure!(
         registrations.len() == SUBAGENT_ROLE_IDS.len(),
         "Codey 子代理运行时文件数量不完整"
     );
     for registration in registrations {
-        let expected = roles
-            .get(&registration.role)
-            .with_context(|| format!("缺少 Codey 子代理任务类型配置：{}", registration.role))?;
-        let contents = fs::read_to_string(&registration.config_file).with_context(|| {
+        let contents = fs::read(&registration.config_file).with_context(|| {
             format!(
                 "读取 Codey 子代理运行时文件失败：{}",
                 registration.config_file.display()
             )
         })?;
-        let document = contents.parse::<DocumentMut>().with_context(|| {
-            format!(
-                "验证 Codey 子代理运行时文件失败：{}",
-                registration.config_file.display()
-            )
-        })?;
-        let expected_model = expected.model.trim();
-        let expected_effort = expected.reasoning_effort.trim().to_ascii_lowercase();
         anyhow::ensure!(
-            document.get("name").and_then(Item::as_str) == Some(registration.role.as_str())
-                && document.get("model").and_then(Item::as_str) == Some(expected_model)
-                && document
-                    .get("model_reasoning_effort")
-                    .and_then(Item::as_str)
-                    == Some(expected_effort.as_str()),
+            crate::fs_util::sha256_hex(&contents) == registration.content_sha256,
             "Codey 子代理运行时文件校验不一致：{}",
             registration.role
         );
@@ -1521,18 +1860,15 @@ fn restore_runtime_cc_switch_provider_config_at(home: &Path, marker: &Path) -> R
         return Ok(false);
     };
     let config_path = home.join("config.toml");
-    let current = match fs::read_to_string(&config_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("读取 Codex 配置失败：{}", config_path.display()));
-        }
+    let Some(current_bytes) = read_codex_config(&config_path)? else {
+        return Ok(false);
     };
+    let current = str::from_utf8(&current_bytes)
+        .with_context(|| format!("Codex 配置不是 UTF-8：{}", config_path.display()))?;
     let provider_still_active =
-        root_key_string(&current, "model_provider").as_deref() == Some(provider_id);
+        root_key_string(current, "model_provider").as_deref() == Some(provider_id);
     let proxy_still_applied =
-        provider_base_url(&current, provider_id).as_deref() == Some(applied_base_url);
+        provider_base_url(current, provider_id).as_deref() == Some(applied_base_url);
     if !provider_still_active || !proxy_still_applied {
         return Ok(false);
     }
@@ -1549,11 +1885,17 @@ fn restore_runtime_cc_switch_provider_config_at(home: &Path, marker: &Path) -> R
     };
     let applied = fs::read_to_string(config_snapshot_dir.join(APPLIED_CONFIG_FILE))
         .context("读取 Codey 已应用配置快照失败")?;
-    let restored = restore_owned_model_provider_changes(&original, &applied, &current)?;
-    if restored == current || !optional_file_matches(&config_path, Some(current.as_bytes()))? {
+    let restored = restore_owned_model_provider_changes(&original, &applied, current)?;
+    if restored == current {
         return Ok(false);
     }
-    atomic_write(&config_path, restored.as_bytes())?;
+    write_codex_config(
+        &config_path,
+        Some(&current_bytes),
+        restored.as_bytes(),
+        "restore route endpoint after runtime overlay",
+        "codex_config.restore_runtime_cc_switch_provider_config_at",
+    )?;
     Ok(true)
 }
 
@@ -1569,19 +1911,14 @@ fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool
         return Ok(true);
     }
     let config_path = home.join("config.toml");
-    let current = match fs::read_to_string(&config_path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("读取 Codex 配置失败：{}", config_path.display()));
-        }
-    };
+    let current_bytes = read_codex_config(&config_path)?;
+    let current = str::from_utf8(current_bytes.as_deref().unwrap_or_default())
+        .with_context(|| format!("Codex 配置不是 UTF-8：{}", config_path.display()))?;
     let provider_id = state.provider_id.as_deref().unwrap_or(CODEY_PROVIDER_ID);
     let provider_matches =
-        root_key_string(&current, "model_provider").as_deref() == Some(provider_id);
+        root_key_string(current, "model_provider").as_deref() == Some(provider_id);
     let endpoint_matches = state.applied_base_url.as_deref().is_none_or(|base_url| {
-        provider_base_url(&current, provider_id).as_deref() == Some(base_url)
+        provider_base_url(current, provider_id).as_deref() == Some(base_url)
     });
     let route_still_applied =
         state.preserve_provider_route || (provider_matches && endpoint_matches);
@@ -1605,17 +1942,29 @@ fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool
                 applied_config.display()
             )
         })?;
-        restore_owned_config_changes(&original, &applied, &current)?
+        restore_owned_config_changes(&original, &applied, current)?
     } else {
-        restore_legacy_owned_config_changes(&original, &current, provider_id)?
+        restore_legacy_owned_config_changes(&original, current, provider_id)?
     };
     if !state.original_config_exists && restored.trim().is_empty() {
-        remove_optional(&config_path)?;
+        remove_codex_config(
+            &config_path,
+            current_bytes.as_deref(),
+            "restore missing pre-Codey config state",
+            "codex_config.restore_runtime_provider_config_at",
+        )?;
     } else {
-        atomic_write(&config_path, restored.as_bytes())?;
+        write_codex_config(
+            &config_path,
+            current_bytes.as_deref(),
+            restored.as_bytes(),
+            "three-way restore of Codey-owned runtime fields",
+            "codex_config.restore_runtime_provider_config_at",
+        )?;
     }
     restore_runtime_hooks_file(home, &state)?;
     restore_runtime_subagent_files(home, &state)?;
+    crate::subagent_gate::clear_runtime_subagent_policy(home)?;
     remove_optional(marker)?;
     Ok(route_still_applied)
 }
@@ -1779,7 +2128,7 @@ fn ensure_child_table<'a>(parent: &'a mut Table, key: &str) -> Result<&'a mut Ta
 /// Codex defaults to its built-in `openai` provider when the root key is absent.
 pub fn current_model_provider(home: &Path) -> Result<String> {
     let config_path = home.join("config.toml");
-    let original = read_optional(&config_path)?;
+    let original = read_codex_config(&config_path)?;
     let existing =
         String::from_utf8(original.unwrap_or_default()).context("Codex config.toml 不是 UTF-8")?;
     let doc = parse_document(&existing)?;
@@ -1794,7 +2143,7 @@ pub fn current_model_provider(home: &Path) -> Result<String> {
 
 pub(crate) fn fast_context_tools_status(home: &Path) -> Result<FastContextToolsStatus> {
     let config_path = home.join("config.toml");
-    let original = read_optional(&config_path)?;
+    let original = read_codex_config(&config_path)?;
     let existing =
         String::from_utf8(original.unwrap_or_default()).context("Codex config.toml 不是 UTF-8")?;
     let document = parse_document(&existing)?;
@@ -1910,19 +2259,14 @@ fn patch_config_with_fastctx_mode_and_proxy(
                 );
             }
             ensure_provider_table(&mut doc)?;
-            let existing_local_provider = profile
-                .cc_switch_provider_id
-                .is_none()
-                .then(|| {
-                    doc.get("model_providers")
-                        .and_then(Item::as_table)
-                        .and_then(|providers| providers.get(&provider_id))
-                        .and_then(Item::as_table)
-                        .cloned()
-                })
-                .flatten();
+            let existing_local_provider = doc
+                .get("model_providers")
+                .and_then(Item::as_table)
+                .and_then(|providers| providers.get(&provider_id))
+                .and_then(Item::as_table)
+                .cloned();
             let provider = if profile.cc_switch_read_only {
-                official_provider_table()
+                official_provider_table(existing_local_provider)
             } else {
                 direct_provider_table(profile, existing_local_provider, protocol_proxy_base_url)?
             };
@@ -1931,11 +2275,7 @@ fn patch_config_with_fastctx_mode_and_proxy(
                 .expect("model_providers was initialized")[&provider_id] = Item::Table(provider);
         }
         doc["model_provider"] = value(&provider_id);
-        if let Some(model_catalog_path) = model_catalog_path {
-            doc["model_catalog_json"] = value(model_catalog_path.to_string_lossy().into_owned());
-        } else {
-            doc.as_table_mut().remove("model_catalog_json");
-        }
+        update_model_catalog_reference(&mut doc, config_path, model_catalog_path);
         set_model_selection(&mut doc, default_model);
     }
     enable_desktop_reasoning_efforts(&mut doc)?;
@@ -3134,13 +3474,51 @@ fn ensure_active_provider_uses_responses(doc: &DocumentMut) -> Result<()> {
     }
 }
 
-fn official_provider_table() -> Table {
-    let mut provider = Table::new();
+fn official_provider_table(existing_provider: Option<Table>) -> Table {
+    let mut provider = existing_provider.unwrap_or_default();
     provider["name"] = value(OPENAI_PROVIDER_NAME);
     provider["base_url"] = value(CHATGPT_CODEX_BASE_URL);
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(true);
+    provider.remove("experimental_bearer_token");
     provider
+}
+
+fn update_model_catalog_reference(
+    document: &mut DocumentMut,
+    config_path: &Path,
+    desired_codey_catalog: Option<&Path>,
+) {
+    let existing = document
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let existing_is_codey_owned =
+        existing.is_some_and(|path| is_codey_owned_model_catalog_path(path, config_path));
+    match (desired_codey_catalog, existing) {
+        (Some(path), None) => {
+            document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
+        }
+        (Some(path), Some(_)) if existing_is_codey_owned => {
+            document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
+        }
+        (None, Some(_)) if existing_is_codey_owned => {
+            document.as_table_mut().remove("model_catalog_json");
+        }
+        _ => {}
+    }
+}
+
+fn is_codey_owned_model_catalog_path(path: &str, config_path: &Path) -> bool {
+    let candidate = Path::new(path);
+    let relative = Path::new(crate::model_catalog::relative_path());
+    if candidate == relative {
+        return true;
+    }
+    config_path
+        .parent()
+        .is_some_and(|parent| candidate == parent.join(relative))
 }
 
 fn parse_document(existing: &str) -> Result<DocumentMut> {

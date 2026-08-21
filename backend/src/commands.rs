@@ -79,7 +79,7 @@ use crate::account_usage;
 use crate::cc_switch;
 use crate::cdp;
 use crate::codex_config::{
-    FastContextToolsStatus, codex_home, fast_context_tools_status, refresh_runtime_subagent_roles,
+    FastContextToolsStatus, codex_home, fast_context_tools_status, reconcile_runtime_subagent_roles,
 };
 use crate::config::{
     CodeyConfig, ConfigStore, PromptOptimizationConfig, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
@@ -95,6 +95,7 @@ use crate::launcher::{CodeyRuntime, RuntimeModelConfig, RuntimeSubagentConfig};
 use crate::message_delete::delete_messages_persistently;
 #[cfg(test)]
 use crate::model_catalog;
+use crate::model_id;
 use crate::notifications::NotificationChannelConfig;
 use crate::pending_approval;
 use crate::plugin_marketplace;
@@ -824,7 +825,7 @@ async fn save_codey_config_input(
 struct SavedCodeyConfig {
     config: CodeyConfig,
     restart_required: bool,
-    refresh_subagent_config: bool,
+    reconcile_subagent_config: bool,
     fast_context_tools_status: FastContextToolsStatus,
 }
 
@@ -867,6 +868,7 @@ async fn save_codey_config_locked(
         &fast_context_tools_status,
     );
     config.subagent_optimization = config_input.subagent_optimization;
+    let mut explicitly_configured_subagent_models = Vec::new();
     let default_role_supplied = subagent_roles_present
         && !config_input.subagent_roles.is_empty()
         && config_input
@@ -875,6 +877,16 @@ async fn save_codey_config_locked(
     if subagent_roles_present && !config_input.subagent_roles.is_empty() {
         for (role, selection) in config_input.subagent_roles {
             if SUBAGENT_ROLE_IDS.contains(&role.as_str()) {
+                let selection_changed = config.subagent_roles.get(&role).is_none_or(|previous| {
+                    !model_id::equal(&previous.model, &selection.model)
+                        || !previous
+                            .reasoning_effort
+                            .trim()
+                            .eq_ignore_ascii_case(selection.reasoning_effort.trim())
+                });
+                if selection_changed {
+                    explicitly_configured_subagent_models.push(selection.model.clone());
+                }
                 config.subagent_roles.insert(role, selection);
             }
         }
@@ -885,32 +897,38 @@ async fn save_codey_config_locked(
         let default_role = config
             .subagent_roles
             .entry(SUBAGENT_ROLE_DEFAULT.to_string())
-            .or_insert_with(|| SubagentRoleConfig::new(fallback_model, fallback_effort));
+            .or_insert_with(|| {
+                SubagentRoleConfig::new(fallback_model.clone(), fallback_effort.clone())
+            });
         if subagent_model_present {
             default_role.model = config_input.subagent_model;
         }
         if subagent_reasoning_effort_present {
             default_role.reasoning_effort = config_input.subagent_reasoning_effort;
         }
+        let default_changed = !model_id::equal(&fallback_model, &default_role.model)
+            || !fallback_effort
+                .trim()
+                .eq_ignore_ascii_case(default_role.reasoning_effort.trim());
+        if default_changed {
+            explicitly_configured_subagent_models.push(default_role.model.clone());
+        }
     }
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     config.remember_current_subagent_config();
     let mut config = config.normalize();
+    config.remember_current_provider_official_model_support(explicitly_configured_subagent_models);
     if config.subagent_optimization
         && let Ok(model_state) = current_model_state_async(&config).await
     {
         subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     }
-    // Codex resolves role declarations at startup but reads each registered
-    // config_file again when spawning a child. Rebuild the stable runtime files
-    // only when an already-enabled policy changed; enabling or disabling the
-    // feature itself still requires a restart to register/unregister tools and
-    // hooks.
-    let refresh_subagent_config = previous.subagent_optimization
-        && config.subagent_optimization
-        && RuntimeSubagentConfig::from_config(&previous)
-            != RuntimeSubagentConfig::from_config(&config);
+    // Codex reads each registered role config_file again when spawning a child.
+    // Check the Codey-owned runtime files on every save while the policy stays
+    // enabled, even when the in-memory role summary did not change. Enabling or
+    // disabling still requires a restart to register/unregister tools and hooks.
+    let reconcile_subagent_config = should_reconcile_runtime_subagent_config(&previous, &config);
     config.settings_revision = previous.settings_revision.saturating_add(1);
     let restart_required = runtime_config_requires_restart(state, &config).await;
     let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
@@ -953,7 +971,7 @@ async fn save_codey_config_locked(
     Ok(SavedCodeyConfig {
         config,
         restart_required,
-        refresh_subagent_config,
+        reconcile_subagent_config,
         fast_context_tools_status,
     })
 }
@@ -1015,21 +1033,22 @@ async fn finish_codey_config_save(
         runtime.set_crashpad_pending_protection(saved.config.protect_crashpad_pending);
     }
     schedule_crashpad_pending_refresh(state, saved.config.protect_crashpad_pending);
-    let mut subagent_config_hot_reloaded = false;
-    let mut subagent_config_hot_reload_error = None;
-    if saved.refresh_subagent_config
-        && let Some(result) = hot_reload_runtime_subagent_config(state, &saved.config).await
-    {
-        match result {
-            Ok(()) => subagent_config_hot_reloaded = true,
-            Err(error) => subagent_config_hot_reload_error = Some(error),
-        }
-    }
-    let restart_required = if saved.refresh_subagent_config {
-        runtime_config_requires_restart(state, &saved.config).await
+    let subagent_hot_reload = if saved.reconcile_subagent_config {
+        hot_reload_runtime_subagent_config(state, &saved.config).await
     } else {
-        saved.restart_required
+        SubagentHotReloadOutcome::default()
     };
+    let restart_required = subagent_hot_reload.requires_restart()
+        || if saved.reconcile_subagent_config {
+            runtime_config_requires_restart(state, &saved.config).await
+        } else {
+            saved.restart_required
+        };
+    let subagent_config_hot_reloaded = subagent_hot_reload.reloaded();
+    let subagent_config_repaired = subagent_hot_reload.repaired();
+    let subagent_config_health = subagent_hot_reload.health();
+    let subagent_config_repair_reasons = subagent_hot_reload.repair_reasons();
+    let subagent_config_hot_reload_error = subagent_hot_reload.error();
     let cc_switch = cc_switch::status_from_config(&saved.config);
     let model_state = current_model_state_async(&saved.config).await?;
     let public_config = redacted_config(&saved.config);
@@ -1041,7 +1060,10 @@ async fn finish_codey_config_save(
         "fastContextToolsStatus":saved.fast_context_tools_status,
         "restartRequired":restart_required,
         "subagentConfigHotReloaded":subagent_config_hot_reloaded,
-        "subagentConfigHotReloadError":subagent_config_hot_reload_error.clone(),
+        "subagentConfigRepaired":subagent_config_repaired,
+        "subagentConfigHealth":subagent_config_health,
+        "subagentConfigRepairReasons":subagent_config_repair_reasons,
+        "subagentConfigHotReloadError":subagent_config_hot_reload_error,
         // Keep the original response keys for older injected consoles.
         "subagentDefaultsHotReloaded":subagent_config_hot_reloaded,
         "subagentDefaultsHotReloadError":subagent_config_hot_reload_error,
@@ -1119,33 +1141,134 @@ fn subagent_hot_reload_commit_is_current(
         && !has_startup_error
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SubagentHotReloadStatus {
+    #[default]
+    NotApplicable,
+    Unchanged,
+    Applied,
+    Repaired,
+    Superseded,
+    Failed,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct SubagentHotReloadOutcome {
+    status: SubagentHotReloadStatus,
+    error: Option<String>,
+    repair_reasons: Vec<String>,
+}
+
+impl SubagentHotReloadOutcome {
+    fn unchanged() -> Self {
+        Self {
+            status: SubagentHotReloadStatus::Unchanged,
+            ..Self::default()
+        }
+    }
+
+    fn applied(repaired: bool, repair_reasons: Vec<String>) -> Self {
+        Self {
+            status: if repaired {
+                SubagentHotReloadStatus::Repaired
+            } else {
+                SubagentHotReloadStatus::Applied
+            },
+            repair_reasons,
+            ..Self::default()
+        }
+    }
+
+    fn superseded(error: impl Into<String>) -> Self {
+        Self {
+            status: SubagentHotReloadStatus::Superseded,
+            error: Some(error.into()),
+            ..Self::default()
+        }
+    }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self {
+            status: SubagentHotReloadStatus::Failed,
+            error: Some(error.into()),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn reloaded(&self) -> bool {
+        matches!(
+            self.status,
+            SubagentHotReloadStatus::Applied | SubagentHotReloadStatus::Repaired
+        )
+    }
+
+    pub(super) fn repaired(&self) -> bool {
+        self.status == SubagentHotReloadStatus::Repaired
+    }
+
+    pub(super) fn requires_restart(&self) -> bool {
+        self.status == SubagentHotReloadStatus::Failed
+    }
+
+    pub(super) fn health(&self) -> &'static str {
+        match self.status {
+            SubagentHotReloadStatus::NotApplicable => "not_applicable",
+            SubagentHotReloadStatus::Unchanged => "healthy",
+            SubagentHotReloadStatus::Applied => "applied",
+            SubagentHotReloadStatus::Repaired => "repaired",
+            SubagentHotReloadStatus::Superseded => "superseded",
+            SubagentHotReloadStatus::Failed => "restart_required",
+        }
+    }
+
+    pub(super) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub(super) fn repair_reasons(&self) -> &[String] {
+        &self.repair_reasons
+    }
+}
+
+fn should_reconcile_runtime_subagent_config(previous: &CodeyConfig, current: &CodeyConfig) -> bool {
+    previous.subagent_optimization && current.subagent_optimization
+}
+
 pub(super) async fn hot_reload_runtime_subagent_config(
     state: &Arc<AppState>,
     config: &CodeyConfig,
-) -> Option<Result<(), String>> {
-    let runtime = state.runtime.lock().await.clone()?;
-    if !runtime.supports_subagent_config_hot_reload(config) {
-        return None;
-    }
+) -> SubagentHotReloadOutcome {
     let desired_config = RuntimeSubagentConfig::from_config(config);
-    if runtime.applied_subagent_config().await == desired_config {
-        return None;
-    }
-    let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
-    // Runtime role files are small and each individual write is atomic. Hold
-    // the lifecycle lock across the group so stop/restart cannot swap the lease
-    // while it is being committed.
+
+    // All code that needs both locks follows the lifecycle -> config order.
+    // Restart already holds the lifecycle lock while launch may synchronize and
+    // persist provider state, so taking the config lock first here would allow a
+    // save/restart lock inversion. Holding both locks across reconciliation still
+    // prevents an older save from committing role files after a newer config.
     let _runtime_operation = state.runtime_operation.lock().await;
+    let _config_commit_guard = state.config_write_lock.lock().await;
+    let current_config = state.config.read().await.clone();
+    let config_matches = current_config.subagent_optimization
+        && RuntimeSubagentConfig::from_config(&current_config) == desired_config
+        && current_config.fast_context_tools == config.fast_context_tools;
+    if !config_matches {
+        return SubagentHotReloadOutcome::superseded(
+            "Codey 设置在子代理配置热更新前已被更新；已跳过过期配置",
+        );
+    }
+    let Some(runtime) = state.runtime.lock().await.clone() else {
+        return SubagentHotReloadOutcome::default();
+    };
+    if !runtime.supports_subagent_config_hot_reload(&current_config) {
+        return SubagentHotReloadOutcome::default();
+    }
+    let applied_config_changed = runtime.applied_subagent_config().await != desired_config;
+    let runtime_generation = state.runtime_generation.load(Ordering::Acquire);
     let current_runtime = state.runtime.lock().await.clone();
     let same_runtime = current_runtime
         .as_ref()
         .is_some_and(|current| Arc::ptr_eq(current, &runtime));
     let current_generation = state.runtime_generation.load(Ordering::Acquire);
-    let current_config = state.config.read().await;
-    let config_matches = current_config.subagent_optimization
-        && RuntimeSubagentConfig::from_config(&current_config) == desired_config
-        && current_config.fast_context_tools == config.fast_context_tools;
-    drop(current_config);
     let has_startup_error = state.startup_error.read().await.is_some();
     if !subagent_hot_reload_commit_is_current(
         state.is_shutting_down(),
@@ -1156,30 +1279,28 @@ pub(super) async fn hot_reload_runtime_subagent_config(
         config_matches,
         has_startup_error,
     ) {
-        return Some(Err(
-            "Codex 运行时在子代理配置热更新前发生变化；已跳过过期配置".to_string(),
-        ));
+        return SubagentHotReloadOutcome::superseded(
+            "Codex 运行时在子代理配置热更新前发生变化；已跳过过期配置",
+        );
     }
 
-    let runtime_config = config.clone();
+    let runtime_config = current_config.clone();
     let result = tokio::task::spawn_blocking(move || {
-        refresh_runtime_subagent_roles(&runtime_config).map_err(|error| format!("{error:#}"))
+        reconcile_runtime_subagent_roles(&runtime_config).map_err(|error| format!("{error:#}"))
     })
     .await
     .map_err(|error| format!("子代理运行时文件更新任务异常退出：{error}"))
     .and_then(std::convert::identity);
     match result {
-        Ok(()) => {
+        Ok(report) => {
+            if !report.repaired && !applied_config_changed {
+                return SubagentHotReloadOutcome::unchanged();
+            }
             let current_runtime = state.runtime.lock().await.clone();
             let same_runtime = current_runtime
                 .as_ref()
                 .is_some_and(|current| Arc::ptr_eq(current, &runtime));
             let current_generation = state.runtime_generation.load(Ordering::Acquire);
-            let current_config = state.config.read().await;
-            let config_matches = current_config.subagent_optimization
-                && RuntimeSubagentConfig::from_config(&current_config) == desired_config
-                && current_config.fast_context_tools == config.fast_context_tools;
-            drop(current_config);
             let has_startup_error = state.startup_error.read().await.is_some();
             if !subagent_hot_reload_commit_is_current(
                 state.is_shutting_down(),
@@ -1190,24 +1311,31 @@ pub(super) async fn hot_reload_runtime_subagent_config(
                 config_matches,
                 has_startup_error,
             ) {
-                return Some(Err(
-                    "Codex 运行时在子代理配置热更新期间发生变化；已跳过过期运行时提交".to_string(),
-                ));
+                return SubagentHotReloadOutcome::failed(
+                    "Codex 运行时在子代理配置热更新期间发生变化；需要重启以重新建立可信运行配置",
+                );
             }
-            runtime.mark_subagent_config_applied(config).await;
-            Some(Ok(()))
+            runtime.mark_subagent_config_applied(&current_config).await;
+            SubagentHotReloadOutcome::applied(
+                report.repaired,
+                report
+                    .reasons
+                    .into_iter()
+                    .map(|reason| reason.as_str().to_string())
+                    .collect(),
+            )
         }
         Err(error) => {
             let error = format!("{error:#}");
             error_log::record_failure(
                 "patch_verification_failed",
-                "refresh_subagent_runtime_files",
+                "reconcile_subagent_runtime_files",
                 error.clone(),
                 json!({
                     "roleCount": config.subagent_roles.len(),
                 }),
             );
-            Some(Err(error))
+            SubagentHotReloadOutcome::failed(error)
         }
     }
 }

@@ -15,7 +15,7 @@ Codey 是一个无界面的 Rust 桌面辅助进程，通过 CDP 连接官方 Co
 - 官方线路沿用 ChatGPT 登录；原生 Responses 第三方线路继续把 API 地址和临时 bearer token 直接交给 Codex。OpenAI 兼容的 Chat Completions 线路启动时会生成一份不依赖全局状态的显式配置快照，把 Codex 的 Responses 请求经临时回环代理转换为 Chat Completions 请求，并把普通响应、SSE 文本流、工具调用、用量和错误转换回 Codex 所需格式。代理使用系统分配的临时端口并跟随受控 Codex 进程启停；本地 listener 最多同时保留 64 个连接，请求头与请求体分别限制为 64 KiB 和 32 MiB，请求读取使用 15 秒 idle timeout 与 45 秒总 deadline，长时 SSE 响应本身不施加总时限。上游请求复用同一个带连接池的 HTTP client，并单独施加 5 秒连接超时和普通/流式响应头超时；启动或运行时配置失败会立即回收。原生 Anthropic、Gemini 等非 OpenAI 兼容协议仍不在该适配范围内。携带第三方模型的原生 Responses 线路同样经该代理：代理按请求中的 `model` 逐请求选路，命中模型目录第三方模型集合时转换为 Chat Completions，其余官方模型原样直通上游 `/v1/responses`，因此同一会话内主模型与子代理模型可以使用不同协议；模型目录无第三方模型时不启动代理，保持原生直连。
 - 官方账号线路默认开启浮动额度展示。额度组件以固定定位浮窗挂在 Codex 右下角，默认保留 24px 边距，套餐、周期额度、余额和本地刷新时间纵向展示；拖拽结束后把浮窗 `left/top` 保存在 Codex renderer 的 localStorage 中，并在窗口尺寸变化时约束回可视范围。轻量 renderer 每 60 秒通过 Codey bridge 请求一次额度快照；Rust 后端只在当前 provider 判定为官方且 `showAccountUsageInHeader` 已开启时读取 `auth.json` 的 ChatGPT access token 和 account ID，请求 ChatGPT backend 的 `/wham/usage`，并兼容 `/api/codex/usage` 旧路径。渲染层只接收已归一化的周期、使用比例、重置时间、方案和余额，不接收 OAuth 凭据；第三方线路、关闭开关或请求失败时会自动隐藏组件或保留上一次成功结果并标记为过期。
 - CC Switch 路由接管通过数据库 `proxy_config.enabled`、Codex 的 `proxy_live_backup` 及旧版 `proxy_takeover_codex` 设置识别管理态，并用活动 provider 的 `PROXY_MANAGED` 标记或 `cc-switch-official` 回环地址验证 Live 接管态。Code Switch R 不复用该数据库和标记；Codey 以活动 provider ID `code-switch-r`（兼容旧 ID `code-switch`）加回环地址识别其 Live 路由，因此 `127.0.0.1:18100` 不再被当成普通第三方直连。两类路由都会在 `CurrentProvider.local_route` 中标记，Renderer 将类型和地址标题显示为“本地路由 / 路由入口”。启动时从同一次 `config.toml` / `auth.json` 读取中建立 Live 路由快照，活动 provider 必须存在对应表并带有效 HTTP(S) 地址；第三方线路不得使用 Codex 保留 provider ID。管理态存在但 Live 标记缺失、provider 悬空或地址无效时，Codey 在会话同步和代理启动前停止，提示用户关闭后重新开启路由。有效接管下沿用快照中的 provider、地址、凭据和协议，跳过 Codey 模型目录刷新，并且不再把推理档位、FastCtx、子代理或 Hook 状态写入 `config.toml`：这些 Codey-owned 字段由 Electron 启动补丁作为 app-server 命令级 `-c` 覆盖注入，优先级高于用户层而不污染路由工具管理的文件。可直接编辑的约束源保存在 Codey 配置目录的 `codex-constraints/`：根代理规则为 `root-instructions.md`，FastCtx 规则为 `fastctx-instructions.md`，协作提示为 `collaboration-hint.md`，通用兜底子代理为 `subagent.toml`，另外五类任务的源配置位于 `agents/*.toml`。启动时根据设置页选择覆盖每份源配置的 `model` 与 `model_reasoning_effort`，并生成 `runtime/default-agent.toml` 和 `runtime/agents/*.toml`；源文件可编辑，运行副本不得直接编辑。六类角色分别通过 `agents.<role>.config_file` 引用运行副本，修改约束源或模型选择后需要受控重启 Codex 才会重新合成。旧版未编辑的根规则会按完整默认文本精确迁移，用户自定义内容不会被模糊检索替换。Hook 定义单独合并到稳定路径 `~/.codex/hooks.json`，只追加带 `--codey-subagent-gate-hook` 标记的 group；精确 `hooks.state` 信任哈希作为进程覆盖项注入，退出时按租约恢复或仅移除 Codey group。这样外部路由工具切线可以整份重写 `config.toml` 而不覆盖 Codey 约束。活动地址为已识别的回环路由代理时不会应用数据库中的 Chat 格式提示或启动第二个 Codey 协议代理。路由关闭且直连线路匹配 `openai_chat` 提示时，Codey 才把临时 provider 的 `base_url` 与 `wire_api` 覆盖为自己的 Responses 协议代理，同时保留真实上游地址和凭据用于 Chat Completions 转换；首次 Renderer 与 bridge 就绪后立即按 original/applied/current 三方合并恢复磁盘上的 `model_providers`，租约与代理继续存活，因此 cc-switch 后续切线不会把 Codey 的回环地址保存回旧线路。恢复前会复核活动 provider 与已应用端点，并在原子写前再次做字节 CAS；并发切线时保守跳过，不覆盖外部新配置。Live 接管必须持续保留 watcher，线路语义变化后通过受控重启重建进程覆盖项。
-- 配置页以官方账号可见的 7 个模型为固定左列；每次拉起第三方线路前会在 5 秒上限内请求 `/v1/models` 或 `/models`，非路由模式使用 Codex 当前 provider，CC Switch 有效接管时则绕过回环代理、只读解析其当前源 API 地址和真实凭据。源地址必须是非回环 HTTP(S) 地址，`PROXY_MANAGED` 只能作为接管标记，绝不作为 bearer token 发往源服务；解析失败按普通模型同步失败处理。同步成功后仅向 Codex 展示上游支持的模型，无需再手动同步并重启。请求失败、超时或返回空列表时优先沿用该线路上次保存的模型支持配置，首次使用且尚无保存配置时才回退到固定 7 模型并继续启动。配置页手动同步失败后仍会打开模型弹框，明确提示线路可能不支持模型目录接口；弹框始终列出 7 个官方模型供用户勾选，并允许输入其他模型 ID。其他模型输入会在前后端同时拒绝官方清单中的模型，保存时把官方勾选与其他模型共同写为该线路已确认的支持范围。模型支持范围、上游目录或默认模型保存后，后端会通过当前 renderer 的 CDP 连接把新目录直接传给模型白名单 `setCatalog()`，避免保存请求内部再次调用 bridge 形成重入等待；renderer 同时改写 Statsig 模型配置、触发 `values_updated`、刷新 React Query 的 `models/list` 活跃缓存，并在 app-server 返回旧目录时于消息捕获阶段替换模型描述。模型白名单还会在 `thread/start`、`thread/resume`、`turn/start` 以及宿主的直接和包装 IPC 请求发出前，把缺失或已经不属于当前目录的模型替换为当前默认模型，避免线路切换后继续发送旧 GPT 模型。后端除校验 `snapshot()` 的模型顺序与默认模型外，还要求命中 Statsig 订阅和当前模型查询缓存才把本次保存报告为立即生效；运行时模型基线仅在这些校验成功后更新，因此模型变更可单独清除重启标记，热刷新失败时则保留重启要求。
+- 配置页以官方账号可见的 7 个模型为固定左列；每次拉起第三方线路前会在 5 秒上限内请求 `/v1/models` 或 `/models`，非路由模式使用 Codex 当前 provider，CC Switch 有效接管时则绕过回环代理、只读解析其当前源 API 地址和真实凭据。源地址必须是非回环 HTTP(S) 地址，`PROXY_MANAGED` 只能作为接管标记，绝不作为 bearer token 发往源服务；解析失败按普通模型同步失败处理。同步成功后仅向 Codex 展示上游支持的模型，无需再手动同步并重启。请求失败、超时或返回空列表时优先沿用该线路上次保存的模型配置，首次使用且尚无保存配置时才回退到固定 7 模型并继续启动。配置页手动同步失败后仍会打开模型弹框，明确提示线路可能不支持模型目录接口；弹框始终列出 7 个官方模型供用户勾选，并允许输入其他模型 ID。其他模型输入会在前后端同时拒绝官方清单中的模型，保存时把官方勾选与其他模型写为该线路的用户声明候选范围，不得描述成 provider 已验证支持。模型声明、上游目录或默认模型保存后，后端会通过当前 renderer 的 CDP 连接把新目录直接传给模型白名单 `setCatalog()`，避免保存请求内部再次调用 bridge 形成重入等待；renderer 同时改写 Statsig 模型配置、触发 `values_updated`、刷新 React Query 的 `models/list` 活跃缓存，并在 app-server 返回旧目录时于消息捕获阶段替换模型描述。模型白名单还会在 `thread/start`、`thread/resume`、`turn/start` 以及宿主的直接和包装 IPC 请求发出前，把缺失或已经不属于当前目录的模型替换为当前默认模型，避免线路切换后继续发送旧 GPT 模型。后端除校验 `snapshot()` 的模型顺序与默认模型外，还要求命中 Statsig 订阅和当前模型查询缓存才把本次保存报告为立即生效；运行时模型基线仅在这些校验成功后更新，因此模型变更可单独清除重启标记，热刷新失败时则保留重启要求。
 - 启动前备份 Codex `config.toml`，退出时按 lease marker 原子恢复，`auth.json` 和官方登录状态保持不变。租约同时记录本次 Chat Completions 协议代理地址。应用临时配置时以启动路由快照做 CAS 校验，并在真正拉起 Codex 前再次核对 `config.toml` 与 `auth.json`，防止启动准备期间发生切线。非 Live 的 CC Switch Chat 线路会在首屏注入成功后先恢复磁盘 provider 表，但保留 applied snapshot、marker、FastCtx、模型目录、推理档位和子代理覆盖；停止或异常恢复仍用完整三方合并撤销剩余 Codey-owned 字段。CC Switch 路由模式从租约应用完成后每秒检查一次 Live 配置与认证；watcher 以活动 provider、去尾斜杠后的端点、缺省为 Responses 的 wire API、有效 provider 凭据及认证路由字段组成语义指纹，忽略 TOML 排版、字段顺序、默认字段补写、JSON 排版及 ChatGPT 账号 token 刷新；无法解析时保守回退原始字节比较。语义变化或配置连续两个检查周期缺失后不再把新 provider 指回旧协议代理，而是触发一次受控 Codex 重启；同一语义的新路由即使每次序列化字节不同，也用语义指纹完成稳定性去抖。若新快照仍处于管理态与 Live 文件不一致、文件写入中或启动前再次切线，Codey 不请求自身退出，而是保留 `startupError` 和重启任务、等待连续两个有效快照后再次拉起 Codex；普通启动故障仍沿用原退出策略。停止流程先结束 watcher 和旧 Codex，再关闭旧协议代理并按三方合并恢复最新 CC Switch 基线；新启动重新读取完整路由快照、同步会话并按需建立新协议代理，因此 provider、端点、token 和 wire API 不会跨快照混用。
 - 启动器对 `sessions` 与 `archived_sessions` 的 rollout 采用逐行流式检查；只有确实需要改写 provider 的文件才会载入全文，避免长会话历史在启动时形成多份大字符串并把内存峰值长期留在分配器中。
 - 启动器只读取 rollout 的首个 `session_meta` 头并流式遍历目录，不再为校验构建全量路径列表；头部校验按目录分片到最多 4 条线程并发执行，任一目录发现 provider 不匹配即整体提前结束。Trace 防护、Crashpad 容量收敛、插件维护和宠物状态会在依赖关系允许时并行执行；诊断存储统计只在用户请求时执行。Provider 迁移、陈旧锁恢复、应用目录解析、模型目录读写、所有 Codey 配置落盘、运行时 TOML 应用以及启动前、失败回滚和停止阶段的配置恢复都通过 blocking worker 执行，避免计划重启、失败清理或保存设置时阻塞仍存活的 async bridge；周期 watcher 写错误日志时使用可等待的 blocking 包装，退出与启动关键路径仍保留同步写入以保证落盘语义。恢复任务仍按原顺序等待完成，不会与进程回收或协议代理关闭并发。启动流程把初始 Renderer 注入、失败清理、watchdog 创建及跨平台进程停止收敛为独立 helper，保持原有失败恢复和 watcher 关闭顺序。配置写锁继续覆盖 CAS 校验、外部副作用、持久化和内存发布，以维持 revision 及磁盘/内存一致性。应用目录解析完成后，启动器先停止并等待旧 Codex 进程退出，再执行 rollout/provider 同步与会话索引清理，避免永久维护和仍在写入的 Codex 竞争；模型目录准备随后在 blocking worker 中执行。官方模型目录在同一次启动内按文件大小和修改时间复用解析结果，不再为 `refresh_for_provider` 和 `selection_state` 各解析一遍。官方 OpenAI 线路只复用该目录计算 Codey 的模型选择状态，不向 Codex 安装 `model_catalog_json`，因此上下文窗口与自动压缩阈值继承 Codex 内置模型元数据；第三方线路仍安装 Codey 目录以支持模型过滤与合成模型。
@@ -30,6 +30,7 @@ Codey 是一个无界面的 Rust 桌面辅助进程，通过 CDP 连接官方 Co
 - 宠物屏蔽脚本不会跨扫描缓存 React fiber 判定：React 可能复用 host element 并独立替换 props/fiber；性能由 bridge 的单个 document-root `MutationObserver`、合并后的 `attributeFilter`、有界根队列和帧调度控制。宠物与完全访问权限提示共用该观察器，最后一个订阅撤销时才断开；宠物脚本还复用 bridge 提供的控件描述归一化、控件子树查询、事件拦截与 teardown 骨架。renderer 启动观察器会在会话工具接管后断开，正式会话工具观察器仍按生命周期接棒，不并入盾牌分发器。完全访问权限提示只扫描新插入的子树并改用 `textContent`，不再每次触发整页按钮遍历和布局刷新。模型白名单的交互重扫按 2 秒节流，未找到 QueryClient 时的完整 React 图发现最多每 10 秒执行一次；目录加载和已加载目录的短时安全重投递都按 120 毫秒起步指数退避，后者上限 1 秒且不会并发执行两次投递，前者上限 2 秒且同一时刻只保留一个刷新计时器；相同目录的后台重推和窗口聚焦重载都会跳过全量失效投递。原生任务 hydration 仍先尝试发现其他窗口的现有 stream owner，但本地协调超过 150 毫秒即继续 `thread/read`/`thread/resume`，不再等待上游固定 5 秒超时。
 - 后台会话状态轮询对每个变更的 rollout 采用可续解析：JSONL 只追加时按已消费字节偏移续读并只解析新增行，因此活跃会话不再每 3 秒重读整份历史；首次读取、重写后的全量回退和增量尾部都通过复用行缓冲区流式消费，不再把整份 rollout 读成一个大字符串。缓存只保留一份可续解析 state；文件变化时直接接管旧 state 的所有权，最终聚合时才生成调用方需要的拥有型结果。无 rollout 变化且没有待确认调用时，缓存与 watcher 通过同一个只读 `Arc` 复用上一轮聚合快照；存在待确认时只重建持续时间会变化的 pending 列表，started/aborted/completed 事件、session 状态与 turn 配置继续按各自 `Arc` 复用，不再每轮深复制 5 个 `Vec` 和 1 个 `HashMap`。每个 rollout 只保留最近 256 个终态 turn 及最多 512 份 turn 配置，终态到达时同步清除该 turn 的待确认调用；通知 tracker 的终态去重集合上限与 64 个最近会话的缓存总容量一致，避免长会话轮询导致 Codey 常驻内存与每轮复制成本持续增长。已消费前缀的头尾各 64 字节使用固定内联缓冲区保存并在续读前校验，校验读取不再临时分配 `Vec`；Codey 自身重写 rollout（删除对话轮、归一 provider）或文件被截断时自动回退为全量解析。只读 SQLite 连接会在数据库文件未变化时跨轮询复用，避免稳定空闲期反复打开同一状态库。会话标题缓存的同步锁与 SQLite 工作整体位于 blocking worker 内，async future 不再持锁跨 `await`，同一个 cache 仍按顺序独占复用。活跃任务保持 3 秒检测，稳定空闲时按 3/6/12/30 秒退避，窗口恢复或用户交互会立即唤醒。
 - 上游模型目录请求在请求级设置 12 秒总时限，并在读取 chunk 时强制执行 8 MiB 响应上限；解析结果最多接受 10000 个唯一模型，每个模型 ID 最多 512 个 UTF-8 字节。启动同步外层的 5 秒预算继续覆盖源配置解析和整个请求；配置页的交互同步不再使用短于双端点回退路径的前端伪超时，同一进程内由专用同步锁串行，避免超时后后台迟到写入与重试竞态。配置页目录合并使用线性 Set 去重，模型弹窗关闭时不构造内容，打开后支持搜索并按 200 项分批挂载，避免大目录一次创建全部 React 节点。
+- 旧版配置可能把固定官方模型写进 `selectedModelsByProvider` 或 `manualThirdPartyModelsByProvider`。`CodeyConfig::normalize` 会按内置官方 slug 大小写不敏感地识别这些条目，规范后迁移到 `declaredOfficialModelsByProvider`，并从两个第三方字段移除；已有官方声明优先保留，真正的第三方模型与 `upstreamModelsByProvider` 不参与迁移。这样用户显式选择过的官方模型在后续 `/v1/models` 同步为空或遗漏条目时仍属于持久声明，但不会被误标为 provider 已验证。
 - 运行期 CDP bridge 将 websocket 读取、handler 执行和响应写回解耦：只读状态、模型目录、账号额度和插件列表最多并发执行 8 项，其他 API、懒加载以及会话导入导出仍进入单一串行通道；待处理队列上限为 256。协议代理入口只解析一次 Responses 请求 JSON，Chat SSE 转换器接管已拥有的请求对象；诊断日志通过 4096 项有界后台队列写入，按 64 条或 100 毫秒批量刷新，队列满时快速失败并在后续日志中记录丢弃数。rollout 头缓存的版本、provider 和条目未变化时不再仅因校验时间变化而重写文件。
 - Codex Trace 写盘防护通过 SQLite `block_log_inserts` trigger 阻止 `logs_*.sqlite` 持续写入高频诊断日志；设置开关，已有日志和会话数据不会被删除。
 - macOS Crashpad 磁盘保护与 Trace 共用诊断存储界面，但保持独立策略和开关。它只检查 `Application Support/Codex/Crashpad/pending` 与旧版 `Application Support/com.openai.codex/web/Crashpad/pending` 两个 allowlist 目录，不递归搜索其他产品数据；只把 UUID 命名的 `.dmp` 与 `_sidecar.json` 识别为同一报告组，跳过符号链接、未知文件、子目录及 Crashpad 的 `new`、`completed`、`attachments` 和设置文件。保护默认开启：启动时执行一次，此后每 5 分钟检查；总占用超过 512 MiB 时按最旧完整报告组回收到 384 MiB，至少保留最近 10 分钟写入。自动收敛不删除孤儿文件；手动清理可额外删除静默超过 24 小时的已识别孤儿。删除前后复核文件长度、修改时间及 Unix inode/device，消失或发生变化按并发竞争跳过。扫描、部分删除或后台任务失败只进入本地错误日志和诊断快照，不阻断 Codex 启动。
@@ -140,6 +141,103 @@ Codey 将运行时 core/data crate 固定在 `vendor/CodeyRuntime`，生命周�
 - CDP 默认端口：`9229`，如 Windows 端口被占用会按 core 的逻辑选择可用回环端口。
 
 - FastCtx 路由 Hook 会对每个命中的 `PreToolUse` 独立执行；拒绝原因只保留目标函数与显式回退标记，完整的工具发现、code mode 和 Windows 路径规则由运行时 FastCtx 指引统一提供，避免连续读取时在 Codex 钩子面板重复刷出整段说明。
+
+### Codex `config.toml` 统一配置模型（2026-08）
+
+本节是 `config.toml` 配置管理的维护契约。Codey 自身的 `config.json`、`auth.json`、运行时 lease、模型目录 JSON 和 Hook 文件不属于这个 schema；它们仍使用各自的存储事务。活动 Codex `config.toml` 的生产读写必须经过 `codey_runtime_core::config_manager::ConfigManager`，备份目录中的历史快照不属于活动配置入口。
+
+#### 强类型 schema 与覆盖优先级
+
+`ConfigManager` 同时保留两种表示：`DocumentMut` 保存未知字段、注释、顺序及 Codex 将来新增的字段；`CodexConfigSchema` 是经过类型和语义校验的只读视图。当前管理字段如下：
+
+```toml
+# 全局公共片段；字段可省略。
+base_url = "https://api.example/v1"
+model_provider = "provider-a"
+model_catalog_json = "custom-models.json"
+
+# 每个 provider/route 是独立分片。切换模式不得删除非活动分片。
+[model_providers.provider-a]
+base_url = "https://provider-a.example/v1"
+wire_api = "responses"
+
+[model_providers.route-b]
+base_url = "https://route-b.example/v1"
+wire_api = "responses"
+
+# Codey 的模式选择器与 provider 数据分离。
+[codey.routing]
+enabled = false
+active_route = "route-b"
+
+[codey.non_routing]
+active_provider = "provider-a"
+```
+
+对应 Rust 类型为 `CodexConfigSchema`、`RoutingConfig`、`NonRoutingConfig`、`RouteConfig`、`ResolvedConfig` 和带 `FieldSource` 的 `ResolvedField<T>`。`routing.enabled` 使用 `Option<bool>` 保存“文件未配置”和“文件明确配置 false”的区别；最终有效值才回落为 `false`。`ConfigSnapshot` 以 `Arc` 发布原始字节、TOML 文档、强类型 schema、解析后有效值及 SHA-256 revision，调用方只能读取不可变快照。
+
+有效配置覆盖顺序固定为：调用方传入的 CLI `ConfigLayer` > Codey 专用环境变量 > 文件 > 内置默认值。环境变量为 `CODEY_CONFIG_BASE_URL`、`CODEY_CONFIG_ROUTING_ENABLED`、`CODEY_CONFIG_ACTIVE_ROUTE` 和 `CODEY_CONFIG_ACTIVE_PROVIDER`。不读取通用 SDK 的 `OPENAI_BASE_URL` 作为隐式覆盖，避免 provider SDK 环境污染 Codex 路由。CLI/环境覆盖只影响有效快照，不反向写回文件。
+
+`set_routing_enabled` 只修改 `[codey.routing].enabled` 并立即发布新的有效快照；`active_route`、`non_routing.active_provider`、全部 `model_providers`、全局字段和未知字段均保留。活动路由与非路由 provider 分别通过 `set_active_route` 和 `set_non_routing_provider` 更新。Provider 的 `base_url` 只能通过 `ConfigManager::set_provider_base_url` / `ConfigEditor::set_provider_base_url`，根 `base_url` 只能通过对应 root setter；增量 `edit_document` 检测到任何绕过 setter 的 URL 变化会拒绝保存。兼容旧的整文档合成流程时只能调用 `replace_text` / `replace_document`，该入口仍在 `ConfigEditor::set_complete_document` 中集中记录所有 URL 差异，并要求非空 `reason` 与 `caller` 后写结构化审计。
+
+#### 统一数据流
+
+```text
+CLI overrides ─┐
+environment ───┼──────────────┐
+config.toml ───┘              │
+                              v
+reader -> ConfigManager.load/reload -> shared process lock + config.toml.lock
+                                      -> immutable bytes + TOML parse
+                                      -> CodexConfigSchema.validate
+                                      -> precedence resolution
+                                      -> Arc<ConfigSnapshot>
+
+writer -> update / typed setter / replace_text
+       -> acquire the same two locks
+       -> reload current bytes + compare expected revision
+       -> mutate DocumentMut and account for every base_url delta
+       -> parse + full schema validation
+       -> rotate config.toml.bak[.N]
+       -> write a unique same-directory temporary file + fsync
+       -> atomic replace/rename config.toml + fsync parent directory
+       -> publish new immutable snapshot + structured audit event
+
+external route watcher -> ConfigManager.read_raw (read-only malformed-write observation)
+restore -> restore_latest_backup / lease three-way merge -> same validated writer transaction
+```
+
+默认保留 5 个历史版本：最新旧值是 `config.toml.bak`，更早版本依次为 `config.toml.bak.1` 至 `.bak.4`。保存前先验证候选；当前文件存在时才旋转并写备份；目标替换失败时旧 `config.toml` 不变，临时文件会清理，`.bak` 仍保存写入前内容。Unix 下目录/文件权限分别收紧为 `0700`/`0600`；Windows 使用带 replace-existing 和 write-through 的原生原子替换。`ConfigFileSystem`、`FileLockGuard`、路径、备份数量和 `ConfigAuditSink` 都可注入测试实现。
+
+#### 生产路径清单
+
+| 责任 | 统一入口及文件 | 行为 |
+| --- | --- | --- |
+| Provider 应用、临时 overlay、租约三方恢复 | `backend/src/codex_config.rs` | 通过 revision CAS 调用 manager 的整文档写入/删除；lease 备份继续承担跨进程恢复证据。 |
+| CC Switch/Code Switch R 活动线路读取 | `backend/src/cc_switch.rs` | 从同一个强类型不可变快照读取 provider、URL、wire API 和请求扩展。 |
+| 路由切线 watcher | `backend/src/launcher/route_overlay.rs` | 文件 metadata 只用于快速跳过；内容统一通过只读 `read_raw` 获取， malformed 外部写仍可触发保守变化检测。 |
+| 后端插件列表 | `backend/src/plugin_marketplace.rs` | 从 manager 快照读取已启用插件。 |
+| Relay 配置、Goals feature 与完整配置切换 | `vendor/CodeyRuntime/crates/codey-runtime-core/src/relay_config.rs` | 候选与 auth 先校验；配置提交使用 manager，auth 失败恢复保持原事务语义。非法现有 TOML 不再用文本 fallback 重建。 |
+| 插件市场注册 | `vendor/CodeyRuntime/crates/codey-runtime-core/src/plugin_marketplace.rs` | 在快照上合并 marketplace/plugin 字段并以 revision 提交。 |
+| Windows Computer Use guard | `vendor/CodeyRuntime/crates/codey-runtime-core/src/computer_use_guard.rs` | 在快照上修复 plugin/marketplace 项并以 revision 提交。 |
+| 模型目录与本地资产读取 | `vendor/CodeyRuntime/crates/codey-runtime-core/src/model_catalog.rs`、`assets.rs` | 只读 manager 快照，不再单独读取和解析活动文件。 |
+
+#### 原问题根因、证据和复现
+
+1. `model_catalog_json` 被当成 Codey 独占字段。旧 `backend/src/codex_config.rs::patch_config_with_fastctx_mode_and_proxy` 在官方/无 Codey 目录分支无条件 `remove`，第三方分支无条件覆盖，因此 `model_catalog_json = "/Users/a1-6/.codex/custom-models.json"` 会在 Codey 启动合成时消失。复现是写入任意用户目录后调用 official patch；回归测试 `official_patch_uses_the_official_endpoint_and_preserves_a_user_catalog` 与 `direct_patch_preserves_a_user_model_catalog_when_codey_catalog_is_requested` 锁定修复。现在只新增/替换 Codey 自己的 `model-catalogs/codey-official.json` 引用，任意其他用户路径原样保留。
+2. CC Switch provider 表被整表替换。旧 provider 合成只有 `cc_switch_provider_id.is_none()` 时才克隆现有表，带 CC Switch ID 时会丢失 `http_headers`、重试参数、`env_key` 和未知字段。`cc_switch_provider_patch_preserves_unowned_provider_fields` 使用带 headers/retry 的现有 provider 复现；现在所有非保留 provider 都以原表为基线，只覆盖 Codey 明确管理的 name、endpoint、wire API、认证标记和本次 token。
+3. 多个全文件写者没有共享锁或 revision。插件市场、Computer Use guard、Relay 切换和后端 runtime writer 曾分别执行“读取整文件 -> 合并 -> 各自原子 rename”；两个原子写都成功仍会由后提交者覆盖先提交者。`config_manager::tests::stale_revisions_cannot_overwrite_a_newer_write` 使用同一 revision 并发两个线程，断言只有一个提交成功，失败者必须 reload。
+4. 非法 TOML fallback 会扩大损失。旧 Goals feature 文本 fallback 在 TOML 解析失败时跳过整个 `[features]` 区段，再拼回单个 `goals` 字段；重复表等局部错误可能因此删除其他 feature。`set_codex_goals_feature_rejects_invalid_existing_toml_without_overwrite` 现在断言报错且字节不变；修复非法文件必须由用户或明确迁移器处理，普通 setter 不猜测重建。
+5. 路由与非路由读取各自解析。CC Switch、模型目录、插件列表和 watcher 曾用不同的缺省值、错误降级和读取时刻，造成 UI 看到的 provider 与启动器应用的 provider 不一致。迁移后除 watcher 的显式 raw observer 外，生产读取都从 `ConfigSnapshot` 获得同一 schema 和 revision。
+6. `base_url` 的临时代理覆盖缺少统一审计。Chat Completions 需要把 Codex endpoint 临时指向本地 Responses 代理，这是有意的运行时变化；问题在于旧写入入口无法区分有意 setter 与整文档副作用。现在所有提交记录 operation、reason、caller、revision、模式和 `base_url_changed`，并继续用 original/applied/current 三方恢复避免覆盖外部切线。
+
+#### 测试、迁移和回滚
+
+核心单元测试覆盖缺失文件默认值、CLI/环境/文件优先级、显式 false 来源、模式往返保留 provider/公共字段/注释、setter 门禁与审计、最近 N 份备份、并发 revision 冲突、非法候选及注入的原子替换失败。Relay、CC Switch、Provider lease、插件市场和 route watcher 的既有集成测试继续覆盖跨模块行为。
+
+升级不在 load 时重写文件；只有第一次真实变更才创建 `.bak` 并提交新内容。已有合法 TOML 的未知字段和注释随 `DocumentMut` 保留；已有非法 TOML 会返回解析错误且不覆盖，维护者应先从错误位置或备份修复。部署前可先复制现有 `config.toml`，升级后检查结构化 `config_manager` 诊断事件及 `.bak`。需要回滚时优先停止 Codey/Codex，调用 `restore_latest_backup` 或把 `config.toml.bak` 复制回 `config.toml`；仍有运行时 lease 时先执行既有 lease restore，再恢复 `.bak`，避免把临时 overlay 当成用户基线。旧版本会忽略 `[codey.routing]` / `[codey.non_routing]`，因此二进制回滚不要求删除分片；若必须完全回退 schema，可恢复升级前备份。
+
+本次核心文件清单：`vendor/CodeyRuntime/crates/codey-runtime-core/src/config_manager.rs`、该 crate 的 `lib.rs`/`Cargo.toml`、`relay_config.rs`、`plugin_marketplace.rs`、`computer_use_guard.rs`、`model_catalog.rs`、`assets.rs`，以及后端 `codex_config.rs`、`cc_switch.rs`、`launcher/route_overlay.rs`、`plugin_marketplace.rs` 和对应测试。技术设计只维护在本文件；公开 README 不记录路径、锁、备份算法或内部模块名。
 
 ### 子代理批次决策控制面
 
@@ -404,10 +502,13 @@ Codex 官方 Hook 契约中，`SubagentStart` 必带 `agent_id`，child 的 `Pre
 前端 `src/notifications/` 以 `channelRegistry.tsx` 为唯一渠道注册入口，每个渠道使用独立编辑器组件；注册项负责显示信息、默认配置和完整性判断，公共列表只负责展示、编辑和删除，启用状态与测试发送都在渠道编辑弹窗内配置。飞书与企业微信编辑器复用 URL 凭据状态，但保留各自的地址提示与后端校验。新增和编辑必须先完成渠道配置，并经不落盘的 `test_notification_channel` 测试成功后才能保存；每次修改草稿都会要求重新测试。外部配置结构继续使用 `webhook.channels`，既有 `test_webhook` 仍保留以兼容已有渲染层调用和持久化数据。涉及凭据的渠道必须保持普通配置返回渲染层前脱敏、留空保存时回填旧值、显式清除时不回填；仅在用户主动打开某一渠道编辑弹窗时，可经 `reveal_notification_channel` 按需返回该渠道凭据，弹窗关闭后立即清空本地草稿。
 
 - 子代理渠道配置使用 `subagentConfigByProvider` 按稳定 provider ID 保存模型、推理档位和六类角色选择；顶层 `subagentModel`、`subagentReasoningEffort` 与 `subagentRoles` 继续表示当前线路并兼容旧存储与前端。旧存储归一化时会把当前顶层选择迁移为当前 provider 的首份快照。线路同步前先保存旧 provider，目标 provider 已有快照时恢复，没有时继承旧线路活动选择；随后只把模型兼容性回退写入目标 provider，因此 A→B→A 不会让 B 的回退覆盖 A。通用设置保存、模型目录刷新和启动回退都同步更新当前 provider 快照。
+- 内置子代理预设保持为全角色 `gpt-5.6-terra`，推理档位依次为 quick/low、deep/high、visual/high、worker/medium、visual-worker/high、default/low；设置页里出现的 Luna、max 等组合属于用户按线路保存的自定义配置，不得反向改写成产品默认值。通用设置保存时会比较请求中的逐角色选择与当前值；模型或推理档位发生显式变化后，该角色使用的内置官方模型会同时进入当前第三方 provider 的 `declaredOfficialModelsByProvider` 与有效 `upstreamModelsByProvider`，再执行可用性回退。这里的 `declared` 只表示用户选择，不是 provider 探测或可用性证明；上游目录结果与用户声明必须继续分开保存和展示。旧存储通过 `subagentRoleModelSupportMigrated` 做一次性迁移：只收集相对内置默认值确有变化的角色模型，并跳过官方 provider；标记落盘后不会因后续归一化把用户已删除的声明重新加回。
+- 只要保存前后增强都处于启用状态，保存链就会按固定的“运行生命周期锁 → `config_write_lock` → 有界跨进程配置锁”顺序核对当前权威配置，防止与重启路径形成反向锁序，也防止较早保存请求在较晚请求之后提交旧角色文件。lease 记录生成 schema 与六个完整角色文档的 SHA-256；校验按由当前可编辑源约束、角色选择和 FastCtx 状态重新渲染出的完整字节进行，不再只检查 `name`、`model`、`model_reasoning_effort`。任意文件缺失、非 UTF-8、TOML 损坏、沙箱/描述/开发指引漂移、摘要或证明策略不一致都会按当前矩阵重建。同步失败会恢复六个文件、原 lease 与原证明策略，并把保存响应标成 `restartRequired`；被较新保存取代且尚未写盘的请求只报告 `superseded`，不要求无意义重启。匹配逻辑不包含供应商或旧模型 ID 白名单，不读取或覆盖用户的 `config.toml`、`AGENTS.md`、`agents/default.toml`。
+- 热更新在改写六个文件前先写 `runtime-subagent-policy.pending.json`，全部文件与 lease 完成后才原子替换证明策略并移除 pending 标记。进程内错误会同步回滚；进程崩溃可能暂时留下跨文件混合代次，因此这里是带 journal 的 fail-closed 最终一致性，不宣称六文件具备文件系统级原子提交。pending 存在时，新 child 的工具调用被拒绝；下次启动或设置保存会按当前持久配置重放并清除标记。成功生成文件后，Hook 还会从受信任 child rollout 的当前 `turn_context` 核对实际 `model` 与 `effort`；首次工具调用无法证明或不匹配时返回 `CODEY_SUBAGENT_RUNTIME_UNVERIFIED` / `CODEY_SUBAGENT_RUNTIME_CONFIG_MISMATCH`，已完成证明的在途 child 可结束原 turn，后续新 child 使用新策略。
 
 ## 启动与恢复
 
-运行时配置的应用、失败回滚与退出恢复由 Codey 配置目录中的跨进程文件锁串行化；锁覆盖租约快照、最终字节复核和原子替换，避免两个 Codey 进程在“检查后写入”窗口互相覆盖。外部编辑器不会遵守该锁，因此恢复逻辑仍必须按 original/applied/current 三方内容只撤销 Codey-owned 字段，不能把这把锁描述成文件系统 CAS。CC Switch Live 目前仍需把门禁 Hook 临时合并到稳定的 `hooks.json`，因为 Codex `app-server` 不接受 profile 选择且 session flag Hook 不能自行取得信任；Electron 启动补丁只给 Codey 管理的 app-server 注入 `CODEY_SUBAGENT_GATE_ACTIVE=1` 和每次启动唯一的 `CODEY_SUBAGENT_GATE_RUNTIME_ID`，门禁 helper 在其他 Codex 会话中固定返回空结果，不执行等待或派生限制。Windows 进入 WSL 启动链时，这两个环境变量会一并注入 shell；命令级覆盖中的盘符路径会在注入前转换为 `/mnt/<drive>/...`，原生 Windows 启动参数保持不变。
+运行时配置的应用、失败回滚与退出恢复由 Codey 配置目录中的跨进程文件锁串行化；锁最多等待 5 秒并以 10 毫秒间隔重试，超时返回可诊断错误而不是无限挂起。锁覆盖租约快照、最终字节复核和原子替换，避免两个 Codey 进程在“检查后写入”窗口互相覆盖。首次启动应用只有在 lease 落盘、输入二次校验及配置或 Hook 写入全部成功后才发布 active 子代理证明策略；策略发布失败会走同一恢复链，避免留下无 lease 的 active/pending policy。外部编辑器不会遵守该锁，因此恢复逻辑仍必须按 original/applied/current 三方内容只撤销 Codey-owned 字段，不能把这把锁描述成文件系统 CAS。CC Switch Live 目前仍需把门禁 Hook 临时合并到稳定的 `hooks.json`，因为 Codex `app-server` 不接受 profile 选择且 session flag Hook 不能自行取得信任；Electron 启动补丁只给 Codey 管理的 app-server 注入 `CODEY_SUBAGENT_GATE_ACTIVE=1` 和每次启动唯一的 `CODEY_SUBAGENT_GATE_RUNTIME_ID`，门禁 helper 在其他 Codex 会话中固定返回空结果，不执行等待或派生限制。Windows 进入 WSL 启动链时，这两个环境变量会一并注入 shell；命令级覆盖中的盘符路径会在注入前转换为 `/mnt/<drive>/...`，原生 Windows 启动参数保持不变。
 
 设置保存接口按 JSON 请求中字段是否真实出现来合并子代理配置：缺少或传入空的 `subagentRoles` 时保留已有逐角色选择；旧版 `subagentModel` / `subagentReasoningEffort` 只更新 `default` 兼容角色；非空的部分角色 map 只覆盖请求中给出的角色。完整新客户端仍可一次更新全部六类。`default` 探索角色与三个探索/分析角色一样显式使用 `sandbox_mode = "read-only"`，只有两个实施角色使用 `workspace-write`。
 

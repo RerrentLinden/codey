@@ -4,8 +4,9 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::{
-    AppState, STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT, hot_reload_runtime_subagent_config,
-    redacted_config, runtime_config_requires_restart, save_config_to_store,
+    AppState, STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT, SubagentHotReloadOutcome,
+    hot_reload_runtime_subagent_config, redacted_config, runtime_config_requires_restart,
+    save_config_to_store,
 };
 use crate::cc_switch;
 use crate::cdp;
@@ -37,17 +38,40 @@ impl ModelHotReloadOutcome {
 
 fn add_subagent_hot_reload_to_response(
     mut response: Value,
-    outcome: Option<Result<(), String>>,
+    outcome: SubagentHotReloadOutcome,
 ) -> Value {
-    let (reloaded, error) = match outcome {
-        Some(Ok(())) => (true, None),
-        Some(Err(error)) => (false, Some(error)),
-        None => (false, None),
-    };
     if let Some(object) = response.as_object_mut() {
-        object.insert("subagentConfigHotReloaded".into(), Value::Bool(reloaded));
-        if let Some(error) = error {
-            object.insert("subagentConfigHotReloadError".into(), Value::String(error));
+        object.insert(
+            "subagentConfigHotReloaded".into(),
+            Value::Bool(outcome.reloaded()),
+        );
+        object.insert(
+            "subagentConfigRepaired".into(),
+            Value::Bool(outcome.repaired()),
+        );
+        object.insert(
+            "subagentConfigHealth".into(),
+            Value::String(outcome.health().to_string()),
+        );
+        object.insert(
+            "subagentConfigRepairReasons".into(),
+            Value::Array(
+                outcome
+                    .repair_reasons()
+                    .iter()
+                    .cloned()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        if outcome.requires_restart() {
+            object.insert("restartRequired".into(), Value::Bool(true));
+        }
+        if let Some(error) = outcome.error() {
+            object.insert(
+                "subagentConfigHotReloadError".into(),
+                Value::String(error.to_string()),
+            );
         }
     }
     response

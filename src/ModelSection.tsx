@@ -153,9 +153,9 @@ function ModelSectionComponent({
                 <small>
                   {provider.official
                     ? "官方目录"
-                    : `已确认 ${
+                    : `已配置 ${
                         supportedOfficialModelCount + modelState.thirdPartyModels.length
-                      } 个可用模型`}
+                      } 个候选模型`}
                 </small>
               </div>
             </div>

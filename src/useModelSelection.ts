@@ -55,6 +55,7 @@ type ModelRuntimeUpdate = {
   modelHotReloaded?: boolean;
   modelHotReloadError?: string;
   subagentConfigHotReloaded?: boolean;
+  subagentConfigRepaired?: boolean;
   subagentConfigHotReloadError?: string;
   modelCatalogFallback?: boolean;
 };
@@ -186,7 +187,7 @@ export function useModelSelection({
       } catch (error) {
         const warning =
           `自动同步失败：${errorText(error)}。当前线路可能不支持 /v1/models 或 /models 接口，` +
-          "请手动确认支持的官方模型，或输入其他模型 ID。";
+          "请手动声明希望保留的官方模型，或输入其他模型 ID；手动声明不代表供应商已验证可用。";
         openModelPicker(modelState, warning);
         setNotice({
           tone: "error",
@@ -334,8 +335,10 @@ export function useModelSelection({
     const hotReloadFailed = Boolean(
       result.modelHotReloadError || result.subagentConfigHotReloadError,
     );
-    const subagentSuffix = result.subagentConfigHotReloaded
-      ? "；受影响的子代理角色也已同步"
+    const subagentSuffix = result.subagentConfigRepaired
+      ? "；已校验并修复受影响的子代理运行配置"
+      : result.subagentConfigHotReloaded
+        ? "；受影响的子代理角色也已同步"
       : "";
     setNotice({
       tone:
@@ -370,7 +373,7 @@ export function useModelSelection({
         thirdPartyModels,
         manualThirdPartyModels,
         deletedThirdPartyModels,
-        `已更新模型支持情况：${officialModels.length} 个官方模型、` +
+        `已更新模型声明：${officialModels.length} 个官方模型、` +
           `${thirdPartyModels.length} 个其他模型`,
         true,
       );
