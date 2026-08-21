@@ -212,20 +212,27 @@ if (import.meta.env.DEV) {
               id: "bridge-helpers",
               name: "桥接辅助",
               source: "builtin",
+              visibility: "internal",
               status: "effective",
               detail: "桥接函数可调用",
             },
-            {
-              id: "windows-wmi-sampler",
-              name: "Windows WMI 周期采样保护",
-              source: "builtin",
-              status: "effective",
-              detail: "已阻止 2 次 WMI 周期进程采样",
-            },
+            ...(previewClientPlatform === "windows"
+              ? [
+                  {
+                    id: "windows-wmi-sampler",
+                    name: "Windows WMI 周期采样保护",
+                    source: "builtin" as const,
+                    visibility: "feature" as const,
+                    status: "effective" as const,
+                    detail: "已阻止 2 次 WMI 周期进程采样",
+                  },
+                ]
+              : []),
             {
               id: "model-whitelist",
               name: "模型白名单",
               source: "builtin",
+              visibility: "internal",
               status: "effective",
               detail: "模型目录已加载（5 个模型）",
             },
@@ -233,6 +240,7 @@ if (import.meta.env.DEV) {
               id: "pet-control-shield",
               name: "宠物控制精简",
               source: "builtin",
+              visibility: "feature",
               status: "effective",
               detail: "宠物控制精简已启用",
             },
@@ -240,13 +248,15 @@ if (import.meta.env.DEV) {
               id: "security-warning-shield",
               name: "安全提示控制",
               source: "builtin",
-              status: "effective",
+              visibility: "feature",
+              status: "inactive",
               detail: "控制器已就绪，当前屏蔽策略关闭",
             },
             {
               id: "settings-overlay-loader",
               name: "配置面板加载器",
               source: "builtin",
+              visibility: "internal",
               status: "effective",
               detail: "配置面板按需加载器可用",
             },
@@ -254,6 +264,7 @@ if (import.meta.env.DEV) {
               id: "renderer-controls",
               name: "渲染器控制",
               source: "builtin",
+              visibility: "feature",
               status: "effective",
               detail: "渲染器控制与按需加载 API 可用",
             },
@@ -261,10 +272,12 @@ if (import.meta.env.DEV) {
               id: "plugin-marketplace-compatibility",
               name: "插件市场兼容",
               source: "builtin",
+              visibility: "internal",
               status: "effective",
               detail: "插件市场桥接已接管",
             },
           ],
+          fastContextToolsActive: previewConfig.fastContextTools,
           ...(previewTraceStats ? { traceLogStats: previewTraceStats } : {}),
           ...(previewCrashpadStats
             ? { crashpadPendingStats: previewCrashpadStats }
@@ -286,9 +299,6 @@ if (import.meta.env.DEV) {
       if (command === "refresh_trace_log_stats") {
         previewTraceStats = previewTraceLogStats;
         return { status: "ok", traceLogStats: previewTraceStats };
-      }
-      if (command === "refresh_injection_status") {
-        return { status: "ok" };
       }
       if (command === "save_codey_config") {
         previewConfig = {

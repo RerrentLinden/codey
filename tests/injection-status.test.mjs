@@ -34,6 +34,8 @@ test("script injection diagnostics report runtime evidence without continuous po
   ]);
 
   assert.match(cdp, /window\.__codeyInjectionStatus/);
+  assert.match(cdp, /enum InjectionScriptVisibility/);
+  assert.match(cdp, /visibility: descriptor\.visibility\.as_str\(\)\.to_string\(\)/);
   assert.match(cdp, /MAX_INJECTION_ERROR_CHARS:\s*usize\s*=\s*500/);
   assert.match(cdp, /read_injection_statuses\(&websocket_url, scripts\)/);
   assert.match(
@@ -62,6 +64,8 @@ test("script injection diagnostics report runtime evidence without continuous po
     overlay,
     /window\.dispatchEvent\(new CustomEvent\(SETTINGS_OPENED_EVENT\)\)/,
   );
+  assert.match(overlay, /let visible = false/);
+  assert.match(overlay, /const open = \(\) => \{\s*if \(visible\) return;/);
   assert.match(runtimeHook, /type StatusPollTask/);
   assert.match(runtimeHook, /clear: \(\) => void/);
   assert.match(runtimeHook, /requestGenerationRef/);
@@ -77,27 +81,55 @@ test("script injection diagnostics report runtime evidence without continuous po
     /const STATUS_POLL_MAX_CONSECUTIVE_ERRORS = 5/,
   );
   assert.match(runtimeHook, /STATUS_POLL_MAX_DURATION_MS/);
-  assert.match(runtimeHook, /GIT_GUARD_PROBE_MAX_DURATION_MS = 30_000/);
-  assert.match(runtimeHook, /WMI_SAMPLER_PROBE_MAX_DURATION_MS = 60_000/);
-  assert.match(runtimeHook, /gitGuardStatus === "executed"/);
-  assert.match(runtimeHook, /wmiSamplerStatus === "executed"/);
+  assert.match(runtimeHook, /INJECTION_PROBE_MAX_DURATION_MS = 60_000/);
+  assert.match(
+    runtimeHook,
+    /script\.source === "builtin" && script\.status === "executed"/,
+  );
+  assert.doesNotMatch(runtimeHook, /script\.id === "git-request-guard"/);
+  assert.doesNotMatch(runtimeHook, /script\.id === "windows-wmi-sampler"/);
   assert.match(runtimeHook, /dueTasks\.some\(\(task\) => task\.refreshesInjectionStatus\)/);
   assert.match(cdp, /completedEntry\.status === \\"pending\\"/);
   assert.match(pluginFix, /markPluginBridgeEffective/);
   assert.match(pluginFix, /entry\.status = "effective"/);
   assert.match(pluginFix, /codey-injection-status-changed/);
+  assert.doesNotMatch(pluginFix, /codey-plugin-marketplace-refresh/);
+  assert.doesNotMatch(pluginFix, /__codeyPluginCacheVersion/);
   assert.match(
     types,
-    /status:\s*"effective"\s*\|\s*"executed"\s*\|\s*"failed"\s*\|\s*"unknown"/,
+    /visibility:\s*"feature"\s*\|\s*"internal"/,
   );
-  assert.match(sections, /脚本生效状态/);
-  assert.match(sections, /生效探针通过/);
-  assert.match(sections, /脚本已执行，但没有生效证据/);
-  assert.match(sections, /Codex 启动后将记录每个脚本的注入结果/);
+  assert.match(
+    types,
+    /status:\s*"effective"\s*\|\s*"executed"\s*\|\s*"inactive"\s*\|\s*"failed"\s*\|\s*"unknown"/,
+  );
+  assert.match(sections, /已生效功能/);
   assert.match(
     sections,
-    /性能策略已生效：WMI 采样保护与泄漏回收已确认/,
+    /injectionScripts\.filter\(\(script\) => script\.visibility === "feature"\)/,
   );
+  assert.match(
+    sections,
+    /userFacingInjectionScripts[\s\S]*?script\.status === "effective"/,
+  );
+  assert.doesNotMatch(sections, /INTERNAL_OPTIMIZATION_SCRIPT_IDS/);
+  assert.match(sections, /name: "FastCtx 上下文加速"/);
+  assert.match(sections, /status\.fastContextToolsActive === true/);
+  assert.match(sections, /fastContextToolsStatus\.userConfigured/);
+  assert.match(sections, /enabledOptimizationFeatures\.map/);
+  assert.match(
+    sections,
+    /enabledFeatureCount: enabledOptimizationFeatures\.length/,
+  );
+  assert.match(sections, /已启用 \{item\.enabledFeatureCount\} 项/);
+  assert.doesNotMatch(sections, /injectionScripts\.map/);
+  assert.doesNotMatch(sections, /effectiveInjectionScripts\.map/);
+  assert.doesNotMatch(sections, /injection-script-state/);
+  assert.doesNotMatch(sections, /injection-status-summary/);
+  assert.doesNotMatch(sections, /id: "opt-fastctx"/);
+  assert.doesNotMatch(sections, /id: "opt-injection"/);
+  assert.doesNotMatch(sections, /id: "opt-patch"/);
+  assert.match(sections, /Codex 启动后将在这里显示已生效功能/);
   assert.doesNotMatch(sections, /setInterval/);
   assert.match(styles, /text-wrap:\s*balance/);
   assert.match(styles, /word-break:\s*normal/);

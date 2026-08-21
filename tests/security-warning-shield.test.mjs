@@ -45,6 +45,7 @@ function createRuntime(config) {
   const html = new FakeElement("html");
   const body = html.appendChild(new FakeElement("body"));
   const listeners = new Map();
+  const statusEvents = [];
   let mutationCallback = null;
   const document = {
     body,
@@ -53,7 +54,20 @@ function createRuntime(config) {
   };
   const window = {
     __codexSessionDeleteBridge: async () => config,
+    __codeyInjectionStatus: {
+      "security-warning-shield": { status: "executed", detail: null, error: null },
+    },
     addEventListener: (name, listener) => listeners.set(name, listener),
+    CustomEvent: class {
+      constructor(type, init = {}) {
+        this.type = type;
+        this.detail = init.detail;
+      }
+    },
+    dispatchEvent: (event) => {
+      statusEvents.push(event);
+      return true;
+    },
     setTimeout: (callback) => {
       callback();
       return 1;
@@ -79,6 +93,7 @@ function createRuntime(config) {
   return {
     body,
     listeners,
+    statusEvents,
     get mutationCallback() {
       return mutationCallback;
     },
@@ -126,6 +141,10 @@ test("disabled shield preserves the native full-access warning", async () => {
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(runtime.window.__codeySecurityWarningShield.enabled, false);
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["security-warning-shield"].status,
+    "inactive",
+  );
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
   assert.equal(button.clicks, 0);
   assert.equal(warning.style.display, undefined);
@@ -137,6 +156,10 @@ test("enabled shield dismisses a verified full-access warning once", async () =>
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(button.clicks, 1);
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["security-warning-shield"].status,
+    "effective",
+  );
   assert.equal(warning.style.display, "none:important");
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
   assert.equal(button.clicks, 1);
@@ -185,4 +208,20 @@ test("unrelated session controls are never clicked", async () => {
 
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
   assert.equal(button.clicks, 0);
+});
+
+test("config changes publish the shield's current injection status", async () => {
+  const runtime = createRuntime({ hideFullAccessWarning: false });
+  await new Promise((resolve) => setImmediate(resolve));
+  const configListener = runtime.listeners.get("codey:config-changed");
+  configListener({ detail: { config: { hideFullAccessWarning: true } } });
+
+  assert.equal(
+    runtime.window.__codeyInjectionStatus["security-warning-shield"].status,
+    "effective",
+  );
+  assert.deepEqual(
+    { ...runtime.statusEvents.at(-1).detail },
+    { id: "security-warning-shield", status: "effective" },
+  );
 });

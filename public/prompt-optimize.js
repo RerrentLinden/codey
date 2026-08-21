@@ -17,6 +17,8 @@
   const styleId = "codey-prompt-optimize-style";
   const toastId = "codey-runtime-toast";
   const configChangedEvent = "codey:config-changed";
+  const injectionStatusId = "prompt-optimize";
+  const injectionStatusChangedEvent = "codey-injection-status-changed";
   const optimizeTimeoutMs = 75_000;
   const pendingOptimizationLimit = 20;
   const scanDelayMs = 250;
@@ -38,6 +40,26 @@
   let inputElement = null;
   let button = null;
   let busy = false;
+
+  const publishInjectionStatus = () => {
+    if (!ready) return;
+    const entry = window.__codeyInjectionStatus?.[injectionStatusId];
+    if (!entry || entry.status === "pending") return;
+    const status = enabled ? "effective" : "inactive";
+    const detail = enabled ? "提示词优化按钮已就绪" : "提示词优化已关闭";
+    if (entry.status === status && entry.detail === detail && !entry.error) return;
+    entry.status = status;
+    entry.detail = detail;
+    entry.error = null;
+    if (
+      typeof window.dispatchEvent === "function"
+      && typeof window.CustomEvent === "function"
+    ) {
+      window.dispatchEvent(new window.CustomEvent(injectionStatusChangedEvent, {
+        detail: { id: injectionStatusId, status },
+      }));
+    }
+  };
   let scanTimer = 0;
   let repositionTimer = 0;
   let configLoadTimer = 0;
@@ -670,6 +692,7 @@
           }
         }
         ready = true;
+        publishInjectionStatus();
       })
       .catch(() => {
         // The bridge may not be ready during early startup; retry with

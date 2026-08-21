@@ -97,6 +97,9 @@ pub(super) async fn runtime_status_with_options(
         ),
         _ => false,
     };
+    let fast_context_tools_active = runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.applied_config.fast_context_tools);
     let mut status = json!({
         "running": runtime.is_some(),
         "appVersion": env!("CARGO_PKG_VERSION"),
@@ -105,6 +108,7 @@ pub(super) async fn runtime_status_with_options(
         "activeProfileName": profile.as_ref().map(|profile| profile.name.as_str()).unwrap_or_default(),
         "restartRequired": restart_required,
         "restartInProgress": state.restart_in_progress.load(Ordering::Acquire),
+        "fastContextToolsActive": fast_context_tools_active,
     });
     drop(config);
     let codex_app_version =
@@ -143,7 +147,6 @@ pub(super) async fn runtime_status_with_options(
         } else {
             runtime.injection_statuses.read().await.clone()
         };
-        let injection_statuses = runtime.injection_statuses_for_display(injection_statuses);
         object.insert(
             "injectionScripts".into(),
             serde_json::to_value(injection_statuses.as_ref())

@@ -1,11 +1,7 @@
 import { memo, useMemo, useRef, useState } from "react";
 import {
   IconActivity as Activity,
-  IconAdjustmentsHorizontal,
-  IconBrandWindows,
-  IconClock,
   IconCode as Code,
-  IconCheck as Check,
   IconCloudCheck,
   IconCpu,
   IconDatabase,
@@ -17,11 +13,14 @@ import {
   IconRefresh as RefreshCw,
   IconShieldCheck,
   IconShoppingBag,
-  IconX as X,
   IconBolt as Zap,
 } from "@tabler/icons-react";
 
-import type { PluginMarketplaceStatus, RuntimeStatus } from "./App.types";
+import type {
+  FastContextToolsStatus,
+  PluginMarketplaceStatus,
+  RuntimeStatus,
+} from "./App.types";
 import { Badge, Button, Card } from "./components/semi";
 
 const Cpu = IconCpu;
@@ -30,6 +29,13 @@ const History = IconHistory;
 const EMPTY_INJECTION_SCRIPTS: NonNullable<
   RuntimeStatus["injectionScripts"]
 > = [];
+type EnabledOptimizationFeature = {
+  id: string;
+  icon: typeof Activity;
+  name: string;
+  detail?: string;
+  sourceLabel: string;
+};
 
 type OperationsRuntimeStatus = Pick<
   RuntimeStatus,
@@ -38,16 +44,15 @@ type OperationsRuntimeStatus = Pick<
   | "clientPlatform"
   | "restartRequired"
   | "restartInProgress"
-  | "startupError"
   | "codexAppPath"
   | "maintenance"
   | "injectionScripts"
+  | "fastContextToolsActive"
 >;
 
 type OperationsPanelProps = {
   codexAppPath: string;
-  fastContextTools: boolean;
-  slimCodexPet: boolean;
+  fastContextToolsStatus: FastContextToolsStatus;
   status: OperationsRuntimeStatus;
   busy: string | null;
   isBusy: boolean;
@@ -59,8 +64,7 @@ type OperationsPanelProps = {
 
 function OperationsPanelComponent({
   codexAppPath,
-  fastContextTools,
-  slimCodexPet,
+  fastContextToolsStatus,
   status,
   busy,
   isBusy,
@@ -96,74 +100,88 @@ function OperationsPanelComponent({
     maintenance?.performanceStatus === "error" ||
     maintenance?.performanceStatus === "degraded";
   const injectionScripts = status.injectionScripts ?? EMPTY_INJECTION_SCRIPTS;
+  const userFacingInjectionScripts = useMemo(
+    () =>
+      injectionScripts.filter((script) => script.visibility === "feature"),
+    [injectionScripts],
+  );
+  const enabledOptimizationFeatures = useMemo<EnabledOptimizationFeature[]>(
+    () => {
+      const injectedFeatures = userFacingInjectionScripts
+        .filter((script) => script.status === "effective")
+        .map((script) => ({
+          id: script.id,
+          icon: Code,
+          name: script.name,
+          detail: script.detail,
+          sourceLabel: script.source === "user" ? "用户脚本" : "内置",
+        }));
+
+      const fastContextToolsActive =
+        status.fastContextToolsActive === true ||
+        (status.running && fastContextToolsStatus.userConfigured);
+      if (!fastContextToolsActive) return injectedFeatures;
+
+      const externalFastContextTools = fastContextToolsStatus.userConfigured;
+
+      return [
+        {
+          id: "fastctx-context-tools",
+          icon: Zap,
+          name: "FastCtx 上下文加速",
+          detail: externalFastContextTools
+            ? `Codex 已配置 FastCtx${
+                fastContextToolsStatus.serverId
+                  ? `（${fastContextToolsStatus.serverId}）`
+                  : ""
+              }`
+            : "Codey 内置 FastCtx 已随当前运行实例加载",
+          sourceLabel: externalFastContextTools ? "外部配置" : "Codey",
+        },
+        ...injectedFeatures,
+      ];
+    },
+    [
+      fastContextToolsStatus.serverId,
+      fastContextToolsStatus.userConfigured,
+      status.fastContextToolsActive,
+      status.running,
+      userFacingInjectionScripts,
+    ],
+  );
   const {
-    effectiveScriptCount,
     failedInjectionScriptCount,
+    internalInjectionError,
+    internalInjectionPending,
     unverifiedInjectionScriptCount,
   } = useMemo(() => {
-    let effective = 0;
     let failed = 0;
+    let internalFailed = false;
+    let internalPending = false;
     let unverified = 0;
     for (const script of injectionScripts) {
-      if (script.status === "effective") effective += 1;
-      else if (script.status === "executed") unverified += 1;
-      else if (script.status === "failed" || script.status === "unknown") {
+      const failedOrUnknown =
+        script.status === "failed" || script.status === "unknown";
+      if (script.visibility === "internal") {
+        internalPending ||= script.status === "executed";
+        internalFailed ||= failedOrUnknown;
+      } else if (script.status === "executed") {
+        unverified += 1;
+      } else if (failedOrUnknown) {
         failed += 1;
       }
     }
     return {
-      effectiveScriptCount: effective,
       failedInjectionScriptCount: failed,
+      internalInjectionError: internalFailed,
+      internalInjectionPending: internalPending,
       unverifiedInjectionScriptCount: unverified,
     };
   }, [injectionScripts]);
   const injectionStatusPending = injectionScripts.length === 0;
-  const injectionError = failedInjectionScriptCount > 0;
+  const injectionError =
+    internalInjectionError || failedInjectionScriptCount > 0;
   const isWindowsClient = status.clientPlatform === "windows";
-  const windowsWmiSampler = injectionScripts.find(
-    (script) => script.id === "windows-wmi-sampler",
-  );
-  const windowsStartupPatchInstalled =
-    maintenance?.performanceStatus === "ready";
-  const windowsWmiSamplerConfirmed =
-    windowsWmiSampler?.status === "effective";
-  const windowsWmiSamplerFailed =
-    windowsWmiSampler?.status === "failed" ||
-    windowsWmiSampler?.status === "unknown";
-  const windowsPatchReady =
-    windowsStartupPatchInstalled && windowsWmiSamplerConfirmed;
-  const windowsPatchFailed =
-    performanceError ||
-    Boolean(status.startupError) ||
-    windowsWmiSamplerFailed;
-  const windowsPatchTone = windowsPatchReady
-    ? "success"
-    : windowsPatchFailed
-      ? "destructive"
-      : "warning";
-  const windowsPatchLabel = windowsPatchReady
-    ? "已启用"
-    : windowsPatchFailed
-      ? "未生效"
-      : windowsStartupPatchInstalled
-        ? "待确认"
-        : "待检测";
-  const windowsPatchDetail = windowsPatchReady
-    ? windowsWmiSampler?.detail ||
-      "WMI 周期采样保护已确认，临时 WebView 与执行环境回收已启用。"
-    : windowsPatchFailed
-      ? status.startupError ||
-        windowsWmiSampler?.error ||
-        windowsWmiSampler?.detail ||
-        maintenance?.performanceDetail ||
-        "Windows 优化补丁加载异常。"
-      : windowsStartupPatchInstalled
-        ? windowsWmiSampler?.detail ||
-          maintenance?.performanceDetail ||
-          "Windows 启动补丁已安装，正在等待 WMI 周期采样保护的运行时证据。"
-      : status.running
-        ? "正在确认 Windows 优化补丁状态。"
-        : "将在 Codex 启动时自动安装并校验 Windows 优化补丁。";
   const resolvedCodexPath = status.codexAppPath || "/Applications/ChatGPT.app";
   const restartPending = Boolean(status.restartRequired);
   const codexVersion = status.codexAppVersion?.trim();
@@ -204,72 +222,6 @@ function OperationsPanelComponent({
       maintenance?.sessionFilesFixed,
       maintenance?.sqliteRowsUpdated,
       sessionOk,
-    ],
-  );
-
-  // System Optimization Metrics
-  const optimizationMetrics = useMemo<MetricItem[]>(
-    () => [
-      {
-        id: "opt-fastctx",
-        icon: Zap,
-        tooltip: fastContextTools
-          ? "FastCtx 上下文加速：已按当前配置启用"
-          : "FastCtx 上下文加速：未启用",
-        tone: fastContextTools ? "success" : "info",
-      },
-      {
-        id: "opt-slim",
-        icon: IconAdjustmentsHorizontal,
-        tooltip: slimCodexPet
-          ? "客户端精简：已开启宠物精简"
-          : "客户端精简：保留完整宠物功能",
-        tone: slimCodexPet ? "success" : "info",
-      },
-      {
-        id: "opt-patch",
-        icon: isWindowsClient ? IconBrandWindows : IconCpu,
-        tooltip: windowsPatchReady
-          ? "性能策略已生效：WMI 采样保护与泄漏回收已确认"
-          : windowsPatchFailed
-            ? "性能策略：Windows 保护存在异常"
-            : "性能策略：WMI 采样保护运行确认中",
-        tone: windowsPatchReady
-          ? "success"
-          : windowsPatchFailed
-            ? "destructive"
-            : "warning",
-      },
-      {
-        id: "opt-injection",
-        icon: Code,
-        tooltip: injectionError
-          ? `脚本注入：${failedInjectionScriptCount} 个异常`
-          : unverifiedInjectionScriptCount > 0
-            ? `脚本注入：${unverifiedInjectionScriptCount} 个未验证生效`
-            : injectionScripts.length > 0
-              ? `脚本注入：${effectiveScriptCount}/${injectionScripts.length} 已生效`
-              : "脚本注入：等待 Codex 启动后检测",
-        tone: injectionError
-          ? "destructive"
-          : unverifiedInjectionScriptCount > 0
-            ? "warning"
-            : injectionScripts.length > 0
-              ? "success"
-              : "warning",
-      },
-    ],
-    [
-      fastContextTools,
-      slimCodexPet,
-      effectiveScriptCount,
-      failedInjectionScriptCount,
-      injectionError,
-      injectionScripts.length,
-      isWindowsClient,
-      unverifiedInjectionScriptCount,
-      windowsPatchFailed,
-      windowsPatchReady,
     ],
   );
 
@@ -342,6 +294,7 @@ function OperationsPanelComponent({
       onClick: () => void;
     };
     showInjectionScripts?: boolean;
+    enabledFeatureCount?: number;
   }> = [
     {
       title: "会话恢复",
@@ -355,37 +308,50 @@ function OperationsPanelComponent({
     },
     {
       title: "系统优化",
-      description: injectionError
-        ? `${failedInjectionScriptCount} 个脚本注入异常，可展开查看错误。`
-        : unverifiedInjectionScriptCount > 0
-          ? `${unverifiedInjectionScriptCount} 个脚本已执行，但未验证实际效果。`
-          : injectionStatusPending
-            ? status.running
-              ? "正在读取最近一次脚本注入结果。"
-              : "Codex 启动后将记录每个脚本的注入结果。"
-            : !performanceError
-              ? "精简策略、性能补丁与脚本生效自检均已通过。"
-              : "部分精简策略尚未启用，保留完整功能。",
-      metrics: optimizationMetrics,
-      label: injectionError
+      description: internalInjectionError
+        ? "基础组件运行异常，已确认生效的功能仍列于下方。"
+        : failedInjectionScriptCount > 0
+        ? `${failedInjectionScriptCount} 个脚本注入异常，下方仅列出已确认生效的功能。`
+        : internalInjectionPending
+          ? "基础组件状态确认中，已生效功能会自动更新。"
+          : unverifiedInjectionScriptCount > 0
+            ? `${unverifiedInjectionScriptCount} 个功能尚待确认，下方仅列出已确认生效的功能。`
+            : injectionStatusPending
+              ? status.running
+                ? "正在读取最近一次功能生效结果。"
+                : "Codex 启动后将在这里汇总已生效功能。"
+              : !performanceError
+                ? isWindowsClient
+                  ? "精简策略、Windows 性能补丁与功能自检均已通过。"
+                  : "精简策略与功能自检均已通过。"
+                : "部分精简策略尚未启用，保留完整功能。",
+      metrics: [],
+      label: internalInjectionError
+        ? "基础异常"
+        : failedInjectionScriptCount > 0
         ? `${failedInjectionScriptCount} 个异常`
-        : unverifiedInjectionScriptCount > 0
-          ? `${unverifiedInjectionScriptCount} 个未验证`
-          : injectionStatusPending
-            ? status.running
-              ? "检测中"
-              : "待启动"
-            : performanceError
-              ? "异常"
-              : "已优化",
+        : internalInjectionPending
+          ? "确认中"
+          : unverifiedInjectionScriptCount > 0
+            ? `${unverifiedInjectionScriptCount} 个待确认`
+            : injectionStatusPending
+              ? status.running
+                ? "检测中"
+                : "待启动"
+              : performanceError
+                ? "异常"
+                : "已优化",
       tone:
         injectionError || performanceError
           ? "destructive"
-          : injectionStatusPending || unverifiedInjectionScriptCount > 0
+          : injectionStatusPending ||
+              internalInjectionPending ||
+              unverifiedInjectionScriptCount > 0
             ? "warning"
             : "success",
       icon: Cpu,
       showInjectionScripts: true,
+      enabledFeatureCount: enabledOptimizationFeatures.length,
     },
     {
       title: "插件市场",
@@ -538,8 +504,15 @@ function OperationsPanelComponent({
                         >
                           <StatusIcon size={18} aria-hidden="true" />
                         </span>
-                        <div>
-                          <h3>{item.title}</h3>
+                        <div className="expanded-card-copy">
+                          <div className="expanded-card-heading">
+                            <h3>{item.title}</h3>
+                            {item.enabledFeatureCount !== undefined && (
+                              <span className="expanded-card-feature-count">
+                                已启用 {item.enabledFeatureCount} 项
+                              </span>
+                            )}
+                          </div>
                           <p>{item.description}</p>
                         </div>
                       </div>
@@ -549,26 +522,28 @@ function OperationsPanelComponent({
                     </div>
 
                     <div className="expanded-card-body">
-                      <div className="expanded-card-metrics">
-                        {item.metrics.map((metric) => {
-                          const MetricIcon = metric.icon;
-                          return (
-                            <div
-                              key={metric.id}
-                              className="expanded-metric-item"
-                            >
-                              <span
-                                className={`expanded-metric-icon tone-${metric.tone || "info"}`}
+                      {item.metrics.length > 0 && (
+                        <div className="expanded-card-metrics">
+                          {item.metrics.map((metric) => {
+                            const MetricIcon = metric.icon;
+                            return (
+                              <div
+                                key={metric.id}
+                                className="expanded-metric-item"
                               >
-                                <MetricIcon size={14} aria-hidden="true" />
-                              </span>
-                              <span className="expanded-metric-text">
-                                {metric.tooltip}
-                              </span>
-                            </div>
-                          );
-                        })}
-                      </div>
+                                <span
+                                  className={`expanded-metric-icon tone-${metric.tone || "info"}`}
+                                >
+                                  <MetricIcon size={14} aria-hidden="true" />
+                                </span>
+                                <span className="expanded-metric-text">
+                                  {metric.tooltip}
+                                </span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
 
                       {item.showInjectionScripts && (
                         <section
@@ -576,93 +551,38 @@ function OperationsPanelComponent({
                           aria-labelledby="injection-status-title"
                         >
                           <div className="injection-status-header">
-                            <h4 id="injection-status-title">脚本生效状态</h4>
-                            <span className="injection-status-summary">
-                              {injectionScripts.length > 0
-                                ? `${effectiveScriptCount}/${injectionScripts.length} 已生效`
-                                : "暂无结果"}
-                            </span>
+                            <h4 id="injection-status-title">已生效功能</h4>
                           </div>
 
-                          {injectionScripts.length > 0 ? (
+                          {enabledOptimizationFeatures.length > 0 ? (
                             <div className="injection-status-list" role="list">
-                              {injectionScripts.map((script) => {
-                                const scriptEffective =
-                                  script.status === "effective";
-                                const scriptUnverified =
-                                  script.status === "executed";
-                                const scriptFailed =
-                                  script.status === "failed";
-                                const scriptUnknown =
-                                  script.status === "unknown";
-                                const scriptProblem =
-                                  scriptFailed || scriptUnknown;
-                                const ScriptStatusIcon = scriptEffective
-                                  ? Check
-                                  : scriptUnverified
-                                    ? IconClock
-                                    : X;
-                                const stateClass = scriptProblem
-                                  ? " failed"
-                                  : scriptUnverified
-                                    ? " unverified"
-                                    : "";
+                              {enabledOptimizationFeatures.map((feature) => {
+                                const FeatureIcon = feature.icon;
                                 return (
                                   <div
-                                    key={script.id}
-                                    className={`injection-status-row${stateClass}`}
+                                    key={feature.id}
+                                    className="injection-status-row"
                                     role="listitem"
                                   >
                                     <span
                                       className="injection-script-icon"
                                       aria-hidden="true"
                                     >
-                                      <Code size={15} />
+                                      <FeatureIcon size={15} />
                                     </span>
                                     <div className="injection-script-copy">
                                       <div className="injection-script-title">
-                                        <span>{script.name}</span>
+                                        <span>{feature.name}</span>
                                         <span className="injection-script-source">
-                                          {script.source === "user"
-                                            ? "用户脚本"
-                                            : "内置"}
+                                          {feature.sourceLabel}
                                         </span>
                                       </div>
-                                      {script.error && (
-                                        <code className="injection-script-error">
-                                          {script.error}
-                                        </code>
-                                      )}
-                                      {!script.error && script.detail && (
+                                      {feature.detail && (
                                         <span className="injection-script-detail">
-                                          {script.detail}
+                                          {feature.detail}
                                         </span>
                                       )}
                                     </div>
-                                    <span
-                                      className={`injection-script-state${stateClass}`}
-                                      title={
-                                        scriptEffective
-                                          ? "生效探针通过"
-                                          : scriptUnverified
-                                            ? "脚本已执行，但没有生效证据"
-                                            : scriptFailed
-                                              ? "脚本未生效"
-                                              : "脚本状态异常"
-                                      }
-                                    >
-                                      <ScriptStatusIcon
-                                        size={14}
-                                        aria-hidden="true"
-                                      />
-                                      {scriptEffective
-                                        ? "已生效"
-                                        : scriptUnverified
-                                          ? "未验证"
-                                          : scriptFailed
-                                            ? "失败"
-                                            : "异常"}
-                                    </span>
                                   </div>
                                 );
                               })}
@@ -670,8 +590,10 @@ function OperationsPanelComponent({
                           ) : (
                             <div className="injection-status-empty">
                               {status.running
-                                ? "正在等待最近一次脚本注入结果"
-                                : "Codex 启动后将在这里显示每个脚本的注入状态"}
+                                ? injectionScripts.length > 0
+                                  ? "暂未检测到已生效功能"
+                                  : "正在读取已生效功能"
+                                : "Codex 启动后将在这里显示已生效功能"}
                             </div>
                           )}
                         </section>
@@ -704,24 +626,6 @@ function OperationsPanelComponent({
           </div>
         )}
 
-        {isWindowsClient && (
-          <div
-            className={`windows-patch-status windows-patch-status-${windowsPatchTone}`}
-            role="status"
-            aria-live="polite"
-          >
-            <span className="windows-patch-icon">
-              <IconBrandWindows size={18} aria-hidden="true" />
-            </span>
-            <div className="windows-patch-copy">
-              <div className="windows-patch-heading">
-                <strong>Windows 优化补丁</strong>
-                <Badge variant={windowsPatchTone}>{windowsPatchLabel}</Badge>
-              </div>
-              <p>{windowsPatchDetail}</p>
-            </div>
-          </div>
-        )}
       </Card>
     </section>
   );

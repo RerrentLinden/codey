@@ -160,6 +160,7 @@ export function App({
       codexAppPath: status.codexAppPath,
       maintenance: status.maintenance,
       injectionScripts: status.injectionScripts,
+      fastContextToolsActive: status.fastContextToolsActive,
     }),
     [
       status.running,
@@ -171,6 +172,7 @@ export function App({
       status.codexAppPath,
       status.maintenance,
       status.injectionScripts,
+      status.fastContextToolsActive,
     ],
   );
   const {
@@ -923,8 +925,7 @@ export function App({
           {/* 最上方：运行状态 (Codex 运行与维护) */}
           <OperationsPanel
             codexAppPath={config.codexAppPath}
-            fastContextTools={config.fastContextTools}
-            slimCodexPet={config.slimCodexPet}
+            fastContextToolsStatus={fastContextToolsStatus}
             status={operationsStatus}
             busy={busy}
             isBusy={isBusy}

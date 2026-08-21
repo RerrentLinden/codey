@@ -24,7 +24,6 @@
       .then((result) => {
         if (result?.status === "failed") return;
         window.__codeyLocalPlugins = Array.isArray(result?.plugins) ? result.plugins : [];
-        window.dispatchEvent(new CustomEvent("codey-plugin-marketplace-refresh", { detail: result }));
       })
       .catch(() => {})
       .finally(() => {
@@ -294,7 +293,6 @@
           patched = patchResponse(response);
         } catch {}
         if (argsMatch(args, pluginMutationPattern)) {
-          window.__codeyPluginCacheVersion = (window.__codeyPluginCacheVersion || 0) + 1;
           refreshLocalPlugins(true);
         }
         return patched;

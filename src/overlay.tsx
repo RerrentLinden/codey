@@ -77,6 +77,7 @@ if (!window.__codeySettingsOverlay) {
   document.documentElement.appendChild(host);
 
   let hideTimer: number | undefined;
+  let visible = false;
   const hide = () => {
     window.clearTimeout(hideTimer);
     hideTimer = undefined;
@@ -96,11 +97,15 @@ if (!window.__codeySettingsOverlay) {
     );
   };
   const close = () => {
+    if (!visible) return;
+    visible = false;
     render(false);
     window.clearTimeout(hideTimer);
     hideTimer = window.setTimeout(hide, 250);
   };
   const open = () => {
+    if (visible) return;
+    visible = true;
     window.clearTimeout(hideTimer);
     hideTimer = undefined;
     document.documentElement.appendChild(host);
@@ -109,7 +114,7 @@ if (!window.__codeySettingsOverlay) {
     render(true);
     window.dispatchEvent(new CustomEvent(SETTINGS_OPENED_EVENT));
   };
-  const isOpen = () => host.style.display !== "none";
+  const isOpen = () => visible;
 
   render(false);
   window.__codeySettingsOverlay = {

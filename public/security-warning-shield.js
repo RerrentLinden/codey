@@ -3,6 +3,8 @@
   window.__codeySecurityWarningShieldInstalled = true;
 
   const configEventName = "codey:config-changed";
+  const injectionStatusId = "security-warning-shield";
+  const injectionStatusChangedEvent = "codey-injection-status-changed";
   const dismissedAttribute = "data-codey-security-warning-dismissed";
   const actionPatterns = [
     /^hide from this session$/i,
@@ -25,6 +27,27 @@
   let enabled = false;
   let scanTimer = 0;
   let unsubscribeMutations = null;
+
+  const publishInjectionStatus = () => {
+    const entry = window.__codeyInjectionStatus?.[injectionStatusId];
+    if (!entry || entry.status === "pending") return;
+    const status = enabled ? "effective" : "inactive";
+    const detail = enabled
+      ? "安全提示屏蔽已启用"
+      : "控制器已就绪，当前屏蔽策略关闭";
+    if (entry.status === status && entry.detail === detail && !entry.error) return;
+    entry.status = status;
+    entry.detail = detail;
+    entry.error = null;
+    if (
+      typeof window.dispatchEvent === "function"
+      && typeof window.CustomEvent === "function"
+    ) {
+      window.dispatchEvent(new window.CustomEvent(injectionStatusChangedEvent, {
+        detail: { id: injectionStatusId, status },
+      }));
+    }
+  };
 
   // innerText forces a layout flush; the action labels this shield matches are
   // plain text nodes, so textContent is both sufficient and layout-free.
@@ -96,6 +119,7 @@
       unsubscribeMutations?.();
       unsubscribeMutations = null;
     }
+    publishInjectionStatus();
     return enabled;
   };
 

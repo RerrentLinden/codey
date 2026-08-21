@@ -116,6 +116,7 @@ const createEnvironment = (options = {}) => {
   const inputEvents = [];
   const documentListeners = new Map();
   const windowListeners = new Map();
+  const statusEvents = [];
   let config = {
     promptOptimization: {
       enabled: options.enabled ?? true,
@@ -327,10 +328,23 @@ const createEnvironment = (options = {}) => {
     innerHeight: 800,
     innerWidth: 1280,
     location: { href: options.locationHref ?? "codex://conversation/1" },
+    __codeyInjectionStatus: {
+      "prompt-optimize": { status: "executed", detail: null, error: null },
+    },
     addEventListener(type, handler) {
       const handlers = windowListeners.get(type) || [];
       handlers.push(handler);
       windowListeners.set(type, handlers);
+    },
+    CustomEvent: class {
+      constructor(type, init = {}) {
+        this.type = type;
+        this.detail = init.detail;
+      }
+    },
+    dispatchEvent(event) {
+      statusEvents.push(event);
+      return true;
     },
     getComputedStyle: () => ({ display: "block", visibility: "visible" }),
   };
@@ -371,6 +385,8 @@ const createEnvironment = (options = {}) => {
     dialogControl,
     dialogInput,
     inputEvents,
+    injectionStatus: window.__codeyInjectionStatus["prompt-optimize"],
+    statusEvents,
     newChatInput,
     textarea,
     toolbar,
@@ -907,6 +923,7 @@ test("re-applies the switch when the console saves config", async () => {
   const env = createEnvironment({ enabled: false, apiKeyConfigured: true });
   await flush();
   assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
+  assert.equal(env.injectionStatus.status, "inactive");
 
   env.setConfig({
     promptOptimization: { enabled: true, apiKeyConfigured: true },
@@ -916,6 +933,11 @@ test("re-applies the switch when the console saves config", async () => {
 
   assert.ok(env.getElementById("codey-prompt-optimize-button"));
   assert.equal(env.snapshot().enabled, true);
+  assert.equal(env.injectionStatus.status, "effective");
+  assert.deepEqual(
+    { ...env.statusEvents.at(-1).detail },
+    { id: "prompt-optimize", status: "effective" },
+  );
   assert.equal(env.getObserverState().active, true);
   assert.equal(env.getObserverState().observeCalls, 1);
 });

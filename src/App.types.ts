@@ -97,7 +97,8 @@ export type InjectionScriptStatus = {
   id: string;
   name: string;
   source: "builtin" | "user";
-  status: "effective" | "executed" | "failed" | "unknown";
+  visibility: "feature" | "internal";
+  status: "effective" | "executed" | "inactive" | "failed" | "unknown";
   detail?: string;
   error?: string;
 };
@@ -116,6 +117,7 @@ export type RuntimeStatus = {
   codexAppPath?: string;
   maintenance?: Maintenance;
   injectionScripts?: InjectionScriptStatus[];
+  fastContextToolsActive?: boolean;
   traceLogStats?: TraceLogStats;
   crashpadPendingStats?: CrashpadPendingStats;
 };

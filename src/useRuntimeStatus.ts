@@ -14,9 +14,8 @@ type UseRuntimeStatusOptions = {
 
 const STATUS_POLL_MAX_DURATION_MS = 5 * 60 * 1_000;
 const STATUS_POLL_MAX_CONSECUTIVE_ERRORS = 5;
-const GIT_GUARD_PROBE_DELAYS_MS = [500, 1_000, 2_000, 5_000];
-const GIT_GUARD_PROBE_MAX_DURATION_MS = 30_000;
-const WMI_SAMPLER_PROBE_MAX_DURATION_MS = 60_000;
+const INJECTION_PROBE_DELAYS_MS = [500, 1_000, 2_000, 5_000];
+const INJECTION_PROBE_MAX_DURATION_MS = 60_000;
 const DIAGNOSTIC_PROBE_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000];
 
 type RuntimeStatusFlight = {
@@ -307,42 +306,30 @@ export function useRuntimeStatus({
     };
   }, [refreshInjectionStatus]);
 
-  const gitGuardStatus = status.injectionScripts?.find(
-    (script) => script.id === "git-request-guard",
-  )?.status;
-  const wmiSamplerStatus = status.injectionScripts?.find(
-    (script) => script.id === "windows-wmi-sampler",
-  )?.status;
-  const gitGuardProbePending = gitGuardStatus === "executed";
-  const wmiSamplerProbePending = wmiSamplerStatus === "executed";
+  const builtinInjectionProbePending =
+    status.injectionScripts?.some(
+      (script) =>
+        script.source === "builtin" && script.status === "executed",
+    ) ?? false;
 
   useEffect(() => {
-    if (!active || (!gitGuardProbePending && !wmiSamplerProbePending)) return;
+    if (!active || !builtinInjectionProbePending) return;
     const task = createStatusPollTask(
       {
         kind: "injection",
-        delays: GIT_GUARD_PROBE_DELAYS_MS,
+        delays: INJECTION_PROBE_DELAYS_MS,
         pending: (next) =>
           next.injectionScripts?.some(
             (script) =>
-              (script.id === "git-request-guard" ||
-                script.id === "windows-wmi-sampler") &&
-              script.status === "executed",
+              script.source === "builtin" && script.status === "executed",
           ) ?? false,
         refreshesInjectionStatus: true,
       },
-      wmiSamplerProbePending
-        ? WMI_SAMPLER_PROBE_MAX_DURATION_MS
-        : GIT_GUARD_PROBE_MAX_DURATION_MS,
+      INJECTION_PROBE_MAX_DURATION_MS,
     );
     statusPollScheduler.add(task);
     return () => statusPollScheduler.remove(task);
-  }, [
-    active,
-    gitGuardProbePending,
-    statusPollScheduler,
-    wmiSamplerProbePending,
-  ]);
+  }, [active, builtinInjectionProbePending, statusPollScheduler]);
 
   useEffect(() => {
     if (

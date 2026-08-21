@@ -634,6 +634,7 @@ async fn prepare_codex_startup_state(
         );
         error
     })?;
+    runtime_subagent_config.fast_context_tools = applied.fast_context_tools_active;
     Ok(PreparedCodexStartupState {
         config_contents: applied.config_contents,
         runtime_config: runtime_subagent_config,
@@ -1461,13 +1462,6 @@ impl CodeyRuntime {
             .store(enabled, Ordering::Release);
     }
 
-    pub fn injection_statuses_for_display(
-        &self,
-        statuses: Arc<[cdp::InjectionScriptStatus]>,
-    ) -> Arc<[cdp::InjectionScriptStatus]> {
-        statuses
-    }
-
     pub async fn refresh_injection_statuses(&self) -> Arc<[cdp::InjectionScriptStatus]> {
         let websocket_url = self.injection_websocket_url.read().await.clone();
         let statuses = cdp::read_injection_statuses(&websocket_url, &self.injection_scripts)
@@ -1477,10 +1471,8 @@ impl CodeyRuntime {
                     .statuses_with_error(format!("实时生效自检失败：{error:#}"))
             });
         if self.injection_websocket_url.read().await.as_ref() != websocket_url.as_ref() {
-            let statuses = self.injection_statuses.read().await.clone();
-            return self.injection_statuses_for_display(statuses);
+            return self.injection_statuses.read().await.clone();
         }
-        let statuses = self.injection_statuses_for_display(statuses);
         *self.injection_statuses.write().await = statuses.clone();
         statuses
     }

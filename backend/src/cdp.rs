@@ -77,7 +77,54 @@ struct InjectionScriptDescriptor {
     id: String,
     name: String,
     source: &'static str,
+    visibility: InjectionScriptVisibility,
     probe: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InjectionScriptVisibility {
+    Feature,
+    Internal,
+}
+
+impl InjectionScriptVisibility {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Feature => "feature",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InjectionHostPlatform {
+    Windows,
+    Other,
+}
+
+impl InjectionHostPlatform {
+    fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Other
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum InjectionScriptApplicability {
+    All,
+    WindowsOnly,
+}
+
+impl InjectionScriptApplicability {
+    fn supports(self, platform: InjectionHostPlatform) -> bool {
+        match self {
+            Self::All => true,
+            Self::WindowsOnly => platform == InjectionHostPlatform::Windows,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -86,6 +133,7 @@ pub struct InjectionScriptStatus {
     pub id: String,
     pub name: String,
     pub source: String,
+    pub visibility: String,
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -151,6 +199,23 @@ pub fn prepare_injection_scripts(
     hide_full_access_warning: bool,
     user_scripts: &[String],
 ) -> PreparedInjectionScripts {
+    prepare_injection_scripts_for_platform(
+        slim_codex_pet,
+        hide_full_access_warning,
+        user_scripts,
+        InjectionHostPlatform::current(),
+    )
+}
+
+fn prepare_injection_scripts_for_platform(
+    slim_codex_pet: bool,
+    hide_full_access_warning: bool,
+    user_scripts: &[String],
+    platform: InjectionHostPlatform,
+) -> PreparedInjectionScripts {
+    use InjectionScriptApplicability::{All, WindowsOnly};
+    use InjectionScriptVisibility::{Feature, Internal};
+
     let builtin_scripts = [
         (
             "bridge-helpers",
@@ -160,6 +225,8 @@ pub fn prepare_injection_scripts(
               && typeof window.__codeyCall === "function"
               ? "桥接函数可调用" : """#
                 .to_string(),
+            Internal,
+            All,
         ),
         (
             "git-request-guard",
@@ -189,6 +256,8 @@ pub fn prepare_injection_scripts(
               };
             })()"#
                 .to_string(),
+            Feature,
+            WindowsOnly,
         ),
         (
             "windows-wmi-sampler",
@@ -244,6 +313,8 @@ pub fn prepare_injection_scripts(
               };
             })()"#
                 .to_string(),
+            Feature,
+            WindowsOnly,
         ),
         (
             "model-whitelist",
@@ -258,6 +329,8 @@ pub fn prepare_injection_scripts(
                 : "";
             })()"#
                 .to_string(),
+            Internal,
+            All,
         ),
         (
             "pet-control-shield",
@@ -267,13 +340,19 @@ pub fn prepare_injection_scripts(
                 r#"window.__codeyPetControlShield?.enabled === {slim_codex_pet}
                   && typeof window.__codeyPetControlShield?.block === "function"
                   ? {} : """#,
-                serde_json::to_string(if slim_codex_pet {
-                    "宠物控制精简已启用"
+                if slim_codex_pet {
+                    serde_json::to_string("宠物控制精简已启用")
+                        .expect("pet probe detail should serialize")
                 } else {
-                    "控制器已就绪，当前精简策略关闭"
-                })
-                .expect("pet probe detail should serialize")
+                    format!(
+                        "{{ effective: false, inactive: true, detail: {} }}",
+                        serde_json::to_string("控制器已就绪，当前精简策略关闭")
+                            .expect("pet inactive detail should serialize")
+                    )
+                }
             ),
+            Feature,
+            All,
         ),
         (
             "security-warning-shield",
@@ -284,13 +363,19 @@ pub fn prepare_injection_scripts(
                   && window.__codeySecurityWarningShield?.enabled === {hide_full_access_warning}
                   && typeof window.__codeySecurityWarningShield?.dismissWarnings === "function"
                   ? {} : """#,
-                serde_json::to_string(if hide_full_access_warning {
-                    "安全提示屏蔽已启用"
+                if hide_full_access_warning {
+                    serde_json::to_string("安全提示屏蔽已启用")
+                        .expect("security probe detail should serialize")
                 } else {
-                    "控制器已就绪，当前屏蔽策略关闭"
-                })
-                .expect("security probe detail should serialize")
+                    format!(
+                        "{{ effective: false, inactive: true, detail: {} }}",
+                        serde_json::to_string("控制器已就绪，当前屏蔽策略关闭")
+                            .expect("security inactive detail should serialize")
+                    )
+                }
             ),
+            Feature,
+            All,
         ),
         (
             "settings-overlay-loader",
@@ -301,6 +386,8 @@ pub fn prepare_injection_scripts(
                 ? "配置面板按需加载器可用" : "配置面板已加载")
               : """#
                 .to_string(),
+            Internal,
+            All,
         ),
         (
             "renderer-controls",
@@ -316,6 +403,8 @@ pub fn prepare_injection_scripts(
                 : "渲染器控制与按需加载 API 可用";
             })()"#
                 .to_string(),
+            Feature,
+            All,
         ),
         (
             "plugin-marketplace-compatibility",
@@ -326,6 +415,8 @@ pub fn prepare_injection_scripts(
               && window.electronBridge?.sendMessageFromView?.__codeyPatched === true
               ? "插件市场桥接已接管" : """#
                 .to_string(),
+            Internal,
+            All,
         ),
         (
             "prompt-optimize",
@@ -335,11 +426,14 @@ pub fn prepare_injection_scripts(
               const optimizer = window.__codeyPromptOptimize;
               if (!optimizer || typeof optimizer.snapshot !== "function") return "";
               const snapshot = optimizer.snapshot();
-              return snapshot.ready === true
-                ? (snapshot.enabled === true ? "提示词优化按钮已就绪" : "提示词优化已关闭")
-                : "";
+              if (snapshot.ready !== true) return "";
+              return snapshot.enabled === true
+                ? "提示词优化按钮已就绪"
+                : { effective: false, inactive: true, detail: "提示词优化已关闭" };
             })()"#
                 .to_string(),
+            Feature,
+            All,
         ),
     ];
     let mut core_bundle = String::with_capacity(
@@ -355,11 +449,15 @@ pub fn prepare_injection_scripts(
             + 4096,
     );
     let mut descriptors = Vec::with_capacity(builtin_scripts.len() + user_scripts.len());
-    for (id, name, script, probe) in builtin_scripts {
+    for (id, name, script, probe, visibility, applicability) in builtin_scripts {
+        if !applicability.supports(platform) {
+            continue;
+        }
         let descriptor = InjectionScriptDescriptor {
             id: id.to_string(),
             name: name.to_string(),
             source: "builtin",
+            visibility,
             probe: Some(probe),
         };
         let prepared = prepare_script(script, slim_codex_pet);
@@ -378,6 +476,7 @@ pub fn prepare_injection_scripts(
             id: format!("user-script-{}", index + 1),
             name: format!("用户脚本 {}", index + 1),
             source: "user",
+            visibility: Feature,
             probe: None,
         };
         let mut guarded = String::with_capacity(script.len() + 512);
@@ -653,6 +752,7 @@ impl PreparedInjectionScripts {
                     id: descriptor.id.clone(),
                     name: descriptor.name.clone(),
                     source: descriptor.source.to_string(),
+                    visibility: descriptor.visibility.as_str().to_string(),
                     status: "unknown".to_string(),
                     detail: None,
                     error: Some(error.clone()),
@@ -860,15 +960,18 @@ fn injection_status_snapshot_script(descriptors: &[InjectionScriptDescriptor]) -
   const verify = () => {{
     for (const [id, probe] of Object.entries(probes)) {{
       const entry = registry[id];
-      if (!entry || entry.status !== "executed") continue;
+      if (!entry || !["executed", "effective", "inactive"].includes(entry.status)) continue;
       try {{
         const evidence = probe();
         const structured = evidence && typeof evidence === "object"
           && Object.prototype.hasOwnProperty.call(evidence, "effective");
         const effective = structured ? evidence.effective === true : Boolean(evidence);
+        const inactive = structured && evidence.inactive === true;
         const detail = structured ? evidence.detail : evidence;
         if (effective) {{
           entry.status = "effective";
+        }} else if (inactive) {{
+          entry.status = "inactive";
         }}
         if (detail) entry.detail = String(detail);
       }} catch (error) {{
@@ -909,6 +1012,7 @@ fn reconcile_injection_statuses(
                         id: descriptor.id.clone(),
                         name: descriptor.name.clone(),
                         source: descriptor.source.to_string(),
+                        visibility: descriptor.visibility.as_str().to_string(),
                         status: "unknown".to_string(),
                         detail: None,
                         error: Some("脚本未返回注入状态".to_string()),
@@ -922,7 +1026,7 @@ fn reconcile_injection_statuses(
                 } = status;
                 let valid_status = matches!(
                     reported_status.as_str(),
-                    "effective" | "executed" | "failed"
+                    "effective" | "executed" | "inactive" | "failed"
                 );
                 let normalized_detail = if valid_status {
                     detail
@@ -943,6 +1047,7 @@ fn reconcile_injection_statuses(
                     id: descriptor.id.clone(),
                     name: descriptor.name.clone(),
                     source: descriptor.source.to_string(),
+                    visibility: descriptor.visibility.as_str().to_string(),
                     status: if valid_status {
                         reported_status
                     } else {
@@ -1412,10 +1517,11 @@ mod tests {
 
     #[test]
     fn core_scripts_share_one_cdp_document_script_and_user_scripts_stay_isolated() {
-        let prepared = prepare_injection_scripts(
+        let prepared = prepare_injection_scripts_for_platform(
             false,
             false,
             &["".to_string(), "window.userScriptRan = true;".to_string()],
+            InjectionHostPlatform::Windows,
         );
 
         assert_eq!(prepared.scripts.len(), 2);
@@ -1441,6 +1547,14 @@ mod tests {
         assert_eq!(prepared.descriptors.len(), 11);
         assert_eq!(prepared.descriptors[10].id, "user-script-1");
         assert_eq!(prepared.descriptors[10].source, "user");
+        assert_eq!(
+            prepared.descriptors[0].visibility,
+            InjectionScriptVisibility::Internal
+        );
+        assert_eq!(
+            prepared.descriptors[10].visibility,
+            InjectionScriptVisibility::Feature
+        );
         let snapshot_script = injection_status_snapshot_script(&prepared.descriptors);
         assert!(snapshot_script.contains("bridge-helpers"));
         assert!(snapshot_script.contains("Windows Git 请求限流已由主进程接管"));
@@ -1449,6 +1563,8 @@ mod tests {
         assert!(snapshot_script.contains("WMI 周期采样保护已安装"));
         assert!(snapshot_script.contains("snapshot.blocked > 0"));
         assert!(snapshot_script.contains("effective: false"));
+        assert!(snapshot_script.contains("entry.status = \"inactive\""));
+        assert!(snapshot_script.contains("[\"executed\", \"effective\", \"inactive\"].includes"));
         assert!(snapshot_script.contains("Object.prototype.hasOwnProperty.call"));
         assert!(snapshot_script.contains("模型目录已加载"));
         assert!(snapshot_script.contains("插件市场桥接已接管"));
@@ -1474,9 +1590,61 @@ mod tests {
     }
 
     #[test]
+    fn windows_only_scripts_are_excluded_from_non_windows_injection() {
+        let user_scripts = ["window.userScriptRan = true;".to_string()];
+        let non_windows = prepare_injection_scripts_for_platform(
+            false,
+            false,
+            &user_scripts,
+            InjectionHostPlatform::Other,
+        );
+        let windows = prepare_injection_scripts_for_platform(
+            false,
+            false,
+            &user_scripts,
+            InjectionHostPlatform::Windows,
+        );
+
+        for windows_only_id in ["git-request-guard", "windows-wmi-sampler"] {
+            assert!(
+                non_windows
+                    .descriptors
+                    .iter()
+                    .all(|descriptor| descriptor.id != windows_only_id)
+            );
+            assert!(
+                windows
+                    .descriptors
+                    .iter()
+                    .any(|descriptor| descriptor.id == windows_only_id)
+            );
+        }
+        assert!(!non_windows.scripts[0].contains("__codeyGitRequestGuard"));
+        assert!(!non_windows.scripts[0].contains("__codeyWindowsWmiSamplerGuard"));
+        assert_eq!(
+            non_windows
+                .descriptors
+                .last()
+                .map(|descriptor| descriptor.id.as_str()),
+            Some("user-script-1")
+        );
+
+        let current = prepare_injection_scripts(false, false, &[]);
+        let current_has_windows_scripts = current
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.id == "git-request-guard");
+        assert_eq!(current_has_windows_scripts, cfg!(windows));
+    }
+
+    #[test]
     fn injection_statuses_preserve_script_order_and_report_missing_entries() {
-        let prepared =
-            prepare_injection_scripts(false, false, &["window.userScriptRan = true;".to_string()]);
+        let prepared = prepare_injection_scripts_for_platform(
+            false,
+            false,
+            &["window.userScriptRan = true;".to_string()],
+            InjectionHostPlatform::Windows,
+        );
         let reported = vec![
             RuntimeInjectionStatus {
                 id: "user-script-1".to_string(),
@@ -1488,6 +1656,12 @@ mod tests {
                 id: "bridge-helpers".to_string(),
                 status: "effective".to_string(),
                 detail: Some("桥接函数可调用".to_string()),
+                error: None,
+            },
+            RuntimeInjectionStatus {
+                id: "security-warning-shield".to_string(),
+                status: "inactive".to_string(),
+                detail: Some("控制器已就绪，当前屏蔽策略关闭".to_string()),
                 error: None,
             },
         ];
@@ -1504,6 +1678,8 @@ mod tests {
         assert_eq!(statuses[2].status, "unknown");
         assert_eq!(statuses[3].id, "model-whitelist");
         assert_eq!(statuses[3].status, "unknown");
+        assert_eq!(statuses[5].id, "security-warning-shield");
+        assert_eq!(statuses[5].status, "inactive");
         assert_eq!(
             statuses.last().map(|status| status.id.as_str()),
             Some("user-script-1")

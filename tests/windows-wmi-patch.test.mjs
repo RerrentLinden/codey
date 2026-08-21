@@ -242,7 +242,7 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
   });
 });
 
-test("settings exposes degraded Windows optimization failures", async () => {
+test("settings keeps Windows optimization checks without a standalone banner", async () => {
   const [
     sectionsSource,
     typesSource,
@@ -262,20 +262,20 @@ test("settings exposes degraded Windows optimization failures", async () => {
   const launcherSource = `${launcherRootSource}\n${launcherProcessSource}`;
 
   assert.match(commandsSource, /"clientPlatform": current_update_platform\(\)/);
-  assert.match(commandsSource, /injection_statuses_for_display/);
+  assert.doesNotMatch(commandsSource, /injection_statuses_for_display/);
   assert.match(typesSource, /clientPlatform\?: string/);
   assert.match(sectionsSource, /status\.clientPlatform === "windows"/);
-  assert.match(sectionsSource, /\{isWindowsClient && \(/);
-  assert.match(sectionsSource, /Windows 优化补丁/);
-  assert.match(sectionsSource, /windowsStartupPatchInstalled/);
-  assert.match(sectionsSource, /windowsWmiSamplerConfirmed/);
-  assert.match(sectionsSource, /script\.id === "windows-wmi-sampler"/);
+  assert.doesNotMatch(sectionsSource, /Windows 优化补丁/);
+  assert.doesNotMatch(sectionsSource, /windows-patch-status/);
+  assert.doesNotMatch(sectionsSource, /windowsStartupPatchInstalled/);
+  assert.doesNotMatch(sectionsSource, /windowsWmiSamplerConfirmed/);
+  assert.doesNotMatch(sectionsSource, /script\.id === "windows-wmi-sampler"/);
   assert.match(
     sectionsSource,
     /performanceStatus === "error" \|\|[\s\S]*?performanceStatus === "degraded"/,
   );
-  assert.match(sectionsSource, /windowsPatchReady[\s\S]*?"已启用"/);
-  assert.match(sectionsSource, /windowsPatchFailed[\s\S]*?"未生效"/);
+  assert.doesNotMatch(sectionsSource, /windowsPatchReady/);
+  assert.doesNotMatch(sectionsSource, /windowsPatchFailed/);
   assert.doesNotMatch(
     sectionsSource,
     /WMI 周期采样、临时 WebView 残留与执行环境泄漏修复已生效/,
@@ -285,7 +285,8 @@ test("settings exposes degraded Windows optimization failures", async () => {
     /WMI 周期采样保护等待运行时确认/,
   );
   assert.match(sectionsSource, /script\.status === "failed"/);
-  assert.match(sectionsSource, /scriptFailed[\s\S]*?\? "失败"/);
+  assert.doesNotMatch(sectionsSource, /injection-script-state/);
+  assert.doesNotMatch(sectionsSource, /id: "opt-patch"/);
   assert.doesNotMatch(launcherSource, /fn mark_pet_slim_startup_failure/);
   assert.doesNotMatch(launcherSource, /pet_status\.status = "failed"/);
 });
