@@ -16,6 +16,7 @@ function createRuntime({
   platform = "Win32",
   statusTransport = "return",
   sampler = {
+    version: 4,
     enabled: true,
     installed: true,
     workerWrapperPatched: true,
@@ -117,23 +118,23 @@ test("WMI sampler guard is registered as an independently probed CDP script", ()
     /"windows-wmi-sampler",\s*"Windows WMI 周期采样保护",\s*WINDOWS_WMI_SAMPLER_GUARD_SCRIPT/,
   );
   assert.match(cdpSource, /window\.__codeyWindowsWmiSamplerGuard/);
-  assert.match(cdpSource, /snapshot\.selfTestPassed === true/);
+  assert.match(cdpSource, /snapshot\.selfTestConfirmed === true/);
   assert.doesNotMatch(source, /setInterval/);
 });
 
-test("WMI sampler guard keeps self-test separate from actual protection", async () => {
+test("WMI sampler guard confirms a complete self-test and reports actual blocks separately", async () => {
   const runtime = createRuntime();
   await runtime.flush();
 
   const entry =
     runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
-  assert.equal(entry.status, "executed");
-  assert.match(entry.detail, /拦截器自检通过/);
-  assert.match(entry.detail, /等待实际目标采样确认/);
+  assert.equal(entry.status, "effective");
+  assert.match(entry.detail, /完整自检通过/);
+  assert.match(entry.detail, /尚未触发实际 WMI 采样/);
   assert.equal(runtime.requests[0].type, "codey-windows-wmi-sampler-status");
   assert.equal(
     runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
-    false,
+    true,
   );
 
   runtime.setSampler({
@@ -154,6 +155,29 @@ test("WMI sampler guard keeps self-test separate from actual protection", async 
     runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
     true,
   );
+});
+
+test("WMI sampler guard does not trust a legacy self-test as complete confirmation", async () => {
+  const runtime = createRuntime({
+    sampler: {
+      version: 3,
+      enabled: true,
+      installed: true,
+      workerWrapperPatched: true,
+      selfTestPassed: true,
+      blocked: 0,
+      observationMs: 1_000,
+    },
+  });
+  await runtime.flush();
+
+  const entry =
+    runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
+  const snapshot = runtime.window.__codeyWindowsWmiSamplerGuard.snapshot();
+  assert.equal(entry.status, "executed");
+  assert.match(entry.detail, /旧版/);
+  assert.equal(snapshot.selfTestConfirmed, false);
+  assert.equal(snapshot.confirmed, false);
 });
 
 test("WMI sampler guard verifies a no-return preload through a renderer event", async () => {
@@ -207,9 +231,10 @@ test("WMI sampler guard keeps an unmatched observation window unverified", async
   );
 });
 
-test("WMI sampler self-test does not hide an unmatched observation", async () => {
+test("WMI sampler complete self-test is not downgraded by an unmatched observation", async () => {
   const runtime = createRuntime({
     sampler: {
+      version: 4,
       enabled: true,
       installed: true,
       workerWrapperPatched: true,
@@ -228,18 +253,20 @@ test("WMI sampler self-test does not hide an unmatched observation", async () =>
 
   const entry =
     runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
-  assert.equal(entry.status, "executed");
+  assert.equal(entry.status, "effective");
+  assert.match(entry.detail, /完整自检通过/);
   assert.match(entry.detail, /已检查 1 个 Worker/);
-  assert.match(entry.detail, /当前来源尚未被识别/);
+  assert.match(entry.detail, /尚未观察到实际 WMI 采样/);
   assert.equal(
     runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
-    false,
+    true,
   );
 });
 
-test("WMI sampler guard stays unverified when a Worker source could not be read", async () => {
+test("WMI sampler complete self-test keeps source-read diagnostics without losing confirmation", async () => {
   const runtime = createRuntime({
     sampler: {
+      version: 4,
       enabled: true,
       installed: true,
       workerWrapperPatched: true,
@@ -253,11 +280,12 @@ test("WMI sampler guard stays unverified when a Worker source could not be read"
 
   const entry =
     runtime.window.__codeyInjectionStatus["windows-wmi-sampler"];
-  assert.equal(entry.status, "executed");
+  assert.equal(entry.status, "effective");
+  assert.match(entry.detail, /完整自检通过/);
   assert.match(entry.detail, /1 个 Worker 源码无法检查/);
   assert.equal(
     runtime.window.__codeyWindowsWmiSamplerGuard.snapshot().confirmed,
-    false,
+    true,
   );
 });
 

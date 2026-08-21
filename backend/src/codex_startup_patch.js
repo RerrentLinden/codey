@@ -140,7 +140,7 @@
   const rendererMessageChannel = "codex_desktop:message-for-view";
   const windowsWmiSamplerInstalledAtMs = Date.now();
   const windowsWmiSamplerEvidence = {
-    version: 3,
+    version: 4,
     enabled: disableWindowsWmiSampler,
     workerWrapperPatched: false,
     esmExportsSynchronized: false,
@@ -2170,6 +2170,23 @@
       "__codeyRunWmiSamplerSelfTest",
       {
         value() {
+          const sourceProbe = [
+            'const { parentPort } = require("node:worker_threads");',
+            'const executable = "powershell.exe";',
+            'const command = "Get-CimInstance Win32_Process Win32_PerfFormattedData_PerfProc_Process";',
+            "parentPort.postMessage({ executable, command });",
+          ].join("\n");
+          const recognizersPassed =
+            isKnownWmiSnapshotWorkerName(
+              "child-process-snapshot-worker-codey-self-test.js",
+            ) &&
+            isKnownWmiSnapshotWorkerThreadName({
+              name: "child-process-snapshot",
+            }) &&
+            hasWmiSnapshotSourceSignature(
+              wmiSnapshotSourceSignals(sourceProbe),
+            );
+          if (!recognizersPassed) return false;
           const probe = new CodeyNoInspectWorker(
             "codey-wmi-sampler-self-test.js",
             { [windowsWmiSamplerSelfTest]: true },
@@ -3231,5 +3248,5 @@
   setImmediate(() => {
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v30";
+  return "codey-startup-patch-installed-v31";
 })()

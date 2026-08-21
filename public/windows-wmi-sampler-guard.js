@@ -3,7 +3,7 @@
 
   const guardKey = "__codeyWindowsWmiSamplerGuard";
   const scriptId = "windows-wmi-sampler";
-  const version = 3;
+  const version = 4;
   const statusRequestType = "codey-windows-wmi-sampler-status";
   const statusResponseType = "codey-windows-wmi-sampler-status-response";
   const probeTimeoutMs = 1_000;
@@ -37,6 +37,8 @@
       : true;
     const blocked = Number(mainProcessSnapshot?.blocked) || 0;
     const selfTestPassed = mainProcessSnapshot?.selfTestPassed === true;
+    const selfTestConfirmed =
+      Number(mainProcessSnapshot?.version) >= 4 && selfTestPassed;
     const observationMs = Number(mainProcessSnapshot?.observationMs) || 0;
     const sourceReadFailures =
       Number(mainProcessSnapshot?.sourceReadFailures) || 0;
@@ -44,9 +46,11 @@
       version,
       enabled,
       installed,
-      confirmed: !enabled || (installed && blocked > 0),
+      confirmed:
+        !enabled || (installed && (selfTestConfirmed || blocked > 0)),
       blocked,
       selfTestPassed,
+      selfTestConfirmed,
       observationMs,
       observationWindowMs,
       sourceInspections:
@@ -90,6 +94,26 @@
       status = "failed";
       detail = `WMI 周期采样保护自检失败：${current.mainProcessSnapshot.selfTestError}`;
       error = detail;
+    } else if (current.installed && current.selfTestConfirmed) {
+      const workersObserved =
+        Number(current.mainProcessSnapshot?.workersObserved) || 0;
+      status = "effective";
+      detail = "WMI Worker 拦截器已安装且完整自检通过";
+      if (current.sourceReadFailures > 0) {
+        detail +=
+          `；有 ${current.sourceReadFailures} 个 Worker 源码无法检查，` +
+          "尚未观察到实际 WMI 采样";
+      } else if (current.sourceInspections > 0) {
+        detail +=
+          `；已检查 ${current.sourceInspections} 个 Worker，` +
+          "尚未观察到实际 WMI 采样";
+      } else if (workersObserved > 0) {
+        detail +=
+          `；已观察 ${workersObserved} 个 Worker，` +
+          "尚未触发实际 WMI 采样";
+      } else {
+        detail += "；尚未触发实际 WMI 采样";
+      }
     } else if (current.sourceReadFailures > 0) {
       detail =
         `有 ${current.sourceReadFailures} 个 Worker 源码无法检查，` +
@@ -104,7 +128,7 @@
         : "WMI 周期采样保护已安装，但观察窗内未匹配到可识别的目标 Worker";
     } else if (current.installed) {
       detail = current.selfTestPassed
-        ? "WMI Worker 拦截器自检通过，等待实际目标采样确认"
+        ? "旧版 WMI Worker 拦截器自检通过，等待实际目标采样确认"
         : `WMI 周期采样保护已安装，等待首次采样确认` +
           `（已观察 ${Math.floor(current.observationMs / 1_000)} 秒）`;
     } else {

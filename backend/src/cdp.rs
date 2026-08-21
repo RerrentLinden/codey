@@ -286,6 +286,21 @@ fn prepare_injection_scripts_for_platform(
                   detail: `WMI 周期采样保护自检失败：${snapshot.mainProcessSnapshot.selfTestError}`,
                 };
               }
+              if (snapshot.installed === true && snapshot.selfTestConfirmed === true) {
+                const workersObserved =
+                  Number(snapshot.mainProcessSnapshot?.workersObserved) || 0;
+                let detail = "WMI Worker 拦截器已安装且完整自检通过";
+                if (snapshot.sourceReadFailures > 0) {
+                  detail += `；有 ${snapshot.sourceReadFailures} 个 Worker 源码无法检查，尚未观察到实际 WMI 采样`;
+                } else if (snapshot.sourceInspections > 0) {
+                  detail += `；已检查 ${snapshot.sourceInspections} 个 Worker，尚未观察到实际 WMI 采样`;
+                } else if (workersObserved > 0) {
+                  detail += `；已观察 ${workersObserved} 个 Worker，尚未触发实际 WMI 采样`;
+                } else {
+                  detail += "；尚未触发实际 WMI 采样";
+                }
+                return detail;
+              }
               if (snapshot.sourceReadFailures > 0) {
                 return {
                   effective: false,
@@ -300,7 +315,7 @@ fn prepare_injection_scripts_for_platform(
                     ? `已检查 ${snapshot.sourceInspections} 个 Worker，尚未命中完整 WMI 周期采样特征；若 WMI 仍高占用，当前来源尚未被识别`
                     : "WMI 周期采样保护已安装，但观察窗内未匹配到可识别的目标 Worker"
                   : snapshot.selfTestPassed === true
-                    ? "WMI Worker 拦截器自检通过，等待实际目标采样确认"
+                    ? "旧版 WMI Worker 拦截器自检通过，等待实际目标采样确认"
                     : `WMI 周期采样保护已安装，等待首次采样确认（已观察 ${Math.floor(snapshot.observationMs / 1000)} 秒）`;
                 return {
                   effective: false,
@@ -1567,6 +1582,7 @@ mod tests {
         assert!(snapshot_script.contains("snapshot.mainProcessProtected === true"));
         assert!(snapshot_script.contains("WMI 周期采样保护已安装"));
         assert!(snapshot_script.contains("snapshot.blocked > 0"));
+        assert!(snapshot_script.contains("snapshot.selfTestConfirmed === true"));
         assert!(snapshot_script.contains("effective: false"));
         assert!(snapshot_script.contains("entry.status = \"inactive\""));
         assert!(snapshot_script.contains("[\"executed\", \"effective\", \"inactive\"].includes"));

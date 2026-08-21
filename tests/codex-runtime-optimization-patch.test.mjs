@@ -75,7 +75,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       (config) => !config.startsWith("__CODEY_WSL_ONLY__:"),
     );
     const expression = await loadPatchExpression(runtimeConfigOverrides);
-    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v30");
+    assert.equal((0, eval)(expression), "codey-startup-patch-installed-v31");
 
     const patchedElectron = Module._load("electron");
     const passthroughGitHandler = () => "git-handler";
@@ -113,6 +113,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       requestId: "wmi-status-1",
     });
     assert.equal(startupWmiSamplerStatus.status, "ok");
+    assert.equal(startupWmiSamplerStatus.sampler.version, 4);
     assert.equal(
       startupWmiSamplerStatus.sampler.workerWrapperPatched,
       true,
