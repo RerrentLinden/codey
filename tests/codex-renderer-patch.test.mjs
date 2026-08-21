@@ -170,7 +170,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
   try {
     assert.equal(
       (0, eval)(await loadStartupPatchExpression(true, "C:\\Codey\\codey.exe")),
-      "codey-startup-patch-installed-v24",
+      "codey-startup-patch-installed-v25",
     );
     const electron = Module._load("electron", undefined, false);
     const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
@@ -359,6 +359,107 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       patchErrors.length,
       2,
       "the compatible hook tooltip patch must not log a skipped renderer gate",
+    );
+
+    const subagentStatusSource = [
+      "function installSubagentWatcher(h,t,r){",
+      "let refreshCalls=0;",
+      "const c=()=>{refreshCalls+=1;return t.discoverSubagentDescendantSnapshot(r,{reconcile:!0})};",
+      "const l=new Set([`child-1`]);c();",
+      "let v=h.addConversationStateCallback((e,n)=>{",
+      "if(n==null||e===r||!l.has(e))return;",
+      "let i=null;if(i==null)return;let s=!1;s&&c?.()}),",
+      "y=h.addNotificationCallback(`thread/status/changed`,()=>{});",
+      "return{getRefreshCalls:()=>refreshCalls,dispose:()=>{v();y()}}}",
+      "const subagentStatusError=`Failed to load subagent threads`;",
+    ].join("");
+    electron.protocol.handle("app", async () => new Response(subagentStatusSource));
+    const subagentStatusResponse = await installedHandler({
+      url: "app://-/assets/app-initial-subagent-status-current-build.js",
+    });
+    const patchedSubagentStatusSource = await subagentStatusResponse.text();
+    assert.match(
+      patchedSubagentStatusSource,
+      /__CODEY_SUBAGENT_STATUS_RECONCILER_V1__/,
+    );
+    assert.match(patchedSubagentStatusSource, /\[0,200,800\]/);
+    assert.doesNotMatch(
+      patchedSubagentStatusSource,
+      /if\(n==null\|\|e===r\|\|!l\.has\(e\)\)return;let i=null/,
+    );
+
+    delete globalThis.__CODEY_SUBAGENT_STATUS_RECONCILER_V1__;
+    const installSubagentWatcher = Function(
+      `${patchedSubagentStatusSource};return installSubagentWatcher`,
+    )();
+    const statusNativeSetTimeout = globalThis.setTimeout;
+    const statusNativeClearTimeout = globalThis.clearTimeout;
+    const statusTimers = [];
+    let conversationStateCallback = null;
+    globalThis.setTimeout = (callback, delay) => {
+      const timer = { callback, delay, cleared: false };
+      statusTimers.push(timer);
+      return timer;
+    };
+    globalThis.clearTimeout = (timer) => {
+      timer.cleared = true;
+    };
+    try {
+      const watcher = installSubagentWatcher(
+        {
+          addConversationStateCallback(callback) {
+            conversationStateCallback = callback;
+            return () => {};
+          },
+          addNotificationCallback() {
+            return () => {};
+          },
+        },
+        {
+          discoverSubagentDescendantSnapshot() {
+            return null;
+          },
+        },
+        "parent-1",
+      );
+      assert.equal(watcher.getRefreshCalls(), 1);
+      conversationStateCallback("child-1", {
+        turns: [{ status: "inProgress" }],
+      });
+      assert.equal(statusTimers.length, 0);
+
+      conversationStateCallback("child-1", {
+        turns: [{ status: "completed" }],
+      });
+      assert.deepEqual(
+        statusTimers.map(({ delay }) => delay),
+        [0, 200, 800, 1000],
+      );
+      conversationStateCallback("child-1", {
+        turns: [{ status: "completed" }],
+      });
+      assert.ok(statusTimers.slice(0, 4).every(({ cleared }) => cleared));
+      assert.deepEqual(
+        statusTimers.slice(4).map(({ delay }) => delay),
+        [0, 200, 800, 1000],
+      );
+      for (const timer of statusTimers.slice(4, 7)) timer.callback();
+      statusTimers[7].callback();
+      assert.equal(watcher.getRefreshCalls(), 4);
+      assert.deepEqual(
+        globalThis.__CODEY_SUBAGENT_STATUS_RECONCILER_V1__.snapshot(),
+        { version: 1, scheduled: 2, refreshes: 3 },
+      );
+      watcher.dispose();
+    } finally {
+      globalThis.setTimeout = statusNativeSetTimeout;
+      globalThis.clearTimeout = statusNativeClearTimeout;
+      delete globalThis.__CODEY_SUBAGENT_STATUS_RECONCILER_V1__;
+    }
+    assert.equal(
+      patchErrors.length,
+      2,
+      "the compatible subagent status patch must not log a skipped renderer gate",
     );
 
     const petSettingsSource = [
@@ -685,6 +786,17 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         productionSource,
         "the production renderer asset should receive compatible Codey gates",
       );
+      if (
+        productionSource.includes("discoverSubagentDescendantSnapshot")
+        && productionSource.includes("Failed to load subagent threads")
+        && productionSource.includes("thread/status/changed")
+      ) {
+        assert.match(
+          patchedProductionSource,
+          /__CODEY_SUBAGENT_STATUS_RECONCILER_V1__/,
+          "the production subagent callback shape should receive terminal reconciliation",
+        );
+      }
       const currentGateFailures = patchErrors
         .slice(previousErrorCount)
         .map(([message]) => String(message))

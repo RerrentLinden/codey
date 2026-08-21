@@ -701,6 +701,31 @@
       "})()).find(",
       `${coordinationName}.clientCoordination,${hostIdName},${conversationIdName})`,
     ].join("");
+  const subagentStatusReconcileExpression = (
+    conversationStateName,
+    refreshSnapshotName,
+  ) => {
+    const latestTurnStatus = `${conversationStateName}.turns.at(-1)?.status`;
+    return [
+      `if((${latestTurnStatus}===\`completed\`||${latestTurnStatus}===\`failed\`||${latestTurnStatus}===\`interrupted\`)&&typeof ${refreshSnapshotName}===\`function\`){`,
+      "(globalThis.__CODEY_SUBAGENT_STATUS_RECONCILER_V1__??={",
+      "version:1,pending:new WeakMap,scheduled:0,refreshes:0,",
+      "schedule(refresh){",
+      "const previous=this.pending.get(refresh);",
+      "if(previous!=null)for(const timer of previous)globalThis.clearTimeout(timer);",
+      "this.scheduled+=1;",
+      "const timers=[0,200,800].map(delay=>globalThis.setTimeout(()=>{",
+      "this.refreshes+=1;try{refresh()}catch{}",
+      "},delay));",
+      "timers.push(globalThis.setTimeout(()=>{",
+      "if(this.pending.get(refresh)===timers)this.pending.delete(refresh)",
+      "},1000));",
+      "this.pending.set(refresh,timers)",
+      "},",
+      "snapshot(){return{version:this.version,scheduled:this.scheduled,refreshes:this.refreshes}}",
+      `}).schedule(${refreshSnapshotName});return}`,
+    ].join("");
+  };
   const patchCodexRendererAsset = (source) => {
     let patched = source;
     let nativeCustomProviderModelAccess = false;
@@ -768,6 +793,42 @@
             conversationIdName,
           ),
         "thread owner discovery coalescing",
+      );
+    }
+    if (
+      source.includes("discoverSubagentDescendantSnapshot")
+      && source.includes("Failed to load subagent threads")
+      && source.includes("thread/status/changed")
+      && source.includes(".addConversationStateCallback")
+    ) {
+      // Codex's summary-panel snapshot listens for thread/status/changed, but a
+      // completed child turn can reach the conversation store without a matching
+      // status notification. Opening the child panel performs a full reconcile,
+      // which is why a stale "working" count fixes itself after navigation. When
+      // a known child conversation reaches a terminal turn, schedule a small,
+      // deduplicated reconcile burst to bridge that notification gap. The native
+      // snapshot loader remains the source of truth; no DOM text or local Codey
+      // subagent ledger is used to infer the displayed status.
+      patched = replaceUniqueRendererGate(
+        patched,
+        /(\.addConversationStateCallback\(\(\s*([$A-Z_a-z][$\w]*)\s*,\s*([$A-Z_a-z][$\w]*)\s*\)\s*=>\s*\{\s*if\s*\(\s*\3\s*==\s*null\s*\|\|\s*\2\s*===\s*([$A-Z_a-z][$\w]*)\s*\|\|\s*!\s*([$A-Z_a-z][$\w]*)\.has\(\s*\2\s*\)\s*\)\s*return\s*;)([\s\S]{0,4096}?)([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\?\.\(\)\s*(\}\))/g,
+        (
+          _match,
+          callbackStart,
+          _conversationIdName,
+          conversationStateName,
+          _parentConversationIdName,
+          _knownDescendantsName,
+          callbackBody,
+          discoveredDescendantsName,
+          refreshSnapshotName,
+          callbackEnd,
+        ) =>
+          `${callbackStart}${subagentStatusReconcileExpression(
+            conversationStateName,
+            refreshSnapshotName,
+          )}${callbackBody}${discoveredDescendantsName}&&${refreshSnapshotName}?.()${callbackEnd}`,
+        "subagent terminal status reconciliation",
       );
     }
     if (
@@ -3006,5 +3067,5 @@
   setImmediate(() => {
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v24";
+  return "codey-startup-patch-installed-v25";
 })()

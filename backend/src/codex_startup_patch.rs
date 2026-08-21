@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 
-const PATCH_RESULT: &str = "codey-startup-patch-installed-v24";
+const PATCH_RESULT: &str = "codey-startup-patch-installed-v25";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
@@ -261,7 +261,7 @@ mod tests {
 
     #[test]
     fn patch_result_is_stable_for_launch_status_validation() {
-        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v24");
+        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v25");
     }
 
     #[test]
