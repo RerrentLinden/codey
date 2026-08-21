@@ -5,6 +5,17 @@ import test from "node:test";
 const delay = (milliseconds) =>
   new Promise((resolve) => setTimeout(resolve, milliseconds));
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
+const standaloneNodeRepl = (pid, overrides = {}) => ({
+  appServerPid: 10,
+  command: "/Codex/Resources/cua_node/bin/node_repl",
+  depth: 1,
+  kind: "other",
+  parentPid: 10,
+  pid,
+  rootChildPid: pid,
+  startedAtMs: 1000,
+  ...overrides,
+});
 
 async function waitFor(predicate, timeoutMs = 5000) {
   const deadline = Date.now() + timeoutMs;
@@ -110,6 +121,7 @@ test("execution snapshot normalizes app-server ownership and root process trees"
   const normalized = lifecycle.normalizeSnapshot([
     { command: "codex app-server", depth: 1, kind: "app_server", parentPid: 9, pid: 10 },
     { command: "node fastctx.js --mcp", depth: 2, kind: "mcp", parentPid: 10, pid: 11 },
+    { command: "node fastctx.js --mcp", depth: 2, kind: "mcp", parentPid: 10, pid: 11 },
     { command: "node fastctx-worker.js", depth: 3, kind: "other", parentPid: 11, pid: 12 },
     { command: "unrelated", depth: 1, kind: "other", parentPid: 9, pid: 13 },
   ]);
@@ -126,6 +138,24 @@ test("execution snapshot normalizes app-server ownership and root process trees"
       { appServerPid: 10, depth: 2, pid: 12, rootChildPid: 11 },
     ],
   );
+});
+
+test("execution terminator rejects MCP targets before attempting a signal", async () => {
+  const lifecycle = globalThis.__CODEY_EXECUTION_PROCESS_LIFECYCLE__;
+  const attemptsBefore = lifecycle.status.terminationAttempts;
+  const terminated = await lifecycle.terminate(999_999, {
+    appServerPid: 10,
+    command: "/Codex/Resources/cua_node/bin/node_repl --mcp",
+    depth: 1,
+    kind: "mcp",
+    parentPid: 10,
+    pid: 999_999,
+    rootChildPid: 999_999,
+    startedAtMs: 1000,
+  });
+
+  assert.equal(terminated, false);
+  assert.equal(lifecycle.status.terminationAttempts, attemptsBefore);
 });
 
 test("startup lifecycle patch preserves unique MCP servers and waits for all turns before cleanup", async () => {
@@ -157,7 +187,7 @@ test("startup lifecycle patch preserves unique MCP servers and waits for all tur
     kill: async (pid) => { killed.push(pid); },
     snapshot: async () => [
       { command: "git-mcp-server --stdio", depth: 2, kind: "mcp", pid: 41 },
-      { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 2, pid: 42 },
+      standaloneNodeRepl(42),
       { command: "npm run vite:dev", depth: 2, kind: "other", pid: 43 },
       { command: "node ./mcp/server.mjs", depth: 2, pid: 44 },
       { command: "node codegraph.js serve --mcp", depth: 2, pid: 45 },
@@ -175,13 +205,160 @@ test("startup lifecycle patch preserves unique MCP servers and waits for all tur
   dispose();
 });
 
-test("execution reaper removes only stale duplicate MCP trees", async () => {
+test("execution reaper unsubscribes completed subagents without reaping an active root", async () => {
+  let notificationHandler = null;
+  let snapshotCalls = 0;
+  const killed = [];
+  const unsubscribed = [];
+  const processes = [
+    {
+      ageSeconds: 120,
+      appServerPid: 10,
+      command: "/Codey/codey-fastctx --codey-fastctx-mcp",
+      depth: 1,
+      kind: "mcp",
+      parentPid: 10,
+      pid: 101,
+      rootChildPid: 101,
+      startedAtMs: 1000,
+    },
+    {
+      ageSeconds: 5,
+      appServerPid: 10,
+      command: "/Codey/codey-fastctx --codey-fastctx-mcp",
+      depth: 1,
+      kind: "mcp",
+      parentPid: 10,
+      pid: 102,
+      rootChildPid: 102,
+      startedAtMs: 116000,
+    },
+  ];
+  const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
+    connection: {
+      registerInternalNotificationHandler(handler) {
+        notificationHandler = handler;
+        return () => { notificationHandler = null; };
+      },
+      async unsubscribeThread(threadId) {
+        unsubscribed.push(threadId);
+        return { status: "unsubscribed" };
+      },
+    },
+    kill: async (pid) => { killed.push(pid); },
+    snapshot: async () => {
+      snapshotCalls += 1;
+      return processes;
+    },
+    completionGraceMs: 5,
+  });
+
+  notificationHandler({
+    method: "turn/started",
+    params: { threadId: "root", turn: { id: "root-turn" } },
+  });
+  notificationHandler({
+    method: "item/completed",
+    params: {
+      threadId: "root",
+      turnId: "root-turn",
+      item: {
+        type: "collabAgentToolCall",
+        tool: "spawnAgent",
+        status: "completed",
+        receiverThreadIds: ["root", "child"],
+      },
+    },
+  });
+  notificationHandler({
+    method: "turn/started",
+    params: { threadId: "child", turn: { id: "child-turn" } },
+  });
+  notificationHandler({
+    method: "turn/completed",
+    params: { threadId: "child", turn: { id: "child-turn" } },
+  });
+  await waitFor(() => unsubscribed.length === 1);
+
+  assert.deepEqual(unsubscribed, ["child"]);
+  assert.equal(snapshotCalls, 0);
+  assert.deepEqual(killed, []);
+
+  notificationHandler({
+    method: "turn/completed",
+    params: { threadId: "root", turn: { id: "root-turn" } },
+  });
+  await waitFor(() => snapshotCalls === 1);
+  assert.deepEqual(unsubscribed, ["child"]);
+  assert.deepEqual(killed, []);
+  dispose();
+});
+
+test("execution reaper cancels subagent unsubscribe when that thread starts another turn", async () => {
+  let notificationHandler = null;
+  let snapshotCalls = 0;
+  const killed = [];
+  const unsubscribed = [];
+  const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
+    connection: {
+      registerInternalNotificationHandler(handler) {
+        notificationHandler = handler;
+        return () => { notificationHandler = null; };
+      },
+      async unsubscribeThread(threadId) {
+        unsubscribed.push(threadId);
+        return { result: { status: "notSubscribed" } };
+      },
+    },
+    kill: async (pid) => { killed.push(pid); },
+    snapshot: async () => {
+      snapshotCalls += 1;
+      return [];
+    },
+    completionGraceMs: 20,
+  });
+
+  notificationHandler({
+    method: "turn/started",
+    params: { threadId: "root", turn: { id: "root-turn" } },
+  });
+  notificationHandler({
+    method: "thread/started",
+    params: { thread: { id: "child", source: { subAgent: {} } } },
+  });
+  notificationHandler({
+    method: "turn/started",
+    params: { threadId: "child", turn: { id: "first" } },
+  });
+  notificationHandler({
+    method: "turn/completed",
+    params: { threadId: "child", turn: { id: "first" } },
+  });
+  notificationHandler({
+    method: "turn/started",
+    params: { threadId: "child", turn: { id: "second" } },
+  });
+  await delay(30);
+
+  assert.deepEqual(unsubscribed, []);
+  assert.equal(snapshotCalls, 0);
+  assert.deepEqual(killed, []);
+
+  notificationHandler({
+    method: "turn/completed",
+    params: { threadId: "child", turn: { id: "second" } },
+  });
+  await waitFor(() => unsubscribed.length === 1);
+  assert.deepEqual(unsubscribed, ["child"]);
+  dispose();
+});
+
+test("execution reaper never terminates MCP processes even when globally idle", async () => {
   let notificationHandler = null;
   let snapshotCalls = 0;
   const killed = [];
   const processes = [
     {
-      ageSeconds: 120,
       appServerPid: 10,
       command: "node fastctx.js --mcp",
       depth: 1,
@@ -192,9 +369,8 @@ test("execution reaper removes only stale duplicate MCP trees", async () => {
       startedAtMs: 1000,
     },
     {
-      ageSeconds: 120,
       appServerPid: 10,
-      command: "node fastctx-worker.js",
+      command: "/Codex/Resources/cua_node/bin/node_repl",
       depth: 2,
       kind: "other",
       parentPid: 101,
@@ -203,7 +379,6 @@ test("execution reaper removes only stale duplicate MCP trees", async () => {
       startedAtMs: 1000,
     },
     {
-      ageSeconds: 5,
       appServerPid: 10,
       command: "node fastctx.js --mcp",
       depth: 1,
@@ -214,20 +389,8 @@ test("execution reaper removes only stale duplicate MCP trees", async () => {
       startedAtMs: 116000,
     },
     {
-      ageSeconds: 5,
       appServerPid: 10,
-      command: "node fastctx-worker.js",
-      depth: 2,
-      kind: "other",
-      parentPid: 103,
-      pid: 104,
-      rootChildPid: 103,
-      startedAtMs: 116000,
-    },
-    {
-      ageSeconds: 90,
-      appServerPid: 10,
-      command: "node unique-mcp.js --stdio",
+      command: "/ThirdParty/node_repl --mcp",
       depth: 1,
       kind: "mcp",
       parentPid: 10,
@@ -236,16 +399,16 @@ test("execution reaper removes only stale duplicate MCP trees", async () => {
       startedAtMs: 31000,
     },
     {
-      ageSeconds: 30,
       appServerPid: 10,
-      command: "/Codex/Resources/cua_node/bin/node_repl",
+      command: "/ThirdParty/node_repl",
       depth: 1,
       kind: "other",
       parentPid: 10,
-      pid: 106,
-      rootChildPid: 106,
-      startedAtMs: 91000,
+      pid: 107,
+      rootChildPid: 107,
+      startedAtMs: 31000,
     },
+    standaloneNodeRepl(106, { startedAtMs: 91000 }),
   ];
   const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
     connection: {
@@ -260,63 +423,27 @@ test("execution reaper removes only stale duplicate MCP trees", async () => {
       return processes;
     },
     completionGraceMs: 5,
-    mcpDuplicateGraceMs: 0,
   });
 
   notificationHandler({
     method: "turn/started",
-    params: { threadId: "mcp-dedup", turn: { id: "first" } },
+    params: { threadId: "idle-safety", turn: { id: "first" } },
   });
   notificationHandler({
     method: "turn/completed",
-    params: { threadId: "mcp-dedup", turn: { id: "first" } },
+    params: { threadId: "idle-safety", turn: { id: "first" } },
   });
-  await waitFor(() => killed.length === 3);
+  await waitFor(() => killed.length === 1);
 
   assert.equal(snapshotCalls, 2);
-  assert.deepEqual([...killed].sort((left, right) => left - right), [101, 102, 106]);
+  assert.deepEqual(killed, [106]);
   dispose();
 });
 
-test("execution reaper rejects a duplicate whose process identity changed", async () => {
+test("execution reaper rejects a standalone node_repl whose identity changed", async () => {
   let notificationHandler = null;
   let snapshotCalls = 0;
   const killed = [];
-  const sharedProcesses = [
-    {
-      ageSeconds: 5,
-      appServerPid: 10,
-      command: "node fastctx.js --mcp",
-      depth: 1,
-      kind: "mcp",
-      parentPid: 10,
-      pid: 202,
-      rootChildPid: 202,
-      startedAtMs: 116000,
-    },
-    {
-      ageSeconds: 30,
-      appServerPid: 10,
-      command: "/Codex/Resources/cua_node/bin/node_repl",
-      depth: 1,
-      kind: "other",
-      parentPid: 10,
-      pid: 203,
-      rootChildPid: 203,
-      startedAtMs: 91000,
-    },
-  ];
-  const staleProcess = {
-    ageSeconds: 120,
-    appServerPid: 10,
-    command: "node fastctx.js --mcp",
-    depth: 1,
-    kind: "mcp",
-    parentPid: 10,
-    pid: 201,
-    rootChildPid: 201,
-    startedAtMs: 1000,
-  };
   const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
     connection: {
       registerInternalNotificationHandler(handler) {
@@ -327,30 +454,61 @@ test("execution reaper rejects a duplicate whose process identity changed", asyn
     kill: async (pid) => { killed.push(pid); },
     snapshot: async () => {
       snapshotCalls += 1;
-      return [
-        {
-          ...staleProcess,
-          startedAtMs: snapshotCalls === 1 ? 1000 : 9000,
-        },
-        ...sharedProcesses,
-      ];
+      return [standaloneNodeRepl(203, {
+        startedAtMs: snapshotCalls === 1 ? 1000 : 9000,
+      })];
     },
     completionGraceMs: 5,
-    mcpDuplicateGraceMs: 0,
   });
 
   notificationHandler({
     method: "turn/started",
-    params: { threadId: "mcp-pid-reuse", turn: { id: "first" } },
+    params: { threadId: "node-repl-pid-reuse", turn: { id: "first" } },
   });
   notificationHandler({
     method: "turn/completed",
-    params: { threadId: "mcp-pid-reuse", turn: { id: "first" } },
+    params: { threadId: "node-repl-pid-reuse", turn: { id: "first" } },
   });
-  await waitFor(() => killed.length === 1);
+  await waitFor(() => snapshotCalls === 2);
+  await delay(15);
 
   assert.equal(snapshotCalls, 2);
-  assert.deepEqual(killed, [203]);
+  assert.deepEqual(killed, []);
+  dispose();
+});
+
+test("execution reaper fails closed when a candidate has no process start identity", async () => {
+  let notificationHandler = null;
+  let snapshotCalls = 0;
+  const killed = [];
+  const candidates = [standaloneNodeRepl(211, { startedAtMs: null })];
+  const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
+    connection: {
+      registerInternalNotificationHandler(handler) {
+        notificationHandler = handler;
+        return () => { notificationHandler = null; };
+      },
+    },
+    kill: async (pid) => { killed.push(pid); },
+    snapshot: async () => {
+      snapshotCalls += 1;
+      return candidates;
+    },
+    completionGraceMs: 5,
+  });
+
+  notificationHandler({
+    method: "turn/started",
+    params: { threadId: "missing-start", turn: { id: "first" } },
+  });
+  notificationHandler({
+    method: "turn/completed",
+    params: { threadId: "missing-start", turn: { id: "first" } },
+  });
+  await waitFor(() => snapshotCalls === 2);
+  await delay(15);
+
+  assert.deepEqual(killed, []);
   dispose();
 });
 
@@ -365,9 +523,7 @@ test("execution reaper recognizes terminal notifications and thread closure", as
       },
     },
     kill: async (pid) => { killed.push(pid); },
-    snapshot: async () => [
-      { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 51 },
-    ],
+    snapshot: async () => [standaloneNodeRepl(51)],
     completionGraceMs: 5,
   });
 
@@ -437,9 +593,7 @@ test("execution reaper rearms when a grace timer fires before the quiet window",
     kill: async (pid) => { killed.push(pid); },
     snapshot: async () => {
       snapshotCalls += 1;
-      return [
-        { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 58 },
-      ];
+      return [standaloneNodeRepl(58)];
     },
     completionGraceMs: 20,
   });
@@ -462,7 +616,7 @@ test("execution reaper rearms when a grace timer fires before the quiet window",
     Date.now = nativeDateNow;
     globalThis.setTimeout = nativeSetTimeout;
     await waitFor(() => killed.length === 1);
-    assert.equal(snapshotCalls, 1);
+    assert.equal(snapshotCalls, 2);
     assert.deepEqual(killed, [58]);
   } finally {
     Date.now = nativeDateNow;
@@ -485,9 +639,7 @@ test("execution reaper ignores unknown lifecycle state until an observed turn fi
     kill: async (pid) => { killed.push(pid); },
     snapshot: async () => {
       snapshotCalls += 1;
-      return [
-        { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 52 },
-      ];
+      return [standaloneNodeRepl(52)];
     },
     completionGraceMs: 5,
   });
@@ -510,7 +662,7 @@ test("execution reaper ignores unknown lifecycle state until an observed turn fi
     params: { threadId: "observed", turn: { id: "known" } },
   });
   await waitFor(() => killed.length === 1);
-  assert.equal(snapshotCalls, 1);
+  assert.equal(snapshotCalls, 2);
   assert.deepEqual(killed, [52]);
   dispose();
 });
@@ -526,9 +678,7 @@ test("execution reaper never evicts a silent long-running turn", async () => {
       },
     },
     kill: async (pid) => { killed.push(pid); },
-    snapshot: async () => [
-      { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 53 },
-    ],
+    snapshot: async () => [standaloneNodeRepl(53)],
     completionGraceMs: 5,
   });
 
@@ -553,9 +703,7 @@ test("execution reaper rechecks turn state after its process snapshot", async ()
   let firstSnapshotSeen = false;
   let snapshotCalls = 0;
   const killed = [];
-  const candidates = [
-    { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 54 },
-  ];
+  const candidates = [standaloneNodeRepl(54)];
   const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
     connection: {
       registerInternalNotificationHandler(handler) {
@@ -605,9 +753,7 @@ test("execution reaper cancels cleanup when a turn starts after the snapshot", a
   let firstSnapshotSeen = false;
   let snapshotCalls = 0;
   const killed = [];
-  const candidates = [
-    { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 55 },
-  ];
+  const candidates = [standaloneNodeRepl(55)];
   const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
     connection: {
       registerInternalNotificationHandler(handler) {
@@ -660,9 +806,7 @@ test("execution reaper retries after snapshot failure when a newer turn finished
   let firstSnapshotSeen = false;
   let snapshotCalls = 0;
   const killed = [];
-  const candidates = [
-    { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 56 },
-  ];
+  const candidates = [standaloneNodeRepl(56)];
   const dispose = globalThis.__CODEY_INSTALL_EXECUTION_REAPER__({
     connection: {
       registerInternalNotificationHandler(handler) {
@@ -727,9 +871,7 @@ test("disposing execution reaper cancels pending cleanup", async () => {
       snapshotCalls += 1;
       firstSnapshotSeen = true;
       return new Promise((resolve) => {
-        releaseSnapshot = () => resolve([
-          { command: "/Codex/Resources/cua_node/bin/node_repl", depth: 1, pid: 57 },
-        ]);
+        releaseSnapshot = () => resolve([standaloneNodeRepl(57)]);
       });
     },
     completionGraceMs: 5,

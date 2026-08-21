@@ -2273,7 +2273,7 @@
       normalizedInput.map((processInfo) => [processInfo.pid, processInfo]),
     );
     const normalized = [];
-    for (const processInfo of normalizedInput) {
+    for (const processInfo of byPid.values()) {
       let cursor = processInfo;
       let rootChild = processInfo;
       let relativeDepth = 1;
@@ -2366,6 +2366,18 @@
       }
     });
   };
+  const isStandaloneNodeReplProcess = (processInfo) => {
+    const command = String(processInfo?.command ?? "");
+    const pid = Number(processInfo?.pid);
+    return (
+      processInfo?.kind === "other" &&
+      Number.isSafeInteger(pid) &&
+      pid === Number(processInfo?.rootChildPid) &&
+      Number(processInfo?.depth) === 1 &&
+      Number(processInfo?.parentPid) === Number(processInfo?.appServerPid) &&
+      /(?:^|[/\\])cua_node[/\\](?:bin[/\\])?node_repl(?:\.exe)?(?:\s|$)/i.test(command)
+    );
+  };
   const terminateExecutionProcess = async (pid, expectedProcess) => {
     const normalizedPid = Number(pid);
     const appServerPid = Number(expectedProcess?.appServerPid);
@@ -2373,6 +2385,7 @@
       !Number.isSafeInteger(normalizedPid) || normalizedPid <= 1 ||
       normalizedPid === process.pid ||
       expectedProcess?.pid !== normalizedPid ||
+      !isStandaloneNodeReplProcess(expectedProcess) ||
       !Number.isSafeInteger(appServerPid) || appServerPid <= 1 ||
       normalizedPid === appServerPid
     ) return false;
@@ -2441,15 +2454,12 @@
     kill,
     snapshot,
     completionGraceMs: configuredCompletionGraceMs,
-    mcpDuplicateGraceMs: configuredMcpDuplicateGraceMs,
   }) => {
     const activeTurns = new Map();
     const completionGraceMs = Math.max(0, configuredCompletionGraceMs ?? 1000);
-    const mcpDuplicateGraceMs = Math.max(
-      0,
-      configuredMcpDuplicateGraceMs ?? 30 * 1000,
-    );
     const reclaimRetryMs = 60 * 1000;
+    const subagentUnsubscribeRetryMs = 60 * 1000;
+    const maxSubagentUnsubscribeAttempts = 3;
     const terminalTurnStates = new Set([
       "completed",
       "aborted",
@@ -2467,6 +2477,14 @@
       "thread/closed",
       "thread/deleted",
     ]);
+    const successfulThreadUnsubscribeStates = new Set([
+      "unsubscribed",
+      "notSubscribed",
+      "notLoaded",
+    ]);
+    const subagentThreadIds = new Set();
+    const subagentUnsubscribeAttempts = new Map();
+    const subagentUnsubscribeTimers = new Map();
     let cleanupPromise = null;
     let reclaimTimer = null;
     let reclaimBarrier = null;
@@ -2475,11 +2493,7 @@
     let lastTurnActivityAt = Date.now();
     let turnStateVersion = 0;
 
-    const isNodeRepl = (processInfo) => {
-      const command = String(processInfo?.command ?? "");
-      return /(?:^|[/\\])node_repl(?:\.exe)?(?:\s|$)/i.test(command);
-    };
-    const mcpCommandIdentity = (processInfo) => {
+    const processCommandIdentity = (processInfo) => {
       let command = String(processInfo?.command ?? "")
         .replace(/\s+/g, " ")
         .trim();
@@ -2490,67 +2504,22 @@
       if (
         left?.pid !== right?.pid ||
         left?.parentPid !== right?.parentPid ||
-        String(left?.command ?? "") !== String(right?.command ?? "")
+        left?.appServerPid !== right?.appServerPid ||
+        left?.rootChildPid !== right?.rootChildPid ||
+        left?.kind !== right?.kind ||
+        processCommandIdentity(left) !== processCommandIdentity(right) ||
+        !Number.isFinite(left?.startedAtMs) ||
+        !Number.isFinite(right?.startedAtMs)
       ) return false;
-      if (
-        Number.isFinite(left?.startedAtMs) &&
-        Number.isFinite(right?.startedAtMs) &&
-        Math.abs(left.startedAtMs - right.startedAtMs) > 2500
-      ) return false;
-      return true;
+      return Math.abs(left.startedAtMs - right.startedAtMs) <= 2500;
     };
     const selectReclaimCandidates = (processes) => {
       const candidates = new Map();
-      const addCandidate = (processInfo, reclaimClass) => {
-        const pid = Number(processInfo?.pid);
-        if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) return;
-        const previous = candidates.get(pid);
-        if (previous?.reclaimClass === "mcp-duplicate") return;
-        candidates.set(pid, { processInfo, reclaimClass });
-      };
       for (const processInfo of processes) {
-        if (isNodeRepl(processInfo)) addCandidate(processInfo, "node-repl");
-      }
-
-      const rootsByIdentity = new Map();
-      for (const processInfo of processes) {
+        if (!isStandaloneNodeReplProcess(processInfo)) continue;
         const pid = Number(processInfo?.pid);
-        const rootChildPid = Number(processInfo?.rootChildPid);
-        const appServerPid = Number(processInfo?.appServerPid);
-        const commandIdentity = mcpCommandIdentity(processInfo);
-        if (
-          processInfo?.kind !== "mcp" ||
-          !Number.isSafeInteger(pid) || pid !== rootChildPid ||
-          !Number.isSafeInteger(appServerPid) || !commandIdentity
-        ) continue;
-        const identity = `${appServerPid}\u0000${commandIdentity}`;
-        const roots = rootsByIdentity.get(identity) ?? [];
-        roots.push(processInfo);
-        rootsByIdentity.set(identity, roots);
-      }
-      for (const roots of rootsByIdentity.values()) {
-        if (roots.length < 2) continue;
-        roots.sort((left, right) => {
-          const leftAge = Number.isFinite(left?.ageSeconds)
-            ? left.ageSeconds
-            : Number.POSITIVE_INFINITY;
-          const rightAge = Number.isFinite(right?.ageSeconds)
-            ? right.ageSeconds
-            : Number.POSITIVE_INFINITY;
-          return leftAge - rightAge || right.pid - left.pid;
-        });
-        for (const staleRoot of roots.slice(1)) {
-          if (
-            !Number.isFinite(staleRoot?.ageSeconds) ||
-            staleRoot.ageSeconds * 1000 < mcpDuplicateGraceMs
-          ) continue;
-          for (const processInfo of processes) {
-            if (
-              processInfo?.appServerPid === staleRoot.appServerPid &&
-              processInfo?.rootChildPid === staleRoot.pid
-            ) addCandidate(processInfo, "mcp-duplicate");
-          }
-        }
+        if (!Number.isSafeInteger(pid) || pid <= 1 || pid === process.pid) continue;
+        candidates.set(pid, { processInfo, reclaimClass: "node-repl" });
       }
       return Array.from(candidates.values()).sort(
         (left, right) =>
@@ -2634,7 +2603,7 @@
             return { reason, reclaimed: 0 };
           }
           let candidates = selectReclaimCandidates(processes);
-          if (candidates.some(({ reclaimClass }) => reclaimClass === "mcp-duplicate")) {
+          if (candidates.length > 0) {
             const originalCandidates = new Map(
               candidates.map((candidate) => [candidate.processInfo.pid, candidate]),
             );
@@ -2707,6 +2676,73 @@
       }
       return changed;
     };
+    const hasActiveThreadTurn = (threadId) => {
+      for (const turn of activeTurns.values()) {
+        if (turn.threadId === threadId) return true;
+      }
+      return false;
+    };
+    const clearSubagentUnsubscribeTimer = (threadId) => {
+      const timer = subagentUnsubscribeTimers.get(threadId);
+      if (timer == null) return;
+      subagentUnsubscribeTimers.delete(threadId);
+      clearTimeout(timer);
+    };
+    const forgetSubagentThread = (threadId) => {
+      clearSubagentUnsubscribeTimer(threadId);
+      subagentThreadIds.delete(threadId);
+      subagentUnsubscribeAttempts.delete(threadId);
+    };
+    const markSubagentThread = (value) => {
+      const threadId = normalizedId(value);
+      if (threadId != null) subagentThreadIds.add(threadId);
+      return threadId;
+    };
+    const scheduleSubagentUnsubscribe = (threadId, delayMs = completionGraceMs) => {
+      if (
+        disposed ||
+        !subagentThreadIds.has(threadId) ||
+        hasActiveThreadTurn(threadId)
+      ) return;
+      if (typeof connection?.unsubscribeThread !== "function") {
+        forgetSubagentThread(threadId);
+        return;
+      }
+      clearSubagentUnsubscribeTimer(threadId);
+      const timer = setTimeout(async () => {
+        if (subagentUnsubscribeTimers.get(threadId) !== timer) return;
+        subagentUnsubscribeTimers.delete(threadId);
+        if (
+          disposed ||
+          !subagentThreadIds.has(threadId) ||
+          hasActiveThreadTurn(threadId)
+        ) return;
+        try {
+          const result = await Reflect.apply(
+            connection.unsubscribeThread,
+            connection,
+            [threadId],
+          );
+          const status = result?.status ?? result?.result?.status;
+          if (
+            typeof status === "string" &&
+            !successfulThreadUnsubscribeStates.has(status)
+          ) throw new Error(`Unexpected thread unsubscribe status: ${status}`);
+          if (!disposed) forgetSubagentThread(threadId);
+        } catch {
+          if (disposed) return;
+          const attempts = (subagentUnsubscribeAttempts.get(threadId) ?? 0) + 1;
+          subagentUnsubscribeAttempts.set(threadId, attempts);
+          if (attempts < maxSubagentUnsubscribeAttempts) {
+            scheduleSubagentUnsubscribe(threadId, subagentUnsubscribeRetryMs);
+          } else {
+            forgetSubagentThread(threadId);
+          }
+        }
+      }, Math.max(1, delayMs));
+      timer.unref?.();
+      subagentUnsubscribeTimers.set(threadId, timer);
+    };
 
     let unsubscribe = connection.registerInternalNotificationHandler((notification) => {
       if (disposed) return;
@@ -2725,8 +2761,41 @@
       const terminalTurnState =
         method.startsWith("turn/") && terminalTurnStates.has(method.slice(5));
       const terminalThread = terminalThreadMethods.has(method);
+      const item = params?.item;
+      if (method === "thread/started") {
+        const source = params?.thread?.source;
+        if (
+          (typeof source === "string" && source.toLowerCase().startsWith("subagent")) ||
+          (source != null && typeof source === "object" && "subAgent" in source)
+        ) markSubagentThread(threadId);
+      }
+      if (
+        (method === "item/started" || method === "item/completed") &&
+        item != null && typeof item === "object"
+      ) {
+        if (item.type === "subAgentActivity") {
+          markSubagentThread(item.agentThreadId);
+        }
+        if (item.type === "collabAgentToolCall") {
+          const receiverThreadIds = Array.isArray(item.receiverThreadIds)
+            ? item.receiverThreadIds
+            : [];
+          for (const receiverThreadId of receiverThreadIds) {
+            if (receiverThreadId === threadId) continue;
+            const subagentThreadId = markSubagentThread(receiverThreadId);
+            if (
+              subagentThreadId != null &&
+              method === "item/completed" &&
+              item.tool === "closeAgent" &&
+              item.status === "completed"
+            ) scheduleSubagentUnsubscribe(subagentThreadId);
+          }
+        }
+      }
 
       if (method === "turn/started" && threadId != null && turnId != null) {
+        clearSubagentUnsubscribeTimer(threadId);
+        subagentUnsubscribeAttempts.delete(threadId);
         recordTurnStateChange(now);
         activeTurns.set(turnKey(threadId, turnId), { threadId, turnId, lastSeen: now });
         return;
@@ -2740,6 +2809,15 @@
           changed = activeTurns.delete(turnKey(threadId, turnId));
         } else if (threadId != null) {
           changed = removeThreadTurns(threadId);
+        }
+        if (terminalThread && threadId != null) {
+          forgetSubagentThread(threadId);
+        } else if (
+          threadId != null &&
+          subagentThreadIds.has(threadId) &&
+          !hasActiveThreadTurn(threadId)
+        ) {
+          scheduleSubagentUnsubscribe(threadId);
         }
         // A terminal event that does not match a turn observed by this
         // subscription cannot prove that the connection is globally idle.
@@ -2763,6 +2841,10 @@
       clearReclaimTimer();
       cancelReclaimBarrier();
       activeTurns.clear();
+      for (const timer of subagentUnsubscribeTimers.values()) clearTimeout(timer);
+      subagentUnsubscribeTimers.clear();
+      subagentUnsubscribeAttempts.clear();
+      subagentThreadIds.clear();
       const disposeNotifications = unsubscribe;
       unsubscribe = null;
       try { disposeNotifications?.(); } catch {}

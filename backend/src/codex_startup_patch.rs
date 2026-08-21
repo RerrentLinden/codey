@@ -358,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_lifecycle_patch_bounds_duplicate_mcp_and_reclaims_execution_helpers() {
+    fn automatic_lifecycle_patch_unsubscribes_subagents_and_reclaims_node_repl() {
         let expression = patch_expression(PatchOptions {
             disable_pet: false,
             subagent_gate_active: true,
@@ -377,9 +377,20 @@ mod tests {
         assert!(expression.contains("turnStateVersion"));
         assert!(expression.contains("__CODEY_EXECUTION_PROCESS_LIFECYCLE__"));
         assert!(expression.contains("child-process-snapshot-worker.js"));
-        assert!(expression.contains("mcpDuplicateGraceMs"));
+        assert!(!expression.contains("mcpDuplicateGraceMs"));
+        assert!(expression.contains("subagentThreadIds"));
+        assert!(expression.contains("unsubscribeThread"));
+        assert!(expression.contains("successfulThreadUnsubscribeStates"));
+        assert!(expression.contains("\"notSubscribed\""));
+        assert!(expression.contains("maxSubagentUnsubscribeAttempts"));
+        assert!(expression.contains("isStandaloneNodeReplProcess"));
+        assert!(expression.contains("processInfo?.kind === \"other\""));
+        assert!(expression.contains("cua_node[/\\\\](?:bin[/\\\\])?node_repl"));
+        assert!(!expression.contains("codeyMcpDuplicateReclaimScope"));
+        assert!(!expression.contains("reclaimAuthorizedScope"));
+        assert!(!expression.contains("rootsByIdentity"));
         assert!(expression.contains("rootChildPid"));
-        assert!(expression.contains("mcp-duplicate"));
+        assert!(!expression.contains("mcp-duplicate"));
         assert!(expression.contains("process.kill(normalizedPid, \"SIGTERM\")"));
         assert!(!expression.contains("codegraph\\.js\\s+serve"));
         assert!(!expression.contains("mcp[/\\\\]server"));
