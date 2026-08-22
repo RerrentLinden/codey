@@ -19,7 +19,6 @@ type TraceLogModuleProps = {
   stats?: TraceLogStats;
   crashpadStats?: CrashpadPendingStats;
   crashpadSupported: boolean;
-  snapshotStale: boolean;
   traceProtectionEnabled: boolean;
   crashpadProtectionEnabled: boolean;
   clearBusy: boolean;
@@ -65,7 +64,6 @@ function TraceLogModuleComponent({
   stats,
   crashpadStats,
   crashpadSupported,
-  snapshotStale,
   traceProtectionEnabled,
   crashpadProtectionEnabled,
   clearBusy,
@@ -230,14 +228,11 @@ function TraceLogModuleComponent({
               </div>
               <Badge
                 variant={
-                  warningCount ||
-                  snapshotStale ||
-                  crashpadSnapshot?.overLimit
+                  warningCount || crashpadSnapshot?.overLimit
                     ? "warning"
                     : "secondary"
                 }
               >
-                {snapshotStale ? "清理前快照 · " : ""}
                 {formatSnapshotTime(capturedAt)}
               </Badge>
             </div>

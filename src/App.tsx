@@ -117,7 +117,6 @@ export function App({
     () => popupContainer ?? portalContainer ?? document.body,
     [popupContainer, portalContainer],
   );
-  const [traceSnapshotStale, setTraceSnapshotStale] = useState(false);
   const noticeController = useAppNoticeController();
   const confirmationController = useConfirmationController();
   const setNotice = noticeController.setNotice;
@@ -594,7 +593,6 @@ export function App({
         traceLogWriteProtectionActive:
           result.traceLogWriteProtectionActive,
       }));
-      setTraceSnapshotStale(false);
       const traceCleanup = result.traceCleanup;
       const crashpadCleanup = result.crashpadCleanup;
       if (
@@ -647,7 +645,6 @@ export function App({
         setNotice({ tone: "info", text: "诊断存储正在统计，请稍候" });
         return;
       }
-      setTraceSnapshotStale(false);
       setNotice({ tone: "success", text: "诊断存储统计已更新" });
     });
   }
@@ -1032,7 +1029,6 @@ export function App({
               stats={status.traceLogStats}
               crashpadStats={status.crashpadPendingStats}
               crashpadSupported={status.clientPlatform === "macos"}
-              snapshotStale={traceSnapshotStale}
               traceProtectionEnabled={config.disableTraceLogWrites}
               crashpadProtectionEnabled={config.protectCrashpadPending}
               clearBusy={busy === "clear-trace-logs"}
