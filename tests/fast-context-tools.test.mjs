@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
+
 const root = new URL("../", import.meta.url);
 
 test("user FastCtx blocks embedded tools across the backend and settings", async () => {
@@ -9,18 +11,18 @@ test("user FastCtx blocks embedded tools across the backend and settings", async
     appSource,
     appTypesSource,
     sectionsSource,
-    operationsSource,
     configSource,
     commandSource,
     runtimeCommandSource,
+    runtimeStatusPresentation,
   ] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/App.types.ts", root), "utf8"),
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
-    readFile(new URL("src/OperationsPanel.tsx", root), "utf8"),
     readFile(new URL("backend/src/config.rs", root), "utf8"),
     readFile(new URL("backend/src/commands.rs", root), "utf8"),
     readFile(new URL("backend/src/commands/runtime.rs", root), "utf8"),
+    loadTypeScriptModule(new URL("src/runtimeStatusPresentation.ts", root)),
   ]);
   const uiSource = `${appSource}\n${sectionsSource}`;
 
@@ -33,9 +35,16 @@ test("user FastCtx blocks embedded tools across the backend and settings", async
   assert.match(appSource, /setFastContextToolsStatus\([\s\S]*result\.fastContextToolsStatus/);
   assert.match(appSource, /fastContextToolsStatus=\{fastContextToolsStatus\}/);
   assert.match(runtimeCommandSource, /"fastContextToolsActive": fast_context_tools_active/);
-  assert.match(operationsSource, /status\.fastContextToolsActive === true/);
-  assert.match(operationsSource, /status\.running && fastContextToolsStatus\.userConfigured/);
-  assert.match(operationsSource, /Codey 内置 FastCtx 已随当前运行实例加载/);
+  const [fastctxFeature] = runtimeStatusPresentation.buildEnabledOptimizationFeatures(
+    { running: true, fastContextToolsActive: true },
+    { userConfigured: false, detectionFailed: false },
+  );
+  assert.equal(fastctxFeature.id, "fastctx-context-tools");
+  assert.equal(fastctxFeature.name, "FastCtx 上下文加速");
+  assert.equal(
+    fastctxFeature.detail,
+    "Codey 内置 FastCtx 已随当前运行实例加载",
+  );
   assert.match(uiSource, /const fastContextToolsEnabled =\s*config\.fastContextTools && !fastctxStatusBlocksEmbedded/);
   assert.match(uiSource, /checked=\{fastContextToolsEnabled\}/);
   assert.match(uiSource, /disabled=\{isBusy \|\| fastctxStatusBlocksEmbedded\}/);

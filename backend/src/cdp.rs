@@ -25,7 +25,11 @@ const WINDOWS_WMI_SAMPLER_GUARD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/windows-wmi-sampler-guard.js");
 const MODEL_WHITELIST_INJECT_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/model-whitelist-inject.js");
-const RENDERER_INJECT_SCRIPT: &str = include_str!("../../dist-overlay/inject/renderer-inject.js");
+const RENDERER_INJECT_SCRIPT: &str = concat!(
+    include_str!("../../dist-overlay/inject/default-chinese-locale.js"),
+    "\n",
+    include_str!("../../dist-overlay/inject/renderer-inject.js")
+);
 const CODEY_SESSION_TOOLS_SCRIPT: &str = include_str!("../../dist-overlay/inject/codey-inject.js");
 const PET_CONTROL_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/pet-control-shield.js");
@@ -1546,6 +1550,17 @@ mod tests {
         assert!(core.contains("__codeyWindowsWmiSamplerGuard"));
         assert!(core.contains("window.__codeyModelWhitelistPatch"));
         assert!(core.contains("/codex-model-catalog"));
+        let shared_runtime_offset = core
+            .find("window.__codeySharedRuntime=Object.freeze")
+            .expect("bridge helpers must initialize the shared runtime");
+        let locale_offset = core
+            .find("__codeyDefaultChineseLocale")
+            .expect("locale bootstrap must be part of renderer-controls");
+        let renderer_offset = core
+            .find("window.__codeyRendererCoreLoaded")
+            .expect("renderer bootstrap must be part of renderer-controls");
+        assert!(shared_runtime_offset < locale_offset);
+        assert!(locale_offset < renderer_offset);
         assert!(core.contains("window.__codeyRendererCoreLoaded"));
         assert!(core.contains(r#"["false"][0]==="true""#));
         assert!(core.contains(SETTINGS_OVERLAY_LOAD_PATH));

@@ -51,6 +51,23 @@ fn observe_route_recovery_readiness(ready_streak: &mut u8, ready: bool) -> bool 
     *ready_streak >= CC_SWITCH_ROUTE_RECOVERY_STABLE_READS
 }
 
+fn runtime_feature_status_value(
+    fast_context_tools_active: bool,
+    subagent_optimization_active: bool,
+    active_notification_channel_count: usize,
+    trace_log_write_protection_active: bool,
+    crashpad_disk_protection_active: bool,
+) -> Value {
+    json!({
+        "fastContextToolsActive": fast_context_tools_active,
+        "subagentOptimizationActive": subagent_optimization_active,
+        "notificationChannelsActive": active_notification_channel_count > 0,
+        "activeNotificationChannelCount": active_notification_channel_count,
+        "traceLogWriteProtectionActive": trace_log_write_protection_active,
+        "crashpadDiskProtectionActive": crashpad_disk_protection_active,
+    })
+}
+
 pub(crate) async fn cc_switch_route_ready_for_recovery() -> bool {
     let home = codex_home();
     matches!(
@@ -140,13 +157,20 @@ pub(super) async fn runtime_status_with_options(
         "activeProfileName": active_profile_name,
         "restartRequired": restart_required,
         "restartInProgress": state.restart_in_progress.load(Ordering::Acquire),
-        "fastContextToolsActive": fast_context_tools_active,
-        "subagentOptimizationActive": subagent_optimization_active,
-        "notificationChannelsActive": active_notification_channel_count > 0,
-        "activeNotificationChannelCount": active_notification_channel_count,
-        "traceLogWriteProtectionActive": trace_log_write_protection_active,
-        "crashpadDiskProtectionActive": crashpad_disk_protection_active,
     });
+    if let (Some(status), Some(feature_status)) = (
+        status.as_object_mut(),
+        runtime_feature_status_value(
+            fast_context_tools_active,
+            subagent_optimization_active,
+            active_notification_channel_count,
+            trace_log_write_protection_active,
+            crashpad_disk_protection_active,
+        )
+        .as_object(),
+    ) {
+        status.extend(feature_status.clone());
+    }
     let codex_app_version =
         codex_app_version_for_status(state, runtime_codex_app_path, configured_codex_app_path)
             .await;
@@ -606,8 +630,28 @@ mod route_recovery_tests {
     use super::{
         CC_SWITCH_ROUTE_RECOVERY_STABLE_READS, forward_codex_exit_to_codey_shutdown,
         is_cc_switch_route_recovery_error, observe_route_recovery_readiness,
+        runtime_feature_status_value,
     };
     use crate::commands::{AppShutdownReason, AppState};
+
+    #[test]
+    fn runtime_feature_status_has_a_stable_public_json_contract() {
+        assert_eq!(
+            runtime_feature_status_value(true, false, 2, true, false),
+            serde_json::json!({
+                "fastContextToolsActive": true,
+                "subagentOptimizationActive": false,
+                "notificationChannelsActive": true,
+                "activeNotificationChannelCount": 2,
+                "traceLogWriteProtectionActive": true,
+                "crashpadDiskProtectionActive": false,
+            })
+        );
+        assert_eq!(
+            runtime_feature_status_value(false, true, 0, false, true)["notificationChannelsActive"],
+            serde_json::Value::Bool(false)
+        );
+    }
 
     #[tokio::test]
     async fn current_codex_exit_requests_codey_shutdown() {

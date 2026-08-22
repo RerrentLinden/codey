@@ -6,6 +6,8 @@ import { join } from "node:path";
 import test from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
+
 const normalizeLineEndings = (source) => source.replace(/\r\n/g, "\n");
 
 async function loadPatchExpression() {
@@ -250,6 +252,7 @@ test("settings keeps Windows optimization checks without a standalone banner", a
     commandsSource,
     launcherRootSource,
     launcherProcessSource,
+    runtimeStatusPresentation,
   ] = await Promise.all([
     readFile(new URL("../src/OperationsPanel.tsx", import.meta.url), "utf8"),
     readFile(new URL("../src/App.types.ts", import.meta.url), "utf8"),
@@ -258,6 +261,9 @@ test("settings keeps Windows optimization checks without a standalone banner", a
     readFile(
       new URL("../backend/src/launcher/process.rs", import.meta.url),
       "utf8",
+    ),
+    loadTypeScriptModule(
+      new URL("../src/runtimeStatusPresentation.ts", import.meta.url),
     ),
   ]);
   const launcherSource = `${launcherRootSource}\n${launcherProcessSource}`;
@@ -285,7 +291,17 @@ test("settings keeps Windows optimization checks without a standalone banner", a
     launcherSource,
     /WMI 周期采样保护等待运行时确认/,
   );
-  assert.match(sectionsSource, /script\.status === "failed"/);
+  const failedSummary = runtimeStatusPresentation.summarizeInjectionScripts([
+    {
+      id: "windows-internal-failure",
+      name: "Windows 内部保护",
+      source: "builtin",
+      visibility: "internal",
+      status: "failed",
+    },
+  ]);
+  assert.equal(failedSummary.internalInjectionError, true);
+  assert.equal(failedSummary.failedInjectionScriptCount, 0);
   assert.doesNotMatch(sectionsSource, /injection-script-state/);
   assert.doesNotMatch(sectionsSource, /id: "opt-patch"/);
   assert.doesNotMatch(launcherSource, /fn mark_pet_slim_startup_failure/);

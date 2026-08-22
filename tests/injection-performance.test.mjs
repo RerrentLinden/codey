@@ -118,31 +118,51 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.doesNotMatch(securityShield, /new MutationObserver/);
 });
 
-test("renderer core defaults Codex locale to Chinese before remote config settles", async () => {
-  const inject = await readFile(new URL("public/renderer-inject.js", root), "utf8");
+test("locale bootstrap patches navigator and Statsig independently from renderer controls", async () => {
+  const [localeSource, rendererSource] = await Promise.all([
+    readFile(new URL("public/default-chinese-locale.js", root), "utf8"),
+    readFile(new URL("public/renderer-inject.js", root), "utf8"),
+  ]);
+  assert.doesNotMatch(rendererSource, /installDefaultChineseLocale/);
 
-  assert.match(inject, /const defaultChineseLocale = "zh-CN"/);
-  assert.match(inject, /const statsigI18nDynamicConfigId = "72216192"/);
-  assert.match(inject, /defineNavigatorGetter\(target, "language", defaultChineseLocale\)/);
-  assert.match(inject, /defineNavigatorGetter\(target, "languages", defaultChineseLanguages\)/);
-  assert.match(inject, /key: "localeOverride"/);
-  assert.match(inject, /value: defaultChineseLocale/);
-  assert.match(inject, /body: JSON\.stringify\(params\)/);
-  assert.doesNotMatch(inject, /body: JSON\.stringify\(\{ params \}\)/);
-  assert.match(inject, /enable_i18n: true/);
-  assert.match(inject, /locale_source: "SYSTEM"/);
-  assert.match(inject, /name === statsigI18nDynamicConfigId/);
-  assert.match(inject, /Object\.defineProperty\(window, "__STATSIG__"/);
-  assert.match(inject, /patchStatsigClients\(\)/);
-  assert.match(inject, /scanStatsigUntilReady/);
-  assert.match(inject, /elapsed < 1000 \? 50 : 250/);
-  assert.match(inject, /const retryDelays = \[0, 250, 750, 1500, 3000, 5000\]/);
-  assert.match(inject, /verification\?\.value !== defaultChineseLocale/);
-  assert.match(inject, /existing\.ensureSynced\?\.\(\)/);
-  assert.match(
-    inject,
-    /globalThis\.__CODEY_DEFAULT_CHINESE_LOCALE_RENDERER_PATCH__ === true/,
-  );
+  function Navigator() {}
+  const dynamicConfig = {
+    value: {},
+    get(key, fallback) {
+      return this.value[key] ?? fallback;
+    },
+  };
+  const statsigClient = {
+    getDynamicConfig() {
+      return dynamicConfig;
+    },
+  };
+  const window = {
+    __codeySharedRuntime: {
+      statsigClients: () => [statsigClient],
+    },
+    addEventListener() {},
+    navigator: Object.create(Navigator.prototype),
+  };
+  window.window = window;
+  const sandbox = {
+    console: { warn() {} },
+    Navigator,
+    window,
+  };
+
+  vm.runInNewContext(localeSource, sandbox);
+  const firstState = window.__codeyDefaultChineseLocale;
+  assert.equal(window.navigator.language, "zh-CN");
+  assert.deepEqual([...window.navigator.languages], ["zh-CN", "zh", "en-US", "en"]);
+  assert.equal(dynamicConfig.get("enable_i18n", false), true);
+  assert.equal(dynamicConfig.get("locale_source", ""), "SYSTEM");
+  assert.equal(firstState.snapshot().locale, "zh-CN");
+  assert.equal(firstState.snapshot().statsigClientsPatched, 1);
+
+  vm.runInNewContext(localeSource, sandbox);
+  assert.equal(window.__codeyDefaultChineseLocale, firstState);
+  assert.equal(firstState.snapshot().statsigClientsPatched, 1);
 });
 
 test("plugin bridge fast-paths unrelated IPC payloads without a DOM observer", async () => {

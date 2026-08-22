@@ -22,6 +22,11 @@ import type {
   RuntimeStatus,
 } from "./App.types";
 import { Badge, Button, Card } from "./components/semi";
+import {
+  buildEnabledOptimizationFeatures,
+  summarizeInjectionScripts,
+  type EnabledOptimizationFeature as PresentationOptimizationFeature,
+} from "./runtimeStatusPresentation";
 
 const Cpu = IconCpu;
 const FolderOpen = IconFolderOpen;
@@ -29,12 +34,21 @@ const History = IconHistory;
 const EMPTY_INJECTION_SCRIPTS: NonNullable<
   RuntimeStatus["injectionScripts"]
 > = [];
-type EnabledOptimizationFeature = {
-  id: string;
+type EnabledOptimizationFeature = Omit<
+  PresentationOptimizationFeature,
+  "icon"
+> & {
   icon: typeof Activity;
-  name: string;
-  detail?: string;
-  sourceLabel: string;
+};
+const OPTIMIZATION_FEATURE_ICONS: Record<
+  PresentationOptimizationFeature["icon"],
+  typeof Activity
+> = {
+  code: Code,
+  database: IconDatabase,
+  fastctx: Zap,
+  notifications: PlugZap,
+  subagent: Cpu,
 };
 
 type OperationsRuntimeStatus = Pick<
@@ -105,93 +119,15 @@ function OperationsPanelComponent({
     maintenance?.performanceStatus === "error" ||
     maintenance?.performanceStatus === "degraded";
   const injectionScripts = status.injectionScripts ?? EMPTY_INJECTION_SCRIPTS;
-  const userFacingInjectionScripts = useMemo(
-    () =>
-      injectionScripts.filter((script) => script.visibility === "feature"),
-    [injectionScripts],
-  );
   const enabledOptimizationFeatures = useMemo<EnabledOptimizationFeature[]>(
-    () => {
-      const injectedFeatures = userFacingInjectionScripts
-        .filter((script) => script.status === "effective")
-        .map((script) => ({
-          id: script.id,
-          icon: Code,
-          name: script.name,
-          detail: script.detail,
-          sourceLabel: script.source === "user" ? "用户脚本" : "内置",
-        }));
-      const appliedFeatures = [...injectedFeatures];
-
-      if (status.subagentOptimizationActive === true) {
-        appliedFeatures.push({
-          id: "subagent-optimization",
-          icon: Cpu,
-          name: "子代理优化",
-          detail: "子代理角色与调度增强已随当前运行实例加载",
-          sourceLabel: "Codey",
-        });
-      }
-
-      const activeNotificationChannelCount =
-        status.activeNotificationChannelCount ?? 0;
-      if (
-        status.notificationChannelsActive === true &&
-        activeNotificationChannelCount > 0
-      ) {
-        appliedFeatures.push({
-          id: "notification-channels",
-          icon: PlugZap,
-          name: "消息通知",
-          detail: `已启用 ${activeNotificationChannelCount} 个通知渠道`,
-          sourceLabel: "Codey",
-        });
-      }
-
-      const traceWriteProtectionActive =
-        status.traceLogWriteProtectionActive === true;
-      const crashpadDiskProtectionActive =
-        status.crashpadDiskProtectionActive === true;
-      if (traceWriteProtectionActive || crashpadDiskProtectionActive) {
-        const protectionDetail =
-          traceWriteProtectionActive && crashpadDiskProtectionActive
-            ? "Codex Trace 日志与 Crashpad 磁盘保护均已生效"
-            : traceWriteProtectionActive
-              ? "Codex Trace 日志写盘保护已生效"
-              : "Codex Crashpad 磁盘保护已生效";
-        appliedFeatures.push({
-          id: "disk-write-protection",
-          icon: IconDatabase,
-          name: "写盘保护",
-          detail: protectionDetail,
-          sourceLabel: "Codey",
-        });
-      }
-
-      const fastContextToolsActive =
-        status.fastContextToolsActive === true ||
-        (status.running && fastContextToolsStatus.userConfigured);
-      if (!fastContextToolsActive) return appliedFeatures;
-
-      const externalFastContextTools = fastContextToolsStatus.userConfigured;
-
-      return [
-        {
-          id: "fastctx-context-tools",
-          icon: Zap,
-          name: "FastCtx 上下文加速",
-          detail: externalFastContextTools
-            ? `Codex 已配置 FastCtx${
-                fastContextToolsStatus.serverId
-                  ? `（${fastContextToolsStatus.serverId}）`
-                  : ""
-              }`
-            : "Codey 内置 FastCtx 已随当前运行实例加载",
-          sourceLabel: externalFastContextTools ? "外部配置" : "Codey",
-        },
-        ...appliedFeatures,
-      ];
-    },
+    () =>
+      buildEnabledOptimizationFeatures(
+        { ...status, injectionScripts },
+        fastContextToolsStatus,
+      ).map((feature) => ({
+        ...feature,
+        icon: OPTIMIZATION_FEATURE_ICONS[feature.icon],
+      })),
     [
       fastContextToolsStatus.serverId,
       fastContextToolsStatus.userConfigured,
@@ -202,7 +138,7 @@ function OperationsPanelComponent({
       status.running,
       status.subagentOptimizationActive,
       status.traceLogWriteProtectionActive,
-      userFacingInjectionScripts,
+      injectionScripts,
     ],
   );
   const {
@@ -210,30 +146,10 @@ function OperationsPanelComponent({
     internalInjectionError,
     internalInjectionPending,
     unverifiedInjectionScriptCount,
-  } = useMemo(() => {
-    let failed = 0;
-    let internalFailed = false;
-    let internalPending = false;
-    let unverified = 0;
-    for (const script of injectionScripts) {
-      const failedOrUnknown =
-        script.status === "failed" || script.status === "unknown";
-      if (script.visibility === "internal") {
-        internalPending ||= script.status === "executed";
-        internalFailed ||= failedOrUnknown;
-      } else if (script.status === "executed") {
-        unverified += 1;
-      } else if (failedOrUnknown) {
-        failed += 1;
-      }
-    }
-    return {
-      failedInjectionScriptCount: failed,
-      internalInjectionError: internalFailed,
-      internalInjectionPending: internalPending,
-      unverifiedInjectionScriptCount: unverified,
-    };
-  }, [injectionScripts]);
+  } = useMemo(
+    () => summarizeInjectionScripts(injectionScripts),
+    [injectionScripts],
+  );
   const injectionStatusPending = injectionScripts.length === 0;
   const injectionError =
     internalInjectionError || failedInjectionScriptCount > 0;

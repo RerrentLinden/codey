@@ -33,7 +33,9 @@ const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
 const READ_ONLY_CONCURRENCY_LIMIT: usize = 3;
 const WRITE_OR_MIXED_CONCURRENCY_LIMIT: usize = 2;
+const MAX_RESERVATIONS_PER_LEDGER: usize = 1_024;
 const DUPLICATE_TASK_ID_ERROR_CODE: &str = "CODEY_SUBAGENT_DUPLICATE_TASK_ID";
+const LEDGER_CAPACITY_ERROR_CODE: &str = "CODEY_SUBAGENT_LEDGER_CAPACITY";
 const FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT_ERROR_CODE: &str =
     "CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT";
 const UNBOUND_ATTEMPT_ERROR_CODE: &str = "CODEY_SUBAGENT_UNBOUND_ATTEMPT";
@@ -990,6 +992,16 @@ fn concurrency_denial(
     ))
 }
 
+fn ledger_capacity_denial(ledger: &SessionLedger) -> Option<String> {
+    let recorded_tasks = ledger.reservations.len().max(ledger.issued_task_ids.len());
+    if recorded_tasks < MAX_RESERVATIONS_PER_LEDGER {
+        return None;
+    }
+    Some(format!(
+        "{LEDGER_CAPACITY_ERROR_CODE}: Codey 本轮子代理账本已记录 {recorded_tasks} 个任务，达到安全上限 {MAX_RESERVATIONS_PER_LEDGER}。为保持任务 ID 防重放，Codey 不会静默删除历史记录；请停止继续派生，完成当前工作并通过 Stop 结算本轮。旧账本仍可读取，但在结算前不会继续增长。"
+    ))
+}
+
 #[cfg(test)]
 pub(crate) fn pre_spawn(
     state_root: &Path,
@@ -1053,6 +1065,9 @@ pub(crate) fn pre_spawn_with_workspace(
             &ledger,
             &prepared.contract.id,
         )));
+    }
+    if let Some(reason) = ledger_capacity_denial(&ledger) {
+        return Ok(Some(reason));
     }
     if let Some(conflict) = resource_conflict(&prepared, &ledger) {
         return Ok(Some(conflict));
@@ -4097,7 +4112,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_encrypted_spawns_remain_recorded_without_a_budget_cap() {
+    fn failed_encrypted_spawns_remain_recorded_below_the_ledger_cap() {
         let temp = tempfile::tempdir().unwrap();
         let attempts = 8_u16;
         for index in 0..attempts {
@@ -4143,6 +4158,52 @@ mod tests {
                 .count(),
             usize::from(attempts)
         );
+    }
+
+    #[test]
+    fn ledger_capacity_fails_closed_without_weakening_task_id_replay_protection() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let mut ledger = SessionLedger::new("runtime-a", "session-a", 10);
+        for index in 0..MAX_RESERVATIONS_PER_LEDGER {
+            ledger.issued_task_ids.insert(format!("historical_{index}"));
+        }
+        store.save(&mut ledger, 20).unwrap();
+        drop(ledger);
+        drop(store);
+
+        let fresh = contract_input(
+            "research_fresh",
+            "codey_deep_research",
+            research_contract("research_fresh"),
+        );
+        let capacity_denial = pre_spawn(temp.path(), "runtime-a", "session-a", Some(&fresh), 0, 30)
+            .unwrap()
+            .unwrap();
+        assert!(capacity_denial.contains(LEDGER_CAPACITY_ERROR_CODE));
+        assert!(capacity_denial.contains("不会静默删除历史记录"));
+
+        let duplicate = contract_input(
+            "historical_0",
+            "codey_deep_research",
+            research_contract("historical_0"),
+        );
+        let duplicate_denial = pre_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&duplicate),
+            0,
+            40,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(duplicate_denial.contains(DUPLICATE_TASK_ID_ERROR_CODE));
+
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let ledger = store.load("runtime-a", "session-a", 50).unwrap().unwrap();
+        assert_eq!(ledger.issued_task_ids.len(), MAX_RESERVATIONS_PER_LEDGER);
+        assert!(!ledger.reservations.contains_key("research_fresh"));
     }
 
     #[test]

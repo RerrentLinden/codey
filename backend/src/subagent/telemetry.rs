@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -18,6 +20,8 @@ const TRACE_ARCHIVE_FILE: &str = "subagent-traces-v1.previous.jsonl";
 const TRACE_ARCHIVE_BACKUP_FILE: &str = "subagent-traces-v1.previous.backup.jsonl";
 const TRACE_LOCK_FILE: &str = "subagent-traces-v1.lock";
 const MAX_TRACE_BYTES: u64 = 8 * 1024 * 1024;
+const TRACE_LOCK_TIMEOUT_MILLIS: u64 = 20;
+const TRACE_LOCK_RETRY_MILLIS: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,8 +131,7 @@ impl<'a> TraceRecorder<'a> {
             .read(true)
             .open(&lock_path)
             .with_context(|| format!("打开子代理 trace 锁失败：{}", lock_path.display()))?;
-        lock.lock_exclusive()
-            .with_context(|| format!("锁定子代理 trace 失败：{}", lock_path.display()))?;
+        acquire_trace_lock(&lock, &lock_path)?;
         let write_result = (|| -> Result<()> {
             let path = trace_file(self.state_root);
             rotate_if_needed(self.state_root, &path, encoded.len() as u64)?;
@@ -150,6 +153,34 @@ impl<'a> TraceRecorder<'a> {
             eprintln!("Codey 子代理 trace 写入失败：{error:#}");
         }
     }
+}
+
+fn acquire_trace_lock(lock: &std::fs::File, lock_path: &Path) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(()),
+            Err(error) if trace_lock_is_contended(&error) => {
+                if started.elapsed() >= Duration::from_millis(TRACE_LOCK_TIMEOUT_MILLIS) {
+                    anyhow::bail!(
+                        "获取子代理 trace 锁超时（{} ms，遥测已丢弃）：{}",
+                        TRACE_LOCK_TIMEOUT_MILLIS,
+                        lock_path.display()
+                    );
+                }
+                thread::sleep(Duration::from_millis(TRACE_LOCK_RETRY_MILLIS));
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("锁定子代理 trace 失败：{}", lock_path.display()));
+            }
+        }
+    }
+}
+
+fn trace_lock_is_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || (cfg!(windows) && error.raw_os_error() == Some(33))
 }
 
 fn rotate_if_needed(state_root: &Path, path: &Path, incoming_bytes: u64) -> Result<()> {
@@ -349,6 +380,49 @@ mod tests {
             lines
                 .iter()
                 .all(|line| serde_json::from_str::<SubagentTraceEvent>(line).is_ok())
+        );
+    }
+
+    #[test]
+    fn trace_lock_contention_is_bounded_and_does_not_poison_later_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path()).unwrap();
+        let lock_path = temp.path().join(TRACE_LOCK_FILE);
+        let held_lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        held_lock.lock_exclusive().unwrap();
+
+        let trace = TraceContext::new(None);
+        let event = SubagentTraceEvent::new(
+            10,
+            &trace,
+            TraceEventKind::Started,
+            ExecutionStatus::Running,
+            "runtime",
+            "session",
+            "task",
+            None,
+            Some("codey_worker"),
+        );
+        let started = Instant::now();
+        let error = TraceRecorder::new(temp.path()).record(&event).unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(format!("{error:#}").contains("遥测已丢弃"));
+        assert!(!trace_file(temp.path()).exists());
+
+        FileExt::unlock(&held_lock).unwrap();
+        TraceRecorder::new(temp.path()).record(&event).unwrap();
+        assert_eq!(
+            fs::read_to_string(trace_file(temp.path()))
+                .unwrap()
+                .lines()
+                .count(),
+            1
         );
     }
 

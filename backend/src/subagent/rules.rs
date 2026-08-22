@@ -1,8 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::SystemTime;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -11,7 +10,6 @@ const RULE_SCHEMA_VERSION: u32 = 1;
 const LIVE_RULE_FILE: &str = "subagent-rules-v1.json";
 const LAST_GOOD_RULE_FILE: &str = "subagent-rules-v1.last-good.json";
 const EMBEDDED_RULES: &str = include_str!("../../resources/subagent-rules.default.json");
-const MAX_RULE_CACHE_ENTRIES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -93,37 +91,6 @@ pub(crate) struct LoadedRuleSet {
     pub rules: RuleSet,
     pub source: RuleSource,
     pub warning: Option<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RuleInputsFingerprint {
-    live: FileFingerprint,
-    last_good: FileFingerprint,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum FileFingerprint {
-    Missing,
-    Present {
-        bytes: u64,
-        modified: Option<SystemTime>,
-        created: Option<SystemTime>,
-        #[cfg(unix)]
-        device: u64,
-        #[cfg(unix)]
-        inode: u64,
-        #[cfg(unix)]
-        changed_seconds: i64,
-        #[cfg(unix)]
-        changed_nanoseconds: i64,
-    },
-    Unreadable,
-}
-
-#[derive(Clone)]
-struct CachedRuleSet {
-    fingerprint: RuleInputsFingerprint,
-    loaded: LoadedRuleSet,
 }
 
 #[derive(Clone, Debug)]
@@ -403,42 +370,10 @@ pub(crate) fn embedded() -> &'static RuleSet {
 }
 
 pub(crate) fn load(state_root: &Path) -> LoadedRuleSet {
-    let cache = rule_cache();
-    let before = rule_inputs_fingerprint(state_root);
-    if let Some(loaded) = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(state_root)
-        .filter(|cached| cached.fingerprint == before)
-        .map(|cached| cached.loaded.clone())
-    {
-        return loaded;
-    }
-
-    let loaded = load_uncached(state_root);
-    let after = rule_inputs_fingerprint(state_root);
-    // If an editor replaced a rule while it was being parsed, do not associate
-    // the parsed value with the new fingerprint. The next call will re-read it.
-    let stable = match loaded.source {
-        RuleSource::Live => before.live == after.live,
-        RuleSource::LastKnownGood | RuleSource::Embedded => before == after,
-    };
-    if stable {
-        let mut cache = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.len() >= MAX_RULE_CACHE_ENTRIES && !cache.contains_key(state_root) {
-            cache.pop_first();
-        }
-        cache.insert(
-            state_root.to_path_buf(),
-            CachedRuleSet {
-                fingerprint: after,
-                loaded: loaded.clone(),
-            },
-        );
-    }
-    loaded
+    // Codey invokes this binary once per Hook event, so a process-local cache
+    // cannot be reused by the next rule evaluation. Keep the embedded baseline
+    // cached, but read live/last-known-good inputs directly on every event.
+    load_uncached(state_root)
 }
 
 fn load_uncached(state_root: &Path) -> LoadedRuleSet {
@@ -489,43 +424,6 @@ fn load_uncached(state_root: &Path) -> LoadedRuleSet {
                 },
             }
         }
-    }
-}
-
-fn rule_cache() -> &'static Mutex<BTreeMap<PathBuf, CachedRuleSet>> {
-    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, CachedRuleSet>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn rule_inputs_fingerprint(state_root: &Path) -> RuleInputsFingerprint {
-    RuleInputsFingerprint {
-        live: file_fingerprint(&live_rule_path(state_root)),
-        last_good: file_fingerprint(&state_root.join(LAST_GOOD_RULE_FILE)),
-    }
-}
-
-fn file_fingerprint(path: &Path) -> FileFingerprint {
-    match fs::metadata(path) {
-        Ok(metadata) => {
-            #[cfg(unix)]
-            use std::os::unix::fs::MetadataExt;
-
-            FileFingerprint::Present {
-                bytes: metadata.len(),
-                modified: metadata.modified().ok(),
-                created: metadata.created().ok(),
-                #[cfg(unix)]
-                device: metadata.dev(),
-                #[cfg(unix)]
-                inode: metadata.ino(),
-                #[cfg(unix)]
-                changed_seconds: metadata.ctime(),
-                #[cfg(unix)]
-                changed_nanoseconds: metadata.ctime_nsec(),
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => FileFingerprint::Missing,
-        Err(_) => FileFingerprint::Unreadable,
     }
 }
 
@@ -881,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn atomic_same_size_rule_replacement_changes_the_fingerprint() {
+    fn atomic_same_size_rule_replacement_is_loaded_without_process_cache_state() {
         let temp = tempfile::tempdir().unwrap();
         let path = live_rule_path(temp.path());
         let mut first = embedded().clone();
@@ -892,11 +790,8 @@ mod tests {
         let second_bytes = serde_json::to_vec(&second).unwrap();
         assert_eq!(first_bytes.len(), second_bytes.len());
         fs::write(&path, first_bytes).unwrap();
-        let before = file_fingerprint(&path);
+        assert_eq!(load(temp.path()).rules.revision, 2);
         crate::fs_util::atomic_write(&path, &second_bytes).unwrap();
-        let after = file_fingerprint(&path);
-
-        assert_ne!(before, after);
         assert_eq!(load(temp.path()).rules.revision, 3);
     }
 
