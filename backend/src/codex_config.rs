@@ -2500,10 +2500,20 @@ fn build_isolated_runtime_overrides(
                     "mcp_servers",
                     crate::subagent_control_mcp::SERVER_ID,
                     "tools",
-                    crate::subagent_control_mcp::TOOL_NAME,
+                    crate::subagent_control_mcp::RESOLVE_BATCH_TOOL_NAME,
                     "approval_mode",
                 ][..],
                 "mcp_servers.codey_subagent_control.tools.resolve_batch.approval_mode",
+            ),
+            (
+                &[
+                    "mcp_servers",
+                    crate::subagent_control_mcp::SERVER_ID,
+                    "tools",
+                    crate::subagent_control_mcp::PREPARE_DELEGATION_TOOL_NAME,
+                    "approval_mode",
+                ][..],
+                "mcp_servers.codey_subagent_control.tools.prepare_delegation.approval_mode",
             ),
         ] {
             push_required_document_override(&mut overrides, effective, path, key)?;

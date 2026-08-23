@@ -64,6 +64,8 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
   try {
     const runtimeConfigOverrides = [
       "features.hooks=true",
+      'model_provider="codey_global"',
+      'model_providers."codey_global".base_url="http://127.0.0.1:61818/v1"',
       'developer_instructions="Codey route"',
       'mcp_servers.codey_fastctx.command="C:\\\\Program Files\\\\Codey\\\\codey-fastctx.exe"',
       'agents.default.config_file="D:\\\\Codey\\\\runtime\\\\default.toml"',
@@ -282,6 +284,42 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       subagentGateRuntimeId,
     );
 
+    const wrappedAppServerArgs = [
+      "/opt/codey/codex.js",
+      "-c",
+      'model_provider="stale_provider"',
+      "--config",
+      'model_providers."codey_global".base_url="https://stale.example/v1"',
+      "app-server",
+      "--analytics-default-enabled",
+    ];
+    childProcess.spawn(process.execPath, wrappedAppServerArgs);
+    const patchedWrappedAppServerArgs = spawnCalls.at(-1)[1];
+    assert.deepEqual(patchedWrappedAppServerArgs, [
+      "/opt/codey/codex.js",
+      "-c",
+      "analytics.enabled=false",
+      ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
+      "app-server",
+    ]);
+    assert.equal(
+      patchedWrappedAppServerArgs.filter(
+        (argument) => argument === 'model_provider="codey_global"',
+      ).length,
+      1,
+    );
+    assert.equal(
+      patchedWrappedAppServerArgs.some((argument) =>
+        String(argument).includes("stale_provider") ||
+        String(argument).includes("stale.example")
+      ),
+      false,
+    );
+    assert.equal(
+      spawnCalls.at(-1)[2].env.CODEY_SUBAGENT_GATE_ACTIVE,
+      "1",
+    );
+
     const configuredArgs = [
       "-c",
       "analytics.enabled=true",
@@ -419,9 +457,14 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     ]);
     assert.equal(spawnCalls.at(-1)[1].at(-1), unrelatedWslShell);
 
-    const unrelatedCodexTokens = ["app-server", "--analytics-default-enabled"];
-    childProcess.spawn("node", unrelatedCodexTokens);
-    assert.equal(spawnCalls.at(-1)[1], unrelatedCodexTokens);
+    const runtimeManagedAppServerArgs = ["app-server", "--analytics-default-enabled"];
+    childProcess.spawn("node", runtimeManagedAppServerArgs);
+    assert.deepEqual(spawnCalls.at(-1)[1], [
+      "-c",
+      "analytics.enabled=false",
+      ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
+      "app-server",
+    ]);
 
     const spawnOptions = { cwd: "/tmp" };
     childProcess.spawn("git", spawnOptions);
@@ -429,7 +472,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.equal(spawnCalls.at(-1)[1], spawnOptions);
     assert.equal(
       globalThis.__CODEY_CODEX_STARTUP_PATCH__.appServerAnalyticsPatchCount,
-      6,
+      8,
     );
 
     const desktopAnalyticsFixture = [

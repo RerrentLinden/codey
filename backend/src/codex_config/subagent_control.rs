@@ -39,7 +39,8 @@ pub(super) fn enable_subagent_control_mcp(doc: &mut DocumentMut) -> Result<()> {
     server["tool_timeout_sec"] = value(crate::subagent_control_mcp::TOOL_TIMEOUT_SECONDS);
     server.remove("default_tools_approval_mode");
     let mut enabled_tools = Array::new();
-    enabled_tools.push(crate::subagent_control_mcp::TOOL_NAME);
+    enabled_tools.push(crate::subagent_control_mcp::RESOLVE_BATCH_TOOL_NAME);
+    enabled_tools.push(crate::subagent_control_mcp::PREPARE_DELEGATION_TOOL_NAME);
     server["enabled_tools"] = Item::Value(Value::Array(enabled_tools));
     server["disabled_tools"] = Item::Value(Value::Array(Array::new()));
 
@@ -47,15 +48,17 @@ pub(super) fn enable_subagent_control_mcp(doc: &mut DocumentMut) -> Result<()> {
         .get("tools")
         .and_then(item_table_clone)
         .unwrap_or_default();
-    let mut resolve_batch = tools
-        .get(crate::subagent_control_mcp::TOOL_NAME)
-        .and_then(item_table_clone)
-        .unwrap_or_default();
-    resolve_batch["approval_mode"] = value("approve");
-    tools.insert(
-        crate::subagent_control_mcp::TOOL_NAME,
-        Item::Table(resolve_batch),
-    );
+    for tool_name in [
+        crate::subagent_control_mcp::RESOLVE_BATCH_TOOL_NAME,
+        crate::subagent_control_mcp::PREPARE_DELEGATION_TOOL_NAME,
+    ] {
+        let mut tool = tools
+            .get(tool_name)
+            .and_then(item_table_clone)
+            .unwrap_or_default();
+        tool["approval_mode"] = value("approve");
+        tools.insert(tool_name, Item::Table(tool));
+    }
     server["tools"] = Item::Table(tools);
     servers.insert(server_id, Item::Table(server));
     ensure_direct_only_tool_namespace(doc, crate::subagent_control_mcp::NAMESPACE)
@@ -130,13 +133,13 @@ mod tests {
                 .as_array()
                 .and_then(|tools| tools.get(0))
                 .and_then(Value::as_str),
-            Some(crate::subagent_control_mcp::TOOL_NAME)
+            Some(crate::subagent_control_mcp::RESOLVE_BATCH_TOOL_NAME)
         );
         assert_eq!(
             document["mcp_servers"][crate::subagent_control_mcp::SERVER_ID]["enabled_tools"]
                 .as_array()
                 .map(Array::len),
-            Some(1)
+            Some(2)
         );
         assert_eq!(
             document["mcp_servers"][crate::subagent_control_mcp::SERVER_ID]["disabled_tools"]
@@ -146,7 +149,13 @@ mod tests {
         );
         assert_eq!(
             document["mcp_servers"][crate::subagent_control_mcp::SERVER_ID]["tools"]
-                [crate::subagent_control_mcp::TOOL_NAME]["approval_mode"]
+                [crate::subagent_control_mcp::RESOLVE_BATCH_TOOL_NAME]["approval_mode"]
+                .as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            document["mcp_servers"][crate::subagent_control_mcp::SERVER_ID]["tools"]
+                [crate::subagent_control_mcp::PREPARE_DELEGATION_TOOL_NAME]["approval_mode"]
                 .as_str(),
             Some("approve")
         );
@@ -185,14 +194,25 @@ mod tests {
 
         let server = &document["mcp_servers"][crate::subagent_control_mcp::SERVER_ID];
         let enabled = server["enabled_tools"].as_array().unwrap();
-        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled.len(), 2);
         assert_eq!(
             enabled.get(0).and_then(Value::as_str),
-            Some(crate::subagent_control_mcp::TOOL_NAME)
+            Some(crate::subagent_control_mcp::RESOLVE_BATCH_TOOL_NAME)
+        );
+        assert_eq!(
+            enabled.get(1).and_then(Value::as_str),
+            Some(crate::subagent_control_mcp::PREPARE_DELEGATION_TOOL_NAME)
         );
         assert_eq!(server["disabled_tools"].as_array().unwrap().len(), 0);
         assert_eq!(
-            server["tools"][crate::subagent_control_mcp::TOOL_NAME]["approval_mode"].as_str(),
+            server["tools"][crate::subagent_control_mcp::RESOLVE_BATCH_TOOL_NAME]["approval_mode"]
+                .as_str(),
+            Some("approve")
+        );
+        assert_eq!(
+            server["tools"][crate::subagent_control_mcp::PREPARE_DELEGATION_TOOL_NAME]
+                ["approval_mode"]
+                .as_str(),
             Some("approve")
         );
         assert!(server.get("default_tools_approval_mode").is_none());

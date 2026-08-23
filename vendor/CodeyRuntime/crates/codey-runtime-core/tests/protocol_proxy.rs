@@ -1857,7 +1857,7 @@ async fn responses_relay_routes_models_per_request_between_passthrough_and_chat(
         api_key: "sk-mixed".to_string(),
         protocol: RelayProtocol::Responses,
         relay_mode: RelayMode::PureApi,
-        chat_completions_models: vec!["kimi-k2.6".to_string()],
+        chat_completions_models: vec!["gpt-5.5".to_string()],
         ..RelayProfile::default()
     };
     let settings = BackendSettings {
@@ -1873,7 +1873,7 @@ async fn responses_relay_routes_models_per_request_between_passthrough_and_chat(
     let converted = client
         .post(format!("{}/responses", proxy.base_url()))
         .json(&json!({
-            "model": "kimi-k2.6",
+            "model": "gpt-5.5",
             "input": "hello",
             "stream": false
         }))
@@ -1882,11 +1882,11 @@ async fn responses_relay_routes_models_per_request_between_passthrough_and_chat(
         .unwrap();
     assert_eq!(converted.status(), reqwest::StatusCode::OK);
 
-    // 未命中的官方模型保持 Responses 直通。
+    // 未命中的模型保持 Responses 直通。
     let passthrough = client
         .post(format!("{}/responses", proxy.base_url()))
         .json(&json!({
-            "model": "gpt-5.5",
+            "model": "gpt-5.4",
             "input": "hello",
             "stream": false
         }))
@@ -1905,14 +1905,14 @@ async fn responses_relay_routes_models_per_request_between_passthrough_and_chat(
         .find(|request| request.request_line.contains("/chat/completions"))
         .expect("converted request should hit the chat completions endpoint");
     let chat_body: serde_json::Value = serde_json::from_str(&chat_request.body).unwrap();
-    assert_eq!(chat_body["model"], "kimi-k2.6");
+    assert_eq!(chat_body["model"], "gpt-5.5");
     assert_eq!(chat_body["messages"][0]["content"], "hello");
     let responses_request = requests
         .iter()
         .find(|request| request.request_line.contains("POST /v1/responses"))
-        .expect("official model should pass through to the responses endpoint");
+        .expect("unlisted model should pass through to the responses endpoint");
     let responses_body: serde_json::Value = serde_json::from_str(&responses_request.body).unwrap();
-    assert_eq!(responses_body["model"], "gpt-5.5");
+    assert_eq!(responses_body["model"], "gpt-5.4");
     assert_eq!(responses_body["input"], "hello");
 }
 

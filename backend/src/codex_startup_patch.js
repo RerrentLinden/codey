@@ -1419,10 +1419,33 @@
   const wslOnlyRuntimeConfigOverrides = validRuntimeConfigOverrides
     .filter((entry) => entry.startsWith(wslOnlyRuntimeOverridePrefix))
     .map((entry) => entry.slice(wslOnlyRuntimeOverridePrefix.length));
-  const appServerRuntimeConfigs = [
+  const runtimeOverrideKey = (config) => {
+    if (typeof config !== "string") return "";
+    const separatorIndex = config.indexOf("=");
+    return (separatorIndex < 0 ? config : config.slice(0, separatorIndex)).trim();
+  };
+  const uniqueRuntimeConfigsByKey = (configs) => {
+    const uniqueConfigs = [];
+    const indexesByKey = new Map();
+    for (const config of configs) {
+      const key = runtimeOverrideKey(config);
+      if (key.length === 0) continue;
+      const existingIndex = indexesByKey.get(key);
+      if (existingIndex == null) {
+        indexesByKey.set(key, uniqueConfigs.length);
+        uniqueConfigs.push(config);
+      } else {
+        uniqueConfigs[existingIndex] = config;
+      }
+    }
+    return uniqueConfigs;
+  };
+  const appServerRuntimeConfigs = uniqueRuntimeConfigsByKey([
     appServerAnalyticsConfig,
-    ...nativeRuntimeConfigOverrides,
-  ];
+    ...nativeRuntimeConfigOverrides.filter(
+      (config) => runtimeOverrideKey(config) !== runtimeOverrideKey(appServerAnalyticsConfig),
+    ),
+  ]);
   const subagentGateRuntimeEnv = "CODEY_SUBAGENT_GATE_ACTIVE";
   const subagentGateRuntimeIdEnv = "CODEY_SUBAGENT_GATE_RUNTIME_ID";
   const subagentGateRuntimeActive =
@@ -1448,19 +1471,6 @@
       }
     });
   };
-  const hasAppServerConfigArg = (args, config) => {
-    for (let index = 0; index < args.length; index += 1) {
-      const argument = args[index];
-      if (
-        (argument === "-c" || argument === "--config") &&
-        args[index + 1] === config
-      ) {
-        return true;
-      }
-      if (argument === `--config=${config}`) return true;
-    }
-    return false;
-  };
   const rewriteCodexAppServerArgs = (args) => {
     if (!Array.isArray(args)) return args;
     const appServerIndexes = args
@@ -1471,37 +1481,38 @@
       .length;
     if (appServerIndexes.length !== 1 || analyticsFlagCount > 1) return args;
 
-    const rewritten = args.filter(
-      (argument) => argument !== "--analytics-default-enabled",
+    const managedConfigKeys = new Set(
+      appServerRuntimeConfigs.map(runtimeOverrideKey),
     );
-    let hasAnalyticsConfig = false;
-    for (let index = 0; index < rewritten.length; index += 1) {
-      const argument = rewritten[index];
+    const rewritten = [];
+    for (let index = 0; index < args.length; index += 1) {
+      const argument = args[index];
+      if (argument === "--analytics-default-enabled") continue;
       if (
         (argument === "-c" || argument === "--config") &&
-        /^analytics\.enabled=/.test(String(rewritten[index + 1] ?? ""))
+        typeof args[index + 1] === "string"
       ) {
-        rewritten[index + 1] = appServerAnalyticsConfig;
-        hasAnalyticsConfig = true;
-      } else if (/^--config=analytics\.enabled=/.test(String(argument))) {
-        rewritten[index] = `--config=${appServerAnalyticsConfig}`;
-        hasAnalyticsConfig = true;
+        const config = args[index + 1];
+        if (managedConfigKeys.has(runtimeOverrideKey(config))) {
+          index += 1;
+          continue;
+        }
+        rewritten.push(argument, config);
+        index += 1;
+        continue;
       }
+      if (typeof argument === "string" && argument.startsWith("--config=")) {
+        const config = argument.slice("--config=".length);
+        if (managedConfigKeys.has(runtimeOverrideKey(config))) continue;
+      }
+      rewritten.push(argument);
     }
     const appServerIndex = rewritten.indexOf("app-server");
-    const missingRuntimeConfigs = appServerRuntimeConfigs.filter(
-      (config) => !hasAppServerConfigArg(rewritten, config),
+    rewritten.splice(
+      appServerIndex,
+      0,
+      ...appServerRuntimeConfigs.flatMap((config) => ["-c", config]),
     );
-    if (!hasAnalyticsConfig && !missingRuntimeConfigs.includes(appServerAnalyticsConfig)) {
-      missingRuntimeConfigs.unshift(appServerAnalyticsConfig);
-    }
-    if (missingRuntimeConfigs.length > 0) {
-      rewritten.splice(
-        appServerIndex,
-        0,
-        ...missingRuntimeConfigs.flatMap((config) => ["-c", config]),
-      );
-    }
     if (
       rewritten.length === args.length &&
       rewritten.every((argument, index) => argument === args[index])
@@ -1607,7 +1618,16 @@
   const rewriteCodexAppServerSpawnArgs = (command, args) => {
     if (!Array.isArray(args)) return args;
     const commandName = String(command ?? "");
-    if (/(?:^|[/\\])codex(?:\.exe)?$/i.test(commandName)) {
+    const appServerArgCount = args
+      .filter((argument) => argument === "app-server")
+      .length;
+    const directCodexCommand = /(?:^|[/\\])codex(?:\.exe)?$/i.test(commandName);
+    const runtimeManagedAppServer =
+      nativeRuntimeConfigOverrides.length > 0 && appServerArgCount === 1;
+    if (
+      appServerArgCount === 1 &&
+      (directCodexCommand || runtimeManagedAppServer)
+    ) {
       return rewriteCodexAppServerArgs(args);
     }
     if (!/(?:^|[/\\])wsl(?:\.exe)?$/i.test(commandName)) return args;
@@ -1623,18 +1643,18 @@
     ) {
       return args;
     }
-    const runtimeOverrideKey = (config) =>
-      config.slice(0, Math.max(0, config.indexOf("=")));
     const wslReplacementKeys = new Set(
       wslOnlyRuntimeConfigOverrides.map(runtimeOverrideKey),
     );
-    const wslRuntimeConfigs = [
+    const wslRuntimeConfigs = uniqueRuntimeConfigsByKey([
       appServerAnalyticsConfig,
       ...nativeRuntimeConfigOverrides.filter(
-        (config) => !wslReplacementKeys.has(runtimeOverrideKey(config)),
+        (config) =>
+          runtimeOverrideKey(config) !== runtimeOverrideKey(appServerAnalyticsConfig) &&
+          !wslReplacementKeys.has(runtimeOverrideKey(config)),
       ),
       ...wslOnlyRuntimeConfigOverrides,
-    ].map(rewriteTomlWindowsPathsForWsl);
+    ]).map(rewriteTomlWindowsPathsForWsl);
     const rewrittenCommand = rewriteCodexAppServerShellCommand(
       args[shellFlagIndex + 1],
       wslRuntimeConfigs,
@@ -1654,11 +1674,14 @@
   const childProcess = process.getBuiltinModule("child_process");
   const NativeSpawn = childProcess.spawn;
   if (!NativeSpawn.__codeyAppServerAnalyticsDisabled) {
-    const isDirectCodexAppServerSpawn = (command, args) =>
+    const isManagedCodexAppServerSpawn = (command, args) =>
       subagentGateRuntimeActive &&
-      /(?:^|[/\\])codex(?:\.exe)?$/i.test(String(command ?? "")) &&
       Array.isArray(args) &&
-      args.filter((argument) => argument === "app-server").length === 1;
+      args.filter((argument) => argument === "app-server").length === 1 &&
+      (
+        /(?:^|[/\\])codex(?:\.exe)?$/i.test(String(command ?? "")) ||
+        nativeRuntimeConfigOverrides.length > 0
+      );
     const withSubagentGateEnvironment = (rest) => {
       const options = rest[0];
       if (options == null) {
@@ -1683,7 +1706,7 @@
     };
     const codeyAnalyticsDisabledSpawn = function (command, args, ...rest) {
       const rewritten = rewriteCodexAppServerSpawnArgs(command, args);
-      const rewrittenRest = isDirectCodexAppServerSpawn(command, rewritten)
+      const rewrittenRest = isManagedCodexAppServerSpawn(command, rewritten)
         ? withSubagentGateEnvironment(rest)
         : rest;
       if (rewritten === args && rewrittenRest === rest) {

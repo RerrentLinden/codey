@@ -86,8 +86,8 @@ pub struct RelayProfile {
     pub user_agent: String,
     /// 按模型覆盖线路协议：请求的 model 命中该集合时，走 Chat Completions
     /// 转换（本地 Responses→Chat 代理），否则按 `protocol` 的默认线路发送。
-    /// 典型场景：Responses 中继上的第三方模型（claude/kimi 等）不支持
-    /// /v1/responses，需要逐请求降级到 chat completions。
+    /// 典型场景：第三方 Responses 中继上的模型不支持 /v1/responses，或其
+    /// 流式响应缺少 Codex 必需的终止事件，需要逐请求降级到 chat completions。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chat_completions_models: Vec<String>,
 }

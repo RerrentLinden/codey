@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::subagent::api::{InvocationMode, TokenUsage, TraceContext};
 use crate::subagent::lifecycle::{ExecutionOutcome, ExecutionPhase as ReservationState};
@@ -28,7 +28,7 @@ use identity::*;
 pub(crate) const CONTRACT_PREFIX: &str = "CODEY_DELEGATION_V2=";
 pub(crate) const POST_TOOL_HOOK_MATCHER: &str = "*";
 
-const LEDGER_SCHEMA_VERSION: u32 = 10;
+const LEDGER_SCHEMA_VERSION: u32 = 11;
 const MIN_LEDGER_SCHEMA_VERSION: u32 = 1;
 const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
@@ -58,6 +58,7 @@ const LEDGER_LOCK_RETRY_MILLIS: u64 = 5;
 const SETTLEMENT_RECEIPT_PREFIX: &str = "orchestrator-settlement-v1";
 const MAX_TRANSCRIPT_METADATA_LINE_BYTES: usize = 1024 * 1024;
 const MAX_SPAWN_RESPONSE_JSON_BYTES: usize = 64 * 1024;
+const PREPARED_DELEGATION_TTL_MILLIS: u64 = 2 * 60 * 1000;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct SessionLedger {
@@ -87,7 +88,21 @@ struct SessionLedger {
     batch_decision_control_failure_count: u16,
     #[serde(default)]
     batch_decision_control_failure_started_at_ms: Option<u64>,
+    #[serde(default)]
+    prepared_delegations: BTreeMap<String, PreparedDelegationSidecar>,
     reservations: BTreeMap<String, Reservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PreparedDelegationSidecar {
+    task_id: String,
+    role: String,
+    contract: Value,
+    contract_hash: String,
+    preparation_id: String,
+    prepared_at_ms: u64,
+    batch_number: u16,
+    runtime_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -144,6 +159,23 @@ struct BatchDecisionInput {
     batch_number: u16,
     decision_id: String,
     reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareDelegationInput {
+    task_name: String,
+    agent_type: String,
+    preparation_id: String,
+    contract: Value,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedPreparedDelegation {
+    task_id: String,
+    role: String,
+    preparation_id: String,
+    contract: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -723,6 +755,7 @@ impl SessionLedger {
             used_decision_ids: BTreeSet::new(),
             batch_decision_control_failure_count: 0,
             batch_decision_control_failure_started_at_ms: None,
+            prepared_delegations: BTreeMap::new(),
             reservations: BTreeMap::new(),
         }
     }
@@ -869,6 +902,10 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
         }
         changed = true;
     }
+    if source_schema_version < 11 {
+        ledger.prepared_delegations.clear();
+        changed = true;
+    }
     anyhow::ensure!(
         ledger.runtime_generation > 0,
         "Codey 子代理账本缺少有效 runtime generation"
@@ -900,6 +937,23 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
         "Codey 子代理编排账本批次决策 ID 数量无效：{}",
         ledger.used_decision_ids.len()
     );
+    anyhow::ensure!(
+        ledger.prepared_delegations.len() <= MAX_RESERVATIONS_PER_LEDGER,
+        "Codey 子代理编排账本预备委派数量无效：{}",
+        ledger.prepared_delegations.len()
+    );
+    for (task_id, sidecar) in &ledger.prepared_delegations {
+        anyhow::ensure!(
+            task_id == &sidecar.task_id
+                && !sidecar.role.is_empty()
+                && !sidecar.preparation_id.is_empty()
+                && !sidecar.contract_hash.is_empty()
+                && sidecar.batch_number > 0
+                && sidecar.runtime_generation > 0
+                && sidecar.runtime_generation <= ledger.runtime_generation,
+            "Codey 子代理编排账本包含无效的预备委派 sidecar"
+        );
+    }
     for reservation in ledger.reservations.values() {
         anyhow::ensure!(
             reservation.fencing_token > 0 && !reservation.attempt_id.is_empty(),
@@ -1187,6 +1241,87 @@ fn ledger_capacity_denial(ledger: &SessionLedger) -> Option<String> {
     ))
 }
 
+fn expire_prepared_delegations(ledger: &mut SessionLedger, now_ms: u64) {
+    ledger.prepared_delegations.retain(|_, sidecar| {
+        sidecar.runtime_generation == ledger.runtime_generation
+            && sidecar.batch_number == ledger.batch_number
+            && now_ms.saturating_sub(sidecar.prepared_at_ms) <= PREPARED_DELEGATION_TTL_MILLIS
+    });
+}
+
+fn prepare_from_staged_delegation(
+    ledger: &SessionLedger,
+    tool_input: Option<&Value>,
+    hook_workspace_root: Option<&str>,
+    rule_set: &rules::RuleSet,
+    now_ms: u64,
+) -> Result<Option<std::result::Result<PreparedContract, String>>> {
+    let Some((task_name, role, message)) = spawn_input_identity(tool_input) else {
+        return Ok(None);
+    };
+    if !is_opaque_encrypted_message(message) {
+        return Ok(None);
+    }
+    let Some(policy) = rule_set.role_policy(role) else {
+        return Ok(None);
+    };
+    if policy.access != RoleAccess::Write {
+        return Ok(None);
+    }
+    let Some(sidecar) = ledger.prepared_delegations.get(task_name) else {
+        return Ok(Some(Err(contract_error(&format!(
+            "message 已由上游加密，无法验证 write ownership 与机械 checks；加密写入角色 `{role}` 缺少可验证 sidecar。请先调用 `{}` 提交同 task_name 的明文 CODEY_DELEGATION_V2 契约，再调用 agents.spawn_agent",
+            crate::subagent_control_mcp::PREPARE_DELEGATION_QUALIFIED_TOOL_NAME
+        )))));
+    };
+    if sidecar.role != role {
+        return Ok(Some(Err(contract_error(
+            "预备 sidecar 的 agent_type 与加密 spawn_agent 不一致",
+        ))));
+    }
+    if sidecar.batch_number != ledger.batch_number
+        || sidecar.runtime_generation != ledger.runtime_generation
+        || now_ms.saturating_sub(sidecar.prepared_at_ms) > PREPARED_DELEGATION_TTL_MILLIS
+    {
+        return Ok(Some(Err(contract_error(
+            "预备 sidecar 已过期或不属于当前批次，请重新提交后再派发写入子代理",
+        ))));
+    }
+    if sidecar.contract_hash != canonical_value_hash(&sidecar.contract) {
+        return Ok(Some(Err(contract_error(
+            "预备 sidecar 哈希与契约内容不一致，已拒绝消费",
+        ))));
+    }
+    let payload = serde_json::to_string(&sidecar.contract)
+        .map_err(|error| anyhow::anyhow!("序列化预备委派契约失败：{error}"))?;
+    let prepared_input = json!({
+        "task_name": task_name,
+        "agent_type": role,
+        "fork_turns": "none",
+        "message": format!("{CONTRACT_PREFIX}{payload}")
+    });
+    let prepared =
+        match prepare_contract_with_rules(Some(&prepared_input), hook_workspace_root, rule_set) {
+            Ok(prepared) => prepared,
+            Err(reason) => return Ok(Some(Err(reason))),
+        };
+    if prepared.policy.access != RoleAccess::Write {
+        return Ok(Some(Err(contract_error("预备 sidecar 只能用于写入角色"))));
+    }
+    Ok(Some(Ok(prepared)))
+}
+
+fn spawn_input_identity(tool_input: Option<&Value>) -> Option<(&str, &str, &str)> {
+    let input = tool_input.and_then(Value::as_object)?;
+    let task_name = string_field(input, &["task_name", "taskName"])?;
+    let role = string_field(
+        input,
+        &["agent_type", "agentType", "agent_role", "agentRole"],
+    )?;
+    let message = string_field(input, &["message", "prompt"])?;
+    Some((task_name, role, message))
+}
+
 #[cfg(test)]
 pub(crate) fn pre_spawn(
     state_root: &Path,
@@ -1222,15 +1357,32 @@ pub(crate) fn pre_spawn_with_workspace(
     if let Some(warning) = &loaded_rules.warning {
         eprintln!("Codey 子代理规则回退：{warning}");
     }
-    let prepared =
-        match prepare_contract_with_rules(tool_input, hook_workspace_root, &loaded_rules.rules) {
-            Ok(prepared) => prepared,
-            Err(reason) => return Ok(Some(reason)),
-        };
     let store = LedgerStore::open(state_root, session_id)?;
     let mut ledger = store
         .load(runtime_id, session_id, now_ms)?
         .unwrap_or_else(|| SessionLedger::new(runtime_id, session_id, now_ms));
+    expire_prepared_delegations(&mut ledger, now_ms);
+    let mut consume_prepared_delegation = None;
+    let prepared =
+        match prepare_contract_with_rules(tool_input, hook_workspace_root, &loaded_rules.rules) {
+            Ok(prepared) => prepared,
+            Err(reason) => {
+                match prepare_from_staged_delegation(
+                    &ledger,
+                    tool_input,
+                    hook_workspace_root,
+                    &loaded_rules.rules,
+                    now_ms,
+                )? {
+                    Some(Ok(prepared)) => {
+                        consume_prepared_delegation = Some(prepared.contract.id.clone());
+                        prepared
+                    }
+                    Some(Err(reason)) => return Ok(Some(reason)),
+                    None => return Ok(Some(reason)),
+                }
+            }
+        };
 
     if active_agents == 0
         && ledger.reservations.values().any(|reservation| {
@@ -1275,6 +1427,9 @@ pub(crate) fn pre_spawn_with_workspace(
 
     ledger.decision_required = true;
     ledger.issued_task_ids.insert(prepared.contract.id.clone());
+    if let Some(task_id) = consume_prepared_delegation {
+        ledger.prepared_delegations.remove(&task_id);
+    }
     let acceptance = prepared
         .contract
         .acceptance
@@ -2511,6 +2666,88 @@ pub(crate) fn open_batch_decision_if_settled(
     )
 }
 
+pub(crate) fn prepare_delegation_sidecar(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    tool_input: Option<&Value>,
+    hook_workspace_root: Option<&str>,
+    now_ms: u64,
+) -> Result<Option<String>> {
+    let loaded_rules = rules::load(state_root);
+    if let Err(reason) =
+        parse_prepare_delegation_input(tool_input, hook_workspace_root, &loaded_rules.rules)
+    {
+        return Ok(Some(reason));
+    }
+    let store = LedgerStore::open(state_root, session_id)?;
+    let mut ledger = store
+        .load(runtime_id, session_id, now_ms)?
+        .unwrap_or_else(|| SessionLedger::new(runtime_id, session_id, now_ms));
+    expire_prepared_delegations(&mut ledger, now_ms);
+    store.save(&mut ledger, now_ms)?;
+    Ok(None)
+}
+
+pub(crate) fn post_delegation_sidecar(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    tool_input: Option<&Value>,
+    tool_response: Option<&Value>,
+    hook_workspace_root: Option<&str>,
+    now_ms: u64,
+) -> Result<Option<String>> {
+    let loaded_rules = rules::load(state_root);
+    let prepared = match parse_prepare_delegation_input(
+        tool_input,
+        hook_workspace_root,
+        &loaded_rules.rules,
+    ) {
+        Ok(prepared) => prepared,
+        Err(reason) => return Ok(Some(reason)),
+    };
+    if !tool_response
+        .is_some_and(|response| delegation_sidecar_receipt_matches(response, &prepared))
+    {
+        return Ok(Some(format!(
+            "Codey 写入 sidecar 门禁：`{}` 未返回匹配的 accepted 回执，预备委派未提交；请重新调用该工具后再派发写入子代理。",
+            crate::subagent_control_mcp::PREPARE_DELEGATION_QUALIFIED_TOOL_NAME
+        )));
+    }
+    let store = LedgerStore::open(state_root, session_id)?;
+    let mut ledger = store
+        .load(runtime_id, session_id, now_ms)?
+        .unwrap_or_else(|| SessionLedger::new(runtime_id, session_id, now_ms));
+    expire_prepared_delegations(&mut ledger, now_ms);
+    if ledger.issued_task_ids.contains(&prepared.task_id)
+        || ledger.reservations.contains_key(&prepared.task_id)
+    {
+        return Ok(Some(duplicate_task_id_denial(&ledger, &prepared.task_id)));
+    }
+    if ledger.prepared_delegations.contains_key(&prepared.task_id) {
+        return Ok(Some(format!(
+            "Codey 写入 sidecar 门禁：任务 `{}` 已有未消费的预备委派；请先使用相同 task_name 调用 agents.spawn_agent，或换用全新的 task_name。",
+            prepared.task_id
+        )));
+    }
+    ledger.prepared_delegations.insert(
+        prepared.task_id.clone(),
+        PreparedDelegationSidecar {
+            task_id: prepared.task_id,
+            role: prepared.role,
+            contract_hash: canonical_value_hash(&prepared.contract),
+            contract: prepared.contract,
+            preparation_id: prepared.preparation_id,
+            prepared_at_ms: now_ms,
+            batch_number: ledger.batch_number,
+            runtime_generation: ledger.runtime_generation,
+        },
+    );
+    store.save(&mut ledger, now_ms)?;
+    Ok(None)
+}
+
 pub(crate) fn prepare_batch_decision(
     state_root: &Path,
     runtime_id: &str,
@@ -2809,6 +3046,90 @@ fn parse_batch_decision_input(
         return Err("Codey 批次决策门禁：reason 必须为 1-512 个字符。".to_string());
     }
     Ok(input)
+}
+
+fn parse_prepare_delegation_input(
+    tool_input: Option<&Value>,
+    hook_workspace_root: Option<&str>,
+    rule_set: &rules::RuleSet,
+) -> std::result::Result<ParsedPreparedDelegation, String> {
+    let mut input = serde_json::from_value::<PrepareDelegationInput>(
+        tool_input
+            .cloned()
+            .ok_or_else(|| "Codey 写入 sidecar 门禁：缺少工具输入。".to_string())?,
+    )
+    .map_err(|error| format!("Codey 写入 sidecar 门禁：工具输入无效：{error}"))?;
+    input.task_name = input.task_name.trim().to_string();
+    input.agent_type = input.agent_type.trim().to_string();
+    input.preparation_id = input.preparation_id.trim().to_string();
+    validate_task_id(&input.task_name)?;
+    if input.preparation_id.is_empty()
+        || input.preparation_id.len() > MAX_BATCH_DECISION_ID_CHARS
+        || !input
+            .preparation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:".contains(&byte))
+    {
+        return Err(
+            "Codey 写入 sidecar 门禁：preparation_id 必须为 1-128 个 ASCII 字母、数字或 `-_.:`。"
+                .to_string(),
+        );
+    }
+    let Some(policy) = rule_set.role_policy(&input.agent_type) else {
+        return Err(contract_error(&format!(
+            "未知或不允许的 agent_type `{}`",
+            input.agent_type
+        )));
+    };
+    if policy.access != RoleAccess::Write {
+        return Err(contract_error("sidecar 只允许为写入角色准备契约"));
+    }
+    let payload = serde_json::to_string(&input.contract)
+        .map_err(|error| contract_error(&format!("sidecar 契约无法序列化：{error}")))?;
+    let spawn_input = json!({
+        "task_name": input.task_name,
+        "agent_type": input.agent_type,
+        "fork_turns": "none",
+        "message": format!("{CONTRACT_PREFIX}{payload}")
+    });
+    let prepared = prepare_contract_with_rules(Some(&spawn_input), hook_workspace_root, rule_set)?;
+    if prepared.policy.access != RoleAccess::Write {
+        return Err(contract_error("sidecar 只允许为写入角色准备契约"));
+    }
+    Ok(ParsedPreparedDelegation {
+        task_id: prepared.contract.id,
+        role: prepared.role,
+        preparation_id: input.preparation_id,
+        contract: input.contract,
+    })
+}
+
+fn delegation_sidecar_receipt_matches(value: &Value, input: &ParsedPreparedDelegation) -> bool {
+    let Some(envelope) = value.as_object() else {
+        return false;
+    };
+    if envelope.get("isError").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+
+    let result = envelope
+        .get("result")
+        .and_then(Value::as_object)
+        .unwrap_or(envelope);
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        return false;
+    }
+
+    let Some(content) = result.get("structuredContent").and_then(Value::as_object) else {
+        return false;
+    };
+    content.get("accepted").and_then(Value::as_bool) == Some(true)
+        && content.get("task_name").and_then(Value::as_str) == Some(input.task_id.as_str())
+        && content.get("agent_type").and_then(Value::as_str) == Some(input.role.as_str())
+        && content.get("preparation_id").and_then(Value::as_str)
+            == Some(input.preparation_id.as_str())
+        && content.get("contract").map(canonical_value_hash)
+            == Some(canonical_value_hash(&input.contract))
 }
 
 fn batch_decision_state_matches(state: &BatchDecisionState, input: &BatchDecisionInput) -> bool {
@@ -3667,6 +3988,35 @@ mod tests {
         })
     }
 
+    fn prepared_delegation_input(
+        task: &str,
+        role: &str,
+        preparation_id: &str,
+        contract: Value,
+    ) -> Value {
+        json!({
+            "task_name": task,
+            "agent_type": role,
+            "preparation_id": preparation_id,
+            "contract": contract
+        })
+    }
+
+    fn prepared_delegation_response(input: &Value) -> Value {
+        let mut structured = input.clone();
+        structured
+            .as_object_mut()
+            .unwrap()
+            .insert("accepted".to_string(), json!(true));
+        json!({ "structuredContent": structured, "isError": false })
+    }
+
+    fn prepared_delegation_json_rpc_response(input: &Value) -> Value {
+        json!({
+            "result": prepared_delegation_response(input)
+        })
+    }
+
     fn batch_decision_input(
         batch_number: u16,
         decision: RootBatchDecision,
@@ -4060,6 +4410,137 @@ mod tests {
                 .unwrap_err()
                 .contains("最后一行缺少 CODEY_DELEGATION_V2")
         );
+    }
+
+    #[test]
+    fn encrypted_write_spawn_consumes_prepared_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let contract = worker_contract("encrypted_worker", "backend/src");
+        let sidecar =
+            prepared_delegation_input("encrypted_worker", "codey_worker", "prep-1", contract);
+        assert_eq!(
+            prepare_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&sidecar),
+                Some("/repo"),
+                10,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            post_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&sidecar),
+                Some(&prepared_delegation_response(&sidecar)),
+                Some("/repo"),
+                11,
+            )
+            .unwrap(),
+            None
+        );
+
+        let encrypted_spawn = json!({
+            "task_name": "encrypted_worker",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        assert_eq!(
+            pre_spawn(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&encrypted_spawn),
+                0,
+                12,
+            )
+            .unwrap(),
+            None
+        );
+
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let ledger = store.load("runtime-a", "session-a", 13).unwrap().unwrap();
+        assert!(ledger.prepared_delegations.is_empty());
+        let reservation = &ledger.reservations["encrypted_worker"];
+        assert!(reservation.write_capable);
+        assert!(!reservation.native_read_scope);
+        assert_eq!(reservation.write_paths, ["/repo/backend/src"]);
+        assert_eq!(reservation.acceptance.len(), 1);
+        assert!(
+            reservation
+                .capabilities
+                .iter()
+                .any(|capability| capability == "workspace.write")
+        );
+    }
+
+    #[test]
+    fn delegation_sidecar_accepts_json_rpc_tool_result_envelope() {
+        let temp = tempfile::tempdir().unwrap();
+        let contract = worker_contract("encrypted_worker", "backend/src");
+        let sidecar =
+            prepared_delegation_input("encrypted_worker", "codey_worker", "prep-1", contract);
+        assert_eq!(
+            prepare_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&sidecar),
+                Some("/repo"),
+                10,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            post_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&sidecar),
+                Some(&prepared_delegation_json_rpc_response(&sidecar)),
+                Some("/repo"),
+                11,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn delegation_sidecar_rejects_error_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let contract = worker_contract("encrypted_worker", "backend/src");
+        let sidecar =
+            prepared_delegation_input("encrypted_worker", "codey_worker", "prep-1", contract);
+        let denial = post_delegation_sidecar(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&sidecar),
+            Some(&json!({
+                "result": {
+                    "isError": true,
+                    "structuredContent": {
+                        "accepted": true,
+                        "task_name": "encrypted_worker",
+                        "agent_type": "codey_worker",
+                        "preparation_id": "prep-1",
+                        "contract": sidecar["contract"].clone()
+                    }
+                }
+            })),
+            Some("/repo"),
+            11,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("未返回匹配的 accepted 回执"));
     }
 
     #[test]

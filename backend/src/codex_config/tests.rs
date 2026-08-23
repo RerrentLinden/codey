@@ -5015,6 +5015,7 @@ wire_api = "responses"
         "mcp_servers.codey_subagent_control.enabled_tools",
         "mcp_servers.codey_subagent_control.disabled_tools",
         "mcp_servers.codey_subagent_control.tools.resolve_batch.approval_mode",
+        "mcp_servers.codey_subagent_control.tools.prepare_delegation.approval_mode",
         "tool_output_token_limit",
         "agents.enabled",
         "agents.max_concurrent_threads_per_session",

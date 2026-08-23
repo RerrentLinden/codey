@@ -725,9 +725,9 @@ fn pre_tool_use_output(
         if let Some(reason) = runtime_subagent_attestation_denial(input, state_root, runtime_id)? {
             return Ok(pre_tool_reason_denial(reason));
         }
-        if is_batch_decision_tool(tool_name) {
+        if is_batch_decision_tool(tool_name) || is_prepare_delegation_tool(tool_name) {
             return Ok(pre_tool_reason_denial(
-                "Codey 批次决策门禁：只有根代理可以提交批次决策。".to_string(),
+                "Codey 子代理控制门禁：只有根代理可以提交批次决策或写入 sidecar。".to_string(),
             ));
         }
         if let Some(agent_id) = child_agent_id {
@@ -770,11 +770,35 @@ fn pre_tool_use_output(
         if is_anonymous_reconciliation_tool(tool_name, input.tool_input.as_ref()) {
             return Ok(json!({}));
         }
-        if is_collaboration_tool(tool_name) || is_batch_decision_tool(tool_name) {
+        if is_collaboration_tool(tool_name)
+            || is_batch_decision_tool(tool_name)
+            || is_prepare_delegation_tool(tool_name)
+        {
             return Ok(pre_tool_reason_denial(format!(
                 "Codey 主体身份门禁：仍有 {active} 个活动子代理，但当前 PreToolUse 载荷既没有可信的 child 身份，也没有匹配本批首个根派生调用的 turn_id，无法证明调用者是根代理。为防止匿名 child 派生、追派、中断或操纵批次，当前仅允许 agents.wait_agent 与不带筛选的 agents.list_agents 对账；其余编排调用已按 fail-closed 拒绝。"
             )));
         }
+    }
+    if input
+        .tool_name
+        .as_deref()
+        .is_some_and(is_prepare_delegation_tool)
+    {
+        let process_cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let workspace_root = nonempty(input.cwd.as_deref()).or(process_cwd.as_deref());
+        if let Some(reason) = crate::subagent_orchestrator::prepare_delegation_sidecar(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            workspace_root,
+            now_ms,
+        )? {
+            return Ok(pre_tool_reason_denial(reason));
+        }
+        return Ok(json!({}));
     }
     if input
         .tool_name
@@ -912,6 +936,27 @@ fn post_tool_use_output(
             &input.session_id,
             input.tool_input.as_ref(),
             input.tool_response.as_ref(),
+            now_ms,
+        )? {
+            return Ok(json!({
+                "decision": "block",
+                "reason": reason,
+            }));
+        }
+        return Ok(json!({}));
+    }
+    if is_prepare_delegation_tool(tool_name) {
+        let process_cwd = std::env::current_dir()
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let workspace_root = nonempty(input.cwd.as_deref()).or(process_cwd.as_deref());
+        if let Some(reason) = crate::subagent_orchestrator::post_delegation_sidecar(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            input.tool_response.as_ref(),
+            workspace_root,
             now_ms,
         )? {
             return Ok(json!({
@@ -1891,6 +1936,13 @@ fn is_batch_decision_tool(tool_name: &str) -> bool {
     normalized == crate::subagent_control_mcp::QUALIFIED_TOOL_NAME
         || normalized == "codey_subagent_control.resolve_batch"
         || normalized == "codey_subagent_control/resolve_batch"
+}
+
+fn is_prepare_delegation_tool(tool_name: &str) -> bool {
+    let normalized = tool_name.trim().to_ascii_lowercase();
+    normalized == crate::subagent_control_mcp::PREPARE_DELEGATION_QUALIFIED_TOOL_NAME
+        || normalized == "codey_subagent_control.prepare_delegation"
+        || normalized == "codey_subagent_control/prepare_delegation"
 }
 
 fn is_wait_agent_tool(tool_name: &str) -> bool {

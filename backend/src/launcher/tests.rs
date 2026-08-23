@@ -58,7 +58,7 @@ fn chat_provider_builds_an_explicit_protocol_proxy_snapshot() {
 }
 
 #[test]
-fn responses_provider_starts_a_per_model_proxy_only_for_third_party_models() {
+fn third_party_responses_provider_converts_every_supported_model() {
     let mut config = CodeyConfig::default();
     let mut profile = crate::config::ProviderProfile::new("Responses");
     profile.base_url = "https://relay.example/v1".to_string();
@@ -66,18 +66,53 @@ fn responses_provider_starts_a_per_model_proxy_only_for_third_party_models() {
     config.profiles = vec![profile.clone()];
 
     assert!(protocol_proxy_settings(&profile, config.default_model(), &[]).is_none());
-    // 即使目录里有第三方模型，无第三方模型的 Responses 线路保持直连。
-    let third_party = vec!["kimi-k2.6".to_string()];
-    assert!(
-        protocol_proxy_settings(&profile, config.default_model(), &third_party).is_some(),
-        "Responses 线路存在第三方模型时应启动按模型选路的本地代理"
+    let model_state = model_catalog::ModelSelectionState {
+        official_models: vec![
+            model_catalog::OfficialModelAvailability {
+                slug: "gpt-5.5".to_string(),
+                display_name: "GPT-5.5".to_string(),
+                supported: true,
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: String::new(),
+            },
+            model_catalog::OfficialModelAvailability {
+                slug: "gpt-5.4".to_string(),
+                display_name: "GPT-5.4".to_string(),
+                supported: false,
+                supported_reasoning_efforts: Vec::new(),
+                default_reasoning_effort: String::new(),
+            },
+        ],
+        third_party_models: vec!["kimi-k2.6".to_string()],
+        ..model_catalog::ModelSelectionState::default()
+    };
+    let chat_completions_models =
+        chat_completions_models_for_protocol_proxy(&profile, &model_state);
+    assert_eq!(
+        chat_completions_models,
+        vec!["kimi-k2.6".to_string(), "gpt-5.5".to_string()]
     );
-    let settings = protocol_proxy_settings(&profile, config.default_model(), &third_party).unwrap();
+    assert!(
+        protocol_proxy_settings(&profile, config.default_model(), &chat_completions_models)
+            .is_some(),
+        "第三方 Responses 线路存在可用模型时应启动兼容代理"
+    );
+    let settings =
+        protocol_proxy_settings(&profile, config.default_model(), &chat_completions_models)
+            .unwrap();
     let relay = settings.active_relay_profile();
     assert_eq!(relay.protocol, RelayProtocol::Responses);
-    assert_eq!(relay.chat_completions_models, vec!["kimi-k2.6".to_string()]);
+    assert_eq!(relay.chat_completions_models, chat_completions_models);
     assert_eq!(relay.base_url, "https://relay.example/v1");
     assert_eq!(relay.relay_mode, RelayMode::PureApi);
+
+    profile.cc_switch_read_only = true;
+    assert!(chat_completions_models_for_protocol_proxy(&profile, &model_state).is_empty());
+    assert!(
+        protocol_proxy_settings(&profile, config.default_model(), &["gpt-5.5".to_string()])
+            .is_none(),
+        "OpenAI 官方线路必须继续使用原生 Responses"
+    );
 }
 
 #[cfg(target_os = "macos")]

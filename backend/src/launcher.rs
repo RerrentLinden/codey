@@ -152,7 +152,7 @@ pub struct CodeyRuntime {
 fn protocol_proxy_settings(
     profile: &ProviderProfile,
     default_model: Option<&str>,
-    third_party_models: &[String],
+    chat_completions_models: &[String],
 ) -> Option<BackendSettings> {
     if profile.cc_switch_read_only {
         return None;
@@ -160,12 +160,14 @@ fn protocol_proxy_settings(
     let chat_completions_models = match profile.protocol {
         RelayProtocol::ChatCompletions => Vec::new(),
         RelayProtocol::Responses => {
-            // Responses 线路只有在存在第三方模型（claude/kimi 等，通常不支持
-            // /v1/responses）时才经本地代理；官方模型逐请求直通，行为不变。
-            if third_party_models.is_empty() {
+            // A third-party relay may advertise official model slugs while its
+            // Responses stream still does not satisfy Codex's terminal-event
+            // contract. Only start the per-model compatibility proxy when at
+            // least one model needs Chat Completions conversion.
+            if chat_completions_models.is_empty() {
                 return None;
             }
-            third_party_models.to_vec()
+            chat_completions_models.to_vec()
         }
     };
     let base_url = profile.normalized_base_url();
@@ -189,12 +191,37 @@ fn protocol_proxy_settings(
     })
 }
 
+fn chat_completions_models_for_protocol_proxy(
+    profile: &ProviderProfile,
+    model_state: &model_catalog::ModelSelectionState,
+) -> Vec<String> {
+    if profile.cc_switch_read_only || profile.protocol != RelayProtocol::Responses {
+        return Vec::new();
+    }
+
+    let mut models = model_state.third_party_models.clone();
+    for official_model in model_state
+        .official_models
+        .iter()
+        .filter(|model| model.supported)
+    {
+        if !models
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(&official_model.slug))
+        {
+            models.push(official_model.slug.clone());
+        }
+    }
+    models
+}
+
 async fn start_runtime_protocol_proxy(
     profile: &ProviderProfile,
     default_model: Option<&str>,
-    third_party_models: &[String],
+    chat_completions_models: &[String],
 ) -> Result<Option<ProtocolProxyHandle>> {
-    let Some(settings) = protocol_proxy_settings(profile, default_model, third_party_models) else {
+    let Some(settings) = protocol_proxy_settings(profile, default_model, chat_completions_models)
+    else {
         return Ok(None);
     };
     start_protocol_proxy(settings)
@@ -1207,8 +1234,8 @@ async fn prepare_runtime_provider_state(
     config: &CodeyConfig,
     route: &StartupRouteContext,
 ) -> Result<PreparedProviderState> {
-    // 模型目录先于协议代理准备：Responses 线路是否需要本地代理、以及哪些
-    // 模型要走 Chat Completions 转换，都取决于目录里的第三方模型集合。
+    // 模型目录先于协议代理准备：第三方 Responses 线路上的全部可用模型都
+    // 通过兼容代理收口，避免上游缺少 response.completed 时让 Codex 中断。
     let startup_catalog = prepare_startup_model_catalog(
         config,
         &route.current_profile,
@@ -1216,10 +1243,14 @@ async fn prepare_runtime_provider_state(
         route.preserve_provider_route,
     )
     .await?;
+    let chat_completions_models = chat_completions_models_for_protocol_proxy(
+        &route.current_profile,
+        &startup_catalog.model_state,
+    );
     let protocol_proxy = start_runtime_protocol_proxy(
         &route.current_profile,
         config.default_model(),
-        &startup_catalog.model_state.third_party_models,
+        &chat_completions_models,
     )
     .await
     .map_err(|error| {
@@ -1230,7 +1261,7 @@ async fn prepare_runtime_provider_state(
             serde_json::json!({
                 "provider": route.original_provider,
                 "protocol": route.current_profile.protocol,
-                "thirdPartyModels": startup_catalog.model_state.third_party_models.len(),
+                "chatCompletionsModels": chat_completions_models.len(),
             }),
         );
         error
