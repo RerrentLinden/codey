@@ -1079,6 +1079,7 @@ pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     LEGACY_CODEY_FASTCTX_GUIDANCE,
 ];
 
+#[cfg(test)]
 const PREVIOUS_CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V6,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5,
@@ -1111,6 +1112,7 @@ pub(crate) fn codey_fastctx_guidance_blocks(current: &str) -> Vec<String> {
     fastctx_guidance_blocks(current, CODEY_FASTCTX_GUIDANCE_VERSIONS)
 }
 
+#[cfg(test)]
 fn previous_codey_fastctx_guidance_blocks(current: &str) -> Vec<String> {
     fastctx_guidance_blocks(current, PREVIOUS_CODEY_FASTCTX_GUIDANCE_VERSIONS)
 }
@@ -1212,6 +1214,7 @@ pub(crate) fn append_root_agent_collaboration_usage_hint(existing: &str) -> Stri
     updated
 }
 
+#[cfg(test)]
 pub(crate) fn root_agent_collaboration_usage_hint_blocks(current: &str) -> Vec<&'static str> {
     ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS
         .iter()
@@ -1236,6 +1239,7 @@ pub(crate) fn remove_codey_fastctx_guidance(current: &str) -> Option<String> {
     remove_fastctx_guidance_blocks(current, codey_fastctx_guidance_blocks(current))
 }
 
+#[cfg(test)]
 pub(crate) fn remove_previous_codey_fastctx_guidance(current: &str) -> Option<String> {
     remove_fastctx_guidance_blocks(current, previous_codey_fastctx_guidance_blocks(current))
 }

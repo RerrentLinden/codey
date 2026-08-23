@@ -93,7 +93,6 @@ fn apply_current_provider_to_prompt_optimization(
     config.prompt_optimization.api_key = api_key.to_string();
     config.prompt_optimization.api_key_configured = true;
     config.prompt_optimization.clear_api_key = false;
-    config.prompt_optimization.protocol = profile.protocol;
     if let Some(default_model) = default_model {
         config.prompt_optimization.model = default_model;
     }
@@ -216,8 +215,6 @@ pub async fn test_prompt_optimization_command(
 mod tests {
     use std::collections::BTreeMap;
 
-    use codey_runtime_core::settings::RelayProtocol;
-
     use super::*;
 
     #[test]
@@ -267,14 +264,13 @@ mod tests {
     }
 
     #[test]
-    fn current_provider_sync_copies_endpoint_key_protocol_and_default_model() {
+    fn current_provider_sync_copies_endpoint_key_and_default_model() {
         let profile = ProviderProfile {
             id: "provider".to_string(),
             name: "Provider".to_string(),
             base_url: " https://provider.example/v1/ ".to_string(),
             api_key: "api-secret".to_string(),
             model_request_headers: BTreeMap::new(),
-            protocol: RelayProtocol::Responses,
             cc_switch_provider_id: None,
             cc_switch_read_only: false,
             supports_remote_compaction: false,
@@ -302,10 +298,6 @@ mod tests {
         );
         assert_eq!(synced.prompt_optimization.api_key, "api-secret");
         assert!(synced.prompt_optimization.api_key_configured);
-        assert_eq!(
-            synced.prompt_optimization.protocol,
-            RelayProtocol::Responses
-        );
         assert_eq!(synced.prompt_optimization.model, "gpt-provider");
         assert_eq!(synced.prompt_optimization.instruction, "保持简洁");
     }
@@ -318,7 +310,6 @@ mod tests {
             base_url: "https://provider.example/v1".to_string(),
             api_key: "api-secret".to_string(),
             model_request_headers: BTreeMap::new(),
-            protocol: RelayProtocol::Responses,
             cc_switch_provider_id: None,
             cc_switch_read_only: false,
             supports_remote_compaction: false,

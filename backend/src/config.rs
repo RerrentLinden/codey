@@ -4,7 +4,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use codey_runtime_core::settings::RelayProtocol;
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -25,8 +24,6 @@ pub struct ProviderProfile {
     /// Codey's store or exposed to the renderer.
     #[serde(skip)]
     pub model_request_headers: BTreeMap<String, String>,
-    #[serde(default)]
-    pub protocol: RelayProtocol,
     /// Stable id of the Codex provider in cc-switch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cc_switch_provider_id: Option<String>,
@@ -46,7 +43,6 @@ impl ProviderProfile {
             base_url: String::new(),
             api_key: String::new(),
             model_request_headers: BTreeMap::new(),
-            protocol: RelayProtocol::Responses,
             cc_switch_provider_id: None,
             cc_switch_read_only: false,
             supports_remote_compaction: false,
@@ -61,7 +57,7 @@ impl ProviderProfile {
 /// Prompt-optimization settings. The API key follows the notification-channel
 /// credential pattern: redacted to the renderer, restored on save, cleared
 /// only on explicit request.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptOptimizationConfig {
     #[serde(default)]
@@ -76,31 +72,10 @@ pub struct PromptOptimizationConfig {
     pub clear_api_key: bool,
     #[serde(default)]
     pub model: String,
-    #[serde(default = "default_prompt_optimization_protocol")]
-    pub protocol: RelayProtocol,
     /// Optional custom optimizer instructions. When empty the built-in
     /// default system prompt is used.
     #[serde(default)]
     pub instruction: String,
-}
-
-fn default_prompt_optimization_protocol() -> RelayProtocol {
-    RelayProtocol::ChatCompletions
-}
-
-impl Default for PromptOptimizationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            base_url: String::new(),
-            api_key: String::new(),
-            api_key_configured: false,
-            clear_api_key: false,
-            model: String::new(),
-            protocol: default_prompt_optimization_protocol(),
-            instruction: String::new(),
-        }
-    }
 }
 
 impl PromptOptimizationConfig {
@@ -917,6 +892,24 @@ mod tests {
     }
 
     #[test]
+    fn deprecated_provider_protocol_fields_are_ignored() {
+        let profile = serde_json::from_value::<ProviderProfile>(serde_json::json!({
+            "id": "legacy-provider",
+            "name": "Legacy Provider",
+            "baseUrl": "https://gateway.example/v1",
+            "apiKey": "",
+            "protocol": "chatCompletions",
+            "chatCompletionsModels": ["legacy-model"]
+        }))
+        .unwrap();
+
+        let serialized = serde_json::to_value(profile).unwrap();
+
+        assert!(serialized.get("protocol").is_none());
+        assert!(serialized.get("chatCompletionsModels").is_none());
+    }
+
+    #[test]
     fn normalizes_missing_active_profile() {
         let config = CodeyConfig {
             active_profile_id: "missing".to_string(),
@@ -1453,10 +1446,6 @@ mod tests {
 
         assert!(!config.prompt_optimization.enabled);
         assert!(config.prompt_optimization.api_key.is_empty());
-        assert_eq!(
-            config.prompt_optimization.protocol,
-            RelayProtocol::ChatCompletions
-        );
     }
 
     #[test]
@@ -1474,11 +1463,8 @@ mod tests {
         assert_eq!(config.prompt_optimization.api_key, "sk-secret");
         assert!(config.prompt_optimization.api_key_configured);
         assert_eq!(config.prompt_optimization.model, "gpt-x");
-        assert_eq!(
-            config.prompt_optimization.protocol,
-            RelayProtocol::Responses
-        );
         assert_eq!(config.prompt_optimization.instruction, "保持简洁");
+        assert!(serialized["promptOptimization"].get("protocol").is_none());
         assert!(
             serialized["promptOptimization"]
                 .get("clearApiKey")

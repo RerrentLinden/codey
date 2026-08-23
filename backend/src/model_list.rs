@@ -25,12 +25,10 @@ pub(crate) fn model_endpoints(
     url.set_fragment(None);
     let mut path = url.path().trim_end_matches('/').to_string();
     let mut base = url.as_str().trim_end_matches('/').to_string();
-    for suffix in ["/chat/completions", "/responses"] {
-        if path.to_ascii_lowercase().ends_with(suffix) {
-            path.truncate(path.len() - suffix.len());
-            base.truncate(base.len() - suffix.len());
-            break;
-        }
+    const RESPONSES_SUFFIX: &str = "/responses";
+    if path.to_ascii_lowercase().ends_with(RESPONSES_SUFFIX) {
+        path.truncate(path.len() - RESPONSES_SUFFIX.len());
+        base.truncate(base.len() - RESPONSES_SUFFIX.len());
     }
     let last_segment = path.rsplit('/').next().unwrap_or_default();
     Ok(if last_segment.eq_ignore_ascii_case("models") {

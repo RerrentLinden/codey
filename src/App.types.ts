@@ -6,7 +6,6 @@ export type Profile = {
   name: string;
   baseUrl: string;
   apiKey: string;
-  protocol: "responses" | "chatCompletions";
   ccSwitchProviderId?: string;
   ccSwitchReadOnly: boolean;
 };
@@ -18,7 +17,6 @@ export type PromptOptimizationConfig = {
   apiKeyConfigured: boolean;
   clearApiKey?: boolean;
   model: string;
-  protocol: "responses" | "chatCompletions";
   instruction: string;
 };
 
@@ -151,7 +149,6 @@ export type CcSwitchStatus = {
     official: boolean;
     baseUrl: string;
     localRoute: boolean;
-    protocol: "responses" | "chatCompletions";
   };
 };
 

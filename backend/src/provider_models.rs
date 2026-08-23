@@ -220,7 +220,7 @@ mod tests {
             vec!["https://relay.example/v1/models"]
         );
         assert_eq!(
-            model_endpoints("https://relay.example/v1/chat/completions").unwrap(),
+            model_endpoints("https://relay.example/v1/responses").unwrap(),
             vec!["https://relay.example/v1/models"]
         );
         assert_eq!(
@@ -228,7 +228,7 @@ mod tests {
             vec!["https://relay.example/api/coding/v3/models"]
         );
         assert_eq!(
-            model_endpoints("https://relay.example/api%20space/v1/chat/completions").unwrap(),
+            model_endpoints("https://relay.example/api%20space/v1/responses").unwrap(),
             vec!["https://relay.example/api%20space/v1/models"]
         );
         assert_eq!(

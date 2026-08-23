@@ -2,10 +2,6 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
-use codey_runtime_core::{
-    protocol_proxy::{chat_completion_to_response_with_request, responses_to_chat_completions},
-    settings::RelayProtocol,
-};
 use reqwest::{
     Client, RequestBuilder,
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
@@ -74,7 +70,6 @@ pub struct ResolvedPromptOptimizationConfig {
     pub base_url: String,
     pub api_key: String,
     pub request_headers: BTreeMap<String, String>,
-    pub protocol: RelayProtocol,
     pub model: String,
     pub instruction: String,
 }
@@ -85,7 +80,6 @@ impl ResolvedPromptOptimizationConfig {
             base_url: config.base_url.clone(),
             api_key: config.api_key.clone(),
             request_headers: BTreeMap::new(),
-            protocol: config.protocol,
             model: config.model.clone(),
             instruction: config.instruction.clone(),
         }
@@ -104,16 +98,7 @@ pub fn optimizer_http_client() -> Result<Client, String> {
         .map_err(|error| format!("创建优化 HTTP 客户端失败：{error}"))
 }
 
-/// Builds the Chat Completions endpoint from the configured base URL. The
-/// user may fill in either the bare base (`https://api.example.com/v1`) or
-/// the complete endpoint (`https://api.example.com/v1/chat/completions`);
-/// both forms are accepted without double-appending the suffix.
-#[cfg(test)]
-pub fn chat_completions_endpoint(config: &PromptOptimizationConfig) -> Result<String, String> {
-    request_endpoint(&config.base_url, RelayProtocol::ChatCompletions)
-}
-
-fn request_endpoint(base_url: &str, protocol: RelayProtocol) -> Result<String, String> {
+fn request_endpoint(base_url: &str) -> Result<String, String> {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.is_empty() {
         return Err("请先配置 OpenAI 兼容 API 地址".to_string());
@@ -123,35 +108,26 @@ fn request_endpoint(base_url: &str, protocol: RelayProtocol) -> Result<String, S
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err("API 地址必须是有效的 HTTP(S) 地址".to_string());
     }
-    let suffix = match protocol {
-        RelayProtocol::ChatCompletions => "/chat/completions",
-        RelayProtocol::Responses => "/responses",
-    };
-    if base_url.ends_with(suffix) {
+    if base_url.ends_with("/chat/completions") {
+        return Err(
+            "Codey 已移除协议转换能力；请改用提供 Responses API 的第三方网关地址".to_string(),
+        );
+    }
+    if base_url.ends_with("/responses") {
         return Ok(base_url.to_string());
     }
-    let base_url = base_url
-        .strip_suffix("/chat/completions")
-        .or_else(|| base_url.strip_suffix("/responses"))
-        .unwrap_or(base_url);
-    Ok(format!("{base_url}{suffix}"))
+    Ok(format!("{base_url}/responses"))
 }
 
 /// Whether a 404 on the built endpoint should trigger the `/v1` retry. The
 /// retry only applies when the user supplied a bare base URL that does not
 /// already carry the `/v1` prefix or the complete endpoint.
 fn should_retry_with_v1(base_url: &str) -> bool {
-    !base_url.ends_with("/v1")
-        && !base_url.ends_with("/chat/completions")
-        && !base_url.ends_with("/responses")
+    !base_url.ends_with("/v1") && !base_url.ends_with("/responses")
 }
 
-fn v1_request_endpoint(base_url: &str, protocol: RelayProtocol) -> String {
-    let suffix = match protocol {
-        RelayProtocol::ChatCompletions => "chat/completions",
-        RelayProtocol::Responses => "responses",
-    };
-    format!("{}/v1/{suffix}", base_url.trim().trim_end_matches('/'))
+fn v1_request_endpoint(base_url: &str) -> String {
+    format!("{}/v1/responses", base_url.trim().trim_end_matches('/'))
 }
 
 /// Builds the first model-list endpoint from the same compatibility rules used
@@ -297,8 +273,7 @@ fn push_model_id(id: &str, seen: &mut std::collections::HashSet<String>, models:
 
 #[cfg(test)]
 pub fn optimizer_payload(config: &PromptOptimizationConfig, text: &str) -> Value {
-    let request = responses_payload(&config.model, &config.instruction, text);
-    upstream_request_payload(&request, config.protocol).expect("optimizer payload should convert")
+    responses_payload(&config.model, &config.instruction, text)
 }
 
 fn effective_instruction(instruction: &str) -> &str {
@@ -340,16 +315,8 @@ fn configuration_test_payload(model: &str) -> Value {
     })
 }
 
-fn upstream_request_payload(request: &Value, protocol: RelayProtocol) -> Result<Value, String> {
-    match protocol {
-        RelayProtocol::Responses => Ok(request.clone()),
-        RelayProtocol::ChatCompletions => responses_to_chat_completions(request.clone())
-            .map_err(|error| format!("转换 Responses 请求到 Chat Completions 失败：{error:#}")),
-    }
-}
-
-/// Optimizes a user prompt through the resolved Chat Completions or Responses
-/// API and returns the rewritten prompt. All returned error messages are
+/// Optimizes a user prompt through a Responses API and returns the rewritten
+/// prompt. All returned error messages are
 /// sanitized so provider credentials never reach the renderer or logs.
 #[cfg(test)]
 pub async fn optimize_prompt(
@@ -380,13 +347,12 @@ pub async fn optimize_prompt_resolved(
     if text.chars().count() > MAX_INPUT_CHARS {
         return Err(format!("提示词过长，最多支持 {MAX_INPUT_CHARS} 个字符"));
     }
-    let endpoint = request_endpoint(&config.base_url, config.protocol)?;
+    let endpoint = request_endpoint(&config.base_url)?;
     if config.model.trim().is_empty() {
         return Err("请先配置优化模型".to_string());
     }
 
-    let original_request = responses_payload(&config.model, &config.instruction, text);
-    let payload = upstream_request_payload(&original_request, config.protocol)?;
+    let payload = responses_payload(&config.model, &config.instruction, text);
     let response = post_optimization_request(client, &endpoint, config, &payload).await?;
     let status = response.status().as_u16();
 
@@ -394,20 +360,20 @@ pub async fn optimize_prompt_resolved(
     // 与线路测试一致；已带 /v1 或已填完整端点时不再追加。
     let base_url = config.base_url.trim().trim_end_matches('/');
     if status == 404 && should_retry_with_v1(base_url) {
-        let v1_endpoint = v1_request_endpoint(base_url, config.protocol);
+        let v1_endpoint = v1_request_endpoint(base_url);
         let v1_response = post_optimization_request(client, &v1_endpoint, config, &payload).await?;
-        return parse_optimized_response(v1_response, &v1_endpoint, config, &original_request)
+        return parse_optimized_response(v1_response, &v1_endpoint, config)
             .await
             .map_err(|error| error.message);
     }
 
-    match parse_optimized_response(response, &endpoint, config, &original_request).await {
+    match parse_optimized_response(response, &endpoint, config).await {
         Ok(optimized) => Ok(optimized),
         Err(error) if error.retryable_with_v1 && should_retry_with_v1(base_url) => {
-            let v1_endpoint = v1_request_endpoint(base_url, config.protocol);
+            let v1_endpoint = v1_request_endpoint(base_url);
             let v1_response =
                 post_optimization_request(client, &v1_endpoint, config, &payload).await?;
-            parse_optimized_response(v1_response, &v1_endpoint, config, &original_request)
+            parse_optimized_response(v1_response, &v1_endpoint, config)
                 .await
                 .map_err(|error| error.message)
         }
@@ -415,7 +381,7 @@ pub async fn optimize_prompt_resolved(
     }
 }
 
-/// Sends a minimal request in the resolved protocol to verify connectivity and
+/// Sends a minimal Responses request to verify connectivity and
 /// credentials. Returns the HTTP status, endpoint and a sanitized response
 /// preview so the console can show the outcome without a full optimization.
 #[cfg(test)]
@@ -437,19 +403,18 @@ pub async fn test_configuration_resolved(
     client: &Client,
     config: &ResolvedPromptOptimizationConfig,
 ) -> Result<Value, String> {
-    let endpoint = request_endpoint(&config.base_url, config.protocol)?;
+    let endpoint = request_endpoint(&config.base_url)?;
     let model = config.model.trim();
     if model.is_empty() {
         return Err("请先配置优化模型".to_string());
     }
-    let request = configuration_test_payload(model);
-    let payload = upstream_request_payload(&request, config.protocol)?;
+    let payload = configuration_test_payload(model);
     let response = post_optimization_request(client, &endpoint, config, &payload).await?;
     let status = response.status().as_u16();
 
     let base_url = config.base_url.trim().trim_end_matches('/');
     if status == 404 && should_retry_with_v1(base_url) {
-        let v1_endpoint = v1_request_endpoint(base_url, config.protocol);
+        let v1_endpoint = v1_request_endpoint(base_url);
         let v1_response = post_optimization_request(client, &v1_endpoint, config, &payload).await?;
         return configuration_test_result(v1_response, &v1_endpoint, config).await;
     }
@@ -537,7 +502,6 @@ async fn parse_optimized_response(
     response: reqwest::Response,
     endpoint: &str,
     config: &ResolvedPromptOptimizationConfig,
-    original_request: &Value,
 ) -> Result<String, OptimizedResponseError> {
     let status = response.status().as_u16();
     if status >= 400 {
@@ -572,17 +536,7 @@ async fn parse_optimized_response(
             "优化 API 返回的不是有效 JSON（{endpoint}）。响应摘要：{preview}"
         ))
     })?;
-    let response = match config.protocol {
-        RelayProtocol::Responses => value,
-        RelayProtocol::ChatCompletions => {
-            chat_completion_to_response_with_request(value, original_request).map_err(|error| {
-                OptimizedResponseError::retryable(format!(
-                    "转换 Chat Completions 响应到 Responses 失败（{endpoint}）：{error:#}"
-                ))
-            })?
-        }
-    };
-    let optimized = extract_responses_optimized_text(&response).ok_or_else(|| {
+    let optimized = extract_responses_optimized_text(&value).ok_or_else(|| {
         OptimizedResponseError::retryable("优化 API 响应中缺少优化结果".to_string())
     })?;
     let optimized = optimized.trim();
@@ -592,26 +546,6 @@ async fn parse_optimized_response(
         ));
     }
     Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect())
-}
-
-/// Extracts `choices[0].message.content`, accepting both the plain string
-/// form and the newer part-array form (`{type:"text",text:...}`).
-#[cfg(test)]
-fn extract_optimized_text(response: &Value) -> Option<String> {
-    let content = response.pointer("/choices/0/message/content")?;
-    match content {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(parts) => {
-            let mut text = String::new();
-            for part in parts {
-                if let Some(segment) = part.get("text").and_then(Value::as_str) {
-                    text.push_str(segment);
-                }
-            }
-            Some(text)
-        }
-        _ => None,
-    }
 }
 
 fn extract_responses_optimized_text(response: &Value) -> Option<String> {
@@ -714,55 +648,52 @@ mod tests {
     fn endpoint_building_trims_and_validates() {
         let mut config = configured();
         assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "https://api.example.com/v1/chat/completions"
+            request_endpoint(&config.base_url).unwrap(),
+            "https://api.example.com/v1/responses"
         );
         config.base_url = "https://api.example.com/v1/".to_string();
         assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "https://api.example.com/v1/chat/completions"
+            request_endpoint(&config.base_url).unwrap(),
+            "https://api.example.com/v1/responses"
         );
         config.base_url = "http://127.0.0.1:11434".to_string();
         assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "http://127.0.0.1:11434/chat/completions"
+            request_endpoint(&config.base_url).unwrap(),
+            "http://127.0.0.1:11434/responses"
         );
         // 直接填写完整端点时不得重复拼接后缀。
-        config.base_url = "https://opencode.ai/zen/v1/chat/completions".to_string();
+        config.base_url = "https://opencode.ai/zen/v1/responses".to_string();
         assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "https://opencode.ai/zen/v1/chat/completions"
+            request_endpoint(&config.base_url).unwrap(),
+            "https://opencode.ai/zen/v1/responses"
         );
-        config.base_url = "https://opencode.ai/zen/v1/chat/completions/".to_string();
+        config.base_url = "https://opencode.ai/zen/v1/responses/".to_string();
         assert_eq!(
-            chat_completions_endpoint(&config).unwrap(),
-            "https://opencode.ai/zen/v1/chat/completions"
+            request_endpoint(&config.base_url).unwrap(),
+            "https://opencode.ai/zen/v1/responses"
         );
         config.base_url = "  ".to_string();
         assert!(
-            chat_completions_endpoint(&config)
+            request_endpoint(&config.base_url)
                 .unwrap_err()
                 .contains("配置")
         );
         config.base_url = "ftp://api.example.com".to_string();
         assert!(
-            chat_completions_endpoint(&config)
+            request_endpoint(&config.base_url)
                 .unwrap_err()
                 .contains("HTTP")
         );
         config.base_url = "not a url".to_string();
         assert!(
-            chat_completions_endpoint(&config)
+            request_endpoint(&config.base_url)
                 .unwrap_err()
                 .contains("HTTP")
         );
-        assert_eq!(
-            request_endpoint(
-                "https://api.example.com/v1/chat/completions",
-                RelayProtocol::Responses
-            )
-            .unwrap(),
-            "https://api.example.com/v1/responses"
+        assert!(
+            request_endpoint("https://api.example.com/v1/chat/completions")
+                .unwrap_err()
+                .contains("第三方网关")
         );
     }
 
@@ -773,11 +704,9 @@ mod tests {
         assert!(!should_retry_with_v1("https://api.example.com/zen/v1"));
         assert!(!should_retry_with_v1("https://api.example.com/v1"));
         assert!(!should_retry_with_v1(
-            "https://opencode.ai/zen/v1/chat/completions"
+            "https://opencode.ai/zen/v1/responses"
         ));
-        assert!(!should_retry_with_v1(
-            "https://api.example.com/chat/completions"
-        ));
+        assert!(!should_retry_with_v1("https://api.example.com/responses"));
         assert!(!should_retry_with_v1(
             "https://api.example.com/v1/responses"
         ));
@@ -791,7 +720,7 @@ mod tests {
             models_endpoint(&config).unwrap(),
             "https://opencode.ai/zen/v1/models"
         );
-        config.base_url = "https://opencode.ai/zen/v1/chat/completions".to_string();
+        config.base_url = "https://opencode.ai/zen/v1/responses".to_string();
         assert_eq!(
             models_endpoint(&config).unwrap(),
             "https://opencode.ai/zen/v1/models"
@@ -988,7 +917,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.contains("401"), "{error}");
-        assert!(error.contains("/v1/chat/completions"), "{error}");
+        assert!(error.contains("/v1/responses"), "{error}");
         assert!(error.contains("retry credentials rejected"), "{error}");
         assert!(!error.contains("missing route"), "{error}");
         server.await.unwrap();
@@ -1027,18 +956,11 @@ mod tests {
     fn payload_uses_custom_instruction_or_the_default() {
         let mut config = configured();
         let payload = optimizer_payload(&config, " 你好 ");
-        assert_eq!(
-            payload["messages"][0]["content"],
-            DEFAULT_OPTIMIZER_INSTRUCTION
-        );
-        assert_eq!(payload["messages"][1]["content"], " 你好 ");
+        assert_eq!(payload["instructions"], DEFAULT_OPTIMIZER_INSTRUCTION);
+        assert_eq!(payload["input"][0]["content"][0]["text"], " 你好 ");
         assert_eq!(payload["model"], "gpt-test");
 
         config.instruction = " 简短回复 ".to_string();
-        let payload = optimizer_payload(&config, "你好");
-        assert_eq!(payload["messages"][0]["content"], "简短回复");
-
-        config.protocol = RelayProtocol::Responses;
         let payload = optimizer_payload(&config, "你好");
         assert_eq!(payload["instructions"], "简短回复");
         assert_eq!(payload["input"][0]["type"], "message");
@@ -1056,39 +978,6 @@ mod tests {
         assert!(payload["input"].is_array());
         assert_eq!(payload["input"][0]["role"], "user");
         assert_eq!(payload["input"][0]["content"][0]["text"], "hi");
-
-        let chat_payload =
-            upstream_request_payload(&payload, RelayProtocol::ChatCompletions).unwrap();
-        assert_eq!(chat_payload["messages"][0]["role"], "user");
-        assert_eq!(chat_payload["messages"][0]["content"], "hi");
-    }
-
-    #[test]
-    fn extracts_text_content_from_string_and_part_arrays() {
-        let string_response = json!({"choices": [{"message": {"content": "优化结果"}}]});
-        assert_eq!(
-            extract_optimized_text(&string_response).as_deref(),
-            Some("优化结果")
-        );
-
-        let array_response = json!({"choices": [{"message": {"content": [
-            {"type": "text", "text": "优化"},
-            {"type": "text", "text": "结果"},
-        ]}}]});
-        assert_eq!(
-            extract_optimized_text(&array_response).as_deref(),
-            Some("优化结果")
-        );
-
-        assert_eq!(extract_optimized_text(&json!({"choices": []})), None);
-        assert_eq!(
-            extract_optimized_text(&json!({"error": {"message": "boom"}})),
-            None
-        );
-        assert_eq!(
-            extract_optimized_text(&json!({"choices": [{"message": {"content": 42}}]})),
-            None
-        );
     }
 
     #[test]
@@ -1132,7 +1021,6 @@ mod tests {
             base_url: "https://provider.example/v1".to_string(),
             api_key: "provider-api-secret".to_string(),
             request_headers,
-            protocol: RelayProtocol::Responses,
             model: "gpt-provider".to_string(),
             instruction: String::new(),
         };
@@ -1226,10 +1114,10 @@ mod tests {
                 }
             }
             let request = String::from_utf8_lossy(&request);
-            assert!(request.starts_with("POST /chat/completions "), "{request}");
-            assert!(request.contains("\"messages\""), "{request}");
-            assert!(!request.contains("\"input\":"), "{request}");
-            let body = r#"{"choices":[{"message":{"content":"优化后的提示词"}}]}"#;
+            assert!(request.starts_with("POST /responses "), "{request}");
+            assert!(request.contains("\"input\":"), "{request}");
+            assert!(!request.contains("\"messages\""), "{request}");
+            let body = r#"{"output_text":"优化后的提示词"}"#;
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),
@@ -1255,11 +1143,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             for (expected_path, body) in [
-                ("/chat/completions", "<html>missing API prefix</html>"),
-                (
-                    "/v1/chat/completions",
-                    r#"{"choices":[{"message":{"content":"回退后的优化结果"}}]}"#,
-                ),
+                ("/responses", "<html>missing API prefix</html>"),
+                ("/v1/responses", r#"{"output_text":"回退后的优化结果"}"#),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -1314,7 +1199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_responses_request_uses_provider_headers_and_protocol() {
+    async fn resolved_responses_request_uses_provider_headers() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -1392,7 +1277,6 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: "ignored-key".to_string(),
             request_headers,
-            protocol: RelayProtocol::Responses,
             model: "gpt-responses".to_string(),
             instruction: "保持原意".to_string(),
         };

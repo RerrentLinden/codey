@@ -6,7 +6,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use codey_runtime_core::config_manager::ConfigManager;
-use codey_runtime_core::settings::RelayProtocol;
 use directories::BaseDirs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::Serialize;
@@ -50,7 +49,6 @@ struct ProviderSchema {
     variant: SchemaVariant,
     has_id: bool,
     has_settings_config: bool,
-    has_meta: bool,
     has_is_current: bool,
     has_category: bool,
 }
@@ -62,14 +60,9 @@ impl ProviderSchema {
             variant: SchemaVariant::from_columns(&columns),
             has_id: columns.contains("id"),
             has_settings_config: columns.contains("settings_config"),
-            has_meta: columns.contains("meta"),
             has_is_current: columns.contains("is_current"),
             has_category: columns.contains("category"),
         })
-    }
-
-    fn supports_protocol_hint(self) -> bool {
-        self.has_id && self.has_settings_config && self.has_meta && self.has_is_current
     }
 
     fn supports_source_api(self) -> bool {
@@ -119,7 +112,6 @@ pub struct CurrentProvider {
     pub supports_remote_compaction: bool,
     pub base_url: String,
     pub local_route: bool,
-    pub protocol: RelayProtocol,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -163,12 +155,6 @@ impl LiveRouteSnapshot {
 pub struct StartupRouteState {
     pub takeover: RouteTakeoverState,
     pub live_route: Option<LiveRouteSnapshot>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CcSwitchProtocolHint {
-    provider_id: String,
-    protocol: RelayProtocol,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -382,13 +368,8 @@ fn startup_route_state_from_paths(db_path: &Path, codex_home: &Path) -> Result<S
         )
     })?;
     let config_contents = config_contents.expect("parsed Live config has source bytes");
-    let live_route = validated_live_route_snapshot(
-        db_path,
-        document,
-        config_contents,
-        auth_contents,
-        auth.as_ref(),
-    )?;
+    let live_route =
+        validated_live_route_snapshot(document, config_contents, auth_contents, auth.as_ref())?;
     Ok(StartupRouteState {
         takeover,
         live_route: Some(live_route),
@@ -573,21 +554,8 @@ pub fn sync_current_provider(
     config: &CodeyConfig,
     codex_home: &Path,
 ) -> Result<(CodeyConfig, CcSwitchStatus)> {
-    sync_current_provider_from_paths(config, codex_home, &default_db_path())
-}
-
-fn sync_current_provider_from_paths(
-    config: &CodeyConfig,
-    codex_home: &Path,
-    db_path: &Path,
-) -> Result<(CodeyConfig, CcSwitchStatus)> {
-    let (mut provider, api_key) = local_provider(codex_home)?;
-    let protocol_hint = cc_switch_protocol_hint(db_path, &provider);
-    if let Some(hint) = protocol_hint.as_ref() {
-        provider.protocol = hint.protocol;
-    }
-    let mut profile = profile_from_provider(&provider, api_key);
-    profile.cc_switch_provider_id = protocol_hint.map(|hint| hint.provider_id);
+    let (provider, api_key) = local_provider(codex_home)?;
+    let profile = profile_from_provider(&provider, api_key);
 
     let mut next = config.clone();
     next.active_profile_id = profile.id.clone();
@@ -596,138 +564,6 @@ fn sync_current_provider_from_paths(
     let changed = &next != config;
     let status = CcSwitchStatus { changed, provider };
     Ok((next, status))
-}
-
-fn cc_switch_protocol_hint(
-    db_path: &Path,
-    provider: &CurrentProvider,
-) -> Option<CcSwitchProtocolHint> {
-    if provider.official
-        || provider.base_url.trim().is_empty()
-        || is_loopback_url(&provider.base_url)
-        || !db_path.is_file()
-    {
-        return None;
-    }
-    read_cc_switch_protocol_hint(db_path, &provider.base_url)
-        .ok()
-        .flatten()
-}
-
-fn read_cc_switch_protocol_hint(
-    db_path: &Path,
-    provider_base_url: &str,
-) -> Result<Option<CcSwitchProtocolHint>> {
-    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("打开 cc-switch 数据库失败：{}", db_path.display()))?;
-    connection.busy_timeout(Duration::from_secs(2))?;
-
-    let provider_schema = ProviderSchema::inspect(&connection)?;
-    if !provider_schema.supports_protocol_hint() {
-        return Ok(None);
-    }
-    let current_provider =
-        provider_schema.query_current(&connection, "id, settings_config, meta", |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            ))
-        })?;
-    let Some((provider_id, settings_config, meta)) = current_provider else {
-        return Ok(None);
-    };
-    let Some(protocol) = protocol_from_cc_switch_meta(&meta) else {
-        return Ok(None);
-    };
-
-    let mut candidate_base_urls = cc_switch_config_base_url(&settings_config)
-        .into_iter()
-        .collect::<Vec<_>>();
-    candidate_base_urls.extend(cc_switch_provider_endpoints(&connection, &provider_id)?);
-    if !candidate_base_urls
-        .iter()
-        .any(|candidate| provider_base_urls_match(candidate, provider_base_url))
-    {
-        return Ok(None);
-    }
-
-    Ok(Some(CcSwitchProtocolHint {
-        provider_id,
-        protocol,
-    }))
-}
-
-fn protocol_from_cc_switch_meta(meta: &str) -> Option<RelayProtocol> {
-    let meta = serde_json::from_str::<Value>(meta).ok()?;
-    match meta
-        .get("apiFormat")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("openai_chat" | "openai_chat_completions" | "chat_completions") => {
-            Some(RelayProtocol::ChatCompletions)
-        }
-        Some("openai_responses" | "responses") => Some(RelayProtocol::Responses),
-        _ => None,
-    }
-}
-
-fn cc_switch_config_base_url(settings_config: &str) -> Option<String> {
-    let settings = serde_json::from_str::<Value>(settings_config).ok()?;
-    let config = settings.get("config").and_then(Value::as_str)?;
-    let document = DocumentMut::from_str(config).ok()?;
-    let provider_id = document
-        .get("model_provider")
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .filter(|provider_id| !provider_id.is_empty())?;
-    document
-        .get("model_providers")
-        .and_then(Item::as_table_like)
-        .and_then(|providers| providers.get(provider_id))
-        .and_then(Item::as_table_like)
-        .and_then(|provider| provider.get("base_url"))
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .filter(|base_url| !base_url.is_empty())
-        .map(ToString::to_string)
-}
-
-fn cc_switch_provider_endpoints(connection: &Connection, provider_id: &str) -> Result<Vec<String>> {
-    let endpoint_columns = table_columns(connection, "provider_endpoints")?;
-    if !endpoint_columns.contains("provider_id") || !endpoint_columns.contains("url") {
-        return Ok(Vec::new());
-    }
-    let schema = SchemaVariant::from_columns(&endpoint_columns);
-    let query = match schema {
-        SchemaVariant::AppScoped => {
-            "SELECT url FROM provider_endpoints WHERE provider_id=?1 AND app_type=?2"
-        }
-        SchemaVariant::LegacyUnscoped => "SELECT url FROM provider_endpoints WHERE provider_id=?1",
-    };
-    let mut statement = connection.prepare(query)?;
-    let endpoints = match schema {
-        SchemaVariant::AppScoped => statement
-            .query_map(params![provider_id, APP_TYPE], |row| {
-                row.get::<_, String>(0)
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-        SchemaVariant::LegacyUnscoped => statement
-            .query_map(params![provider_id], |row| row.get::<_, String>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-    };
-    Ok(endpoints
-        .into_iter()
-        .map(|url| url.trim().trim_end_matches('/').to_string())
-        .filter(|url| !url.is_empty())
-        .collect())
-}
-
-fn provider_base_urls_match(left: &str, right: &str) -> bool {
-    left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/')
 }
 
 fn read_current_cc_switch_source_api(db_path: &Path) -> Result<CcSwitchSourceApi> {
@@ -859,7 +695,6 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
             supports_remote_compaction: profile.supports_remote_compaction,
             base_url: profile.base_url.clone(),
             local_route: profile_uses_local_route(profile),
-            protocol: profile.protocol,
         })
         .unwrap_or_else(|| CurrentProvider {
             id: LOCAL_OFFICIAL_PROVIDER_ID.to_string(),
@@ -868,7 +703,6 @@ pub fn status_from_config(config: &CodeyConfig) -> CcSwitchStatus {
             supports_remote_compaction: true,
             base_url: String::new(),
             local_route: false,
-            protocol: RelayProtocol::Responses,
         });
     CcSwitchStatus {
         changed: false,
@@ -896,7 +730,6 @@ fn profile_from_provider(provider: &CurrentProvider, api_key: String) -> Provide
         base_url: provider.base_url.clone(),
         api_key,
         model_request_headers: BTreeMap::new(),
-        protocol: provider.protocol,
         cc_switch_provider_id: None,
         cc_switch_read_only: provider.official,
         supports_remote_compaction: provider.supports_remote_compaction,
@@ -904,7 +737,6 @@ fn profile_from_provider(provider: &CurrentProvider, api_key: String) -> Provide
 }
 
 fn validated_live_route_snapshot(
-    db_path: &Path,
     document: DocumentMut,
     config_contents: Vec<u8>,
     auth_contents: Option<Vec<u8>>,
@@ -958,6 +790,7 @@ fn validated_live_route_snapshot(
         .get("wire_api")
         .and_then(Item::as_str)
         .unwrap_or("responses");
+    ensure_responses_wire_api(wire_api)?;
     let auth_mode = auth
         .and_then(|auth| auth.get("auth_mode"))
         .and_then(Value::as_str);
@@ -978,7 +811,7 @@ fn validated_live_route_snapshot(
         );
     }
 
-    let mut provider = CurrentProvider {
+    let provider = CurrentProvider {
         id: provider_id.to_string(),
         name: if official {
             "OpenAI 官方直登".to_string()
@@ -989,15 +822,8 @@ fn validated_live_route_snapshot(
         supports_remote_compaction: official || name == "OpenAI",
         local_route: is_loopback_url(&base_url),
         base_url,
-        protocol: protocol_from_wire_api(wire_api),
     };
-    let protocol_hint = cc_switch_protocol_hint(db_path, &provider);
-    if let Some(hint) = protocol_hint.as_ref() {
-        provider.protocol = hint.protocol;
-    }
-    let mut profile =
-        profile_from_provider(&provider, if official { String::new() } else { api_key });
-    profile.cc_switch_provider_id = protocol_hint.map(|hint| hint.provider_id);
+    let profile = profile_from_provider(&provider, if official { String::new() } else { api_key });
 
     Ok(LiveRouteSnapshot {
         provider,
@@ -1039,6 +865,7 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         .and_then(|provider| provider.get("wire_api"))
         .and_then(Item::as_str)
         .unwrap_or("responses");
+    ensure_responses_wire_api(wire_api)?;
     let auth_path = codex_home.join("auth.json");
     let auth = match fs::read(&auth_path) {
         Ok(bytes) => Some(
@@ -1092,7 +919,6 @@ fn local_provider(codex_home: &Path) -> Result<(CurrentProvider, String)> {
         supports_remote_compaction: official || name == "OpenAI",
         base_url,
         local_route,
-        protocol: protocol_from_wire_api(wire_api),
     };
     Ok((provider, if official { String::new() } else { api_key }))
 }
@@ -1214,12 +1040,11 @@ fn is_official_base_url(base_url: &str) -> bool {
     base_url.contains("chatgpt.com/backend-api/codex") || base_url.contains("api.openai.com")
 }
 
-fn protocol_from_wire_api(value: &str) -> RelayProtocol {
-    if value.to_ascii_lowercase().contains("chat") {
-        RelayProtocol::ChatCompletions
-    } else {
-        RelayProtocol::Responses
+fn ensure_responses_wire_api(value: &str) -> Result<()> {
+    if value.trim().to_ascii_lowercase().contains("chat") {
+        bail!("Codey 已移除协议转换能力；当前线路不是 Responses API，请改用第三方网关完成协议路由");
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1343,12 +1168,6 @@ mod tests {
             )
             .unwrap();
         drop(connection);
-
-        let hint = read_cc_switch_protocol_hint(&path, base_url)
-            .unwrap()
-            .unwrap();
-        assert_eq!(hint.provider_id, "legacy-provider");
-        assert_eq!(hint.protocol, RelayProtocol::ChatCompletions);
 
         let source = read_current_cc_switch_source_api(&path).unwrap();
         assert_eq!(source.base_url, base_url);
@@ -1498,7 +1317,6 @@ mod tests {
             base_url: format!("https://{id}.example/v1"),
             api_key: format!("{id}-secret"),
             model_request_headers: BTreeMap::new(),
-            protocol: RelayProtocol::Responses,
             cc_switch_provider_id: Some(id.to_string()),
             cc_switch_read_only: false,
             supports_remote_compaction: false,
@@ -1530,8 +1348,7 @@ experimental_bearer_token = "sk-codex-local"
         )
         .unwrap();
 
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
         assert_eq!(status.provider.id, "codex-local");
         assert_eq!(synced.profiles.len(), 1);
@@ -1540,12 +1357,11 @@ experimental_bearer_token = "sk-codex-local"
             "https://codex-local.example/v1"
         );
         assert_eq!(synced.profiles[0].api_key, "sk-codex-local");
-        assert_eq!(synced.profiles[0].protocol, RelayProtocol::Responses);
         assert!(synced.profiles[0].cc_switch_provider_id.is_none());
     }
 
     #[test]
-    fn matching_cc_switch_chat_format_drives_the_codey_protocol_proxy() {
+    fn deprecated_cc_switch_api_format_metadata_is_ignored() {
         let (_directory, path, home) = fixture();
         insert_provider_with_api_format(
             &path,
@@ -1569,21 +1385,16 @@ experimental_bearer_token = "sk-chat"
         )
         .unwrap();
 
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
-        assert_eq!(status.provider.protocol, RelayProtocol::ChatCompletions);
-        assert_eq!(synced.profiles[0].protocol, RelayProtocol::ChatCompletions);
-        assert_eq!(
-            synced.profiles[0].cc_switch_provider_id.as_deref(),
-            Some("chat-route")
-        );
+        assert_eq!(status.provider.base_url, "https://chat.example/v1");
+        assert!(synced.profiles[0].cc_switch_provider_id.is_none());
         assert_eq!(synced.profiles[0].base_url, "https://chat.example/v1");
         assert_eq!(synced.profiles[0].api_key, "sk-chat");
     }
 
     #[test]
-    fn matching_cc_switch_responses_format_stays_native() {
+    fn matching_cc_switch_database_metadata_does_not_tag_the_local_profile() {
         let (_directory, path, home) = fixture();
         insert_provider_with_api_format(
             &path,
@@ -1600,19 +1411,14 @@ experimental_bearer_token = "sk-chat"
             "sk-responses",
         );
 
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
-        assert_eq!(status.provider.protocol, RelayProtocol::Responses);
-        assert_eq!(synced.profiles[0].protocol, RelayProtocol::Responses);
-        assert_eq!(
-            synced.profiles[0].cc_switch_provider_id.as_deref(),
-            Some("responses-route")
-        );
+        assert_eq!(status.provider.base_url, "https://responses.example/v1");
+        assert!(synced.profiles[0].cc_switch_provider_id.is_none());
     }
 
     #[test]
-    fn selected_cc_switch_endpoint_can_supply_the_chat_format_hint() {
+    fn selected_cc_switch_endpoint_does_not_override_the_codex_provider() {
         let (_directory, path, home) = fixture();
         insert_provider_with_api_format(
             &path,
@@ -1630,18 +1436,13 @@ experimental_bearer_token = "sk-chat"
             "sk-chat",
         );
 
-        let (synced, _) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+        let (synced, _) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
-        assert_eq!(synced.profiles[0].protocol, RelayProtocol::ChatCompletions);
-        assert_eq!(
-            synced.profiles[0].cc_switch_provider_id.as_deref(),
-            Some("chat-route")
-        );
+        assert!(synced.profiles[0].cc_switch_provider_id.is_none());
     }
 
     #[test]
-    fn cc_switch_loopback_route_never_enables_a_second_codey_proxy() {
+    fn cc_switch_loopback_route_stays_owned_by_cc_switch() {
         let (_directory, path, home) = fixture();
         insert_provider_with_api_format(
             &path,
@@ -1658,11 +1459,9 @@ experimental_bearer_token = "sk-chat"
             PROXY_MANAGED_TOKEN,
         );
 
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+        let (synced, status) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
-        assert_eq!(status.provider.protocol, RelayProtocol::Responses);
-        assert_eq!(synced.profiles[0].protocol, RelayProtocol::Responses);
+        assert!(status.provider.local_route);
         assert!(synced.profiles[0].cc_switch_provider_id.is_none());
     }
 
@@ -1685,10 +1484,8 @@ experimental_bearer_token = "sk-chat"
             .unwrap();
         write_live_route(&home, "manual", "https://manual.example/v1", "sk-manual");
 
-        let (synced, status) =
-            sync_current_provider_from_paths(&CodeyConfig::default(), &home, &path).unwrap();
+        let (synced, _) = sync_current_provider(&CodeyConfig::default(), &home).unwrap();
 
-        assert_eq!(status.provider.protocol, RelayProtocol::Responses);
         assert_eq!(synced.profiles[0].base_url, "https://manual.example/v1");
         assert!(synced.profiles[0].cc_switch_provider_id.is_none());
     }
@@ -1974,7 +1771,6 @@ requires_openai_auth = true
             base_url: "http://127.0.0.1:15721/v1".into(),
             api_key: PROXY_MANAGED_TOKEN.into(),
             model_request_headers: BTreeMap::new(),
-            protocol: RelayProtocol::Responses,
             cc_switch_provider_id: None,
             cc_switch_read_only: false,
             supports_remote_compaction: false,
@@ -2262,7 +2058,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn startup_route_snapshot_keeps_provider_endpoint_key_and_protocol_together() {
+    fn startup_route_snapshot_rejects_chat_wire_api() {
         let (_directory, path, home) = fixture();
         install_proxy_schema(&path);
         Connection::open(&path)
@@ -2284,24 +2080,11 @@ experimental_bearer_token = "sk-live"
         fs::write(home.join("config.toml"), config).unwrap();
         fs::write(home.join("auth.json"), auth).unwrap();
 
-        let state = startup_route_state_from_paths(&path, &home).unwrap();
-        let snapshot = state.live_route.unwrap();
-        let profile = snapshot.profile();
+        let error = startup_route_state_from_paths(&path, &home)
+            .err()
+            .expect("Chat wire API must be rejected");
 
-        assert_eq!(
-            state.takeover,
-            RouteTakeoverState {
-                managed: true,
-                live: true,
-            }
-        );
-        assert_eq!(snapshot.provider_id(), "relay");
-        assert_eq!(snapshot.config_contents(), config);
-        assert_eq!(snapshot.auth_contents(), Some(auth.as_slice()));
-        assert_eq!(profile.id, "relay");
-        assert_eq!(profile.base_url, "https://relay.example/v1");
-        assert_eq!(profile.api_key, "sk-live");
-        assert_eq!(profile.protocol, RelayProtocol::ChatCompletions);
+        assert!(format!("{error:#}").contains("第三方网关"));
     }
 
     #[test]

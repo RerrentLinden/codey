@@ -3,15 +3,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use serde_json::Value;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 
 use crate::settings::{BackendSettings, SettingsStore, normalize_codex_extra_args};
 use crate::status::{LaunchStatus, StatusStore};
@@ -20,11 +19,6 @@ use crate::status::{LaunchStatus, StatusStore};
 const POST_LAUNCH_COMPUTER_USE_GUARD_SECONDS: &[u64] = &[0, 5, 15, 30, 60, 120, 180, 240, 300];
 #[cfg_attr(not(windows), allow(dead_code))]
 const POST_LAUNCH_COMPUTER_USE_GUARD_STABLE_ATTEMPTS: usize = 3;
-const PROTOCOL_PROXY_MAX_CONNECTIONS: usize = 64;
-const PROTOCOL_PROXY_MAX_HEADER_BYTES: usize = 64 * 1024;
-const PROTOCOL_PROXY_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
-const PROTOCOL_PROXY_REQUEST_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
-const PROTOCOL_PROXY_REQUEST_DEADLINE: Duration = Duration::from_secs(45);
 static PET_OVERLAY_SYNC_FAILED: AtomicBool = AtomicBool::new(false);
 #[cfg(windows)]
 static PET_CURSOR_DRIVER_FAILED: AtomicBool = AtomicBool::new(false);
@@ -125,113 +119,6 @@ impl LaunchHandle {
         }
         result
     }
-}
-
-pub struct ProtocolProxyHandle {
-    port: u16,
-    base_url: String,
-    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl std::fmt::Debug for ProtocolProxyHandle {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ProtocolProxyHandle")
-            .field("port", &self.port)
-            .field("base_url", &self.base_url)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ProtocolProxyHandle {
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-
-    pub async fn shutdown(mut self) -> anyhow::Result<()> {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(task) = self.task.take() {
-            task.await.context("protocol proxy task failed")?;
-        }
-        Ok(())
-    }
-}
-
-impl Drop for ProtocolProxyHandle {
-    fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
-    }
-}
-
-pub async fn start_protocol_proxy(
-    settings: BackendSettings,
-) -> anyhow::Result<ProtocolProxyHandle> {
-    let bind_host = "127.0.0.1";
-    let listener = tokio::net::TcpListener::bind((bind_host, 0))
-        .await
-        .context("failed to bind protocol proxy")?;
-    let port = listener.local_addr()?.port();
-    let base_url = crate::protocol_proxy::local_responses_proxy_base_url(port);
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        "protocol_proxy.listening",
-        serde_json::json!({
-            "port": port,
-            "bindHost": bind_host,
-            "baseUrl": base_url,
-        }),
-    );
-    let settings = Arc::new(settings);
-    let connection_limit = Arc::new(Semaphore::new(PROTOCOL_PROXY_MAX_CONNECTIONS));
-    let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let mut connections = tokio::task::JoinSet::new();
-        loop {
-            tokio::select! {
-                _ = &mut shutdown_rx => break,
-                accepted = listener.accept() => {
-                    if let Ok((stream, addr)) = accepted {
-                        let Ok(permit) = connection_limit.clone().try_acquire_owned() else {
-                            drop(stream);
-                            continue;
-                        };
-                        let settings = settings.clone();
-                        connections.spawn(async move {
-                            let _permit = permit;
-                            let _ = handle_helper_connection_with_settings(
-                                stream,
-                                Some(addr),
-                                Some(settings),
-                            )
-                            .await;
-                        });
-                    }
-                }
-                joined = connections.join_next(), if !connections.is_empty() => {
-                    let _ = joined;
-                }
-            }
-        }
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
-    });
-    Ok(ProtocolProxyHandle {
-        port,
-        base_url,
-        shutdown: Some(shutdown),
-        task: Some(task),
-    })
 }
 
 #[async_trait(?Send)]
@@ -406,11 +293,7 @@ where
                 );
             }
         }
-        let protocol_proxy_enabled = relay_protocol_proxy_enabled(&settings);
-        if protocol_proxy_enabled {
-            helper_port = crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT;
-        }
-        if settings.enhancements_enabled || protocol_proxy_enabled {
+        if settings.enhancements_enabled {
             helper_port = hooks.start_helper(helper_port).await?;
             helper_started = true;
         }
@@ -494,10 +377,6 @@ where
             Err(error)
         }
     }
-}
-
-fn relay_protocol_proxy_enabled(settings: &BackendSettings) -> bool {
-    settings.active_relay_uses_protocol_proxy()
 }
 
 fn select_native_menu_inspector_port(debug_port: u16) -> u16 {
@@ -1058,25 +937,14 @@ async fn handle_helper_connection(
     stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
 ) -> anyhow::Result<()> {
-    handle_helper_connection_with_settings(stream, remote_addr, None).await
-}
-
-#[derive(Clone, Copy)]
-struct ForwardedProxyHeaders<'a> {
-    user_agent: Option<&'a str>,
-    installation_id: Option<&'a str>,
+    handle_helper_connection_with_settings(stream, remote_addr).await
 }
 
 async fn handle_helper_connection_with_settings(
     mut stream: tokio::net::TcpStream,
     remote_addr: Option<SocketAddr>,
-    proxy_settings: Option<Arc<BackendSettings>>,
 ) -> anyhow::Result<()> {
-    let request_bytes = if proxy_settings.is_some() {
-        read_http_request_with_limits(&mut stream, HttpRequestLimits::protocol_proxy()).await?
-    } else {
-        read_http_request(&mut stream).await?
-    };
+    let request_bytes = read_http_request(&mut stream).await?;
     let request = String::from_utf8_lossy(&request_bytes);
     let request_line = request.lines().next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
@@ -1084,12 +952,6 @@ async fn handle_helper_connection_with_settings(
     let raw_path = parts.next().unwrap_or_default();
     let path = raw_path.split('?').next().unwrap_or(raw_path);
     let request_body = http_request_body(&request);
-    let request_user_agent = header_value_from_request(&request, "user-agent");
-    let request_installation_id = header_value_from_request(&request, "x-codex-installation-id");
-    let forwarded_headers = ForwardedProxyHeaders {
-        user_agent: request_user_agent.as_deref(),
-        installation_id: request_installation_id.as_deref(),
-    };
     let remote_addr_text = remote_addr.map(|addr| addr.to_string());
 
     let _ = crate::diagnostic_log::append_diagnostic_log(
@@ -1102,40 +964,6 @@ async fn handle_helper_connection_with_settings(
             "body_bytes": request_body.len()
         }),
     );
-
-    if crate::protocol_proxy::is_responses_proxy_path(path) && method == "POST" {
-        return handle_protocol_proxy_connection(
-            &mut stream,
-            request_body,
-            forwarded_headers,
-            method,
-            path,
-            remote_addr_text,
-            proxy_settings.as_deref(),
-        )
-        .await;
-    }
-    if crate::protocol_proxy::is_chat_completions_proxy_path(path) && method == "POST" {
-        return handle_chat_completions_proxy_connection(
-            &mut stream,
-            request_body,
-            forwarded_headers,
-            method,
-            path,
-            remote_addr_text,
-        )
-        .await;
-    }
-    if crate::protocol_proxy::is_models_proxy_path(path) && matches!(method, "GET" | "OPTIONS") {
-        return handle_models_proxy_connection(
-            &mut stream,
-            forwarded_headers,
-            method,
-            path,
-            remote_addr_text,
-        )
-        .await;
-    }
 
     let (status, body, content_type, log_event) = if path == "/backend/status"
         && matches!(method, "GET" | "POST" | "OPTIONS")
@@ -1297,399 +1125,9 @@ fn overlay_image_content_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-async fn handle_models_proxy_connection(
-    stream: &mut tokio::net::TcpStream,
-    forwarded_headers: ForwardedProxyHeaders<'_>,
-    method: &str,
-    path: &str,
-    remote_addr_text: Option<String>,
-) -> anyhow::Result<()> {
-    if method == "OPTIONS" {
-        write_http_response(
-            stream,
-            "204 No Content",
-            "application/json; charset=utf-8",
-            &[],
-        )
-        .await?;
-        stream.shutdown().await?;
-        return Ok(());
-    }
-    let upstream = match crate::protocol_proxy::open_models_proxy_request_with_headers(
-        forwarded_headers.user_agent,
-        forwarded_headers.installation_id,
-    )
-    .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            let body = serde_json::to_vec(
-                &serde_json::json!({                 "status": "failed",                 "message": error.to_string()             }),
-            )?;
-            write_http_response(
-                stream,
-                "502 Bad Gateway",
-                "application/json; charset=utf-8",
-                &body,
-            )
-            .await?;
-            log_helper_response(
-                "helper.models_proxy_failed",
-                method,
-                path,
-                "502 Bad Gateway",
-                remote_addr_text,
-            );
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    };
-    let status = upstream.status();
-    let is_success = upstream.is_success();
-    let content_type = if upstream.content_type.is_empty() {
-        "application/json; charset=utf-8".to_string()
-    } else {
-        upstream.content_type.clone()
-    };
-    let body = upstream.response.bytes().await?.to_vec();
-    write_http_response(stream, &status, &content_type, &body).await?;
-    log_helper_response(
-        if is_success {
-            "helper.models_proxy_ok"
-        } else {
-            "helper.models_proxy_upstream_error"
-        },
-        method,
-        path,
-        &status,
-        remote_addr_text,
-    );
-    stream.shutdown().await?;
-    Ok(())
-}
-async fn handle_protocol_proxy_connection(
-    stream: &mut tokio::net::TcpStream,
-    request_body: &str,
-    forwarded_headers: ForwardedProxyHeaders<'_>,
-    method: &str,
-    path: &str,
-    remote_addr_text: Option<String>,
-    proxy_settings: Option<&BackendSettings>,
-) -> anyhow::Result<()> {
-    let (request_json, upstream_result) = match serde_json::from_str::<serde_json::Value>(
-        request_body,
-    ) {
-        Ok(request_json) => {
-            let upstream_result = if let Some(settings) = proxy_settings {
-                crate::protocol_proxy::open_responses_proxy_request_value_with_settings_and_headers(
-                    &request_json,
-                    settings.clone(),
-                    forwarded_headers.user_agent,
-                    forwarded_headers.installation_id,
-                )
-                .await
-            } else {
-                crate::protocol_proxy::open_responses_proxy_request_value_with_headers(
-                    &request_json,
-                    forwarded_headers.user_agent,
-                    forwarded_headers.installation_id,
-                )
-                .await
-            };
-            (Some(request_json), upstream_result)
-        }
-        Err(error) => (None, Err(error.into())),
-    };
-    let upstream = match upstream_result {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            let body = serde_json::to_vec(
-                &serde_json::json!({                     "status": "failed",                     "message": error.to_string()                 }),
-            )?;
-            write_http_response(
-                stream,
-                "502 Bad Gateway",
-                "application/json; charset=utf-8",
-                &body,
-            )
-            .await?;
-            log_helper_response(
-                "helper.protocol_proxy_failed",
-                method,
-                path,
-                "502 Bad Gateway",
-                remote_addr_text,
-            );
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    };
-    let request_json =
-        request_json.expect("a successful protocol proxy request must contain valid JSON");
-    if !upstream.is_success() {
-        let status = upstream.status();
-        let upstream_content_type = upstream.content_type.clone();
-        let upstream_body = upstream.response.bytes().await?.to_vec();
-        let error = crate::protocol_proxy::responses_error_from_upstream(
-            upstream.status_code,
-            &upstream_content_type,
-            &upstream_body,
-        );
-        let model = request_json
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .unwrap_or_default();
-        let _ = crate::diagnostic_log::append_diagnostic_log(
-            "protocol_proxy.upstream_error",
-            serde_json::json!({
-                "model": model,
-                "wireApi": upstream.wire_api,
-                "statusCode": upstream.status_code,
-                "upstreamBodyBytes": upstream_body.len(),
-                "structuredError": error.get("error").is_some(),
-                "errorTypePresent": error.pointer("/error/type").is_some(),
-                "errorCodePresent": error.pointer("/error/code").is_some(),
-            }),
-        );
-        let body = serde_json::to_vec(&error)?;
-        write_http_response(stream, &status, "application/json; charset=utf-8", &body).await?;
-        log_helper_response(
-            "helper.protocol_proxy_upstream_error",
-            method,
-            path,
-            &status,
-            remote_addr_text,
-        );
-        stream.shutdown().await?;
-        return Ok(());
-    }
-    if upstream.is_stream {
-        write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
-        if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-            let mut bytes_stream = upstream.response.bytes_stream();
-            while let Some(chunk) = bytes_stream.next().await {
-                if let Ok(bytes) = chunk {
-                    stream.write_all(&bytes).await?;
-                } else {
-                    break;
-                }
-            }
-            log_helper_response(
-                "helper.protocol_proxy_stream_ok",
-                method,
-                path,
-                "200 OK",
-                remote_addr_text,
-            );
-            stream.shutdown().await?;
-            return Ok(());
-        }
-        let mut converter =
-            crate::protocol_proxy::ChatSseToResponsesConverter::with_owned_request(request_json);
-        let mut bytes_stream = upstream.response.bytes_stream();
-        let mut stream_failed = false;
-        while let Some(chunk) = bytes_stream.next().await {
-            match chunk {
-                Ok(bytes) => {
-                    let converted = converter.push_bytes(&bytes);
-                    if !converted.is_empty() {
-                        stream.write_all(&converted).await?;
-                    }
-                }
-                Err(error) => {
-                    let failed = converter.fail(
-                        format!("Stream error: {error}"),
-                        Some("stream_error".to_string()),
-                    );
-                    if !failed.is_empty() {
-                        stream.write_all(&failed).await?;
-                    }
-                    stream_failed = true;
-                    break;
-                }
-            }
-        }
-        if !stream_failed {
-            let tail = converter.finish();
-            if !tail.is_empty() {
-                stream.write_all(&tail).await?;
-            }
-        }
-        log_helper_response(
-            "helper.protocol_proxy_stream_ok",
-            method,
-            path,
-            "200 OK",
-            remote_addr_text,
-        );
-        stream.shutdown().await?;
-        return Ok(());
-    }
-    let upstream_body = upstream.response.bytes().await?;
-    if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
-        write_http_response(
-            stream,
-            "200 OK",
-            if upstream.content_type.is_empty() {
-                "application/json; charset=utf-8"
-            } else {
-                &upstream.content_type
-            },
-            &upstream_body,
-        )
-        .await?;
-        log_helper_response(
-            "helper.protocol_proxy_ok",
-            method,
-            path,
-            "200 OK",
-            remote_addr_text,
-        );
-        stream.shutdown().await?;
-        return Ok(());
-    }
-    let chat_json: serde_json::Value = serde_json::from_slice(&upstream_body)?;
-    let response_json =
-        crate::protocol_proxy::chat_completion_to_response_with_request(chat_json, &request_json)?;
-    let body = serde_json::to_vec(&response_json)?;
-    write_http_response(stream, "200 OK", "application/json; charset=utf-8", &body).await?;
-    log_helper_response(
-        "helper.protocol_proxy_ok",
-        method,
-        path,
-        "200 OK",
-        remote_addr_text,
-    );
-    stream.shutdown().await?;
-    Ok(())
-}
-async fn handle_chat_completions_proxy_connection(
-    stream: &mut tokio::net::TcpStream,
-    request_body: &str,
-    forwarded_headers: ForwardedProxyHeaders<'_>,
-    method: &str,
-    path: &str,
-    remote_addr_text: Option<String>,
-) -> anyhow::Result<()> {
-    let upstream = match crate::protocol_proxy::open_chat_completions_proxy_request_with_headers(
-        request_body,
-        forwarded_headers.user_agent,
-        forwarded_headers.installation_id,
-    )
-    .await
-    {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            let body = serde_json::to_vec(
-                &serde_json::json!({                 "status": "failed",                 "message": error.to_string()             }),
-            )?;
-            write_http_response(
-                stream,
-                "502 Bad Gateway",
-                "application/json; charset=utf-8",
-                &body,
-            )
-            .await?;
-            log_helper_response(
-                "helper.chat_completions_proxy_failed",
-                method,
-                path,
-                "502 Bad Gateway",
-                remote_addr_text,
-            );
-            stream.shutdown().await?;
-            return Ok(());
-        }
-    };
-    let status = upstream.status();
-    let is_success = upstream.is_success();
-    let content_type = if upstream.content_type.is_empty() {
-        "application/json; charset=utf-8".to_string()
-    } else {
-        upstream.content_type.clone()
-    };
-    if upstream.is_stream && is_success {
-        write_http_stream_headers(stream, &status, &content_type).await?;
-        let mut bytes_stream = upstream.response.bytes_stream();
-        while let Some(chunk) = bytes_stream.next().await {
-            stream.write_all(&chunk?).await?;
-        }
-        log_helper_response(
-            "helper.chat_completions_proxy_stream_ok",
-            method,
-            path,
-            &status,
-            remote_addr_text,
-        );
-        stream.shutdown().await?;
-        return Ok(());
-    }
-    let body = upstream.response.bytes().await?.to_vec();
-    write_http_response(stream, &status, &content_type, &body).await?;
-    log_helper_response(
-        if is_success {
-            "helper.chat_completions_proxy_ok"
-        } else {
-            "helper.chat_completions_proxy_upstream_error"
-        },
-        method,
-        path,
-        &status,
-        remote_addr_text,
-    );
-    stream.shutdown().await?;
-    Ok(())
-}
-
-async fn write_http_response(
-    stream: &mut tokio::net::TcpStream,
-    status: &str,
-    content_type: &str,
-    body: &[u8],
-) -> anyhow::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.write_all(body).await?;
-    Ok(())
-}
-
-async fn write_http_stream_headers(
-    stream: &mut tokio::net::TcpStream,
-    status: &str,
-    content_type: &str,
-) -> anyhow::Result<()> {
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nConnection: close\r\n\r\n"
-    );
-    stream.write_all(response.as_bytes()).await?;
-    Ok(())
-}
-
-fn log_helper_response(
-    event: &str,
-    method: &str,
-    path: &str,
-    status: &str,
-    remote_addr_text: Option<String>,
-) {
-    let _ = crate::diagnostic_log::append_diagnostic_log(
-        event,
-        serde_json::json!({
-            "method": method,
-            "path": path,
-            "status": status,
-            "remote_addr": remote_addr_text
-        }),
-    );
-}
-
 #[cfg(test)]
 mod computer_use_tests {
-    use super::{header_value_from_request, overlay_image_content_type};
+    use super::overlay_image_content_type;
     use std::path::Path;
 
     #[test]
@@ -1707,104 +1145,6 @@ mod computer_use_tests {
             Some("image/webp")
         );
         assert_eq!(overlay_image_content_type(Path::new("overlay.txt")), None);
-    }
-
-    #[test]
-    fn header_value_from_request_reads_user_agent_case_insensitively() {
-        let request = "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: Codex/26.614\r\nContent-Length: 2\r\n\r\n{}";
-
-        assert_eq!(
-            header_value_from_request(request, "user-agent").as_deref(),
-            Some("Codex/26.614")
-        );
-    }
-}
-
-#[cfg(test)]
-mod protocol_proxy_request_limit_tests {
-    use super::{HttpRequestLimits, read_http_request_with_limits};
-    use std::time::Duration;
-    use tokio::io::AsyncWriteExt;
-
-    fn limits(max_header_bytes: usize, max_body_bytes: usize) -> HttpRequestLimits {
-        HttpRequestLimits {
-            max_header_bytes,
-            max_body_bytes,
-            idle_timeout: Duration::from_millis(50),
-            deadline: Duration::from_millis(250),
-        }
-    }
-
-    #[tokio::test]
-    async fn limited_reader_waits_for_a_fragmented_complete_body() {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        let writer = tokio::spawn(async move {
-            client
-                .write_all(b"POST /responses HTTP/1.1\r\nContent-Length: 7\r\n\r\n{\"a\"")
-                .await
-                .unwrap();
-            tokio::task::yield_now().await;
-            client.write_all(b":1}").await.unwrap();
-        });
-
-        let request = read_http_request_with_limits(&mut server, limits(1024, 1024))
-            .await
-            .unwrap();
-
-        writer.await.unwrap();
-        assert!(request.ends_with(b"\r\n\r\n{\"a\":1}"));
-    }
-
-    #[tokio::test]
-    async fn limited_reader_rejects_an_oversized_declared_body_before_reading_it() {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        client
-            .write_all(b"POST /responses HTTP/1.1\r\nContent-Length: 9\r\n\r\n")
-            .await
-            .unwrap();
-
-        let error = read_http_request_with_limits(&mut server, limits(1024, 8))
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("body is too large"));
-    }
-
-    #[tokio::test]
-    async fn limited_reader_rejects_oversized_incomplete_headers() {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        client
-            .write_all(b"GET /models HTTP/1.1\r\nX-Fill: abcdefghijklmnop")
-            .await
-            .unwrap();
-
-        let error = read_http_request_with_limits(&mut server, limits(32, 1024))
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("headers are too large"));
-    }
-
-    #[tokio::test]
-    async fn limited_reader_times_out_an_incomplete_request() {
-        let (mut client, mut server) = tokio::io::duplex(4096);
-        client
-            .write_all(b"POST /responses HTTP/1.1\r\n")
-            .await
-            .unwrap();
-
-        let error = read_http_request_with_limits(
-            &mut server,
-            HttpRequestLimits {
-                idle_timeout: Duration::from_millis(10),
-                deadline: Duration::from_millis(100),
-                ..limits(1024, 1024)
-            },
-        )
-        .await
-        .unwrap_err();
-
-        assert!(error.to_string().contains("idle timeout"));
     }
 }
 
@@ -1839,96 +1179,6 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result
     Ok(buffer)
 }
 
-#[derive(Debug, Clone, Copy)]
-struct HttpRequestLimits {
-    max_header_bytes: usize,
-    max_body_bytes: usize,
-    idle_timeout: Duration,
-    deadline: Duration,
-}
-
-impl HttpRequestLimits {
-    const fn protocol_proxy() -> Self {
-        Self {
-            max_header_bytes: PROTOCOL_PROXY_MAX_HEADER_BYTES,
-            max_body_bytes: PROTOCOL_PROXY_MAX_BODY_BYTES,
-            idle_timeout: PROTOCOL_PROXY_REQUEST_IDLE_TIMEOUT,
-            deadline: PROTOCOL_PROXY_REQUEST_DEADLINE,
-        }
-    }
-}
-
-async fn read_http_request_with_limits<R>(
-    stream: &mut R,
-    limits: HttpRequestLimits,
-) -> anyhow::Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let deadline = tokio::time::Instant::now() + limits.deadline;
-    let mut buffer = Vec::with_capacity(4096);
-    let mut chunk = [0_u8; 4096];
-    let mut target_len = None;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!("HTTP request read deadline exceeded");
-        }
-        let read_timeout = limits.idle_timeout.min(remaining);
-        let read = match tokio::time::timeout(read_timeout, stream.read(&mut chunk)).await {
-            Ok(result) => result?,
-            Err(_) if tokio::time::Instant::now() >= deadline => {
-                anyhow::bail!("HTTP request read deadline exceeded");
-            }
-            Err(_) => anyhow::bail!("HTTP request read idle timeout exceeded"),
-        };
-        if read == 0 {
-            if target_len.is_some_and(|target_len| buffer.len() < target_len) {
-                anyhow::bail!("HTTP request body ended before Content-Length bytes arrived");
-            }
-            break;
-        }
-        buffer.extend_from_slice(&chunk[..read]);
-
-        if target_len.is_none() {
-            if let Some(header_end) = find_header_end(&buffer) {
-                let header_len = header_end
-                    .checked_add(4)
-                    .context("HTTP request header length overflow")?;
-                if header_len > limits.max_header_bytes {
-                    anyhow::bail!("HTTP request headers are too large");
-                }
-                let content_length = strict_content_length_from_headers(
-                    &buffer[..header_end],
-                    limits.max_body_bytes,
-                )?;
-                target_len = Some(
-                    header_len
-                        .checked_add(content_length)
-                        .context("HTTP request length overflow")?,
-                );
-            } else if buffer.len() >= limits.max_header_bytes {
-                anyhow::bail!("HTTP request headers are too large");
-            }
-        }
-
-        if let Some(target_len) = target_len {
-            if buffer.len() > target_len {
-                anyhow::bail!("HTTP request contains bytes beyond its declared Content-Length");
-            }
-            if buffer.len() == target_len {
-                return Ok(buffer);
-            }
-        }
-    }
-
-    if target_len.is_none() {
-        anyhow::bail!("HTTP request ended before its headers were complete");
-    }
-    Ok(buffer)
-}
-
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -1945,66 +1195,11 @@ fn content_length_from_headers(headers: &[u8]) -> Option<usize> {
     })
 }
 
-fn strict_content_length_from_headers(
-    headers: &[u8],
-    max_body_bytes: usize,
-) -> anyhow::Result<usize> {
-    let text = std::str::from_utf8(headers).context("HTTP request headers are not valid UTF-8")?;
-    let method = text
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().next())
-        .unwrap_or_default();
-    let mut content_length = None;
-    for line in text.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else {
-            anyhow::bail!("HTTP request contains a malformed header");
-        };
-        if name.trim().eq_ignore_ascii_case("transfer-encoding") && !value.trim().is_empty() {
-            anyhow::bail!("HTTP request Transfer-Encoding is unsupported");
-        }
-        if !name.trim().eq_ignore_ascii_case("content-length") {
-            continue;
-        }
-        if content_length.is_some() {
-            anyhow::bail!("HTTP request contains duplicate Content-Length headers");
-        }
-        let parsed = value
-            .trim()
-            .parse::<usize>()
-            .context("HTTP request Content-Length is invalid")?;
-        if parsed > max_body_bytes {
-            anyhow::bail!("HTTP request body is too large");
-        }
-        content_length = Some(parsed);
-    }
-    if method.eq_ignore_ascii_case("POST") && content_length.is_none() {
-        anyhow::bail!("HTTP POST request is missing Content-Length");
-    }
-    Ok(content_length.unwrap_or(0))
-}
-
 fn http_request_body(request: &str) -> &str {
     request
         .split_once("\r\n\r\n")
         .map(|(_, body)| body)
         .unwrap_or_default()
-}
-
-fn header_value_from_request(request: &str, header_name: &str) -> Option<String> {
-    request
-        .split_once("\r\n\r\n")
-        .map(|(headers, _)| headers)
-        .unwrap_or(request)
-        .lines()
-        .skip(1)
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case(header_name)
-                .then(|| value.trim().to_string())
-        })
-        .filter(|value| !value.is_empty())
 }
 
 fn sanitize_diagnostic_event(event: &str) -> String {

@@ -13,7 +13,7 @@ use codey_runtime_core::relay_config::{
     set_codex_goals_feature_in_home, strip_common_config_from_config,
     sync_live_config_context_entries, upsert_context_entry_in_common_config,
 };
-use codey_runtime_core::settings::{RelayContextSelection, RelayMode, RelayProfile, RelayProtocol};
+use codey_runtime_core::settings::{RelayContextSelection, RelayMode, RelayProfile};
 
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {
     let root = home.join(".tmp").join("plugins-remote");
@@ -322,89 +322,6 @@ model = "gpt-5-mini"
     assert!(updated.contains("requires_openai_auth = true"));
     assert!(updated.contains(r#"base_url = "https://relay.example.test/v1""#));
     assert!(updated.contains(r#"experimental_bearer_token = "sk-test-redacted""#));
-}
-
-#[test]
-fn apply_chat_protocol_relay_points_codex_to_local_responses_proxy() {
-    let temp = tempfile::tempdir().unwrap();
-
-    let result = codey_runtime_core::relay_config::apply_relay_config_to_home_with_protocol(
-        temp.path(),
-        "https://chat-only.example.test/v1",
-        "sk-test-redacted",
-        RelayProtocol::ChatCompletions,
-        57321,
-    )
-    .unwrap();
-    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-
-    assert!(result.configured);
-    assert!(updated.contains(r#"wire_api = "responses""#));
-    assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
-    assert!(updated.contains(r#"experimental_bearer_token = "sk-test-redacted""#));
-    assert!(!updated.contains("codey_chat_base_url"));
-}
-
-#[test]
-fn apply_aggregate_relay_points_codex_to_local_responses_proxy_without_snapshot() {
-    let temp = tempfile::tempdir().unwrap();
-    let profile = RelayProfile {
-        id: "agg".to_string(),
-        name: "聚合供应商 1".to_string(),
-        relay_mode: RelayMode::Aggregate,
-        config_contents: String::new(),
-        auth_contents: String::new(),
-        ..RelayProfile::default()
-    };
-
-    let result = apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
-    let updated = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-
-    assert!(result.configured);
-    assert!(updated.contains(r#"wire_api = "responses""#));
-    assert!(updated.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
-    assert!(updated.contains(r#"experimental_bearer_token = "codey-aggregate""#));
-}
-
-#[test]
-fn chat_protocol_profile_keeps_upstream_base_url_separate_from_codex_proxy() {
-    let temp = tempfile::tempdir().unwrap();
-    let mut profile = RelayProfile {
-        id: "relay-chat".to_string(),
-        model: "deepseek-chat".to_string(),
-        upstream_base_url: "https://api.deepseek.com".to_string(),
-        api_key: "sk-test-redacted".to_string(),
-        protocol: RelayProtocol::ChatCompletions,
-        relay_mode: RelayMode::PureApi,
-        config_contents: r#"model = "deepseek-chat"
-model_provider = "custom"
-
-[model_providers.custom]
-name = "custom"
-wire_api = "responses"
-requires_openai_auth = true
-base_url = "http://127.0.0.1:57321/v1"
-"#
-        .to_string(),
-        auth_contents: r#"{"OPENAI_API_KEY":"sk-test-redacted"}"#.to_string(),
-        ..RelayProfile::default()
-    };
-
-    normalize_relay_profile_for_storage(&mut profile).unwrap();
-
-    assert_eq!(profile.upstream_base_url, "https://api.deepseek.com");
-    assert_eq!(profile.base_url, "https://api.deepseek.com");
-    assert!(!profile.config_contents.contains("codey_chat_base_url"));
-    assert!(
-        profile
-            .config_contents
-            .contains(r#"base_url = "http://127.0.0.1:57321/v1""#)
-    );
-
-    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
-    let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(!live.contains("codey_chat_base_url"));
-    assert!(live.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
 }
 
 #[test]

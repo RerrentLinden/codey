@@ -7,11 +7,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use toml_edit::{DocumentMut, Item, Table, TableLike};
 
 use crate::config_manager::ConfigManager;
-use crate::settings::{RelayContextSelection, RelayProfile, RelayProtocol};
+use crate::settings::{RelayContextSelection, RelayProfile};
 
 const RELAY_PROVIDER: &str = "custom";
 const LEGACY_RELAY_PROVIDERS: &[&str] = &["CodeyRuntime", "CodeyRuntime"];
-const CHAT_UPSTREAM_BASE_URL_KEY: &str = "codey_chat_base_url";
 const RESERVED_MODEL_PROVIDER_IDS: &[&str] = &[
     "amazon-bedrock",
     "openai",
@@ -208,22 +207,6 @@ pub fn apply_relay_config_to_home(
     base_url: &str,
     bearer_token: &str,
 ) -> anyhow::Result<RelayApplyResult> {
-    apply_relay_config_to_home_with_protocol(
-        home,
-        base_url,
-        bearer_token,
-        RelayProtocol::Responses,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-    )
-}
-
-pub fn apply_relay_config_to_home_with_protocol(
-    home: &Path,
-    base_url: &str,
-    bearer_token: &str,
-    protocol: RelayProtocol,
-    proxy_port: u16,
-) -> anyhow::Result<RelayApplyResult> {
     let base_url = base_url.trim();
     if base_url.is_empty() {
         anyhow::bail!("中转 Base URL 不能为空");
@@ -232,8 +215,7 @@ pub fn apply_relay_config_to_home_with_protocol(
     if bearer_token.is_empty() {
         anyhow::bail!("中转 Key 不能为空");
     }
-    let codex_base_url = codex_base_url_for_protocol(base_url, protocol, proxy_port);
-    let updated = upsert_model_provider_config("", &codex_base_url, bearer_token)?;
+    let updated = upsert_model_provider_config("", base_url, bearer_token)?;
     let auth_contents = serde_json::to_string_pretty(&json!({
         "OPENAI_API_KEY": bearer_token
     }))?;
@@ -243,7 +225,7 @@ pub fn apply_relay_config_to_home_with_protocol(
         Some(auth_contents.as_bytes()),
         false,
         "apply relay endpoint and credentials",
-        "relay_config.apply_relay_config_to_home_with_protocol",
+        "relay_config.apply_relay_config_to_home",
     )?;
     let status = relay_config_status_from_home(home);
     Ok(RelayApplyResult {
@@ -258,13 +240,7 @@ pub fn apply_pure_api_config_to_home(
     base_url: &str,
     bearer_token: &str,
 ) -> anyhow::Result<RelayApplyResult> {
-    apply_pure_api_config_to_home_with_protocol(
-        home,
-        base_url,
-        bearer_token,
-        RelayProtocol::Responses,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-    )
+    apply_relay_config_to_home(home, base_url, bearer_token)
 }
 
 pub fn apply_relay_files_to_home(
@@ -492,25 +468,6 @@ pub fn apply_relay_config_file_to_home(
     })
 }
 
-pub fn apply_pure_api_config_to_home_with_protocol(
-    home: &Path,
-    base_url: &str,
-    bearer_token: &str,
-    protocol: RelayProtocol,
-    proxy_port: u16,
-) -> anyhow::Result<RelayApplyResult> {
-    apply_relay_config_to_home_with_protocol(home, base_url, bearer_token, protocol, proxy_port)
-}
-
-fn codex_base_url_for_protocol(base_url: &str, protocol: RelayProtocol, proxy_port: u16) -> String {
-    match protocol {
-        RelayProtocol::Responses => base_url.to_string(),
-        RelayProtocol::ChatCompletions => {
-            crate::protocol_proxy::local_responses_proxy_base_url(proxy_port)
-        }
-    }
-}
-
 pub fn clear_relay_config_to_home(home: &Path) -> anyhow::Result<RelayApplyResult> {
     clear_relay_config_to_home_with_auth(home, None)
 }
@@ -630,13 +587,7 @@ pub fn backfill_relay_profile_from_home_with_common(
 
 pub fn extract_common_config_from_config(config_text: &str) -> anyhow::Result<String> {
     let mut doc = parse_toml_document(config_text)?;
-    for key in [
-        "model",
-        "model_provider",
-        "base_url",
-        "model_catalog_json",
-        CHAT_UPSTREAM_BASE_URL_KEY,
-    ] {
+    for key in ["model", "model_provider", "base_url", "model_catalog_json"] {
         doc.as_table_mut().remove(key);
     }
     doc.as_table_mut().remove("model_providers");
@@ -1137,13 +1088,7 @@ fn parse_toml_document(contents: &str) -> anyhow::Result<DocumentMut> {
 }
 
 fn remove_provider_specific_common_keys(table: &mut dyn TableLike) {
-    for key in [
-        "model",
-        "model_provider",
-        "base_url",
-        "model_catalog_json",
-        CHAT_UPSTREAM_BASE_URL_KEY,
-    ] {
+    for key in ["model", "model_provider", "base_url", "model_catalog_json"] {
         table.remove(key);
     }
     table.remove("model_providers");
@@ -1171,11 +1116,7 @@ fn sanitize_common_config_text_fallback(common_config: &str) -> String {
             let key = key.trim();
             if matches!(
                 key,
-                "model"
-                    | "model_provider"
-                    | "base_url"
-                    | "model_catalog_json"
-                    | CHAT_UPSTREAM_BASE_URL_KEY
+                "model" | "model_provider" | "base_url" | "model_catalog_json"
             ) {
                 continue;
             }
@@ -1817,35 +1758,10 @@ pub fn relay_profile_model(profile: &RelayProfile) -> String {
 }
 
 pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
-    if profile.relay_mode == crate::settings::RelayMode::Aggregate {
-        return crate::protocol_proxy::local_responses_proxy_base_url(
-            crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-        );
-    }
-    if profile.protocol == RelayProtocol::ChatCompletions {
-        if !profile.upstream_base_url.trim().is_empty() {
-            return profile.upstream_base_url.trim().to_string();
-        }
-        if let Some(value) = root_key_string(&profile.config_contents, CHAT_UPSTREAM_BASE_URL_KEY)
-            .filter(|value| !value.trim().is_empty())
-        {
-            return value;
-        }
-        if !profile.base_url.trim().is_empty() {
-            return profile.base_url.trim().to_string();
-        }
-    }
     let provider_base_url = provider_string_from_config(&profile.config_contents, "base_url")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_default();
-    if profile.protocol == RelayProtocol::ChatCompletions
-        && provider_base_url
-            == crate::protocol_proxy::local_responses_proxy_base_url(
-                crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-            )
-    {
-        String::new()
-    } else if !provider_base_url.is_empty() {
+    if !provider_base_url.is_empty() {
         provider_base_url
     } else {
         profile.base_url.trim().to_string()
@@ -1853,9 +1769,6 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
 }
 
 pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
-    if profile.relay_mode == crate::settings::RelayMode::Aggregate {
-        return "codey-aggregate".to_string();
-    }
     if profile.relay_mode == crate::settings::RelayMode::Official {
         return experimental_bearer_token_from_config(&profile.config_contents)
             .ok()
@@ -1900,7 +1813,6 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
 
     let base_url = relay_profile_base_url(profile);
     let api_key = relay_profile_api_key(profile);
-    doc.as_table_mut().remove(CHAT_UPSTREAM_BASE_URL_KEY);
     retain_only_provider_table(&mut doc, &provider_id);
     for legacy_provider in LEGACY_RELAY_PROVIDERS {
         if provider_id != *legacy_provider {
@@ -1931,13 +1843,8 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     {
         provider["requires_openai_auth"] = toml_edit::value(true);
     }
-    let provider_base_url = codex_base_url_for_protocol(
-        base_url.trim(),
-        profile.protocol,
-        crate::protocol_proxy::DEFAULT_PROTOCOL_PROXY_PORT,
-    );
-    if !provider_base_url.trim().is_empty() {
-        provider["base_url"] = toml_edit::value(provider_base_url.trim());
+    if !base_url.trim().is_empty() {
+        provider["base_url"] = toml_edit::value(base_url.trim());
     }
     if profile.relay_mode == crate::settings::RelayMode::PureApi {
         provider.remove("experimental_bearer_token");
@@ -1970,7 +1877,6 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
         }
         profile.model.clear();
         profile.base_url.clear();
-        profile.upstream_base_url.clear();
         profile.api_key.clear();
         if auth_contents_looks_like_chatgpt_auth(&profile.auth_contents) {
             profile.auth_contents =
@@ -2001,7 +1907,6 @@ pub fn normalize_relay_profile_for_storage(profile: &mut RelayProfile) -> anyhow
     }
     profile.model = relay_profile_model(profile);
     profile.model_list = merge_model_into_model_list(&profile.model, &profile.model_list);
-    profile.upstream_base_url = source_base_url.clone();
     profile.base_url = source_base_url;
     profile.api_key = relay_profile_api_key(profile);
     Ok(())
@@ -2515,7 +2420,6 @@ mod tests {
 
         let mut profile = RelayProfile {
             relay_mode: crate::settings::RelayMode::PureApi,
-            protocol: crate::settings::RelayProtocol::Responses,
             config_contents: "model_provider = \"ai\"\nmodel = \"gpt-image-2\"\n\n[model_providers.ai]\nname = \"ai\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nbase_url = \"https://ahg.codes\"\n"
                 .to_string(),
             auth_contents: "{}\n".to_string(),

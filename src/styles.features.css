@@ -968,7 +968,6 @@
   opacity: 0.45;
 }
 
-.prompt-optimization-protocol-select,
 .prompt-optimization-model-select {
   min-width: 0;
   flex: 1 1 auto;
@@ -981,11 +980,6 @@
   overflow: visible;
 }
 
-.prompt-optimization-protocol-select:hover,
-.prompt-optimization-protocol-select:focus,
-.prompt-optimization-protocol-select:active,
-.prompt-optimization-protocol-select.semi-select-open,
-.prompt-optimization-protocol-select.semi-select-focus,
 .prompt-optimization-model-select:hover,
 .prompt-optimization-model-select:focus,
 .prompt-optimization-model-select:active,
@@ -996,7 +990,6 @@
   box-shadow: none !important;
 }
 
-.prompt-optimization-protocol-select .semi-select-selection,
 .prompt-optimization-model-select .semi-select-selection {
   min-width: 0;
   margin-left: 0;
@@ -1006,21 +999,17 @@
   font-weight: 500;
 }
 
-.prompt-optimization-protocol-select .semi-select-arrow,
 .prompt-optimization-model-select .semi-select-arrow {
   width: 24px;
   color: #1d1d1f;
 }
 
-.prompt-optimization-protocol-select:disabled,
-.prompt-optimization-protocol-select.semi-select-disabled,
 .prompt-optimization-model-select:disabled,
 .prompt-optimization-model-select.semi-select-disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
 
-.prompt-optimization-protocol-dropdown,
 .prompt-optimization-model-dropdown {
   border-radius: 10px;
 }

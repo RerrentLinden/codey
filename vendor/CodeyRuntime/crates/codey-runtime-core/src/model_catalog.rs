@@ -531,11 +531,7 @@ pub async fn fetch_relay_profile_model_ids(
         } else {
             profile.name.trim().to_string()
         },
-        base_url: if profile.upstream_base_url.trim().is_empty() {
-            profile.base_url.trim().to_string()
-        } else {
-            profile.upstream_base_url.trim().to_string()
-        },
+        base_url: profile.base_url.trim().to_string(),
         api_key: profile.api_key.trim().to_string(),
     };
     if source.base_url.is_empty() {
@@ -583,12 +579,19 @@ fn models_endpoint(base_url: &str) -> String {
     // Only append the default `/v1` version prefix when the base URL does not
     // already carry a version segment. Providers such as Volcano Engine ARK use
     // a versioned base (e.g. `.../api/coding/v3`), so blindly appending
-    // `/v1/models` produced `.../api/coding/v3/v1/models` and 404'd. This mirrors
-    // the version handling already used by the protocol proxy. See issue #1349.
-    if crate::protocol_proxy::has_version_suffix(&cleaned) {
+    // `/v1/models` produced `.../api/coding/v3/v1/models` and 404'd.
+    if has_version_suffix(&cleaned) {
         return format!("{cleaned}/models");
     }
     format!("{cleaned}/v1/models")
+}
+
+fn has_version_suffix(base_url: &str) -> bool {
+    let segment = base_url.rsplit('/').next().unwrap_or(base_url);
+    let Some(rest) = segment.strip_prefix('v') else {
+        return false;
+    };
+    rest.chars().next().is_some_and(|ch| ch.is_ascii_digit())
 }
 
 fn parse_model_payload(payload: &Value) -> Vec<String> {

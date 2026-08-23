@@ -38,17 +38,17 @@ pub struct RelayProfile {
     pub model: String,
     #[serde(default = "default_relay_base_url", skip_serializing)]
     pub base_url: String,
-    #[serde(rename = "upstreamBaseUrl", default)]
-    pub upstream_base_url: String,
     #[serde(
         default,
         skip_serializing,
         deserialize_with = "deserialize_profile_api_key"
     )]
     pub api_key: String,
-    #[serde(default)]
-    pub protocol: RelayProtocol,
-    #[serde(rename = "relayMode", default)]
+    #[serde(
+        rename = "relayMode",
+        default,
+        deserialize_with = "deserialize_relay_mode"
+    )]
     pub relay_mode: RelayMode,
     #[serde(rename = "officialMixApiKey", default)]
     pub official_mix_api_key: bool,
@@ -84,42 +84,6 @@ pub struct RelayProfile {
         skip_serializing_if = "String::is_empty"
     )]
     pub user_agent: String,
-    /// 按模型覆盖线路协议：请求的 model 命中该集合时，走 Chat Completions
-    /// 转换（本地 Responses→Chat 代理），否则按 `protocol` 的默认线路发送。
-    /// 典型场景：第三方 Responses 中继上的模型不支持 /v1/responses，或其
-    /// 流式响应缺少 Codex 必需的终止事件，需要逐请求降级到 chat completions。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub chat_completions_models: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub enum AggregateRelayStrategy {
-    #[default]
-    Failover,
-    ConversationRoundRobin,
-    RequestRoundRobin,
-    WeightedRoundRobin,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AggregateRelayMember {
-    #[serde(rename = "relayId")]
-    pub relay_id: String,
-    #[serde(default = "default_aggregate_member_weight")]
-    pub weight: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AggregateRelayProfile {
-    pub id: String,
-    pub name: String,
-    #[serde(default)]
-    pub strategy: AggregateRelayStrategy,
-    #[serde(default)]
-    pub members: Vec<AggregateRelayMember>,
 }
 
 impl Default for RelayProfile {
@@ -129,9 +93,7 @@ impl Default for RelayProfile {
             name: "默认中转".to_string(),
             model: String::new(),
             base_url: default_relay_base_url(),
-            upstream_base_url: String::new(),
             api_key: String::new(),
-            protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             test_model: String::new(),
@@ -146,7 +108,6 @@ impl Default for RelayProfile {
             model_list: String::new(),
             model_windows: String::new(),
             user_agent: String::new(),
-            chat_completions_models: Vec::new(),
         }
     }
 }
@@ -161,20 +122,11 @@ pub enum RelayModelInsertMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub enum RelayProtocol {
-    #[default]
-    Responses,
-    ChatCompletions,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
 pub enum RelayMode {
     Official,
     #[default]
     MixedApi,
     PureApi,
-    Aggregate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -307,10 +259,6 @@ pub struct BackendSettings {
     pub relay_context_config_contents: String,
     #[serde(rename = "activeRelayId", default = "default_active_relay_id")]
     pub active_relay_id: String,
-    #[serde(rename = "aggregateRelayProfiles", default)]
-    pub aggregate_relay_profiles: Vec<AggregateRelayProfile>,
-    #[serde(rename = "activeAggregateRelayId", default)]
-    pub active_aggregate_relay_id: String,
     #[serde(rename = "relayTestModel", default = "default_relay_test_model")]
     pub relay_test_model: String,
 }
@@ -368,8 +316,6 @@ impl Default for BackendSettings {
             relay_common_config_contents: String::new(),
             relay_context_config_contents: String::new(),
             active_relay_id: default_active_relay_id(),
-            aggregate_relay_profiles: Vec::new(),
-            active_aggregate_relay_id: String::new(),
             relay_test_model: default_relay_test_model(),
         }
     }
@@ -391,13 +337,7 @@ impl BackendSettings {
                 } else {
                     self.relay_base_url.clone()
                 },
-                upstream_base_url: if self.relay_base_url.is_empty() {
-                    default_relay_base_url()
-                } else {
-                    self.relay_base_url.clone()
-                },
                 api_key: self.relay_api_key.clone(),
-                protocol: RelayProtocol::Responses,
                 relay_mode: RelayMode::MixedApi,
                 official_mix_api_key: true,
                 test_model: String::new(),
@@ -412,7 +352,6 @@ impl BackendSettings {
                 model_list: String::new(),
                 model_windows: String::new(),
                 user_agent: String::new(),
-                chat_completions_models: Vec::new(),
             };
         }
 
@@ -437,13 +376,7 @@ impl BackendSettings {
             } else {
                 self.relay_base_url.clone()
             },
-            upstream_base_url: if self.relay_base_url.is_empty() {
-                default_relay_base_url()
-            } else {
-                self.relay_base_url.clone()
-            },
             api_key: self.relay_api_key.clone(),
-            protocol: RelayProtocol::Responses,
             relay_mode: RelayMode::Official,
             official_mix_api_key: false,
             test_model: String::new(),
@@ -458,38 +391,7 @@ impl BackendSettings {
             model_list: String::new(),
             model_windows: String::new(),
             user_agent: String::new(),
-            chat_completions_models: Vec::new(),
         }
-    }
-
-    pub fn active_aggregate_relay_profile(&self) -> Option<AggregateRelayProfile> {
-        let active_relay = self
-            .relay_profiles
-            .iter()
-            .find(|profile| profile.id == self.active_relay_id)?;
-        if active_relay.relay_mode != RelayMode::Aggregate {
-            return None;
-        }
-
-        let active_aggregate_id = if self.active_aggregate_relay_id.trim().is_empty() {
-            active_relay.id.as_str()
-        } else {
-            self.active_aggregate_relay_id.trim()
-        };
-
-        if active_aggregate_id != active_relay.id {
-            return None;
-        }
-
-        self.aggregate_relay_profiles
-            .iter()
-            .find(|profile| profile.id == active_aggregate_id)
-            .cloned()
-    }
-
-    pub fn active_relay_uses_protocol_proxy(&self) -> bool {
-        self.active_aggregate_relay_profile().is_some()
-            || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
     }
 }
 
@@ -568,10 +470,6 @@ pub fn default_relay_profiles() -> Vec<RelayProfile> {
     vec![RelayProfile::default()]
 }
 
-pub fn default_aggregate_member_weight() -> u32 {
-    1
-}
-
 pub fn empty_as_default_stepwise_api_key_env<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -641,6 +539,19 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+fn deserialize_relay_mode<'de, D>(deserializer: D) -> Result<RelayMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(match value.as_deref() {
+        Some("official") => RelayMode::Official,
+        Some("pureApi") => RelayMode::PureApi,
+        Some("mixedApi") => RelayMode::MixedApi,
+        _ => RelayMode::default(),
+    })
 }
 
 pub fn normalize_codex_extra_args(args: &[String]) -> Vec<String> {
@@ -943,21 +854,6 @@ fn merge_known_setting_fields(target: &mut Map<String, Value>, source: &Map<Stri
     if let Some(value) = source.get("activeRelayId").and_then(Value::as_str) {
         target.insert(
             "activeRelayId".to_string(),
-            Value::String(value.to_string()),
-        );
-    }
-    if let Some(value) = source
-        .get("aggregateRelayProfiles")
-        .and_then(Value::as_array)
-    {
-        target.insert(
-            "aggregateRelayProfiles".to_string(),
-            Value::Array(value.clone()),
-        );
-    }
-    if let Some(value) = source.get("activeAggregateRelayId").and_then(Value::as_str) {
-        target.insert(
-            "activeAggregateRelayId".to_string(),
             Value::String(value.to_string()),
         );
     }
@@ -1377,56 +1273,20 @@ mod tests {
     }
 
     #[test]
-    fn chat_protocol_profile_roundtrip_migrates_upstream_base_url_out_of_config() {
-        let dir = temp_dir();
-        let store = SettingsStore::new(dir.join("settings.json"));
-        let settings = BackendSettings {
-            relay_profiles: vec![RelayProfile {
-                id: "relay-chat".to_string(),
-                name: "DeepSeek".to_string(),
-                protocol: RelayProtocol::ChatCompletions,
-                relay_mode: RelayMode::PureApi,
-                config_contents: r#"model = "deepseek-chat"
-codey_chat_base_url = "https://api.deepseek.com"
-model_provider = "custom"
+    fn deprecated_protocol_fields_are_ignored() {
+        let profile: RelayProfile = serde_json::from_str(
+            r#"{
+                "id":"relay-old",
+                "name":"旧线路",
+                "protocol":"chatCompletions",
+                "chatCompletionsModels":["legacy-model"]
+            }"#,
+        )
+        .unwrap();
+        let saved = serde_json::to_value(profile).unwrap();
 
-[model_providers.custom]
-name = "custom"
-wire_api = "responses"
-requires_openai_auth = true
-base_url = "http://127.0.0.1:57321/v1"
-"#
-                .to_string(),
-                auth_contents: r#"{"OPENAI_API_KEY":"sk-test"}"#.to_string(),
-                ..RelayProfile::default()
-            }],
-            active_relay_id: "relay-chat".to_string(),
-            ..BackendSettings::default()
-        };
-
-        store.save(&settings).unwrap();
-        let loaded = store.load().unwrap();
-        let active = loaded.active_relay_profile();
-
-        assert_eq!(active.protocol, RelayProtocol::ChatCompletions);
-        assert_eq!(active.base_url, "https://api.deepseek.com");
-        assert_eq!(active.upstream_base_url, "https://api.deepseek.com");
-        assert_eq!(active.api_key, "sk-test");
-        assert!(!active.config_contents.contains("codey_chat_base_url"));
-
-        let saved: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("settings.json")).unwrap())
-                .unwrap();
-        let profile = &saved["relayProfiles"][0];
-        assert!(profile.get("baseUrl").is_none());
-        assert_eq!(profile["upstreamBaseUrl"], "https://api.deepseek.com");
-        assert!(profile.get("apiKey").is_none());
-        assert!(
-            !profile["configContents"]
-                .as_str()
-                .unwrap()
-                .contains("codey_chat_base_url")
-        );
+        assert!(saved.get("protocol").is_none());
+        assert!(saved.get("chatCompletionsModels").is_none());
     }
 
     #[test]
@@ -1675,61 +1535,27 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
-    fn settings_store_save_load_roundtrip_preserves_aggregate_relay_settings() {
-        let dir = temp_dir();
-        let store = SettingsStore::new(dir.join("settings.json"));
-        let settings = BackendSettings {
-            relay_profiles: vec![
-                RelayProfile {
-                    id: "relay-a".to_string(),
-                    name: "中转 A".to_string(),
-                    ..RelayProfile::default()
-                },
-                RelayProfile {
-                    id: "relay-b".to_string(),
-                    name: "中转 B".to_string(),
-                    ..RelayProfile::default()
-                },
-                RelayProfile {
-                    id: "agg".to_string(),
-                    name: "聚合".to_string(),
-                    relay_mode: RelayMode::Aggregate,
-                    ..RelayProfile::default()
-                },
-            ],
-            active_relay_id: "agg".to_string(),
-            aggregate_relay_profiles: vec![AggregateRelayProfile {
-                id: "agg".to_string(),
-                name: "聚合".to_string(),
-                strategy: AggregateRelayStrategy::WeightedRoundRobin,
-                members: vec![
-                    AggregateRelayMember {
-                        relay_id: "relay-a".to_string(),
-                        weight: 1,
-                    },
-                    AggregateRelayMember {
-                        relay_id: "relay-b".to_string(),
-                        weight: 3,
-                    },
-                ],
+    fn deprecated_aggregate_settings_are_ignored() {
+        let settings: BackendSettings = serde_json::from_value(json!({
+            "relayProfiles": [{
+                "id": "legacy",
+                "name": "旧聚合线路",
+                "relayMode": "aggregate"
             }],
-            active_aggregate_relay_id: "agg".to_string(),
-            ..BackendSettings::default()
-        };
+            "activeRelayId": "legacy",
+            "aggregateRelayProfiles": [{
+                "id": "legacy",
+                "strategy": "weightedRoundRobin",
+                "members": [{"relayId": "relay-a", "weight": 1}]
+            }],
+            "activeAggregateRelayId": "legacy"
+        }))
+        .unwrap();
+        let saved = serde_json::to_value(settings).unwrap();
 
-        store.save(&settings).unwrap();
-
-        let loaded = store.load().unwrap();
-        let expected = normalize_settings_config_sections(settings);
-        let active_aggregate = loaded.active_aggregate_relay_profile().unwrap();
-        assert_eq!(loaded, expected);
-        assert_eq!(
-            active_aggregate.strategy,
-            AggregateRelayStrategy::WeightedRoundRobin
-        );
-        assert_eq!(active_aggregate.members[1].relay_id, "relay-b");
-        assert_eq!(active_aggregate.members[1].weight, 3);
-        assert!(loaded.active_relay_uses_protocol_proxy());
+        assert!(saved.get("aggregateRelayProfiles").is_none());
+        assert!(saved.get("activeAggregateRelayId").is_none());
+        assert_eq!(saved["relayProfiles"][0]["relayMode"], "mixedApi");
     }
 
     #[test]
@@ -1998,7 +1824,7 @@ experimental_bearer_token = "sk-existing""#
     }
 
     #[test]
-    fn settings_store_update_persists_aggregate_relay_profiles_and_active_id() {
+    fn settings_store_update_ignores_deprecated_aggregate_fields() {
         let dir = temp_dir();
         let store = SettingsStore::new(dir.join("settings.json"));
 
@@ -2025,17 +1851,14 @@ experimental_bearer_token = "sk-existing""#
             }))
             .unwrap();
 
-        let active_aggregate = updated.active_aggregate_relay_profile().unwrap();
         assert_eq!(updated.active_relay_id, "agg");
-        assert_eq!(updated.active_aggregate_relay_id, "agg");
         assert_eq!(
-            active_aggregate.strategy,
-            AggregateRelayStrategy::WeightedRoundRobin
+            updated.active_relay_profile().relay_mode,
+            RelayMode::MixedApi
         );
-        assert_eq!(active_aggregate.members.len(), 2);
-        assert_eq!(active_aggregate.members[1].relay_id, "relay-b");
-        assert_eq!(active_aggregate.members[1].weight, 4);
-        assert!(updated.active_relay_uses_protocol_proxy());
+        let saved = serde_json::to_value(updated).unwrap();
+        assert!(saved.get("aggregateRelayProfiles").is_none());
+        assert!(saved.get("activeAggregateRelayId").is_none());
     }
 
     #[test]

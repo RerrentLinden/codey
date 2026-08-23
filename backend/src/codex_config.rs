@@ -10,19 +10,17 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use anyhow::{Context, Result, bail};
 use codey_runtime_core::config_manager::ConfigManager;
-use codey_runtime_core::settings::RelayProtocol;
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
 
 #[cfg(test)]
 use crate::codex_config_guidance::PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT;
 use crate::codex_config_guidance::{
-    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, DEFAULT_AGENT_CONFIG,
-    ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
-    ROOT_AGENT_MULTI_AGENT_MODE_HINT, SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS,
-    append_root_agent_collaboration_usage_hint, codey_fastctx_guidance_blocks,
+    CODEY_FASTCTX_GUIDANCE, CODEY_FASTCTX_GUIDANCE_VERSIONS, ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS, ROOT_AGENT_MULTI_AGENT_MODE_HINT,
+    SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS, append_root_agent_collaboration_usage_hint,
     previous_default_agent_config_without_sandbox, remove_codey_fastctx_guidance,
-    remove_previous_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
+    remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, ProviderProfile, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT,
@@ -31,37 +29,24 @@ use crate::config::{
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
 use crate::fs_util::timestamp_millis;
-use crate::provider_lease::CODEY_PROVIDER_ID;
 
 mod fastctx;
 mod fs_io;
-mod legacy_restore;
-// Kept as a regression fixture for pre-isolated leases. Production startup no
-// longer imports or calls the write-based apply transaction.
-#[allow(dead_code)]
-mod runtime_provider_transaction;
 mod runtime_role_transaction;
 mod subagent_control;
-mod toml_restore;
 
 use fastctx::{
     apply_fastctx_guidance_to_table, arguments_have_codey_fastctx_marker,
-    direct_only_tool_namespaces, direct_only_tool_namespaces_mut, disable_fast_context_tools,
-    enable_fast_context_tools, fast_context_tools_status_from_document, remove_guidance_from_table,
+    disable_fast_context_tools, enable_fast_context_tools, fast_context_tools_status_from_document,
+    remove_guidance_from_table,
 };
 #[cfg(test)]
-use fastctx::{configured_user_fastctx_server_id, mcp_server_exists};
+use fastctx::{configured_user_fastctx_server_id, direct_only_tool_namespaces, mcp_server_exists};
 use fs_io::{
     atomic_write, create_private_dir_all, read_optional, remove_optional, write_private_file,
 };
-use legacy_restore::restore_legacy_owned_config_changes;
-#[cfg(test)]
-use runtime_provider_transaction::apply_runtime_provider_config_at_mode;
 use runtime_role_transaction::refresh_runtime_subagent_roles_at;
 use subagent_control::{disable_subagent_control_mcp, enable_subagent_control_mcp};
-#[cfg(test)]
-use toml_restore::{items_semantically_equal, tables_semantically_equal};
-use toml_restore::{restore_owned_config_changes, restore_owned_model_provider_changes};
 
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
@@ -77,7 +62,6 @@ const CODEY_FASTCTX_STARTUP_TIMEOUT_SECONDS: i64 = 120;
 const CODEY_FASTCTX_TOOL_TIMEOUT_SECONDS: i64 = 300;
 const DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 3;
 const PREVIOUS_DEFAULT_SUBAGENT_MAX_CONCURRENCY: i64 = 2;
-const APPLIED_CONFIG_FILE: &str = "applied-config.toml";
 const APPLIED_AGENTS_MD_FILE: &str = "applied-AGENTS.md";
 const APPLIED_DEFAULT_AGENT_FILE: &str = "agents/applied-default.toml";
 const APPLIED_HOOKS_JSON_FILE: &str = "applied-hooks.json";
@@ -108,15 +92,6 @@ const RESERVED_PROVIDER_IDS: [&str; 6] = [
 #[serde(rename_all = "camelCase")]
 struct RuntimeConfigLease {
     backup_dir: PathBuf,
-    // Older route-overlay leases may point at a rebased snapshot. Current
-    // runtimes restart on route changes, but still need to restore those leases.
-    #[serde(default)]
-    config_snapshot_dir: Option<PathBuf>,
-    original_config_exists: bool,
-    #[serde(default)]
-    preserve_provider_route: bool,
-    #[serde(default)]
-    protocol_proxy_base_url: Option<String>,
     #[serde(default)]
     fastctx_command: Option<PathBuf>,
     #[serde(default)]
@@ -139,10 +114,6 @@ struct RuntimeConfigLease {
     original_default_agent_exists: bool,
     #[serde(default)]
     original_agents_dir_exists: bool,
-    #[serde(default)]
-    provider_id: Option<String>,
-    #[serde(default)]
-    applied_base_url: Option<String>,
     #[serde(default)]
     isolated_runtime_constraints: bool,
     #[serde(default)]
@@ -167,42 +138,6 @@ fn read_codex_config(path: &Path) -> Result<Option<Vec<u8>>> {
 
 fn codex_config_matches(path: &Path, expected: Option<&[u8]>) -> Result<bool> {
     Ok(read_codex_config(path)?.as_deref() == expected)
-}
-
-fn write_codex_config(
-    path: &Path,
-    expected: Option<&[u8]>,
-    contents: &[u8],
-    reason: &str,
-    caller: &str,
-) -> Result<()> {
-    let contents = str::from_utf8(contents).context("Codex config.toml 不是 UTF-8")?;
-    let manager = ConfigManager::new(path);
-    let snapshot = manager.load()?;
-    anyhow::ensure!(
-        snapshot.exists() == expected.is_some()
-            && expected.is_none_or(|value| snapshot.raw() == value),
-        "Codex config.toml 已被其他写者修改；请 reload 后重试"
-    );
-    manager.replace_text(Some(snapshot.revision()), contents, reason, caller)?;
-    Ok(())
-}
-
-fn remove_codex_config(
-    path: &Path,
-    expected: Option<&[u8]>,
-    reason: &str,
-    caller: &str,
-) -> Result<()> {
-    let manager = ConfigManager::new(path);
-    let snapshot = manager.load()?;
-    anyhow::ensure!(
-        snapshot.exists() == expected.is_some()
-            && expected.is_none_or(|value| snapshot.raw() == value),
-        "Codex config.toml 已被其他写者修改；请 reload 后重试"
-    );
-    manager.remove(Some(snapshot.revision()), reason, caller)?;
-    Ok(())
 }
 
 fn lease_marker_path() -> PathBuf {
@@ -276,7 +211,6 @@ pub(crate) struct RuntimeProviderConfigOptions<'a> {
     pub subagent_reasoning_effort: &'a str,
     pub subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
     pub preserve_provider_route: bool,
-    pub protocol_proxy_base_url: Option<&'a str>,
     pub expected_config: Option<&'a [u8]>,
 }
 
@@ -306,28 +240,7 @@ struct ProviderApplyOptions<'a> {
     marker: &'a Path,
     backup_root: &'a Path,
     preserve_provider_route: bool,
-    protocol_proxy_base_url: Option<&'a str>,
     expected_config: Option<&'a [u8]>,
-}
-
-#[cfg(test)]
-impl<'a> ProviderApplyOptions<'a> {
-    fn for_test(marker: &'a Path, backup_root: &'a Path) -> Self {
-        Self {
-            use_official_catalog: true,
-            default_model: None,
-            fastctx_command: None,
-            subagent_optimization: false,
-            subagent_model: DEFAULT_SUBAGENT_MODEL,
-            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-            subagent_roles: None,
-            marker,
-            backup_root,
-            preserve_provider_route: false,
-            protocol_proxy_base_url: None,
-            expected_config: None,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -380,7 +293,6 @@ pub(crate) fn apply_runtime_provider_config(
             marker: &marker,
             backup_root: &backup_root,
             preserve_provider_route: options.preserve_provider_route,
-            protocol_proxy_base_url: options.protocol_proxy_base_url,
             expected_config: options.expected_config,
         },
     )
@@ -426,86 +338,6 @@ fn fastctx_server_command() -> Result<PathBuf> {
         })
 }
 
-fn persist_previous_fastctx_guidance_migration(
-    path: &Path,
-    original: Option<Vec<u8>>,
-    include_subagent_guidance: bool,
-    label: &str,
-) -> Result<Option<Vec<u8>>> {
-    let Some(original) = original else {
-        return Ok(None);
-    };
-    let existing = str::from_utf8(&original).with_context(|| format!("{label} 不是 UTF-8"))?;
-    let Some(migrated) =
-        migrate_previous_fastctx_guidance(existing, include_subagent_guidance, label)?
-    else {
-        return Ok(Some(original));
-    };
-    if read_optional(path)?.as_deref() != Some(original.as_slice()) {
-        bail!("{label} 在历史 FastCtx 提示词迁移期间发生变化；已取消本次启动");
-    }
-    atomic_write(path, migrated.as_bytes())
-        .with_context(|| format!("持久化 {label} 的历史 FastCtx 提示词迁移失败"))?;
-    Ok(Some(migrated.into_bytes()))
-}
-
-fn migrate_previous_fastctx_guidance(
-    existing: &str,
-    include_subagent_guidance: bool,
-    label: &str,
-) -> Result<Option<String>> {
-    if !existing.contains("Codey FastCtx context tools are enabled.") {
-        return Ok(None);
-    }
-    let mut document = parse_document(existing).with_context(|| format!("解析 {label} 失败"))?;
-    let root_changed = remove_guidance_from_table(
-        document.as_table_mut(),
-        "developer_instructions",
-        remove_previous_codey_fastctx_guidance,
-    );
-    let subagent_changed = include_subagent_guidance
-        && document
-            .get_mut("features")
-            .and_then(Item::as_table_like_mut)
-            .and_then(|features| features.get_mut("multi_agent_v2"))
-            .and_then(Item::as_table_like_mut)
-            .is_some_and(|multi_agent| {
-                remove_guidance_from_table(
-                    multi_agent,
-                    "subagent_developer_instructions",
-                    remove_previous_codey_fastctx_guidance,
-                )
-            });
-    if !root_changed && !subagent_changed {
-        return Ok(None);
-    }
-    document_string(&document).map(Some)
-}
-
-fn persist_embedded_config_prompt_migration(
-    path: &Path,
-    original: Option<Vec<u8>>,
-) -> Result<Option<Vec<u8>>> {
-    let Some(original) = original else {
-        return Ok(None);
-    };
-    let existing = str::from_utf8(&original).context("Codex config.toml 不是 UTF-8")?;
-    let mut document = parse_document(existing).context("解析 Codex config.toml 失败")?;
-    if !remove_embedded_codey_prompt_sources(&mut document) {
-        return Ok(Some(original));
-    }
-    let migrated = document_string(&document)?;
-    write_codex_config(
-        path,
-        Some(original.as_slice()),
-        migrated.as_bytes(),
-        "remove obsolete Codey-owned prompt fields",
-        "codex_config.persist_embedded_config_prompt_migration",
-    )
-    .context("迁移 Codex config.toml 中的旧版 Codey 规则失败")?;
-    Ok(Some(migrated.into_bytes()))
-}
-
 fn apply_isolated_runtime_provider_config(
     home: &Path,
     profile: &ProviderProfile,
@@ -523,10 +355,8 @@ fn apply_isolated_runtime_provider_config(
         marker,
         backup_root,
         preserve_provider_route,
-        protocol_proxy_base_url,
         expected_config,
     } = options;
-    ensure_supported_provider_protocol(profile.protocol, protocol_proxy_base_url)?;
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let hooks_path = home.join("hooks.json");
@@ -546,7 +376,7 @@ fn apply_isolated_runtime_provider_config(
             && subagent_optimization
             && crate::model_catalog::is_available(home)))
     .then(|| home.join(crate::model_catalog::relative_path()));
-    let effective = patch_config_with_fastctx_mode_and_proxy(
+    let effective = patch_config_with_fastctx_mode(
         existing,
         profile,
         &provider_id,
@@ -559,7 +389,6 @@ fn apply_isolated_runtime_provider_config(
             subagent_model,
             subagent_reasoning_effort,
             preserve_provider_route,
-            protocol_proxy_base_url,
         },
     )?;
     let mut effective_document = parse_document(&effective).context("解析 Codey 运行时约束失败")?;
@@ -654,7 +483,6 @@ fn apply_isolated_runtime_provider_config(
         &runtime_agents,
         model_catalog_path.as_deref(),
         fastctx_namespace,
-        protocol_proxy_base_url,
         &provider_id,
         &hook_trust_entries,
         preserve_provider_route,
@@ -664,13 +492,6 @@ fn apply_isolated_runtime_provider_config(
     prune_stale_backup_dirs(backup_root, marker);
     let backup_dir = backup_root.join(format!("{}-{}", timestamp_millis(), std::process::id()));
     create_private_dir_all(&backup_dir)?;
-    if let Some(bytes) = original_config.as_deref() {
-        write_private_file(&backup_dir.join("config.toml"), bytes)?;
-    }
-    write_private_file(
-        &backup_dir.join(APPLIED_CONFIG_FILE),
-        original_config.as_deref().unwrap_or_default(),
-    )?;
     if let Some(bytes) = original_hooks.as_deref() {
         write_private_file(&backup_dir.join("hooks.json"), bytes)?;
     }
@@ -681,10 +502,6 @@ fn apply_isolated_runtime_provider_config(
 
     let state = RuntimeConfigLease {
         backup_dir: backup_dir.clone(),
-        config_snapshot_dir: None,
-        original_config_exists: original_config.is_some(),
-        preserve_provider_route,
-        protocol_proxy_base_url: protocol_proxy_base_url.map(str::to_string),
         fastctx_command: fastctx_command.map(Path::to_path_buf),
         subagent_optimization_applied: subagent_optimization,
         subagent_model: subagent_model.to_string(),
@@ -700,8 +517,6 @@ fn apply_isolated_runtime_provider_config(
         original_agents_md_exists: false,
         original_default_agent_exists: false,
         original_agents_dir_exists: home.join("agents").is_dir(),
-        provider_id: Some(provider_id.clone()),
-        applied_base_url: protocol_proxy_base_url.map(str::to_string),
         isolated_runtime_constraints: true,
         independent_prompt_sources: true,
         runtime_hooks_applied: updated_hooks.is_some(),
@@ -779,7 +594,6 @@ fn apply_isolated_cc_switch_runtime_config(
     subagent_model: &str,
     subagent_reasoning_effort: &str,
     subagent_roles: Option<&BTreeMap<String, SubagentRoleConfig>>,
-    protocol_proxy_base_url: Option<&str>,
     expected_config: Option<&[u8]>,
     marker: &Path,
     backup_root: &Path,
@@ -799,7 +613,6 @@ fn apply_isolated_cc_switch_runtime_config(
             marker,
             backup_root,
             preserve_provider_route: true,
-            protocol_proxy_base_url,
             expected_config,
         },
     )
@@ -825,56 +638,6 @@ fn read_or_create_constraint_file_with_exact_migration(
         return Ok(default_contents.to_string());
     }
     Ok(existing)
-}
-
-fn persist_embedded_subagent_guidance_migration(
-    path: &Path,
-    original: Option<Vec<u8>>,
-) -> Result<Option<Vec<u8>>> {
-    let Some(original) = original else {
-        return Ok(None);
-    };
-    let existing = str::from_utf8(&original).context("Codex AGENTS.md 不是 UTF-8")?;
-    let Some(migrated) = remove_subagent_guidance(existing) else {
-        return Ok(Some(original));
-    };
-    if read_optional(path)?.as_deref() != Some(original.as_slice()) {
-        bail!("Codex AGENTS.md 在 Codey 规则迁移期间发生变化；已取消本次启动");
-    }
-    if migrated.trim().is_empty() {
-        remove_optional(path)?;
-        return Ok(None);
-    }
-    atomic_write(path, migrated.as_bytes())
-        .context("迁移 Codex AGENTS.md 中的旧版 Codey 规则失败")?;
-    Ok(Some(migrated.into_bytes()))
-}
-
-fn persist_legacy_default_agent_migration(
-    path: &Path,
-    original: Option<Vec<u8>>,
-) -> Result<Option<Vec<u8>>> {
-    let Some(original) = original else {
-        return Ok(None);
-    };
-    let existing = str::from_utf8(&original).context("Codex agents/default.toml 不是 UTF-8")?;
-    let migrated = remove_codey_fastctx_guidance(existing).unwrap_or_else(|| existing.to_string());
-    let previous_default = previous_default_agent_config_without_sandbox();
-    let codey_owned =
-        [DEFAULT_AGENT_CONFIG, previous_default.as_str()].contains(&migrated.as_str());
-    if !codey_owned && migrated == existing {
-        return Ok(Some(original));
-    }
-    if read_optional(path)?.as_deref() != Some(original.as_slice()) {
-        bail!("Codex agents/default.toml 在 Codey 规则迁移期间发生变化；已取消本次启动");
-    }
-    if codey_owned {
-        remove_optional(path)?;
-        return Ok(None);
-    }
-    atomic_write(path, migrated.as_bytes())
-        .context("迁移 Codex agents/default.toml 中的旧版 Codey 规则失败")?;
-    Ok(Some(migrated.into_bytes()))
 }
 
 fn runtime_subagent_roles(
@@ -1027,27 +790,6 @@ fn runtime_agent_hashes(registrations: &[RuntimeAgentRegistration]) -> BTreeMap<
         .collect()
 }
 
-fn register_runtime_agents(
-    document: &mut DocumentMut,
-    registrations: &[RuntimeAgentRegistration],
-) -> Result<()> {
-    if registrations.is_empty() {
-        return Ok(());
-    }
-    let agents = ensure_root_table(document, "agents")?;
-    for registration in registrations {
-        if agents.get(&registration.role).is_none() {
-            agents[&registration.role] = Item::Table(Table::new());
-        }
-        let role_table = agents[&registration.role]
-            .as_table_mut()
-            .with_context(|| format!("agents.{} 必须是 TOML table", registration.role))?;
-        role_table["description"] = value(&registration.description);
-        role_table["config_file"] = value(registration.config_file.to_string_lossy().into_owned());
-    }
-    Ok(())
-}
-
 fn apply_isolated_prompt_sources(
     document: &mut DocumentMut,
     root_instructions: Option<&str>,
@@ -1123,126 +865,6 @@ fn apply_isolated_prompt_sources(
         );
     }
     Ok(())
-}
-
-fn remove_embedded_codey_prompt_sources(document: &mut DocumentMut) -> bool {
-    let mut changed = remove_guidance_from_table(
-        document.as_table_mut(),
-        "developer_instructions",
-        remove_codey_fastctx_guidance,
-    );
-    changed |= remove_guidance_from_table(
-        document.as_table_mut(),
-        "developer_instructions",
-        remove_subagent_guidance,
-    );
-
-    let Some(multi_agent) = document
-        .get_mut("features")
-        .and_then(Item::as_table_like_mut)
-        .and_then(|features| features.get_mut("multi_agent_v2"))
-        .and_then(Item::as_table_like_mut)
-    else {
-        return changed;
-    };
-    changed |= remove_guidance_from_table(
-        multi_agent,
-        "subagent_developer_instructions",
-        remove_codey_fastctx_guidance,
-    );
-    changed |= remove_guidance_from_table(
-        multi_agent,
-        "subagent_developer_instructions",
-        remove_subagent_guidance,
-    );
-    let Some(existing) = multi_agent
-        .get("root_agent_usage_hint_text")
-        .and_then(Item::as_str)
-        .map(str::to_string)
-    else {
-        return changed;
-    };
-    let cleaned = ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS
-        .iter()
-        .fold(existing.clone(), |current, guidance| {
-            remove_constraint_text(&current, guidance)
-        });
-    if cleaned == existing {
-        return changed;
-    }
-    if cleaned.trim().is_empty() {
-        multi_agent.remove("root_agent_usage_hint_text");
-    } else {
-        multi_agent.insert("root_agent_usage_hint_text", value(cleaned));
-    }
-    true
-}
-
-#[cfg(test)]
-fn build_independent_prompt_runtime_overrides(
-    config_contents: &[u8],
-    constraints_dir: &Path,
-    subagent_optimization: bool,
-) -> Result<Vec<String>> {
-    let config = str::from_utf8(config_contents).context("Codex config.toml 不是 UTF-8")?;
-    let mut effective = parse_document(config).context("解析 Codey 独立规则运行时配置失败")?;
-    let fastctx_enabled = effective
-        .get("mcp_servers")
-        .and_then(Item::as_table)
-        .and_then(|servers| servers.get(CODEY_FASTCTX_SERVER_ID))
-        .and_then(Item::as_table)
-        .is_some_and(fastctx_table_server_is_codey_owned);
-    let read_source = |name: &str| -> Result<String> {
-        let path = constraints_dir.join(name);
-        fs::read_to_string(&path)
-            .with_context(|| format!("读取 Codey 独立规则文件失败：{}", path.display()))
-    };
-    let fastctx_instructions = fastctx_enabled
-        .then(|| read_source(CODEY_FASTCTX_INSTRUCTIONS_FILE))
-        .transpose()?;
-    let root_instructions = subagent_optimization
-        .then(|| read_source(CODEY_ROOT_INSTRUCTIONS_FILE))
-        .transpose()?;
-    let collaboration_hint = subagent_optimization
-        .then(|| read_source(CODEY_COLLABORATION_HINT_FILE))
-        .transpose()?;
-    apply_isolated_prompt_sources(
-        &mut effective,
-        root_instructions.as_deref(),
-        fastctx_instructions.as_deref(),
-        collaboration_hint.as_deref(),
-    )?;
-
-    let mut overrides = Vec::new();
-    if fastctx_enabled || subagent_optimization {
-        push_required_document_override(
-            &mut overrides,
-            &effective,
-            &["developer_instructions"],
-            "developer_instructions",
-        )?;
-    }
-    if subagent_optimization {
-        push_required_document_override(
-            &mut overrides,
-            &effective,
-            &["features", "multi_agent_v2", "root_agent_usage_hint_text"],
-            "features.multi_agent_v2.root_agent_usage_hint_text",
-        )?;
-    }
-    if fastctx_enabled && subagent_optimization {
-        push_required_document_override(
-            &mut overrides,
-            &effective,
-            &[
-                "features",
-                "multi_agent_v2",
-                "subagent_developer_instructions",
-            ],
-            "features.multi_agent_v2.subagent_developer_instructions",
-        )?;
-    }
-    Ok(overrides)
 }
 
 fn append_table_constraint_text(
@@ -1507,71 +1129,6 @@ pub fn restore_runtime_provider_config(home: &Path) -> Result<bool> {
     restore_runtime_provider_config_at(home, &marker)
 }
 
-pub(crate) fn restore_runtime_cc_switch_provider_config(home: &Path) -> Result<bool> {
-    let marker = lease_marker_path();
-    let _runtime_config_lock = RuntimeConfigLock::acquire(&marker)?;
-    restore_runtime_cc_switch_provider_config_at(home, &marker)
-}
-
-fn restore_runtime_cc_switch_provider_config_at(home: &Path, marker: &Path) -> Result<bool> {
-    let state = match fs::read_to_string(marker) {
-        Ok(contents) => serde_json::from_str::<RuntimeConfigLease>(&contents)
-            .with_context(|| format!("解析 Codey Codex lease 失败：{}", marker.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
-    if state.isolated_runtime_constraints {
-        return Ok(false);
-    }
-    if state.preserve_provider_route || state.protocol_proxy_base_url.is_none() {
-        return Ok(false);
-    }
-    let Some(provider_id) = state.provider_id.as_deref() else {
-        return Ok(false);
-    };
-    let Some(applied_base_url) = state.applied_base_url.as_deref() else {
-        return Ok(false);
-    };
-    let config_path = home.join("config.toml");
-    let Some(current_bytes) = read_codex_config(&config_path)? else {
-        return Ok(false);
-    };
-    let current = str::from_utf8(&current_bytes)
-        .with_context(|| format!("Codex 配置不是 UTF-8：{}", config_path.display()))?;
-    let provider_still_active =
-        root_key_string(current, "model_provider").as_deref() == Some(provider_id);
-    let proxy_still_applied =
-        provider_base_url(current, provider_id).as_deref() == Some(applied_base_url);
-    if !provider_still_active || !proxy_still_applied {
-        return Ok(false);
-    }
-
-    let config_snapshot_dir = state
-        .config_snapshot_dir
-        .as_deref()
-        .unwrap_or(&state.backup_dir);
-    let original = if state.original_config_exists {
-        fs::read_to_string(config_snapshot_dir.join("config.toml"))
-            .context("读取 Codex 原配置备份失败")?
-    } else {
-        String::new()
-    };
-    let applied = fs::read_to_string(config_snapshot_dir.join(APPLIED_CONFIG_FILE))
-        .context("读取 Codey 已应用配置快照失败")?;
-    let restored = restore_owned_model_provider_changes(&original, &applied, current)?;
-    if restored == current {
-        return Ok(false);
-    }
-    write_codex_config(
-        &config_path,
-        Some(&current_bytes),
-        restored.as_bytes(),
-        "restore route endpoint after runtime overlay",
-        "codex_config.restore_runtime_cc_switch_provider_config_at",
-    )?;
-    Ok(true)
-}
-
 fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool> {
     let state = match fs::read_to_string(marker) {
         Ok(contents) => serde_json::from_str::<RuntimeConfigLease>(&contents)
@@ -1583,63 +1140,11 @@ fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool
         rollback_isolated_runtime_config(home, marker, &state)?;
         return Ok(true);
     }
-    let config_path = home.join("config.toml");
-    let current_bytes = read_codex_config(&config_path)?;
-    let current = str::from_utf8(current_bytes.as_deref().unwrap_or_default())
-        .with_context(|| format!("Codex 配置不是 UTF-8：{}", config_path.display()))?;
-    let provider_id = state.provider_id.as_deref().unwrap_or(CODEY_PROVIDER_ID);
-    let provider_matches =
-        root_key_string(current, "model_provider").as_deref() == Some(provider_id);
-    let endpoint_matches = state.applied_base_url.as_deref().is_none_or(|base_url| {
-        provider_base_url(current, provider_id).as_deref() == Some(base_url)
-    });
-    let route_still_applied =
-        state.preserve_provider_route || (provider_matches && endpoint_matches);
-
-    let config_snapshot_dir = state
-        .config_snapshot_dir
-        .as_deref()
-        .unwrap_or(&state.backup_dir);
-    let backup_config = config_snapshot_dir.join("config.toml");
-    let original = if state.original_config_exists {
-        fs::read_to_string(&backup_config)
-            .with_context(|| format!("找不到 Codex 原配置备份：{}", backup_config.display()))?
-    } else {
-        String::new()
-    };
-    let applied_config = config_snapshot_dir.join(APPLIED_CONFIG_FILE);
-    let restored = if applied_config.exists() {
-        let applied = fs::read_to_string(&applied_config).with_context(|| {
-            format!(
-                "读取 Codey 已应用配置快照失败：{}",
-                applied_config.display()
-            )
-        })?;
-        restore_owned_config_changes(&original, &applied, current)?
-    } else {
-        restore_legacy_owned_config_changes(&original, current, provider_id)?
-    };
-    if !state.original_config_exists && restored.trim().is_empty() {
-        remove_codex_config(
-            &config_path,
-            current_bytes.as_deref(),
-            "restore missing pre-Codey config state",
-            "codex_config.restore_runtime_provider_config_at",
-        )?;
-    } else {
-        write_codex_config(
-            &config_path,
-            current_bytes.as_deref(),
-            restored.as_bytes(),
-            "three-way restore of Codey-owned runtime fields",
-            "codex_config.restore_runtime_provider_config_at",
-        )?;
-    }
     restore_runtime_hooks_file(home, &state)?;
     restore_runtime_subagent_files(home, &state)?;
     crate::subagent_gate::clear_runtime_subagent_policy(home)?;
     remove_optional(marker)?;
-    Ok(route_still_applied)
+    Ok(true)
 }
 
 fn restore_runtime_subagent_files(home: &Path, state: &RuntimeConfigLease) -> Result<()> {
@@ -1853,7 +1358,7 @@ fn patch_config_with_fastctx(
     fastctx_command: Option<&Path>,
     subagent_optimization: bool,
 ) -> Result<String> {
-    patch_config_with_fastctx_mode_and_proxy(
+    patch_config_with_fastctx_mode(
         existing,
         profile,
         provider_id,
@@ -1866,7 +1371,6 @@ fn patch_config_with_fastctx(
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             preserve_provider_route: false,
-            protocol_proxy_base_url: None,
         },
     )
 }
@@ -1880,10 +1384,9 @@ struct ProviderPatchOptions<'a> {
     subagent_model: &'a str,
     subagent_reasoning_effort: &'a str,
     preserve_provider_route: bool,
-    protocol_proxy_base_url: Option<&'a str>,
 }
 
-fn patch_config_with_fastctx_mode_and_proxy(
+fn patch_config_with_fastctx_mode(
     existing: &str,
     profile: &ProviderProfile,
     provider_id: &str,
@@ -1898,7 +1401,6 @@ fn patch_config_with_fastctx_mode_and_proxy(
         subagent_model,
         subagent_reasoning_effort,
         preserve_provider_route,
-        protocol_proxy_base_url,
     } = options;
     // Official OpenAI routes use Codex's built-in model metadata. In
     // particular, do not let Codey's generated catalog override the official
@@ -1907,12 +1409,9 @@ fn patch_config_with_fastctx_mode_and_proxy(
     let model_catalog_path = (!profile.cc_switch_read_only)
         .then_some(model_catalog_path)
         .flatten();
-    if !preserve_provider_route {
-        ensure_supported_provider_protocol(profile.protocol, protocol_proxy_base_url)?;
-    }
     let mut doc = parse_document(existing)?;
     if preserve_provider_route {
-        apply_preserved_provider_route(&mut doc, protocol_proxy_base_url)?;
+        ensure_active_provider_uses_responses(&doc)?;
     }
     // CC Switch owns all routing and model-selection fields while Live
     // takeover is active. Codey only layers its independent runtime
@@ -1941,7 +1440,7 @@ fn patch_config_with_fastctx_mode_and_proxy(
             let provider = if profile.cc_switch_read_only {
                 official_provider_table(existing_local_provider)
             } else {
-                direct_provider_table(profile, existing_local_provider, protocol_proxy_base_url)?
+                direct_provider_table(profile, existing_local_provider)?
             };
             doc["model_providers"]
                 .as_table_mut()
@@ -2307,7 +1806,6 @@ fn build_isolated_runtime_overrides(
     runtime_agents: &[RuntimeAgentRegistration],
     model_catalog_path: Option<&Path>,
     fastctx_namespace: Option<&str>,
-    protocol_proxy_base_url: Option<&str>,
     provider_id: &str,
     hook_trust_entries: &[RuntimeHookTrustEntry],
     preserve_provider_route: bool,
@@ -2321,21 +1819,7 @@ fn build_isolated_runtime_overrides(
     )?;
     push_required_document_override(&mut overrides, effective, &["service_tier"], "service_tier")?;
 
-    if preserve_provider_route && protocol_proxy_base_url.is_some() {
-        let provider_segment = toml_string_literal(provider_id);
-        push_required_document_override(
-            &mut overrides,
-            effective,
-            &["model_providers", provider_id, "base_url"],
-            &format!("model_providers.{provider_segment}.base_url"),
-        )?;
-        push_required_document_override(
-            &mut overrides,
-            effective,
-            &["model_providers", provider_id, "wire_api"],
-            &format!("model_providers.{provider_segment}.wire_api"),
-        )?;
-    } else if !preserve_provider_route {
+    if !preserve_provider_route {
         push_required_document_override(
             &mut overrides,
             effective,
@@ -3096,21 +2580,8 @@ fn codey_hook_inline_table(
 fn direct_provider_table(
     profile: &ProviderProfile,
     existing_local_provider: Option<Table>,
-    protocol_proxy_base_url: Option<&str>,
 ) -> Result<Table> {
-    // 本地协议代理启动后统一接管 base_url：Chat Completions 线路整体转换，
-    // Responses 线路仅第三方模型逐请求转换、官方模型直通。
-    let proxied_base_url = protocol_proxy_base_url
-        .map(str::trim)
-        .filter(|base_url| !base_url.is_empty())
-        .map(str::to_string);
-    let base_url = match (proxied_base_url, profile.protocol) {
-        (Some(proxy_base_url), _) => proxy_base_url,
-        (None, RelayProtocol::Responses) => profile.normalized_base_url(),
-        (None, RelayProtocol::ChatCompletions) => {
-            anyhow::bail!("Chat Completions 线路的本地协议代理尚未启动")
-        }
-    };
+    let base_url = profile.normalized_base_url();
     if base_url.is_empty() {
         anyhow::bail!("第三方线路缺少 API 地址");
     }
@@ -3130,53 +2601,6 @@ fn direct_provider_table(
         provider["experimental_bearer_token"] = value(profile.api_key.trim());
     }
     Ok(provider)
-}
-
-fn ensure_supported_provider_protocol(
-    protocol: RelayProtocol,
-    protocol_proxy_base_url: Option<&str>,
-) -> Result<()> {
-    match protocol {
-        RelayProtocol::Responses => Ok(()),
-        RelayProtocol::ChatCompletions
-            if protocol_proxy_base_url
-                .map(str::trim)
-                .is_some_and(|base_url| !base_url.is_empty()) =>
-        {
-            Ok(())
-        }
-        RelayProtocol::ChatCompletions => {
-            anyhow::bail!("Chat Completions 线路的本地 Responses 协议代理尚未启动")
-        }
-    }
-}
-
-fn apply_preserved_provider_route(
-    doc: &mut DocumentMut,
-    protocol_proxy_base_url: Option<&str>,
-) -> Result<()> {
-    let Some(protocol_proxy_base_url) = protocol_proxy_base_url
-        .map(str::trim)
-        .filter(|base_url| !base_url.is_empty())
-    else {
-        return ensure_active_provider_uses_responses(doc);
-    };
-    let provider_id = doc
-        .get("model_provider")
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .filter(|provider_id| !provider_id.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("CC Switch Live 配置缺少活动 model_provider"))?
-        .to_string();
-    let provider = doc
-        .get_mut("model_providers")
-        .and_then(Item::as_table_mut)
-        .and_then(|providers| providers.get_mut(&provider_id))
-        .and_then(Item::as_table_mut)
-        .ok_or_else(|| anyhow::anyhow!("CC Switch Live 配置缺少活动 Provider「{provider_id}」"))?;
-    provider["base_url"] = value(protocol_proxy_base_url);
-    provider["wire_api"] = value("responses");
-    Ok(())
 }
 
 fn ensure_active_provider_uses_responses(doc: &DocumentMut) -> Result<()> {
@@ -3336,11 +2760,13 @@ fn set_model_selection(doc: &mut DocumentMut, default_model: Option<&str>) {
     doc["model"] = value(default_model);
 }
 
+#[cfg(test)]
 fn root_key_string(contents: &str, key: &str) -> Option<String> {
     let doc = contents.parse::<DocumentMut>().ok()?;
     doc.get(key).and_then(Item::as_str).map(ToString::to_string)
 }
 
+#[cfg(test)]
 fn provider_base_url(contents: &str, provider_id: &str) -> Option<String> {
     let doc = contents.parse::<DocumentMut>().ok()?;
     doc.get("model_providers")

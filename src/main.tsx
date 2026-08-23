@@ -45,7 +45,6 @@ if (import.meta.env.DEV) {
           name: "主力代理 (ChatGPT)",
           baseUrl: previewEndpoints.primary,
           apiKey: previewApiKey,
-          protocol: "responses" as const,
           ccSwitchProviderId: "primary",
           ccSwitchReadOnly: false,
         },
@@ -54,7 +53,6 @@ if (import.meta.env.DEV) {
           name: "备用中转 (Claude)",
           baseUrl: previewEndpoints.backup,
           apiKey: "",
-          protocol: "responses" as const,
           ccSwitchProviderId: "backup",
           ccSwitchReadOnly: false,
         },
@@ -106,7 +104,6 @@ if (import.meta.env.DEV) {
         apiKeyConfigured: true,
         clearApiKey: false,
         model: "gpt-5.6-sol",
-        protocol: "responses" as const,
         instruction: "",
       },
       codexAppPath: "/Applications/ChatGPT.app",
@@ -146,7 +143,6 @@ if (import.meta.env.DEV) {
         name: "主力代理 (ChatGPT)",
         official: false,
         baseUrl: previewEndpoints.primary,
-        protocol: "responses" as const,
       },
     };
     let previewModelState = {
@@ -367,7 +363,6 @@ if (import.meta.env.DEV) {
             apiKeyConfigured: true,
             clearApiKey: false,
             model: previewModelState.defaultModel,
-            protocol: previewCcSwitch.provider.protocol,
           },
         };
         return { config: previewConfig };

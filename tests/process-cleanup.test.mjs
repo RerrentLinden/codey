@@ -115,7 +115,7 @@ test("startup stops the old Codex before permanent session maintenance", async (
 
   assert.notEqual(stopOldCodex, -1);
   assert.notEqual(permanentMaintenance, -1);
-  assert.notEqual(protocolProxy, -1);
+  assert.equal(protocolProxy, -1);
   assert.ok(
     stopOldCodex < permanentMaintenance,
     "the old Codex writer must stop before session files are maintained",

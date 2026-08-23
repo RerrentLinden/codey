@@ -9,10 +9,7 @@ use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
 use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved;
-use codey_runtime_core::launcher::{
-    ProtocolProxyHandle, build_codex_command, start_protocol_proxy,
-};
-use codey_runtime_core::settings::{BackendSettings, RelayMode, RelayProfile, RelayProtocol};
+use codey_runtime_core::launcher::build_codex_command;
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
 use serde::Serialize;
 use tokio::process::Child;
@@ -24,8 +21,7 @@ use crate::cc_switch::{self, RouteTakeoverState};
 use crate::cdp;
 use crate::codex_config::{
     RuntimeProviderConfigOptions, apply_runtime_provider_config, codex_home,
-    current_model_provider, restore_runtime_cc_switch_provider_config,
-    restore_runtime_provider_config,
+    current_model_provider, restore_runtime_provider_config,
 };
 use crate::config::{CodeyConfig, GpuLaunchMode, ProviderProfile};
 use crate::crashpad_pending_guard::{self, CrashpadPendingStatsHandle};
@@ -146,88 +142,6 @@ pub struct CodeyRuntime {
     crashpad_guard_enabled: Arc<AtomicBool>,
     crashpad_guard_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     crashpad_guard_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    protocol_proxy: Mutex<Option<ProtocolProxyHandle>>,
-}
-
-fn protocol_proxy_settings(
-    profile: &ProviderProfile,
-    default_model: Option<&str>,
-    chat_completions_models: &[String],
-) -> Option<BackendSettings> {
-    if profile.cc_switch_read_only {
-        return None;
-    }
-    let chat_completions_models = match profile.protocol {
-        RelayProtocol::ChatCompletions => Vec::new(),
-        RelayProtocol::Responses => {
-            // A third-party relay may advertise official model slugs while its
-            // Responses stream still does not satisfy Codex's terminal-event
-            // contract. Only start the per-model compatibility proxy when at
-            // least one model needs Chat Completions conversion.
-            if chat_completions_models.is_empty() {
-                return None;
-            }
-            chat_completions_models.to_vec()
-        }
-    };
-    let base_url = profile.normalized_base_url();
-    let relay = RelayProfile {
-        id: profile.id.clone(),
-        name: profile.name.clone(),
-        model: default_model.unwrap_or_default().to_string(),
-        base_url: base_url.clone(),
-        upstream_base_url: base_url,
-        api_key: profile.api_key.clone(),
-        protocol: profile.protocol,
-        relay_mode: RelayMode::PureApi,
-        chat_completions_models,
-        ..RelayProfile::default()
-    };
-    Some(BackendSettings {
-        active_relay_id: relay.id.clone(),
-        relay_profiles: vec![relay],
-        enhancements_enabled: false,
-        ..BackendSettings::default()
-    })
-}
-
-fn chat_completions_models_for_protocol_proxy(
-    profile: &ProviderProfile,
-    model_state: &model_catalog::ModelSelectionState,
-) -> Vec<String> {
-    if profile.cc_switch_read_only || profile.protocol != RelayProtocol::Responses {
-        return Vec::new();
-    }
-
-    let mut models = model_state.third_party_models.clone();
-    for official_model in model_state
-        .official_models
-        .iter()
-        .filter(|model| model.supported)
-    {
-        if !models
-            .iter()
-            .any(|model| model.eq_ignore_ascii_case(&official_model.slug))
-        {
-            models.push(official_model.slug.clone());
-        }
-    }
-    models
-}
-
-async fn start_runtime_protocol_proxy(
-    profile: &ProviderProfile,
-    default_model: Option<&str>,
-    chat_completions_models: &[String],
-) -> Result<Option<ProtocolProxyHandle>> {
-    let Some(settings) = protocol_proxy_settings(profile, default_model, chat_completions_models)
-    else {
-        return Ok(None);
-    };
-    start_protocol_proxy(settings)
-        .await
-        .map(Some)
-        .context("启动本地协议代理失败")
 }
 
 async fn resolve_startup_provider(home: &std::path::Path) -> Result<String> {
@@ -439,7 +353,6 @@ async fn resolve_configured_codex_app_dir(config: &CodeyConfig) -> Result<PathBu
 struct CodexStartupStateOptions<'a> {
     original_provider: &'a str,
     preserve_provider_route: bool,
-    protocol_proxy_base_url: Option<&'a str>,
     expected_config: Option<&'a [u8]>,
 }
 
@@ -585,7 +498,6 @@ async fn prepare_codex_startup_state(
     let CodexStartupStateOptions {
         original_provider,
         preserve_provider_route,
-        protocol_proxy_base_url,
         expected_config,
     } = options;
     let StartupModelCatalog {
@@ -604,8 +516,6 @@ async fn prepare_codex_startup_state(
     let subagent_model = runtime_subagent_config.subagent_model.clone();
     let subagent_reasoning_effort = runtime_subagent_config.subagent_reasoning_effort.clone();
     let subagent_roles = runtime_subagent_config.subagent_roles.clone();
-    let protocol_proxy_base_url = protocol_proxy_base_url.map(str::to_string);
-    let protocol_proxy_enabled = protocol_proxy_base_url.is_some();
     let expected_config = expected_config.map(<[u8]>::to_vec);
     let runtime_config = tokio::task::spawn_blocking(move || {
         apply_runtime_provider_config(
@@ -621,7 +531,6 @@ async fn prepare_codex_startup_state(
                 subagent_reasoning_effort: &subagent_reasoning_effort,
                 subagent_roles: Some(&subagent_roles),
                 preserve_provider_route,
-                protocol_proxy_base_url: protocol_proxy_base_url.as_deref(),
                 expected_config: expected_config.as_deref(),
             },
         )
@@ -639,7 +548,6 @@ async fn prepare_codex_startup_state(
                 "fastContextTools": config.fast_context_tools,
                 "subagentOptimization": config.subagent_optimization,
                 "preserveProviderRoute": preserve_provider_route,
-                "protocolProxyEnabled": protocol_proxy_enabled,
                 "taskJoinFailed": true,
             }),
         );
@@ -656,7 +564,6 @@ async fn prepare_codex_startup_state(
                 "fastContextTools": config.fast_context_tools,
                 "subagentOptimization": config.subagent_optimization,
                 "preserveProviderRoute": preserve_provider_route,
-                "protocolProxyEnabled": protocol_proxy_enabled,
             }),
         );
         error
@@ -1052,7 +959,6 @@ struct StartupStorageState {
 }
 
 struct PreparedProviderState {
-    protocol_proxy: Option<ProtocolProxyHandle>,
     applied_route_files: Option<RouteFilesSnapshot>,
     runtime_config: CodeyConfig,
     runtime_config_overrides: Vec<String>,
@@ -1234,8 +1140,6 @@ async fn prepare_runtime_provider_state(
     config: &CodeyConfig,
     route: &StartupRouteContext,
 ) -> Result<PreparedProviderState> {
-    // 模型目录先于协议代理准备：第三方 Responses 线路上的全部可用模型都
-    // 通过兼容代理收口，避免上游缺少 response.completed 时让 Codex 中断。
     let startup_catalog = prepare_startup_model_catalog(
         config,
         &route.current_profile,
@@ -1243,32 +1147,6 @@ async fn prepare_runtime_provider_state(
         route.preserve_provider_route,
     )
     .await?;
-    let chat_completions_models = chat_completions_models_for_protocol_proxy(
-        &route.current_profile,
-        &startup_catalog.model_state,
-    );
-    let protocol_proxy = start_runtime_protocol_proxy(
-        &route.current_profile,
-        config.default_model(),
-        &chat_completions_models,
-    )
-    .await
-    .map_err(|error| {
-        error_log::record_failure(
-            "protocol_proxy_start_failed",
-            "start_protocol_proxy",
-            format!("{error:#}"),
-            serde_json::json!({
-                "provider": route.original_provider,
-                "protocol": route.current_profile.protocol,
-                "chatCompletionsModels": chat_completions_models.len(),
-            }),
-        );
-        error
-    })?;
-    let protocol_proxy_base_url = protocol_proxy
-        .as_ref()
-        .map(|proxy| proxy.base_url().to_string());
     let prepared_startup = prepare_codex_startup_state(
         config,
         &route.current_profile,
@@ -1276,7 +1154,6 @@ async fn prepare_runtime_provider_state(
         CodexStartupStateOptions {
             original_provider: &route.original_provider,
             preserve_provider_route: route.preserve_provider_route,
-            protocol_proxy_base_url: protocol_proxy_base_url.as_deref(),
             expected_config: route
                 .live_route
                 .as_ref()
@@ -1293,7 +1170,6 @@ async fn prepare_runtime_provider_state(
             auth: live_route.auth_contents().map(<[u8]>::to_vec),
         });
     Ok(PreparedProviderState {
-        protocol_proxy,
         applied_route_files,
         runtime_config: prepared_startup.runtime_config,
         runtime_config_overrides: prepared_startup.runtime_config_overrides,
@@ -1551,7 +1427,6 @@ impl CodeyRuntime {
         )
         .await?;
         let PreparedProviderState {
-            protocol_proxy,
             applied_route_files,
             runtime_config,
             runtime_config_overrides,
@@ -1574,7 +1449,6 @@ impl CodeyRuntime {
             &runtime_config_overrides,
         )
         .await?;
-        restore_cc_switch_provider_after_startup(home, &route).await;
         #[cfg(target_os = "macos")]
         let inspector_argument = spawned.inspector_argument.clone();
         let process_id = spawned.process_id;
@@ -1626,7 +1500,6 @@ impl CodeyRuntime {
                 crashpad_guard_enabled,
                 crashpad_guard_shutdown: Mutex::new(Some(crashpad_guard_shutdown)),
                 crashpad_guard_task: Mutex::new(Some(crashpad_guard_task)),
-                protocol_proxy: Mutex::new(protocol_proxy),
             },
             codex_exit,
             patch.route_changed,
@@ -1679,11 +1552,6 @@ impl CodeyRuntime {
         if let Some(child) = self.child.lock().await.take() {
             reap_child_after_cleanup(child, "reap_child_during_runtime_stop").await;
         }
-        let protocol_proxy_stop = if let Some(proxy) = self.protocol_proxy.lock().await.take() {
-            proxy.shutdown().await
-        } else {
-            Ok(())
-        };
         let config_restore = restore_runtime_config(codex_home()).await;
         if let Err(error) = &process_stop {
             error_log::record_failure(
@@ -1696,20 +1564,9 @@ impl CodeyRuntime {
                 }),
             );
         }
-        if let Err(error) = &protocol_proxy_stop {
-            error_log::record_failure(
-                "cleanup_failed",
-                "stop_chat_completions_protocol_proxy",
-                format!("{error:#}"),
-                serde_json::json!({}),
-            );
-        }
         let mut failures = Vec::new();
         if let Err(error) = process_stop {
             failures.push(format!("清理 Codex 遗留进程失败：{error:#}"));
-        }
-        if let Err(error) = protocol_proxy_stop {
-            failures.push(format!("关闭本地协议代理失败：{error:#}"));
         }
         if let Err(error) = config_restore {
             failures.push(format!("恢复 Codex 配置失败：{error:#}"));
@@ -1730,37 +1587,6 @@ fn preserve_cc_switch_route(state: RouteTakeoverState) -> Result<bool> {
         );
     }
     Ok(state.live)
-}
-
-async fn restore_cc_switch_provider_after_startup(
-    home: &std::path::Path,
-    route: &StartupRouteContext,
-) {
-    if route.preserve_provider_route
-        || route.current_profile.protocol != RelayProtocol::ChatCompletions
-        || route.current_profile.cc_switch_provider_id.is_none()
-    {
-        return;
-    }
-    let home = home.to_path_buf();
-    let restored =
-        tokio::task::spawn_blocking(move || restore_runtime_cc_switch_provider_config(&home))
-            .await
-            .map_err(|error| {
-                anyhow::Error::new(error).context("还原 CC Switch Provider 任务异常退出")
-            })
-            .and_then(|result| result);
-    if let Err(error) = restored {
-        error_log::record_failure(
-            "restore_failed",
-            "restore_cc_switch_provider_after_startup",
-            format!("{error:#}"),
-            serde_json::json!({
-                "provider": route.original_provider,
-            }),
-        );
-        eprintln!("Codex 启动后还原 CC Switch Provider 失败：{error:#}");
-    }
 }
 
 fn spawn_crashpad_guard_watcher(

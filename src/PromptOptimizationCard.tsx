@@ -23,10 +23,6 @@ const FETCH_MODELS_TIMEOUT_MS = 20_000;
 const SAVED_API_KEY_MASK = "****************";
 const DEFAULT_OPTIMIZER_INSTRUCTION =
   "你是提示词优化专家。用户会提供一段提示词，请在不改变其意图的前提下，把它重写为更清晰、更具体、可执行的高质量提示词。只输出优化后的提示词本身，不要添加任何解释、前言、后记或代码围栏。";
-const PROMPT_OPTIMIZATION_PROTOCOL_OPTIONS = [
-  { label: "Responses API", value: "responses" },
-  { label: "Chat Completions", value: "chatCompletions" },
-];
 
 type PromptOptimizationCardProps = {
   config: Config;
@@ -189,7 +185,7 @@ function PromptOptimizationCardComponent({
       setModelsResult({ tone: "idle", text: "" });
       setSyncResult({
         tone: "success",
-        text: `已同步「${provider.name}」的地址、密钥、上游格式和默认模型`,
+        text: `已同步「${provider.name}」的地址、密钥、Responses API 和默认模型`,
       });
     } catch (error) {
       setSyncResult({ tone: "error", text: errorText(error) });
@@ -435,32 +431,6 @@ function PromptOptimizationCardComponent({
                   </Button>
                 </div>
               </div>
-
-              <label className="field prompt-optimization-protocol-field">
-                <span>上游格式</span>
-                <div className="input-shell">
-                  <IconPlugConnected size={15} aria-hidden="true" />
-                  <Select
-                    className="prompt-optimization-protocol-select"
-                    value={optimization.protocol}
-                    disabled={isBusy}
-                    aria-label="提示词优化上游 API 格式"
-                    optionList={PROMPT_OPTIMIZATION_PROTOCOL_OPTIONS}
-                    dropdownClassName="prompt-optimization-protocol-dropdown"
-                    showClear={false}
-                    filter={false}
-                    getPopupContainer={() => popupContainer ?? document.body}
-                    zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                    onChange={(value) => {
-                      clearModelSuggestions();
-                      updateOptimization({
-                        protocol: String(value) as
-                          "responses" | "chatCompletions",
-                      });
-                    }}
-                  />
-                </div>
-              </label>
 
               <div className="field prompt-optimization-model-field">
                 <label htmlFor={modelInputId}>模型</label>

@@ -268,6 +268,7 @@ pub(super) fn ensure_direct_only_tool_namespace(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn direct_only_tool_namespaces(doc: &DocumentMut) -> Option<&Array> {
     doc.get("features")
         .and_then(Item::as_table_like)

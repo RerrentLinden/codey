@@ -11,9 +11,7 @@ use std::thread;
 use codey_runtime_core::model_catalog::{
     read_codex_model_catalog, read_codex_model_catalog_from_home,
 };
-use codey_runtime_core::settings::{
-    BackendSettings, RelayMode, RelayProfile, RelayProtocol, SettingsStore,
-};
+use codey_runtime_core::settings::{BackendSettings, RelayMode, RelayProfile, SettingsStore};
 use serde_json::json;
 
 #[tokio::test]
@@ -138,7 +136,6 @@ async fn model_catalog_uses_active_relay_profile_model_list_for_display() {
                     name: "Relay A".to_string(),
                     model: "qwen3-coder".to_string(),
                     base_url: "https://example.test/v1".to_string(),
-                    protocol: RelayProtocol::Responses,
                     relay_mode: RelayMode::MixedApi,
                     model_list: "deepseek-coder\nqwen3-coder\nclaude-compatible".to_string(),
                     config_contents: "model = \"qwen3-coder\"\n".to_string(),

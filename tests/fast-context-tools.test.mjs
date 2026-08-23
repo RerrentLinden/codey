@@ -82,6 +82,6 @@ test("Codey keeps FastCtx in the dedicated sidecar", async () => {
   assert.match(configPatchSource, /CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx"/);
   assert.match(configPatchSource, /FASTCTX_TOKEN_BUDGET/);
   assert.match(configPatchSource, /configured_user_fastctx_server_id\(doc\)\.is_some\(\)[\s\S]*disable_fast_context_tools\(doc\);[\s\S]*return Ok\(None\)/);
-  assert.match(configPatchSource, /persist_previous_fastctx_guidance_migration/);
-  assert.match(configPatchSource, /remove_previous_codey_fastctx_guidance/);
+  assert.doesNotMatch(configPatchSource, /persist_previous_fastctx_guidance_migration/);
+  assert.doesNotMatch(configPatchSource, /remove_previous_codey_fastctx_guidance/);
 });
