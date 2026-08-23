@@ -304,8 +304,7 @@ fn handle_hook_for_runtime_at(
         "UserPromptSubmit" => user_prompt_submit_output(input, state_root, runtime_id, now_ms),
         "SubagentStart" => {
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
-                create_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
-                crate::subagent_orchestrator::subagent_started_with_context(
+                let should_track = crate::subagent_orchestrator::subagent_started_with_context(
                     state_root,
                     runtime_id,
                     &input.session_id,
@@ -314,6 +313,9 @@ fn handle_hook_for_runtime_at(
                     nonempty(input.transcript_path.as_deref()),
                     now_ms,
                 )?;
+                if should_track {
+                    create_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
+                }
             } else {
                 if nonempty(input.agent_type.as_deref()).is_some() {
                     record_subagent_context_observed(
@@ -933,7 +935,6 @@ fn post_tool_use_output(
                     &acknowledgement,
                     now_ms,
                 )?
-            && settlement.changed
         {
             if let Some(agent_id_hash) = settlement.agent_id_hash.as_deref() {
                 remove_active_marker_by_hash(
@@ -1132,7 +1133,7 @@ fn stop_output(
     if input_has_subagent_context(input) {
         return Ok(json!({}));
     }
-    let Some(active) = active_agent_count_or_recover_corrupt_state(
+    let Some(mut active) = active_agent_count_or_recover_corrupt_state(
         state_root,
         runtime_id,
         &input.session_id,
@@ -1144,23 +1145,51 @@ fn stop_output(
     if active == 0 {
         return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
     }
+    let ledger_pending_recovery =
+        crate::subagent_orchestrator::recover_expired_pending_init_reservations(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            now_ms,
+            PENDING_INIT_GRACE_MILLIS,
+        )?;
+    if let Some(recovery) = &ledger_pending_recovery {
+        remove_session_auxiliary_file(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            PENDING_INIT_OBSERVED_FILE,
+        )?;
+        for agent_id_hash in &recovery.agent_id_hashes {
+            remove_active_marker_by_hash(state_root, runtime_id, &input.session_id, agent_id_hash)?;
+        }
+        active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+        if active == 0 {
+            remove_session_state(state_root, runtime_id, &input.session_id)?;
+            return finalize_root_turn(state_root, runtime_id, &input.session_id, now_ms);
+        }
+    }
     // 先检查可重置的停滞窗口，确保绝对放行后如果协作路径不再推进，遗留
     // 活跃标记仍能在后续 10 分钟内回收，而不会被已到期的绝对计时永久短路。
-    if observation_elapsed_if_present(
-        state_root,
-        runtime_id,
-        &input.session_id,
-        PENDING_INIT_OBSERVED_FILE,
-        now_ms,
-        PENDING_INIT_GRACE_MILLIS,
-    )? || observe_and_check_elapsed(
-        state_root,
-        runtime_id,
-        &input.session_id,
-        STOP_BLOCKED_SINCE_FILE,
-        now_ms,
-        STOP_STALL_GRACE_MILLIS,
-    )? {
+    let legacy_pending_init_elapsed = ledger_pending_recovery.is_none()
+        && observation_elapsed_if_present(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            PENDING_INIT_OBSERVED_FILE,
+            now_ms,
+            PENDING_INIT_GRACE_MILLIS,
+        )?;
+    if legacy_pending_init_elapsed
+        || observe_and_check_elapsed(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            STOP_BLOCKED_SINCE_FILE,
+            now_ms,
+            STOP_STALL_GRACE_MILLIS,
+        )?
+    {
         crate::subagent_orchestrator::recover_active_reservations(
             state_root,
             runtime_id,
@@ -1613,7 +1642,43 @@ fn reconcile_list_agents_response(
     if !list_agents_query_is_full(input.tool_input.as_ref()) {
         return Ok(false);
     }
-    match summarize_list_agents_response(input.tool_response.as_ref()) {
+    let snapshot = summarize_list_agents_response(input.tool_response.as_ref());
+    if snapshot == AgentListSnapshotState::Unknown {
+        return Ok(false);
+    }
+
+    if let Some(recovery) = crate::subagent_orchestrator::reconcile_pending_init_status_response(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        input.tool_response.as_ref(),
+        now_ms,
+        PENDING_INIT_GRACE_MILLIS,
+    )? {
+        // Ledger-backed sessions keep the timer in the authoritative
+        // reservation. Remove a pre-upgrade session-wide observation so Stop
+        // cannot later fence healthy siblings with the legacy all-or-nothing
+        // recovery path.
+        remove_session_auxiliary_file(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            PENDING_INIT_OBSERVED_FILE,
+        )?;
+        for agent_id_hash in &recovery.agent_id_hashes {
+            remove_active_marker_by_hash(state_root, runtime_id, &input.session_id, agent_id_hash)?;
+        }
+        if snapshot == AgentListSnapshotState::AllChildrenTerminal {
+            remove_session_state(state_root, runtime_id, &input.session_id)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    // Legacy marker-only sessions have no reversible identity mapping. Preserve
+    // the conservative session-level fallback instead of guessing which opaque
+    // marker belongs to a canonical task path.
+    match snapshot {
         AgentListSnapshotState::AllChildrenTerminal => {
             remove_session_state(state_root, runtime_id, &input.session_id)?;
             Ok(true)
@@ -2656,6 +2721,234 @@ mod tests {
         assert_eq!(
             active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn terminal_unknown_interrupt_ack_idempotently_reopens_batch_reconciliation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "terminal-unknown-interrupt-session";
+        let target = "/root/terminal_reader";
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.cwd = Some("/repo".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "terminal_reader",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "terminal_reader",
+                "why": "independent_review",
+                "visual": false,
+                "root": "/repo",
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        handle_hook_for_runtime_at(&spawn, root, runtime_id, 10).unwrap();
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "agent_id": target }));
+        handle_hook_for_runtime_at(&spawned, root, runtime_id, 20).unwrap();
+        let mut started = input("SubagentStart", session_id);
+        started.agent_id = Some(target.to_string());
+        handle_hook_for_runtime_at(&started, root, runtime_id, 25).unwrap();
+
+        let mut stopped = input("SubagentStop", session_id);
+        stopped.agent_id = Some(target.to_string());
+        handle_hook_for_runtime_at(&stopped, root, runtime_id, 30).unwrap();
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            0
+        );
+
+        // The provider may acknowledge a root interrupt after lifecycle Stop
+        // already produced Terminal/Unknown. Cleanup and batch recomputation are
+        // idempotent even though the lifecycle reservation no longer changes.
+        let mut interrupt = input("PostToolUse", session_id);
+        interrupt.turn_id = Some("root-turn-a".to_string());
+        interrupt.tool_name = Some("agents.interrupt_agent".to_string());
+        interrupt.tool_input = Some(json!({ "target": target }));
+        interrupt.tool_response = Some(json!({ "previous_status": "pending_init" }));
+        for now_ms in [31, 32] {
+            let output = handle_hook_for_runtime_at(&interrupt, root, runtime_id, now_ms).unwrap();
+            assert_eq!(output["decision"].as_str(), Some("block"));
+            assert!(
+                output["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("resolve_batch"))
+            );
+        }
+
+        let mut stale_list = input("PostToolUse", session_id);
+        stale_list.tool_name = Some("agents.list_agents".to_string());
+        stale_list.tool_input = Some(json!({}));
+        stale_list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "status": "running" },
+                { "agent_name": target, "status": "pending_init" }
+            ]
+        }));
+        let stale = handle_hook_for_runtime_at(&stale_list, root, runtime_id, 33).unwrap();
+        assert_eq!(stale["decision"].as_str(), Some("block"));
+        assert!(
+            stale["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("resolve_batch"))
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn runtime_change_reconciles_interrupted_tombstone_and_allows_batch_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let old_runtime = "runtime-old";
+        let new_runtime = "runtime-new";
+        let session_id = "runtime-migration-interrupt-session";
+        let target = "/root/migrated_reader";
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.turn_id = Some("root-turn-old".to_string());
+        spawn.cwd = Some("/repo".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "migrated_reader",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "migrated_reader",
+                "why": "independent_review",
+                "visual": false,
+                "root": "/repo",
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        handle_hook_for_runtime_at(&spawn, root, old_runtime, 10).unwrap();
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "agent_id": target }));
+        handle_hook_for_runtime_at(&spawned, root, old_runtime, 20).unwrap();
+        let mut started = input("SubagentStart", session_id);
+        started.agent_id = Some(target.to_string());
+        handle_hook_for_runtime_at(&started, root, old_runtime, 25).unwrap();
+
+        let session_dir = session_state_dir(root, session_id);
+        let old_marker = agent_marker_path(&session_dir, old_runtime, target);
+        let new_marker = agent_marker_path(&session_dir, new_runtime, target);
+        assert!(old_marker.exists());
+
+        let mut interrupted_list = input("PostToolUse", session_id);
+        interrupted_list.tool_name = Some("agents.list_agents".to_string());
+        interrupted_list.tool_input = Some(json!({}));
+        interrupted_list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "status": "running" },
+                { "agent_name": target, "status": "interrupted" }
+            ]
+        }));
+        let migrated =
+            handle_hook_for_runtime_at(&interrupted_list, root, new_runtime, 30).unwrap();
+        assert_eq!(migrated["decision"].as_str(), Some("block"));
+        assert!(
+            migrated["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("resolve_batch"))
+        );
+        assert!(!old_marker.exists());
+        assert!(!new_marker.exists());
+        assert_eq!(
+            active_agent_count_for_runtime(root, new_runtime, session_id).unwrap(),
+            0
+        );
+
+        // A late hook from the retired runtime cannot migrate the ledger back
+        // or recreate a marker under either generation.
+        let stale_error = handle_hook_for_runtime_at(&started, root, old_runtime, 31).unwrap_err();
+        assert!(format!("{stale_error:#}").contains("CODEY_SUBAGENT_STALE_RUNTIME_EVENT"));
+        assert!(!old_marker.exists());
+        assert!(!new_marker.exists());
+        assert_eq!(
+            handle_hook_for_runtime_at(&input("SessionEnd", session_id), root, old_runtime, 31,)
+                .unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, new_runtime, session_id).unwrap(),
+            0
+        );
+
+        let mut interrupt = input("PostToolUse", session_id);
+        interrupt.tool_name = Some("agents.interrupt_agent".to_string());
+        interrupt.tool_input = Some(json!({ "target": target }));
+        interrupt.tool_response = Some(json!({ "previous_status": "interrupted" }));
+        let reconciled = handle_hook_for_runtime_at(&interrupt, root, new_runtime, 32).unwrap();
+        assert_eq!(reconciled["decision"].as_str(), Some("block"));
+        assert!(
+            reconciled["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("resolve_batch"))
+        );
+
+        interrupted_list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "status": "running" },
+                { "agent_name": target, "status": "pending_init" }
+            ]
+        }));
+        let lagging = handle_hook_for_runtime_at(&interrupted_list, root, new_runtime, 33).unwrap();
+        assert_eq!(lagging["decision"].as_str(), Some("block"));
+        assert!(
+            lagging["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("resolve_batch"))
+        );
+
+        let decision = json!({
+            "decision": "complete",
+            "batch_number": 1,
+            "decision_id": "runtime-migration-complete",
+            "reason": "the migrated attempt is permanently fenced"
+        });
+        let mut pre_decision = input("PreToolUse", session_id);
+        pre_decision.tool_name = Some(crate::subagent_control_mcp::QUALIFIED_TOOL_NAME.to_string());
+        pre_decision.tool_input = Some(decision.clone());
+        assert_eq!(
+            handle_hook_for_runtime_at(&pre_decision, root, new_runtime, 34).unwrap(),
+            json!({})
+        );
+
+        let mut post_decision = input("PostToolUse", session_id);
+        post_decision.tool_name = pre_decision.tool_name;
+        post_decision.tool_input = Some(decision);
+        post_decision.tool_response = Some(json!({
+            "structuredContent": {
+                "accepted": true,
+                "decision": "complete",
+                "batch_number": 1,
+                "decision_id": "runtime-migration-complete",
+                "reason": "the migrated attempt is permanently fenced"
+            }
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&post_decision, root, new_runtime, 35).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            handle_hook_for_runtime_at(&input("Stop", session_id), root, new_runtime, 36).unwrap(),
+            json!({})
         );
     }
 
@@ -4024,6 +4317,220 @@ mod tests {
             .unwrap(),
             json!({})
         );
+    }
+
+    #[test]
+    fn mixed_pending_init_and_live_agents_use_independent_recovery_timers() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "mixed-pending-live-session";
+        let root_turn = "root-turn-a";
+        let pending_target = "/root/pending_reader";
+        let live_target = "/root/live_reader";
+
+        let spawn_agent = |task_id: &str, target: &str, now_ms: u64| {
+            let mut spawn = input("PreToolUse", session_id);
+            spawn.turn_id = Some(root_turn.to_string());
+            spawn.cwd = Some("/repo".to_string());
+            spawn.tool_name = Some("agents.spawn_agent".to_string());
+            spawn.tool_input = Some(json!({
+                "task_name": task_id,
+                "agent_type": "codey_deep_research",
+                "fork_turns": "none",
+                "message": delegation_message(json!({
+                    "id": task_id,
+                    "why": "independent_review",
+                    "visual": false,
+                    "root": "/repo",
+                    "read": [],
+                    "write": [],
+                    "checks": []
+                }))
+            }));
+            handle_hook_for_runtime_at(&spawn, root, runtime_id, now_ms).unwrap();
+            let mut spawned = input("PostToolUse", session_id);
+            spawned.tool_name = spawn.tool_name.clone();
+            spawned.tool_input = spawn.tool_input.clone();
+            spawned.tool_response = Some(json!({ "agent_id": target }));
+            handle_hook_for_runtime_at(&spawned, root, runtime_id, now_ms + 1).unwrap();
+            let mut started = input("SubagentStart", session_id);
+            started.agent_id = Some(target.to_string());
+            handle_hook_for_runtime_at(&started, root, runtime_id, now_ms + 2).unwrap();
+        };
+        spawn_agent("pending_reader", pending_target, 10);
+        spawn_agent("live_reader", live_target, 20);
+
+        let pending_marker = agent_marker_path(
+            &session_state_dir(root, session_id),
+            runtime_id,
+            pending_target,
+        );
+        let live_marker = agent_marker_path(
+            &session_state_dir(root, session_id),
+            runtime_id,
+            live_target,
+        );
+        assert!(pending_marker.exists());
+        assert!(live_marker.exists());
+
+        let first_seen = 1_000;
+        let mut mixed = input("PostToolUse", session_id);
+        mixed.turn_id = Some(root_turn.to_string());
+        mixed.tool_name = Some("agents.list_agents".to_string());
+        mixed.tool_input = Some(json!({}));
+        mixed.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "status": "running" },
+                { "agent_name": pending_target, "status": "pending_init" },
+                { "agent_name": live_target, "status": "running" }
+            ]
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&mixed, root, runtime_id, first_seen).unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+        // Repeating the same mixed snapshot must not restart the pending
+        // reservation's clock merely because its sibling is live.
+        assert_eq!(
+            handle_hook_for_runtime_at(
+                &mixed,
+                root,
+                runtime_id,
+                first_seen + PENDING_INIT_GRACE_MILLIS / 2,
+            )
+            .unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+
+        let before_deadline = handle_hook_for_runtime_at(
+            &input("Stop", session_id),
+            root,
+            runtime_id,
+            first_seen + PENDING_INIT_GRACE_MILLIS - 1,
+        )
+        .unwrap();
+        assert_eq!(before_deadline["decision"].as_str(), Some("block"));
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            2
+        );
+
+        let recovered = handle_hook_for_runtime_at(
+            &input("Stop", session_id),
+            root,
+            runtime_id,
+            first_seen + PENDING_INIT_GRACE_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(recovered["decision"].as_str(), Some("block"));
+        assert!(
+            recovered["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("仍有 1 个子代理"))
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
+        );
+        assert!(!pending_marker.exists());
+        assert!(live_marker.exists());
+
+        let trace = std::fs::read_to_string(crate::subagent::telemetry::trace_file(root)).unwrap();
+        assert!(trace.contains("pending_init_grace_elapsed"));
+
+        // A lagging provider snapshot cannot restart or resurrect the recovered
+        // reservation while the healthy sibling continues.
+        assert_eq!(
+            handle_hook_for_runtime_at(
+                &mixed,
+                root,
+                runtime_id,
+                first_seen + PENDING_INIT_GRACE_MILLIS + 1,
+            )
+            .unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
+        );
+        assert!(!pending_marker.exists());
+        assert!(live_marker.exists());
+    }
+
+    #[test]
+    fn live_observation_clears_only_that_reservations_pending_init_timer() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "pending-becomes-live-session";
+        let target = "/root/reader_a";
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "reader_a",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "reader_a",
+                "why": "independent_review",
+                "visual": false,
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        handle_hook_for_runtime_at(&spawn, root, runtime_id, 10).unwrap();
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "agent_id": target }));
+        handle_hook_for_runtime_at(&spawned, root, runtime_id, 20).unwrap();
+        let mut started = input("SubagentStart", session_id);
+        started.agent_id = Some(target.to_string());
+        handle_hook_for_runtime_at(&started, root, runtime_id, 30).unwrap();
+
+        let mut list = input("PostToolUse", session_id);
+        list.tool_name = Some("agents.list_agents".to_string());
+        list.tool_input = Some(json!({}));
+        list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "status": "running" },
+                { "agent_name": target, "status": "pending_init" }
+            ]
+        }));
+        handle_hook_for_runtime_at(&list, root, runtime_id, 1_000).unwrap();
+        list.tool_response = Some(json!({
+            "agents": [
+                { "agent_name": "/root", "status": "running" },
+                { "agent_name": target, "status": "running" }
+            ]
+        }));
+        handle_hook_for_runtime_at(&list, root, runtime_id, 2_000).unwrap();
+
+        let stopped = handle_hook_for_runtime_at(
+            &input("Stop", session_id),
+            root,
+            runtime_id,
+            1_000 + PENDING_INIT_GRACE_MILLIS,
+        )
+        .unwrap();
+        assert_eq!(stopped["decision"].as_str(), Some("block"));
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
+        );
+        assert!(
+            agent_marker_path(&session_state_dir(root, session_id), runtime_id, target).exists()
+        );
+        let trace = std::fs::read_to_string(crate::subagent::telemetry::trace_file(root)).unwrap();
+        assert!(!trace.contains("pending_init_grace_elapsed"));
     }
 
     #[test]

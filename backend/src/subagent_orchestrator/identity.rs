@@ -379,6 +379,7 @@ pub(super) fn fence_identity_conflict(
             continue;
         };
         reservation.agent_id_hash = None;
+        reservation.pending_init_observed_at_ms = None;
         if reservation.state.is_active() {
             reservation.state = ReservationState::Recovered;
             reservation.outcome = ExecutionOutcome::Lost;

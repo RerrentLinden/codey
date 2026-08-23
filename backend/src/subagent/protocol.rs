@@ -33,6 +33,12 @@ pub(crate) struct TerminalObservation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgentStatusObservation {
+    pub identifiers: Vec<String>,
+    pub state: AgentState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct InterruptAcknowledgement {
     /// A target-specific terminal status reported as the state observed before
     /// the interrupt. Generic `status=completed` remains a tool-call ack and
@@ -103,6 +109,19 @@ pub(crate) fn collect_terminal_observations(value: &Value, target: &mut Vec<Term
     let decoded = decode_json_encoded_response(value);
     let value = decoded.as_ref().unwrap_or(value);
     collect_terminal_observations_in_envelope(value, target, 0, true);
+}
+
+/// Collects provider-owned per-agent lifecycle observations from list/status
+/// envelopes. Each entry keeps all identities supplied by the provider so the
+/// orchestrator can require them to resolve to one reservation before changing
+/// a persisted PendingInit timer.
+pub(crate) fn collect_agent_status_observations(
+    value: &Value,
+    target: &mut Vec<AgentStatusObservation>,
+) {
+    let decoded = decode_json_encoded_response(value);
+    let value = decoded.as_ref().unwrap_or(value);
+    collect_agent_status_observations_in_envelope(value, target, 0, true);
 }
 
 /// Detects the provider-owned collaboration update emitted when a child could
@@ -240,6 +259,76 @@ fn collect_terminal_observations_in_envelope(
         }
         _ => {}
     }
+}
+
+fn collect_agent_status_observations_in_envelope(
+    value: &Value,
+    target: &mut Vec<AgentStatusObservation>,
+    depth: usize,
+    entry_allowed: bool,
+) {
+    if depth > 8 {
+        return;
+    }
+    match value {
+        Value::Array(values) if entry_allowed => {
+            for value in values {
+                collect_agent_status_observations_in_envelope(value, target, depth + 1, true);
+            }
+        }
+        Value::Object(values) => {
+            if entry_allowed && let Some(state) = agent_entry_state(value, values) {
+                let identifiers = values
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        matches!(
+                            normalize_identifier(key).as_str(),
+                            "taskname" | "agentname" | "agentid" | "subagentid"
+                        )
+                        .then(|| value.as_str().map(str::trim))
+                        .flatten()
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                    })
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if !identifiers.is_empty() {
+                    target.push(AgentStatusObservation { identifiers, state });
+                }
+            }
+            for (key, value) in values {
+                if is_agent_collection_field(key) || is_provider_envelope_field(key) {
+                    collect_agent_status_observations_in_envelope(value, target, depth + 1, true);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn agent_entry_state(value: &Value, values: &Map<String, Value>) -> Option<AgentState> {
+    let direct = classify_agent_status(value);
+    let mut observed = (direct != AgentState::Unknown).then_some(direct);
+    for (key, value) in values {
+        if !matches!(
+            normalize_identifier(key).as_str(),
+            "agentstatus" | "status" | "state"
+        ) {
+            continue;
+        }
+        let Ok(Some((state, _))) = target_status_observation(value) else {
+            continue;
+        };
+        if state == AgentState::Unknown {
+            continue;
+        }
+        if observed.is_some_and(|current| current != state) {
+            return None;
+        }
+        observed = Some(state);
+    }
+    observed
 }
 
 fn collect_terminal_identifiers_with(
@@ -857,6 +946,52 @@ mod tests {
         assert_eq!(
             classify_agent_status(&json!("mystery")),
             AgentState::Unknown
+        );
+    }
+
+    #[test]
+    fn per_agent_status_observations_preserve_identity_and_reject_conflicts() {
+        let value = json!({
+            "result": {
+                "agents": [
+                    { "agent_name": "/root", "status": "running" },
+                    {
+                        "task_name": "/root/reader_a",
+                        "agent_id": "agent-reader-a",
+                        "agent_status": "pending_init"
+                    },
+                    { "agent_name": "/root/reader_b", "status": "interrupted" },
+                    {
+                        "agent_name": "/root/conflicted",
+                        "status": "running",
+                        "agent_status": "completed"
+                    }
+                ]
+            },
+            "payload": {
+                "agents": [
+                    { "agent_name": "/root/business", "status": "pending_init" }
+                ]
+            }
+        });
+        let mut observations = Vec::new();
+        collect_agent_status_observations(&value, &mut observations);
+        assert_eq!(
+            observations,
+            [
+                AgentStatusObservation {
+                    identifiers: vec!["/root".into()],
+                    state: AgentState::Live,
+                },
+                AgentStatusObservation {
+                    identifiers: vec!["/root/reader_a".into(), "agent-reader-a".into()],
+                    state: AgentState::PendingInit,
+                },
+                AgentStatusObservation {
+                    identifiers: vec!["/root/reader_b".into()],
+                    state: AgentState::Live,
+                },
+            ]
         );
     }
 
