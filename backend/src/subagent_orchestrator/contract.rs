@@ -8,7 +8,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::subagent::api::{InvocationMode, TraceContext};
 #[cfg(test)]
@@ -16,7 +16,7 @@ use crate::subagent::rules;
 use crate::subagent::rules::{RoleAccess, RolePolicy, RuleSet};
 
 use super::CONTRACT_PREFIX;
-use super::identity::string_field;
+use super::identity::consistent_string_field;
 
 pub(super) const LEGACY_CONTRACT_PREFIX_V1: &str = "CODEY_DELEGATION_V1=";
 pub(super) const MAX_CLAIMS_PER_MODE: usize = 16;
@@ -105,16 +105,19 @@ pub(super) fn prepare_contract_with_rules(
     let input = tool_input
         .and_then(Value::as_object)
         .ok_or_else(|| contract_error("spawn 输入不是 JSON object"))?;
-    let task_name = string_field(input, &["task_name", "taskName"])
+    let task_name = consistent_spawn_field(input, &["task_name", "taskName"], "task_name")?
         .ok_or_else(|| contract_error("缺少 task_name"))?;
-    let role = string_field(
+    let role = consistent_spawn_field(
         input,
         &["agent_type", "agentType", "agent_role", "agentRole"],
-    )
+        "agent_type",
+    )?
     .ok_or_else(|| contract_error("缺少 agent_type"))?;
-    let message = string_field(input, &["message", "prompt"])
+    let message = consistent_spawn_field(input, &["message", "prompt"], "message")?
         .ok_or_else(|| contract_error("缺少 message"))?;
-    if string_field(input, &["fork_turns", "forkTurns"]).unwrap_or("none") != "none" {
+    let fork_turns = consistent_spawn_field(input, &["fork_turns", "forkTurns"], "fork_turns")?
+        .ok_or_else(|| contract_error("缺少 fork_turns；必须显式为 none"))?;
+    if fork_turns != "none" {
         return Err(contract_error("fork_turns 必须为 none"));
     }
     let policy = rule_set
@@ -319,6 +322,15 @@ pub(super) fn prepare_contract_with_rules(
         native_read_scope: false,
         write_paths,
     })
+}
+
+fn consistent_spawn_field<'a>(
+    input: &'a Map<String, Value>,
+    aliases: &[&str],
+    field_name: &str,
+) -> std::result::Result<Option<&'a str>, String> {
+    consistent_string_field(input, aliases)
+        .map_err(|()| contract_error(&format!("{field_name} 别名冲突或类型无效")))
 }
 
 pub(super) fn is_opaque_encrypted_message(message: &str) -> bool {

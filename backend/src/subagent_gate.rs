@@ -799,9 +799,12 @@ fn pre_tool_use_output(
             runtime_id,
             &input.session_id,
             input.tool_input.as_ref(),
-            workspace_root,
-            Some(root_turn_id),
-            now_ms,
+            crate::subagent_orchestrator::RootHookContext::new(
+                workspace_root,
+                Some(root_turn_id),
+                active,
+                now_ms,
+            ),
         )? {
             return Ok(pre_tool_reason_denial(reason));
         }
@@ -875,10 +878,12 @@ fn pre_tool_use_output(
             runtime_id,
             &input.session_id,
             input.tool_input.as_ref(),
-            workspace_root,
-            nonempty(input.turn_id.as_deref()),
-            active,
-            now_ms,
+            crate::subagent_orchestrator::RootHookContext::new(
+                workspace_root,
+                nonempty(input.turn_id.as_deref()),
+                active,
+                now_ms,
+            ),
         )? {
             return Ok(pre_tool_reason_denial(reason));
         }
@@ -984,15 +989,19 @@ fn post_tool_use_output(
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
         let workspace_root = nonempty(input.cwd.as_deref()).or(process_cwd.as_deref());
+        let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
         if let Some(reason) = crate::subagent_orchestrator::post_delegation_sidecar(
             state_root,
             runtime_id,
             &input.session_id,
             input.tool_input.as_ref(),
             input.tool_response.as_ref(),
-            workspace_root,
-            Some(root_turn_id),
-            now_ms,
+            crate::subagent_orchestrator::RootHookContext::new(
+                workspace_root,
+                Some(root_turn_id),
+                active,
+                now_ms,
+            ),
         )? {
             return Ok(json!({
                 "decision": "block",
@@ -3282,6 +3291,35 @@ mod tests {
             "preparation_id": "prep-encrypted-writer",
             "contract": contract
         });
+
+        let mut reader_spawn = input("PreToolUse", session_id);
+        reader_spawn.turn_id = Some(root_turn.to_string());
+        reader_spawn.cwd = Some(workspace.clone());
+        reader_spawn.tool_name = Some("agents.spawn_agent".to_string());
+        reader_spawn.tool_input = Some(json!({
+            "task_name": "active_reader",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "active_reader",
+                "why": "independent_review",
+                "visual": false,
+                "root": workspace,
+                "read": ["docs"],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        assert_eq!(handle_hook(&reader_spawn, state_root).unwrap(), json!({}));
+        let mut reader_spawned = input("PostToolUse", session_id);
+        reader_spawned.turn_id = Some(root_turn.to_string());
+        reader_spawned.tool_name = reader_spawn.tool_name.clone();
+        reader_spawned.tool_input = reader_spawn.tool_input.clone();
+        reader_spawned.tool_response = Some(json!({ "task_name": "/root/active_reader" }));
+        assert_eq!(handle_hook(&reader_spawned, state_root).unwrap(), json!({}));
+        let mut reader_started = input("SubagentStart", session_id);
+        reader_started.agent_id = Some("/root/active_reader".to_string());
+        assert_eq!(handle_hook(&reader_started, state_root).unwrap(), json!({}));
 
         let mut prepare = input("PreToolUse", session_id);
         prepare.turn_id = Some(root_turn.to_string());

@@ -160,9 +160,11 @@ pub(super) fn stricter_outcome(
     }
 }
 
-pub(super) fn spawn_task_id(tool_input: Option<&Value>) -> Option<&str> {
-    let input = tool_input?.as_object()?;
-    string_field(input, &["task_name", "taskName"])
+pub(super) fn spawn_task_id(tool_input: Option<&Value>) -> std::result::Result<Option<&str>, ()> {
+    let Some(input) = tool_input.and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    consistent_string_field(input, &["task_name", "taskName"])
 }
 
 pub(super) fn followup_task_target(tool_input: Option<&Value>) -> Option<&str> {

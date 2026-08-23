@@ -109,7 +109,7 @@ fn resolve_batch_tool_definition() -> Value {
 fn prepare_delegation_tool_definition() -> Value {
     json!({
         "name": PREPARE_DELEGATION_TOOL_NAME,
-        "description": "Authorize one encrypted writable spawn_agent call from the same root turn by staging its plaintext Codey delegation policy. The permit is single-use and expires on turn, batch, runtime, or TTL boundaries; this tool never spawns agents itself.",
+        "description": "Authorize one encrypted writable spawn_agent call from the same root turn by staging its plaintext Codey delegation policy. The contract must declare an explicit absolute root. The permit binds the normalized root/read/write scope, is single-use, and expires on turn, batch, runtime, or TTL boundaries; this tool never spawns agents itself.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -121,7 +121,11 @@ fn prepare_delegation_tool_definition() -> Value {
                 "preparation_id": { "type": "string", "minLength": 1, "maxLength": 128 },
                 "contract": {
                     "type": "object",
-                    "description": "The exact CODEY_DELEGATION_V2 JSON object whose id equals task_name."
+                    "description": "The exact CODEY_DELEGATION_V2 JSON object whose id equals task_name and whose root is explicit and absolute.",
+                    "properties": {
+                        "root": { "type": "string", "minLength": 1 }
+                    },
+                    "required": ["root"]
                 }
             },
             "required": ["task_name", "agent_type", "preparation_id", "contract"],
@@ -261,6 +265,14 @@ fn validate_prepare_delegation_arguments(arguments: &Value) -> std::result::Resu
     if contract.get("id").and_then(Value::as_str) != Some(task_name) {
         return Err("contract.id must equal task_name".to_string());
     }
+    let root = contract
+        .get("root")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if !valid_absolute_root(root) {
+        return Err("contract.root must be an explicit absolute path".to_string());
+    }
     Ok(())
 }
 
@@ -270,6 +282,15 @@ fn valid_task_name(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn valid_absolute_root(value: &str) -> bool {
+    let value = value.trim().replace('\\', "/");
+    value.starts_with('/')
+        || (value.len() >= 3
+            && value.as_bytes()[0].is_ascii_alphabetic()
+            && value.as_bytes()[1] == b':'
+            && value.as_bytes()[2] == b'/')
 }
 
 fn tool_error(message: &str) -> Value {
@@ -340,6 +361,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(invalid["result"]["isError"], true);
+
+        let relative_root = handle_message(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"prepare_delegation","arguments":{"task_name":"worker_a","agent_type":"codey_worker","preparation_id":"prep-2","contract":{"id":"worker_a","root":"repo"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(relative_root["result"]["isError"], true);
+        assert_eq!(
+            relative_root["result"]["content"][0]["text"],
+            "contract.root must be an explicit absolute path"
+        );
     }
 
     #[test]

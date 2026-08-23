@@ -28,7 +28,7 @@ use identity::*;
 pub(crate) const CONTRACT_PREFIX: &str = "CODEY_DELEGATION_V2=";
 pub(crate) const POST_TOOL_HOOK_MATCHER: &str = "*";
 
-const LEDGER_SCHEMA_VERSION: u32 = 12;
+const LEDGER_SCHEMA_VERSION: u32 = 13;
 const MIN_LEDGER_SCHEMA_VERSION: u32 = 1;
 const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
@@ -106,6 +106,10 @@ struct PreparedDelegationSidecar {
     preparation_id_hash: String,
     #[serde(default)]
     root_turn_id_hash: String,
+    #[serde(default)]
+    scope_hash: String,
+    #[serde(default)]
+    receipt_confirmed: bool,
     prepared_at_ms: u64,
     batch_number: u16,
     runtime_generation: u64,
@@ -182,6 +186,31 @@ struct ParsedPreparedDelegation {
     role: String,
     preparation_id: String,
     contract: Value,
+    scope_hash: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RootHookContext<'a> {
+    workspace_root: Option<&'a str>,
+    root_turn_id: Option<&'a str>,
+    active_agents: usize,
+    now_ms: u64,
+}
+
+impl<'a> RootHookContext<'a> {
+    pub(crate) fn new(
+        workspace_root: Option<&'a str>,
+        root_turn_id: Option<&'a str>,
+        active_agents: usize,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            workspace_root,
+            root_turn_id,
+            active_agents,
+            now_ms,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -932,6 +961,14 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
         ledger.used_preparation_id_hashes.clear();
         changed = true;
     }
+    if source_schema_version < 13 {
+        // Schema v12 sidecars did not bind the normalized coordination scope
+        // across Pre/Post or record receipt confirmation. Invalidate only those
+        // ephemeral permits instead of reinterpreting their root/read/write
+        // claims; retain nonce history and existing reservations.
+        ledger.prepared_delegations.clear();
+        changed = true;
+    }
     anyhow::ensure!(
         ledger.runtime_generation > 0,
         "Codey 子代理账本缺少有效 runtime generation"
@@ -984,7 +1021,8 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
         anyhow::ensure!(
             is_canonical_hash(&sidecar.preparation_id_hash)
                 && is_canonical_hash(&sidecar.root_turn_id_hash)
-                && is_canonical_value_hash(&sidecar.contract_hash),
+                && is_canonical_value_hash(&sidecar.contract_hash)
+                && is_canonical_value_hash(&sidecar.scope_hash),
             "Codey 子代理编排账本预备委派的哈希格式无效"
         );
         anyhow::ensure!(
@@ -1371,6 +1409,11 @@ fn prepare_from_staged_delegation(
             crate::subagent_control_mcp::PREPARE_DELEGATION_QUALIFIED_TOOL_NAME
         )))));
     };
+    if !sidecar.receipt_confirmed {
+        return Ok(Some(Err(contract_error(
+            "预备 sidecar 仍在等待 prepare_delegation 的成功 PostToolUse 回执，不能提前消费",
+        ))));
+    }
     if sidecar.role != role {
         return Ok(Some(Err(contract_error(
             "预备 sidecar 的 agent_type 与加密 spawn_agent 不一致",
@@ -1409,6 +1452,11 @@ fn prepare_from_staged_delegation(
         };
     if prepared.policy.access != RoleAccess::Write {
         return Ok(Some(Err(contract_error("预备 sidecar 只能用于写入角色"))));
+    }
+    if coordination_scope_hash(&prepared) != sidecar.scope_hash {
+        return Ok(Some(Err(contract_error(
+            "预备 sidecar 的规范化 root/read/write 范围与登记时不一致，已拒绝工作目录或文件系统漂移后的消费",
+        ))));
     }
     Ok(Some(Ok(prepared)))
 }
@@ -1451,7 +1499,9 @@ fn spawn_input_identity(
     }
     let fork_turns = consistent_string_field(input, &["fork_turns", "forkTurns"])
         .map_err(|()| contract_error("fork_turns 别名冲突或类型无效"))?
-        .unwrap_or("none");
+        .ok_or_else(|| {
+            contract_error("加密写入 sidecar 的真实 spawn_agent 必须显式声明 fork_turns=none")
+        })?;
     if fork_turns != "none" {
         return Err(contract_error(
             "加密写入 sidecar 不能覆盖真实 spawn_agent 的 fork_turns；该字段必须为 none",
@@ -1476,10 +1526,7 @@ pub(crate) fn pre_spawn(
         runtime_id,
         session_id,
         tool_input,
-        Some("/repo"),
-        None,
-        active_agents,
-        now_ms,
+        RootHookContext::new(Some("/repo"), None, active_agents, now_ms),
     )
 }
 
@@ -1498,10 +1545,7 @@ fn pre_spawn_with_workspace(
         runtime_id,
         session_id,
         tool_input,
-        hook_workspace_root,
-        None,
-        active_agents,
-        now_ms,
+        RootHookContext::new(hook_workspace_root, None, active_agents, now_ms),
     )
 }
 
@@ -1510,11 +1554,14 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
     runtime_id: &str,
     session_id: &str,
     tool_input: Option<&Value>,
-    hook_workspace_root: Option<&str>,
-    root_turn_id: Option<&str>,
-    active_agents: usize,
-    now_ms: u64,
+    context: RootHookContext<'_>,
 ) -> Result<Option<String>> {
+    let RootHookContext {
+        workspace_root: hook_workspace_root,
+        root_turn_id,
+        active_agents,
+        now_ms,
+    } = context;
     let loaded_rules = rules::load(state_root);
     if let Some(warning) = &loaded_rules.warning {
         eprintln!("Codey 子代理规则回退：{warning}");
@@ -1579,6 +1626,12 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             store.save(&mut ledger, now_ms)?;
         }
         return Ok(Some(reason));
+    }
+    if batch_changed && consume_prepared_delegation.is_some() {
+        store.save(&mut ledger, now_ms)?;
+        return Ok(Some(contract_error(
+            "预备 sidecar 属于刚结束的上一批，不能跨批次建立写入 reservation；请在当前批次重新登记后再派发",
+        )));
     }
 
     if let Some(reason) = concurrency_denial(&ledger, &prepared, active_agents) {
@@ -1732,8 +1785,12 @@ pub(crate) fn post_spawn(
     tool_response: Option<&Value>,
     now_ms: u64,
 ) -> Result<()> {
-    let Some(task_id) = spawn_task_id(tool_input) else {
-        return Ok(());
+    let task_id = match spawn_task_id(tool_input) {
+        Ok(Some(task_id)) => task_id,
+        Ok(None) => return Ok(()),
+        Err(()) => anyhow::bail!(
+            "Codey spawn PostToolUse 门禁：task_name/taskName 别名冲突或类型无效，拒绝把回执关联到任何 reservation"
+        ),
     };
     let store = LedgerStore::open(state_root, session_id)?;
     let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
@@ -2834,13 +2891,18 @@ pub(crate) fn prepare_delegation_sidecar(
     runtime_id: &str,
     session_id: &str,
     tool_input: Option<&Value>,
-    hook_workspace_root: Option<&str>,
-    root_turn_id: Option<&str>,
-    now_ms: u64,
+    context: RootHookContext<'_>,
 ) -> Result<Option<String>> {
-    if let Err(reason) = required_root_turn_id(root_turn_id) {
-        return Ok(Some(reason));
-    }
+    let RootHookContext {
+        workspace_root: hook_workspace_root,
+        root_turn_id,
+        active_agents,
+        now_ms,
+    } = context;
+    let root_turn_id = match required_root_turn_id(root_turn_id) {
+        Ok(root_turn_id) => root_turn_id,
+        Err(reason) => return Ok(Some(reason)),
+    };
     let loaded_rules = rules::load(state_root);
     let prepared = match parse_prepare_delegation_input(
         tool_input,
@@ -2855,55 +2917,18 @@ pub(crate) fn prepare_delegation_sidecar(
         .load(runtime_id, session_id, now_ms)?
         .unwrap_or_else(|| SessionLedger::new(runtime_id, session_id, now_ms));
     let expired = expire_prepared_delegations(&mut ledger, now_ms);
-    if let Some(reason) = prepared_delegation_admission_denial(&ledger, &prepared) {
-        if expired {
+    let (batch_changed, batch_denial) =
+        advance_batch_if_settled(&mut ledger, active_agents, now_ms);
+    if let Some(reason) = batch_denial {
+        if expired || batch_changed {
             store.save(&mut ledger, now_ms)?;
         }
         return Ok(Some(reason));
     }
-    if expired {
-        store.save(&mut ledger, now_ms)?;
-    }
-    Ok(None)
-}
-
-pub(crate) fn post_delegation_sidecar(
-    state_root: &Path,
-    runtime_id: &str,
-    session_id: &str,
-    tool_input: Option<&Value>,
-    tool_response: Option<&Value>,
-    hook_workspace_root: Option<&str>,
-    root_turn_id: Option<&str>,
-    now_ms: u64,
-) -> Result<Option<String>> {
-    let root_turn_id = match required_root_turn_id(root_turn_id) {
-        Ok(root_turn_id) => root_turn_id,
-        Err(reason) => return Ok(Some(reason)),
-    };
-    let loaded_rules = rules::load(state_root);
-    let prepared = match parse_prepare_delegation_input(
-        tool_input,
-        hook_workspace_root,
-        &loaded_rules.rules,
-    ) {
-        Ok(prepared) => prepared,
-        Err(reason) => return Ok(Some(reason)),
-    };
-    if !tool_response
-        .is_some_and(|response| delegation_sidecar_receipt_matches(response, &prepared))
-    {
-        return Ok(Some(format!(
-            "Codey 写入 sidecar 门禁：`{}` 未返回匹配的 accepted 回执，预备委派未提交；请重新调用该工具后再派发写入子代理。",
-            crate::subagent_control_mcp::PREPARE_DELEGATION_QUALIFIED_TOOL_NAME
-        )));
-    }
-    let store = LedgerStore::open(state_root, session_id)?;
-    let mut ledger = store
-        .load(runtime_id, session_id, now_ms)?
-        .unwrap_or_else(|| SessionLedger::new(runtime_id, session_id, now_ms));
-    expire_prepared_delegations(&mut ledger, now_ms);
     if let Some(reason) = prepared_delegation_admission_denial(&ledger, &prepared) {
+        if expired || batch_changed {
+            store.save(&mut ledger, now_ms)?;
+        }
         return Ok(Some(reason));
     }
     let preparation_id_hash = hash_component(&prepared.preparation_id);
@@ -2919,11 +2944,97 @@ pub(crate) fn post_delegation_sidecar(
             contract: prepared.contract,
             preparation_id_hash,
             root_turn_id_hash: hash_component(root_turn_id),
+            scope_hash: prepared.scope_hash,
+            receipt_confirmed: false,
             prepared_at_ms: now_ms,
             batch_number: ledger.batch_number,
             runtime_generation: ledger.runtime_generation,
         },
     );
+    store.save(&mut ledger, now_ms)?;
+    Ok(None)
+}
+
+pub(crate) fn post_delegation_sidecar(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    tool_input: Option<&Value>,
+    tool_response: Option<&Value>,
+    context: RootHookContext<'_>,
+) -> Result<Option<String>> {
+    let RootHookContext {
+        workspace_root: hook_workspace_root,
+        root_turn_id,
+        active_agents,
+        now_ms,
+    } = context;
+    let root_turn_id = match required_root_turn_id(root_turn_id) {
+        Ok(root_turn_id) => root_turn_id,
+        Err(reason) => return Ok(Some(reason)),
+    };
+    let loaded_rules = rules::load(state_root);
+    let prepared = match parse_prepare_delegation_input(
+        tool_input,
+        hook_workspace_root,
+        &loaded_rules.rules,
+    ) {
+        Ok(prepared) => prepared,
+        Err(reason) => return Ok(Some(reason)),
+    };
+    let receipt_matches = tool_response
+        .is_some_and(|response| delegation_sidecar_receipt_matches(response, &prepared));
+    let store = LedgerStore::open(state_root, session_id)?;
+    let mut ledger = store
+        .load(runtime_id, session_id, now_ms)?
+        .unwrap_or_else(|| SessionLedger::new(runtime_id, session_id, now_ms));
+    let expired = expire_prepared_delegations(&mut ledger, now_ms);
+    let (batch_changed, batch_denial) =
+        advance_batch_if_settled(&mut ledger, active_agents, now_ms);
+    if let Some(reason) = batch_denial {
+        if expired || batch_changed {
+            store.save(&mut ledger, now_ms)?;
+        }
+        return Ok(Some(reason));
+    }
+    let contract_hash = canonical_value_hash(&prepared.contract);
+    let preparation_id_hash = hash_component(&prepared.preparation_id);
+    let root_turn_id_hash = hash_component(root_turn_id);
+    let pending_matches = ledger
+        .prepared_delegations
+        .get(&prepared.task_id)
+        .is_some_and(|pending| {
+            pending.task_id == prepared.task_id
+                && pending.role == prepared.role
+                && pending.contract_hash == contract_hash
+                && pending.preparation_id_hash == preparation_id_hash
+                && pending.root_turn_id_hash == root_turn_id_hash
+                && pending.scope_hash == prepared.scope_hash
+                && pending.batch_number == ledger.batch_number
+                && pending.runtime_generation == ledger.runtime_generation
+        });
+    if !pending_matches {
+        if expired || batch_changed {
+            store.save(&mut ledger, now_ms)?;
+        }
+        return Ok(Some(
+            "Codey 写入 sidecar 门禁：PostToolUse 与 PreToolUse 暂存的 task、role、nonce、root turn、contract 或规范化范围不一致；预备委派未确认。"
+                .to_string(),
+        ));
+    }
+    if !receipt_matches {
+        ledger.prepared_delegations.remove(&prepared.task_id);
+        store.save(&mut ledger, now_ms)?;
+        return Ok(Some(format!(
+            "Codey 写入 sidecar 门禁：`{}` 未返回匹配的 accepted 回执，PreToolUse 暂存已撤销；请使用新的 preparation_id 重新调用该工具后再派发写入子代理。",
+            crate::subagent_control_mcp::PREPARE_DELEGATION_QUALIFIED_TOOL_NAME
+        )));
+    }
+    ledger
+        .prepared_delegations
+        .get_mut(&prepared.task_id)
+        .expect("pending sidecar matched above")
+        .receipt_confirmed = true;
     store.save(&mut ledger, now_ms)?;
     Ok(None)
 }
@@ -2937,11 +3048,18 @@ fn prepared_delegation_admission_denial(
     {
         return Some(duplicate_task_id_denial(ledger, &prepared.task_id));
     }
-    if ledger.prepared_delegations.contains_key(&prepared.task_id) {
-        return Some(format!(
-            "Codey 写入 sidecar 门禁：任务 `{}` 已有未消费的预备委派；请先使用相同 task_name 调用 agents.spawn_agent，或换用全新的 task_name。",
-            prepared.task_id
-        ));
+    if let Some(existing) = ledger.prepared_delegations.get(&prepared.task_id) {
+        return Some(if existing.receipt_confirmed {
+            format!(
+                "Codey 写入 sidecar 门禁：任务 `{}` 已有已确认但未消费的预备委派；请先使用相同 task_name 调用 agents.spawn_agent，或换用全新的 task_name。",
+                prepared.task_id
+            )
+        } else {
+            format!(
+                "Codey 写入 sidecar 门禁：任务 `{}` 已有等待 PostToolUse 回执的 pending 预备委派；当前 preparation_id 已占用。请等待本次工具调用完成，失败时使用新的 preparation_id，或在两分钟过期后重试。",
+                prepared.task_id
+            )
+        });
     }
     let recorded = recorded_delegation_count(ledger, None);
     if recorded >= MAX_RESERVATIONS_PER_LEDGER {
@@ -3315,12 +3433,28 @@ fn parse_prepare_delegation_input(
     if prepared.policy.access != RoleAccess::Write {
         return Err(contract_error("sidecar 只允许为写入角色准备契约"));
     }
+    if prepared.contract.workspace_root.is_none() || prepared.workspace_root.is_none() {
+        return Err(contract_error(
+            "sidecar 写入契约必须显式声明绝对 root，不能依赖 Hook 工作目录推断协调范围",
+        ));
+    }
+    let scope_hash = coordination_scope_hash(&prepared);
     Ok(ParsedPreparedDelegation {
         task_id: prepared.contract.id,
         role: prepared.role,
         preparation_id: input.preparation_id,
         contract: input.contract,
+        scope_hash,
     })
+}
+
+fn coordination_scope_hash(prepared: &PreparedContract) -> String {
+    canonical_value_hash(&json!({
+        "root": prepared.workspace_root.as_deref(),
+        "read": &prepared.read_paths,
+        "write": &prepared.write_paths,
+        "native_read_scope": prepared.native_read_scope,
+    }))
 }
 
 fn required_root_turn_id(root_turn_id: Option<&str>) -> std::result::Result<&str, String> {
@@ -4268,9 +4402,7 @@ mod tests {
                 "runtime-a",
                 session_id,
                 Some(&sidecar),
-                Some("/repo"),
-                Some(root_turn_id),
-                now_ms,
+                RootHookContext::new(Some("/repo"), Some(root_turn_id), 0, now_ms),
             )
             .unwrap(),
             None
@@ -4282,9 +4414,7 @@ mod tests {
                 session_id,
                 Some(&sidecar),
                 Some(&prepared_delegation_response(&sidecar)),
-                Some("/repo"),
-                Some(root_turn_id),
-                now_ms + 1,
+                RootHookContext::new(Some("/repo"), Some(root_turn_id), 0, now_ms + 1),
             )
             .unwrap(),
             None
@@ -4688,6 +4818,86 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_spawn_rejects_conflicting_or_invalid_aliases() {
+        let input = contract_input(
+            "plain_worker",
+            "codey_worker",
+            worker_contract("plain_worker", "backend/src"),
+        );
+        for (alias, value, expected_field) in [
+            ("taskName", json!("different_task"), "task_name"),
+            ("agentRole", json!("codey_quick_scan"), "agent_type"),
+            ("prompt", json!("different message"), "message"),
+            ("forkTurns", json!("all"), "fork_turns"),
+        ] {
+            let mut conflicting = input.clone();
+            conflicting
+                .as_object_mut()
+                .unwrap()
+                .insert(alias.to_string(), value);
+            let denial =
+                prepare_contract_with_workspace(Some(&conflicting), Some("/repo")).unwrap_err();
+            assert!(denial.contains(expected_field), "{denial}");
+            assert!(denial.contains("别名冲突或类型无效"), "{denial}");
+        }
+
+        let mut invalid_type = input;
+        invalid_type["forkTurns"] = json!(false);
+        let denial =
+            prepare_contract_with_workspace(Some(&invalid_type), Some("/repo")).unwrap_err();
+        assert!(denial.contains("fork_turns 别名冲突或类型无效"));
+
+        invalid_type.as_object_mut().unwrap().remove("fork_turns");
+        invalid_type.as_object_mut().unwrap().remove("forkTurns");
+        let denial =
+            prepare_contract_with_workspace(Some(&invalid_type), Some("/repo")).unwrap_err();
+        assert!(denial.contains("缺少 fork_turns；必须显式为 none"));
+    }
+
+    #[test]
+    fn spawn_post_rejects_conflicting_task_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = contract_input(
+            "post_alias_worker",
+            "codey_worker",
+            worker_contract("post_alias_worker", "backend/src"),
+        );
+        assert_eq!(
+            pre_spawn(
+                temp.path(),
+                "runtime-a",
+                "post-alias-session",
+                Some(&input),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+        let mut conflicting = input;
+        conflicting["taskName"] = json!("different_task");
+        let error = post_spawn(
+            temp.path(),
+            "runtime-a",
+            "post-alias-session",
+            Some(&conflicting),
+            Some(&json!({ "agent_id": "agent-post-alias" })),
+            11,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("task_name/taskName 别名冲突"));
+
+        let store = LedgerStore::open(temp.path(), "post-alias-session").unwrap();
+        let ledger = store
+            .load("runtime-a", "post-alias-session", 12)
+            .unwrap()
+            .unwrap();
+        let reservation = &ledger.reservations["post_alias_worker"];
+        assert_eq!(reservation.state, ReservationState::Pending);
+        assert!(reservation.agent_id_hash.is_none());
+    }
+
+    #[test]
     fn encrypted_write_spawn_consumes_prepared_sidecar() {
         let temp = tempfile::tempdir().unwrap();
         let contract = worker_contract("encrypted_worker", "backend/src");
@@ -4699,13 +4909,27 @@ mod tests {
                 "runtime-a",
                 "session-a",
                 Some(&sidecar),
-                Some("/repo"),
-                Some("root-turn-a"),
-                10,
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 10),
             )
             .unwrap(),
             None
         );
+        let encrypted_spawn = json!({
+            "task_name": "encrypted_worker",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        let denial = pre_spawn_with_workspace_and_turn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&encrypted_spawn),
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 10),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("等待 prepare_delegation 的成功 PostToolUse 回执"));
         assert_eq!(
             post_delegation_sidecar(
                 temp.path(),
@@ -4713,30 +4937,18 @@ mod tests {
                 "session-a",
                 Some(&sidecar),
                 Some(&prepared_delegation_response(&sidecar)),
-                Some("/repo"),
-                Some("root-turn-a"),
-                11,
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 11),
             )
             .unwrap(),
             None
         );
-
-        let encrypted_spawn = json!({
-            "task_name": "encrypted_worker",
-            "agent_type": "codey_worker",
-            "fork_turns": "none",
-            "message": format!("gAAAAA{}", "A".repeat(160))
-        });
         assert_eq!(
             pre_spawn_with_workspace_and_turn(
                 temp.path(),
                 "runtime-a",
                 "session-a",
                 Some(&encrypted_spawn),
-                Some("/repo"),
-                Some("root-turn-a"),
-                0,
-                12,
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 12),
             )
             .unwrap(),
             None
@@ -4759,6 +4971,318 @@ mod tests {
     }
 
     #[test]
+    fn writable_sidecar_requires_an_explicit_absolute_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut contract = worker_contract("implicit_root_worker", "backend/src");
+        contract.as_object_mut().unwrap().remove("root");
+        let sidecar = prepared_delegation_input(
+            "implicit_root_worker",
+            "codey_worker",
+            "prep-implicit-root",
+            contract,
+        );
+        let denial = prepare_delegation_sidecar(
+            temp.path(),
+            "runtime-a",
+            "implicit-root-session",
+            Some(&sidecar),
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 10),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("必须显式声明绝对 root"), "{denial}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_sidecar_rejects_normalized_scope_drift() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target_a = temp.path().join("workspace-a");
+        let target_b = temp.path().join("workspace-b");
+        fs::create_dir_all(&target_a).unwrap();
+        fs::create_dir_all(&target_b).unwrap();
+        let workspace_link = temp.path().join("workspace-link");
+        symlink(&target_a, &workspace_link).unwrap();
+
+        let mut contract = worker_contract("scope_drift_worker", "backend/src");
+        contract["root"] = json!(workspace_link.to_string_lossy());
+        let sidecar = prepared_delegation_input(
+            "scope_drift_worker",
+            "codey_worker",
+            "prep-scope-drift",
+            contract,
+        );
+        assert_eq!(
+            prepare_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "scope-drift-session",
+                Some(&sidecar),
+                RootHookContext::new(Some("/ignored-pre-cwd"), Some("root-turn-a"), 0, 10,),
+            )
+            .unwrap(),
+            None
+        );
+        fs::remove_file(&workspace_link).unwrap();
+        symlink(&target_b, &workspace_link).unwrap();
+        let denial = post_delegation_sidecar(
+            temp.path(),
+            "runtime-a",
+            "scope-drift-session",
+            Some(&sidecar),
+            Some(&prepared_delegation_response(&sidecar)),
+            RootHookContext::new(Some("/ignored-post-cwd"), Some("root-turn-a"), 0, 11),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            denial.contains("PostToolUse 与 PreToolUse 暂存"),
+            "{denial}"
+        );
+        let store = LedgerStore::open(temp.path(), "scope-drift-session").unwrap();
+        let ledger = store
+            .load("runtime-a", "scope-drift-session", 12)
+            .unwrap()
+            .unwrap();
+        assert!(!ledger.prepared_delegations["scope_drift_worker"].receipt_confirmed);
+        drop(ledger);
+        drop(store);
+
+        fs::remove_file(&workspace_link).unwrap();
+        symlink(&target_a, &workspace_link).unwrap();
+        assert_eq!(
+            post_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "scope-drift-session",
+                Some(&sidecar),
+                Some(&prepared_delegation_response(&sidecar)),
+                RootHookContext::new(Some("/ignored-post-cwd"), Some("root-turn-a"), 0, 13,),
+            )
+            .unwrap(),
+            None
+        );
+
+        fs::remove_file(&workspace_link).unwrap();
+        symlink(&target_b, &workspace_link).unwrap();
+        let encrypted_spawn = json!({
+            "task_name": "scope_drift_worker",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        let denial = pre_spawn_with_workspace_and_turn(
+            temp.path(),
+            "runtime-a",
+            "scope-drift-session",
+            Some(&encrypted_spawn),
+            RootHookContext::new(Some("/ignored-spawn-cwd"), Some("root-turn-a"), 0, 14),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("规范化 root/read/write 范围"), "{denial}");
+
+        let store = LedgerStore::open(temp.path(), "scope-drift-session").unwrap();
+        let ledger = store
+            .load("runtime-a", "scope-drift-session", 15)
+            .unwrap()
+            .unwrap();
+        assert!(
+            ledger
+                .prepared_delegations
+                .contains_key("scope_drift_worker")
+        );
+        assert!(!ledger.reservations.contains_key("scope_drift_worker"));
+    }
+
+    #[test]
+    fn preparing_a_sidecar_consumes_next_batch_before_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = contract_input(
+            "first_reader",
+            "codey_deep_research",
+            research_contract("first_reader"),
+        );
+        assert_eq!(
+            pre_spawn(
+                temp.path(),
+                "runtime-a",
+                "sidecar-next-batch-session",
+                Some(&first),
+                0,
+                10,
+            )
+            .unwrap(),
+            None
+        );
+        observe_status_response(
+            temp.path(),
+            "runtime-a",
+            "sidecar-next-batch-session",
+            None,
+            true,
+            20,
+        )
+        .unwrap();
+        commit_batch_decision_for_test(
+            temp.path(),
+            "sidecar-next-batch-session",
+            1,
+            RootBatchDecision::SpawnNextBatch,
+            21,
+        );
+
+        let sidecar = prepared_delegation_input(
+            "second_writer",
+            "codey_worker",
+            "prep-next-batch",
+            worker_contract("second_writer", "backend/src"),
+        );
+        assert_eq!(
+            prepare_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "sidecar-next-batch-session",
+                Some(&sidecar),
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 22),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            post_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "sidecar-next-batch-session",
+                Some(&sidecar),
+                Some(&prepared_delegation_response(&sidecar)),
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 23),
+            )
+            .unwrap(),
+            None
+        );
+
+        let encrypted_spawn = json!({
+            "task_name": "second_writer",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        assert_eq!(
+            pre_spawn_with_workspace_and_turn(
+                temp.path(),
+                "runtime-a",
+                "sidecar-next-batch-session",
+                Some(&encrypted_spawn),
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 24),
+            )
+            .unwrap(),
+            None
+        );
+
+        let store = LedgerStore::open(temp.path(), "sidecar-next-batch-session").unwrap();
+        let ledger = store
+            .load("runtime-a", "sidecar-next-batch-session", 25)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.batch_number, 2);
+        assert_eq!(ledger.reservations["second_writer"].batch_number, 2);
+    }
+
+    #[test]
+    fn prepared_sidecar_cannot_cross_a_settled_batch_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = contract_input(
+            "active_reader",
+            "codey_deep_research",
+            research_contract("active_reader"),
+        );
+        pre_spawn(
+            temp.path(),
+            "runtime-a",
+            "stale-sidecar-batch-session",
+            Some(&first),
+            0,
+            10,
+        )
+        .unwrap();
+
+        let sidecar = prepared_delegation_input(
+            "staged_writer",
+            "codey_worker",
+            "prep-old-batch",
+            worker_contract("staged_writer", "backend/src"),
+        );
+        assert_eq!(
+            prepare_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "stale-sidecar-batch-session",
+                Some(&sidecar),
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 1, 11),
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            post_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "stale-sidecar-batch-session",
+                Some(&sidecar),
+                Some(&prepared_delegation_response(&sidecar)),
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 1, 12),
+            )
+            .unwrap(),
+            None
+        );
+        observe_status_response(
+            temp.path(),
+            "runtime-a",
+            "stale-sidecar-batch-session",
+            None,
+            true,
+            20,
+        )
+        .unwrap();
+        commit_batch_decision_for_test(
+            temp.path(),
+            "stale-sidecar-batch-session",
+            1,
+            RootBatchDecision::SpawnNextBatch,
+            21,
+        );
+
+        let encrypted_spawn = json!({
+            "task_name": "staged_writer",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        let denial = pre_spawn_with_workspace_and_turn(
+            temp.path(),
+            "runtime-a",
+            "stale-sidecar-batch-session",
+            Some(&encrypted_spawn),
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 22),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("不能跨批次"), "{denial}");
+
+        let store = LedgerStore::open(temp.path(), "stale-sidecar-batch-session").unwrap();
+        let ledger = store
+            .load("runtime-a", "stale-sidecar-batch-session", 23)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.batch_number, 2);
+        assert!(ledger.prepared_delegations.is_empty());
+        assert!(!ledger.reservations.contains_key("staged_writer"));
+    }
+
+    #[test]
     fn delegation_sidecar_accepts_json_rpc_tool_result_envelope() {
         let temp = tempfile::tempdir().unwrap();
         let contract = worker_contract("encrypted_worker", "backend/src");
@@ -4770,9 +5294,7 @@ mod tests {
                 "runtime-a",
                 "session-a",
                 Some(&sidecar),
-                Some("/repo"),
-                Some("root-turn-a"),
-                10,
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 10),
             )
             .unwrap(),
             None
@@ -4784,9 +5306,7 @@ mod tests {
                 "session-a",
                 Some(&sidecar),
                 Some(&prepared_delegation_json_rpc_response(&sidecar)),
-                Some("/repo"),
-                Some("root-turn-a"),
-                11,
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 11),
             )
             .unwrap(),
             None
@@ -4799,6 +5319,17 @@ mod tests {
         let contract = worker_contract("encrypted_worker", "backend/src");
         let sidecar =
             prepared_delegation_input("encrypted_worker", "codey_worker", "prep-1", contract);
+        assert_eq!(
+            prepare_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&sidecar),
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 10),
+            )
+            .unwrap(),
+            None
+        );
         let denial = post_delegation_sidecar(
             temp.path(),
             "runtime-a",
@@ -4816,25 +5347,48 @@ mod tests {
                     }
                 }
             })),
-            Some("/repo"),
-            Some("root-turn-a"),
-            11,
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 11),
         )
         .unwrap()
         .unwrap();
         assert!(denial.contains("未返回匹配的 accepted 回执"));
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let ledger = store.load("runtime-a", "session-a", 12).unwrap().unwrap();
+        assert!(ledger.prepared_delegations.is_empty());
+        assert!(
+            ledger
+                .used_preparation_id_hashes
+                .contains(&hash_component("prep-1"))
+        );
+        drop(ledger);
+        drop(store);
 
-        let mut missing_status = prepared_delegation_response(&sidecar);
+        let missing_sidecar = prepared_delegation_input(
+            "encrypted_worker",
+            "codey_worker",
+            "prep-2",
+            worker_contract("encrypted_worker", "backend/tests"),
+        );
+        assert_eq!(
+            prepare_delegation_sidecar(
+                temp.path(),
+                "runtime-a",
+                "session-a",
+                Some(&missing_sidecar),
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 13),
+            )
+            .unwrap(),
+            None
+        );
+        let mut missing_status = prepared_delegation_response(&missing_sidecar);
         missing_status.as_object_mut().unwrap().remove("isError");
         let denial = post_delegation_sidecar(
             temp.path(),
             "runtime-a",
             "session-a",
-            Some(&sidecar),
+            Some(&missing_sidecar),
             Some(&missing_status),
-            Some("/repo"),
-            Some("root-turn-a"),
-            12,
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 14),
         )
         .unwrap()
         .unwrap();
@@ -4863,10 +5417,7 @@ mod tests {
             "runtime-a",
             "fork-session",
             Some(&encrypted_spawn),
-            Some("/repo"),
-            Some("root-turn-a"),
-            0,
-            12,
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 12),
         )
         .unwrap()
         .unwrap();
@@ -4879,26 +5430,36 @@ mod tests {
             "runtime-a",
             "fork-session",
             Some(&encrypted_spawn),
-            Some("/repo"),
-            Some("root-turn-a"),
-            0,
-            13,
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 13),
         )
         .unwrap()
         .unwrap();
         assert!(denial.contains("fork_turns 别名冲突"));
 
         encrypted_spawn.as_object_mut().unwrap().remove("forkTurns");
+        encrypted_spawn
+            .as_object_mut()
+            .unwrap()
+            .remove("fork_turns");
+        let denial = pre_spawn_with_workspace_and_turn(
+            temp.path(),
+            "runtime-a",
+            "fork-session",
+            Some(&encrypted_spawn),
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 14),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("必须显式声明 fork_turns=none"));
+
+        encrypted_spawn["fork_turns"] = json!("none");
         assert_eq!(
             pre_spawn_with_workspace_and_turn(
                 temp.path(),
                 "runtime-a",
                 "fork-session",
                 Some(&encrypted_spawn),
-                Some("/repo"),
-                Some("root-turn-a"),
-                0,
-                14,
+                RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 15),
             )
             .unwrap(),
             None
@@ -4928,10 +5489,7 @@ mod tests {
                 "runtime-a",
                 "turn-session",
                 Some(&encrypted_spawn),
-                Some("/repo"),
-                root_turn_id,
-                0,
-                12,
+                RootHookContext::new(Some("/repo"), root_turn_id, 0, 12),
             )
             .unwrap()
             .unwrap();
@@ -4964,15 +5522,12 @@ mod tests {
             "shared-preparation",
             worker_contract("worker_b", "backend/tests"),
         );
-        let denial = post_delegation_sidecar(
+        let denial = prepare_delegation_sidecar(
             temp.path(),
             "runtime-a",
             "nonce-session",
             Some(&replay),
-            Some(&prepared_delegation_response(&replay)),
-            Some("/repo"),
-            Some("root-turn-a"),
-            12,
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 12),
         )
         .unwrap()
         .unwrap();
@@ -4999,6 +5554,13 @@ mod tests {
                     contract,
                     preparation_id_hash,
                     root_turn_id_hash: hash_component("root-turn-a"),
+                    scope_hash: canonical_value_hash(&json!({
+                        "root": "/repo",
+                        "read": ["/repo/backend/src"],
+                        "write": ["/repo/backend/src"],
+                        "native_read_scope": false,
+                    })),
+                    receipt_confirmed: true,
                     prepared_at_ms: 10,
                     batch_number: 1,
                     runtime_generation: 1,
@@ -5015,15 +5577,12 @@ mod tests {
             "overflow-prep",
             worker_contract("overflow", "backend/src"),
         );
-        let denial = post_delegation_sidecar(
+        let denial = prepare_delegation_sidecar(
             temp.path(),
             "runtime-a",
             "capacity-session",
             Some(&overflow),
-            Some(&prepared_delegation_response(&overflow)),
-            Some("/repo"),
-            Some("root-turn-a"),
-            11,
+            RootHookContext::new(Some("/repo"), Some("root-turn-a"), 0, 11),
         )
         .unwrap()
         .unwrap();
@@ -8934,6 +9493,7 @@ mod tests {
             .unwrap();
         sidecar.remove("preparation_id_hash");
         sidecar.remove("root_turn_id_hash");
+        sidecar.remove("scope_hash");
         sidecar.insert("preparation_id".to_string(), json!("legacy-preparation"));
         crate::fs_util::atomic_write(&ledger_path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
 
@@ -8945,6 +9505,65 @@ mod tests {
         assert_eq!(migrated.schema_version, LEDGER_SCHEMA_VERSION);
         assert!(migrated.prepared_delegations.is_empty());
         assert!(migrated.used_preparation_id_hashes.is_empty());
+    }
+
+    #[test]
+    fn schema_v12_unscoped_sidecars_are_dropped_during_migration() {
+        let temp = tempfile::tempdir().unwrap();
+        let retained = contract_input(
+            "retained_reader",
+            "codey_deep_research",
+            research_contract("retained_reader"),
+        );
+        assert_eq!(
+            pre_spawn(
+                temp.path(),
+                "runtime-a",
+                "schema-twelve-session",
+                Some(&retained),
+                0,
+                1,
+            )
+            .unwrap(),
+            None
+        );
+        stage_worker_sidecar(
+            temp.path(),
+            "schema-twelve-session",
+            "unscoped_sidecar",
+            "unscoped-preparation",
+            "root-turn-a",
+            10,
+        );
+        let ledger_path = temp
+            .path()
+            .join(hash_component("schema-twelve-session"))
+            .join(LEDGER_FILE);
+        let mut legacy: Value = serde_json::from_slice(&fs::read(&ledger_path).unwrap()).unwrap();
+        legacy["schema_version"] = json!(12);
+        legacy["prepared_delegations"]["unscoped_sidecar"]
+            .as_object_mut()
+            .unwrap()
+            .remove("scope_hash");
+        legacy["prepared_delegations"]["unscoped_sidecar"]
+            .as_object_mut()
+            .unwrap()
+            .remove("receipt_confirmed");
+        crate::fs_util::atomic_write(&ledger_path, &serde_json::to_vec(&legacy).unwrap()).unwrap();
+
+        let store = LedgerStore::open(temp.path(), "schema-twelve-session").unwrap();
+        let migrated = store
+            .load("runtime-a", "schema-twelve-session", 12)
+            .unwrap()
+            .unwrap();
+        assert_eq!(migrated.schema_version, LEDGER_SCHEMA_VERSION);
+        assert!(migrated.prepared_delegations.is_empty());
+        assert!(
+            migrated
+                .used_preparation_id_hashes
+                .contains(&hash_component("unscoped-preparation"))
+        );
+        assert!(migrated.reservations.contains_key("retained_reader"));
     }
 
     #[test]
