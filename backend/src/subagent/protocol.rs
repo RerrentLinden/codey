@@ -4,6 +4,8 @@
 //! time.  Keeping that tolerance here gives the gate and lifecycle ledger one
 //! definition of terminal state, interruption and spawn failure.
 
+use std::collections::BTreeSet;
+
 use serde_json::{Map, Value};
 
 const MAX_JSON_ENCODED_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -20,6 +22,7 @@ pub(crate) enum AgentState {
 pub(crate) enum TerminalOutcome {
     Succeeded,
     Failed,
+    TimedOut,
     Lost,
 }
 
@@ -27,6 +30,18 @@ pub(crate) enum TerminalOutcome {
 pub(crate) struct TerminalObservation {
     pub identifier: String,
     pub outcome: TerminalOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct InterruptAcknowledgement {
+    /// A target-specific terminal status reported as the state observed before
+    /// the interrupt. Generic `status=completed` remains a tool-call ack and
+    /// therefore does not populate this field.
+    pub prior_outcome: Option<TerminalOutcome>,
+    /// Provider-owned identities found in the acknowledgement envelope. The
+    /// orchestrator must correlate every identity with the requested target
+    /// before releasing the local lifecycle fence.
+    pub identifiers: Vec<String>,
 }
 
 pub(crate) fn normalize_identifier(value: &str) -> String {
@@ -320,64 +335,240 @@ pub(crate) fn response_is_explicit_spawn_failure(value: &Value) -> bool {
     response_has_structured_failure(value) || response_has_textual_spawn_failure(value)
 }
 
-/// Accepts only a provider-owned, structured acknowledgement that an
+/// Parses only a provider-owned, structured acknowledgement that an
 /// `interrupt_agent` call reached its target. A free-form message is not enough
 /// to release Codey's local lifecycle fence because it may itself be an error
 /// string returned by the collaboration transport.
-pub(crate) fn interrupt_response_succeeded(value: &Value) -> bool {
+pub(crate) fn interrupt_acknowledgement(value: &Value) -> Option<InterruptAcknowledgement> {
     let decoded = decode_json_encoded_response(value);
     let value = decoded.as_ref().unwrap_or(value);
-    interrupt_response_succeeded_in_envelope(value, 0)
+    if interrupt_envelope_has_failure(value, 0, true) {
+        return None;
+    }
+
+    let mut accumulator = InterruptAckAccumulator::default();
+    collect_interrupt_acknowledgement(value, 0, true, &mut accumulator);
+    if !accumulator.acknowledged || accumulator.invalid {
+        return None;
+    }
+    Some(InterruptAcknowledgement {
+        prior_outcome: accumulator.prior_outcome,
+        identifiers: accumulator.identifiers.into_iter().collect(),
+    })
 }
 
-fn interrupt_response_succeeded_in_envelope(value: &Value, depth: usize) -> bool {
+#[derive(Default)]
+struct InterruptAckAccumulator {
+    acknowledged: bool,
+    invalid: bool,
+    prior_outcome: Option<TerminalOutcome>,
+    identifiers: BTreeSet<String>,
+}
+
+fn collect_interrupt_acknowledgement(
+    value: &Value,
+    depth: usize,
+    entry_allowed: bool,
+    accumulator: &mut InterruptAckAccumulator,
+) {
+    if depth > 8 {
+        return;
+    }
+    match value {
+        Value::Array(values) if entry_allowed => {
+            for value in values {
+                collect_interrupt_acknowledgement(value, depth + 1, true, accumulator);
+            }
+        }
+        Value::Object(values) => {
+            if entry_allowed {
+                for (key, value) in values {
+                    let key = normalize_identifier(key);
+                    match key.as_str() {
+                        "taskname" | "agentname" | "agentid" | "subagentid" => {
+                            let Some(identifier) = value
+                                .as_str()
+                                .map(str::trim)
+                                .filter(|identifier| !identifier.is_empty())
+                            else {
+                                accumulator.invalid = true;
+                                continue;
+                            };
+                            accumulator.identifiers.insert(identifier.to_owned());
+                        }
+                        "interrupted" | "wasinterrupted" if value.as_bool() == Some(true) => {
+                            accumulator.acknowledged = true;
+                        }
+                        // These fields describe the target's state before/after
+                        // the interrupt. A terminal value is authoritative and
+                        // must not later be collapsed into Recovered/Lost.
+                        "previousstatus" | "agentstatus" => {
+                            collect_interrupt_identities(value, depth + 1, true, accumulator);
+                            match target_status_observation(value) {
+                                Err(()) => accumulator.invalid = true,
+                                Ok(Some((AgentState::PendingInit | AgentState::Live, _))) => {
+                                    accumulator.acknowledged = true;
+                                }
+                                Ok(Some((AgentState::Terminal, Some(outcome)))) => {
+                                    accumulator.acknowledged = true;
+                                    if accumulator
+                                        .prior_outcome
+                                        .is_some_and(|current| current != outcome)
+                                    {
+                                        accumulator.invalid = true;
+                                    } else {
+                                        accumulator.prior_outcome = Some(outcome);
+                                    }
+                                }
+                                Ok(Some((AgentState::Terminal, None))) => {
+                                    accumulator.invalid = true;
+                                }
+                                Ok(Some((AgentState::Unknown, _)) | None) => {}
+                            }
+                        }
+                        // Generic status fields can instead describe the tool
+                        // call. Preserve compatible success/live acks, but an
+                        // explicit failed/lost status invalidates the response.
+                        "status" | "state" => {
+                            collect_interrupt_identities(value, depth + 1, true, accumulator);
+                            match classify_agent_status(value) {
+                                AgentState::PendingInit | AgentState::Live => {
+                                    accumulator.acknowledged = true;
+                                }
+                                AgentState::Terminal => match terminal_outcome_from_value(value) {
+                                    Some(TerminalOutcome::Succeeded) => {
+                                        accumulator.acknowledged = true;
+                                    }
+                                    Some(
+                                        TerminalOutcome::Failed
+                                        | TerminalOutcome::TimedOut
+                                        | TerminalOutcome::Lost,
+                                    ) => accumulator.invalid = true,
+                                    None => {}
+                                },
+                                AgentState::Unknown => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            for (key, value) in values {
+                if is_provider_envelope_field(key) {
+                    collect_interrupt_acknowledgement(value, depth + 1, true, accumulator);
+                }
+            }
+        }
+        Value::String(value) if entry_allowed => {
+            if let Ok(decoded) = serde_json::from_str::<Value>(value) {
+                collect_interrupt_acknowledgement(&decoded, depth + 1, true, accumulator);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn target_status_observation(
+    value: &Value,
+) -> std::result::Result<Option<(AgentState, Option<TerminalOutcome>)>, ()> {
+    let direct_state = classify_agent_status(value);
+    if direct_state != AgentState::Unknown {
+        return Ok(Some((direct_state, terminal_outcome_from_value(value))));
+    }
+    let Value::Object(values) = value else {
+        return Ok(None);
+    };
+    let mut observation = None;
+    for (key, value) in values {
+        if !matches!(normalize_identifier(key).as_str(), "status" | "state") {
+            continue;
+        }
+        let state = classify_agent_status(value);
+        if state == AgentState::Unknown {
+            continue;
+        }
+        let candidate = (state, terminal_outcome_from_value(value));
+        if observation.is_some_and(|current| current != candidate) {
+            return Err(());
+        }
+        observation = Some(candidate);
+    }
+    Ok(observation)
+}
+
+fn collect_interrupt_identities(
+    value: &Value,
+    depth: usize,
+    entry_allowed: bool,
+    accumulator: &mut InterruptAckAccumulator,
+) {
+    if depth > 8 {
+        return;
+    }
+    match value {
+        Value::Array(values) if entry_allowed => {
+            for value in values {
+                collect_interrupt_identities(value, depth + 1, true, accumulator);
+            }
+        }
+        Value::Object(values) => {
+            if entry_allowed {
+                for (key, value) in values {
+                    if !matches!(
+                        normalize_identifier(key).as_str(),
+                        "taskname" | "agentname" | "agentid" | "subagentid"
+                    ) {
+                        continue;
+                    }
+                    let Some(identifier) = value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|identifier| !identifier.is_empty())
+                    else {
+                        accumulator.invalid = true;
+                        continue;
+                    };
+                    accumulator.identifiers.insert(identifier.to_owned());
+                }
+            }
+            for (key, value) in values {
+                if is_provider_envelope_field(key) {
+                    collect_interrupt_identities(value, depth + 1, true, accumulator);
+                }
+            }
+        }
+        Value::String(value) if entry_allowed => {
+            if let Ok(decoded) = serde_json::from_str::<Value>(value) {
+                collect_interrupt_identities(&decoded, depth + 1, true, accumulator);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn interrupt_envelope_has_failure(value: &Value, depth: usize, entry_allowed: bool) -> bool {
     if depth > 8 {
         return false;
     }
     match value {
-        Value::Array(values) => values
+        Value::Array(values) if entry_allowed => values
             .iter()
-            .any(|value| interrupt_response_succeeded_in_envelope(value, depth + 1)),
+            .any(|value| interrupt_envelope_has_failure(value, depth + 1, true)),
         Value::Object(values) => {
-            if response_has_structured_failure(value) {
-                return false;
-            }
-            let explicitly_interrupted = values.iter().any(|(key, value)| {
-                matches!(
-                    normalize_identifier(key).as_str(),
-                    "interrupted" | "wasinterrupted"
-                ) && value.as_bool() == Some(true)
-            });
-            let acknowledged_status = values.iter().any(|(key, value)| {
-                let key = normalize_identifier(key);
-                match key.as_str() {
-                    // These fields describe the target's state before/after the
-                    // interrupt, so every recognized lifecycle state is an ack.
-                    "previousstatus" | "agentstatus" => {
-                        classify_agent_status(value) != AgentState::Unknown
-                    }
-                    // Generic status fields can instead describe the tool call.
-                    // Do not interpret `failed`/`not_found` as a successful ack.
-                    "status" | "state" => {
-                        matches!(
-                            classify_agent_status(value),
-                            AgentState::PendingInit | AgentState::Live
-                        ) || terminal_outcome_from_value(value) == Some(TerminalOutcome::Succeeded)
-                    }
-                    _ => false,
-                }
-            });
-            explicitly_interrupted
-                || acknowledged_status
+            (entry_allowed && response_has_structured_failure(value))
                 || values.iter().any(|(key, value)| {
-                    is_provider_envelope_field(key)
-                        && interrupt_response_succeeded_in_envelope(value, depth + 1)
+                    (is_provider_envelope_field(key)
+                        || matches!(
+                            normalize_identifier(key).as_str(),
+                            "previousstatus" | "agentstatus" | "status" | "state"
+                        ))
+                        && interrupt_envelope_has_failure(value, depth + 1, true)
                 })
         }
-        Value::String(value) => serde_json::from_str::<Value>(value)
+        Value::String(value) if entry_allowed => serde_json::from_str::<Value>(value)
             .ok()
             .as_ref()
-            .is_some_and(|value| interrupt_response_succeeded_in_envelope(value, depth + 1)),
+            .is_some_and(|value| interrupt_envelope_has_failure(value, depth + 1, true)),
         _ => false,
     }
 }
@@ -452,6 +643,9 @@ fn object_terminal_outcome(values: &Map<String, Value>) -> Option<TerminalOutcom
                 (Some(TerminalOutcome::Failed), _) | (_, TerminalOutcome::Failed) => {
                     TerminalOutcome::Failed
                 }
+                (Some(TerminalOutcome::TimedOut), _) | (_, TerminalOutcome::TimedOut) => {
+                    TerminalOutcome::TimedOut
+                }
                 (Some(TerminalOutcome::Lost), _) | (_, TerminalOutcome::Lost) => {
                     TerminalOutcome::Lost
                 }
@@ -468,6 +662,8 @@ fn is_terminal_marker_field(key: &str) -> bool {
             | "completed"
             | "errored"
             | "failed"
+            | "timedout"
+            | "timeout"
             | "shutdown"
             | "notfound"
     )
@@ -485,6 +681,7 @@ fn terminal_outcome_from_identifier(value: &str) -> Option<TerminalOutcome> {
     match value {
         "finalanswer" | "taskcomplete" | "completed" => Some(TerminalOutcome::Succeeded),
         "errored" | "error" | "failed" => Some(TerminalOutcome::Failed),
+        "timedout" | "timeout" => Some(TerminalOutcome::TimedOut),
         "shutdown" | "notfound" => Some(TerminalOutcome::Lost),
         _ => None,
     }
@@ -533,7 +730,7 @@ mod tests {
             json!({ "structuredContent": { "interrupted": true } }),
             Value::String(serde_json::to_string(&json!({ "status": "completed" })).unwrap()),
         ] {
-            assert!(interrupt_response_succeeded(&response), "{response}");
+            assert!(interrupt_acknowledgement(&response).is_some(), "{response}");
         }
 
         for response in [
@@ -545,7 +742,89 @@ mod tests {
             json!("Interrupted agent /root/worker"),
             json!({ "result": { "message": "interrupt failed" } }),
         ] {
-            assert!(!interrupt_response_succeeded(&response), "{response}");
+            assert!(interrupt_acknowledgement(&response).is_none(), "{response}");
+        }
+    }
+
+    #[test]
+    fn interrupt_acknowledgement_preserves_identity_and_authoritative_prior_outcome() {
+        let response = json!({
+            "result": {
+                "structuredContent": {
+                    "task_name": "/root/reader_a",
+                    "agent_id": "agent-reader-a",
+                    "previous_status": "completed"
+                }
+            }
+        });
+        assert_eq!(
+            interrupt_acknowledgement(&response),
+            Some(InterruptAcknowledgement {
+                prior_outcome: Some(TerminalOutcome::Succeeded),
+                identifiers: vec!["/root/reader_a".into(), "agent-reader-a".into()],
+            })
+        );
+
+        let encoded = Value::String(
+            serde_json::to_string(&json!({
+                "data": {
+                    "subagent_id": "agent-reader-b",
+                    "agent_status": "timed_out"
+                }
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            interrupt_acknowledgement(&encoded),
+            Some(InterruptAcknowledgement {
+                prior_outcome: Some(TerminalOutcome::TimedOut),
+                identifiers: vec!["agent-reader-b".into()],
+            })
+        );
+
+        assert_eq!(
+            interrupt_acknowledgement(&json!({
+                "result": {
+                    "agent_status": {
+                        "status": "running",
+                        "agent_id": "agent-reader-c"
+                    }
+                }
+            })),
+            Some(InterruptAcknowledgement {
+                prior_outcome: None,
+                identifiers: vec!["agent-reader-c".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn interrupt_acknowledgement_rejects_nested_failure_or_conflicting_status() {
+        for response in [
+            json!({
+                "previous_status": "running",
+                "result": { "error": "agent not found" }
+            }),
+            json!({
+                "interrupted": true,
+                "status": "failed"
+            }),
+            json!({
+                "previous_status": "completed",
+                "result": { "agent_status": "failed" }
+            }),
+            json!({
+                "agent_id": 42,
+                "previous_status": "running"
+            }),
+            json!({
+                "agent_status": {
+                    "status": "running",
+                    "error": "agent not found"
+                }
+            }),
+        ] {
+            assert!(interrupt_acknowledgement(&response).is_none(), "{response}");
         }
     }
 

@@ -92,6 +92,8 @@ struct HookInput {
     tool_response: Option<Value>,
     #[serde(default, alias = "turnId")]
     turn_id: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
     #[serde(default, alias = "transcriptPath")]
     transcript_path: Option<String>,
     #[serde(default, alias = "agentTranscriptPath")]
@@ -299,6 +301,7 @@ fn handle_hook_for_runtime_at(
     now_ms: u64,
 ) -> Result<Value> {
     match input.hook_event_name.as_str() {
+        "UserPromptSubmit" => user_prompt_submit_output(input, state_root, runtime_id, now_ms),
         "SubagentStart" => {
             if let Some(agent_id) = nonempty(input.agent_id.as_deref()) {
                 create_active_marker(state_root, runtime_id, &input.session_id, agent_id)?;
@@ -368,14 +371,53 @@ fn handle_hook_for_runtime_at(
                         now_ms,
                     )?;
                 }
+                let settlement = crate::subagent_orchestrator::settle_unique_anonymous_stop(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    nonempty(input.agent_type.as_deref()),
+                    now_ms,
+                )?;
                 record_protocol_issue(
                     state_root,
                     runtime_id,
                     &input.session_id,
                     ProtocolIssueKind::MissingAgentId,
-                    "SubagentStop 载荷缺少 agent_id，无法安全清理对应活跃代理",
+                    if settlement.is_some() {
+                        "SubagentStop 载荷缺少 agent_id；已按唯一活动账本候选保守结算"
+                    } else {
+                        "SubagentStop 载荷缺少 agent_id，且活动候选不唯一，已保留门禁等待权威对账"
+                    },
                     now_ms,
                 )?;
+                if let Some(settlement) = settlement {
+                    if let Some(agent_id_hash) = settlement.agent_id_hash.as_deref() {
+                        remove_active_marker_by_hash(
+                            state_root,
+                            runtime_id,
+                            &input.session_id,
+                            agent_id_hash,
+                        )?;
+                    }
+                    let active =
+                        active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+                    if active == 0 {
+                        remove_active_marker(
+                            state_root,
+                            runtime_id,
+                            &input.session_id,
+                            MISSING_AGENT_ID_MARKER,
+                        )?;
+                        let _ = crate::subagent_orchestrator::open_batch_decision_if_settled(
+                            state_root,
+                            runtime_id,
+                            &input.session_id,
+                            0,
+                            now_ms,
+                        )?;
+                        remove_session_state(state_root, runtime_id, &input.session_id)?;
+                    }
+                }
             }
             Ok(json!({}))
         }
@@ -394,6 +436,43 @@ fn handle_hook_for_runtime_at(
         "Stop" => stop_output(input, state_root, runtime_id, now_ms),
         _ => Ok(json!({})),
     }
+}
+
+fn user_prompt_submit_output(
+    input: &HookInput,
+    state_root: &Path,
+    runtime_id: &str,
+    now_ms: u64,
+) -> Result<Value> {
+    if input_has_subagent_context(input) {
+        return Ok(json!({}));
+    }
+    let active = active_agent_count_for_runtime(state_root, runtime_id, &input.session_id)?;
+    if active == 0 {
+        return Ok(json!({}));
+    }
+
+    let rebound = if let Some(turn_id) = nonempty(input.turn_id.as_deref()) {
+        bind_root_turn(state_root, runtime_id, &input.session_id, turn_id, now_ms)?;
+        true
+    } else {
+        false
+    };
+    let compatibility = if rebound {
+        String::new()
+    } else {
+        " 当前 Hook 载荷缺少 turn_id，根身份无法重新绑定；除无筛选 list/wait 外的协作调用仍会 fail-closed。"
+            .to_string()
+    };
+    let _prompt_was_present = nonempty(input.prompt.as_deref()).is_some();
+    Ok(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": format!(
+                "Codey 检测到本轮用户输入到达时仍有 {active} 个子代理未确认终态。当前用户输入优先于旧任务描述：先调用一次不带筛选的 agents.list_agents 对账；若用户明确取消或缩小了某个子任务，只中断仍非终态且被明确取消的 target，再继续 wait/list 直到本批全部终态。普通状态询问或补充信息不得被解释为取消全部代理；完成对账前不得恢复非协作本地工作。{compatibility}"
+            )
+        }
+    }))
 }
 
 fn runtime_subagent_attestation_denial(
@@ -774,6 +853,17 @@ fn pre_tool_use_output(
     {
         return Ok(json!({}));
     }
+    if active > 0
+        && trusted_root_turn
+        && input
+            .tool_name
+            .as_deref()
+            .is_some_and(is_root_local_read_tool)
+        && verified_local_read_only_active_count(state_root, runtime_id, &input.session_id, now_ms)?
+            == Some(active)
+    {
+        return Ok(json!({}));
+    }
     if active == 0 {
         if let Some(reason) = crate::subagent_orchestrator::pre_root_tool(
             state_root,
@@ -830,19 +920,22 @@ fn post_tool_use_output(
         return Ok(json!({}));
     }
     if is_interrupt_agent_tool(tool_name) {
-        if input
+        if let Some(acknowledgement) = input
             .tool_response
             .as_ref()
-            .is_some_and(protocol::interrupt_response_succeeded)
-            && let Some(abandoned) = crate::subagent_orchestrator::abandon_interrupted_reservation(
-                state_root,
-                runtime_id,
-                &input.session_id,
-                input.tool_input.as_ref(),
-                now_ms,
-            )?
+            .and_then(protocol::interrupt_acknowledgement)
+            && let Some(settlement) =
+                crate::subagent_orchestrator::settle_interrupt_acknowledgement(
+                    state_root,
+                    runtime_id,
+                    &input.session_id,
+                    input.tool_input.as_ref(),
+                    &acknowledgement,
+                    now_ms,
+                )?
+            && settlement.changed
         {
-            if let Some(agent_id_hash) = abandoned.agent_id_hash.as_deref() {
+            if let Some(agent_id_hash) = settlement.agent_id_hash.as_deref() {
                 remove_active_marker_by_hash(
                     state_root,
                     runtime_id,
@@ -979,18 +1072,53 @@ fn post_tool_use_output(
         false,
         now_ms,
     )?;
+    let Some(active) = active_agent_count_or_recover_corrupt_state(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        now_ms,
+    )?
+    else {
+        return Ok(json!({}));
+    };
+    if active == 0 {
+        remove_session_state(state_root, runtime_id, &input.session_id)?;
+        if let Some(reason) = crate::subagent_orchestrator::open_batch_decision_if_settled(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            0,
+            now_ms,
+        )? {
+            return Ok(json!({ "decision": "block", "reason": reason }));
+        }
+        return Ok(json!({}));
+    }
+    let root_local_reads_allowed = root_turn_matches(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        nonempty(input.turn_id.as_deref()),
+    )? && verified_local_read_only_active_count(
+        state_root,
+        runtime_id,
+        &input.session_id,
+        now_ms,
+    )? == Some(active);
     let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
     if is_wait_agent_tool(tool_name) {
         Ok(post_wait_continuation(
             active,
             input.tool_response.as_ref(),
             protocol_issue.as_deref(),
+            root_local_reads_allowed,
         ))
     } else {
         Ok(post_list_continuation(
             active,
             input.tool_response.as_ref(),
             protocol_issue.as_deref(),
+            root_local_reads_allowed,
         ))
     }
 }
@@ -1233,6 +1361,7 @@ fn post_wait_continuation(
     active: usize,
     tool_response: Option<&Value>,
     protocol_issue: Option<&str>,
+    root_local_reads_allowed: bool,
 ) -> Value {
     let returned_update = render_tool_result(tool_response, "wait_agent");
     let decryption_recovery = tool_response
@@ -1246,10 +1375,15 @@ fn post_wait_continuation(
     let compatibility = protocol_issue
         .map(|issue| format!("\n\nHook 协议兼容性诊断：{issue}。"))
         .unwrap_or_default();
+    let local_read_guidance = if root_local_reads_allowed {
+        " 当前账本与活动 marker 已共同证明剩余子代理均已绑定且只具备 `files.read`；可信根代理可使用 `mcp__codey_fastctx__inspect_local_file`、`mcp__codey_fastctx__grep` 或 `mcp__codey_fastctx__glob` 消化本次部分结果。写入、命令、网络、其他本地工具和结束任务仍被拒绝；完成有界读取后继续 wait/list 汇合。"
+    } else {
+        " 在所有子代理进入终态或被根成功中断并 fence 前，不得恢复非协作本地工作、形成最终结论或结束当前任务。"
+    };
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理继续等待。根中断获得结构化成功回执后，该 target 即在 Codey 中永久放弃并视为本批已结算；后来仍显示 pending_init、running 或 interrupted 的上游快照不得触发再次等待。不得自动重派；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。在所有子代理进入终态或被根成功中断并 fence 前，不得恢复非协作本地工作、形成最终结论或结束当前任务。\n\n本次 wait_agent 已返回内容：\n{returned_update}{decryption_recovery}{compatibility}"
+            "Codey 子代理汇合门禁：本次 agents.wait_agent 返回后仍有 {active} 个子代理活动标记尚未核销。保留下方内容；可继续使用 agents.wait_agent 或不带筛选的 agents.list_agents 对账。只有当前调用仍携带并匹配本批首个根派生调用的 turn_id 时，才可使用 agents.send_message、agents.followup_task 或 agents.interrupt_agent 协调；缺少该绑定时按匿名主体 fail-closed。completed、errored、shutdown、not_found、FINAL_ANSWER 和 task_complete 都视为终态；只对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理继续等待。根中断获得结构化成功回执后，该 target 即在 Codey 中永久放弃并视为本批已结算；后来仍显示 pending_init、running 或 interrupted 的上游快照不得触发再次等待。不得自动重派；若持续没有可信终态，Stop 恢复路径会在受控宽限期后 fence 遗留 attempt。{local_read_guidance}\n\n本次 wait_agent 已返回内容：\n{returned_update}{decryption_recovery}{compatibility}"
         ),
     })
 }
@@ -1258,15 +1392,21 @@ fn post_list_continuation(
     active: usize,
     tool_response: Option<&Value>,
     protocol_issue: Option<&str>,
+    root_local_reads_allowed: bool,
 ) -> Value {
     let returned_update = render_tool_result(tool_response, "list_agents");
     let compatibility = protocol_issue
         .map(|issue| format!("\n\nHook 协议兼容性诊断：{issue}。"))
         .unwrap_or_default();
+    let local_read_guidance = if root_local_reads_allowed {
+        " 当前账本与活动 marker 已共同证明剩余子代理均已绑定且只具备 `files.read`；可信根代理可使用 FastCtx 的 inspect、grep 或 glob 消化已返回证据，但写入、命令、网络、其他本地工具和结束任务仍被拒绝，随后必须继续汇合。"
+    } else {
+        " 所有活动代理结算前继续保持全局本地工具屏障。"
+    };
     json!({
         "decision": "block",
         "reason": format!(
-            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。只对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理继续等待、转向或停止；completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理；中断获得结构化成功回执后立即接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。不得无限 wait 或自动重派。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。\n\n本次 list_agents 已返回内容：\n{returned_update}{compatibility}"
+            "Codey 子代理汇合门禁：agents.list_agents 核对后仍有 {active} 个子代理尚未确认进入终态。只对仍活动且未被根成功中断的 running、pending_init 或 interrupted 代理继续等待、转向或停止；completed、errored、shutdown 和 not_found 不再阻塞。累计 10 分钟仍无终态时只中断一次对应代理；中断获得结构化成功回执后立即接管，不再等待该 target 的上游状态变化，只有中断失败或目标无法匹配时才继续对账。不得无限 wait 或自动重派。若 pending_init 实际已僵死，门禁会在持续 10 分钟无法进展后释放遗留状态。{local_read_guidance}\n\n本次 list_agents 已返回内容：\n{returned_update}{compatibility}"
         ),
     })
 }
@@ -1643,6 +1783,31 @@ fn normalized_ascii_identifier(value: &str) -> String {
     protocol::normalize_identifier(value)
 }
 
+fn verified_local_read_only_active_count(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<Option<usize>> {
+    let marker_hashes = active_marker_hashes_for_runtime(state_root, runtime_id, session_id)?;
+    crate::subagent_orchestrator::verified_local_read_only_active_count(
+        state_root,
+        runtime_id,
+        session_id,
+        &marker_hashes,
+        now_ms,
+    )
+}
+
+fn is_root_local_read_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name.trim().to_ascii_lowercase().as_str(),
+        "mcp__codey_fastctx__inspect_local_file"
+            | "mcp__codey_fastctx__grep"
+            | "mcp__codey_fastctx__glob"
+    )
+}
+
 fn is_collaboration_tool(tool_name: &str) -> bool {
     matches!(
         normalized_collaboration_tool(tool_name).as_str(),
@@ -1748,6 +1913,7 @@ mod tests {
             tool_input: None,
             tool_response: None,
             turn_id: None,
+            prompt: None,
             transcript_path: None,
             agent_transcript_path: None,
             cwd: None,
@@ -2494,6 +2660,75 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_after_target_completion_preserves_success_instead_of_abandoning_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "interrupt-after-completion";
+        let target = "/root/completed_reader";
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "completed_reader",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "completed_reader",
+                "why": "independent_review",
+                "visual": false,
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        handle_hook_for_runtime_at(&spawn, root, runtime_id, 10).unwrap();
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "agent_id": target }));
+        handle_hook_for_runtime_at(&spawned, root, runtime_id, 20).unwrap();
+        let mut started = input("SubagentStart", session_id);
+        started.agent_id = Some(target.to_string());
+        handle_hook_for_runtime_at(&started, root, runtime_id, 25).unwrap();
+
+        let mut interrupt = input("PostToolUse", session_id);
+        interrupt.turn_id = Some("root-turn-a".to_string());
+        interrupt.tool_name = Some("agents.interrupt_agent".to_string());
+        interrupt.tool_input = Some(json!({ "target": target }));
+        interrupt.tool_response = Some(json!({
+            "agent_id": target,
+            "previous_status": "completed"
+        }));
+        let settled = handle_hook_for_runtime_at(&interrupt, root, runtime_id, 30).unwrap();
+        assert_eq!(settled["decision"].as_str(), Some("block"));
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            0
+        );
+
+        let events = std::fs::read_to_string(crate::subagent::telemetry::trace_file(root)).unwrap();
+        let terminal = events
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<crate::subagent::telemetry::SubagentTraceEvent>(line)
+                    .unwrap()
+            })
+            .find(|event| event.timestamp_ms == 30)
+            .unwrap();
+        assert_eq!(
+            terminal.event,
+            crate::subagent::telemetry::TraceEventKind::Completed
+        );
+        assert_eq!(
+            terminal.status,
+            crate::subagent::telemetry::ExecutionStatus::Succeeded
+        );
+        assert_eq!(terminal.error_code, None);
+    }
+
+    #[test]
     fn failed_or_unmatched_interrupt_does_not_release_an_active_attempt() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -2543,10 +2778,23 @@ mod tests {
             1
         );
 
+        interrupt.tool_response = Some(json!({
+            "agent_id": "/root/different_reader",
+            "previous_status": "running"
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&interrupt, root, runtime_id, 31).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+            1
+        );
+
         interrupt.tool_input = Some(json!({ "target": "/root/unknown_reader" }));
         interrupt.tool_response = Some(json!({ "previous_status": "interrupted" }));
         assert_eq!(
-            handle_hook_for_runtime_at(&interrupt, root, runtime_id, 31).unwrap(),
+            handle_hook_for_runtime_at(&interrupt, root, runtime_id, 32).unwrap(),
             json!({})
         );
         assert_eq!(
@@ -2804,6 +3052,84 @@ mod tests {
     }
 
     #[test]
+    fn user_prompt_submit_rebinds_the_trusted_root_turn_without_blanket_cancellation() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+        let session_id = "user-steering-session";
+
+        let mut spawn = input("PreToolUse", session_id);
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "steer_reader",
+            "agent_type": "codey_deep_research",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "steer_reader",
+                "why": "independent_review",
+                "visual": false,
+                "read": [],
+                "write": [],
+                "checks": []
+            }))
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&spawn, root, runtime_id, 10).unwrap(),
+            json!({})
+        );
+
+        let mut interrupt = input("PreToolUse", session_id);
+        interrupt.turn_id = Some("root-turn-b".to_string());
+        interrupt.tool_name = Some("agents.interrupt_agent".to_string());
+        interrupt.tool_input = Some(json!({ "target": "/root/steer_reader" }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&interrupt, root, runtime_id, 20).unwrap()
+                ["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+
+        let mut child_prompt = input("UserPromptSubmit", session_id);
+        child_prompt.agent_id = Some("child-agent".to_string());
+        child_prompt.turn_id = Some("child-turn".to_string());
+        child_prompt.prompt = Some("continue".to_string());
+        assert_eq!(
+            handle_hook_for_runtime_at(&child_prompt, root, runtime_id, 25).unwrap(),
+            json!({})
+        );
+        interrupt.turn_id = Some("child-turn".to_string());
+        assert_eq!(
+            handle_hook_for_runtime_at(&interrupt, root, runtime_id, 26).unwrap()
+                ["hookSpecificOutput"]["permissionDecision"]
+                .as_str(),
+            Some("deny")
+        );
+
+        let mut user_prompt = input("UserPromptSubmit", session_id);
+        user_prompt.turn_id = Some("root-turn-b".to_string());
+        user_prompt.prompt = Some("取消这个读取代理，保留其他任务".to_string());
+        let steering = handle_hook_for_runtime_at(&user_prompt, root, runtime_id, 30).unwrap();
+        let context = steering["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(context.contains("当前用户输入优先"));
+        assert!(context.contains("只中断仍非终态且被明确取消的 target"));
+        assert!(context.contains("不得被解释为取消全部代理"));
+        interrupt.turn_id = Some("root-turn-b".to_string());
+        assert_eq!(
+            handle_hook_for_runtime_at(&interrupt, root, runtime_id, 40).unwrap(),
+            json!({})
+        );
+
+        let idle = input("UserPromptSubmit", "idle-session");
+        assert_eq!(
+            handle_hook_for_runtime_at(&idle, root, runtime_id, 50).unwrap(),
+            json!({})
+        );
+    }
+
+    #[test]
     fn combined_hook_keeps_fastctx_active_and_prioritizes_the_subagent_gate() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -3055,6 +3381,82 @@ mod tests {
     }
 
     #[test]
+    fn missing_id_stop_settles_only_a_unique_active_ledger_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-a";
+
+        let spawn_agent = |session_id: &str, task_id: &str, now_ms: u64| {
+            let mut spawn = input("PreToolUse", session_id);
+            spawn.turn_id = Some("root-turn-a".to_string());
+            spawn.tool_name = Some("agents.spawn_agent".to_string());
+            spawn.tool_input = Some(json!({
+                "task_name": task_id,
+                "agent_type": "codey_deep_research",
+                "fork_turns": "none",
+                "message": delegation_message(json!({
+                    "id": task_id,
+                    "why": "independent_review",
+                    "visual": false,
+                    "read": [],
+                    "write": [],
+                    "checks": []
+                }))
+            }));
+            handle_hook_for_runtime_at(&spawn, root, runtime_id, now_ms).unwrap();
+            let mut spawned = input("PostToolUse", session_id);
+            spawned.tool_name = spawn.tool_name.clone();
+            spawned.tool_input = spawn.tool_input.clone();
+            spawned.tool_response = Some(json!({
+                "agent_id": format!("agent-{task_id}")
+            }));
+            handle_hook_for_runtime_at(&spawned, root, runtime_id, now_ms + 1).unwrap();
+        };
+
+        let unique_session = "unique-anonymous-stop";
+        spawn_agent(unique_session, "only_reader", 10);
+        let mut anonymous_start = input("SubagentStart", unique_session);
+        anonymous_start.agent_type = Some("codey_deep_research".to_string());
+        handle_hook_for_runtime_at(&anonymous_start, root, runtime_id, 12).unwrap();
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, unique_session).unwrap(),
+            1
+        );
+        let mut anonymous_stop = input("SubagentStop", unique_session);
+        anonymous_stop.agent_type = Some("codey_deep_research".to_string());
+        assert_eq!(
+            handle_hook_for_runtime_at(&anonymous_stop, root, runtime_id, 13).unwrap(),
+            json!({})
+        );
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, unique_session).unwrap(),
+            0
+        );
+
+        let ambiguous_session = "ambiguous-anonymous-stop";
+        spawn_agent(ambiguous_session, "reader_a", 20);
+        spawn_agent(ambiguous_session, "reader_b", 30);
+        let mut anonymous_start = input("SubagentStart", ambiguous_session);
+        anonymous_start.agent_type = Some("codey_deep_research".to_string());
+        handle_hook_for_runtime_at(&anonymous_start, root, runtime_id, 32).unwrap();
+        let mut anonymous_stop = input("SubagentStop", ambiguous_session);
+        anonymous_stop.agent_type = Some("codey_deep_research".to_string());
+        handle_hook_for_runtime_at(&anonymous_stop, root, runtime_id, 33).unwrap();
+        assert_eq!(
+            active_agent_count_for_runtime(root, runtime_id, ambiguous_session).unwrap(),
+            2
+        );
+        assert!(
+            agent_marker_path(
+                &session_state_dir(root, ambiguous_session),
+                runtime_id,
+                MISSING_AGENT_ID_MARKER,
+            )
+            .exists()
+        );
+    }
+
+    #[test]
     fn unknown_wait_shape_is_reported_then_cleared_by_a_known_shape() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
@@ -3103,6 +3505,233 @@ mod tests {
             handle_hook(&input("Stop", "session-a"), root).unwrap(),
             json!({})
         );
+    }
+
+    #[test]
+    fn verified_read_only_batch_allows_only_trusted_root_fastctx_reads() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let runtime_id = "runtime-read-window";
+        let root_turn = "root-turn-read-window";
+        let base = current_timestamp_millis();
+        let spawn_agent = |session_id: &str,
+                           task_id: &str,
+                           role: &str,
+                           agent_id: &str,
+                           contract: Value,
+                           now_ms: u64| {
+            let mut spawn = input("PreToolUse", session_id);
+            spawn.turn_id = Some(root_turn.to_string());
+            spawn.tool_name = Some("agents.spawn_agent".to_string());
+            spawn.tool_input = Some(json!({
+                "task_name": task_id,
+                "agent_type": role,
+                "fork_turns": "none",
+                "message": delegation_message(contract),
+            }));
+            assert_eq!(
+                handle_hook_for_runtime_at(&spawn, root, runtime_id, now_ms).unwrap(),
+                json!({})
+            );
+
+            let mut spawned = input("PostToolUse", session_id);
+            spawned.turn_id = Some(root_turn.to_string());
+            spawned.tool_name = spawn.tool_name.clone();
+            spawned.tool_input = spawn.tool_input.clone();
+            spawned.tool_response = Some(json!({ "agent_id": agent_id }));
+            assert_eq!(
+                handle_hook_for_runtime_at(&spawned, root, runtime_id, now_ms + 1).unwrap(),
+                json!({})
+            );
+
+            let mut started = input("SubagentStart", session_id);
+            started.agent_id = Some(agent_id.to_string());
+            started.agent_type = Some(role.to_string());
+            assert_eq!(
+                handle_hook_for_runtime_at(&started, root, runtime_id, now_ms + 2).unwrap(),
+                json!({})
+            );
+        };
+        let read_contract = |task_id: &str| {
+            json!({
+                "id": task_id,
+                "why": "breadth",
+                "visual": false,
+                "read": [],
+                "write": [],
+                "capabilities": ["files.read"],
+                "checks": [],
+            })
+        };
+        let root_tool = |session_id: &str, turn_id: &str, tool_name: &str| {
+            let mut tool = input("PreToolUse", session_id);
+            tool.turn_id = Some(turn_id.to_string());
+            tool.tool_name = Some(tool_name.to_string());
+            tool
+        };
+        let permission = |output: &Value| {
+            output["hookSpecificOutput"]["permissionDecision"]
+                .as_str()
+                .map(str::to_string)
+        };
+
+        let read_session = "verified-read-session";
+        spawn_agent(
+            read_session,
+            "reader_a",
+            "codey_deep_research",
+            "agent-reader-a",
+            read_contract("reader_a"),
+            base + 10,
+        );
+        spawn_agent(
+            read_session,
+            "reader_b",
+            "codey_quick_scan",
+            "agent-reader-b",
+            read_contract("reader_b"),
+            base + 20,
+        );
+
+        for tool_name in [
+            "mcp__codey_fastctx__inspect_local_file",
+            "mcp__codey_fastctx__grep",
+            "mcp__codey_fastctx__glob",
+        ] {
+            assert_eq!(
+                handle_hook_for_runtime_at(
+                    &root_tool(read_session, root_turn, tool_name),
+                    root,
+                    runtime_id,
+                    base + 30,
+                )
+                .unwrap(),
+                json!({}),
+                "{tool_name}"
+            );
+        }
+        for tool_name in [
+            "mcp__codey_fastctx__replace",
+            "functions.apply_patch",
+            "functions.exec",
+            "web.run",
+            "tool_search",
+            "functions.view_image",
+        ] {
+            let denied = handle_hook_for_runtime_at(
+                &root_tool(read_session, root_turn, tool_name),
+                root,
+                runtime_id,
+                base + 31,
+            )
+            .unwrap();
+            assert_eq!(permission(&denied).as_deref(), Some("deny"), "{tool_name}");
+        }
+        let untrusted = handle_hook_for_runtime_at(
+            &root_tool(read_session, "different-turn", "mcp__codey_fastctx__grep"),
+            root,
+            runtime_id,
+            base + 32,
+        )
+        .unwrap();
+        assert_eq!(permission(&untrusted).as_deref(), Some("deny"));
+        assert_eq!(
+            handle_hook_for_runtime_at(&input("Stop", read_session), root, runtime_id, base + 33,)
+                .unwrap()["decision"]
+                .as_str(),
+            Some("block")
+        );
+
+        let mut partial_wait = input("PostToolUse", read_session);
+        partial_wait.turn_id = Some(root_turn.to_string());
+        partial_wait.tool_name = Some("agents.wait_agent".to_string());
+        partial_wait.tool_response = Some(json!({
+            "updates": [
+                { "agent_id": "agent-reader-a", "status": "completed", "message": "evidence" },
+                { "agent_id": "agent-reader-b", "status": "running" }
+            ],
+            "timed_out": false
+        }));
+        let continuation =
+            handle_hook_for_runtime_at(&partial_wait, root, runtime_id, base + 40).unwrap();
+        assert_eq!(continuation["decision"].as_str(), Some("block"));
+        let reason = continuation["reason"].as_str().unwrap();
+        assert!(reason.contains("仍有 1 个子代理"));
+        assert!(reason.contains("mcp__codey_fastctx__inspect_local_file"));
+        assert!(reason.contains("写入、命令、网络"));
+        assert_eq!(
+            handle_hook_for_runtime_at(
+                &root_tool(read_session, root_turn, "mcp__codey_fastctx__grep"),
+                root,
+                runtime_id,
+                base + 41,
+            )
+            .unwrap(),
+            json!({})
+        );
+
+        remove_active_marker(root, runtime_id, read_session, "agent-reader-b").unwrap();
+        create_active_marker(root, runtime_id, read_session, "untracked-agent").unwrap();
+        let marker_mismatch = handle_hook_for_runtime_at(
+            &root_tool(read_session, root_turn, "mcp__codey_fastctx__grep"),
+            root,
+            runtime_id,
+            base + 42,
+        )
+        .unwrap();
+        assert_eq!(permission(&marker_mismatch).as_deref(), Some("deny"));
+
+        let command_session = "command-capable-read-session";
+        spawn_agent(
+            command_session,
+            "command_reader",
+            "codey_deep_research",
+            "agent-command-reader",
+            json!({
+                "id": "command_reader",
+                "why": "breadth",
+                "visual": false,
+                "read": [],
+                "write": [],
+                "capabilities": ["files.read", "command.execute"],
+                "checks": [],
+            }),
+            base + 50,
+        );
+        let command_capable = handle_hook_for_runtime_at(
+            &root_tool(command_session, root_turn, "mcp__codey_fastctx__grep"),
+            root,
+            runtime_id,
+            base + 53,
+        )
+        .unwrap();
+        assert_eq!(permission(&command_capable).as_deref(), Some("deny"));
+
+        let write_session = "writer-session";
+        spawn_agent(
+            write_session,
+            "writer_a",
+            "codey_worker",
+            "agent-writer-a",
+            json!({
+                "id": "writer_a",
+                "why": "independent_work",
+                "visual": false,
+                "read": [],
+                "write": ["backend/src"],
+                "capabilities": ["files.read", "workspace.write"],
+                "checks": [{ "id": "tests", "cmd": "cargo test -p codey --lib" }],
+            }),
+            base + 60,
+        );
+        let writer_active = handle_hook_for_runtime_at(
+            &root_tool(write_session, root_turn, "mcp__codey_fastctx__grep"),
+            root,
+            runtime_id,
+            base + 63,
+        )
+        .unwrap();
+        assert_eq!(permission(&writer_active).as_deref(), Some("deny"));
     }
 
     #[test]

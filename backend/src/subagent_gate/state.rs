@@ -3,6 +3,7 @@
 //! This module owns state files, timestamps, markers, and their validation. It
 //! deliberately does not decide whether a Hook event is allowed or denied.
 
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -518,10 +519,24 @@ pub(super) fn active_agent_count_for_runtime(
     )? {
         return Ok(active);
     }
+    Ok(active_marker_hashes_for_runtime(state_root, runtime_id, session_id)?.len())
+}
+
+/// Returns the validated provider-identity hashes represented by legacy active
+/// markers. Modern lifecycle decisions use the ledger, but comparing this set
+/// with bound ledger identities prevents an untracked lifecycle event from
+/// being mistaken for a verified read-only batch.
+pub(super) fn active_marker_hashes_for_runtime(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+) -> Result<BTreeSet<String>> {
     let session_dir = session_state_dir(state_root, session_id);
     let entries = match fs::read_dir(&session_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
         Err(error) => {
             return Err(error).with_context(|| {
                 format!("读取 Codex 子代理门禁状态失败：{}", session_dir.display())
@@ -530,7 +545,7 @@ pub(super) fn active_agent_count_for_runtime(
     };
     let expected_runtime_id_hash = hash_component(runtime_id);
     let prefix = runtime_marker_prefix(runtime_id);
-    let mut count = 0;
+    let mut hashes = BTreeSet::new();
     for entry in entries {
         let entry = entry?;
         if !entry.file_type()?.is_file() || !marker_name_has_prefix(&entry.path(), &prefix) {
@@ -551,9 +566,25 @@ pub(super) fn active_agent_count_for_runtime(
             "Codex 子代理门禁状态代次不一致：{}",
             path.display()
         );
-        count += 1;
+        let file_name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .context("Codex 子代理门禁 marker 文件名不是有效 UTF-8")?;
+        let agent_id_hash = file_name
+            .strip_prefix(&prefix)
+            .and_then(|value| value.strip_suffix(".active"))
+            .context("Codex 子代理门禁 marker 文件名格式无效")?;
+        anyhow::ensure!(
+            agent_id_hash.len() == 64
+                && agent_id_hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+            "Codex 子代理门禁 marker 身份哈希格式无效：{}",
+            path.display()
+        );
+        hashes.insert(agent_id_hash.to_string());
     }
-    Ok(count)
+    Ok(hashes)
 }
 
 pub(super) fn session_state_dir(state_root: &Path, session_id: &str) -> PathBuf {

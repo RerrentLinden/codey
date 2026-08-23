@@ -2079,7 +2079,7 @@ struct RuntimeHooksFile {
     trust_entries: Vec<RuntimeHookTrustEntry>,
 }
 
-const SUBAGENT_GATE_HOOKS: [CodeyHookSpec; 6] = [
+const SUBAGENT_GATE_HOOKS: [CodeyHookSpec; 7] = [
     CodeyHookSpec {
         toml_event: "PreToolUse",
         event_key: "pre_tool_use",
@@ -2090,6 +2090,12 @@ const SUBAGENT_GATE_HOOKS: [CodeyHookSpec; 6] = [
         toml_event: "PostToolUse",
         event_key: "post_tool_use",
         matcher: Some(crate::subagent_orchestrator::POST_TOOL_HOOK_MATCHER),
+        timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
+    },
+    CodeyHookSpec {
+        toml_event: "UserPromptSubmit",
+        event_key: "user_prompt_submit",
+        matcher: None,
         timeout_seconds: crate::subagent_gate::HOOK_TIMEOUT_SECONDS,
     },
     CodeyHookSpec {
@@ -2125,9 +2131,10 @@ const FASTCTX_ROUTE_HOOKS: [CodeyHookSpec; 1] = [CodeyHookSpec {
     timeout_seconds: crate::fastctx_route_gate::HOOK_TIMEOUT_SECONDS,
 }];
 
-const CODEY_HOOK_EVENTS: [&str; 6] = [
+const CODEY_HOOK_EVENTS: [&str; 7] = [
     "PreToolUse",
     "PostToolUse",
+    "UserPromptSubmit",
     "SubagentStart",
     "SubagentStop",
     "Stop",
@@ -2688,6 +2695,7 @@ fn remove_codey_hooks(
     for (toml_event, event_key) in [
         ("PreToolUse", "pre_tool_use"),
         ("PostToolUse", "post_tool_use"),
+        ("UserPromptSubmit", "user_prompt_submit"),
         ("SubagentStart", "subagent_start"),
         ("SubagentStop", "subagent_stop"),
         ("Stop", "stop"),

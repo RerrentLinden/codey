@@ -128,6 +128,7 @@ pub(super) fn collect_terminal_task_outcomes(
         let outcome = match observation.outcome {
             protocol::TerminalOutcome::Succeeded => ExecutionOutcome::Succeeded,
             protocol::TerminalOutcome::Failed => ExecutionOutcome::Failed,
+            protocol::TerminalOutcome::TimedOut => ExecutionOutcome::TimedOut,
             protocol::TerminalOutcome::Lost => ExecutionOutcome::Lost,
         };
         terminal_tasks

@@ -1786,7 +1786,13 @@ command = "echo preserve-user-hook"
         post_tool_use.get(0).unwrap()["matcher"].as_str(),
         Some(crate::subagent_orchestrator::POST_TOOL_HOOK_MATCHER)
     );
-    for event in ["SubagentStart", "SubagentStop", "Stop", "SessionEnd"] {
+    for event in [
+        "UserPromptSubmit",
+        "SubagentStart",
+        "SubagentStop",
+        "Stop",
+        "SessionEnd",
+    ] {
         assert_eq!(
             document["hooks"][event].as_array_of_tables().unwrap().len(),
             1,
@@ -1794,7 +1800,7 @@ command = "echo preserve-user-hook"
         );
     }
     let hook_state = document["hooks"]["state"].as_table().unwrap();
-    assert_eq!(hook_state.len(), 6);
+    assert_eq!(hook_state.len(), SUBAGENT_GATE_HOOKS.len());
     let pre_tool_key = "/tmp/codey-codex/config.toml:pre_tool_use:1:0";
     assert!(
         hook_state[pre_tool_key]["trusted_hash"]
@@ -1848,6 +1854,7 @@ fn subagent_and_fastctx_share_one_pre_tool_hook() {
     );
     for event in [
         "PostToolUse",
+        "UserPromptSubmit",
         "SubagentStart",
         "SubagentStop",
         "Stop",
@@ -4946,6 +4953,7 @@ wire_api = "responses"
     assert!(windows_command.contains(crate::subagent_gate::COMBINED_HOOK_ARGUMENT));
     for event in [
         "PostToolUse",
+        "UserPromptSubmit",
         "SubagentStart",
         "SubagentStop",
         "Stop",

@@ -330,12 +330,12 @@ Codey 在 attempt 身份和角色 capability 校验通过后，不再解析、�
 
 ### 汇合、异常与接管
 
-- 同一批独立任务先全部派发，再进入等待。Hook 会把本批首个根派生调用的可信 `turn_id` 绑定为编排主体；同一根 turn 可继续完成本批派发与必要协调，child turn 或缺失/不匹配的 turn 只能使用 `agents.wait_agent` 和无筛选的 `agents.list_agents` 对账，不能派生、追派、中断或操纵批次。所有代理进入终态前不得恢复普通本地工作。
+- 同一批独立任务先全部派发，再进入等待。Hook 会把本批首个根派生调用的可信 `turn_id` 绑定为编排主体；活动批次期间收到官方 `UserPromptSubmit` 时，会把该可信根事件的 `turn_id` 重新绑定到新一轮，并注入本段对账规则。child turn 或缺失/不匹配的 turn 仍只能使用 `agents.wait_agent` 和无筛选的 `agents.list_agents` 对账，不能派生、追派、中断或操纵批次。只有账本与活动 marker 共同证明全部剩余 attempt 均已绑定且仅具备 `files.read` 时，可信根代理才可在汇合间隙使用 FastCtx 的 `inspect_local_file`、`grep` 或 `glob` 消化部分结果；写入、命令、网络、其他本地工具和结束任务继续阻断，完成有界读取后立即回到 wait/list。存在 writer、命令能力、身份缺失、marker/账本不一致或状态异常时，所有代理进入终态前不得恢复普通本地工作。
 - 每个子代理只用一轮，不复用、不追派，也不得继续派生。失败后默认由主代理接管；只有缩小或改变范围后仍值得独立委派，才允许使用新任务 ID 最多重派一次。
 - 收到 `CODEY_SUBAGENT_DUPLICATE_TASK_ID` 时，不得重复旧 ID，也不得把拒绝当作完成后立即 Stop。先调用一次无筛选的 `agents.list_agents` 对账：原代理存在时等待其终态或消费已有终态结果，明确不存在时由主代理接管；只有任务范围确实改变且仍值得委派时，才可使用全新的 `task_name` 最多重试一次，并把 `CODEY_DELEGATION_V2.id` 同步改为完全相同的新值。
 - `MESSAGE` 或不完整结果只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`running`、`pending_init` 和 `interrupted` 不是终态。
-- `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态且根 turn 绑定有效时只中断一次。成功的 `agents.interrupt_agent` 表示根代理永久放弃该 attempt，Codey 会立即 fence 并核销本地活动状态；不要再等待或追派该 target，直接接管。中断失败或目标无法唯一匹配时才继续对账，并依赖 Stop 的受控恢复路径。禁止无限 wait、无限重试或静默重派。
-- 用户新输入使旧批次失效时，先完成对账；只有可信根 turn 绑定仍有效时才中断活动代理。中断成功后立即接管并忽略迟到结果，不再等待上游把 `interrupted` 另行改成终态；否则让受控恢复路径接管。编排账本、未清偿验收债和未验证结算证据按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
+- `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态且根 turn 绑定有效时只中断一次。成功的 `agents.interrupt_agent` 回执若报告目标先前仍在活动，Codey 才把它作为根代理永久放弃并立即 fence；若回执报告目标已经成功、失败、超时或丢失，则保留该真实终态。响应中出现的任何目标身份都必须与请求 target 唯一一致，否则不释放门禁。不要再等待或追派已核销 target；中断失败或身份无法唯一匹配时继续对账，并依赖 Stop 的受控恢复路径。禁止无限 wait、无限重试或静默重派。
+- 用户新输入优先于旧任务描述，但不等于自动取消全部子代理。先执行一次无筛选 `agents.list_agents` 对账；只有用户明确取消、替换或缩小的子任务，才对仍非终态的对应 target 执行一次中断。状态询问、补充材料或对其他分支的修改不得误停未被点名的代理。中断核销后忽略该已取消请求的迟到结果；其余分支继续正常汇合。编排账本、未清偿验收债和未验证结算证据按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
 "#;
 
 pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V12: &str = r#"## 子代理使用

@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::subagent::api::{InvocationMode, TokenUsage, TraceContext};
 use crate::subagent::lifecycle::{ExecutionOutcome, ExecutionPhase as ReservationState};
+use crate::subagent::protocol::{InterruptAcknowledgement, TerminalOutcome};
 use crate::subagent::rules::{self, RoleAccess, RuleActor, RuleContext, RuleEffect, ToolClass};
 use crate::subagent::telemetry::{
     self, ExecutionStatus, SubagentTraceEvent, TraceEventKind, TraceRecorder,
@@ -1480,6 +1481,52 @@ pub(crate) fn subagent_stopped_with_context(
     )
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AnonymousStopSettlement {
+    pub(crate) agent_id_hash: Option<String>,
+}
+
+/// Settles an identity-less SubagentStop only when the ledger leaves exactly one
+/// safe active candidate. Role information narrows the candidate set when the
+/// Hook supplies it; ambiguity deliberately remains fail-closed for later
+/// authoritative wait/list reconciliation.
+pub(crate) fn settle_unique_anonymous_stop(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    agent_type: Option<&str>,
+    now_ms: u64,
+) -> Result<Option<AnonymousStopSettlement>> {
+    let store = LedgerStore::open(state_root, session_id)?;
+    let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
+        return Ok(None);
+    };
+    let candidates = ledger
+        .reservations
+        .iter()
+        .filter(|(_, reservation)| {
+            reservation.state.is_active() && agent_type.is_none_or(|role| reservation.role == role)
+        })
+        .map(|(task_id, _)| task_id.clone())
+        .collect::<Vec<_>>();
+    let [task_id] = candidates.as_slice() else {
+        return Ok(None);
+    };
+    let reservation = ledger
+        .reservations
+        .get_mut(task_id)
+        .expect("anonymous stop candidate must exist");
+    let agent_id_hash = reservation.agent_id_hash.clone();
+    reservation.state = ReservationState::Terminal;
+    reservation.outcome = ExecutionOutcome::Unknown;
+    reservation.updated_at_ms = now_ms;
+    reservation.completed_at_ms = Some(now_ms);
+    reservation.fenced_at_ms = Some(now_ms);
+    reservation.error_message = None;
+    store.save(&mut ledger, now_ms)?;
+    Ok(Some(AnonymousStopSettlement { agent_id_hash }))
+}
+
 struct LifecycleContext<'a> {
     agent_id: &'a str,
     agent_type: Option<&'a str>,
@@ -1582,58 +1629,59 @@ fn update_reservation_lifecycle(
         reservation.state = state;
         reservation.agent_id_hash = Some(agent_hash);
         reservation.updated_at_ms = now_ms;
-        let (event_kind, status) = match state {
+        let trace_status = match state {
             ReservationState::Running => {
                 reservation.outcome = ExecutionOutcome::Unknown;
                 reservation.started_at_ms.get_or_insert(now_ms);
-                (TraceEventKind::Started, ExecutionStatus::Running)
+                Some((TraceEventKind::Started, ExecutionStatus::Running))
             }
             ReservationState::Terminal => {
                 reservation.outcome = ExecutionOutcome::Unknown;
                 reservation.completed_at_ms = Some(now_ms);
                 reservation.fenced_at_ms = Some(now_ms);
-                reservation.error_message = Some(
-                    "lifecycle stop did not include an authoritative execution outcome".to_string(),
-                );
-                (TraceEventKind::Failed, ExecutionStatus::Failed)
+                reservation.error_message = None;
+                // SubagentStop proves only that execution ended. Emitting a
+                // failed trace here would double-count the attempt when the
+                // subsequent wait/list response supplies its real outcome.
+                None
             }
             ReservationState::Failed => {
                 reservation.outcome = ExecutionOutcome::Failed;
                 reservation.completed_at_ms = Some(now_ms);
                 reservation.fenced_at_ms = Some(now_ms);
-                (TraceEventKind::Failed, ExecutionStatus::Failed)
+                Some((TraceEventKind::Failed, ExecutionStatus::Failed))
             }
             ReservationState::Recovered => {
                 reservation.outcome = ExecutionOutcome::Lost;
                 reservation.completed_at_ms = Some(now_ms);
                 reservation.fenced_at_ms = Some(now_ms);
-                (TraceEventKind::Recovered, ExecutionStatus::Recovered)
+                Some((TraceEventKind::Recovered, ExecutionStatus::Recovered))
             }
-            ReservationState::Pending => (TraceEventKind::Scheduled, ExecutionStatus::Pending),
+            ReservationState::Pending => {
+                Some((TraceEventKind::Scheduled, ExecutionStatus::Pending))
+            }
         };
-        let trace = reservation_trace(reservation);
-        let mut event = SubagentTraceEvent::new(
-            now_ms,
-            &trace,
-            event_kind,
-            status,
-            runtime_id,
-            session_id,
-            &task_id,
-            Some(agent_id),
-            Some(&reservation.role),
-        );
-        event.latency_ms = Some(now_ms.saturating_sub(reservation.created_at_ms));
-        event.usage = reservation.token_usage.clone();
-        event.attributes.insert(
-            "execution.outcome".into(),
-            Value::String(format!("{:?}", reservation.outcome).to_ascii_lowercase()),
-        );
-        if state == ReservationState::Terminal {
-            event.error_code = Some("unknown_terminal_outcome".into());
-            event.error_message = reservation.error_message.clone();
+        if let Some((event_kind, status)) = trace_status {
+            let trace = reservation_trace(reservation);
+            let mut event = SubagentTraceEvent::new(
+                now_ms,
+                &trace,
+                event_kind,
+                status,
+                runtime_id,
+                session_id,
+                &task_id,
+                Some(agent_id),
+                Some(&reservation.role),
+            );
+            event.latency_ms = Some(now_ms.saturating_sub(reservation.created_at_ms));
+            event.usage = reservation.token_usage.clone();
+            event.attributes.insert(
+                "execution.outcome".into(),
+                Value::String(format!("{:?}", reservation.outcome).to_ascii_lowercase()),
+            );
+            trace_event = Some(event);
         }
-        trace_event = Some(event);
     }
     store.save(&mut ledger, now_ms)?;
     if let Some(event) = trace_event {
@@ -1783,6 +1831,71 @@ pub(crate) fn active_reservation_count(
     ))
 }
 
+/// Proves that every active attempt is a bound, local-read-only child and that
+/// the lifecycle marker identities exactly match the ledger projection. This
+/// deliberately accepts only `files.read`: read-only roles that can execute
+/// commands or use other capabilities keep the normal global root barrier.
+pub(crate) fn verified_local_read_only_active_count(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    active_marker_hashes: &BTreeSet<String>,
+    now_ms: u64,
+) -> Result<Option<usize>> {
+    if active_marker_hashes.is_empty() {
+        return Ok(None);
+    }
+    let loaded_rules = rules::load(state_root);
+    if let Some(warning) = &loaded_rules.warning {
+        eprintln!("Codey 子代理规则回退：{warning}");
+    }
+    let store = LedgerStore::open(state_root, session_id)?;
+    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
+        return Ok(None);
+    };
+    let active = ledger
+        .reservations
+        .values()
+        .filter(|reservation| reservation.state.is_active())
+        .collect::<Vec<_>>();
+    if active.is_empty() || active.len() != active_marker_hashes.len() {
+        return Ok(None);
+    }
+
+    let mut bound_agent_hashes = BTreeSet::new();
+    for reservation in &active {
+        let role_is_read_only = loaded_rules
+            .rules
+            .role_policy(&reservation.role)
+            .is_some_and(|policy| policy.access == RoleAccess::ReadOnly);
+        let files_read_only = matches!(
+            reservation.capabilities.as_slice(),
+            [capability] if capability == "files.read"
+        );
+        let Some(agent_id_hash) = reservation.agent_id_hash.as_ref() else {
+            return Ok(None);
+        };
+        if reservation.batch_number != ledger.batch_number
+            || reservation.spawn_failed
+            || reservation.fenced_at_ms.is_some()
+            || reservation.started_at_ms.is_none()
+            || reservation.outcome != ExecutionOutcome::Unknown
+            || !role_is_read_only
+            || reservation.write_capable
+            || !reservation.write_paths.is_empty()
+            || !reservation.acceptance.is_empty()
+            || !files_read_only
+            || !bound_agent_hashes.insert(agent_id_hash.clone())
+        {
+            return Ok(None);
+        }
+    }
+    if &bound_agent_hashes != active_marker_hashes {
+        return Ok(None);
+    }
+    Ok(Some(active.len()))
+}
+
 /// Atomically fences every still-active reservation before the gate discards
 /// legacy marker files. This keeps the ledger as the authoritative source of
 /// truth and prevents a Stop recovery loop from resurrecting stale work.
@@ -1818,7 +1931,7 @@ pub(crate) fn recover_active_reservations(
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AbandonedReservation {
+pub(crate) struct InterruptSettlement {
     /// Hash used by the legacy active-marker filename. The ledger remains the
     /// source of truth, but returning it lets the gate remove the migration
     /// fallback without retaining a raw provider identifier.
@@ -1826,17 +1939,19 @@ pub(crate) struct AbandonedReservation {
     pub(crate) changed: bool,
 }
 
-/// Permanently abandons exactly the reservation named by a successful root
-/// `interrupt_agent` call. The upstream interrupted state is intentionally
-/// resumable; Codey's root-level interrupt means this task is no longer wanted,
-/// so the local attempt is fenced before root work is allowed to continue.
-pub(crate) fn abandon_interrupted_reservation(
+/// Applies a provider-owned interrupt acknowledgement only after every identity
+/// in that acknowledgement resolves to the exact reservation requested by the
+/// root. A live/pending acknowledgement means the root abandoned the task; a
+/// target-specific prior terminal outcome instead settles the attempt with that
+/// authoritative result.
+pub(crate) fn settle_interrupt_acknowledgement(
     state_root: &Path,
     runtime_id: &str,
     session_id: &str,
     tool_input: Option<&Value>,
+    acknowledgement: &InterruptAcknowledgement,
     now_ms: u64,
-) -> Result<Option<AbandonedReservation>> {
+) -> Result<Option<InterruptSettlement>> {
     let Some(target) = interrupt_task_target(tool_input) else {
         return Ok(None);
     };
@@ -1847,13 +1962,29 @@ pub(crate) fn abandon_interrupted_reservation(
     let Some(task_id) = unique_task_for_identifier(&ledger, &target)? else {
         return Ok(None);
     };
+
+    // Missing response identities remain backward compatible. Once the
+    // provider supplies one, however, it is authoritative enough that an
+    // unknown, ambiguous, or mismatched identity must keep the fence intact.
+    for identifier in &acknowledgement.identifiers {
+        let Ok(Some(identity_task_id)) = unique_task_for_identifier(&ledger, identifier) else {
+            return Ok(None);
+        };
+        if identity_task_id != task_id {
+            return Ok(None);
+        }
+    }
+
     let reservation = ledger
         .reservations
         .get_mut(&task_id)
         .expect("resolved reservation must exist");
     let agent_id_hash = reservation.agent_id_hash.clone();
-    if !reservation.state.is_active() {
-        return Ok(Some(AbandonedReservation {
+    let refines_unknown_terminal = reservation.state == ReservationState::Terminal
+        && reservation.outcome == ExecutionOutcome::Unknown
+        && acknowledgement.prior_outcome.is_some();
+    if !reservation.state.is_active() && !refines_unknown_terminal {
+        return Ok(Some(InterruptSettlement {
             agent_id_hash,
             changed: false,
         }));
@@ -1861,33 +1992,99 @@ pub(crate) fn abandon_interrupted_reservation(
 
     let trace = reservation_trace(reservation);
     let role = reservation.role.clone();
-    reservation.state = ReservationState::Recovered;
-    reservation.outcome = ExecutionOutcome::Lost;
+    let prior_outcome = acknowledgement.prior_outcome.map(|outcome| match outcome {
+        TerminalOutcome::Succeeded => ExecutionOutcome::Succeeded,
+        TerminalOutcome::Failed => ExecutionOutcome::Failed,
+        TerminalOutcome::TimedOut => ExecutionOutcome::TimedOut,
+        TerminalOutcome::Lost => ExecutionOutcome::Lost,
+    });
+    let outcome = prior_outcome.unwrap_or(ExecutionOutcome::Lost);
+    reservation.state = if prior_outcome.is_some() {
+        ReservationState::Terminal
+    } else {
+        ReservationState::Recovered
+    };
+    reservation.outcome = outcome;
     reservation.agent_id_hash = None;
     reservation.updated_at_ms = now_ms;
     reservation.completed_at_ms = Some(now_ms);
     reservation.fenced_at_ms = Some(now_ms);
-    reservation.error_message =
-        Some("root successfully interrupted and permanently abandoned this task".to_string());
+    reservation.error_message = match prior_outcome {
+        Some(ExecutionOutcome::Succeeded) => None,
+        Some(ExecutionOutcome::Failed) => {
+            Some("interrupt acknowledgement reported that the task had already failed".into())
+        }
+        Some(ExecutionOutcome::TimedOut) => {
+            Some("interrupt acknowledgement reported that the task had already timed out".into())
+        }
+        Some(ExecutionOutcome::Lost) => Some(
+            "interrupt acknowledgement reported that the task had already become unavailable"
+                .into(),
+        ),
+        Some(ExecutionOutcome::Unknown) => unreachable!(),
+        None => {
+            Some("root successfully interrupted and permanently abandoned this task".to_string())
+        }
+    };
+    let error_message = reservation.error_message.clone();
     store.save(&mut ledger, now_ms)?;
 
-    let mut event = SubagentTraceEvent::new(
-        now_ms,
-        &trace,
-        TraceEventKind::Recovered,
-        ExecutionStatus::Recovered,
-        runtime_id,
-        session_id,
-        &task_id,
-        Some(&target),
-        Some(&role),
+    let success = outcome.is_success();
+    let mut event = if prior_outcome.is_some() {
+        SubagentTraceEvent::new(
+            now_ms,
+            &trace,
+            if success {
+                TraceEventKind::Completed
+            } else {
+                TraceEventKind::Failed
+            },
+            if success {
+                ExecutionStatus::Succeeded
+            } else {
+                ExecutionStatus::Failed
+            },
+            runtime_id,
+            session_id,
+            &task_id,
+            Some(&target),
+            Some(&role),
+        )
+    } else {
+        SubagentTraceEvent::new(
+            now_ms,
+            &trace,
+            TraceEventKind::Recovered,
+            ExecutionStatus::Recovered,
+            runtime_id,
+            session_id,
+            &task_id,
+            Some(&target),
+            Some(&role),
+        )
+    };
+    event.attributes.insert(
+        "execution.outcome".into(),
+        Value::String(format!("{outcome:?}").to_ascii_lowercase()),
     );
-    event.error_code = Some("root_interrupt_abandoned".into());
-    event.error_message =
-        Some("root successfully interrupted and permanently abandoned this task".to_string());
+    if prior_outcome.is_none() {
+        event.error_code = Some("root_interrupt_abandoned".into());
+        event.error_message = error_message.clone();
+    } else if !success {
+        event.error_code = Some(
+            match outcome {
+                ExecutionOutcome::Failed => "agent_failed",
+                ExecutionOutcome::TimedOut => "agent_timed_out",
+                ExecutionOutcome::Lost => "agent_lost",
+                ExecutionOutcome::Unknown | ExecutionOutcome::Succeeded => unreachable!(),
+            }
+            .into(),
+        );
+        event.error_message = error_message;
+    }
     TraceRecorder::new(state_root).record_best_effort(&event);
 
-    Ok(Some(AbandonedReservation {
+    Ok(Some(InterruptSettlement {
         agent_id_hash,
         changed: true,
     }))
@@ -4589,11 +4786,16 @@ mod tests {
         }
 
         let interrupt = json!({ "target": "/root/reader_a" });
-        let abandoned = abandon_interrupted_reservation(
+        let acknowledgement = InterruptAcknowledgement {
+            prior_outcome: None,
+            identifiers: Vec::new(),
+        };
+        let abandoned = settle_interrupt_acknowledgement(
             temp.path(),
             "runtime-a",
             session_id,
             Some(&interrupt),
+            &acknowledgement,
             30,
         )
         .unwrap()
@@ -4620,11 +4822,12 @@ mod tests {
 
         let duplicate = Value::String(serde_json::to_string(&interrupt).unwrap());
         assert!(
-            !abandon_interrupted_reservation(
+            !settle_interrupt_acknowledgement(
                 temp.path(),
                 "runtime-a",
                 session_id,
                 Some(&duplicate),
+                &acknowledgement,
                 33,
             )
             .unwrap()
@@ -4647,6 +4850,166 @@ mod tests {
         assert_eq!(
             ledger.reservations["reader_b"].state,
             ReservationState::Running
+        );
+    }
+
+    #[test]
+    fn interrupt_acknowledgement_must_match_the_requested_target_and_preserves_terminal_outcome() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "interrupt-identity-session";
+        for (index, task_id) in ["reader_a", "reader_b"].into_iter().enumerate() {
+            let spawn = contract_input(task_id, "codey_deep_research", research_contract(task_id));
+            pre_spawn(
+                temp.path(),
+                "runtime-a",
+                session_id,
+                Some(&spawn),
+                index,
+                10 + index as u64,
+            )
+            .unwrap();
+            post_spawn(
+                temp.path(),
+                "runtime-a",
+                session_id,
+                Some(&spawn),
+                Some(&json!({ "agent_id": format!("agent-{task_id}") })),
+                20 + index as u64,
+            )
+            .unwrap();
+        }
+
+        let interrupt_a = json!({ "target": "/root/reader_a" });
+        let mismatched = InterruptAcknowledgement {
+            prior_outcome: None,
+            identifiers: vec!["agent-reader_b".into()],
+        };
+        assert!(
+            settle_interrupt_acknowledgement(
+                temp.path(),
+                "runtime-a",
+                session_id,
+                Some(&interrupt_a),
+                &mismatched,
+                30,
+            )
+            .unwrap()
+            .is_none()
+        );
+        let store = LedgerStore::open(temp.path(), session_id).unwrap();
+        let ledger = store.load("runtime-a", session_id, 31).unwrap().unwrap();
+        assert_eq!(
+            ledger.reservations["reader_a"].state,
+            ReservationState::Running
+        );
+        assert_eq!(
+            ledger.reservations["reader_b"].state,
+            ReservationState::Running
+        );
+        drop(ledger);
+        drop(store);
+
+        let already_completed = InterruptAcknowledgement {
+            prior_outcome: Some(TerminalOutcome::Succeeded),
+            identifiers: vec!["/root/reader_a".into(), "agent-reader_a".into()],
+        };
+        assert!(
+            settle_interrupt_acknowledgement(
+                temp.path(),
+                "runtime-a",
+                session_id,
+                Some(&interrupt_a),
+                &already_completed,
+                32,
+            )
+            .unwrap()
+            .unwrap()
+            .changed
+        );
+        let store = LedgerStore::open(temp.path(), session_id).unwrap();
+        let ledger = store.load("runtime-a", session_id, 33).unwrap().unwrap();
+        assert_eq!(
+            ledger.reservations["reader_a"].state,
+            ReservationState::Terminal
+        );
+        assert_eq!(
+            ledger.reservations["reader_a"].outcome,
+            ExecutionOutcome::Succeeded
+        );
+        assert_eq!(ledger.reservations["reader_a"].error_message, None);
+        assert_eq!(
+            ledger.reservations["reader_b"].state,
+            ReservationState::Running
+        );
+    }
+
+    #[test]
+    fn lifecycle_stop_waits_for_authoritative_outcome_before_emitting_terminal_trace() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "terminal-trace-session";
+        let task_id = "trace_reader";
+        let agent_id = "agent-trace-reader";
+        let spawn = contract_input(task_id, "codey_deep_research", research_contract(task_id));
+        pre_spawn(temp.path(), "runtime-a", session_id, Some(&spawn), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            session_id,
+            Some(&spawn),
+            Some(&json!({ "agent_id": agent_id })),
+            20,
+        )
+        .unwrap();
+
+        subagent_stopped(temp.path(), "runtime-a", session_id, agent_id, 30).unwrap();
+        let decode_events = || {
+            fs::read_to_string(telemetry::trace_file(temp.path()))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<SubagentTraceEvent>(line).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let after_stop = decode_events();
+        assert!(!after_stop.iter().any(|event| {
+            event.timestamp_ms == 30
+                || event.error_code.as_deref() == Some("unknown_terminal_outcome")
+        }));
+
+        let terminal = json!({
+            "updates": [{ "agent_id": agent_id, "status": "completed" }]
+        });
+        observe_status_response(
+            temp.path(),
+            "runtime-a",
+            session_id,
+            Some(&terminal),
+            false,
+            40,
+        )
+        .unwrap();
+        observe_status_response(
+            temp.path(),
+            "runtime-a",
+            session_id,
+            Some(&terminal),
+            false,
+            50,
+        )
+        .unwrap();
+        let after_status = decode_events();
+        assert_eq!(
+            after_status
+                .iter()
+                .filter(|event| event.event == TraceEventKind::Completed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            after_status
+                .iter()
+                .filter(|event| event.event == TraceEventKind::Failed)
+                .count(),
+            0
         );
     }
 
