@@ -15,14 +15,15 @@
   ];
   const titlePatterns = [
     /full access is on/i,
-    /完全访问权限.*(?:已开启|开启中|已打开)/,
+    /完(?:全|整)访问权限.*(?:已开启|开启中|已打开)/,
   ];
   const riskPatterns = [
     /without your permission/i,
     /without your approval/i,
     /risk of data loss/i,
     /prompt injection/i,
-    /未经(?:你|您)的许可/,
+    /未经(?:你|您)(?:的)?(?:许可|批准)/,
+    /数据丢失/,
     /提示词?注入/,
   ];
   let enabled = false;

@@ -129,6 +129,16 @@ function appendCurrentSessionWarning(body) {
   return { button, warning };
 }
 
+function appendCurrentChineseWarning(body) {
+  const warning = body.appendChild(new FakeElement(
+    "aside",
+    "完整访问权限已开启 ChatGPT 可以在未经你批准的情况下编辑任何文件，并通过互联网访问权限运行命令。这会增加数据丢失、信息暴露和意外更改的风险。了解更多关于风险升高的信息。",
+  ));
+  warning.setAttribute("role", "status");
+  const button = warning.appendChild(new FakeElement("button", "不再显示"));
+  return { button, warning };
+}
+
 test("full-access warning shield is opt-in and persisted by Codey settings", async () => {
   const [sectionsSource, configSource, commandSource, cdpSource] = await Promise.all([
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
@@ -191,6 +201,17 @@ test("enabled shield dismisses the current icon-only session warning", async () 
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(button.textContent, "");
+  assert.equal(button.clicks, 1);
+  assert.equal(warning.style.display, "none:important");
+  assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
+});
+
+test("enabled shield dismisses the current Chinese full-access callout", async () => {
+  const runtime = createRuntime({ hideFullAccessWarning: true });
+  const { button, warning } = appendCurrentChineseWarning(runtime.body);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(warning.getAttribute("role"), "status");
   assert.equal(button.clicks, 1);
   assert.equal(warning.style.display, "none:important");
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
