@@ -36,6 +36,9 @@ use crate::provider_lease::CODEY_PROVIDER_ID;
 mod fastctx;
 mod fs_io;
 mod legacy_restore;
+// Kept as a regression fixture for pre-isolated leases. Production startup no
+// longer imports or calls the write-based apply transaction.
+#[allow(dead_code)]
 mod runtime_provider_transaction;
 mod runtime_role_transaction;
 mod subagent_control;
@@ -52,6 +55,7 @@ use fs_io::{
     atomic_write, create_private_dir_all, read_optional, remove_optional, write_private_file,
 };
 use legacy_restore::restore_legacy_owned_config_changes;
+#[cfg(test)]
 use runtime_provider_transaction::apply_runtime_provider_config_at_mode;
 use runtime_role_transaction::refresh_runtime_subagent_roles_at;
 use subagent_control::{disable_subagent_control_mcp, enable_subagent_control_mcp};
@@ -354,23 +358,14 @@ pub(crate) fn apply_runtime_provider_config(
     let default_model = (!options.preserve_provider_route)
         .then_some(options.default_model)
         .flatten();
-    if options.preserve_provider_route && cfg!(any(windows, target_os = "macos")) {
-        return apply_isolated_cc_switch_runtime_config(
-            home,
-            profile,
-            provider_id,
-            fastctx_command.as_deref(),
-            options.subagent_optimization,
-            options.subagent_model,
-            options.subagent_reasoning_effort,
-            options.subagent_roles,
-            options.protocol_proxy_base_url,
-            options.expected_config,
-            &marker,
-            &backup_root,
+    if !cfg!(any(windows, target_os = "macos")) {
+        bail!(
+            "当前平台尚不能把 Codey Provider 配置限定到单次 Codex 进程；为避免修改用户 config.toml，已取消启动"
         );
     }
-    let backup_dir = apply_runtime_provider_config_at_mode(
+    // The startup patch injects these values into every managed app-server as
+    // command-local `-c` overrides. Never fall back to rewriting config.toml.
+    apply_isolated_runtime_provider_config(
         home,
         profile,
         provider_id,
@@ -388,20 +383,7 @@ pub(crate) fn apply_runtime_provider_config(
             protocol_proxy_base_url: options.protocol_proxy_base_url,
             expected_config: options.expected_config,
         },
-    )?;
-    let config_contents =
-        fs::read(backup_dir.join(APPLIED_CONFIG_FILE)).context("读取 Codey 已应用配置快照失败")?;
-    let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
-    let runtime_config_overrides = build_independent_prompt_runtime_overrides(
-        &config_contents,
-        &constraints_dir,
-        options.subagent_optimization,
-    )?;
-    Ok(AppliedRuntimeProviderConfig {
-        config_contents,
-        runtime_config_overrides,
-        fast_context_tools_active: fastctx_command.is_some(),
-    })
+    )
 }
 
 const FASTCTX_SERVER_BINARY: &str = if cfg!(windows) {
@@ -524,21 +506,26 @@ fn persist_embedded_config_prompt_migration(
     Ok(Some(migrated.into_bytes()))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn apply_isolated_cc_switch_runtime_config(
+fn apply_isolated_runtime_provider_config(
     home: &Path,
     profile: &ProviderProfile,
     provider_id: &str,
-    fastctx_command: Option<&Path>,
-    subagent_optimization: bool,
-    subagent_model: &str,
-    subagent_reasoning_effort: &str,
-    subagent_roles: Option<&BTreeMap<String, SubagentRoleConfig>>,
-    protocol_proxy_base_url: Option<&str>,
-    expected_config: Option<&[u8]>,
-    marker: &Path,
-    backup_root: &Path,
+    options: ProviderApplyOptions<'_>,
 ) -> Result<AppliedRuntimeProviderConfig> {
+    let ProviderApplyOptions {
+        use_official_catalog,
+        default_model,
+        fastctx_command,
+        subagent_optimization,
+        subagent_model,
+        subagent_reasoning_effort,
+        subagent_roles,
+        marker,
+        backup_root,
+        preserve_provider_route,
+        protocol_proxy_base_url,
+        expected_config,
+    } = options;
     ensure_supported_provider_protocol(profile.protocol, protocol_proxy_base_url)?;
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
@@ -547,24 +534,31 @@ fn apply_isolated_cc_switch_runtime_config(
     if let Some(expected_config) = expected_config
         && original_config.as_deref() != Some(expected_config)
     {
-        bail!("CC Switch Live 配置在启动准备期间发生变化；已取消本次启动以避免混用线路");
+        bail!("Codex 配置在启动准备期间发生变化；已取消本次启动以避免混用线路");
     }
     let existing = str::from_utf8(original_config.as_deref().unwrap_or_default())
         .context("Codex config.toml 不是 UTF-8")?;
     let provider_id = validated_provider_id(provider_id)?;
+    // Codex resolves this path from the app-server working directory, which is
+    // `/` for the packaged macOS app, rather than from CODEX_HOME.
+    let model_catalog_path = (use_official_catalog
+        || (preserve_provider_route
+            && subagent_optimization
+            && crate::model_catalog::is_available(home)))
+    .then(|| home.join(crate::model_catalog::relative_path()));
     let effective = patch_config_with_fastctx_mode_and_proxy(
         existing,
         profile,
         &provider_id,
         ProviderPatchOptions {
             config_path: &config_path,
-            model_catalog_path: None,
-            default_model: None,
+            model_catalog_path: model_catalog_path.as_deref(),
+            default_model,
             fastctx_command,
             subagent_optimization,
             subagent_model,
             subagent_reasoning_effort,
-            preserve_provider_route: true,
+            preserve_provider_route,
             protocol_proxy_base_url,
         },
     )?;
@@ -654,8 +648,6 @@ fn apply_isolated_cc_switch_runtime_config(
     } else {
         (None, Vec::new())
     };
-    let model_catalog_path = (subagent_optimization && crate::model_catalog::is_available(home))
-        .then(|| home.join(crate::model_catalog::relative_path()));
     let runtime_config_overrides = build_isolated_runtime_overrides(
         &effective_document,
         root_instructions.as_deref(),
@@ -665,6 +657,7 @@ fn apply_isolated_cc_switch_runtime_config(
         protocol_proxy_base_url,
         &provider_id,
         &hook_trust_entries,
+        preserve_provider_route,
     )?;
 
     create_private_dir_all(backup_root)?;
@@ -690,7 +683,7 @@ fn apply_isolated_cc_switch_runtime_config(
         backup_dir: backup_dir.clone(),
         config_snapshot_dir: None,
         original_config_exists: original_config.is_some(),
-        preserve_provider_route: true,
+        preserve_provider_route,
         protocol_proxy_base_url: protocol_proxy_base_url.map(str::to_string),
         fastctx_command: fastctx_command.map(Path::to_path_buf),
         subagent_optimization_applied: subagent_optimization,
@@ -773,6 +766,43 @@ fn apply_isolated_cc_switch_runtime_config(
         runtime_config_overrides,
         fast_context_tools_active: fastctx_command.is_some(),
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn apply_isolated_cc_switch_runtime_config(
+    home: &Path,
+    profile: &ProviderProfile,
+    provider_id: &str,
+    fastctx_command: Option<&Path>,
+    subagent_optimization: bool,
+    subagent_model: &str,
+    subagent_reasoning_effort: &str,
+    subagent_roles: Option<&BTreeMap<String, SubagentRoleConfig>>,
+    protocol_proxy_base_url: Option<&str>,
+    expected_config: Option<&[u8]>,
+    marker: &Path,
+    backup_root: &Path,
+) -> Result<AppliedRuntimeProviderConfig> {
+    apply_isolated_runtime_provider_config(
+        home,
+        profile,
+        provider_id,
+        ProviderApplyOptions {
+            use_official_catalog: false,
+            default_model: None,
+            fastctx_command,
+            subagent_optimization,
+            subagent_model,
+            subagent_reasoning_effort,
+            subagent_roles,
+            marker,
+            backup_root,
+            preserve_provider_route: true,
+            protocol_proxy_base_url,
+            expected_config,
+        },
+    )
 }
 
 fn read_or_create_constraint_file(path: &Path, default_contents: &str) -> Result<String> {
@@ -1148,6 +1178,7 @@ fn remove_embedded_codey_prompt_sources(document: &mut DocumentMut) -> bool {
     true
 }
 
+#[cfg(test)]
 fn build_independent_prompt_runtime_overrides(
     config_contents: &[u8],
     constraints_dir: &Path,
@@ -1489,6 +1520,9 @@ fn restore_runtime_cc_switch_provider_config_at(home: &Path, marker: &Path) -> R
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.into()),
     };
+    if state.isolated_runtime_constraints {
+        return Ok(false);
+    }
     if state.preserve_provider_route || state.protocol_proxy_base_url.is_none() {
         return Ok(false);
     }
@@ -2276,6 +2310,7 @@ fn build_isolated_runtime_overrides(
     protocol_proxy_base_url: Option<&str>,
     provider_id: &str,
     hook_trust_entries: &[RuntimeHookTrustEntry],
+    preserve_provider_route: bool,
 ) -> Result<Vec<String>> {
     let mut overrides = Vec::new();
     push_required_document_override(
@@ -2286,7 +2321,7 @@ fn build_isolated_runtime_overrides(
     )?;
     push_required_document_override(&mut overrides, effective, &["service_tier"], "service_tier")?;
 
-    if protocol_proxy_base_url.is_some() {
+    if preserve_provider_route && protocol_proxy_base_url.is_some() {
         let provider_segment = toml_string_literal(provider_id);
         push_required_document_override(
             &mut overrides,
@@ -2299,6 +2334,44 @@ fn build_isolated_runtime_overrides(
             effective,
             &["model_providers", provider_id, "wire_api"],
             &format!("model_providers.{provider_segment}.wire_api"),
+        )?;
+    } else if !preserve_provider_route {
+        push_required_document_override(
+            &mut overrides,
+            effective,
+            &["model_provider"],
+            "model_provider",
+        )?;
+        if !is_reserved_provider_id(provider_id)
+            && effective
+                .get("model_providers")
+                .and_then(Item::as_table)
+                .and_then(|providers| providers.get(provider_id))
+                .and_then(Item::as_table)
+                .is_some()
+        {
+            let provider_segment = toml_string_literal(provider_id);
+            for field in [
+                "name",
+                "base_url",
+                "wire_api",
+                "requires_openai_auth",
+                "experimental_bearer_token",
+            ] {
+                push_document_override(
+                    &mut overrides,
+                    effective,
+                    &["model_providers", provider_id, field],
+                    &format!("model_providers.{provider_segment}.{field}"),
+                )?;
+            }
+        }
+        push_document_override(&mut overrides, effective, &["model"], "model")?;
+        push_document_override(
+            &mut overrides,
+            effective,
+            &["model_catalog_json"],
+            "model_catalog_json",
         )?;
     }
 
@@ -2443,7 +2516,7 @@ fn build_isolated_runtime_overrides(
                 "features.code_mode.direct_only_tool_namespaces",
             )?;
         }
-        if let Some(model_catalog_path) = model_catalog_path {
+        if preserve_provider_route && let Some(model_catalog_path) = model_catalog_path {
             push_runtime_override_value(
                 &mut overrides,
                 "model_catalog_json",

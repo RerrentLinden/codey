@@ -4611,6 +4611,152 @@ fn preserves_an_existing_non_reserved_provider() {
 }
 
 #[test]
+fn direct_runtime_provider_stays_out_of_config_even_without_restore() {
+    for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let state_dir = temp.path().join("codey-state");
+        let marker = state_dir.join("codex-lease.json");
+        let backup_root = state_dir.join("codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        let original_config =
+            br#"# Keep formatting and all user-owned provider fields byte-for-byte.
+model_provider = "relay"
+model = "user-model"
+
+[model_providers.relay]
+name = "User Relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+requires_openai_auth = false
+experimental_bearer_token = "user-token"
+env_key = "USER_RELAY_TOKEN"
+
+[model_providers.relay.http_headers]
+X-User-Header = "keep-me"
+"#;
+        let config_path = home.join("config.toml");
+        fs::write(&config_path, original_config).unwrap();
+        #[cfg(unix)]
+        let original_file_identity = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(&config_path).unwrap();
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+            )
+        };
+        #[cfg(windows)]
+        let original_file_identity = {
+            use std::os::windows::fs::MetadataExt;
+            let metadata = fs::metadata(&config_path).unwrap();
+            (
+                metadata.creation_time(),
+                metadata.last_write_time(),
+                metadata.file_size(),
+            )
+        };
+        let proxy_base_url = "http://127.0.0.1:63458/v1";
+
+        let applied = apply_isolated_runtime_provider_config(
+            &home,
+            &direct_profile(protocol),
+            "relay",
+            ProviderApplyOptions {
+                use_official_catalog: true,
+                default_model: Some("runtime-model"),
+                fastctx_command: None,
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                subagent_roles: None,
+                marker: &marker,
+                backup_root: &backup_root,
+                preserve_provider_route: false,
+                protocol_proxy_base_url: Some(proxy_base_url),
+                expected_config: Some(original_config),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(applied.config_contents, original_config);
+        assert_eq!(fs::read(&config_path).unwrap(), original_config);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(&config_path).unwrap();
+            assert_eq!(
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                ),
+                original_file_identity,
+                "config.toml must not be atomically replaced or rewritten"
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let metadata = fs::metadata(&config_path).unwrap();
+            assert_eq!(
+                (
+                    metadata.creation_time(),
+                    metadata.last_write_time(),
+                    metadata.file_size(),
+                ),
+                original_file_identity,
+                "config.toml must not be atomically replaced or rewritten"
+            );
+        }
+        assert!(marker.exists(), "the crash-recovery lease should be active");
+        for expected in [
+            "model_provider=\"relay\"",
+            "model=\"runtime-model\"",
+            "model_providers.\"relay\".name=\"Relay\"",
+            "model_providers.\"relay\".base_url=\"http://127.0.0.1:63458/v1\"",
+            "model_providers.\"relay\".wire_api=\"responses\"",
+            "model_providers.\"relay\".requires_openai_auth=false",
+            "model_providers.\"relay\".experimental_bearer_token=\"sk-direct\"",
+        ] {
+            assert!(
+                applied
+                    .runtime_config_overrides
+                    .iter()
+                    .any(|entry| entry == expected),
+                "missing runtime-only provider override {expected}"
+            );
+        }
+        assert!(
+            applied
+                .runtime_config_overrides
+                .iter()
+                .any(|entry| entry.starts_with("model_catalog_json="))
+        );
+        assert!(
+            !applied
+                .runtime_config_overrides
+                .iter()
+                .any(|entry| entry.contains("https://relay.example/v1"))
+        );
+        for runtime_override in &applied.runtime_config_overrides {
+            runtime_override
+                .parse::<DocumentMut>()
+                .unwrap_or_else(|error| {
+                    panic!("invalid runtime override {runtime_override:?}: {error}")
+                });
+        }
+
+        // Deliberately do not call restore_runtime_provider_config_at: this is
+        // the abnormal-exit boundary the runtime-only route must make harmless.
+        assert_eq!(fs::read(&config_path).unwrap(), original_config);
+    }
+}
+
+#[test]
 fn isolated_fastctx_installs_route_hook_without_subagent_optimization() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
