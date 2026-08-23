@@ -119,6 +119,16 @@ function appendPersistentEnglishWarning(body) {
   return { button, warning };
 }
 
+function appendCurrentSessionWarning(body) {
+  const warning = body.appendChild(new FakeElement(
+    "section",
+    "Full access is on ChatGPT can edit any file and run commands with internet access without your approval. This increases the risk of data loss, exposed information, and unexpected changes.",
+  ));
+  const button = warning.appendChild(new FakeElement("button", ""));
+  button.setAttribute("aria-label", "Dismiss Full access warning for this session");
+  return { button, warning };
+}
+
 test("full-access warning shield is opt-in and persisted by Codey settings", async () => {
   const [sectionsSource, configSource, commandSource, cdpSource] = await Promise.all([
     readFile(new URL("src/FeaturePolicyCard.tsx", root), "utf8"),
@@ -175,6 +185,17 @@ test("enabled shield dismisses the persistent full-access warning", async () => 
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
 });
 
+test("enabled shield dismisses the current icon-only session warning", async () => {
+  const runtime = createRuntime({ hideFullAccessWarning: true });
+  const { button, warning } = appendCurrentSessionWarning(runtime.body);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(button.textContent, "");
+  assert.equal(button.clicks, 1);
+  assert.equal(warning.style.display, "none:important");
+  assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
+});
+
 test("a warning label that renders after insertion is still dismissed", async () => {
   const runtime = createRuntime({ hideFullAccessWarning: true });
   const warning = runtime.body.appendChild(new FakeElement(
@@ -204,10 +225,13 @@ test("unrelated session controls are never clicked", async () => {
     "Session preferences without your permission",
   ));
   const button = panel.appendChild(new FakeElement("button", "Hide from this session"));
+  const iconButton = panel.appendChild(new FakeElement("button", ""));
+  iconButton.setAttribute("aria-label", "Dismiss Full access warning for this session");
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(runtime.window.__codeySecurityWarningShield.dismissWarnings(), 0);
   assert.equal(button.clicks, 0);
+  assert.equal(iconButton.clicks, 0);
 });
 
 test("config changes publish the shield's current injection status", async () => {

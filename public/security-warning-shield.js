@@ -8,6 +8,7 @@
   const dismissedAttribute = "data-codey-security-warning-dismissed";
   const actionPatterns = [
     /^hide from this session$/i,
+    /^dismiss full access warning for this session$/i,
     /^don['’]t show again$/i,
     /^(?:在|于)?本次会话(?:中)?(?:隐藏|不再显示)$/,
     /^(?:隐藏|不再显示)(?:本次会话)?$/,
@@ -49,11 +50,14 @@
     }
   };
 
-  // innerText forces a layout flush; the action labels this shield matches are
-  // plain text nodes, so textContent is both sufficient and layout-free.
-  const normalizedText = (element) => String(
-    element?.textContent || "",
-  ).replace(/\s+/g, " ").trim();
+  // innerText forces a layout flush. Read visible text and accessible labels
+  // directly so icon-only controls remain layout-free as well.
+  const normalizedValue = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const normalizedText = (element) => normalizedValue(element?.textContent);
+  const normalizedControlLabels = (control) => [
+    control?.getAttribute?.("aria-label"),
+    control?.textContent,
+  ].map(normalizedValue).filter(Boolean);
 
   const matchesAny = (value, patterns) => patterns.some((pattern) => pattern.test(value));
 
@@ -88,7 +92,7 @@
       if (
         control.disabled
         || control.getAttribute?.(dismissedAttribute) === "true"
-        || !matchesAny(normalizedText(control), actionPatterns)
+        || !normalizedControlLabels(control).some((label) => matchesAny(label, actionPatterns))
       ) {
         continue;
       }
