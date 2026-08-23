@@ -109,7 +109,7 @@ fn resolve_batch_tool_definition() -> Value {
 fn prepare_delegation_tool_definition() -> Value {
     json!({
         "name": PREPARE_DELEGATION_TOOL_NAME,
-        "description": "Stage a plaintext Codey delegation contract for the next encrypted writable spawn_agent call. The Codey Hook validates and consumes the staged contract; this tool never spawns agents itself.",
+        "description": "Authorize one encrypted writable spawn_agent call from the same root turn by staging its plaintext Codey delegation policy. The permit is single-use and expires on turn, batch, runtime, or TTL boundaries; this tool never spawns agents itself.",
         "inputSchema": {
             "type": "object",
             "properties": {

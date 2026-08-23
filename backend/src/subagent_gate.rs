@@ -784,6 +784,12 @@ fn pre_tool_use_output(
         .as_deref()
         .is_some_and(is_prepare_delegation_tool)
     {
+        let Some(root_turn_id) = nonempty(input.turn_id.as_deref()) else {
+            return Ok(pre_tool_reason_denial(
+                "Codey 写入 sidecar 门禁：当前 PreToolUse 缺少根 turn_id，无法建立只限本回合消费的一次性写入授权。"
+                    .to_string(),
+            ));
+        };
         let process_cwd = std::env::current_dir()
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
@@ -794,9 +800,19 @@ fn pre_tool_use_output(
             &input.session_id,
             input.tool_input.as_ref(),
             workspace_root,
+            Some(root_turn_id),
             now_ms,
         )? {
             return Ok(pre_tool_reason_denial(reason));
+        }
+        if active == 0 {
+            bind_root_turn(
+                state_root,
+                runtime_id,
+                &input.session_id,
+                root_turn_id,
+                now_ms,
+            )?;
         }
         return Ok(json!({}));
     }
@@ -854,12 +870,13 @@ fn pre_tool_use_output(
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
         let workspace_root = nonempty(input.cwd.as_deref()).or(process_cwd.as_deref());
-        if let Some(reason) = crate::subagent_orchestrator::pre_spawn_with_workspace(
+        if let Some(reason) = crate::subagent_orchestrator::pre_spawn_with_workspace_and_turn(
             state_root,
             runtime_id,
             &input.session_id,
             input.tool_input.as_ref(),
             workspace_root,
+            nonempty(input.turn_id.as_deref()),
             active,
             now_ms,
         )? {
@@ -946,6 +963,23 @@ fn post_tool_use_output(
         return Ok(json!({}));
     }
     if is_prepare_delegation_tool(tool_name) {
+        let Some(root_turn_id) = nonempty(input.turn_id.as_deref()) else {
+            return Ok(json!({
+                "decision": "block",
+                "reason": "Codey 写入 sidecar 门禁：PostToolUse 缺少根 turn_id，预备委派未提交。",
+            }));
+        };
+        if !root_turn_matches(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            Some(root_turn_id),
+        )? {
+            return Ok(json!({
+                "decision": "block",
+                "reason": "Codey 写入 sidecar 门禁：PostToolUse 的根 turn_id 与 PreToolUse 绑定不一致，预备委派未提交。",
+            }));
+        }
         let process_cwd = std::env::current_dir()
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
@@ -957,6 +991,7 @@ fn post_tool_use_output(
             input.tool_input.as_ref(),
             input.tool_response.as_ref(),
             workspace_root,
+            Some(root_turn_id),
             now_ms,
         )? {
             return Ok(json!({
@@ -3157,6 +3192,7 @@ mod tests {
         let workspace = workspace.to_string_lossy().into_owned();
 
         let mut spawn = input("PreToolUse", "encrypted-contract-session");
+        spawn.turn_id = Some("root-turn-encrypted".to_string());
         spawn.cwd = Some(workspace.clone());
         spawn.tool_name = Some("agents.spawn_agent".to_string());
         spawn.tool_input = Some(json!({
@@ -3173,7 +3209,7 @@ mod tests {
         assert!(
             denied["hookSpecificOutput"]["permissionDecisionReason"]
                 .as_str()
-                .is_some_and(|reason| reason.contains("无法验证 write ownership"))
+                .is_some_and(|reason| reason.contains("缺少可验证 sidecar"))
         );
 
         spawn.tool_input = Some(json!({
@@ -3219,6 +3255,136 @@ mod tests {
             "file_path": state_root.join("sibling-worktree/backend/src/lib.rs")
         }));
         assert_eq!(handle_hook(&external_read, state_root).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn root_control_sidecar_allows_only_the_same_turn_encrypted_writer() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path();
+        let workspace = state_root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.to_string_lossy().into_owned();
+        let session_id = "encrypted-writer-sidecar-session";
+        let root_turn = "root-turn-sidecar";
+        let contract = json!({
+            "id": "encrypted_writer",
+            "why": "implementation",
+            "visual": false,
+            "root": workspace,
+            "read": [],
+            "write": ["backend/src"],
+            "capabilities": ["files.read", "workspace.write"],
+            "checks": [{ "id": "tests", "cmd": "cargo test -p codey --lib" }]
+        });
+        let sidecar = json!({
+            "task_name": "encrypted_writer",
+            "agent_type": "codey_worker",
+            "preparation_id": "prep-encrypted-writer",
+            "contract": contract
+        });
+
+        let mut prepare = input("PreToolUse", session_id);
+        prepare.turn_id = Some(root_turn.to_string());
+        prepare.cwd = Some(workspace.clone());
+        prepare.tool_name =
+            Some(crate::subagent_control_mcp::PREPARE_DELEGATION_QUALIFIED_TOOL_NAME.to_string());
+        prepare.tool_input = Some(sidecar.clone());
+        assert_eq!(handle_hook(&prepare, state_root).unwrap(), json!({}));
+
+        let mut receipt = sidecar.clone();
+        receipt
+            .as_object_mut()
+            .unwrap()
+            .insert("accepted".to_string(), json!(true));
+        let mut prepared = input("PostToolUse", session_id);
+        prepared.turn_id = Some(root_turn.to_string());
+        prepared.cwd = Some(workspace.clone());
+        prepared.tool_name = prepare.tool_name.clone();
+        prepared.tool_input = Some(sidecar);
+        prepared.tool_response = Some(json!({
+            "structuredContent": receipt,
+            "isError": false
+        }));
+        assert_eq!(handle_hook(&prepared, state_root).unwrap(), json!({}));
+
+        let encrypted_spawn_input = json!({
+            "task_name": "encrypted_writer",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": format!("gAAAAA{}", "A".repeat(160))
+        });
+        let mut wrong_turn_spawn = input("PreToolUse", session_id);
+        wrong_turn_spawn.turn_id = Some("root-turn-other".to_string());
+        wrong_turn_spawn.cwd = Some(workspace.clone());
+        wrong_turn_spawn.tool_name = Some("agents.spawn_agent".to_string());
+        wrong_turn_spawn.tool_input = Some(encrypted_spawn_input.clone());
+        let denied = handle_hook(&wrong_turn_spawn, state_root).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("turn_id"))
+        );
+
+        let mut spawn = wrong_turn_spawn;
+        spawn.turn_id = Some(root_turn.to_string());
+        assert_eq!(handle_hook(&spawn, state_root).unwrap(), json!({}));
+
+        let mut spawned = input("PostToolUse", session_id);
+        spawned.turn_id = Some(root_turn.to_string());
+        spawned.tool_name = spawn.tool_name.clone();
+        spawned.tool_input = spawn.tool_input.clone();
+        spawned.tool_response = Some(json!({ "task_name": "/root/encrypted_writer" }));
+        assert_eq!(handle_hook(&spawned, state_root).unwrap(), json!({}));
+
+        let mut started = input("SubagentStart", session_id);
+        started.agent_id = Some("/root/encrypted_writer".to_string());
+        assert_eq!(handle_hook(&started, state_root).unwrap(), json!({}));
+
+        let mut write = input("PreToolUse", session_id);
+        write.agent_id = Some("/root/encrypted_writer".to_string());
+        write.cwd = Some(workspace);
+        write.tool_name = Some("apply_patch".to_string());
+        write.tool_input = Some(json!({
+            "patch": "*** Begin Patch\n*** Update File: backend/src/lib.rs\n*** End Patch"
+        }));
+        assert_eq!(handle_hook(&write, state_root).unwrap(), json!({}));
+    }
+
+    #[test]
+    fn root_control_sidecar_requires_a_root_turn_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut prepare = input("PreToolUse", "missing-sidecar-turn-session");
+        prepare.tool_name =
+            Some(crate::subagent_control_mcp::PREPARE_DELEGATION_QUALIFIED_TOOL_NAME.to_string());
+        prepare.tool_input = Some(json!({
+            "task_name": "encrypted_writer",
+            "agent_type": "codey_worker",
+            "preparation_id": "prep-missing-turn",
+            "contract": {
+                "id": "encrypted_writer",
+                "why": "implementation",
+                "visual": false,
+                "root": "/repo",
+                "read": [],
+                "write": ["backend/src"],
+                "capabilities": ["files.read", "workspace.write"],
+                "checks": [{ "id": "tests", "cmd": "cargo test" }]
+            }
+        }));
+        let denied = handle_hook(&prepare, temp.path()).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("turn_id"))
+        );
     }
 
     #[test]

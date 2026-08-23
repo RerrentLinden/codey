@@ -417,7 +417,7 @@ Codex 官方 Hook 契约中，`SubagentStart` 必带 `agent_id`，child 的 `Pre
 | 缺少 ID 的生命周期事件会任意猜测任务 | 删除唯一 pending/授权面相同回退，只接受明确哈希、精确 `/root/<task_id>` 或上述 transcript 桥接；多候选、角色/父会话/重复 metadata 不一致均拒绝或 fence | 迟到/乱序 Hook 不会把高权限 attempt 绑定到错误代理，等价权限任务也不互换身份 |
 | 声明 deadline 但执行路径不消费 | 每次加载账本先终止过期 attempt，写入 `timed_out` 并 fence | 超时任务不再无限占用 ownership，迟到事件也不能复活 |
 | 未绑定子代理可读取文件，角色 capability 只存在于提示文本 | 读取要求活动绑定与 `files.read`；命令要求活动绑定与 `command.execute`，不再捆绑写角色；直接写入仍要求可写角色和 `workspace.write`；目标路径交给 Codex 原生权限 | 关闭未绑定身份越权，同时允许只读审查运行 Git 等终端读取，并避免 Hook 用不完整上下文复制一套误拒绝 worktree 的伪沙箱 |
-| 密文兼容契约无法证明写入范围却仍可能选择写角色 | 密文路径默认限定为只读；写任务必须先通过 `mcp__codey_subagent_control__prepare_delegation` 提交可验证 sidecar，再由匹配的加密 `spawn_agent` 单次消费；没有 sidecar 时交回主代理 | 不依赖上游解密即可恢复默认写代理路径，同时保留 ownership/check 的 fail-closed 边界 |
+| 密文兼容契约无法证明写入范围却仍可能选择写角色 | 密文路径默认限定为只读；写任务必须由可信根在同一 `turn_id` 内通过 `mcp__codey_subagent_control__prepare_delegation` 提交本地授权，再由同名、同角色且真实 `fork_turns=none` 的加密 `spawn_agent` 单次消费；授权绑定 nonce、batch、runtime generation 与两分钟 TTL，任一冲突均拒绝 | 不依赖上游解密即可恢复默认写代理路径，同时明确该授权不是密文正文的签名证明，并保留 ownership/check 的 fail-closed 边界 |
 | 网络工具沿用 read 类别；嵌套派生同时受硬编码与规则拒绝 | 新增独立 Network 类别，删除 gate 重复派生判断，仅由规则层裁决 | 权限语义更准确，拒绝原因和热更新来源唯一 |
 | FastCtx 重复 JSON-RPC ID 覆盖 pending，非法 batch 留下半批状态 | 重复 ID 快速拒绝，batch 预检后原子提交 | 防止响应错配、悬挂 pending 和恢复状态污染 |
 | supervisor 部分异常出口遗留 worker 或 reader task | 所有出口走统一 finalizer，并对 kill/wait/channel 回收做集成测试 | 杜绝孤儿进程、句柄和队列泄漏 |
