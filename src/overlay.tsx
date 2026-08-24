@@ -1,17 +1,18 @@
 import ReactDOM from "react-dom/client";
-import "../node_modules/@douyinfe/semi-ui/lib/es/_base/base.css";
+import { MantineProvider } from "@mantine/core";
+import mantineStyles from "@mantine/core/styles.css?inline";
 import { App } from "./App";
 import coreStyles from "./styles.css?inline";
 import operationsStyles from "./styles.operations.css?inline";
 import modelStyles from "./styles.models.css?inline";
 import featureStyles from "./styles.features.css?inline";
 import diagnosticStyles from "./styles.diagnostics.css?inline";
-import componentStyles from "./styles.components.css?inline";
 import responsiveStyles from "./styles.responsive.css?inline";
-import overlayStyles from "./overlay.css?inline";
 import { codeyApiPath } from "./api";
 import { SETTINGS_OVERLAY_Z_INDEX_CSS } from "./overlay.constants";
 import { SETTINGS_OPENED_EVENT } from "./useRuntimeStatus";
+import { codeyMantineTheme } from "./mantine";
+import tailwindStyles from "./tailwind.css?inline";
 
 type OverlayController = {
   open: () => void;
@@ -26,9 +27,28 @@ declare global {
       path: string,
       payload: unknown,
     ) => Promise<unknown>;
-    __codeyComponentStyles?: string;
     __codeySettingsOverlay?: OverlayController;
   }
+}
+
+function isElement(target: EventTarget): target is HTMLElement {
+  return target instanceof HTMLElement;
+}
+
+function canScrollVertically(element: HTMLElement, deltaY: number) {
+  const maxScrollTop = element.scrollHeight - element.clientHeight;
+  if (maxScrollTop <= 0 || deltaY === 0) return false;
+
+  const { overflowY } = window.getComputedStyle(element);
+  if (!/(auto|scroll|overlay)/.test(overflowY)) return false;
+
+  return deltaY < 0
+    ? element.scrollTop > 0
+    : element.scrollTop < maxScrollTop;
+}
+
+function getOverlayMountTarget() {
+  return document.body ?? document.documentElement;
 }
 
 window.__codeyInvokeApi = async (command, args) => {
@@ -39,8 +59,6 @@ window.__codeyInvokeApi = async (command, args) => {
 };
 
 if (!window.__codeySettingsOverlay) {
-  const injectedComponentStyles = window.__codeyComponentStyles ?? "";
-  delete window.__codeyComponentStyles;
   const host = document.createElement("div");
   host.id = "codey-settings-overlay-host";
   host.style.display = "none";
@@ -55,29 +73,80 @@ if (!window.__codeySettingsOverlay) {
     SETTINGS_OVERLAY_Z_INDEX_CSS,
     "important",
   );
+  host.style.setProperty("background", "transparent", "important");
+  host.setAttribute("data-mantine-color-scheme", "light");
   host.setAttribute("aria-hidden", "true");
   const shadow = host.attachShadow({ mode: "open" });
   const style = document.createElement("style");
   style.textContent = [
-    injectedComponentStyles,
-    overlayStyles,
+    mantineStyles,
+    tailwindStyles,
     coreStyles,
     operationsStyles,
     modelStyles,
     featureStyles,
     diagnosticStyles,
-    componentStyles,
     responsiveStyles,
   ].join("\n");
   const rootElement = document.createElement("div");
   rootElement.id = "codey-overlay-root";
+  rootElement.style.inset = "0";
+  rootElement.style.pointerEvents = "none";
+  rootElement.style.position = "fixed";
+  rootElement.style.width = "100%";
+  rootElement.setAttribute("data-mantine-color-scheme", "light");
   const modalContainer = document.createElement("div");
   modalContainer.id = "codey-overlay-modal-container";
+  modalContainer.style.inset = "0";
+  modalContainer.style.position = "fixed";
+  modalContainer.style.width = "100%";
+  modalContainer.setAttribute("data-mantine-color-scheme", "light");
   shadow.append(style, rootElement, modalContainer);
-  document.documentElement.appendChild(host);
+  getOverlayMountTarget().appendChild(host);
 
   let hideTimer: number | undefined;
   let visible = false;
+
+  const handleOverlayWheel = (event: WheelEvent) => {
+    if (!visible) return;
+
+    const path = event.composedPath();
+    const nestedScrollable = path.find(
+      (target) =>
+        isElement(target) &&
+        !target.classList.contains("page-scroll") &&
+        canScrollVertically(target, event.deltaY),
+    );
+    if (nestedScrollable) {
+      event.stopPropagation();
+      return;
+    }
+
+    const scrollContainer =
+      path.find(
+        (target): target is HTMLElement =>
+          isElement(target) && target.classList.contains("page-scroll"),
+      ) ?? modalContainer.querySelector<HTMLElement>(".page-scroll");
+
+    event.stopPropagation();
+
+    if (!scrollContainer) return;
+
+    const maxScrollTop =
+      scrollContainer.scrollHeight - scrollContainer.clientHeight;
+    if (maxScrollTop <= 0) return;
+
+    event.preventDefault();
+    scrollContainer.scrollTop = Math.min(
+      maxScrollTop,
+      Math.max(0, scrollContainer.scrollTop + event.deltaY),
+    );
+  };
+  modalContainer.addEventListener("wheel", handleOverlayWheel, {
+    capture: true,
+    passive: false,
+  });
+
   const hide = () => {
     window.clearTimeout(hideTimer);
     hideTimer = undefined;
@@ -87,13 +156,20 @@ if (!window.__codeySettingsOverlay) {
   const reactRoot = ReactDOM.createRoot(rootElement);
   const render = (visible: boolean) => {
     reactRoot.render(
-      <App
-        embedded
-        modalContainer={modalContainer}
-        modalVisible={visible}
-        onAfterClose={hide}
-        onClose={close}
-      />,
+      <MantineProvider
+        cssVariablesSelector=":host"
+        forceColorScheme="light"
+        getRootElement={() => host}
+        theme={codeyMantineTheme}
+      >
+        <App
+          embedded
+          modalContainer={modalContainer}
+          modalVisible={visible}
+          onAfterClose={hide}
+          onClose={close}
+        />
+      </MantineProvider>,
     );
   };
   const close = () => {
@@ -108,7 +184,7 @@ if (!window.__codeySettingsOverlay) {
     visible = true;
     window.clearTimeout(hideTimer);
     hideTimer = undefined;
-    document.documentElement.appendChild(host);
+    getOverlayMountTarget().appendChild(host);
     host.style.display = "block";
     host.setAttribute("aria-hidden", "false");
     render(true);

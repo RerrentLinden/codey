@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "10";
+  const patchVersion = "14";
   const existingPatch = window.__codeyModelWhitelistPatch;
   if (existingPatch?.version === patchVersion) {
     void existingPatch.refresh();
@@ -13,6 +13,9 @@
   const fastServiceTierId = "priority";
   const fastSpeedTierId = "fast";
   const interactionEvents = ["pointerdown", "focusin"];
+  const groupedMenuStyleId = "codey-model-route-menu-style";
+  const groupedMenuSelector = "[role='menu'], [role='listbox']";
+  const groupedMenuItemSelector = "[role='menuitem'], [role='menuitemradio'], [role='option']";
   const modelQueryKey = ["models", "list"];
   const modelResponseEvent = "message";
   const modelRequestEvent = "codex-message-from-view";
@@ -26,6 +29,7 @@
     models: [],
     defaultModel: "",
     modelMetadata: {},
+    routeMetadata: {},
   };
   let refreshTimer = 0;
   let refreshUntil = 0;
@@ -42,6 +46,9 @@
   const knownModelQueryClients = new Set();
   let originalDispatchEvent = null;
   let patchedDispatchEvent = null;
+  let groupedMenuTimer = 0;
+  let groupedMenuObserver = null;
+  const patchedProviderKey = Symbol("codeyPatchedModelProvider");
   let deliveryState = {
     revision: 0,
     statsigClients: 0,
@@ -77,6 +84,39 @@
     const key = modelKey(value);
     return key ? models.find((model) => modelKey(model) === key) || "" : "";
   };
+  const requestProviderId = (providerId) => (
+    typeof providerId === "string" ? providerId.trim() : ""
+  );
+  const markPatchedProvider = (params, providerId) => {
+    try {
+      Object.defineProperty(params, patchedProviderKey, {
+        value: providerId,
+        configurable: true,
+      });
+    } catch {
+      // Ignore non-extensible request objects; the serialized request payload is unchanged.
+    }
+    return params;
+  };
+  const cleanText = (value) => (
+    typeof value === "string" ? value.trim().replace(/\s+/g, " ") : ""
+  );
+  const metadataText = (metadata, key) => cleanText(
+    metadata && typeof metadata === "object" ? metadata[key] : "",
+  );
+  const displayNameParts = (displayName) => {
+    const separator = displayName.indexOf(" / ");
+    return separator > 0
+      ? {
+        routeName: cleanText(displayName.slice(0, separator)),
+        modelName: cleanText(displayName.slice(separator + 3)),
+      }
+      : { routeName: "", modelName: cleanText(displayName) };
+  };
+  const modelFallbackName = (modelName) => {
+    const separator = modelName.indexOf("/");
+    return cleanText(separator > 0 ? modelName.slice(separator + 1) : modelName);
+  };
 
   const sameModelNames = (left, right) => (
     Array.isArray(left)
@@ -108,11 +148,36 @@
           return model ? [[model, metadata]] : [];
         }),
     );
+    const routeMetadata = Object.fromEntries(
+      Object.entries(modelMetadata).map(([model, metadata]) => {
+        const providerId = typeof metadata.provider_id === "string"
+          ? metadata.provider_id.trim()
+          : "";
+        const sourceModel = typeof metadata.source_model === "string"
+          ? metadata.source_model.trim()
+          : "";
+        const routeName = metadataText(metadata, "route_name")
+          || displayNameParts(metadataText(metadata, "display_name")).routeName
+          || providerId;
+        return [model, { providerId, sourceModel, routeName }];
+      }).filter(([, route]) => route.providerId && route.sourceModel),
+    );
+    for (const model of models) {
+      if (routeMetadata[model]) continue;
+      const separator = model.indexOf("/");
+      if (separator <= 0) continue;
+      const providerId = model.slice(0, separator).trim();
+      const sourceModel = model.slice(separator + 1).replace(/#\d+$/, "").trim();
+      if (providerId && sourceModel) {
+        routeMetadata[model] = { providerId, sourceModel, routeName: providerId };
+      }
+    }
     return {
       loaded: true,
       models,
       defaultModel: requestedDefault?.trim() || models[0] || "",
       modelMetadata,
+      routeMetadata,
     };
   };
 
@@ -167,8 +232,39 @@
     return tiers.includes(fastSpeedTierId) ? tiers : [...tiers, fastSpeedTierId];
   };
 
+  const modelPresentation = (modelName, current = null) => {
+    const metadata = catalog.modelMetadata[modelName];
+    const route = catalog.routeMetadata[modelName];
+    const metadataDisplayName = metadataText(metadata, "display_name");
+    const displayParts = displayNameParts(metadataDisplayName);
+    const routeName = metadataText(metadata, "route_name")
+      || route?.routeName
+      || displayParts.routeName
+      || cleanText(route?.providerId)
+      || "";
+    const sourceModel = metadataText(metadata, "source_model") || route?.sourceModel || "";
+    const modelLabel = metadataText(metadata, "model_display_name")
+      || sourceModel
+      || displayParts.modelName
+      || modelFallbackName(modelName);
+    const currentDisplayName = cleanText(current?.displayName);
+    const displayName = metadataDisplayName
+      || (routeName && modelLabel ? `${routeName} / ${modelLabel}` : "")
+      || currentDisplayName
+      || modelName;
+    return {
+      routeName,
+      modelName: modelLabel,
+      displayName,
+      providerId: cleanText(route?.providerId) || metadataText(metadata, "provider_id"),
+      sourceModel: sourceModel || modelName,
+    };
+  };
+
   const modelDescriptor = (modelName, current = null) => {
     const metadata = catalog.modelMetadata[modelName];
+    const presentation = modelPresentation(modelName, current);
+    const displayName = presentation.displayName;
     const supportedReasoningEfforts = reasoningEffortDescriptors(
       metadata?.supported_reasoning_efforts,
     );
@@ -195,13 +291,18 @@
       model: modelName,
       id: typeof current?.id === "string" && current.id ? current.id : modelName,
       slug: typeof current?.slug === "string" && current.slug ? current.slug : modelName,
-      name: typeof current?.name === "string" && current.name ? current.name : modelName,
-      displayName: typeof current?.displayName === "string" && current.displayName
-        ? current.displayName
-        : modelName,
+      name: displayName
+        || (typeof current?.name === "string" && current.name ? current.name : modelName),
+      displayName,
+      routeName: presentation.routeName,
+      providerName: presentation.routeName,
+      providerId: presentation.providerId,
+      sourceModel: presentation.sourceModel,
+      codeyRouteName: presentation.routeName,
+      codeyModelName: presentation.modelName,
       description: typeof current?.description === "string" && current.description
         ? current.description
-        : "Custom model",
+        : presentation.routeName || "Custom model",
       hidden: false,
       isDefault: modelName === catalog.defaultModel,
       defaultReasoningEffort: requestedDefault?.trim() || "medium",
@@ -239,6 +340,11 @@
     if (!leftMetadata || !rightMetadata) return leftMetadata === rightMetadata;
     return (
       leftMetadata.default_reasoning_effort === rightMetadata.default_reasoning_effort
+      && leftMetadata.display_name === rightMetadata.display_name
+      && leftMetadata.route_name === rightMetadata.route_name
+      && leftMetadata.model_display_name === rightMetadata.model_display_name
+      && leftMetadata.provider_id === rightMetadata.provider_id
+      && leftMetadata.source_model === rightMetadata.source_model
       && sameReasoningEffortNames(
         leftMetadata.supported_reasoning_efforts,
         rightMetadata.supported_reasoning_efforts,
@@ -273,6 +379,14 @@
       models.length === nextModels.length
       && models.every((model, index) => (
         model?.model === nextModels[index]?.model
+        && model?.name === nextModels[index]?.name
+        && model?.displayName === nextModels[index]?.displayName
+        && model?.routeName === nextModels[index]?.routeName
+        && model?.providerName === nextModels[index]?.providerName
+        && model?.providerId === nextModels[index]?.providerId
+        && model?.sourceModel === nextModels[index]?.sourceModel
+        && model?.codeyRouteName === nextModels[index]?.codeyRouteName
+        && model?.codeyModelName === nextModels[index]?.codeyModelName
         && model?.hidden === false
         && model?.isDefault === nextModels[index]?.isDefault
         && model?.defaultReasoningEffort === nextModels[index]?.defaultReasoningEffort
@@ -495,6 +609,174 @@
       if (patchStatsigClient(client)) changed = true;
     });
     return changed;
+  };
+
+  const ensureGroupedMenuStyles = () => {
+    if (
+      document.getElementById?.(groupedMenuStyleId)
+      || typeof document.createElement !== "function"
+    ) return;
+    const style = document.createElement("style");
+    if (!style) return;
+    style.id = groupedMenuStyleId;
+    style.textContent = `
+      .codey-model-route-heading {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin: 8px 8px 4px;
+        padding: 0 2px;
+        color: #8b949e;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 16px;
+        pointer-events: none;
+        user-select: none;
+      }
+      .codey-model-route-heading::after {
+        content: "";
+        flex: 1 1 auto;
+        border-top: 1px solid rgba(139, 148, 158, 0.24);
+      }
+    `;
+    (document.head || document.documentElement || document.body)?.appendChild?.(style);
+  };
+
+  const replaceTextOnce = (element, from, to) => {
+    const source = cleanText(from);
+    const target = cleanText(to);
+    if (!source || !target || source === target) return false;
+    if (typeof document.createTreeWalker === "function") {
+      const walker = document.createTreeWalker(element, 4);
+      let node = walker.nextNode();
+      while (node) {
+        const text = node.nodeValue || "";
+        if (text.includes(source)) {
+          node.nodeValue = text.replace(source, target);
+          return true;
+        }
+        node = walker.nextNode();
+      }
+    }
+    if (cleanText(element.textContent) === source) {
+      element.textContent = target;
+      return true;
+    }
+    return false;
+  };
+
+  const createRouteHeading = (routeName) => {
+    if (typeof document.createElement !== "function") return null;
+    const heading = document.createElement("div");
+    heading.className = "codey-model-route-heading";
+    heading.textContent = routeName;
+    heading.setAttribute("role", "presentation");
+    heading.setAttribute("aria-hidden", "true");
+    heading.dataset.codeyRouteHeading = routeName;
+    return heading;
+  };
+
+  const directRouteHeadings = (parent) => Array.from(parent?.children || [])
+    .filter((child) => Boolean(child?.dataset?.codeyRouteHeading));
+
+  const reconcileRouteHeadings = (parent, items) => {
+    const routeStarts = [];
+    let previousRoute = "";
+    for (const { item, routeName } of items) {
+      if (routeName === previousRoute) continue;
+      routeStarts.push({ item, routeName });
+      previousRoute = routeName;
+    }
+    const headings = directRouteHeadings(parent);
+    const children = Array.from(parent?.children || []);
+    const alreadyGrouped = headings.length === routeStarts.length
+      && routeStarts.every(({ item, routeName }) => {
+        const itemIndex = children.indexOf(item);
+        return itemIndex > 0
+          && children[itemIndex - 1]?.dataset?.codeyRouteHeading === routeName;
+      });
+    if (alreadyGrouped) return false;
+    headings.forEach((heading) => heading.remove?.());
+    for (const { item, routeName } of routeStarts) {
+      const heading = createRouteHeading(routeName);
+      if (heading) parent.insertBefore?.(heading, item);
+    }
+    return true;
+  };
+
+  const enhanceGroupedModelMenus = () => {
+    if (!catalog.loaded || disposed || typeof document.querySelectorAll !== "function") return;
+    ensureGroupedMenuStyles();
+    const byDisplayName = new Map();
+    for (const modelName of catalog.models) {
+      const presentation = modelPresentation(modelName);
+      const displayName = cleanText(presentation.displayName);
+      if (!displayName || !presentation.routeName || !presentation.modelName) continue;
+      byDisplayName.set(displayName, { modelName, presentation });
+    }
+    if (byDisplayName.size === 0) return;
+    const containers = Array.from(document.querySelectorAll(groupedMenuSelector) || []);
+    for (const container of containers) {
+      const items = Array.from(container.querySelectorAll?.(groupedMenuItemSelector) || []);
+      const enhancedItems = [];
+      for (const item of items) {
+        const itemText = cleanText(item.textContent);
+        const existingModel = item.dataset?.codeyRouteModel || "";
+        const existingPresentation = existingModel ? modelPresentation(existingModel) : null;
+        const existingPresentationStillMatches = existingPresentation?.routeName
+          && [existingPresentation.displayName, existingPresentation.modelName]
+            .map(cleanText)
+            .includes(itemText);
+        const matched = existingPresentationStillMatches
+          ? { modelName: existingModel, presentation: existingPresentation }
+          : byDisplayName.get(itemText);
+        if (!matched?.presentation?.routeName || !matched.presentation.modelName) continue;
+        item.dataset.codeyRouteModel = matched.modelName;
+        item.dataset.codeyRouteName = matched.presentation.routeName;
+        item.classList?.add?.("codey-model-route-item");
+        item.setAttribute?.(
+          "aria-label",
+          `${matched.presentation.routeName} / ${matched.presentation.modelName}`,
+        );
+        replaceTextOnce(
+          item,
+          matched.presentation.displayName,
+          matched.presentation.modelName,
+        );
+        enhancedItems.push({ item, routeName: matched.presentation.routeName });
+      }
+      if (enhancedItems.length === 0) continue;
+      const itemsByParent = new Map();
+      for (const entry of enhancedItems) {
+        const { item } = entry;
+        const parent = item.parentElement || container;
+        const siblings = itemsByParent.get(parent) || [];
+        siblings.push(entry);
+        itemsByParent.set(parent, siblings);
+      }
+      for (const [parent, groupedItems] of itemsByParent) {
+        reconcileRouteHeadings(parent, groupedItems);
+      }
+    }
+  };
+
+  const scheduleGroupedModelMenuEnhancement = () => {
+    if (disposed || groupedMenuTimer || !catalog.loaded) return;
+    groupedMenuTimer = window.setTimeout(() => {
+      groupedMenuTimer = 0;
+      enhanceGroupedModelMenus();
+    }, 0);
+  };
+
+  const installGroupedModelMenuObserver = () => {
+    const MutationObserver = window.MutationObserver || globalThis.MutationObserver;
+    if (
+      groupedMenuObserver
+      || typeof MutationObserver !== "function"
+      || !document.body
+    ) return;
+    groupedMenuObserver = new MutationObserver(scheduleGroupedModelMenuEnhancement);
+    groupedMenuObserver.observe(document.body, { childList: true, subtree: true });
   };
 
   const reactFiberKeys = (element) =>
@@ -743,6 +1025,7 @@
       queryEntries: Math.max(firstPass.queryEntries, secondPass.queryEntries),
       reactContainers: firstPass.reactContainers + secondPass.reactContainers,
     });
+    scheduleGroupedModelMenuEnhancement();
     return true;
   };
 
@@ -846,6 +1129,46 @@
     });
   };
 
+  const routeForModel = (modelName) => {
+    const route = catalog.routeMetadata[modelName];
+    if (route) return route;
+    const metadata = catalog.modelMetadata[modelName];
+    const providerId = typeof metadata?.provider_id === "string"
+      ? metadata.provider_id.trim()
+      : "";
+    const sourceModel = typeof metadata?.source_model === "string"
+      ? metadata.source_model.trim()
+      : "";
+    return providerId && sourceModel ? { providerId, sourceModel } : null;
+  };
+
+  const routeForProviderAlias = (modelName) => {
+    const model = typeof modelName === "string" ? modelName.trim() : "";
+    const separator = model.indexOf("/");
+    if (separator <= 0) return null;
+    const providerId = model.slice(0, separator).trim();
+    const sourceModel = model.slice(separator + 1).trim();
+    if (!providerId || !sourceModel) return null;
+    const catalogAlias = canonicalModelName(catalog.models, model);
+    if (catalogAlias) {
+      const catalogRoute = routeForModel(catalogAlias);
+      if (catalogRoute) return catalogRoute;
+      const catalogSeparator = catalogAlias.indexOf("/");
+      if (catalogSeparator > 0) {
+        return {
+          providerId: catalogAlias.slice(0, catalogSeparator).trim(),
+          sourceModel: catalogAlias.slice(catalogSeparator + 1).replace(/#\d+$/, "").trim(),
+        };
+      }
+    }
+    return catalog.models
+      .map(routeForModel)
+      .find((route) => (
+        modelKey(route?.providerId) === modelKey(providerId)
+        && modelKey(route?.sourceModel) === modelKey(sourceModel)
+      )) || null;
+  };
+
   const patchedRequestParams = (method, params) => {
     if (
       !catalog.loaded
@@ -858,16 +1181,85 @@
     const requestedModel = typeof source.model === "string"
       ? source.model.trim()
       : "";
+    const requestedProvider = typeof source.model_provider === "string"
+      ? source.model_provider.trim()
+      : "";
+    const requestedModelForProvider = (() => {
+      if (!requestedProvider || !requestedModel) return requestedModel;
+      const prefix = `${requestedProvider}/`;
+      return requestedModel.toLowerCase().startsWith(prefix.toLowerCase())
+        ? requestedModel.slice(prefix.length).trim()
+        : requestedModel;
+    })();
     const canonicalRequestedModel = canonicalModelName(catalog.models, requestedModel);
-    if (canonicalRequestedModel) {
-      return requestedModel === canonicalRequestedModel
-        ? params
-        : { ...source, model: canonicalRequestedModel };
+    const canonicalRoute = canonicalRequestedModel
+      ? routeForModel(canonicalRequestedModel)
+      : null;
+    const shouldPreferOfficialRawModel = (
+      canonicalRoute?.providerId === "openai"
+      && requestedProvider
+      && requestedProvider !== "openai"
+      && source[patchedProviderKey] !== requestedProvider
+    );
+    const existingRoute = requestedProvider && !shouldPreferOfficialRawModel
+      ? catalog.models
+        .map(routeForModel)
+        .find((route) => (
+          route?.providerId === requestedProvider
+          && modelKey(route.sourceModel) === modelKey(requestedModelForProvider)
+        ))
+      : null;
+    if (existingRoute) {
+      const providerId = requestProviderId(existingRoute.providerId);
+      if (
+        requestedModel === existingRoute.sourceModel
+        && (source.model_provider || "") === providerId
+      ) return params;
+      const next = {
+        ...source,
+        model: existingRoute.sourceModel,
+      };
+      if (providerId) next.model_provider = providerId;
+      else delete next.model_provider;
+      return markPatchedProvider(next, providerId);
     }
-    return {
+    const aliasRoute = routeForProviderAlias(requestedModel);
+    if (aliasRoute) {
+      const providerId = requestProviderId(aliasRoute.providerId);
+      const next = {
+        ...source,
+        model: aliasRoute.sourceModel,
+      };
+      if (providerId) next.model_provider = providerId;
+      else delete next.model_provider;
+      return (
+        requestedModel === next.model
+        && (source.model_provider || "") === (next.model_provider || "")
+      ) ? params : markPatchedProvider(next, providerId);
+    }
+    if (canonicalRequestedModel) {
+      const nextModel = canonicalRoute?.sourceModel || canonicalRequestedModel;
+      const next = {
+        ...source,
+        model: nextModel,
+      };
+      const providerId = requestProviderId(canonicalRoute?.providerId || "");
+      if (providerId) next.model_provider = providerId;
+      else delete next.model_provider;
+      return (
+        requestedModel === next.model
+        && (source.model_provider || "") === (next.model_provider || "")
+      ) ? params : markPatchedProvider(next, providerId);
+    }
+    const route = routeForModel(catalog.defaultModel);
+    const next = {
       ...source,
-      model: catalog.defaultModel,
+      model: route?.sourceModel || catalog.defaultModel,
     };
+    const providerId = requestProviderId(route?.providerId || "");
+    if (providerId) next.model_provider = providerId;
+    else delete next.model_provider;
+    return markPatchedProvider(next, providerId);
   };
 
   const patchOutgoingModelRequest = (detail) => {
@@ -957,6 +1349,7 @@
   let lastInteractionApply = 0;
   const interactionApplyIntervalMs = 2_000;
   const handleInteraction = () => {
+    scheduleGroupedModelMenuEnhancement();
     const now = Date.now();
     if (now - lastInteractionApply < interactionApplyIntervalMs) return;
     lastInteractionApply = now;
@@ -968,6 +1361,7 @@
   interactionEvents.forEach((eventName) => {
     document.addEventListener(eventName, handleInteraction, true);
   });
+  installGroupedModelMenuObserver();
   window.addEventListener?.("focus", handleFocus);
   installModelRequestDispatchPatch();
   if (typeof window.addEventListener === "function") {
@@ -981,6 +1375,7 @@
     apply: applyModelWhitelist,
     refresh: loadModelCatalog,
     setCatalog: setModelCatalog,
+    enhanceModelMenus: enhanceGroupedModelMenus,
     delivery: () => ({ ...deliveryState }),
     snapshot: () => ({
       loaded: catalog.loaded,
@@ -991,6 +1386,10 @@
       disposed = true;
       window.clearTimeout(refreshTimer);
       refreshTimer = 0;
+      window.clearTimeout(groupedMenuTimer);
+      groupedMenuTimer = 0;
+      groupedMenuObserver?.disconnect?.();
+      groupedMenuObserver = null;
       interactionEvents.forEach((eventName) => {
         document.removeEventListener(eventName, handleInteraction, true);
       });

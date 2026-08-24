@@ -187,7 +187,7 @@ export function useModelSelection({
       } catch (error) {
         const warning =
           `自动同步失败：${errorText(error)}。当前线路可能不支持 /v1/models 或 /models 接口，` +
-          "请手动声明希望保留的官方模型，或输入其他模型 ID；手动声明不代表供应商已验证可用。";
+          "请手动输入当前线路支持的模型 ID。";
         openModelPicker(modelState, warning);
         setNotice({
           tone: "error",
@@ -373,8 +373,7 @@ export function useModelSelection({
         thirdPartyModels,
         manualThirdPartyModels,
         deletedThirdPartyModels,
-        `已更新模型声明：${officialModels.length} 个官方模型、` +
-          `${thirdPartyModels.length} 个其他模型`,
+        `已更新模型声明：${thirdPartyModels.length} 个线路模型`,
         true,
       );
     });
@@ -481,6 +480,7 @@ export function useModelSelection({
     draftManualThirdPartyModelKeys,
     manualThirdPartyModelKeys,
     thirdPartyModelOptions,
+    openModelPicker,
     fetchCurrentModels,
     toggleDraftModel,
     deleteDraftThirdPartyModel,

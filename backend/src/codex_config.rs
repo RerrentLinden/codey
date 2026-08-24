@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -29,6 +29,7 @@ use crate::config::{
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
 use crate::fs_util::timestamp_millis;
+use crate::local_router::{self, RuntimeRouterEndpoint};
 
 mod fastctx;
 mod fs_io;
@@ -203,6 +204,8 @@ impl Drop for RuntimeConfigLock {
 }
 
 pub(crate) struct RuntimeProviderConfigOptions<'a> {
+    pub profiles: &'a [ProviderProfile],
+    pub local_router: Option<&'a RuntimeRouterEndpoint>,
     pub use_official_catalog: bool,
     pub default_model: Option<&'a str>,
     pub fast_context_tools: bool,
@@ -214,6 +217,7 @@ pub(crate) struct RuntimeProviderConfigOptions<'a> {
     pub expected_config: Option<&'a [u8]>,
 }
 
+#[derive(Debug)]
 pub(crate) struct AppliedRuntimeProviderConfig {
     pub config_contents: Vec<u8>,
     pub runtime_config_overrides: Vec<String>,
@@ -230,6 +234,8 @@ pub(crate) struct FastContextToolsStatus {
 }
 
 struct ProviderApplyOptions<'a> {
+    profiles: &'a [ProviderProfile],
+    local_router: Option<&'a RuntimeRouterEndpoint>,
     use_official_catalog: bool,
     default_model: Option<&'a str>,
     fastctx_command: Option<&'a Path>,
@@ -267,7 +273,7 @@ pub(crate) fn apply_runtime_provider_config(
     let _runtime_config_lock = RuntimeConfigLock::acquire(&marker)?;
     let backup_root = marker.with_file_name("codex-backups");
     let fastctx_command = resolve_fastctx_command(options.fast_context_tools);
-    let use_official_catalog = !options.preserve_provider_route && options.use_official_catalog;
+    let use_official_catalog = options.use_official_catalog;
     let default_model = (!options.preserve_provider_route)
         .then_some(options.default_model)
         .flatten();
@@ -283,6 +289,8 @@ pub(crate) fn apply_runtime_provider_config(
         profile,
         provider_id,
         ProviderApplyOptions {
+            profiles: options.profiles,
+            local_router: options.local_router,
             use_official_catalog,
             default_model,
             fastctx_command: fastctx_command.as_deref(),
@@ -345,6 +353,8 @@ fn apply_isolated_runtime_provider_config(
     options: ProviderApplyOptions<'_>,
 ) -> Result<AppliedRuntimeProviderConfig> {
     let ProviderApplyOptions {
+        profiles,
+        local_router,
         use_official_catalog,
         default_model,
         fastctx_command,
@@ -368,6 +378,20 @@ fn apply_isolated_runtime_provider_config(
     }
     let existing = str::from_utf8(original_config.as_deref().unwrap_or_default())
         .context("Codex config.toml 不是 UTF-8")?;
+    if local_router.is_some() {
+        let persistent = parse_document(existing).context("解析 Codex config.toml 失败")?;
+        if persistent
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(local_router::ROUTER_PROVIDER_ID))
+            .is_some()
+        {
+            anyhow::bail!(
+                "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
+                local_router::ROUTER_PROVIDER_ID
+            );
+        }
+    }
     let provider_id = validated_provider_id(provider_id)?;
     // Codex resolves this path from the app-server working directory, which is
     // `/` for the packaged macOS app, rather than from CODEX_HOME.
@@ -389,9 +413,24 @@ fn apply_isolated_runtime_provider_config(
             subagent_model,
             subagent_reasoning_effort,
             preserve_provider_route,
+            local_router,
         },
     )?;
     let mut effective_document = parse_document(&effective).context("解析 Codey 运行时约束失败")?;
+    if use_official_catalog {
+        update_model_catalog_reference(
+            &mut effective_document,
+            &config_path,
+            model_catalog_path.as_deref(),
+        );
+    }
+    let runtime_provider_ids = install_runtime_provider_tables(
+        &mut effective_document,
+        profiles,
+        &provider_id,
+        preserve_provider_route,
+        local_router,
+    )?;
     let fastctx_namespace = effective_document
         .get("mcp_servers")
         .and_then(Item::as_table)
@@ -483,7 +522,7 @@ fn apply_isolated_runtime_provider_config(
         &runtime_agents,
         model_catalog_path.as_deref(),
         fastctx_namespace,
-        &provider_id,
+        &runtime_provider_ids,
         &hook_trust_entries,
         preserve_provider_route,
     )?;
@@ -603,6 +642,8 @@ fn apply_isolated_cc_switch_runtime_config(
         profile,
         provider_id,
         ProviderApplyOptions {
+            profiles: std::slice::from_ref(profile),
+            local_router: None,
             use_official_catalog: false,
             default_model: None,
             fastctx_command,
@@ -1371,6 +1412,7 @@ fn patch_config_with_fastctx(
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             preserve_provider_route: false,
+            local_router: None,
         },
     )
 }
@@ -1384,6 +1426,7 @@ struct ProviderPatchOptions<'a> {
     subagent_model: &'a str,
     subagent_reasoning_effort: &'a str,
     preserve_provider_route: bool,
+    local_router: Option<&'a RuntimeRouterEndpoint>,
 }
 
 fn patch_config_with_fastctx_mode(
@@ -1401,6 +1444,7 @@ fn patch_config_with_fastctx_mode(
         subagent_model,
         subagent_reasoning_effort,
         preserve_provider_route,
+        local_router,
     } = options;
     // Official OpenAI routes use Codex's built-in model metadata. In
     // particular, do not let Codey's generated catalog override the official
@@ -1437,7 +1481,11 @@ fn patch_config_with_fastctx_mode(
                 .and_then(|providers| providers.get(&provider_id))
                 .and_then(Item::as_table)
                 .cloned();
-            let provider = if profile.cc_switch_read_only {
+            let provider = if provider_id == local_router::ROUTER_PROVIDER_ID {
+                let router = local_router
+                    .ok_or_else(|| anyhow::anyhow!("Codey 本地路由 Provider 缺少运行时入口"))?;
+                local_router_provider_table(router, existing_local_provider)
+            } else if profile.cc_switch_read_only {
                 official_provider_table(existing_local_provider)
             } else {
                 direct_provider_table(profile, existing_local_provider)?
@@ -1477,6 +1525,91 @@ fn patch_config_with_fastctx_mode(
         }
     }
     document_string(&doc)
+}
+
+/// Add every saved Codey route to the in-memory Codex document. The resulting
+/// tables are emitted exclusively as command-local `-c` overrides, so the
+/// user's persistent config.toml is never rewritten.
+fn install_runtime_provider_tables(
+    doc: &mut DocumentMut,
+    profiles: &[ProviderProfile],
+    active_provider_id: &str,
+    preserve_provider_route: bool,
+    local_router: Option<&RuntimeRouterEndpoint>,
+) -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut installed = Vec::new();
+
+    if let Some(router) = local_router {
+        ensure_provider_table(doc)?;
+        let existing_provider = doc
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(local_router::ROUTER_PROVIDER_ID))
+            .and_then(Item::as_table)
+            .cloned();
+        doc["model_providers"]
+            .as_table_mut()
+            .expect("model_providers was initialized")[local_router::ROUTER_PROVIDER_ID] =
+            Item::Table(local_router_provider_table(router, existing_provider));
+        installed.push(local_router::ROUTER_PROVIDER_ID.to_string());
+    }
+
+    if !preserve_provider_route
+        && !is_reserved_provider_id(active_provider_id)
+        && doc
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(active_provider_id))
+            .and_then(Item::as_table)
+            .is_some()
+    {
+        installed.push(active_provider_id.to_string());
+    }
+
+    for profile in profiles {
+        let provider_id = validated_provider_id(profile.provider_id())?;
+        if !seen.insert(provider_id.clone()) {
+            bail!("多条线路使用了相同的 Codex Provider ID「{provider_id}」");
+        }
+        if provider_id == active_provider_id {
+            continue;
+        }
+        profile.validate().map_err(anyhow::Error::msg)?;
+        if local_router.is_some() && !profile.cc_switch_read_only {
+            continue;
+        }
+        if profile.cc_switch_read_only && is_reserved_provider_id(&provider_id) {
+            continue;
+        }
+        if is_reserved_provider_id(&provider_id) {
+            bail!(
+                "第三方线路「{}」使用了 Codex 保留 Provider ID「{provider_id}」",
+                profile.name
+            );
+        }
+
+        ensure_provider_table(doc)?;
+        let existing_provider = doc
+            .get("model_providers")
+            .and_then(Item::as_table)
+            .and_then(|providers| providers.get(&provider_id))
+            .and_then(Item::as_table)
+            .cloned();
+        let provider = if profile.cc_switch_read_only {
+            official_provider_table(existing_provider)
+        } else {
+            direct_provider_table(profile, existing_provider)?
+        };
+        doc["model_providers"]
+            .as_table_mut()
+            .expect("model_providers was initialized")[&provider_id] = Item::Table(provider);
+        installed.push(provider_id);
+    }
+
+    installed.sort();
+    installed.dedup();
+    Ok(installed)
 }
 
 fn enable_subagent_optimization(
@@ -1806,7 +1939,7 @@ fn build_isolated_runtime_overrides(
     runtime_agents: &[RuntimeAgentRegistration],
     model_catalog_path: Option<&Path>,
     fastctx_namespace: Option<&str>,
-    provider_id: &str,
+    provider_ids: &[String],
     hook_trust_entries: &[RuntimeHookTrustEntry],
     preserve_provider_route: bool,
 ) -> Result<Vec<String>> {
@@ -1826,6 +1959,22 @@ fn build_isolated_runtime_overrides(
             &["model_provider"],
             "model_provider",
         )?;
+        push_document_override(&mut overrides, effective, &["model"], "model")?;
+    }
+
+    if model_catalog_path.is_some() && !(preserve_provider_route && !runtime_agents.is_empty()) {
+        push_document_override(
+            &mut overrides,
+            effective,
+            &["model_catalog_json"],
+            "model_catalog_json",
+        )?;
+    }
+
+    // Provider tables are process-local even while a CC Switch live route owns
+    // the root model_provider. That lets the renderer switch to any other saved
+    // Codey route without mutating the live or persistent Codex configuration.
+    for provider_id in provider_ids {
         if !is_reserved_provider_id(provider_id)
             && effective
                 .get("model_providers")
@@ -1834,7 +1983,8 @@ fn build_isolated_runtime_overrides(
                 .and_then(Item::as_table)
                 .is_some()
         {
-            let provider_segment = toml_string_literal(provider_id);
+            let provider_segment =
+                codex_config_override_bare_segment(provider_id, "Codex Provider ID")?;
             for field in [
                 "name",
                 "base_url",
@@ -1845,18 +1995,11 @@ fn build_isolated_runtime_overrides(
                 push_document_override(
                     &mut overrides,
                     effective,
-                    &["model_providers", provider_id, field],
+                    &["model_providers", provider_id.as_str(), field],
                     &format!("model_providers.{provider_segment}.{field}"),
                 )?;
             }
         }
-        push_document_override(&mut overrides, effective, &["model"], "model")?;
-        push_document_override(
-            &mut overrides,
-            effective,
-            &["model_catalog_json"],
-            "model_catalog_json",
-        )?;
     }
 
     if fastctx_namespace.is_some() {
@@ -2192,6 +2335,22 @@ fn push_runtime_override_value(overrides: &mut Vec<String>, key: &str, value: &V
 
 fn toml_string_literal(value: &str) -> String {
     Value::from(value).to_string()
+}
+
+/// Codex parses the key portion of `-c key=value` as a plain dotted path, not
+/// as TOML. Quoting a path segment therefore makes the quote characters part
+/// of the provider id and leaves the real provider undefined. Codey-owned ids
+/// already use this bare-key character set; reject imported ids that cannot be
+/// represented safely instead of launching Codex with a dangling provider.
+fn codex_config_override_bare_segment<'a>(value: &'a str, label: &str) -> Result<&'a str> {
+    anyhow::ensure!(
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "{label}「{value}」包含 Codex 临时配置路径不支持的字符"
+    );
+    Ok(value)
 }
 
 fn append_constraint_text(existing: &str, addition: &str) -> String {
@@ -2593,14 +2752,29 @@ fn direct_provider_table(
         profile.name.trim()
     });
     provider["base_url"] = value(base_url);
-    provider["wire_api"] = value("responses");
+    provider["wire_api"] = value(profile.runtime_wire_api().map_err(anyhow::Error::msg)?);
     if !preserves_manual_settings {
-        provider["requires_openai_auth"] = value(true);
+        provider["requires_openai_auth"] = value(profile.supports_remote_compaction);
     }
     if !profile.api_key.trim().is_empty() {
         provider["experimental_bearer_token"] = value(profile.api_key.trim());
+    } else {
+        anyhow::bail!("第三方线路「{}」缺少 API Key", profile.name);
     }
     Ok(provider)
+}
+
+fn local_router_provider_table(
+    endpoint: &RuntimeRouterEndpoint,
+    existing_local_provider: Option<Table>,
+) -> Table {
+    let mut provider = existing_local_provider.unwrap_or_default();
+    provider["name"] = value("Codey Local Router");
+    provider["base_url"] = value(endpoint.base_url.trim_end_matches('/'));
+    provider["wire_api"] = value("responses");
+    provider["requires_openai_auth"] = value(false);
+    provider["experimental_bearer_token"] = value(endpoint.token.as_str());
+    provider
 }
 
 fn ensure_active_provider_uses_responses(doc: &DocumentMut) -> Result<()> {

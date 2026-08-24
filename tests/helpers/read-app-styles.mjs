@@ -6,7 +6,6 @@ const APP_STYLE_FILES = [
   "src/styles.models.css",
   "src/styles.features.css",
   "src/styles.diagnostics.css",
-  "src/styles.components.css",
   "src/styles.responsive.css",
 ];
 

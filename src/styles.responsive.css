@@ -9,14 +9,33 @@
 }
 
 @media (max-width: 900px) {
-  .auxiliary-dashboard-grid,
-  .upper-dashboard-grid,
   .provider-summary {
     grid-template-columns: 1fr;
   }
 
   .provider-meta {
     grid-template-columns: repeat(2, 1fr);
+  }
+
+  .route-manager {
+    grid-template-columns: 1fr;
+  }
+
+  .route-list-pane {
+    border-right: 0;
+    border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+  }
+
+  .route-manager {
+    min-height: 0;
+  }
+
+  .route-catalog-pane {
+    padding-top: 14px;
+  }
+
+  .provider-model-groups {
+    max-height: 440px;
   }
 }
 
@@ -27,10 +46,6 @@
 }
 
 @media (max-width: 680px) {
-  .prompt-optimization-config-grid {
-    grid-template-columns: 1fr;
-  }
-
   .prompt-optimization-actions-row {
     align-items: stretch;
     flex-direction: column-reverse;
@@ -39,27 +54,6 @@
   .prompt-optimization-action-buttons {
     justify-content: flex-start;
     flex-wrap: wrap;
-  }
-
-  .prompt-optimization-model-control {
-    align-items: stretch;
-    flex-direction: column;
-  }
-
-  .prompt-optimization-model-picker,
-  .prompt-optimization-model-control .codey-button {
-    width: 100%;
-  }
-
-  .config-header-inner {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-
-  .config-header-right {
-    width: 100%;
-    flex-direction: column;
-    align-items: stretch;
   }
 
   .operations-header {
@@ -87,6 +81,25 @@
 
   .model-groups {
     grid-template-columns: 1fr;
+  }
+
+  .route-form-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .route-field-wide {
+    grid-column: span 1;
+  }
+
+  .route-heading-actions,
+  .provider-model-group-heading,
+  .provider-model-empty {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .provider-model-group-actions {
+    justify-content: flex-start;
   }
 
   .section-title.trace-section-title {
@@ -132,14 +145,6 @@
     flex-wrap: wrap;
   }
 
-  .trace-card {
-    min-height: 537px;
-  }
-
-  .trace-empty-container {
-    min-height: 495px;
-  }
-
   .trace-empty {
     max-width: 520px;
     grid-template-columns: 1fr;
@@ -152,7 +157,7 @@
   }
 
   .trace-metric-card {
-    grid-column: span 1 !important;
+    grid-column: span 1;
   }
 
 }

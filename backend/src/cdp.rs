@@ -36,7 +36,6 @@ const PET_CONTROL_SHIELD_SCRIPT: &str =
 const SECURITY_WARNING_SHIELD_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/security-warning-shield.js");
 const SETTINGS_OVERLAY_SCRIPT: &str = include_str!("../../dist-overlay/codey-overlay.js");
-const SETTINGS_OVERLAY_STYLES: &str = include_str!("../../dist-overlay/codey.css");
 const PLUGIN_MARKETPLACE_FIX_SCRIPT: &str =
     include_str!("../../dist-overlay/inject/plugin-marketplace-fix.js");
 const PROMPT_OPTIMIZE_SCRIPT: &str = include_str!("../../dist-overlay/inject/prompt-optimize.js");
@@ -855,12 +854,11 @@ async fn record_failed_injection_statuses(websocket_url: &str, statuses: &[Injec
 
 pub async fn refresh_model_whitelist(
     websocket_url: &str,
-    expected_models: &[String],
-    expected_default_model: &str,
+    expected_catalog: &serde_json::Value,
 ) -> Result<()> {
     let response = codey_runtime_core::bridge::evaluate_script_with_await_promise(
         websocket_url,
-        &model_whitelist_refresh_script(expected_models, expected_default_model),
+        &model_whitelist_refresh_script(expected_catalog),
         true,
     )
     .await
@@ -868,24 +866,20 @@ pub async fn refresh_model_whitelist(
     verify_model_whitelist_refresh_response(&response)
 }
 
-fn model_whitelist_refresh_script(
-    expected_models: &[String],
-    expected_default_model: &str,
-) -> String {
-    let expected_models =
-        serde_json::to_string(expected_models).expect("model ids should serialize");
-    let expected_default_model =
-        serde_json::to_string(expected_default_model).expect("default model should serialize");
+fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> String {
+    let expected_catalog =
+        serde_json::to_string(expected_catalog).expect("model catalog should serialize");
     format!(
         r#"(async () => {{
-  const expectedModels = {expected_models};
-  const expectedDefaultModel = {expected_default_model};
-  const expectedCatalog = {{
-    status: expectedModels.length > 0 ? "ok" : "not_configured",
-    model: expectedDefaultModel,
-    default_model: expectedDefaultModel,
-    models: expectedModels,
-  }};
+  const expectedCatalog = {expected_catalog};
+  const expectedModels = Array.isArray(expectedCatalog.models)
+    ? expectedCatalog.models
+    : [];
+  const expectedDefaultModel = typeof expectedCatalog.default_model === "string"
+    ? expectedCatalog.default_model
+    : typeof expectedCatalog.model === "string"
+      ? expectedCatalog.model
+      : "";
   const matchesExpected = (snapshot) => (
     snapshot?.loaded === true
     && Array.isArray(snapshot.models)
@@ -1136,12 +1130,7 @@ fn with_lazy_loaders(handler: BridgeHandler, websocket_url: Arc<str>) -> BridgeH
 
 fn prepared_settings_overlay_load_script() -> Arc<str> {
     SETTINGS_OVERLAY_LOAD_SCRIPT
-        .get_or_init(|| {
-            Arc::from(settings_overlay_load_script(
-                SETTINGS_OVERLAY_SCRIPT,
-                SETTINGS_OVERLAY_STYLES,
-            ))
-        })
+        .get_or_init(|| Arc::from(settings_overlay_load_script(SETTINGS_OVERLAY_SCRIPT)))
         .clone()
 }
 
@@ -1207,9 +1196,8 @@ fn lazy_settings_overlay_loader_script() -> &'static str {
 })()"#
 }
 
-fn settings_overlay_load_script(script: &str, styles: &str) -> String {
+fn settings_overlay_load_script(script: &str) -> String {
     let wrapped = wrap_settings_overlay(script);
-    let styles = serde_json::to_string(styles).expect("serialize settings overlay styles");
     format!(
         r#"(() => {{
   const current = window.__codeySettingsOverlay;
@@ -1217,12 +1205,10 @@ fn settings_overlay_load_script(script: &str, styles: &str) -> String {
     return "";
   }}
   if (current?.__codeyLazyLoader) delete window.__codeySettingsOverlay;
-  window.__codeyComponentStyles = {styles};
   {wrapped}
   const ready = typeof window.__codeySettingsOverlay === "object"
     && typeof window.__codeySettingsOverlay.toggle === "function"
     && !window.__codeySettingsOverlay.__codeyLazyLoader;
-  delete window.__codeyComponentStyles;
   if (ready) return "";
   if (current?.__codeyLazyLoader) window.__codeySettingsOverlay = current;
   return String(window.__codeyOverlayError || "未生成浮层控制器");
@@ -1484,10 +1470,18 @@ mod tests {
 
     #[test]
     fn model_whitelist_refresh_script_retries_and_verifies_the_expected_snapshot() {
-        let script = model_whitelist_refresh_script(
-            &["gpt-5.6-sol".into(), "provider-\"quoted".into()],
-            "provider-\"quoted",
-        );
+        let script = model_whitelist_refresh_script(&serde_json::json!({
+            "status": "ok",
+            "model": "provider-\"quoted",
+            "default_model": "provider-\"quoted",
+            "models": ["gpt-5.6-sol", "provider-\"quoted"],
+            "model_metadata": [{
+                "model": "provider-\"quoted",
+                "display_name": "Provider / provider-\"quoted",
+                "provider_id": "provider",
+                "source_model": "provider-\"quoted"
+            }]
+        }));
 
         assert!(script.contains("window.__codeyModelWhitelistPatch"));
         assert!(script.contains("await patch.setCatalog(expectedCatalog)"));
@@ -1496,6 +1490,7 @@ mod tests {
         assert!(!script.contains("patch.refresh()"));
         assert!(!script.contains("/codex-model-catalog"));
         assert!(script.contains("[0, 80, 200, 500]"));
+        assert!(script.contains("model_metadata"));
         assert!(script.contains(r#"provider-\"quoted"#));
         assert!(script.contains("snapshot.defaultModel === expectedDefaultModel"));
         assert!(script.contains("delivery.queryEntries"));
@@ -1608,9 +1603,9 @@ mod tests {
         assert!(!snapshot_script.contains("user-script-1\": () =>"));
         let overlay_load_script = prepared_settings_overlay_load_script();
         assert!(overlay_load_script.contains("codey-settings-overlay-host"));
-        assert!(overlay_load_script.contains("window.__codeyComponentStyles = "));
-        assert!(overlay_load_script.contains(".semi-button"));
-        assert!(overlay_load_script.contains("--semi-color-primary:"));
+        assert!(overlay_load_script.contains("data-mantine-color-scheme"));
+        assert!(overlay_load_script.contains("--button-bg"));
+        assert!(overlay_load_script.contains("--mantine-color-blue-6:"));
         assert!(overlay_load_script.contains("delete window.__codeySettingsOverlay"));
         assert!(
             overlay_load_script.contains("window.__codeySettingsOverlay = current"),
@@ -1736,10 +1731,7 @@ mod tests {
 
     #[test]
     fn failed_settings_overlay_bundle_restores_the_lazy_loader() {
-        let script = settings_overlay_load_script(
-            "throw new Error('bundle failed');",
-            ".semi-button { color: red; }",
-        );
+        let script = settings_overlay_load_script("throw new Error('bundle failed');");
 
         let delete_index = script
             .find("delete window.__codeySettingsOverlay")
@@ -1750,6 +1742,5 @@ mod tests {
 
         assert!(restore_index > delete_index);
         assert!(script.contains("if (ready) return \"\""));
-        assert!(script.contains("delete window.__codeyComponentStyles"));
     }
 }

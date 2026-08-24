@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use crate::notifications::WebhookConfig;
-use crate::{model_catalog, model_id};
+use crate::{local_router, model_catalog, model_id};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -19,6 +19,14 @@ pub struct ProviderProfile {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default = "default_upstream_protocol")]
+    pub upstream_protocol: String,
+    #[serde(default = "default_auth_mode")]
+    pub auth_mode: String,
+    #[serde(default)]
+    pub api_key_configured: bool,
+    #[serde(default, skip_serializing)]
+    pub clear_api_key: bool,
     /// Request-only provider headers loaded from the active Codex/CC Switch
     /// source. They may contain credentials, so they are never serialized into
     /// Codey's store or exposed to the renderer.
@@ -35,6 +43,8 @@ pub struct ProviderProfile {
     pub supports_remote_compaction: bool,
 }
 
+pub const DERIVED_OFFICIAL_PROFILE_ID: &str = "codey-official-account";
+
 impl ProviderProfile {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
@@ -42,6 +52,10 @@ impl ProviderProfile {
             name: name.into(),
             base_url: String::new(),
             api_key: String::new(),
+            upstream_protocol: default_upstream_protocol(),
+            auth_mode: default_auth_mode(),
+            api_key_configured: false,
+            clear_api_key: false,
             model_request_headers: BTreeMap::new(),
             cc_switch_provider_id: None,
             cc_switch_read_only: false,
@@ -51,6 +65,113 @@ impl ProviderProfile {
 
     pub fn normalized_base_url(&self) -> String {
         self.base_url.trim().trim_end_matches('/').to_string()
+    }
+
+    /// The provider id passed to Codex and used by every route-scoped model
+    /// map. CC Switch routes keep their source provider identity; Codey-owned
+    /// routes use the profile id directly.
+    pub fn provider_id(&self) -> &str {
+        self.cc_switch_provider_id
+            .as_deref()
+            .unwrap_or(self.id.as_str())
+    }
+
+    pub(crate) fn runtime_wire_api(&self) -> Result<&'static str, String> {
+        match self.upstream_protocol.as_str() {
+            UPSTREAM_PROTOCOL_OFFICIAL
+            | UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+            | UPSTREAM_PROTOCOL_OPENAI_COMPATIBLE => Ok("responses"),
+            protocol => Err(format!(
+                "线路「{}」使用了不支持的上游协议：{protocol}",
+                self.name
+            )),
+        }
+    }
+
+    pub(crate) fn is_unconfigured_default(&self) -> bool {
+        self.name == "默认配置"
+            && self.base_url.trim().is_empty()
+            && self.api_key.trim().is_empty()
+            && !self.api_key_configured
+            && !self.cc_switch_read_only
+    }
+
+    pub(crate) fn normalize(&mut self) {
+        self.id = self.id.trim().to_string();
+        self.name = self.name.trim().to_string();
+        if self.name.is_empty() {
+            self.name = "未命名线路".to_string();
+        }
+        self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
+        self.api_key = self.api_key.trim().to_string();
+        self.cc_switch_provider_id = self
+            .cc_switch_provider_id
+            .take()
+            .map(|provider_id| provider_id.trim().to_string())
+            .filter(|provider_id| !provider_id.is_empty());
+        self.upstream_protocol = normalize_upstream_protocol(&self.upstream_protocol);
+        self.auth_mode = normalize_auth_mode(&self.auth_mode, self.cc_switch_read_only);
+        if self.auth_mode == AUTH_MODE_OFFICIAL_ACCOUNT {
+            self.cc_switch_read_only = true;
+            self.api_key.clear();
+            self.supports_remote_compaction = true;
+            self.upstream_protocol = UPSTREAM_PROTOCOL_OFFICIAL.to_string();
+            self.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+        } else {
+            self.cc_switch_read_only = false;
+            if self.upstream_protocol == UPSTREAM_PROTOCOL_OFFICIAL {
+                self.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string();
+            }
+        }
+        self.api_key_configured = !self.api_key.is_empty();
+        self.clear_api_key = false;
+    }
+
+    pub fn merge_redacted_secret(&mut self, previous: Option<&Self>) {
+        if self.clear_api_key {
+            self.api_key.clear();
+            self.api_key_configured = false;
+            return;
+        }
+        if !self.api_key.trim().is_empty() || !self.api_key_configured {
+            return;
+        }
+        if let Some(previous) = previous {
+            self.api_key = previous.api_key.clone();
+        }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() {
+            return Err("线路 ID 不能为空".to_string());
+        }
+        if self.provider_id() == local_router::ROUTER_PROVIDER_ID {
+            return Err(format!(
+                "线路不能使用 Codey 内部 Provider ID「{}」",
+                local_router::ROUTER_PROVIDER_ID
+            ));
+        }
+        let name = self.name.trim();
+        if name.is_empty() {
+            return Err("线路名称不能为空".to_string());
+        }
+        if self.auth_mode == AUTH_MODE_OFFICIAL_ACCOUNT || self.cc_switch_read_only {
+            return Ok(());
+        }
+        let base_url = self.base_url.trim();
+        if base_url.is_empty() {
+            return Err(format!("线路「{name}」缺少 API URL"));
+        }
+        let url = reqwest::Url::parse(base_url)
+            .map_err(|_| format!("线路「{name}」的 API URL 格式无效"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(format!("线路「{name}」的 API URL 必须是 HTTP(S) 地址"));
+        }
+        self.runtime_wire_api()?;
+        if self.api_key.trim().is_empty() {
+            return Err(format!("线路「{name}」缺少第三方 API Key"));
+        }
+        Ok(())
     }
 }
 
@@ -246,6 +367,12 @@ pub struct CodeyConfig {
     /// selections into provider-scoped official-model declarations.
     #[serde(default)]
     pub subagent_role_model_support_migrated: bool,
+    /// Tracks whether Codey has already consumed the one-time default route
+    /// import window. Existing non-empty configs are treated as already
+    /// initialized so later launches never overwrite saved third-party routes
+    /// from the ambient Codex configuration.
+    #[serde(default)]
+    pub initial_route_import_completed: bool,
     /// Automatically dismisses Codex's full-access safety notice in the
     /// renderer. Opt-in so the native warning remains visible by default.
     #[serde(default)]
@@ -254,6 +381,11 @@ pub struct CodeyConfig {
     /// header. The renderer only activates this for an official login route.
     #[serde(default = "default_true")]
     pub show_account_usage_in_header: bool,
+    /// Launch-scoped authentication capability captured from Codex before
+    /// Codey's temporary provider overrides are applied. It is intentionally
+    /// never persisted or exposed as part of the editable configuration.
+    #[serde(skip)]
+    pub official_account_available_this_launch: bool,
     /// Public HTTPS endpoint for the version manifest published to Cloudflare R2.
     /// This is build-time configuration, not a user setting.
     #[serde(
@@ -291,8 +423,10 @@ impl Default for CodeyConfig {
             subagent_roles: default_subagent_roles(),
             subagent_config_by_provider: BTreeMap::new(),
             subagent_role_model_support_migrated: true,
+            initial_route_import_completed: false,
             hide_full_access_warning: false,
             show_account_usage_in_header: true,
+            official_account_available_this_launch: false,
             update_manifest_url: default_update_manifest_url(),
         }
     }
@@ -304,9 +438,7 @@ impl CodeyConfig {
         self.profiles
             .retain(|profile| !profile.id.trim().is_empty());
         for profile in &mut self.profiles {
-            if profile.cc_switch_read_only {
-                profile.supports_remote_compaction = true;
-            }
+            profile.normalize();
         }
         if self.profiles.is_empty() {
             let profile = ProviderProfile::new("默认配置");
@@ -320,6 +452,12 @@ impl CodeyConfig {
         {
             self.active_profile_id = self.profiles[0].id.clone();
         }
+        let official_provider_ids = self
+            .profiles
+            .iter()
+            .filter(|profile| profile.cc_switch_read_only)
+            .map(|profile| profile.provider_id().to_string())
+            .collect::<BTreeSet<_>>();
         normalize_model_lists(&mut self.selected_models_by_provider);
         normalize_model_lists(&mut self.manual_third_party_models_by_provider);
         normalize_model_lists(&mut self.declared_official_models_by_provider);
@@ -327,6 +465,7 @@ impl CodeyConfig {
             &mut self.selected_models_by_provider,
             &mut self.manual_third_party_models_by_provider,
             &mut self.declared_official_models_by_provider,
+            &official_provider_ids,
         );
         normalize_upstream_model_lists(&mut self.upstream_models_by_provider);
         merge_declared_official_models_into_upstream(
@@ -354,9 +493,69 @@ impl CodeyConfig {
             self.migrate_custom_subagent_role_model_support();
             self.subagent_role_model_support_migrated = true;
         }
+        if !self.initial_route_import_completed && !self.looks_like_empty_default_route() {
+            self.initial_route_import_completed = true;
+        }
         self.webhook.normalize();
         self.prompt_optimization.normalize();
         self
+    }
+
+    pub(crate) fn apply_launch_official_profile(
+        &mut self,
+        official_profile: Option<ProviderProfile>,
+    ) {
+        self.remember_current_subagent_config();
+        let previous_active_id = self.active_profile_id.clone();
+        let placeholder_provider_id = self
+            .looks_like_empty_default_route()
+            .then(|| self.profiles[0].provider_id().to_string());
+        if self.looks_like_empty_default_route() {
+            self.profiles.clear();
+        } else {
+            self.profiles.retain(|profile| !profile.cc_switch_read_only);
+        }
+        // The launch-derived official profile may disappear on an API-key
+        // launch and return on a later official launch. Keep its provider-scoped
+        // model/default/subagent preferences across that temporary absence.
+        // Only the disposable empty placeholder owns data that can be removed.
+        if let Some(provider_id) = placeholder_provider_id {
+            self.selected_models_by_provider.remove(&provider_id);
+            self.manual_third_party_models_by_provider
+                .remove(&provider_id);
+            self.declared_official_models_by_provider
+                .remove(&provider_id);
+            self.upstream_models_by_provider.remove(&provider_id);
+            self.default_model_by_provider.remove(&provider_id);
+            self.subagent_config_by_provider.remove(&provider_id);
+        }
+        if let Some(mut official_profile) = official_profile {
+            official_profile.id = DERIVED_OFFICIAL_PROFILE_ID.to_string();
+            official_profile.normalize();
+            let official_provider_id = official_profile.provider_id().to_string();
+            if let Some(existing) = self
+                .profiles
+                .iter_mut()
+                .find(|profile| profile.id == DERIVED_OFFICIAL_PROFILE_ID)
+            {
+                *existing = official_profile;
+            } else {
+                self.profiles.insert(0, official_profile);
+            }
+            self.selected_models_by_provider
+                .entry(official_provider_id)
+                .or_insert_with(model_catalog::default_official_model_slugs);
+        }
+        if self
+            .profiles
+            .iter()
+            .any(|profile| profile.id == previous_active_id)
+        {
+            self.active_profile_id = previous_active_id;
+        } else if let Some(profile) = self.profiles.first() {
+            self.active_profile_id = profile.id.clone();
+        }
+        self.restore_current_subagent_config();
     }
 
     pub fn active_profile(&self) -> Option<ProviderProfile> {
@@ -371,12 +570,7 @@ impl CodeyConfig {
         self.profiles
             .iter()
             .find(|profile| profile.id == self.active_profile_id)
-            .map(|profile| {
-                profile
-                    .cc_switch_provider_id
-                    .as_deref()
-                    .unwrap_or(profile.id.as_str())
-            })
+            .map(ProviderProfile::provider_id)
     }
 
     pub fn selected_models(&self) -> &[String] {
@@ -384,6 +578,25 @@ impl CodeyConfig {
             .and_then(|provider_id| self.selected_models_by_provider.get(provider_id))
             .map(Vec::as_slice)
             .unwrap_or_default()
+    }
+
+    /// Models enabled on an API-key route. Legacy official-looking model IDs
+    /// are stored separately for backward compatibility, but they still belong
+    /// to this route and must be routed by provenance rather than by name.
+    pub(crate) fn enabled_route_models(&self, provider_id: &str) -> Vec<String> {
+        let selected = self
+            .selected_models_by_provider
+            .get(provider_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let declared = self
+            .declared_official_models_by_provider
+            .get(provider_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        model_id::dedupe_preserving_first(
+            selected.iter().chain(declared.iter()).map(String::as_str),
+        )
     }
 
     pub fn manual_third_party_models(&self) -> &[String] {
@@ -414,6 +627,86 @@ impl CodeyConfig {
         self.current_provider_id()
             .and_then(|provider_id| self.default_model_by_provider.get(provider_id))
             .map(String::as_str)
+    }
+
+    pub fn has_third_party_route(&self) -> bool {
+        self.profiles
+            .iter()
+            .any(|profile| !profile.cc_switch_read_only)
+    }
+
+    pub(crate) fn looks_like_empty_default_route(&self) -> bool {
+        let Some(profile) = self.profiles.first() else {
+            return true;
+        };
+        self.profiles.len() == 1
+            && profile.name == "默认配置"
+            && profile.base_url.trim().is_empty()
+            && profile.api_key.trim().is_empty()
+            && !profile.api_key_configured
+            && !profile.cc_switch_read_only
+            && self.selected_models_by_provider.is_empty()
+            && self.manual_third_party_models_by_provider.is_empty()
+            && self.declared_official_models_by_provider.is_empty()
+            && self.upstream_models_by_provider.is_empty()
+            && self.default_model_by_provider.is_empty()
+    }
+
+    pub(crate) fn needs_initial_route_import(&self) -> bool {
+        !self.initial_route_import_completed && self.looks_like_empty_default_route()
+    }
+
+    /// Build one model catalog for all routes registered in the current Codex
+    /// process. Third-party entries use local-router aliases so Codex can send
+    /// requests through one stable provider while Codey restores upstream ids.
+    pub fn runtime_catalog_models(&self) -> (Vec<String>, Vec<String>) {
+        let official_models = model_catalog::default_official_model_slugs();
+        let include_all_official = self.official_account_available_this_launch
+            && self
+                .profiles
+                .iter()
+                .any(|profile| profile.cc_switch_read_only);
+        let include_official_in_selected = include_all_official && !self.has_third_party_route();
+        let mut upstream = Vec::new();
+        let mut selected = Vec::new();
+        for profile in &self.profiles {
+            if profile.cc_switch_read_only {
+                if include_all_official {
+                    let enabled = self
+                        .selected_models_by_provider
+                        .get(profile.provider_id())
+                        .filter(|models| !models.is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| official_models.clone());
+                    upstream.extend(enabled.iter().cloned());
+                    if include_official_in_selected {
+                        selected.extend(enabled);
+                    }
+                }
+                continue;
+            }
+            let provider_id = profile.provider_id();
+            if let Some(models) = self.upstream_models_by_provider.get(profile.provider_id()) {
+                upstream.extend(
+                    models
+                        .iter()
+                        .map(|model| local_router::model_alias(provider_id, model)),
+                );
+            }
+            let enabled_models = self.enabled_route_models(provider_id);
+            if !enabled_models.is_empty() {
+                let aliases = enabled_models
+                    .iter()
+                    .map(|model| local_router::model_alias(provider_id, model))
+                    .collect::<Vec<_>>();
+                upstream.extend(aliases.iter().cloned());
+                selected.extend(aliases);
+            }
+        }
+        (
+            model_id::dedupe_preserving_first(upstream.iter().map(String::as_str)),
+            model_id::dedupe_preserving_first(selected.iter().map(String::as_str)),
+        )
     }
 
     pub(crate) fn remember_current_subagent_config(&mut self) {
@@ -513,14 +806,9 @@ impl CodeyConfig {
     }
 
     fn provider_is_official(&self, provider_id: &str) -> bool {
-        self.profiles.iter().any(|profile| {
-            profile.cc_switch_read_only
-                && profile
-                    .cc_switch_provider_id
-                    .as_deref()
-                    .unwrap_or(profile.id.as_str())
-                    == provider_id
-        })
+        self.profiles
+            .iter()
+            .any(|profile| profile.cc_switch_read_only && profile.provider_id() == provider_id)
     }
 
     fn active_subagent_config(&self) -> SubagentProviderConfig {
@@ -530,6 +818,33 @@ impl CodeyConfig {
             roles: self.subagent_roles.clone(),
         }
     }
+}
+
+pub(crate) fn validate_provider_profiles(profiles: &[ProviderProfile]) -> Result<(), String> {
+    if profiles.is_empty() {
+        return Err("至少需要保留一条线路".to_string());
+    }
+    let mut profile_ids = BTreeSet::new();
+    let mut provider_ids = BTreeSet::new();
+    let allows_empty_default = profiles.len() == 1 && profiles[0].is_unconfigured_default();
+    for profile in profiles {
+        if !allows_empty_default {
+            profile.validate()?;
+        }
+        if !profile_ids.insert(profile.id.clone()) {
+            return Err(format!("线路 ID 重复：{}", profile.id));
+        }
+        let provider_id = profile.provider_id().trim();
+        if provider_id.is_empty() {
+            return Err(format!("线路「{}」缺少 Codex Provider ID", profile.name));
+        }
+        if !provider_ids.insert(provider_id.to_string()) {
+            return Err(format!(
+                "多条线路使用了相同的 Codex Provider ID：{provider_id}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_model_lists(lists: &mut BTreeMap<String, Vec<String>>) {
@@ -561,6 +876,7 @@ fn migrate_legacy_official_model_selections(
     selected_models_by_provider: &mut BTreeMap<String, Vec<String>>,
     manual_third_party_models_by_provider: &mut BTreeMap<String, Vec<String>>,
     declared_official_models_by_provider: &mut BTreeMap<String, Vec<String>>,
+    official_provider_ids: &BTreeSet<String>,
 ) {
     let official_models_by_key = official_models_by_key();
     let provider_ids = selected_models_by_provider
@@ -570,6 +886,9 @@ fn migrate_legacy_official_model_selections(
         .collect::<BTreeSet<_>>();
 
     for provider_id in provider_ids {
+        if official_provider_ids.contains(&provider_id) {
+            continue;
+        }
         let mut migrated_models = Vec::new();
         if let Some(models) = selected_models_by_provider.get_mut(&provider_id) {
             take_official_models(models, &official_models_by_key, &mut migrated_models);
@@ -637,6 +956,11 @@ fn default_true() -> bool {
 
 pub const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-terra";
 pub const DEFAULT_SUBAGENT_REASONING_EFFORT: &str = "low";
+pub const UPSTREAM_PROTOCOL_OFFICIAL: &str = "official";
+pub const UPSTREAM_PROTOCOL_OPENAI_RESPONSES: &str = "openaiResponses";
+pub const UPSTREAM_PROTOCOL_OPENAI_COMPATIBLE: &str = "openaiCompatible";
+pub const AUTH_MODE_OFFICIAL_ACCOUNT: &str = "officialAccount";
+pub const AUTH_MODE_API_KEY: &str = "apiKey";
 pub const SUBAGENT_REASONING_EFFORTS: [&str; 6] =
     ["low", "medium", "high", "xhigh", "max", "ultra"];
 pub const SUBAGENT_ROLE_QUICK_SCAN: &str = "codey_quick_scan";
@@ -697,6 +1021,32 @@ fn normalize_subagent_selection(model: &mut String, reasoning_effort: &mut Strin
     if !SUBAGENT_REASONING_EFFORTS.contains(&reasoning_effort.as_str()) {
         *reasoning_effort = default_subagent_reasoning_effort();
     }
+}
+
+fn default_upstream_protocol() -> String {
+    UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string()
+}
+
+fn default_auth_mode() -> String {
+    AUTH_MODE_API_KEY.to_string()
+}
+
+fn normalize_upstream_protocol(value: &str) -> String {
+    match value.trim() {
+        UPSTREAM_PROTOCOL_OFFICIAL => UPSTREAM_PROTOCOL_OFFICIAL,
+        UPSTREAM_PROTOCOL_OPENAI_COMPATIBLE => UPSTREAM_PROTOCOL_OPENAI_COMPATIBLE,
+        _ => UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
+    }
+    .to_string()
+}
+
+fn normalize_auth_mode(value: &str, official: bool) -> String {
+    if official || value.trim() == AUTH_MODE_OFFICIAL_ACCOUNT {
+        AUTH_MODE_OFFICIAL_ACCOUNT
+    } else {
+        AUTH_MODE_API_KEY
+    }
+    .to_string()
 }
 
 fn normalize_subagent_config(
@@ -780,8 +1130,16 @@ impl ConfigStore {
     pub fn load(&self) -> Result<CodeyConfig> {
         match fs::read_to_string(&self.path) {
             Ok(contents) => {
-                let config = serde_json::from_str::<CodeyConfig>(&contents)
+                let raw = serde_json::from_str::<serde_json::Value>(&contents)
                     .with_context(|| format!("解析 Codey 配置失败：{}", self.path.display()))?;
+                let has_initial_import_marker = raw
+                    .as_object()
+                    .is_some_and(|object| object.contains_key("initialRouteImportCompleted"));
+                let mut config = serde_json::from_value::<CodeyConfig>(raw)
+                    .with_context(|| format!("解析 Codey 配置失败：{}", self.path.display()))?;
+                if !has_initial_import_marker && !config.looks_like_empty_default_route() {
+                    config.initial_route_import_completed = true;
+                }
                 Ok(config.normalize())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -848,6 +1206,22 @@ fn write_private_temp(path: &Path, bytes: &[u8]) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_profiles_cannot_shadow_the_internal_router_provider() {
+        let mut profile = ProviderProfile::new("Reserved route");
+        profile.id = local_router::ROUTER_PROVIDER_ID.to_string();
+        profile.base_url = "https://relay.example/v1".into();
+        profile.api_key = "sk-test".into();
+        profile.normalize();
+
+        assert!(
+            profile
+                .validate()
+                .unwrap_err()
+                .contains("Codey 内部 Provider ID")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn config_temp_files_are_private_before_atomic_replace() {
@@ -910,6 +1284,89 @@ mod tests {
     }
 
     #[test]
+    fn redacted_third_party_route_requires_its_saved_secret_before_validation() {
+        let mut saved = ProviderProfile::new("Relay");
+        saved.id = "relay".into();
+        saved.base_url = "https://relay.example/v1".into();
+        saved.api_key = "secret-token".into();
+        saved.normalize();
+
+        let mut redacted = saved.clone();
+        redacted.api_key.clear();
+        redacted.api_key_configured = true;
+        assert!(redacted.validate().is_err());
+
+        redacted.merge_redacted_secret(Some(&saved));
+        redacted.normalize();
+        assert!(redacted.validate().is_ok());
+        assert_eq!(redacted.api_key, "secret-token");
+    }
+
+    #[test]
+    fn route_validation_rejects_duplicate_runtime_provider_ids() {
+        let mut first = ProviderProfile::new("First");
+        first.id = "first".into();
+        first.base_url = "https://first.example/v1".into();
+        first.api_key = "first-key".into();
+        first.cc_switch_provider_id = Some("shared-provider".into());
+        first.normalize();
+
+        let mut second = ProviderProfile::new("Second");
+        second.id = "second".into();
+        second.base_url = "https://second.example/v1".into();
+        second.api_key = "second-key".into();
+        second.cc_switch_provider_id = Some("shared-provider".into());
+        second.normalize();
+
+        let error = validate_provider_profiles(&[first, second]).unwrap_err();
+        assert!(error.contains("shared-provider"));
+    }
+
+    #[test]
+    fn runtime_catalog_combines_models_from_every_registered_route() {
+        let mut official = ProviderProfile::new("Official");
+        official.id = "official-profile".into();
+        official.cc_switch_provider_id = Some("openai".into());
+        official.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+
+        let mut relay = ProviderProfile::new("Relay");
+        relay.id = "relay".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "relay-key".into();
+        relay.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: official.id.clone(),
+            profiles: vec![official, relay],
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        };
+        config.upstream_models_by_provider.insert(
+            "relay".into(),
+            vec!["relay-a".into(), "shared-model".into()],
+        );
+        config.selected_models_by_provider.insert(
+            "relay".into(),
+            vec!["shared-model".into(), "manual-model".into()],
+        );
+
+        let (upstream, selected) = config.runtime_catalog_models();
+
+        assert!(upstream.iter().any(|model| model == "gpt-5.6-sol"));
+        assert!(upstream.iter().any(|model| model == "relay/relay-a"));
+        assert!(upstream.iter().any(|model| model == "relay/manual-model"));
+        assert_eq!(
+            upstream
+                .iter()
+                .filter(|model| model.as_str() == "relay/shared-model")
+                .count(),
+            1
+        );
+        assert_eq!(selected, ["relay/shared-model", "relay/manual-model"]);
+    }
+
+    #[test]
     fn normalizes_missing_active_profile() {
         let config = CodeyConfig {
             active_profile_id: "missing".to_string(),
@@ -917,6 +1374,99 @@ mod tests {
         };
         let normalized = config.normalize();
         assert_eq!(normalized.active_profile_id, normalized.profiles[0].id);
+    }
+
+    #[test]
+    fn non_empty_legacy_configs_are_marked_as_imported() {
+        let mut route = ProviderProfile::new("Relay");
+        route.id = "relay".into();
+        route.base_url = "https://relay.example/v1".into();
+        route.api_key = "sk-relay".into();
+        route.normalize();
+        let config = CodeyConfig {
+            active_profile_id: route.id.clone(),
+            profiles: vec![route],
+            initial_route_import_completed: false,
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        assert!(config.initial_route_import_completed);
+    }
+
+    #[test]
+    fn launch_official_profile_is_first_without_stealing_active_third_party_route() {
+        let mut relay = ProviderProfile::new("Relay");
+        relay.id = "relay".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "sk-relay".into();
+        relay.normalize();
+        let mut official = ProviderProfile::new("OpenAI 官方直登");
+        official.id = "openai-source".into();
+        official.cc_switch_provider_id = Some("openai".into());
+        official.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+        let mut config = CodeyConfig {
+            active_profile_id: relay.id.clone(),
+            profiles: vec![relay],
+            initial_route_import_completed: true,
+            ..CodeyConfig::default()
+        };
+        config
+            .default_model_by_provider
+            .insert("openai".into(), "gpt-5.6-sol".into());
+
+        config.apply_launch_official_profile(Some(official));
+        config = config.normalize();
+
+        assert_eq!(config.profiles[0].id, DERIVED_OFFICIAL_PROFILE_ID);
+        assert_eq!(config.active_profile_id, "relay");
+        assert_eq!(config.profiles[0].provider_id(), "openai");
+        assert_eq!(config.default_model_by_provider["openai"], "gpt-5.6-sol");
+        assert_eq!(
+            config.selected_models_by_provider["openai"],
+            model_catalog::default_official_model_slugs(),
+        );
+
+        config
+            .selected_models_by_provider
+            .insert("openai".into(), vec!["gpt-5.6-sol".into()]);
+        config = config.normalize();
+        assert_eq!(
+            config.selected_models_by_provider["openai"],
+            ["gpt-5.6-sol"],
+        );
+    }
+
+    #[test]
+    fn api_key_launch_removes_derived_official_route_and_falls_back_to_saved_route() {
+        let mut official = ProviderProfile::new("OpenAI 官方直登");
+        official.id = DERIVED_OFFICIAL_PROFILE_ID.into();
+        official.cc_switch_provider_id = Some("openai".into());
+        official.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+        let mut relay = ProviderProfile::new("Relay");
+        relay.id = "relay".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "sk-relay".into();
+        relay.normalize();
+        let mut config = CodeyConfig {
+            active_profile_id: official.id.clone(),
+            profiles: vec![official, relay],
+            initial_route_import_completed: true,
+            ..CodeyConfig::default()
+        };
+        config
+            .default_model_by_provider
+            .insert("openai".into(), "gpt-5.6-sol".into());
+
+        config.apply_launch_official_profile(None);
+        config = config.normalize();
+
+        assert_eq!(config.profiles.len(), 1);
+        assert_eq!(config.profiles[0].id, "relay");
+        assert_eq!(config.active_profile_id, "relay");
+        assert_eq!(config.default_model_by_provider["openai"], "gpt-5.6-sol");
     }
 
     #[test]

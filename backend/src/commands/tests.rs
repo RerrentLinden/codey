@@ -145,6 +145,8 @@ fn renderer_settings_clear_provider_and_notification_secrets() {
     let public = serde_json::to_value(redacted_config(&config)).unwrap();
 
     assert_eq!(public["profiles"][0]["apiKey"], "");
+    assert_eq!(public["profiles"][0]["apiKeyConfigured"], true);
+    assert!(public["profiles"][0].get("clearApiKey").is_none());
     assert_eq!(public["hideFullAccessWarning"], true);
     assert!(public["webhook"].get("url").is_none());
     assert_eq!(public["webhook"]["channels"][0]["url"], "");
@@ -157,6 +159,42 @@ fn renderer_settings_clear_provider_and_notification_secrets() {
     assert!(!public.to_string().contains("telegram-secret"));
     assert!(!public.to_string().contains("wecom-secret"));
     assert!(!public.to_string().contains("legacy-secret"));
+}
+
+#[test]
+fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
+    let mut official = crate::config::ProviderProfile::new("OpenAI 官方直登");
+    official.id = "official-route".to_string();
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.cc_switch_provider_id = Some("local-official".to_string());
+    official.normalize();
+
+    let previous = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official.clone()],
+        ..CodeyConfig::default()
+    };
+    let mut input = official;
+    input.auth_mode = crate::config::AUTH_MODE_API_KEY.to_string();
+    input.upstream_protocol = crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string();
+    input.base_url = "https://relay.example/v1".to_string();
+    input.api_key = "sk-relay".to_string();
+    input.api_key_configured = false;
+    input.cc_switch_read_only = false;
+
+    let merged = merge_profile_secrets(vec![input], &previous).unwrap();
+    let route = &merged[0];
+
+    assert_eq!(route.auth_mode, crate::config::AUTH_MODE_API_KEY);
+    assert_eq!(
+        route.upstream_protocol,
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+    );
+    assert_eq!(route.base_url, "https://relay.example/v1");
+    assert_eq!(route.api_key, "sk-relay");
+    assert!(!route.cc_switch_read_only);
+    assert!(route.cc_switch_provider_id.is_none());
+    assert!(!route.supports_remote_compaction);
 }
 
 #[tokio::test]

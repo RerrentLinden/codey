@@ -920,6 +920,28 @@ tools. Route local workspace work by task: use `mcp__codey_fastctx__inspect_loca
 inspection, `mcp__codey_fastctx__grep` for content search, `mcp__codey_fastctx__glob` for path \
 discovery, and `mcp__codey_fastctx__replace` only for deterministic mechanical replacement. Batch \
 2-32 already-known text files or ranges into one `inspect_local_file(files=[...])` call; for large \
+files request only the needed ranges. When batching, a top-level `limit` applies to entries that do \
+not set their own `limit`. Pass plain absolute filesystem paths, converting URI-shaped local \
+references and Windows paths to a drive-letter path such as `E:/repo/file.ts`. Start broad searches \
+with grep's `files_with_matches`, then use \
+`content` with the smallest useful context and result limit; use `summary` or `count` only when totals \
+are the requested result. Use glob with `filter_mode=ignore` and stable path sorting unless ignored \
+files or modification order are explicitly required; use `output_mode=details` when file size or \
+modified time is useful. Run replace as dry-run first, set `max_replacements`, then inspect or grep \
+the result and run relevant tests; never transparently retry a write after transport failure. Follow \
+every Complete or Partial continuation exactly and do not speculatively request later pages in \
+parallel. FastCtx is a direct-only tool namespace, not an MCP Resources server and not a code-mode \
+aggregate; call the tools directly, using `tool_search` when a direct tool is deferred. Use terminal \
+commands for builds, tests, Git, package managers, metadata beyond glob details, streaming \
+operations, advanced shell semantics, or after the applicable FastCtx tool is unavailable or fails. Use CodeGraph only for \
+semantic code understanding such as symbols, callers, callees, and call paths. Every tool call must \
+advance the requested task; put progress and corrections in commentary.";
+
+pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE_V8: &str = "Codey FastCtx context tools are enabled as direct \
+tools. Route local workspace work by task: use `mcp__codey_fastctx__inspect_local_file` for focused \
+inspection, `mcp__codey_fastctx__grep` for content search, `mcp__codey_fastctx__glob` for path \
+discovery, and `mcp__codey_fastctx__replace` only for deterministic mechanical replacement. Batch \
+2-32 already-known text files or ranges into one `inspect_local_file(files=[...])` call; for large \
 files request only the needed ranges. Pass plain absolute filesystem paths, converting URI-shaped \
 local references and Windows paths to a drive-letter path such as `E:/repo/file.ts`. Start broad \
 searches with grep's `files_with_matches`, then use \
@@ -1068,6 +1090,7 @@ follow every Complete or Partial pagination note exactly.";
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     CODEY_FASTCTX_GUIDANCE,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V8,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V7,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V6,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5,
@@ -1081,6 +1104,8 @@ pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
 
 #[cfg(test)]
 const PREVIOUS_CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V8,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V7,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V6,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V5,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V4,
@@ -1303,8 +1328,10 @@ mod tests {
         );
         assert!(CODEY_FASTCTX_GUIDANCE.contains("enabled as direct tools"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Batch 2-32 already-known text files"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("top-level `limit`"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("grep's `files_with_matches`"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("`filter_mode=project`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("`filter_mode=ignore`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("`output_mode=details`"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Run replace as dry-run first"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("never transparently retry a write"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Complete or Partial continuation"));
@@ -1591,7 +1618,7 @@ mod tests {
     #[test]
     fn previous_fastctx_guidance_cleanup_keeps_the_current_version() {
         let configured =
-            format!("{CODEY_FASTCTX_GUIDANCE}\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V6}");
+            format!("{CODEY_FASTCTX_GUIDANCE}\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V8}");
 
         assert_eq!(
             remove_previous_codey_fastctx_guidance(&configured).as_deref(),

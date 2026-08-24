@@ -1,7 +1,9 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import "../node_modules/@douyinfe/semi-ui/lib/es/_base/base.css";
+import { MantineProvider } from "@mantine/core";
+import "@mantine/core/styles.css";
 import { App } from "./App";
+import type { CcSwitchStatus, Config, ModelState, Profile } from "./App.types";
 import {
   includesModelId,
   modelIdsEqual,
@@ -9,6 +11,8 @@ import {
   uniqueModelIds,
 } from "./modelIds";
 import { previewOfficialModels, previewUpstreamModels } from "./previewModels";
+import { codeyMantineTheme } from "./mantine";
+import "./tailwind.css";
 import {
   previewCrashpadPendingStats,
   previewTraceLogStats,
@@ -18,7 +22,6 @@ import "./styles.operations.css";
 import "./styles.models.css";
 import "./styles.features.css";
 import "./styles.diagnostics.css";
-import "./styles.components.css";
 import "./styles.responsive.css";
 
 // 在 Vite 开发模式下，若未通过 Codey Bridge/Token 访问，自动注入 Mock 接口方便 UI 调试
@@ -36,25 +39,36 @@ if (import.meta.env.DEV) {
       wecom: "https://webhook.example.invalid/wecom/preview-only?key=preview",
     } as const;
     const previewApiKey = "preview-only-not-a-secret";
-    let previewConfig = {
+    let previewConfig: Config = {
       settingsRevision: 0,
       activeProfileId: "primary",
+      initialRouteImportCompleted: true,
       profiles: [
         {
           id: "primary",
           name: "主力代理 (ChatGPT)",
           baseUrl: previewEndpoints.primary,
-          apiKey: previewApiKey,
+          apiKey: "",
+          upstreamProtocol: "openaiResponses",
+          authMode: "apiKey",
+          apiKeyConfigured: true,
+          clearApiKey: false,
           ccSwitchProviderId: "primary",
           ccSwitchReadOnly: false,
+          supportsRemoteCompaction: false,
         },
         {
           id: "backup",
           name: "备用中转 (Claude)",
           baseUrl: previewEndpoints.backup,
           apiKey: "",
+          upstreamProtocol: "openaiCompatible",
+          authMode: "apiKey",
+          apiKeyConfigured: true,
+          clearApiKey: false,
           ccSwitchProviderId: "backup",
           ccSwitchReadOnly: false,
+          supportsRemoteCompaction: false,
         },
       ],
       webhook: {
@@ -136,16 +150,7 @@ if (import.meta.env.DEV) {
       hideFullAccessWarning: false,
       showAccountUsageInHeader: true,
     };
-    const previewCcSwitch = {
-      changed: false,
-      provider: {
-        id: "primary",
-        name: "主力代理 (ChatGPT)",
-        official: false,
-        baseUrl: previewEndpoints.primary,
-      },
-    };
-    let previewModelState = {
+    let previewModelState: ModelState = {
       officialModels: previewOfficialModels.map((model) => ({
         ...model,
         supported: includesModelId(previewUpstreamModels, model.slug),
@@ -155,6 +160,63 @@ if (import.meta.env.DEV) {
       manualThirdPartyModels: ["provider-fast-coder"],
       upstreamModels: previewUpstreamModels,
       defaultModel: "gpt-5.6-sol",
+    };
+    const routeProviderId = (profile: Profile) =>
+      profile.ccSwitchProviderId || profile.id;
+    const activePreviewProfile = () =>
+      previewConfig.profiles.find(
+        (profile) => profile.id === previewConfig.activeProfileId,
+      ) || previewConfig.profiles[0];
+    const previewCcSwitch = (): CcSwitchStatus => {
+      const profile = activePreviewProfile();
+      return {
+        changed: false,
+        provider: {
+          id: profile ? routeProviderId(profile) : "openai",
+          name: profile?.name || "OpenAI 官方直登",
+          official: profile?.authMode === "officialAccount",
+          baseUrl: profile?.baseUrl || "",
+          localRoute: false,
+        },
+      };
+    };
+    const refreshPreviewModelState = () => {
+      const profile = activePreviewProfile();
+      if (!profile) return;
+      const providerId = routeProviderId(profile);
+      const official = profile.authMode === "officialAccount";
+      const upstream = previewConfig.upstreamModelsByProvider[providerId] || [];
+      const selected = previewConfig.selectedModelsByProvider[providerId] || [];
+      const manual = previewConfig.manualThirdPartyModelsByProvider[providerId] || [];
+      const selectableOfficial = previewOfficialModels.filter(
+        (model) => official || includesModelId(upstream, model.slug),
+      );
+      const thirdPartyModels = official ? [] : selected;
+      const requestedDefault = previewConfig.defaultModelByProvider[providerId];
+      const defaultModel =
+        [
+          ...selectableOfficial.map((model) => model.slug),
+          ...thirdPartyModels,
+        ].find(
+          (model) =>
+            Boolean(requestedDefault) && modelIdsEqual(model, requestedDefault),
+        ) ||
+        selectableOfficial[0]?.slug ||
+        thirdPartyModels[0] ||
+        "";
+      previewModelState = {
+        officialModels: previewOfficialModels.map((model) => ({
+          ...model,
+          supported: official || includesModelId(upstream, model.slug),
+        })),
+        officialModelIds: previewOfficialModels.map((model) => model.slug),
+        thirdPartyModels,
+        manualThirdPartyModels: manual.filter((model) =>
+          includesModelId(thirdPartyModels, model),
+        ),
+        upstreamModels: official ? [] : upstream,
+        defaultModel,
+      };
     };
     let previewTraceStats: typeof previewTraceLogStats | undefined;
     let previewCrashpadStats:
@@ -171,7 +233,7 @@ if (import.meta.env.DEV) {
           config: previewConfig,
           modelState: previewModelState,
           startupError: undefined,
-          ccSwitch: previewCcSwitch,
+          ccSwitch: previewCcSwitch(),
           fastContextToolsStatus: {
             userConfigured: false,
             detectionFailed: false,
@@ -312,14 +374,24 @@ if (import.meta.env.DEV) {
         return { status: "ok", traceLogStats: previewTraceStats };
       }
       if (command === "save_codey_config") {
+        const incoming = args.config as Config;
         previewConfig = {
-          ...(args.config as typeof previewConfig),
+          ...incoming,
+          profiles: incoming.profiles.map((profile) => ({
+            ...profile,
+            apiKey: "",
+            apiKeyConfigured: profile.clearApiKey
+              ? false
+              : Boolean(profile.apiKey.trim() || profile.apiKeyConfigured),
+            clearApiKey: false,
+          })),
           settingsRevision: previewConfig.settingsRevision + 1,
         };
+        refreshPreviewModelState();
         return {
           config: previewConfig,
           modelState: previewModelState,
-          ccSwitch: previewCcSwitch,
+          ccSwitch: previewCcSwitch(),
           fastContextToolsStatus: {
             userConfigured: false,
             detectionFailed: false,
@@ -348,8 +420,136 @@ if (import.meta.env.DEV) {
         return {
           config: previewConfig,
           modelState: previewModelState,
-          ccSwitch: previewCcSwitch,
+          ccSwitch: previewCcSwitch(),
           restartRequired: false,
+        };
+      }
+      if (
+        command === "save_route" ||
+        command === "activate_route" ||
+        command === "delete_route" ||
+        command === "fetch_route_models"
+      ) {
+        const expectedRevision = Number(args.expectedRevision);
+        if (expectedRevision !== previewConfig.settingsRevision) {
+          return {
+            status: "failed",
+            message: "Codey 设置已被其他操作更新，请重新载入后再操作线路",
+          };
+        }
+      }
+      if (command === "save_route") {
+        const route = args.route as Profile;
+        const existing = previewConfig.profiles.find(
+          (profile) => profile.id === route.id,
+        );
+        const savedRoute: Profile = {
+          ...route,
+          apiKey: "",
+          apiKeyConfigured: route.clearApiKey
+            ? false
+            : Boolean(route.apiKey.trim() || route.apiKeyConfigured || existing?.apiKeyConfigured),
+          clearApiKey: false,
+        };
+        previewConfig = {
+          ...previewConfig,
+          settingsRevision: previewConfig.settingsRevision + 1,
+          activeProfileId: savedRoute.id,
+          profiles: existing
+            ? previewConfig.profiles.map((profile) =>
+                profile.id === savedRoute.id ? savedRoute : profile,
+              )
+            : [...previewConfig.profiles, savedRoute],
+        };
+        refreshPreviewModelState();
+        return {
+          status: "ok",
+          config: previewConfig,
+          modelState: previewModelState,
+          ccSwitch: previewCcSwitch(),
+          restartRequired: !existing,
+          modelHotReloaded: Boolean(existing),
+        };
+      }
+      if (command === "activate_route") {
+        const routeId = String(args.routeId || "");
+        if (!previewConfig.profiles.some((profile) => profile.id === routeId)) {
+          return { status: "failed", message: "找不到要启用的线路" };
+        }
+        previewConfig = {
+          ...previewConfig,
+          settingsRevision: previewConfig.settingsRevision + 1,
+          activeProfileId: routeId,
+        };
+        refreshPreviewModelState();
+        return {
+          status: "ok",
+          config: previewConfig,
+          modelState: previewModelState,
+          ccSwitch: previewCcSwitch(),
+          restartRequired: false,
+          modelHotReloaded: true,
+        };
+      }
+      if (command === "delete_route") {
+        const routeId = String(args.routeId || "");
+        const route = previewConfig.profiles.find((profile) => profile.id === routeId);
+        if (!route) return { status: "failed", message: "找不到要删除的线路" };
+        if (previewConfig.profiles.length <= 1) {
+          return { status: "failed", message: "至少需要保留一条线路" };
+        }
+        const providerId = routeProviderId(route);
+        const profiles = previewConfig.profiles.filter((profile) => profile.id !== routeId);
+        delete previewConfig.selectedModelsByProvider[providerId];
+        delete previewConfig.manualThirdPartyModelsByProvider[providerId];
+        delete previewConfig.declaredOfficialModelsByProvider[providerId];
+        delete previewConfig.upstreamModelsByProvider[providerId];
+        delete previewConfig.defaultModelByProvider[providerId];
+        previewConfig = {
+          ...previewConfig,
+          settingsRevision: previewConfig.settingsRevision + 1,
+          profiles,
+          activeProfileId:
+            previewConfig.activeProfileId === routeId
+              ? profiles[0].id
+              : previewConfig.activeProfileId,
+        };
+        refreshPreviewModelState();
+        return {
+          status: "ok",
+          config: previewConfig,
+          modelState: previewModelState,
+          ccSwitch: previewCcSwitch(),
+          restartRequired: false,
+          modelHotReloaded: true,
+        };
+      }
+      if (command === "fetch_route_models") {
+        const routeId = String(args.routeId || "");
+        const route = previewConfig.profiles.find((profile) => profile.id === routeId);
+        if (!route) return { status: "failed", message: "找不到要同步模型的线路" };
+        const providerId = routeProviderId(route);
+        const models = uniqueModelIds([
+          ...previewUpstreamModels,
+          ...(providerId === "backup" ? ["claude-sonnet-4-5"] : []),
+        ]);
+        previewConfig = {
+          ...previewConfig,
+          settingsRevision: previewConfig.settingsRevision + 1,
+          upstreamModelsByProvider: {
+            ...previewConfig.upstreamModelsByProvider,
+            [providerId]: models,
+          },
+        };
+        refreshPreviewModelState();
+        return {
+          status: "ok",
+          config: previewConfig,
+          modelState: previewModelState,
+          ccSwitch: previewCcSwitch(),
+          models,
+          restartRequired: false,
+          modelHotReloaded: true,
         };
       }
       if (command === "sync_prompt_optimization_current_provider") {
@@ -358,7 +558,7 @@ if (import.meta.env.DEV) {
           settingsRevision: previewConfig.settingsRevision + 1,
           promptOptimization: {
             ...previewConfig.promptOptimization,
-            baseUrl: previewCcSwitch.provider.baseUrl,
+            baseUrl: previewCcSwitch().provider.baseUrl,
             apiKey: "",
             apiKeyConfigured: true,
             clearApiKey: false,
@@ -433,8 +633,10 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "fetch_current_provider_models") {
+        const activeProfile = activePreviewProfile();
+        const providerId = activeProfile ? routeProviderId(activeProfile) : "primary";
         const declaredOfficialModels =
-          previewConfig.declaredOfficialModelsByProvider.primary || [];
+          previewConfig.declaredOfficialModelsByProvider[providerId] || [];
         const effectiveModels = uniqueModelIds([
           ...previewUpstreamModels,
           ...declaredOfficialModels,
@@ -455,6 +657,7 @@ if (import.meta.env.DEV) {
         };
         return {
           status: "ok",
+          config: previewConfig,
           models: previewUpstreamModels,
           modelState: previewModelState,
           restartRequired: false,
@@ -462,6 +665,8 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "save_selected_models") {
+        const activeProfile = activePreviewProfile();
+        const providerId = activeProfile ? routeProviderId(activeProfile) : "primary";
         const officialModels = (args.officialModels as string[]) || [];
         const thirdPartyModels = (args.thirdPartyModels as string[]) || [];
         const manualThirdPartyModels = (args.manualThirdPartyModels as string[]) || [];
@@ -474,19 +679,19 @@ if (import.meta.env.DEV) {
           ...previewConfig,
           selectedModelsByProvider: {
             ...previewConfig.selectedModelsByProvider,
-            primary: thirdPartyModels,
+            [providerId]: thirdPartyModels,
           },
           manualThirdPartyModelsByProvider: {
             ...previewConfig.manualThirdPartyModelsByProvider,
-            primary: manualThirdPartyModels,
+            [providerId]: manualThirdPartyModels,
           },
           declaredOfficialModelsByProvider: {
             ...previewConfig.declaredOfficialModelsByProvider,
-            primary: officialModels,
+            [providerId]: officialModels,
           },
           upstreamModelsByProvider: {
             ...previewConfig.upstreamModelsByProvider,
-            primary: supportedModels,
+            [providerId]: supportedModels,
           },
         };
         const defaultModel = supportedModels.find((model) =>
@@ -517,14 +722,65 @@ if (import.meta.env.DEV) {
       }
       if (command === "save_default_model") {
         const model = String(args.model || "");
+        const routeId = String(args.routeId || "");
+        const targetProfile = previewConfig.profiles.find(
+          (profile) => profile.id === routeId,
+        ) || activePreviewProfile();
+        const providerId = targetProfile ? routeProviderId(targetProfile) : "primary";
         previewConfig = {
           ...previewConfig,
           defaultModelByProvider: {
             ...previewConfig.defaultModelByProvider,
-            primary: model,
+            [providerId]: model,
           },
         };
-        previewModelState = { ...previewModelState, defaultModel: model };
+        if (targetProfile?.id === previewConfig.activeProfileId) {
+          previewModelState = { ...previewModelState, defaultModel: model };
+        }
+        return {
+          status: "ok",
+          config: previewConfig,
+          modelState: previewModelState,
+          restartRequired: false,
+          modelHotReloaded: true,
+        };
+      }
+      if (command === "save_official_route_models") {
+        const routeId = String(args.routeId || "");
+        const models = uniqueModelIds((args.models as string[]) || []);
+        const targetProfile = previewConfig.profiles.find(
+          (profile) => profile.id === routeId,
+        );
+        if (!targetProfile || targetProfile.authMode !== "officialAccount" || models.length === 0) {
+          return { status: "failed", message: "官方线路至少需要保留一个模型" };
+        }
+        const providerId = routeProviderId(targetProfile);
+        const requestedDefault = previewConfig.defaultModelByProvider[providerId];
+        const defaultModel = models.find((candidate) =>
+          modelIdsEqual(candidate, requestedDefault || ""),
+        ) || models[0];
+        previewConfig = {
+          ...previewConfig,
+          selectedModelsByProvider: {
+            ...previewConfig.selectedModelsByProvider,
+            [providerId]: models,
+          },
+          defaultModelByProvider: {
+            ...previewConfig.defaultModelByProvider,
+            [providerId]: defaultModel,
+          },
+        };
+        if (targetProfile.id === previewConfig.activeProfileId) {
+          const selected = new Set(models.map(modelKey));
+          previewModelState = {
+            ...previewModelState,
+            officialModels: previewOfficialModels.map((model) => ({
+              ...model,
+              supported: selected.has(modelKey(model.slug)),
+            })),
+            defaultModel,
+          };
+        }
         return {
           status: "ok",
           config: previewConfig,
@@ -609,6 +865,12 @@ if (import.meta.env.DEV) {
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    <MantineProvider
+      cssVariablesSelector="#root"
+      forceColorScheme="light"
+      theme={codeyMantineTheme}
+    >
+      <App />
+    </MantineProvider>
   </React.StrictMode>,
 );

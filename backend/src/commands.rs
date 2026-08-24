@@ -30,6 +30,11 @@ use diagnostics::{
     clear_codex_trace_logs, clear_diagnostic_storage, refresh_diagnostic_storage_stats,
     refresh_trace_log_stats,
 };
+pub use models::{
+    activate_route, delete_route, fetch_current_provider_models, fetch_route_models,
+    save_default_model, save_official_route_models, save_route, save_selected_models,
+    sync_current_provider_command,
+};
 #[cfg(test)]
 use models::{
     config_with_current_provider_models, preserve_selected_third_party_models,
@@ -38,12 +43,9 @@ use models::{
     validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
-    current_model_state_async, current_renderer_model_catalog_async,
-    provider_route_requires_restart, sync_provider_models_for_launch,
-};
-pub use models::{
-    fetch_current_provider_models, save_default_model, save_selected_models, sync_cc_switch_state,
-    sync_current_provider_command,
+    current_model_state_async, current_renderer_model_catalog_async, hot_reload_runtime_models,
+    official_route_snapshots, provider_route_requires_restart,
+    sync_current_third_party_provider_state, sync_provider_models_for_launch,
 };
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
 use prompt_optimization::{
@@ -82,8 +84,8 @@ use crate::codex_config::{
     FastContextToolsStatus, codex_home, fast_context_tools_status, reconcile_runtime_subagent_roles,
 };
 use crate::config::{
-    CodeyConfig, ConfigStore, PromptOptimizationConfig, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
-    SubagentRoleConfig,
+    CodeyConfig, ConfigStore, PromptOptimizationConfig, ProviderProfile, SUBAGENT_ROLE_DEFAULT,
+    SUBAGENT_ROLE_IDS, SubagentRoleConfig, validate_provider_profiles,
 };
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
@@ -529,6 +531,96 @@ async fn save_config_to_store(state: &AppState, config: &CodeyConfig) -> Result<
         .map_err(|error| error.to_string())
 }
 
+pub(super) fn validate_official_account_config_change(
+    previous: &CodeyConfig,
+    next: &CodeyConfig,
+) -> Result<(), String> {
+    if previous.official_account_available_this_launch {
+        return Ok(());
+    }
+    if next
+        .active_profile()
+        .is_some_and(|profile| profile.cc_switch_read_only)
+    {
+        return Err(
+            "本次 Codex 由 API Key 线路启动，不能启用官方账号线路；请先在 Codex 中完成官方账号登录并重新启动 Codey"
+                .to_string(),
+        );
+    }
+    if next.profiles.iter().any(|profile| {
+        profile.cc_switch_read_only
+            && !previous.profiles.iter().any(|previous_profile| {
+                previous_profile.id == profile.id && previous_profile.cc_switch_read_only
+            })
+    }) {
+        return Err(
+            "本次 Codex 由 API Key 线路启动，不能新增官方账号线路；请先在 Codex 中完成官方账号登录并重新启动 Codey"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> Result<(), String> {
+    let home = codex_home().to_path_buf();
+    let official_account_available =
+        tokio::task::spawn_blocking(move || crate::cc_switch::official_account_available(&home))
+            .await
+            .map_err(|error| format!("检测 Codex 官方账号登录状态的任务异常退出：{error}"))?
+            .map_err(|error| format!("检测 Codex 官方账号登录状态失败：{error:#}"))?;
+
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let previous = state.config.read().await.clone();
+    let mut next = previous.clone();
+    next.official_account_available_this_launch = official_account_available;
+    if official_account_available {
+        let home = codex_home().to_path_buf();
+        let source = next.clone();
+        next = tokio::task::spawn_blocking(move || {
+            crate::cc_switch::sync_official_account_route(&source, &home)
+        })
+        .await
+        .map_err(|error| format!("同步 Codex 官方账号线路任务异常退出：{error}"))?
+        .map_err(|error| format!("同步 Codex 官方账号线路失败：{error:#}"))?;
+        next.official_account_available_this_launch = true;
+    } else {
+        if next
+            .profiles
+            .iter()
+            .any(|profile| profile.cc_switch_read_only)
+        {
+            if !next.has_third_party_route() {
+                return Err(
+                    "当前 Codex 没有可用的官方账号登录，也没有已保存的 API Key 线路；请先在 Codex 中完成官方账号登录，或在 Codey 中添加第三方 API 线路"
+                        .to_string(),
+                );
+            }
+            next.apply_launch_official_profile(None);
+            next = next.normalize();
+        }
+        next.official_account_available_this_launch = false;
+    }
+
+    if persisted_config_changed(&previous, &next) {
+        if next.settings_revision == previous.settings_revision {
+            next.settings_revision = previous.settings_revision.saturating_add(1);
+        }
+        save_config_to_store(state, &next)
+            .await
+            .map_err(|error| format!("保存启动线路准备结果失败：{error}"))?;
+    }
+    *state.config.write().await = next;
+    Ok(())
+}
+
+fn persisted_config_changed(previous: &CodeyConfig, next: &CodeyConfig) -> bool {
+    let mut previous = previous.clone();
+    let mut next = next.clone();
+    previous.official_account_available_this_launch = false;
+    next.official_account_available_this_launch = false;
+    previous != next
+}
+
 async fn resolve_session_name_cached(
     state: &Arc<AppState>,
     home: PathBuf,
@@ -556,6 +648,40 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             }
         }
         "fetch_current_provider_models" => fetch_current_provider_models(state).await,
+        "save_route" => match (
+            argument::<ProviderProfile>(&args, "route"),
+            argument::<u64>(&args, "expectedRevision"),
+        ) {
+            (Ok(route), Ok(expected_revision)) => save_route(state, route, expected_revision).await,
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "delete_route" => match (
+            string_argument(&args, "routeId"),
+            argument::<u64>(&args, "expectedRevision"),
+        ) {
+            (Ok(route_id), Ok(expected_revision)) => {
+                delete_route(state, route_id, expected_revision).await
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "activate_route" => match (
+            string_argument(&args, "routeId"),
+            argument::<u64>(&args, "expectedRevision"),
+        ) {
+            (Ok(route_id), Ok(expected_revision)) => {
+                activate_route(state, route_id, expected_revision).await
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "fetch_route_models" => match (
+            string_argument(&args, "routeId"),
+            argument::<u64>(&args, "expectedRevision"),
+        ) {
+            (Ok(route_id), Ok(expected_revision)) => {
+                fetch_route_models(state, route_id, expected_revision).await
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
         "save_selected_models" => match (
             argument::<Vec<String>>(&args, "officialModels"),
             argument::<Vec<String>>(&args, "thirdPartyModels"),
@@ -582,9 +708,19 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             | (_, _, Err(error), _)
             | (_, _, _, Err(error)) => Err(error),
         },
-        "save_default_model" => match string_argument(&args, "model") {
-            Ok(model) => save_default_model(state, model).await,
-            Err(error) => Err(error),
+        "save_default_model" => match (
+            string_argument(&args, "model"),
+            optional_argument::<String>(&args, "routeId"),
+        ) {
+            (Ok(model), Ok(route_id)) => save_default_model(state, model, route_id).await,
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        },
+        "save_official_route_models" => match (
+            string_argument(&args, "routeId"),
+            argument::<Vec<String>>(&args, "models"),
+        ) {
+            (Ok(route_id), Ok(models)) => save_official_route_models(state, route_id, models).await,
+            (Err(error), _) | (_, Err(error)) => Err(error),
         },
         "runtime_status" => {
             let refresh_injection_status = args
@@ -648,7 +784,23 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
 }
 
 pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
-    let config = state.config.read().await.clone();
+    let runtime_running = state.runtime.lock().await.is_some();
+    if !runtime_running {
+        if let Err(error) = prepare_routes_for_current_launch(state).await {
+            error_log::record_failure(
+                "route_prepare_failed",
+                "load_codey_config",
+                error,
+                json!({}),
+            );
+        }
+    }
+    let imported = ensure_default_route_imported(state).await;
+    let config = if imported {
+        sync_provider_models_for_launch(state, true).await
+    } else {
+        state.config.read().await.clone()
+    };
     let startup_error = state.startup_error.read().await.clone();
     let cc_switch = cc_switch::status_from_config(&config);
     let model_state = current_model_state_async(&config).await?;
@@ -662,10 +814,77 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         "config": public_config,
         "path": state.store.path().to_string_lossy(),
         "startupError": startup_error,
+        "officialAccountAvailable": config.official_account_available_this_launch,
         "ccSwitch": cc_switch,
         "modelState": model_state,
         "fastContextToolsStatus": fast_context_tools_status,
     }))
+}
+
+pub(super) async fn ensure_default_route_imported(state: &Arc<AppState>) -> bool {
+    let config = state.config.read().await.clone();
+    if !config.needs_initial_route_import() || config.official_account_available_this_launch {
+        return false;
+    }
+    let current_provider = match current_codex_provider_for_initial_import().await {
+        Ok(provider) => provider,
+        Err(error) => {
+            error_log::record_failure(
+                "route_import_failed",
+                "ensure_default_route_imported",
+                error,
+                json!({}),
+            );
+            return false;
+        }
+    };
+    if current_provider.official {
+        return false;
+    }
+    match sync_current_third_party_provider_state(state).await {
+        Ok(status) => {
+            if !status.changed {
+                let _ = mark_initial_route_import_completed(state).await;
+            }
+            status.changed
+        }
+        Err(error) => {
+            error_log::record_failure(
+                "route_import_failed",
+                "ensure_default_route_imported",
+                error,
+                json!({
+                    "providerId": current_provider.id,
+                    "providerName": current_provider.name,
+                }),
+            );
+            false
+        }
+    }
+}
+
+async fn current_codex_provider_for_initial_import() -> Result<cc_switch::CurrentProvider, String> {
+    let home = codex_home().to_path_buf();
+    tokio::task::spawn_blocking(move || cc_switch::current_provider(&home))
+        .await
+        .map_err(|error| format!("读取当前 Codex 线路任务异常退出：{error}"))?
+        .map_err(|error| format!("读取当前 Codex 线路失败：{error:#}"))
+}
+
+async fn mark_initial_route_import_completed(state: &Arc<AppState>) -> Result<bool, String> {
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let previous = state.config.read().await.clone();
+    if previous.initial_route_import_completed {
+        return Ok(false);
+    }
+    let mut next = previous.clone();
+    next.initial_route_import_completed = true;
+    next.settings_revision = previous.settings_revision.saturating_add(1);
+    save_config_to_store(state, &next)
+        .await
+        .map_err(|error| format!("保存首次线路导入标记失败：{error}"))?;
+    *state.config.write().await = next;
+    Ok(true)
 }
 
 async fn reveal_notification_channel(
@@ -826,7 +1045,6 @@ async fn save_codey_config_input(
 
 struct SavedCodeyConfig {
     config: CodeyConfig,
-    restart_required: bool,
     reconcile_subagent_config: bool,
     fast_context_tools_status: FastContextToolsStatus,
 }
@@ -845,9 +1063,10 @@ async fn save_codey_config_locked(
     if config_input.settings_revision != previous.settings_revision {
         return Err("Codey 设置已被其他操作更新，请关闭后重新打开设置页面再保存".to_string());
     }
-    // Provider records, credentials and model-selection caches are read-only
-    // through this general settings endpoint.
     let mut config = previous.clone();
+    config.profiles = merge_profile_secrets(config_input.profiles, &previous)?;
+    config.active_profile_id = config_input.active_profile_id;
+    retain_route_scoped_config(&mut config);
     config_input
         .webhook
         .merge_redacted_secrets(&previous.webhook);
@@ -920,11 +1139,14 @@ async fn save_codey_config_locked(
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
     config.remember_current_subagent_config();
     let mut config = config.normalize();
+    validate_official_account_config_change(&previous, &config)?;
     config.remember_current_provider_official_model_support(explicitly_configured_subagent_models);
+    config = config.normalize();
     if config.subagent_optimization
         && let Ok(model_state) = current_model_state_async(&config).await
     {
         subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
+        config = config.normalize();
     }
     // Codex reads each registered role config_file again when spawning a child.
     // Check the Codey-owned runtime files on every save while the policy stays
@@ -932,7 +1154,6 @@ async fn save_codey_config_locked(
     // disabling still requires a restart to register/unregister tools and hooks.
     let reconcile_subagent_config = should_reconcile_runtime_subagent_config(&previous, &config);
     config.settings_revision = previous.settings_revision.saturating_add(1);
-    let restart_required = runtime_config_requires_restart(state, &config).await;
     let trace_guard_changed = config.disable_trace_log_writes != previous.disable_trace_log_writes;
     let _diagnostic_operation = if trace_guard_changed {
         Some(state.diagnostic_storage_operation.lock().await)
@@ -989,10 +1210,82 @@ async fn save_codey_config_locked(
     }
     Ok(SavedCodeyConfig {
         config,
-        restart_required,
         reconcile_subagent_config,
         fast_context_tools_status,
     })
+}
+
+fn merge_profile_secrets(
+    mut profiles: Vec<crate::config::ProviderProfile>,
+    previous: &CodeyConfig,
+) -> Result<Vec<crate::config::ProviderProfile>, String> {
+    let previous_by_id = previous
+        .profiles
+        .iter()
+        .map(|profile| (profile.id.as_str(), profile))
+        .collect::<std::collections::HashMap<_, _>>();
+    for profile in &mut profiles {
+        let previous_profile = previous_by_id.get(profile.id.as_str()).copied();
+        profile.merge_redacted_secret(previous_profile);
+        if let Some(previous_profile) = previous_profile {
+            let auth_mode_changed = !profile
+                .auth_mode
+                .trim()
+                .eq_ignore_ascii_case(previous_profile.auth_mode.trim());
+            if auth_mode_changed {
+                profile.model_request_headers.clear();
+                profile.cc_switch_provider_id = None;
+                profile.supports_remote_compaction = false;
+                if profile.auth_mode.trim() == crate::config::AUTH_MODE_API_KEY {
+                    profile.cc_switch_read_only = false;
+                }
+            } else {
+                // These fields are discovered from the trusted Codex/CC Switch
+                // source and are not editable renderer input. Keep them attached
+                // to the saved route even though the renderer receives a redacted
+                // profile and sends the whole form back on save.
+                profile.model_request_headers = previous_profile.model_request_headers.clone();
+                profile.cc_switch_provider_id = previous_profile.cc_switch_provider_id.clone();
+                profile.cc_switch_read_only = previous_profile.cc_switch_read_only;
+                profile.supports_remote_compaction = previous_profile.supports_remote_compaction;
+            }
+        }
+        profile.normalize();
+    }
+    validate_provider_profiles(&profiles)?;
+    Ok(profiles)
+}
+
+fn retain_route_scoped_config(config: &mut CodeyConfig) {
+    let provider_ids = config
+        .profiles
+        .iter()
+        .map(|profile| {
+            profile
+                .cc_switch_provider_id
+                .as_deref()
+                .unwrap_or(profile.id.as_str())
+                .to_string()
+        })
+        .collect::<std::collections::HashSet<_>>();
+    config
+        .selected_models_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+    config
+        .manual_third_party_models_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+    config
+        .declared_official_models_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+    config
+        .upstream_models_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+    config
+        .default_model_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
+    config
+        .subagent_config_by_provider
+        .retain(|provider_id, _| provider_ids.contains(provider_id));
 }
 
 fn current_fast_context_tools_status() -> FastContextToolsStatus {
@@ -1054,26 +1347,23 @@ async fn finish_codey_config_save(
         runtime.set_crashpad_pending_protection(saved.config.protect_crashpad_pending);
     }
     schedule_crashpad_pending_refresh(state, saved.config.protect_crashpad_pending);
+    let model_state = current_model_state_async(&saved.config).await?;
+    let model_hot_reload = hot_reload_runtime_models(state, &saved.config, &model_state).await;
     let subagent_hot_reload = if saved.reconcile_subagent_config {
         hot_reload_runtime_subagent_config(state, &saved.config).await
     } else {
         SubagentHotReloadOutcome::default()
     };
     let restart_required = subagent_hot_reload.requires_restart()
-        || if saved.reconcile_subagent_config {
-            runtime_config_requires_restart(state, &saved.config).await
-        } else {
-            saved.restart_required
-        };
+        || runtime_config_requires_restart(state, &saved.config).await;
     let subagent_config_hot_reloaded = subagent_hot_reload.reloaded();
     let subagent_config_repaired = subagent_hot_reload.repaired();
     let subagent_config_health = subagent_hot_reload.health();
     let subagent_config_repair_reasons = subagent_hot_reload.repair_reasons();
     let subagent_config_hot_reload_error = subagent_hot_reload.error();
     let cc_switch = cc_switch::status_from_config(&saved.config);
-    let model_state = current_model_state_async(&saved.config).await?;
     let public_config = redacted_config(&saved.config);
-    Ok(json!({
+    Ok(model_hot_reload.add_to_response(json!({
         "status":"ok",
         "config":public_config,
         "ccSwitch":cc_switch,
@@ -1088,7 +1378,7 @@ async fn finish_codey_config_save(
         // Keep the original response keys for older injected consoles.
         "subagentDefaultsHotReloaded":subagent_config_hot_reloaded,
         "subagentDefaultsHotReloadError":subagent_config_hot_reload_error,
-    }))
+    })))
 }
 
 fn schedule_crashpad_pending_refresh(state: &Arc<AppState>, protection_enabled: bool) {
@@ -1367,6 +1657,7 @@ mod subagent_hot_reload_commit_tests;
 fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
     let mut public = config.clone();
     for profile in &mut public.profiles {
+        profile.api_key_configured = !profile.api_key.trim().is_empty();
         profile.api_key.clear();
     }
     public.webhook.url.clear();
@@ -1413,13 +1704,31 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn config_requires_restart(
     applied: &CodeyConfig,
     applied_models: &RuntimeModelConfig,
     applied_subagent: &RuntimeSubagentConfig,
     current: &CodeyConfig,
 ) -> bool {
-    applied.active_profile() != current.active_profile()
+    config_requires_restart_with_route_status(
+        provider_route_requires_restart(applied, current),
+        applied,
+        applied_models,
+        applied_subagent,
+        current,
+    )
+}
+
+pub(super) fn config_requires_restart_with_route_status(
+    provider_route_restart_required: bool,
+    applied: &CodeyConfig,
+    applied_models: &RuntimeModelConfig,
+    applied_subagent: &RuntimeSubagentConfig,
+    current: &CodeyConfig,
+) -> bool {
+    provider_route_restart_required
         || applied.codex_app_path != current.codex_app_path
         || applied.user_scripts != current.user_scripts
         || applied.slim_codex_pet != current.slim_codex_pet
@@ -1429,6 +1738,17 @@ fn config_requires_restart(
         || applied_models != &RuntimeModelConfig::from_config(current)
         || ((applied.subagent_optimization || current.subagent_optimization)
             && applied_subagent != &RuntimeSubagentConfig::from_config(current))
+}
+
+pub(super) fn provider_route_restart_required_for_runtime(
+    runtime: &CodeyRuntime,
+    current: &CodeyConfig,
+) -> bool {
+    if runtime.has_local_router() {
+        official_route_snapshots(&runtime.applied_config) != official_route_snapshots(current)
+    } else {
+        provider_route_requires_restart(&runtime.applied_config, current)
+    }
 }
 
 #[cfg(test)]
@@ -1448,7 +1768,10 @@ async fn runtime_config_requires_restart(state: &Arc<AppState>, current: &CodeyC
     };
     let applied_models = runtime.applied_model_config().await;
     let applied_subagent = runtime.applied_subagent_config().await;
-    config_requires_restart(
+    let provider_route_restart_required =
+        provider_route_restart_required_for_runtime(&runtime, current);
+    config_requires_restart_with_route_status(
+        provider_route_restart_required,
         &runtime.applied_config,
         &applied_models,
         &applied_subagent,

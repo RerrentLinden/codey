@@ -13,7 +13,7 @@ use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
 
 use crate::codex_config::is_reserved_provider_id;
-use crate::config::{CodeyConfig, ProviderProfile};
+use crate::config::{CodeyConfig, DERIVED_OFFICIAL_PROFILE_ID, ProviderProfile};
 use crate::sqlite_util::table_columns;
 
 const APP_TYPE: &str = "codex";
@@ -249,6 +249,86 @@ pub fn startup_route_state(codex_home: &Path) -> Result<StartupRouteState> {
     startup_route_state_from_paths(&default_db_path(), codex_home)
 }
 
+/// Returns whether the Codex configuration that exists before Codey's
+/// runtime-only overrides is using a real ChatGPT account login.
+///
+/// This deliberately does not infer an official login from an empty API key.
+/// A retained `auth.json` is also insufficient when the active provider points
+/// at a third-party endpoint: both the active official endpoint and usable
+/// ChatGPT tokens must belong to the current Codex route.
+pub fn official_account_available(codex_home: &Path) -> Result<bool> {
+    let config_path = codex_home.join("config.toml");
+    let snapshot = ConfigManager::new(&config_path).load()?;
+    let document = snapshot.document();
+    let provider_id = document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(LOCAL_OFFICIAL_PROVIDER_ID);
+    let provider = document
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(provider_id))
+        .and_then(Item::as_table_like);
+    let base_url = provider
+        .and_then(|provider| provider.get("base_url"))
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let official_endpoint = base_url.is_empty() || is_official_base_url(base_url);
+    if !official_endpoint || provider_config_api_key(document, provider).is_some() {
+        return Ok(false);
+    }
+
+    let auth_path = codex_home.join("auth.json");
+    let auth = match fs::read(&auth_path) {
+        Ok(bytes) => serde_json::from_slice::<Value>(&bytes)
+            .with_context(|| format!("解析本地 Codex 认证失败：{}", auth_path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("读取本地 Codex 认证失败：{}", auth_path.display()));
+        }
+    };
+    Ok(auth_has_chatgpt_tokens(&auth))
+}
+
+pub fn current_official_account_profile(codex_home: &Path) -> Result<Option<ProviderProfile>> {
+    if !official_account_available(codex_home)? {
+        return Ok(None);
+    }
+    let (provider, _) = local_provider(codex_home)?;
+    if !provider.official {
+        return Ok(None);
+    }
+    let provider_id = provider.id.clone();
+    let mut profile = profile_from_provider(&provider, String::new());
+    profile.id = DERIVED_OFFICIAL_PROFILE_ID.to_string();
+    profile.cc_switch_provider_id = Some(provider_id);
+    profile.normalize();
+    Ok(Some(profile))
+}
+
+pub fn current_provider(codex_home: &Path) -> Result<CurrentProvider> {
+    local_provider(codex_home).map(|(provider, _)| provider)
+}
+
+fn auth_has_chatgpt_tokens(auth: &Value) -> bool {
+    auth.get("auth_mode").and_then(Value::as_str) == Some("chatgpt")
+        && auth
+            .get("tokens")
+            .and_then(Value::as_object)
+            .is_some_and(|tokens| {
+                ["access_token", "id_token"].iter().any(|name| {
+                    tokens
+                        .get(*name)
+                        .and_then(Value::as_str)
+                        .is_some_and(|token| !token.trim().is_empty())
+                })
+            })
+}
+
 pub fn provider_model_fetch_profile(
     profile: &ProviderProfile,
     codex_home: &Path,
@@ -271,6 +351,14 @@ fn provider_model_fetch_profile_from_paths(
             fetch_profile.model_request_headers = extensions.headers;
         }
         return Ok(fetch_profile);
+    }
+
+    // A live CC Switch route only owns the provider currently installed in
+    // Codex. Other Codey routes must keep their own endpoint and credential;
+    // otherwise syncing route B would silently query route A's source API.
+    let (live_provider, _) = local_provider(codex_home)?;
+    if profile.provider_id() != live_provider.id {
+        return Ok(profile.clone());
     }
 
     let source = read_current_cc_switch_source_api(db_path)?;
@@ -297,7 +385,7 @@ fn local_provider_model_request_extensions(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(LOCAL_OFFICIAL_PROVIDER_ID);
-    if provider_id != profile.id {
+    if provider_id != profile.provider_id() {
         return Ok(None);
     }
     let provider = document
@@ -550,20 +638,95 @@ fn is_loopback_url(url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127.")
 }
 
+#[cfg(test)]
 pub fn sync_current_provider(
     config: &CodeyConfig,
     codex_home: &Path,
 ) -> Result<(CodeyConfig, CcSwitchStatus)> {
     let (provider, api_key) = local_provider(codex_home)?;
+    sync_provider_profile(config, provider, api_key)
+}
+
+pub fn sync_current_third_party_provider(
+    config: &CodeyConfig,
+    codex_home: &Path,
+) -> Result<(CodeyConfig, CcSwitchStatus)> {
+    let (provider, api_key) = local_provider(codex_home)?;
+    if provider.official {
+        bail!("当前 Codex 配置是官方账号线路，不自动导入为第三方线路");
+    }
+    sync_provider_profile(config, provider, api_key)
+}
+
+fn sync_provider_profile(
+    config: &CodeyConfig,
+    provider: CurrentProvider,
+    api_key: String,
+) -> Result<(CodeyConfig, CcSwitchStatus)> {
     let profile = profile_from_provider(&provider, api_key);
 
     let mut next = config.clone();
-    next.active_profile_id = profile.id.clone();
-    next.profiles = vec![profile];
+    let imported_id = profile.id.clone();
+    let imported_provider_id = profile.provider_id().to_string();
+    let mut active_profile_id = imported_id.clone();
+    let replace_placeholder = next.profiles.len() == 1
+        && next.profiles[0].name == "默认配置"
+        && next.profiles[0].base_url.trim().is_empty()
+        && next.profiles[0].api_key.trim().is_empty();
+    if replace_placeholder {
+        let placeholder_provider_id = next.profiles[0].provider_id().to_string();
+        next.profiles = vec![profile];
+        next.selected_models_by_provider
+            .remove(&placeholder_provider_id);
+        next.manual_third_party_models_by_provider
+            .remove(&placeholder_provider_id);
+        next.declared_official_models_by_provider
+            .remove(&placeholder_provider_id);
+        next.upstream_models_by_provider
+            .remove(&placeholder_provider_id);
+        next.default_model_by_provider
+            .remove(&placeholder_provider_id);
+        next.subagent_config_by_provider
+            .remove(&placeholder_provider_id);
+    } else if let Some(existing) = next.profiles.iter_mut().find(|existing| {
+        existing.provider_id() == imported_provider_id || existing.id == imported_id
+    }) {
+        // Preserve Codey's UI identity when this provider was imported before
+        // under a profile id that differs from Codex's runtime provider id.
+        // The provider-scoped model maps stay keyed by imported_provider_id.
+        active_profile_id = existing.id.clone();
+        let mut replacement = profile;
+        if replacement.id != active_profile_id {
+            replacement.id = active_profile_id.clone();
+            replacement.cc_switch_provider_id = Some(imported_provider_id);
+        }
+        *existing = replacement;
+    } else {
+        next.profiles.push(profile);
+    }
+    next.active_profile_id = active_profile_id;
+    next.initial_route_import_completed = true;
     next = next.normalize();
     let changed = &next != config;
+    if changed {
+        next.settings_revision = config.settings_revision.saturating_add(1);
+    }
     let status = CcSwitchStatus { changed, provider };
     Ok((next, status))
+}
+
+pub fn sync_official_account_route(config: &CodeyConfig, codex_home: &Path) -> Result<CodeyConfig> {
+    let Some(official_profile) = current_official_account_profile(codex_home)? else {
+        bail!("当前 Codex 配置不是可用的官方账号线路");
+    };
+    let mut next = config.clone();
+    next.apply_launch_official_profile(Some(official_profile));
+    next.initial_route_import_completed = true;
+    next = next.normalize();
+    if next != *config {
+        next.settings_revision = config.settings_revision.saturating_add(1);
+    }
+    Ok(next)
 }
 
 fn read_current_cc_switch_source_api(db_path: &Path) -> Result<CcSwitchSourceApi> {
@@ -729,6 +892,18 @@ fn profile_from_provider(provider: &CurrentProvider, api_key: String) -> Provide
         name: provider.name.clone(),
         base_url: provider.base_url.clone(),
         api_key,
+        upstream_protocol: if provider.official {
+            crate::config::UPSTREAM_PROTOCOL_OFFICIAL.to_string()
+        } else {
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string()
+        },
+        auth_mode: if provider.official {
+            crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string()
+        } else {
+            crate::config::AUTH_MODE_API_KEY.to_string()
+        },
+        api_key_configured: !provider.official,
+        clear_api_key: false,
         model_request_headers: BTreeMap::new(),
         cc_switch_provider_id: None,
         cc_switch_read_only: provider.official,
@@ -1316,6 +1491,10 @@ mod tests {
             name: format!("线路 {id}"),
             base_url: format!("https://{id}.example/v1"),
             api_key: format!("{id}-secret"),
+            upstream_protocol: crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
+            auth_mode: crate::config::AUTH_MODE_API_KEY.to_string(),
+            api_key_configured: true,
+            clear_api_key: false,
             model_request_headers: BTreeMap::new(),
             cc_switch_provider_id: Some(id.to_string()),
             cc_switch_read_only: false,
@@ -1508,6 +1687,73 @@ experimental_bearer_token = "sk-chat"
     }
 
     #[test]
+    fn third_party_bootstrap_rejects_official_account_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#,
+        )
+        .unwrap();
+
+        let error = sync_current_third_party_provider(&CodeyConfig::default(), &home).unwrap_err();
+
+        assert!(format!("{error:#}").contains("官方账号线路"));
+    }
+
+    #[test]
+    fn official_launch_route_is_first_without_stealing_active_api_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        write_live_route(&home, "openai", "https://api.openai.com/v1", "");
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#,
+        )
+        .unwrap();
+        let route_a = saved_route_profile("route-a");
+        let route_b = saved_route_profile("route-b");
+        let config = CodeyConfig {
+            active_profile_id: route_b.id.clone(),
+            profiles: vec![route_a, route_b.clone()],
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        let synced = sync_official_account_route(&config, &home).unwrap();
+
+        assert_eq!(synced.profiles[0].id, DERIVED_OFFICIAL_PROFILE_ID);
+        assert_eq!(synced.profiles[0].provider_id(), "openai");
+        assert!(synced.profiles[0].cc_switch_read_only);
+        assert!(synced.profiles[0].api_key.is_empty());
+        assert_eq!(synced.profiles.len(), 3);
+        assert_eq!(synced.active_profile_id, route_b.id);
+        assert!(synced.initial_route_import_completed);
+    }
+
+    #[test]
+    fn official_launch_route_replaces_empty_default_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#,
+        )
+        .unwrap();
+
+        let synced = sync_official_account_route(&CodeyConfig::default(), &home).unwrap();
+
+        assert_eq!(synced.profiles.len(), 1);
+        assert_eq!(synced.profiles[0].id, DERIVED_OFFICIAL_PROFILE_ID);
+        assert_eq!(synced.active_profile_id, DERIVED_OFFICIAL_PROFILE_ID);
+        assert!(synced.profiles[0].cc_switch_read_only);
+        assert!(synced.initial_route_import_completed);
+    }
+
+    #[test]
     fn preserved_chatgpt_login_does_not_replace_the_codex_api_route() {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("codex-home");
@@ -1608,6 +1854,81 @@ experimental_bearer_token = "sk-relay"
 
         assert!(status.provider.official);
         assert!(synced.profiles[0].api_key.is_empty());
+    }
+
+    #[test]
+    fn official_account_capability_requires_chatgpt_tokens_on_the_active_official_route() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"secret"}}"#,
+        )
+        .unwrap();
+
+        assert!(official_account_available(&home).unwrap());
+
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{}}"#,
+        )
+        .unwrap();
+        assert!(!official_account_available(&home).unwrap());
+    }
+
+    #[test]
+    fn retained_chatgpt_tokens_do_not_enable_official_routes_for_an_api_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"
+model_provider = "relay"
+
+[model_providers.relay]
+name = "Relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-relay"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"retained"}}"#,
+        )
+        .unwrap();
+
+        assert!(!official_account_available(&home).unwrap());
+    }
+
+    #[test]
+    fn provider_scoped_api_key_disables_official_account_capability() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("codex-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join("config.toml"),
+            r#"
+model_provider = "openai"
+
+[model_providers.openai]
+name = "OpenAI API"
+base_url = "https://api.openai.com/v1"
+wire_api = "responses"
+experimental_bearer_token = "sk-api"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            home.join("auth.json"),
+            br#"{"auth_mode":"chatgpt","tokens":{"access_token":"retained"}}"#,
+        )
+        .unwrap();
+
+        assert!(!official_account_available(&home).unwrap());
     }
 
     #[test]
@@ -1741,6 +2062,87 @@ requires_openai_auth = true
     }
 
     #[test]
+    fn provider_synchronization_upserts_without_removing_other_saved_routes() {
+        let (_directory, _path, home) = fixture();
+        write_live_route(
+            &home,
+            "route-a",
+            "https://route-a.example/v2",
+            "route-a-new-secret",
+        );
+        let mut config = CodeyConfig {
+            active_profile_id: "route-b".into(),
+            profiles: vec![
+                saved_route_profile("route-a"),
+                saved_route_profile("route-b"),
+            ],
+            settings_revision: 7,
+            ..CodeyConfig::default()
+        };
+        config
+            .selected_models_by_provider
+            .insert("route-b".into(), vec!["route-b-model".into()]);
+
+        let (synced, status) = sync_current_provider(&config, &home).unwrap();
+
+        assert!(status.changed);
+        assert_eq!(synced.settings_revision, 8);
+        assert_eq!(synced.active_profile_id, "route-a");
+        assert_eq!(synced.profiles.len(), 2);
+        assert_eq!(
+            synced
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "route-a")
+                .unwrap()
+                .base_url,
+            "https://route-a.example/v2"
+        );
+        assert_eq!(
+            synced
+                .profiles
+                .iter()
+                .find(|profile| profile.id == "route-b")
+                .unwrap(),
+            &saved_route_profile("route-b")
+        );
+        assert_eq!(
+            synced.selected_models_by_provider["route-b"],
+            ["route-b-model"]
+        );
+    }
+
+    #[test]
+    fn provider_synchronization_reuses_a_profile_with_the_same_runtime_provider_id() {
+        let (_directory, _path, home) = fixture();
+        write_live_route(
+            &home,
+            "route-a",
+            "https://route-a.example/v2",
+            "route-a-new-secret",
+        );
+        let mut imported_before = saved_route_profile("route-a");
+        imported_before.id = "ui-route-a".into();
+        let config = CodeyConfig {
+            active_profile_id: "route-b".into(),
+            profiles: vec![imported_before, saved_route_profile("route-b")],
+            ..CodeyConfig::default()
+        };
+
+        let (synced, _) = sync_current_provider(&config, &home).unwrap();
+
+        assert_eq!(synced.profiles.len(), 2);
+        assert_eq!(synced.active_profile_id, "ui-route-a");
+        let imported = synced
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "ui-route-a")
+            .unwrap();
+        assert_eq!(imported.provider_id(), "route-a");
+        assert_eq!(imported.base_url, "https://route-a.example/v2");
+    }
+
+    #[test]
     fn model_fetch_uses_the_cc_switch_source_api_during_live_route_takeover() {
         let (_directory, path, home) = fixture();
         install_proxy_schema(&path);
@@ -1770,6 +2172,10 @@ requires_openai_auth = true
             name: "CC Switch 路由".into(),
             base_url: "http://127.0.0.1:15721/v1".into(),
             api_key: PROXY_MANAGED_TOKEN.into(),
+            upstream_protocol: crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
+            auth_mode: crate::config::AUTH_MODE_API_KEY.to_string(),
+            api_key_configured: true,
+            clear_api_key: false,
             model_request_headers: BTreeMap::new(),
             cc_switch_provider_id: None,
             cc_switch_read_only: false,
@@ -1784,6 +2190,41 @@ requires_openai_auth = true
         assert_eq!(fetch_profile.base_url, "https://source.example/v1");
         assert_eq!(fetch_profile.api_key, "source-route-secret");
         assert_eq!(live_profile.api_key, PROXY_MANAGED_TOKEN);
+    }
+
+    #[test]
+    fn live_route_takeover_does_not_replace_another_saved_routes_fetch_target() {
+        let (_directory, path, home) = fixture();
+        install_proxy_schema(&path);
+        insert_provider_with_api_format(
+            &path,
+            "source-route",
+            "源线路",
+            "https://source.example/v1",
+            true,
+            Some("openai_responses"),
+        );
+        Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO proxy_config (app_type, enabled) VALUES ('codex', 1)",
+                [],
+            )
+            .unwrap();
+        write_live_route(
+            &home,
+            "relay",
+            "http://127.0.0.1:15721/v1",
+            PROXY_MANAGED_TOKEN,
+        );
+        let other_route = saved_route_profile("other-route");
+
+        let fetch_profile =
+            provider_model_fetch_profile_from_paths(&other_route, &home, &path).unwrap();
+
+        assert_eq!(fetch_profile, other_route);
+        assert_eq!(fetch_profile.base_url, "https://other-route.example/v1");
+        assert_eq!(fetch_profile.api_key, "other-route-secret");
     }
 
     #[test]

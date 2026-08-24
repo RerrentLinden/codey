@@ -3,8 +3,7 @@
    ========================================================================== */
 
 .trace-card {
-  min-height: 200px;
-  padding: 18px 20px;
+  min-height: 0;
   border-radius: 12px;
 }
 
@@ -29,19 +28,6 @@
   display: flex;
   align-items: center;
   gap: 8px;
-}
-
-.trace-clear-button {
-  color: #d70015 !important;
-  background: rgba(255, 59, 48, 0.07) !important;
-  border: 1px solid rgba(255, 59, 48, 0.18) !important;
-  box-shadow: none !important;
-  transition: all 0.15s ease !important;
-}
-
-.trace-clear-button:hover:not(:disabled) {
-  background: rgba(255, 59, 48, 0.14) !important;
-  border-color: rgba(255, 59, 48, 0.3) !important;
 }
 
 .trace-snapshot-row {
@@ -240,7 +226,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  min-height: 160px;
+  min-height: 128px;
 }
 
 .trace-empty {
@@ -286,65 +272,4 @@
   font-size: 12px;
   color: #6e6e73;
   line-height: 1.4;
-}
-
-.trace-start-btn,
-.trace-start-btn.semi-button {
-  padding: 0 16px !important;
-  height: 34px !important;
-  border: 1px solid #007aff !important;
-  border-radius: 8px !important;
-  background: #007aff !important;
-  background-color: #007aff !important;
-  color: #ffffff !important;
-  font-size: 13px !important;
-  font-weight: 500 !important;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08) !important;
-}
-
-.trace-start-btn *,
-.trace-start-btn span,
-.trace-start-btn svg,
-.trace-start-btn .semi-button-content,
-.trace-start-btn .semi-button-content-text {
-  color: #ffffff !important;
-  fill: #ffffff !important;
-  stroke: #ffffff !important;
-}
-
-.trace-start-btn:hover:not(:disabled) {
-  background: #0066d6 !important;
-  background-color: #0066d6 !important;
-  border-color: #0066d6 !important;
-  box-shadow: 0 2px 4px rgba(0, 122, 255, 0.2) !important;
-}
-
-.trace-start-btn:active:not(:disabled) {
-  transform: translateY(0);
-}
-
-.trace-start-btn:disabled,
-.trace-start-btn.semi-button-disabled {
-  background: rgba(0, 122, 255, 0.08) !important;
-  background-color: rgba(0, 122, 255, 0.08) !important;
-  border: 1px solid rgba(0, 122, 255, 0.25) !important;
-  border-color: rgba(0, 122, 255, 0.25) !important;
-  box-shadow: none !important;
-  opacity: 0.85 !important;
-  cursor: not-allowed !important;
-}
-
-.trace-start-btn:disabled *,
-.trace-start-btn:disabled span,
-.trace-start-btn:disabled svg,
-.trace-start-btn:disabled .semi-button-content,
-.trace-start-btn:disabled .semi-button-content-text,
-.trace-start-btn.semi-button-disabled *,
-.trace-start-btn.semi-button-disabled span,
-.trace-start-btn.semi-button-disabled svg,
-.trace-start-btn.semi-button-disabled .semi-button-content,
-.trace-start-btn.semi-button-disabled .semi-button-content-text {
-  color: #007aff !important;
-  fill: #007aff !important;
-  stroke: #007aff !important;
 }

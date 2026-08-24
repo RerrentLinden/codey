@@ -12,6 +12,7 @@ pub mod fastctx;
 mod fastctx_route_gate;
 mod fs_util;
 mod launcher;
+mod local_router;
 mod maintenance_lock;
 mod message_delete;
 mod model_catalog;

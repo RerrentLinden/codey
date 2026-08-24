@@ -15,12 +15,16 @@ import {
 import type { CcSwitchStatus, Config, InlineResult } from "./App.types";
 import { invoke } from "./api";
 import { errorText, withTimeout } from "./appUtils";
-import { Button, Card, Input, Select, Switch } from "./components/semi";
+import { Button, Card, Input, PasswordInput, Select, Switch } from "./components/mantine";
 import { SETTINGS_OVERLAY_Z_INDEX } from "./overlay.constants";
+import {
+  inputShellClass,
+  insetInputClass,
+  surfaceCardPaddingClass,
+} from "./uiClasses";
 
 const TEST_TIMEOUT_MS = 65_000;
 const FETCH_MODELS_TIMEOUT_MS = 20_000;
-const SAVED_API_KEY_MASK = "****************";
 const DEFAULT_OPTIMIZER_INSTRUCTION =
   "你是提示词优化专家。用户会提供一段提示词，请在不改变其意图的前提下，把它重写为更清晰、更具体、可执行的高质量提示词。只输出优化后的提示词本身，不要添加任何解释、前言、后记或代码围栏。";
 
@@ -78,14 +82,7 @@ function PromptOptimizationCardComponent({
       promptOptimization: { ...optimization, ...patch },
     });
   };
-  const showingSavedApiKey =
-    optimization.apiKeyConfigured &&
-    optimization.apiKey.trim() === "" &&
-    revealedApiKey === null;
-  const apiKeyValue =
-    revealedApiKey ??
-    (showingSavedApiKey ? SAVED_API_KEY_MASK : optimization.apiKey);
-  const apiKeyTextVisible = apiKeyVisible && !showingSavedApiKey;
+  const apiKeyValue = revealedApiKey ?? optimization.apiKey;
   const apiKeyInputId = `${controlId}-api-key`;
   const modelInputId = `${controlId}-model`;
   const modelSelectOptions = useMemo(
@@ -98,13 +95,6 @@ function PromptOptimizationCardComponent({
     ],
     [cloudModels, optimization.model],
   );
-  // Semi Select retains stale options when a controlled, creatable Select gets
-  // a new optionList. Remount only when the fetched list actually changes.
-  const modelSelectKey = useMemo(
-    () => JSON.stringify(cloudModels),
-    [cloudModels],
-  );
-
   const handleApiKeyChange = (value: string) => {
     setRevealedApiKey(null);
     if (value === "") {
@@ -115,32 +105,23 @@ function PromptOptimizationCardComponent({
       });
       return;
     }
-    if (showingSavedApiKey) {
-      if (/^\*+$/.test(value)) {
-        updateOptimization({
-          apiKey: "",
-          apiKeyConfigured: true,
-          clearApiKey: false,
-        });
-        return;
-      }
-    }
-    const nextValue = showingSavedApiKey
-      ? value.replace(SAVED_API_KEY_MASK, "")
-      : value;
     updateOptimization({
-      apiKey: nextValue,
-      apiKeyConfigured: nextValue.trim() !== "",
+      apiKey: value,
+      apiKeyConfigured: value.trim() !== "",
       clearApiKey: false,
     });
   };
 
   const toggleApiKeyVisibility = async () => {
-    if (apiKeyTextVisible) {
+    if (apiKeyVisible) {
       setApiKeyVisible(false);
       return;
     }
-    if (showingSavedApiKey) {
+    const isSavedAndHidden =
+      optimization.apiKeyConfigured &&
+      optimization.apiKey.trim() === "" &&
+      revealedApiKey === null;
+    if (isSavedAndHidden) {
       setRevealingApiKey(true);
       setSyncResult({ tone: "idle", text: "" });
       try {
@@ -298,7 +279,7 @@ function PromptOptimizationCardComponent({
           </div>
         </div>
       </div>
-      <Card className="secondary-card prompt-optimization-card">
+      <Card className={`secondary-card prompt-optimization-card ${surfaceCardPaddingClass}`}>
         <div
           className={`feature-card prompt-optimization-toggle${optimization.enabled ? " active" : ""}`}
         >
@@ -335,7 +316,7 @@ function PromptOptimizationCardComponent({
               <div className="prompt-optimization-action-buttons">
                 {!provider.official ? (
                   <Button
-                    variant="secondary"
+                    variant="light"
                     size="xs"
                     disabled={isBusy || testing || fetchingModels}
                     onClick={() => void runSyncCurrentProvider()}
@@ -343,7 +324,7 @@ function PromptOptimizationCardComponent({
                     <IconRefresh
                       className={
                         syncing || busy === "sync-prompt-provider"
-                          ? "spinner"
+                          ? "animate-spin"
                           : ""
                       }
                       aria-hidden="true"
@@ -352,7 +333,7 @@ function PromptOptimizationCardComponent({
                   </Button>
                 ) : null}
                 <Button
-                  variant="secondary"
+                  variant="light"
                   size="xs"
                   disabled={isBusy || testing || fetchingModels}
                   onClick={() => void runTest()}
@@ -363,12 +344,13 @@ function PromptOptimizationCardComponent({
               </div>
             </div>
 
-            <div className="prompt-optimization-config-grid">
+            <div className="flex flex-col items-stretch gap-3">
               <label className="field prompt-optimization-address-field">
                 <span>API 地址</span>
-                <div className="input-shell">
+                <div className={inputShellClass}>
                   <IconWorld size={15} aria-hidden="true" />
                   <Input
+                    className={insetInputClass}
                     value={optimization.baseUrl}
                     disabled={isBusy}
                     onChange={(event) => {
@@ -383,72 +365,75 @@ function PromptOptimizationCardComponent({
 
               <div className="field prompt-optimization-key-field">
                 <label htmlFor={apiKeyInputId}>API Key</label>
-                <div className="input-shell">
+                <div className={inputShellClass}>
                   <IconKey size={15} aria-hidden="true" />
-                  <input
+                  <PasswordInput
                     id={apiKeyInputId}
-                    type={apiKeyTextVisible ? "text" : "password"}
-                    className="prompt-optimization-secret-input"
+                    variant="unstyled"
+                    className="min-w-0 flex-1"
+                    classNames={{
+                      innerInput: insetInputClass,
+                      visibilityToggle:
+                        "h-7! w-7! min-w-7! rounded-[7px]! text-[#6e6e73]! hover:bg-black/6! hover:text-[#1d1d1f]!",
+                    }}
+                    visible={apiKeyVisible}
+                    onVisibilityChange={() => void toggleApiKeyVisibility()}
                     value={apiKeyValue}
                     disabled={isBusy}
                     onChange={(event) => {
                       clearModelSuggestions();
                       handleApiKeyChange(event.target.value);
                     }}
-                    onFocus={(event) => {
-                      if (showingSavedApiKey) event.currentTarget.select();
-                    }}
                     placeholder={
-                      optimization.apiKeyConfigured
-                        ? "已保存（输入新 Key 可替换）"
+                      optimization.apiKeyConfigured &&
+                      !revealedApiKey &&
+                      optimization.apiKey.trim() === ""
+                        ? "已保存（点击眼睛查看，或输入新 Key 替换）"
                         : "sk-…"
                     }
                     autoComplete="new-password"
                     spellCheck={false}
-                  />
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    className="prompt-optimization-icon-button"
-                    disabled={isBusy || revealingApiKey}
-                    aria-label={
-                      apiKeyTextVisible ? "隐藏 API Key" : "显示 API Key"
+                    visibilityToggleIcon={({ reveal }) =>
+                      reveal ? (
+                        <IconEyeOff size={15} aria-hidden="true" />
+                      ) : (
+                        <IconEye size={15} aria-hidden="true" />
+                      )
                     }
-                    title={
-                      revealingApiKey
+                    visibilityToggleButtonProps={{
+                      disabled: isBusy || revealingApiKey,
+                      title: revealingApiKey
                         ? "正在读取 API Key"
-                        : apiKeyTextVisible
+                        : apiKeyVisible
                           ? "隐藏 API Key"
-                          : "显示 API Key"
-                    }
-                    onClick={() => void toggleApiKeyVisibility()}
-                  >
-                    {apiKeyTextVisible ? (
-                      <IconEyeOff size={15} aria-hidden="true" />
-                    ) : (
-                      <IconEye size={15} aria-hidden="true" />
-                    )}
-                  </Button>
+                          : "显示 API Key",
+                      "aria-label": apiKeyVisible
+                        ? "隐藏 API Key"
+                        : "显示 API Key",
+                    }}
+                  />
                 </div>
               </div>
 
               <div className="field prompt-optimization-model-field">
                 <label htmlFor={modelInputId}>模型</label>
-                <div className="prompt-optimization-model-wrapper">
-                  <div className="prompt-optimization-model-control">
-                    <div className="prompt-optimization-model-picker">
-                      <div className="input-shell prompt-optimization-model-row">
+                <div className="flex min-w-0 flex-col gap-1">
+                  <div className="flex min-w-0 items-center gap-2 max-[680px]:flex-col max-[680px]:items-stretch">
+                    <div className="relative min-w-0 flex-1 max-[680px]:w-full">
+                      <div className={`${inputShellClass} w-full flex-1`}>
                         <IconRobot size={15} aria-hidden="true" />
                         <Select
-                          key={modelSelectKey}
                           id={modelInputId}
-                          className="prompt-optimization-model-select"
+                          className="min-w-0 flex-1"
+                          inputClassName={`${insetInputClass} font-medium`}
+                          optionClassName="min-w-0 truncate"
+                          sectionClassName="w-6 text-[#1d1d1f]"
                           value={optimization.model || undefined}
                           disabled={isBusy || fetchingModels}
                           aria-label="提示词优化模型"
                           optionList={modelSelectOptions}
                           placeholder="gpt-4o-mini"
-                          dropdownClassName="prompt-optimization-model-dropdown"
+                          dropdownClassName="rounded-[10px]"
                           emptyContent={
                             cloudModels.length > 0
                               ? "没有匹配模型"
@@ -463,14 +448,14 @@ function PromptOptimizationCardComponent({
                           renderCreateItem={(inputValue, focused, style) =>
                             inputValue ? (
                               <div
-                                className={`prompt-optimization-model-create-option${focused ? " focused" : ""}`}
+                                className={`flex min-h-[34px] w-full items-center gap-[7px] rounded-md px-3 py-[7px] text-[13px] leading-5 text-[#1d1d1f] ${focused ? "bg-blue-500/8" : ""}`}
                                 style={style}
                               >
                                 <IconPlus size={14} aria-hidden="true" />
-                                <span className="prompt-optimization-model-create-label">
+                                <span className="shrink-0 text-[#6e6e73]">
                                   使用
                                 </span>
-                                <span className="prompt-optimization-model-create-value">
+                                <span className="min-w-0 truncate font-semibold text-[#1d1d1f]">
                                   {String(inputValue)}
                                 </span>
                               </div>
@@ -484,7 +469,8 @@ function PromptOptimizationCardComponent({
                       </div>
                     </div>
                     <Button
-                      variant="secondary"
+                      className="h-[38px]! min-w-[76px] shrink-0 max-[680px]:w-full!"
+                      variant="light"
                       size="xs"
                       disabled={isBusy || fetchingModels || testing}
                       onClick={() => void runFetchModels()}

@@ -27,7 +27,7 @@ import {
   DialogHeader,
   DialogTitle,
   Input,
-} from "./components/semi";
+} from "./components/mantine";
 
 type ModelPickerDialogProps = {
   open: boolean;
@@ -96,7 +96,7 @@ function ModelPickerDialogComponent({
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       {open && <DialogContent
-        className="model-picker-dialog"
+        className="w-[min(560px,calc(100vw-32px))]"
         container={container}
         onEscapeKeyDown={(event) => {
           if (isBusy) event.preventDefault();
@@ -108,17 +108,19 @@ function ModelPickerDialogComponent({
         <DialogHeader>
           <DialogTitle>配置当前线路支持的模型</DialogTitle>
           <DialogDescription>
-            默认展示 7 个官方模型，请按线路实际能力勾选；其他模型可输入模型 ID 手动添加。
+            {modelState.officialModels.length > 0
+              ? "请选择本次官方账号登录可用的模型。"
+              : "请选择同步到的线路模型，或手动输入当前线路支持的模型 ID。"}
           </DialogDescription>
         </DialogHeader>
         {modelSyncWarning && (
-          <div className="model-picker-warning" role="alert">
-            <AlertTriangle size={17} aria-hidden="true" />
-            <span>{modelSyncWarning}</span>
+          <div className="mt-3.5 flex items-start gap-2 rounded-[9px] border border-amber-700/20 bg-[#fff8eb] px-3 py-2.5 text-[11px] leading-5 text-[#8a4b08]" role="alert">
+            <AlertTriangle className="mt-px shrink-0" size={17} aria-hidden="true" />
+            <span className="min-w-0 break-words">{modelSyncWarning}</span>
           </div>
         )}
-        <div className="model-picker-add">
-          <div className="input-shell">
+        <div className="mt-3.5 flex items-center gap-3">
+          <div className="min-w-0 flex-1">
             <Input
               value={customModelInput}
               onChange={(event) => onCustomModelInputChange(event.target.value)}
@@ -128,9 +130,9 @@ function ModelPickerDialogComponent({
                   onAddCustomModel();
                 }
               }}
-              placeholder="输入其他模型 ID，例如 provider-model-v2"
+              placeholder="输入当前线路模型 ID，例如 provider-model-v2"
               spellCheck={false}
-              aria-label="输入其他模型 ID"
+              aria-label="输入线路模型 ID"
               aria-invalid={Boolean(modelInputError)}
               disabled={isBusy}
             />
@@ -146,36 +148,40 @@ function ModelPickerDialogComponent({
           </Button>
         </div>
         {modelInputError && (
-          <p className="model-picker-input-error" role="alert">{modelInputError}</p>
+          <p className="mt-1.5 text-[11px] leading-[1.45] text-[#d70015]" role="alert">{modelInputError}</p>
         )}
-        <div className="model-picker-list">
-          <div className="model-picker-list-heading">
-            <div>
-              <strong>官方模型</strong>
-              <small>勾选当前第三方线路实际支持的模型</small>
-            </div>
-            <Badge variant="info">{modelState.officialModels.length} 个</Badge>
-          </div>
-          {modelState.officialModels.map((model) => (
-            <div className="model-picker-row official" key={model.slug}>
-              <Checkbox
-                checked={draftModelSet.has(modelKey(model.slug))}
-                disabled={isBusy}
-                onCheckedChange={(checked) =>
-                  onToggleDraftModel(model.slug, checked === true)}
-                aria-label={`当前线路支持 ${model.slug}`}
-              />
-              <div className="model-picker-model-copy">
-                <strong>{model.displayName}</strong>
-                <small>{model.slug}</small>
+        <div className="my-3 max-h-[360px] overflow-y-auto rounded-[10px] border border-black/8 bg-[#fbfbfc] py-1 pl-1 pr-0.5 [scrollbar-color:rgba(99,99,104,0.46)_transparent] [scrollbar-gutter:stable] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-button]:hidden [&::-webkit-scrollbar-thumb]:min-h-11 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-transparent [&::-webkit-scrollbar-thumb]:bg-black/40 [&::-webkit-scrollbar-thumb]:bg-clip-padding">
+          {modelState.officialModels.length > 0 && (
+            <>
+              <div className="m-0.5 flex items-center justify-between gap-3 rounded-[7px] bg-[#f1f5fb] px-2.5 py-2">
+                <div className="grid gap-0.5">
+                  <strong className="text-xs font-semibold text-[#1d1d1f]">官方模型</strong>
+                  <small className="text-[10px] leading-[1.35] text-[#6e6e73]">来自本次 Codex 官方账号登录</small>
+                </div>
+                <Badge variant="info">{modelState.officialModels.length} 个</Badge>
               </div>
-              <Badge variant="info">官方模型</Badge>
-            </div>
-          ))}
-          <div className="model-picker-list-heading other-models">
-            <div>
-              <strong>其他模型</strong>
-              <small>可选择同步发现的模型，也可在上方手动输入</small>
+              {modelState.officialModels.map((model) => (
+                <div className="flex items-center gap-2.5 rounded-md bg-blue-500/[0.025] px-3 py-2 hover:bg-blue-500/[0.07]" key={model.slug}>
+                  <Checkbox
+                    checked={draftModelSet.has(modelKey(model.slug))}
+                    disabled={isBusy}
+                    onCheckedChange={(checked) =>
+                      onToggleDraftModel(model.slug, checked === true)}
+                    aria-label={`当前线路支持 ${model.slug}`}
+                  />
+                  <div className="grid min-w-0 flex-1 gap-px">
+                    <strong className="break-words text-xs font-semibold text-[#1d1d1f]">{model.displayName}</strong>
+                    <small className="break-words text-[11px] text-[#86868b]">{model.slug}</small>
+                  </div>
+                  <Badge className="ml-auto" variant="info">官方模型</Badge>
+                </div>
+              ))}
+            </>
+          )}
+          <div className="mx-0.5 mb-0.5 mt-1.5 flex items-center justify-between gap-3 rounded-[7px] border-t border-black/6 bg-[#f5f5f7] px-2.5 py-2">
+            <div className="grid gap-0.5">
+              <strong className="text-xs font-semibold text-[#1d1d1f]">线路模型</strong>
+              <small className="text-[10px] leading-[1.35] text-[#6e6e73]">全部通过当前 API Key 线路调用，可同步发现或手动输入</small>
             </div>
             <Badge variant="secondary">
               {filteredThirdPartyModels.length === thirdPartyModelOptions.length
@@ -184,7 +190,7 @@ function ModelPickerDialogComponent({
             </Badge>
           </div>
           {thirdPartyModelOptions.length > 0 && (
-            <div className="model-picker-search">
+            <div className="px-2 pb-1.5 pt-1">
               <Input
                 value={modelQuery}
                 onChange={(event) => {
@@ -204,19 +210,19 @@ function ModelPickerDialogComponent({
               selectedThirdPartyModelKeys.has(modelKey(model));
             const manual = manualThirdPartyModelKeys.has(modelKey(model));
             return (
-              <div className="model-picker-row" key={model}>
+              <div className="flex items-center gap-2.5 rounded-md px-3 py-2 hover:bg-blue-500/6" key={model}>
                 <Checkbox
                   checked={draftModelSet.has(modelKey(model))}
                   disabled={isBusy}
                   onCheckedChange={(checked) => onToggleDraftModel(model, checked === true)}
                   aria-label={`当前线路支持 ${model}`}
                 />
-                <span className="model-picker-model-id">{model}</span>
+                <span className="min-w-0 flex-1 break-words text-xs font-semibold text-[#1d1d1f]">{model}</span>
                 {added && manual && (
                   <Button
                     variant="ghost"
                     size="xs"
-                    className="model-picker-delete-button"
+                    className="shrink-0 text-[#d70015]"
                     disabled={isBusy}
                     onClick={() => onDeleteThirdPartyModel(model)}
                     aria-label={`删除其他模型 ${model}`}
@@ -229,7 +235,7 @@ function ModelPickerDialogComponent({
             );
           })}
           {visibleThirdPartyModels.length < filteredThirdPartyModels.length && (
-            <div className="model-picker-load-more">
+            <div className="flex justify-center px-2 pb-1 pt-1.5">
               <Button
                 variant="ghost"
                 size="sm"
@@ -254,8 +260,8 @@ function ModelPickerDialogComponent({
           {filteredThirdPartyModels.length === 0 && (
             <div className="empty-state">
               {thirdPartyModelOptions.length === 0
-                ? "尚无其他模型，可在上方输入模型 ID 添加"
-                : "没有匹配的其他模型"}
+                ? "尚无线路模型，可在上方输入模型 ID 添加"
+                : "没有匹配的线路模型"}
             </div>
           )}
         </div>
@@ -268,7 +274,7 @@ function ModelPickerDialogComponent({
             onClick={onSave}
           >
             {busy === "save-models"
-              ? <LoaderCircle className="spinner" aria-hidden="true" />
+              ? <LoaderCircle className="animate-spin" aria-hidden="true" />
               : <Check aria-hidden="true" />}
             保存模型声明
           </Button>

@@ -34,6 +34,52 @@ fn third_party_provider_installs_the_codey_model_catalog_when_available() {
     assert!(!should_install_codey_model_catalog(false, false));
 }
 
+#[test]
+fn third_party_runtime_models_are_scoped_to_the_local_route() {
+    assert_eq!(
+        runtime_routed_model(Some("route-a"), "shared-model"),
+        "route-a/shared-model"
+    );
+    assert_eq!(runtime_routed_model(None, "gpt-5.6-sol"), "gpt-5.6-sol");
+}
+
+#[test]
+fn session_maintenance_repairs_a_runtime_only_provider_to_the_persistent_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "model_provider = \"openai\"\n",
+    )
+    .unwrap();
+    let sessions = temp.path().join("sessions/2026/08/24");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let rollout = sessions.join("rollout-thread-1.jsonl");
+    std::fs::write(
+        &rollout,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-1",
+                    "model_provider": "route-runtime-only"
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let provider = persistent_session_provider(temp.path()).unwrap();
+    let result =
+        codey_runtime_data::run_provider_sync_with_target(Some(temp.path()), Some(&provider));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.target_provider, "openai");
+    let repaired = std::fs::read_to_string(rollout).unwrap();
+    assert!(repaired.contains("\"model_provider\":\"openai\""));
+    assert!(!repaired.contains("route-runtime-only"));
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_launch_forces_a_new_app_instance() {
@@ -55,6 +101,19 @@ fn macos_launch_forces_a_new_app_instance() {
             .iter()
             .any(|part| part == "--inspect-brk=127.0.0.1:19321")
     );
+}
+
+#[test]
+fn official_and_external_live_routes_bypass_the_internal_router() {
+    assert!(!should_route_current_profile_through_local_router(
+        true, false, true
+    ));
+    assert!(!should_route_current_profile_through_local_router(
+        true, true, false
+    ));
+    assert!(should_route_current_profile_through_local_router(
+        true, false, false
+    ));
 }
 
 #[cfg(target_os = "macos")]

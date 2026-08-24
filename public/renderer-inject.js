@@ -13,7 +13,6 @@
   const accountUsagePath = "/account/usage";
   const buttonId = "codey-settings-button";
   const accountUsageId = "codey-account-usage";
-  const accountUsagePositionStorageKey = "codey.accountUsage.position.v1";
   const styleId = "codey-core-injected-style";
   const updateAvailableEvent = "codey-update-availability-changed";
   const runtimeHealthEvent = "codey-runtime-health-changed";
@@ -26,8 +25,8 @@
   const runtimeHealthFailureThreshold = 2;
   const accountUsageRefreshIntervalMs = 60_000;
   const accountUsageTimeoutMs = 8_000;
-  const accountUsageViewportMargin = 24;
   const sidebarSelector = [
+    "[data-app-action-sidebar-scroll]",
     "[data-app-action-sidebar-section]",
     "[data-app-action-sidebar-thread-row]",
     "[data-app-action-sidebar-project-row]",
@@ -55,7 +54,6 @@
   let accountUsageCheckInFlight = false;
   let accountUsagePollingEnabled = true;
   let accountUsageLastResult = null;
-  let accountUsageDragState = null;
   let sessionToolsInteractionArmed = false;
   let bootstrapObserver = null;
   let headerMountDirty = true;
@@ -102,29 +100,39 @@
       #${buttonId}[data-codey-update-available="true"]::after { opacity: 1; transform: scale(1); }
       #${buttonId}[data-codey-header-actions="true"]::after { top: 4px; right: 4px; }
       #${buttonId}[data-codey-runtime-state="unavailable"][data-codey-update-available="true"]::after { top: auto; right: 3px; bottom: 3px; width: 5px; height: 5px; }
-      #${accountUsageId} { -webkit-app-region: no-drag !important; pointer-events: auto !important; position: fixed; right: ${accountUsageViewportMargin}px; bottom: ${accountUsageViewportMargin}px; z-index: 2147483640; display: flex; width: 176px; max-width: calc(100vw - ${accountUsageViewportMargin * 2}px); max-height: calc(100vh - ${accountUsageViewportMargin * 2}px); flex-direction: column; gap: 6px; overflow: hidden; border: 1px solid color-mix(in srgb, CanvasText 9%, transparent); border-radius: 8px; padding: 8px; background: color-mix(in srgb, Canvas 58%, transparent); box-shadow: 0 7px 20px color-mix(in srgb, CanvasText 9%, transparent), 0 1px 5px color-mix(in srgb, CanvasText 7%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 44%, transparent); color: CanvasText; cursor: grab; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; font-size: 11px; line-height: 1.12; opacity: .66; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); touch-action: none; transition: background .16s ease, border-color .16s ease, box-shadow .16s ease, opacity .16s ease; user-select: none; }
-      #${accountUsageId}:hover { border-color: color-mix(in srgb, CanvasText 13%, transparent); background: color-mix(in srgb, Canvas 93%, transparent); box-shadow: 0 10px 28px color-mix(in srgb, CanvasText 14%, transparent), 0 2px 8px color-mix(in srgb, CanvasText 10%, transparent), inset 0 1px 0 color-mix(in srgb, Canvas 74%, transparent); opacity: .98; }
-      #${accountUsageId}[data-state="stale"] { opacity: .5; }
-      #${accountUsageId}[data-state="stale"]:hover { opacity: .86; }
-      #${accountUsageId}[data-state="error"] { width: auto; min-width: 118px; align-items: center; justify-content: center; padding: 8px 10px; color: color-mix(in srgb, CanvasText 66%, transparent); }
-      #${accountUsageId}[data-dragging="true"] { cursor: grabbing; opacity: .92; }
-      #${accountUsageId} .codey-usage-heading { display: flex; min-width: 0; align-items: center; gap: 6px; padding-bottom: 1px; }
-      #${accountUsageId} .codey-usage-heading-title { min-width: 0; overflow: hidden; margin-inline-end: auto; color: color-mix(in srgb, CanvasText 68%, transparent); font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-heading::before { content: ""; flex: 0 0 auto; width: 12px; height: 7px; border-block: 2px dotted color-mix(in srgb, CanvasText 22%, transparent); }
-      #${accountUsageId} .codey-usage-list { display: flex; min-width: 0; flex-direction: column; gap: 5px; overflow: auto; }
-      #${accountUsageId} .codey-usage-segment { display: grid; min-width: 0; grid-template-columns: minmax(0, 1fr) auto; align-content: center; column-gap: 8px; border-radius: 6px; padding: 6px 7px 5px; background: color-mix(in srgb, CanvasText 4%, transparent); }
-      #${accountUsageId} .codey-usage-window { display: flex; min-width: 0; align-items: center; gap: 4px; overflow: hidden; color: color-mix(in srgb, CanvasText 62%, transparent); font-size: 10px; font-weight: 600; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-window-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-      #${accountUsageId} .codey-usage-plan { flex: 0 0 auto; border: 1px solid color-mix(in srgb, #0a84ff 24%, transparent); border-radius: 4px; padding: 1px 4px; background: color-mix(in srgb, #0a84ff 9%, transparent); color: color-mix(in srgb, #0a84ff 78%, CanvasText); font-size: 9px; font-weight: 700; letter-spacing: .01em; line-height: 1.15; }
-      #${accountUsageId} .codey-usage-value { font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 700; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-meter { grid-column: 1 / -1; height: 2px; margin-top: 5px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, CanvasText 10%, transparent); }
-      #${accountUsageId} .codey-usage-meter > span { display: block; width: 100%; height: 100%; border-radius: inherit; background: #0a84ff; transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; }
-      #${accountUsageId} .codey-usage-reset { grid-column: 1 / -1; overflow: hidden; margin-top: 4px; color: color-mix(in srgb, CanvasText 48%, transparent); font-size: 9px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
-      #${accountUsageId} .codey-usage-segment[data-tone="healthy"] .codey-usage-meter > span { background: #30d158; }
-      #${accountUsageId} .codey-usage-segment[data-tone="warning"] .codey-usage-meter > span { background: #ffd60a; }
+      #${accountUsageId} { -webkit-app-region: no-drag !important; position: relative; display: block; box-sizing: border-box; width: 100%; min-width: 0; padding: 7px 16px 8px; background: transparent; color: CanvasText; container-type: inline-size; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif; line-height: 1.15; pointer-events: auto !important; transition: opacity .16s ease; user-select: none; }
+      #${accountUsageId}[data-state="stale"] { opacity: .58; }
+      #${accountUsageId}[data-state="error"] { padding-block: 8px; color: color-mix(in srgb, CanvasText 58%, transparent); font-size: 10px; }
+      #${accountUsageId} .codey-usage-list { display: grid; min-width: 0; grid-template-columns: repeat(var(--codey-usage-window-count), minmax(0, 1fr)); gap: 12px; }
+      #${accountUsageId} .codey-usage-segment { min-width: 0; }
+      #${accountUsageId}[data-window-count="2"] .codey-usage-segment + .codey-usage-segment { border-inline-start: 1px solid color-mix(in srgb, CanvasText 9%, transparent); padding-inline-start: 12px; }
+      #${accountUsageId} .codey-usage-overview { display: flex; min-width: 0; align-items: baseline; gap: 6px; }
+      #${accountUsageId} .codey-usage-window-label { min-width: 0; overflow: hidden; color: color-mix(in srgb, CanvasText 58%, transparent); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-plan-tag { flex: 0 0 auto; overflow: hidden; max-width: 44%; border: 1px solid color-mix(in srgb, #0a84ff 32%, transparent); border-radius: 4px; padding: 0 4px; background: color-mix(in srgb, #0a84ff 13%, transparent); color: color-mix(in srgb, #0a84ff 82%, CanvasText); font-size: 8px; font-weight: 700; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-value { margin-inline-start: auto; font-size: 12px; font-variant-numeric: tabular-nums; font-weight: 700; letter-spacing: -.01em; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-meter { display: block; box-sizing: border-box; width: 100%; height: 2px; min-height: 2px; max-height: 2px; margin-top: 5px; overflow: hidden; border-radius: 999px; background: color-mix(in srgb, CanvasText 8%, transparent); contain: size; line-height: 0; }
+      #${accountUsageId} .codey-usage-meter > span { display: block; box-sizing: border-box; width: 100%; height: 2px; min-height: 2px; max-height: 2px; border-radius: inherit; background: #0a84ff; transform: scaleX(var(--codey-usage-remaining)); transform-origin: left center; }
+      #${accountUsageId} .codey-usage-reset { display: block; overflow: hidden; margin-top: 4px; color: color-mix(in srgb, CanvasText 45%, transparent); font-size: 9px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-segment[data-tone="healthy"] .codey-usage-meter > span { background: #34c759; }
+      #${accountUsageId} .codey-usage-segment[data-tone="normal"] .codey-usage-meter > span { background: #0a84ff; }
+      #${accountUsageId} .codey-usage-segment[data-tone="warning"] .codey-usage-meter > span { background: #ffcc00; }
       #${accountUsageId} .codey-usage-segment[data-tone="critical"] .codey-usage-meter > span { background: #ff453a; }
-      @media (max-width: 860px) {
-        #${accountUsageId} { right: 16px; bottom: 16px; width: 164px; max-width: calc(100vw - 32px); max-height: calc(100vh - 32px); }
+      #${accountUsageId} .codey-usage-details { position: absolute; z-index: 2; right: 12px; bottom: calc(100% - 1px); left: 12px; box-sizing: border-box; min-width: 0; padding: 10px 11px 9px; border: 1px solid rgb(255 255 255 / .12); border-radius: 9px; background: rgb(34 34 34 / .97); box-shadow: 0 8px 24px rgb(0 0 0 / .24); color: #f5f5f5; opacity: 0; pointer-events: none; transform: translateY(4px); transition: opacity .14s ease, transform .14s ease, visibility .14s ease; visibility: hidden; }
+      #${accountUsageId}:hover .codey-usage-details, #${accountUsageId}:focus-visible .codey-usage-details { opacity: 1; transform: translateY(0); visibility: visible; }
+      #${accountUsageId}:focus-visible { border-radius: 6px; outline: 2px solid color-mix(in srgb, #0a84ff 72%, transparent); outline-offset: -2px; }
+      #${accountUsageId} .codey-usage-details-heading { display: flex; min-width: 0; align-items: center; gap: 8px; padding-bottom: 7px; }
+      #${accountUsageId} .codey-usage-details-title { color: rgb(245 245 245 / .72); font-size: 10px; font-weight: 650; }
+      #${accountUsageId} .codey-usage-details-list { display: grid; min-width: 0; gap: 7px; }
+      #${accountUsageId} .codey-usage-detail-row { min-width: 0; padding-block-start: 7px; border-block-start: 1px solid rgb(255 255 255 / .09); }
+      #${accountUsageId} .codey-usage-detail-main, #${accountUsageId} .codey-usage-detail-meta { display: flex; min-width: 0; align-items: baseline; gap: 8px; }
+      #${accountUsageId} .codey-usage-detail-label { overflow: hidden; color: rgb(245 245 245 / .78); font-size: 10px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-detail-value { margin-inline-start: auto; color: #f5f5f5; font-size: 11px; font-variant-numeric: tabular-nums; font-weight: 720; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-detail-meta { margin-top: 3px; color: rgb(245 245 245 / .48); font-size: 9px; font-variant-numeric: tabular-nums; }
+      #${accountUsageId} .codey-usage-detail-meta span:last-child { margin-inline-start: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #${accountUsageId} .codey-usage-details-updated { padding-top: 7px; color: rgb(245 245 245 / .38); font-size: 9px; font-variant-numeric: tabular-nums; text-align: right; }
+      @container (max-width: 220px) {
+        #${accountUsageId} .codey-usage-list { grid-template-columns: minmax(0, 1fr); gap: 7px; }
+        #${accountUsageId}[data-window-count="2"] .codey-usage-segment + .codey-usage-segment { border-block-start: 1px solid color-mix(in srgb, CanvasText 9%, transparent); border-inline-start: 0; padding-block-start: 7px; padding-inline-start: 0; }
       }
       @media (prefers-reduced-motion: reduce) {
         #${buttonId}, #${buttonId} *, #${accountUsageId}, #${accountUsageId} * { animation: none !important; transition: none !important; }
@@ -332,11 +340,48 @@
     }
   };
 
-  const accountUsageWindowLabel = (minutes) => {
-    const value = Math.max(1, Math.round(Number(minutes) || 0));
-    if (value % (24 * 60) === 0) return `${value / (24 * 60)} 天`;
-    if (value % 60 === 0) return `${value / 60} 小时`;
-    return `${value} 分钟`;
+  const accountUsageWindowKind = (window) => {
+    const minutes = Number(window?.windowMinutes);
+    if (!Number.isFinite(minutes) || !Number.isFinite(Number(window?.usedPercent))) {
+      return null;
+    }
+    if (minutes >= 6 * 24 * 60 && minutes <= 8 * 24 * 60) return "weekly";
+    if (minutes >= 270 && minutes <= 330) return "five-hour";
+    return null;
+  };
+
+  const escapeAccountUsageText = (value) => String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+
+  const accountUsageWindowLabel = (window) => {
+    const kind = accountUsageWindowKind(window);
+    if (kind === "weekly") return "周额度";
+    if (kind === "five-hour") return "5 小时额度";
+    const minutes = Math.max(1, Math.round(Number(window?.windowMinutes) || 0));
+    if (minutes % (24 * 60) === 0) return `${minutes / (24 * 60)} 天额度`;
+    if (minutes % 60 === 0) return `${minutes / 60} 小时额度`;
+    return `${minutes} 分钟额度`;
+  };
+
+  const accountUsagePlanLabel = (planType) => {
+    const raw = String(planType || "").trim();
+    if (!raw) return "";
+    const compact = raw.toLowerCase().replace(/[\s_$-]+/g, "");
+    if (compact === "5x" || compact.includes("pro5x") || compact.includes("pro100")) {
+      return "Pro 5x";
+    }
+    if (compact === "pro" || compact.includes("pro20x") || compact.includes("pro200")) {
+      return "Pro 20x";
+    }
+    if (compact.includes("plus")) return "Plus";
+    if (compact.includes("free")) return "Free";
+    return raw
+      .replace(/[_-]+/g, " ")
+      .replace(/\b\w/g, (character) => character.toUpperCase());
   };
 
   const accountUsageResetLabel = (resetsAt) => {
@@ -381,214 +426,49 @@
       minute: "2-digit",
       hour12: false,
     });
-    if (dayOffset === 0) return `今天 ${time} 刷新`;
-    if (dayOffset === 1) return `明天 ${time} 刷新`;
-    return `${resetAt.getMonth() + 1}月${resetAt.getDate()}日 ${time} 刷新`;
+    if (dayOffset === 0) return `今天 ${time} 重置`;
+    if (dayOffset === 1) return `明天 ${time} 重置`;
+    return `${resetAt.getMonth() + 1}月${resetAt.getDate()}日 ${time} 重置`;
   };
 
-  const accountUsagePlan = (planType) => {
-    const raw = String(planType || "").trim();
-    if (!raw) return null;
-    const compact = raw.toLowerCase().replace(/[\s_$-]+/g, "");
-    if (
-      compact === "5x"
-      || compact.includes("pro5x")
-      || compact.includes("pro100")
-    ) {
-      return { key: "pro-5x", label: "Pro 5x" };
+  const findAccountUsageMount = () => {
+    const seenNavigations = new Set();
+    for (const anchor of queryWithin(document, sidebarSelector)) {
+      const navigation = anchor.matches?.("nav") ? anchor : anchor.closest?.("nav");
+      if (!(navigation instanceof HTMLElement) || seenNavigations.has(navigation)) continue;
+      seenNavigations.add(navigation);
+      if (!visibleMountRect(navigation)) continue;
+      const sidebarRoot = navigation.parentElement;
+      if (!(sidebarRoot instanceof HTMLElement)) continue;
+      const siblings = Array.from(sidebarRoot.children || []);
+      const navigationIndex = siblings.indexOf(navigation);
+      for (const target of siblings.slice(navigationIndex + 1)) {
+        if (!(target instanceof HTMLElement) || target.id === accountUsageId) continue;
+        const controls = target.querySelectorAll?.("button, [role=button], a[href]") || [];
+        if (!controls.length) continue;
+        const before = Array.from(target.children || [])
+          .reverse()
+          .find((child) => child instanceof HTMLElement && child.id !== accountUsageId);
+        if (before) return { target, before };
+      }
     }
-    if (
-      compact === "pro"
-      || compact.includes("pro20x")
-      || compact.includes("pro200")
-    ) {
-      return { key: "pro-20x", label: "Pro 20x" };
-    }
-    if (compact.includes("plus")) return { key: "plus", label: "Plus" };
-    if (compact.includes("free")) return { key: "free", label: "Free" };
-    return {
-      key: "other",
-      label: raw
-        .replace(/[_-]+/g, " ")
-        .replace(/\b\w/g, (character) => character.toUpperCase()),
-    };
+    return null;
   };
 
-  const escapeAccountUsageText = (value) => String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-
-  const accountUsageViewportSize = () => ({
-    width: Math.max(
-      window.innerWidth || 0,
-      document.documentElement?.clientWidth || 0,
-      document.documentElement?.getBoundingClientRect?.().width || 0,
-      320,
-    ),
-    height: Math.max(
-      window.innerHeight || 0,
-      document.documentElement?.clientHeight || 0,
-      document.documentElement?.getBoundingClientRect?.().height || 0,
-      240,
-    ),
-  });
-
-  const constrainAccountUsagePosition = (left, top, width, height) => {
-    const viewport = accountUsageViewportSize();
-    const maxLeft = Math.max(
-      accountUsageViewportMargin,
-      viewport.width - Math.max(1, width) - accountUsageViewportMargin,
-    );
-    const maxTop = Math.max(
-      accountUsageViewportMargin,
-      viewport.height - Math.max(1, height) - accountUsageViewportMargin,
-    );
-    return {
-      left: Math.round(Math.min(Math.max(accountUsageViewportMargin, left), maxLeft)),
-      top: Math.round(Math.min(Math.max(accountUsageViewportMargin, top), maxTop)),
-    };
+  const mountedAccountUsageIsUsable = (usage) => {
+    if (!(usage instanceof HTMLElement) || usage.isConnected !== true) return false;
+    const host = usage.parentElement;
+    return host instanceof HTMLElement
+      && host.getAttribute("data-codey-usage-host") === "true"
+      && usage.nextElementSibling === usage.__codeyUsageAnchor;
   };
 
-  const readAccountUsageStoredPosition = () => {
-    try {
-      const raw = window.localStorage?.getItem?.(accountUsagePositionStorageKey);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      const left = Number(parsed?.left);
-      const top = Number(parsed?.top);
-      if (!Number.isFinite(left) || !Number.isFinite(top)) return null;
-      return { left, top };
-    } catch {
-      return null;
-    }
-  };
-
-  const saveAccountUsagePosition = (position) => {
-    try {
-      window.localStorage?.setItem?.(
-        accountUsagePositionStorageKey,
-        JSON.stringify({
-          left: Math.round(position.left),
-          top: Math.round(position.top),
-        }),
-      );
-    } catch {
-    }
-  };
-
-  const applyAccountUsagePosition = (usage) => {
-    if (!(usage instanceof HTMLElement)) return;
-    const stored = readAccountUsageStoredPosition();
-    if (!stored) {
-      usage.style.left = "auto";
-      usage.style.top = "auto";
-      usage.style.right = `${accountUsageViewportMargin}px`;
-      usage.style.bottom = `${accountUsageViewportMargin}px`;
-      return;
-    }
-    const rect = usage.getBoundingClientRect?.() || {};
-    const next = constrainAccountUsagePosition(
-      stored.left,
-      stored.top,
-      Number(rect.width) || 176,
-      Number(rect.height) || 120,
-    );
-    usage.style.left = `${next.left}px`;
-    usage.style.top = `${next.top}px`;
-    usage.style.right = "auto";
-    usage.style.bottom = "auto";
-  };
-
-  const finishAccountUsageDrag = (event) => {
-    if (!accountUsageDragState) return;
-    const { usage, pointerId, latest } = accountUsageDragState;
-    if (event?.pointerId != null && pointerId != null && event.pointerId !== pointerId) return;
-    try {
-      usage.releasePointerCapture?.(pointerId);
-    } catch {
-    }
-    usage.removeAttribute?.("data-dragging");
-    if (latest) saveAccountUsagePosition(latest);
-    window.removeEventListener?.("pointermove", moveAccountUsageDrag, true);
-    window.removeEventListener?.("pointerup", finishAccountUsageDrag, true);
-    window.removeEventListener?.("pointercancel", finishAccountUsageDrag, true);
-    accountUsageDragState = null;
-  };
-
-  const moveAccountUsageDrag = (event) => {
-    if (!accountUsageDragState) return;
-    const { usage, pointerId, startX, startY, startLeft, startTop, width, height } =
-      accountUsageDragState;
-    if (event?.pointerId != null && pointerId != null && event.pointerId !== pointerId) return;
-    const next = constrainAccountUsagePosition(
-      startLeft + Number(event.clientX - startX || 0),
-      startTop + Number(event.clientY - startY || 0),
-      width,
-      height,
-    );
-    usage.style.left = `${next.left}px`;
-    usage.style.top = `${next.top}px`;
-    usage.style.right = "auto";
-    usage.style.bottom = "auto";
-    accountUsageDragState.latest = next;
-    event.preventDefault?.();
-  };
-
-  const startAccountUsageDrag = (event) => {
-    const usage = event.currentTarget instanceof HTMLElement
-      ? event.currentTarget
-      : document.getElementById(accountUsageId);
-    if (!(usage instanceof HTMLElement)) return;
-    if (event.button != null && event.button !== 0) return;
-    const rect = usage.getBoundingClientRect?.();
-    if (!rect) return;
-    const start = constrainAccountUsagePosition(
-      Number(rect.left) || 0,
-      Number(rect.top) || 0,
-      Number(rect.width) || 224,
-      Number(rect.height) || 120,
-    );
-    accountUsageDragState = {
-      usage,
-      pointerId: event.pointerId,
-      startX: Number(event.clientX) || 0,
-      startY: Number(event.clientY) || 0,
-      startLeft: start.left,
-      startTop: start.top,
-      width: Number(rect.width) || 176,
-      height: Number(rect.height) || 120,
-      latest: start,
-    };
-    usage.setAttribute("data-dragging", "true");
-    try {
-      usage.setPointerCapture?.(event.pointerId);
-    } catch {
-    }
-    window.addEventListener?.("pointermove", moveAccountUsageDrag, true);
-    window.addEventListener?.("pointerup", finishAccountUsageDrag, true);
-    window.addEventListener?.("pointercancel", finishAccountUsageDrag, true);
-    event.preventDefault?.();
-    event.stopPropagation?.();
-  };
-
-  const installAccountUsageDrag = (usage) => {
-    if (!(usage instanceof HTMLElement) || usage.__codeyUsageDragInstalled) return;
-    usage.__codeyUsageDragInstalled = true;
-    usage.addEventListener("pointerdown", startAccountUsageDrag, true);
-  };
-
-  const accountUsagePlanMarkup = (plan) => plan
-    ? `<span class="codey-usage-plan" data-plan="${plan.key}">${escapeAccountUsageText(plan.label)}</span>`
-    : "";
-
-  const accountUsageWindowSegment = (window) => {
-    if (!window || !Number.isFinite(Number(window.usedPercent))) return null;
+  const accountUsageWindowSegment = (window, kind, plan = "") => {
+    if (!window || accountUsageWindowKind(window) !== kind) return null;
     const remaining = Math.max(0, Math.min(100, 100 - Number(window.usedPercent)));
     const roundedRemaining = Math.round(remaining);
-    const label = accountUsageWindowLabel(window.windowMinutes);
+    const label = kind === "weekly" ? "周额度" : "5 小时";
+    const ariaLabel = kind === "weekly" ? "周额度" : "5 小时额度";
     const reset = accountUsageResetLabel(window.resetsAt);
     const resetTime = accountUsageResetTimeLabel(window.resetsAt);
     const tone = roundedRemaining <= 20
@@ -599,47 +479,112 @@
           ? "normal"
           : "healthy";
     return {
-      aria: `${label}额度剩余 ${roundedRemaining}%${reset ? `，${reset}` : ""}`,
+      aria: `${ariaLabel}剩余 ${roundedRemaining}%${reset ? `，${reset}` : ""}`,
       html: `
-        <span class="codey-usage-segment" data-tone="${tone}" style="--codey-usage-remaining:${remaining / 100}">
-          <span class="codey-usage-window">
+        <span class="codey-usage-segment" data-window="${kind}" data-tone="${tone}" style="--codey-usage-remaining:${remaining / 100}">
+          <span class="codey-usage-overview">
+            ${plan ? `<span class="codey-usage-plan-tag">${escapeAccountUsageText(plan)}</span>` : ""}
             <span class="codey-usage-window-label">${label}</span>
+            <span class="codey-usage-value">${roundedRemaining}%</span>
           </span>
-          <span class="codey-usage-value">${roundedRemaining}%</span>
-          <span class="codey-usage-meter"><span></span></span>
+          <span class="codey-usage-meter" aria-hidden="true"><span></span></span>
           ${resetTime ? `<span class="codey-usage-reset">${resetTime}</span>` : ""}
         </span>
       `,
     };
   };
 
-  const accountCreditsSegment = (credits) => {
-    if (!credits || (!credits.hasCredits && !credits.unlimited)) return null;
-    const balance = credits.unlimited ? "不限" : String(credits.balance || "0");
-    return {
-      aria: `账号额度余额 ${balance}`,
-      html: `
-        <span class="codey-usage-segment" style="--codey-usage-remaining:1">
-          <span class="codey-usage-window">
-            <span class="codey-usage-window-label">余额</span>
-          </span>
-          <span class="codey-usage-value">${escapeAccountUsageText(balance)}</span>
-          <span class="codey-usage-meter"><span></span></span>
-        </span>
-      `,
-    };
+  const accountUsageSegments = (result) => {
+    const windowsByKind = new Map();
+    for (const window of [result?.primary, result?.secondary]) {
+      const kind = accountUsageWindowKind(window);
+      if (kind && !windowsByKind.has(kind)) windowsByKind.set(kind, window);
+    }
+    const visibleKinds = ["weekly", "five-hour"]
+      .filter((kind) => windowsByKind.has(kind));
+    const plan = accountUsagePlanLabel(result?.planType);
+    return visibleKinds.map((kind, index) => accountUsageWindowSegment(
+      windowsByKind.get(kind),
+      kind,
+      index === 0 ? plan : "",
+    ));
+  };
+
+  const accountUsageDetailWindow = (window) => {
+    if (!window || !Number.isFinite(Number(window.usedPercent))) return "";
+    const used = Math.max(0, Math.min(100, Number(window.usedPercent)));
+    const remaining = Math.max(0, Math.min(100, 100 - used));
+    const reset = accountUsageResetTimeLabel(window.resetsAt);
+    return `
+      <div class="codey-usage-detail-row">
+        <div class="codey-usage-detail-main">
+          <span class="codey-usage-detail-label">${escapeAccountUsageText(accountUsageWindowLabel(window))}</span>
+          <span class="codey-usage-detail-value">剩余 ${Math.round(remaining)}%</span>
+        </div>
+        <div class="codey-usage-detail-meta">
+          <span>已用 ${Math.round(used)}%</span>
+          ${reset ? `<span>${escapeAccountUsageText(reset)}</span>` : ""}
+        </div>
+      </div>
+    `;
+  };
+
+  const accountUsageCreditsDetail = (credits) => {
+    if (!credits) return "";
+    const balance = credits.unlimited
+      ? "不限"
+      : credits.balance !== undefined && credits.balance !== null
+        ? String(credits.balance)
+        : credits.hasCredits
+          ? "可用"
+          : "0";
+    return `
+      <div class="codey-usage-detail-row">
+        <div class="codey-usage-detail-main">
+          <span class="codey-usage-detail-label">Credits 余额</span>
+          <span class="codey-usage-detail-value">${escapeAccountUsageText(balance)}</span>
+        </div>
+      </div>
+    `;
+  };
+
+  const accountUsageFetchedLabel = (fetchedAt) => {
+    const timestamp = Number(fetchedAt);
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return "";
+    const fetched = new Date(timestamp * 1000);
+    if (Number.isNaN(fetched.getTime())) return "";
+    return `更新于 ${fetched.toLocaleTimeString("zh-CN", {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    })}`;
+  };
+
+  const accountUsageDetailsMarkup = (result) => {
+    const rows = [
+      accountUsageDetailWindow(result?.primary),
+      accountUsageDetailWindow(result?.secondary),
+      accountUsageCreditsDetail(result?.credits),
+    ].filter(Boolean);
+    const fetched = accountUsageFetchedLabel(result?.fetchedAt);
+    if (!rows.length && !fetched) return "";
+    return `
+      <div id="codey-account-usage-details" class="codey-usage-details" role="tooltip">
+        <div class="codey-usage-details-heading">
+          <span class="codey-usage-details-title">额度详情</span>
+        </div>
+        <div class="codey-usage-details-list">${rows.join("")}</div>
+        ${fetched ? `<div class="codey-usage-details-updated">${escapeAccountUsageText(fetched)}</div>` : ""}
+      </div>
+    `;
   };
 
   const removeAccountUsage = () => {
     const usage = document.getElementById(accountUsageId);
-    if (accountUsageDragState?.usage === usage) {
-      usage?.removeAttribute?.("data-dragging");
-      window.removeEventListener?.("pointermove", moveAccountUsageDrag, true);
-      window.removeEventListener?.("pointerup", finishAccountUsageDrag, true);
-      window.removeEventListener?.("pointercancel", finishAccountUsageDrag, true);
-      accountUsageDragState = null;
+    if (usage) {
+      usage.__codeyLastUsageHtml = "";
+      usage.__codeyUsageAnchor = null;
     }
-    if (usage) usage.__codeyLastUsageHtml = "";
     usage?.remove?.();
     document.querySelectorAll?.("[data-codey-usage-host]")?.forEach?.((host) => {
       host.removeAttribute?.("data-codey-usage-host");
@@ -648,21 +593,29 @@
 
   const accountUsageMount = () => {
     addStyle();
-    const mountTarget = document.body || document.documentElement;
-    if (!(mountTarget instanceof HTMLElement)) return null;
     let usage = document.getElementById(accountUsageId);
+    if (mountedAccountUsageIsUsable(usage)) return usage;
+    const mount = findAccountUsageMount();
+    if (!mount) {
+      usage?.remove?.();
+      return null;
+    }
     if (!(usage instanceof HTMLElement)) {
       usage = document.createElement("div");
       usage.id = accountUsageId;
       usage.setAttribute("role", "status");
       usage.setAttribute("aria-live", "polite");
       usage.setAttribute("aria-atomic", "true");
+      usage.setAttribute("tabindex", "0");
     }
-    installAccountUsageDrag(usage);
-    if (usage.parentElement !== mountTarget) {
-      mountTarget.appendChild(usage);
+    document.querySelectorAll?.("[data-codey-usage-host]")?.forEach?.((host) => {
+      if (host !== mount.target) host.removeAttribute?.("data-codey-usage-host");
+    });
+    mount.target.setAttribute("data-codey-usage-host", "true");
+    if (usage.parentElement !== mount.target || usage.nextElementSibling !== mount.before) {
+      mount.target.insertBefore(usage, mount.before);
     }
-    applyAccountUsagePosition(usage);
+    usage.__codeyUsageAnchor = mount.before;
     return usage;
   };
 
@@ -693,38 +646,27 @@
     }
     if (result.status !== "ok") return;
 
-    const plan = accountUsagePlan(result.planType);
-    const primary = accountUsageWindowSegment(result.primary);
-    const secondary = accountUsageWindowSegment(result.secondary);
-    const credits = accountCreditsSegment(result.credits);
-    const segments = [primary, secondary, credits].filter(Boolean);
+    const segments = accountUsageSegments(result);
+    accountUsageLastResult = result;
     if (!segments.length) {
-      renderAccountUsage({
-        status: "error",
-        message: "官方账号额度响应中没有可展示的信息",
-      });
+      removeAccountUsage();
       return;
     }
-    accountUsageLastResult = result;
     const usage = accountUsageMount();
     if (!usage) return;
-    const aria = [
-      plan ? `当前套餐 ${plan.label}` : null,
-      ...segments.map((segment) => segment.aria),
-    ].filter(Boolean).join("；");
+    const aria = segments.map((segment) => segment.aria).join("；");
     usage.dataset.state = "ready";
-    if (plan) usage.dataset.plan = plan.key;
-    else delete usage.dataset.plan;
+    usage.dataset.windowCount = String(segments.length);
+    delete usage.dataset.plan;
+    usage.style.setProperty("--codey-usage-window-count", String(segments.length));
     usage.setAttribute("aria-label", aria);
-    usage.title = aria;
+    usage.setAttribute("aria-describedby", "codey-account-usage-details");
+    usage.removeAttribute?.("title");
     const nextHtml = `
-      <div class="codey-usage-heading">
-        <span class="codey-usage-heading-title">官方额度</span>
-        ${accountUsagePlanMarkup(plan)}
-      </div>
       <div class="codey-usage-list">
         ${segments.map((segment) => segment.html).join("")}
       </div>
+      ${accountUsageDetailsMarkup(result)}
     `;
     // 额度未变化时跳过重建，避免每 60 秒的轮询都触发 DOM 重排和 aria-live
     // 重复播报。
@@ -732,7 +674,6 @@
       usage.__codeyLastUsageHtml = nextHtml;
       usage.innerHTML = nextHtml;
     }
-    applyAccountUsagePosition(usage);
   };
 
   const scheduleAccountUsageCheck = (delayMs = accountUsageRefreshIntervalMs) => {
@@ -1041,6 +982,23 @@
       ) {
         continue;
       }
+      const usageTreeChanged = accountUsageLastResult?.status === "ok"
+        && [...(mutation.addedNodes || []), ...(mutation.removedNodes || [])].some((node) => {
+          const element = node instanceof HTMLElement ? node : null;
+          return element?.id === accountUsageId
+            || !!element?.querySelector?.(`#${accountUsageId}`);
+        });
+      if (
+        accountUsageLastResult?.status === "ok"
+        && (
+          usageTreeChanged
+          || target?.getAttribute?.("data-codey-usage-host") === "true"
+          || target?.closest?.("[data-codey-usage-host]")
+        )
+      ) {
+        scheduleScan(target || document);
+        return;
+      }
       if (mutation.type === "attributes") {
         if (target?.matches?.(headerSelector) || target?.matches?.(sidebarSelector)) {
           if (target.matches?.(headerSelector)) headerMountDirty = true;
@@ -1081,6 +1039,7 @@
   bootstrapObserver.observe(document.documentElement, {
     attributes: true,
     attributeFilter: [
+      "data-app-action-sidebar-scroll",
       "data-app-action-sidebar-section",
       "data-app-action-sidebar-thread-id",
       "data-app-action-sidebar-thread-title",
@@ -1111,8 +1070,5 @@
   window.addEventListener?.("pageshow", () => {
     scan();
     scheduleRuntimeHealthCheck(0);
-  });
-  window.addEventListener?.("resize", () => {
-    applyAccountUsagePosition(document.getElementById(accountUsageId));
   });
 })();

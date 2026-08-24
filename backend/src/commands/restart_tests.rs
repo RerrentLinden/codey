@@ -1,6 +1,100 @@
 use super::*;
 
 #[test]
+fn api_key_launch_rejects_new_or_active_official_account_routes() {
+    let mut api_route = crate::config::ProviderProfile::new("Relay");
+    api_route.id = "relay".into();
+    api_route.base_url = "https://relay.example/v1".into();
+    api_route.api_key = "secret".into();
+    api_route.normalize();
+    let previous = CodeyConfig {
+        active_profile_id: api_route.id.clone(),
+        profiles: vec![api_route.clone()],
+        official_account_available_this_launch: false,
+        ..CodeyConfig::default()
+    };
+
+    let mut official = crate::config::ProviderProfile::new("Official");
+    official.id = "official".into();
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.normalize();
+
+    let mut with_new_official = previous.clone();
+    with_new_official.profiles.push(official.clone());
+    assert!(
+        validate_official_account_config_change(&previous, &with_new_official)
+            .unwrap_err()
+            .contains("不能新增")
+    );
+
+    let previous_with_saved_official = CodeyConfig {
+        profiles: vec![api_route, official.clone()],
+        ..previous
+    };
+    let mut activated = previous_with_saved_official.clone();
+    activated.active_profile_id = official.id;
+    assert!(
+        validate_official_account_config_change(&previous_with_saved_official, &activated)
+            .unwrap_err()
+            .contains("不能启用")
+    );
+}
+
+#[test]
+fn official_account_launch_allows_official_routes() {
+    let mut previous = CodeyConfig::default();
+    previous.official_account_available_this_launch = true;
+    let mut official = crate::config::ProviderProfile::new("Official");
+    official.id = "official".into();
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.normalize();
+    let mut next = previous.clone();
+    next.active_profile_id = official.id.clone();
+    next.profiles.push(official);
+
+    assert!(validate_official_account_config_change(&previous, &next).is_ok());
+}
+
+#[test]
+fn full_config_save_restores_route_secrets_and_source_owned_identity() {
+    let mut saved = crate::config::ProviderProfile::new("Imported Relay");
+    saved.id = "route-profile".into();
+    saved.base_url = "https://relay.example/v1".into();
+    saved.api_key = "saved-secret".into();
+    saved.api_key_configured = true;
+    saved.cc_switch_provider_id = Some("source-provider".into());
+    saved.supports_remote_compaction = true;
+    saved
+        .model_request_headers
+        .insert("X-Private-Route".into(), "private-header".into());
+    let previous = CodeyConfig {
+        active_profile_id: saved.id.clone(),
+        profiles: vec![saved.clone()],
+        ..CodeyConfig::default()
+    };
+
+    let mut redacted = saved;
+    redacted.api_key.clear();
+    redacted.api_key_configured = true;
+    redacted.cc_switch_provider_id = Some("spoofed-provider".into());
+    redacted.supports_remote_compaction = false;
+    redacted.model_request_headers.clear();
+
+    let merged = merge_profile_secrets(vec![redacted], &previous).unwrap();
+
+    assert_eq!(merged[0].api_key, "saved-secret");
+    assert_eq!(merged[0].provider_id(), "source-provider");
+    assert!(merged[0].supports_remote_compaction);
+    assert_eq!(
+        merged[0]
+            .model_request_headers
+            .get("X-Private-Route")
+            .map(String::as_str),
+        Some("private-header")
+    );
+}
+
+#[test]
 fn every_available_route_model_can_be_selected_for_subagents() {
     let state = model_catalog::ModelSelectionState {
         third_party_models: vec!["provider-coder".into()],
@@ -68,20 +162,27 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
     assert_eq!(
         catalog["models"],
         json!([
-            "gpt-5.6-sol",
-            "gpt-5.6-luna",
-            "gpt-5.5",
-            "gpt-5.4",
-            "gpt-5.3-codex-spark",
-            "provider-fast-coder"
+            "cc-switch-provider/gpt-5.6-sol",
+            "cc-switch-provider/gpt-5.6-luna",
+            "cc-switch-provider/gpt-5.5",
+            "cc-switch-provider/gpt-5.4",
+            "cc-switch-provider/gpt-5.3-codex-spark",
+            "cc-switch-provider/provider-fast-coder"
         ])
     );
-    assert_eq!(catalog["default_model"], "gpt-5.6-sol");
+    assert_eq!(catalog["default_model"], "cc-switch-provider/gpt-5.6-sol");
     assert_eq!(catalog["model_provider"], "cc-switch-provider");
     assert_eq!(
         catalog["model_metadata"][0],
         json!({
-            "model": "gpt-5.6-sol",
+            "model": "cc-switch-provider/gpt-5.6-sol",
+            "display_name": "默认配置 / gpt-5.6-sol",
+            "route_name": "默认配置",
+            "provider_id": "codey_router",
+            "source_model": "cc-switch-provider/gpt-5.6-sol",
+            "route_provider_id": "cc-switch-provider",
+            "upstream_model": "gpt-5.6-sol",
+            "model_display_name": "gpt-5.6-sol",
             "supported_reasoning_efforts": ["low", "medium", "high", "xhigh"],
             "default_reasoning_effort": "low",
         })
@@ -89,12 +190,57 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
     assert_eq!(
         catalog["model_metadata"][5],
         json!({
-            "model": "provider-fast-coder",
+            "model": "cc-switch-provider/provider-fast-coder",
+            "display_name": "默认配置 / provider-fast-coder",
+            "route_name": "默认配置",
+            "provider_id": "codey_router",
+            "source_model": "cc-switch-provider/provider-fast-coder",
+            "route_provider_id": "cc-switch-provider",
+            "upstream_model": "provider-fast-coder",
+            "model_display_name": "provider-fast-coder",
             "supported_reasoning_efforts": ["low", "medium", "high", "xhigh"],
             "default_reasoning_effort": "low",
         })
     );
     assert_eq!(catalog["model_metadata"].as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn renderer_model_catalog_keeps_official_account_models_unprefixed() {
+    let mut config = CodeyConfig::default();
+    config.official_account_available_this_launch = true;
+    config.profiles[0].cc_switch_provider_id = Some("openai".into());
+    config.profiles[0].auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    config.profiles[0].normalize();
+    let model_state = model_catalog::ModelSelectionState {
+        official_models: vec![model_catalog::OfficialModelAvailability {
+            slug: "gpt-5.6-sol".into(),
+            display_name: "GPT-5.6-Sol".into(),
+            supported: true,
+            supported_reasoning_efforts: vec!["low".into(), "medium".into()],
+            default_reasoning_effort: "low".into(),
+        }],
+        default_model: "gpt-5.6-sol".into(),
+        ..model_catalog::ModelSelectionState::default()
+    };
+
+    let catalog = renderer_model_catalog_value(&config, &model_state);
+
+    assert_eq!(catalog["models"], json!(["gpt-5.6-sol"]));
+    assert_eq!(catalog["default_model"], "gpt-5.6-sol");
+    assert_eq!(catalog["model_provider"], "openai");
+    assert_eq!(
+        catalog["model_metadata"][0],
+        json!({
+            "model": "gpt-5.6-sol",
+            "display_name": "默认配置 / gpt-5.6-sol",
+            "route_name": "默认配置",
+            "provider_id": "openai",
+            "source_model": "gpt-5.6-sol",
+            "supported_reasoning_efforts": ["low", "medium"],
+            "default_reasoning_effort": "low",
+        })
+    );
 }
 
 #[test]
@@ -323,7 +469,7 @@ async fn runtime_status_exposes_cached_available_update() {
 }
 
 #[test]
-fn successful_startup_model_sync_filters_unsupported_models() {
+fn successful_startup_model_sync_keeps_only_enabled_route_models() {
     let mut config = CodeyConfig::default();
     let provider_id = config.current_provider_id().unwrap().to_string();
     config.selected_models_by_provider.insert(
@@ -345,20 +491,12 @@ fn successful_startup_model_sync_filters_unsupported_models() {
     )
     .unwrap();
 
-    assert_eq!(
-        state
-            .official_models
-            .iter()
-            .filter(|model| model.supported)
-            .map(|model| model.slug.as_str())
-            .collect::<Vec<_>>(),
-        ["gpt-5.6-sol"]
-    );
+    assert!(state.official_models.is_empty());
     assert_eq!(state.third_party_models, ["provider-fast-coder"]);
 }
 
 #[test]
-fn failed_startup_model_sync_falls_back_to_exactly_seven_models() {
+fn failed_startup_model_sync_does_not_inject_unconfirmed_official_models() {
     let mut config = CodeyConfig::default();
     let provider_id = config.current_provider_id().unwrap().to_string();
     config
@@ -367,10 +505,9 @@ fn failed_startup_model_sync_falls_back_to_exactly_seven_models() {
     config
         .default_model_by_provider
         .insert(provider_id, "provider-fast-coder".into());
-    let expected = model_catalog::default_official_model_slugs();
     let (fallback_models, synced) = startup_model_sync_models_or_fallback(Vec::new(), None);
     assert!(!synced);
-    assert_eq!(fallback_models, expected);
+    assert!(fallback_models.is_empty());
     let fallback = config_with_current_provider_models(&config, fallback_models);
     let home = tempfile::tempdir().unwrap();
 
@@ -383,17 +520,9 @@ fn failed_startup_model_sync_falls_back_to_exactly_seven_models() {
     )
     .unwrap();
 
-    assert_eq!(
-        state
-            .official_models
-            .iter()
-            .filter(|model| model.supported)
-            .map(|model| model.slug.clone())
-            .collect::<Vec<_>>(),
-        expected
-    );
+    assert!(state.official_models.is_empty());
     assert!(state.third_party_models.is_empty());
-    assert_eq!(state.default_model, "gpt-5.6-sol");
+    assert!(state.default_model.is_empty());
 }
 
 #[test]
@@ -419,7 +548,12 @@ fn successful_model_sync_preserves_user_confirmed_other_models() {
 
     assert_eq!(
         merged,
-        ["gpt-5.6-sol", "provider-listed", "provider-manual",]
+        [
+            "gpt-5.6-sol",
+            "provider-listed",
+            "provider-manual",
+            "gpt-5.4",
+        ]
     );
 }
 
@@ -445,7 +579,10 @@ fn manual_model_selection_deletion_removes_saved_other_model_support() {
         &std::collections::HashSet::new(),
     );
 
-    assert_eq!(supported_models, ["gpt-5.6-sol", "provider-listed"]);
+    assert_eq!(
+        supported_models,
+        ["gpt-5.6-sol", "provider-listed", "gpt-5.4"]
+    );
 }
 
 #[test]

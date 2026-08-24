@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -159,6 +160,10 @@ pub fn refresh_for_provider(
         .filter_map(|model| model.get("slug").and_then(Value::as_str))
         .map(model_id::key)
         .collect::<HashSet<_>>();
+    let selected_model_keys = selected_models
+        .iter()
+        .map(|model| model_id::key(model))
+        .collect::<HashSet<_>>();
     let provider_models_synced = official_provider || upstream_models.is_some();
     let upstream = upstream_models
         .unwrap_or_default()
@@ -168,12 +173,15 @@ pub fn refresh_for_provider(
     let mut catalog_models = official_models
         .iter()
         .filter(|model| {
-            official_provider
-                || !provider_models_synced
-                || model
-                    .get("slug")
-                    .and_then(Value::as_str)
-                    .is_some_and(|slug| upstream.contains(&model_id::key(slug)))
+            let slug = model.get("slug").and_then(Value::as_str);
+            if official_provider {
+                return slug.is_some_and(|slug| {
+                    selected_model_keys.is_empty()
+                        || selected_model_keys.contains(&model_id::key(slug))
+                });
+            }
+            !provider_models_synced
+                || slug.is_some_and(|slug| upstream.contains(&model_id::key(slug)))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -254,16 +262,25 @@ pub fn selection_state_with_manual_models(
     manual_third_party_models: &[String],
     requested_default_model: Option<&str>,
 ) -> Result<ModelSelectionState> {
-    let official_entries = read_official_entries(home)?;
+    // Model provenance comes from the route, not from a slug prefix. An API-key
+    // provider may legitimately expose a model whose id also appears in the
+    // official catalog; it must remain a route-scoped model and go through the
+    // local router instead of acquiring official-account semantics.
+    let official_entries = if official_provider {
+        read_official_entries(home)?
+    } else {
+        Arc::new(Vec::new())
+    };
     let official_model_ids = official_entries
         .iter()
         .filter_map(|model| model.get("slug").and_then(Value::as_str))
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let official_slugs = official_model_ids
+    let selected_official_keys = selected_models
         .iter()
         .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
+    let filter_official_selection = official_provider && !selected_official_keys.is_empty();
     let provider_models_synced = official_provider || upstream_models.is_some();
     let upstream_models = upstream_models.unwrap_or_default();
     let upstream = upstream_models
@@ -277,9 +294,8 @@ pub fn selection_state_with_manual_models(
             let default_reasoning_effort =
                 default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
             let model = official_model_from_value(model)?;
-            let supported = official_provider
-                || !provider_models_synced
-                || upstream.contains(&model_id::key(&model.slug));
+            let supported = !filter_official_selection
+                || selected_official_keys.contains(&model_id::key(&model.slug));
             Some(OfficialModelAvailability {
                 slug: model.slug,
                 display_name: model.display_name,
@@ -299,7 +315,6 @@ pub fn selection_state_with_manual_models(
                 let model = model.trim();
                 let key = model_id::key(model);
                 if key.is_empty()
-                    || official_slugs.contains(&key)
                     || (provider_models_synced && !upstream.contains(&key))
                     || !seen.insert(key)
                 {
@@ -1940,29 +1955,19 @@ mod tests {
     }
 
     #[test]
-    fn unsynced_third_party_provider_shows_the_fixed_official_models() {
+    fn unsynced_third_party_provider_does_not_invent_official_models() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
 
         let state = selection_state(home.path(), false, None, &[], None).unwrap();
 
-        assert_eq!(
-            state
-                .official_models
-                .iter()
-                .map(|model| model.slug.as_str())
-                .collect::<Vec<_>>(),
-            OFFICIAL_MODELS
-                .iter()
-                .map(|(slug, _)| *slug)
-                .collect::<Vec<_>>()
-        );
-        assert!(state.official_models.iter().all(|model| model.supported));
-        assert_eq!(state.default_model, "gpt-5.6-sol");
+        assert!(state.official_models.is_empty());
+        assert!(state.third_party_models.is_empty());
+        assert!(state.default_model.is_empty());
     }
 
     #[test]
-    fn synced_third_party_provider_marks_unsupported_official_models() {
+    fn synced_third_party_provider_keeps_official_looking_ids_route_scoped() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
         let upstream = vec!["gpt-5.6-sol".into(), "third-model".into()];
@@ -1976,29 +1981,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            state
-                .official_models
-                .iter()
-                .map(|model| model.slug.as_str())
-                .collect::<Vec<_>>(),
-            OFFICIAL_MODELS
-                .iter()
-                .map(|(slug, _)| *slug)
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            state
-                .official_models
-                .iter()
-                .map(|model| (model.slug.as_str(), model.supported))
-                .collect::<Vec<_>>(),
-            OFFICIAL_MODELS
-                .iter()
-                .map(|(slug, _)| (*slug, *slug == "gpt-5.6-sol"))
-                .collect::<Vec<_>>()
-        );
-        assert_eq!(state.third_party_models, ["third-model"]);
+        assert!(state.official_models.is_empty());
+        assert_eq!(state.third_party_models, ["gpt-5.6-sol", "third-model"]);
         assert_eq!(state.manual_third_party_models, ["third-model"]);
         assert_eq!(state.default_model, "gpt-5.6-sol");
     }
@@ -2018,50 +2002,41 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.official_models.len(), OFFICIAL_MODELS.len());
-        assert!(!state.official_models.iter().any(|model| model.supported));
+        assert!(state.official_models.is_empty());
         assert!(state.third_party_models.is_empty());
         assert!(state.upstream_models.is_empty());
         assert!(state.default_model.is_empty());
     }
 
     #[test]
-    fn selection_state_does_not_add_hidden_upstream_models_to_the_fixed_list() {
+    fn selection_state_does_not_enable_unselected_upstream_models() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
         let upstream = vec!["gpt-5.4".into(), "codex-auto-review".into()];
         let state = selection_state(home.path(), false, Some(&upstream), &[], None).unwrap();
 
-        assert_eq!(state.official_models.len(), OFFICIAL_MODELS.len());
-        assert!(
-            state
-                .official_models
-                .iter()
-                .any(|model| model.slug == "gpt-5.4" && model.supported)
-        );
-        assert!(
-            !state
-                .official_models
-                .iter()
-                .any(|model| model.slug == "codex-auto-review")
-        );
-        assert_eq!(state.default_model, "gpt-5.4");
+        assert!(state.official_models.is_empty());
+        assert!(state.third_party_models.is_empty());
+        assert!(state.default_model.is_empty());
     }
 
     #[test]
-    fn synced_provider_keeps_spark_when_the_channel_supports_it() {
+    fn synced_provider_keeps_selected_spark_as_a_route_model() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
         let upstream = vec!["gpt-5.3-codex-spark".into()];
 
-        let state = selection_state(home.path(), false, Some(&upstream), &[], None).unwrap();
+        let state = selection_state(
+            home.path(),
+            false,
+            Some(&upstream),
+            &["gpt-5.3-codex-spark".into()],
+            None,
+        )
+        .unwrap();
 
-        assert!(
-            state
-                .official_models
-                .iter()
-                .any(|model| model.slug == "gpt-5.3-codex-spark" && model.supported)
-        );
+        assert!(state.official_models.is_empty());
+        assert_eq!(state.third_party_models, ["gpt-5.3-codex-spark"]);
         assert_eq!(state.default_model, "gpt-5.3-codex-spark");
     }
 
@@ -2078,7 +2053,11 @@ mod tests {
             home.path(),
             false,
             Some(&upstream),
-            &["third-model".into(), "THIRD-MODEL".into()],
+            &[
+                "third-model".into(),
+                "THIRD-MODEL".into(),
+                "gpt-5.6-luna".into(),
+            ],
             Some("THIRD-MODEL"),
         )
         .unwrap();
@@ -2090,20 +2069,37 @@ mod tests {
         );
         assert_eq!(state.available_model("third-model"), Some("third-model"));
         assert_eq!(state.available_model("gpt-5.4"), None);
-        let sol = state
-            .official_models
-            .iter()
-            .find(|model| model.slug == "gpt-5.6-sol")
-            .unwrap();
-        assert_eq!(sol.default_reasoning_effort, "low");
-        assert_eq!(
-            sol.supported_reasoning_efforts,
-            ["low", "medium", "high", "xhigh", "max", "ultra"]
+        assert!(state.official_models.is_empty());
+    }
+
+    #[test]
+    fn official_selection_marks_only_enabled_models_as_supported() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec!["gpt-5.6-sol".into()];
+
+        let state =
+            selection_state(home.path(), true, None, &selected, Some("gpt-5.6-luna")).unwrap();
+
+        assert_eq!(state.default_model, "gpt-5.6-sol");
+        assert!(
+            state
+                .official_models
+                .iter()
+                .find(|model| model.slug == "gpt-5.6-sol")
+                .is_some_and(|model| model.supported)
+        );
+        assert!(
+            state
+                .official_models
+                .iter()
+                .filter(|model| model.slug != "gpt-5.6-sol")
+                .all(|model| !model.supported)
         );
     }
 
     #[test]
-    fn selection_state_falls_back_from_unavailable_default_to_first_official() {
+    fn selection_state_falls_back_from_unavailable_default_to_first_route_model() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
         let upstream = vec!["gpt-5.6-sol".into(), "third-model".into()];
@@ -2116,7 +2112,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.default_model, "gpt-5.6-sol");
+        assert_eq!(state.default_model, "third-model");
     }
 
     #[test]
@@ -2134,14 +2130,7 @@ mod tests {
             "third-model".into(),
         ];
 
-        let state = selection_state(
-            home.path(),
-            false,
-            Some(&upstream),
-            &["third-model".into()],
-            None,
-        )
-        .unwrap();
+        let state = selection_state(home.path(), false, Some(&upstream), &upstream, None).unwrap();
 
         for model in &upstream {
             assert!(state.available_model(model).is_some(), "{model}");
@@ -2169,7 +2158,7 @@ mod tests {
             home.path(),
             false,
             Some(&upstream),
-            &["third-model".into()],
+            &["gpt-5.6-luna".into(), "third-model".into()],
             None,
         )
         .unwrap();

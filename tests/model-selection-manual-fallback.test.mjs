@@ -12,13 +12,15 @@ test("third-party model sync can fall back to manual model support configuration
     readFile(new URL("backend/src/commands/models.rs", root), "utf8"),
   ]);
 
-  assert.match(dialogSource, /默认展示 7 个官方模型/);
+  assert.match(dialogSource, /modelState\.officialModels\.length > 0/);
+  assert.match(dialogSource, /本次官方账号登录可用的模型/);
   assert.match(dialogSource, /modelState\.officialModels\.map/);
-  assert.match(dialogSource, /placeholder="输入其他模型 ID/);
+  assert.match(dialogSource, /placeholder="输入当前线路模型 ID/);
   assert.match(dialogSource, /manualThirdPartyModelKeys\.has/);
   assert.match(dialogSource, /aria-label=\{`删除其他模型 \$\{model\}`\}/);
   assert.match(dialogSource, /onDeleteThirdPartyModel\(model\)/);
   assert.match(hookSource, /可能不支持 \/v1\/models 或 \/models 接口/);
+  assert.match(hookSource, /请手动输入当前线路支持的模型 ID/);
   assert.match(hookSource, /modelState\.officialModelIds\.find/);
   assert.match(hookSource, /已在上方官方模型列表中，请直接勾选，不可重复输入/);
   assert.match(hookSource, /deleteDraftThirdPartyModel/);

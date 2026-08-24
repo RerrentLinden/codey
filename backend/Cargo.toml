@@ -28,7 +28,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 codey-runtime-core = { path = "../vendor/CodeyRuntime/crates/codey-runtime-core" }
 codey-runtime-data = { path = "../vendor/CodeyRuntime/crates/codey-runtime-data" }
 directories = "6"
-fastctx = { git = "https://github.com/yc-duan/fastctx", rev = "e9b80dd8d6ed8ce080ce8e3db3828cf9d90fea6f", default-features = false }
+fastctx = { git = "https://github.com/yc-duan/fastctx", rev = "22b40ea324a186a921dfe38c205e3ffacdf6546d", default-features = false }
 fs2 = "0.4"
 futures-util.workspace = true
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"], default-features = false }

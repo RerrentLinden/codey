@@ -2,12 +2,14 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+import { FakeElementCore } from "./helpers/fake-element.mjs";
+
 const MODEL_CONFIG_ID = "107580212";
 
 async function loadPatch(
   catalogResponse,
   clients,
-  { bridgeReady = true, queryClient = null } = {},
+  { bridgeReady = true, queryClient = null, documentBody = null } = {},
 ) {
   const [bridgeSource, source] = await Promise.all([
     readFile(new URL("../public/codey-bridge.js", import.meta.url), "utf8"),
@@ -18,7 +20,7 @@ async function loadPatch(
   const windowListeners = new Map();
   const documentListeners = new Map();
   let wildcardScanCount = 0;
-  const body = {};
+  const body = documentBody || {};
   if (queryClient) {
     body.__reactFiber$codeyTest = {
       memoizedProps: {
@@ -26,15 +28,24 @@ async function loadPatch(
       },
     };
   }
+  const head = documentBody ? new FakeElementCore("head") : null;
+  const documentElement = documentBody ? new FakeElementCore("html") : {};
+  const allDocumentRoots = () => [head, body, documentElement].filter(Boolean);
   const document = {
     body,
-    documentElement: {},
+    documentElement,
+    head,
+    createElement(tagName) {
+      return documentBody ? new FakeElementCore(tagName) : null;
+    },
     getElementById() {
-      return null;
+      return allDocumentRoots()
+        .map((root) => root.querySelector?.("[id]"))
+        .find(Boolean) || null;
     },
     querySelectorAll(selector) {
       if (selector === "*") wildcardScanCount += 1;
-      return [];
+      return documentBody ? body.querySelectorAll(selector) : [];
     },
     addEventListener(name, listener) {
       const listeners = documentListeners.get(name) || new Set();
@@ -307,7 +318,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "10");
+  assert.equal(patch.version, "14");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -394,6 +405,443 @@ test("stale thread and turn models are repaired before app-server dispatch", asy
     runtime.dispatchWindowEvent("codex-message-from-view", event);
     assert.equal(event.detail.request.params.model, "gpt-5.6-sol");
   }
+  runtime.patch.dispose();
+});
+
+test("route aliases display clearly and dispatch to the selected provider", async () => {
+  const queryClient = activeModelQueryClient(["stale-model"]);
+  const routeCatalog = {
+    status: "ok",
+    models: ["route-a/shared-model", "route-b/shared-model"],
+    default_model: "route-a/shared-model",
+    model_metadata: [
+      {
+        model: "route-a/shared-model",
+        display_name: "主线路 / shared-model",
+        route_name: "主线路",
+        provider_id: "route-a",
+        source_model: "shared-model",
+      },
+      {
+        model: "route-b/shared-model",
+        display_name: "备用线路 / shared-model",
+        route_name: "备用线路",
+        provider_id: "route-b",
+        source_model: "shared-model",
+      },
+    ],
+  };
+  const runtime = await loadPatch(routeCatalog, [statsigClient()], { queryClient });
+
+  assert.equal(
+    queryClient.model("route-a/shared-model").displayName,
+    "主线路 / shared-model",
+  );
+  assert.equal(queryClient.model("route-a/shared-model").routeName, "主线路");
+  assert.equal(queryClient.model("route-a/shared-model").codeyModelName, "shared-model");
+  assert.equal(
+    queryClient.model("route-b/shared-model").displayName,
+    "备用线路 / shared-model",
+  );
+
+  const direct = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "route-direct",
+        method: "turn/start",
+        params: { model: "route-b/shared-model" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", direct);
+  assert.deepEqual(direct.detail.request.params, {
+    model: "shared-model",
+    model_provider: "route-b",
+  });
+
+  const wrapped = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "route-wrapped",
+        method: "send-cli-request-for-host",
+        params: {
+          method: "thread/start",
+          params: { model: "route-a/shared-model" },
+        },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", wrapped);
+  assert.deepEqual(wrapped.detail.request.params.params, {
+    model: "shared-model",
+    model_provider: "route-a",
+  });
+
+  const resumed = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "route-resumed",
+        method: "thread/resume",
+        params: { model: "shared-model", model_provider: "route-b" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", resumed);
+  assert.deepEqual(resumed.detail.request.params, {
+    model: "shared-model",
+    model_provider: "route-b",
+  });
+
+  await runtime.patch.setCatalog({
+    ...routeCatalog,
+    model_metadata: routeCatalog.model_metadata.map((metadata) =>
+      metadata.provider_id === "route-b"
+        ? { ...metadata, display_name: "灾备线路 / shared-model" }
+        : metadata,
+    ),
+  });
+  assert.equal(
+    queryClient.model("route-b/shared-model").displayName,
+    "灾备线路 / shared-model",
+  );
+
+  await runtime.patch.setCatalog({
+    status: "ok",
+    models: ["route-a/shared-model"],
+    default_model: "route-a/shared-model",
+    model_metadata: [routeCatalog.model_metadata[0]],
+  });
+  const deletedRouteRequest = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "deleted-route",
+        method: "turn/start",
+        params: {
+          model: "route-b/shared-model",
+          model_provider: "route-b",
+        },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", deletedRouteRequest);
+  assert.deepEqual(deletedRouteRequest.detail.request.params, {
+    model: "shared-model",
+    model_provider: "route-a",
+  });
+  runtime.patch.dispose();
+});
+
+test("local-router aliases stay scoped when selected from an official route", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "relay/shared-model"],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        display_name: "官方线路 / gpt-5.6-sol",
+        route_name: "官方线路",
+        provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+      },
+      {
+        model: "relay/shared-model",
+        display_name: "中转线路 / shared-model",
+        route_name: "中转线路",
+        provider_id: "codey_router",
+        source_model: "relay/shared-model",
+        route_provider_id: "relay",
+        upstream_model: "shared-model",
+      },
+    ],
+  }, [statsigClient()]);
+
+  const selected = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "select-local-router-model",
+        method: "turn/start",
+        params: { model: "relay/shared-model", model_provider: "openai" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", selected);
+  assert.deepEqual(selected.detail.request.params, {
+    model: "relay/shared-model",
+    model_provider: "codey_router",
+  });
+
+  const staleDirectProvider = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "repair-old-direct-provider",
+        method: "thread/resume",
+        params: { model: "relay/shared-model", model_provider: "relay" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", staleDirectProvider);
+  assert.deepEqual(staleDirectProvider.detail.request.params, {
+    model: "relay/shared-model",
+    model_provider: "codey_router",
+  });
+  runtime.patch.dispose();
+});
+
+test("model picker menu groups models under route headings without changing model ids", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const menu = body.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
+  const officialItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  officialItem.textContent = "官方线路 / gpt-5.6-sol";
+  const relayItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  relayItem.textContent = "中转线路 / gpt-5.6-sol";
+
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "relay/gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        display_name: "官方线路 / gpt-5.6-sol",
+        route_name: "官方线路",
+        provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+      },
+      {
+        model: "relay/gpt-5.6-sol",
+        display_name: "中转线路 / gpt-5.6-sol",
+        route_name: "中转线路",
+        provider_id: "relay",
+        source_model: "gpt-5.6-sol",
+      },
+    ],
+  }, [statsigClient()], { documentBody: body });
+
+  runtime.patch.enhanceModelMenus();
+
+  assert.equal(menu.children[0].textContent, "官方线路");
+  assert.equal(menu.children[1], officialItem);
+  assert.equal(officialItem.textContent, "gpt-5.6-sol");
+  assert.equal(officialItem.dataset.codeyRouteModel, "gpt-5.6-sol");
+  assert.equal(officialItem.getAttribute("aria-label"), "官方线路 / gpt-5.6-sol");
+  assert.equal(menu.children[2].textContent, "中转线路");
+  assert.equal(menu.children[3], relayItem);
+  assert.equal(relayItem.textContent, "gpt-5.6-sol");
+  assert.equal(relayItem.dataset.codeyRouteModel, "relay/gpt-5.6-sol");
+  assert.equal(relayItem.getAttribute("aria-label"), "中转线路 / gpt-5.6-sol");
+
+  const originalHeadings = [menu.children[0], menu.children[2]];
+  runtime.patch.enhanceModelMenus();
+  assert.equal(menu.children.length, 4);
+  assert.equal(menu.children[0], originalHeadings[0]);
+  assert.equal(menu.children[2], originalHeadings[1]);
+
+  const request = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "grouped-menu-selected-relay",
+        method: "turn/start",
+        params: { model: "relay/gpt-5.6-sol" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", request);
+  assert.deepEqual(request.detail.request.params, {
+    model: "gpt-5.6-sol",
+    model_provider: "relay",
+  });
+  runtime.patch.dispose();
+});
+
+test("official account route models keep raw ids and dispatch to the OpenAI provider", async () => {
+  const queryClient = activeModelQueryClient(["stale-model"]);
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [{
+      model: "gpt-5.6-sol",
+      display_name: "OpenAI 官方直登 / gpt-5.6-sol",
+      route_name: "OpenAI 官方直登",
+      provider_id: "openai",
+      source_model: "gpt-5.6-sol",
+    }],
+  }, [statsigClient()], { queryClient });
+
+  assert.equal(
+    queryClient.model("gpt-5.6-sol").displayName,
+    "OpenAI 官方直登 / gpt-5.6-sol",
+  );
+  assert.equal(queryClient.model("gpt-5.6-sol").routeName, "OpenAI 官方直登");
+
+  const request = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "official-raw-model",
+        method: "turn/start",
+        params: { model: "gpt-5.6-sol" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", request);
+
+  assert.deepEqual(request.detail.request.params, {
+    model: "gpt-5.6-sol",
+    model_provider: "openai",
+  });
+  runtime.patch.dispose();
+});
+
+test("official OpenAI route aliases dispatch raw model ids through the OpenAI provider from a relay default", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "relay/gpt-5.6-sol"],
+    default_model: "relay/gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        display_name: "官方线路 / gpt-5.6-sol",
+        provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+      },
+      {
+        model: "relay/gpt-5.6-sol",
+        display_name: "中转线路 / gpt-5.6-sol",
+        provider_id: "relay",
+        source_model: "gpt-5.6-sol",
+      },
+    ],
+  }, [statsigClient()]);
+
+  const official = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "official-route",
+        method: "turn/start",
+        params: {
+          model: "openai/gpt-5.6-sol",
+          model_provider: "openai",
+        },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", official);
+  assert.deepEqual(official.detail.request.params, {
+    model: "gpt-5.6-sol",
+    model_provider: "openai",
+  });
+
+  const currentOfficial = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "official-current",
+        method: "turn/start",
+        params: {
+          model: "gpt-5.6-sol",
+          model_provider: "openai",
+        },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", currentOfficial);
+  assert.deepEqual(currentOfficial.detail.request.params, {
+    model: "gpt-5.6-sol",
+    model_provider: "openai",
+  });
+
+  const relay = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "relay-route",
+        method: "turn/start",
+        params: { model: "relay/gpt-5.6-sol" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", relay);
+  assert.deepEqual(relay.detail.request.params, {
+    model: "gpt-5.6-sol",
+    model_provider: "relay",
+  });
+  runtime.patch.dispose();
+});
+
+test("official route selection does not inherit an active third party provider", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    model: "relay/gpt-5.6-sol",
+    default_model: "relay/gpt-5.6-sol",
+    model_provider: "relay",
+    models: ["gpt-5.6-terra", "relay/gpt-5.6-sol"],
+    model_metadata: [
+      {
+        model: "gpt-5.6-terra",
+        display_name: "OpenAI 官方直登 / gpt-5.6-terra",
+        route_name: "OpenAI 官方直登",
+        provider_id: "openai",
+        source_model: "gpt-5.6-terra",
+      },
+      {
+        model: "relay/gpt-5.6-sol",
+        display_name: "第三方线路 / gpt-5.6-sol",
+        route_name: "第三方线路",
+        provider_id: "relay",
+        source_model: "gpt-5.6-sol",
+      },
+    ],
+  }, [statsigClient()]);
+
+  const request = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "official-from-third-party-runtime",
+        method: "turn/start",
+        params: { model: "gpt-5.6-terra" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", request);
+
+  assert.deepEqual(request.detail.request.params, {
+    model: "gpt-5.6-terra",
+    model_provider: "openai",
+  });
+
+  const staleProviderRequest = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "official-from-stale-third-party-provider",
+        method: "turn/start",
+        params: { model: "gpt-5.6-terra", model_provider: "relay" },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", staleProviderRequest);
+
+  assert.deepEqual(staleProviderRequest.detail.request.params, {
+    model: "gpt-5.6-terra",
+    model_provider: "openai",
+  });
   runtime.patch.dispose();
 });
 

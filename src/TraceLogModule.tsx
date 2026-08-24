@@ -11,9 +11,10 @@ import {
   IconTrash as Trash2,
 } from "@tabler/icons-react";
 
-import { Badge, Button, Card } from "./components/semi";
+import { Badge, Button, Card } from "./components/mantine";
 import { formatBytes } from "./formatters";
 import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
+import { surfaceCardPaddingClass } from "./uiClasses";
 
 type TraceLogModuleProps = {
   stats?: TraceLogStats;
@@ -137,18 +138,17 @@ function TraceLogModuleComponent({
             disabled={disabled}
             onClick={onRefresh}
           >
-            <RefreshCw className={loading ? "spinner" : ""} aria-hidden="true" />
+            <RefreshCw className={loading ? "animate-spin" : ""} aria-hidden="true" />
             刷新统计
           </Button>
           <Button
-            className="trace-clear-button"
-            variant="destructive"
+            variant="destructive-light"
             size="sm"
             disabled={disabled}
             onClick={onClear}
           >
             {clearBusy
-              ? <LoaderCircle className="spinner" aria-hidden="true" />
+              ? <LoaderCircle className="animate-spin" aria-hidden="true" />
               : <Trash2 aria-hidden="true" />}
             清理诊断存储
           </Button>
@@ -156,7 +156,7 @@ function TraceLogModuleComponent({
       </div>
 
       <Card
-        className={`trace-card${hasSnapshot ? "" : " trace-card-empty"}`}
+        className={`trace-card ${surfaceCardPaddingClass}${hasSnapshot ? "" : " trace-card-empty"}`}
         aria-busy={loading}
       >
         {!hasSnapshot ? (
@@ -165,7 +165,7 @@ function TraceLogModuleComponent({
               <div className="trace-empty-badge">
                 <span className="trace-empty-icon">
                   {loading
-                    ? <LoaderCircle className="spinner" size={28} aria-hidden="true" />
+                    ? <LoaderCircle className="animate-spin" size={28} aria-hidden="true" />
                     : <RefreshCw size={26} aria-hidden="true" />}
                 </span>
               </div>
@@ -191,11 +191,10 @@ function TraceLogModuleComponent({
                   size="default"
                   disabled={disabled}
                   onClick={onRefresh}
-                  className="trace-start-btn"
                 >
                   {loading ? (
                     <>
-                      <LoaderCircle className="spinner" aria-hidden="true" />
+                      <LoaderCircle className="animate-spin" aria-hidden="true" />
                       扫描分析中…
                     </>
                   ) : (

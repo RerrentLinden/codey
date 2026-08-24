@@ -7,7 +7,8 @@ import {
 } from "@tabler/icons-react";
 
 import type { Config } from "../App.types";
-import { Badge, Button, Card } from "../components/semi";
+import { Badge, Button, Card } from "../components/mantine";
+import { surfaceCardPaddingClass } from "../uiClasses";
 import { getNotificationChannelDefinition } from "./channelRegistry";
 import { NotificationChannelDialog } from "./NotificationChannelDialog";
 import {
@@ -98,7 +99,7 @@ function NotificationChannelsCardComponent({
           </div>
         </div>
         {config.webhook.channels.length === 0 ? (
-          <Card className="secondary-card notification-empty">
+          <Card className={`secondary-card notification-empty ${surfaceCardPaddingClass}`}>
             <IconBell size={20} aria-hidden="true" />
             <strong>还没有通知渠道</strong>
             <small>点击“添加渠道”选择推送方式并完成配置。</small>
@@ -114,7 +115,7 @@ function NotificationChannelsCardComponent({
               return (
                 <li key={channel.id}>
                   <Card
-                    className={`secondary-card notification-card ${channel.enabled ? "active" : "inactive"}`}
+                    className={`secondary-card notification-card ${surfaceCardPaddingClass} ${channel.enabled ? "active" : "inactive"}`}
                   >
                     <div className="notification-card-header">
                       <div className="notification-title">
@@ -130,7 +131,7 @@ function NotificationChannelsCardComponent({
                         <Badge variant={status.variant}>{status.label}</Badge>
                         <Button
                           className="notification-edit-button"
-                          variant="ghost"
+                          variant="outline"
                           size="xs"
                           disabled={isBusy}
                           onClick={() => openEditDialog(channel.id)}

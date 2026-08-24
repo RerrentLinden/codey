@@ -23,6 +23,7 @@ import {
 import type { NotificationChannel } from "./notifications";
 import { errorText, withTimeout } from "./appUtils";
 import { formatBytes } from "./formatters";
+import { modelIdsEqual } from "./modelIds";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { useModelSelection } from "./useModelSelection";
 import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
@@ -46,9 +47,10 @@ import type {
   FastContextToolsStatus,
   ModelState,
   PluginMarketplaceStatus,
+  Profile,
   TraceLogCleanup,
 } from "./App.types";
-import { Badge, Button, Button as SaveButton, Tooltip } from "./components/semi";
+import { Badge, Button, Tooltip } from "./components/mantine";
 
 const Check = IconCheck;
 const X = IconX;
@@ -194,16 +196,13 @@ export function App({
     modelSyncWarning,
     draftModelSet,
     draftManualThirdPartyModelKeys,
-    manualThirdPartyModelKeys,
     thirdPartyModelOptions,
-    fetchCurrentModels,
+    openModelPicker,
     toggleDraftModel,
     deleteDraftThirdPartyModel,
     updateCustomModelInput,
     addCustomModel,
     saveModelSelection,
-    deleteThirdPartyModel,
-    setDefaultModel,
   } = useModelSelection({
     provider,
     runOperation,
@@ -240,11 +239,18 @@ export function App({
         config: Config;
         modelState?: ModelState;
         startupError?: string;
+        officialAccountAvailable?: boolean;
         ccSwitch?: CcSwitchStatus;
         fastContextToolsStatus?: FastContextToolsStatus;
       }>("load_codey_config");
       setPersistedConfig(result.config);
       setCcSwitchStatus(result.ccSwitch ?? null);
+      if (typeof result.officialAccountAvailable === "boolean") {
+        setStatus((current) => ({
+          ...current,
+          officialAccountAvailable: result.officialAccountAvailable,
+        }));
+      }
       setFastContextToolsStatus(
         result.fastContextToolsStatus ?? UNKNOWN_FAST_CONTEXT_TOOLS_STATUS,
       );
@@ -300,6 +306,8 @@ export function App({
       ccSwitch?: CcSwitchStatus;
       modelState?: ModelState;
       restartRequired?: boolean;
+      modelHotReloaded?: boolean;
+      modelHotReloadError?: string;
       subagentConfigHotReloaded?: boolean;
       subagentConfigRepaired?: boolean;
       subagentConfigHealth?: string;
@@ -416,8 +424,249 @@ export function App({
       setNotice({
         tone: result.restartRequired ? "info" : "success",
         text: result.restartRequired
-          ? `已读取「${result.ccSwitch.provider.name}」，重启 Codex 后应用线路`
-          : `已同步「${result.ccSwitch.provider.name}」`,
+          ? "已重新读取 Codex 配置，重启后应用当前线路"
+          : "已重新读取 Codex 配置",
+      });
+    });
+  }
+
+  function applyRouteResult(result: {
+    config: Config;
+    ccSwitch?: CcSwitchStatus;
+    modelState?: ModelState;
+    restartRequired?: boolean;
+  }) {
+    setPersistedConfig(result.config);
+    if (result.ccSwitch) setCcSwitchStatus(result.ccSwitch);
+    if (result.modelState) setModelState(result.modelState);
+    if (typeof result.restartRequired === "boolean") {
+      setStatus((current) => ({
+        ...current,
+        restartRequired: result.restartRequired,
+      }));
+    }
+    setDirty(false);
+    window.dispatchEvent(
+      new CustomEvent("codey:config-changed", {
+        detail: { config: result.config },
+      }),
+    );
+  }
+
+  async function saveRoute(route: Profile) {
+    if (!config) return false;
+    let saved = false;
+    await runOperation("save-route", async () => {
+      const routeExists = config.profiles.some(
+        (profile) => profile.id === route.id,
+      );
+      const nextConfig = {
+        ...config,
+        profiles: routeExists
+          ? config.profiles.map((profile) =>
+              profile.id === route.id ? route : profile
+            )
+          : [...config.profiles, route],
+      };
+      const result = await persist(nextConfig);
+      saved = true;
+      setNotice({
+        tone: result.restartRequired ? "info" : "success",
+        text: result.restartRequired
+          ? `线路「${route.name}」已保存，重启 Codex 后注册新的接入配置`
+          : `线路「${route.name}」已保存，模型选择器已刷新`,
+      });
+    });
+    return saved;
+  }
+
+  async function deleteRoute(routeId: string) {
+    if (!config || dirty) return;
+    await runOperation("delete-route", async () => {
+      const result = await invoke<{
+        config: Config;
+        ccSwitch: CcSwitchStatus;
+        modelState: ModelState;
+        restartRequired?: boolean;
+        modelHotReloaded?: boolean;
+      }>("delete_route", {
+        routeId,
+        expectedRevision: config.settingsRevision,
+      });
+      applyRouteResult(result);
+      setNotice({
+        tone: result.modelHotReloaded === false ? "info" : "success",
+        text: "线路已删除，相关模型已从选择器移除",
+      });
+    });
+  }
+
+  function requestDeleteRoute(routeId: string) {
+    if (!config) return;
+    const persisted = persistedConfigRef.current;
+    const persistedRoute = persisted?.profiles.some(
+      (profile) => profile.id === routeId,
+    );
+    if (!persistedRoute) {
+      const profiles = config.profiles.filter((profile) => profile.id !== routeId);
+      if (profiles.length === 0) return;
+      const next = {
+        ...config,
+        activeProfileId:
+          config.activeProfileId === routeId
+            ? profiles[0].id
+            : config.activeProfileId,
+        profiles,
+      };
+      setConfig(next);
+      setDirty(
+        !persisted ||
+          JSON.stringify({ ...next, settingsRevision: 0 }) !==
+            JSON.stringify({ ...persisted, settingsRevision: 0 }),
+      );
+      return;
+    }
+    if (dirty) {
+      setNotice({ tone: "info", text: "请先保存或放弃当前更改，再删除已保存线路" });
+      return;
+    }
+    const route = config.profiles.find((profile) => profile.id === routeId);
+    setConfirmation({
+      action: "delete-route",
+      title: `删除线路「${route?.name || "未命名线路"}」？`,
+      description: "该线路及其模型选择会立即从对话模型选择器移除。此操作无法撤销。",
+      confirmLabel: "删除线路",
+      run: () => void deleteRoute(routeId),
+    });
+  }
+
+  async function fetchRouteModels(route: Profile) {
+    if (!config) return;
+    await runOperation("fetch-route-models", async () => {
+      let savedConfig = config;
+      let savedModelState = modelState;
+      if (route.id !== config.activeProfileId) {
+        const activated = await invoke<{
+          config: Config;
+          ccSwitch: CcSwitchStatus;
+          modelState: ModelState;
+          restartRequired?: boolean;
+        }>("activate_route", {
+          routeId: route.id,
+          expectedRevision: config.settingsRevision,
+        });
+        savedConfig = activated.config;
+        savedModelState = activated.modelState;
+        applyRouteResult(activated);
+      }
+      const savedRoute =
+        savedConfig.profiles.find((profile) => profile.id === route.id) ??
+        savedConfig.profiles.find(
+          (profile) => profile.id === savedConfig.activeProfileId,
+        );
+      if (!savedRoute) throw new Error("找不到要同步模型的线路");
+      try {
+        const result = await invoke<{
+          config: Config;
+          ccSwitch: CcSwitchStatus;
+          modelState: ModelState;
+          models: string[];
+          restartRequired?: boolean;
+          modelHotReloaded?: boolean;
+        }>("fetch_route_models", {
+          routeId: savedRoute.id,
+          expectedRevision: savedConfig.settingsRevision,
+        });
+        applyRouteResult(result);
+        openModelPicker(result.modelState);
+        setNotice({
+          tone: "success",
+          text: `已同步「${savedRoute.name}」的 ${result.models.length} 个模型，请勾选要启用的模型`,
+        });
+      } catch (error) {
+        const warning = `自动同步失败：${errorText(error)}。仍可手动录入当前线路支持的模型 ID。`;
+        openModelPicker(savedModelState, warning);
+        setNotice({
+          tone: "error",
+          text: "模型同步失败，已打开手动配置",
+        });
+      }
+    });
+  }
+
+  async function saveOfficialRouteSettings(
+    routeId: string,
+    models: string[],
+    showAccountUsageInHeader: boolean,
+  ) {
+    if (!config) return false;
+    const profile = config.profiles.find((candidate) => candidate.id === routeId);
+    if (!profile || profile.authMode !== "officialAccount") return false;
+    if (models.length === 0) {
+      setNotice({ tone: "info", text: "官方账号线路至少需要保留一个模型" });
+      return false;
+    }
+    const providerId = profile.ccSwitchProviderId || profile.id;
+    const currentDefault = config.defaultModelByProvider[providerId] || "";
+    const defaultModel = models.find((model) =>
+      modelIdsEqual(model, currentDefault),
+    ) || models[0];
+    let saved = false;
+    await runOperation("save-official-route-settings", async () => {
+      const result = await persist({
+        ...config,
+        showAccountUsageInHeader,
+        selectedModelsByProvider: {
+          ...config.selectedModelsByProvider,
+          [providerId]: models,
+        },
+        defaultModelByProvider: {
+          ...config.defaultModelByProvider,
+          [providerId]: defaultModel,
+        },
+      });
+      saved = true;
+      setNotice({
+        tone: result.restartRequired ? "info" : "success",
+        text: result.restartRequired
+          ? "官方账号设置已保存，重启 Codex 后完全生效"
+          : "官方账号设置已保存，模型与额度展示已更新",
+      });
+    });
+    return saved;
+  }
+
+  async function setRouteDefaultModel(routeId: string, model: string) {
+    if (!config) return;
+    const profile = config.profiles.find((candidate) => candidate.id === routeId);
+    if (!profile) return;
+    const providerId = profile.ccSwitchProviderId || profile.id;
+    const configuredOfficialModels = config.selectedModelsByProvider[providerId] || [];
+    const enabledModels = profile.authMode === "officialAccount"
+      ? configuredOfficialModels.length > 0
+        ? configuredOfficialModels
+        : modelState.officialModelIds
+      : [
+          ...(config.selectedModelsByProvider[providerId] || []),
+          ...(config.declaredOfficialModelsByProvider[providerId] || []),
+        ];
+    if (!enabledModels.some((candidate) => modelIdsEqual(candidate, model))) {
+      setNotice({ tone: "error", text: `模型 ${model} 不属于该线路` });
+      return;
+    }
+    await runOperation("save-default-model", async () => {
+      const result = await invoke<{
+        config: Config;
+        modelState: ModelState;
+        restartRequired?: boolean;
+      }>("save_default_model", {
+        routeId,
+        model,
+      });
+      applyRouteResult(result);
+      setNotice({
+        tone: result.restartRequired ? "info" : "success",
+        text: `已将「${profile.name}」的默认模型设为 ${model}`,
       });
     });
   }
@@ -674,15 +923,21 @@ export function App({
   const handleSyncCurrentProvider = useStableEvent(
     () => void syncCurrentProvider(),
   );
+  const handleSaveRoute = useStableEvent(saveRoute);
+  const handleDeleteRoute = useStableEvent(requestDeleteRoute);
+  const handleFetchRouteModels = useStableEvent((route: Profile) => {
+    void fetchRouteModels(route);
+  });
+  const handleSaveOfficialRouteSettings = useStableEvent(
+    saveOfficialRouteSettings,
+  );
+  const handleSetRouteDefaultModel = useStableEvent(
+    (routeId: string, model: string) => {
+      void setRouteDefaultModel(routeId, model);
+    },
+  );
   const handleSyncPromptOptimizationCurrentProvider = useStableEvent(
     syncPromptOptimizationCurrentProvider,
-  );
-  const handleShowAccountUsageInHeaderChange = useStableEvent(
-    (checked: boolean) => {
-      if (config) {
-        editConfig({ ...config, showAccountUsageInHeader: checked });
-      }
-    },
   );
   const handleClearTraceLogs = useStableEvent(askClearTraceLogs);
   const handleRefreshTraceLogStats = useStableEvent(
@@ -704,7 +959,7 @@ export function App({
           </p>
         </div>
         <LoaderCircle
-          className="spinner loading-spinner"
+          className="animate-spin loading-animate-spin"
           size={16}
           aria-hidden="true"
         />
@@ -742,13 +997,13 @@ export function App({
           : "检查 Codey 在线更新";
 
   const configHeaderContent = (
-    <div className="config-header-inner">
-      <div className="config-brand">
+    <div className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-5 max-[760px]:grid-cols-[minmax(0,1fr)_auto_auto] max-[760px]:gap-2.5">
+      <div className="flex min-w-0 items-center gap-3 justify-self-start max-[760px]:gap-2">
         <CodeyBrandMark />
-        <div className="config-brand-copy">
-          <div className="config-brand-title-row">
-            <h1 id={embedded ? "semi-modal-title" : undefined}>Codey 控制台</h1>
-            <span className="app-version-text">
+        <div className="flex min-w-0 flex-col">
+          <div className="flex min-w-0 items-center gap-2">
+            <h1 className="m-0 whitespace-nowrap text-base font-bold tracking-[-0.02em] text-[#1d1d1f]">Codey 控制台</h1>
+            <span className="whitespace-nowrap text-[11px] font-medium tracking-[0.01em] text-[#8e8e93]">
               v{status.appVersion || "0.2.0"}
             </span>
 
@@ -780,7 +1035,7 @@ export function App({
                   }}
                 >
                   {isCheckingUpdate || isDownloadingUpdate || isInstallingUpdate ? (
-                    <LoaderCircle className="spinner" size={12} aria-hidden="true" />
+                    <LoaderCircle className="animate-spin" size={12} aria-hidden="true" />
                   ) : downloadedUpdate ? (
                     <IconCheck size={12} aria-hidden="true" />
                   ) : (
@@ -800,26 +1055,26 @@ export function App({
             </Tooltip>
 
             {dirty && (
-              <Badge variant="warning" className="unsaved-badge">
+              <Badge variant="warning">
                 未保存更改
               </Badge>
             )}
           </div>
-          <p>管理 Codex 线路、模型服务、运行策略与诊断日志</p>
+          <p className="m-0 mt-0.5 text-[11px] text-[#6e6e73] max-[760px]:hidden">管理 Codex 线路、模型服务、运行策略与诊断日志</p>
         </div>
       </div>
 
       {embedded && (
-        <div className="config-header-feedback">
+        <div className="config-header-feedback justify-self-center">
           <Button
             aria-describedby="codey-feedback-qr-description"
             aria-label="问题反馈群，悬浮或聚焦查看二维码"
-            className="feedback-group-trigger"
+            className="whitespace-nowrap max-[520px]:w-8! max-[520px]:px-0!"
             size="sm"
-            variant="outline"
+            variant="brand-outline"
           >
             <IconMessageCircleQuestion aria-hidden="true" />
-            <span className="feedback-group-label">问题反馈群</span>
+            <span className="inline-flex items-center gap-[7px] max-[520px]:hidden">问题反馈群</span>
           </Button>
           <div className="feedback-qr-popover" role="tooltip">
             <img src={feedbackGroupQrUrl} alt="问题反馈群二维码" />
@@ -828,48 +1083,50 @@ export function App({
         </div>
       )}
 
-      <div className="config-header-right">
-        <div className="config-header-actions">
+      <div className="flex min-w-0 items-center gap-4 justify-self-end">
+        <div className="flex items-center gap-2">
           {embedded && (
             <Button
               aria-label={status.running ? "重启 Codex" : "Codex 未运行"}
-              className="title-restart-button"
+              className="max-[520px]:w-8! max-[520px]:px-0!"
               disabled={isBusy || status.restartInProgress || !status.running}
               onClick={handleRestartCodex}
               size="sm"
               variant="warning"
             >
               {busy === "restart" || status.restartInProgress ? (
-                <LoaderCircle className="spinner" aria-hidden="true" />
+                <LoaderCircle className="animate-spin" aria-hidden="true" />
               ) : (
                 <RefreshCw aria-hidden="true" />
               )}
-              <span className="title-action-label">
+              <span className="max-[520px]:hidden">
                 {status.running ? "重启 Codex" : "未运行"}
               </span>
             </Button>
           )}
-          <SaveButton
+          <Button
             aria-label={dirty ? "保存更改" : "已保存"}
-            className={`save-button${embedded ? " title-save-button" : ""}${dirty ? " dirty" : ""}`}
+            className="h-8 min-w-[88px] px-3.5 text-xs max-[520px]:min-w-8! max-[520px]:w-8! max-[520px]:px-0!"
             disabled={!dirty || isBusy}
             onClick={handleSaveCurrent}
+            size="sm"
+            variant={dirty ? "default" : "secondary"}
           >
             {busy === "save" ? (
-              <LoaderCircle className="spinner" aria-hidden="true" />
+              <LoaderCircle className="animate-spin" aria-hidden="true" />
             ) : dirty ? (
               <Save aria-hidden="true" />
             ) : (
               <Check aria-hidden="true" />
             )}
-            <span className="title-action-label">
+            <span className="max-[520px]:hidden">
               {dirty ? "保存更改" : "已保存"}
             </span>
-          </SaveButton>
+          </Button>
           {embedded && (
             <Button
               aria-label="关闭配置"
-              className="codey-settings-modal-close"
+              className="flex-none max-[520px]:h-8! max-[520px]:w-8! max-[520px]:p-0!"
               onClick={handleCloseSettings}
               size="icon-sm"
               variant="ghost"
@@ -897,21 +1154,21 @@ export function App({
             <Button
               variant="ghost"
               size="icon"
-              className="traffic-light close"
+              className="size-3! min-w-3! rounded-full! border! border-black/15! bg-[#ff5f56]! p-0! shadow-none! hover:opacity-85"
               title="关闭"
               aria-label="关闭窗口"
             />
             <Button
               variant="ghost"
               size="icon"
-              className="traffic-light minimize"
+              className="size-3! min-w-3! rounded-full! border! border-black/15! bg-[#ffbd2e]! p-0! shadow-none! hover:opacity-85"
               title="最小化"
               aria-label="最小化窗口"
             />
             <Button
               variant="ghost"
               size="icon"
-              className="traffic-light zoom"
+              className="size-3! min-w-3! rounded-full! border! border-black/15! bg-[#27c93f]! p-0! shadow-none! hover:opacity-85"
               title="缩放"
               aria-label="全屏缩放"
             />
@@ -927,7 +1184,9 @@ export function App({
       )}
 
       {!embedded && (
-        <header className="config-header">{configHeaderContent}</header>
+        <header className="z-30 flex flex-col border-b border-black/8 bg-white/75 px-5 py-2.5 backdrop-blur-xl">
+          {configHeaderContent}
+        </header>
       )}
 
       <div className="page-scroll">
@@ -948,20 +1207,20 @@ export function App({
           {/* 线路与模型：单独一行展示 */}
           <div className="full-row-section">
             <ModelSection
-              provider={provider}
+              config={config}
+              officialAccountAvailable={status.officialAccountAvailable === true}
+              popupContainer={popupContainer}
               modelState={modelState}
               dirty={dirty}
               isBusy={isBusy}
               busy={busy}
               showAccountUsageInHeader={config.showAccountUsageInHeader}
               onSyncCurrentProvider={handleSyncCurrentProvider}
-              onFetchCurrentModels={fetchCurrentModels}
-              onSetDefaultModel={setDefaultModel}
-              onDeleteThirdPartyModel={deleteThirdPartyModel}
-              manualThirdPartyModelKeys={manualThirdPartyModelKeys}
-              onShowAccountUsageInHeaderChange={
-                handleShowAccountUsageInHeaderChange
-              }
+              onSaveRoute={handleSaveRoute}
+              onDeleteRoute={handleDeleteRoute}
+              onFetchRouteModels={handleFetchRouteModels}
+              onSaveOfficialRouteSettings={handleSaveOfficialRouteSettings}
+              onSetDefaultModel={handleSetRouteDefaultModel}
             />
           </div>
 
@@ -1077,7 +1336,7 @@ export function App({
       afterClose={onAfterClose}
       container={modalContainer}
       header={
-        <div className="semi-modal-header codey-settings-modal-header">
+        <div className="relative z-[2] flex w-full items-center overflow-visible">
           {configHeaderContent}
         </div>
       }

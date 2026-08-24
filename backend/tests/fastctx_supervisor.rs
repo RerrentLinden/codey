@@ -116,11 +116,8 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
     terminate_process(first_host, true);
     let hosts = wait_for_host_starts(&event_log, 2);
     assert_ne!(hosts[0], hosts[1]);
-    let recovery = wait_for_error_record(&app_state.join("codey-errors.log"));
-    assert_eq!(recovery["event"], "fastctx_transport_closed");
-    assert_eq!(recovery["operation"], "run_fastctx_mcp_worker");
-    assert_eq!(recovery["stage"], "runtime.fastctx_mcp_worker");
-    assert_eq!(recovery["recoverable"], true);
+    // FastCtx 0.2.6 在 runtime session 内部重启 control center host，worker
+    // 不再为这类故障退出；这里验证宿主确实替换，并继续验证原 MCP 会话可用。
 
     send(
         &mut stdin,
@@ -221,26 +218,6 @@ fn wait_for_host_starts(path: &Path, count: usize) -> Vec<u32> {
             Instant::now() < deadline,
             "only {} FastCtx host starts observed",
             pids.len()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn wait_for_error_record(path: &Path) -> Value {
-    let deadline = Instant::now() + PROCESS_TIMEOUT;
-    loop {
-        if let Ok(contents) = std::fs::read_to_string(path)
-            && let Some(record) = contents
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .find(|record| record["event"] == "fastctx_transport_closed")
-        {
-            return record;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "recoverable FastCtx transport record was not written to {}",
-            path.display()
         );
         std::thread::sleep(Duration::from_millis(20));
     }

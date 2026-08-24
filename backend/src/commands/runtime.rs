@@ -13,8 +13,9 @@ use super::webhooks::{
     start_waiting_webhook_watcher, stop_waiting_webhook_watcher, webhook_watcher_should_run,
 };
 use super::{
-    AppState, RestartInProgressGuard, ScheduledRestart, config_requires_restart,
-    current_update_platform, make_bridge_handler, sync_provider_models_for_launch,
+    AppState, RestartInProgressGuard, ScheduledRestart, config_requires_restart_with_route_status,
+    current_update_platform, make_bridge_handler, prepare_routes_for_current_launch,
+    provider_route_restart_required_for_runtime, sync_provider_models_for_launch,
 };
 use crate::codex_config::codex_home;
 use crate::error_log;
@@ -110,6 +111,7 @@ pub(super) async fn runtime_status_with_options(
         .map(|profile| profile.name.clone())
         .unwrap_or_default();
     let configured_codex_app_path = config.codex_app_path.clone();
+    let official_account_available = config.official_account_available_this_launch;
     let runtime_codex_app_path = runtime
         .as_ref()
         .map(|runtime| runtime.codex_app_path.clone());
@@ -118,12 +120,15 @@ pub(super) async fn runtime_status_with_options(
         applied_models.as_ref(),
         applied_subagent.as_ref(),
     ) {
-        (Some(runtime), Some(applied_models), Some(applied_subagent)) => config_requires_restart(
-            &runtime.applied_config,
-            applied_models,
-            applied_subagent,
-            &config,
-        ),
+        (Some(runtime), Some(applied_models), Some(applied_subagent)) => {
+            config_requires_restart_with_route_status(
+                provider_route_restart_required_for_runtime(runtime, &config),
+                &runtime.applied_config,
+                applied_models,
+                applied_subagent,
+                &config,
+            )
+        }
         _ => false,
     };
     let fast_context_tools_active = runtime
@@ -155,6 +160,7 @@ pub(super) async fn runtime_status_with_options(
         "clientPlatform": current_update_platform(),
         "activeProfileId": active_profile_id,
         "activeProfileName": active_profile_name,
+        "officialAccountAvailable": official_account_available,
         "restartRequired": restart_required,
         "restartInProgress": state.restart_in_progress.load(Ordering::Acquire),
     });
@@ -375,10 +381,9 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     restore_previous_runtime_state(codex_home())
         .await
         .map_err(|error| format!("恢复上次 Codey 临时 Codex 配置失败：{error}"))?;
-    super::sync_cc_switch_state(state)
-        .await
-        .map_err(|error| format!("重新读取当前 Codex 线路失败：{error}"))?;
-    let config = sync_provider_models_for_launch(state).await;
+    prepare_routes_for_current_launch(state).await?;
+    let imported_default_route = super::ensure_default_route_imported(state).await;
+    let config = sync_provider_models_for_launch(state, imported_default_route).await;
     let initial_scan_task = if webhook_watcher_should_run(&config) {
         let initial_event_cache = state
             .recent_session_event_cache

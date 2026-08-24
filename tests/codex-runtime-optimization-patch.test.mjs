@@ -65,7 +65,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     const runtimeConfigOverrides = [
       "features.hooks=true",
       'model_provider="codey_global"',
-      'model_providers."codey_global".base_url="http://127.0.0.1:61818/v1"',
+      'model_providers.codey_global.base_url="http://127.0.0.1:61818/v1"',
       'developer_instructions="Codey route"',
       'mcp_servers.codey_fastctx.command="C:\\\\Program Files\\\\Codey\\\\codey-fastctx.exe"',
       'agents.default.config_file="D:\\\\Codey\\\\runtime\\\\default.toml"',
@@ -289,7 +289,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       "-c",
       'model_provider="stale_provider"',
       "--config",
-      'model_providers."codey_global".base_url="https://stale.example/v1"',
+      'model_providers.codey_global.base_url="https://stale.example/v1"',
       "app-server",
       "--analytics-default-enabled",
     ];

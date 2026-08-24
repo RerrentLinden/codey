@@ -1,8 +1,9 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), tailwindcss()],
   publicDir: false,
   // The overlay is evaluated directly inside Codex's renderer instead of
   // being loaded by a normal Vite HTML entry. Replace React's CommonJS

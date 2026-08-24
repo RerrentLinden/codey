@@ -471,6 +471,7 @@ enabled = true
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             preserve_provider_route: true,
+            local_router: None,
         },
     )
     .unwrap();
@@ -531,6 +532,7 @@ experimental_bearer_token = "code-switch-r"
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             preserve_provider_route: true,
+            local_router: None,
         },
     )
     .unwrap();
@@ -573,6 +575,7 @@ wire_api = "chat"
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
             preserve_provider_route: true,
+            local_router: None,
         },
     )
     .unwrap_err();
@@ -1467,6 +1470,7 @@ command = "echo preserve-user-hook"
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
             preserve_provider_route: false,
+            local_router: None,
         },
     )
     .unwrap();
@@ -1640,6 +1644,7 @@ fn subagent_and_fastctx_share_one_pre_tool_hook() {
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
             preserve_provider_route: false,
+            local_router: None,
         },
     )
     .unwrap();
@@ -1762,6 +1767,7 @@ timeout = 2
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
             preserve_provider_route: false,
+            local_router: None,
         },
     )
     .unwrap();
@@ -1823,6 +1829,7 @@ timeout = 2
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
             preserve_provider_route: false,
+            local_router: None,
         },
     )
     .unwrap();
@@ -1854,6 +1861,7 @@ default_subagent_reasoning_effort = "low"
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
             preserve_provider_route: false,
+            local_router: None,
         },
     )
     .unwrap();
@@ -1924,6 +1932,7 @@ tool_namespace = "agents"
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
             preserve_provider_route: false,
+            local_router: None,
         },
     )
     .unwrap();
@@ -1950,6 +1959,7 @@ fn subagent_optimization_keeps_a_standalone_explicit_lower_concurrency() {
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
             preserve_provider_route: false,
+            local_router: None,
         },
     )
     .unwrap();
@@ -1983,6 +1993,7 @@ fn subagent_optimization_defaults_concurrency_for_new_or_invalid_configs() {
                 subagent_model: "gpt-5.6-sol",
                 subagent_reasoning_effort: "high",
                 preserve_provider_route: false,
+                local_router: None,
             },
         )
         .unwrap();
@@ -2017,6 +2028,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
             subagent_model: "gpt-5.6-luna",
             subagent_reasoning_effort: "high",
             preserve_provider_route: false,
+            local_router: None,
         },
     )
     .unwrap();
@@ -2039,6 +2051,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
             subagent_model: "   ",
             subagent_reasoning_effort: "high",
             preserve_provider_route: false,
+            local_router: None,
         },
     )
     .unwrap_err();
@@ -2243,6 +2256,8 @@ X-User-Header = "keep-me"
         &direct_profile(),
         "relay",
         ProviderApplyOptions {
+            profiles: std::slice::from_ref(&direct_profile()),
+            local_router: None,
             use_official_catalog: true,
             default_model: Some("runtime-model"),
             fastctx_command: None,
@@ -2293,11 +2308,11 @@ X-User-Header = "keep-me"
     for expected in [
         "model_provider=\"relay\"",
         "model=\"runtime-model\"",
-        "model_providers.\"relay\".name=\"Relay\"",
-        "model_providers.\"relay\".base_url=\"https://relay.example/v1\"",
-        "model_providers.\"relay\".wire_api=\"responses\"",
-        "model_providers.\"relay\".requires_openai_auth=false",
-        "model_providers.\"relay\".experimental_bearer_token=\"sk-direct\"",
+        "model_providers.relay.name=\"Relay\"",
+        "model_providers.relay.base_url=\"https://relay.example/v1\"",
+        "model_providers.relay.wire_api=\"responses\"",
+        "model_providers.relay.requires_openai_auth=false",
+        "model_providers.relay.experimental_bearer_token=\"sk-direct\"",
     ] {
         assert!(
             applied
@@ -2333,6 +2348,187 @@ X-User-Header = "keep-me"
     // Deliberately do not call restore_runtime_provider_config_at: this is
     // the abnormal-exit boundary the runtime-only route must make harmless.
     assert_eq!(fs::read(&config_path).unwrap(), original_config);
+}
+
+#[test]
+fn local_router_runtime_hides_upstream_routes_and_secrets_from_codex() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let state_dir = temp.path().join("codey-state");
+    let marker = state_dir.join("codex-lease.json");
+    let backup_root = state_dir.join("codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original_config = b"model_provider = \"openai\"\n";
+    fs::write(home.join("config.toml"), original_config).unwrap();
+    let mut route = direct_profile();
+    route.id = "route-a".into();
+    route.base_url = "https://upstream-secret.example/v1".into();
+    route.api_key = "upstream-secret-token".into();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+    };
+
+    let applied = apply_isolated_runtime_provider_config(
+        &home,
+        &route,
+        crate::local_router::ROUTER_PROVIDER_ID,
+        ProviderApplyOptions {
+            profiles: std::slice::from_ref(&route),
+            local_router: Some(&endpoint),
+            use_official_catalog: true,
+            default_model: Some("route-a/provider-model"),
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backup_root,
+            preserve_provider_route: false,
+            expected_config: Some(original_config),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
+    for expected in [
+        "model_provider=\"codey_router\"",
+        "model=\"route-a/provider-model\"",
+        "model_providers.codey_router.name=\"Codey Local Router\"",
+        "model_providers.codey_router.base_url=\"http://127.0.0.1:43127/v1\"",
+        "model_providers.codey_router.wire_api=\"responses\"",
+        "model_providers.codey_router.requires_openai_auth=false",
+        "model_providers.codey_router.experimental_bearer_token=\"launch-only-router-token\"",
+    ] {
+        assert!(
+            applied
+                .runtime_config_overrides
+                .iter()
+                .any(|entry| entry == expected),
+            "missing local-router runtime override {expected}"
+        );
+    }
+    let rendered = applied.runtime_config_overrides.join("\n");
+    assert!(!rendered.contains("upstream-secret.example"));
+    assert!(!rendered.contains("upstream-secret-token"));
+}
+
+#[test]
+fn local_router_refuses_a_persistent_provider_id_collision() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey-state/codex-lease.json");
+    let backup_root = temp.path().join("codey-state/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original_config = br#"[model_providers.codey_router]
+base_url = "https://user-owned.example/v1"
+wire_api = "responses"
+"#;
+    fs::write(home.join("config.toml"), original_config).unwrap();
+    let route = direct_profile();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+    };
+
+    let error = apply_isolated_runtime_provider_config(
+        &home,
+        &route,
+        crate::local_router::ROUTER_PROVIDER_ID,
+        ProviderApplyOptions {
+            profiles: std::slice::from_ref(&route),
+            local_router: Some(&endpoint),
+            use_official_catalog: true,
+            default_model: Some("relay/provider-model"),
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backup_root,
+            preserve_provider_route: false,
+            expected_config: Some(original_config),
+        },
+    )
+    .unwrap_err();
+
+    assert!(format!("{error:#}").contains("已占用 Codey 内部 Provider ID"));
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
+}
+
+#[test]
+fn isolated_runtime_registers_multiple_routes_without_persisting_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let state_dir = temp.path().join("codey-state");
+    let marker = state_dir.join("codex-lease.json");
+    let backup_root = state_dir.join("codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original_config = br#"# User-owned config must remain untouched.
+model_provider = "user-provider"
+
+[model_providers.user-provider]
+name = "User Provider"
+base_url = "https://user.example/v1"
+wire_api = "responses"
+"#;
+    let config_path = home.join("config.toml");
+    fs::write(&config_path, original_config).unwrap();
+
+    let mut route_a = direct_profile();
+    route_a.id = "route-a".into();
+    route_a.name = "Route A".into();
+    route_a.base_url = "https://route-a.example/v1".into();
+    route_a.api_key = "route-a-secret".into();
+    let mut route_b = direct_profile();
+    route_b.id = "route-b".into();
+    route_b.name = "Route B".into();
+    route_b.base_url = "https://route-b.example/v1".into();
+    route_b.api_key = "route-b-secret".into();
+    let profiles = vec![route_a.clone(), route_b];
+
+    let applied = apply_isolated_runtime_provider_config(
+        &home,
+        &route_a,
+        "route-a",
+        ProviderApplyOptions {
+            profiles: &profiles,
+            local_router: None,
+            use_official_catalog: true,
+            default_model: Some("route-a-model"),
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backup_root,
+            preserve_provider_route: false,
+            expected_config: Some(original_config),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(fs::read(&config_path).unwrap(), original_config);
+    for expected in [
+        "model_provider=\"route-a\"",
+        "model_providers.route-a.base_url=\"https://route-a.example/v1\"",
+        "model_providers.route-a.experimental_bearer_token=\"route-a-secret\"",
+        "model_providers.route-b.base_url=\"https://route-b.example/v1\"",
+        "model_providers.route-b.experimental_bearer_token=\"route-b-secret\"",
+    ] {
+        assert!(
+            applied
+                .runtime_config_overrides
+                .iter()
+                .any(|entry| entry == expected),
+            "missing process-local route override {expected}"
+        );
+    }
+    assert!(!String::from_utf8_lossy(original_config).contains("route-a-secret"));
+    assert!(!String::from_utf8_lossy(original_config).contains("route-b-secret"));
 }
 
 #[test]

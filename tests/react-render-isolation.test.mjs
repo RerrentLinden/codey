@@ -53,15 +53,46 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   assert.match(app, /onRepairPluginMarketplace=\{handleRepairPluginMarketplace\}/);
   assert.match(app, /onRefresh=\{handleRefreshTraceLogStats\}/);
   assert.match(app, /onToggleDraftModel=\{toggleDraftModel\}/);
-  assert.match(app, /onFetchCurrentModels=\{fetchCurrentModels\}/);
-  assert.match(app, /onSetDefaultModel=\{setDefaultModel\}/);
+  assert.match(app, /onSaveRoute=\{handleSaveRoute\}/);
+  assert.doesNotMatch(app, /onActivateRoute|handleActivateRoute/);
+  assert.doesNotMatch(app, /activeProfileId:\s*route\.id/);
+  assert.match(app, /onDeleteRoute=\{handleDeleteRoute\}/);
+  assert.match(app, /onFetchRouteModels=\{handleFetchRouteModels\}/);
+  assert.match(app, /onSetDefaultModel=\{handleSetRouteDefaultModel\}/);
+  assert.match(
+    app,
+    /onSaveOfficialRouteSettings=\{handleSaveOfficialRouteSettings\}/,
+  );
   assert.match(app, /onSave=\{saveModelSelection\}/);
   assert.doesNotMatch(modelSelection, /withTimeout/);
-  assert.doesNotMatch(app, /handleFetchCurrentModels|handleSetDefaultModel/);
+  assert.doesNotMatch(app, /onSetDefaultModel=\{\(.*=>/);
   assert.doesNotMatch(
     app,
     /onRepairPluginMarketplace=\{\(\) => void repairPluginMarketplace\(\)\}/,
   );
+  assert.match(sections, /aria-labelledby="route-protocol-label"/);
+  assert.doesNotMatch(sections, /route-auth-mode-label/);
+  assert.equal(sections.match(/<Select\s/g)?.length, 3);
+  assert.doesNotMatch(sections, /<select|route-native-select/);
+  assert.match(sections, /className="route-manager route-manager-balanced"/);
+  assert.match(sections, /className="provider-model-groups"/);
+  assert.match(sections, /modelState\.officialModelIds/);
+  assert.match(sections, /checked=\{usageDraft\}/);
+  assert.match(sections, /checked=\{checked\}/);
+  assert.match(sections, /额度已开启/);
+  assert.match(sections, /支持的模型/);
+  assert.match(sections, /<DialogTitle>/);
+  assert.match(sections, /重新读取 Codex 配置/);
+  assert.match(
+    sections,
+    /disabled=\{isBusy \|\| config\.profiles\.length <= 1\}/,
+  );
+  assert.match(sections, /统一模型目录/);
+  assert.match(sections, /第三方线路同时接入统一路由/);
+  assert.match(sections, /已接入路由/);
+  assert.doesNotMatch(sections, /aria-pressed|route-list-select/);
+  assert.doesNotMatch(sections, /role="radiogroup"/);
+  assert.doesNotMatch(sections, /activeRouteLocked/);
 
   for (const component of [
     "OperationsPanel",

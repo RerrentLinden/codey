@@ -15,7 +15,7 @@ import {
 } from "@tabler/icons-react";
 
 import type { Notice } from "./App.types";
-import { Button } from "./components/semi";
+import { Button } from "./components/mantine";
 
 const NOTICE_AUTO_DISMISS_MS = 5_000;
 const INITIAL_NOTICE: Notice = {
@@ -112,9 +112,14 @@ export const NoticeToast = memo(function NoticeToast({
   ]);
 
   if (!notice.text) return null;
+  const toneBorder = notice.tone === "success"
+    ? "border-l-[#34c759]"
+    : notice.tone === "error"
+      ? "border-l-[#ff3b30]"
+      : "border-l-[#007aff]";
   return (
     <div
-      className={`notice-toast ${notice.tone}`}
+      className={`absolute bottom-6 right-6 z-[90] flex max-w-[min(420px,calc(100%_-_48px))] items-center gap-2.5 rounded-xl border border-black/10 border-l-4 bg-white/92 px-4 py-3 text-xs text-[#1d1d1f] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-2xl ${toneBorder}`}
       role="status"
       aria-live="polite"
       onMouseEnter={() => setAutoDismissPaused(true)}
@@ -129,8 +134,9 @@ export const NoticeToast = memo(function NoticeToast({
       ) : (
         <Activity size={17} />
       )}
-      <span>{notice.text}</span>
+      <span className="min-w-0 break-words">{notice.text}</span>
       <Button
+        className="ml-auto shrink-0"
         variant="ghost"
         size="icon-sm"
         aria-label="关闭提示"

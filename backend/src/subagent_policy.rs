@@ -20,11 +20,19 @@ pub(crate) fn reconcile_for_current_provider(
     official_provider: bool,
 ) {
     prepare_subagent_roles(config);
+    let selected_models = if official_provider {
+        config.selected_models().to_vec()
+    } else {
+        config
+            .current_provider_id()
+            .map(|provider_id| config.enabled_route_models(provider_id))
+            .unwrap_or_default()
+    };
     let state = model_catalog::selection_state_with_manual_models(
         codex_home,
         official_provider,
         config.upstream_models_snapshot(),
-        config.selected_models(),
+        &selected_models,
         config.manual_third_party_models(),
         Some(&config.subagent_model),
     )
@@ -241,7 +249,7 @@ mod tests {
             Case {
                 upstream_models: &["provider-custom-model"],
                 saved_effort: "high",
-                expected_model: "provider-old-model",
+                expected_model: "provider-custom-model",
                 expected_effort: "high",
                 optimization_enabled: true,
             },
@@ -252,6 +260,13 @@ mod tests {
             let mut config = route_config("route-b");
             config.subagent_reasoning_effort = case.saved_effort.into();
             config.upstream_models_by_provider.insert(
+                "route-b".into(),
+                case.upstream_models
+                    .iter()
+                    .map(|model| (*model).to_string())
+                    .collect(),
+            );
+            config.selected_models_by_provider.insert(
                 "route-b".into(),
                 case.upstream_models
                     .iter()
@@ -404,7 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_provider_reconciles_an_unsupported_reasoning_effort() {
+    fn api_route_models_use_route_reasoning_efforts_even_when_names_match_official_models() {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(
             home.path().join("models_cache.json"),
@@ -428,12 +443,15 @@ mod tests {
         config
             .upstream_models_by_provider
             .insert("route-a".into(), vec!["gpt-5.6-sol".into()]);
+        config
+            .selected_models_by_provider
+            .insert("route-a".into(), vec!["gpt-5.6-sol".into()]);
 
         reconcile_for_current_provider(&mut config, home.path(), false);
 
         assert!(config.subagent_optimization);
         assert_eq!(config.subagent_model, "gpt-5.6-sol");
-        assert_eq!(config.subagent_reasoning_effort, "medium");
+        assert_eq!(config.subagent_reasoning_effort, "low");
     }
 
     #[test]

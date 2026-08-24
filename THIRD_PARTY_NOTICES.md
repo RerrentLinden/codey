@@ -19,7 +19,7 @@ Codey's optional built-in context tool sidecar includes FastCtx.
 
 | Component | Locked version | License | Source or copyright |
 | --- | --- | --- | --- |
-| `fastctx` | 0.2.5 | Apache-2.0 | [yc-duan/fastctx](https://github.com/yc-duan/fastctx); Copyright (c) 2026 yc-duan <dy2958830371@gmail.com> |
+| `fastctx` | 0.2.6 | Apache-2.0 | [yc-duan/fastctx](https://github.com/yc-duan/fastctx); Copyright (c) 2026 yc-duan <dy2958830371@gmail.com> |
 
 FastCtx's Apache License 2.0 text and NOTICE file are preserved in
 `licenses/FastCtx/`.
@@ -43,8 +43,9 @@ The primary frontend dependencies are:
 
 | Package | Version | License | Copyright or project |
 | --- | --- | --- | --- |
-| `@douyinfe/semi-ui` | 2.101.1 | MIT | DouyinFE / Semi Design contributors |
+| `@mantine/core`, `@mantine/hooks` | 9.5.2 | MIT | Mantine contributors |
 | `@tabler/icons-react` | 3.45.0 | MIT | Paweł Kuna and Tabler contributors |
+| `tailwindcss`, `@tailwindcss/vite` | 4.3.0 | MIT | Tailwind Labs, Inc. |
 | `@vitejs/plugin-react` | 4.3.4 | MIT | Vite and Babel contributors |
 | `react`, `react-dom` | 19.2.7 | MIT | Meta Platforms, Inc. and affiliates |
 | `typescript` | 5.8.2 | Apache-2.0 | Microsoft Corporation |
