@@ -440,7 +440,7 @@ function FeaturePolicyCardComponent({
             <div className="feature-card-header">
               <div className="feature-card-title">
                 <strong>FastCtx 上下文工具</strong>
-                <Badge variant="secondary">v0.2.5</Badge>
+                <Badge variant="secondary">v0.2.6</Badge>
               </div>
               {fastctxStatusBlocksEmbedded ? (
                 <Tooltip
