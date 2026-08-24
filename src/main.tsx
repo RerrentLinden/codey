@@ -180,9 +180,7 @@ if (import.meta.env.DEV) {
         },
       };
     };
-    const refreshPreviewModelState = () => {
-      const profile = activePreviewProfile();
-      if (!profile) return;
+    const previewModelStateForProfile = (profile: Profile): ModelState => {
       const providerId = routeProviderId(profile);
       const official = profile.authMode === "officialAccount";
       const upstream = previewConfig.upstreamModelsByProvider[providerId] || [];
@@ -204,7 +202,7 @@ if (import.meta.env.DEV) {
         selectableOfficial[0]?.slug ||
         thirdPartyModels[0] ||
         "";
-      previewModelState = {
+      return {
         officialModels: previewOfficialModels.map((model) => ({
           ...model,
           supported: official || includesModelId(upstream, model.slug),
@@ -217,6 +215,10 @@ if (import.meta.env.DEV) {
         upstreamModels: official ? [] : upstream,
         defaultModel,
       };
+    };
+    const refreshPreviewModelState = () => {
+      const profile = activePreviewProfile();
+      if (profile) previewModelState = previewModelStateForProfile(profile);
     };
     let previewTraceStats: typeof previewTraceLogStats | undefined;
     let previewCrashpadStats:
@@ -546,6 +548,7 @@ if (import.meta.env.DEV) {
           status: "ok",
           config: previewConfig,
           modelState: previewModelState,
+          routeModelState: previewModelStateForProfile(route),
           ccSwitch: previewCcSwitch(),
           models,
           restartRequired: false,
@@ -665,12 +668,14 @@ if (import.meta.env.DEV) {
         };
       }
       if (command === "save_selected_models") {
-        const activeProfile = activePreviewProfile();
-        const providerId = activeProfile ? routeProviderId(activeProfile) : "primary";
+        const routeId = String(args.routeId || "");
+        const targetProfile = previewConfig.profiles.find(
+          (profile) => profile.id === routeId,
+        ) || activePreviewProfile();
+        const providerId = targetProfile ? routeProviderId(targetProfile) : "primary";
         const officialModels = (args.officialModels as string[]) || [];
         const thirdPartyModels = (args.thirdPartyModels as string[]) || [];
         const manualThirdPartyModels = (args.manualThirdPartyModels as string[]) || [];
-        const requestedOfficial = new Set(officialModels.map(modelKey));
         const supportedModels = uniqueModelIds([
           ...officialModels,
           ...thirdPartyModels,
@@ -694,24 +699,7 @@ if (import.meta.env.DEV) {
             [providerId]: supportedModels,
           },
         };
-        const defaultModel = supportedModels.find((model) =>
-          modelIdsEqual(model, previewModelState.defaultModel)
-        )
-          ?? supportedModels[0]
-          ?? "";
-        previewModelState = {
-          ...previewModelState,
-          officialModels: previewOfficialModels.map((model) => ({
-            ...model,
-            supported: requestedOfficial.has(modelKey(model.slug)),
-          })),
-          thirdPartyModels,
-          manualThirdPartyModels: manualThirdPartyModels.filter((model) =>
-            includesModelId(thirdPartyModels, model)
-          ),
-          upstreamModels: supportedModels,
-          defaultModel,
-        };
+        refreshPreviewModelState();
         return {
           status: "ok",
           config: previewConfig,

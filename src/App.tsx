@@ -23,7 +23,7 @@ import {
 import type { NotificationChannel } from "./notifications";
 import { errorText, withTimeout } from "./appUtils";
 import { formatBytes } from "./formatters";
-import { modelIdsEqual } from "./modelIds";
+import { modelIdsEqual, uniqueModelIds } from "./modelIds";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { useModelSelection } from "./useModelSelection";
 import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
@@ -84,6 +84,31 @@ function hasUnsavedConfigOutsidePromptOptimization(
     JSON.stringify(configWithoutPromptOptimization(current)) !==
     JSON.stringify(configWithoutPromptOptimization(persisted))
   );
+}
+
+function thirdPartyRouteModelState(
+  config: Config,
+  route: Profile,
+  catalog: ModelState,
+): ModelState {
+  const providerId = route.ccSwitchProviderId || route.id;
+  const selectedModels = uniqueModelIds([
+    ...(config.selectedModelsByProvider[providerId] || []),
+    ...(config.declaredOfficialModelsByProvider[providerId] || []),
+  ]);
+  return {
+    officialModels: [],
+    officialModelIds: catalog.officialModelIds,
+    thirdPartyModels: selectedModels,
+    manualThirdPartyModels:
+      config.manualThirdPartyModelsByProvider[providerId] || [],
+    upstreamModels: uniqueModelIds([
+      ...(config.upstreamModelsByProvider[providerId] || []),
+      ...selectedModels,
+    ]),
+    defaultModel:
+      config.defaultModelByProvider[providerId] || selectedModels[0] || "",
+  };
 }
 
 export function App({
@@ -188,6 +213,7 @@ export function App({
   const {
     subagentModelOptions,
     modelState,
+    modelEditorState,
     setModelState,
     modelPickerVisible,
     setModelPickerVisible,
@@ -543,33 +569,17 @@ export function App({
   async function fetchRouteModels(route: Profile) {
     if (!config) return;
     await runOperation("fetch-route-models", async () => {
-      let savedConfig = config;
-      let savedModelState = modelState;
-      if (route.id !== config.activeProfileId) {
-        const activated = await invoke<{
-          config: Config;
-          ccSwitch: CcSwitchStatus;
-          modelState: ModelState;
-          restartRequired?: boolean;
-        }>("activate_route", {
-          routeId: route.id,
-          expectedRevision: config.settingsRevision,
-        });
-        savedConfig = activated.config;
-        savedModelState = activated.modelState;
-        applyRouteResult(activated);
-      }
-      const savedRoute =
-        savedConfig.profiles.find((profile) => profile.id === route.id) ??
-        savedConfig.profiles.find(
-          (profile) => profile.id === savedConfig.activeProfileId,
-        );
+      const savedConfig = config;
+      const savedRoute = savedConfig.profiles.find(
+        (profile) => profile.id === route.id,
+      );
       if (!savedRoute) throw new Error("找不到要同步模型的线路");
       try {
         const result = await invoke<{
           config: Config;
           ccSwitch: CcSwitchStatus;
           modelState: ModelState;
+          routeModelState: ModelState;
           models: string[];
           restartRequired?: boolean;
           modelHotReloaded?: boolean;
@@ -578,14 +588,22 @@ export function App({
           expectedRevision: savedConfig.settingsRevision,
         });
         applyRouteResult(result);
-        openModelPicker(result.modelState);
+        openModelPicker(
+          { ...result.routeModelState, officialModels: [] },
+          "",
+          savedRoute.id,
+        );
         setNotice({
           tone: "success",
           text: `已同步「${savedRoute.name}」的 ${result.models.length} 个模型，请勾选要启用的模型`,
         });
       } catch (error) {
         const warning = `自动同步失败：${errorText(error)}。仍可手动录入当前线路支持的模型 ID。`;
-        openModelPicker(savedModelState, warning);
+        openModelPicker(
+          thirdPartyRouteModelState(savedConfig, savedRoute, modelState),
+          warning,
+          savedRoute.id,
+        );
         setNotice({
           tone: "error",
           text: "模型同步失败，已打开手动配置",
@@ -1314,7 +1332,7 @@ export function App({
         modelInputError={modelInputError}
         modelSyncWarning={modelSyncWarning}
         thirdPartyModelOptions={thirdPartyModelOptions}
-        modelState={modelState}
+        modelState={modelEditorState}
         draftModelSet={draftModelSet}
         manualThirdPartyModelKeys={draftManualThirdPartyModelKeys}
         onOpenChange={handleModelPickerOpenChange}

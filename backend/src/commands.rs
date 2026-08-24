@@ -687,12 +687,14 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             argument::<Vec<String>>(&args, "thirdPartyModels"),
             optional_argument::<Vec<String>>(&args, "manualThirdPartyModels"),
             optional_argument::<Vec<String>>(&args, "deletedThirdPartyModels"),
+            optional_argument::<String>(&args, "routeId"),
         ) {
             (
                 Ok(official_models),
                 Ok(third_party_models),
                 Ok(manual_third_party_models),
                 Ok(deleted_third_party_models),
+                Ok(route_id),
             ) => {
                 save_selected_models(
                     state,
@@ -700,13 +702,15 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                     third_party_models,
                     manual_third_party_models.unwrap_or_default(),
                     deleted_third_party_models.unwrap_or_default(),
+                    route_id,
                 )
                 .await
             }
-            (Err(error), _, _, _)
-            | (_, Err(error), _, _)
-            | (_, _, Err(error), _)
-            | (_, _, _, Err(error)) => Err(error),
+            (Err(error), _, _, _, _)
+            | (_, Err(error), _, _, _)
+            | (_, _, Err(error), _, _)
+            | (_, _, _, Err(error), _)
+            | (_, _, _, _, Err(error)) => Err(error),
         },
         "save_default_model" => match (
             string_argument(&args, "model"),

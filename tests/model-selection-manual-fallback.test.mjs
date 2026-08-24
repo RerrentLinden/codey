@@ -21,7 +21,7 @@ test("third-party model sync can fall back to manual model support configuration
   assert.match(dialogSource, /onDeleteThirdPartyModel\(model\)/);
   assert.match(hookSource, /可能不支持 \/v1\/models 或 \/models 接口/);
   assert.match(hookSource, /请手动输入当前线路支持的模型 ID/);
-  assert.match(hookSource, /modelState\.officialModelIds\.find/);
+  assert.match(hookSource, /modelEditorState\.officialModelIds\.find/);
   assert.match(hookSource, /已在上方官方模型列表中，请直接勾选，不可重复输入/);
   assert.match(hookSource, /deleteDraftThirdPartyModel/);
   assert.match(hookSource, /deleteThirdPartyModel/);

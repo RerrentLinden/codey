@@ -613,10 +613,6 @@ impl CodeyConfig {
             .unwrap_or_default()
     }
 
-    pub fn upstream_models(&self) -> &[String] {
-        self.upstream_models_snapshot().unwrap_or_default()
-    }
-
     pub fn upstream_models_snapshot(&self) -> Option<&[String]> {
         self.current_provider_id()
             .and_then(|provider_id| self.upstream_models_by_provider.get(provider_id))

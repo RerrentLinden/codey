@@ -76,6 +76,8 @@ export function useModelSelection({
     defaultModel: "",
   });
   const [modelPickerVisible, setModelPickerVisible] = useState(false);
+  const [modelPickerRouteId, setModelPickerRouteId] = useState<string | null>(null);
+  const [modelPickerState, setModelPickerState] = useState<ModelState | null>(null);
   const [draftModels, setDraftModels] = useState<string[]>([]);
   const [draftManualThirdPartyModels, setDraftManualThirdPartyModels] = useState<string[]>([]);
   const [deletedThirdPartyModels, setDeletedThirdPartyModels] = useState<string[]>([]);
@@ -83,9 +85,13 @@ export function useModelSelection({
   const [modelInputError, setModelInputError] = useState("");
   const [modelSyncWarning, setModelSyncWarning] = useState("");
 
+  const modelEditorState = modelPickerState ?? modelState;
   const officialSlugKeys = useMemo(
-    () => new Set(modelState.officialModelIds.map(modelKey)),
-    [modelState.officialModelIds],
+    () =>
+      new Set(
+        modelPickerRouteId ? [] : modelEditorState.officialModelIds.map(modelKey),
+      ),
+    [modelEditorState.officialModelIds, modelPickerRouteId],
   );
   const draftModelSet = useMemo(
     () => new Set(draftModels.map(modelKey)),
@@ -96,8 +102,8 @@ export function useModelSelection({
     [draftManualThirdPartyModels],
   );
   const manualThirdPartyModelKeys = useMemo(
-    () => new Set(modelState.manualThirdPartyModels.map(modelKey)),
-    [modelState.manualThirdPartyModels],
+    () => new Set(modelEditorState.manualThirdPartyModels.map(modelKey)),
+    [modelEditorState.manualThirdPartyModels],
   );
   const deletedThirdPartyModelKeys = useMemo(
     () => new Set(deletedThirdPartyModels.map(modelKey)),
@@ -107,8 +113,8 @@ export function useModelSelection({
     () => {
       const seenKeys = new Set<string>();
       return [
-        ...modelState.upstreamModels,
-        ...modelState.thirdPartyModels,
+        ...modelEditorState.upstreamModels,
+        ...modelEditorState.thirdPartyModels,
         ...draftModels,
       ].reduce<string[]>((models, model) => {
         const normalized = model.trim();
@@ -128,8 +134,8 @@ export function useModelSelection({
     [
       draftModels,
       deletedThirdPartyModelKeys,
-      modelState.thirdPartyModels,
-      modelState.upstreamModels,
+      modelEditorState.thirdPartyModels,
+      modelEditorState.upstreamModels,
       officialSlugKeys,
     ],
   );
@@ -157,13 +163,19 @@ export function useModelSelection({
     [modelState.officialModels, modelState.thirdPartyModels],
   );
 
-  const openModelPicker = useCallback((state: ModelState, warning = "") => {
+  const openModelPicker = useCallback((
+    state: ModelState,
+    warning = "",
+    routeId: string | null = null,
+  ) => {
     setDraftModels(pickerSelection(state));
     setDraftManualThirdPartyModels(state.manualThirdPartyModels);
     setDeletedThirdPartyModels([]);
     setCustomModelInput("");
     setModelInputError("");
     setModelSyncWarning(warning);
+    setModelPickerRouteId(routeId);
+    setModelPickerState(state);
     setModelPickerVisible(true);
   }, []);
 
@@ -246,16 +258,18 @@ export function useModelSelection({
       setModelInputError(`模型数量不能超过 ${MAX_MODEL_COUNT} 个`);
       return;
     }
-    const officialModel = modelState.officialModelIds.find(
-      (official) => modelKey(official) === modelKey(model),
-    );
+    const officialModel = modelPickerRouteId
+      ? undefined
+      : modelEditorState.officialModelIds.find(
+          (official) => modelKey(official) === modelKey(model),
+        );
     if (officialModel) {
       setModelInputError(
         `${officialModel} 已在上方官方模型列表中，请直接勾选，不可重复输入`,
       );
       return;
     }
-    const existingUpstreamModel = modelState.upstreamModels.find(
+    const existingUpstreamModel = modelEditorState.upstreamModels.find(
       (upstream) => modelKey(upstream) === modelKey(model),
     );
     setDraftModels((current) =>
@@ -277,8 +291,9 @@ export function useModelSelection({
     customModelInput,
     draftModels,
     manualThirdPartyModelKeys,
-    modelState.officialModelIds,
-    modelState.upstreamModels,
+    modelEditorState.officialModelIds,
+    modelEditorState.upstreamModels,
+    modelPickerRouteId,
   ]);
 
   const deleteDraftThirdPartyModel = useCallback((model: string) => {
@@ -321,6 +336,7 @@ export function useModelSelection({
       thirdPartyModels,
       manualThirdPartyModels,
       deletedThirdPartyModels: deletedModels,
+      routeId: modelPickerRouteId,
     });
     setPersistedConfig(result.config);
     setModelState(result.modelState);
@@ -330,6 +346,8 @@ export function useModelSelection({
     }));
     if (closePicker) {
       setModelPickerVisible(false);
+      setModelPickerRouteId(null);
+      setModelPickerState(null);
     }
     setDeletedThirdPartyModels([]);
     const hotReloadFailed = Boolean(
@@ -355,6 +373,7 @@ export function useModelSelection({
     setNotice,
     setPersistedConfig,
     setStatus,
+    modelPickerRouteId,
   ]);
 
   const saveModelSelection = useCallback(async () => {
@@ -470,6 +489,7 @@ export function useModelSelection({
   return {
     subagentModelOptions,
     modelState,
+    modelEditorState,
     setModelState,
     modelPickerVisible,
     setModelPickerVisible,

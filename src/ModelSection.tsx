@@ -297,7 +297,9 @@ function ModelSectionComponent({
                           {group?.models.length || 0} 模型
                         </Badge>
                         {profile.authMode !== "officialAccount" && (
-                          <Badge variant="brand">已接入路由</Badge>
+                          <Badge variant={group?.models.length ? "brand" : "secondary"}>
+                            {group?.models.length ? "已接入路由" : "待配置模型"}
+                          </Badge>
                         )}
                         {profile.authMode === "officialAccount" &&
                           showAccountUsageInHeader && (

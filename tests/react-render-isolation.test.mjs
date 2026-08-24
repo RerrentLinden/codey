@@ -65,6 +65,9 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   );
   assert.match(app, /onSave=\{saveModelSelection\}/);
   assert.doesNotMatch(modelSelection, /withTimeout/);
+  assert.match(modelSelection, /routeId: modelPickerRouteId/);
+  assert.match(app, /routeModelState/);
+  assert.doesNotMatch(app, /"activate_route"/);
   assert.doesNotMatch(app, /onSetDefaultModel=\{\(.*=>/);
   assert.doesNotMatch(
     app,

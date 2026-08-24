@@ -731,6 +731,7 @@ pub async fn fetch_route_models(
         codex_home(),
     );
     latest.settings_revision = latest.settings_revision.saturating_add(1);
+    let route_model_state = model_state_for_route_async(&latest, route_id).await?;
     let (catalog_refresh, model_state) = refreshed_model_state_async(&latest, true).await?;
     if let Err(error) = save_config_to_store(state, &latest).await {
         return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
@@ -747,6 +748,7 @@ pub async fn fetch_route_models(
             "ccSwitch": cc_switch::status_from_config(&latest),
             "models": fetched_models,
             "modelState": model_state,
+            "routeModelState": route_model_state,
             "restartRequired": restart_required,
         })),
         subagent_hot_reload,
@@ -804,6 +806,7 @@ pub async fn save_selected_models(
     requested_third_party_models: Vec<String>,
     requested_manual_third_party_models: Vec<String>,
     requested_deleted_third_party_models: Vec<String>,
+    requested_route_id: Option<String>,
 ) -> Result<Value, String> {
     validate_requested_model_list_bounds("官方模型", &requested_official_models)?;
     validate_requested_model_list_bounds("其他模型", &requested_third_party_models)?;
@@ -817,14 +820,31 @@ pub async fn save_selected_models(
     )?;
     let _config_write_guard = state.config_write_lock.lock().await;
     let mut config = state.config.read().await.clone();
+    let target_route_id = requested_route_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|route_id| !route_id.is_empty())
+        .unwrap_or(config.active_profile_id.as_str());
     let profile = config
         .profiles
         .iter()
-        .find(|profile| profile.id == config.active_profile_id)
-        .ok_or_else(|| "找不到当前线路".to_string())?;
+        .find(|profile| profile.id == target_route_id)
+        .cloned()
+        .ok_or_else(|| "找不到要配置模型的线路".to_string())?;
     if profile.cc_switch_read_only {
         return Err("官方线路不支持添加第三方模型".to_string());
     }
+    let provider_id = profile.provider_id().to_string();
+    let upstream_models = config
+        .upstream_models_by_provider
+        .get(&provider_id)
+        .cloned()
+        .unwrap_or_default();
+    let existing_manual_models = config
+        .manual_third_party_models_by_provider
+        .get(&provider_id)
+        .cloned()
+        .unwrap_or_default();
     if !requested_official_models.is_empty() {
         return Err(
             "API Key 线路不能添加官方账号模型；该线路上游返回的同名模型请作为线路模型选择"
@@ -845,26 +865,19 @@ pub async fn save_selected_models(
         .into_iter()
         .filter(|model| !deleted_third_party_model_keys.contains(&model_id::key(model)))
         .collect::<Vec<_>>();
-    let provider_id = config
-        .current_provider_id()
-        .ok_or_else(|| "当前线路缺少标识".to_string())?
-        .to_string();
-    validate_deleted_models_are_manual(
-        config.manual_third_party_models(),
-        &deleted_third_party_model_keys,
-    )?;
+    validate_deleted_models_are_manual(&existing_manual_models, &deleted_third_party_model_keys)?;
     let manual_third_party_models = validate_manual_third_party_model_sources(
         route_official_model_ids,
         &selected,
-        config.upstream_models(),
-        config.manual_third_party_models(),
+        &upstream_models,
+        &existing_manual_models,
         &requested_manual_third_party_models,
     )?;
     let declared_official_models = supported_official.clone();
     let mut supported_models = supported_official;
     preserve_selected_third_party_models_except(
         &mut supported_models,
-        config.upstream_models(),
+        &upstream_models,
         &deleted_third_party_model_keys,
     );
     preserve_selected_third_party_models_except(&mut supported_models, &selected, &HashSet::new());
@@ -1318,6 +1331,15 @@ pub(super) async fn current_model_state_async(
     tokio::task::spawn_blocking(move || current_model_state(&config))
         .await
         .map_err(|error| format!("读取 Codey 模型目录的任务异常退出：{error}"))?
+}
+
+async fn model_state_for_route_async(
+    config: &CodeyConfig,
+    route_id: &str,
+) -> Result<model_catalog::ModelSelectionState, String> {
+    let mut scoped = config.clone();
+    scoped.active_profile_id = route_id.to_string();
+    current_model_state_async(&scoped).await
 }
 
 fn current_renderer_model_catalog(config: &CodeyConfig) -> Result<Value, String> {
