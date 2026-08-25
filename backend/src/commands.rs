@@ -1682,11 +1682,11 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
     if !config.show_account_usage_in_header {
         return json!({"status": "disabled"});
     }
-    if !cc_switch::status_from_config(&config).provider.official {
+    if !account_usage_enabled_for_config(&config) {
         return json!({
             "status": "unavailable",
-            "reason": "third_party",
-            "message": "顶部额度仅支持官方账号线路",
+            "reason": "official_account_missing",
+            "message": "当前线路列表中没有可用的官方账号线路",
         });
     }
 
@@ -1706,6 +1706,14 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
             "message": error.to_string(),
         }),
     }
+}
+
+fn account_usage_enabled_for_config(config: &CodeyConfig) -> bool {
+    config.show_account_usage_in_header
+        && config
+            .profiles
+            .iter()
+            .any(|profile| profile.cc_switch_read_only)
 }
 
 #[cfg(test)]

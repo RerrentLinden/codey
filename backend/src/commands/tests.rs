@@ -197,6 +197,57 @@ fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
     assert!(!route.supports_remote_compaction);
 }
 
+#[test]
+fn account_usage_stays_enabled_when_an_official_route_exists_but_a_third_party_route_is_active() {
+    let mut official = ProviderProfile::new("OpenAI 官方直登");
+    official.id = "official-route".to_string();
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.normalize();
+
+    let mut third_party = ProviderProfile::new("第三方线路");
+    third_party.id = "third-party-route".to_string();
+    third_party.base_url = "https://relay.example/v1".to_string();
+    third_party.api_key = "sk-relay".to_string();
+    third_party.normalize();
+
+    let config = CodeyConfig {
+        active_profile_id: third_party.id.clone(),
+        profiles: vec![official, third_party],
+        show_account_usage_in_header: true,
+        ..CodeyConfig::default()
+    };
+
+    assert!(account_usage_enabled_for_config(&config));
+}
+
+#[test]
+fn account_usage_requires_both_the_display_setting_and_an_official_route() {
+    let mut third_party = ProviderProfile::new("第三方线路");
+    third_party.id = "third-party-route".to_string();
+    third_party.base_url = "https://relay.example/v1".to_string();
+    third_party.api_key = "sk-relay".to_string();
+    third_party.normalize();
+
+    let without_official = CodeyConfig {
+        active_profile_id: third_party.id.clone(),
+        profiles: vec![third_party],
+        show_account_usage_in_header: true,
+        ..CodeyConfig::default()
+    };
+    assert!(!account_usage_enabled_for_config(&without_official));
+
+    let mut official = ProviderProfile::new("OpenAI 官方直登");
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.normalize();
+    let disabled = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official],
+        show_account_usage_in_header: false,
+        ..CodeyConfig::default()
+    };
+    assert!(!account_usage_enabled_for_config(&disabled));
+}
+
 #[tokio::test]
 async fn settings_bridge_matches_the_redacted_config_contract() {
     let state = Arc::new(AppState::default());
