@@ -1316,10 +1316,18 @@ struct ResponsesToolBridge {
     upstream_to_response: HashMap<String, ResponsesToolName>,
     response_to_upstream: HashMap<ResponsesToolName, String>,
     has_namespace_tools: bool,
+    has_custom_tools: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ResponsesToolKind {
+    Function,
+    Custom,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ResponsesToolName {
+    kind: ResponsesToolKind,
     namespace: Vec<String>,
     name: String,
 }
@@ -1327,9 +1335,22 @@ struct ResponsesToolName {
 impl ResponsesToolName {
     fn plain(name: &str) -> Self {
         Self {
+            kind: ResponsesToolKind::Function,
             namespace: Vec::new(),
             name: name.to_string(),
         }
+    }
+
+    fn custom(name: &str) -> Self {
+        Self {
+            kind: ResponsesToolKind::Custom,
+            namespace: Vec::new(),
+            name: name.to_string(),
+        }
+    }
+
+    fn is_custom(&self) -> bool {
+        self.kind == ResponsesToolKind::Custom
     }
 
     fn namespace_string(&self) -> Option<String> {
@@ -1351,8 +1372,14 @@ impl ResponsesToolBridge {
         if let Some(upstream_name) = self.response_to_upstream.get(tool_name) {
             return Ok(upstream_name.clone());
         }
-        if tool_name.namespace.is_empty() {
+        if tool_name.kind == ResponsesToolKind::Function && tool_name.namespace.is_empty() {
             return Ok(tool_name.name.clone());
+        }
+        if tool_name.is_custom() {
+            anyhow::bail!(
+                "custom_tool_call 指向未声明的 custom 工具 {}",
+                tool_name.name
+            )
         }
         anyhow::bail!(
             "function_call 指向未声明的 namespace 工具 {}.{}",
@@ -1367,6 +1394,9 @@ impl ResponsesToolBridge {
         }
         if self.has_namespace_tools && looks_like_namespace_upstream_name(upstream_name) {
             anyhow::bail!("上游返回了未知的 namespace function 名称 {upstream_name}");
+        }
+        if self.has_custom_tools && looks_like_custom_upstream_name(upstream_name) {
+            anyhow::bail!("上游返回了未知的 custom function 名称 {upstream_name}");
         }
         Ok(ResponsesToolName::plain(upstream_name))
     }
@@ -1397,6 +1427,12 @@ impl ResponsesToolBridge {
         if self.has_namespace_tools && could_be_namespace_upstream_name(upstream_name) {
             if final_name {
                 anyhow::bail!("上游返回了未知的 namespace function 名称 {upstream_name}");
+            }
+            return Ok(None);
+        }
+        if self.has_custom_tools && could_be_custom_upstream_name(upstream_name) {
+            if final_name {
+                anyhow::bail!("上游返回了未知的 custom function 名称 {upstream_name}");
             }
             return Ok(None);
         }
@@ -2162,7 +2198,13 @@ fn append_chat_message_item(
                 append_responses_function_call_item(object, messages, tool_bridge)
             }
             Some("function_call_output") => {
-                append_responses_function_call_output_item(object, messages)
+                append_responses_tool_call_output_item(object, messages, "function_call_output")
+            }
+            Some("custom_tool_call") => {
+                append_responses_custom_tool_call_item(object, messages, tool_bridge)
+            }
+            Some("custom_tool_call_output") => {
+                append_responses_tool_call_output_item(object, messages, "custom_tool_call_output")
             }
             Some("input_text" | "output_text" | "text" | "input_image" | "image_url") => {
                 append_single_content_part_as_user_message(item, messages)
@@ -2195,7 +2237,7 @@ fn append_responses_message_object(
         .transpose()?
         .unwrap_or("user");
     if role == "tool" {
-        return append_responses_function_call_output_item(object, messages);
+        return append_responses_tool_call_output_item(object, messages, "tool message");
     }
     let mut message = serde_json::Map::new();
     message.insert("role".to_string(), Value::String(role.to_string()));
@@ -2377,6 +2419,47 @@ fn append_responses_function_call_item(
     let upstream_name = tool_bridge.upstream_name_for_call(&tool_name)?;
     let arguments =
         json_value_as_chat_string(object.get("arguments")).unwrap_or_else(|| "{}".to_string());
+    append_chat_assistant_tool_call(messages, call_id, &upstream_name, &arguments)
+}
+
+fn append_responses_custom_tool_call_item(
+    object: &serde_json::Map<String, Value>,
+    messages: &mut Vec<Value>,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    let call_id = object
+        .get("call_id")
+        .or_else(|| object.get("id"))
+        .and_then(Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("custom_tool_call 缺少 call_id"))?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("custom_tool_call 缺少 name"))?;
+    if object
+        .get("namespace")
+        .is_some_and(|value| !value.is_null())
+    {
+        anyhow::bail!("custom_tool_call 不支持 namespace");
+    }
+    let input = object
+        .get("input")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("custom_tool_call.input 必须是字符串"))?;
+    let tool_name = ResponsesToolName::custom(name);
+    let upstream_name = tool_bridge.upstream_name_for_call(&tool_name)?;
+    let arguments = wrap_custom_tool_input(input)?;
+    append_chat_assistant_tool_call(messages, call_id, &upstream_name, &arguments)
+}
+
+fn append_chat_assistant_tool_call(
+    messages: &mut Vec<Value>,
+    call_id: &str,
+    upstream_name: &str,
+    arguments: &str,
+) -> Result<()> {
     let tool_call = json!({
         "id": call_id,
         "type": "function",
@@ -2413,20 +2496,21 @@ fn append_responses_function_call_item(
     Ok(())
 }
 
-fn append_responses_function_call_output_item(
+fn append_responses_tool_call_output_item(
     object: &serde_json::Map<String, Value>,
     messages: &mut Vec<Value>,
+    context: &str,
 ) -> Result<()> {
     let call_id = object
         .get("call_id")
         .or_else(|| object.get("tool_call_id"))
         .and_then(Value::as_str)
         .filter(|call_id| !call_id.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("function_call_output 缺少 call_id"))?;
+        .ok_or_else(|| anyhow::anyhow!("{context} 缺少 call_id"))?;
     let output = object
         .get("output")
         .or_else(|| object.get("content"))
-        .ok_or_else(|| anyhow::anyhow!("function_call_output 缺少 output"))?;
+        .ok_or_else(|| anyhow::anyhow!("{context} 缺少 output"))?;
     let content = json_value_as_chat_string(Some(output)).unwrap_or_default();
     messages.push(json!({
         "role": "tool",
@@ -2503,6 +2587,7 @@ fn normalize_chat_legacy_function_call(
 }
 
 const NAMESPACE_UPSTREAM_TOOL_PREFIX: &str = "codey_ns__";
+const CUSTOM_UPSTREAM_TOOL_PREFIX: &str = "codey_custom__";
 const UPSTREAM_FUNCTION_NAME_MAX_BYTES: usize = 64;
 const MAX_RESPONSES_NAMESPACE_DEPTH: usize = 8;
 
@@ -2515,14 +2600,14 @@ fn responses_tools_to_chat_tools_with_bridge(
         .ok_or_else(|| anyhow::anyhow!("tools 必须是数组"))?;
     let mut converted = Vec::new();
     let mut upstream_names = HashMap::<String, ResponsesToolName>::new();
-    let mut namespace_definitions = HashMap::<ResponsesToolName, Value>::new();
+    let mut bridged_definitions = HashMap::<ResponsesToolName, Value>::new();
     for tool in tools {
         append_responses_tool_to_chat_tools(
             tool,
             &[],
             tool_bridge,
             &mut upstream_names,
-            &mut namespace_definitions,
+            &mut bridged_definitions,
             &mut converted,
         )?;
     }
@@ -2534,7 +2619,7 @@ fn append_responses_tool_to_chat_tools(
     namespace_path: &[String],
     tool_bridge: &mut ResponsesToolBridge,
     upstream_names: &mut HashMap<String, ResponsesToolName>,
-    namespace_definitions: &mut HashMap<ResponsesToolName, Value>,
+    bridged_definitions: &mut HashMap<ResponsesToolName, Value>,
     converted: &mut Vec<Value>,
 ) -> Result<()> {
     let object = tool
@@ -2547,6 +2632,7 @@ fn append_responses_tool_to_chat_tools(
         let mut function = responses_function_tool_map(object)?;
         let name = response_function_name(&function, "function tool")?.to_string();
         let tool_name = ResponsesToolName {
+            kind: ResponsesToolKind::Function,
             namespace: namespace_path.to_vec(),
             name: name.clone(),
         };
@@ -2561,7 +2647,7 @@ fn append_responses_tool_to_chat_tools(
                 &original_definition,
                 tool_bridge,
                 upstream_names,
-                namespace_definitions,
+                bridged_definitions,
             )? {
                 Some(upstream_name) => {
                     function.insert("name".to_string(), Value::String(upstream_name));
@@ -2584,14 +2670,50 @@ fn append_responses_tool_to_chat_tools(
             namespace_path,
             tool_bridge,
             upstream_names,
-            namespace_definitions,
+            bridged_definitions,
             converted,
         );
     }
-    if matches!(tool_type, Some("custom" | "tool_search")) {
-        let tool_name = tool_type.unwrap_or("unknown");
+    if tool_type == Some("custom") {
+        if !namespace_path.is_empty() {
+            anyhow::bail!("namespace.tools 只支持 function 工具，不能包含 custom");
+        }
+        let name = response_function_name(object, "custom tool")?.to_string();
+        let tool_name = ResponsesToolName::custom(&name);
+        let original_definition = Value::Object(object.clone());
+        let Some(upstream_name) = register_custom_tool_name(
+            tool_name,
+            &original_definition,
+            tool_bridge,
+            upstream_names,
+            bridged_definitions,
+        )?
+        else {
+            return Ok(());
+        };
+        converted.push(json!({
+            "type":"function",
+            "function":{
+                "name":upstream_name,
+                "description":custom_tool_bridge_description(object)?,
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "input":{
+                            "type":"string",
+                            "description":"Raw free-form input for the original Responses custom tool."
+                        }
+                    },
+                    "required":["input"],
+                    "additionalProperties":false
+                }
+            }
+        }));
+        return Ok(());
+    }
+    if tool_type == Some("tool_search") {
         anyhow::bail!(
-            "Responses 工具 {tool_name} 不能安全转换为 Chat/Anthropic function 工具；请改用支持 Responses 的线路"
+            "Responses 工具 tool_search 不能安全转换为 Chat/Anthropic function 工具；请改用支持 Responses 的线路"
         );
     }
     if !namespace_path.is_empty() {
@@ -2609,7 +2731,7 @@ fn append_responses_namespace_tools(
     parent_namespace: &[String],
     tool_bridge: &mut ResponsesToolBridge,
     upstream_names: &mut HashMap<String, ResponsesToolName>,
-    namespace_definitions: &mut HashMap<ResponsesToolName, Value>,
+    bridged_definitions: &mut HashMap<ResponsesToolName, Value>,
     converted: &mut Vec<Value>,
 ) -> Result<()> {
     let namespace = responses_namespace_name(object)?;
@@ -2633,7 +2755,7 @@ fn append_responses_namespace_tools(
                 &namespace_path,
                 tool_bridge,
                 upstream_names,
-                namespace_definitions,
+                bridged_definitions,
                 converted,
             )?;
         }
@@ -2648,7 +2770,7 @@ fn append_responses_namespace_tools(
                 &namespace_path,
                 tool_bridge,
                 upstream_names,
-                namespace_definitions,
+                bridged_definitions,
                 converted,
             )?;
         }
@@ -2680,8 +2802,8 @@ fn register_plain_tool_name(
 ) -> Result<()> {
     let tool_name = ResponsesToolName::plain(name);
     if let Some(existing) = upstream_names.get(name) {
-        if !existing.namespace.is_empty() {
-            anyhow::bail!("namespace 工具展开名称 {name} 与 function 工具冲突");
+        if existing != &tool_name {
+            anyhow::bail!("桥接工具展开名称 {name} 与 function 工具冲突");
         }
     } else {
         upstream_names.insert(name.to_string(), tool_name.clone());
@@ -2730,6 +2852,54 @@ fn register_namespaced_tool_name(
         .upstream_to_response
         .insert(upstream_name.clone(), tool_name);
     Ok(Some(upstream_name))
+}
+
+fn register_custom_tool_name(
+    tool_name: ResponsesToolName,
+    original_definition: &Value,
+    tool_bridge: &mut ResponsesToolBridge,
+    upstream_names: &mut HashMap<String, ResponsesToolName>,
+    bridged_definitions: &mut HashMap<ResponsesToolName, Value>,
+) -> Result<Option<String>> {
+    if let Some(existing_definition) = bridged_definitions.get(&tool_name) {
+        if existing_definition == original_definition {
+            return Ok(None);
+        }
+        anyhow::bail!("custom 工具 {} 存在定义冲突", tool_name.name);
+    }
+    let upstream_name = custom_upstream_tool_name(&tool_name.name);
+    if let Some(existing) = upstream_names.get(&upstream_name)
+        && existing != &tool_name
+    {
+        anyhow::bail!("custom 工具展开名称 {upstream_name} 发生冲突");
+    }
+    bridged_definitions.insert(tool_name.clone(), original_definition.clone());
+    upstream_names.insert(upstream_name.clone(), tool_name.clone());
+    tool_bridge.has_custom_tools = true;
+    tool_bridge
+        .response_to_upstream
+        .insert(tool_name.clone(), upstream_name.clone());
+    tool_bridge
+        .upstream_to_response
+        .insert(upstream_name.clone(), tool_name);
+    Ok(Some(upstream_name))
+}
+
+fn custom_tool_bridge_description(object: &serde_json::Map<String, Value>) -> Result<String> {
+    let original = serde_json::to_string(object).context("序列化 Responses custom 工具定义失败")?;
+    let mut description = object
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|description| !description.is_empty())
+        .map(|description| format!("{description}\n\n"))
+        .unwrap_or_default();
+    description.push_str(
+        "[Codey compatibility bridge] This was an OpenAI Responses custom free-form tool. \
+Call this function with exactly one `input` string containing the complete raw tool input. \
+Do not JSON-encode the string again and do not add wrapper text. Original definition: ",
+    );
+    description.push_str(&original);
+    Ok(description)
 }
 
 fn response_function_name<'a>(
@@ -2782,6 +2952,17 @@ fn namespaced_upstream_tool_name(namespace: &[String], name: &str) -> String {
     format!("{NAMESPACE_UPSTREAM_TOOL_PREFIX}{stem}{suffix}")
 }
 
+fn custom_upstream_tool_name(name: &str) -> String {
+    let hash = stable_tool_hash_hex(&format!("custom\u{1e}{name}"));
+    let stem = sanitize_upstream_tool_stem(name);
+    let suffix = format!("__{hash}");
+    let max_stem_len = UPSTREAM_FUNCTION_NAME_MAX_BYTES
+        .saturating_sub(CUSTOM_UPSTREAM_TOOL_PREFIX.len())
+        .saturating_sub(suffix.len());
+    let stem = stem.chars().take(max_stem_len).collect::<String>();
+    format!("{CUSTOM_UPSTREAM_TOOL_PREFIX}{stem}{suffix}")
+}
+
 fn stable_tool_hash_hex(value: &str) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in value.as_bytes() {
@@ -2818,10 +2999,20 @@ fn looks_like_namespace_upstream_name(name: &str) -> bool {
     name.starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX)
 }
 
+fn looks_like_custom_upstream_name(name: &str) -> bool {
+    name.starts_with(CUSTOM_UPSTREAM_TOOL_PREFIX)
+}
+
 fn could_be_namespace_upstream_name(name: &str) -> bool {
     !name.is_empty()
         && (NAMESPACE_UPSTREAM_TOOL_PREFIX.starts_with(name)
             || name.starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX))
+}
+
+fn could_be_custom_upstream_name(name: &str) -> bool {
+    !name.is_empty()
+        && (CUSTOM_UPSTREAM_TOOL_PREFIX.starts_with(name)
+            || name.starts_with(CUSTOM_UPSTREAM_TOOL_PREFIX))
 }
 
 fn responses_namespace_path(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
@@ -2870,6 +3061,7 @@ fn responses_tool_name_from_function_object(
         context,
     )?;
     Ok(ResponsesToolName {
+        kind: ResponsesToolKind::Function,
         namespace,
         name: name.to_string(),
     })
@@ -2892,6 +3084,7 @@ fn responses_tool_name_from_call_object(
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{context} 缺少 name"))?;
     Ok(ResponsesToolName {
+        kind: ResponsesToolKind::Function,
         namespace: responses_namespace_path(object.get("namespace"), "namespace")?,
         name: name.to_string(),
     })
@@ -2907,13 +3100,27 @@ fn responses_tool_choice_to_chat_tool_choice(
         }
         Value::Object(object) => {
             let choice_type = object.get("type").and_then(Value::as_str);
-            if choice_type != Some("function") {
-                let tool_name = choice_type.unwrap_or("unknown");
-                anyhow::bail!(
-                    "Responses tool_choice 类型 {tool_name} 不能转换为 Chat Completions tool_choice"
-                );
-            }
-            let tool_name = responses_tool_name_from_call_object(object, "function tool_choice")?;
+            let tool_name = match choice_type {
+                Some("function") => {
+                    responses_tool_name_from_call_object(object, "function tool_choice")?
+                }
+                Some("custom") => {
+                    if object
+                        .get("namespace")
+                        .is_some_and(|value| !value.is_null())
+                    {
+                        anyhow::bail!("custom tool_choice 不支持 namespace");
+                    }
+                    let name = response_function_name(object, "custom tool_choice")?;
+                    ResponsesToolName::custom(name)
+                }
+                _ => {
+                    let tool_name = choice_type.unwrap_or("unknown");
+                    anyhow::bail!(
+                        "Responses tool_choice 类型 {tool_name} 不能转换为 Chat Completions tool_choice"
+                    );
+                }
+            };
             let upstream_name = tool_bridge.upstream_name_for_call(&tool_name)?;
             Ok(json!({"type":"function","function":{"name":upstream_name}}))
         }
@@ -2944,6 +3151,85 @@ fn json_value_as_chat_string(value: Option<&Value>) -> Option<String> {
         Value::Null => String::new(),
         other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
     })
+}
+
+fn wrap_custom_tool_input(input: &str) -> Result<String> {
+    serde_json::to_string(&json!({"input":input})).context("序列化 custom 工具 input 包装失败")
+}
+
+fn custom_tool_input_from_value(value: &Value, context: &str) -> Result<String> {
+    value
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("{context} 必须是 JSON 对象"))?
+        .get("input")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("{context}.input 必须是字符串"))
+}
+
+fn custom_tool_input_from_arguments(arguments: &str, context: &str) -> Result<String> {
+    let value = serde_json::from_str::<Value>(arguments)
+        .with_context(|| format!("{context} 不是有效 JSON"))?;
+    custom_tool_input_from_value(&value, context)
+}
+
+fn responses_tool_call_item_from_upstream_arguments(
+    tool_name: &ResponsesToolName,
+    call_id: String,
+    arguments: String,
+    status: &str,
+    context: &str,
+) -> Result<Value> {
+    let payload = if tool_name.is_custom() {
+        custom_tool_input_from_arguments(&arguments, context)?
+    } else {
+        arguments
+    };
+    Ok(responses_tool_call_item_from_payload(
+        tool_name, call_id, payload, status,
+    ))
+}
+
+fn responses_tool_call_item_from_payload(
+    tool_name: &ResponsesToolName,
+    call_id: String,
+    payload: String,
+    status: &str,
+) -> Value {
+    let item_id = responses_tool_call_item_id(tool_name);
+    responses_tool_call_item_with_id(tool_name, item_id, call_id, payload, status)
+}
+
+fn responses_tool_call_item_id(tool_name: &ResponsesToolName) -> String {
+    let prefix = if tool_name.is_custom() {
+        "ctc_codey_"
+    } else {
+        "fc_codey_"
+    };
+    format!("{prefix}{}", Uuid::new_v4())
+}
+
+fn responses_tool_call_item_with_id(
+    tool_name: &ResponsesToolName,
+    item_id: String,
+    call_id: String,
+    payload: String,
+    status: &str,
+) -> Value {
+    let (item_type, payload_field) = if tool_name.is_custom() {
+        ("custom_tool_call", "input")
+    } else {
+        ("function_call", "arguments")
+    };
+    let mut item = serde_json::Map::from_iter([
+        ("id".to_string(), Value::String(item_id)),
+        ("type".to_string(), Value::String(item_type.to_string())),
+        ("status".to_string(), Value::String(status.to_string())),
+        ("call_id".to_string(), Value::String(call_id)),
+        (payload_field.to_string(), Value::String(payload)),
+    ]);
+    tool_name.insert_response_fields(&mut item);
+    Value::Object(item)
 }
 
 fn push_chat_text_message(messages: &mut Vec<Value>, role: &str, content: &str) -> Result<()> {
@@ -3550,27 +3836,15 @@ fn anthropic_message_to_responses_body_with_tool_bridge(
                     anyhow::bail!("Anthropic tool_use.input 必须是 JSON 对象");
                 }
                 let tool_name = tool_bridge.restore_upstream_name(name)?;
-                let mut function_call = serde_json::Map::from_iter([
-                    (
-                        "id".to_string(),
-                        Value::String(format!("fc_codey_{}", Uuid::new_v4())),
-                    ),
-                    (
-                        "type".to_string(),
-                        Value::String("function_call".to_string()),
-                    ),
-                    ("status".to_string(), Value::String("completed".to_string())),
-                    ("call_id".to_string(), Value::String(call_id.to_string())),
-                    (
-                        "arguments".to_string(),
-                        Value::String(
-                            serde_json::to_string(&input)
-                                .context("序列化 Anthropic tool_use.input 失败")?,
-                        ),
-                    ),
-                ]);
-                tool_name.insert_response_fields(&mut function_call);
-                output.push(Value::Object(function_call));
+                let arguments = serde_json::to_string(&input)
+                    .context("序列化 Anthropic tool_use.input 失败")?;
+                output.push(responses_tool_call_item_from_upstream_arguments(
+                    &tool_name,
+                    call_id.to_string(),
+                    arguments,
+                    "completed",
+                    "Anthropic custom tool_use.input",
+                )?);
             }
             // Raw chain-of-thought must not be surfaced as assistant text.
             // Signature/redacted blocks are provider state and have no safe
@@ -4342,21 +4616,13 @@ fn append_chat_tool_calls_to_responses_output(
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| format!("call_codey_{}", Uuid::new_v4()));
         let tool_name = tool_bridge.restore_upstream_name(name)?;
-        let mut function_call = serde_json::Map::from_iter([
-            (
-                "id".to_string(),
-                Value::String(format!("fc_codey_{}", Uuid::new_v4())),
-            ),
-            (
-                "type".to_string(),
-                Value::String("function_call".to_string()),
-            ),
-            ("status".to_string(), Value::String("completed".to_string())),
-            ("call_id".to_string(), Value::String(call_id)),
-            ("arguments".to_string(), Value::String(arguments)),
-        ]);
-        tool_name.insert_response_fields(&mut function_call);
-        output.push(Value::Object(function_call));
+        output.push(responses_tool_call_item_from_upstream_arguments(
+            &tool_name,
+            call_id,
+            arguments,
+            "completed",
+            "Chat custom tool_call.function.arguments",
+        )?);
     }
     Ok(())
 }
@@ -4375,30 +4641,13 @@ fn append_legacy_chat_function_call_to_responses_output(
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow::anyhow!("Chat message.function_call 缺少 name"))?;
     let tool_name = tool_bridge.restore_upstream_name(name)?;
-    let mut output_item = serde_json::Map::from_iter([
-        (
-            "id".to_string(),
-            Value::String(format!("fc_codey_{}", Uuid::new_v4())),
-        ),
-        (
-            "type".to_string(),
-            Value::String("function_call".to_string()),
-        ),
-        ("status".to_string(), Value::String("completed".to_string())),
-        (
-            "call_id".to_string(),
-            Value::String(format!("call_codey_{}", Uuid::new_v4())),
-        ),
-        (
-            "arguments".to_string(),
-            Value::String(
-                json_value_as_chat_string(function.get("arguments"))
-                    .unwrap_or_else(|| "{}".to_string()),
-            ),
-        ),
-    ]);
-    tool_name.insert_response_fields(&mut output_item);
-    output.push(Value::Object(output_item));
+    output.push(responses_tool_call_item_from_upstream_arguments(
+        &tool_name,
+        format!("call_codey_{}", Uuid::new_v4()),
+        json_value_as_chat_string(function.get("arguments")).unwrap_or_else(|| "{}".to_string()),
+        "completed",
+        "Chat legacy custom function_call.arguments",
+    )?);
     Ok(())
 }
 
@@ -4935,6 +5184,7 @@ struct ResponsesStreamTool {
     name: String,
     response_name: Option<ResponsesToolName>,
     arguments: String,
+    response_input: Option<String>,
     emitted_arguments: usize,
     fallback_arguments: Option<String>,
     added: bool,
@@ -5110,12 +5360,13 @@ impl<'a> ResponsesSseState<'a> {
             self.tools.insert(
                 upstream_index,
                 ResponsesStreamTool {
-                    item_id: format!("fc_codey_{}", Uuid::new_v4()),
+                    item_id: String::new(),
                     output_index,
                     call_id: String::new(),
                     name: String::new(),
                     response_name: None,
                     arguments: String::new(),
+                    response_input: None,
                     emitted_arguments: 0,
                     fallback_arguments: None,
                     added: false,
@@ -5159,29 +5410,30 @@ impl<'a> ResponsesSseState<'a> {
             if tool.call_id.is_empty() {
                 tool.call_id = format!("call_codey_{}", Uuid::new_v4());
             }
+            if tool.item_id.is_empty() {
+                tool.item_id = responses_tool_call_item_id(response_name);
+            }
             tool.added = true;
-            let mut item = serde_json::Map::from_iter([
-                ("id".to_string(), Value::String(tool.item_id.clone())),
-                (
-                    "type".to_string(),
-                    Value::String("function_call".to_string()),
-                ),
-                (
-                    "status".to_string(),
-                    Value::String("in_progress".to_string()),
-                ),
-                ("call_id".to_string(), Value::String(tool.call_id.clone())),
-                ("arguments".to_string(), Value::String(String::new())),
-            ]);
-            response_name.insert_response_fields(&mut item);
             events.push(json!({
                 "type":"response.output_item.added",
                 "response_id":response_id,
                 "output_index":tool.output_index,
-                "item":Value::Object(item)
+                "item":responses_tool_call_item_with_id(
+                    response_name,
+                    tool.item_id.clone(),
+                    tool.call_id.clone(),
+                    String::new(),
+                    "in_progress",
+                )
             }));
         }
-        if tool.added && tool.emitted_arguments < tool.arguments.len() {
+        if tool.added
+            && tool
+                .response_name
+                .as_ref()
+                .is_some_and(|response_name| !response_name.is_custom())
+            && tool.emitted_arguments < tool.arguments.len()
+        {
             let delta = &tool.arguments[tool.emitted_arguments..];
             events.push(json!({
                 "type":"response.function_call_arguments.delta",
@@ -5271,51 +5523,72 @@ impl<'a> ResponsesSseState<'a> {
             if tool.call_id.is_empty() {
                 tool.call_id = format!("call_codey_{}", Uuid::new_v4());
             }
+            let response_name = tool
+                .response_name
+                .as_ref()
+                .expect("response tool name must be restored before serialization");
+            if response_name.is_custom() && tool.response_input.is_none() {
+                tool.response_input = Some(custom_tool_input_from_arguments(
+                    &tool.arguments,
+                    "流式 custom function arguments",
+                )?);
+            }
+            if tool.item_id.is_empty() {
+                tool.item_id = responses_tool_call_item_id(response_name);
+            }
             if !tool.added {
                 tool.added = true;
-                let response_name = tool
-                    .response_name
-                    .as_ref()
-                    .expect("response tool name must be restored before add");
-                let mut item = serde_json::Map::from_iter([
-                    ("id".to_string(), Value::String(tool.item_id.clone())),
-                    (
-                        "type".to_string(),
-                        Value::String("function_call".to_string()),
-                    ),
-                    (
-                        "status".to_string(),
-                        Value::String("in_progress".to_string()),
-                    ),
-                    ("call_id".to_string(), Value::String(tool.call_id.clone())),
-                    ("arguments".to_string(), Value::String(String::new())),
-                ]);
-                response_name.insert_response_fields(&mut item);
                 events.push(json!({
                     "type":"response.output_item.added",
                     "response_id":self.response_id,
                     "output_index":tool.output_index,
-                    "item":Value::Object(item)
+                    "item":responses_tool_call_item_with_id(
+                        response_name,
+                        tool.item_id.clone(),
+                        tool.call_id.clone(),
+                        String::new(),
+                        "in_progress",
+                    )
                 }));
             }
-            if tool.emitted_arguments < tool.arguments.len() {
-                let delta = &tool.arguments[tool.emitted_arguments..];
+            if response_name.is_custom() {
+                let input = tool.response_input.as_deref().unwrap_or_default();
+                if !input.is_empty() {
+                    events.push(json!({
+                        "type":"response.custom_tool_call_input.delta",
+                        "response_id":self.response_id,
+                        "item_id":tool.item_id,
+                        "output_index":tool.output_index,
+                        "delta":input,
+                    }));
+                }
                 events.push(json!({
-                    "type":"response.function_call_arguments.delta",
+                    "type":"response.custom_tool_call_input.done",
                     "response_id":self.response_id,
                     "item_id":tool.item_id,
                     "output_index":tool.output_index,
-                    "delta":delta,
+                    "input":input,
                 }));
-                tool.emitted_arguments = tool.arguments.len();
+            } else {
+                if tool.emitted_arguments < tool.arguments.len() {
+                    let delta = &tool.arguments[tool.emitted_arguments..];
+                    events.push(json!({
+                        "type":"response.function_call_arguments.delta",
+                        "response_id":self.response_id,
+                        "item_id":tool.item_id,
+                        "output_index":tool.output_index,
+                        "delta":delta,
+                    }));
+                    tool.emitted_arguments = tool.arguments.len();
+                }
+                events.push(json!({
+                    "type":"response.function_call_arguments.done",
+                    "response_id":self.response_id,
+                    "item_id":tool.item_id,
+                    "output_index":tool.output_index,
+                    "arguments":tool.arguments,
+                }));
             }
-            events.push(json!({
-                "type":"response.function_call_arguments.done",
-                "response_id":self.response_id,
-                "item_id":tool.item_id,
-                "output_index":tool.output_index,
-                "arguments":tool.arguments,
-            }));
             events.push(json!({
                 "type":"response.output_item.done",
                 "response_id":self.response_id,
@@ -5415,24 +5688,22 @@ fn stream_message_item(message: &ResponsesStreamMessage) -> Value {
 }
 
 fn stream_tool_item(tool: &ResponsesStreamTool) -> Value {
-    let mut item = serde_json::Map::from_iter([
-        ("id".to_string(), Value::String(tool.item_id.clone())),
-        (
-            "type".to_string(),
-            Value::String("function_call".to_string()),
-        ),
-        ("status".to_string(), Value::String("completed".to_string())),
-        ("call_id".to_string(), Value::String(tool.call_id.clone())),
-        (
-            "arguments".to_string(),
-            Value::String(tool.arguments.clone()),
-        ),
-    ]);
-    tool.response_name
+    let response_name = tool
+        .response_name
         .as_ref()
-        .expect("stream tool response name must be restored before serialization")
-        .insert_response_fields(&mut item);
-    Value::Object(item)
+        .expect("stream tool response name must be restored before serialization");
+    let payload = if response_name.is_custom() {
+        tool.response_input.clone().unwrap_or_default()
+    } else {
+        tool.arguments.clone()
+    };
+    responses_tool_call_item_with_id(
+        response_name,
+        tool.item_id.clone(),
+        tool.call_id.clone(),
+        payload,
+        "completed",
+    )
 }
 
 async fn write_responses_sse_event(stream: &mut TcpStream, event: &Value) -> Result<()> {
@@ -5501,6 +5772,9 @@ async fn write_responses_sse_response(stream: &mut TcpStream, response: &Value) 
                 Some("function_call") => {
                     added_item.insert("arguments".to_string(), Value::String(String::new()));
                 }
+                Some("custom_tool_call") => {
+                    added_item.insert("input".to_string(), Value::String(String::new()));
+                }
                 _ => {}
             }
         }
@@ -5532,6 +5806,25 @@ async fn write_responses_sse_response(stream: &mut TcpStream, response: &Value) 
                     "item_id": item_id,
                     "output_index": output_index,
                     "arguments": arguments,
+                }));
+            }
+            Some("custom_tool_call") => {
+                let input = item.get("input").and_then(Value::as_str).unwrap_or("");
+                if !input.is_empty() {
+                    events.push(json!({
+                        "type":"response.custom_tool_call_input.delta",
+                        "response_id": response_id,
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "delta": input,
+                    }));
+                }
+                events.push(json!({
+                    "type":"response.custom_tool_call_input.done",
+                    "response_id": response_id,
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "input": input,
                 }));
             }
             _ => {}
@@ -6368,6 +6661,7 @@ mod tests {
                 .restore_upstream_name(upstream_name)
                 .unwrap(),
             ResponsesToolName {
+                kind: ResponsesToolKind::Function,
                 namespace: vec!["mcp_files".to_string()],
                 name: "read".to_string(),
             }
@@ -6423,6 +6717,230 @@ mod tests {
     }
 
     #[test]
+    fn custom_tools_wrap_definition_choice_history_and_result() {
+        let patch = "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch";
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":[
+                {"role":"user","content":"apply it"},
+                {"type":"custom_tool_call","call_id":"call-patch","name":"apply_patch","input":patch},
+                {"type":"custom_tool_call_output","call_id":"call-patch","output":"Done!"}
+            ],
+            "tools":[{
+                "type":"custom",
+                "name":"apply_patch",
+                "description":"Apply a patch",
+                "format":{"type":"grammar","syntax":"lark","definition":"start: /[\\s\\S]+/"}
+            }],
+            "tool_choice":{"type":"custom","name":"apply_patch"}
+        }))
+        .unwrap();
+
+        let upstream_name = converted.body["tools"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        assert!(upstream_name.starts_with(CUSTOM_UPSTREAM_TOOL_PREFIX));
+        assert!(upstream_name.len() <= UPSTREAM_FUNCTION_NAME_MAX_BYTES);
+        assert_eq!(
+            converted.body["tools"][0]["function"]["parameters"]["required"],
+            json!(["input"])
+        );
+        assert_eq!(
+            converted.body["tools"][0]["function"]["parameters"]["additionalProperties"],
+            false
+        );
+        assert!(
+            converted.body["tools"][0]["function"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("\"syntax\":\"lark\"")
+        );
+        assert_eq!(
+            converted.body["tool_choice"]["function"]["name"],
+            upstream_name
+        );
+        assert_eq!(
+            converted.body["messages"][1]["tool_calls"][0]["function"]["name"],
+            upstream_name
+        );
+        let wrapped = serde_json::from_str::<Value>(
+            converted.body["messages"][1]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(wrapped["input"], patch);
+        assert_eq!(converted.body["messages"][2]["role"], "tool");
+        assert_eq!(converted.body["messages"][2]["tool_call_id"], "call-patch");
+        assert_eq!(converted.body["messages"][2]["content"], "Done!");
+
+        let anthropic = responses_to_anthropic_messages_body(&json!({
+            "model":"provider-model",
+            "input":[
+                {"role":"user","content":"apply it"},
+                {"type":"custom_tool_call","call_id":"call-patch","name":"apply_patch","input":patch},
+                {"type":"custom_tool_call_output","call_id":"call-patch","output":"Done!"}
+            ],
+            "tools":[{"type":"custom","name":"apply_patch"}]
+        }))
+        .unwrap();
+        assert!(
+            anthropic["tools"][0]["name"]
+                .as_str()
+                .unwrap()
+                .starts_with(CUSTOM_UPSTREAM_TOOL_PREFIX)
+        );
+        assert_eq!(
+            anthropic["messages"][1]["content"][0]["input"]["input"],
+            patch
+        );
+        assert_eq!(
+            anthropic["messages"][2]["content"][0]["type"],
+            "tool_result"
+        );
+        assert_eq!(
+            anthropic["messages"][2]["content"][0]["tool_use_id"],
+            "call-patch"
+        );
+    }
+
+    #[test]
+    fn custom_response_calls_restore_for_chat_and_anthropic() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[{"type":"custom","name":"apply_patch","description":"Apply a patch"}]
+        }))
+        .unwrap();
+        let upstream_name = converted.body["tools"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        let raw_input = "*** Begin Patch\n*** End Patch";
+        let wrapped = wrap_custom_tool_input(raw_input).unwrap();
+
+        let chat = chat_completion_to_responses_body_with_tool_bridge(
+            json!({
+                "choices":[{"message":{"role":"assistant","tool_calls":[{
+                    "id":"call-chat",
+                    "type":"function",
+                    "function":{"name":upstream_name,"arguments":wrapped}
+                }]},"finish_reason":"tool_calls"}]
+            }),
+            "provider-model",
+            &converted.tool_bridge,
+        )
+        .unwrap();
+        assert_eq!(chat["output"][0]["type"], "custom_tool_call");
+        assert_eq!(chat["output"][0]["name"], "apply_patch");
+        assert_eq!(chat["output"][0]["input"], raw_input);
+        assert!(
+            chat["output"][0]["id"]
+                .as_str()
+                .unwrap()
+                .starts_with("ctc_codey_")
+        );
+
+        let anthropic = anthropic_message_to_responses_body_with_tool_bridge(
+            &json!({
+                "type":"message",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"call-anthropic",
+                    "name":upstream_name,
+                    "input":{"input":raw_input}
+                }]
+            }),
+            "provider-model",
+            &converted.tool_bridge,
+        )
+        .unwrap();
+        assert_eq!(anthropic["output"][0]["type"], "custom_tool_call");
+        assert_eq!(anthropic["output"][0]["name"], "apply_patch");
+        assert_eq!(anthropic["output"][0]["input"], raw_input);
+    }
+
+    #[test]
+    fn custom_tools_deduplicate_identical_definitions_and_reject_conflicts() {
+        let definition = json!({
+            "type":"custom",
+            "name":"apply_patch",
+            "format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}
+        });
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[definition.clone(), definition]
+        }))
+        .unwrap();
+        assert_eq!(converted.body["tools"].as_array().unwrap().len(), 1);
+
+        let conflict = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[
+                {"type":"custom","name":"apply_patch","description":"first"},
+                {"type":"custom","name":"apply_patch","description":"second"}
+            ]
+        }))
+        .unwrap_err();
+        assert!(conflict.to_string().contains("定义冲突"));
+
+        let generated = custom_upstream_tool_name("apply_patch");
+        let collision = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[
+                {"type":"function","name":generated,"parameters":{"type":"object"}},
+                {"type":"custom","name":"apply_patch"}
+            ]
+        }))
+        .unwrap_err();
+        assert!(collision.to_string().contains("冲突"));
+    }
+
+    #[test]
+    fn custom_streaming_waits_for_the_complete_json_wrapper() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[{"type":"custom","name":"apply_patch"}]
+        }))
+        .unwrap();
+        let upstream_name = converted.body["tools"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        let mut stream = ResponsesSseState::new("provider-model", &converted.tool_bridge);
+
+        let events = stream
+            .tool_delta(
+                0,
+                Some("call-patch"),
+                Some(upstream_name),
+                Some("{\"input\":\"*** Begin"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "response.output_item.added");
+        assert_eq!(events[0]["item"]["type"], "custom_tool_call");
+        assert_eq!(events[0]["item"]["name"], "apply_patch");
+        assert_eq!(events[0]["item"]["input"], "");
+
+        let events = stream
+            .tool_delta(0, None, None, Some(" Patch\"}"), None)
+            .unwrap();
+        assert!(events.is_empty());
+        assert_eq!(
+            custom_tool_input_from_arguments(
+                &stream.tools.get(&0).unwrap().arguments,
+                "test custom arguments"
+            )
+            .unwrap(),
+            "*** Begin Patch"
+        );
+    }
+
+    #[test]
     fn namespace_tools_fail_closed_on_conflicts_and_unsupported_tool_kinds() {
         let duplicate = responses_to_chat_completions_request(&json!({
             "model":"provider-model",
@@ -6439,14 +6957,14 @@ mod tests {
         .unwrap_err();
         assert!(duplicate.to_string().contains("存在定义冲突"));
 
-        for tool_type in ["custom", "tool_search"] {
+        for tool_type in ["tool_search", "web_search_preview"] {
             let error = responses_to_chat_completions_request(&json!({
                 "model":"provider-model",
                 "input":"hello",
                 "tools":[{"type":tool_type,"name":"lookup"}]
             }))
             .unwrap_err();
-            assert!(error.to_string().contains("不能安全转换"));
+            assert!(error.to_string().contains("请改用支持 Responses 的线路"));
         }
     }
 
@@ -7042,6 +7560,143 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX)
+        );
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_route_bridges_apply_patch_custom_tool_and_stream_events() {
+        const RAW_PATCH: &str =
+            "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch";
+
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            let upstream_tool_name = body["tools"][0]["name"].as_str().unwrap().to_string();
+            assert!(upstream_tool_name.starts_with(CUSTOM_UPSTREAM_TOOL_PREFIX));
+            let wrapped_input = json!({"input":RAW_PATCH}).to_string();
+            let sse = [
+                (
+                    "message_start",
+                    json!({
+                        "type":"message_start",
+                        "message":{
+                            "id":"msg-custom-stream",
+                            "type":"message",
+                            "role":"assistant",
+                            "model":"claude-sonnet-test",
+                            "content":[],
+                            "usage":{"input_tokens":5}
+                        }
+                    }),
+                ),
+                (
+                    "content_block_start",
+                    json!({
+                        "type":"content_block_start",
+                        "index":0,
+                        "content_block":{
+                            "type":"tool_use",
+                            "id":"call-apply-patch",
+                            "name":upstream_tool_name,
+                            "input":{}
+                        }
+                    }),
+                ),
+                (
+                    "content_block_delta",
+                    json!({
+                        "type":"content_block_delta",
+                        "index":0,
+                        "delta":{
+                            "type":"input_json_delta",
+                            "partial_json":wrapped_input
+                        }
+                    }),
+                ),
+                (
+                    "message_delta",
+                    json!({
+                        "type":"message_delta",
+                        "delta":{"stop_reason":"tool_use"},
+                        "usage":{"output_tokens":3}
+                    }),
+                ),
+                ("message_stop", json!({"type":"message_stop"})),
+            ]
+            .into_iter()
+            .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+            .collect::<String>();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            body
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":"apply the patch",
+                "stream":true,
+                "tools":[{
+                    "type":"custom",
+                    "name":"apply_patch",
+                    "description":"Apply a patch to the workspace",
+                    "format":{
+                        "type":"grammar",
+                        "syntax":"lark",
+                        "definition":"start: /[\\s\\S]+/"
+                    }
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let events = response.text().await.unwrap();
+        assert!(events.contains("response.custom_tool_call_input.delta"));
+        assert!(events.contains("response.custom_tool_call_input.done"));
+        assert!(events.contains("\"type\":\"custom_tool_call\""));
+        assert!(events.contains("\"name\":\"apply_patch\""));
+        assert!(events.contains("*** Begin Patch"));
+        assert!(!events.contains("response.function_call_arguments"));
+        assert!(!events.contains(CUSTOM_UPSTREAM_TOOL_PREFIX));
+        assert!(events.contains("response.completed"));
+
+        let body = upstream_task.await.unwrap();
+        assert_eq!(
+            body["tools"][0]["input_schema"]["required"],
+            json!(["input"])
+        );
+        assert_eq!(
+            body["tools"][0]["input_schema"]["additionalProperties"],
+            false
+        );
+        assert!(
+            body["tools"][0]["description"]
+                .as_str()
+                .unwrap()
+                .contains("\"syntax\":\"lark\"")
         );
         router.stop().await.unwrap();
     }
