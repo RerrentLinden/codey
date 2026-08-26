@@ -31,6 +31,7 @@ directories = "6"
 fastctx = { git = "https://github.com/yc-duan/fastctx", rev = "22b40ea324a186a921dfe38c205e3ffacdf6546d", default-features = false }
 fs2 = "0.4"
 futures-util.workspace = true
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"], default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 semver = "1"

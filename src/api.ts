@@ -21,6 +21,8 @@ export const CODEY_API_COMMANDS = [
   "clear_codex_trace_logs",
   "test_webhook",
   "test_notification_channel",
+  "start_wechat_claw_login",
+  "poll_wechat_claw_login",
   "optimize_prompt",
   "test_prompt_optimization",
   "fetch_prompt_optimization_models",

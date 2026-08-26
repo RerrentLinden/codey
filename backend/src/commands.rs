@@ -17,6 +17,7 @@ mod prompt_optimization;
 mod runtime;
 mod updates;
 mod webhooks;
+mod wechat_claw;
 
 #[cfg(windows)]
 use codey_runtime_core::app_paths::{
@@ -72,6 +73,10 @@ use webhooks::{
     WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
     sync_waiting_webhook_watcher, test_notification_channel, test_webhook,
 };
+use wechat_claw::{
+    WechatClawLoginState, poll_wechat_claw_login, start_wechat_claw_login,
+    wechat_claw_login_http_client,
+};
 
 use crate::account_usage;
 use crate::cdp;
@@ -114,6 +119,7 @@ pub struct AppState {
     provider_model_sync_lock: Mutex<()>,
     pub http_client: reqwest::Client,
     pub webhook_http_client: reqwest::Client,
+    wechat_claw_login_http_client: reqwest::Client,
     account_usage_cache: Mutex<account_usage::AccountUsageCache>,
     pub runtime: Mutex<Option<Arc<CodeyRuntime>>>,
     runtime_operation: Mutex<()>,
@@ -136,6 +142,7 @@ pub struct AppState {
     webhook_notifications: Mutex<WebhookNotificationState>,
     persisted_waiting_notifications: Mutex<WaitingLedgerState>,
     recent_session_event_cache: Mutex<Option<pending_approval::RecentSessionEventCache>>,
+    wechat_claw_logins: Mutex<WechatClawLoginState>,
     waiting_watcher_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     waiting_watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     waiting_watcher_sync: Mutex<()>,
@@ -197,6 +204,7 @@ impl Default for AppState {
                 .expect("shared Codey HTTP client should be constructible"),
             webhook_http_client: crate::notifications::notification_http_client()
                 .expect("notification HTTP client should be constructible"),
+            wechat_claw_login_http_client: wechat_claw_login_http_client(),
             account_usage_cache: Mutex::new(account_usage::AccountUsageCache::default()),
             runtime: Mutex::new(None),
             runtime_operation: Mutex::new(()),
@@ -225,6 +233,7 @@ impl Default for AppState {
             recent_session_event_cache: Mutex::new(Some(
                 pending_approval::RecentSessionEventCache::default(),
             )),
+            wechat_claw_logins: Mutex::new(WechatClawLoginState::default()),
             waiting_watcher_shutdown: Mutex::new(None),
             waiting_watcher_task: Mutex::new(None),
             waiting_watcher_sync: Mutex::new(()),
@@ -748,6 +757,11 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Err(error) => Err(error),
             }
         }
+        "start_wechat_claw_login" => start_wechat_claw_login(state).await,
+        "poll_wechat_claw_login" => match string_argument(&args, "loginId") {
+            Ok(login_id) => poll_wechat_claw_login(state, login_id).await,
+            Err(error) => Err(error),
+        },
         "optimize_prompt" => match string_argument(&args, "text") {
             Ok(text) => optimize_prompt_command(state, text).await,
             Err(error) => Err(error),

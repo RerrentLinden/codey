@@ -74,6 +74,7 @@ impl NotificationDispatcher {
             return Ok(());
         }
         let adapter = adapter_for(&self.config);
+        let preparation_error = self.prepare_channel(adapter.as_ref()).await;
         let mut last_error = None;
         for attempt in 0..attempts.max(1) {
             let request = adapter
@@ -122,7 +123,12 @@ impl NotificationDispatcher {
                 tokio::time::sleep(Duration::from_millis(250 * 2u64.pow(attempt))).await;
             }
         }
-        let error = last_error.unwrap_or_else(|| "未知错误".to_string());
+        let mut error = last_error.unwrap_or_else(|| "未知错误".to_string());
+        if let Some(preparation_error) = preparation_error {
+            error.push_str("（iLink 激活检查未完成：");
+            error.push_str(&preparation_error);
+            error.push('）');
+        }
         Err(NotificationDeliveryError::definitive(format!(
             "{}消息发送失败：{}",
             adapter.display_name(),
@@ -156,6 +162,30 @@ impl NotificationDispatcher {
             .await
             .map_err(anyhow::Error::new)?;
         Ok(json!({"status":"ok", "eventId": event.event_id}))
+    }
+
+    async fn prepare_channel(&self, adapter: &dyn NotificationChannelAdapter) -> Option<String> {
+        let request = adapter.prepare_request(&self.client)?;
+        let request = match request {
+            Ok(request) => request,
+            Err(error) => return Some(adapter.sanitize_error(&error.to_string())),
+        };
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => return Some(adapter.sanitize_error(&error.to_string())),
+        };
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => return Some(adapter.sanitize_error(&error.to_string())),
+        };
+        match validate_http_response(adapter, status, &body) {
+            Ok(()) => {
+                adapter.mark_prepared();
+                None
+            }
+            Err(error) => Some(adapter.sanitize_error(&error)),
+        }
     }
 }
 

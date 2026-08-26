@@ -256,8 +256,10 @@ if (import.meta.env.DEV) {
           previewConfig.webhook.channels.filter(
             (channel) =>
               channel.enabled &&
-              (channel.kind === "telegram"
-                ? channel.botTokenConfigured && Boolean(channel.chatId.trim())
+              (channel.kind === "telegram" || channel.kind === "wechatClaw"
+                ? channel.botTokenConfigured &&
+                  Boolean(channel.chatId.trim()) &&
+                  (channel.kind !== "wechatClaw" || channel.urlConfigured)
                 : channel.urlConfigured),
           ).length;
         return {
@@ -833,12 +835,32 @@ if (import.meta.env.DEV) {
           botToken?: string;
           chatId?: string;
         } | undefined;
-        const configured = channel?.kind === "telegram"
-          ? Boolean(channel.botToken?.trim() && channel.chatId?.trim())
+        const configured = channel?.kind === "telegram" || channel?.kind === "wechatClaw"
+          ? Boolean(
+            channel.botToken?.trim() &&
+              channel.chatId?.trim() &&
+              (channel.kind !== "wechatClaw" || channel.url?.trim()),
+          )
           : Boolean(channel?.url?.trim());
         return configured
           ? { status: "ok", eventId: "preview-notification-test" }
           : { status: "failed", message: "请先完成渠道配置" };
+      }
+      if (command === "start_wechat_claw_login") {
+        return {
+          loginId: "preview-wechat-claw-login",
+          status: "wait",
+          qrCode: "preview-wechat-claw-qr-code",
+          qrCodeImageUrl: "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='192' height='192' viewBox='0 0 12 12'%3E%3Crect width='12' height='12' fill='white'/%3E%3Cpath d='M1 1h3v3H1zm7 0h3v3H8zM1 8h3v3H1zm4-4h2v2H5zm1 3h2v2H6zm3 2h2v2H9zM4 8h1v3H4zm5-3h2v1H9z' fill='%231d1d1f'/%3E%3C/svg%3E",
+        };
+      }
+      if (command === "poll_wechat_claw_login") {
+        return {
+          status: "confirmed",
+          baseUrl: "https://ilinkai.weixin.qq.com",
+          botToken: "preview-wechat-claw-token",
+          recipientId: "preview-user@im.wechat",
+        };
       }
       if (command === "fetch_prompt_optimization_models") {
         return { models: previewModelState.upstreamModels };

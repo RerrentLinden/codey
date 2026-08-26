@@ -12,6 +12,7 @@ pub enum NotificationChannelKind {
     Feishu,
     Wecom,
     Telegram,
+    WechatClaw,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -69,6 +70,11 @@ impl NotificationChannelConfig {
             NotificationChannelKind::Telegram => {
                 !self.bot_token.trim().is_empty() && !self.chat_id.trim().is_empty()
             }
+            NotificationChannelKind::WechatClaw => {
+                !self.bot_token.trim().is_empty()
+                    && !self.chat_id.trim().is_empty()
+                    && self.wechat_claw_base_url().is_ok()
+            }
         }
     }
 
@@ -123,6 +129,29 @@ impl NotificationChannelConfig {
             || url.path() != "/cgi-bin/webhook/send"
             || url.fragment().is_some()
             || !valid_key
+        {
+            return Err(INVALID_URL);
+        }
+        Ok(url)
+    }
+
+    pub(crate) fn wechat_claw_base_url(&self) -> Result<reqwest::Url, &'static str> {
+        const INVALID_URL: &str = "微信 ClawBot 服务地址必须是腾讯 iLink 的 HTTPS 根地址";
+        let value = self.url.trim();
+        if value.is_empty() {
+            return Err("请先通过扫码登录微信 ClawBot");
+        }
+        let url = reqwest::Url::parse(value).map_err(|_| INVALID_URL)?;
+        let host = url.host_str().unwrap_or_default();
+        let official_host = host == "ilinkai.weixin.qq.com" || host.ends_with(".weixin.qq.com");
+        if url.scheme() != "https"
+            || !official_host
+            || url.port_or_known_default() != Some(443)
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || !matches!(url.path(), "" | "/")
+            || url.query().is_some()
+            || url.fragment().is_some()
         {
             return Err(INVALID_URL);
         }
@@ -207,6 +236,13 @@ impl WebhookConfig {
                     channel.wecom_webhook_url().map_err(ToString::to_string)?;
                 }
                 NotificationChannelKind::Telegram => {}
+                NotificationChannelKind::WechatClaw => {
+                    if !channel.url.trim().is_empty() {
+                        channel
+                            .wechat_claw_base_url()
+                            .map_err(ToString::to_string)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -233,7 +269,20 @@ impl WebhookConfig {
                         channel.url = existing.url.clone();
                     }
                 }
-                NotificationChannelKind::Telegram => {
+                NotificationChannelKind::Telegram | NotificationChannelKind::WechatClaw => {
+                    let kind = channel.kind;
+                    if kind == NotificationChannelKind::WechatClaw
+                        && channel.url.trim().is_empty()
+                        && channel.url_configured
+                    {
+                        if let Some(existing) = previous
+                            .channels
+                            .iter()
+                            .find(|existing| existing.id == channel.id && existing.kind == kind)
+                        {
+                            channel.url = existing.url.clone();
+                        }
+                    }
                     if channel.clear_bot_token {
                         channel.bot_token.clear();
                         channel.bot_token_configured = false;
@@ -242,10 +291,11 @@ impl WebhookConfig {
                     if !channel.bot_token.trim().is_empty() || !channel.bot_token_configured {
                         continue;
                     }
-                    if let Some(existing) = previous.channels.iter().find(|existing| {
-                        existing.id == channel.id
-                            && existing.kind == NotificationChannelKind::Telegram
-                    }) {
+                    if let Some(existing) = previous
+                        .channels
+                        .iter()
+                        .find(|existing| existing.id == channel.id && existing.kind == kind)
+                    {
                         channel.bot_token = existing.bot_token.clone();
                     }
                 }
@@ -483,5 +533,60 @@ mod tests {
                 .get("clearBotToken")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn wechat_claw_requires_an_official_ilink_https_root_url() {
+        for accepted in [
+            "https://ilinkai.weixin.qq.com",
+            "https://region.weixin.qq.com/",
+        ] {
+            let config = NotificationChannelConfig {
+                kind: NotificationChannelKind::WechatClaw,
+                url: accepted.to_string(),
+                ..NotificationChannelConfig::default()
+            };
+            assert!(config.wechat_claw_base_url().is_ok(), "{accepted}");
+        }
+
+        for rejected in [
+            "http://ilinkai.weixin.qq.com",
+            "https://ilinkai.weixin.qq.com:8443",
+            "https://ilinkai.weixin.qq.com/ilink/bot/sendmessage",
+            "https://ilinkai.weixin.qq.com?redirect=1",
+            "https://weixin.qq.com.evil.example",
+            "https://user@ilinkai.weixin.qq.com",
+        ] {
+            let config = NotificationChannelConfig {
+                kind: NotificationChannelKind::WechatClaw,
+                url: rejected.to_string(),
+                ..NotificationChannelConfig::default()
+            };
+            assert!(config.wechat_claw_base_url().is_err(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn redacted_wechat_claw_token_is_restored_when_other_settings_are_saved() {
+        let previous = WebhookConfig {
+            channels: vec![NotificationChannelConfig {
+                id: "wechat-claw-1".to_string(),
+                kind: NotificationChannelKind::WechatClaw,
+                url: "https://ilinkai.weixin.qq.com".to_string(),
+                url_configured: true,
+                bot_token: "ilink-secret".to_string(),
+                bot_token_configured: true,
+                chat_id: "user@im.wechat".to_string(),
+                ..NotificationChannelConfig::default()
+            }],
+            ..WebhookConfig::default()
+        };
+        let mut incoming = previous.clone();
+        incoming.channels[0].url.clear();
+        incoming.channels[0].bot_token.clear();
+        incoming.merge_redacted_secrets(&previous);
+
+        assert_eq!(incoming.channels[0].bot_token, "ilink-secret");
+        assert_eq!(incoming.channels[0].url, "https://ilinkai.weixin.qq.com");
     }
 }

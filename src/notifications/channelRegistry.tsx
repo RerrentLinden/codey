@@ -3,6 +3,7 @@ import { IconBrandWechat } from "@tabler/icons-react";
 
 import { FeishuChannelEditor } from "./FeishuChannelEditor";
 import { TelegramChannelEditor } from "./TelegramChannelEditor";
+import { WechatClawChannelEditor } from "./WechatClawChannelEditor";
 import { WecomChannelEditor } from "./WecomChannelEditor";
 import type {
   NotificationChannel,
@@ -88,6 +89,10 @@ function WecomIcon(props: NotificationChannelIconProps) {
   return <IconBrandWechat {...props} color="#07c160" />;
 }
 
+function WechatClawIcon(props: NotificationChannelIconProps) {
+  return <IconBrandWechat {...props} color="#07c160" />;
+}
+
 const CHANNEL_DEFINITIONS: Record<
   NotificationChannelKind,
   NotificationChannelDefinition
@@ -128,6 +133,22 @@ const CHANNEL_DEFINITIONS: Record<
     isConfigured: (channel) =>
       Boolean(
         (channel.botToken.trim() || channel.botTokenConfigured) &&
+          channel.chatId.trim(),
+      ),
+  },
+  wechatClaw: {
+    kind: "wechatClaw",
+    addLabel: "微信 ClawBot",
+    displayName: "微信 ClawBot",
+    title: "微信 ClawBot 通知",
+    description: "扫码绑定后，把任务状态直接发送到个人微信",
+    iconClassName: "wecom",
+    Icon: WechatClawIcon,
+    Editor: WechatClawChannelEditor,
+    isConfigured: (channel) =>
+      Boolean(
+        (channel.botToken.trim() || channel.botTokenConfigured) &&
+          (channel.url.trim() || channel.urlConfigured) &&
           channel.chatId.trim(),
       ),
   },

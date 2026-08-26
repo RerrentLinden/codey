@@ -1,4 +1,4 @@
-export type NotificationChannelKind = "feishu" | "wecom" | "telegram";
+export type NotificationChannelKind = "feishu" | "wecom" | "telegram" | "wechatClaw";
 
 export const MAX_NOTIFICATION_CHANNELS = 32;
 
