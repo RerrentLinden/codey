@@ -118,6 +118,136 @@ fn discarding_a_cancelled_startup_clears_active_and_pending_runtime_policy() {
 }
 
 #[test]
+fn restore_without_a_lease_repairs_legacy_persistent_codey_runtime_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let original = br#"model_provider = "codey_router"
+model = "custom/gpt-5.6-terra"
+model_catalog_json = "model-catalogs/codey-official.json"
+
+[model_providers.codey_router]
+name = "Codey Local Router"
+base_url = "http://127.0.0.1:43127/v1"
+wire_api = "responses"
+supports_websockets = false
+experimental_bearer_token = "runtime-token"
+http_headers = { x-codey-router-token = "runtime-token" }
+
+[model_providers.user_relay]
+name = "User Relay"
+base_url = "https://relay.example/v1"
+
+[agents]
+enabled = true
+default_subagent_model = "custom/gpt-5.6-terra"
+default_subagent_reasoning_effort = "low"
+
+[agents.default]
+model = "custom/gpt-5.6-terra"
+model_reasoning_effort = "low"
+config_file = "/tmp/codey/codex-constraints/runtime/default-agent.toml"
+
+[agents.codey_worker]
+model = "custom/gpt-5.6-terra"
+model_reasoning_effort = "medium"
+config_file = "/tmp/codey/codex-constraints/runtime/agents/codey_worker.toml"
+
+[features.multi_agent_v2]
+enabled = true
+tool_namespace = "agents"
+multi_agent_mode_hint_text = "Codey runtime hint"
+default_subagent_model = "custom/gpt-5.6-luna"
+default_subagent_reasoning_effort = "max"
+"#;
+    fs::write(home.join("config.toml"), original).unwrap();
+
+    assert!(restore_runtime_config_at(&home, &temp.path().join("missing-lease.json")).unwrap());
+    let repaired = fs::read_to_string(home.join("config.toml")).unwrap();
+    let document = repaired.parse::<DocumentMut>().unwrap();
+
+    assert!(document.get("model").is_none());
+    assert!(document.get("model_provider").is_none());
+    assert!(document.get("model_catalog_json").is_none());
+    assert!(document["model_providers"].get("codey_router").is_none());
+    assert_eq!(
+        document["model_providers"]["user_relay"]["base_url"].as_str(),
+        Some("https://relay.example/v1")
+    );
+    assert!(document["agents"].get("default_subagent_model").is_none());
+    assert!(
+        document["agents"]
+            .get("default_subagent_reasoning_effort")
+            .is_none()
+    );
+    assert!(document["agents"].get("default").is_none());
+    assert!(document["agents"].get("codey_worker").is_none());
+    assert_eq!(document["agents"]["enabled"].as_bool(), Some(true));
+    assert!(
+        document
+            .get("features")
+            .and_then(Item::as_table)
+            .and_then(|features| features.get("multi_agent_v2"))
+            .is_some()
+    );
+    assert!(
+        document["features"]["multi_agent_v2"]
+            .get("default_subagent_model")
+            .is_none()
+    );
+    assert!(
+        document["features"]["multi_agent_v2"]
+            .get("default_subagent_reasoning_effort")
+            .is_none()
+    );
+    assert_eq!(fs::read(home.join("config.toml.bak")).unwrap(), original);
+}
+
+#[test]
+fn legacy_repair_keeps_a_user_owned_codey_router_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let original = br#"model_provider = "codey_router"
+model = "user-model"
+
+[model_providers.codey_router]
+name = "User-Owned Router"
+base_url = "http://127.0.0.1:9876/v1"
+wire_api = "responses"
+"#;
+    fs::write(home.join("config.toml"), original).unwrap();
+
+    assert!(!restore_runtime_config_at(&home, &temp.path().join("missing-lease.json")).unwrap());
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+}
+
+#[test]
+fn legacy_repair_keeps_user_subagent_defaults_without_codey_ownership_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let original = br#"[agents]
+enabled = true
+default_subagent_model = "company/gpt-5.6-terra"
+default_subagent_reasoning_effort = "low"
+
+[agents.researcher]
+model = "company/gpt-5.6-terra"
+model_reasoning_effort = "low"
+
+[features.multi_agent_v2]
+enabled = true
+tool_namespace = "agents"
+"#;
+    fs::write(home.join("config.toml"), original).unwrap();
+
+    assert!(!restore_runtime_config_at(&home, &temp.path().join("missing-lease.json")).unwrap());
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+    assert!(!home.join("config.toml.bak").exists());
+}
+
+#[test]
 fn default_agent_source_exactly_migrates_to_read_only() {
     let temp = tempfile::tempdir().unwrap();
     let constraints_dir = temp.path().join("codex-constraints");

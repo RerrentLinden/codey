@@ -114,16 +114,26 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
 
     let first_host = wait_for_host_starts(&event_log, 1)[0];
     terminate_process(first_host, true);
-    let hosts = wait_for_host_starts(&event_log, 2);
-    assert_ne!(hosts[0], hosts[1]);
-    // FastCtx 0.2.6 在 runtime session 内部重启 control center host，worker
-    // 不再为这类故障退出；这里验证宿主确实替换，并继续验证原 MCP 会话可用。
-
+    // FastCtx 在下一次 MCP 请求读写时也可能才观察到 control center 链路断开。
+    // 用只读请求驱动恢复；如果断链恰好发生在请求执行中，该请求允许返回结果未知错误。
     send(
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
             "id": 3,
+            "method": "tools/list",
+            "params": {}
+        }),
+    );
+    let _recovery_probe = response_with_id(&responses_rx, 3);
+    let hosts = wait_for_host_starts(&event_log, 2);
+    assert_ne!(hosts[0], hosts[1]);
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
             "method": "tools/call",
             "params": {
                 "name": "glob",
@@ -131,7 +141,7 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
             }
         }),
     );
-    let response = response_with_id(&responses_rx, 3);
+    let response = response_with_id(&responses_rx, 4);
     assert_eq!(response["result"]["isError"], false, "{response}");
 
     drop(stdin);
