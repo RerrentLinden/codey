@@ -142,6 +142,15 @@ fn renderer_settings_keep_api_keys_and_clear_notification_secrets() {
         url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=wecom-secret".to_string(),
         ..NotificationChannelConfig::default()
     });
+    config.webhook.channels.push(NotificationChannelConfig {
+        id: "wechat-claw-1".to_string(),
+        kind: crate::notifications::NotificationChannelKind::WechatClaw,
+        url: "https://ilinkai.weixin.qq.com".to_string(),
+        bot_token: "wechat-claw-secret".to_string(),
+        context_token: "wechat-context-secret".to_string(),
+        chat_id: "user@im.wechat".to_string(),
+        ..NotificationChannelConfig::default()
+    });
 
     let public = serde_json::to_value(redacted_config(&config)).unwrap();
 
@@ -158,11 +167,20 @@ fn renderer_settings_keep_api_keys_and_clear_notification_secrets() {
     assert_eq!(public["webhook"]["channels"][1]["botTokenConfigured"], true);
     assert_eq!(public["webhook"]["channels"][2]["url"], "");
     assert_eq!(public["webhook"]["channels"][2]["urlConfigured"], true);
+    assert_eq!(public["webhook"]["channels"][3]["botToken"], "");
+    assert_eq!(public["webhook"]["channels"][3]["botTokenConfigured"], true);
+    assert_eq!(public["webhook"]["channels"][3]["contextToken"], "");
+    assert_eq!(
+        public["webhook"]["channels"][3]["contextTokenConfigured"],
+        true
+    );
     assert!(public.to_string().contains("renderer-secret"));
     assert!(public.to_string().contains("optimizer-secret"));
     assert!(!public.to_string().contains("feishu-secret"));
     assert!(!public.to_string().contains("telegram-secret"));
     assert!(!public.to_string().contains("wecom-secret"));
+    assert!(!public.to_string().contains("wechat-claw-secret"));
+    assert!(!public.to_string().contains("wechat-context-secret"));
     assert!(!public.to_string().contains("legacy-secret"));
 }
 

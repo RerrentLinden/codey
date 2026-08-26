@@ -12,6 +12,9 @@ export type NotificationChannel = {
   botToken: string;
   botTokenConfigured: boolean;
   clearBotToken?: boolean;
+  contextToken: string;
+  contextTokenConfigured: boolean;
+  clearContextToken?: boolean;
   chatId: string;
 };
 

@@ -1624,6 +1624,8 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
         channel.url.clear();
         channel.bot_token_configured = !channel.bot_token.trim().is_empty();
         channel.bot_token.clear();
+        channel.context_token_configured = !channel.context_token.trim().is_empty();
+        channel.context_token.clear();
     }
     public.prompt_optimization.api_key_configured =
         !public.prompt_optimization.api_key.trim().is_empty();

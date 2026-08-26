@@ -130,7 +130,12 @@ function NotificationChannelDialogComponent({
         12_000,
         `${definition.addLabel}测试在 12 秒内没有完成，请检查渠道配置和网络`,
       );
-      setTestResult({ tone: "success", text: "测试发送成功" });
+      setTestResult({
+        tone: "success",
+        text: draft.kind === "wechatClaw"
+          ? "iLink 已接受测试消息，请在微信中确认接收"
+          : "测试发送成功",
+      });
     } catch (error) {
       setTestResult({ tone: "error", text: errorText(error) });
     } finally {

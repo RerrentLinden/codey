@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use qrcode::{QrCode, render::svg};
-use reqwest::{Client, Url, header::HeaderMap, redirect};
+use reqwest::{Client, RequestBuilder, StatusCode, Url, header::HeaderMap, redirect};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -33,9 +33,23 @@ pub(super) struct WechatClawLoginState {
 
 #[derive(Debug)]
 struct PendingWechatClawLogin {
-    qr_code: String,
     base_url: String,
     created_at: Instant,
+    poll_in_flight: bool,
+    phase: WechatClawLoginPhase,
+}
+
+#[derive(Debug, Clone)]
+enum WechatClawLoginPhase {
+    Qr {
+        qr_code: String,
+    },
+    Activating {
+        bot_token: String,
+        recipient_id: String,
+        get_updates_buf: String,
+        notify_started: bool,
+    },
 }
 
 pub(super) async fn start_wechat_claw_login(state: &AppState) -> Result<Value, String> {
@@ -61,9 +75,12 @@ pub(super) async fn start_wechat_claw_login(state: &AppState) -> Result<Value, S
     logins.sessions.insert(
         login_id.clone(),
         PendingWechatClawLogin {
-            qr_code: qr_code.clone(),
             base_url: ILINK_BASE_URL.to_string(),
             created_at: Instant::now(),
+            poll_in_flight: false,
+            phase: WechatClawLoginPhase::Qr {
+                qr_code: qr_code.clone(),
+            },
         },
     );
     Ok(json!({
@@ -78,18 +95,62 @@ pub(super) async fn poll_wechat_claw_login(
     state: &AppState,
     login_id: String,
 ) -> Result<Value, String> {
-    let (qr_code, base_url) = {
+    let (base_url, phase) = {
         let mut logins = state.wechat_claw_logins.lock().await;
         logins.remove_expired();
-        let Some(session) = logins.sessions.get(&login_id) else {
+        let Some(session) = logins.sessions.get_mut(&login_id) else {
             return Ok(json!({
                 "status": "expired",
                 "message": "二维码已过期，请重新开始扫码",
             }));
         };
-        (session.qr_code.clone(), session.base_url.clone())
+        if session.poll_in_flight {
+            return Ok(pending_login_response(&session.phase));
+        }
+        session.poll_in_flight = true;
+        (session.base_url.clone(), session.phase.clone())
     };
 
+    let result = match phase {
+        WechatClawLoginPhase::Qr { qr_code } => {
+            poll_wechat_claw_qr(state, &login_id, qr_code, base_url).await
+        }
+        WechatClawLoginPhase::Activating {
+            bot_token,
+            recipient_id,
+            get_updates_buf,
+            notify_started,
+        } => {
+            poll_wechat_claw_activation(
+                state,
+                &login_id,
+                base_url,
+                bot_token,
+                recipient_id,
+                get_updates_buf,
+                notify_started,
+            )
+            .await
+        }
+    };
+    if let Some(session) = state
+        .wechat_claw_logins
+        .lock()
+        .await
+        .sessions
+        .get_mut(&login_id)
+    {
+        session.poll_in_flight = false;
+    }
+    result
+}
+
+async fn poll_wechat_claw_qr(
+    state: &AppState,
+    login_id: &str,
+    qr_code: String,
+    base_url: String,
+) -> Result<Value, String> {
     let url = endpoint_url(&base_url, "ilink/bot/get_qrcode_status")?;
     let response = state
         .wechat_claw_login_http_client
@@ -115,7 +176,7 @@ pub(super) async fn poll_wechat_claw_login(
                 );
             };
             let mut logins = state.wechat_claw_logins.lock().await;
-            if let Some(session) = logins.sessions.get_mut(&login_id) {
+            if let Some(session) = logins.sessions.get_mut(login_id) {
                 session.base_url = next_base_url;
             }
             Ok(json!({"status":"scanned", "message":"已扫码，请在微信中确认授权"}))
@@ -141,18 +202,26 @@ pub(super) async fn poll_wechat_claw_login(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .unwrap_or_default();
-            state
-                .wechat_claw_logins
-                .lock()
-                .await
-                .sessions
-                .remove(&login_id);
+                .unwrap_or_default()
+                .to_string();
+            let mut logins = state.wechat_claw_logins.lock().await;
+            let Some(session) = logins.sessions.get_mut(login_id) else {
+                return Ok(json!({
+                    "status": "expired",
+                    "message": "激活已过期，请重新开始扫码",
+                }));
+            };
+            session.base_url = confirmed_base_url;
+            session.created_at = Instant::now();
+            session.phase = WechatClawLoginPhase::Activating {
+                bot_token: token,
+                recipient_id,
+                get_updates_buf: String::new(),
+                notify_started: false,
+            };
             Ok(json!({
-                "status": "confirmed",
-                "baseUrl": confirmed_base_url,
-                "botToken": token,
-                "recipientId": recipient_id,
+                "status": "activating",
+                "message": "扫码已确认。请在微信中打开 ClawBot，并发送一条消息完成激活。",
             }))
         }
         "expired" => {
@@ -161,7 +230,7 @@ pub(super) async fn poll_wechat_claw_login(
                 .lock()
                 .await
                 .sessions
-                .remove(&login_id);
+                .remove(login_id);
             Ok(json!({"status":"expired", "message":"二维码已过期，请重新开始扫码"}))
         }
         _ => {
@@ -170,10 +239,336 @@ pub(super) async fn poll_wechat_claw_login(
                 .lock()
                 .await
                 .sessions
-                .remove(&login_id);
+                .remove(login_id);
             Ok(json!({"status":"failed", "message":"微信 ClawBot 登录未完成，请重新开始扫码"}))
         }
     }
+}
+
+fn pending_login_response(phase: &WechatClawLoginPhase) -> Value {
+    match phase {
+        WechatClawLoginPhase::Qr { .. } => json!({"status":"wait"}),
+        WechatClawLoginPhase::Activating { .. } => json!({
+            "status": "activating",
+            "message": "正在等待微信消息完成 ClawBot 激活。",
+        }),
+    }
+}
+
+#[derive(Debug)]
+enum ActivationRequestError {
+    Retryable,
+    Fatal(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ActivationResponseContract {
+    Strict,
+    GetUpdates,
+}
+
+async fn poll_wechat_claw_activation(
+    state: &AppState,
+    login_id: &str,
+    base_url: String,
+    bot_token: String,
+    recipient_id: String,
+    get_updates_buf: String,
+    notify_started: bool,
+) -> Result<Value, String> {
+    if !notify_started {
+        let request =
+            notify_start_request(&state.wechat_claw_login_http_client, &base_url, &bot_token)?;
+        match activation_response_json(request, "激活", ActivationResponseContract::Strict).await
+        {
+            Ok(_) => {
+                let mut logins = state.wechat_claw_logins.lock().await;
+                if let Some(PendingWechatClawLogin {
+                    phase: WechatClawLoginPhase::Activating { notify_started, .. },
+                    ..
+                }) = logins.sessions.get_mut(login_id)
+                {
+                    *notify_started = true;
+                }
+            }
+            Err(ActivationRequestError::Retryable) => {
+                return Ok(activation_retry_response());
+            }
+            Err(ActivationRequestError::Fatal(message)) => {
+                return Ok(fail_activation(state, login_id, message).await);
+            }
+        }
+    }
+
+    let request = get_updates_request(
+        &state.wechat_claw_login_http_client,
+        &base_url,
+        &bot_token,
+        &get_updates_buf,
+    )?;
+    let payload =
+        match activation_response_json(request, "消息同步", ActivationResponseContract::GetUpdates)
+            .await
+        {
+            Ok(payload) => payload,
+            Err(ActivationRequestError::Retryable) => return Ok(activation_retry_response()),
+            Err(ActivationRequestError::Fatal(message)) => {
+                return Ok(fail_activation(state, login_id, message).await);
+            }
+        };
+    let next_updates_buf = response_updates_buffer(&payload)
+        .unwrap_or(get_updates_buf.as_str())
+        .to_string();
+
+    if let Some((from_user_id, context_token)) = activation_context(&payload, &recipient_id) {
+        state
+            .wechat_claw_logins
+            .lock()
+            .await
+            .sessions
+            .remove(login_id);
+        return Ok(json!({
+            "status": "confirmed",
+            "baseUrl": base_url,
+            "botToken": bot_token,
+            "recipientId": from_user_id,
+            "contextToken": context_token,
+        }));
+    }
+
+    let mut logins = state.wechat_claw_logins.lock().await;
+    if let Some(PendingWechatClawLogin {
+        phase: WechatClawLoginPhase::Activating {
+            get_updates_buf, ..
+        },
+        ..
+    }) = logins.sessions.get_mut(login_id)
+    {
+        *get_updates_buf = next_updates_buf;
+    }
+    Ok(json!({
+        "status": "activating",
+        "message": "请在微信中打开 ClawBot，并发送一条消息完成激活。",
+    }))
+}
+
+fn activation_retry_response() -> Value {
+    json!({
+        "status": "activating",
+        "message": "微信 ClawBot 激活服务暂时无响应，正在自动重试；请保持当前页面打开。",
+    })
+}
+
+async fn fail_activation(state: &AppState, login_id: &str, message: String) -> Value {
+    state
+        .wechat_claw_logins
+        .lock()
+        .await
+        .sessions
+        .remove(login_id);
+    json!({"status":"failed", "message":message})
+}
+
+fn notify_start_request(
+    client: &Client,
+    base_url: &str,
+    bot_token: &str,
+) -> Result<RequestBuilder, String> {
+    ilink_post_request(
+        client,
+        base_url,
+        bot_token,
+        "ilink/bot/msg/notifystart",
+        json!({"base_info": wechat_claw_base_info()}),
+    )
+}
+
+fn get_updates_request(
+    client: &Client,
+    base_url: &str,
+    bot_token: &str,
+    get_updates_buf: &str,
+) -> Result<RequestBuilder, String> {
+    ilink_post_request(
+        client,
+        base_url,
+        bot_token,
+        "ilink/bot/getupdates",
+        json!({
+            "get_updates_buf": get_updates_buf,
+            "base_info": wechat_claw_base_info(),
+        }),
+    )
+}
+
+fn ilink_post_request(
+    client: &Client,
+    base_url: &str,
+    bot_token: &str,
+    endpoint: &str,
+    body: Value,
+) -> Result<RequestBuilder, String> {
+    Ok(client
+        .post(endpoint_url(base_url, endpoint)?)
+        .headers(ilink_headers(Some(bot_token)))
+        .json(&body))
+}
+
+async fn activation_response_json(
+    request: RequestBuilder,
+    action: &str,
+    contract: ActivationResponseContract,
+) -> Result<Value, ActivationRequestError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|_| ActivationRequestError::Retryable)?;
+    let status = response.status();
+    if !status.is_success() {
+        if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+            return Err(ActivationRequestError::Retryable);
+        }
+        return Err(ActivationRequestError::Fatal(format!(
+            "微信 ClawBot {action}服务返回 HTTP {status}，请重新扫码"
+        )));
+    }
+    let payload = response.json::<Value>().await.map_err(|_| {
+        ActivationRequestError::Fatal(format!(
+            "微信 ClawBot {action}服务返回了无法解析的响应，请重新扫码"
+        ))
+    })?;
+    validate_activation_response(&payload, action, contract)
+        .map_err(ActivationRequestError::Fatal)?;
+    Ok(payload)
+}
+
+fn validate_activation_response(
+    payload: &Value,
+    action: &str,
+    contract: ActivationResponseContract,
+) -> Result<(), String> {
+    let message = remote_error_message(payload);
+    if let Some(result) = response_code(payload, "ret") {
+        if result != 0 {
+            return Err(format!(
+                "微信 ClawBot {action}失败（{result}）：{}",
+                bounded_remote_message(message)
+            ));
+        }
+    } else if matches!(contract, ActivationResponseContract::Strict) {
+        return Err(format!(
+            "微信 ClawBot {action}服务没有返回明确结果，请重新扫码"
+        ));
+    }
+
+    for key in ["errcode", "err_code"] {
+        if let Some(errcode) = response_code(payload, key) {
+            if errcode != 0 {
+                return Err(format!(
+                    "微信 ClawBot {action}失败（{errcode}）：{}",
+                    bounded_remote_message(message)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn activation_context(payload: &Value, expected_recipient_id: &str) -> Option<(String, String)> {
+    let messages = response_messages(payload)?;
+    let expected = expected_recipient_id.trim();
+    messages.iter().find_map(|message| {
+        let from_user_id = message_string(message, "from_user_id")?;
+        if !expected.is_empty() && from_user_id != expected {
+            return None;
+        }
+        let context_token = message_string(message, "context_token")?;
+        Some((from_user_id.to_string(), context_token.to_string()))
+    })
+}
+
+fn message_string<'a>(message: &'a Value, field: &str) -> Option<&'a str> {
+    message
+        .get(field)
+        .and_then(Value::as_str)
+        .or_else(|| {
+            message
+                .get("msg")
+                .and_then(|nested| nested.get(field))
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn response_updates_buffer(payload: &Value) -> Option<&str> {
+    response_string(payload, &["get_updates_buf", "sync_buf"])
+}
+
+fn response_messages(payload: &Value) -> Option<&Vec<Value>> {
+    for key in ["msgs", "messages", "message_list", "updates"] {
+        if let Some(messages) = payload.get(key).and_then(Value::as_array) {
+            return Some(messages);
+        }
+    }
+    for key in ["data", "result", "body", "payload"] {
+        if let Some(messages) = payload.get(key).and_then(response_messages) {
+            return Some(messages);
+        }
+    }
+    None
+}
+
+fn response_string<'a>(payload: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    for key in keys {
+        if let Some(value) = payload
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value);
+        }
+    }
+    for key in ["data", "result", "body", "payload"] {
+        if let Some(value) = payload
+            .get(key)
+            .and_then(|nested| response_string(nested, keys))
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn response_code(payload: &Value, key: &str) -> Option<i64> {
+    payload.get(key).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+    })
+}
+
+fn remote_error_message(payload: &Value) -> &str {
+    response_string(payload, &["errmsg", "error_message", "err_msg", "message"])
+        .unwrap_or("未知错误")
+}
+
+fn bounded_remote_message(message: &str) -> String {
+    let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let value = normalized.chars().take(160).collect::<String>();
+    if value.is_empty() {
+        "未知错误".to_string()
+    } else {
+        value
+    }
+}
+
+fn wechat_claw_base_info() -> Value {
+    json!({
+        "channel_version": env!("CARGO_PKG_VERSION"),
+        "bot_agent": format!("Codey/{}", env!("CARGO_PKG_VERSION")),
+    })
 }
 
 impl WechatClawLoginState {
@@ -377,9 +772,12 @@ mod tests {
         state.sessions.insert(
             "old".to_string(),
             PendingWechatClawLogin {
-                qr_code: "qr".to_string(),
                 base_url: ILINK_BASE_URL.to_string(),
                 created_at: Instant::now() - LOGIN_TIMEOUT,
+                poll_in_flight: false,
+                phase: WechatClawLoginPhase::Qr {
+                    qr_code: "qr".to_string(),
+                },
             },
         );
         state.remove_expired();
@@ -414,5 +812,155 @@ mod tests {
             .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
             .unwrap();
         assert_eq!(body["local_token_list"], json!([]));
+    }
+
+    #[test]
+    fn activation_requests_use_notify_start_then_buffered_get_updates() {
+        let client = Client::new();
+        let notify = notify_start_request(&client, ILINK_BASE_URL, "secret")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            notify.url().as_str(),
+            "https://ilinkai.weixin.qq.com/ilink/bot/msg/notifystart"
+        );
+        assert_eq!(notify.headers()["authorization"], "Bearer secret");
+
+        let updates = get_updates_request(&client, ILINK_BASE_URL, "secret", "next-buffer")
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(
+            updates.url().as_str(),
+            "https://ilinkai.weixin.qq.com/ilink/bot/getupdates"
+        );
+        let body = updates
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .unwrap();
+        assert_eq!(body["get_updates_buf"], "next-buffer");
+        assert!(
+            body["base_info"]["bot_agent"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("Codey/"))
+        );
+    }
+
+    #[test]
+    fn activation_only_accepts_an_inbound_context_for_the_bound_user() {
+        let payload = json!({
+            "ret": 0,
+            "get_updates_buf": "next",
+            "msgs": [
+                {"from_user_id":"other@im.wechat", "context_token":"other-context"},
+                {"from_user_id":"user@im.wechat", "context_token":"user-context"}
+            ]
+        });
+
+        assert_eq!(
+            activation_context(&payload, "user@im.wechat"),
+            Some(("user@im.wechat".to_string(), "user-context".to_string()))
+        );
+        assert_eq!(response_updates_buffer(&payload), Some("next"));
+        assert_eq!(
+            activation_context(&payload, ""),
+            Some(("other@im.wechat".to_string(), "other-context".to_string()))
+        );
+    }
+
+    #[test]
+    fn activation_parses_nested_messages_and_legacy_sync_buffers() {
+        let payload = json!({
+            "ret": 0,
+            "data": {
+                "sync_buf": "legacy-next",
+                "updates": [{
+                    "msg": {
+                        "from_user_id": "user@im.wechat",
+                        "context_token": "nested-context"
+                    }
+                }]
+            }
+        });
+
+        assert_eq!(
+            activation_context(&payload, "user@im.wechat"),
+            Some(("user@im.wechat".to_string(), "nested-context".to_string()))
+        );
+        assert_eq!(response_updates_buffer(&payload), Some("legacy-next"));
+    }
+
+    #[test]
+    fn notify_start_responses_require_explicit_success_fields() {
+        assert!(
+            validate_activation_response(
+                &json!({"ret":0}),
+                "激活",
+                ActivationResponseContract::Strict
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_activation_response(
+                &json!({"ret":0,"errcode":0}),
+                "激活",
+                ActivationResponseContract::Strict,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_activation_response(&json!({}), "激活", ActivationResponseContract::Strict)
+                .is_err()
+        );
+        assert!(
+            validate_activation_response(
+                &json!({"ret":-2,"errmsg":"prepare failed"}),
+                "激活",
+                ActivationResponseContract::Strict,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn get_updates_responses_allow_empty_long_poll_results() {
+        for payload in [
+            json!({}),
+            json!({"get_updates_buf":"next"}),
+            json!({"ret":0}),
+            json!({"err_code":0,"messages":[]}),
+            json!({"data":{"sync_buf":"nested-next","updates":[]}}),
+        ] {
+            assert!(
+                validate_activation_response(
+                    &payload,
+                    "消息同步",
+                    ActivationResponseContract::GetUpdates,
+                )
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn get_updates_responses_reject_explicit_remote_errors() {
+        assert!(
+            validate_activation_response(
+                &json!({"ret":-14,"errmsg":"token expired"}),
+                "消息同步",
+                ActivationResponseContract::GetUpdates,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_activation_response(
+                &json!({"err_code":"-2","err_msg":"prepare failed"}),
+                "消息同步",
+                ActivationResponseContract::GetUpdates,
+            )
+            .is_err()
+        );
     }
 }

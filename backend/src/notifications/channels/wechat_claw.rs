@@ -54,6 +54,8 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
     fn configuration_error(&self) -> Option<&'static str> {
         if self.config.bot_token.trim().is_empty() {
             Some("请先通过扫码登录微信 ClawBot")
+        } else if self.config.context_token.trim().is_empty() {
+            Some("请先在微信中向 ClawBot 发送一条消息完成激活")
         } else if self.config.chat_id.trim().is_empty() {
             Some("请先填写接收通知的 iLink 用户 ID")
         } else {
@@ -65,7 +67,7 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
         self.ilink_post(
             client,
             "ilink/bot/sendmessage",
-            wechat_claw_body(event, &self.config.chat_id),
+            wechat_claw_body(event, &self.config.chat_id, &self.config.context_token),
         )
     }
 
@@ -95,6 +97,10 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
         } else {
             error.replace(token, "***")
         };
+        let context_token = self.config.context_token.trim();
+        if !context_token.is_empty() {
+            sanitized = sanitized.replace(context_token, "***");
+        }
         let url = self.config.url.trim();
         if !url.is_empty() {
             sanitized = sanitized.replace(url, "***");
@@ -153,11 +159,12 @@ fn wechat_claw_base_info() -> Value {
     })
 }
 
-fn wechat_claw_body(event: &NotificationEvent, recipient_id: &str) -> Value {
+fn wechat_claw_body(event: &NotificationEvent, recipient_id: &str, context_token: &str) -> Value {
     json!({
         "msg": {
             "from_user_id": "",
             "to_user_id": recipient_id.trim(),
+            "context_token": context_token.trim(),
             "client_id": wechat_claw_client_id(),
             "message_type": 2,
             "message_state": 2,
@@ -219,23 +226,37 @@ fn truncate_text(text: &str) -> String {
 fn validate_wechat_claw_response(body: &str) -> std::result::Result<(), String> {
     let value = serde_json::from_str::<Value>(body)
         .map_err(|_| "微信 ClawBot 返回了无法解析的响应".to_string())?;
-    let result = value.get("ret").and_then(Value::as_i64).unwrap_or(0);
-    if result == 0 {
-        return Ok(());
-    }
+    let result = value
+        .get("ret")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "微信 ClawBot 没有返回明确的发送结果".to_string())?;
     let message = value
         .get("errmsg")
         .and_then(Value::as_str)
         .unwrap_or("未知错误");
-    if result == -2 && message.trim().eq_ignore_ascii_case("prepare failed") {
-        return Err(
-            "微信 ClawBot 暂时无法准备投递。请先在微信中打开 ClawBot 对话并发送一条消息，然后重试；若仍失败，请重新扫码绑定或稍后重试".to_string(),
-        );
+    if result != 0 {
+        if result == -2 && message.trim().eq_ignore_ascii_case("prepare failed") {
+            return Err(
+                "微信 ClawBot 暂时无法准备投递。请重新扫码，并按提示先在微信中向 ClawBot 发送一条消息完成激活；若仍失败，请稍后重试".to_string(),
+            );
+        }
+        return Err(format!(
+            "微信 ClawBot 返回错误 {result}：{}",
+            bounded_remote_message(message)
+        ));
     }
-    Err(format!(
-        "微信 ClawBot 返回错误 {result}：{}",
-        bounded_remote_message(message)
-    ))
+    if let Some(errcode) = value.get("errcode") {
+        let errcode = errcode
+            .as_i64()
+            .ok_or_else(|| "微信 ClawBot 返回了无效的业务状态".to_string())?;
+        if errcode != 0 {
+            return Err(format!(
+                "微信 ClawBot 返回错误 {errcode}：{}",
+                bounded_remote_message(message)
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -248,6 +269,7 @@ mod tests {
             kind: NotificationChannelKind::WechatClaw,
             url: "https://ilinkai.weixin.qq.com".to_string(),
             bot_token: "ilink-secret-token".to_string(),
+            context_token: "context-secret-token".to_string(),
             chat_id: "recipient@im.wechat".to_string(),
             ..NotificationChannelConfig::default()
         }
@@ -279,6 +301,7 @@ mod tests {
             .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
             .unwrap();
         assert_eq!(body["msg"]["to_user_id"], "recipient@im.wechat");
+        assert_eq!(body["msg"]["context_token"], "context-secret-token");
         assert_eq!(body["msg"]["message_type"], 2);
         assert_eq!(body["msg"]["item_list"][0]["type"], 1);
         assert!(
@@ -292,6 +315,18 @@ mod tests {
                 .unwrap()
                 .contains("Codey 通知测试")
         );
+    }
+
+    #[test]
+    fn channel_is_not_ready_until_activation_context_is_available() {
+        let mut config = configured_channel();
+        config.context_token.clear();
+
+        assert_eq!(
+            WechatClawChannel::new(&config).configuration_error(),
+            Some("请先在微信中向 ClawBot 发送一条消息完成激活")
+        );
+        assert!(!config.is_configured());
     }
 
     #[test]
@@ -327,7 +362,10 @@ mod tests {
     #[test]
     fn response_requires_a_successful_ret_value() {
         assert!(validate_wechat_claw_response(r#"{"ret":0}"#).is_ok());
-        assert!(validate_wechat_claw_response("{}").is_ok());
+        assert!(validate_wechat_claw_response(r#"{"ret":0,"errcode":0}"#).is_ok());
+        assert!(validate_wechat_claw_response("{}").is_err());
+        assert!(validate_wechat_claw_response(r#"{"ret":0,"errcode":null}"#).is_err());
+        assert!(validate_wechat_claw_response(r#"{"ret":0,"errcode":-1}"#).is_err());
         assert!(
             validate_wechat_claw_response(r#"{"ret":-14,"errmsg":"token expired"}"#)
                 .unwrap_err()
@@ -336,7 +374,7 @@ mod tests {
         assert!(
             validate_wechat_claw_response(r#"{"ret":-2,"errmsg":"prepare failed"}"#)
                 .unwrap_err()
-                .contains("打开 ClawBot 对话")
+                .contains("重新扫码")
         );
         assert!(validate_wechat_claw_response("not json").is_err());
     }
@@ -345,9 +383,11 @@ mod tests {
     fn errors_never_expose_the_login_token_or_base_url() {
         let config = configured_channel();
         let channel = WechatClawChannel::new(&config);
-        let error = channel
-            .sanitize_error("request https://ilinkai.weixin.qq.com failed with ilink-secret-token");
+        let error = channel.sanitize_error(
+            "request https://ilinkai.weixin.qq.com failed with ilink-secret-token and context-secret-token",
+        );
         assert!(!error.contains("ilink-secret-token"));
+        assert!(!error.contains("context-secret-token"));
         assert!(!error.contains("ilinkai.weixin.qq.com"));
     }
 

@@ -9,7 +9,7 @@ import { invoke } from "../api";
 import { errorText } from "../appUtils";
 import { Button, Input } from "../components/mantine";
 import { inputShellClass, insetInputClass } from "../uiClasses";
-import type { NotificationChannel, NotificationChannelEditorProps } from "./types";
+import type { NotificationChannelEditorProps } from "./types";
 
 type WechatClawLoginStartResult = {
   loginId: string;
@@ -19,17 +19,18 @@ type WechatClawLoginStartResult = {
 };
 
 type WechatClawLoginPollResult = {
-  status: "wait" | "scanned" | "confirmed" | "expired" | "failed";
+  status: "wait" | "scanned" | "activating" | "confirmed" | "expired" | "failed";
   message?: string;
   baseUrl?: string;
   botToken?: string;
   recipientId?: string;
+  contextToken?: string;
 };
 
 type ActiveLogin = {
   loginId: string;
   qrCodeImageUrl?: string;
-  phase: "waiting" | "scanned" | "confirmed" | "expired" | "failed";
+  phase: "waiting" | "scanned" | "activating" | "confirmed" | "expired" | "failed";
   message: string;
 };
 
@@ -41,9 +42,7 @@ function WechatClawChannelEditorComponent({
   const [login, setLogin] = useState<ActiveLogin | null>(null);
   const [isStarting, setIsStarting] = useState(false);
   const mounted = useRef(true);
-  const channelRef = useRef<NotificationChannel>(channel);
   const onChangeRef = useRef(onChange);
-  channelRef.current = channel;
   onChangeRef.current = onChange;
 
   useEffect(() => {
@@ -75,9 +74,11 @@ function WechatClawChannelEditorComponent({
         if (result.status === "confirmed") {
           const token = result.botToken?.trim();
           const baseUrl = result.baseUrl?.trim();
-          if (!token || !baseUrl) {
+          const recipientId = result.recipientId?.trim();
+          const contextToken = result.contextToken?.trim();
+          if (!token || !baseUrl || !recipientId || !contextToken) {
             setLogin((current) => current?.loginId === loginId
-              ? { ...current, phase: "failed", message: "微信 ClawBot 没有返回完整的绑定凭据，请重新扫码" }
+              ? { ...current, phase: "failed", message: "微信 ClawBot 没有返回完整的激活凭据，请重新扫码" }
               : current);
             return;
           }
@@ -88,10 +89,13 @@ function WechatClawChannelEditorComponent({
             botToken: token,
             botTokenConfigured: true,
             clearBotToken: false,
-            chatId: result.recipientId?.trim() || channelRef.current.chatId,
+            contextToken,
+            contextTokenConfigured: true,
+            clearContextToken: false,
+            chatId: recipientId,
           });
           setLogin((current) => current?.loginId === loginId
-            ? { ...current, phase: "confirmed", message: "绑定成功。确认接收人 ID 后保存即可。" }
+            ? { ...current, phase: "confirmed", message: "绑定并激活成功，保存后即可接收通知。" }
             : current);
           return;
         }
@@ -110,10 +114,16 @@ function WechatClawChannelEditorComponent({
         setLogin((current) => current?.loginId === loginId
           ? {
             ...current,
-            phase: result.status === "scanned" ? "scanned" : "waiting",
-            message: result.message || (result.status === "scanned"
-              ? "已扫码，请在微信中确认授权。"
-              : "请使用微信扫描二维码。"),
+            phase: result.status === "activating"
+              ? "activating"
+              : result.status === "scanned"
+                ? "scanned"
+                : "waiting",
+            message: result.message || (result.status === "activating"
+              ? "请在微信中打开 ClawBot，并发送一条消息完成激活。"
+              : result.status === "scanned"
+                ? "已扫码，请在微信中确认授权。"
+                : "请使用微信扫描二维码。"),
           }
           : current);
         scheduleNext();
@@ -161,10 +171,17 @@ function WechatClawChannelEditorComponent({
     }
   }
 
-  const isBound = Boolean(channel.botToken.trim() || channel.botTokenConfigured);
-  const loginMessage = login?.message || (isBound
-    ? "当前已绑定。重新扫码会替换已保存的登录凭据。"
-    : "扫描后会自动填写登录凭据和当前微信的接收人 ID。二维码 10 分钟内有效。");
+  const hasBinding = Boolean(channel.botToken.trim() || channel.botTokenConfigured);
+  const isActivated = Boolean(
+    hasBinding &&
+      (channel.contextToken.trim() || channel.contextTokenConfigured) &&
+      channel.chatId.trim(),
+  );
+  const loginMessage = login?.message || (isActivated
+    ? "当前已完成绑定和激活。重新扫码会替换已保存的凭据。"
+    : hasBinding
+      ? "当前绑定缺少激活上下文，请重新扫码并按提示向 ClawBot 发送一条消息。"
+      : "扫码确认后，需要在微信中向 ClawBot 发送一条消息完成激活。二维码 10 分钟内有效。");
 
   return (
     <>
@@ -186,7 +203,7 @@ function WechatClawChannelEditorComponent({
             onClick={() => void startLogin()}
           >
             {isStarting ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <IconBrandWechat aria-hidden="true" />}
-            {isStarting ? "正在生成" : isBound ? "重新扫码" : "扫码绑定"}
+            {isStarting ? "正在生成" : hasBinding ? "重新扫码" : "扫码绑定"}
           </Button>
         </div>
         <p className="mt-2 text-[11px] leading-5 text-[#526158]" role="status" aria-live="polite">
@@ -217,14 +234,14 @@ function WechatClawChannelEditorComponent({
             className={insetInputClass}
             value={channel.chatId}
             disabled={disabled}
-            onChange={(event) => onChange({ chatId: event.target.value })}
-            placeholder="扫码后自动填入，可按需修改"
+            readOnly
+            placeholder="完成激活后自动填入"
             spellCheck={false}
           />
         </div>
       </label>
 
-      {isBound ? (
+      {hasBinding || channel.contextTokenConfigured ? (
         <div className="-mt-[7px] flex justify-end">
           <Button
             className="text-[#8e8e93] hover:text-[#d70015]"
@@ -240,6 +257,10 @@ function WechatClawChannelEditorComponent({
                 botToken: "",
                 botTokenConfigured: false,
                 clearBotToken: true,
+                contextToken: "",
+                contextTokenConfigured: false,
+                clearContextToken: true,
+                chatId: "",
               });
             }}
           >

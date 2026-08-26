@@ -37,6 +37,12 @@ pub struct NotificationChannelConfig {
     #[serde(default, skip_serializing)]
     pub clear_bot_token: bool,
     #[serde(default)]
+    pub context_token: String,
+    #[serde(default)]
+    pub context_token_configured: bool,
+    #[serde(default, skip_serializing)]
+    pub clear_context_token: bool,
+    #[serde(default)]
     pub chat_id: String,
     #[cfg(test)]
     #[serde(skip)]
@@ -55,6 +61,9 @@ impl Default for NotificationChannelConfig {
             bot_token: String::new(),
             bot_token_configured: false,
             clear_bot_token: false,
+            context_token: String::new(),
+            context_token_configured: false,
+            clear_context_token: false,
             chat_id: String::new(),
             #[cfg(test)]
             allow_insecure_test_url: false,
@@ -72,6 +81,7 @@ impl NotificationChannelConfig {
             }
             NotificationChannelKind::WechatClaw => {
                 !self.bot_token.trim().is_empty()
+                    && !self.context_token.trim().is_empty()
                     && !self.chat_id.trim().is_empty()
                     && self.wechat_claw_base_url().is_ok()
             }
@@ -201,9 +211,12 @@ impl WebhookConfig {
             channel.url_configured = !channel.url.is_empty();
             channel.clear_url = false;
             channel.bot_token = channel.bot_token.trim().to_string();
+            channel.context_token = channel.context_token.trim().to_string();
             channel.chat_id = channel.chat_id.trim().to_string();
             channel.bot_token_configured = !channel.bot_token.is_empty();
             channel.clear_bot_token = false;
+            channel.context_token_configured = !channel.context_token.is_empty();
+            channel.clear_context_token = false;
         }
     }
 
@@ -280,6 +293,20 @@ impl WebhookConfig {
                             .find(|existing| existing.id == channel.id && existing.kind == kind)
                     {
                         channel.url = existing.url.clone();
+                    }
+                    if kind == NotificationChannelKind::WechatClaw {
+                        if channel.clear_context_token {
+                            channel.context_token.clear();
+                            channel.context_token_configured = false;
+                        } else if channel.context_token.trim().is_empty()
+                            && channel.context_token_configured
+                            && let Some(existing) = previous
+                                .channels
+                                .iter()
+                                .find(|existing| existing.id == channel.id && existing.kind == kind)
+                        {
+                            channel.context_token = existing.context_token.clone();
+                        }
                     }
                     if channel.clear_bot_token {
                         channel.bot_token.clear();
@@ -574,6 +601,8 @@ mod tests {
                 url_configured: true,
                 bot_token: "ilink-secret".to_string(),
                 bot_token_configured: true,
+                context_token: "context-secret".to_string(),
+                context_token_configured: true,
                 chat_id: "user@im.wechat".to_string(),
                 ..NotificationChannelConfig::default()
             }],
@@ -582,9 +611,49 @@ mod tests {
         let mut incoming = previous.clone();
         incoming.channels[0].url.clear();
         incoming.channels[0].bot_token.clear();
+        incoming.channels[0].context_token.clear();
         incoming.merge_redacted_secrets(&previous);
 
         assert_eq!(incoming.channels[0].bot_token, "ilink-secret");
+        assert_eq!(incoming.channels[0].context_token, "context-secret");
         assert_eq!(incoming.channels[0].url, "https://ilinkai.weixin.qq.com");
+    }
+
+    #[test]
+    fn wechat_claw_requires_activation_context_and_can_clear_it_explicitly() {
+        let previous = WebhookConfig {
+            channels: vec![NotificationChannelConfig {
+                id: "wechat-claw-1".to_string(),
+                kind: NotificationChannelKind::WechatClaw,
+                enabled: true,
+                url: "https://ilinkai.weixin.qq.com".to_string(),
+                url_configured: true,
+                bot_token: "ilink-secret".to_string(),
+                bot_token_configured: true,
+                context_token: "context-secret".to_string(),
+                context_token_configured: true,
+                chat_id: "user@im.wechat".to_string(),
+                ..NotificationChannelConfig::default()
+            }],
+            ..WebhookConfig::default()
+        };
+        assert!(previous.channels[0].is_configured());
+
+        let mut incomplete = previous.channels[0].clone();
+        incomplete.context_token.clear();
+        assert!(!incomplete.is_configured());
+
+        let mut incoming = previous.clone();
+        incoming.channels[0].context_token.clear();
+        incoming.channels[0].clear_context_token = true;
+        incoming.merge_redacted_secrets(&previous);
+
+        assert!(incoming.channels[0].context_token.is_empty());
+        assert!(!incoming.channels[0].context_token_configured);
+        assert!(
+            serde_json::to_value(&incoming).unwrap()["channels"][0]
+                .get("clearContextToken")
+                .is_none()
+        );
     }
 }

@@ -85,6 +85,9 @@ if (import.meta.env.DEV) {
             botToken: "",
             botTokenConfigured: false,
             clearBotToken: false,
+            contextToken: "",
+            contextTokenConfigured: false,
+            clearContextToken: false,
             chatId: "",
           },
           {
@@ -97,6 +100,9 @@ if (import.meta.env.DEV) {
             botToken: "",
             botTokenConfigured: false,
             clearBotToken: false,
+            contextToken: "",
+            contextTokenConfigured: false,
+            clearContextToken: false,
             chatId: "",
           },
           {
@@ -109,6 +115,9 @@ if (import.meta.env.DEV) {
             botToken: "",
             botTokenConfigured: true,
             clearBotToken: false,
+            contextToken: "",
+            contextTokenConfigured: false,
+            clearContextToken: false,
             chatId: "preview-chat-id",
           },
         ],
@@ -261,7 +270,8 @@ if (import.meta.env.DEV) {
               (channel.kind === "telegram" || channel.kind === "wechatClaw"
                 ? channel.botTokenConfigured &&
                   Boolean(channel.chatId.trim()) &&
-                  (channel.kind !== "wechatClaw" || channel.urlConfigured)
+                  (channel.kind !== "wechatClaw" ||
+                    (channel.urlConfigured && channel.contextTokenConfigured))
                 : channel.urlConfigured),
           ).length;
         return {
@@ -820,13 +830,15 @@ if (import.meta.env.DEV) {
           kind?: string;
           url?: string;
           botToken?: string;
+          contextToken?: string;
           chatId?: string;
         } | undefined;
         const configured = channel?.kind === "telegram" || channel?.kind === "wechatClaw"
           ? Boolean(
             channel.botToken?.trim() &&
               channel.chatId?.trim() &&
-              (channel.kind !== "wechatClaw" || channel.url?.trim()),
+              (channel.kind !== "wechatClaw" ||
+                (channel.url?.trim() && channel.contextToken?.trim())),
           )
           : Boolean(channel?.url?.trim());
         return configured
@@ -847,6 +859,7 @@ if (import.meta.env.DEV) {
           baseUrl: "https://ilinkai.weixin.qq.com",
           botToken: "preview-wechat-claw-token",
           recipientId: "preview-user@im.wechat",
+          contextToken: "preview-wechat-claw-context",
         };
       }
       if (command === "fetch_prompt_optimization_models") {

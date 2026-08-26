@@ -148,6 +148,7 @@ const CHANNEL_DEFINITIONS: Record<
     isConfigured: (channel) =>
       Boolean(
         (channel.botToken.trim() || channel.botTokenConfigured) &&
+          (channel.contextToken.trim() || channel.contextTokenConfigured) &&
           (channel.url.trim() || channel.urlConfigured) &&
           channel.chatId.trim(),
       ),
@@ -180,6 +181,9 @@ export function createNotificationChannel(
     botToken: "",
     botTokenConfigured: false,
     clearBotToken: false,
+    contextToken: "",
+    contextTokenConfigured: false,
+    clearContextToken: false,
     chatId: "",
   };
 }
