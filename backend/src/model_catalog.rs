@@ -215,7 +215,17 @@ pub fn refresh_for_provider(
             {
                 continue;
             }
-            catalog_models.push(synthetic_model(&template, model_id, index));
+            let source_template =
+                official_template_for_route_alias(official_models.as_slice(), model_id);
+            let (source_template, preserve_source_runtime_metadata) = source_template
+                .map(|source_template| (source_template, true))
+                .unwrap_or((&template, false));
+            catalog_models.push(synthetic_model(
+                source_template,
+                model_id,
+                index,
+                preserve_source_runtime_metadata,
+            ));
         }
     }
     write_catalog(home, &catalog_models)?;
@@ -950,8 +960,33 @@ fn remove_fast_speed_controls(model: &mut Value) {
     }
 }
 
-fn synthetic_model(template: &Value, model_id: &str, index: usize) -> Value {
+fn official_template_for_route_alias<'a>(
+    official_models: &'a [Value],
+    route_model_id: &str,
+) -> Option<&'a Value> {
+    let (_, upstream_model_id) = route_model_id.split_once('/')?;
+    let upstream_model_id = upstream_model_id.trim();
+    if upstream_model_id.is_empty() {
+        return None;
+    }
+    official_models.iter().find(|model| {
+        model
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| model_id::equal(slug, upstream_model_id))
+    })
+}
+
+fn synthetic_model(
+    template: &Value,
+    model_id: &str,
+    index: usize,
+    preserve_source_runtime_metadata: bool,
+) -> Value {
     let mut model = template.clone();
+    if !preserve_source_runtime_metadata {
+        codey_runtime_core::model_suffix::sanitize_generic_model_metadata(&mut model);
+    }
     model["slug"] = json!(model_id);
     model["display_name"] = json!(model_id);
     model["description"] = json!("Third-party API model");
@@ -971,7 +1006,6 @@ fn synthetic_model(template: &Value, model_id: &str, index: usize) -> Value {
     if let Some(object) = model.as_object_mut() {
         object.remove("availability_nux");
         object.remove("upgrade");
-        object.remove("default_service_tier");
         // Provider-defined models are leaf candidates in current Codex releases,
         // but they must not inherit the template model's coordinator capability.
         object.remove("multi_agent_version");
@@ -1048,6 +1082,17 @@ mod tests {
                         {"effort": "low"}, {"effort": "medium"}, {"effort": "high"},
                         {"effort": "xhigh"}, {"effort": "max"}, {"effort": "ultra"}
                     ],
+                    "use_responses_lite": true,
+                    "tool_mode": "code_mode_only",
+                    "comp_hash": "3000",
+                    "default_service_tier": "priority",
+                    "prefer_websockets": true,
+                    "include_skills_usage_instructions": false,
+                    "include_plugin_usage_instructions": true,
+                    "include_apps_usage_instructions": true,
+                    "experimental_supported_tools": ["gpt-5.6-only-tool"],
+                    "node_repl_auto_review_required": false,
+                    "node_repl_disabled": false,
                     "service_tiers": [{"id": "priority"}],
                     "additional_speed_tiers": ["fast"]
                 },
@@ -1058,6 +1103,14 @@ mod tests {
                     "priority": 7,
                     "default_reasoning_level": "medium",
                     "supported_reasoning_levels": [{"effort": "low"}, {"effort": "xhigh"}],
+                    "use_responses_lite": false,
+                    "comp_hash": "2911",
+                    "include_skills_usage_instructions": true,
+                    "include_plugin_usage_instructions": true,
+                    "include_apps_usage_instructions": true,
+                    "experimental_supported_tools": [],
+                    "node_repl_auto_review_required": false,
+                    "node_repl_disabled": false,
                     "additional_speed_tiers": ["fast"]
                 },
                 {
@@ -1723,6 +1776,89 @@ mod tests {
                 .find(|model| model["slug"] == "gpt-5.4")
                 .unwrap(),
         );
+    }
+
+    #[test]
+    fn route_aliases_use_matching_official_runtime_metadata_and_sanitize_unknown_models() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec![
+            "openai/gpt-5.6-sol".into(),
+            "openai/gpt-5.5".into(),
+            "provider/custom-model".into(),
+        ];
+
+        assert_eq!(
+            refresh_for_provider(home.path(), false, Some(&selected), &selected).unwrap(),
+            3
+        );
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+
+        let gpt_56 = models
+            .iter()
+            .find(|model| model["slug"] == "openai/gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(gpt_56["use_responses_lite"], true);
+        assert_eq!(gpt_56["tool_mode"], "code_mode_only");
+        assert_eq!(gpt_56["comp_hash"], "3000");
+        assert_eq!(gpt_56["default_service_tier"], "priority");
+        assert_eq!(gpt_56["prefer_websockets"], true);
+        assert_eq!(gpt_56["include_skills_usage_instructions"], false);
+        assert_eq!(
+            gpt_56["experimental_supported_tools"],
+            json!(["gpt-5.6-only-tool"])
+        );
+        assert!(gpt_56.get("multi_agent_version").is_none());
+        assert_eq!(
+            gpt_56["base_instructions"],
+            "test-only instructions for gpt-5.6-sol"
+        );
+
+        let gpt_55 = models
+            .iter()
+            .find(|model| model["slug"] == "openai/gpt-5.5")
+            .unwrap();
+        assert_eq!(gpt_55["use_responses_lite"], false);
+        assert!(gpt_55.get("tool_mode").is_none());
+        assert_eq!(gpt_55["comp_hash"], "2911");
+        assert_eq!(gpt_55["include_skills_usage_instructions"], true);
+        assert_eq!(gpt_55["experimental_supported_tools"], json!([]));
+        assert!(gpt_55.get("multi_agent_version").is_none());
+        assert_eq!(
+            gpt_55["base_instructions"],
+            "test-only instructions for gpt-5.5"
+        );
+
+        let custom = models
+            .iter()
+            .find(|model| model["slug"] == "provider/custom-model")
+            .unwrap();
+        assert_eq!(custom["use_responses_lite"], false);
+        for field in [
+            "tool_mode",
+            "multi_agent_version",
+            "comp_hash",
+            "default_service_tier",
+            "prefer_websockets",
+            "reasoning_summary_format",
+            "auto_review_model_override",
+            "node_repl_auto_review_required",
+            "node_repl_disabled",
+        ] {
+            assert!(
+                custom.get(field).is_none(),
+                "unknown model inherited model-specific field {field}"
+            );
+        }
+        assert_eq!(custom["include_skills_usage_instructions"], true);
+        assert_eq!(custom["include_plugin_usage_instructions"], true);
+        assert_eq!(custom["include_apps_usage_instructions"], true);
+        assert_eq!(custom["experimental_supported_tools"], json!([]));
+        assert!(custom["auto_compact_token_limit"].is_null());
     }
 
     #[test]

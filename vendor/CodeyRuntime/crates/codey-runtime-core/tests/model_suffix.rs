@@ -139,6 +139,56 @@ fn build_catalog_strips_prompt_fields_from_an_external_template() {
 }
 
 #[test]
+fn build_catalog_sanitizes_model_specific_runtime_metadata_from_external_template() {
+    let entries = collect_catalog_entries("third-party-model", &HashMap::new(), "");
+    let template = json!({
+        "slug": "gpt-template",
+        "use_responses_lite": true,
+        "tool_mode": "code_mode_only",
+        "multi_agent_version": "v2",
+        "comp_hash": "3000",
+        "default_service_tier": "priority",
+        "prefer_websockets": true,
+        "reasoning_summary_format": "experimental",
+        "auto_review_model_override": "review-template",
+        "node_repl_auto_review_required": true,
+        "node_repl_disabled": true,
+        "include_skills_usage_instructions": false,
+        "include_plugin_usage_instructions": false,
+        "include_apps_usage_instructions": false,
+        "experimental_supported_tools": ["template-only-tool"],
+        "auto_compact_token_limit": 12345
+    });
+
+    let catalog = build_model_catalog_json_with_template(&entries, None, Some(&template));
+    let catalog: Value = serde_json::from_str(&catalog).unwrap();
+    let model = &catalog["models"][0];
+
+    assert_eq!(model["use_responses_lite"], false);
+    for field in [
+        "tool_mode",
+        "multi_agent_version",
+        "comp_hash",
+        "default_service_tier",
+        "prefer_websockets",
+        "reasoning_summary_format",
+        "auto_review_model_override",
+        "node_repl_auto_review_required",
+        "node_repl_disabled",
+    ] {
+        assert!(
+            model.get(field).is_none(),
+            "found model-specific field {field}"
+        );
+    }
+    assert_eq!(model["include_skills_usage_instructions"], true);
+    assert_eq!(model["include_plugin_usage_instructions"], true);
+    assert_eq!(model["include_apps_usage_instructions"], true);
+    assert_eq!(model["experimental_supported_tools"], json!([]));
+    assert!(model["auto_compact_token_limit"].is_null());
+}
+
+#[test]
 fn collect_entries_adopts_suffix_for_current_model_from_list() {
     // 当前 model 本身无后缀，但 model_list 中靠后位置有同名带后缀条目。
     let mut windows = HashMap::new();

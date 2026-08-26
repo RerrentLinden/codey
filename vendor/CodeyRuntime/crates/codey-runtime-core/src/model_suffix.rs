@@ -151,6 +151,18 @@ const MODEL_PROMPT_FIELDS: [&str; 7] = [
     "personality_pragmatic",
 ];
 
+const GENERIC_MODEL_SPECIFIC_FIELDS: [&str; 9] = [
+    "tool_mode",
+    "multi_agent_version",
+    "comp_hash",
+    "default_service_tier",
+    "prefer_websockets",
+    "reasoning_summary_format",
+    "auto_review_model_override",
+    "node_repl_auto_review_required",
+    "node_repl_disabled",
+];
+
 /// 构建 codex model_catalog_json 内容。
 ///
 /// 取 Codex 自带 bundled entry 作为模板，
@@ -177,6 +189,7 @@ pub fn build_model_catalog_json_with_template(
         .or_else(load_bundled_template_entry)
         .unwrap_or_else(|| json!({}));
     remove_model_prompt_fields(&mut template);
+    sanitize_generic_model_metadata(&mut template);
 
     let models: Vec<Value> = entries
         .iter()
@@ -243,4 +256,26 @@ pub fn remove_model_prompt_fields(value: &mut Value) {
         }
         _ => {}
     }
+}
+
+/// Removes runtime and transport capabilities that belong to one concrete
+/// Codex model and therefore cannot safely be inferred for a generic provider
+/// model cloned from that model's catalog entry.
+pub fn sanitize_generic_model_metadata(value: &mut Value) {
+    let Some(model) = value.as_object_mut() else {
+        return;
+    };
+    for field in GENERIC_MODEL_SPECIFIC_FIELDS {
+        model.remove(field);
+    }
+
+    // Unknown provider models use the conservative full Responses transport.
+    // Usage instructions stay enabled because the generic model has no native
+    // model-specific tool orchestration contract to replace them.
+    model.insert("use_responses_lite".to_string(), json!(false));
+    model.insert("include_skills_usage_instructions".to_string(), json!(true));
+    model.insert("include_plugin_usage_instructions".to_string(), json!(true));
+    model.insert("include_apps_usage_instructions".to_string(), json!(true));
+    model.insert("experimental_supported_tools".to_string(), json!([]));
+    model.insert("auto_compact_token_limit".to_string(), Value::Null);
 }
