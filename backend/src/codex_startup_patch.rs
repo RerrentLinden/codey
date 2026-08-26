@@ -2,7 +2,9 @@
 
 use anyhow::Result;
 
-const PATCH_RESULT: &str = "codey-startup-patch-installed-v36";
+const PATCH_RESULT: &str = "codey-startup-patch-installed-v37";
+const APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT: &str =
+    "codey-app-server-runtime-overrides-verified";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
@@ -24,6 +26,14 @@ fn patch_expression(options: PatchOptions) -> String {
 fn patch_expression_with_runtime_overrides(
     options: PatchOptions,
     runtime_config_overrides: &[String],
+) -> String {
+    patch_expression_with_runtime_overrides_and_validation(options, runtime_config_overrides, false)
+}
+
+fn patch_expression_with_runtime_overrides_and_validation(
+    options: PatchOptions,
+    runtime_config_overrides: &[String],
+    require_app_server_runtime_overrides: bool,
 ) -> String {
     let error_logger_executable = match std::env::current_exe() {
         Ok(path) => serde_json::to_string(&path.to_string_lossy().to_string())
@@ -60,6 +70,14 @@ fn patch_expression_with_runtime_overrides(
                 "false"
             },
         )
+        .replace(
+            "__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__",
+            if require_app_server_runtime_overrides {
+                "true"
+            } else {
+                "false"
+            },
+        )
 }
 
 pub fn reserve_loopback_port() -> Result<u16> {
@@ -71,12 +89,21 @@ pub async fn install(
     port: u16,
     options: PatchOptions,
     runtime_config_overrides: &[String],
+    require_app_server_runtime_overrides: bool,
 ) -> Result<()> {
     let websocket_url = wait_for_inspector(port).await?;
-    let expression = patch_expression_with_runtime_overrides(options, runtime_config_overrides);
+    let expression = patch_expression_with_runtime_overrides_and_validation(
+        options,
+        runtime_config_overrides,
+        require_app_server_runtime_overrides,
+    );
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        install_over_websocket(&websocket_url, &expression),
+        install_over_websocket(
+            &websocket_url,
+            &expression,
+            require_app_server_runtime_overrides,
+        ),
     )
     .await
     .map_err(|_| anyhow::anyhow!("Codex 启动补丁调试会话超时"))??;
@@ -123,7 +150,11 @@ async fn wait_for_inspector(port: u16) -> Result<String> {
     anyhow::bail!("等待 Codex 启动补丁超时：{last_error}")
 }
 
-async fn install_over_websocket(websocket_url: &str, expression: &str) -> Result<()> {
+async fn install_over_websocket(
+    websocket_url: &str,
+    expression: &str,
+    require_app_server_runtime_overrides: bool,
+) -> Result<()> {
     use futures_util::StreamExt;
     use tokio_tungstenite::tungstenite::Message;
 
@@ -177,6 +208,38 @@ async fn install_over_websocket(websocket_url: &str, expression: &str) -> Result
             }
             Some(5) => {
                 ensure_protocol_success(&payload, "Debugger.resume")?;
+                if require_app_server_runtime_overrides {
+                    send_command(
+                        &mut socket,
+                        6,
+                        "Runtime.evaluate",
+                        serde_json::json!({
+                            "expression": "globalThis.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__()",
+                            "awaitPromise": true,
+                            "returnByValue": true,
+                            "silent": false,
+                        }),
+                    )
+                    .await?;
+                    continue;
+                }
+                let _ = socket.close(None).await;
+                return Ok(());
+            }
+            Some(6) => {
+                ensure_protocol_success(&payload, "Runtime.evaluate")?;
+                if let Some(exception) = payload
+                    .get("result")
+                    .and_then(|result| result.get("exceptionDetails"))
+                {
+                    anyhow::bail!("Codex app-server 运行时覆盖校验失败：{exception}");
+                }
+                let value = payload
+                    .pointer("/result/result/value")
+                    .and_then(serde_json::Value::as_str);
+                if value != Some(APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT) {
+                    anyhow::bail!("Codex app-server 运行时覆盖校验未返回预期状态");
+                }
                 let _ = socket.close(None).await;
                 return Ok(());
             }
@@ -261,7 +324,11 @@ mod tests {
 
     #[test]
     fn patch_result_is_stable_for_launch_status_validation() {
-        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v36");
+        assert_eq!(PATCH_RESULT, "codey-startup-patch-installed-v37");
+        assert_eq!(
+            APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT,
+            "codey-app-server-runtime-overrides-verified"
+        );
     }
 
     #[test]
@@ -309,6 +376,10 @@ mod tests {
         assert!(expression.contains("writeCodeyPatchFailuresAsync"));
         assert!(expression.contains("optionalPatchFailureQueue"));
         assert!(expression.contains("--codey-record-error"));
+        assert!(expression.contains(
+            "setImmediate(() => {\n        try { process.getBuiltinModule(\"inspector\").close()"
+        ));
+        assert!(!expression.contains("__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__"));
         assert!(!expression.contains("\"__CODEY_ERROR_LOGGER_EXECUTABLE__\""));
     }
 
@@ -506,7 +577,148 @@ mod tests {
             disable_pet: true,
             subagent_gate_active: true,
         });
-        install_over_websocket(&format!("ws://{address}"), &expression)
+        install_over_websocket(&format!("ws://{address}"), &expression, false)
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn inspector_protocol_waits_for_app_server_runtime_override_validation() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+
+            for expected_id in [1_u64, 2] {
+                let message = socket.next().await.unwrap().unwrap();
+                let Message::Text(text) = message else {
+                    panic!("expected inspector command");
+                };
+                let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+                assert_eq!(command["id"], expected_id);
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"id": expected_id, "result": {}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            let message = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = message else {
+                panic!("expected runIfWaitingForDebugger");
+            };
+            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+            assert_eq!(command["id"], 3);
+            assert_eq!(command["method"], "Runtime.runIfWaitingForDebugger");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id": 3, "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "method": "Debugger.paused",
+                        "params": {
+                            "callFrames": [{"callFrameId": "frame-1"}]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let message = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = message else {
+                panic!("expected evaluateOnCallFrame");
+            };
+            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+            assert_eq!(command["id"], 4);
+            assert_eq!(command["method"], "Debugger.evaluateOnCallFrame");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "id": 4,
+                        "result": {
+                            "result": {
+                                "type": "string",
+                                "value": PATCH_RESULT
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+
+            let message = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = message else {
+                panic!("expected Debugger.resume");
+            };
+            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+            assert_eq!(command["id"], 5);
+            assert_eq!(command["method"], "Debugger.resume");
+            socket
+                .send(Message::Text(
+                    serde_json::json!({"id": 5, "result": {}})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .unwrap();
+
+            let message = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = message else {
+                panic!("expected Runtime.evaluate");
+            };
+            let command: serde_json::Value = serde_json::from_str(text.as_ref()).unwrap();
+            assert_eq!(command["id"], 6);
+            assert_eq!(command["method"], "Runtime.evaluate");
+            assert_eq!(command["params"]["awaitPromise"], true);
+            assert!(
+                command["params"]["expression"]
+                    .as_str()
+                    .unwrap()
+                    .contains("__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__")
+            );
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "id": 6,
+                        "result": {
+                            "result": {
+                                "type": "string",
+                                "value": APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT
+                            }
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+
+        let expression = patch_expression(PatchOptions {
+            disable_pet: true,
+            subagent_gate_active: true,
+        });
+        install_over_websocket(&format!("ws://{address}"), &expression, true)
             .await
             .unwrap();
         server.await.unwrap();
@@ -568,7 +780,7 @@ mod tests {
         });
         let error = tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            install_over_websocket(&format!("ws://{address}"), &expression),
+            install_over_websocket(&format!("ws://{address}"), &expression, false),
         )
         .await
         .expect("protocol error should not wait for the outer startup timeout")

@@ -16,7 +16,9 @@ async function loadPatchExpression() {
     "utf8",
   ));
   assert.ok(template, "startup patch template should be readable by the regression test");
-  return template.replaceAll("__DISABLE_PET__", "false");
+  return template
+    .replaceAll("__DISABLE_PET__", "false")
+    .replaceAll("__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__", "false");
 }
 
 test("Windows worker source signature cache is bounded", async () => {
@@ -58,7 +60,7 @@ test("Windows lag patch bypasses only the recurring WMI snapshot worker", async 
 
     try {
       const expression = await loadPatchExpression();
-      assert.equal((0, eval)(expression), "codey-startup-patch-installed-v36");
+      assert.equal((0, eval)(expression), "codey-startup-patch-installed-v37");
       const initialSampler =
         globalThis.__CODEY_CODEX_STARTUP_PATCH__.windowsWmiSampler;
       assert.equal(initialSampler.version, 4);

@@ -184,6 +184,7 @@ pub(super) async fn spawn_codex(
             inspector_port,
             patch_options,
             runtime_config_overrides,
+            !runtime_config_overrides.is_empty(),
         )
         .await
         {
@@ -203,6 +204,7 @@ pub(super) async fn spawn_codex(
                         "inspectorPort": inspector_port,
                         "processId": spawned.process_id,
                         "disablePet": patch_options.disable_pet,
+                        "runtimeConfigOverrideCount": runtime_config_overrides.len(),
                     }),
                 );
                 if let Err(cleanup_error) = stop_windows_spawned_codex(&mut spawned, app_dir).await
@@ -211,7 +213,12 @@ pub(super) async fn spawn_codex(
                         "Codex 启动补丁未能安装，且无法安全清理暂停的启动进程：{patch_error}；{cleanup_error:#}"
                     );
                 }
-                if !runtime_config_overrides.is_empty() || subagent_gate_active {
+                if !runtime_config_overrides.is_empty() {
+                    anyhow::bail!(
+                        "Codex 启动补丁未能确认 app-server 运行时覆盖；为避免丢失 Codey 运行时约束，已停止 Codex。当前 Codex 版本可能与 Codey 不兼容：{patch_error}"
+                    );
+                }
+                if subagent_gate_active {
                     anyhow::bail!(
                         "Codex 启动补丁未能安装；为避免丢失 Codey 运行时约束，已停止 Codex：{patch_error}"
                     );
@@ -270,6 +277,7 @@ pub(super) async fn spawn_codex(
             inspector_port,
             patch_options,
             runtime_config_overrides,
+            false,
         )
         .await
         {

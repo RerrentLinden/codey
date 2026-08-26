@@ -33,7 +33,9 @@ async function loadStartupPatchExpression() {
     "utf8",
   ));
   assert.ok(template);
-  return template.replaceAll("__DISABLE_PET__", "false");
+  return template
+    .replaceAll("__DISABLE_PET__", "false")
+    .replaceAll("__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__", "false");
 }
 
 test("main bundle detection accepts renamed CommonJS entry chunks by signature", async () => {
@@ -76,7 +78,7 @@ test("startup patch preserves native child processes and ordinary BrowserWindows
   try {
     assert.equal(
       (0, eval)(await loadStartupPatchExpression()),
-      "codey-startup-patch-installed-v36",
+      "codey-startup-patch-installed-v37",
     );
 
     const childProcess = Module._load("node:child_process", undefined, false);

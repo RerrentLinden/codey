@@ -1,5 +1,7 @@
 (() => {
   const disablePet = __DISABLE_PET__;
+  const requireAppServerRuntimeOverrideValidation =
+    __REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__;
   const codeyErrorLoggerExecutable = "__CODEY_ERROR_LOGGER_EXECUTABLE__";
   const maxOptionalPatchFailureBatchSize = 64;
   const optionalPatchFailureQueue = [];
@@ -1266,6 +1268,201 @@
       (config) => runtimeOverrideKey(config) !== runtimeOverrideKey(appServerAnalyticsConfig),
     ),
   ]);
+  const appServerRuntimeOverrideVerifiedResult =
+    "codey-app-server-runtime-overrides-verified";
+  const appServerRuntimeOverrideTimeoutMs = 8_000;
+  const appServerRuntimeOverrideEvidence = {
+    version: 1,
+    observed: false,
+    complete: appServerRuntimeConfigs.length === 0,
+    attempts: 0,
+    mode: "",
+    command: "",
+    missingRuntimeConfigs: [...appServerRuntimeConfigs],
+    requiredRuntimeConfigs: [...appServerRuntimeConfigs],
+  };
+  let resolveAppServerRuntimeOverrideValidation = null;
+  const appServerRuntimeOverrideValidationPromise = new Promise((resolve) => {
+    resolveAppServerRuntimeOverrideValidation = resolve;
+  });
+  const formatAppServerRuntimeOverrideError = (status) => {
+    const missing = status.missingRuntimeConfigs?.length
+      ? `；缺失：${status.missingRuntimeConfigs.join(", ")}`
+      : "";
+    return (
+      "当前 Codex 版本的 app-server 启动参数结构与 Codey 不兼容，" +
+      `未能确认注入 model_provider=codey_router 与 model_providers.codey_router.*${missing}`
+    );
+  };
+  const finishAppServerRuntimeOverrideValidation = (status) => {
+    if (appServerRuntimeOverrideEvidence.complete) return;
+    Object.assign(appServerRuntimeOverrideEvidence, status);
+    if (status.complete) {
+      appServerRuntimeOverrideEvidence.complete = true;
+      resolveAppServerRuntimeOverrideValidation?.(
+        appServerRuntimeOverrideVerifiedResult,
+      );
+      return;
+    }
+    resolveAppServerRuntimeOverrideValidation?.(status);
+  };
+  const collectRuntimeConfigArgsBeforeAppServer = (args) => {
+    const appServerIndex = args.indexOf("app-server");
+    if (appServerIndex < 0) return [];
+    const configs = [];
+    for (let index = 0; index < appServerIndex; index += 1) {
+      const argument = args[index];
+      if (
+        (argument === "-c" || argument === "--config") &&
+        typeof args[index + 1] === "string" &&
+        index + 1 < appServerIndex
+      ) {
+        configs.push(args[index + 1]);
+        index += 1;
+        continue;
+      }
+      if (typeof argument === "string" && argument.startsWith("--config=")) {
+        configs.push(argument.slice("--config=".length));
+      }
+    }
+    return configs;
+  };
+  const validateRuntimeConfigSet = (configs, requiredConfigs) => {
+    const observed = new Set(configs);
+    return requiredConfigs.filter((config) => !observed.has(config));
+  };
+  const recordCodexAppServerRuntimeOverrideAttempt = (status) => {
+    const normalized = {
+      version: 1,
+      observed: true,
+      complete: status.missingRuntimeConfigs.length === 0,
+      attempts: appServerRuntimeOverrideEvidence.attempts + 1,
+      mode: status.mode,
+      command: String(status.command ?? "").slice(0, 512),
+      missingRuntimeConfigs: status.missingRuntimeConfigs,
+      requiredRuntimeConfigs: [...status.requiredRuntimeConfigs],
+    };
+    finishAppServerRuntimeOverrideValidation(normalized);
+  };
+  const inspectCodexAppServerRuntimeOverrides = (command, args) => {
+    if (!Array.isArray(args)) return null;
+    const commandName = String(command ?? "");
+    const appServerArgCount = args
+      .filter((argument) => argument === "app-server")
+      .length;
+    const directCodexCommand = /(?:^|[/\\])codex(?:\.exe)?$/i.test(commandName);
+    const runtimeManagedAppServer =
+      nativeRuntimeConfigOverrides.length > 0 && appServerArgCount === 1;
+    if (
+      appServerArgCount === 1 &&
+      (directCodexCommand || runtimeManagedAppServer)
+    ) {
+      const configs = collectRuntimeConfigArgsBeforeAppServer(args);
+      return {
+        mode: "argv",
+        command,
+        requiredRuntimeConfigs: appServerRuntimeConfigs,
+        missingRuntimeConfigs: validateRuntimeConfigSet(
+          configs,
+          appServerRuntimeConfigs,
+        ),
+      };
+    }
+    if (!/(?:^|[/\\])wsl(?:\.exe)?$/i.test(commandName)) return null;
+    const shellFlagIndexes = args
+      .map((argument, index) => argument === "-lc" ? index : -1)
+      .filter((index) => index >= 0);
+    if (shellFlagIndexes.length !== 1) return null;
+    const shellFlagIndex = shellFlagIndexes[0];
+    const shellCommand = args[shellFlagIndex + 1];
+    if (
+      !/(?:^|[/\\])bash$/i.test(String(args[shellFlagIndex - 1] ?? "")) ||
+      typeof shellCommand !== "string"
+    ) {
+      return null;
+    }
+    const execMatches = [...shellCommand.matchAll(/(?:^|;)\s*exec\s+/g)];
+    if (execMatches.length !== 1) return null;
+    const execCommandOffset = execMatches[0].index + execMatches[0][0].length;
+    const execCommand = shellCommand.slice(execCommandOffset);
+    const executableToken = /^(?:"[^"]+"|'[^']+'|(?:\\.|[^\s;&|])+)/.exec(
+      execCommand,
+    )?.[0];
+    if (executableToken == null) return null;
+    const normalizedExecutable = executableToken
+      .replace(/^(["'])|(["'])$/g, "")
+      .replace(/\\ /g, " ");
+    if (!/(?:^|[/\\])codex(?:\.exe)?$/i.test(normalizedExecutable)) {
+      return null;
+    }
+    const appServerOffset = execCommand.search(/\bapp-server\b/);
+    if (appServerOffset < 0) return null;
+    const beforeAppServer = execCommand.slice(0, appServerOffset);
+    const wslReplacementKeys = new Set(
+      wslOnlyRuntimeConfigOverrides.map(runtimeOverrideKey),
+    );
+    const requiredRuntimeConfigs = uniqueRuntimeConfigsByKey([
+      appServerAnalyticsConfig,
+      ...nativeRuntimeConfigOverrides.filter(
+        (config) =>
+          runtimeOverrideKey(config) !== runtimeOverrideKey(appServerAnalyticsConfig) &&
+          !wslReplacementKeys.has(runtimeOverrideKey(config)),
+      ),
+      ...wslOnlyRuntimeConfigOverrides,
+    ]).map(rewriteTomlWindowsPathsForWsl);
+    return {
+      mode: "wsl-shell",
+      command,
+      requiredRuntimeConfigs,
+      missingRuntimeConfigs: requiredRuntimeConfigs.filter(
+        (config) => !hasShellConfigArg(beforeAppServer, config),
+      ),
+    };
+  };
+  const awaitCodexAppServerRuntimeOverrides = async () => {
+    if (appServerRuntimeOverrideEvidence.complete) {
+      return appServerRuntimeOverrideVerifiedResult;
+    }
+    if (appServerRuntimeOverrideEvidence.observed) {
+      throw new Error(
+        formatAppServerRuntimeOverrideError(appServerRuntimeOverrideEvidence),
+      );
+    }
+    let timeout = null;
+    try {
+      const result = await Promise.race([
+        appServerRuntimeOverrideValidationPromise,
+        new Promise((_resolve, reject) => {
+          timeout = setTimeout(() => {
+            reject(
+              new Error(
+                formatAppServerRuntimeOverrideError(
+                  appServerRuntimeOverrideEvidence,
+                ),
+              ),
+            );
+          }, appServerRuntimeOverrideTimeoutMs);
+          timeout.unref?.();
+        }),
+      ]);
+      if (result === appServerRuntimeOverrideVerifiedResult) return result;
+      throw new Error(formatAppServerRuntimeOverrideError(result));
+    } finally {
+      if (timeout != null) clearTimeout(timeout);
+      setImmediate(() => {
+        try { process.getBuiltinModule("inspector").close(); } catch {}
+      });
+    }
+  };
+  Object.defineProperty(
+    globalThis,
+    "__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__",
+    {
+      configurable: false,
+      value: awaitCodexAppServerRuntimeOverrides,
+      writable: false,
+    },
+  );
   const subagentGateRuntimeEnv = "CODEY_SUBAGENT_GATE_ACTIVE";
   const subagentGateRuntimeIdEnv = "CODEY_SUBAGENT_GATE_RUNTIME_ID";
   const subagentGateRuntimeActive =
@@ -1529,6 +1726,13 @@
       const rewrittenRest = isManagedCodexAppServerSpawn(command, rewritten)
         ? withSubagentGateEnvironment(rest)
         : rest;
+      const runtimeOverrideStatus = inspectCodexAppServerRuntimeOverrides(
+        command,
+        rewritten,
+      );
+      if (runtimeOverrideStatus != null) {
+        recordCodexAppServerRuntimeOverrideAttempt(runtimeOverrideStatus);
+      }
       if (rewritten === args && rewrittenRest === rest) {
         return Reflect.apply(NativeSpawn, this, arguments);
       }
@@ -3134,6 +3338,9 @@
     get appServerAnalyticsPatchCount() {
       return appServerAnalyticsPatchCount;
     },
+    get appServerRuntimeOverrides() {
+      return { ...appServerRuntimeOverrideEvidence };
+    },
     get throttleExternalPluginFocusReconcile() {
       return !hasOptionalMainBundlePatchFailure(
         "externalPluginFocusReconcile",
@@ -3171,7 +3378,8 @@
     },
   });
   setImmediate(() => {
+    if (requireAppServerRuntimeOverrideValidation) return;
     try { process.getBuiltinModule("inspector").close(); } catch {}
   });
-  return "codey-startup-patch-installed-v36";
+  return "codey-startup-patch-installed-v37";
 })()

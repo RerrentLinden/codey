@@ -18,7 +18,7 @@ async function loadStartupPatchExpression(
   const expression = template.replaceAll(
     "__DISABLE_PET__",
     disablePet ? "true" : "false",
-  );
+  ).replaceAll("__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__", "false");
   return errorLoggerExecutable == null
     ? expression
     : expression.replaceAll(
@@ -170,7 +170,7 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
   try {
     assert.equal(
       (0, eval)(await loadStartupPatchExpression(true, "C:\\Codey\\codey.exe")),
-      "codey-startup-patch-installed-v36",
+      "codey-startup-patch-installed-v37",
     );
     const electron = Module._load("electron", undefined, false);
     const petSurface = new electron.BrowserWindow({ title: "Pet Surface test" });
