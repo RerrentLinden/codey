@@ -9,7 +9,9 @@ const source = fs.readFileSync(
 
 test("development preview fixtures cannot be mistaken for live credentials", () => {
   assert.match(source, /example\.invalid/);
-  assert.match(source, /preview-only-not-a-secret/);
+  assert.match(source, /apiKey: "preview-route-primary-key"/);
+  assert.match(source, /apiKey: "preview-route-backup-key"/);
+  assert.match(source, /apiKey: "preview-prompt-optimization-key"/);
   assert.match(source, /preview-chat-id/);
   assert.doesNotMatch(source, /\bsk-(?:proj-)?[A-Za-z0-9._-]+/);
   assert.doesNotMatch(source, /api\.(?:openai|anthropic)\.com/);

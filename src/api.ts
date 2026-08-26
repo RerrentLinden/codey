@@ -22,7 +22,6 @@ export const CODEY_API_COMMANDS = [
   "test_webhook",
   "test_notification_channel",
   "reveal_notification_channel",
-  "reveal_prompt_optimization_api_key",
   "optimize_prompt",
   "test_prompt_optimization",
   "fetch_prompt_optimization_models",

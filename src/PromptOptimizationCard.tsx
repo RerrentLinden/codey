@@ -57,8 +57,6 @@ function PromptOptimizationCardComponent({
   const requestSequenceRef = useRef(0);
   const activeOperationRef = useRef<"sync" | "models" | "test" | null>(null);
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
-  const [revealedApiKey, setRevealedApiKey] = useState<string | null>(null);
-  const [revealingApiKey, setRevealingApiKey] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncResult, setSyncResult] = useState<InlineResult>({
     tone: "idle",
@@ -82,7 +80,6 @@ function PromptOptimizationCardComponent({
       promptOptimization: { ...optimization, ...patch },
     });
   };
-  const apiKeyValue = revealedApiKey ?? optimization.apiKey;
   const apiKeyInputId = `${controlId}-api-key`;
   const modelInputId = `${controlId}-model`;
   const modelSelectOptions = useMemo(
@@ -96,7 +93,6 @@ function PromptOptimizationCardComponent({
     [cloudModels, optimization.model],
   );
   const handleApiKeyChange = (value: string) => {
-    setRevealedApiKey(null);
     if (value === "") {
       updateOptimization({
         apiKey: "",
@@ -112,35 +108,7 @@ function PromptOptimizationCardComponent({
     });
   };
 
-  const toggleApiKeyVisibility = async () => {
-    if (apiKeyVisible) {
-      setApiKeyVisible(false);
-      return;
-    }
-    const isSavedAndHidden =
-      optimization.apiKeyConfigured &&
-      optimization.apiKey.trim() === "" &&
-      revealedApiKey === null;
-    if (isSavedAndHidden) {
-      setRevealingApiKey(true);
-      setSyncResult({ tone: "idle", text: "" });
-      try {
-        const result = await invoke<{ apiKey?: string }>(
-          "reveal_prompt_optimization_api_key",
-        );
-        setRevealedApiKey(result.apiKey ?? "");
-      } catch (error) {
-        setSyncResult({
-          tone: "error",
-          text: `无法回显 API Key：${errorText(error)}`,
-        });
-        return;
-      } finally {
-        setRevealingApiKey(false);
-      }
-    }
-    setApiKeyVisible(true);
-  };
+  const toggleApiKeyVisibility = () => setApiKeyVisible((visible) => !visible);
 
   const clearModelSuggestions = () => {
     setCloudModels([]);
@@ -160,7 +128,6 @@ function PromptOptimizationCardComponent({
     try {
       const synced = await onSyncCurrentProvider();
       if (!synced) return;
-      setRevealedApiKey(null);
       setApiKeyVisible(false);
       setCloudModels([]);
       setModelsResult({ tone: "idle", text: "" });
@@ -377,8 +344,8 @@ function PromptOptimizationCardComponent({
                         "h-7! w-7! min-w-7! rounded-[7px]! text-[#6e6e73]! hover:bg-black/6! hover:text-[#1d1d1f]!",
                     }}
                     visible={apiKeyVisible}
-                    onVisibilityChange={() => void toggleApiKeyVisibility()}
-                    value={apiKeyValue}
+                    onVisibilityChange={toggleApiKeyVisibility}
+                    value={optimization.apiKey}
                     disabled={isBusy}
                     onChange={(event) => {
                       clearModelSuggestions();
@@ -386,7 +353,6 @@ function PromptOptimizationCardComponent({
                     }}
                     placeholder={
                       optimization.apiKeyConfigured &&
-                      !revealedApiKey &&
                       optimization.apiKey.trim() === ""
                         ? "已保存（点击眼睛查看，或输入新 Key 替换）"
                         : "sk-…"
@@ -401,12 +367,8 @@ function PromptOptimizationCardComponent({
                       )
                     }
                     visibilityToggleButtonProps={{
-                      disabled: isBusy || revealingApiKey,
-                      title: revealingApiKey
-                        ? "正在读取 API Key"
-                        : apiKeyVisible
-                          ? "隐藏 API Key"
-                          : "显示 API Key",
+                      disabled: isBusy || !optimization.apiKey.trim(),
+                      title: apiKeyVisible ? "隐藏 API Key" : "显示 API Key",
                       "aria-label": apiKeyVisible
                         ? "隐藏 API Key"
                         : "显示 API Key",

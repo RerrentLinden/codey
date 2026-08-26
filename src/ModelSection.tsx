@@ -2,6 +2,8 @@ import { memo, useMemo, useState } from "react";
 import {
   IconCheck as Check,
   IconEdit as Edit,
+  IconEye,
+  IconEyeOff,
   IconPlus as Plus,
   IconRefresh as RefreshCw,
   IconServer as Server,
@@ -21,6 +23,7 @@ import {
   DialogHeader,
   DialogTitle,
   Input,
+  PasswordInput,
   Select,
   Switch,
 } from "./components/mantine";
@@ -120,6 +123,7 @@ function ModelSectionComponent({
 }: ModelSectionProps) {
   const [routeDialogOpen, setRouteDialogOpen] = useState(false);
   const [routeDraft, setRouteDraft] = useState<Profile | null>(null);
+  const [routeApiKeyVisible, setRouteApiKeyVisible] = useState(false);
   const [officialModelDraft, setOfficialModelDraft] = useState<string[]>([]);
   const [usageDraft, setUsageDraft] = useState(showAccountUsageInHeader);
   const visibleProfiles = useMemo(
@@ -183,16 +187,14 @@ function ModelSectionComponent({
 
   const openNewRouteDialog = () => {
     setRouteDraft(createRoute(config.profiles));
+    setRouteApiKeyVisible(false);
     setOfficialModelDraft([]);
     setRouteDialogOpen(true);
   };
   const openEditRouteDialog = (profile: Profile) => {
     const official = profile.authMode === "officialAccount";
-    setRouteDraft(
-      official
-        ? { ...profile }
-        : { ...profile, apiKey: "", clearApiKey: false },
-    );
+    setRouteDraft({ ...profile, clearApiKey: false });
+    setRouteApiKeyVisible(false);
     if (official) {
       const providerId = routeProviderId(profile);
       const configuredModels = config.selectedModelsByProvider[providerId] || [];
@@ -221,6 +223,7 @@ function ModelSectionComponent({
         )
       : await onSaveRoute(routeDraft);
     if (saved) {
+      setRouteApiKeyVisible(false);
       setRouteDialogOpen(false);
       setRouteDraft(null);
     }
@@ -585,15 +588,18 @@ function ModelSectionComponent({
                 </label>
                 <label className="route-field">
                   <span>Key</span>
-                  <Input
+                  <PasswordInput
+                    id="route-key-input"
                     aria-label="Key"
-                    type="password"
-                    autoComplete="off"
+                    autoComplete="new-password"
+                    visible={routeApiKeyVisible}
+                    onVisibilityChange={() =>
+                      setRouteApiKeyVisible((visible) => !visible)}
                     value={routeDraft.apiKey}
                     disabled={isBusy}
                     placeholder={
                       routeDraft.apiKeyConfigured
-                        ? "已保存（输入新 Key 可替换）"
+                        ? "已保存（点击眼睛查看，或输入新 Key 替换）"
                         : "sk-..."
                     }
                     onChange={(event) => {
@@ -603,6 +609,20 @@ function ModelSectionComponent({
                         clearApiKey: value.trim() === "" ? routeDraft.clearApiKey : false,
                       });
                     }}
+                    visibilityToggleIcon={({ reveal }) =>
+                      reveal ? (
+                        <IconEyeOff size={16} aria-hidden="true" />
+                      ) : (
+                        <IconEye size={16} aria-hidden="true" />
+                      )
+                    }
+                    visibilityToggleButtonProps={{
+                      disabled: isBusy || !routeDraft.apiKey.trim(),
+                      title: routeApiKeyVisible ? "隐藏 API Key" : "显示 API Key",
+                      "aria-label": routeApiKeyVisible
+                        ? "隐藏线路 API Key"
+                        : "显示线路 API Key",
+                    }}
                   />
                   {routeDraft.apiKeyConfigured && !routeDraft.clearApiKey && (
                     <Button
@@ -611,12 +631,14 @@ function ModelSectionComponent({
                       variant="ghost"
                       size="xs"
                       disabled={isBusy}
-                      onClick={() =>
+                      onClick={() => {
+                        setRouteApiKeyVisible(false);
                         updateRouteDraft({
                           apiKey: "",
                           apiKeyConfigured: false,
                           clearApiKey: true,
-                        })}
+                        });
+                      }}
                     >
                       清除已保存 Key
                     </Button>
@@ -633,6 +655,7 @@ function ModelSectionComponent({
                   variant="ghost"
                   disabled={isBusy || config.profiles.length <= 1}
                   onClick={() => {
+                    setRouteApiKeyVisible(false);
                     setRouteDialogOpen(false);
                     setRouteDraft(null);
                     onDeleteRoute(routeDraft.id);
@@ -646,6 +669,7 @@ function ModelSectionComponent({
                 variant="outline"
                 disabled={isBusy}
                 onClick={() => {
+                  setRouteApiKeyVisible(false);
                   setRouteDialogOpen(false);
                   setRouteDraft(null);
                 }}

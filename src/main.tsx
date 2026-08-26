@@ -38,7 +38,6 @@ if (import.meta.env.DEV) {
       feishu: "https://webhook.example.invalid/feishu/preview-only",
       wecom: "https://webhook.example.invalid/wecom/preview-only?key=preview",
     } as const;
-    const previewApiKey = "preview-only-not-a-secret";
     let previewConfig: Config = {
       settingsRevision: 0,
       activeProfileId: "primary",
@@ -48,7 +47,7 @@ if (import.meta.env.DEV) {
           id: "primary",
           name: "主力代理 (ChatGPT)",
           baseUrl: previewEndpoints.primary,
-          apiKey: "",
+          apiKey: "preview-route-primary-key",
           upstreamProtocol: "openaiResponses",
           authMode: "apiKey",
           apiKeyConfigured: true,
@@ -61,7 +60,7 @@ if (import.meta.env.DEV) {
           id: "backup",
           name: "备用中转 (Claude)",
           baseUrl: previewEndpoints.backup,
-          apiKey: "",
+          apiKey: "preview-route-backup-key",
           upstreamProtocol: "openaiCompatible",
           authMode: "apiKey",
           apiKeyConfigured: true,
@@ -114,7 +113,7 @@ if (import.meta.env.DEV) {
       promptOptimization: {
         enabled: true,
         baseUrl: previewEndpoints.primary,
-        apiKey: "",
+        apiKey: "preview-prompt-optimization-key",
         apiKeyConfigured: true,
         clearApiKey: false,
         model: "gpt-5.6-sol",
@@ -381,12 +380,20 @@ if (import.meta.env.DEV) {
           ...incoming,
           profiles: incoming.profiles.map((profile) => ({
             ...profile,
-            apiKey: "",
-            apiKeyConfigured: profile.clearApiKey
-              ? false
-              : Boolean(profile.apiKey.trim() || profile.apiKeyConfigured),
+            apiKey: profile.clearApiKey ? "" : profile.apiKey,
+            apiKeyConfigured: !profile.clearApiKey && Boolean(profile.apiKey.trim()),
             clearApiKey: false,
           })),
+          promptOptimization: {
+            ...incoming.promptOptimization,
+            apiKey: incoming.promptOptimization.clearApiKey
+              ? ""
+              : incoming.promptOptimization.apiKey,
+            apiKeyConfigured:
+              !incoming.promptOptimization.clearApiKey &&
+              Boolean(incoming.promptOptimization.apiKey.trim()),
+            clearApiKey: false,
+          },
           settingsRevision: previewConfig.settingsRevision + 1,
         };
         refreshPreviewModelState();
@@ -409,14 +416,6 @@ if (import.meta.env.DEV) {
         return channel
           ? { channel }
           : { status: "failed", message: "找不到要编辑的通知渠道" };
-      }
-      if (command === "reveal_prompt_optimization_api_key") {
-        return previewConfig.promptOptimization.apiKeyConfigured
-          ? { apiKey: previewApiKey }
-          : {
-              status: "failed",
-              message: "提示词优化 API Key 尚未保存",
-            };
       }
       if (command === "sync_current_provider") {
         return {
@@ -445,12 +444,13 @@ if (import.meta.env.DEV) {
         const existing = previewConfig.profiles.find(
           (profile) => profile.id === route.id,
         );
+        const savedApiKey = route.clearApiKey
+          ? ""
+          : route.apiKey || existing?.apiKey || "";
         const savedRoute: Profile = {
           ...route,
-          apiKey: "",
-          apiKeyConfigured: route.clearApiKey
-            ? false
-            : Boolean(route.apiKey.trim() || route.apiKeyConfigured || existing?.apiKeyConfigured),
+          apiKey: savedApiKey,
+          apiKeyConfigured: Boolean(savedApiKey.trim()),
           clearApiKey: false,
         };
         previewConfig = {
@@ -562,8 +562,8 @@ if (import.meta.env.DEV) {
           promptOptimization: {
             ...previewConfig.promptOptimization,
             baseUrl: previewCcSwitch().provider.baseUrl,
-            apiKey: "",
-            apiKeyConfigured: true,
+            apiKey: activePreviewProfile()?.apiKey || "",
+            apiKeyConfigured: Boolean(activePreviewProfile()?.apiKey.trim()),
             clearApiKey: false,
             model: previewModelState.defaultModel,
           },

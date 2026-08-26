@@ -757,7 +757,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Ok(channel_id) => reveal_notification_channel(state, channel_id).await,
             Err(error) => Err(error),
         },
-        "reveal_prompt_optimization_api_key" => reveal_prompt_optimization_api_key(state).await,
         "optimize_prompt" => match string_argument(&args, "text") {
             Ok(text) => optimize_prompt_command(state, text).await,
             Err(error) => Err(error),
@@ -907,20 +906,6 @@ async fn reveal_notification_channel(
         .cloned()
         .ok_or_else(|| "找不到要编辑的通知渠道".to_string())?;
     Ok(json!({"channel": channel}))
-}
-
-async fn reveal_prompt_optimization_api_key(state: &Arc<AppState>) -> Result<Value, String> {
-    let api_key = state
-        .config
-        .read()
-        .await
-        .prompt_optimization
-        .api_key
-        .clone();
-    if api_key.trim().is_empty() {
-        return Err("提示词优化 API Key 尚未保存".to_string());
-    }
-    Ok(json!({"apiKey": api_key}))
 }
 
 #[cfg(windows)]
@@ -1246,8 +1231,8 @@ fn merge_profile_secrets(
             } else {
                 // These fields are discovered from the trusted Codex/CC Switch
                 // source and are not editable renderer input. Keep them attached
-                // to the saved route even though the renderer receives a redacted
-                // profile and sends the whole form back on save.
+                // to the saved route even though the renderer-visible profile
+                // does not include them and sends the whole form back on save.
                 profile.model_request_headers = previous_profile.model_request_headers.clone();
                 profile.cc_switch_provider_id = previous_profile.cc_switch_provider_id.clone();
                 profile.cc_switch_read_only = previous_profile.cc_switch_read_only;
@@ -1662,7 +1647,6 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
     let mut public = config.clone();
     for profile in &mut public.profiles {
         profile.api_key_configured = !profile.api_key.trim().is_empty();
-        profile.api_key.clear();
     }
     public.webhook.url.clear();
     for channel in &mut public.webhook.channels {
@@ -1673,7 +1657,6 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
     }
     public.prompt_optimization.api_key_configured =
         !public.prompt_optimization.api_key.trim().is_empty();
-    public.prompt_optimization.api_key.clear();
     public
 }
 

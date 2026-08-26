@@ -175,9 +175,9 @@ impl ProviderProfile {
     }
 }
 
-/// Prompt-optimization settings. The API key follows the notification-channel
-/// credential pattern: redacted to the renderer, restored on save, cleared
-/// only on explicit request.
+/// Prompt-optimization settings. The local renderer receives the API key and
+/// masks or reveals it entirely client-side. Save merging remains for backward
+/// compatibility with older redacted renderer payloads.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptOptimizationConfig {

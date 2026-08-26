@@ -118,14 +118,15 @@ async fn session_metadata_cache_operations_are_serialized_in_blocking_workers() 
 }
 
 #[test]
-fn renderer_settings_clear_provider_and_notification_secrets() {
+fn renderer_settings_keep_api_keys_and_clear_notification_secrets() {
     let mut config = CodeyConfig::default();
     config.profiles[0].api_key = "renderer-secret".to_string();
+    config.prompt_optimization.api_key = "optimizer-secret".to_string();
     config.hide_full_access_warning = true;
     config.webhook.url = "https://open.feishu.cn/legacy-secret".to_string();
     config.webhook.channels.push(NotificationChannelConfig {
         id: "feishu-1".to_string(),
-        url: "https://open.feishu.cn/open-apis/bot/v2/hook/renderer-secret".to_string(),
+        url: "https://open.feishu.cn/open-apis/bot/v2/hook/feishu-secret".to_string(),
         ..NotificationChannelConfig::default()
     });
     config.webhook.channels.push(NotificationChannelConfig {
@@ -144,8 +145,10 @@ fn renderer_settings_clear_provider_and_notification_secrets() {
 
     let public = serde_json::to_value(redacted_config(&config)).unwrap();
 
-    assert_eq!(public["profiles"][0]["apiKey"], "");
+    assert_eq!(public["profiles"][0]["apiKey"], "renderer-secret");
     assert_eq!(public["profiles"][0]["apiKeyConfigured"], true);
+    assert_eq!(public["promptOptimization"]["apiKey"], "optimizer-secret");
+    assert_eq!(public["promptOptimization"]["apiKeyConfigured"], true);
     assert!(public["profiles"][0].get("clearApiKey").is_none());
     assert_eq!(public["hideFullAccessWarning"], true);
     assert!(public["webhook"].get("url").is_none());
@@ -155,7 +158,9 @@ fn renderer_settings_clear_provider_and_notification_secrets() {
     assert_eq!(public["webhook"]["channels"][1]["botTokenConfigured"], true);
     assert_eq!(public["webhook"]["channels"][2]["url"], "");
     assert_eq!(public["webhook"]["channels"][2]["urlConfigured"], true);
-    assert!(!public.to_string().contains("renderer-secret"));
+    assert!(public.to_string().contains("renderer-secret"));
+    assert!(public.to_string().contains("optimizer-secret"));
+    assert!(!public.to_string().contains("feishu-secret"));
     assert!(!public.to_string().contains("telegram-secret"));
     assert!(!public.to_string().contains("wecom-secret"));
     assert!(!public.to_string().contains("legacy-secret"));
@@ -266,7 +271,7 @@ async fn settings_bridge_matches_the_redacted_config_contract() {
         .await;
 
     assert_eq!(actual, expected);
-    assert!(!actual.to_string().contains("bridge-provider-secret"));
+    assert!(actual.to_string().contains("bridge-provider-secret"));
     assert!(!actual.to_string().contains("bridge-secret"));
 }
 
