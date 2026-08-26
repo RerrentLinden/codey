@@ -9,7 +9,7 @@ const MODEL_CONFIG_ID = "107580212";
 async function loadPatch(
   catalogResponse,
   clients,
-  { bridgeReady = true, queryClient = null, documentBody = null } = {},
+  { bridgeReady = true, queryClient = null, documentBody = null, storage = null } = {},
 ) {
   const [bridgeSource, source] = await Promise.all([
     readFile(new URL("../public/codey-bridge.js", import.meta.url), "utf8"),
@@ -19,6 +19,7 @@ async function loadPatch(
   const timers = new Map();
   const windowListeners = new Map();
   const documentListeners = new Map();
+  const dispatchedEvents = [];
   let wildcardScanCount = 0;
   const body = documentBody || {};
   if (queryClient) {
@@ -63,6 +64,12 @@ async function loadPatch(
       : catalogResponse;
   };
   const window = {
+    CustomEvent: class CustomEvent {
+      constructor(type, init = {}) {
+        this.type = type;
+        this.detail = init.detail;
+      }
+    },
     __STATSIG__: {
       firstInstance: clients[0],
       instances: Object.fromEntries(clients.slice(1).map((client, index) => [index, client])),
@@ -84,12 +91,14 @@ async function loadPatch(
       timers.delete(id);
     },
     dispatchEvent(event) {
+      dispatchedEvents.push(event);
       for (const listener of windowListeners.get(event?.type) || []) {
         listener(event);
       }
       return true;
     },
   };
+  if (storage) window.localStorage = storage;
   if (bridgeReady) window.__codexSessionDeleteBridge = bridge;
   Function("window", "document", "globalThis", "console", bridgeSource)(
     window,
@@ -118,6 +127,9 @@ async function loadPatch(
         listener({ ...event, type: name });
       }
     },
+    dispatchedEvents() {
+      return [...dispatchedEvents];
+    },
     wildcardScanCount() {
       return wildcardScanCount;
     },
@@ -140,6 +152,23 @@ function modelConfig(models, defaultModel) {
       available_models: models,
       default_model: defaultModel,
       untouched: true,
+    },
+  };
+}
+
+function memoryStorage() {
+  const values = new Map();
+  let writes = 0;
+  return {
+    getItem(key) {
+      return values.has(key) ? values.get(key) : null;
+    },
+    setItem(key, value) {
+      writes += 1;
+      values.set(key, String(value));
+    },
+    writeCount() {
+      return writes;
     },
   };
 }
@@ -318,7 +347,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "14");
+  assert.equal(patch.version, "29");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -381,7 +410,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   patch.dispose();
 });
 
-test("stale thread and turn models are repaired before app-server dispatch", async () => {
+test("explicit unknown thread and turn models are never replaced by a default", async () => {
   const runtime = await loadPatch({
     status: "ok",
     models: ["gpt-5.6-sol", "gpt-5.6-terra"],
@@ -403,7 +432,7 @@ test("stale thread and turn models are repaired before app-server dispatch", asy
       },
     };
     runtime.dispatchWindowEvent("codex-message-from-view", event);
-    assert.equal(event.detail.request.params.model, "gpt-5.6-sol");
+    assert.equal(event.detail.request.params.model, "claude-opus-4-8");
   }
   runtime.patch.dispose();
 });
@@ -419,15 +448,21 @@ test("route aliases display clearly and dispatch to the selected provider", asyn
         model: "route-a/shared-model",
         display_name: "主线路 / shared-model",
         route_name: "主线路",
-        provider_id: "route-a",
-        source_model: "shared-model",
+        provider_id: "codey_router",
+        source_model: "route-a/shared-model",
+        route_provider_id: "route-a",
+        upstream_model: "shared-model",
+        model_display_name: "shared-model",
       },
       {
         model: "route-b/shared-model",
         display_name: "备用线路 / shared-model",
         route_name: "备用线路",
-        provider_id: "route-b",
-        source_model: "shared-model",
+        provider_id: "codey_router",
+        source_model: "route-b/shared-model",
+        route_provider_id: "route-b",
+        upstream_model: "shared-model",
+        model_display_name: "shared-model",
       },
     ],
   };
@@ -450,14 +485,17 @@ test("route aliases display clearly and dispatch to the selected provider", asyn
       request: {
         id: "route-direct",
         method: "turn/start",
-        params: { model: "route-b/shared-model" },
+        params: {
+          model: "route-b/shared-model",
+          responsesapiClientMetadata: { trace: "preserved", codey_route: "stale" },
+        },
       },
     },
   };
   runtime.dispatchWindowEvent("codex-message-from-view", direct);
   assert.deepEqual(direct.detail.request.params, {
-    model: "shared-model",
-    model_provider: "route-b",
+    model: "route-b/shared-model",
+    responsesapiClientMetadata: { trace: "preserved", codey_route: "route-b" },
   });
 
   const wrapped = {
@@ -475,8 +513,8 @@ test("route aliases display clearly and dispatch to the selected provider", asyn
   };
   runtime.dispatchWindowEvent("codex-message-from-view", wrapped);
   assert.deepEqual(wrapped.detail.request.params.params, {
-    model: "shared-model",
-    model_provider: "route-a",
+    model: "route-a/shared-model",
+    modelProvider: "codey_router",
   });
 
   const resumed = {
@@ -485,20 +523,20 @@ test("route aliases display clearly and dispatch to the selected provider", asyn
       request: {
         id: "route-resumed",
         method: "thread/resume",
-        params: { model: "shared-model", model_provider: "route-b" },
+        params: { model: "route-b/shared-model", model_provider: "codey_router" },
       },
     },
   };
   runtime.dispatchWindowEvent("codex-message-from-view", resumed);
   assert.deepEqual(resumed.detail.request.params, {
-    model: "shared-model",
-    model_provider: "route-b",
+    model: "route-b/shared-model",
+    modelProvider: "codey_router",
   });
 
   await runtime.patch.setCatalog({
     ...routeCatalog,
     model_metadata: routeCatalog.model_metadata.map((metadata) =>
-      metadata.provider_id === "route-b"
+      metadata.route_provider_id === "route-b"
         ? { ...metadata, display_name: "灾备线路 / shared-model" }
         : metadata,
     ),
@@ -529,13 +567,467 @@ test("route aliases display clearly and dispatch to the selected provider", asyn
   };
   runtime.dispatchWindowEvent("codex-message-from-view", deletedRouteRequest);
   assert.deepEqual(deletedRouteRequest.detail.request.params, {
+    model: "route-b/shared-model",
+    responsesapiClientMetadata: { codey_route: "route-b" },
+  });
+  assert.equal(
+    runtime.patch.isBlockedOutgoingMessage(deletedRouteRequest.detail),
+    false,
+    "a stale route alias remains exact so the local gateway can reject it without guessing",
+  );
+  runtime.patch.dispose();
+});
+
+test("a raw model keeps its persisted thread route when multiple routes share the id", async () => {
+  const storage = memoryStorage();
+  const catalog = {
+    status: "ok",
+    models: ["route-a/shared-model", "route-b/shared-model"],
+    default_model: "route-a/shared-model",
+    model_metadata: [
+      {
+        model: "route-a/shared-model",
+        provider_id: "codey_router",
+        source_model: "shared-model",
+        route_provider_id: "route-a",
+      },
+      {
+        model: "route-b/shared-model",
+        provider_id: "codey_router",
+        source_model: "shared-model",
+        route_provider_id: "route-b",
+      },
+    ],
+  };
+  const firstRuntime = await loadPatch(catalog, [statsigClient()], { storage });
+  const unboundRawTurn = firstRuntime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "ambiguous-unbound-turn",
+      method: "turn/start",
+      params: { threadId: "unknown-thread", model: "shared-model" },
+    },
+  });
+  assert.deepEqual(unboundRawTurn.request.params, {
+    threadId: "unknown-thread",
     model: "shared-model",
-    model_provider: "route-a",
+  }, "an ambiguous raw id must reach the gateway without a guessed route");
+  const started = firstRuntime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "persisted-route-start",
+      method: "thread/start",
+      params: { model: "route-b/shared-model" },
+    },
+  });
+  assert.deepEqual(started.request.params, {
+    model: "route-b/shared-model",
+    modelProvider: "codey_router",
+  });
+  firstRuntime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "persisted-route-start",
+        result: { thread: { id: "persisted-thread", model: "shared-model" } },
+      },
+    },
+  });
+  firstRuntime.patch.dispose();
+
+  const restoredRuntime = await loadPatch(catalog, [statsigClient()], { storage });
+  const resumedTurn = restoredRuntime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "persisted-route-turn",
+      method: "turn/start",
+      params: { threadId: "persisted-thread", model: "shared-model" },
+    },
+  });
+  assert.deepEqual(resumedTurn.request.params, {
+    threadId: "persisted-thread",
+    model: "route-b/shared-model",
+    responsesapiClientMetadata: { codey_route: "route-b" },
+  });
+  restoredRuntime.patch.dispose();
+});
+
+test("unchanged thread routes do not rewrite the full persisted binding table", async () => {
+  const storage = memoryStorage();
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["route-a/shared-model", "route-b/shared-model"],
+    default_model: "route-a/shared-model",
+    model_metadata: [
+      {
+        model: "route-a/shared-model",
+        provider_id: "codey_router",
+        source_model: "shared-model",
+        route_provider_id: "route-a",
+      },
+      {
+        model: "route-b/shared-model",
+        provider_id: "codey_router",
+        source_model: "shared-model",
+        route_provider_id: "route-b",
+      },
+    ],
+  }, [statsigClient()], { storage });
+
+  const rewriteTurn = (model) => runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: `persist-${model}`,
+      method: "turn/start",
+      params: { threadId: "stable-route-thread", model },
+    },
+  });
+
+  rewriteTurn("route-a/shared-model");
+  const writesAfterFirstBinding = storage.writeCount();
+  assert.ok(writesAfterFirstBinding > 0);
+  for (let index = 0; index < 20; index += 1) {
+    rewriteTurn("route-a/shared-model");
+  }
+  assert.equal(storage.writeCount(), writesAfterFirstBinding);
+
+  rewriteTurn("route-b/shared-model");
+  assert.equal(storage.writeCount(), writesAfterFirstBinding + 1);
+  runtime.patch.dispose();
+});
+
+test("a persisted thread route is discarded when that route no longer exposes the model", async () => {
+  const storage = memoryStorage();
+  storage.setItem("codey.thread-route-bindings.v1", JSON.stringify([
+    ["stale-route-thread", {
+      routeProviderId: "route-b",
+      sourceModel: "gpt-5.6-sol",
+    }],
+  ]));
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["openai/gpt-5.6-sol", "route-b/claude-opus-5"],
+    default_model: "route-b/claude-opus-5",
+    model_metadata: [
+      {
+        model: "openai/gpt-5.6-sol",
+        provider_id: "codey_router",
+        source_model: "gpt-5.6-sol",
+        route_provider_id: "openai",
+      },
+      {
+        model: "route-b/claude-opus-5",
+        provider_id: "codey_router",
+        source_model: "claude-opus-5",
+        route_provider_id: "route-b",
+      },
+    ],
+  }, [statsigClient()], { storage });
+
+  const nextTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "turn-after-route-model-removal",
+      method: "turn/start",
+      params: {
+        threadId: "stale-route-thread",
+        model: "gpt-5.6-sol",
+      },
+    },
+  });
+  assert.deepEqual(nextTurn.request.params, {
+    threadId: "stale-route-thread",
+    model: "openai/gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "openai" },
+  });
+  assert.deepEqual(
+    JSON.parse(storage.getItem("codey.thread-route-bindings.v1")),
+    [["stale-route-thread", {
+      routeProviderId: "openai",
+      sourceModel: "gpt-5.6-sol",
+    }]],
+  );
+  runtime.patch.dispose();
+});
+
+test("thread settings model changes replace the old route before the next turn", async () => {
+  const catalog = {
+    status: "ok",
+    models: ["gpt-5.6-sol", "route-b/claude-opus-5"],
+    default_model: "route-b/claude-opus-5",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        provider_id: "codey_router",
+        source_model: "gpt-5.6-sol",
+        route_provider_id: "openai",
+        route_name: "OpenAI 官方直登",
+      },
+      {
+        model: "route-b/claude-opus-5",
+        provider_id: "codey_router",
+        source_model: "claude-opus-5",
+        route_provider_id: "route-b",
+        route_name: "新线路 2",
+      },
+    ],
+  };
+  const runtime = await loadPatch(catalog, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "thread-list",
+        result: {
+          data: [{ id: "settings-route-thread", modelProvider: "codey_router" }],
+        },
+      },
+    },
+  });
+
+  const relaySelection = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "select-relay-model",
+      method: "thread/settings/update",
+      params: {
+        threadId: "settings-route-thread",
+        model: "route-b/claude-opus-5",
+      },
+    },
+  });
+  assert.deepEqual(relaySelection.request.params, {
+    threadId: "settings-route-thread",
+    model: "route-b/claude-opus-5",
+  });
+
+  const officialSelection = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "select-official-model",
+      method: "thread/settings/update",
+      params: {
+        threadId: "settings-route-thread",
+        model: "gpt-5.6-sol",
+      },
+    },
+  });
+  assert.deepEqual(officialSelection.request.params, {
+    threadId: "settings-route-thread",
+    model: "gpt-5.6-sol",
+  });
+
+  const nextTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "turn-after-official-selection",
+      method: "turn/start",
+      params: {
+        threadId: "settings-route-thread",
+        input: [{ type: "text", text: "hello" }],
+      },
+    },
+  });
+  assert.deepEqual(nextTurn.request.params, {
+    threadId: "settings-route-thread",
+    input: [{ type: "text", text: "hello" }],
+    model: "gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "openai" },
   });
   runtime.patch.dispose();
 });
 
-test("local-router aliases stay scoped when selected from an official route", async () => {
+test("an explicit official settings choice beats an old same-id relay route", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "relay/gpt-5.6-sol"],
+    default_model: "relay/gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        provider_id: "codey_router",
+        source_model: "gpt-5.6-sol",
+        route_provider_id: "openai",
+      },
+      {
+        model: "relay/gpt-5.6-sol",
+        provider_id: "codey_router",
+        source_model: "gpt-5.6-sol",
+        route_provider_id: "relay",
+      },
+    ],
+  }, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "same-id-thread-list",
+        result: {
+          data: [{ id: "same-id-thread", modelProvider: "codey_router" }],
+        },
+      },
+    },
+  });
+
+  runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "same-id-select-relay",
+      method: "thread/settings/update",
+      params: { threadId: "same-id-thread", model: "relay/gpt-5.6-sol" },
+    },
+  });
+  const officialSelection = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "same-id-select-official",
+      method: "thread/settings/update",
+      params: { threadId: "same-id-thread", model: "gpt-5.6-sol" },
+    },
+  });
+  assert.deepEqual(officialSelection.request.params, {
+    threadId: "same-id-thread",
+    model: "gpt-5.6-sol",
+  });
+
+  const nextTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "same-id-next-turn",
+      method: "turn/start",
+      params: { threadId: "same-id-thread", model: "gpt-5.6-sol" },
+    },
+  });
+  assert.deepEqual(nextTurn.request.params, {
+    threadId: "same-id-thread",
+    model: "gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "openai" },
+  });
+
+  const cleared = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "same-id-clear-model",
+      method: "thread/settings/update",
+      params: { threadId: "same-id-thread", model: null },
+    },
+  });
+  assert.deepEqual(cleared.request.params, {
+    threadId: "same-id-thread",
+    model: null,
+  });
+  const turnAfterClear = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "same-id-turn-after-clear",
+      method: "turn/start",
+      params: { threadId: "same-id-thread" },
+    },
+  });
+  assert.deepEqual(turnAfterClear.request.params, {
+    threadId: "same-id-thread",
+    model: "relay/gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "relay" },
+  });
+  runtime.patch.dispose();
+});
+
+test("a slash-containing model is preserved before the catalog finishes loading", async () => {
+  const runtime = await loadPatch({ status: "failed" }, [statsigClient()]);
+  const message = {
+    type: "mcp-request",
+    request: {
+      id: "catalog-bootstrap-route",
+      method: "thread/start",
+      params: {
+        model: "route-bootstrap/gpt-5.5",
+        model_provider: "openai",
+      },
+    },
+  };
+
+  const rewritten = runtime.patch.rewriteOutgoingMessage(message);
+  assert.deepEqual(rewritten.request.params, {
+    model: "route-bootstrap/gpt-5.5",
+    modelProvider: "openai",
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(rewritten), false);
+  runtime.patch.dispose();
+});
+
+test("stale turn route metadata is removed before the catalog finishes loading", async () => {
+  const storage = memoryStorage();
+  storage.setItem("codey.thread-route-bindings.v1", JSON.stringify([
+    ["early-catalog-thread", {
+      routeProviderId: "route-b",
+      sourceModel: "claude-opus-5",
+    }],
+  ]));
+  const runtime = await loadPatch({ status: "failed" }, [statsigClient()], { storage });
+  const rewritten = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "early-catalog-model-switch",
+      method: "turn/start",
+      params: {
+        threadId: "early-catalog-thread",
+        model: "gpt-5.6-sol",
+        responsesapiClientMetadata: {
+          codey_route: "route-b",
+          workspace_kind: "project",
+        },
+      },
+    },
+  });
+  assert.deepEqual(rewritten.request.params, {
+    threadId: "early-catalog-thread",
+    model: "gpt-5.6-sol",
+    responsesapiClientMetadata: { workspace_kind: "project" },
+  });
+
+  const matchingRoute = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "early-catalog-same-model",
+      method: "turn/start",
+      params: {
+        threadId: "early-catalog-thread",
+        model: "claude-opus-5",
+        responsesapiClientMetadata: { codey_route: "route-b" },
+      },
+    },
+  });
+  assert.deepEqual(matchingRoute.request.params, {
+    threadId: "early-catalog-thread",
+    model: "claude-opus-5",
+    responsesapiClientMetadata: { codey_route: "route-b" },
+  });
+  runtime.patch.dispose();
+});
+
+test("a legacy OpenAI task resumes on the HTTP router even before catalog load", async () => {
+  const runtime = await loadPatch({ status: "failed" }, [statsigClient()]);
+  const rewritten = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "early-openai-resume",
+      method: "thread/resume",
+      params: {
+        threadId: "legacy-official-thread",
+        model_provider: "openai",
+      },
+    },
+  });
+
+  assert.deepEqual(rewritten.request.params, {
+    threadId: "legacy-official-thread",
+    modelProvider: "codey_router",
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(rewritten), false);
+  runtime.patch.dispose();
+});
+
+test("a legacy official task resumes through the HTTP-only local router carrier", async () => {
   const runtime = await loadPatch({
     status: "ok",
     models: ["gpt-5.6-sol", "relay/shared-model"],
@@ -545,8 +1037,9 @@ test("local-router aliases stay scoped when selected from an official route", as
         model: "gpt-5.6-sol",
         display_name: "官方线路 / gpt-5.6-sol",
         route_name: "官方线路",
-        provider_id: "openai",
+        provider_id: "codey_router",
         source_model: "gpt-5.6-sol",
+        route_provider_id: "openai",
       },
       {
         model: "relay/shared-model",
@@ -560,36 +1053,659 @@ test("local-router aliases stay scoped when selected from an official route", as
     ],
   }, [statsigClient()]);
 
+  const resumed = {
+    detail: {
+      type: "mcp-request",
+      request: {
+        id: "resume-official-through-router",
+        method: "thread/resume",
+        params: {
+          threadId: "official-thread",
+          model: "gpt-5.6-sol",
+          model_provider: "openai",
+        },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("codex-message-from-view", resumed);
+  assert.deepEqual(resumed.detail.request.params, {
+    threadId: "official-thread",
+    model: "gpt-5.6-sol",
+    modelProvider: "codey_router",
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(resumed.detail), false);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "resume-official-through-router",
+        result: {
+          thread: { id: "official-thread", modelProvider: "openai" },
+          modelProvider: "codey_router",
+        },
+      },
+    },
+  });
+
   const selected = {
     detail: {
       type: "mcp-request",
       request: {
         id: "select-local-router-model",
         method: "turn/start",
-        params: { model: "relay/shared-model", model_provider: "openai" },
+        params: {
+          threadId: "official-thread",
+          model: "relay/shared-model",
+          model_provider: "openai",
+        },
       },
     },
   };
   runtime.dispatchWindowEvent("codex-message-from-view", selected);
   assert.deepEqual(selected.detail.request.params, {
+    threadId: "official-thread",
     model: "relay/shared-model",
-    model_provider: "codey_router",
+    responsesapiClientMetadata: { codey_route: "relay" },
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(selected.detail), false);
+  runtime.patch.dispose();
+});
+
+test("an id-less app-server resume records its router migration after request creation", async () => {
+  const alias = "relay/shared-model";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", alias],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        route_name: "OpenAI 官方直登",
+        provider_id: "codey_router",
+        source_model: "gpt-5.6-sol",
+        route_provider_id: "openai",
+      },
+      {
+        model: alias,
+        route_name: "中转线路",
+        provider_id: "codey_router",
+        source_model: "shared-model",
+        route_provider_id: "relay",
+      },
+    ],
+  }, [statsigClient()]);
+
+  const preflight = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      method: "thread/resume",
+      params: {
+        threadId: "id-less-resume-thread",
+        model: "gpt-5.6-sol",
+        model_provider: "openai",
+      },
+    },
+  });
+  assert.deepEqual(preflight.request.params, {
+    threadId: "id-less-resume-thread",
+    model: "gpt-5.6-sol",
+    modelProvider: "codey_router",
   });
 
-  const staleDirectProvider = {
-    detail: {
-      type: "mcp-request",
-      request: {
-        id: "repair-old-direct-provider",
-        method: "thread/resume",
-        params: { model: "relay/shared-model", model_provider: "relay" },
+  runtime.patch.trackOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "created-after-preflight",
+      method: preflight.request.method,
+      params: preflight.request.params,
+    },
+  });
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "created-after-preflight",
+        result: {
+          thread: {
+            id: "id-less-resume-thread",
+            modelProvider: "openai",
+          },
+        },
+      },
+    },
+  });
+
+  const switched = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "turn-after-id-less-resume",
+      method: "turn/start",
+      params: {
+        threadId: "id-less-resume-thread",
+        model: alias,
+      },
+    },
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(switched), false);
+  assert.deepEqual(switched.request.params, {
+    threadId: "id-less-resume-thread",
+    model: alias,
+    responsesapiClientMetadata: { codey_route: "relay" },
+  });
+  runtime.patch.dispose();
+});
+
+test("an official thread must resume onto the router before selecting a third-party model", async () => {
+  const alias = "relay/gpt-5.5";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", alias],
+    default_model: alias,
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+      },
+      {
+        model: alias,
+        route_name: "中转线路",
+        provider_id: "codey_router",
+        source_model: alias,
+      },
+    ],
+  }, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "thread-list",
+        result: {
+          data: [{ id: "official-thread", modelProvider: "openai" }],
+        },
+      },
+    },
+  });
+  const message = {
+    type: "mcp-request",
+    request: {
+      id: "third-party-on-official",
+      method: "turn/start",
+      params: { threadId: "official-thread", model: alias },
+    },
+  };
+
+  const rewritten = runtime.patch.rewriteOutgoingMessage(message);
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(rewritten), true);
+  assert.deepEqual(rewritten.request.params, {
+    threadId: "official-thread",
+    model: alias,
+    responsesapiClientMetadata: { codey_route: "relay" },
+  });
+  runtime.patch.dispose();
+});
+
+test("a task bound to a genuinely external provider cannot silently cross into the Codey gateway", async () => {
+  const alias = "relay/gpt-5.5";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: [alias],
+    default_model: alias,
+    model_metadata: [{
+      model: alias,
+      route_name: "中转线路",
+      provider_id: "openai",
+      source_model: alias,
+      route_provider_id: "relay",
+      upstream_model: "gpt-5.5",
+    }],
+  }, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "thread-list",
+        result: {
+          data: [{ id: "external-thread", modelProvider: "external_live" }],
+        },
+      },
+    },
+  });
+
+  const rewritten = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "external-to-gateway",
+      method: "turn/start",
+      params: { threadId: "external-thread", model: alias },
+    },
+  });
+
+  assert.deepEqual(rewritten.request.params, {
+    threadId: "external-thread",
+    model: alias,
+    responsesapiClientMetadata: { codey_route: "relay" },
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(rewritten), true);
+  runtime.patch.dispose();
+});
+
+test("a local-router thread can switch among third-party and official gateway routes", async () => {
+  const routeA = "route-a/shared-model";
+  const routeB = "route-b/shared-model";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", routeA, routeB],
+    default_model: routeA,
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        route_name: "OpenAI 官方直登",
+        provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+      },
+      {
+        model: routeA,
+        route_name: "线路 A",
+        provider_id: "codey_router",
+        source_model: routeA,
+      },
+      {
+        model: routeB,
+        route_name: "线路 B",
+        provider_id: "codey_router",
+        source_model: routeB,
+      },
+    ],
+  }, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "thread-list",
+        result: {
+          data: [{ id: "router-thread", modelProvider: "codey_router" }],
+        },
+      },
+    },
+  });
+
+  const thirdPartySwitch = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "switch-route",
+      method: "turn/start",
+      params: { threadId: "router-thread", model: routeB },
+    },
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(thirdPartySwitch), false);
+  assert.deepEqual(thirdPartySwitch.request.params, {
+    threadId: "router-thread",
+    model: routeB,
+    responsesapiClientMetadata: { codey_route: "route-b" },
+  });
+
+  const officialSwitch = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "switch-official",
+      method: "turn/start",
+      params: { threadId: "router-thread", model: "gpt-5.6-sol" },
+    },
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(officialSwitch), false);
+  assert.deepEqual(officialSwitch.request.params, {
+    threadId: "router-thread",
+    model: "gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "openai" },
+  });
+  runtime.patch.dispose();
+});
+
+test("a prewarmed gateway thread switches models without an invalid turn provider override", async () => {
+  const alias = "route-a/gpt-5.5";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", alias],
+    default_model: alias,
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        route_name: "OpenAI 官方直登",
+        provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+      },
+      {
+        model: alias,
+        route_name: "第三方线路",
+        provider_id: "codey_router",
+        source_model: alias,
+      },
+    ],
+  }, [statsigClient()]);
+  const prewarm = runtime.patch.rewriteOutgoingMessage({
+    type: "thread-prewarm-start",
+    request: {
+      id: "prewarm-router-draft",
+      method: "thread/start",
+      params: {
+        model: alias,
+        modelProvider: "openai",
+      },
+    },
+  });
+  assert.deepEqual(prewarm.request.params, {
+    model: alias,
+    modelProvider: "codey_router",
+  });
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "prewarm-router-draft",
+        result: {
+          thread: { id: "draft-thread", modelProvider: "codey_router" },
+        },
+      },
+    },
+  });
+
+  const firstTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "first-official-turn",
+      method: "turn/start",
+      params: { threadId: "draft-thread", model: "gpt-5.6-sol" },
+    },
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(firstTurn), false);
+  assert.deepEqual(firstTurn.request.params, {
+    threadId: "draft-thread",
+    model: "gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "openai" },
+  });
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        method: "turn/started",
+        params: {
+          threadId: "draft-thread",
+          turn: { id: "turn-1" },
+        },
+      },
+    },
+  });
+
+  const laterThirdPartyTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "later-third-party-turn",
+      method: "turn/start",
+      params: { threadId: "draft-thread", model: alias },
+    },
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(laterThirdPartyTurn), false);
+  assert.deepEqual(laterThirdPartyTurn.request.params, {
+    threadId: "draft-thread",
+    model: alias,
+    responsesapiClientMetadata: { codey_route: "route-a" },
+  });
+  runtime.patch.dispose();
+});
+
+test("the transport preflight binds a new third-party thread to the local router", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "route-mt6lv4lx-i2bfax/gpt-5.5"],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+      },
+      {
+        model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+        provider_id: "codey_router",
+        source_model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+        route_provider_id: "route-mt6lv4lx-i2bfax",
+        upstream_model: "gpt-5.5",
+      },
+    ],
+  }, [statsigClient()]);
+  const message = {
+    type: "mcp-request",
+    hostId: "local",
+    request: {
+      id: 91,
+      method: "thread/start",
+      params: {
+        model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+        model_provider: "openai",
       },
     },
   };
-  runtime.dispatchWindowEvent("codex-message-from-view", staleDirectProvider);
-  assert.deepEqual(staleDirectProvider.detail.request.params, {
-    model: "relay/shared-model",
-    model_provider: "codey_router",
+
+  const rewritten = runtime.patch.rewriteOutgoingMessage(message);
+  assert.notEqual(rewritten, message);
+  assert.equal(rewritten.hostId, "local");
+  assert.deepEqual(rewritten.request.params, {
+    model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+    modelProvider: "codey_router",
+  });
+  assert.deepEqual(message.request.params, {
+    model: "route-mt6lv4lx-i2bfax/gpt-5.5",
+    model_provider: "openai",
+  }, "the bridge preflight must be able to return a clone for frozen renderer envelopes");
+  runtime.patch.dispose();
+});
+
+test("thread prewarm binds third-party models to the local router before the app server starts", async () => {
+  const alias = "route-mt6lv4lx-i2bfax/gpt-5.5";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", alias],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+      },
+      {
+        model: alias,
+        provider_id: "codey_router",
+        source_model: alias,
+        route_provider_id: "route-mt6lv4lx-i2bfax",
+        upstream_model: "gpt-5.5",
+      },
+    ],
+  }, [statsigClient()]);
+  const message = {
+    type: "thread-prewarm-start",
+    hostId: "local",
+    request: {
+      id: 93,
+      method: "thread/start",
+      params: {
+        model: alias,
+        modelProvider: "openai",
+      },
+    },
+    priority: "critical",
+    source: "thread_open",
+  };
+
+  const rewritten = runtime.patch.rewriteOutgoingMessage(message);
+  assert.notEqual(rewritten, message);
+  assert.equal(rewritten.type, "thread-prewarm-start");
+  assert.equal(rewritten.hostId, "local");
+  assert.deepEqual(rewritten.request.params, {
+    model: alias,
+    modelProvider: "codey_router",
+  });
+  assert.deepEqual(message.request.params, {
+    model: alias,
+    modelProvider: "openai",
+  });
+  runtime.patch.dispose();
+});
+
+test("a hot default-model change replaces only the stale prewarm default", async () => {
+  const oldDefault = "route-a/gpt-5.5";
+  const newDefault = "route-a/claude-opus-5";
+  const modelMetadata = [
+    {
+      model: oldDefault,
+      display_name: "线路 A / gpt-5.5",
+      route_name: "线路 A",
+      provider_id: "codey_router",
+      route_provider_id: "route-a",
+      source_model: "gpt-5.5",
+      upstream_model: "gpt-5.5",
+    },
+    {
+      model: newDefault,
+      display_name: "线路 A / claude-opus-5",
+      route_name: "线路 A",
+      provider_id: "codey_router",
+      route_provider_id: "route-a",
+      source_model: "claude-opus-5",
+      upstream_model: "claude-opus-5",
+    },
+  ];
+  const runtime = await loadPatch({
+    status: "ok",
+    models: [oldDefault, newDefault],
+    default_model: oldDefault,
+    model_metadata: modelMetadata,
+  }, [statsigClient()]);
+  await runtime.patch.setCatalog({
+    status: "ok",
+    models: [oldDefault, newDefault],
+    default_model: newDefault,
+    model_metadata: modelMetadata,
+  });
+
+  const prewarm = runtime.patch.rewriteOutgoingMessage({
+    type: "thread-prewarm-start",
+    request: {
+      id: "stale-default-prewarm",
+      method: "thread/start",
+      params: { model: oldDefault, modelProvider: "codey_router" },
+    },
+  });
+  assert.deepEqual(prewarm.request.params, {
+    model: newDefault,
+    modelProvider: "codey_router",
+  });
+
+  const explicitExistingThreadChange = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "explicit-old-model-on-existing-thread",
+      method: "thread/settings/update",
+      params: { threadId: "existing-thread", model: oldDefault },
+    },
+  });
+  assert.deepEqual(explicitExistingThreadChange.request.params, {
+    threadId: "existing-thread",
+    model: oldDefault,
+  });
+  runtime.patch.dispose();
+});
+
+test("the first model-menu click overrides a lagging prewarm payload", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const menu = body.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
+  const oldItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  oldItem.textContent = "线路 A / gpt-5.5";
+  const selectedItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  selectedItem.textContent = "线路 A / claude-opus-5";
+  const oldModel = "route-a/gpt-5.5";
+  const selectedModel = "route-a/claude-opus-5";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: [oldModel, selectedModel],
+    default_model: oldModel,
+    model_metadata: [
+      {
+        model: oldModel,
+        display_name: "线路 A / gpt-5.5",
+        route_name: "线路 A",
+        provider_id: "codey_router",
+        route_provider_id: "route-a",
+        source_model: "gpt-5.5",
+      },
+      {
+        model: selectedModel,
+        display_name: "线路 A / claude-opus-5",
+        route_name: "线路 A",
+        provider_id: "codey_router",
+        route_provider_id: "route-a",
+        source_model: "claude-opus-5",
+      },
+    ],
+  }, [statsigClient()], { documentBody: body });
+  runtime.patch.enhanceModelMenus();
+  runtime.dispatchDocumentEvent("pointerdown", { target: selectedItem });
+
+  const prewarm = runtime.patch.rewriteOutgoingMessage({
+    type: "thread-prewarm-start",
+    request: {
+      id: "first-click-lagging-prewarm",
+      method: "thread/start",
+      params: { model: oldModel, modelProvider: "codey_router" },
+    },
+  });
+  assert.deepEqual(prewarm.request.params, {
+    model: selectedModel,
+    modelProvider: "codey_router",
+  });
+  runtime.patch.dispose();
+});
+
+test("wrapped host thread starts preserve their envelope at the transport preflight", async () => {
+  const alias = "route-mt6lv4lx-i2bfax/gpt-5.5";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: [alias],
+    default_model: alias,
+    model_metadata: [{
+      model: alias,
+      provider_id: "codey_router",
+      source_model: alias,
+    }],
+  }, [statsigClient()]);
+  const message = {
+    type: "mcp-request",
+    request: {
+      id: 92,
+      method: "send-cli-request-for-host",
+      params: {
+        hostId: "local",
+        method: "thread/start",
+        params: { model: alias },
+      },
+    },
+  };
+
+  const rewritten = runtime.patch.rewriteOutgoingMessage(message);
+  assert.equal(rewritten.request.method, "send-cli-request-for-host");
+  assert.deepEqual(rewritten.request.params, {
+    hostId: "local",
+    method: "thread/start",
+    params: {
+      model: alias,
+      modelProvider: "codey_router",
+    },
   });
   runtime.patch.dispose();
 });
@@ -602,11 +1718,11 @@ test("model picker menu groups models under route headings without changing mode
   const officialItem = menu.appendChild(new FakeElementCore("div", {
     attributes: { role: "menuitemradio" },
   }));
-  officialItem.textContent = "官方线路 / gpt-5.6-sol";
+  officialItem.textContent = "[官] gpt-5.6-sol";
   const relayItem = menu.appendChild(new FakeElementCore("div", {
     attributes: { role: "menuitemradio" },
   }));
-  relayItem.textContent = "中转线路 / gpt-5.6-sol";
+  relayItem.textContent = "[中转] gpt-5.6-sol";
 
   const runtime = await loadPatch({
     status: "ok",
@@ -615,15 +1731,17 @@ test("model picker menu groups models under route headings without changing mode
     model_metadata: [
       {
         model: "gpt-5.6-sol",
-        display_name: "官方线路 / gpt-5.6-sol",
+        display_name: "[官] gpt-5.6-sol",
         route_name: "官方线路",
+        route_prefix: "官",
         provider_id: "openai",
         source_model: "gpt-5.6-sol",
       },
       {
         model: "relay/gpt-5.6-sol",
-        display_name: "中转线路 / gpt-5.6-sol",
+        display_name: "[中转] gpt-5.6-sol",
         route_name: "中转线路",
+        route_prefix: "中转",
         provider_id: "relay",
         source_model: "gpt-5.6-sol",
       },
@@ -661,8 +1779,88 @@ test("model picker menu groups models under route headings without changing mode
   };
   runtime.dispatchWindowEvent("codex-message-from-view", request);
   assert.deepEqual(request.detail.request.params, {
-    model: "gpt-5.6-sol",
-    model_provider: "relay",
+    model: "relay/gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "relay" },
+  });
+  runtime.patch.dispose();
+});
+
+test("the clicked model route overrides stale thread and turn metadata", async () => {
+  const storage = memoryStorage();
+  storage.setItem("codey.thread-route-bindings.v1", JSON.stringify([
+    ["menu-route-thread", {
+      routeProviderId: "route-b",
+      sourceModel: "gpt-5.6-sol",
+    }],
+  ]));
+  const body = new FakeElementCore("body", { connected: true });
+  const menu = body.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
+  const officialItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  officialItem.textContent = "OpenAI 官方直登 / gpt-5.6-sol";
+  const relayItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  relayItem.textContent = "新线路 2 / gpt-5.6-sol";
+
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["openai/gpt-5.6-sol", "route-b/gpt-5.6-sol"],
+    default_model: "route-b/gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "openai/gpt-5.6-sol",
+        display_name: "OpenAI 官方直登 / gpt-5.6-sol",
+        route_name: "OpenAI 官方直登",
+        provider_id: "codey_router",
+        source_model: "gpt-5.6-sol",
+        route_provider_id: "openai",
+      },
+      {
+        model: "route-b/gpt-5.6-sol",
+        display_name: "新线路 2 / gpt-5.6-sol",
+        route_name: "新线路 2",
+        provider_id: "codey_router",
+        source_model: "gpt-5.6-sol",
+        route_provider_id: "route-b",
+      },
+    ],
+  }, [statsigClient()], { documentBody: body, storage });
+  runtime.patch.enhanceModelMenus();
+  runtime.dispatchDocumentEvent("pointerdown", { target: officialItem });
+
+  const selectedTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "turn-after-explicit-menu-selection",
+      method: "turn/start",
+      params: {
+        threadId: "menu-route-thread",
+        responsesapiClientMetadata: { codey_route: "route-b" },
+      },
+    },
+  });
+  assert.deepEqual(selectedTurn.request.params, {
+    threadId: "menu-route-thread",
+    model: "openai/gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "openai" },
+  });
+
+  const laterTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "turn-after-menu-intent-was-consumed",
+      method: "turn/start",
+      params: { threadId: "menu-route-thread" },
+    },
+  });
+  assert.deepEqual(laterTurn.request.params, {
+    threadId: "menu-route-thread",
+    model: "openai/gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "openai" },
   });
   runtime.patch.dispose();
 });
@@ -675,8 +1873,9 @@ test("official account route models keep raw ids and dispatch to the OpenAI prov
     default_model: "gpt-5.6-sol",
     model_metadata: [{
       model: "gpt-5.6-sol",
-      display_name: "OpenAI 官方直登 / gpt-5.6-sol",
+      display_name: "[官] gpt-5.6-sol",
       route_name: "OpenAI 官方直登",
+      route_prefix: "官",
       provider_id: "openai",
       source_model: "gpt-5.6-sol",
     }],
@@ -684,7 +1883,7 @@ test("official account route models keep raw ids and dispatch to the OpenAI prov
 
   assert.equal(
     queryClient.model("gpt-5.6-sol").displayName,
-    "OpenAI 官方直登 / gpt-5.6-sol",
+    "[官] gpt-5.6-sol",
   );
   assert.equal(queryClient.model("gpt-5.6-sol").routeName, "OpenAI 官方直登");
 
@@ -702,7 +1901,63 @@ test("official account route models keep raw ids and dispatch to the OpenAI prov
 
   assert.deepEqual(request.detail.request.params, {
     model: "gpt-5.6-sol",
-    model_provider: "openai",
+    responsesapiClientMetadata: { codey_route: "openai" },
+  });
+  runtime.patch.dispose();
+});
+
+test("official account models can run through the local router provider", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "relay/gpt-5.5"],
+    default_model: "relay/gpt-5.5",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        display_name: "OpenAI 官方直登 / gpt-5.6-sol",
+        route_name: "OpenAI 官方直登",
+        provider_id: "codey_router",
+        source_model: "gpt-5.6-sol",
+        route_provider_id: "openai",
+        upstream_model: "gpt-5.6-sol",
+      },
+      {
+        model: "relay/gpt-5.5",
+        display_name: "第三方线路 / gpt-5.5",
+        route_name: "第三方线路",
+        provider_id: "codey_router",
+        source_model: "relay/gpt-5.5",
+        route_provider_id: "relay",
+        upstream_model: "gpt-5.5",
+      },
+    ],
+  }, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "thread-list",
+        result: {
+          data: [{ id: "router-thread", modelProvider: "codey_router" }],
+        },
+      },
+    },
+  });
+
+  const officialTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "router-official-turn",
+      method: "turn/start",
+      params: { threadId: "router-thread", model: "gpt-5.6-sol" },
+    },
+  });
+
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(officialTurn), false);
+  assert.deepEqual(officialTurn.request.params, {
+    threadId: "router-thread",
+    model: "gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "openai" },
   });
   runtime.patch.dispose();
 });
@@ -744,7 +1999,7 @@ test("official OpenAI route aliases dispatch raw model ids through the OpenAI pr
   runtime.dispatchWindowEvent("codex-message-from-view", official);
   assert.deepEqual(official.detail.request.params, {
     model: "gpt-5.6-sol",
-    model_provider: "openai",
+    responsesapiClientMetadata: { codey_route: "openai" },
   });
 
   const currentOfficial = {
@@ -763,7 +2018,7 @@ test("official OpenAI route aliases dispatch raw model ids through the OpenAI pr
   runtime.dispatchWindowEvent("codex-message-from-view", currentOfficial);
   assert.deepEqual(currentOfficial.detail.request.params, {
     model: "gpt-5.6-sol",
-    model_provider: "openai",
+    responsesapiClientMetadata: { codey_route: "openai" },
   });
 
   const relay = {
@@ -778,8 +2033,8 @@ test("official OpenAI route aliases dispatch raw model ids through the OpenAI pr
   };
   runtime.dispatchWindowEvent("codex-message-from-view", relay);
   assert.deepEqual(relay.detail.request.params, {
-    model: "gpt-5.6-sol",
-    model_provider: "relay",
+    model: "relay/gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "relay" },
   });
   runtime.patch.dispose();
 });
@@ -823,7 +2078,7 @@ test("official route selection does not inherit an active third party provider",
 
   assert.deepEqual(request.detail.request.params, {
     model: "gpt-5.6-terra",
-    model_provider: "openai",
+    responsesapiClientMetadata: { codey_route: "openai" },
   });
 
   const staleProviderRequest = {
@@ -840,7 +2095,7 @@ test("official route selection does not inherit an active third party provider",
 
   assert.deepEqual(staleProviderRequest.detail.request.params, {
     model: "gpt-5.6-terra",
-    model_provider: "openai",
+    responsesapiClientMetadata: { codey_route: "openai" },
   });
   runtime.patch.dispose();
 });
@@ -943,7 +2198,7 @@ test("configured third-party models survive direct and wrapped requests", async 
   runtime.patch.dispose();
 });
 
-test("valid current-route models survive direct and wrapped requests", async () => {
+test("valid models survive and an explicit unknown wrapped model is preserved", async () => {
   const runtime = await loadPatch({
     status: "ok",
     models: ["gpt-5.6-sol", "gpt-5.6-terra"],
@@ -978,7 +2233,7 @@ test("valid current-route models survive direct and wrapped requests", async () 
   assert.equal(direct.detail.request.params.model, "gpt-5.6-terra");
   assert.equal(
     wrapped.detail.request.params.params.model,
-    "gpt-5.6-sol",
+    "claude-opus-4-8",
   );
   runtime.patch.dispose();
 });

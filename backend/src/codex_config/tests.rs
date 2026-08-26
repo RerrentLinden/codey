@@ -4,7 +4,7 @@ use crate::codex_config_guidance::{
     PREVIOUS_SUBAGENT_GUIDANCE_V2, codey_fastctx_guidance_for_namespace,
     remove_codey_fastctx_guidance,
 };
-const GLOBAL_PROVIDER_ID: &str = "codey_global";
+const LEGACY_GLOBAL_PROVIDER_ID: &str = "codey_global";
 
 #[test]
 fn codex_home_is_resolved_once_per_process() {
@@ -76,18 +76,14 @@ fn failed_initial_lease_never_publishes_runtime_policy() {
     fs::create_dir_all(&marker).unwrap();
     let original_config = b"model_provider = \"codey_global\"\n";
     fs::write(home.join("config.toml"), original_config).unwrap();
-    let profile = direct_profile();
-
-    let result = apply_isolated_cc_switch_runtime_config(
+    let result = apply_isolated_test_runtime_config(
         &home,
-        &profile,
-        GLOBAL_PROVIDER_ID,
+        false,
         None,
         true,
         DEFAULT_SUBAGENT_MODEL,
         DEFAULT_SUBAGENT_REASONING_EFFORT,
         None,
-        Some(original_config),
         &marker,
         &backup_root,
     );
@@ -196,105 +192,56 @@ fn stale_backup_dirs_are_pruned_beyond_retention() {
     assert!(backup_root.join("unrelated").is_dir(), "foreign dir kept");
 }
 
-fn official_profile() -> ProviderProfile {
-    let mut profile = ProviderProfile::new("OpenAI Official");
-    profile.id = "codex-official".to_string();
-    profile.cc_switch_read_only = true;
-    profile
-}
-
-fn direct_profile() -> ProviderProfile {
-    let mut profile = ProviderProfile::new("Relay");
-    profile.base_url = "https://relay.example/v1".to_string();
-    profile.api_key = "sk-direct".to_string();
-    profile
-}
-
 fn relative_model_catalog_path() -> Option<&'static Path> {
     Some(Path::new(crate::model_catalog::relative_path()))
 }
 
 #[test]
-fn official_patch_uses_the_official_endpoint_and_preserves_a_user_catalog() {
+fn router_patch_installs_only_the_loopback_provider_and_preserves_user_catalog() {
     let result = patch_config(
-        "model = \"gpt\"\nmodel_catalog_json = \"/Users/a1-6/.codex/custom-models.json\"\n",
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        true,
-    )
-    .unwrap();
-    assert!(result.contains("base_url = \"https://chatgpt.com/backend-api/codex\""));
-    assert!(!result.contains("experimental_bearer_token"));
-    assert_eq!(
-        root_key_string(&result, "model_catalog_json").as_deref(),
-        Some("/Users/a1-6/.codex/custom-models.json")
-    );
-    assert_eq!(root_key_string(&result, "model"), None);
-    assert_eq!(
-        root_key_string(&result, "service_tier").as_deref(),
-        Some("default")
-    );
-    let document = result.parse::<DocumentMut>().unwrap();
-    assert!(
-        document["desktop"]["enabled-reasoning-efforts"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|effort| effort.as_str() == Some("ultra"))
-    );
-}
+        r#"model_provider = "relay"
+model_catalog_json = "/user/catalog.json"
 
-#[test]
-fn official_patch_keeps_builtin_openai_without_a_configured_provider_table() {
-    let result = patch_config(
-        "model_provider = \"openai\"\n",
-        &official_profile(),
-        BUILTIN_OPENAI_PROVIDER_ID,
+[model_providers.relay]
+base_url = "https://relay.example/v1"
+experimental_bearer_token = "user-secret"
+"#,
         true,
     )
     .unwrap();
     let document = result.parse::<DocumentMut>().unwrap();
+    let router = document["model_providers"][local_router::ROUTER_PROVIDER_ID]
+        .as_table()
+        .unwrap();
 
     assert_eq!(
         document["model_provider"].as_str(),
-        Some(BUILTIN_OPENAI_PROVIDER_ID)
+        Some(local_router::ROUTER_PROVIDER_ID)
     );
-    assert!(
-        document
-            .get("model_providers")
-            .and_then(Item::as_table)
-            .is_none_or(|providers| providers.get(BUILTIN_OPENAI_PROVIDER_ID).is_none())
+    assert_eq!(router["name"].as_str(), Some("Codey Local Router"));
+    assert_eq!(
+        router["base_url"].as_str(),
+        Some("http://127.0.0.1:43127/v1")
     );
-    assert!(document.get("model_catalog_json").is_none());
-}
-
-#[test]
-fn official_patch_keeps_other_builtin_providers_without_overrides() {
-    let result = patch_config(
-        "model_provider = \"ollama\"\n",
-        &official_profile(),
-        "ollama",
-        false,
-    )
-    .unwrap();
-    let document = result.parse::<DocumentMut>().unwrap();
-
-    assert_eq!(document["model_provider"].as_str(), Some("ollama"));
-    assert!(
-        document
-            .get("model_providers")
-            .and_then(Item::as_table)
-            .is_none_or(|providers| providers.get("ollama").is_none())
+    assert_eq!(router["wire_api"].as_str(), Some("responses"));
+    assert_eq!(router["supports_websockets"].as_bool(), Some(false));
+    assert_eq!(
+        router["experimental_bearer_token"].as_str(),
+        Some("test-router-token")
+    );
+    assert_eq!(
+        root_key_string(&result, "model_catalog_json").as_deref(),
+        Some("/user/catalog.json")
     );
 }
 
 #[test]
-fn provider_patch_enables_all_desktop_reasoning_efforts() {
+fn router_patch_enables_all_desktop_reasoning_efforts() {
     let existing = r#"
 [desktop]
 enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
 "#;
-    let result = patch_config(existing, &official_profile(), GLOBAL_PROVIDER_ID, true).unwrap();
+    let result = patch_config(existing, true).unwrap();
     let document = result.parse::<DocumentMut>().unwrap();
     let efforts = document["desktop"]["enabled-reasoning-efforts"]
         .as_array()
@@ -307,14 +254,8 @@ enabled-reasoning-efforts = ["low", "medium", "high", "xhigh"]
 }
 
 #[test]
-fn provider_patch_preserves_selected_service_tier() {
-    let result = patch_config(
-        "service_tier = \"priority\"\n",
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        true,
-    )
-    .unwrap();
+fn router_patch_preserves_selected_service_tier() {
+    let result = patch_config("service_tier = \"priority\"\n", true).unwrap();
 
     assert_eq!(
         root_key_string(&result, "service_tier").as_deref(),
@@ -323,11 +264,9 @@ fn provider_patch_preserves_selected_service_tier() {
 }
 
 #[test]
-fn provider_patch_sets_the_requested_default_model() {
+fn router_patch_sets_the_requested_default_model() {
     let result = patch_config_with_fastctx(
         "model = \"old-model\"\n\n[profiles.work]\nmodel = \"profile-model\"\n",
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         Some("gpt-5.6-sol"),
         None,
@@ -342,249 +281,6 @@ fn provider_patch_sets_the_requested_default_model() {
     let document = result.parse::<DocumentMut>().unwrap();
     let work_profile = document["profiles"]["work"].as_table().unwrap();
     assert!(work_profile.get("model").is_none());
-}
-
-#[test]
-fn direct_patch_configures_a_responses_provider_without_a_loopback_endpoint() {
-    let result = patch_config(
-        "model_provider = \"relay\"\n",
-        &direct_profile(),
-        "relay",
-        false,
-    )
-    .unwrap();
-    assert!(result.contains("base_url = \"https://relay.example/v1\""));
-    assert!(result.contains("wire_api = \"responses\""));
-    assert!(result.contains("experimental_bearer_token = \"sk-direct\""));
-    assert!(!result.contains("127.0.0.1"));
-    assert_eq!(
-        root_key_string(&result, "model_provider").as_deref(),
-        Some("relay")
-    );
-}
-
-#[test]
-fn direct_patch_preserves_a_user_model_catalog_when_codey_catalog_is_requested() {
-    let result = patch_config(
-        "model_catalog_json = \"old.json\"\n",
-        &direct_profile(),
-        "relay",
-        true,
-    )
-    .unwrap();
-
-    assert_eq!(
-        root_key_string(&result, "model_catalog_json").as_deref(),
-        Some("old.json")
-    );
-}
-
-#[test]
-fn direct_patch_installs_the_codey_model_catalog_when_none_is_configured() {
-    let result = patch_config(
-        "model = \"third-party\"\n",
-        &direct_profile(),
-        "relay",
-        true,
-    )
-    .unwrap();
-
-    assert_eq!(
-        root_key_string(&result, "model_catalog_json").as_deref(),
-        Some("model-catalogs/codey-official.json")
-    );
-}
-
-#[test]
-fn cc_switch_provider_patch_preserves_unowned_provider_fields() {
-    let mut profile = direct_profile();
-    profile.cc_switch_provider_id = Some("relay".to_string());
-    let result = patch_config(
-        r#"model_provider = "relay"
-
-[model_providers.relay]
-name = "Existing"
-base_url = "https://old.example/v1"
-wire_api = "responses"
-requires_openai_auth = false
-request_max_retries = 9
-
-[model_providers.relay.http_headers]
-X-Route = "keep"
-"#,
-        &profile,
-        "relay",
-        false,
-    )
-    .unwrap();
-    let document = result.parse::<DocumentMut>().unwrap();
-    let provider = document["model_providers"]["relay"].as_table().unwrap();
-
-    assert_eq!(provider["request_max_retries"].as_integer(), Some(9));
-    assert_eq!(provider["http_headers"]["X-Route"].as_str(), Some("keep"));
-    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
-    assert_eq!(
-        provider["base_url"].as_str(),
-        Some("https://relay.example/v1")
-    );
-}
-
-#[test]
-fn direct_patch_rejects_a_reserved_provider_id_instead_of_silently_renaming_it() {
-    let error = patch_config(
-        "model_provider = \"openai\"\n",
-        &direct_profile(),
-        BUILTIN_OPENAI_PROVIDER_ID,
-        false,
-    )
-    .unwrap_err();
-
-    assert!(error.to_string().contains("Codex 保留 Provider ID"));
-}
-
-#[test]
-fn route_preserving_patch_keeps_cc_switch_routing_and_model_fields() {
-    let existing = r#"
-model_provider = "cc-switch-official"
-model = "route-model"
-model_catalog_json = "/cc-switch/catalog.json"
-
-[model_providers.cc-switch-official]
-name = "CC Switch Proxy"
-base_url = "http://127.0.0.1:15721/v1"
-wire_api = "responses"
-experimental_bearer_token = "PROXY_MANAGED"
-
-[features.cc_switch_owned]
-enabled = true
-"#;
-    let result = patch_config_with_fastctx_mode(
-        existing,
-        &direct_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
-            config_path: Path::new("/tmp/codey-codex/config.toml"),
-            model_catalog_path: relative_model_catalog_path(),
-            default_model: Some("codey-model"),
-            fastctx_command: Some(Path::new("/opt/codey")),
-            subagent_optimization: true,
-            subagent_model: DEFAULT_SUBAGENT_MODEL,
-            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-            preserve_provider_route: true,
-            local_router: None,
-        },
-    )
-    .unwrap();
-    let before = parse_document(existing).unwrap();
-    let after = parse_document(&result).unwrap();
-
-    assert_eq!(
-        root_key_string(&result, "model_provider").as_deref(),
-        Some("cc-switch-official")
-    );
-    assert_eq!(
-        root_key_string(&result, "model").as_deref(),
-        Some("route-model")
-    );
-    assert_eq!(
-        root_key_string(&result, "model_catalog_json").as_deref(),
-        Some("/cc-switch/catalog.json")
-    );
-    assert_eq!(
-        before.get("model_providers").unwrap().to_string(),
-        after.get("model_providers").unwrap().to_string()
-    );
-    assert!(
-        after["features"]["cc_switch_owned"]["enabled"]
-            .as_bool()
-            .unwrap()
-    );
-    assert!(
-        after["features"]["multi_agent_v2"]["enabled"]
-            .as_bool()
-            .unwrap()
-    );
-    assert!(after["mcp_servers"][CODEY_FASTCTX_SERVER_ID].is_table());
-}
-
-#[test]
-fn route_preserving_patch_keeps_the_code_switch_r_18100_endpoint() {
-    let existing = r#"
-model_provider = "code-switch-r"
-model = "route-model"
-
-[model_providers.code-switch-r]
-name = "code-switch-r"
-base_url = "http://127.0.0.1:18100"
-wire_api = "responses"
-experimental_bearer_token = "code-switch-r"
-"#;
-    let result = patch_config_with_fastctx_mode(
-        existing,
-        &direct_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
-            config_path: Path::new("/tmp/codey-codex/config.toml"),
-            model_catalog_path: None,
-            default_model: Some("codey-model"),
-            fastctx_command: None,
-            subagent_optimization: false,
-            subagent_model: DEFAULT_SUBAGENT_MODEL,
-            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-            preserve_provider_route: true,
-            local_router: None,
-        },
-    )
-    .unwrap();
-
-    assert_eq!(
-        root_key_string(&result, "model_provider").as_deref(),
-        Some("code-switch-r")
-    );
-    assert_eq!(
-        root_key_string(&result, "model").as_deref(),
-        Some("route-model")
-    );
-    assert_eq!(
-        provider_base_url(&result, "code-switch-r").as_deref(),
-        Some("http://127.0.0.1:18100")
-    );
-    assert!(result.contains("experimental_bearer_token = \"code-switch-r\""));
-}
-
-#[test]
-fn route_preserving_patch_rejects_non_responses_wire_api() {
-    let existing = r#"
-model_provider = "cc-switch-live"
-
-[model_providers.cc-switch-live]
-name = "CC Switch Live"
-base_url = "http://127.0.0.1:15721/v1"
-wire_api = "chat"
-"#;
-    let error = patch_config_with_fastctx_mode(
-        existing,
-        &direct_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
-            config_path: Path::new("/tmp/codey-codex/config.toml"),
-            model_catalog_path: None,
-            default_model: None,
-            fastctx_command: None,
-            subagent_optimization: false,
-            subagent_model: DEFAULT_SUBAGENT_MODEL,
-            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-            preserve_provider_route: true,
-            local_router: None,
-        },
-    )
-    .unwrap_err();
-
-    assert!(
-        error
-            .to_string()
-            .contains("请将 CC Switch Live 线路改为 Responses API")
-    );
 }
 
 #[test]
@@ -670,8 +366,6 @@ mcp_servers = { context_tools = { command = "uvx", args = ["fastctx", "--stdio"]
 
     let result = patch_config_with_fastctx(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey-fastctx")),
@@ -703,16 +397,9 @@ mcp_servers = { codey_fastctx = { command = "/tmp/codey-fastctx", args = ["--cod
 direct_only_tool_namespaces = ["mcp__codey_fastctx"]
 "#,
     ] {
-        let result = patch_config_with_fastctx(
-            existing,
-            &official_profile(),
-            GLOBAL_PROVIDER_ID,
-            relative_model_catalog_path(),
-            None,
-            None,
-            false,
-        )
-        .unwrap();
+        let result =
+            patch_config_with_fastctx(existing, relative_model_catalog_path(), None, None, false)
+                .unwrap();
         let document = parse_document(&result).unwrap();
 
         assert!(!mcp_server_exists(&document, CODEY_FASTCTX_SERVER_ID));
@@ -732,8 +419,6 @@ mcp_servers = { codey_fastctx = { command = "/old/codey", args = ["--codey-fastc
 "#;
     let result = patch_config_with_fastctx(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/new/codey-fastctx")),
@@ -792,8 +477,6 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__fastctx"]
 "#;
     let result = patch_config_with_fastctx(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/Applications/Codey.app/Contents/MacOS/codey")),
@@ -850,8 +533,6 @@ CONCURRENT = "preserve"
 "#;
     let result = patch_config_with_fastctx(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new(
@@ -900,8 +581,6 @@ CONCURRENT = "preserve"
 fn fast_context_tools_scale_budgets_down_for_a_smaller_user_host_limit() {
     let result = patch_config_with_fastctx(
         "tool_output_token_limit = 16000\n",
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey-fastctx")),
@@ -935,8 +614,6 @@ fn fast_context_tools_scale_budgets_down_for_a_smaller_user_host_limit() {
 fn fast_context_tools_keep_an_explicit_zero_host_output_limit() {
     let result = patch_config_with_fastctx(
         "tool_output_token_limit = 0\n",
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey-fastctx")),
@@ -971,8 +648,6 @@ USER_KEY = "preserve"
 "#;
     let result = patch_config_with_fastctx(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey-fastctx")),
@@ -1008,8 +683,6 @@ args = ["fastctx", "--stdio"]
 "#;
     let result = patch_config_with_fastctx(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey")),
@@ -1037,8 +710,6 @@ context_tools = { command = "/opt/tools/FASTCTX.exe", args = ["--stdio"] }
 "#;
     let result = patch_config_with_fastctx(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey")),
@@ -1064,8 +735,6 @@ command = "/custom/breakfastctx"
 "#;
     let result = patch_config_with_fastctx(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey")),
@@ -1094,8 +763,6 @@ direct_only_tool_namespaces = ["mcp__existing"]
 "#;
     let enabled = patch_config_with_fastctx(
         original,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey")),
@@ -1119,8 +786,6 @@ direct_only_tool_namespaces = ["mcp__existing"]
 
     let disabled = patch_config_with_fastctx(
         &document_string(&stale).unwrap(),
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         None,
@@ -1175,16 +840,9 @@ direct_only_tool_namespaces = ["mcp__fastctx"]
 "#
     );
 
-    let result = patch_config_with_fastctx(
-        &existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        relative_model_catalog_path(),
-        None,
-        None,
-        false,
-    )
-    .unwrap();
+    let result =
+        patch_config_with_fastctx(&existing, relative_model_catalog_path(), None, None, false)
+            .unwrap();
     let document = result.parse::<DocumentMut>().unwrap();
 
     assert_eq!(
@@ -1218,16 +876,9 @@ args = ["serve"]
 direct_only_tool_namespaces = ["mcp__codey_fastctx"]
 "#
     );
-    let disabled = patch_config_with_fastctx(
-        &existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        relative_model_catalog_path(),
-        None,
-        None,
-        false,
-    )
-    .unwrap();
+    let disabled =
+        patch_config_with_fastctx(&existing, relative_model_catalog_path(), None, None, false)
+            .unwrap();
     let document = disabled.parse::<DocumentMut>().unwrap();
 
     assert_eq!(
@@ -1250,16 +901,9 @@ fn disabling_fast_context_tools_cleans_an_orphan_reserved_namespace() {
 [features.code_mode]
 direct_only_tool_namespaces = ["mcp__codey_fastctx", "mcp__user"]
 "#;
-    let disabled = patch_config_with_fastctx(
-        existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        relative_model_catalog_path(),
-        None,
-        None,
-        false,
-    )
-    .unwrap();
+    let disabled =
+        patch_config_with_fastctx(existing, relative_model_catalog_path(), None, None, false)
+            .unwrap();
     let document = disabled.parse::<DocumentMut>().unwrap();
     let namespaces = document["features"]["code_mode"]["direct_only_tool_namespaces"]
         .as_array()
@@ -1292,8 +936,6 @@ developer_instructions = "User guidance.\n\n{stale_guidance}\n\n{CODEY_FASTCTX_G
 
     let result = patch_config_with_fastctx(
         &existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey")),
@@ -1327,8 +969,6 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
 "#;
     let first = patch_config_with_fastctx(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey")),
@@ -1337,8 +977,6 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
     .unwrap();
     let second = patch_config_with_fastctx(
         &first,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
         relative_model_catalog_path(),
         None,
         Some(Path::new("/tmp/codey")),
@@ -1405,8 +1043,6 @@ user_flag = true
     ] {
         let result = patch_config_with_fastctx(
             existing,
-            &official_profile(),
-            GLOBAL_PROVIDER_ID,
             relative_model_catalog_path(),
             None,
             Some(Path::new("/tmp/codey")),
@@ -1459,9 +1095,7 @@ command = "echo preserve-user-hook"
 "#;
     let result = patch_config_with_fastctx_mode(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
@@ -1469,8 +1103,7 @@ command = "echo preserve-user-hook"
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap();
@@ -1633,9 +1266,7 @@ fn subagent_and_fastctx_share_one_pre_tool_hook() {
     let config_path = Path::new("/tmp/codey-codex/config.toml");
     let result = patch_config_with_fastctx_mode(
         "",
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path,
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
@@ -1643,8 +1274,7 @@ fn subagent_and_fastctx_share_one_pre_tool_hook() {
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap();
@@ -1756,9 +1386,7 @@ timeout = 2
     );
     let result = patch_config_with_fastctx_mode(
         &existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path,
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
@@ -1766,8 +1394,7 @@ timeout = 2
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap();
@@ -1818,9 +1445,7 @@ timeout = 2
 
     let repeated = patch_config_with_fastctx_mode(
         &result,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path,
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
@@ -1828,8 +1453,7 @@ timeout = 2
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap();
@@ -1850,9 +1474,7 @@ default_subagent_reasoning_effort = "low"
 "#;
     let result = patch_config_with_fastctx_mode(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
@@ -1860,8 +1482,7 @@ default_subagent_reasoning_effort = "low"
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap();
@@ -1921,9 +1542,7 @@ tool_namespace = "agents"
 "#;
     let result = patch_config_with_fastctx_mode(
         existing,
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
@@ -1931,8 +1550,7 @@ tool_namespace = "agents"
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap();
@@ -1948,9 +1566,7 @@ tool_namespace = "agents"
 fn subagent_optimization_keeps_a_standalone_explicit_lower_concurrency() {
     let result = patch_config_with_fastctx_mode(
         "[agents]\nmax_concurrent_threads_per_session = 2\n",
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
@@ -1958,8 +1574,7 @@ fn subagent_optimization_keeps_a_standalone_explicit_lower_concurrency() {
             subagent_optimization: true,
             subagent_model: "gpt-5.6-sol",
             subagent_reasoning_effort: "high",
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap();
@@ -1982,9 +1597,7 @@ fn subagent_optimization_defaults_concurrency_for_new_or_invalid_configs() {
     ] {
         let result = patch_config_with_fastctx_mode(
             existing,
-            &official_profile(),
-            GLOBAL_PROVIDER_ID,
-            ProviderPatchOptions {
+            RouterPatchOptions {
                 config_path: Path::new("/tmp/codey-codex/config.toml"),
                 model_catalog_path: relative_model_catalog_path(),
                 default_model: None,
@@ -1992,8 +1605,7 @@ fn subagent_optimization_defaults_concurrency_for_new_or_invalid_configs() {
                 subagent_optimization: true,
                 subagent_model: "gpt-5.6-sol",
                 subagent_reasoning_effort: "high",
-                preserve_provider_route: false,
-                local_router: None,
+                local_router: test_runtime_router_endpoint(),
             },
         )
         .unwrap();
@@ -2017,9 +1629,7 @@ fn subagent_optimization_defaults_concurrency_for_new_or_invalid_configs() {
 fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
     let patched = patch_config_with_fastctx_mode(
         "",
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
@@ -2027,8 +1637,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
             subagent_optimization: true,
             subagent_model: "gpt-5.6-luna",
             subagent_reasoning_effort: "high",
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap();
@@ -2040,9 +1649,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
 
     let error = patch_config_with_fastctx_mode(
         "",
-        &official_profile(),
-        GLOBAL_PROVIDER_ID,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path: Path::new("/tmp/codey-codex/config.toml"),
             model_catalog_path: relative_model_catalog_path(),
             default_model: None,
@@ -2050,8 +1657,7 @@ fn subagent_optimization_accepts_dynamic_model_ids_and_rejects_empty_values() {
             subagent_optimization: true,
             subagent_model: "   ",
             subagent_reasoning_effort: "high",
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
     .unwrap_err();
@@ -2107,7 +1713,10 @@ requires_openai_auth = true
     .unwrap();
 
     let original = fs::read_to_string(home.join("config.toml")).unwrap();
-    assert_eq!(current_model_provider(&home).unwrap(), GLOBAL_PROVIDER_ID);
+    assert_eq!(
+        current_model_provider(&home).unwrap(),
+        LEGACY_GLOBAL_PROVIDER_ID
+    );
     assert_eq!(
         fs::read_to_string(home.join("config.toml")).unwrap(),
         original
@@ -2156,7 +1765,10 @@ experimental_bearer_token = "sk-existing"
 "#;
     fs::write(home.join("config.toml"), original).unwrap();
 
-    assert_eq!(current_model_provider(&home).unwrap(), GLOBAL_PROVIDER_ID);
+    assert_eq!(
+        current_model_provider(&home).unwrap(),
+        LEGACY_GLOBAL_PROVIDER_ID
+    );
     assert_eq!(
         fs::read_to_string(home.join("config.toml")).unwrap(),
         original
@@ -2179,7 +1791,10 @@ experimental_bearer_token = "must-not-be-removed"
 "#;
     fs::write(home.join("config.toml"), original).unwrap();
 
-    assert_eq!(current_model_provider(&home).unwrap(), GLOBAL_PROVIDER_ID);
+    assert_eq!(
+        current_model_provider(&home).unwrap(),
+        LEGACY_GLOBAL_PROVIDER_ID
+    );
     assert_eq!(
         fs::read_to_string(home.join("config.toml")).unwrap(),
         original
@@ -2204,153 +1819,6 @@ fn preserves_an_existing_non_reserved_provider() {
 }
 
 #[test]
-fn direct_runtime_provider_stays_out_of_config_even_without_restore() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("codex-home");
-    let state_dir = temp.path().join("codey-state");
-    let marker = state_dir.join("codex-lease.json");
-    let backup_root = state_dir.join("codex-backups");
-    fs::create_dir_all(&home).unwrap();
-    let original_config = br#"# Keep formatting and all user-owned provider fields byte-for-byte.
-model_provider = "relay"
-model = "user-model"
-
-[model_providers.relay]
-name = "User Relay"
-base_url = "https://relay.example/v1"
-wire_api = "responses"
-requires_openai_auth = false
-experimental_bearer_token = "user-token"
-env_key = "USER_RELAY_TOKEN"
-codey_chat_base_url = "https://legacy-chat.example/v1"
-protocol_proxy_base_url = "http://127.0.0.1:43123/v1"
-
-[model_providers.relay.http_headers]
-X-User-Header = "keep-me"
-"#;
-    let config_path = home.join("config.toml");
-    fs::write(&config_path, original_config).unwrap();
-    #[cfg(unix)]
-    let original_file_identity = {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(&config_path).unwrap();
-        (
-            metadata.dev(),
-            metadata.ino(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-        )
-    };
-    #[cfg(windows)]
-    let original_file_identity = {
-        use std::os::windows::fs::MetadataExt;
-        let metadata = fs::metadata(&config_path).unwrap();
-        (
-            metadata.creation_time(),
-            metadata.last_write_time(),
-            metadata.file_size(),
-        )
-    };
-    let applied = apply_isolated_runtime_provider_config(
-        &home,
-        &direct_profile(),
-        "relay",
-        ProviderApplyOptions {
-            profiles: std::slice::from_ref(&direct_profile()),
-            local_router: None,
-            use_official_catalog: true,
-            default_model: Some("runtime-model"),
-            fastctx_command: None,
-            subagent_optimization: false,
-            subagent_model: DEFAULT_SUBAGENT_MODEL,
-            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-            subagent_roles: None,
-            marker: &marker,
-            backup_root: &backup_root,
-            preserve_provider_route: false,
-            expected_config: Some(original_config),
-        },
-    )
-    .unwrap();
-
-    assert_eq!(applied.config_contents, original_config);
-    assert_eq!(fs::read(&config_path).unwrap(), original_config);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(&config_path).unwrap();
-        assert_eq!(
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.mtime(),
-                metadata.mtime_nsec(),
-            ),
-            original_file_identity,
-            "config.toml must not be atomically replaced or rewritten"
-        );
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        let metadata = fs::metadata(&config_path).unwrap();
-        assert_eq!(
-            (
-                metadata.creation_time(),
-                metadata.last_write_time(),
-                metadata.file_size(),
-            ),
-            original_file_identity,
-            "config.toml must not be atomically replaced or rewritten"
-        );
-    }
-    assert!(marker.exists(), "the crash-recovery lease should be active");
-    for expected in [
-        "model_provider=\"relay\"",
-        "model=\"runtime-model\"",
-        "model_providers.relay.name=\"Relay\"",
-        "model_providers.relay.base_url=\"https://relay.example/v1\"",
-        "model_providers.relay.wire_api=\"responses\"",
-        "model_providers.relay.requires_openai_auth=false",
-        "model_providers.relay.experimental_bearer_token=\"sk-direct\"",
-    ] {
-        assert!(
-            applied
-                .runtime_config_overrides
-                .iter()
-                .any(|entry| entry == expected),
-            "missing runtime-only provider override {expected}"
-        );
-    }
-    assert!(
-        applied
-            .runtime_config_overrides
-            .iter()
-            .any(|entry| entry.starts_with("model_catalog_json="))
-    );
-    assert!(
-        !applied
-            .runtime_config_overrides
-            .iter()
-            .any(|entry| { entry.contains("127.0.0.1") || entry.contains("localhost") })
-    );
-    assert!(!applied.runtime_config_overrides.iter().any(|entry| {
-        entry.contains("codey_chat_base_url") || entry.contains("protocol_proxy_base_url")
-    }));
-    for runtime_override in &applied.runtime_config_overrides {
-        runtime_override
-            .parse::<DocumentMut>()
-            .unwrap_or_else(|error| {
-                panic!("invalid runtime override {runtime_override:?}: {error}")
-            });
-    }
-
-    // Deliberately do not call restore_runtime_provider_config_at: this is
-    // the abnormal-exit boundary the runtime-only route must make harmless.
-    assert_eq!(fs::read(&config_path).unwrap(), original_config);
-}
-
-#[test]
 fn local_router_runtime_hides_upstream_routes_and_secrets_from_codex() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
@@ -2358,24 +1826,25 @@ fn local_router_runtime_hides_upstream_routes_and_secrets_from_codex() {
     let marker = state_dir.join("codex-lease.json");
     let backup_root = state_dir.join("codex-backups");
     fs::create_dir_all(&home).unwrap();
-    let original_config = b"model_provider = \"openai\"\n";
+    let original_config = br#"model_provider = "relay"
+
+[model_providers.relay]
+name = "User Relay"
+base_url = "https://upstream-secret.example/v1"
+wire_api = "responses"
+experimental_bearer_token = "upstream-secret-token"
+"#;
     fs::write(home.join("config.toml"), original_config).unwrap();
-    let mut route = direct_profile();
-    route.id = "route-a".into();
-    route.base_url = "https://upstream-secret.example/v1".into();
-    route.api_key = "upstream-secret-token".into();
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
+        requires_openai_auth: false,
     };
 
-    let applied = apply_isolated_runtime_provider_config(
+    let applied = apply_isolated_runtime_router_config(
         &home,
-        &route,
-        crate::local_router::ROUTER_PROVIDER_ID,
-        ProviderApplyOptions {
-            profiles: std::slice::from_ref(&route),
-            local_router: Some(&endpoint),
+        RouterApplyOptions {
+            local_router: &endpoint,
             use_official_catalog: true,
             default_model: Some("route-a/provider-model"),
             fastctx_command: None,
@@ -2385,8 +1854,6 @@ fn local_router_runtime_hides_upstream_routes_and_secrets_from_codex() {
             subagent_roles: None,
             marker: &marker,
             backup_root: &backup_root,
-            preserve_provider_route: false,
-            expected_config: Some(original_config),
         },
     )
     .unwrap();
@@ -2399,6 +1866,7 @@ fn local_router_runtime_hides_upstream_routes_and_secrets_from_codex() {
         "model_providers.codey_router.base_url=\"http://127.0.0.1:43127/v1\"",
         "model_providers.codey_router.wire_api=\"responses\"",
         "model_providers.codey_router.requires_openai_auth=false",
+        "model_providers.codey_router.supports_websockets=false",
         "model_providers.codey_router.experimental_bearer_token=\"launch-only-router-token\"",
     ] {
         assert!(
@@ -2410,8 +1878,60 @@ fn local_router_runtime_hides_upstream_routes_and_secrets_from_codex() {
         );
     }
     let rendered = applied.runtime_config_overrides.join("\n");
+    assert!(
+        applied.runtime_config_overrides.iter().any(|entry| {
+            entry.starts_with("model_providers.codey_router.http_headers=")
+                && entry.contains("x-codey-router-token")
+                && entry.contains("launch-only-router-token")
+        }),
+        "missing local-router header token runtime override"
+    );
     assert!(!rendered.contains("upstream-secret.example"));
     assert!(!rendered.contains("upstream-secret-token"));
+    assert!(!rendered.contains("openai_base_url="));
+}
+
+#[test]
+fn official_login_uses_the_http_only_router_without_overriding_builtin_openai() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey-state/codex-lease.json");
+    let backup_root = temp.path().join("codey-state/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original_config = b"model_provider = \"openai\"\n";
+    fs::write(home.join("config.toml"), original_config).unwrap();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+        requires_openai_auth: true,
+    };
+
+    let applied = apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            local_router: &endpoint,
+            use_official_catalog: true,
+            default_model: Some("openai/gpt-5.6-sol"),
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backup_root,
+        },
+    )
+    .unwrap();
+
+    let rendered = applied.runtime_config_overrides.join("\n");
+    assert!(rendered.contains("model_provider=\"codey_router\""));
+    assert!(rendered.contains("model=\"openai/gpt-5.6-sol\""));
+    assert!(rendered.contains("model_providers.codey_router.requires_openai_auth=true"));
+    assert!(rendered.contains("model_providers.codey_router.supports_websockets=false"));
+    assert!(rendered.contains("x-codey-router-token"));
+    assert!(rendered.contains("launch-only-router-token"));
+    assert!(!rendered.contains("model_providers.codey_router.experimental_bearer_token"));
+    assert!(!rendered.contains("openai_base_url="));
 }
 
 #[test]
@@ -2426,19 +1946,16 @@ base_url = "https://user-owned.example/v1"
 wire_api = "responses"
 "#;
     fs::write(home.join("config.toml"), original_config).unwrap();
-    let route = direct_profile();
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
+        requires_openai_auth: false,
     };
 
-    let error = apply_isolated_runtime_provider_config(
+    let error = apply_isolated_runtime_router_config(
         &home,
-        &route,
-        crate::local_router::ROUTER_PROVIDER_ID,
-        ProviderApplyOptions {
-            profiles: std::slice::from_ref(&route),
-            local_router: Some(&endpoint),
+        RouterApplyOptions {
+            local_router: &endpoint,
             use_official_catalog: true,
             default_model: Some("relay/provider-model"),
             fastctx_command: None,
@@ -2448,87 +1965,12 @@ wire_api = "responses"
             subagent_roles: None,
             marker: &marker,
             backup_root: &backup_root,
-            preserve_provider_route: false,
-            expected_config: Some(original_config),
         },
     )
     .unwrap_err();
 
     assert!(format!("{error:#}").contains("已占用 Codey 内部 Provider ID"));
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
-}
-
-#[test]
-fn isolated_runtime_registers_multiple_routes_without_persisting_them() {
-    let temp = tempfile::tempdir().unwrap();
-    let home = temp.path().join("codex-home");
-    let state_dir = temp.path().join("codey-state");
-    let marker = state_dir.join("codex-lease.json");
-    let backup_root = state_dir.join("codex-backups");
-    fs::create_dir_all(&home).unwrap();
-    let original_config = br#"# User-owned config must remain untouched.
-model_provider = "user-provider"
-
-[model_providers.user-provider]
-name = "User Provider"
-base_url = "https://user.example/v1"
-wire_api = "responses"
-"#;
-    let config_path = home.join("config.toml");
-    fs::write(&config_path, original_config).unwrap();
-
-    let mut route_a = direct_profile();
-    route_a.id = "route-a".into();
-    route_a.name = "Route A".into();
-    route_a.base_url = "https://route-a.example/v1".into();
-    route_a.api_key = "route-a-secret".into();
-    let mut route_b = direct_profile();
-    route_b.id = "route-b".into();
-    route_b.name = "Route B".into();
-    route_b.base_url = "https://route-b.example/v1".into();
-    route_b.api_key = "route-b-secret".into();
-    let profiles = vec![route_a.clone(), route_b];
-
-    let applied = apply_isolated_runtime_provider_config(
-        &home,
-        &route_a,
-        "route-a",
-        ProviderApplyOptions {
-            profiles: &profiles,
-            local_router: None,
-            use_official_catalog: true,
-            default_model: Some("route-a-model"),
-            fastctx_command: None,
-            subagent_optimization: false,
-            subagent_model: DEFAULT_SUBAGENT_MODEL,
-            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-            subagent_roles: None,
-            marker: &marker,
-            backup_root: &backup_root,
-            preserve_provider_route: false,
-            expected_config: Some(original_config),
-        },
-    )
-    .unwrap();
-
-    assert_eq!(fs::read(&config_path).unwrap(), original_config);
-    for expected in [
-        "model_provider=\"route-a\"",
-        "model_providers.route-a.base_url=\"https://route-a.example/v1\"",
-        "model_providers.route-a.experimental_bearer_token=\"route-a-secret\"",
-        "model_providers.route-b.base_url=\"https://route-b.example/v1\"",
-        "model_providers.route-b.experimental_bearer_token=\"route-b-secret\"",
-    ] {
-        assert!(
-            applied
-                .runtime_config_overrides
-                .iter()
-                .any(|entry| entry == expected),
-            "missing process-local route override {expected}"
-        );
-    }
-    assert!(!String::from_utf8_lossy(original_config).contains("route-a-secret"));
-    assert!(!String::from_utf8_lossy(original_config).contains("route-b-secret"));
 }
 
 #[test]
@@ -2548,16 +1990,14 @@ wire_api = "responses"
 "#;
     fs::write(home.join("config.toml"), original_config).unwrap();
 
-    let applied = apply_isolated_cc_switch_runtime_config(
+    let applied = apply_isolated_test_runtime_config(
         &home,
-        &direct_profile(),
-        "relay",
+        false,
         Some(Path::new("/opt/codey/codey-fastctx")),
         false,
         DEFAULT_SUBAGENT_MODEL,
         DEFAULT_SUBAGENT_REASONING_EFFORT,
         None,
-        Some(original_config),
         &marker,
         &backup_root,
     )
@@ -2598,13 +2038,13 @@ wire_api = "responses"
             .contains(crate::fastctx_route_gate::HOOK_ARGUMENT)
     );
 
-    assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+    assert!(restore_runtime_config_at(&home, &marker).unwrap());
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
     assert!(!home.join("hooks.json").exists());
 }
 
 #[test]
-fn cc_switch_runtime_constraints_stay_out_of_config_and_restore_hooks() {
+fn isolated_runtime_constraints_stay_out_of_config_and_restore_hooks() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
     let state_dir = temp.path().join("codey-state");
@@ -2612,7 +2052,7 @@ fn cc_switch_runtime_constraints_stay_out_of_config_and_restore_hooks() {
     let backup_root = state_dir.join("codex-backups");
     fs::create_dir_all(&home).unwrap();
     let original_config = br#"model_provider = "relay"
-model_catalog_json = "/cc-switch/catalog.json"
+model_catalog_json = "/user/catalog.json"
 developer_instructions = "Keep the user's instructions."
 
 [model_providers.relay]
@@ -2636,21 +2076,6 @@ wire_api = "responses"
 "#;
     fs::write(home.join("config.toml"), original_config).unwrap();
     fs::write(home.join("hooks.json"), original_hooks).unwrap();
-    let model_catalog_path = home.join(crate::model_catalog::relative_path());
-    fs::create_dir_all(model_catalog_path.parent().unwrap()).unwrap();
-    fs::write(
-        &model_catalog_path,
-        serde_json::to_vec(&serde_json::json!({
-            "models": [{
-                "slug": "gpt-5.6-luna",
-                "description": "Luna test model",
-                "base_instructions": "Test instructions",
-                "multi_agent_version": "v2"
-            }]
-        }))
-        .unwrap(),
-    )
-    .unwrap();
     let seeded_constraints_dir = state_dir.join(CODEY_CONSTRAINTS_DIR);
     fs::create_dir_all(&seeded_constraints_dir).unwrap();
     fs::write(
@@ -2668,24 +2093,19 @@ wire_api = "responses"
         PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT,
     )
     .unwrap();
-    let profile = direct_profile();
-
-    let applied = apply_isolated_cc_switch_runtime_config(
+    let applied = apply_isolated_test_runtime_config(
         &home,
-        &profile,
-        "relay",
+        true,
         Some(Path::new("/opt/codey/codey-fastctx")),
         true,
         "gpt-5.6-mini",
         "high",
         None,
-        Some(original_config),
         &marker,
         &backup_root,
     )
     .unwrap();
 
-    assert_eq!(applied.config_contents, original_config);
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), original_config);
     assert!(!home.join("AGENTS.md").exists());
     assert!(!home.join("agents/default.toml").exists());
@@ -2702,10 +2122,9 @@ wire_api = "responses"
         .unwrap()
         .parse::<DocumentMut>()
         .unwrap();
-    let expected_model_catalog_path = model_catalog_path.to_string_lossy().into_owned();
     assert_eq!(
         model_catalog_override["model_catalog_json"].as_str(),
-        Some(expected_model_catalog_path.as_str())
+        Some("/user/catalog.json")
     );
     assert!(
         applied
@@ -2940,11 +2359,11 @@ wire_api = "responses"
 
     let switched_config = [
         original_config.as_slice(),
-        b"\n# CC Switch changed route state\n",
+        b"\n# User changed persistent config\n",
     ]
     .concat();
     fs::write(home.join("config.toml"), &switched_config).unwrap();
-    assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+    assert!(restore_runtime_config_at(&home, &marker).unwrap());
     assert_eq!(fs::read(home.join("config.toml")).unwrap(), switched_config);
     assert_eq!(fs::read(home.join("hooks.json")).unwrap(), original_hooks);
     assert!(!marker.exists());
@@ -2974,16 +2393,14 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
     )
     .unwrap();
 
-    let reapplied = apply_isolated_cc_switch_runtime_config(
+    let reapplied = apply_isolated_test_runtime_config(
         &home,
-        &profile,
-        "relay",
+        true,
         Some(Path::new("/opt/codey/codey-fastctx")),
         true,
         "gpt-5.6-mini",
         "high",
         None,
-        Some(original_config),
         &marker,
         &backup_root,
     )
@@ -3017,5 +2434,5 @@ developer_instructions = "CUSTOM SUBAGENT CONSTRAINT"
         fs::read_to_string(constraints_dir.join(CODEY_RUNTIME_DEFAULT_AGENT_FILE)).unwrap();
     assert!(runtime_agent.contains("CUSTOM SUBAGENT CONSTRAINT"));
     assert!(runtime_agent.contains("CUSTOM FASTCTX CONSTRAINT"));
-    assert!(restore_runtime_provider_config_at(&home, &marker).unwrap());
+    assert!(restore_runtime_config_at(&home, &marker).unwrap());
 }

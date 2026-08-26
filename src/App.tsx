@@ -24,6 +24,7 @@ import type { NotificationChannel } from "./notifications";
 import { errorText, withTimeout } from "./appUtils";
 import { formatBytes } from "./formatters";
 import { modelIdsEqual, uniqueModelIds } from "./modelIds";
+import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
 import { CodeyBrandMark, SettingsModalShell } from "./SettingsModalShell";
 import { useModelSelection } from "./useModelSelection";
 import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
@@ -41,7 +42,7 @@ import {
 import { useStableEvent } from "./useStableEvent";
 import type {
   AppProps,
-  CcSwitchStatus,
+  ProviderStatus,
   Config,
   CrashpadCleanup,
   FastContextToolsStatus,
@@ -91,7 +92,7 @@ function thirdPartyRouteModelState(
   route: Profile,
   catalog: ModelState,
 ): ModelState {
-  const providerId = route.ccSwitchProviderId || route.id;
+  const providerId = routeProviderId(route);
   const selectedModels = uniqueModelIds([
     ...(config.selectedModelsByProvider[providerId] || []),
     ...(config.declaredOfficialModelsByProvider[providerId] || []),
@@ -107,7 +108,7 @@ function thirdPartyRouteModelState(
       ...selectedModels,
     ]),
     defaultModel:
-      config.defaultModelByProvider[providerId] || selectedModels[0] || "",
+      globalDefaultForRoute(config, route, selectedModels) || selectedModels[0] || "",
   };
 }
 
@@ -129,7 +130,7 @@ export function App({
     });
   const [pluginMarketplaceStatus, setPluginMarketplaceStatus] =
     useState<PluginMarketplaceStatus | null>(null);
-  const [ccSwitchStatus, setCcSwitchStatus] = useState<CcSwitchStatus | null>(
+  const [providerStatus, setProviderStatus] = useState<ProviderStatus | null>(
     null,
   );
   const [fastContextToolsStatus, setFastContextToolsStatus] =
@@ -149,7 +150,7 @@ export function App({
   const setNotice = noticeController.setNotice;
   const setConfirmation = confirmationController.setConfirmation;
 
-  const provider = ccSwitchStatus?.provider;
+  const provider = providerStatus?.provider;
   const isBusy = busy !== null;
   const configLoaded = config !== null;
   const setPersistedConfig = useCallback((next: Config) => {
@@ -230,6 +231,8 @@ export function App({
     addCustomModel,
     saveModelSelection,
   } = useModelSelection({
+    config,
+    officialAccountAvailable: status.officialAccountAvailable === true,
     provider,
     runOperation,
     setPersistedConfig,
@@ -266,11 +269,11 @@ export function App({
         modelState?: ModelState;
         startupError?: string;
         officialAccountAvailable?: boolean;
-        ccSwitch?: CcSwitchStatus;
+        providerStatus?: ProviderStatus;
         fastContextToolsStatus?: FastContextToolsStatus;
       }>("load_codey_config");
       setPersistedConfig(result.config);
-      setCcSwitchStatus(result.ccSwitch ?? null);
+      setProviderStatus(result.providerStatus ?? null);
       if (typeof result.officialAccountAvailable === "boolean") {
         setStatus((current) => ({
           ...current,
@@ -329,7 +332,7 @@ export function App({
   async function persist(next: Config) {
     const result = await invoke<{
       config: Config;
-      ccSwitch?: CcSwitchStatus;
+      providerStatus?: ProviderStatus;
       modelState?: ModelState;
       restartRequired?: boolean;
       modelHotReloaded?: boolean;
@@ -339,8 +342,6 @@ export function App({
       subagentConfigHealth?: string;
       subagentConfigRepairReasons?: string[];
       subagentConfigHotReloadError?: string;
-      subagentDefaultsHotReloaded?: boolean;
-      subagentDefaultsHotReloadError?: string;
       fastContextToolsStatus?: FastContextToolsStatus;
     }>("save_codey_config", { config: next });
     setPersistedConfig(result.config);
@@ -352,7 +353,7 @@ export function App({
         detail: { config: result.config },
       }),
     );
-    if (result.ccSwitch) setCcSwitchStatus(result.ccSwitch);
+    if (result.providerStatus) setProviderStatus(result.providerStatus);
     if (result.modelState) setModelState(result.modelState);
     if (typeof result.restartRequired === "boolean") {
       setStatus((current) => ({
@@ -436,12 +437,12 @@ export function App({
     await runOperation("sync-provider", async () => {
       const result = await invoke<{
         config: Config;
-        ccSwitch: CcSwitchStatus;
+        providerStatus: ProviderStatus;
         modelState: ModelState;
         restartRequired?: boolean;
       }>("sync_current_provider");
       setPersistedConfig(result.config);
-      setCcSwitchStatus(result.ccSwitch);
+      setProviderStatus(result.providerStatus);
       setModelState(result.modelState);
       setStatus((current) => ({
         ...current,
@@ -458,12 +459,12 @@ export function App({
 
   function applyRouteResult(result: {
     config: Config;
-    ccSwitch?: CcSwitchStatus;
+    providerStatus?: ProviderStatus;
     modelState?: ModelState;
     restartRequired?: boolean;
   }) {
     setPersistedConfig(result.config);
-    if (result.ccSwitch) setCcSwitchStatus(result.ccSwitch);
+    if (result.providerStatus) setProviderStatus(result.providerStatus);
     if (result.modelState) setModelState(result.modelState);
     if (typeof result.restartRequired === "boolean") {
       setStatus((current) => ({
@@ -511,7 +512,7 @@ export function App({
     await runOperation("delete-route", async () => {
       const result = await invoke<{
         config: Config;
-        ccSwitch: CcSwitchStatus;
+        providerStatus: ProviderStatus;
         modelState: ModelState;
         restartRequired?: boolean;
         modelHotReloaded?: boolean;
@@ -568,6 +569,10 @@ export function App({
 
   async function fetchRouteModels(route: Profile) {
     if (!config) return;
+    if (route.authMode === "officialAccount") {
+      await syncCurrentProvider();
+      return;
+    }
     await runOperation("fetch-route-models", async () => {
       const savedConfig = config;
       const savedRoute = savedConfig.profiles.find(
@@ -577,7 +582,7 @@ export function App({
       try {
         const result = await invoke<{
           config: Config;
-          ccSwitch: CcSwitchStatus;
+          providerStatus: ProviderStatus;
           modelState: ModelState;
           routeModelState: ModelState;
           models: string[];
@@ -624,25 +629,21 @@ export function App({
       setNotice({ tone: "info", text: "官方账号线路至少需要保留一个模型" });
       return false;
     }
-    const providerId = profile.ccSwitchProviderId || profile.id;
-    const currentDefault = config.defaultModelByProvider[providerId] || "";
-    const defaultModel = models.find((model) =>
-      modelIdsEqual(model, currentDefault),
-    ) || models[0];
     let saved = false;
     await runOperation("save-official-route-settings", async () => {
-      const result = await persist({
-        ...config,
-        showAccountUsageInHeader,
-        selectedModelsByProvider: {
-          ...config.selectedModelsByProvider,
-          [providerId]: models,
-        },
-        defaultModelByProvider: {
-          ...config.defaultModelByProvider,
-          [providerId]: defaultModel,
-        },
-      });
+      const modelResult = await invoke<{
+        config: Config;
+        modelState: ModelState;
+        restartRequired?: boolean;
+        modelHotReloaded?: boolean;
+      }>("save_official_route_models", { routeId, models });
+      applyRouteResult(modelResult);
+      const result = modelResult.config.showAccountUsageInHeader === showAccountUsageInHeader
+        ? modelResult
+        : await persist({
+            ...modelResult.config,
+            showAccountUsageInHeader,
+          });
       saved = true;
       setNotice({
         tone: result.restartRequired ? "info" : "success",
@@ -658,7 +659,7 @@ export function App({
     if (!config) return;
     const profile = config.profiles.find((candidate) => candidate.id === routeId);
     if (!profile) return;
-    const providerId = profile.ccSwitchProviderId || profile.id;
+    const providerId = profile.sourceProviderId || profile.id;
     const configuredOfficialModels = config.selectedModelsByProvider[providerId] || [];
     const enabledModels = profile.authMode === "officialAccount"
       ? configuredOfficialModels.length > 0
@@ -684,7 +685,7 @@ export function App({
       applyRouteResult(result);
       setNotice({
         tone: result.restartRequired ? "info" : "success",
-        text: `已将「${profile.name}」的默认模型设为 ${model}`,
+        text: `已将全局默认模型设为「${profile.name} / ${model}」`,
       });
     });
   }
@@ -728,14 +729,8 @@ export function App({
     if (!config) return;
     await runOperation("save", async () => {
       const result = await persist(config);
-      const subagentHotReloaded = Boolean(
-        result.subagentConfigHotReloaded ??
-          result.subagentDefaultsHotReloaded,
-      );
-      const subagentHotReloadFailed = Boolean(
-        result.subagentConfigHotReloadError ??
-          result.subagentDefaultsHotReloadError,
-      );
+      const subagentHotReloaded = Boolean(result.subagentConfigHotReloaded);
+      const subagentHotReloadFailed = Boolean(result.subagentConfigHotReloadError);
       const subagentConfigRepaired = Boolean(result.subagentConfigRepaired);
       setNotice({
         tone:
@@ -946,6 +941,13 @@ export function App({
   const handleFetchRouteModels = useStableEvent((route: Profile) => {
     void fetchRouteModels(route);
   });
+  const handleToggleAccountUsage = useStableEvent((checked: boolean) => {
+    if (!config) return;
+    editConfig({
+      ...config,
+      showAccountUsageInHeader: checked,
+    });
+  });
   const handleSaveOfficialRouteSettings = useStableEvent(
     saveOfficialRouteSettings,
   );
@@ -1092,7 +1094,7 @@ export function App({
             variant="brand-outline"
           >
             <IconMessageCircleQuestion aria-hidden="true" />
-            <span className="inline-flex items-center gap-[7px] max-[520px]:hidden">问题反馈群</span>
+            <span className="max-[520px]:hidden">问题反馈群</span>
           </Button>
           <div className="feedback-qr-popover" role="tooltip">
             <img src={feedbackGroupQrUrl} alt="问题反馈群二维码" />
@@ -1237,6 +1239,7 @@ export function App({
               onSaveRoute={handleSaveRoute}
               onDeleteRoute={handleDeleteRoute}
               onFetchRouteModels={handleFetchRouteModels}
+              onToggleAccountUsage={handleToggleAccountUsage}
               onSaveOfficialRouteSettings={handleSaveOfficialRouteSettings}
               onSetDefaultModel={handleSetRouteDefaultModel}
             />

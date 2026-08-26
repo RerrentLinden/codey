@@ -8,11 +8,11 @@ use super::{
     hot_reload_runtime_subagent_config, redacted_config, runtime_config_requires_restart,
     save_config_to_store, validate_official_account_config_change,
 };
-use crate::cc_switch;
 use crate::cdp;
 use crate::codex_config::codex_home;
+use crate::codex_provider;
 use crate::config::{
-    AUTH_MODE_OFFICIAL_ACCOUNT, CodeyConfig, DERIVED_OFFICIAL_PROFILE_ID, ProviderProfile,
+    CodeyConfig, DERIVED_OFFICIAL_PROFILE_ID, OFFICIAL_ROUTE_SHORT_NAME, ProviderProfile,
     validate_provider_profiles,
 };
 use crate::error_log;
@@ -84,9 +84,9 @@ fn add_subagent_hot_reload_to_response(
 pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Value, String> {
     super::prepare_routes_for_current_launch(state).await?;
     let current_provider = current_codex_provider().await?;
-    let cc_switch = if current_provider.official {
+    let provider_status = if current_provider.official {
         let config = state.config.read().await;
-        cc_switch::status_from_config(&config)
+        codex_provider::status_from_config(&config)
     } else {
         sync_current_third_party_provider_state(state).await?
     };
@@ -101,15 +101,15 @@ pub async fn sync_current_provider_command(state: &Arc<AppState>) -> Result<Valu
     Ok(json!({
         "status":"ok",
         "config":public_config,
-        "ccSwitch":cc_switch,
+        "providerStatus":provider_status,
         "modelState":model_state,
         "restartRequired":restart_required,
     }))
 }
 
-async fn current_codex_provider() -> Result<cc_switch::CurrentProvider, String> {
+async fn current_codex_provider() -> Result<codex_provider::CurrentProvider, String> {
     let home = codex_home().to_path_buf();
-    tokio::task::spawn_blocking(move || cc_switch::current_provider(&home))
+    tokio::task::spawn_blocking(move || codex_provider::current_provider(&home))
         .await
         .map_err(|error| format!("读取当前 Codex 线路任务异常退出：{error}"))?
         .map_err(|error| format!("读取当前 Codex 线路失败：{error:#}"))
@@ -117,14 +117,12 @@ async fn current_codex_provider() -> Result<cc_switch::CurrentProvider, String> 
 
 pub(super) async fn sync_current_third_party_provider_state(
     state: &Arc<AppState>,
-) -> Result<cc_switch::CcSwitchStatus, String> {
+) -> Result<codex_provider::ProviderStatus, String> {
     let home = codex_home();
-    sync_cc_switch_state_with(state, move |config| {
-        let mut source = config.clone();
-        source.remember_current_subagent_config();
-        let (mut next, mut status) = cc_switch::sync_current_third_party_provider(&source, home)
-            .map_err(|error| error.to_string())?;
-        next.restore_current_subagent_config();
+    sync_provider_state_with(state, move |config| {
+        let (mut next, mut status) =
+            codex_provider::sync_current_third_party_provider(&config, home)
+                .map_err(|error| error.to_string())?;
         subagent_policy::reconcile_for_current_provider(&mut next, home, status.provider.official);
         next = next.normalize();
         status.changed = next != config;
@@ -133,12 +131,12 @@ pub(super) async fn sync_current_third_party_provider_state(
     .await
 }
 
-pub(super) async fn sync_cc_switch_state_with<F>(
+pub(super) async fn sync_provider_state_with<F>(
     state: &Arc<AppState>,
     sync: F,
-) -> Result<cc_switch::CcSwitchStatus, String>
+) -> Result<codex_provider::ProviderStatus, String>
 where
-    F: FnOnce(CodeyConfig) -> Result<(CodeyConfig, cc_switch::CcSwitchStatus), String>
+    F: FnOnce(CodeyConfig) -> Result<(CodeyConfig, codex_provider::ProviderStatus), String>
         + Send
         + 'static,
 {
@@ -311,7 +309,7 @@ async fn fetch_provider_models(
 ) -> anyhow::Result<Vec<String>> {
     let home = codex_home();
     let fetch_profile = tokio::task::spawn_blocking(move || {
-        cc_switch::provider_model_fetch_profile(&profile, home)
+        codex_provider::provider_model_fetch_profile(&profile, home)
     })
     .await
     .map_err(|error| anyhow::anyhow!("解析模型源 API 配置任务异常退出：{error}"))??;
@@ -326,7 +324,7 @@ pub(super) async fn sync_provider_models_for_launch(
     let Some(profile) = config.active_profile() else {
         return config;
     };
-    if profile.cc_switch_read_only {
+    if profile.official_account {
         return reconcile_current_subagent_defaults(state, None)
             .await
             .map(|(config, _)| config)
@@ -455,7 +453,7 @@ pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Valu
         .find(|profile| profile.id == config.active_profile_id)
         .cloned()
         .ok_or_else(|| "找不到当前线路".to_string())?;
-    if profile.cc_switch_read_only {
+    if profile.official_account {
         return Err("官方线路使用官方模型目录，无需同步第三方模型".to_string());
     }
     let provider_id = config
@@ -523,8 +521,8 @@ pub async fn save_route(
         .cloned();
     if let Some(previous_route) = previous_route.as_ref() {
         route.model_request_headers = previous_route.model_request_headers.clone();
-        route.cc_switch_provider_id = previous_route.cc_switch_provider_id.clone();
-        route.cc_switch_read_only = previous_route.cc_switch_read_only;
+        route.source_provider_id = previous_route.source_provider_id.clone();
+        route.official_account = previous_route.official_account;
         route.supports_remote_compaction = previous_route.supports_remote_compaction;
     }
     route.merge_redacted_secret(previous_route.as_ref());
@@ -558,7 +556,7 @@ pub async fn save_route(
         hot_reload.add_to_response(json!({
             "status":"ok",
             "config": redacted_config(&config),
-            "ccSwitch": cc_switch::status_from_config(&config),
+            "providerStatus": codex_provider::status_from_config(&config),
             "modelState": model_state,
             "restartRequired": restart_required,
         })),
@@ -580,23 +578,21 @@ pub async fn activate_route(
         .iter()
         .find(|profile| profile.id == route_id)
         .ok_or_else(|| "找不到要启用的线路".to_string())?;
-    if target_route.cc_switch_read_only && !previous.official_account_available_this_launch {
+    if target_route.official_account && !previous.official_account_available_this_launch {
         return Err(
             "本次 Codex 由 API Key 线路启动，不能启用官方账号线路；请先在 Codex 中完成官方账号登录并重新启动 Codey"
                 .to_string(),
         );
     }
     let mut config = previous.clone();
-    config.remember_current_subagent_config();
     config.active_profile_id = route_id.to_string();
-    config.restore_current_subagent_config();
     config = config.normalize();
     if config == previous {
         let model_state = current_model_state_async(&config).await?;
         return Ok(json!({
             "status":"ok",
             "config": redacted_config(&config),
-            "ccSwitch": cc_switch::status_from_config(&config),
+            "providerStatus": codex_provider::status_from_config(&config),
             "modelState": model_state,
             "restartRequired": runtime_config_requires_restart(state, &config).await,
         }));
@@ -613,7 +609,7 @@ pub async fn activate_route(
         hot_reload.add_to_response(json!({
             "status":"ok",
             "config": redacted_config(&config),
-            "ccSwitch": cc_switch::status_from_config(&config),
+            "providerStatus": codex_provider::status_from_config(&config),
             "modelState": model_state,
             "restartRequired": restart_required,
         })),
@@ -630,6 +626,30 @@ pub async fn delete_route(
     let previous = state.config.read().await.clone();
     ensure_route_revision(&previous, expected_revision)?;
     let route_id = route_id.trim();
+    let config = config_after_route_deletion(&previous, route_id)?;
+    save_config_to_store(state, &config).await?;
+    *state.config.write().await = config.clone();
+    let model_state = current_model_state_async(&config).await?;
+    drop(_config_write_guard);
+    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+    let restart_required = runtime_config_requires_restart(state, &config).await;
+    Ok(add_subagent_hot_reload_to_response(
+        hot_reload.add_to_response(json!({
+            "status":"ok",
+            "config": redacted_config(&config),
+            "providerStatus": codex_provider::status_from_config(&config),
+            "modelState": model_state,
+            "restartRequired": restart_required,
+        })),
+        subagent_hot_reload,
+    ))
+}
+
+fn config_after_route_deletion(
+    previous: &CodeyConfig,
+    route_id: &str,
+) -> Result<CodeyConfig, String> {
     if route_id == DERIVED_OFFICIAL_PROFILE_ID {
         return Err("官方账号线路由当前 Codex 登录状态管理，不能手动删除".to_string());
     }
@@ -656,38 +676,17 @@ pub async fn delete_route(
     config
         .upstream_models_by_provider
         .remove(&removed_provider_id);
-    config
-        .default_model_by_provider
-        .remove(&removed_provider_id);
-    config
-        .subagent_config_by_provider
-        .remove(&removed_provider_id);
     if config.active_profile_id == route_id
         && let Some(first) = config.profiles.first()
     {
         config.active_profile_id = first.id.clone();
     }
-    config.restore_current_subagent_config();
+    config = config.normalize();
+    config.reconcile_after_route_removal(&removed_provider_id);
     config = config.normalize();
     validate_provider_profiles(&config.profiles)?;
     config.settings_revision = previous.settings_revision.saturating_add(1);
-    save_config_to_store(state, &config).await?;
-    *state.config.write().await = config.clone();
-    let model_state = current_model_state_async(&config).await?;
-    drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
-    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
-    let restart_required = runtime_config_requires_restart(state, &config).await;
-    Ok(add_subagent_hot_reload_to_response(
-        hot_reload.add_to_response(json!({
-            "status":"ok",
-            "config": redacted_config(&config),
-            "ccSwitch": cc_switch::status_from_config(&config),
-            "modelState": model_state,
-            "restartRequired": restart_required,
-        })),
-        subagent_hot_reload,
-    ))
+    Ok(config)
 }
 
 pub async fn fetch_route_models(
@@ -705,7 +704,7 @@ pub async fn fetch_route_models(
         .find(|profile| profile.id == route_id)
         .cloned()
         .ok_or_else(|| "找不到要同步模型的线路".to_string())?;
-    if profile.cc_switch_read_only {
+    if profile.official_account {
         return Err("官方账号线路使用官方模型目录，无需同步第三方模型".to_string());
     }
     profile.validate()?;
@@ -745,7 +744,7 @@ pub async fn fetch_route_models(
         hot_reload.add_to_response(json!({
             "status":"ok",
             "config": redacted_config(&latest),
-            "ccSwitch": cc_switch::status_from_config(&latest),
+            "providerStatus": codex_provider::status_from_config(&latest),
             "models": fetched_models,
             "modelState": model_state,
             "routeModelState": route_model_state,
@@ -831,7 +830,7 @@ pub async fn save_selected_models(
         .find(|profile| profile.id == target_route_id)
         .cloned()
         .ok_or_else(|| "找不到要配置模型的线路".to_string())?;
-    if profile.cc_switch_read_only {
+    if profile.official_account {
         return Err("官方线路不支持添加第三方模型".to_string());
     }
     let provider_id = profile.provider_id().to_string();
@@ -1115,27 +1114,18 @@ pub async fn save_default_model(
         .profiles
         .iter()
         .find(|profile| profile.id == target_route_id)
+        .cloned()
         .ok_or_else(|| "找不到要设置默认模型的线路".to_string())?;
-    let provider_id = target_profile.provider_id().to_string();
-    let available_models = if target_profile.cc_switch_read_only {
-        config
-            .selected_models_by_provider
-            .get(&provider_id)
-            .filter(|models| !models.is_empty())
-            .cloned()
-            .unwrap_or_else(model_catalog::default_official_model_slugs)
-    } else {
-        config.enabled_route_models(&provider_id)
-    };
-    let canonical_model = available_models
-        .iter()
-        .find(|model| model_id::equal(model, requested_model))
-        .map(String::as_str)
-        .ok_or_else(|| format!("模型 {requested_model} 当前不可用，无法设为默认"))?
-        .to_string();
-    config
-        .default_model_by_provider
-        .insert(provider_id, canonical_model.clone());
+    if target_profile.official_account && !config.official_account_available_this_launch {
+        return Err("本次 Codex 没有可用的官方账号登录态，不能选择官方模型".to_string());
+    }
+    let target = config
+        .model_target_for_route(target_route_id, requested_model)
+        .ok_or_else(|| format!("模型 {requested_model} 当前不可用，无法设为默认"))?;
+    config.default_model = target.alias;
+    // `active_profile_id` remains a compatibility projection for older features.
+    // The model default is authoritative and therefore owns that projection.
+    config.active_profile_id = target_profile.id;
     config = config.normalize();
     let model_state = current_model_state_async(&config).await?;
     save_config_to_store(state, &config).await?;
@@ -1166,7 +1156,7 @@ pub async fn save_official_route_models(
         .iter()
         .find(|profile| profile.id == route_id)
         .ok_or_else(|| "找不到要更新模型的官方账号线路".to_string())?;
-    if !profile.cc_switch_read_only || !config.official_account_available_this_launch {
+    if !profile.official_account || !config.official_account_available_this_launch {
         return Err("当前线路不是本次登录可用的官方账号线路".to_string());
     }
     let provider_id = profile.provider_id().to_string();
@@ -1192,20 +1182,9 @@ pub async fn save_official_route_models(
         .into_iter()
         .filter(|model| requested_keys.contains(&model_id::key(model)))
         .collect::<Vec<_>>();
-    let current_default = config.default_model_by_provider.get(&provider_id);
-    let default_available = current_default.is_some_and(|current| {
-        selected_models
-            .iter()
-            .any(|model| model_id::equal(model, current))
-    });
     config
         .selected_models_by_provider
-        .insert(provider_id.clone(), selected_models.clone());
-    if !default_available {
-        config
-            .default_model_by_provider
-            .insert(provider_id, selected_models[0].clone());
-    }
+        .insert(provider_id, selected_models);
     config = config.normalize();
     let (catalog_refresh, model_state) = refreshed_model_state_async(&config, false).await?;
     subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
@@ -1239,11 +1218,7 @@ pub(super) async fn hot_reload_runtime_models(
     let Some(runtime) = runtime else {
         return ModelHotReloadOutcome::default();
     };
-    if !runtime_supports_current_routes_for_hot_reload(
-        &runtime.applied_config,
-        config,
-        runtime.has_local_router(),
-    ) {
+    if !runtime_supports_current_routes_for_hot_reload(&runtime.applied_config, config) {
         return ModelHotReloadOutcome::default();
     }
     let expected_catalog = renderer_model_catalog_value(config, model_state);
@@ -1252,21 +1227,7 @@ pub(super) async fn hot_reload_runtime_models(
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or_default();
-    if let Err(error) = runtime.sync_local_router_routes(config).await {
-        let error = format!("{error:#}");
-        error_log::record_failure(
-            "local_router_reload_failed",
-            "sync_local_router_routes",
-            error.clone(),
-            json!({
-                "modelCount": expected_models,
-            }),
-        );
-        return ModelHotReloadOutcome {
-            reloaded: false,
-            error: Some(error),
-        };
-    }
+    runtime.sync_local_router_routes(config);
     let websocket_url = runtime.renderer_websocket_url().await;
     match cdp::refresh_model_whitelist(&websocket_url, &expected_catalog).await {
         Ok(()) => {
@@ -1303,7 +1264,7 @@ pub(super) fn current_model_state(
         .iter()
         .find(|profile| profile.id == config.active_profile_id);
     let official = active_profile.is_some_and(|profile| {
-        profile.cc_switch_read_only && config.official_account_available_this_launch
+        profile.official_account && config.official_account_available_this_launch
     });
     let selected_models = if official {
         config.selected_models().to_vec()
@@ -1313,13 +1274,15 @@ pub(super) fn current_model_state(
             .map(|provider_id| config.enabled_route_models(provider_id))
             .unwrap_or_default()
     };
+    let requested_default_model =
+        active_profile.and_then(|profile| config.default_model_for_profile(profile));
     model_catalog::selection_state_with_manual_models(
         codex_home(),
         official,
         config.upstream_models_snapshot(),
         &selected_models,
         config.manual_third_party_models(),
-        config.default_model(),
+        requested_default_model.as_deref(),
     )
     .map_err(|error| error.to_string())
 }
@@ -1362,24 +1325,10 @@ pub(super) fn provider_route_requires_restart(
     provider_route_snapshots(applied) != provider_route_snapshots(current)
 }
 
-pub(super) fn runtime_supports_current_routes(
-    applied: &CodeyConfig,
-    current: &CodeyConfig,
-) -> bool {
-    let applied = provider_route_snapshots(applied);
-    provider_route_snapshots(current)
-        .into_iter()
-        .all(|(provider_id, route)| applied.get(&provider_id) == Some(&route))
-}
-
 pub(super) fn runtime_supports_current_routes_for_hot_reload(
     applied: &CodeyConfig,
     current: &CodeyConfig,
-    local_router_active: bool,
 ) -> bool {
-    if !local_router_active {
-        return runtime_supports_current_routes(applied, current);
-    }
     let applied = official_route_snapshots(applied);
     official_route_snapshots(current)
         .into_iter()
@@ -1392,7 +1341,7 @@ pub(super) struct ProviderRouteSnapshot {
     api_key: String,
     upstream_protocol: String,
     auth_mode: String,
-    cc_switch_read_only: bool,
+    official_account: bool,
     supports_remote_compaction: bool,
     model_request_headers: BTreeMap<String, String>,
 }
@@ -1409,7 +1358,7 @@ fn provider_route_snapshots(config: &CodeyConfig) -> BTreeMap<String, ProviderRo
                     api_key: profile.api_key.trim().to_string(),
                     upstream_protocol: profile.upstream_protocol.clone(),
                     auth_mode: profile.auth_mode.clone(),
-                    cc_switch_read_only: profile.cc_switch_read_only,
+                    official_account: profile.official_account,
                     supports_remote_compaction: profile.supports_remote_compaction,
                     model_request_headers: profile.model_request_headers.clone(),
                 },
@@ -1423,7 +1372,7 @@ pub(super) fn official_route_snapshots(
 ) -> BTreeMap<String, ProviderRouteSnapshot> {
     provider_route_snapshots(config)
         .into_iter()
-        .filter(|(_, route)| route.cc_switch_read_only)
+        .filter(|(_, route)| route.official_account)
         .collect()
 }
 
@@ -1441,18 +1390,17 @@ pub(super) fn renderer_model_catalog_value(
         .map(|entry| {
             let mut metadata = json!({
                 "model": entry.alias,
-                "display_name": format!("{} / {}", entry.route_name, entry.model),
+                "display_name": format!("[{}] {}", entry.route_prefix, entry.model),
                 "route_name": entry.route_name,
+                "route_prefix": entry.route_prefix,
                 "provider_id": entry.request_provider_id,
                 "source_model": entry.request_model,
                 "supported_reasoning_efforts": entry.supported_reasoning_efforts,
                 "default_reasoning_effort": entry.default_reasoning_effort,
             });
-            if entry.request_provider_id == local_router::ROUTER_PROVIDER_ID {
-                metadata["route_provider_id"] = Value::String(entry.provider_id.clone());
-                metadata["upstream_model"] = Value::String(entry.model.clone());
-                metadata["model_display_name"] = Value::String(entry.model.clone());
-            }
+            metadata["route_provider_id"] = Value::String(entry.provider_id.clone());
+            metadata["upstream_model"] = Value::String(entry.model.clone());
+            metadata["model_display_name"] = Value::String(entry.model.clone());
             metadata
         })
         .collect::<Vec<_>>();
@@ -1462,19 +1410,15 @@ pub(super) fn renderer_model_catalog_value(
         .or_else(|| route_catalog.first())
         .map(|entry| entry.alias.clone())
         .unwrap_or_else(|| model_state.default_model.clone());
-    let active_provider = config
-        .current_provider_id()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let active_profile = config
-        .profiles
+    let default_entry = route_catalog
         .iter()
-        .find(|profile| profile.id == config.active_profile_id);
-    let provider_name = active_profile
-        .map(|profile| profile.name.trim())
-        .filter(|name| !name.is_empty())
-        .unwrap_or(active_provider.as_str());
+        .find(|entry| entry.alias == default_model);
+    let active_provider = default_entry
+        .map(|entry| entry.request_provider_id.as_str())
+        .unwrap_or_default();
+    let provider_name = default_entry
+        .map(|entry| entry.route_name.as_str())
+        .unwrap_or(active_provider);
     json!({
         "status": if models.is_empty() { "not_configured" } else { "ok" },
         "model": default_model,
@@ -1498,6 +1442,7 @@ struct RendererRouteModelEntry {
     request_provider_id: String,
     request_model: String,
     route_name: String,
+    route_prefix: String,
     model: String,
     supported_reasoning_efforts: Vec<String>,
     default_reasoning_effort: String,
@@ -1511,19 +1456,15 @@ fn renderer_route_model_catalog(
     let mut entries = Vec::new();
     let mut aliases = HashSet::new();
     for profile in &config.profiles {
-        if profile.cc_switch_read_only && !config.official_account_available_this_launch {
+        if profile.official_account && !config.official_account_available_this_launch {
             continue;
         }
         let provider_id = profile.provider_id().trim().to_string();
         if provider_id.is_empty() {
             continue;
         }
-        let selected_models = if profile.cc_switch_read_only {
-            config
-                .selected_models_by_provider
-                .get(&provider_id)
-                .cloned()
-                .unwrap_or_default()
+        let selected_models = if profile.official_account {
+            config.enabled_official_route_models(&provider_id)
         } else {
             config.enabled_route_models(&provider_id)
         };
@@ -1536,20 +1477,17 @@ fn renderer_route_model_catalog(
             .upstream_models_by_provider
             .get(&provider_id)
             .map(Vec::as_slice);
-        let default_model = config
-            .default_model_by_provider
-            .get(&provider_id)
-            .map(String::as_str);
+        let default_model = config.default_model_for_profile(profile);
         let state = if provider_id == config.current_provider_id().unwrap_or_default() {
             active_model_state.clone()
         } else {
             model_catalog::selection_state_with_manual_models(
                 codex_home(),
-                profile.cc_switch_read_only,
+                profile.official_account,
                 upstream_models,
                 &selected_models,
                 manual_models,
-                default_model,
+                default_model.as_deref(),
             )
             .unwrap_or_default()
         };
@@ -1558,6 +1496,11 @@ fn renderer_route_model_catalog(
             provider_id.as_str()
         } else {
             route_name
+        };
+        let route_prefix = if profile.official_account {
+            OFFICIAL_ROUTE_SHORT_NAME.to_string()
+        } else {
+            profile.short_name.trim().to_string()
         };
         let official_models = state
             .official_models
@@ -1583,19 +1526,25 @@ fn renderer_route_model_catalog(
         for (model, supported_reasoning_efforts, default_reasoning_effort) in
             official_models.chain(third_party_models)
         {
-            let alias = route_model_alias_for_profile(profile, &provider_id, &model, &mut aliases);
-            let (request_provider_id, request_model) = if profile.cc_switch_read_only {
-                (provider_id.clone(), model.clone())
-            } else {
-                (local_router::ROUTER_PROVIDER_ID.to_string(), alias.clone())
-            };
+            let alias = route_model_alias(&provider_id, &model, &mut aliases);
+            // `alias` is only a renderer selector id. Codex and the upstream
+            // must see the provider's real model id; the renderer sends the
+            // route id separately in Responses client metadata.
+            let (request_provider_id, request_model) = (
+                config.runtime_gateway_provider_id().to_string(),
+                model.clone(),
+            );
+            let is_default = config
+                .default_model()
+                .is_some_and(|default| model_id::equal(default, &alias));
             entries.push(RendererRouteModelEntry {
                 alias,
                 provider_id: provider_id.clone(),
                 request_provider_id,
                 request_model,
                 route_name: route_name.to_string(),
-                is_default: state.default_model == model && profile.id == config.active_profile_id,
+                route_prefix: route_prefix.clone(),
+                is_default,
                 model,
                 supported_reasoning_efforts,
                 default_reasoning_effort,
@@ -1603,18 +1552,6 @@ fn renderer_route_model_catalog(
         }
     }
     entries
-}
-
-fn route_model_alias_for_profile(
-    profile: &ProviderProfile,
-    provider_id: &str,
-    model: &str,
-    aliases: &mut HashSet<String>,
-) -> String {
-    if profile.auth_mode == AUTH_MODE_OFFICIAL_ACCOUNT && aliases.insert(model.to_string()) {
-        return model.to_string();
-    }
-    route_model_alias(provider_id, model, aliases)
 }
 
 fn route_model_alias(provider_id: &str, model: &str, aliases: &mut HashSet<String>) -> String {
@@ -1721,13 +1658,6 @@ fn config_with_reconciled_subagent_defaults(
     persisted
         .subagent_roles
         .clone_from(&reconciled.subagent_roles);
-    if let Some(provider_id) = reconciled.current_provider_id()
-        && let Some(selection) = reconciled.subagent_config_by_provider.get(provider_id)
-    {
-        persisted
-            .subagent_config_by_provider
-            .insert(provider_id.to_string(), selection.clone());
-    }
     persisted.normalize()
 }
 
@@ -1794,6 +1724,19 @@ fn try_refresh_model_catalog(config: &CodeyConfig) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    fn configured_route(id: &str, model: Option<&str>) -> ProviderProfile {
+        let mut profile = ProviderProfile::new(id);
+        profile.id = id.to_string();
+        profile.base_url = format!("https://{id}.example/v1");
+        profile.api_key = format!("{id}-key");
+        profile.api_key_configured = true;
+        if model.is_none() {
+            profile.name = format!("{id}-without-models");
+        }
+        profile.normalize();
+        profile
+    }
+
     #[test]
     fn route_mutations_reject_a_stale_settings_revision() {
         let config = CodeyConfig {
@@ -1806,6 +1749,179 @@ mod tests {
             ensure_route_revision(&config, 8)
                 .unwrap_err()
                 .contains("重新载入")
+        );
+    }
+
+    #[test]
+    fn deleting_a_route_falls_back_global_default_and_dependent_subagent_roles() {
+        let route_a = configured_route("route-a", Some("model-a"));
+        let route_b = configured_route("route-b", Some("model-b"));
+        let mut roles = crate::config::uniform_subagent_roles("route-b/model-b", "high");
+        roles.insert(
+            crate::config::SUBAGENT_ROLE_WORKER.into(),
+            crate::config::SubagentRoleConfig::new("route-a/model-a", "medium"),
+        );
+        let previous = CodeyConfig {
+            settings_revision: 7,
+            active_profile_id: route_b.id.clone(),
+            profiles: vec![route_a, route_b],
+            selected_models_by_provider: BTreeMap::from([
+                ("route-a".into(), vec!["model-a".into()]),
+                ("route-b".into(), vec!["model-b".into()]),
+            ]),
+            manual_third_party_models_by_provider: BTreeMap::from([(
+                "route-b".into(),
+                vec!["model-b".into()],
+            )]),
+            declared_official_models_by_provider: BTreeMap::from([(
+                "route-b".into(),
+                vec!["gpt-5.6-terra".into()],
+            )]),
+            upstream_models_by_provider: BTreeMap::from([(
+                "route-b".into(),
+                vec!["model-b".into(), "gpt-5.6-terra".into()],
+            )]),
+            default_model: "route-b/model-b".into(),
+            subagent_model: "route-b/model-b".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: roles,
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        let next = config_after_route_deletion(&previous, "route-b").unwrap();
+
+        assert_eq!(next.settings_revision, 8);
+        assert_eq!(next.active_profile_id, "route-a");
+        assert_eq!(next.default_model, "route-a/model-a");
+        assert_eq!(next.subagent_model, "route-a/model-a");
+        assert!(
+            next.subagent_roles
+                .values()
+                .all(|selection| selection.model == "route-a/model-a")
+        );
+        assert!(!next.selected_models_by_provider.contains_key("route-b"));
+        assert!(
+            !next
+                .manual_third_party_models_by_provider
+                .contains_key("route-b")
+        );
+        assert!(
+            !next
+                .declared_official_models_by_provider
+                .contains_key("route-b")
+        );
+        assert!(!next.upstream_models_by_provider.contains_key("route-b"));
+        assert!(next.legacy_subagent_config_by_provider.is_empty());
+
+        let valid_aliases = next
+            .runtime_model_targets()
+            .into_iter()
+            .map(|target| target.alias)
+            .collect::<HashSet<_>>();
+        assert!(valid_aliases.contains(&next.default_model));
+        assert!(
+            next.subagent_roles
+                .values()
+                .all(|selection| valid_aliases.contains(&selection.model))
+        );
+    }
+
+    #[test]
+    fn deleting_a_route_used_only_by_one_role_falls_back_to_the_existing_default() {
+        let route_a = configured_route("route-a", Some("model-a"));
+        let route_b = configured_route("route-b", Some("model-b"));
+        let mut roles = crate::config::uniform_subagent_roles("route-a/model-a", "high");
+        roles.insert(
+            crate::config::SUBAGENT_ROLE_QUICK_SCAN.into(),
+            crate::config::SubagentRoleConfig::new("route-b/model-b", "low"),
+        );
+        let previous = CodeyConfig {
+            active_profile_id: route_a.id.clone(),
+            profiles: vec![route_a, route_b],
+            selected_models_by_provider: BTreeMap::from([
+                ("route-a".into(), vec!["model-a".into()]),
+                ("route-b".into(), vec!["model-b".into()]),
+            ]),
+            default_model: "route-a/model-a".into(),
+            subagent_model: "route-a/model-a".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: roles,
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        let next = config_after_route_deletion(&previous, "route-b").unwrap();
+
+        assert_eq!(next.default_model, "route-a/model-a");
+        assert_eq!(next.subagent_model, "route-a/model-a");
+        assert_eq!(
+            next.subagent_roles[crate::config::SUBAGENT_ROLE_QUICK_SCAN].model,
+            "route-a/model-a"
+        );
+        assert_eq!(
+            next.subagent_roles[crate::config::SUBAGENT_ROLE_QUICK_SCAN].reasoning_effort,
+            "low"
+        );
+    }
+
+    #[test]
+    fn deleting_an_unrelated_route_preserves_valid_global_model_references() {
+        let route_a = configured_route("route-a", Some("model-a"));
+        let route_b = configured_route("route-b", Some("model-b"));
+        let previous = CodeyConfig {
+            active_profile_id: route_a.id.clone(),
+            profiles: vec![route_a, route_b],
+            selected_models_by_provider: BTreeMap::from([
+                ("route-a".into(), vec!["model-a".into()]),
+                ("route-b".into(), vec!["model-b".into()]),
+            ]),
+            default_model: "route-a/model-a".into(),
+            subagent_model: "route-a/model-a".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: crate::config::uniform_subagent_roles("route-a/model-a", "high"),
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        let next = config_after_route_deletion(&previous, "route-b").unwrap();
+
+        assert_eq!(next.default_model, "route-a/model-a");
+        assert_eq!(next.subagent_model, "route-a/model-a");
+        assert!(
+            next.subagent_roles
+                .values()
+                .all(|selection| selection.model == "route-a/model-a")
+        );
+    }
+
+    #[test]
+    fn deleting_the_only_modeled_route_clears_stale_default_and_uses_product_subagent_default() {
+        let route_a = configured_route("route-a", None);
+        let route_b = configured_route("route-b", Some("model-b"));
+        let previous = CodeyConfig {
+            active_profile_id: route_b.id.clone(),
+            profiles: vec![route_a, route_b],
+            selected_models_by_provider: BTreeMap::from([(
+                "route-b".into(),
+                vec!["model-b".into()],
+            )]),
+            default_model: "route-b/model-b".into(),
+            subagent_model: "route-b/model-b".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: crate::config::uniform_subagent_roles("route-b/model-b", "high"),
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        let next = config_after_route_deletion(&previous, "route-b").unwrap();
+
+        assert!(next.default_model.is_empty());
+        assert_eq!(next.subagent_model, crate::config::DEFAULT_SUBAGENT_MODEL);
+        assert!(
+            next.subagent_roles
+                .values()
+                .all(|selection| { selection.model == crate::config::DEFAULT_SUBAGENT_MODEL })
         );
     }
 
@@ -2059,11 +2175,11 @@ mod tests {
     }
 
     #[test]
-    fn renderer_catalog_uses_raw_model_ids_for_the_official_openai_route() {
+    fn renderer_catalog_routes_every_model_through_the_codey_router_carrier() {
         let mut official = ProviderProfile::new("官方线路");
         official.id = "official-profile".into();
-        official.cc_switch_provider_id = Some("openai".into());
-        official.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.source_provider_id = Some("openai".into());
+        official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
         official.normalize();
 
         let mut relay = ProviderProfile::new("中转线路");
@@ -2081,6 +2197,7 @@ mod tests {
         config
             .selected_models_by_provider
             .insert("relay".into(), vec!["gpt-5.6-sol".into()]);
+        config.default_model = "relay/gpt-5.6-sol".into();
         config = config.normalize();
 
         let model_state = model_catalog::ModelSelectionState {
@@ -2105,25 +2222,42 @@ mod tests {
             .iter()
             .map(|model| model.as_str().unwrap())
             .collect::<Vec<_>>();
-        assert!(model_names.contains(&"gpt-5.6-sol"));
+        assert!(model_names.contains(&"openai/gpt-5.6-sol"));
         assert!(model_names.contains(&"relay/gpt-5.6-sol"));
-        assert!(!model_names.contains(&"openai/gpt-5.6-sol"));
-        assert_eq!(catalog["default_model"].as_str(), Some("gpt-5.6-sol"));
+        assert!(!model_names.contains(&"gpt-5.6-sol"));
+        assert_eq!(catalog["default_model"].as_str(), Some("relay/gpt-5.6-sol"));
+        assert_eq!(
+            catalog["model_provider"].as_str(),
+            Some(local_router::ROUTER_PROVIDER_ID)
+        );
+        assert_eq!(catalog["provider_name"].as_str(), Some("中转线路"));
 
         let official_metadata = catalog["model_metadata"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|entry| entry["model"].as_str() == Some("gpt-5.6-sol"))
+            .find(|entry| entry["model"].as_str() == Some("openai/gpt-5.6-sol"))
             .unwrap();
         assert_eq!(
             official_metadata["display_name"].as_str(),
-            Some("官方线路 / gpt-5.6-sol")
+            Some("[官] gpt-5.6-sol")
         );
         assert_eq!(official_metadata["route_name"].as_str(), Some("官方线路"));
-        assert_eq!(official_metadata["provider_id"].as_str(), Some("openai"));
+        assert_eq!(official_metadata["route_prefix"].as_str(), Some("官"));
+        assert_eq!(
+            official_metadata["provider_id"].as_str(),
+            Some(local_router::ROUTER_PROVIDER_ID)
+        );
         assert_eq!(
             official_metadata["source_model"].as_str(),
+            Some("gpt-5.6-sol")
+        );
+        assert_eq!(
+            official_metadata["route_provider_id"].as_str(),
+            Some("openai")
+        );
+        assert_eq!(
+            official_metadata["upstream_model"].as_str(),
             Some("gpt-5.6-sol")
         );
     }
@@ -2146,15 +2280,12 @@ mod tests {
         let mut current = applied.clone();
         current.active_profile_id = "route-b".into();
         current.profiles[0].name = "Renamed Route A".into();
-        current
-            .default_model_by_provider
-            .insert("route-b".into(), "provider-default".into());
+        current.default_model = "route-b/provider-default".into();
         current
             .selected_models_by_provider
             .insert("route-a".into(), vec!["route-a-model".into()]);
 
         assert!(!provider_route_requires_restart(&applied, &current));
-        assert!(runtime_supports_current_routes(&applied, &current));
     }
 
     #[test]
@@ -2166,11 +2297,10 @@ mod tests {
         changed.profiles[0].base_url = "https://route-a.example/v2".into();
 
         assert!(provider_route_requires_restart(&applied, &changed));
-        assert!(!runtime_supports_current_routes(&applied, &changed));
     }
 
     #[test]
-    fn running_process_can_drop_a_route_but_cannot_gain_an_unregistered_route() {
+    fn built_in_router_hot_reloads_added_and_removed_third_party_routes() {
         let mut route_a = crate::config::ProviderProfile::new("Route A");
         route_a.id = "route-a".into();
         route_a.base_url = "https://route-a.example/v1".into();
@@ -2191,7 +2321,10 @@ mod tests {
             ..applied.clone()
         };
         assert!(provider_route_requires_restart(&applied, &after_delete));
-        assert!(runtime_supports_current_routes(&applied, &after_delete));
+        assert!(runtime_supports_current_routes_for_hot_reload(
+            &applied,
+            &after_delete
+        ));
 
         let mut route_c = crate::config::ProviderProfile::new("Route C");
         route_c.id = "route-c".into();
@@ -2200,6 +2333,8 @@ mod tests {
         let mut after_add = applied.clone();
         after_add.profiles.push(route_c);
         assert!(provider_route_requires_restart(&applied, &after_add));
-        assert!(!runtime_supports_current_routes(&applied, &after_add));
+        assert!(runtime_supports_current_routes_for_hot_reload(
+            &applied, &after_add
+        ));
     }
 }

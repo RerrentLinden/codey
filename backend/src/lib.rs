@@ -1,8 +1,8 @@
 mod account_usage;
-mod cc_switch;
 mod cdp;
 mod codex_config;
 mod codex_config_guidance;
+mod codex_provider;
 mod codex_startup_patch;
 mod commands;
 mod config;
@@ -26,7 +26,6 @@ mod plugin_marketplace;
 mod process_cleanup;
 mod process_tree;
 mod prompt_optimization;
-mod provider_lease;
 mod provider_models;
 mod session_delete;
 mod session_index_cleanup;
@@ -176,59 +175,30 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
     if startup_update_outcome == startup_update::StartupUpdateOutcome::InstallScheduled {
         return Ok(());
     }
-    let shutdown_reason = 'runtime: loop {
-        match commands::launch_codey_runtime(&state).await {
-            Ok(_) => {
-                break tokio::select! {
-                    reason = state.wait_for_shutdown() => match reason {
-                        AppShutdownReason::CodexExited => ShutdownReason::CodexExited,
-                        AppShutdownReason::InstallUpdate => ShutdownReason::InstallUpdate,
-                    },
-                    _ = &mut shutdown => ShutdownReason::Signal,
-                };
-            }
-            Err(error) if commands::is_cc_switch_route_recovery_error(&error) => {
-                eprintln!(
-                    "Codey 自动启动 Codex 时检测到 CC Switch 路由尚未稳定；Codey 将保持运行并等待路由恢复：{error}"
+    let shutdown_reason = match commands::launch_codey_runtime(&state).await {
+        Ok(_) => tokio::select! {
+            reason = state.wait_for_shutdown() => match reason {
+                AppShutdownReason::CodexExited => ShutdownReason::CodexExited,
+                AppShutdownReason::InstallUpdate => ShutdownReason::InstallUpdate,
+            },
+            _ = &mut shutdown => ShutdownReason::Signal,
+        },
+        Err(error) => {
+            eprintln!("Codey 自动启动 Codex 失败：{error:#}");
+            let cleanup = stop_runtime_with_retry(&state).await;
+            if let Err(cleanup_error) = &cleanup {
+                error_log::record_failure(
+                    "restore_failed",
+                    "restore_runtime_after_startup_failure",
+                    cleanup_error.clone(),
+                    serde_json::json!({}),
                 );
-                let mut ready_streak = 0_u8;
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(
-                            commands::CC_SWITCH_ROUTE_RECOVERY_INTERVAL
-                        ) => {}
-                        _ = &mut shutdown => break 'runtime ShutdownReason::Signal,
-                    }
-                    if commands::cc_switch_route_ready_for_recovery().await {
-                        ready_streak = ready_streak.saturating_add(1);
-                    } else {
-                        ready_streak = 0;
-                    }
-                    if ready_streak >= commands::CC_SWITCH_ROUTE_RECOVERY_STABLE_READS {
-                        eprintln!("CC Switch 路由已稳定，正在启动 Codex");
-                        break;
-                    }
-                }
             }
-            Err(error) => {
-                eprintln!("Codey 自动启动 Codex 失败：{error:#}");
-                let cleanup = stop_runtime_with_retry(&state).await;
-                if let Err(cleanup_error) = &cleanup {
-                    error_log::record_failure(
-                        "restore_failed",
-                        "restore_runtime_after_startup_failure",
-                        cleanup_error.clone(),
-                        serde_json::json!({}),
-                    );
-                }
-                let error = initial_startup_failure_error(
-                    &error,
-                    cleanup.as_ref().err().map(String::as_str),
-                );
-                #[cfg(windows)]
-                show_initial_startup_failure(&error).await;
-                return Err(anyhow::Error::msg(error));
-            }
+            let error =
+                initial_startup_failure_error(&error, cleanup.as_ref().err().map(String::as_str));
+            #[cfg(windows)]
+            show_initial_startup_failure(&error).await;
+            return Err(anyhow::Error::msg(error));
         }
     };
 

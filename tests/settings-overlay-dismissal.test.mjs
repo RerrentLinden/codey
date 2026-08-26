@@ -23,16 +23,17 @@ test("settings modal keeps dismissal and stacking inside the overlay", async () 
     /<Modal[\s\S]*closeOnClickOutside=\{false\}[\s\S]*closeOnEscape=\{false\}[\s\S]*onClose=\{onCancel\}/,
   );
   assert.match(shellSource, /lockScroll=\{false\}/);
-  assert.match(shellSource, /overlay:\s*"bg-black\/25 backdrop-blur-\[20px\]"/);
-  assert.match(
+  assert.match(shellSource, /data-codey-settings-shell="true"/);
+  assert.doesNotMatch(
     shellSource,
-    /overlayProps=\{\{\s*backgroundOpacity:\s*0\.25,\s*blur:\s*20\s*\}\}/,
+    /overlay:\s*"bg-black\/25|backdrop-blur|overlayProps=/,
   );
   assert.match(shellSource, /content:\s*\n\s*"[^"]*overflow-hidden!/);
   assert.match(
     overlaySource,
     /modalContainer\.addEventListener\("wheel", handleOverlayWheel, \{\s*capture: true,\s*passive: false,/,
   );
+  assert.match(overlaySource, /hasActiveDialog/);
   assert.match(
     overlaySource,
     /modalContainer\.querySelector<HTMLElement>\("\.page-scroll"\)/,

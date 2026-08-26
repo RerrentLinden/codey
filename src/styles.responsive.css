@@ -92,6 +92,7 @@
   }
 
   .route-heading-actions,
+  .catalog-aggregate-heading,
   .provider-model-group-heading,
   .provider-model-empty {
     align-items: stretch;

@@ -6,8 +6,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use super::AppState;
-use crate::cc_switch;
 use crate::codex_config::codex_home;
+use crate::codex_provider;
 use crate::config::{CodeyConfig, PromptOptimizationConfig, ProviderProfile};
 use crate::error_log;
 use crate::prompt_optimization;
@@ -30,12 +30,12 @@ async fn current_provider_request_profile(config: &CodeyConfig) -> Result<Provid
     let profile = config
         .active_profile()
         .ok_or_else(|| "找不到当前 GPT API 线路".to_string())?;
-    if profile.cc_switch_read_only {
+    if profile.official_account {
         return Err("当前为 ChatGPT 官方登录线路，仅第三方线路可以同步 API 配置".to_string());
     }
     let home = codex_home();
     tokio::task::spawn_blocking(move || {
-        cc_switch::provider_model_fetch_profile(&profile, home)
+        codex_provider::provider_model_fetch_profile(&profile, home)
             .map_err(|error| format!("读取当前 GPT API 配置失败：{error:#}"))
     })
     .await
@@ -84,11 +84,7 @@ fn apply_current_provider_to_prompt_optimization(
     if api_key.is_empty() {
         return Err("当前第三方线路没有可同步的 API Key，请手动填写".to_string());
     }
-    let default_model = config
-        .default_model()
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(ToString::to_string);
+    let default_model = config.default_model_for_profile(&profile);
     config.prompt_optimization.base_url = base_url;
     config.prompt_optimization.api_key = api_key.to_string();
     config.prompt_optimization.api_key_configured = true;
@@ -153,8 +149,7 @@ pub async fn optimize_prompt_command(state: &Arc<AppState>, text: String) -> Res
 }
 
 /// Fetches the model list advertised by the configured service for the
-/// console picker. Accepts an unsaved draft like the connectivity test, with
-/// the saved key restored for the request.
+/// console picker. Accepts an unsaved draft like the connectivity test.
 pub async fn fetch_prompt_optimization_models_command(
     state: &Arc<AppState>,
     draft: Option<PromptOptimizationConfig>,
@@ -181,9 +176,8 @@ pub async fn fetch_prompt_optimization_models_command(
 }
 
 /// Tests connectivity against the saved configuration, or against an
-/// unsaved draft passed by the console. Draft API keys arrive redacted, so
-/// the saved key is restored through the same merge used by the save path
-/// before the request is sent.
+/// unsaved draft passed by the console. The compatibility merge still accepts
+/// older redacted drafts before the request is sent.
 pub async fn test_prompt_optimization_command(
     state: &Arc<AppState>,
     draft: Option<PromptOptimizationConfig>,
@@ -268,6 +262,7 @@ mod tests {
         let profile = ProviderProfile {
             id: "provider".to_string(),
             name: "Provider".to_string(),
+            short_name: "Pr".to_string(),
             base_url: " https://provider.example/v1/ ".to_string(),
             api_key: "api-secret".to_string(),
             upstream_protocol: crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
@@ -275,17 +270,18 @@ mod tests {
             api_key_configured: true,
             clear_api_key: false,
             model_request_headers: BTreeMap::new(),
-            cc_switch_provider_id: None,
-            cc_switch_read_only: false,
+            source_provider_id: None,
+            official_account: false,
             supports_remote_compaction: false,
         };
         let config = CodeyConfig {
             active_profile_id: "provider".to_string(),
             profiles: vec![profile.clone()],
-            default_model_by_provider: BTreeMap::from([(
+            selected_models_by_provider: BTreeMap::from([(
                 "provider".to_string(),
-                "gpt-provider".to_string(),
+                vec!["gpt-provider".to_string()],
             )]),
+            default_model: "provider/gpt-provider".to_string(),
             prompt_optimization: PromptOptimizationConfig {
                 enabled: true,
                 instruction: "保持简洁".to_string(),
@@ -311,6 +307,7 @@ mod tests {
         let profile = ProviderProfile {
             id: "provider".to_string(),
             name: "Provider".to_string(),
+            short_name: "Pr".to_string(),
             base_url: "https://provider.example/v1".to_string(),
             api_key: "api-secret".to_string(),
             upstream_protocol: crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
@@ -318,17 +315,18 @@ mod tests {
             api_key_configured: true,
             clear_api_key: false,
             model_request_headers: BTreeMap::new(),
-            cc_switch_provider_id: None,
-            cc_switch_read_only: false,
+            source_provider_id: None,
+            official_account: false,
             supports_remote_compaction: false,
         };
         let mut config = CodeyConfig {
             active_profile_id: "provider".to_string(),
             profiles: vec![profile.clone()],
-            default_model_by_provider: BTreeMap::from([(
+            selected_models_by_provider: BTreeMap::from([(
                 "provider".to_string(),
-                "gpt-provider".to_string(),
+                vec!["gpt-provider".to_string()],
             )]),
+            default_model: "provider/gpt-provider".to_string(),
             ..CodeyConfig::default()
         };
         let draft = PromptOptimizationConfig {

@@ -72,17 +72,16 @@ export function SettingsModalShell({
         header:
           "m-0 min-h-0! flex-none border-b border-gray-200 px-5! py-2.5! max-[760px]:px-3.5! max-[760px]:py-2!",
         inner: "p-3! max-[760px]:p-1.5!",
-        overlay: "bg-black/25 backdrop-blur-[20px]",
         root: "[-webkit-app-region:no-drag]",
         title: "min-w-0 flex-1",
       }}
       closeButtonProps={{ "aria-label": "关闭配置" }}
       closeOnClickOutside={false}
       closeOnEscape={false}
+      data-codey-settings-shell="true"
       onClose={onCancel}
       onExitTransitionEnd={afterClose}
       opened={visible}
-      overlayProps={{ backgroundOpacity: 0.25, blur: 20 }}
       padding={0}
       lockScroll={false}
       portalProps={container ? { target: container } : undefined}

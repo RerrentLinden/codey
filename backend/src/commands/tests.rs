@@ -171,7 +171,7 @@ fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
     let mut official = crate::config::ProviderProfile::new("OpenAI 官方直登");
     official.id = "official-route".to_string();
     official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
-    official.cc_switch_provider_id = Some("local-official".to_string());
+    official.source_provider_id = Some("local-official".to_string());
     official.normalize();
 
     let previous = CodeyConfig {
@@ -185,7 +185,8 @@ fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
     input.base_url = "https://relay.example/v1".to_string();
     input.api_key = "sk-relay".to_string();
     input.api_key_configured = false;
-    input.cc_switch_read_only = false;
+    input.official_account = false;
+    input.short_name = "中转".to_string();
 
     let merged = merge_profile_secrets(vec![input], &previous).unwrap();
     let route = &merged[0];
@@ -197,8 +198,9 @@ fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
     );
     assert_eq!(route.base_url, "https://relay.example/v1");
     assert_eq!(route.api_key, "sk-relay");
-    assert!(!route.cc_switch_read_only);
-    assert!(route.cc_switch_provider_id.is_none());
+    assert_eq!(route.short_name, "中转");
+    assert!(!route.official_account);
+    assert!(route.source_provider_id.is_none());
     assert!(!route.supports_remote_compaction);
 }
 
@@ -287,36 +289,38 @@ async fn backend_health_bridge_avoids_runtime_status_collection() {
 }
 
 #[tokio::test]
-async fn explicit_notification_channel_reveal_returns_only_the_selected_channel() {
+async fn renderer_api_keeps_notification_secrets_without_reveal_commands() {
     let state = Arc::new(AppState::default());
-    state.config.write().await.webhook.channels.extend([
-        NotificationChannelConfig {
-            id: "feishu-1".to_string(),
-            url: "https://open.feishu.cn/open-apis/bot/v2/hook/reveal-secret".to_string(),
-            ..NotificationChannelConfig::default()
-        },
-        NotificationChannelConfig {
+    state.config.write().await.prompt_optimization.api_key = "optimizer-secret".to_string();
+    state
+        .config
+        .write()
+        .await
+        .webhook
+        .channels
+        .push(NotificationChannelConfig {
             id: "telegram-1".to_string(),
             kind: crate::notifications::NotificationChannelKind::Telegram,
-            bot_token: "telegram-reveal-secret".to_string(),
+            bot_token: "telegram-secret".to_string(),
             chat_id: "-100123".to_string(),
             ..NotificationChannelConfig::default()
-        },
-    ]);
+        });
 
-    let revealed = reveal_notification_channel(&state, "telegram-1".to_string())
-        .await
-        .unwrap();
-
-    assert_eq!(revealed["channel"]["id"], "telegram-1");
-    assert_eq!(revealed["channel"]["botToken"], "telegram-reveal-secret");
-    assert!(!revealed.to_string().contains("hook/reveal-secret"));
+    let result = invoke_api(
+        &state,
+        "reveal_notification_channel",
+        json!({ "channelId": "telegram-1" }),
+    )
+    .await;
+    assert_eq!(result["status"], "failed");
     assert!(
-        reveal_notification_channel(&state, "unknown".to_string())
-            .await
-            .unwrap_err()
-            .contains("找不到")
+        result["message"]
+            .as_str()
+            .unwrap()
+            .contains("未知 Codey API 命令")
     );
+    assert!(!result.to_string().contains("optimizer-secret"));
+    assert!(!result.to_string().contains("telegram-secret"));
 }
 
 #[tokio::test]
@@ -618,11 +622,11 @@ async fn provider_sync_does_not_block_config_writes_or_commit_a_stale_result() {
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let sync_state = Arc::clone(&state);
     let sync_task = tokio::spawn(async move {
-        sync_cc_switch_state_with(&sync_state, move |mut config| {
+        sync_provider_state_with(&sync_state, move |mut config| {
             started_tx.send(()).unwrap();
             release_rx.recv().unwrap();
             config.profiles[0].name = "stale provider".to_string();
-            let mut status = cc_switch::status_from_config(&config);
+            let mut status = codex_provider::status_from_config(&config);
             status.changed = true;
             Ok((config, status))
         })

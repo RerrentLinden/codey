@@ -389,7 +389,7 @@ function OperationsPanelComponent({
             </span>
             <div className="operations-heading-copy">
               <div className="operations-title-row">
-                <h1 id="operations-title">Codex 运行状态</h1>
+                <h2 id="operations-title">Codex 运行状态</h2>
                 <span className="codex-version-tag">{codexVersionLabel}</span>
               </div>
               <div

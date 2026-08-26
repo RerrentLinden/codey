@@ -727,6 +727,19 @@ pub(super) async fn test_notification_channel(
     state: &Arc<AppState>,
     channel: NotificationChannelConfig,
 ) -> Result<Value, String> {
+    // Renderer drafts never receive saved webhook URLs or bot tokens. Restore
+    // only the matching channel's redacted value for this one test request,
+    // using the same explicit-clear semantics as the save path.
+    let previous = state.config.read().await.webhook.clone();
+    let mut draft = crate::notifications::WebhookConfig {
+        channels: vec![channel],
+        ..crate::notifications::WebhookConfig::default()
+    };
+    draft.merge_redacted_secrets(&previous);
+    let channel = draft
+        .channels
+        .pop()
+        .expect("notification test draft must contain one channel");
     let dispatcher =
         NotificationDispatcher::with_client(state.webhook_http_client.clone(), channel);
     dispatcher.test().await.map_err(|error| error.to_string())

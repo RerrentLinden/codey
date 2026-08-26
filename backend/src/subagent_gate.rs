@@ -16,11 +16,10 @@ mod runtime_policy;
 mod state;
 
 use runtime_policy::{RuntimeSubagentPolicy, read_optional_runtime_policy_file};
-#[allow(unused_imports)]
 pub(crate) use runtime_policy::{
     begin_runtime_subagent_policy_update, clear_runtime_subagent_policy,
-    commit_runtime_subagent_policy, runtime_subagent_policy_bytes, runtime_subagent_policy_matches,
-    runtime_subagent_policy_paths, write_runtime_subagent_policy,
+    commit_runtime_subagent_policy, runtime_subagent_policy_matches, runtime_subagent_policy_paths,
+    write_runtime_subagent_policy,
 };
 use state::*;
 

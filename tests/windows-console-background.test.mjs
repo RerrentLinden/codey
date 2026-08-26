@@ -29,7 +29,7 @@ test("Windows source contract: fatal startup failures remain visible", async () 
   const library = normalizeLineEndings(
     await readFile(new URL("../backend/src/lib.rs", import.meta.url), "utf8"),
   );
-  const failureStart = library.indexOf("let shutdown_reason = 'runtime: loop");
+  const failureStart = library.indexOf("let shutdown_reason = match");
   const fatalCleanup = library.indexOf(
     "let cleanup = stop_runtime_with_retry(&state).await;",
     failureStart,
@@ -45,9 +45,6 @@ test("Windows source contract: fatal startup failures remain visible", async () 
 
   const failureBranch = library.slice(failureStart, shutdownCleanup);
   assert.match(failureBranch, /commands::launch_codey_runtime\(&state\)\.await/);
-  assert.match(failureBranch, /is_cc_switch_route_recovery_error\(&error\)/);
-  assert.match(failureBranch, /cc_switch_route_ready_for_recovery\(\)\.await/);
-  assert.match(failureBranch, /CC_SWITCH_ROUTE_RECOVERY_STABLE_READS/);
   assert.match(failureBranch, /stop_runtime_with_retry\(&state\)\.await/);
   assert.match(failureBranch, /show_initial_startup_failure\(&error\)\.await/);
   assert.match(failureBranch, /return Err\(/);

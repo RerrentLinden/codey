@@ -8,7 +8,7 @@ import {
 
 import { invoke } from "./api";
 import type {
-  CcSwitchStatus,
+  ProviderStatus,
   Config,
   ModelState,
   Notice,
@@ -22,8 +22,8 @@ import {
   uniqueModelIds,
   withoutModelId,
 } from "./modelIds";
+import { buildSubagentModelOptions } from "./subagentModels";
 
-const THIRD_PARTY_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
 const MAX_MODEL_ID_BYTES = 512;
 const MAX_MODEL_COUNT = 10_000;
 const modelIdEncoder = new TextEncoder();
@@ -35,15 +35,10 @@ const pickerSelection = (state: ModelState) => [
   ...state.thirdPartyModels,
 ];
 
-export type SubagentModelOption = {
-  value: string;
-  label: string;
-  supportedReasoningEfforts: string[];
-  defaultReasoningEffort: string;
-};
-
 type UseModelSelectionOptions = {
-  provider: CcSwitchStatus["provider"] | undefined;
+  config: Config | null;
+  officialAccountAvailable: boolean;
+  provider: ProviderStatus["provider"] | undefined;
   runOperation: (name: string, action: () => Promise<void>) => Promise<void>;
   setPersistedConfig: (config: Config) => void;
   setStatus: Dispatch<SetStateAction<RuntimeStatus>>;
@@ -61,6 +56,8 @@ type ModelRuntimeUpdate = {
 };
 
 export function useModelSelection({
+  config,
+  officialAccountAvailable,
   provider,
   runOperation,
   setPersistedConfig,
@@ -139,28 +136,14 @@ export function useModelSelection({
       officialSlugKeys,
     ],
   );
-  const subagentModelOptions = useMemo<SubagentModelOption[]>(
-    () => [
-      ...modelState.officialModels
-        .filter((model) => model.supported)
-        .map((model) => ({
-          value: model.slug,
-          label: model.displayName,
-          supportedReasoningEfforts:
-            model.supportedReasoningEfforts.length > 0
-              ? model.supportedReasoningEfforts
-              : ["low"],
-          defaultReasoningEffort: model.defaultReasoningEffort || "low",
-        })),
-      ...modelState.thirdPartyModels
-        .map((model) => ({
-          value: model,
-          label: model,
-          supportedReasoningEfforts: THIRD_PARTY_REASONING_EFFORTS,
-          defaultReasoningEffort: "low",
-        })),
-    ],
-    [modelState.officialModels, modelState.thirdPartyModels],
+  const subagentModelOptions = useMemo(
+    () =>
+      buildSubagentModelOptions(
+        config,
+        modelState,
+        officialAccountAvailable,
+      ),
+    [config, modelState, officialAccountAvailable],
   );
 
   const openModelPicker = useCallback((

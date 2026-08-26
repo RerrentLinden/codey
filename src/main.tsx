@@ -3,13 +3,14 @@ import ReactDOM from "react-dom/client";
 import { MantineProvider } from "@mantine/core";
 import "@mantine/core/styles.css";
 import { App } from "./App";
-import type { CcSwitchStatus, Config, ModelState, Profile } from "./App.types";
+import type { ProviderStatus, Config, ModelState, Profile } from "./App.types";
 import {
   includesModelId,
   modelIdsEqual,
   modelKey,
   uniqueModelIds,
 } from "./modelIds";
+import { routeModelAlias } from "./modelRoutes";
 import { previewOfficialModels, previewUpstreamModels } from "./previewModels";
 import { codeyMantineTheme } from "./mantine";
 import "./tailwind.css";
@@ -46,27 +47,29 @@ if (import.meta.env.DEV) {
         {
           id: "primary",
           name: "主力代理 (ChatGPT)",
+          shortName: "主",
           baseUrl: previewEndpoints.primary,
           apiKey: "preview-route-primary-key",
           upstreamProtocol: "openaiResponses",
           authMode: "apiKey",
           apiKeyConfigured: true,
           clearApiKey: false,
-          ccSwitchProviderId: "primary",
-          ccSwitchReadOnly: false,
+          sourceProviderId: "primary",
+          officialAccount: false,
           supportsRemoteCompaction: false,
         },
         {
           id: "backup",
           name: "备用中转 (Claude)",
+          shortName: "备",
           baseUrl: previewEndpoints.backup,
           apiKey: "preview-route-backup-key",
-          upstreamProtocol: "openaiCompatible",
+          upstreamProtocol: "openaiChatCompletions",
           authMode: "apiKey",
           apiKeyConfigured: true,
           clearApiKey: false,
-          ccSwitchProviderId: "backup",
-          ccSwitchReadOnly: false,
+          sourceProviderId: "backup",
+          officialAccount: false,
           supportsRemoteCompaction: false,
         },
       ],
@@ -123,13 +126,17 @@ if (import.meta.env.DEV) {
       userScripts: [],
       selectedModelsByProvider: {
         primary: ["provider-fast-coder", "claude-sonnet-4-5"],
+        backup: ["claude-sonnet-4-5", "claude-opus-4-1"],
       },
       manualThirdPartyModelsByProvider: {
         primary: ["provider-fast-coder"],
       },
       declaredOfficialModelsByProvider: {} as Record<string, string[]>,
-      upstreamModelsByProvider: { primary: previewUpstreamModels },
-      defaultModelByProvider: {},
+      upstreamModelsByProvider: {
+        primary: previewUpstreamModels,
+        backup: ["claude-sonnet-4-5", "claude-opus-4-1"],
+      },
+      defaultModel: "primary/provider-fast-coder",
       disableTraceLogWrites: true,
       protectCrashpadPending: true,
       slimCodexPet: true,
@@ -141,7 +148,10 @@ if (import.meta.env.DEV) {
       subagentRoles: {
         codey_quick_scan: { model: "gpt-5.6-sol", reasoningEffort: "low" },
         codey_deep_research: { model: "gpt-5.6-sol", reasoningEffort: "high" },
-        codey_visual_analysis: { model: "gpt-5.6-sol", reasoningEffort: "high" },
+        codey_visual_analysis: {
+          model: "backup/claude-sonnet-4-5",
+          reasoningEffort: "high",
+        },
         codey_worker: { model: "provider-fast-coder", reasoningEffort: "medium" },
         codey_visual_worker: { model: "gpt-5.6-sol", reasoningEffort: "high" },
         default: { model: "gpt-5.6-sol", reasoningEffort: "medium" },
@@ -161,12 +171,12 @@ if (import.meta.env.DEV) {
       defaultModel: "gpt-5.6-sol",
     };
     const routeProviderId = (profile: Profile) =>
-      profile.ccSwitchProviderId || profile.id;
+      profile.sourceProviderId || profile.id;
     const activePreviewProfile = () =>
       previewConfig.profiles.find(
         (profile) => profile.id === previewConfig.activeProfileId,
       ) || previewConfig.profiles[0];
-    const previewCcSwitch = (): CcSwitchStatus => {
+    const previewProviderStatus = (): ProviderStatus => {
       const profile = activePreviewProfile();
       return {
         changed: false,
@@ -175,7 +185,6 @@ if (import.meta.env.DEV) {
           name: profile?.name || "OpenAI 官方直登",
           official: profile?.authMode === "officialAccount",
           baseUrl: profile?.baseUrl || "",
-          localRoute: false,
         },
       };
     };
@@ -189,14 +198,15 @@ if (import.meta.env.DEV) {
         (model) => official || includesModelId(upstream, model.slug),
       );
       const thirdPartyModels = official ? [] : selected;
-      const requestedDefault = previewConfig.defaultModelByProvider[providerId];
+      const requestedDefault = previewConfig.defaultModel;
       const defaultModel =
         [
           ...selectableOfficial.map((model) => model.slug),
           ...thirdPartyModels,
         ].find(
           (model) =>
-            Boolean(requestedDefault) && modelIdsEqual(model, requestedDefault),
+            Boolean(requestedDefault) &&
+            modelIdsEqual(routeModelAlias(profile, model), requestedDefault),
         ) ||
         selectableOfficial[0]?.slug ||
         thirdPartyModels[0] ||
@@ -234,7 +244,7 @@ if (import.meta.env.DEV) {
           config: previewConfig,
           modelState: previewModelState,
           startupError: undefined,
-          ccSwitch: previewCcSwitch(),
+          providerStatus: previewProviderStatus(),
           fastContextToolsStatus: {
             userConfigured: false,
             detectionFailed: false,
@@ -400,7 +410,7 @@ if (import.meta.env.DEV) {
         return {
           config: previewConfig,
           modelState: previewModelState,
-          ccSwitch: previewCcSwitch(),
+          providerStatus: previewProviderStatus(),
           fastContextToolsStatus: {
             userConfigured: false,
             detectionFailed: false,
@@ -408,20 +418,11 @@ if (import.meta.env.DEV) {
           restartRequired: false,
         };
       }
-      if (command === "reveal_notification_channel") {
-        const channelId = String(args.channelId || "");
-        const channel = previewConfig.webhook.channels.find(
-          (candidate) => candidate.id === channelId,
-        );
-        return channel
-          ? { channel }
-          : { status: "failed", message: "找不到要编辑的通知渠道" };
-      }
       if (command === "sync_current_provider") {
         return {
           config: previewConfig,
           modelState: previewModelState,
-          ccSwitch: previewCcSwitch(),
+          providerStatus: previewProviderStatus(),
           restartRequired: false,
         };
       }
@@ -468,7 +469,7 @@ if (import.meta.env.DEV) {
           status: "ok",
           config: previewConfig,
           modelState: previewModelState,
-          ccSwitch: previewCcSwitch(),
+          providerStatus: previewProviderStatus(),
           restartRequired: !existing,
           modelHotReloaded: Boolean(existing),
         };
@@ -488,7 +489,7 @@ if (import.meta.env.DEV) {
           status: "ok",
           config: previewConfig,
           modelState: previewModelState,
-          ccSwitch: previewCcSwitch(),
+          providerStatus: previewProviderStatus(),
           restartRequired: false,
           modelHotReloaded: true,
         };
@@ -506,7 +507,6 @@ if (import.meta.env.DEV) {
         delete previewConfig.manualThirdPartyModelsByProvider[providerId];
         delete previewConfig.declaredOfficialModelsByProvider[providerId];
         delete previewConfig.upstreamModelsByProvider[providerId];
-        delete previewConfig.defaultModelByProvider[providerId];
         previewConfig = {
           ...previewConfig,
           settingsRevision: previewConfig.settingsRevision + 1,
@@ -521,7 +521,7 @@ if (import.meta.env.DEV) {
           status: "ok",
           config: previewConfig,
           modelState: previewModelState,
-          ccSwitch: previewCcSwitch(),
+          providerStatus: previewProviderStatus(),
           restartRequired: false,
           modelHotReloaded: true,
         };
@@ -549,7 +549,7 @@ if (import.meta.env.DEV) {
           config: previewConfig,
           modelState: previewModelState,
           routeModelState: previewModelStateForProfile(route),
-          ccSwitch: previewCcSwitch(),
+          providerStatus: previewProviderStatus(),
           models,
           restartRequired: false,
           modelHotReloaded: true,
@@ -561,7 +561,7 @@ if (import.meta.env.DEV) {
           settingsRevision: previewConfig.settingsRevision + 1,
           promptOptimization: {
             ...previewConfig.promptOptimization,
-            baseUrl: previewCcSwitch().provider.baseUrl,
+            baseUrl: previewProviderStatus().provider.baseUrl,
             apiKey: activePreviewProfile()?.apiKey || "",
             apiKeyConfigured: Boolean(activePreviewProfile()?.apiKey.trim()),
             clearApiKey: false,
@@ -714,13 +714,13 @@ if (import.meta.env.DEV) {
         const targetProfile = previewConfig.profiles.find(
           (profile) => profile.id === routeId,
         ) || activePreviewProfile();
-        const providerId = targetProfile ? routeProviderId(targetProfile) : "primary";
+        if (!targetProfile) {
+          return { status: "failed", message: "找不到要设置默认模型的线路" };
+        }
         previewConfig = {
           ...previewConfig,
-          defaultModelByProvider: {
-            ...previewConfig.defaultModelByProvider,
-            [providerId]: model,
-          },
+          activeProfileId: targetProfile.id,
+          defaultModel: routeModelAlias(targetProfile, model),
         };
         if (targetProfile?.id === previewConfig.activeProfileId) {
           previewModelState = { ...previewModelState, defaultModel: model };
@@ -743,21 +743,24 @@ if (import.meta.env.DEV) {
           return { status: "failed", message: "官方线路至少需要保留一个模型" };
         }
         const providerId = routeProviderId(targetProfile);
-        const requestedDefault = previewConfig.defaultModelByProvider[providerId];
-        const defaultModel = models.find((candidate) =>
-          modelIdsEqual(candidate, requestedDefault || ""),
-        ) || models[0];
         previewConfig = {
           ...previewConfig,
           selectedModelsByProvider: {
             ...previewConfig.selectedModelsByProvider,
             [providerId]: models,
           },
-          defaultModelByProvider: {
-            ...previewConfig.defaultModelByProvider,
-            [providerId]: defaultModel,
-          },
         };
+        const defaultModel = models.find((candidate) =>
+          modelIdsEqual(routeModelAlias(targetProfile, candidate), previewConfig.defaultModel),
+        ) || models[0];
+        if (!models.some((candidate) =>
+          modelIdsEqual(routeModelAlias(targetProfile, candidate), previewConfig.defaultModel),
+        )) {
+          previewConfig = {
+            ...previewConfig,
+            defaultModel: routeModelAlias(targetProfile, defaultModel),
+          };
+        }
         if (targetProfile.id === previewConfig.activeProfileId) {
           const selected = new Set(models.map(modelKey));
           previewModelState = {

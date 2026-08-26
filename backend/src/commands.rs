@@ -39,7 +39,7 @@ pub use models::{
 use models::{
     config_with_current_provider_models, preserve_selected_third_party_models,
     preserve_selected_third_party_models_except, renderer_model_catalog_value,
-    should_refresh_model_catalog, startup_model_sync_models_or_fallback, sync_cc_switch_state_with,
+    should_refresh_model_catalog, startup_model_sync_models_or_fallback, sync_provider_state_with,
     validate_deleted_third_party_models, validate_manual_model_selection,
 };
 use models::{
@@ -51,10 +51,6 @@ use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
 use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
     sync_prompt_optimization_current_provider_command, test_prompt_optimization_command,
-};
-pub(crate) use runtime::{
-    CC_SWITCH_ROUTE_RECOVERY_INTERVAL, CC_SWITCH_ROUTE_RECOVERY_STABLE_READS,
-    cc_switch_route_ready_for_recovery, is_cc_switch_route_recovery_error,
 };
 #[cfg(test)]
 use runtime::{begin_shutdown, launch_codey_inner};
@@ -78,11 +74,11 @@ use webhooks::{
 };
 
 use crate::account_usage;
-use crate::cc_switch;
 use crate::cdp;
 use crate::codex_config::{
     FastContextToolsStatus, codex_home, fast_context_tools_status, reconcile_runtime_subagent_roles,
 };
+use crate::codex_provider;
 use crate::config::{
     CodeyConfig, ConfigStore, PromptOptimizationConfig, ProviderProfile, SUBAGENT_ROLE_DEFAULT,
     SUBAGENT_ROLE_IDS, SubagentRoleConfig, validate_provider_profiles,
@@ -177,7 +173,15 @@ pub enum AppShutdownReason {
 impl Default for AppState {
     fn default() -> Self {
         let store = ConfigStore::default();
-        let config = store.load().unwrap_or_default();
+        let (config, config_load_error) = match store.load() {
+            Ok(config) => (config, None),
+            Err(error) => (
+                CodeyConfig::default(),
+                Some(format!(
+                    "Codey 配置无法读取，已使用安全默认值启动；请先检查或恢复配置文件：{error:#}"
+                )),
+            ),
+        };
         let protect_crashpad_pending = config.protect_crashpad_pending;
         let persisted_waiting_notifications = initial_waiting_notifications(&store, &[]);
         let (shutdown_reason, _) = watch::channel(None);
@@ -200,7 +204,7 @@ impl Default for AppState {
             trace_log_stats: TraceLogStatsHandle::idle(),
             trace_log_write_protection_active: AtomicBool::new(false),
             crashpad_pending_stats: CrashpadPendingStatsHandle::idle(protect_crashpad_pending),
-            startup_error: RwLock::new(None),
+            startup_error: RwLock::new(config_load_error),
             available_update: RwLock::new(None),
             update_candidate_cache: Mutex::new(None),
             codex_app_version_cache: Mutex::new(None),
@@ -540,7 +544,7 @@ pub(super) fn validate_official_account_config_change(
     }
     if next
         .active_profile()
-        .is_some_and(|profile| profile.cc_switch_read_only)
+        .is_some_and(|profile| profile.official_account)
     {
         return Err(
             "本次 Codex 由 API Key 线路启动，不能启用官方账号线路；请先在 Codex 中完成官方账号登录并重新启动 Codey"
@@ -548,9 +552,9 @@ pub(super) fn validate_official_account_config_change(
         );
     }
     if next.profiles.iter().any(|profile| {
-        profile.cc_switch_read_only
+        profile.official_account
             && !previous.profiles.iter().any(|previous_profile| {
-                previous_profile.id == profile.id && previous_profile.cc_switch_read_only
+                previous_profile.id == profile.id && previous_profile.official_account
             })
     }) {
         return Err(
@@ -563,32 +567,23 @@ pub(super) fn validate_official_account_config_change(
 
 pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> Result<(), String> {
     let home = codex_home().to_path_buf();
-    let official_account_available =
-        tokio::task::spawn_blocking(move || crate::cc_switch::official_account_available(&home))
-            .await
-            .map_err(|error| format!("检测 Codex 官方账号登录状态的任务异常退出：{error}"))?
-            .map_err(|error| format!("检测 Codex 官方账号登录状态失败：{error:#}"))?;
+    let official_profile = tokio::task::spawn_blocking(move || {
+        crate::codex_provider::current_official_account_profile(&home)
+    })
+    .await
+    .map_err(|error| format!("检测 Codex 官方账号登录状态的任务异常退出：{error}"))?
+    .map_err(|error| format!("检测 Codex 官方账号登录状态失败：{error:#}"))?;
 
     let _config_write_guard = state.config_write_lock.lock().await;
     let previous = state.config.read().await.clone();
     let mut next = previous.clone();
-    next.official_account_available_this_launch = official_account_available;
-    if official_account_available {
-        let home = codex_home().to_path_buf();
-        let source = next.clone();
-        next = tokio::task::spawn_blocking(move || {
-            crate::cc_switch::sync_official_account_route(&source, &home)
-        })
-        .await
-        .map_err(|error| format!("同步 Codex 官方账号线路任务异常退出：{error}"))?
-        .map_err(|error| format!("同步 Codex 官方账号线路失败：{error:#}"))?;
+    if let Some(official_profile) = official_profile {
+        next.apply_launch_official_profile(Some(official_profile));
+        next.initial_route_import_completed = true;
+        next = next.normalize();
         next.official_account_available_this_launch = true;
     } else {
-        if next
-            .profiles
-            .iter()
-            .any(|profile| profile.cc_switch_read_only)
-        {
+        if next.profiles.iter().any(|profile| profile.official_account) {
             if !next.has_third_party_route() {
                 return Err(
                     "当前 Codex 没有可用的官方账号登录，也没有已保存的 API Key 线路；请先在 Codex 中完成官方账号登录，或在 Codey 中添加第三方 API 线路"
@@ -753,10 +748,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Err(error) => Err(error),
             }
         }
-        "reveal_notification_channel" => match string_argument(&args, "channelId") {
-            Ok(channel_id) => reveal_notification_channel(state, channel_id).await,
-            Err(error) => Err(error),
-        },
         "optimize_prompt" => match string_argument(&args, "text") {
             Ok(text) => optimize_prompt_command(state, text).await,
             Err(error) => Err(error),
@@ -788,15 +779,13 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
 
 pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
     let runtime_running = state.runtime.lock().await.is_some();
-    if !runtime_running {
-        if let Err(error) = prepare_routes_for_current_launch(state).await {
-            error_log::record_failure(
-                "route_prepare_failed",
-                "load_codey_config",
-                error,
-                json!({}),
-            );
-        }
+    if !runtime_running && let Err(error) = prepare_routes_for_current_launch(state).await {
+        error_log::record_failure(
+            "route_prepare_failed",
+            "load_codey_config",
+            error,
+            json!({}),
+        );
     }
     let imported = ensure_default_route_imported(state).await;
     let config = if imported {
@@ -805,7 +794,7 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         state.config.read().await.clone()
     };
     let startup_error = state.startup_error.read().await.clone();
-    let cc_switch = cc_switch::status_from_config(&config);
+    let provider_status = codex_provider::status_from_config(&config);
     let model_state = current_model_state_async(&config).await?;
     let fast_context_tools_status = current_fast_context_tools_status();
     let mut public_config = redacted_config(&config);
@@ -818,7 +807,7 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         "path": state.store.path().to_string_lossy(),
         "startupError": startup_error,
         "officialAccountAvailable": config.official_account_available_this_launch,
-        "ccSwitch": cc_switch,
+        "providerStatus": provider_status,
         "modelState": model_state,
         "fastContextToolsStatus": fast_context_tools_status,
     }))
@@ -866,9 +855,10 @@ pub(super) async fn ensure_default_route_imported(state: &Arc<AppState>) -> bool
     }
 }
 
-async fn current_codex_provider_for_initial_import() -> Result<cc_switch::CurrentProvider, String> {
+async fn current_codex_provider_for_initial_import()
+-> Result<codex_provider::CurrentProvider, String> {
     let home = codex_home().to_path_buf();
-    tokio::task::spawn_blocking(move || cc_switch::current_provider(&home))
+    tokio::task::spawn_blocking(move || codex_provider::current_provider(&home))
         .await
         .map_err(|error| format!("读取当前 Codex 线路任务异常退出：{error}"))?
         .map_err(|error| format!("读取当前 Codex 线路失败：{error:#}"))
@@ -888,24 +878,6 @@ async fn mark_initial_route_import_completed(state: &Arc<AppState>) -> Result<bo
         .map_err(|error| format!("保存首次线路导入标记失败：{error}"))?;
     *state.config.write().await = next;
     Ok(true)
-}
-
-async fn reveal_notification_channel(
-    state: &Arc<AppState>,
-    channel_id: String,
-) -> Result<Value, String> {
-    let channel_id = channel_id.trim();
-    let channel = state
-        .config
-        .read()
-        .await
-        .webhook
-        .channels
-        .iter()
-        .find(|channel| channel.id == channel_id)
-        .cloned()
-        .ok_or_else(|| "找不到要编辑的通知渠道".to_string())?;
-    Ok(json!({"channel": channel}))
 }
 
 #[cfg(windows)]
@@ -1126,7 +1098,6 @@ async fn save_codey_config_locked(
     }
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
-    config.remember_current_subagent_config();
     let mut config = config.normalize();
     validate_official_account_config_change(&previous, &config)?;
     config.remember_current_provider_official_model_support(explicitly_configured_subagent_models);
@@ -1223,19 +1194,19 @@ fn merge_profile_secrets(
                 .eq_ignore_ascii_case(previous_profile.auth_mode.trim());
             if auth_mode_changed {
                 profile.model_request_headers.clear();
-                profile.cc_switch_provider_id = None;
+                profile.source_provider_id = None;
                 profile.supports_remote_compaction = false;
                 if profile.auth_mode.trim() == crate::config::AUTH_MODE_API_KEY {
-                    profile.cc_switch_read_only = false;
+                    profile.official_account = false;
                 }
             } else {
-                // These fields are discovered from the trusted Codex/CC Switch
-                // source and are not editable renderer input. Keep them attached
-                // to the saved route even though the renderer-visible profile
-                // does not include them and sends the whole form back on save.
+                // These fields are discovered from the trusted Codex source and
+                // are not editable renderer input. Keep them attached
+                // to the saved route even though the renderer receives a redacted
+                // profile and sends the whole form back on save.
                 profile.model_request_headers = previous_profile.model_request_headers.clone();
-                profile.cc_switch_provider_id = previous_profile.cc_switch_provider_id.clone();
-                profile.cc_switch_read_only = previous_profile.cc_switch_read_only;
+                profile.source_provider_id = previous_profile.source_provider_id.clone();
+                profile.official_account = previous_profile.official_account;
                 profile.supports_remote_compaction = previous_profile.supports_remote_compaction;
             }
         }
@@ -1251,7 +1222,7 @@ fn retain_route_scoped_config(config: &mut CodeyConfig) {
         .iter()
         .map(|profile| {
             profile
-                .cc_switch_provider_id
+                .source_provider_id
                 .as_deref()
                 .unwrap_or(profile.id.as_str())
                 .to_string()
@@ -1268,12 +1239,6 @@ fn retain_route_scoped_config(config: &mut CodeyConfig) {
         .retain(|provider_id, _| provider_ids.contains(provider_id));
     config
         .upstream_models_by_provider
-        .retain(|provider_id, _| provider_ids.contains(provider_id));
-    config
-        .default_model_by_provider
-        .retain(|provider_id, _| provider_ids.contains(provider_id));
-    config
-        .subagent_config_by_provider
         .retain(|provider_id, _| provider_ids.contains(provider_id));
 }
 
@@ -1350,12 +1315,12 @@ async fn finish_codey_config_save(
     let subagent_config_health = subagent_hot_reload.health();
     let subagent_config_repair_reasons = subagent_hot_reload.repair_reasons();
     let subagent_config_hot_reload_error = subagent_hot_reload.error();
-    let cc_switch = cc_switch::status_from_config(&saved.config);
+    let provider_status = codex_provider::status_from_config(&saved.config);
     let public_config = redacted_config(&saved.config);
     Ok(model_hot_reload.add_to_response(json!({
         "status":"ok",
         "config":public_config,
-        "ccSwitch":cc_switch,
+        "providerStatus":provider_status,
         "modelState":model_state,
         "fastContextToolsStatus":saved.fast_context_tools_status,
         "restartRequired":restart_required,
@@ -1364,9 +1329,6 @@ async fn finish_codey_config_save(
         "subagentConfigHealth":subagent_config_health,
         "subagentConfigRepairReasons":subagent_config_repair_reasons,
         "subagentConfigHotReloadError":subagent_config_hot_reload_error,
-        // Keep the original response keys for older injected consoles.
-        "subagentDefaultsHotReloaded":subagent_config_hot_reloaded,
-        "subagentDefaultsHotReloadError":subagent_config_hot_reload_error,
     })))
 }
 
@@ -1696,11 +1658,10 @@ fn account_usage_enabled_for_config(config: &CodeyConfig) -> bool {
         && config
             .profiles
             .iter()
-            .any(|profile| profile.cc_switch_read_only)
+            .any(|profile| profile.official_account)
 }
 
 #[cfg(test)]
-#[allow(dead_code)]
 fn config_requires_restart(
     applied: &CodeyConfig,
     applied_models: &RuntimeModelConfig,
@@ -1739,11 +1700,7 @@ pub(super) fn provider_route_restart_required_for_runtime(
     runtime: &CodeyRuntime,
     current: &CodeyConfig,
 ) -> bool {
-    if runtime.has_local_router() {
-        official_route_snapshots(&runtime.applied_config) != official_route_snapshots(current)
-    } else {
-        provider_route_requires_restart(&runtime.applied_config, current)
-    }
+    official_route_snapshots(&runtime.applied_config) != official_route_snapshots(current)
 }
 
 #[cfg(test)]

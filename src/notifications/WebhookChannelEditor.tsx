@@ -9,7 +9,6 @@ export function createWebhookChannelEditor(emptyPlaceholder: string) {
   function WebhookChannelEditor({
     channel,
     disabled,
-    revealSecrets = false,
     onChange,
   }: NotificationChannelEditorProps) {
     return (
@@ -20,7 +19,7 @@ export function createWebhookChannelEditor(emptyPlaceholder: string) {
             <IconSend size={15} aria-hidden="true" />
             <Input
               className={insetInputClass}
-              type={revealSecrets ? "text" : "password"}
+              type="password"
               value={channel.url}
               disabled={disabled}
               onChange={(event) =>

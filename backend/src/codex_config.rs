@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -23,8 +23,8 @@ use crate::codex_config_guidance::{
     remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
-    CodeyConfig, ProviderProfile, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT,
-    SUBAGENT_ROLE_IDS, SubagentRoleConfig, default_config_path,
+    CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
+    SubagentRoleConfig, default_config_path,
 };
 #[cfg(test)]
 use crate::config::{DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT};
@@ -51,7 +51,6 @@ use subagent_control::{disable_subagent_control_mcp, enable_subagent_control_mcp
 
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
-const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
 const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_ARG_MARKER: &str = "--codey-fastctx-mcp";
@@ -80,14 +79,6 @@ const RUNTIME_CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const RUNTIME_CONFIG_LOCK_RETRY: Duration = Duration::from_millis(10);
 const RUNTIME_AGENT_SCHEMA_VERSION: u32 = 1;
 const CODEY_WSL_ONLY_OVERRIDE_PREFIX: &str = "__CODEY_WSL_ONLY__:";
-const RESERVED_PROVIDER_IDS: [&str; 6] = [
-    "amazon-bedrock",
-    "openai",
-    "ollama",
-    "lmstudio",
-    "oss",
-    "ollama-chat",
-];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -203,9 +194,8 @@ impl Drop for RuntimeConfigLock {
     }
 }
 
-pub(crate) struct RuntimeProviderConfigOptions<'a> {
-    pub profiles: &'a [ProviderProfile],
-    pub local_router: Option<&'a RuntimeRouterEndpoint>,
+pub(crate) struct RuntimeRouterConfigOptions<'a> {
+    pub local_router: &'a RuntimeRouterEndpoint,
     pub use_official_catalog: bool,
     pub default_model: Option<&'a str>,
     pub fast_context_tools: bool,
@@ -213,13 +203,10 @@ pub(crate) struct RuntimeProviderConfigOptions<'a> {
     pub subagent_model: &'a str,
     pub subagent_reasoning_effort: &'a str,
     pub subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
-    pub preserve_provider_route: bool,
-    pub expected_config: Option<&'a [u8]>,
 }
 
 #[derive(Debug)]
-pub(crate) struct AppliedRuntimeProviderConfig {
-    pub config_contents: Vec<u8>,
+pub(crate) struct AppliedRuntimeRouterConfig {
     pub runtime_config_overrides: Vec<String>,
     pub fast_context_tools_active: bool,
 }
@@ -233,9 +220,8 @@ pub(crate) struct FastContextToolsStatus {
     pub server_id: Option<String>,
 }
 
-struct ProviderApplyOptions<'a> {
-    profiles: &'a [ProviderProfile],
-    local_router: Option<&'a RuntimeRouterEndpoint>,
+struct RouterApplyOptions<'a> {
+    local_router: &'a RuntimeRouterEndpoint,
     use_official_catalog: bool,
     default_model: Option<&'a str>,
     fastctx_command: Option<&'a Path>,
@@ -245,8 +231,6 @@ struct ProviderApplyOptions<'a> {
     subagent_roles: Option<&'a BTreeMap<String, SubagentRoleConfig>>,
     marker: &'a Path,
     backup_root: &'a Path,
-    preserve_provider_route: bool,
-    expected_config: Option<&'a [u8]>,
 }
 
 #[derive(Clone, Debug)]
@@ -263,20 +247,16 @@ struct RuntimeAgentPlan {
     contents: Vec<u8>,
 }
 
-pub(crate) fn apply_runtime_provider_config(
+pub(crate) fn apply_runtime_router_config(
     home: &Path,
-    profile: &ProviderProfile,
-    provider_id: &str,
-    options: RuntimeProviderConfigOptions<'_>,
-) -> Result<AppliedRuntimeProviderConfig> {
+    options: RuntimeRouterConfigOptions<'_>,
+) -> Result<AppliedRuntimeRouterConfig> {
     let marker = lease_marker_path();
     let _runtime_config_lock = RuntimeConfigLock::acquire(&marker)?;
     let backup_root = marker.with_file_name("codex-backups");
     let fastctx_command = resolve_fastctx_command(options.fast_context_tools);
     let use_official_catalog = options.use_official_catalog;
-    let default_model = (!options.preserve_provider_route)
-        .then_some(options.default_model)
-        .flatten();
+    let default_model = options.default_model;
     if !cfg!(any(windows, target_os = "macos")) {
         bail!(
             "当前平台尚不能把 Codey Provider 配置限定到单次 Codex 进程；为避免修改用户 config.toml，已取消启动"
@@ -284,12 +264,9 @@ pub(crate) fn apply_runtime_provider_config(
     }
     // The startup patch injects these values into every managed app-server as
     // command-local `-c` overrides. Never fall back to rewriting config.toml.
-    apply_isolated_runtime_provider_config(
+    apply_isolated_runtime_router_config(
         home,
-        profile,
-        provider_id,
-        ProviderApplyOptions {
-            profiles: options.profiles,
+        RouterApplyOptions {
             local_router: options.local_router,
             use_official_catalog,
             default_model,
@@ -300,8 +277,6 @@ pub(crate) fn apply_runtime_provider_config(
             subagent_roles: options.subagent_roles,
             marker: &marker,
             backup_root: &backup_root,
-            preserve_provider_route: options.preserve_provider_route,
-            expected_config: options.expected_config,
         },
     )
 }
@@ -346,14 +321,11 @@ fn fastctx_server_command() -> Result<PathBuf> {
         })
 }
 
-fn apply_isolated_runtime_provider_config(
+fn apply_isolated_runtime_router_config(
     home: &Path,
-    profile: &ProviderProfile,
-    provider_id: &str,
-    options: ProviderApplyOptions<'_>,
-) -> Result<AppliedRuntimeProviderConfig> {
-    let ProviderApplyOptions {
-        profiles,
+    options: RouterApplyOptions<'_>,
+) -> Result<AppliedRuntimeRouterConfig> {
+    let RouterApplyOptions {
         local_router,
         use_official_catalog,
         default_model,
@@ -364,47 +336,32 @@ fn apply_isolated_runtime_provider_config(
         subagent_roles,
         marker,
         backup_root,
-        preserve_provider_route,
-        expected_config,
     } = options;
     fs::create_dir_all(home)?;
     let config_path = home.join("config.toml");
     let hooks_path = home.join("hooks.json");
     let original_config = read_codex_config(&config_path)?;
-    if let Some(expected_config) = expected_config
-        && original_config.as_deref() != Some(expected_config)
-    {
-        bail!("Codex 配置在启动准备期间发生变化；已取消本次启动以避免混用线路");
-    }
     let existing = str::from_utf8(original_config.as_deref().unwrap_or_default())
         .context("Codex config.toml 不是 UTF-8")?;
-    if local_router.is_some() {
-        let persistent = parse_document(existing).context("解析 Codex config.toml 失败")?;
-        if persistent
-            .get("model_providers")
-            .and_then(Item::as_table)
-            .and_then(|providers| providers.get(local_router::ROUTER_PROVIDER_ID))
-            .is_some()
-        {
-            anyhow::bail!(
-                "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
-                local_router::ROUTER_PROVIDER_ID
-            );
-        }
+    let persistent = parse_document(existing).context("解析 Codex config.toml 失败")?;
+    if persistent
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(local_router::ROUTER_PROVIDER_ID))
+        .is_some()
+    {
+        anyhow::bail!(
+            "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
+            local_router::ROUTER_PROVIDER_ID
+        );
     }
-    let provider_id = validated_provider_id(provider_id)?;
     // Codex resolves this path from the app-server working directory, which is
     // `/` for the packaged macOS app, rather than from CODEX_HOME.
-    let model_catalog_path = (use_official_catalog
-        || (preserve_provider_route
-            && subagent_optimization
-            && crate::model_catalog::is_available(home)))
-    .then(|| home.join(crate::model_catalog::relative_path()));
+    let model_catalog_path =
+        use_official_catalog.then(|| home.join(crate::model_catalog::relative_path()));
     let effective = patch_config_with_fastctx_mode(
         existing,
-        profile,
-        &provider_id,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path: &config_path,
             model_catalog_path: model_catalog_path.as_deref(),
             default_model,
@@ -412,7 +369,6 @@ fn apply_isolated_runtime_provider_config(
             subagent_optimization,
             subagent_model,
             subagent_reasoning_effort,
-            preserve_provider_route,
             local_router,
         },
     )?;
@@ -424,13 +380,6 @@ fn apply_isolated_runtime_provider_config(
             model_catalog_path.as_deref(),
         );
     }
-    let runtime_provider_ids = install_runtime_provider_tables(
-        &mut effective_document,
-        profiles,
-        &provider_id,
-        preserve_provider_route,
-        local_router,
-    )?;
     let fastctx_namespace = effective_document
         .get("mcp_servers")
         .and_then(Item::as_table)
@@ -522,9 +471,8 @@ fn apply_isolated_runtime_provider_config(
         &runtime_agents,
         model_catalog_path.as_deref(),
         fastctx_namespace,
-        &runtime_provider_ids,
+        local_router::ROUTER_PROVIDER_ID,
         &hook_trust_entries,
-        preserve_provider_route,
     )?;
 
     create_private_dir_all(backup_root)?;
@@ -615,8 +563,7 @@ fn apply_isolated_runtime_provider_config(
         }
     }
 
-    Ok(AppliedRuntimeProviderConfig {
-        config_contents: original_config.unwrap_or_default(),
+    Ok(AppliedRuntimeRouterConfig {
         runtime_config_overrides,
         fast_context_tools_active: fastctx_command.is_some(),
     })
@@ -624,27 +571,22 @@ fn apply_isolated_runtime_provider_config(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn apply_isolated_cc_switch_runtime_config(
+fn apply_isolated_test_runtime_config(
     home: &Path,
-    profile: &ProviderProfile,
-    provider_id: &str,
+    use_official_catalog: bool,
     fastctx_command: Option<&Path>,
     subagent_optimization: bool,
     subagent_model: &str,
     subagent_reasoning_effort: &str,
     subagent_roles: Option<&BTreeMap<String, SubagentRoleConfig>>,
-    expected_config: Option<&[u8]>,
     marker: &Path,
     backup_root: &Path,
-) -> Result<AppliedRuntimeProviderConfig> {
-    apply_isolated_runtime_provider_config(
+) -> Result<AppliedRuntimeRouterConfig> {
+    apply_isolated_runtime_router_config(
         home,
-        profile,
-        provider_id,
-        ProviderApplyOptions {
-            profiles: std::slice::from_ref(profile),
-            local_router: None,
-            use_official_catalog: false,
+        RouterApplyOptions {
+            local_router: test_runtime_router_endpoint(),
+            use_official_catalog,
             default_model: None,
             fastctx_command,
             subagent_optimization,
@@ -653,8 +595,6 @@ fn apply_isolated_cc_switch_runtime_config(
             subagent_roles,
             marker,
             backup_root,
-            preserve_provider_route: true,
-            expected_config,
         },
     )
 }
@@ -1164,13 +1104,13 @@ fn runtime_home_for_lease(state: &RuntimeConfigLease) -> PathBuf {
     }
 }
 
-pub fn restore_runtime_provider_config(home: &Path) -> Result<bool> {
+pub fn restore_runtime_config(home: &Path) -> Result<bool> {
     let marker = lease_marker_path();
     let _runtime_config_lock = RuntimeConfigLock::acquire(&marker)?;
-    restore_runtime_provider_config_at(home, &marker)
+    restore_runtime_config_at(home, &marker)
 }
 
-fn restore_runtime_provider_config_at(home: &Path, marker: &Path) -> Result<bool> {
+fn restore_runtime_config_at(home: &Path, marker: &Path) -> Result<bool> {
     let state = match fs::read_to_string(marker) {
         Ok(contents) => serde_json::from_str::<RuntimeConfigLease>(&contents)
             .with_context(|| format!("解析 Codey Codex lease 失败：{}", marker.display()))?,
@@ -1370,30 +1310,15 @@ pub(crate) fn fast_context_tools_status(home: &Path) -> Result<FastContextToolsS
 }
 
 #[cfg(test)]
-pub fn patch_config(
-    existing: &str,
-    profile: &ProviderProfile,
-    provider_id: &str,
-    use_official_catalog: bool,
-) -> Result<String> {
+pub fn patch_config(existing: &str, use_official_catalog: bool) -> Result<String> {
     let model_catalog_path =
         use_official_catalog.then(|| Path::new(crate::model_catalog::relative_path()));
-    patch_config_with_fastctx(
-        existing,
-        profile,
-        provider_id,
-        model_catalog_path,
-        None,
-        None,
-        false,
-    )
+    patch_config_with_fastctx(existing, model_catalog_path, None, None, false)
 }
 
 #[cfg(test)]
 fn patch_config_with_fastctx(
     existing: &str,
-    profile: &ProviderProfile,
-    provider_id: &str,
     model_catalog_path: Option<&Path>,
     default_model: Option<&str>,
     fastctx_command: Option<&Path>,
@@ -1401,9 +1326,7 @@ fn patch_config_with_fastctx(
 ) -> Result<String> {
     patch_config_with_fastctx_mode(
         existing,
-        profile,
-        provider_id,
-        ProviderPatchOptions {
+        RouterPatchOptions {
             config_path: Path::new("config.toml"),
             model_catalog_path,
             default_model,
@@ -1411,13 +1334,22 @@ fn patch_config_with_fastctx(
             subagent_optimization,
             subagent_model: DEFAULT_SUBAGENT_MODEL,
             subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
-            preserve_provider_route: false,
-            local_router: None,
+            local_router: test_runtime_router_endpoint(),
         },
     )
 }
 
-struct ProviderPatchOptions<'a> {
+#[cfg(test)]
+fn test_runtime_router_endpoint() -> &'static RuntimeRouterEndpoint {
+    static ENDPOINT: OnceLock<RuntimeRouterEndpoint> = OnceLock::new();
+    ENDPOINT.get_or_init(|| RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".to_string(),
+        token: "test-router-token".to_string(),
+        requires_openai_auth: false,
+    })
+}
+
+struct RouterPatchOptions<'a> {
     config_path: &'a Path,
     model_catalog_path: Option<&'a Path>,
     default_model: Option<&'a str>,
@@ -1425,17 +1357,14 @@ struct ProviderPatchOptions<'a> {
     subagent_optimization: bool,
     subagent_model: &'a str,
     subagent_reasoning_effort: &'a str,
-    preserve_provider_route: bool,
-    local_router: Option<&'a RuntimeRouterEndpoint>,
+    local_router: &'a RuntimeRouterEndpoint,
 }
 
 fn patch_config_with_fastctx_mode(
     existing: &str,
-    profile: &ProviderProfile,
-    provider_id: &str,
-    options: ProviderPatchOptions<'_>,
+    options: RouterPatchOptions<'_>,
 ) -> Result<String> {
-    let ProviderPatchOptions {
+    let RouterPatchOptions {
         config_path,
         model_catalog_path,
         default_model,
@@ -1443,61 +1372,17 @@ fn patch_config_with_fastctx_mode(
         subagent_optimization,
         subagent_model,
         subagent_reasoning_effort,
-        preserve_provider_route,
         local_router,
     } = options;
-    // Official OpenAI routes use Codex's built-in model metadata. In
-    // particular, do not let Codey's generated catalog override the official
-    // context window or automatic-compaction defaults. Third-party routes keep
-    // using the generated catalog for filtering and synthetic model entries.
-    let model_catalog_path = (!profile.cc_switch_read_only)
-        .then_some(model_catalog_path)
-        .flatten();
     let mut doc = parse_document(existing)?;
-    if preserve_provider_route {
-        ensure_active_provider_uses_responses(&doc)?;
-    }
-    // CC Switch owns all routing and model-selection fields while Live
-    // takeover is active. Codey only layers its independent runtime
-    // enhancements onto the current Live document.
-    if !preserve_provider_route {
-        let provider_id = validated_provider_id(provider_id)?;
-        let uses_builtin_provider =
-            profile.cc_switch_read_only && is_reserved_provider_id(&provider_id);
-        if uses_builtin_provider {
-            // Keep built-in providers built-in. Current Codex ignores most
-            // configured overrides for reserved provider ids, and these routes
-            // already obtain their endpoint and authentication internally.
-        } else {
-            if is_reserved_provider_id(&provider_id) {
-                anyhow::bail!(
-                    "当前第三方线路使用了 Codex 保留 Provider ID「{provider_id}」；请改用非保留的自定义 ID 后重试"
-                );
-            }
-            ensure_provider_table(&mut doc)?;
-            let existing_local_provider = doc
-                .get("model_providers")
-                .and_then(Item::as_table)
-                .and_then(|providers| providers.get(&provider_id))
-                .and_then(Item::as_table)
-                .cloned();
-            let provider = if provider_id == local_router::ROUTER_PROVIDER_ID {
-                let router = local_router
-                    .ok_or_else(|| anyhow::anyhow!("Codey 本地路由 Provider 缺少运行时入口"))?;
-                local_router_provider_table(router, existing_local_provider)
-            } else if profile.cc_switch_read_only {
-                official_provider_table(existing_local_provider)
-            } else {
-                direct_provider_table(profile, existing_local_provider)?
-            };
-            doc["model_providers"]
-                .as_table_mut()
-                .expect("model_providers was initialized")[&provider_id] = Item::Table(provider);
-        }
-        doc["model_provider"] = value(&provider_id);
-        update_model_catalog_reference(&mut doc, config_path, model_catalog_path);
-        set_model_selection(&mut doc, default_model);
-    }
+    ensure_provider_table(&mut doc)?;
+    doc["model_providers"]
+        .as_table_mut()
+        .expect("model_providers was initialized")[local_router::ROUTER_PROVIDER_ID] =
+        Item::Table(local_router_provider_table(local_router));
+    doc["model_provider"] = value(local_router::ROUTER_PROVIDER_ID);
+    update_model_catalog_reference(&mut doc, config_path, model_catalog_path);
+    set_model_selection(&mut doc, default_model);
     enable_desktop_reasoning_efforts(&mut doc)?;
     ensure_default_service_tier(&mut doc);
     let fastctx_namespace = if let Some(command) = fastctx_command {
@@ -1525,91 +1410,6 @@ fn patch_config_with_fastctx_mode(
         }
     }
     document_string(&doc)
-}
-
-/// Add every saved Codey route to the in-memory Codex document. The resulting
-/// tables are emitted exclusively as command-local `-c` overrides, so the
-/// user's persistent config.toml is never rewritten.
-fn install_runtime_provider_tables(
-    doc: &mut DocumentMut,
-    profiles: &[ProviderProfile],
-    active_provider_id: &str,
-    preserve_provider_route: bool,
-    local_router: Option<&RuntimeRouterEndpoint>,
-) -> Result<Vec<String>> {
-    let mut seen = BTreeSet::new();
-    let mut installed = Vec::new();
-
-    if let Some(router) = local_router {
-        ensure_provider_table(doc)?;
-        let existing_provider = doc
-            .get("model_providers")
-            .and_then(Item::as_table)
-            .and_then(|providers| providers.get(local_router::ROUTER_PROVIDER_ID))
-            .and_then(Item::as_table)
-            .cloned();
-        doc["model_providers"]
-            .as_table_mut()
-            .expect("model_providers was initialized")[local_router::ROUTER_PROVIDER_ID] =
-            Item::Table(local_router_provider_table(router, existing_provider));
-        installed.push(local_router::ROUTER_PROVIDER_ID.to_string());
-    }
-
-    if !preserve_provider_route
-        && !is_reserved_provider_id(active_provider_id)
-        && doc
-            .get("model_providers")
-            .and_then(Item::as_table)
-            .and_then(|providers| providers.get(active_provider_id))
-            .and_then(Item::as_table)
-            .is_some()
-    {
-        installed.push(active_provider_id.to_string());
-    }
-
-    for profile in profiles {
-        let provider_id = validated_provider_id(profile.provider_id())?;
-        if !seen.insert(provider_id.clone()) {
-            bail!("多条线路使用了相同的 Codex Provider ID「{provider_id}」");
-        }
-        if provider_id == active_provider_id {
-            continue;
-        }
-        profile.validate().map_err(anyhow::Error::msg)?;
-        if local_router.is_some() && !profile.cc_switch_read_only {
-            continue;
-        }
-        if profile.cc_switch_read_only && is_reserved_provider_id(&provider_id) {
-            continue;
-        }
-        if is_reserved_provider_id(&provider_id) {
-            bail!(
-                "第三方线路「{}」使用了 Codex 保留 Provider ID「{provider_id}」",
-                profile.name
-            );
-        }
-
-        ensure_provider_table(doc)?;
-        let existing_provider = doc
-            .get("model_providers")
-            .and_then(Item::as_table)
-            .and_then(|providers| providers.get(&provider_id))
-            .and_then(Item::as_table)
-            .cloned();
-        let provider = if profile.cc_switch_read_only {
-            official_provider_table(existing_provider)
-        } else {
-            direct_provider_table(profile, existing_provider)?
-        };
-        doc["model_providers"]
-            .as_table_mut()
-            .expect("model_providers was initialized")[&provider_id] = Item::Table(provider);
-        installed.push(provider_id);
-    }
-
-    installed.sort();
-    installed.dedup();
-    Ok(installed)
 }
 
 fn enable_subagent_optimization(
@@ -1939,9 +1739,8 @@ fn build_isolated_runtime_overrides(
     runtime_agents: &[RuntimeAgentRegistration],
     model_catalog_path: Option<&Path>,
     fastctx_namespace: Option<&str>,
-    provider_ids: &[String],
+    provider_id: &str,
     hook_trust_entries: &[RuntimeHookTrustEntry],
-    preserve_provider_route: bool,
 ) -> Result<Vec<String>> {
     let mut overrides = Vec::new();
     push_required_document_override(
@@ -1952,17 +1751,15 @@ fn build_isolated_runtime_overrides(
     )?;
     push_required_document_override(&mut overrides, effective, &["service_tier"], "service_tier")?;
 
-    if !preserve_provider_route {
-        push_required_document_override(
-            &mut overrides,
-            effective,
-            &["model_provider"],
-            "model_provider",
-        )?;
-        push_document_override(&mut overrides, effective, &["model"], "model")?;
-    }
+    push_required_document_override(
+        &mut overrides,
+        effective,
+        &["model_provider"],
+        "model_provider",
+    )?;
+    push_document_override(&mut overrides, effective, &["model"], "model")?;
 
-    if model_catalog_path.is_some() && !(preserve_provider_route && !runtime_agents.is_empty()) {
+    if model_catalog_path.is_some() {
         push_document_override(
             &mut overrides,
             effective,
@@ -1971,35 +1768,30 @@ fn build_isolated_runtime_overrides(
         )?;
     }
 
-    // Provider tables are process-local even while a CC Switch live route owns
-    // the root model_provider. That lets the renderer switch to any other saved
-    // Codey route without mutating the live or persistent Codex configuration.
-    for provider_id in provider_ids {
-        if !is_reserved_provider_id(provider_id)
-            && effective
-                .get("model_providers")
-                .and_then(Item::as_table)
-                .and_then(|providers| providers.get(provider_id))
-                .and_then(Item::as_table)
-                .is_some()
+    // The only runtime provider is Codey's process-local loopback gateway.
+    // Upstream route tables and credentials never enter Codex's configuration.
+    let provider_segment = codex_config_override_bare_segment(provider_id, "Codex Provider ID")?;
+    for field in [
+        "name",
+        "base_url",
+        "wire_api",
+        "requires_openai_auth",
+        "supports_websockets",
+        "experimental_bearer_token",
+        "http_headers",
+    ] {
+        if field == "http_headers"
+            && document_item_at(effective, &["model_providers", provider_id, field])
+                .is_some_and(|item| item.as_value().is_none())
         {
-            let provider_segment =
-                codex_config_override_bare_segment(provider_id, "Codex Provider ID")?;
-            for field in [
-                "name",
-                "base_url",
-                "wire_api",
-                "requires_openai_auth",
-                "experimental_bearer_token",
-            ] {
-                push_document_override(
-                    &mut overrides,
-                    effective,
-                    &["model_providers", provider_id.as_str(), field],
-                    &format!("model_providers.{provider_segment}.{field}"),
-                )?;
-            }
+            continue;
         }
+        push_document_override(
+            &mut overrides,
+            effective,
+            &["model_providers", provider_id, field],
+            &format!("model_providers.{provider_segment}.{field}"),
+        )?;
     }
 
     if fastctx_namespace.is_some() {
@@ -2152,13 +1944,6 @@ fn build_isolated_runtime_overrides(
                 &["features", "code_mode", "direct_only_tool_namespaces"],
                 "features.code_mode.direct_only_tool_namespaces",
             )?;
-        }
-        if preserve_provider_route && let Some(model_catalog_path) = model_catalog_path {
-            push_runtime_override_value(
-                &mut overrides,
-                "model_catalog_json",
-                &Value::from(model_catalog_path.to_string_lossy().into_owned()),
-            );
         }
         for (path, key) in [
             (&["agents", "enabled"][..], "agents.enabled"),
@@ -2736,79 +2521,22 @@ fn codey_hook_inline_table(
     handler
 }
 
-fn direct_provider_table(
-    profile: &ProviderProfile,
-    existing_local_provider: Option<Table>,
-) -> Result<Table> {
-    let base_url = profile.normalized_base_url();
-    if base_url.is_empty() {
-        anyhow::bail!("第三方线路缺少 API 地址");
-    }
-    let preserves_manual_settings = existing_local_provider.is_some();
-    let mut provider = existing_local_provider.unwrap_or_default();
-    provider["name"] = value(if profile.supports_remote_compaction {
-        OPENAI_PROVIDER_NAME
-    } else {
-        profile.name.trim()
-    });
-    provider["base_url"] = value(base_url);
-    provider["wire_api"] = value(profile.runtime_wire_api().map_err(anyhow::Error::msg)?);
-    if !preserves_manual_settings {
-        provider["requires_openai_auth"] = value(profile.supports_remote_compaction);
-    }
-    if !profile.api_key.trim().is_empty() {
-        provider["experimental_bearer_token"] = value(profile.api_key.trim());
-    } else {
-        anyhow::bail!("第三方线路「{}」缺少 API Key", profile.name);
-    }
-    Ok(provider)
-}
-
-fn local_router_provider_table(
-    endpoint: &RuntimeRouterEndpoint,
-    existing_local_provider: Option<Table>,
-) -> Table {
-    let mut provider = existing_local_provider.unwrap_or_default();
+fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
+    let mut provider = Table::new();
     provider["name"] = value("Codey Local Router");
     provider["base_url"] = value(endpoint.base_url.trim_end_matches('/'));
     provider["wire_api"] = value("responses");
-    provider["requires_openai_auth"] = value(false);
-    provider["experimental_bearer_token"] = value(endpoint.token.as_str());
-    provider
-}
-
-fn ensure_active_provider_uses_responses(doc: &DocumentMut) -> Result<()> {
-    let provider_id = doc
-        .get("model_provider")
-        .and_then(Item::as_str)
-        .map(str::trim)
-        .filter(|provider_id| !provider_id.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("CC Switch Live 配置缺少活动 model_provider"))?;
-    let wire_api = doc
-        .get("model_providers")
-        .and_then(Item::as_table_like)
-        .and_then(|providers| providers.get(provider_id))
-        .and_then(Item::as_table_like)
-        .and_then(|provider| provider.get("wire_api"))
-        .and_then(Item::as_str)
-        .unwrap_or("responses")
-        .trim();
-    if wire_api.eq_ignore_ascii_case("responses") {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "当前 Codex 已移除 wire_api = {wire_api:?}；请将 CC Switch Live 线路改为 Responses API 后重试"
-        )
+    provider["requires_openai_auth"] = value(endpoint.requires_openai_auth);
+    provider["supports_websockets"] = value(false);
+    let mut headers = InlineTable::new();
+    headers.insert(
+        local_router::ROUTER_AUTH_HEADER,
+        Value::from(endpoint.token.as_str()),
+    );
+    provider["http_headers"] = Item::Value(Value::InlineTable(headers));
+    if !endpoint.requires_openai_auth {
+        provider["experimental_bearer_token"] = value(endpoint.token.as_str());
     }
-}
-
-fn official_provider_table(existing_provider: Option<Table>) -> Table {
-    let mut provider = existing_provider.unwrap_or_default();
-    provider["name"] = value(OPENAI_PROVIDER_NAME);
-    provider["base_url"] = value(CHATGPT_CODEX_BASE_URL);
-    provider["wire_api"] = value("responses");
-    provider["requires_openai_auth"] = value(true);
-    provider.remove("experimental_bearer_token");
     provider
 }
 
@@ -2938,30 +2666,6 @@ fn set_model_selection(doc: &mut DocumentMut, default_model: Option<&str>) {
 fn root_key_string(contents: &str, key: &str) -> Option<String> {
     let doc = contents.parse::<DocumentMut>().ok()?;
     doc.get(key).and_then(Item::as_str).map(ToString::to_string)
-}
-
-#[cfg(test)]
-fn provider_base_url(contents: &str, provider_id: &str) -> Option<String> {
-    let doc = contents.parse::<DocumentMut>().ok()?;
-    doc.get("model_providers")
-        .and_then(Item::as_table)?
-        .get(provider_id)
-        .and_then(Item::as_table)?
-        .get("base_url")
-        .and_then(Item::as_str)
-        .map(|value| value.trim_end_matches('/').to_string())
-}
-
-fn validated_provider_id(provider_id: &str) -> Result<String> {
-    let provider_id = provider_id.trim();
-    if provider_id.is_empty() {
-        anyhow::bail!("Codex 活动 model_provider 不能为空");
-    }
-    Ok(provider_id.to_string())
-}
-
-pub(crate) fn is_reserved_provider_id(provider_id: &str) -> bool {
-    RESERVED_PROVIDER_IDS.contains(&provider_id)
 }
 
 const BACKUP_RETENTION_COUNT: usize = 5;

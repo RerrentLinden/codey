@@ -1,4 +1,4 @@
-import { memo, useMemo, type CSSProperties } from "react";
+import { memo, type CSSProperties } from "react";
 import { IconAdjustmentsHorizontal, IconInfoCircle, IconUsersGroup } from "@tabler/icons-react";
 
 import type {
@@ -15,9 +15,14 @@ import {
   Table,
   Tooltip,
 } from "./components/mantine";
+import { ModelCombobox } from "./components/ModelCombobox";
+import { routeProviderId } from "./modelRoutes";
+import {
+  resolveSubagentModelOption,
+  type SubagentModelOption,
+} from "./subagentModels";
 import { compactSelectInputClass, surfaceCardPaddingClass } from "./uiClasses";
 import { SETTINGS_OVERLAY_Z_INDEX } from "./overlay.constants";
-import type { SubagentModelOption } from "./useModelSelection";
 
 const GPU_LAUNCH_MODES = [
   { value: "off", label: "关闭" },
@@ -87,14 +92,12 @@ export function SubagentPolicyCardComponent({
   onSubagentOptimizationChange,
 }: SubagentPolicyCardProps) {
   const subagentPolicyControlsDisabled = isBusy;
-  const subagentModelSelectOptions = useMemo(
-    () =>
-      subagentModelOptions.map((option) => ({
-        label: option.label,
-        value: option.value,
-      })),
-    [subagentModelOptions],
-  );
+  const preferredProfile =
+    config.profiles.find((profile) => profile.id === config.activeProfileId) ??
+    config.profiles[0];
+  const preferredProviderId = preferredProfile
+    ? routeProviderId(preferredProfile)
+    : undefined;
 
   return (
     <section className="secondary-section subagent-section" aria-labelledby="subagent-title">
@@ -149,10 +152,10 @@ export function SubagentPolicyCardComponent({
                         model: config.subagentModel,
                         reasoningEffort: config.subagentReasoningEffort,
                       };
-                      const selectedModel = subagentModelOptions.find(
-                        (option) =>
-                          option.value.trim().toLowerCase() ===
-                          selection.model.trim().toLowerCase(),
+                      const selectedModel = resolveSubagentModelOption(
+                        subagentModelOptions,
+                        selection.model,
+                        preferredProviderId,
                       );
                       const reasoningEfforts =
                         selectedModel?.supportedReasoningEfforts ?? [];
@@ -199,31 +202,25 @@ export function SubagentPolicyCardComponent({
                             </div>
                           </Table.Td>
                           <Table.Td>
-                            <Select
-                              className="w-full min-w-0"
-                              inputClassName={compactSelectInputClass}
-                              sectionClassName="text-[#6e6e73]"
+                            <ModelCombobox
                               aria-label={`${task.name}模型`}
-                              value={selectedModel?.value}
+                              value={selection.model}
                               placeholder={
                                 subagentModelOptions.length === 0
-                                  ? "当前线路暂无模型"
+                                  ? "所有线路均暂无模型"
                                   : "请选择模型"
                               }
                               disabled={
                                 subagentPolicyControlsDisabled ||
                                 subagentModelOptions.length === 0
                               }
-                              optionList={subagentModelSelectOptions}
-                              dropdownClassName="rounded-[10px]"
-                              showClear={false}
-                              filter={false}
+                              options={subagentModelOptions}
+                              preferredProviderId={preferredProviderId}
                               getPopupContainer={() => popupContainer ?? document.body}
                               zIndex={SETTINGS_OVERLAY_Z_INDEX}
                               onChange={(value) => {
                                 const option = subagentModelOptions.find(
-                                  (candidate) =>
-                                    candidate.value === String(value ?? ""),
+                                  (candidate) => candidate.value === value,
                                 );
                                 if (!option) return;
                                 const reasoningEffort =
@@ -260,7 +257,7 @@ export function SubagentPolicyCardComponent({
                               zIndex={SETTINGS_OVERLAY_Z_INDEX}
                               onChange={(value) =>
                                 updateRole(
-                                  selection.model,
+                                  selectedModel?.value ?? selection.model,
                                   String(value ?? ""),
                                 )
                               }
@@ -274,8 +271,8 @@ export function SubagentPolicyCardComponent({
               </Table.ScrollContainer>
               <small>
                 {subagentModelOptions.length === 0
-                  ? "请先在模型管理中添加当前线路可用模型"
-                  : "首次开启需重启；模型或思考深度保存后对下一次派生效。角色权限是默认值，实际受父任务权限模式约束"}
+                  ? "请先在模型管理中为任一可用线路启用模型"
+                  : "可搜索并选择任意可用线路的模型；首次开启需重启，保存后对下一次派生生效。角色权限仍受父任务权限模式约束"}
               </small>
             </>
           ) : (

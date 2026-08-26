@@ -94,6 +94,7 @@ pub fn optimizer_http_client() -> Result<Client, String> {
     Client::builder()
         .user_agent(format!("Codey/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|error| format!("创建优化 HTTP 客户端失败：{error}"))
 }
@@ -103,11 +104,7 @@ fn request_endpoint(base_url: &str) -> Result<String, String> {
     if base_url.is_empty() {
         return Err("请先配置 OpenAI 兼容 API 地址".to_string());
     }
-    let url =
-        reqwest::Url::parse(base_url).map_err(|_| "API 地址不是有效的 HTTP(S) 地址".to_string())?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err("API 地址必须是有效的 HTTP(S) 地址".to_string());
-    }
+    crate::config::validate_outbound_api_url(base_url, "API 地址")?;
     if base_url.ends_with("/chat/completions") {
         return Err(
             "Codey 已移除协议转换能力；请改用提供 Responses API 的第三方网关地址".to_string(),
@@ -142,6 +139,7 @@ fn models_endpoints_from_base(base_url: &str) -> Result<Vec<String>, String> {
     if base_url.is_empty() {
         return Err("请先配置 OpenAI 兼容 API 地址".to_string());
     }
+    crate::config::validate_outbound_api_url(base_url, "API 地址")?;
     model_list::model_endpoints(base_url, false, true).map_err(|error| match error {
         ModelEndpointError::InvalidUrl => "API 地址不是有效的 HTTP(S) 地址".to_string(),
         ModelEndpointError::UnsupportedSchemeOrHost => {

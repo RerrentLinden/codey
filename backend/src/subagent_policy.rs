@@ -45,13 +45,25 @@ pub(crate) fn reconcile_with_model_state(
     state: Option<&model_catalog::ModelSelectionState>,
 ) {
     prepare_subagent_roles(config);
+    let route_aliases = config
+        .runtime_model_targets()
+        .into_iter()
+        .map(|target| target.alias)
+        .collect::<Vec<_>>();
     let Some(state) = state else {
+        canonicalize_route_aliases(&mut config.subagent_roles, &route_aliases);
         sync_legacy_default(config);
-        config.remember_current_subagent_config();
         return;
     };
     for selection in config.subagent_roles.values_mut() {
         let requested = selection.model.trim();
+        if let Some(alias) = route_aliases
+            .iter()
+            .find(|alias| model_id::equal(alias, requested))
+        {
+            selection.model.clone_from(alias);
+            continue;
+        }
         let Some(model) = state
             .available_model(requested)
             .or_else(|| state.available_model(&state.default_model))
@@ -66,7 +78,20 @@ pub(crate) fn reconcile_with_model_state(
         selection.model = model;
     }
     sync_legacy_default(config);
-    config.remember_current_subagent_config();
+}
+
+fn canonicalize_route_aliases(
+    roles: &mut std::collections::BTreeMap<String, SubagentRoleConfig>,
+    aliases: &[String],
+) {
+    for selection in roles.values_mut() {
+        if let Some(alias) = aliases
+            .iter()
+            .find(|alias| model_id::equal(alias, selection.model.trim()))
+        {
+            selection.model.clone_from(alias);
+        }
+    }
 }
 
 fn prepare_subagent_roles(config: &mut CodeyConfig) {
@@ -204,7 +229,7 @@ mod tests {
     fn route_config(provider_id: &str) -> CodeyConfig {
         let mut profile = ProviderProfile::new("Route");
         profile.id = provider_id.to_string();
-        profile.cc_switch_read_only = false;
+        profile.official_account = false;
         CodeyConfig {
             active_profile_id: provider_id.to_string(),
             profiles: vec![profile],
@@ -354,7 +379,39 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_provider_fallback_does_not_overwrite_another_provider() {
+    fn route_qualified_model_is_preserved_outside_the_current_route_state() {
+        let mut provider_a = ProviderProfile::new("A");
+        provider_a.id = "route-a".into();
+        let mut provider_b = ProviderProfile::new("B");
+        provider_b.id = "route-b".into();
+        let mut config = CodeyConfig {
+            active_profile_id: provider_a.id.clone(),
+            profiles: vec![provider_a, provider_b],
+            selected_models_by_provider: std::collections::BTreeMap::from([
+                ("route-a".into(), vec![DEFAULT_SUBAGENT_MODEL.into()]),
+                ("route-b".into(), vec!["provider-special".into()]),
+            ]),
+            subagent_optimization: true,
+            subagent_model: "route-b/provider-special".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: uniform_subagent_roles("route-b/provider-special", "high"),
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        reconcile_with_model_state(&mut config, Some(&model_state()));
+
+        assert_eq!(config.subagent_model, "route-b/provider-special");
+        assert!(
+            config
+                .subagent_roles
+                .values()
+                .all(|selection| selection.model == "route-b/provider-special")
+        );
+    }
+
+    #[test]
+    fn incompatible_provider_fallback_remains_global_across_route_changes() {
         let mut provider_a = ProviderProfile::new("A");
         provider_a.id = "route-a".into();
         let mut provider_b = ProviderProfile::new("B");
@@ -371,7 +428,6 @@ mod tests {
         .normalize();
 
         config.active_profile_id = "route-b".into();
-        config.restore_current_subagent_config();
         let mut route_b_models = model_state();
         route_b_models
             .official_models
@@ -381,12 +437,10 @@ mod tests {
         assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
 
         config.active_profile_id = "route-a".into();
-        config.restore_current_subagent_config();
-        assert_eq!(config.subagent_model, "gpt-5.6-luna");
+        assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
         assert_eq!(config.subagent_reasoning_effort, "high");
 
         config.active_profile_id = "route-b".into();
-        config.restore_current_subagent_config();
         assert_eq!(config.subagent_model, DEFAULT_SUBAGENT_MODEL);
     }
 

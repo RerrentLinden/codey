@@ -1,13 +1,19 @@
-import { memo, useMemo, useState } from "react";
+import { memo, useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import {
   IconCheck as Check,
+  IconCpu,
   IconEdit as Edit,
   IconEye,
   IconEyeOff,
+  IconInfoCircle,
   IconPlus as Plus,
   IconRefresh as RefreshCw,
+  IconSearch,
   IconServer as Server,
+  IconShieldCheck,
   IconTrash as Trash,
+  IconWorld,
+  IconX,
 } from "@tabler/icons-react";
 
 import type { Config, ModelState, Profile } from "./App.types";
@@ -27,9 +33,12 @@ import {
   Select,
   Switch,
 } from "./components/mantine";
-import { modelIdsEqual, modelKey } from "./modelIds";
+import { modelIdsEqual, modelKey, uniqueModelIds } from "./modelIds";
+import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
 import { SETTINGS_OVERLAY_Z_INDEX } from "./overlay.constants";
+import { validateThirdPartyRouteShortName } from "./routeShortNames";
 import { flushCardClass } from "./uiClasses";
+import { validateOutboundApiUrl } from "./urlValidation";
 
 type ModelSectionProps = {
   config: Config;
@@ -44,7 +53,8 @@ type ModelSectionProps = {
   onSaveRoute: (route: Profile) => Promise<boolean>;
   onDeleteRoute: (routeId: string) => void;
   onFetchRouteModels: (route: Profile) => void;
-  onSaveOfficialRouteSettings: (
+  onToggleAccountUsage?: (checked: boolean) => void;
+  onSaveOfficialRouteSettings?: (
     routeId: string,
     models: string[],
     showAccountUsageInHeader: boolean,
@@ -60,20 +70,6 @@ type RouteModelGroup = {
   official: boolean;
 };
 
-function routeProviderId(profile: Profile) {
-  return profile.ccSwitchProviderId || profile.id;
-}
-
-function uniqueModels(models: string[]) {
-  const seen = new Set<string>();
-  return models.filter((model) => {
-    const key = modelKey(model);
-    if (!key || seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
 function newRouteName(profiles: Profile[]) {
   let index = profiles.length + 1;
   const names = new Set(profiles.map((profile) => profile.name));
@@ -86,15 +82,41 @@ function createRoute(profiles: Profile[]): Profile {
   return {
     id,
     name: newRouteName(profiles),
+    shortName: "",
     baseUrl: "",
     apiKey: "",
     upstreamProtocol: "openaiResponses",
     authMode: "apiKey",
     apiKeyConfigured: false,
     clearApiKey: false,
-    ccSwitchReadOnly: false,
+    officialAccount: false,
     supportsRemoteCompaction: false,
   };
+}
+
+type RouteDraftErrors = {
+  name: string;
+  shortName: string;
+  baseUrl: string;
+  apiKey: string;
+};
+
+function validateRouteDraft(route: Profile, profiles: readonly Profile[]): RouteDraftErrors {
+  if (route.authMode === "officialAccount") {
+    return { name: "", shortName: "", baseUrl: "", apiKey: "" };
+  }
+  const errors: RouteDraftErrors = {
+    name: route.name.trim() ? "" : "请输入线路名称",
+    shortName: validateThirdPartyRouteShortName(route.shortName, profiles, route.id),
+    baseUrl: "",
+    apiKey: "",
+  };
+  errors.baseUrl = validateOutboundApiUrl(route.baseUrl);
+  const hasApiKey =
+    route.apiKey.trim() !== "" ||
+    (route.apiKeyConfigured && !route.clearApiKey);
+  if (!hasApiKey) errors.apiKey = "请输入 API Key";
+  return errors;
 }
 
 const routeProtocolOptions: Array<{
@@ -102,7 +124,8 @@ const routeProtocolOptions: Array<{
   value: Profile["upstreamProtocol"];
 }> = [
   { label: "OpenAI Responses", value: "openaiResponses" },
-  { label: "第三方 Responses 兼容", value: "openaiCompatible" },
+  { label: "OpenAI Chat Completions", value: "openaiChatCompletions" },
+  { label: "Anthropic Messages", value: "anthropicMessages" },
 ];
 
 function ModelSectionComponent({
@@ -118,14 +141,18 @@ function ModelSectionComponent({
   onSaveRoute,
   onDeleteRoute,
   onFetchRouteModels,
+  onToggleAccountUsage,
   onSaveOfficialRouteSettings,
   onSetDefaultModel,
 }: ModelSectionProps) {
   const [routeDialogOpen, setRouteDialogOpen] = useState(false);
   const [routeDraft, setRouteDraft] = useState<Profile | null>(null);
+  const [routeValidationAttempted, setRouteValidationAttempted] = useState(false);
   const [routeApiKeyVisible, setRouteApiKeyVisible] = useState(false);
   const [officialModelDraft, setOfficialModelDraft] = useState<string[]>([]);
-  const [usageDraft, setUsageDraft] = useState(showAccountUsageInHeader);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedProviderFilter, setSelectedProviderFilter] = useState<string>("all");
+
   const visibleProfiles = useMemo(
     () =>
       config.profiles.filter(
@@ -146,7 +173,7 @@ function ModelSectionComponent({
   );
   const officialCatalog = useMemo(
     () =>
-      uniqueModels([
+      uniqueModelIds([
         ...modelState.officialModelIds,
         ...modelState.officialModels.map((model) => model.slug),
       ]),
@@ -165,11 +192,8 @@ function ModelSectionComponent({
         const models = official
           ? configuredModels.length > 0
             ? configuredModels
-            : uniqueModels([
-                ...modelState.officialModelIds,
-                ...modelState.officialModels.map((model) => model.slug),
-              ])
-          : uniqueModels([
+            : officialCatalog
+          : uniqueModelIds([
               ...configuredModels,
               ...(config.declaredOfficialModelsByProvider[providerId] || []),
             ]);
@@ -177,16 +201,88 @@ function ModelSectionComponent({
           profile,
           providerId,
           models,
-          defaultModel:
-            config.defaultModelByProvider[providerId] || models[0] || "",
+          defaultModel: globalDefaultForRoute(config, profile, models),
           official,
         };
       }),
-    [config, modelState.officialModelIds, modelState.officialModels, visibleProfiles],
+    [config, officialCatalog, visibleProfiles],
   );
+  const modelGroupByProviderId = useMemo(
+    () => new Map(modelGroups.map((group) => [group.providerId, group])),
+    [modelGroups],
+  );
+
+  const totalModelCount = useMemo(
+    () => modelGroups.reduce((count, group) => count + group.models.length, 0),
+    [modelGroups],
+  );
+  const providerFilterIds = useMemo(
+    () => ["all", ...modelGroups.map((group) => group.providerId)],
+    [modelGroups],
+  );
+  useEffect(() => {
+    if (!providerFilterIds.includes(selectedProviderFilter)) {
+      setSelectedProviderFilter("all");
+    }
+  }, [providerFilterIds, selectedProviderFilter]);
+  const routeDraftErrors = useMemo(
+    () => routeDraft ? validateRouteDraft(routeDraft, config.profiles) : null,
+    [config.profiles, routeDraft],
+  );
+  const routeDraftHasErrors = Boolean(
+    routeDraftErrors && Object.values(routeDraftErrors).some(Boolean),
+  );
+
+  const handleProviderTabKeyDown = (
+    event: KeyboardEvent<HTMLButtonElement>,
+  ) => {
+    const currentIndex = providerFilterIds.indexOf(selectedProviderFilter);
+    let nextIndex = currentIndex < 0 ? 0 : currentIndex;
+    if (event.key === "ArrowRight") {
+      nextIndex = (nextIndex + 1) % providerFilterIds.length;
+    } else if (event.key === "ArrowLeft") {
+      nextIndex = (nextIndex - 1 + providerFilterIds.length) % providerFilterIds.length;
+    } else if (event.key === "Home") {
+      nextIndex = 0;
+    } else if (event.key === "End") {
+      nextIndex = providerFilterIds.length - 1;
+    } else {
+      return;
+    }
+    event.preventDefault();
+    setSelectedProviderFilter(providerFilterIds[nextIndex]);
+    event.currentTarget
+      .parentElement
+      ?.querySelectorAll<HTMLButtonElement>('[role="tab"]')
+      .item(nextIndex)
+      .focus();
+  };
+
+  const displayedGroups = useMemo(() => {
+    const providerGroups = selectedProviderFilter === "all"
+      ? modelGroups
+      : modelGroups.filter((group) => group.providerId === selectedProviderFilter);
+    const term = searchQuery.trim().toLowerCase();
+    if (!term) return providerGroups;
+    return providerGroups.map((group) => {
+      return {
+        ...group,
+        models: group.models.filter((model) => {
+          const displayName = group.official
+            ? officialDisplayNames.get(modelKey(model)) || model
+            : model;
+          return (
+            model.toLowerCase().includes(term) ||
+            displayName.toLowerCase().includes(term)
+          );
+        }),
+      };
+    });
+  }, [modelGroups, officialDisplayNames, searchQuery, selectedProviderFilter]);
 
   const openNewRouteDialog = () => {
     setRouteDraft(createRoute(config.profiles));
+    setRouteValidationAttempted(false);
     setRouteApiKeyVisible(false);
     setOfficialModelDraft([]);
     setRouteDialogOpen(true);
@@ -194,6 +290,7 @@ function ModelSectionComponent({
   const openEditRouteDialog = (profile: Profile) => {
     const official = profile.authMode === "officialAccount";
     setRouteDraft({ ...profile, clearApiKey: false });
+    setRouteValidationAttempted(false);
     setRouteApiKeyVisible(false);
     if (official) {
       const providerId = routeProviderId(profile);
@@ -201,29 +298,39 @@ function ModelSectionComponent({
       setOfficialModelDraft(
         configuredModels.length > 0
           ? configuredModels
-          : uniqueModels([
-              ...modelState.officialModelIds,
-              ...modelState.officialModels.map((model) => model.slug),
-            ]),
+          : officialCatalog,
       );
-      setUsageDraft(showAccountUsageInHeader);
     }
     setRouteDialogOpen(true);
   };
   const updateRouteDraft = (patch: Partial<Profile>) => {
     setRouteDraft((current) => current ? { ...current, ...patch } : current);
   };
+  const toggleRouteApiKeyVisibility = () => {
+    setRouteApiKeyVisible((visible) => !visible);
+  };
   const saveRouteDraft = async () => {
     if (!routeDraft) return;
+    if (routeDraft.authMode !== "officialAccount" && routeDraftHasErrors) {
+      setRouteValidationAttempted(true);
+      requestAnimationFrame(() => {
+        const firstInvalid = document.querySelector<HTMLInputElement>(
+          ".route-editor-fields [aria-invalid='true']",
+        );
+        firstInvalid?.focus();
+      });
+      return;
+    }
     const saved = routeDraft.authMode === "officialAccount"
-      ? await onSaveOfficialRouteSettings(
-          routeDraft.id,
-          officialModelDraft,
-          usageDraft,
-        )
+      ? (onSaveOfficialRouteSettings
+          ? await onSaveOfficialRouteSettings(
+              routeDraft.id,
+              officialModelDraft,
+              showAccountUsageInHeader,
+            )
+          : true)
       : await onSaveRoute(routeDraft);
     if (saved) {
-      setRouteApiKeyVisible(false);
       setRouteDialogOpen(false);
       setRouteDraft(null);
     }
@@ -262,7 +369,12 @@ function ModelSectionComponent({
           <aside className="route-list-pane" aria-label="线路列表">
             <div className="route-list-heading">
               <div>
-                <strong>供应商线路</strong>
+                <div className="route-list-heading-title">
+                  <strong>供应商线路</strong>
+                  <Badge variant="secondary" size="xs">
+                    {visibleProfiles.length}
+                  </Badge>
+                </div>
                 <small>第三方线路同时接入统一路由</small>
               </div>
               <Button
@@ -271,56 +383,108 @@ function ModelSectionComponent({
                 disabled={isBusy || dirty}
                 onClick={openNewRouteDialog}
               >
-                <Plus aria-hidden="true" />
+                <Plus size={13} aria-hidden="true" />
                 新增线路
               </Button>
             </div>
             <div className="route-list">
               {visibleProfiles.map((profile) => {
                 const providerId = routeProviderId(profile);
-                const group = modelGroups.find(
-                  (candidate) => candidate.providerId === providerId,
-                );
+                const group = modelGroupByProviderId.get(providerId);
+                const isOfficial = profile.authMode === "officialAccount";
                 return (
                   <div
                     className="route-list-item"
                     key={profile.id}
                   >
-                    <div className="route-list-summary">
-                      <span>
-                        <strong>{profile.name || "未命名线路"}</strong>
-                        <small>
-                          {profile.authMode === "officialAccount"
-                            ? "官方账号登录"
-                            : profile.baseUrl || "待填写 URL"}
-                        </small>
-                      </span>
-                      <span className="route-list-meta">
-                        <Badge variant="secondary">
+                    <div className="route-item-header">
+                      <div className="route-item-title-wrap">
+                        <div
+                          className={`route-item-icon-pill ${isOfficial ? "official" : "custom"}`}
+                          aria-hidden="true"
+                        >
+                          {isOfficial ? (
+                            <IconShieldCheck size={15} />
+                          ) : (
+                            <IconWorld size={15} />
+                          )}
+                        </div>
+                        <div className="route-item-names">
+                          <strong title={profile.name || "未命名线路"}>
+                            {profile.name || "未命名线路"}
+                          </strong>
+                          <small
+                            title={
+                              isOfficial
+                                ? "官方账号登录"
+                                : profile.baseUrl || "待填写 URL"
+                            }
+                          >
+                            {isOfficial
+                              ? "官方账号登录"
+                              : profile.baseUrl || "待填写 URL"}
+                          </small>
+                        </div>
+                      </div>
+                      {!isOfficial && (
+                        <div className="route-item-actions">
+                          <Button
+                            className="route-action-button route-edit-button"
+                            variant="ghost"
+                            size="xs"
+                            disabled={isBusy || dirty}
+                            onClick={() => openEditRouteDialog(profile)}
+                            aria-label={`编辑线路 ${profile.name}`}
+                            title={`编辑线路 ${profile.name}`}
+                          >
+                            <Edit size={13} aria-hidden="true" />
+                          </Button>
+                          <Button
+                            className="route-action-button route-delete-button"
+                            variant="ghost"
+                            size="xs"
+                            disabled={isBusy || dirty || config.profiles.length <= 1}
+                            onClick={() => onDeleteRoute(profile.id)}
+                            aria-label={`删除线路 ${profile.name}`}
+                            title={
+                              config.profiles.length <= 1
+                                ? "至少需要保留一条线路"
+                                : `删除线路 ${profile.name}`
+                            }
+                          >
+                            <Trash size={13} aria-hidden="true" />
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                    <div className="route-item-footer">
+                      <div className="route-item-badges">
+                        <Badge variant="secondary" size="xs">
                           {group?.models.length || 0} 模型
                         </Badge>
-                        {profile.authMode !== "officialAccount" && (
-                          <Badge variant={group?.models.length ? "brand" : "secondary"}>
+                        {!isOfficial && (
+                          <Badge
+                            variant={group?.models.length ? "brand" : "secondary"}
+                            size="xs"
+                          >
                             {group?.models.length ? "已接入路由" : "待配置模型"}
                           </Badge>
                         )}
-                        {profile.authMode === "officialAccount" &&
-                          showAccountUsageInHeader && (
-                            <Badge variant="info">额度已开启</Badge>
-                          )}
-                      </span>
+                      </div>
+                      {isOfficial && (
+                        <div className="route-item-usage-toggle">
+                          <span className="route-item-usage-label">额度显示</span>
+                          <Switch
+                            size="xs"
+                            checked={showAccountUsageInHeader}
+                            disabled={isBusy}
+                            onCheckedChange={(checked) =>
+                              onToggleAccountUsage?.(checked)}
+                            aria-label="在账户区域显示额度"
+                          />
+                        </div>
+                      )}
                     </div>
-                    <Button
-                      className="route-edit-button"
-                      variant="ghost"
-                      size="xs"
-                      disabled={isBusy || dirty}
-                      onClick={() => openEditRouteDialog(profile)}
-                      aria-label={`编辑线路 ${profile.name}`}
-                    >
-                      <Edit aria-hidden="true" />
-                      编辑
-                    </Button>
                   </div>
                 );
               })}
@@ -329,43 +493,134 @@ function ModelSectionComponent({
 
           <div className="route-catalog-pane">
             <div className="catalog-aggregate-heading">
-              <div>
-                <strong>统一模型目录</strong>
+              <div className="catalog-aggregate-title-wrap">
+                <div className="catalog-aggregate-title">
+                  <strong>统一模型目录</strong>
+                  <Badge variant="secondary" size="xs">
+                    {totalModelCount} 个
+                  </Badge>
+                </div>
                 <small>选择模型时，本地路由会自动分发到所属供应商</small>
               </div>
-              <Badge variant="secondary">
-                {modelGroups.reduce((count, group) => count + group.models.length, 0)} 个
-              </Badge>
+              <div className="catalog-search-wrap">
+                <div className="catalog-search-input-box">
+                  <IconSearch size={13} className="catalog-search-icon" aria-hidden="true" />
+                  <input
+                    type="text"
+                    className="catalog-search-input"
+                    placeholder="搜索模型..."
+                    value={searchQuery}
+                    onChange={(e) => setSearchQuery(e.target.value)}
+                  />
+                  {searchQuery && (
+                    <button
+                      type="button"
+                      className="catalog-search-clear"
+                      onClick={() => setSearchQuery("")}
+                      aria-label="清除搜索"
+                    >
+                      <IconX size={12} />
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
 
-            <div className="provider-model-groups">
-              {modelGroups.map((group) => (
-                <section
-                  className="provider-model-group"
-                  key={group.providerId}
-                  aria-labelledby={`provider-model-${group.profile.id}`}
+            {modelGroups.length > 1 && (
+              <div
+                className="provider-tabs-bar"
+                role="tablist"
+                aria-label="按供应商筛选模型"
+              >
+                <button
+                  type="button"
+                  id="provider-filter-tab-0"
+                  role="tab"
+                  aria-controls="provider-model-groups"
+                  aria-selected={selectedProviderFilter === "all"}
+                  tabIndex={selectedProviderFilter === "all" ? 0 : -1}
+                  className={`provider-tab-pill ${selectedProviderFilter === "all" ? "active" : ""}`}
+                  onClick={() => setSelectedProviderFilter("all")}
+                  onKeyDown={handleProviderTabKeyDown}
                 >
-                  <div className="provider-model-group-heading">
-                    <div>
-                      <strong id={`provider-model-${group.profile.id}`}>
-                        {group.profile.name}
-                      </strong>
-                      <small>
-                        {group.official ? "官方账号" : "第三方 API Key"}
-                      </small>
-                    </div>
-                    <div className="provider-model-group-actions">
-                      <Badge variant={group.official ? "info" : "brand"}>
-                        {group.models.length} 模型
-                      </Badge>
-                      {!group.official && (
+                  <span>全部</span>
+                  <span className="tab-pill-count">{totalModelCount}</span>
+                </button>
+                {modelGroups.map((g, index) => (
+                  <button
+                    type="button"
+                    key={g.providerId}
+                    id={`provider-filter-tab-${index + 1}`}
+                    role="tab"
+                    aria-controls="provider-model-groups"
+                    aria-selected={selectedProviderFilter === g.providerId}
+                    tabIndex={selectedProviderFilter === g.providerId ? 0 : -1}
+                    className={`provider-tab-pill ${selectedProviderFilter === g.providerId ? "active" : ""}`}
+                    onClick={() => setSelectedProviderFilter(g.providerId)}
+                    onKeyDown={handleProviderTabKeyDown}
+                  >
+                    <span className="tab-pill-icon" aria-hidden="true">
+                      {g.official ? <IconShieldCheck size={12} /> : <Server size={12} />}
+                    </span>
+                    <span>{g.profile.name}</span>
+                    <span className="tab-pill-count">{g.models.length}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            <div
+              id="provider-model-groups"
+              className="provider-model-groups"
+              role={modelGroups.length > 1 ? "tabpanel" : undefined}
+            >
+              {displayedGroups.map((group) => {
+                const isSearching = searchQuery.trim().length > 0;
+                return (
+                  <section
+                    className="provider-model-group"
+                    key={group.providerId}
+                    aria-labelledby={`provider-model-${group.profile.id}`}
+                  >
+                    <div className="provider-model-group-heading">
+                      <div className="provider-heading-main">
+                        <div
+                          className={`provider-avatar-pill ${group.official ? "official" : "custom"}`}
+                          aria-hidden="true"
+                        >
+                          {group.official ? (
+                            <IconShieldCheck size={14} />
+                          ) : (
+                            <Server size={14} />
+                          )}
+                        </div>
+                        <div className="provider-heading-text">
+                          <strong id={`provider-model-${group.profile.id}`}>
+                            {group.profile.name}
+                          </strong>
+                          <small>
+                            {group.official ? "官方账号" : "第三方 API Key"}
+                          </small>
+                        </div>
+                      </div>
+                      <div className="provider-model-group-actions">
+                        <Badge variant={group.official ? "info" : "brand"} size="xs">
+                          {group.models.length} 模型
+                        </Badge>
                         <Button
                           variant="ghost"
                           size="xs"
                           disabled={isBusy || dirty}
-                          onClick={() => onFetchRouteModels(group.profile)}
+                          onClick={() => {
+                            if (group.official) {
+                              openEditRouteDialog(group.profile);
+                            } else {
+                              onFetchRouteModels(group.profile);
+                            }
+                          }}
                         >
                           <RefreshCw
+                            size={12}
                             className={
                               busy === "fetch-route-models" &&
                               group.profile.id === config.activeProfileId
@@ -376,67 +631,108 @@ function ModelSectionComponent({
                           />
                           同步模型
                         </Button>
-                      )}
+                      </div>
                     </div>
-                  </div>
 
-                  <div className="provider-model-list">
-                    {group.models.map((model) => {
-                      const isDefault = modelIdsEqual(group.defaultModel, model);
-                      return (
-                        <div
-                          className={`provider-model-row${isDefault ? " default-model" : ""}`}
-                          key={`${group.providerId}:${model}`}
-                        >
-                          <button
-                            type="button"
-                            className="provider-model-select"
-                            disabled={isBusy || dirty || isDefault}
-                            onClick={() =>
-                              onSetDefaultModel(group.profile.id, model)}
-                          >
-                            <span>
-                              <strong>
-                                {group.official
-                                  ? officialDisplayNames.get(modelKey(model)) || model
-                                  : model}
-                              </strong>
-                              {group.official && <small>{model}</small>}
-                            </span>
-                            {isDefault ? (
-                              <Badge variant="brand">默认</Badge>
-                            ) : (
-                              <span className="set-default-label">设为默认</span>
-                            )}
-                          </button>
-                        </div>
-                      );
-                    })}
-                    {group.models.length === 0 && (
+                    {group.models.length > 0 ? (
+                      <div className="provider-capsules-grid">
+                        {group.models.map((model) => {
+                          const isDefault = modelIdsEqual(group.defaultModel, model);
+                          const displayName = group.official
+                            ? officialDisplayNames.get(modelKey(model)) || model
+                            : model;
+                          const showSlug = group.official && displayName !== model;
+                          return (
+                            <button
+                              type="button"
+                              key={`${group.providerId}:${model}`}
+                              className={`model-capsule${isDefault ? " is-default" : ""}`}
+                              disabled={isBusy || dirty || isDefault}
+                              onClick={() => onSetDefaultModel(group.profile.id, model)}
+                              title={
+                                isDefault
+                                  ? `${displayName} (当前默认)`
+                                  : `点击设为默认模型: ${displayName}`
+                              }
+                            >
+                              <div className="model-capsule-left">
+                                <div className={`model-capsule-indicator ${isDefault ? "default-indicator" : ""}`}>
+                                  {isDefault ? (
+                                    <Check size={11} aria-hidden="true" />
+                                  ) : (
+                                    <span className="indicator-dot" aria-hidden="true" />
+                                  )}
+                                </div>
+                                <div className="model-capsule-text">
+                                  <span className="model-capsule-name">{displayName}</span>
+                                  {showSlug && (
+                                    <span className="model-capsule-slug">{model}</span>
+                                  )}
+                                </div>
+                              </div>
+                                <div className="model-capsule-right">
+                                  {isDefault ? (
+                                    <span className="capsule-tag-default">
+                                      <Check size={10} strokeWidth={2.5} aria-hidden="true" />
+                                      默认
+                                    </span>
+                                  ) : (
+                                    <span className="capsule-tag-action">设为默认</span>
+                                  )}
+                                </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ) : isSearching ? (
                       <div className="provider-model-empty">
-                        <span>尚未配置模型</span>
-                        {!group.official && (
-                          <Button
-                            variant="outline"
-                            size="xs"
-                            disabled={isBusy || dirty}
-                            onClick={() => onFetchRouteModels(group.profile)}
-                          >
-                            <RefreshCw aria-hidden="true" />
-                            同步或手动添加
-                          </Button>
-                        )}
+                        <div className="provider-empty-content">
+                          <IconSearch size={16} className="provider-empty-icon" aria-hidden="true" />
+                          <span>未匹配到相关模型</span>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="provider-model-empty">
+                        <div className="provider-empty-content">
+                          <IconCpu size={16} className="provider-empty-icon" aria-hidden="true" />
+                          <span>尚未配置模型</span>
+                        </div>
+                        <Button
+                          variant="outline"
+                          size="xs"
+                          disabled={isBusy || dirty}
+                          onClick={() => {
+                            if (group.official) {
+                              openEditRouteDialog(group.profile);
+                            } else {
+                              onFetchRouteModels(group.profile);
+                            }
+                          }}
+                        >
+                          <RefreshCw size={12} aria-hidden="true" />
+                          {group.official ? "配置官方模型" : "同步或手动添加"}
+                        </Button>
                       </div>
                     )}
-                  </div>
-                </section>
-              ))}
+                  </section>
+                );
+              })}
+              {displayedGroups.every((g) => g.models.length === 0) && searchQuery && (
+                <div className="catalog-no-results">
+                  <IconSearch size={22} className="no-results-icon" aria-hidden="true" />
+                  <strong>未找到符合 &ldquo;{searchQuery}&rdquo; 的模型</strong>
+                  <p>请尝试搜索其他关键字，或检查供应商配置。</p>
+                  <Button variant="outline" size="xs" onClick={() => setSearchQuery("")}>
+                    清除搜索条件
+                  </Button>
+                </div>
+              )}
             </div>
           </div>
         </div>
 
         <div className="readonly-note">
-          <Server size={14} />
+          <IconInfoCircle size={14} className="readonly-note-icon" aria-hidden="true" />
           <span className="readonly-note-text">
             所有第三方线路通过 Codey 本地路由同时生效，线路列表仅用于管理配置
           </span>
@@ -451,7 +747,10 @@ function ModelSectionComponent({
         onOpenChange={(open) => {
           if (!isBusy) {
             setRouteDialogOpen(open);
-            if (!open) setRouteDraft(null);
+            if (!open) {
+              setRouteDraft(null);
+              setRouteApiKeyVisible(false);
+            }
           }
         }}
       >
@@ -470,14 +769,14 @@ function ModelSectionComponent({
             <DialogHeader>
               <DialogTitle>
                 {routeDraft.authMode === "officialAccount"
-                  ? "编辑官方账号"
+                  ? "配置官方账号模型"
                   : config.profiles.some((profile) => profile.id === routeDraft.id)
                     ? "编辑线路"
                     : "新增线路"}
               </DialogTitle>
               <DialogDescription>
                 {routeDraft.authMode === "officialAccount"
-                  ? "选择允许在 Codex 中使用的官方模型，并配置账户额度展示。"
+                  ? "选择允许在 Codex 中使用的官方候选模型。未勾选的模型不会在模型目录和选择器中出现。"
                   : "配置第三方服务的接入信息。保存后可在模型目录中同步模型。"}
               </DialogDescription>
             </DialogHeader>
@@ -490,19 +789,6 @@ function ModelSectionComponent({
                     <small>使用当前 Codex 官方账号登录状态</small>
                   </span>
                   <Badge variant="info">官方账号</Badge>
-                </div>
-
-                <div className="official-usage-setting">
-                  <span>
-                    <strong>在账户区域显示额度</strong>
-                    <small>开启后，Codex 账户卡片会展示额度与重置时间。</small>
-                  </span>
-                  <Switch
-                    checked={usageDraft}
-                    disabled={isBusy}
-                    onCheckedChange={setUsageDraft}
-                    aria-label="在账户区域显示额度"
-                  />
                 </div>
 
                 <div className="official-model-editor">
@@ -526,7 +812,7 @@ function ModelSectionComponent({
                             onCheckedChange={(nextChecked) => {
                               setOfficialModelDraft((current) =>
                                 nextChecked === true
-                                  ? uniqueModels([...current, model])
+                                  ? uniqueModelIds([...current, model])
                                   : current.filter(
                                       (candidate) => !modelIdsEqual(candidate, model),
                                     ),
@@ -551,11 +837,63 @@ function ModelSectionComponent({
                 <label className="route-field">
                   <span>线路名</span>
                   <Input
+                    id="route-name-input"
                     aria-label="线路名"
+                    aria-invalid={Boolean(
+                      routeDraftErrors?.name &&
+                      (routeValidationAttempted || routeDraft.name.length > 0),
+                    )}
+                    aria-describedby={
+                      routeDraftErrors?.name &&
+                      (routeValidationAttempted || routeDraft.name.length > 0)
+                        ? "route-name-error"
+                        : undefined
+                    }
                     value={routeDraft.name}
                     disabled={isBusy}
                     onChange={(event) => updateRouteDraft({ name: event.target.value })}
                   />
+                  {routeDraftErrors?.name &&
+                  (routeValidationAttempted || routeDraft.name.length > 0) ? (
+                    <small id="route-name-error" className="text-[#d70015]" role="alert">
+                      {routeDraftErrors.name}
+                    </small>
+                  ) : null}
+                </label>
+                <label className="route-field">
+                  <span>短名称</span>
+                  <Input
+                    id="route-short-name-input"
+                    aria-label="短名称"
+                    error={Boolean(
+                      routeDraftErrors?.shortName &&
+                      (routeValidationAttempted || routeDraft.shortName.length > 0),
+                    )}
+                    aria-errormessage={
+                      routeDraftErrors?.shortName &&
+                      (routeValidationAttempted || routeDraft.shortName.length > 0)
+                        ? "route-short-name-error"
+                        : undefined
+                    }
+                    value={routeDraft.shortName}
+                    disabled={isBusy}
+                    placeholder="如：主、备、中转"
+                    onChange={(event) =>
+                      updateRouteDraft({ shortName: event.target.value })}
+                  />
+                  <small id="route-short-name-hint" className="route-field-hint">
+                    最多 2 个字符且不可重复，模型名称前会显示为 [短名称]
+                  </small>
+                  {routeDraftErrors?.shortName &&
+                  (routeValidationAttempted || routeDraft.shortName.length > 0) ? (
+                    <small
+                      id="route-short-name-error"
+                      className="text-[#d70015]"
+                      role="alert"
+                    >
+                      {routeDraftErrors.shortName}
+                    </small>
+                  ) : null}
                 </label>
                 <div className="route-field">
                   <span id="route-protocol-label">上游协议</span>
@@ -573,34 +911,64 @@ function ModelSectionComponent({
                     optionList={routeProtocolOptions}
                   />
                   <small className="route-field-hint">
-                    请选择上游服务实际支持的 Responses 协议。
+                    请选择上游实际支持的接口协议；Chat Completions 与 Anthropic Messages 会由本地路由适配为 Codex 可用格式。
                   </small>
                 </div>
                 <label className="route-field">
                   <span>URL</span>
                   <Input
+                    id="route-url-input"
                     aria-label="URL"
+                    aria-invalid={Boolean(
+                      routeDraftErrors?.baseUrl &&
+                      (routeValidationAttempted || routeDraft.baseUrl.trim()),
+                    )}
+                    aria-describedby={
+                      routeDraftErrors?.baseUrl &&
+                      (routeValidationAttempted || routeDraft.baseUrl.trim())
+                        ? "route-url-error"
+                        : undefined
+                    }
                     value={routeDraft.baseUrl}
                     disabled={isBusy}
-                    placeholder="https://api.example.com/v1"
+                    placeholder={
+                      routeDraft.upstreamProtocol === "anthropicMessages"
+                        ? "https://api.anthropic.com"
+                        : "https://api.example.com/v1"
+                    }
                     onChange={(event) => updateRouteDraft({ baseUrl: event.target.value })}
                   />
+                  {routeDraftErrors?.baseUrl &&
+                  (routeValidationAttempted || routeDraft.baseUrl.trim()) ? (
+                    <small id="route-url-error" className="text-[#d70015]" role="alert">
+                      {routeDraftErrors.baseUrl}
+                    </small>
+                  ) : null}
                 </label>
                 <label className="route-field">
                   <span>Key</span>
                   <PasswordInput
                     id="route-key-input"
                     aria-label="Key"
+                    aria-invalid={Boolean(
+                      routeValidationAttempted && routeDraftErrors?.apiKey,
+                    )}
+                    aria-describedby={
+                      routeValidationAttempted && routeDraftErrors?.apiKey
+                        ? "route-key-error"
+                        : undefined
+                    }
                     autoComplete="new-password"
                     visible={routeApiKeyVisible}
-                    onVisibilityChange={() =>
-                      setRouteApiKeyVisible((visible) => !visible)}
+                    onVisibilityChange={toggleRouteApiKeyVisibility}
                     value={routeDraft.apiKey}
                     disabled={isBusy}
                     placeholder={
                       routeDraft.apiKeyConfigured
                         ? "已保存（点击眼睛查看，或输入新 Key 替换）"
-                        : "sk-..."
+                        : routeDraft.upstreamProtocol === "anthropicMessages"
+                          ? "sk-ant-..."
+                          : "sk-..."
                     }
                     onChange={(event) => {
                       const value = event.target.value;
@@ -624,6 +992,11 @@ function ModelSectionComponent({
                         : "显示线路 API Key",
                     }}
                   />
+                  {routeValidationAttempted && routeDraftErrors?.apiKey ? (
+                    <small id="route-key-error" className="text-[#d70015]" role="alert">
+                      {routeDraftErrors.apiKey}
+                    </small>
+                  ) : null}
                   {routeDraft.apiKeyConfigured && !routeDraft.clearApiKey && (
                     <Button
                       className="route-clear-key"
@@ -655,7 +1028,6 @@ function ModelSectionComponent({
                   variant="ghost"
                   disabled={isBusy || config.profiles.length <= 1}
                   onClick={() => {
-                    setRouteApiKeyVisible(false);
                     setRouteDialogOpen(false);
                     setRouteDraft(null);
                     onDeleteRoute(routeDraft.id);
@@ -669,22 +1041,24 @@ function ModelSectionComponent({
                 variant="outline"
                 disabled={isBusy}
                 onClick={() => {
-                  setRouteApiKeyVisible(false);
                   setRouteDialogOpen(false);
                   setRouteDraft(null);
+                  setRouteValidationAttempted(false);
+                  setRouteApiKeyVisible(false);
                 }}
               >
                 取消
               </Button>
               <Button
                 disabled={isBusy || (
-                  routeDraft.authMode === "officialAccount" &&
-                  officialModelDraft.length === 0
+                  routeDraft.authMode === "officialAccount"
+                    ? officialModelDraft.length === 0
+                    : routeValidationAttempted && routeDraftHasErrors
                 )}
                 onClick={() => void saveRouteDraft()}
               >
                 <Check aria-hidden="true" />
-                {routeDraft.authMode === "officialAccount" ? "保存设置" : "保存线路"}
+                {routeDraft.authMode === "officialAccount" ? "保存模型" : "保存线路"}
               </Button>
             </DialogFooter>
           </DialogContent>

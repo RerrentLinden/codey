@@ -11,7 +11,6 @@ import type { NotificationChannelEditorProps } from "./types";
 function TelegramChannelEditorComponent({
   channel,
   disabled,
-  revealSecrets = false,
   onChange,
 }: NotificationChannelEditorProps) {
   return (
@@ -22,7 +21,7 @@ function TelegramChannelEditorComponent({
           <IconKey size={15} aria-hidden="true" />
           <Input
             className={insetInputClass}
-            type={revealSecrets ? "text" : "password"}
+            type="password"
             value={channel.botToken}
             disabled={disabled}
             onChange={(event) =>

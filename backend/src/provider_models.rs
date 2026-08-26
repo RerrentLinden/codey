@@ -9,7 +9,7 @@ use reqwest::{
 };
 use serde_json::Value;
 
-use crate::config::ProviderProfile;
+use crate::config::{ProviderProfile, UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES};
 use crate::model_id;
 use crate::model_list::{self, ModelEndpointError};
 
@@ -62,13 +62,39 @@ pub async fn fetch(profile: &ProviderProfile, client: &Client) -> Result<Vec<Str
     let endpoints = model_endpoints(&base)?;
     for (index, endpoint) in endpoints.iter().enumerate() {
         let mut request = client.get(endpoint).header(ACCEPT, "application/json");
+        let anthropic_messages = profile.upstream_protocol == UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES;
         let has_custom_authorization = profile.model_request_headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case(AUTHORIZATION.as_str()) && !value.trim().is_empty()
         });
-        if !profile.api_key.trim().is_empty() && !has_custom_authorization {
+        let has_custom_anthropic_key = profile.model_request_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("x-api-key") && !value.trim().is_empty()
+        });
+        let has_custom_anthropic_version =
+            profile.model_request_headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("anthropic-version") && !value.trim().is_empty()
+            });
+        if anthropic_messages && !profile.api_key.trim().is_empty() && !has_custom_anthropic_key {
+            request = request.header("x-api-key", profile.api_key.trim());
+        } else if !anthropic_messages
+            && !profile.api_key.trim().is_empty()
+            && !has_custom_authorization
+        {
             request = request.bearer_auth(profile.api_key.trim());
         }
+        if anthropic_messages && !has_custom_anthropic_version {
+            request = request.header("anthropic-version", "2023-06-01");
+        }
         for (name, value) in &profile.model_request_headers {
+            if anthropic_messages && name.eq_ignore_ascii_case(AUTHORIZATION.as_str()) {
+                continue;
+            }
+            if anthropic_messages
+                && (name.eq_ignore_ascii_case("x-api-key")
+                    || name.eq_ignore_ascii_case("anthropic-version"))
+                && value.trim().is_empty()
+            {
+                continue;
+            }
             if name.eq_ignore_ascii_case(AUTHORIZATION.as_str()) && value.trim().is_empty() {
                 continue;
             }
@@ -222,6 +248,10 @@ mod tests {
         assert_eq!(
             model_endpoints("https://relay.example/v1/responses").unwrap(),
             vec!["https://relay.example/v1/models"]
+        );
+        assert_eq!(
+            model_endpoints("https://api.anthropic.com/v1/messages").unwrap(),
+            vec!["https://api.anthropic.com/v1/models"]
         );
         assert_eq!(
             model_endpoints("https://relay.example/api/coding/v3").unwrap(),
@@ -390,6 +420,39 @@ mod tests {
         let models = fetch(&profile, &client).await.unwrap();
 
         assert_eq!(models, vec!["bearer-model"]);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_model_sync_uses_x_api_key_and_version_without_bearer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
+            assert!(request.starts_with("get /v1/models http/1.1"));
+            assert!(request.contains("x-api-key: anthropic-key"));
+            assert!(request.contains("anthropic-version: 2023-06-01"));
+            assert!(!request.contains("authorization:"));
+            let body = r#"{"data":[{"id":"claude-sonnet-test"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let mut profile = ProviderProfile::new("Anthropic");
+        profile.base_url = format!("http://{address}/v1/messages");
+        profile.api_key = "anthropic-key".to_string();
+        profile.upstream_protocol = UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES.to_string();
+        let client = Client::builder().no_proxy().build().unwrap();
+
+        let models = fetch(&profile, &client).await.unwrap();
+
+        assert_eq!(models, vec!["claude-sonnet-test"]);
         server.join().unwrap();
     }
 

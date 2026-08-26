@@ -21,7 +21,6 @@ export const CODEY_API_COMMANDS = [
   "clear_codex_trace_logs",
   "test_webhook",
   "test_notification_channel",
-  "reveal_notification_channel",
   "optimize_prompt",
   "test_prompt_optimization",
   "fetch_prompt_optimization_models",

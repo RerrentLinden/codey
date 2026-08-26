@@ -10,7 +10,6 @@ pub use crate::windows_integration::WindowsProcessInfo;
 
 pub const WATCHER_INTERVAL_SECONDS: f64 = 3.0;
 pub const CDP_PROBE_TIMEOUT_SECONDS: f64 = 0.5;
-pub const TAKEOVER_FAILURE_BACKOFF_SECONDS: f64 = 30.0;
 pub const RESTART_STOP_WAIT_TIMEOUT_MS: u64 = 5_000;
 #[cfg(windows)]
 const RESTART_STOP_WAIT_INTERVAL_MS: u64 = 100;

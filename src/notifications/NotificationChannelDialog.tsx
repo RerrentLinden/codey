@@ -1,9 +1,4 @@
-import {
-  memo,
-  useEffect,
-  useLayoutEffect,
-  useState,
-} from "react";
+import { memo, useLayoutEffect, useState } from "react";
 import {
   IconCheck,
   IconLoader2 as LoaderCircle,
@@ -53,15 +48,12 @@ function NotificationChannelDialogComponent({
   onSave,
 }: NotificationChannelDialogProps) {
   const [draft, setDraft] = useState<NotificationChannel | null>(null);
-  const [isRevealing, setIsRevealing] = useState(false);
-  const [revealError, setRevealError] = useState("");
   const [isTesting, setIsTesting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [testResult, setTestResult] = useState<{
     text: string;
     tone: "idle" | "pending" | "success" | "error";
   }>({ tone: "idle", text: "" });
-  const [hasSuccessfulTest, setHasSuccessfulTest] = useState(false);
   const isEditing = editingChannel !== null;
   const definition = draft
     ? getNotificationChannelDefinition(draft.kind)
@@ -70,12 +62,9 @@ function NotificationChannelDialogComponent({
   useLayoutEffect(() => {
     if (!open) {
       setDraft(null);
-      setIsRevealing(false);
-      setRevealError("");
       setIsTesting(false);
       setIsSaving(false);
       setTestResult({ tone: "idle", text: "" });
-      setHasSuccessfulTest(false);
       return;
     }
     setDraft(
@@ -83,33 +72,9 @@ function NotificationChannelDialogComponent({
         ? { ...editingChannel }
         : createNotificationChannel(defaultNotificationChannelKind),
     );
-    setIsRevealing(editingChannel !== null);
-    setRevealError("");
     setIsTesting(false);
     setIsSaving(false);
     setTestResult({ tone: "idle", text: "" });
-    setHasSuccessfulTest(false);
-  }, [editingChannel?.id, open]);
-
-  useEffect(() => {
-    if (!open || !editingChannel) return;
-    let cancelled = false;
-    void invoke<{ channel: NotificationChannel }>(
-      "reveal_notification_channel",
-      { channelId: editingChannel.id },
-    )
-      .then(({ channel }) => {
-        if (!cancelled) setDraft(channel);
-      })
-      .catch((error) => {
-        if (!cancelled) setRevealError(errorText(error));
-      })
-      .finally(() => {
-        if (!cancelled) setIsRevealing(false);
-      });
-    return () => {
-      cancelled = true;
-    };
   }, [editingChannel?.id, open]);
 
   function selectChannel(kind: NotificationChannelKind) {
@@ -119,7 +84,6 @@ function NotificationChannelDialogComponent({
   }
 
   function resetTestResult() {
-    setHasSuccessfulTest(false);
     setTestResult({ tone: "idle", text: "" });
   }
 
@@ -137,9 +101,7 @@ function NotificationChannelDialogComponent({
   async function saveChannel() {
     if (
       !draft ||
-      isRevealing ||
-      !definition?.isConfigured(draft) ||
-      !hasSuccessfulTest
+      !definition?.isConfigured(draft)
     ) {
       return;
     }
@@ -156,13 +118,11 @@ function NotificationChannelDialogComponent({
       !draft ||
       !definition?.isConfigured(draft) ||
       isBusy ||
-      isRevealing ||
       isTesting
     ) {
       return;
     }
     setIsTesting(true);
-    setHasSuccessfulTest(false);
     setTestResult({ tone: "pending", text: "正在发送测试通知…" });
     try {
       await withTimeout(
@@ -170,10 +130,8 @@ function NotificationChannelDialogComponent({
         12_000,
         `${definition.addLabel}测试在 12 秒内没有完成，请检查渠道配置和网络`,
       );
-      setHasSuccessfulTest(true);
       setTestResult({ tone: "success", text: "测试发送成功" });
     } catch (error) {
-      setHasSuccessfulTest(false);
       setTestResult({ tone: "error", text: errorText(error) });
     } finally {
       setIsTesting(false);
@@ -187,11 +145,9 @@ function NotificationChannelDialogComponent({
     label: item.displayName,
     value: item.kind,
   }));
-  const formBusy = isBusy || isRevealing || isTesting || isSaving;
+  const formBusy = isBusy || isTesting || isSaving;
   const canTest = Boolean(draft && definition?.isConfigured(draft));
-  const canSave = Boolean(
-    draft && definition?.isConfigured(draft) && hasSuccessfulTest,
-  );
+  const canSave = Boolean(draft && definition?.isConfigured(draft));
 
   return (
     <Dialog open={open} onOpenChange={(nextOpen) => {
@@ -207,25 +163,7 @@ function NotificationChannelDialogComponent({
           if (isBusy || isTesting || isSaving) event.preventDefault();
         }}
       >
-        {isEditing && isRevealing ? (
-          <>
-            <DialogHeader>
-              <DialogTitle>正在读取渠道配置</DialogTitle>
-              <DialogDescription>
-                正在按本次编辑请求读取已保存的渠道内容。
-              </DialogDescription>
-            </DialogHeader>
-            <div className="notification-reveal-loading" role="status">
-              <LoaderCircle className="animate-spin" aria-hidden="true" />
-              正在读取已保存配置…
-            </div>
-            <DialogFooter>
-              <Button variant="outline" disabled={isBusy} onClick={closeDialog}>
-                取消
-              </Button>
-            </DialogFooter>
-          </>
-        ) : draft && definition && ChannelEditor && SelectedChannelIcon ? (
+        {draft && definition && ChannelEditor && SelectedChannelIcon ? (
           <>
             <DialogHeader>
               <DialogTitle>
@@ -233,7 +171,7 @@ function NotificationChannelDialogComponent({
               </DialogTitle>
               <DialogDescription>
                 {isEditing
-                  ? "更新渠道配置；启用状态也会在这里一起保存。"
+                  ? "已保存的敏感字段保持隐藏；留空会保留，输入新值可替换。"
                   : "选择发送渠道，并填写该渠道需要的专属配置。"}
               </DialogDescription>
             </DialogHeader>
@@ -301,7 +239,6 @@ function NotificationChannelDialogComponent({
               <ChannelEditor
                 channel={draft}
                 disabled={formBusy}
-                revealSecrets={isEditing && !revealError}
                 onChange={updateDraft}
               />
             </div>
@@ -329,7 +266,7 @@ function NotificationChannelDialogComponent({
                     {testResult.tone === "error"
                       ? "测试失败，请检查配置"
                       : testResult.text || (canTest
-                        ? "测试成功后可保存"
+                        ? "可先测试，也可直接保存"
                         : "填写配置后可测试")}
                   </span>
                 </div>
@@ -352,11 +289,6 @@ function NotificationChannelDialogComponent({
             {testResult.tone === "error" ? (
               <p className="notification-test-error" role="alert">
                 {testResult.text}
-              </p>
-            ) : null}
-            {revealError ? (
-              <p className="notification-reveal-error" role="alert">
-                无法回显已保存内容：{revealError}。你仍可填写新内容后保存。
               </p>
             ) : null}
             <DialogFooter>

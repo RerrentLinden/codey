@@ -1,17 +1,24 @@
 import type { CrashpadPendingStats, TraceLogStats } from "./traceLogTypes";
 import type { NotificationChannel } from "./notifications/types";
 
+export type UpstreamProtocol =
+  | "official"
+  | "openaiResponses"
+  | "openaiChatCompletions"
+  | "anthropicMessages";
+
 export type Profile = {
   id: string;
   name: string;
+  shortName: string;
   baseUrl: string;
   apiKey: string;
-  upstreamProtocol: "official" | "openaiResponses" | "openaiCompatible";
+  upstreamProtocol: UpstreamProtocol;
   authMode: "officialAccount" | "apiKey";
   apiKeyConfigured: boolean;
   clearApiKey?: boolean;
-  ccSwitchProviderId?: string;
-  ccSwitchReadOnly: boolean;
+  sourceProviderId?: string;
+  officialAccount: boolean;
   supportsRemoteCompaction?: boolean;
 };
 
@@ -51,7 +58,7 @@ export type Config = {
   manualThirdPartyModelsByProvider: Record<string, string[]>;
   declaredOfficialModelsByProvider: Record<string, string[]>;
   upstreamModelsByProvider: Record<string, string[]>;
-  defaultModelByProvider: Record<string, string>;
+  defaultModel: string;
   disableTraceLogWrites: boolean;
   protectCrashpadPending: boolean;
   slimCodexPet: boolean;
@@ -148,14 +155,13 @@ export type PluginMarketplaceStatus = {
   message?: string;
 };
 
-export type CcSwitchStatus = {
+export type ProviderStatus = {
   changed: boolean;
   provider: {
     id: string;
     name: string;
     official: boolean;
     baseUrl: string;
-    localRoute: boolean;
   };
 };
 

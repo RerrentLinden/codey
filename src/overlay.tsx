@@ -111,6 +111,39 @@ if (!window.__codeySettingsOverlay) {
     if (!visible) return;
 
     const path = event.composedPath();
+    const isInsideDialog = path.some(
+      (target) =>
+        isElement(target) &&
+        (target.hasAttribute("data-codey-dialog") ||
+          target.closest?.("[data-codey-dialog]") !== null ||
+          (target.getAttribute("role") === "dialog" &&
+            !target.hasAttribute("data-codey-settings-shell"))),
+    );
+    const hasActiveDialog =
+      isInsideDialog ||
+      Boolean(
+        shadow.querySelector(
+          '[data-codey-dialog], [role="dialog"]:not([data-codey-settings-shell])',
+        ),
+      );
+
+    if (hasActiveDialog) {
+      const nestedScrollable = path.find(
+        (target) =>
+          isElement(target) &&
+          !target.classList.contains("page-scroll") &&
+          canScrollVertically(target, event.deltaY),
+      );
+      if (nestedScrollable) {
+        event.stopPropagation();
+        return;
+      }
+
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
     const nestedScrollable = path.find(
       (target) =>
         isElement(target) &&

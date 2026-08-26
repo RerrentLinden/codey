@@ -54,6 +54,22 @@ test("standard selects leave dropdown lifecycle and positioning to Mantine", asy
   assert.match(wrapper, /<MantineSelect[\s\S]*comboboxProps=\{\{/);
 });
 
+test("subagent model picker uses the shared Mantine combobox primitives", async () => {
+  const [wrapper, picker] = await Promise.all([
+    readFile(new URL("src/components/mantine/index.tsx", root), "utf8"),
+    readFile(new URL("src/components/ModelCombobox.tsx", root), "utf8"),
+  ]);
+
+  assert.match(wrapper, /export \{ Combobox, InputBase, useCombobox \}/);
+  assert.match(
+    picker,
+    /import \{ Combobox, InputBase, useCombobox \} from "\.\/mantine"/,
+  );
+  assert.match(picker, /portalProps=\{portalTarget \? \{ target: portalTarget \} : undefined\}/);
+  assert.match(picker, /withinPortal=\{Boolean\(portalTarget\)\}/);
+  assert.match(picker, /middlewares=\{\{ flip: true, shift: true \}\}/);
+});
+
 test("settings overlay stays inside body so Mantine can detect outside clicks", async () => {
   const overlaySource = await readFile(
     new URL("src/overlay.tsx", root),

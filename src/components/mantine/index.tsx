@@ -22,6 +22,7 @@ import type {
 import { IconX } from "@tabler/icons-react";
 
 export { ActionIcon, Table } from "@mantine/core";
+export { Combobox, InputBase, useCombobox };
 
 function classNames(...names: Array<string | false | null | undefined>) {
   return names.filter(Boolean).join(" ");
@@ -139,7 +140,7 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(
         {...props}
         ref={ref}
         className={classNames(
-          "inline-flex items-center justify-center gap-1.5 font-semibold transition-colors duration-150 [&_svg]:max-h-4 [&_svg]:max-w-4 [&_svg]:shrink-0",
+          "inline-flex items-center justify-center gap-1.5 font-semibold transition-colors duration-150 [&_svg]:max-h-4 [&_svg]:max-w-4 [&_svg]:shrink-0 [&_.mantine-Button-inner]:gap-1.5 [&_.mantine-Button-label]:inline-flex [&_.mantine-Button-label]:items-center [&_.mantine-Button-label]:gap-1.5",
           buttonSizeClassName[size],
           className,
         )}
@@ -233,6 +234,7 @@ export const Collapse = MantineCollapse;
 
 export interface InputProps
   extends Omit<React.InputHTMLAttributes<HTMLInputElement>, "size"> {
+  error?: boolean;
   wrapperClassName?: string;
 }
 
@@ -731,17 +733,16 @@ export function DialogContent({
       classNames={{
         body: "m-0 w-full overflow-visible",
         content: classNames(
-          "max-w-[calc(100%_-_32px)] rounded-2xl border border-black/10 bg-white p-6 shadow-[0_24px_64px_rgba(0,0,0,0.18)]",
+          "max-w-[calc(100%_-_32px)] rounded-2xl border border-black/10 bg-white p-6 shadow-[0_24px_64px_rgba(0,0,0,0.18)] overscroll-contain",
           className,
         ),
         inner: "p-6",
-        overlay: "bg-black/25 backdrop-blur-[20px]",
       }}
       closeOnClickOutside
       closeOnEscape
+      data-codey-dialog="true"
       onClose={handleCancel}
       opened={dialog.open}
-      overlayProps={{ backgroundOpacity: 0.25, blur: 20 }}
       padding={0}
       portalProps={container ? { target: container } : undefined}
       size={512}

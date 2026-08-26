@@ -20,12 +20,13 @@ test("all configuration API keys use PasswordInput with local values", async () 
     routes,
     /<Input[\s\S]*?id="route-key-input"[\s\S]*?type="password"/,
   );
+  assert.doesNotMatch(routes, /reveal_route_api_key/);
   assert.match(
     promptOptimization,
     /<PasswordInput[\s\S]*?id=\{apiKeyInputId\}[\s\S]*?onVisibilityChange=/,
   );
   assert.doesNotMatch(promptOptimization, /reveal_prompt_optimization_api_key/);
-  assert.doesNotMatch(api, /reveal_prompt_optimization_api_key/);
+  assert.doesNotMatch(api, /reveal_(?:route|prompt_optimization)_api_key/);
   assert.doesNotMatch(backend, /profile\.api_key\.clear\(\)/);
   assert.doesNotMatch(backend, /prompt_optimization\.api_key\.clear\(\)/);
 });

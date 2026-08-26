@@ -42,8 +42,10 @@ fn api_key_launch_rejects_new_or_active_official_account_routes() {
 
 #[test]
 fn official_account_launch_allows_official_routes() {
-    let mut previous = CodeyConfig::default();
-    previous.official_account_available_this_launch = true;
+    let previous = CodeyConfig {
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    };
     let mut official = crate::config::ProviderProfile::new("Official");
     official.id = "official".into();
     official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
@@ -62,7 +64,7 @@ fn full_config_save_restores_route_secrets_and_source_owned_identity() {
     saved.base_url = "https://relay.example/v1".into();
     saved.api_key = "saved-secret".into();
     saved.api_key_configured = true;
-    saved.cc_switch_provider_id = Some("source-provider".into());
+    saved.source_provider_id = Some("source-provider".into());
     saved.supports_remote_compaction = true;
     saved
         .model_request_headers
@@ -76,7 +78,7 @@ fn full_config_save_restores_route_secrets_and_source_owned_identity() {
     let mut redacted = saved;
     redacted.api_key.clear();
     redacted.api_key_configured = true;
-    redacted.cc_switch_provider_id = Some("spoofed-provider".into());
+    redacted.source_provider_id = Some("spoofed-provider".into());
     redacted.supports_remote_compaction = false;
     redacted.model_request_headers.clear();
 
@@ -119,7 +121,7 @@ fn every_available_route_model_can_be_selected_for_subagents() {
 #[test]
 fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
     let mut config = CodeyConfig::default();
-    config.profiles[0].cc_switch_provider_id = Some("cc-switch-provider".into());
+    config.profiles[0].source_provider_id = Some("source-provider".into());
     let official_models = [
         ("gpt-5.6-sol", "GPT-5.6-Sol"),
         ("gpt-5.6-terra", "GPT-5.6-Terra"),
@@ -162,25 +164,26 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
     assert_eq!(
         catalog["models"],
         json!([
-            "cc-switch-provider/gpt-5.6-sol",
-            "cc-switch-provider/gpt-5.6-luna",
-            "cc-switch-provider/gpt-5.5",
-            "cc-switch-provider/gpt-5.4",
-            "cc-switch-provider/gpt-5.3-codex-spark",
-            "cc-switch-provider/provider-fast-coder"
+            "source-provider/gpt-5.6-sol",
+            "source-provider/gpt-5.6-luna",
+            "source-provider/gpt-5.5",
+            "source-provider/gpt-5.4",
+            "source-provider/gpt-5.3-codex-spark",
+            "source-provider/provider-fast-coder"
         ])
     );
-    assert_eq!(catalog["default_model"], "cc-switch-provider/gpt-5.6-sol");
-    assert_eq!(catalog["model_provider"], "cc-switch-provider");
+    assert_eq!(catalog["default_model"], "source-provider/gpt-5.6-sol");
+    assert_eq!(catalog["model_provider"], "codey_router");
     assert_eq!(
         catalog["model_metadata"][0],
         json!({
-            "model": "cc-switch-provider/gpt-5.6-sol",
-            "display_name": "默认配置 / gpt-5.6-sol",
+            "model": "source-provider/gpt-5.6-sol",
+            "display_name": "[默认] gpt-5.6-sol",
             "route_name": "默认配置",
+            "route_prefix": "默认",
             "provider_id": "codey_router",
-            "source_model": "cc-switch-provider/gpt-5.6-sol",
-            "route_provider_id": "cc-switch-provider",
+            "source_model": "gpt-5.6-sol",
+            "route_provider_id": "source-provider",
             "upstream_model": "gpt-5.6-sol",
             "model_display_name": "gpt-5.6-sol",
             "supported_reasoning_efforts": ["low", "medium", "high", "xhigh"],
@@ -190,12 +193,13 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
     assert_eq!(
         catalog["model_metadata"][5],
         json!({
-            "model": "cc-switch-provider/provider-fast-coder",
-            "display_name": "默认配置 / provider-fast-coder",
+            "model": "source-provider/provider-fast-coder",
+            "display_name": "[默认] provider-fast-coder",
             "route_name": "默认配置",
+            "route_prefix": "默认",
             "provider_id": "codey_router",
-            "source_model": "cc-switch-provider/provider-fast-coder",
-            "route_provider_id": "cc-switch-provider",
+            "source_model": "provider-fast-coder",
+            "route_provider_id": "source-provider",
             "upstream_model": "provider-fast-coder",
             "model_display_name": "provider-fast-coder",
             "supported_reasoning_efforts": ["low", "medium", "high", "xhigh"],
@@ -206,10 +210,12 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
 }
 
 #[test]
-fn renderer_model_catalog_keeps_official_account_models_unprefixed() {
-    let mut config = CodeyConfig::default();
-    config.official_account_available_this_launch = true;
-    config.profiles[0].cc_switch_provider_id = Some("openai".into());
+fn renderer_model_catalog_routes_official_account_models_through_the_codey_router_carrier() {
+    let mut config = CodeyConfig {
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    };
+    config.profiles[0].source_provider_id = Some("openai".into());
     config.profiles[0].auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
     config.profiles[0].normalize();
     let model_state = model_catalog::ModelSelectionState {
@@ -226,17 +232,24 @@ fn renderer_model_catalog_keeps_official_account_models_unprefixed() {
 
     let catalog = renderer_model_catalog_value(&config, &model_state);
 
-    assert_eq!(catalog["models"], json!(["gpt-5.6-sol"]));
-    assert_eq!(catalog["default_model"], "gpt-5.6-sol");
-    assert_eq!(catalog["model_provider"], "openai");
+    assert_eq!(catalog["models"], json!(["openai/gpt-5.6-sol"]));
+    assert_eq!(catalog["default_model"], "openai/gpt-5.6-sol");
+    assert_eq!(
+        catalog["model_provider"],
+        crate::local_router::ROUTER_PROVIDER_ID
+    );
     assert_eq!(
         catalog["model_metadata"][0],
         json!({
-            "model": "gpt-5.6-sol",
-            "display_name": "默认配置 / gpt-5.6-sol",
+            "model": "openai/gpt-5.6-sol",
+            "display_name": "[官] gpt-5.6-sol",
             "route_name": "默认配置",
-            "provider_id": "openai",
+            "route_prefix": "官",
+            "provider_id": crate::local_router::ROUTER_PROVIDER_ID,
             "source_model": "gpt-5.6-sol",
+            "route_provider_id": "openai",
+            "upstream_model": "gpt-5.6-sol",
+            "model_display_name": "gpt-5.6-sol",
             "supported_reasoning_efforts": ["low", "medium"],
             "default_reasoning_effort": "low",
         })
@@ -262,10 +275,7 @@ fn renderer_catalog_uses_applied_route_while_provider_restart_is_pending() {
 fn renderer_catalog_uses_current_config_for_model_only_changes() {
     let applied = CodeyConfig::default();
     let mut current = applied.clone();
-    let provider_id = current.current_provider_id().unwrap().to_string();
-    current
-        .default_model_by_provider
-        .insert(provider_id, "provider-default".into());
+    current.default_model = "provider-default".into();
 
     assert!(std::ptr::eq(
         model_catalog_config_for_runtime(&current, Some(&applied)),
@@ -298,13 +308,7 @@ fn restart_sensitive_config_changes_are_detected() {
     ));
 
     let mut default_model_change = applied.clone();
-    let provider_id = default_model_change
-        .current_provider_id()
-        .unwrap()
-        .to_string();
-    default_model_change
-        .default_model_by_provider
-        .insert(provider_id, "provider-default".into());
+    default_model_change.default_model = "provider-default".into();
     assert!(config_requires_restart(
         &applied,
         &applied_models,
@@ -375,6 +379,23 @@ fn restart_sensitive_config_changes_are_detected() {
         &enabled_models,
         &enabled_subagent,
         &changed_task_role
+    ));
+
+    let mut two_routes = applied.clone();
+    let mut second_route = crate::config::ProviderProfile::new("Route B");
+    second_route.base_url = "https://route-b.example/v1".into();
+    second_route.api_key = "route-b-key".into();
+    second_route.normalize();
+    two_routes.profiles.push(second_route.clone());
+    let two_route_models = RuntimeModelConfig::from_config(&two_routes);
+    let two_route_subagent = RuntimeSubagentConfig::from_config(&two_routes);
+    let mut projection_only_change = two_routes.clone();
+    projection_only_change.active_profile_id = second_route.id;
+    assert!(!config_requires_restart(
+        &two_routes,
+        &two_route_models,
+        &two_route_subagent,
+        &projection_only_change
     ));
 }
 
@@ -502,9 +523,7 @@ fn failed_startup_model_sync_does_not_inject_unconfirmed_official_models() {
     config
         .selected_models_by_provider
         .insert(provider_id.clone(), vec!["provider-fast-coder".into()]);
-    config
-        .default_model_by_provider
-        .insert(provider_id, "provider-fast-coder".into());
+    config.default_model = format!("{provider_id}/provider-fast-coder");
     let (fallback_models, synced) = startup_model_sync_models_or_fallback(Vec::new(), None);
     assert!(!synced);
     assert!(fallback_models.is_empty());

@@ -35,12 +35,41 @@ fn third_party_provider_installs_the_codey_model_catalog_when_available() {
 }
 
 #[test]
-fn third_party_runtime_models_are_scoped_to_the_local_route() {
+fn generated_catalog_uses_the_route_aware_default_selector() {
+    let config = CodeyConfig {
+        default_model: "route-a/shared-model".into(),
+        ..CodeyConfig::default()
+    };
+    let state = model_catalog::ModelSelectionState {
+        default_model: "shared-model".into(),
+        ..model_catalog::ModelSelectionState::default()
+    };
+
     assert_eq!(
-        runtime_routed_model(Some("route-a"), "shared-model"),
+        runtime_default_model(&config, true, &state).as_deref(),
+        Some("route-a/shared-model")
+    );
+    assert_eq!(
+        runtime_default_model(&config, false, &state).as_deref(),
+        Some("shared-model")
+    );
+}
+
+#[test]
+fn subagent_runtime_models_use_route_aware_aliases() {
+    let route_aliases = vec!["route-b/shared-model".to_string()];
+    assert_eq!(
+        route_subagent_model("route-a", "shared-model", &route_aliases),
         "route-a/shared-model"
     );
-    assert_eq!(runtime_routed_model(None, "gpt-5.6-sol"), "gpt-5.6-sol");
+    assert_eq!(
+        route_subagent_model("route-a", "gpt-5.6-sol", &route_aliases),
+        "route-a/gpt-5.6-sol"
+    );
+    assert_eq!(
+        route_subagent_model("route-a", "route-b/shared-model", &route_aliases),
+        "route-b/shared-model"
+    );
 }
 
 #[test]
@@ -101,19 +130,6 @@ fn macos_launch_forces_a_new_app_instance() {
             .iter()
             .any(|part| part == "--inspect-brk=127.0.0.1:19321")
     );
-}
-
-#[test]
-fn official_and_external_live_routes_bypass_the_internal_router() {
-    assert!(!should_route_current_profile_through_local_router(
-        true, false, true
-    ));
-    assert!(!should_route_current_profile_through_local_router(
-        true, true, false
-    ));
-    assert!(should_route_current_profile_through_local_router(
-        true, false, false
-    ));
 }
 
 #[cfg(target_os = "macos")]

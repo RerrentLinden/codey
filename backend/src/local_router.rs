@@ -1,34 +1,57 @@
-use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{RwLock, Semaphore, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use uuid::Uuid;
 
-use crate::config::CodeyConfig;
+use crate::codex_config::CHATGPT_CODEX_BASE_URL;
+use crate::config::{
+    CodeyConfig, UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES, UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+};
 
 pub(crate) const ROUTER_PROVIDER_ID: &str = "codey_router";
+pub(crate) const ROUTER_AUTH_HEADER: &str = "x-codey-router-token";
+const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+const ROUTE_METADATA_KEY: &str = "codey_route";
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+const MAX_UPSTREAM_ERROR_BYTES: usize = 64 * 1024;
+const MAX_UPSTREAM_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_UPSTREAM_SSE_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+const MAX_CONCURRENT_REJECTIONS: usize = 4;
+const REQUEST_BODY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+const REQUEST_BODY_BUDGET_UNIT_BYTES: usize = 64 * 1024;
+const REQUEST_BODY_BUDGET_PERMITS: usize =
+    REQUEST_BODY_BUDGET_BYTES / REQUEST_BODY_BUDGET_UNIT_BYTES;
+const MAX_ROUTE_BINDINGS: usize = 4096;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const DOWNSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+tokio::task_local! {
+    static ROUTER_REQUEST_ID: String;
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct RuntimeRouterEndpoint {
     pub base_url: String,
     pub token: String,
+    pub requires_openai_auth: bool,
 }
 
 pub(crate) struct LocalRouter {
     endpoint: RuntimeRouterEndpoint,
-    snapshot: Arc<RwLock<RouterSnapshot>>,
+    snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -46,16 +69,22 @@ impl LocalRouter {
         let endpoint = RuntimeRouterEndpoint {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             token,
+            requires_openai_auth: config.router_requires_openai_auth(),
         };
-        let snapshot = Arc::new(RwLock::new(RouterSnapshot::from_config(config)));
+        let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let server = RouterServer {
             token: endpoint.token.clone(),
+            bearer_token: format!("Bearer {}", endpoint.token),
             snapshot: Arc::clone(&snapshot),
             connection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            rejection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REJECTIONS)),
+            request_body_budget: Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
+            bindings: Arc::new(Mutex::new(RouteBindings::default())),
             client: reqwest::Client::builder()
                 .user_agent(format!("Codey-Router/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .context("创建 Codey 本地路由 HTTP 客户端失败")?,
         };
@@ -66,34 +95,50 @@ impl LocalRouter {
                         match result {
                             Ok((stream, _)) => {
                                 let server = server.clone();
-                                tokio::spawn(async move {
-                                    let permit = match Arc::clone(&server.connection_limit)
+                                let permit = match Arc::clone(&server.connection_limit)
+                                    .try_acquire_owned()
+                                {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        if let Ok(rejection_permit) = Arc::clone(
+                                            &server.rejection_limit,
+                                        )
                                         .try_acquire_owned()
-                                    {
-                                        Ok(permit) => permit,
-                                        Err(_) => {
-                                            let mut stream = stream;
-                                            let _ = write_error_response(
-                                                &mut stream,
-                                                503,
-                                                "router_busy",
-                                                "Codey 本地路由当前请求过多，请稍后重试",
-                                                None,
-                                            )
-                                            .await;
-                                            return;
+                                        {
+                                            let request_id = Uuid::new_v4().simple().to_string();
+                                            tokio::spawn(async move {
+                                                ROUTER_REQUEST_ID.scope(request_id, async move {
+                                                    let _rejection_permit = rejection_permit;
+                                                    let mut stream = stream;
+                                                    let _ = tokio::time::timeout(
+                                                        DOWNSTREAM_WRITE_TIMEOUT,
+                                                        write_error_response(
+                                                            &mut stream,
+                                                            503,
+                                                            "router_busy",
+                                                            "Codey 本地路由当前请求过多，请稍后重试",
+                                                            None,
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }).await;
+                                            });
                                         }
-                                    };
+                                        continue;
+                                    }
+                                };
+                                let request_id = Uuid::new_v4().simple().to_string();
+                                tokio::spawn(ROUTER_REQUEST_ID.scope(request_id.clone(), async move {
                                     let _permit = permit;
                                     if let Err(error) = server.handle_connection(stream).await {
                                         crate::error_log::record_failure(
                                             "local_router_request_failed",
                                             "handle_local_router_connection",
                                             format!("{error:#}"),
-                                            serde_json::json!({}),
+                                            serde_json::json!({ "requestId": request_id }),
                                         );
                                     }
-                                });
+                                }));
                             }
                             Err(error) => {
                                 crate::error_log::record_failure(
@@ -122,8 +167,12 @@ impl LocalRouter {
         self.endpoint.clone()
     }
 
-    pub(crate) async fn update_config(&self, config: &CodeyConfig) {
-        *self.snapshot.write().await = RouterSnapshot::from_config(config);
+    pub(crate) fn update_config(&self, config: &CodeyConfig) {
+        let next = Arc::new(RouterSnapshot::from_config(config));
+        *self
+            .snapshot
+            .write()
+            .expect("local router snapshot lock poisoned") = next;
     }
 
     pub(crate) async fn stop(&self) -> Result<()> {
@@ -165,74 +214,232 @@ impl Drop for LocalRouter {
 #[derive(Clone)]
 struct RouterServer {
     token: String,
-    snapshot: Arc<RwLock<RouterSnapshot>>,
+    bearer_token: String,
+    snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
     connection_limit: Arc<Semaphore>,
+    rejection_limit: Arc<Semaphore>,
+    request_body_budget: Arc<Semaphore>,
+    bindings: Arc<Mutex<RouteBindings>>,
     client: reqwest::Client,
 }
 
 #[derive(Clone, Debug, Default)]
+struct RouteBindings {
+    routes: HashMap<String, RouteBinding>,
+    order: VecDeque<(String, u64)>,
+    next_generation: u64,
+}
+
+#[derive(Clone, Debug)]
+struct RouteBinding {
+    provider_id: String,
+    generation: u64,
+}
+
+impl RouteBindings {
+    fn route_for_keys(&self, keys: &[String]) -> Option<String> {
+        // A concrete thread binding wins over its session-tree fallback. This
+        // lets subagents self-route without changing the parent thread while
+        // still giving metadata-free child/compaction requests a safe fallback.
+        keys.iter().find_map(|key| {
+            self.routes
+                .get(key)
+                .map(|binding| binding.provider_id.clone())
+        })
+    }
+
+    fn remember(&mut self, keys: &[String], provider_id: &str) {
+        for key in keys {
+            if key.starts_with("session-id:") && self.routes.contains_key(key) {
+                continue;
+            }
+            self.next_generation = self.next_generation.wrapping_add(1);
+            let generation = self.next_generation;
+            self.routes.insert(
+                key.clone(),
+                RouteBinding {
+                    provider_id: provider_id.to_string(),
+                    generation,
+                },
+            );
+            self.order.push_back((key.clone(), generation));
+        }
+        while self.routes.len() > MAX_ROUTE_BINDINGS {
+            let Some((expired, generation)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .routes
+                .get(&expired)
+                .is_some_and(|binding| binding.generation == generation)
+            {
+                self.routes.remove(&expired);
+            }
+        }
+        // Repeated turns refresh the same thread binding. Keep those updates
+        // amortized O(1) and periodically collapse stale queue entries instead
+        // of scanning the whole LRU on every request.
+        if self.order.len() > MAX_ROUTE_BINDINGS * 4 {
+            let mut live = self
+                .routes
+                .iter()
+                .map(|(key, binding)| (key.clone(), binding.generation))
+                .collect::<Vec<_>>();
+            live.sort_unstable_by_key(|(_, generation)| *generation);
+            self.order = live.into();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 struct RouterSnapshot {
-    routes: BTreeMap<String, RouteTarget>,
-    aliases: BTreeMap<String, AliasTarget>,
+    routes: HashMap<String, Arc<RouteTarget>>,
+    aliases: HashMap<String, AliasTarget>,
+    raw_models: HashMap<String, Vec<AliasTarget>>,
+    model_ids: Vec<String>,
 }
 
 impl RouterSnapshot {
     fn from_config(config: &CodeyConfig) -> Self {
-        let mut routes = BTreeMap::new();
-        let mut aliases = BTreeMap::new();
+        let mut routes = HashMap::new();
+        let mut aliases = HashMap::new();
+        let mut raw_models = HashMap::<String, Vec<AliasTarget>>::new();
         for profile in &config.profiles {
-            if profile.cc_switch_read_only {
+            if profile.official_account && !config.official_account_available_this_launch {
                 continue;
             }
             let provider_id = profile.provider_id().trim();
             if provider_id.is_empty() {
                 continue;
             }
-            let base_url = profile.normalized_base_url();
+            let base_url = if profile.official_account {
+                CHATGPT_CODEX_BASE_URL.to_string()
+            } else {
+                profile.normalized_base_url()
+            };
             if base_url.is_empty() {
                 continue;
             }
-            let target = RouteTarget {
+            let adapter = upstream_adapter(profile.official_account, &profile.upstream_protocol);
+            let mut target = RouteTarget {
                 provider_id: provider_id.to_string(),
                 route_name: profile.name.trim().to_string(),
-                base_url,
-                api_key: profile.api_key.trim().to_string(),
-                headers: profile.model_request_headers.clone(),
+                upstream_url: prepare_upstream_url(adapter, &base_url),
+                upstream_headers: prepare_upstream_headers(profile, adapter),
+                upstream_authority: upstream_authority(&base_url),
+                adapter,
+                official_account: profile.official_account,
+                models: HashSet::new(),
             };
-            for model in route_models(config, provider_id) {
-                aliases.insert(
-                    model_alias(provider_id, &model),
-                    AliasTarget {
-                        provider_id: provider_id.to_string(),
-                        model,
-                    },
-                );
+            for model in route_models(config, profile, provider_id) {
+                let alias_target = AliasTarget {
+                    provider_id: provider_id.to_string(),
+                    model: model.clone(),
+                };
+                aliases.insert(model_alias(provider_id, &model), alias_target.clone());
+                raw_models
+                    .entry(model.clone())
+                    .or_default()
+                    .push(alias_target.clone());
+                target.models.insert(model.clone());
             }
-            routes.insert(provider_id.to_string(), target);
+            routes.insert(provider_id.to_string(), Arc::new(target));
         }
-        Self { routes, aliases }
+        let mut model_ids = raw_models.keys().cloned().collect::<Vec<_>>();
+        model_ids.sort_unstable();
+        Self {
+            routes,
+            aliases,
+            raw_models,
+            model_ids,
+        }
     }
 
-    fn target_for_model(&self, requested_model: &str) -> Result<ResolvedTarget> {
+    fn target_for_request(
+        &self,
+        requested_model: &str,
+        route_hint: Option<&str>,
+        bound_route: Option<&str>,
+    ) -> Result<ResolvedTarget> {
         let requested_model = requested_model.trim();
         if requested_model.is_empty() {
             anyhow::bail!("请求缺少 model 字段");
         }
         if let Some(alias) = self.aliases.get(requested_model) {
-            let target = self
+            // A qualified `provider/model` selector already identifies the
+            // route. Codex can replay client metadata from an earlier turn, so
+            // an independent route hint must not redirect an explicit alias.
+            return self.target_for_route_model(&alias.provider_id, &alias.model);
+        }
+        if let Some(route_hint) = route_hint
+            && self
                 .routes
-                .get(&alias.provider_id)
-                .ok_or_else(|| anyhow::anyhow!("线路已不存在：{}", alias.provider_id))?;
-            return Ok(ResolvedTarget {
-                route: target.clone(),
-                upstream_model: alias.model.clone(),
-            });
+                .get(route_hint)
+                .is_some_and(|target| target.models.contains(requested_model))
+        {
+            return self.target_for_route_model(route_hint, requested_model);
+        }
+        // Codex can replay Responses client metadata from an earlier turn
+        // after the sticky model has changed. An invalid hint therefore is
+        // not sufficient evidence of a current route choice. Continue into
+        // the bound/unique lookup; valid hints still win above, and equal
+        // raw model ids on multiple routes still fail closed below.
+        if let Some(bound_route) = bound_route
+            && self
+                .routes
+                .get(bound_route)
+                .is_some_and(|target| target.models.contains(requested_model))
+        {
+            return self.target_for_route_model(bound_route, requested_model);
+        }
+        // A thread binding describes the route used by its previous turn,
+        // not an explicit choice for every future model. When the user
+        // changes models and the old route cannot serve it, continue into
+        // the normal unique-candidate lookup below. Ambiguous raw ids still
+        // fail closed, so this fallback never guesses between routes.
+        let candidates = self
+            .raw_models
+            .get(requested_model)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        if candidates.len() == 1 {
+            let candidate = &candidates[0];
+            return self.target_for_route_model(&candidate.provider_id, &candidate.model);
+        }
+        if candidates.len() > 1 {
+            anyhow::bail!("模型 {requested_model} 同时存在于多条线路，缺少明确的 Codey 线路元数据");
         }
         anyhow::bail!("模型未在线路路由表中启用：{requested_model}")
     }
 
+    #[cfg(test)]
+    fn target_for_model(&self, requested_model: &str) -> Result<ResolvedTarget> {
+        self.target_for_request(requested_model, None, None)
+    }
+
+    fn target_for_route_model(&self, provider_id: &str, model: &str) -> Result<ResolvedTarget> {
+        let target = self
+            .routes
+            .get(provider_id)
+            .ok_or_else(|| anyhow::anyhow!("线路已不存在：{provider_id}"))?;
+        if !target.models.contains(model) {
+            anyhow::bail!("线路「{}」未启用模型 {model}", route_display_name(target));
+        }
+        Ok(ResolvedTarget {
+            route: Arc::clone(target),
+            upstream_model: model.to_string(),
+        })
+    }
+
+    fn model_ids(&self) -> &[String] {
+        &self.model_ids
+    }
+
+    #[cfg(test)]
     fn model_aliases(&self) -> Vec<String> {
-        self.aliases.keys().cloned().collect()
+        let mut aliases = self.aliases.keys().cloned().collect::<Vec<_>>();
+        aliases.sort_unstable();
+        aliases
     }
 }
 
@@ -240,9 +447,12 @@ impl RouterSnapshot {
 struct RouteTarget {
     provider_id: String,
     route_name: String,
-    base_url: String,
-    api_key: String,
-    headers: BTreeMap<String, String>,
+    upstream_url: std::result::Result<String, String>,
+    upstream_headers: std::result::Result<HeaderMap, String>,
+    upstream_authority: String,
+    adapter: UpstreamAdapter,
+    official_account: bool,
+    models: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -253,11 +463,18 @@ struct AliasTarget {
 
 #[derive(Clone, Debug)]
 struct ResolvedTarget {
-    route: RouteTarget,
+    route: Arc<RouteTarget>,
     upstream_model: String,
 }
 
-fn route_models(config: &CodeyConfig, provider_id: &str) -> Vec<String> {
+fn route_models(
+    config: &CodeyConfig,
+    profile: &crate::config::ProviderProfile,
+    provider_id: &str,
+) -> Vec<String> {
+    if profile.official_account {
+        return config.enabled_official_route_models(provider_id);
+    }
     config.enabled_route_models(provider_id)
 }
 
@@ -284,11 +501,26 @@ impl RouterServer {
     async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
         let request = match tokio::time::timeout(
             REQUEST_READ_TIMEOUT,
-            read_http_request(&mut stream),
+            read_http_request_with_budget(&mut stream, Some(&self.request_body_budget)),
         )
         .await
         {
             Ok(Ok(request)) => request,
+            Ok(Err(error))
+                if error
+                    .downcast_ref::<RequestBodyBudgetUnavailable>()
+                    .is_some() =>
+            {
+                write_error_response(
+                    &mut stream,
+                    503,
+                    "router_memory_busy",
+                    "Codey 本地路由请求缓冲区已满，请稍后重试",
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
             Ok(Err(error)) => {
                 write_error_response(
                     &mut stream,
@@ -327,11 +559,18 @@ impl RouterServer {
             .await?;
             return Ok(());
         }
-        match (request.method.as_str(), request.path.as_str()) {
+        let route_path = request.path.as_str();
+        match (request.method.as_str(), route_path) {
             ("GET", "/v1/models") | ("GET", "/models") => {
-                let models = self.snapshot.read().await.model_aliases();
-                let data = models
-                    .into_iter()
+                let snapshot = Arc::clone(
+                    &self
+                        .snapshot
+                        .read()
+                        .expect("local router snapshot lock poisoned"),
+                );
+                let data = snapshot
+                    .model_ids()
+                    .iter()
                     .map(|id| json!({"id":id,"object":"model","owned_by":"codey"}))
                     .collect::<Vec<_>>();
                 write_json_response(&mut stream, 200, &json!({"object":"list","data":data}))
@@ -355,14 +594,15 @@ impl RouterServer {
     }
 
     fn authorized(&self, request: &HttpRequest) -> bool {
-        let expected = format!("Bearer {}", self.token);
         request.headers.iter().any(|(name, value)| {
-            name.eq_ignore_ascii_case("authorization")
-                && constant_time_eq(value.trim().as_bytes(), expected.as_bytes())
+            (name.eq_ignore_ascii_case(ROUTER_AUTH_HEADER)
+                && constant_time_eq(value.trim().as_bytes(), self.token.as_bytes()))
+                || (name.eq_ignore_ascii_case("authorization")
+                    && constant_time_eq(value.trim().as_bytes(), self.bearer_token.as_bytes()))
         })
     }
 
-    async fn proxy_responses(&self, request: HttpRequest, mut stream: TcpStream) -> Result<()> {
+    async fn proxy_responses(&self, mut request: HttpRequest, mut stream: TcpStream) -> Result<()> {
         let mut body = match serde_json::from_slice::<Value>(&request.body) {
             Ok(body) if body.is_object() => body,
             Ok(_) => {
@@ -406,7 +646,44 @@ impl RouterServer {
             .await?;
             return Ok(());
         }
-        let resolved = match self.snapshot.read().await.target_for_model(&model) {
+        let route_hint = match take_codey_route_metadata(&mut request, &mut body) {
+            Ok(route_hint) => route_hint,
+            Err(error) => {
+                write_error_response(
+                    &mut stream,
+                    400,
+                    "route_metadata_invalid",
+                    format!("Codey 线路元数据无效：{error:#}"),
+                    None,
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let binding_keys = request_binding_keys(&request);
+        let snapshot = Arc::clone(
+            &self
+                .snapshot
+                .read()
+                .expect("local router snapshot lock poisoned"),
+        );
+        // Route lookup and binding refresh are both synchronous hash lookups.
+        // Keeping them under one short critical section halves mutex traffic on
+        // the request hot path without holding the lock across any I/O.
+        let resolved = {
+            let mut bindings = self
+                .bindings
+                .lock()
+                .expect("local router bindings mutex poisoned");
+            let bound_route = bindings.route_for_keys(&binding_keys);
+            let resolved =
+                snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref());
+            if let Ok(resolved) = &resolved {
+                bindings.remember(&binding_keys, &resolved.route.provider_id);
+            }
+            resolved
+        };
+        let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
                 write_error_response(
@@ -420,32 +697,99 @@ impl RouterServer {
                 return Ok(());
             }
         };
-        body.as_object_mut()
-            .expect("validated Responses body must remain an object")
-            .insert(
-                "model".to_string(),
-                Value::String(resolved.upstream_model.clone()),
-            );
-        let upstream_url = match responses_endpoint(&resolved.route.base_url) {
-            Ok(url) => url,
+        if model != resolved.upstream_model {
+            body.as_object_mut()
+                .expect("validated Responses body must remain an object")
+                .insert(
+                    "model".to_string(),
+                    Value::String(resolved.upstream_model.clone()),
+                );
+        }
+        let stream_requested = body
+            .as_object()
+            .and_then(|body| body.get("stream"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let adapter = resolved.route.adapter;
+        let upstream_url = match &resolved.route.upstream_url {
+            Ok(upstream_url) => upstream_url.as_str(),
             Err(error) => {
                 write_error_response(
                     &mut stream,
                     502,
                     "route_configuration_error",
-                    format!(
-                        "线路「{}」的 API URL 无效：{error:#}",
-                        resolved.route.route_name
-                    ),
+                    format!("线路「{}」的 {error}", route_display_name(&resolved.route)),
                     Some(&resolved.route),
                 )
                 .await?;
                 return Ok(());
             }
         };
-        let mut headers = HeaderMap::new();
+        let mut tool_bridge = ResponsesToolBridge::default();
+        let upstream_body = match adapter {
+            UpstreamAdapter::OpenAiChatCompletions => {
+                match responses_to_chat_completions_request(&body) {
+                    Ok(converted) => {
+                        tool_bridge = converted.tool_bridge;
+                        converted.body
+                    }
+                    Err(error) => {
+                        write_error_response(
+                            &mut stream,
+                            400,
+                            "unsupported_responses_payload",
+                            format!(
+                                "线路「{}」选择了 OpenAI Chat Completions，但当前请求无法转换：{error:#}",
+                                route_display_name(&resolved.route)
+                            ),
+                            Some(&resolved.route),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            UpstreamAdapter::AnthropicMessages => {
+                match responses_to_anthropic_messages_request(&body) {
+                    Ok(converted) => {
+                        tool_bridge = converted.tool_bridge;
+                        converted.body
+                    }
+                    Err(error) => {
+                        write_error_response(
+                            &mut stream,
+                            400,
+                            "unsupported_responses_payload",
+                            format!(
+                                "线路「{}」选择了 Anthropic Messages，但当前请求无法转换：{error:#}",
+                                route_display_name(&resolved.route)
+                            ),
+                            Some(&resolved.route),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+            UpstreamAdapter::Responses => body,
+        };
+        let prepared_headers = match &resolved.route.upstream_headers {
+            Ok(headers) => headers,
+            Err(error) => {
+                write_error_response(
+                    &mut stream,
+                    502,
+                    "route_configuration_error",
+                    error,
+                    Some(&resolved.route),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let mut headers = HeaderMap::with_capacity(request.headers.len() + prepared_headers.len());
         for (name, value) in &request.headers {
-            if should_forward_incoming_header(name)
+            if should_forward_incoming_header(name, resolved.route.official_account)
                 && let (Ok(name), Ok(value)) = (
                     HeaderName::from_bytes(name.as_bytes()),
                     HeaderValue::from_str(value),
@@ -454,18 +798,34 @@ impl RouterServer {
                 headers.insert(name, value);
             }
         }
-        let has_custom_authorization =
-            resolved.route.headers.iter().any(|(name, value)| {
-                name.eq_ignore_ascii_case("authorization") && !value.is_empty()
-            });
-        if !resolved.route.api_key.is_empty() && !has_custom_authorization {
-            let Ok(value) = HeaderValue::from_str(&format!("Bearer {}", resolved.route.api_key))
-            else {
+        // Saved route headers deliberately win over incoming Codex headers,
+        // matching the previous per-request construction order.
+        for (name, value) in prepared_headers {
+            headers.insert(name, value.clone());
+        }
+        if let Some(request_id) = current_router_request_id()
+            && let Ok(value) = HeaderValue::from_str(&request_id)
+        {
+            headers.insert(HeaderName::from_static("x-codey-request-id"), value);
+        }
+        if resolved.route.official_account {
+            let Some(authorization) = incoming_header(&request, "authorization") else {
                 write_error_response(
                     &mut stream,
-                    502,
-                    "route_configuration_error",
-                    format!("线路「{}」的 API Key 格式无效", resolved.route.route_name),
+                    401,
+                    "openai_auth_missing",
+                    "官方账号线路缺少 Codex OpenAI 登录态，请重新登录后重试",
+                    Some(&resolved.route),
+                )
+                .await?;
+                return Ok(());
+            };
+            let Ok(value) = HeaderValue::from_str(authorization) else {
+                write_error_response(
+                    &mut stream,
+                    401,
+                    "openai_auth_invalid",
+                    "官方账号线路的 Codex OpenAI 登录态无效，请重新登录后重试",
                     Some(&resolved.route),
                 )
                 .await?;
@@ -473,59 +833,20 @@ impl RouterServer {
             };
             headers.insert(AUTHORIZATION, value);
         }
-        for (name, value) in &resolved.route.headers {
-            if value.trim().is_empty() {
-                continue;
-            }
-            if is_hop_by_hop_header(name) {
-                write_error_response(
-                    &mut stream,
-                    502,
-                    "route_configuration_error",
-                    format!(
-                        "线路「{}」包含不允许覆盖的请求头 {name}",
-                        resolved.route.route_name
-                    ),
-                    Some(&resolved.route),
-                )
-                .await?;
-                return Ok(());
-            }
-            let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
-                write_error_response(
-                    &mut stream,
-                    502,
-                    "route_configuration_error",
-                    format!("线路「{}」包含非法请求头名称", resolved.route.route_name),
-                    Some(&resolved.route),
-                )
-                .await?;
-                return Ok(());
-            };
-            let Ok(value) = HeaderValue::from_str(value) else {
-                write_error_response(
-                    &mut stream,
-                    502,
-                    "route_configuration_error",
-                    format!("线路「{}」包含非法请求头值", resolved.route.route_name),
-                    Some(&resolved.route),
-                )
-                .await?;
-                return Ok(());
-            };
-            headers.insert(name, value);
-        }
-        let response = match self
-            .client
-            .post(upstream_url)
-            .headers(headers)
-            .json(&body)
-            .send()
-            .await
+        let response = match tokio::time::timeout(
+            UPSTREAM_RESPONSE_HEADER_TIMEOUT,
+            self.client
+                .post(upstream_url)
+                .headers(headers)
+                .json(&upstream_body)
+                .send(),
+        )
+        .await
         {
-            Ok(response) => response,
-            Err(error) => {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
                 let timeout = error.is_timeout();
+                let connect = error.is_connect();
                 let sanitized_error = error.without_url().to_string();
                 crate::error_log::record_failure(
                     "local_router_upstream_failed",
@@ -536,49 +857,277 @@ impl RouterServer {
                         "routeName": resolved.route.route_name.as_str(),
                         "model": resolved.upstream_model.as_str(),
                         "timeout": timeout,
+                        "connect": connect,
+                        "upstream": resolved.route.upstream_authority.as_str(),
+                        "requestId": current_router_request_id(),
                     }),
                 );
-                write_error_response(
+                let route_name = route_display_name(&resolved.route);
+                let upstream = resolved.route.upstream_authority.as_str();
+                let (status, code, message) = if timeout {
+                    (
+                        504,
+                        "upstream_timeout",
+                        format!(
+                            "Codey 线路「{route_name}」请求上游 {upstream} 超时；请检查上游服务状态或网络连接"
+                        ),
+                    )
+                } else {
+                    (
+                        424,
+                        "upstream_unreachable",
+                        format!(
+                            "Codey 线路「{route_name}」无法连接上游 {upstream}；请确认上游服务已启动，并检查线路 URL、证书和网络设置"
+                        ),
+                    )
+                };
+                // Codex currently reduces JSON bodies from locally generated
+                // gateway failures to "Unknown error". A concise text body is
+                // preserved in its surfaced `unexpected status` message. A
+                // transport setup failure uses non-retryable 424 so Codex does
+                // not repeat the same deterministic failure four more times.
+                write_text_error_response(&mut stream, status, code, message).await?;
+                return Ok(());
+            }
+            Err(_) => {
+                crate::error_log::record_failure(
+                    "local_router_upstream_failed",
+                    "wait_for_local_router_upstream_headers",
+                    "等待上游响应头超时",
+                    serde_json::json!({
+                        "routeId": resolved.route.provider_id.as_str(),
+                        "routeName": resolved.route.route_name.as_str(),
+                        "model": resolved.upstream_model.as_str(),
+                        "timeout": true,
+                        "stage": "response_headers",
+                        "upstream": resolved.route.upstream_authority.as_str(),
+                        "requestId": current_router_request_id(),
+                    }),
+                );
+                write_text_error_response(
                     &mut stream,
-                    if timeout { 504 } else { 502 },
-                    if timeout {
-                        "upstream_timeout"
-                    } else {
-                        "upstream_unreachable"
-                    },
-                    if timeout {
-                        format!("线路「{}」请求超时", resolved.route.route_name)
-                    } else {
-                        format!("无法连接线路「{}」", resolved.route.route_name)
-                    },
-                    Some(&resolved.route),
+                    504,
+                    "upstream_header_timeout",
+                    format!(
+                        "Codey 线路「{}」等待上游 {} 返回响应头超时",
+                        route_display_name(&resolved.route),
+                        resolved.route.upstream_authority
+                    ),
                 )
                 .await?;
                 return Ok(());
             }
         };
-        write_proxy_response(&mut stream, response).await
+        match adapter {
+            UpstreamAdapter::OpenAiChatCompletions if response.status().is_success() => {
+                write_chat_completions_as_responses(
+                    &mut stream,
+                    response,
+                    &resolved.upstream_model,
+                    stream_requested,
+                    &resolved.route,
+                    &tool_bridge,
+                )
+                .await
+            }
+            UpstreamAdapter::AnthropicMessages => {
+                write_anthropic_messages_as_responses(
+                    &mut stream,
+                    response,
+                    &resolved.upstream_model,
+                    stream_requested,
+                    &resolved.route,
+                    &tool_bridge,
+                )
+                .await
+            }
+            _ => write_proxy_response(&mut stream, response).await,
+        }
     }
 }
 
-fn should_forward_incoming_header(name: &str) -> bool {
-    !name.eq_ignore_ascii_case("authorization") && !is_hop_by_hop_header(name)
+fn request_binding_keys(request: &HttpRequest) -> Vec<String> {
+    ["thread-id", "session-id"]
+        .into_iter()
+        .filter_map(|header_name| {
+            let value = incoming_header(request, header_name)?.trim();
+            (!value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control))
+                .then(|| format!("{header_name}:{value}"))
+        })
+        .collect()
+}
+
+fn take_codey_route_metadata(
+    request: &mut HttpRequest,
+    body: &mut Value,
+) -> Result<Option<String>> {
+    let mut route_hint = None;
+    for (name, value) in &mut request.headers {
+        if !name.eq_ignore_ascii_case(TURN_METADATA_HEADER) {
+            continue;
+        }
+        let Ok(mut metadata) = serde_json::from_str::<Value>(value) else {
+            continue;
+        };
+        let extracted = take_route_hint_from_metadata_value(&mut metadata)?;
+        merge_route_hint(&mut route_hint, extracted)?;
+        *value =
+            serde_json::to_string(&metadata).context("序列化清理后的 Codex turn metadata 失败")?;
+    }
+
+    let Some(client_metadata) = body
+        .as_object_mut()
+        .and_then(|body| body.get_mut("client_metadata"))
+        .and_then(Value::as_object_mut)
+    else {
+        return Ok(route_hint);
+    };
+    let direct = client_metadata.remove(ROUTE_METADATA_KEY);
+    merge_route_hint(
+        &mut route_hint,
+        direct.map(validated_route_hint_value).transpose()?,
+    )?;
+    if let Some(metadata) = client_metadata.get_mut(TURN_METADATA_HEADER) {
+        let extracted = match metadata {
+            Value::String(serialized) => {
+                let Ok(mut parsed) = serde_json::from_str::<Value>(serialized) else {
+                    return Ok(route_hint);
+                };
+                let extracted = take_route_hint_from_metadata_value(&mut parsed)?;
+                *serialized = serde_json::to_string(&parsed)
+                    .context("序列化清理后的 Responses client metadata 失败")?;
+                extracted
+            }
+            Value::Object(_) => take_route_hint_from_metadata_value(metadata)?,
+            _ => None,
+        };
+        merge_route_hint(&mut route_hint, extracted)?;
+    }
+    Ok(route_hint)
+}
+
+fn take_route_hint_from_metadata_value(metadata: &mut Value) -> Result<Option<String>> {
+    let Some(metadata) = metadata.as_object_mut() else {
+        return Ok(None);
+    };
+    metadata
+        .remove(ROUTE_METADATA_KEY)
+        .map(validated_route_hint_value)
+        .transpose()
+}
+
+fn validated_route_hint_value(value: Value) -> Result<String> {
+    let route_hint = value
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("{ROUTE_METADATA_KEY} 必须是字符串"))?
+        .trim();
+    if route_hint.is_empty() || route_hint.len() > 256 || route_hint.chars().any(char::is_control) {
+        anyhow::bail!("{ROUTE_METADATA_KEY} 不是有效的线路 ID");
+    }
+    Ok(route_hint.to_string())
+}
+
+fn merge_route_hint(current: &mut Option<String>, next: Option<String>) -> Result<()> {
+    let Some(next) = next else {
+        return Ok(());
+    };
+    if current.as_ref().is_some_and(|current| current != &next) {
+        anyhow::bail!("请求头和请求体携带了冲突的 {ROUTE_METADATA_KEY}");
+    }
+    *current = Some(next);
+    Ok(())
+}
+
+fn should_forward_incoming_header(name: &str, official_account: bool) -> bool {
+    if name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case(ROUTER_AUTH_HEADER)
+        || name.eq_ignore_ascii_case(ROUTE_METADATA_KEY)
+        || is_hop_by_hop_header(name)
+    {
+        return false;
+    }
+    // ChatGPT-account headers are required by the official Codex endpoint but
+    // must never cross into an API-key provider. Third-party routes receive
+    // only a harmless content-negotiation header plus their saved route headers.
+    official_account || name.eq_ignore_ascii_case("accept")
+}
+
+fn incoming_header<'a>(request: &'a HttpRequest, header_name: &str) -> Option<&'a str> {
+    request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(header_name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn route_display_name(route: &RouteTarget) -> &str {
+    let route_name = route.route_name.trim();
+    if route_name.is_empty() {
+        route.provider_id.as_str()
+    } else {
+        route_name
+    }
+}
+
+fn upstream_authority(base_url: &str) -> String {
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return "已配置地址".to_string();
+    };
+    let Some(host) = url.host_str() else {
+        return "已配置地址".to_string();
+    };
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpstreamAdapter {
+    Responses,
+    OpenAiChatCompletions,
+    AnthropicMessages,
+}
+
+fn upstream_adapter(official_account: bool, upstream_protocol: &str) -> UpstreamAdapter {
+    if official_account {
+        return UpstreamAdapter::Responses;
+    }
+    match upstream_protocol {
+        UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS => UpstreamAdapter::OpenAiChatCompletions,
+        UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES => UpstreamAdapter::AnthropicMessages,
+        _ => UpstreamAdapter::Responses,
+    }
 }
 
 fn is_hop_by_hop_header(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "host"
-            | "content-length"
-            | "connection"
-            | "proxy-connection"
-            | "keep-alive"
-            | "transfer-encoding"
-            | "te"
-            | "trailer"
-            | "upgrade"
-            | "accept-encoding"
-    )
+    [
+        "host",
+        "content-length",
+        "connection",
+        "proxy-connection",
+        "keep-alive",
+        "transfer-encoding",
+        "te",
+        "trailer",
+        "upgrade",
+        "accept-encoding",
+    ]
+    .iter()
+    .any(|blocked| name.eq_ignore_ascii_case(blocked))
+}
+
+fn is_sse_content_type(value: &str) -> bool {
+    const SSE_CONTENT_TYPE: &[u8] = b"text/event-stream";
+    value
+        .as_bytes()
+        .windows(SSE_CONTENT_TYPE.len())
+        .any(|candidate| candidate.eq_ignore_ascii_case(SSE_CONTENT_TYPE))
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -593,15 +1142,1839 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
-fn responses_endpoint(base_url: &str) -> Result<String> {
-    let mut url = reqwest::Url::parse(base_url.trim()).context("线路 API URL 格式无效")?;
+fn current_router_request_id() -> Option<String> {
+    ROUTER_REQUEST_ID
+        .try_with(|request_id| request_id.clone())
+        .ok()
+}
+
+fn router_request_id_header() -> String {
+    current_router_request_id()
+        .map(|request_id| format!("x-codey-request-id: {request_id}\r\n"))
+        .unwrap_or_default()
+}
+
+fn normalized_endpoint_url(base_url: &str) -> Result<reqwest::Url> {
+    let mut url = crate::config::validate_outbound_api_url(base_url.trim(), "线路 API URL")
+        .map_err(anyhow::Error::msg)?;
     url.set_query(None);
     url.set_fragment(None);
-    let base = url.as_str().trim_end_matches('/').to_string();
-    if base.to_ascii_lowercase().ends_with("/responses") {
-        Ok(base)
+    Ok(url)
+}
+
+fn strip_ascii_case_suffix<'a>(value: &'a str, suffix: &str) -> Option<&'a str> {
+    let prefix_len = value.len().checked_sub(suffix.len())?;
+    value[prefix_len..]
+        .eq_ignore_ascii_case(suffix)
+        .then_some(&value[..prefix_len])
+}
+
+fn responses_endpoint(base_url: &str) -> Result<String> {
+    let url = normalized_endpoint_url(base_url)?;
+    let base = url.as_str().trim_end_matches('/');
+    if strip_ascii_case_suffix(base, "/responses").is_some() {
+        Ok(base.to_string())
     } else {
         Ok(format!("{base}/responses"))
+    }
+}
+
+fn chat_completions_endpoint(base_url: &str) -> Result<String> {
+    let url = normalized_endpoint_url(base_url)?;
+    let base = url.as_str().trim_end_matches('/');
+    if strip_ascii_case_suffix(base, "/chat/completions").is_some() {
+        return Ok(base.to_string());
+    }
+    if let Some(prefix) = strip_ascii_case_suffix(base, "/responses") {
+        return Ok(format!("{}/chat/completions", prefix.trim_end_matches('/')));
+    }
+    let last_segment = url
+        .path()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if has_version_suffix(last_segment) {
+        Ok(format!("{base}/chat/completions"))
+    } else {
+        Ok(format!("{base}/v1/chat/completions"))
+    }
+}
+
+fn anthropic_messages_endpoint(base_url: &str) -> Result<String> {
+    let url = normalized_endpoint_url(base_url)?;
+    let base = url.as_str().trim_end_matches('/');
+    if strip_ascii_case_suffix(base, "/messages").is_some() {
+        return Ok(base.to_string());
+    }
+    for suffix in ["/chat/completions", "/responses"] {
+        if let Some(prefix) = strip_ascii_case_suffix(base, suffix) {
+            return Ok(format!("{}/messages", prefix.trim_end_matches('/')));
+        }
+    }
+    let last_segment = url
+        .path()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    if has_version_suffix(last_segment) {
+        Ok(format!("{base}/messages"))
+    } else {
+        Ok(format!("{base}/v1/messages"))
+    }
+}
+
+fn prepare_upstream_url(
+    adapter: UpstreamAdapter,
+    base_url: &str,
+) -> std::result::Result<String, String> {
+    let result = match adapter {
+        UpstreamAdapter::Responses => responses_endpoint(base_url),
+        UpstreamAdapter::OpenAiChatCompletions => chat_completions_endpoint(base_url),
+        UpstreamAdapter::AnthropicMessages => anthropic_messages_endpoint(base_url),
+    };
+    result.map_err(|error| {
+        let endpoint = match adapter {
+            UpstreamAdapter::Responses => "API URL",
+            UpstreamAdapter::OpenAiChatCompletions => "Chat Completions API URL",
+            UpstreamAdapter::AnthropicMessages => "Anthropic Messages API URL",
+        };
+        format!("{endpoint} 无效：{error:#}")
+    })
+}
+
+fn prepare_upstream_headers(
+    profile: &crate::config::ProviderProfile,
+    adapter: UpstreamAdapter,
+) -> std::result::Result<HeaderMap, String> {
+    let route_name = profile.name.trim();
+    let mut headers = HeaderMap::with_capacity(profile.model_request_headers.len() + 2);
+    for (name, value) in &profile.model_request_headers {
+        if value.trim().is_empty() {
+            continue;
+        }
+        if is_hop_by_hop_header(name) {
+            return Err(format!("线路「{route_name}」包含不允许覆盖的请求头 {name}"));
+        }
+        let name = HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| format!("线路「{route_name}」包含非法请求头名称"))?;
+        let value = HeaderValue::from_str(value)
+            .map_err(|_| format!("线路「{route_name}」包含非法请求头值"))?;
+        headers.insert(name, value);
+    }
+
+    let has_custom_authorization = headers.contains_key(AUTHORIZATION);
+    if adapter == UpstreamAdapter::AnthropicMessages && has_custom_authorization {
+        return Err(format!(
+            "线路「{route_name}」使用 Anthropic Messages 时不允许配置 Authorization；请使用该线路的 Key 字段或 x-api-key"
+        ));
+    }
+    if !profile.official_account && !profile.api_key.trim().is_empty() {
+        let header_name = if adapter == UpstreamAdapter::AnthropicMessages {
+            HeaderName::from_static("x-api-key")
+        } else {
+            AUTHORIZATION
+        };
+        if !headers.contains_key(&header_name) {
+            let header_value = if adapter == UpstreamAdapter::AnthropicMessages {
+                profile.api_key.trim().to_string()
+            } else {
+                format!("Bearer {}", profile.api_key.trim())
+            };
+            let value = HeaderValue::from_str(&header_value)
+                .map_err(|_| format!("线路「{route_name}」的 API Key 格式无效"))?;
+            headers.insert(header_name, value);
+        }
+    }
+    if adapter == UpstreamAdapter::AnthropicMessages
+        && !headers.contains_key(HeaderName::from_static("anthropic-version"))
+    {
+        headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+    }
+    Ok(headers)
+}
+
+fn has_version_suffix(segment: &str) -> bool {
+    segment
+        .strip_prefix('v')
+        .or_else(|| segment.strip_prefix('V'))
+        .is_some_and(|version| version.chars().next().is_some_and(|ch| ch.is_ascii_digit()))
+}
+
+#[derive(Clone, Debug)]
+struct ConvertedResponsesRequest {
+    body: Value,
+    tool_bridge: ResponsesToolBridge,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResponsesToolBridge {
+    upstream_to_response: HashMap<String, ResponsesToolName>,
+    response_to_upstream: HashMap<ResponsesToolName, String>,
+    has_namespace_tools: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ResponsesToolName {
+    namespace: Vec<String>,
+    name: String,
+}
+
+impl ResponsesToolName {
+    fn plain(name: &str) -> Self {
+        Self {
+            namespace: Vec::new(),
+            name: name.to_string(),
+        }
+    }
+
+    fn namespace_string(&self) -> Option<String> {
+        (!self.namespace.is_empty()).then(|| self.namespace.join("."))
+    }
+
+    fn insert_response_fields(&self, object: &mut serde_json::Map<String, Value>) {
+        object.insert("name".to_string(), Value::String(self.name.clone()));
+        if let Some(namespace) = self.namespace_string() {
+            object.insert("namespace".to_string(), Value::String(namespace));
+        } else {
+            object.remove("namespace");
+        }
+    }
+}
+
+impl ResponsesToolBridge {
+    fn upstream_name_for_call(&self, tool_name: &ResponsesToolName) -> Result<String> {
+        if let Some(upstream_name) = self.response_to_upstream.get(tool_name) {
+            return Ok(upstream_name.clone());
+        }
+        if tool_name.namespace.is_empty() {
+            return Ok(tool_name.name.clone());
+        }
+        anyhow::bail!(
+            "function_call 指向未声明的 namespace 工具 {}.{}",
+            tool_name.namespace.join("."),
+            tool_name.name
+        )
+    }
+
+    fn restore_upstream_name(&self, upstream_name: &str) -> Result<ResponsesToolName> {
+        if let Some(tool_name) = self.upstream_to_response.get(upstream_name) {
+            return Ok(tool_name.clone());
+        }
+        if self.has_namespace_tools && looks_like_namespace_upstream_name(upstream_name) {
+            anyhow::bail!("上游返回了未知的 namespace function 名称 {upstream_name}");
+        }
+        Ok(ResponsesToolName::plain(upstream_name))
+    }
+
+    fn restore_stream_upstream_name(
+        &self,
+        upstream_name: &str,
+        final_name: bool,
+    ) -> Result<Option<ResponsesToolName>> {
+        if let Some(tool_name) = self.upstream_to_response.get(upstream_name) {
+            if !final_name
+                && self.upstream_to_response.keys().any(|known| {
+                    known.len() > upstream_name.len() && known.starts_with(upstream_name)
+                })
+            {
+                return Ok(None);
+            }
+            return Ok(Some(tool_name.clone()));
+        }
+        if !final_name
+            && self
+                .upstream_to_response
+                .keys()
+                .any(|known| known.starts_with(upstream_name))
+        {
+            return Ok(None);
+        }
+        if self.has_namespace_tools && could_be_namespace_upstream_name(upstream_name) {
+            if final_name {
+                anyhow::bail!("上游返回了未知的 namespace function 名称 {upstream_name}");
+            }
+            return Ok(None);
+        }
+        Ok(Some(ResponsesToolName::plain(upstream_name)))
+    }
+}
+
+#[cfg(test)]
+fn responses_to_chat_completions_body(body: &Value) -> Result<Value> {
+    Ok(responses_to_chat_completions_request(body)?.body)
+}
+
+fn responses_to_chat_completions_request(body: &Value) -> Result<ConvertedResponsesRequest> {
+    let object = body
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Responses 请求体必须是 JSON 对象"))?;
+    let model = object
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("缺少 model 字段"))?;
+    let mut messages = Vec::new();
+    if let Some(instructions) = object.get("instructions").and_then(Value::as_str)
+        && !instructions.is_empty()
+    {
+        messages.push(json!({"role":"system","content":instructions}));
+    }
+    // Responses can add tools at a specific point in `input`. Chat and
+    // Anthropic only accept request-level tool declarations, so retain the
+    // message order while promoting those declarations for the current model
+    // generation. Historical assistant items are not re-executed.
+    let (normalized_input, additional_tools) =
+        responses_input_without_additional_tools(object.get("input"))?;
+    let merged_tools = merge_responses_tools(object.get("tools"), additional_tools)?;
+    let mut tool_bridge = ResponsesToolBridge::default();
+    let chat_tools = merged_tools
+        .as_ref()
+        .map(|tools| responses_tools_to_chat_tools_with_bridge(tools, &mut tool_bridge))
+        .transpose()?;
+    append_chat_messages_from_responses_input(
+        normalized_input.as_ref(),
+        &mut messages,
+        &tool_bridge,
+    )?;
+    if messages.is_empty() {
+        anyhow::bail!("缺少可转换为 Chat Completions messages 的 input");
+    }
+    if object
+        .get("previous_response_id")
+        .is_some_and(|value| !value.is_null())
+    {
+        anyhow::bail!(
+            "previous_response_id 依赖 Responses 服务端状态，不能无损转换为 Chat Completions"
+        );
+    }
+    let stream = object
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut chat = serde_json::Map::from_iter([
+        ("model".to_string(), Value::String(model.to_string())),
+        ("messages".to_string(), Value::Array(messages)),
+        ("stream".to_string(), Value::Bool(stream)),
+    ]);
+    copy_number_or_string_field(object, &mut chat, "temperature", "temperature");
+    copy_number_or_string_field(object, &mut chat, "top_p", "top_p");
+    copy_number_or_string_field(object, &mut chat, "presence_penalty", "presence_penalty");
+    copy_number_or_string_field(object, &mut chat, "frequency_penalty", "frequency_penalty");
+    copy_number_or_string_field(object, &mut chat, "reasoning_effort", "reasoning_effort");
+    if !chat.contains_key("reasoning_effort")
+        && let Some(reasoning) = object.get("reasoning").and_then(Value::as_object)
+    {
+        copy_number_or_string_field(reasoning, &mut chat, "effort", "reasoning_effort");
+    }
+    copy_number_or_string_field(object, &mut chat, "user", "user");
+    copy_json_field(object, &mut chat, "stop", "stop");
+    copy_json_field(object, &mut chat, "seed", "seed");
+    copy_json_field(object, &mut chat, "logit_bias", "logit_bias");
+    copy_json_field(object, &mut chat, "logprobs", "logprobs");
+    copy_json_field(object, &mut chat, "top_logprobs", "top_logprobs");
+    if stream {
+        let mut stream_options = object
+            .get("stream_options")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        // Chat Completions only reports usage for streams when explicitly
+        // requested. The final Responses event needs that usage shape.
+        stream_options.insert("include_usage".to_string(), Value::Bool(true));
+        chat.insert("stream_options".to_string(), Value::Object(stream_options));
+    }
+    if let Some(text) = object.get("text").and_then(Value::as_object)
+        && let Some(format) = text.get("format")
+    {
+        chat.insert(
+            "response_format".to_string(),
+            responses_text_format_to_chat_response_format(format)?,
+        );
+    }
+    if let Some(max_tokens) = object
+        .get("max_output_tokens")
+        .or_else(|| object.get("max_tokens"))
+        .cloned()
+    {
+        chat.insert("max_tokens".to_string(), max_tokens);
+    }
+    if let Some(tools) = chat_tools {
+        chat.insert("tools".to_string(), tools);
+    }
+    if let Some(tool_choice) = object.get("tool_choice") {
+        chat.insert(
+            "tool_choice".to_string(),
+            responses_tool_choice_to_chat_tool_choice(tool_choice, &tool_bridge)?,
+        );
+    }
+    if let Some(parallel_tool_calls) = object.get("parallel_tool_calls") {
+        if !parallel_tool_calls.is_boolean() {
+            anyhow::bail!("parallel_tool_calls 必须是布尔值");
+        }
+        chat.insert(
+            "parallel_tool_calls".to_string(),
+            parallel_tool_calls.clone(),
+        );
+    }
+    if let Some(function_call) = object.get("function_call") {
+        chat.insert(
+            "function_call".to_string(),
+            responses_function_call_choice_to_chat(function_call, &tool_bridge)?,
+        );
+    }
+    Ok(ConvertedResponsesRequest {
+        body: Value::Object(chat),
+        tool_bridge,
+    })
+}
+
+fn responses_input_without_additional_tools(
+    input: Option<&Value>,
+) -> Result<(Option<Value>, Vec<Value>)> {
+    let Some(input) = input else {
+        return Ok((None, Vec::new()));
+    };
+    let mut additional_tools = Vec::new();
+    match input {
+        Value::Array(items) => {
+            let mut normalized = Vec::with_capacity(items.len());
+            for item in items {
+                if !append_responses_additional_tools(item, &mut additional_tools)? {
+                    normalized.push(item.clone());
+                }
+            }
+            Ok((Some(Value::Array(normalized)), additional_tools))
+        }
+        Value::Object(_) if append_responses_additional_tools(input, &mut additional_tools)? => {
+            Ok((None, additional_tools))
+        }
+        _ => Ok((Some(input.clone()), additional_tools)),
+    }
+}
+
+fn append_responses_additional_tools(item: &Value, tools: &mut Vec<Value>) -> Result<bool> {
+    let Some(object) = item.as_object() else {
+        return Ok(false);
+    };
+    if object.get("type").and_then(Value::as_str) != Some("additional_tools") {
+        return Ok(false);
+    }
+    if object.get("role").and_then(Value::as_str) != Some("developer") {
+        anyhow::bail!("additional_tools.role 必须是 developer");
+    }
+    let additional = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("additional_tools.tools 必须是数组"))?;
+    tools.extend(additional.iter().cloned());
+    Ok(true)
+}
+
+fn merge_responses_tools(
+    configured: Option<&Value>,
+    additional: Vec<Value>,
+) -> Result<Option<Value>> {
+    if additional.is_empty() {
+        return Ok(configured.cloned());
+    }
+    let mut merged = match configured {
+        Some(Value::Array(tools)) => tools.clone(),
+        Some(_) => anyhow::bail!("tools 必须是数组"),
+        None => Vec::new(),
+    };
+    for tool in additional {
+        if let Some(identity) = responses_tool_identity(&tool)
+            && let Some(existing) = merged.iter().find(|existing| {
+                responses_tool_identity(existing).as_deref() == Some(identity.as_str())
+            })
+        {
+            if existing == &tool {
+                continue;
+            }
+            anyhow::bail!("additional_tools 包含定义冲突的工具 {identity}");
+        }
+        merged.push(tool);
+    }
+    Ok(Some(Value::Array(merged)))
+}
+
+fn responses_tool_identity(tool: &Value) -> Option<String> {
+    let object = tool.as_object()?;
+    let tool_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("function");
+    let name = object
+        .get("name")
+        .or_else(|| {
+            object
+                .get("function")
+                .and_then(|function| function.get("name"))
+        })
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())?;
+    Some(format!("{tool_type}/{name}"))
+}
+
+const DEFAULT_ANTHROPIC_MAX_TOKENS: u64 = 8192;
+
+#[cfg(test)]
+fn responses_to_anthropic_messages_body(body: &Value) -> Result<Value> {
+    Ok(responses_to_anthropic_messages_request(body)?.body)
+}
+
+fn responses_to_anthropic_messages_request(body: &Value) -> Result<ConvertedResponsesRequest> {
+    // Reuse the normalized Chat message representation so Responses message,
+    // image, function-call and function-result variants have one parser. The
+    // second stage below changes only the Anthropic-specific wire semantics.
+    let ConvertedResponsesRequest {
+        body: chat,
+        tool_bridge,
+    } = responses_to_chat_completions_request(body)?;
+    let chat = chat
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Responses 请求无法归一化为消息对象"))?;
+    for unsupported in [
+        "presence_penalty",
+        "frequency_penalty",
+        "seed",
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+    ] {
+        if chat.contains_key(unsupported) {
+            anyhow::bail!("Anthropic Messages 不支持 Responses 字段 {unsupported}");
+        }
+    }
+    if let Some(response_format) = chat.get("response_format")
+        && response_format.get("type").and_then(Value::as_str) != Some("text")
+    {
+        anyhow::bail!("Anthropic Messages 暂不支持当前 Responses 结构化输出格式");
+    }
+
+    let model = chat
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("缺少 model 字段"))?;
+    let mut system_parts = Vec::new();
+    let mut messages = Vec::new();
+    for message in chat
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        append_anthropic_message_from_chat(message, &mut system_parts, &mut messages)?;
+    }
+    if messages.is_empty() {
+        anyhow::bail!("缺少可转换为 Anthropic Messages messages 的 input");
+    }
+
+    let max_tokens = chat
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_ANTHROPIC_MAX_TOKENS);
+    if max_tokens == 0 {
+        anyhow::bail!("max_output_tokens 必须大于 0");
+    }
+    let mut anthropic = serde_json::Map::from_iter([
+        ("model".to_string(), Value::String(model.to_string())),
+        ("messages".to_string(), Value::Array(messages)),
+        ("max_tokens".to_string(), Value::Number(max_tokens.into())),
+        (
+            "stream".to_string(),
+            Value::Bool(chat.get("stream").and_then(Value::as_bool).unwrap_or(false)),
+        ),
+    ]);
+    if !system_parts.is_empty() {
+        anthropic.insert(
+            "system".to_string(),
+            Value::String(system_parts.join("\n\n")),
+        );
+    }
+    copy_number_or_string_field(chat, &mut anthropic, "temperature", "temperature");
+    copy_number_or_string_field(chat, &mut anthropic, "top_p", "top_p");
+    if let Some(top_k) = body.get("top_k") {
+        if !top_k.is_number() {
+            anyhow::bail!("top_k 必须是数字");
+        }
+        anthropic.insert("top_k".to_string(), top_k.clone());
+    }
+    if let Some(stop) = chat.get("stop") {
+        anthropic.insert(
+            "stop_sequences".to_string(),
+            anthropic_stop_sequences(stop)?,
+        );
+    }
+    if let Some(user_id) = chat
+        .get("user")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        anthropic.insert("metadata".to_string(), json!({"user_id":user_id}));
+    }
+    if let Some(effort) = chat
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(normalize_anthropic_effort)
+    {
+        anthropic.insert("output_config".to_string(), json!({"effort":effort}));
+    }
+
+    let parallel_tool_calls = chat
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if let Some(tools) = chat.get("tools") {
+        let converted_tools = chat_tools_to_anthropic_tools(tools)?;
+        let mut tool_choice = chat
+            .get("tool_choice")
+            .map(chat_tool_choice_to_anthropic_tool_choice)
+            .transpose()?;
+        if tool_choice.is_none()
+            && let Some(function_call) = chat.get("function_call")
+        {
+            tool_choice = Some(chat_function_call_to_anthropic_tool_choice(function_call)?);
+        }
+        if tool_choice
+            .as_ref()
+            .is_some_and(|choice| choice.get("type").and_then(Value::as_str) == Some("none"))
+        {
+            tool_choice = None;
+        } else {
+            anthropic.insert("tools".to_string(), converted_tools);
+            if !parallel_tool_calls {
+                let choice = tool_choice.get_or_insert_with(|| json!({"type":"auto"}));
+                choice
+                    .as_object_mut()
+                    .expect("Anthropic tool choice must be an object")
+                    .insert("disable_parallel_tool_use".to_string(), Value::Bool(true));
+            }
+        }
+        if let Some(tool_choice) = tool_choice {
+            anthropic.insert("tool_choice".to_string(), tool_choice);
+        }
+    }
+    Ok(ConvertedResponsesRequest {
+        body: Value::Object(anthropic),
+        tool_bridge,
+    })
+}
+
+fn append_anthropic_message_from_chat(
+    message: &Value,
+    system_parts: &mut Vec<String>,
+    messages: &mut Vec<Value>,
+) -> Result<()> {
+    let message = message
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("归一化消息必须是对象"))?;
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("归一化消息缺少 role"))?;
+    if role == "system" {
+        let text = message
+            .get("content")
+            .map(chat_message_content_text)
+            .unwrap_or_default();
+        if !text.is_empty() {
+            system_parts.push(text);
+        }
+        return Ok(());
+    }
+    if role == "tool" {
+        let call_id = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("tool 消息缺少 tool_call_id"))?;
+        let content = json_value_as_chat_string(message.get("content")).unwrap_or_default();
+        return push_anthropic_message(
+            messages,
+            "user",
+            vec![json!({
+                "type":"tool_result",
+                "tool_use_id":call_id,
+                "content":content,
+            })],
+        );
+    }
+    if !matches!(role, "user" | "assistant") {
+        anyhow::bail!("Anthropic Messages 不支持消息角色 {role}");
+    }
+    let mut blocks = message
+        .get("content")
+        .map(|content| chat_content_to_anthropic_blocks(content, role == "user"))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(tool_calls) = message.get("tool_calls") {
+        blocks.extend(chat_tool_calls_to_anthropic_blocks(tool_calls)?);
+    }
+    if let Some(function_call) = message.get("function_call") {
+        blocks.extend(chat_legacy_function_call_to_anthropic_blocks(
+            function_call,
+        )?);
+    }
+    if blocks.is_empty() {
+        return Ok(());
+    }
+    push_anthropic_message(messages, role, blocks)
+}
+
+fn push_anthropic_message(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) -> Result<()> {
+    if let Some(last) = messages.last_mut().and_then(Value::as_object_mut)
+        && last.get("role").and_then(Value::as_str) == Some(role)
+    {
+        let content = last
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| anyhow::anyhow!("Anthropic message.content 必须是数组"))?;
+        content.extend(blocks);
+        return Ok(());
+    }
+    messages.push(json!({"role":role,"content":blocks}));
+    Ok(())
+}
+
+fn chat_content_to_anthropic_blocks(content: &Value, allow_images: bool) -> Result<Vec<Value>> {
+    match content {
+        Value::Null => Ok(Vec::new()),
+        Value::String(text) => Ok(if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({"type":"text","text":text})]
+        }),
+        Value::Array(parts) => {
+            let mut blocks = Vec::new();
+            for part in parts {
+                let part = part
+                    .as_object()
+                    .ok_or_else(|| anyhow::anyhow!("消息 content 条目必须是对象"))?;
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let text = part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("text content 缺少 text"))?;
+                        blocks.push(json!({"type":"text","text":text}));
+                    }
+                    Some("image_url") if allow_images => {
+                        let image_url = part
+                            .get("image_url")
+                            .ok_or_else(|| anyhow::anyhow!("image_url content 缺少 image_url"))?;
+                        blocks.push(json!({
+                            "type":"image",
+                            "source":chat_image_url_to_anthropic_source(image_url)?,
+                        }));
+                    }
+                    Some("image_url") => anyhow::bail!("Anthropic Messages 只允许用户消息包含图片"),
+                    Some(part_type) => {
+                        anyhow::bail!("消息 content 类型 {part_type} 不能转换为 Anthropic Messages")
+                    }
+                    None => anyhow::bail!("消息 content 条目缺少 type"),
+                }
+            }
+            Ok(blocks)
+        }
+        _ => anyhow::bail!("消息 content 必须是字符串或数组"),
+    }
+}
+
+fn chat_image_url_to_anthropic_source(image_url: &Value) -> Result<Value> {
+    let url = match image_url {
+        Value::String(url) => url.as_str(),
+        Value::Object(object) => object
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("image_url 缺少 url"))?,
+        _ => anyhow::bail!("image_url 必须是字符串或对象"),
+    };
+    if let Some(data) = url.strip_prefix("data:") {
+        let (media_type, data) = data
+            .split_once(";base64,")
+            .ok_or_else(|| anyhow::anyhow!("Anthropic 图片 data URL 必须使用 base64"))?;
+        if !matches!(
+            media_type,
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        ) {
+            anyhow::bail!("Anthropic Messages 不支持图片类型 {media_type}");
+        }
+        if data.is_empty() {
+            anyhow::bail!("Anthropic 图片 data URL 缺少数据");
+        }
+        return Ok(json!({"type":"base64","media_type":media_type,"data":data}));
+    }
+    let parsed = reqwest::Url::parse(url).context("图片 URL 格式无效")?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        anyhow::bail!("Anthropic 图片 URL 必须是 HTTP(S) 或 base64 data URL");
+    }
+    Ok(json!({"type":"url","url":url}))
+}
+
+fn chat_tool_calls_to_anthropic_blocks(tool_calls: &Value) -> Result<Vec<Value>> {
+    let tool_calls = tool_calls
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tool_calls 必须是数组"))?;
+    tool_calls
+        .iter()
+        .map(|tool_call| {
+            let tool_call = tool_call
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("tool_call 必须是对象"))?;
+            let id = tool_call
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("tool_call 缺少 id"))?;
+            let function = tool_call
+                .get("function")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow::anyhow!("tool_call 缺少 function"))?;
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("tool_call.function 缺少 name"))?;
+            let input = parse_anthropic_tool_input(function.get("arguments"))?;
+            Ok(json!({"type":"tool_use","id":id,"name":name,"input":input}))
+        })
+        .collect()
+}
+
+fn chat_legacy_function_call_to_anthropic_blocks(function_call: &Value) -> Result<Vec<Value>> {
+    let function_call = function_call
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("function_call 必须是对象"))?;
+    let name = function_call
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("function_call 缺少 name"))?;
+    Ok(vec![json!({
+        "type":"tool_use",
+        "id":format!("call_codey_{}", Uuid::new_v4()),
+        "name":name,
+        "input":parse_anthropic_tool_input(function_call.get("arguments"))?,
+    })])
+}
+
+fn parse_anthropic_tool_input(arguments: Option<&Value>) -> Result<Value> {
+    let input = match arguments {
+        None | Some(Value::Null) => json!({}),
+        Some(Value::Object(object)) => Value::Object(object.clone()),
+        Some(Value::String(arguments)) if arguments.trim().is_empty() => json!({}),
+        Some(Value::String(arguments)) => {
+            serde_json::from_str::<Value>(arguments).context("工具调用 arguments 不是有效 JSON")?
+        }
+        Some(value) => value.clone(),
+    };
+    if !input.is_object() {
+        anyhow::bail!("Anthropic tool_use.input 必须是 JSON 对象");
+    }
+    Ok(input)
+}
+
+fn chat_tools_to_anthropic_tools(tools: &Value) -> Result<Value> {
+    let tools = tools
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tools 必须是数组"))?;
+    let mut converted = Vec::new();
+    for tool in tools {
+        let tool = tool
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("tool 条目必须是对象"))?;
+        if tool.get("type").and_then(Value::as_str) != Some("function") {
+            anyhow::bail!("Anthropic Messages 只支持 Responses function 工具");
+        }
+        let function = tool
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("function tool 缺少 function"))?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("function tool 缺少 name"))?;
+        let input_schema = function
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+        if !input_schema.is_object() {
+            anyhow::bail!("function tool.parameters 必须是 JSON Schema 对象");
+        }
+        let mut converted_tool = serde_json::Map::from_iter([
+            ("name".to_string(), Value::String(name.to_string())),
+            ("input_schema".to_string(), input_schema),
+        ]);
+        if let Some(description) = function.get("description").and_then(Value::as_str) {
+            converted_tool.insert(
+                "description".to_string(),
+                Value::String(description.to_string()),
+            );
+        }
+        converted.push(Value::Object(converted_tool));
+    }
+    Ok(Value::Array(converted))
+}
+
+fn chat_tool_choice_to_anthropic_tool_choice(tool_choice: &Value) -> Result<Value> {
+    match tool_choice {
+        Value::String(choice) => match choice.as_str() {
+            "auto" => Ok(json!({"type":"auto"})),
+            "required" => Ok(json!({"type":"any"})),
+            "none" => Ok(json!({"type":"none"})),
+            _ => anyhow::bail!("Anthropic Messages 不支持 tool_choice={choice}"),
+        },
+        Value::Object(object) => {
+            let name = object
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("function tool_choice 缺少 name"))?;
+            Ok(json!({"type":"tool","name":name}))
+        }
+        _ => anyhow::bail!("tool_choice 必须是字符串或 function 对象"),
+    }
+}
+
+fn chat_function_call_to_anthropic_tool_choice(function_call: &Value) -> Result<Value> {
+    match function_call {
+        Value::String(choice) if choice == "auto" => Ok(json!({"type":"auto"})),
+        Value::String(choice) if choice == "none" => Ok(json!({"type":"none"})),
+        Value::Object(function) => {
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("function_call 缺少 name"))?;
+            Ok(json!({"type":"tool","name":name}))
+        }
+        _ => anyhow::bail!("function_call 不能转换为 Anthropic tool_choice"),
+    }
+}
+
+fn anthropic_stop_sequences(stop: &Value) -> Result<Value> {
+    match stop {
+        Value::String(stop) => Ok(Value::Array(vec![Value::String(stop.clone())])),
+        Value::Array(stops) if stops.iter().all(Value::is_string) => {
+            Ok(Value::Array(stops.clone()))
+        }
+        _ => anyhow::bail!("stop 必须是字符串或字符串数组"),
+    }
+}
+
+fn normalize_anthropic_effort(effort: &str) -> &'static str {
+    let effort = effort.trim();
+    if effort.eq_ignore_ascii_case("low") || effort.eq_ignore_ascii_case("minimal") {
+        "low"
+    } else if effort.eq_ignore_ascii_case("medium") {
+        "medium"
+    } else if effort.eq_ignore_ascii_case("max")
+        || effort.eq_ignore_ascii_case("xhigh")
+        || effort.eq_ignore_ascii_case("ultra")
+    {
+        "max"
+    } else {
+        "high"
+    }
+}
+
+fn responses_text_format_to_chat_response_format(format: &Value) -> Result<Value> {
+    let object = format
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("text.format 必须是对象"))?;
+    match object.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(json!({"type":"text"})),
+        Some("json_object") => Ok(json!({"type":"json_object"})),
+        Some("json_schema") => {
+            let name = object
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("text.format.json_schema 缺少 name"))?;
+            let schema = object
+                .get("schema")
+                .ok_or_else(|| anyhow::anyhow!("text.format.json_schema 缺少 schema"))?;
+            let mut json_schema = serde_json::Map::from_iter([
+                ("name".to_string(), Value::String(name.to_string())),
+                ("schema".to_string(), schema.clone()),
+            ]);
+            for field in ["description", "strict"] {
+                if let Some(value) = object.get(field) {
+                    json_schema.insert(field.to_string(), value.clone());
+                }
+            }
+            Ok(json!({
+                "type": "json_schema",
+                "json_schema": Value::Object(json_schema),
+            }))
+        }
+        Some(format_type) => {
+            anyhow::bail!("Responses text.format 类型 {format_type} 不能转换为 Chat Completions")
+        }
+        None => anyhow::bail!("text.format 缺少 type"),
+    }
+}
+
+fn append_chat_messages_from_responses_input(
+    input: Option<&Value>,
+    messages: &mut Vec<Value>,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    let Some(input) = input else {
+        return Ok(());
+    };
+    match input {
+        Value::String(text) => push_chat_text_message(messages, "user", text),
+        Value::Array(items) => {
+            for item in items {
+                append_chat_message_item(item, messages, tool_bridge)?;
+            }
+            Ok(())
+        }
+        Value::Object(_) => append_chat_message_item(input, messages, tool_bridge),
+        _ => anyhow::bail!("input 必须是字符串、对象或数组"),
+    }
+}
+
+fn append_chat_message_item(
+    item: &Value,
+    messages: &mut Vec<Value>,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    match item {
+        Value::String(text) => push_chat_text_message(messages, "user", text),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("message") => append_responses_message_object(object, messages, tool_bridge),
+            None if looks_like_message_object(object) => {
+                append_responses_message_object(object, messages, tool_bridge)
+            }
+            Some("function_call") => {
+                append_responses_function_call_item(object, messages, tool_bridge)
+            }
+            Some("function_call_output") => {
+                append_responses_function_call_output_item(object, messages)
+            }
+            Some("input_text" | "output_text" | "text" | "input_image" | "image_url") => {
+                append_single_content_part_as_user_message(item, messages)
+            }
+            Some(item_type) => anyhow::bail!(
+                "Responses input item 类型 {item_type} 不能无损转换为 Chat Completions message"
+            ),
+            None => anyhow::bail!("Responses input item 缺少可转换的 role/content/type 字段"),
+        },
+        _ => anyhow::bail!("Responses input 数组只能包含字符串或对象"),
+    }
+}
+
+fn looks_like_message_object(object: &serde_json::Map<String, Value>) -> bool {
+    object.contains_key("role")
+        || object.contains_key("content")
+        || object.contains_key("tool_calls")
+        || object.contains_key("function_call")
+}
+
+fn append_responses_message_object(
+    object: &serde_json::Map<String, Value>,
+    messages: &mut Vec<Value>,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    let role = object
+        .get("role")
+        .and_then(Value::as_str)
+        .map(normalize_chat_role)
+        .transpose()?
+        .unwrap_or("user");
+    if role == "tool" {
+        return append_responses_function_call_output_item(object, messages);
+    }
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), Value::String(role.to_string()));
+    if let Some(content) = object.get("content") {
+        if let Some(chat_content) = responses_content_to_chat_content(content, role)? {
+            message.insert("content".to_string(), chat_content);
+        }
+    } else if let Some(text) = first_text_field(object) {
+        message.insert("content".to_string(), Value::String(text.to_string()));
+    }
+    if let Some(tool_calls) = object.get("tool_calls") {
+        message.insert(
+            "tool_calls".to_string(),
+            normalize_chat_tool_calls(tool_calls, tool_bridge)?,
+        );
+        message.entry("content".to_string()).or_insert(Value::Null);
+    }
+    if let Some(function_call) = object.get("function_call") {
+        message.insert(
+            "function_call".to_string(),
+            normalize_chat_legacy_function_call(function_call, tool_bridge)?,
+        );
+        message.entry("content".to_string()).or_insert(Value::Null);
+    }
+    if message.contains_key("content")
+        || message.contains_key("tool_calls")
+        || message.contains_key("function_call")
+    {
+        messages.push(Value::Object(message));
+    }
+    Ok(())
+}
+
+fn normalize_chat_role(role: &str) -> Result<&'static str> {
+    match role.trim() {
+        "user" => Ok("user"),
+        "assistant" => Ok("assistant"),
+        "system" | "developer" => Ok("system"),
+        "tool" => Ok("tool"),
+        other => anyhow::bail!("不支持的 Responses message role：{other}"),
+    }
+}
+
+fn first_text_field(object: &serde_json::Map<String, Value>) -> Option<&str> {
+    object
+        .get("text")
+        .or_else(|| object.get("input_text"))
+        .or_else(|| object.get("output_text"))
+        .and_then(Value::as_str)
+}
+
+fn responses_content_to_chat_content(content: &Value, role: &str) -> Result<Option<Value>> {
+    match content {
+        Value::String(text) => Ok((!text.is_empty()).then(|| Value::String(text.clone()))),
+        Value::Array(parts) => {
+            let mut chat_parts = Vec::new();
+            for part in parts {
+                if let Some(chat_part) = responses_content_part_to_chat_part(part)? {
+                    chat_parts.push(chat_part);
+                }
+            }
+            if chat_parts.is_empty() {
+                return Ok(None);
+            }
+            let has_image = chat_parts
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("image_url"));
+            if role != "user" {
+                if has_image {
+                    anyhow::bail!(
+                        "Chat Completions 只支持把用户消息中的 Responses 图片内容无损转换"
+                    );
+                }
+                let text = chat_parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                return Ok((!text.is_empty()).then_some(Value::String(text)));
+            }
+            Ok(Some(Value::Array(chat_parts)))
+        }
+        Value::Object(_) => responses_content_part_to_chat_part(content)
+            .map(|part| part.map(|part| Value::Array(vec![part]))),
+        _ => anyhow::bail!("message.content 必须是字符串、对象或数组"),
+    }
+}
+
+fn responses_content_part_to_chat_part(part: &Value) -> Result<Option<Value>> {
+    match part {
+        Value::String(text) => Ok(Some(json!({"type":"text","text":text}))),
+        Value::Object(object) => {
+            let part_type = object.get("type").and_then(Value::as_str);
+            match part_type {
+                Some("input_text" | "output_text" | "text") => {
+                    let text = first_text_field(object)
+                        .ok_or_else(|| anyhow::anyhow!("文本 content part 缺少 text"))?;
+                    Ok(Some(json!({"type":"text","text":text})))
+                }
+                None if first_text_field(object).is_some() => {
+                    let text = first_text_field(object).unwrap_or_default();
+                    Ok(Some(json!({"type":"text","text":text})))
+                }
+                Some("input_image" | "image_url") => Ok(Some(json!({
+                    "type": "image_url",
+                    "image_url": responses_image_url_to_chat_image_url(object)?
+                }))),
+                None if object.contains_key("image_url") || object.contains_key("url") => {
+                    Ok(Some(json!({
+                        "type": "image_url",
+                        "image_url": responses_image_url_to_chat_image_url(object)?
+                    })))
+                }
+                Some(part_type) => anyhow::bail!(
+                    "Responses content part 类型 {part_type} 不能无损转换为 Chat Completions content"
+                ),
+                None => anyhow::bail!("Responses content part 缺少 text 或 image_url"),
+            }
+        }
+        _ => anyhow::bail!("Responses content part 必须是字符串或对象"),
+    }
+}
+
+fn responses_image_url_to_chat_image_url(object: &serde_json::Map<String, Value>) -> Result<Value> {
+    if object.contains_key("file_id")
+        && !object.contains_key("image_url")
+        && !object.contains_key("url")
+    {
+        anyhow::bail!(
+            "input_image.file_id 依赖 Responses 文件状态，不能无损转换为 Chat Completions"
+        );
+    }
+    let mut image_url = match object.get("image_url").or_else(|| object.get("url")) {
+        Some(Value::String(url)) if !url.is_empty() => json!({ "url": url }),
+        Some(Value::Object(image_url)) => Value::Object(image_url.clone()),
+        Some(_) => anyhow::bail!("input_image.image_url 必须是字符串或对象"),
+        None => anyhow::bail!("input_image 缺少 image_url"),
+    };
+    if let Some(detail) = object.get("detail") {
+        let detail = detail
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("input_image.detail 必须是字符串"))?;
+        if !matches!(detail, "auto" | "low" | "high") {
+            anyhow::bail!(
+                "input_image.detail={detail} 不能无损转换为 Chat Completions image_url.detail"
+            );
+        }
+        if let Some(image_url) = image_url.as_object_mut() {
+            image_url
+                .entry("detail".to_string())
+                .or_insert_with(|| Value::String(detail.to_string()));
+        }
+    }
+    Ok(image_url)
+}
+
+fn append_single_content_part_as_user_message(
+    item: &Value,
+    messages: &mut Vec<Value>,
+) -> Result<()> {
+    if let Some(chat_part) = responses_content_part_to_chat_part(item)? {
+        messages.push(json!({"role":"user","content":[chat_part]}));
+    }
+    Ok(())
+}
+
+fn append_responses_function_call_item(
+    object: &serde_json::Map<String, Value>,
+    messages: &mut Vec<Value>,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    let call_id = object
+        .get("call_id")
+        .or_else(|| object.get("id"))
+        .and_then(Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("function_call 缺少 call_id"))?;
+    let tool_name = responses_tool_name_from_call_object(object, "function_call")?;
+    let upstream_name = tool_bridge.upstream_name_for_call(&tool_name)?;
+    let arguments =
+        json_value_as_chat_string(object.get("arguments")).unwrap_or_else(|| "{}".to_string());
+    let tool_call = json!({
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": upstream_name,
+            "arguments": arguments
+        }
+    });
+    if let Some(last) = messages.last_mut().and_then(Value::as_object_mut)
+        && last.get("role").and_then(Value::as_str) == Some("assistant")
+        && last
+            .get("content")
+            .is_none_or(|content| content.is_null() || content.as_str() == Some(""))
+        && !last.contains_key("function_call")
+    {
+        last.entry("content".to_string()).or_insert(Value::Null);
+        match last.get_mut("tool_calls") {
+            Some(Value::Array(tool_calls)) => {
+                tool_calls.push(tool_call);
+                return Ok(());
+            }
+            Some(_) => anyhow::bail!("assistant message.tool_calls 必须是数组"),
+            None => {
+                last.insert("tool_calls".to_string(), Value::Array(vec![tool_call]));
+                return Ok(());
+            }
+        }
+    }
+    messages.push(json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": [tool_call]
+    }));
+    Ok(())
+}
+
+fn append_responses_function_call_output_item(
+    object: &serde_json::Map<String, Value>,
+    messages: &mut Vec<Value>,
+) -> Result<()> {
+    let call_id = object
+        .get("call_id")
+        .or_else(|| object.get("tool_call_id"))
+        .and_then(Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("function_call_output 缺少 call_id"))?;
+    let output = object
+        .get("output")
+        .or_else(|| object.get("content"))
+        .ok_or_else(|| anyhow::anyhow!("function_call_output 缺少 output"))?;
+    let content = json_value_as_chat_string(Some(output)).unwrap_or_default();
+    messages.push(json!({
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": content,
+    }));
+    Ok(())
+}
+
+fn normalize_chat_tool_calls(
+    tool_calls: &Value,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<Value> {
+    let tool_calls = tool_calls
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tool_calls 必须是数组"))?;
+    let mut normalized = Vec::new();
+    for tool_call in tool_calls {
+        let object = tool_call
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("tool_calls 条目必须是对象"))?;
+        let call_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function");
+        if call_type != "function" {
+            anyhow::bail!("Chat tool_call 类型 {call_type} 不支持");
+        }
+        let function = object
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("tool_call 缺少 function"))?;
+        let tool_name = responses_tool_name_from_function_object(
+            function,
+            object.get("namespace"),
+            "tool_call.function",
+        )?;
+        let upstream_name = tool_bridge.upstream_name_for_call(&tool_name)?;
+        let arguments = json_value_as_chat_string(function.get("arguments"))
+            .unwrap_or_else(|| "{}".to_string());
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("call_codey_{}", Uuid::new_v4()));
+        normalized.push(json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": upstream_name,
+                "arguments": arguments,
+            }
+        }));
+    }
+    Ok(Value::Array(normalized))
+}
+
+fn normalize_chat_legacy_function_call(
+    function_call: &Value,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<Value> {
+    match function_call {
+        Value::String(choice) if matches!(choice.as_str(), "auto" | "none") => {
+            Ok(Value::String(choice.clone()))
+        }
+        Value::Object(object) => {
+            let tool_name = responses_tool_name_from_call_object(object, "function_call")?;
+            let upstream_name = tool_bridge.upstream_name_for_call(&tool_name)?;
+            Ok(json!({"name": upstream_name}))
+        }
+        _ => anyhow::bail!("function_call 必须是 auto/none 或包含 name 的对象"),
+    }
+}
+
+const NAMESPACE_UPSTREAM_TOOL_PREFIX: &str = "codey_ns__";
+const UPSTREAM_FUNCTION_NAME_MAX_BYTES: usize = 64;
+const MAX_RESPONSES_NAMESPACE_DEPTH: usize = 8;
+
+fn responses_tools_to_chat_tools_with_bridge(
+    tools: &Value,
+    tool_bridge: &mut ResponsesToolBridge,
+) -> Result<Value> {
+    let tools = tools
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("tools 必须是数组"))?;
+    let mut converted = Vec::new();
+    let mut upstream_names = HashMap::<String, ResponsesToolName>::new();
+    let mut namespace_definitions = HashMap::<ResponsesToolName, Value>::new();
+    for tool in tools {
+        append_responses_tool_to_chat_tools(
+            tool,
+            &[],
+            tool_bridge,
+            &mut upstream_names,
+            &mut namespace_definitions,
+            &mut converted,
+        )?;
+    }
+    Ok(Value::Array(converted))
+}
+
+fn append_responses_tool_to_chat_tools(
+    tool: &Value,
+    namespace_path: &[String],
+    tool_bridge: &mut ResponsesToolBridge,
+    upstream_names: &mut HashMap<String, ResponsesToolName>,
+    namespace_definitions: &mut HashMap<ResponsesToolName, Value>,
+    converted: &mut Vec<Value>,
+) -> Result<()> {
+    let object = tool
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("tools 条目必须是对象"))?;
+    let tool_type = object.get("type").and_then(Value::as_str);
+    if matches!(tool_type, Some("function"))
+        || (tool_type.is_none() && object.contains_key("function"))
+    {
+        let mut function = responses_function_tool_map(object)?;
+        let name = response_function_name(&function, "function tool")?.to_string();
+        let tool_name = ResponsesToolName {
+            namespace: namespace_path.to_vec(),
+            name: name.clone(),
+        };
+        let should_push = if namespace_path.is_empty() {
+            register_plain_tool_name(&name, tool_bridge, upstream_names)?;
+            true
+        } else {
+            validate_namespaced_function_name(&name)?;
+            let original_definition = Value::Object(function.clone());
+            match register_namespaced_tool_name(
+                tool_name,
+                &original_definition,
+                tool_bridge,
+                upstream_names,
+                namespace_definitions,
+            )? {
+                Some(upstream_name) => {
+                    function.insert("name".to_string(), Value::String(upstream_name));
+                    true
+                }
+                None => false,
+            }
+        };
+        if should_push {
+            if namespace_path.is_empty() {
+                function.insert("name".to_string(), Value::String(name));
+            }
+            converted.push(json!({"type":"function","function":Value::Object(function)}));
+        }
+        return Ok(());
+    }
+    if tool_type == Some("namespace") {
+        return append_responses_namespace_tools(
+            object,
+            namespace_path,
+            tool_bridge,
+            upstream_names,
+            namespace_definitions,
+            converted,
+        );
+    }
+    if matches!(tool_type, Some("custom" | "tool_search")) {
+        let tool_name = tool_type.unwrap_or("unknown");
+        anyhow::bail!(
+            "Responses 工具 {tool_name} 不能安全转换为 Chat/Anthropic function 工具；请改用支持 Responses 的线路"
+        );
+    }
+    if !namespace_path.is_empty() {
+        let tool_name = tool_type.unwrap_or("unknown");
+        anyhow::bail!("namespace.tools 只支持 function 工具，不能包含 {tool_name}");
+    }
+    let tool_name = tool_type.unwrap_or("unknown");
+    anyhow::bail!(
+        "Responses 内置工具 {tool_name} 不能转换为 Chat Completions tools，请改用支持 Responses 的线路"
+    )
+}
+
+fn append_responses_namespace_tools(
+    object: &serde_json::Map<String, Value>,
+    parent_namespace: &[String],
+    tool_bridge: &mut ResponsesToolBridge,
+    upstream_names: &mut HashMap<String, ResponsesToolName>,
+    namespace_definitions: &mut HashMap<ResponsesToolName, Value>,
+    converted: &mut Vec<Value>,
+) -> Result<()> {
+    let namespace = responses_namespace_name(object)?;
+    let mut namespace_path = parent_namespace.to_vec();
+    namespace_path.push(namespace);
+    if namespace_path.len() > MAX_RESPONSES_NAMESPACE_DEPTH {
+        anyhow::bail!("namespace 嵌套层级超过 {MAX_RESPONSES_NAMESPACE_DEPTH}");
+    }
+    let tools = object.get("tools");
+    let children = object.get("children");
+    if tools.is_none() && children.is_none() {
+        anyhow::bail!("namespace 工具缺少 tools 或 children");
+    }
+    if let Some(tools) = tools {
+        let tools = tools
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("namespace.tools 必须是数组"))?;
+        for tool in tools {
+            append_responses_tool_to_chat_tools(
+                tool,
+                &namespace_path,
+                tool_bridge,
+                upstream_names,
+                namespace_definitions,
+                converted,
+            )?;
+        }
+    }
+    if let Some(children) = children {
+        let children = children
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("namespace.children 必须是数组"))?;
+        for child in children {
+            append_responses_tool_to_chat_tools(
+                child,
+                &namespace_path,
+                tool_bridge,
+                upstream_names,
+                namespace_definitions,
+                converted,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn responses_function_tool_map(
+    object: &serde_json::Map<String, Value>,
+) -> Result<serde_json::Map<String, Value>> {
+    let mut function = if let Some(function) = object.get("function").and_then(Value::as_object) {
+        function.clone()
+    } else {
+        object
+            .iter()
+            .filter(|(key, _)| key.as_str() != "type")
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<_, _>>()
+    };
+    let name = response_function_name(&function, "function tool")?.to_string();
+    function.insert("name".to_string(), Value::String(name));
+    Ok(function)
+}
+
+fn register_plain_tool_name(
+    name: &str,
+    tool_bridge: &mut ResponsesToolBridge,
+    upstream_names: &mut HashMap<String, ResponsesToolName>,
+) -> Result<()> {
+    let tool_name = ResponsesToolName::plain(name);
+    if let Some(existing) = upstream_names.get(name) {
+        if !existing.namespace.is_empty() {
+            anyhow::bail!("namespace 工具展开名称 {name} 与 function 工具冲突");
+        }
+    } else {
+        upstream_names.insert(name.to_string(), tool_name.clone());
+    }
+    tool_bridge
+        .upstream_to_response
+        .entry(name.to_string())
+        .or_insert_with(|| tool_name.clone());
+    tool_bridge
+        .response_to_upstream
+        .entry(tool_name)
+        .or_insert_with(|| name.to_string());
+    Ok(())
+}
+
+fn register_namespaced_tool_name(
+    tool_name: ResponsesToolName,
+    original_definition: &Value,
+    tool_bridge: &mut ResponsesToolBridge,
+    upstream_names: &mut HashMap<String, ResponsesToolName>,
+    namespace_definitions: &mut HashMap<ResponsesToolName, Value>,
+) -> Result<Option<String>> {
+    if let Some(existing_definition) = namespace_definitions.get(&tool_name) {
+        if existing_definition == original_definition {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "namespace 工具 {}.{} 存在定义冲突",
+            tool_name.namespace.join("."),
+            tool_name.name
+        );
+    }
+    let upstream_name = namespaced_upstream_tool_name(&tool_name.namespace, &tool_name.name);
+    if let Some(existing) = upstream_names.get(&upstream_name)
+        && existing != &tool_name
+    {
+        anyhow::bail!("namespace 工具展开名称 {upstream_name} 发生冲突");
+    }
+    namespace_definitions.insert(tool_name.clone(), original_definition.clone());
+    upstream_names.insert(upstream_name.clone(), tool_name.clone());
+    tool_bridge.has_namespace_tools = true;
+    tool_bridge
+        .response_to_upstream
+        .insert(tool_name.clone(), upstream_name.clone());
+    tool_bridge
+        .upstream_to_response
+        .insert(upstream_name.clone(), tool_name);
+    Ok(Some(upstream_name))
+}
+
+fn response_function_name<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<&'a str> {
+    object
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{context} 缺少 name"))
+}
+
+fn responses_namespace_name(object: &serde_json::Map<String, Value>) -> Result<String> {
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("namespace 工具缺少 name"))?;
+    validate_namespace_segment(name, "namespace.name")
+}
+
+fn validate_namespace_segment(segment: &str, field: &str) -> Result<String> {
+    if segment.is_empty()
+        || segment.trim() != segment
+        || segment.contains('.')
+        || segment.chars().any(char::is_control)
+    {
+        anyhow::bail!("{field} 必须是非空、无控制字符且不包含点号的字符串");
+    }
+    Ok(segment.to_string())
+}
+
+fn validate_namespaced_function_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.trim() != name || name.chars().any(char::is_control) {
+        anyhow::bail!("namespace function tool.name 必须是非空且无控制字符的字符串");
+    }
+    Ok(())
+}
+
+fn namespaced_upstream_tool_name(namespace: &[String], name: &str) -> String {
+    let canonical = format!("{}\u{1e}{name}", namespace.join("\u{1f}"));
+    let hash = stable_tool_hash_hex(&canonical);
+    let stem_source = format!("{}__{name}", namespace.join("__"));
+    let stem = sanitize_upstream_tool_stem(&stem_source);
+    let suffix = format!("__{hash}");
+    let max_stem_len = UPSTREAM_FUNCTION_NAME_MAX_BYTES
+        .saturating_sub(NAMESPACE_UPSTREAM_TOOL_PREFIX.len())
+        .saturating_sub(suffix.len());
+    let stem = stem.chars().take(max_stem_len).collect::<String>();
+    format!("{NAMESPACE_UPSTREAM_TOOL_PREFIX}{stem}{suffix}")
+}
+
+fn stable_tool_hash_hex(value: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+fn sanitize_upstream_tool_stem(value: &str) -> String {
+    let mut sanitized = String::with_capacity(value.len());
+    let mut last_was_separator = false;
+    for ch in value.chars() {
+        let next = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+            ch
+        } else {
+            '_'
+        };
+        if next == '_' && last_was_separator {
+            continue;
+        }
+        last_was_separator = next == '_';
+        sanitized.push(next);
+    }
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        "tool".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn looks_like_namespace_upstream_name(name: &str) -> bool {
+    name.starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX)
+}
+
+fn could_be_namespace_upstream_name(name: &str) -> bool {
+    !name.is_empty()
+        && (NAMESPACE_UPSTREAM_TOOL_PREFIX.starts_with(name)
+            || name.starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX))
+}
+
+fn responses_namespace_path(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(namespace)) => namespace
+            .split('.')
+            .map(|segment| validate_namespace_segment(segment, field))
+            .collect(),
+        Some(Value::Array(segments)) => segments
+            .iter()
+            .map(|segment| {
+                segment
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("{field} 数组只能包含字符串"))
+                    .and_then(|segment| validate_namespace_segment(segment, field))
+            })
+            .collect(),
+        Some(_) => anyhow::bail!("{field} 必须是字符串或字符串数组"),
+    }
+}
+
+fn merge_namespace_paths(
+    outer: Vec<String>,
+    inner: Vec<String>,
+    field: &str,
+) -> Result<Vec<String>> {
+    if outer.is_empty() {
+        return Ok(inner);
+    }
+    if inner.is_empty() || inner == outer {
+        return Ok(outer);
+    }
+    anyhow::bail!("{field} 同时包含冲突的 namespace")
+}
+
+fn responses_tool_name_from_function_object(
+    function: &serde_json::Map<String, Value>,
+    outer_namespace: Option<&Value>,
+    context: &str,
+) -> Result<ResponsesToolName> {
+    let name = response_function_name(function, context)?;
+    let namespace = merge_namespace_paths(
+        responses_namespace_path(outer_namespace, "namespace")?,
+        responses_namespace_path(function.get("namespace"), "function.namespace")?,
+        context,
+    )?;
+    Ok(ResponsesToolName {
+        namespace,
+        name: name.to_string(),
+    })
+}
+
+fn responses_tool_name_from_call_object(
+    object: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<ResponsesToolName> {
+    if let Some(function) = object.get("function").and_then(Value::as_object) {
+        return responses_tool_name_from_function_object(
+            function,
+            object.get("namespace"),
+            context,
+        );
+    }
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{context} 缺少 name"))?;
+    Ok(ResponsesToolName {
+        namespace: responses_namespace_path(object.get("namespace"), "namespace")?,
+        name: name.to_string(),
+    })
+}
+
+fn responses_tool_choice_to_chat_tool_choice(
+    tool_choice: &Value,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<Value> {
+    match tool_choice {
+        Value::String(choice) if matches!(choice.as_str(), "auto" | "none" | "required") => {
+            Ok(Value::String(choice.clone()))
+        }
+        Value::Object(object) => {
+            let choice_type = object.get("type").and_then(Value::as_str);
+            if choice_type != Some("function") {
+                let tool_name = choice_type.unwrap_or("unknown");
+                anyhow::bail!(
+                    "Responses tool_choice 类型 {tool_name} 不能转换为 Chat Completions tool_choice"
+                );
+            }
+            let tool_name = responses_tool_name_from_call_object(object, "function tool_choice")?;
+            let upstream_name = tool_bridge.upstream_name_for_call(&tool_name)?;
+            Ok(json!({"type":"function","function":{"name":upstream_name}}))
+        }
+        _ => anyhow::bail!("tool_choice 必须是 auto/none/required 或 function 对象"),
+    }
+}
+
+fn responses_function_call_choice_to_chat(
+    function_call: &Value,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<Value> {
+    match function_call {
+        Value::String(choice) if matches!(choice.as_str(), "auto" | "none") => {
+            Ok(Value::String(choice.clone()))
+        }
+        Value::Object(object) => {
+            let tool_name = responses_tool_name_from_call_object(object, "function_call")?;
+            let upstream_name = tool_bridge.upstream_name_for_call(&tool_name)?;
+            Ok(json!({"name":upstream_name}))
+        }
+        _ => anyhow::bail!("function_call 必须是 auto/none 或 function name 对象"),
+    }
+}
+
+fn json_value_as_chat_string(value: Option<&Value>) -> Option<String> {
+    value.map(|value| match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    })
+}
+
+fn push_chat_text_message(messages: &mut Vec<Value>, role: &str, content: &str) -> Result<()> {
+    if content.is_empty() {
+        return Ok(());
+    }
+    messages.push(json!({"role":role,"content":content}));
+    Ok(())
+}
+
+fn copy_number_or_string_field(
+    from: &serde_json::Map<String, Value>,
+    to: &mut serde_json::Map<String, Value>,
+    source: &str,
+    target: &str,
+) {
+    if let Some(value) = from.get(source)
+        && (value.is_number() || value.is_string() || value.is_boolean())
+    {
+        to.insert(target.to_string(), value.clone());
+    }
+}
+
+fn copy_json_field(
+    from: &serde_json::Map<String, Value>,
+    to: &mut serde_json::Map<String, Value>,
+    source: &str,
+    target: &str,
+) {
+    if let Some(value) = from.get(source) {
+        to.insert(target.to_string(), value.clone());
     }
 }
 
@@ -611,9 +2984,35 @@ struct HttpRequest {
     path: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    _body_budget_permit: Option<OwnedSemaphorePermit>,
 }
 
-async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+#[cfg(test)]
+async fn read_http_request<R>(stream: &mut R) -> Result<HttpRequest>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    read_http_request_with_budget(stream, None).await
+}
+
+#[derive(Debug)]
+struct RequestBodyBudgetUnavailable;
+
+impl std::fmt::Display for RequestBodyBudgetUnavailable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Codey 本地路由请求缓冲预算不足")
+    }
+}
+
+impl std::error::Error for RequestBodyBudgetUnavailable {}
+
+async fn read_http_request_with_budget<R>(
+    stream: &mut R,
+    body_budget: Option<&Arc<Semaphore>>,
+) -> Result<HttpRequest>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
     let mut buffer = Vec::new();
     let header_end = loop {
         let mut chunk = [0_u8; 4096];
@@ -673,13 +3072,31 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
     if content_length > MAX_REQUEST_BYTES {
         anyhow::bail!("请求体超过 Codey 本地路由安全上限");
     }
+    let body_budget_permit = if let Some(body_budget) = body_budget {
+        let permits = content_length.div_ceil(REQUEST_BODY_BUDGET_UNIT_BYTES);
+        if permits == 0 {
+            None
+        } else {
+            let permits = u32::try_from(permits).context("请求体缓冲预算超出内部上限")?;
+            Some(
+                Arc::clone(body_budget)
+                    .try_acquire_many_owned(permits)
+                    .map_err(|_| anyhow::Error::new(RequestBodyBudgetUnavailable))?,
+            )
+        }
+    } else {
+        None
+    };
     let body_start = header_end + 4;
-    let mut body = buffer.get(body_start..).unwrap_or_default().to_vec();
+    let buffered_body = buffer.get(body_start..).unwrap_or_default();
+    let mut body = Vec::with_capacity(content_length);
+    body.extend_from_slice(&buffered_body[..buffered_body.len().min(content_length)]);
+    let mut chunk = [0_u8; 8192];
     while body.len() < content_length {
         let remaining = content_length - body.len();
-        let mut chunk = vec![0_u8; remaining.min(8192)];
+        let read_length = remaining.min(chunk.len());
         let read = stream
-            .read(&mut chunk)
+            .read(&mut chunk[..read_length])
             .await
             .context("读取 Codey 本地路由请求体失败")?;
         if read == 0 {
@@ -693,6 +3110,7 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
         path,
         headers,
         body,
+        _body_budget_permit: body_budget_permit,
     })
 }
 
@@ -712,6 +3130,9 @@ async fn write_error_response(
         codey.insert("routeId".into(), Value::String(route.provider_id.clone()));
         codey.insert("routeName".into(), Value::String(route.route_name.clone()));
     }
+    if let Some(request_id) = current_router_request_id() {
+        codey.insert("requestId".into(), Value::String(request_id));
+    }
     let mut error = serde_json::Map::from_iter([
         ("message".into(), Value::String(message.into())),
         ("type".into(), Value::String("codey_route_error".into())),
@@ -723,21 +3144,99 @@ async fn write_error_response(
     write_json_response(stream, status, &json!({ "error": error })).await
 }
 
+async fn write_text_error_response<W>(
+    stream: &mut W,
+    status: u16,
+    code: &str,
+    message: impl AsRef<str>,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let body = if let Some(request_id) = current_router_request_id() {
+        format!(
+            "{}（错误码：{code}；请求 ID：{request_id}）\n",
+            message.as_ref()
+        )
+    } else {
+        format!("{}（错误码：{code}）\n", message.as_ref())
+    };
+    let reason = reason_phrase(status);
+    let request_id_header = router_request_id_header();
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: text/plain; charset=utf-8\r\ncontent-length: {}\r\n{request_id_header}connection: close\r\n\r\n",
+        body.len()
+    );
+    write_all_with_timeout(stream, header.as_bytes(), "写入本地路由错误响应头失败").await?;
+    write_all_with_timeout(stream, body.as_bytes(), "写入本地路由错误响应失败").await?;
+    Ok(())
+}
+
 async fn write_json_response(stream: &mut TcpStream, status: u16, value: &Value) -> Result<()> {
     let mut body = serde_json::to_vec(value).context("序列化 Codey 本地路由响应失败")?;
     body.push(b'\n');
     let reason = reason_phrase(status);
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            )
-            .as_bytes(),
-        )
-        .await?;
-    stream.write_all(&body).await?;
+    let request_id_header = router_request_id_header();
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n{request_id_header}connection: close\r\n\r\n",
+        body.len()
+    );
+    write_all_with_timeout(stream, header.as_bytes(), "写入本地路由 JSON 响应头失败").await?;
+    write_all_with_timeout(stream, &body, "写入本地路由 JSON 响应失败").await?;
     Ok(())
+}
+
+#[derive(Debug)]
+struct UpstreamReadIdleTimeout {
+    operation: &'static str,
+}
+
+impl std::fmt::Display for UpstreamReadIdleTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}超过读取空闲期限", self.operation)
+    }
+}
+
+impl std::error::Error for UpstreamReadIdleTimeout {}
+
+async fn read_upstream_chunk(
+    response: &mut reqwest::Response,
+    operation: &'static str,
+) -> Result<Option<Vec<u8>>> {
+    let chunk = tokio::time::timeout(UPSTREAM_READ_IDLE_TIMEOUT, response.chunk())
+        .await
+        .map_err(|_| anyhow::Error::new(UpstreamReadIdleTimeout { operation }))?
+        .with_context(|| operation)?;
+    Ok(chunk.map(|chunk| chunk.to_vec()))
+}
+
+async fn read_bounded_upstream_body(
+    mut response: reqwest::Response,
+    limit: usize,
+    operation: &'static str,
+) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = read_upstream_chunk(&mut response, operation).await? {
+        if body.len().saturating_add(chunk.len()) > limit {
+            anyhow::bail!("{operation}超过 Codey 安全上限");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+async fn write_all_with_timeout<W>(
+    stream: &mut W,
+    bytes: &[u8],
+    operation: &'static str,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::time::timeout(DOWNSTREAM_WRITE_TIMEOUT, stream.write_all(bytes))
+        .await
+        .with_context(|| format!("{operation}超过写入期限"))?
+        .with_context(|| operation)
 }
 
 async fn write_proxy_response(
@@ -751,26 +3250,2401 @@ async fn write_proxy_response(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json");
-    stream
-        .write_all(
-            format!(
-                "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
-            )
-            .as_bytes(),
+    write_all_with_timeout(
+        stream,
+        format!(
+            "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ntransfer-encoding: chunked\r\n{}connection: close\r\n\r\n",
+            router_request_id_header()
         )
-        .await?;
-    while let Some(chunk) = response.chunk().await.context("读取上游响应失败")? {
+        .as_bytes(),
+        "写入上游响应头失败",
+    )
+    .await?;
+    while let Some(chunk) = read_upstream_chunk(&mut response, "读取上游响应失败").await? {
         if chunk.is_empty() {
             continue;
         }
-        stream
-            .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
-            .await?;
-        stream.write_all(&chunk).await?;
-        stream.write_all(b"\r\n").await?;
+        write_all_with_timeout(
+            stream,
+            format!("{:x}\r\n", chunk.len()).as_bytes(),
+            "写入上游响应块长度失败",
+        )
+        .await?;
+        write_all_with_timeout(stream, &chunk, "写入上游响应块失败").await?;
+        write_all_with_timeout(stream, b"\r\n", "结束上游响应块失败").await?;
     }
-    stream.write_all(b"0\r\n\r\n").await?;
+    write_all_with_timeout(stream, b"0\r\n\r\n", "结束上游响应流失败").await?;
     Ok(())
+}
+
+async fn write_chat_completions_as_responses(
+    stream: &mut TcpStream,
+    response: reqwest::Response,
+    model: &str,
+    stream_requested: bool,
+    route: &RouteTarget,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    let upstream_is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_sse_content_type);
+    if stream_requested && upstream_is_sse {
+        return stream_chat_completions_as_responses(stream, response, model, route, tool_bridge)
+            .await;
+    }
+    let responses = match read_chat_completions_as_responses(response, model, tool_bridge).await {
+        Ok(responses) => responses,
+        Err(error) => {
+            return write_error_response(
+                stream,
+                502,
+                "upstream_protocol_error",
+                format!(
+                    "线路「{}」的 Chat Completions 响应无法转换为 Responses：{error:#}",
+                    route_display_name(route)
+                ),
+                Some(route),
+            )
+            .await;
+        }
+    };
+    if stream_requested {
+        write_responses_sse_response(stream, &responses).await
+    } else {
+        write_json_response(stream, 200, &responses).await
+    }
+}
+
+async fn read_chat_completions_as_responses(
+    mut response: reqwest::Response,
+    model: &str,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<Value> {
+    let upstream_is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_sse_content_type);
+    let chat = if upstream_is_sse {
+        collect_chat_completion_sse(&mut response, model).await?
+    } else {
+        let body = read_bounded_upstream_body(
+            response,
+            MAX_UPSTREAM_RESPONSE_BYTES,
+            "读取 Chat Completions 上游响应失败",
+        )
+        .await?;
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(chat) => chat,
+            Err(json_error) if body.starts_with(b"data:") || body.windows(6).any(|w| w == b"\ndata:") => {
+                parse_chat_completion_sse_bytes(&body, model).with_context(|| {
+                    format!("Chat Completions 上游响应既不是有效 JSON，也无法作为 SSE 解析：{json_error}")
+                })?
+            }
+            Err(error) => return Err(error).context("Chat Completions 上游响应不是有效 JSON"),
+        }
+    };
+    chat_completion_to_responses_body_with_tool_bridge(chat, model, tool_bridge)
+}
+
+async fn write_anthropic_messages_as_responses(
+    stream: &mut TcpStream,
+    response: reqwest::Response,
+    model: &str,
+    stream_requested: bool,
+    route: &RouteTarget,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = read_bounded_upstream_error_body(response).await?;
+        let detail = anthropic_upstream_error_detail(&body);
+        return write_error_response(
+            stream,
+            502,
+            "anthropic_upstream_error",
+            format!(
+                "线路「{}」的 Anthropic Messages 上游返回 HTTP {}{}",
+                route_display_name(route),
+                status.as_u16(),
+                detail
+                    .as_deref()
+                    .map(|detail| format!("：{detail}"))
+                    .unwrap_or_default()
+            ),
+            Some(route),
+        )
+        .await;
+    }
+    let upstream_is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_sse_content_type);
+    if stream_requested && upstream_is_sse {
+        return stream_anthropic_messages_as_responses(stream, response, model, route, tool_bridge)
+            .await;
+    }
+    let responses = match read_anthropic_messages_as_responses(response, model, tool_bridge).await {
+        Ok(responses) => responses,
+        Err(error) => {
+            return write_error_response(
+                stream,
+                502,
+                "upstream_protocol_error",
+                format!(
+                    "线路「{}」的 Anthropic Messages 响应无法转换为 Responses：{error:#}",
+                    route_display_name(route)
+                ),
+                Some(route),
+            )
+            .await;
+        }
+    };
+    if stream_requested {
+        write_responses_sse_response(stream, &responses).await
+    } else {
+        write_json_response(stream, 200, &responses).await
+    }
+}
+
+fn anthropic_upstream_error_detail(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let message = value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)?
+        .trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(message.chars().take(512).collect())
+}
+
+async fn read_bounded_upstream_error_body(mut response: reqwest::Response) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) =
+        read_upstream_chunk(&mut response, "读取 Anthropic Messages 上游错误响应失败").await?
+    {
+        let remaining = MAX_UPSTREAM_ERROR_BYTES.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+        if body.len() == MAX_UPSTREAM_ERROR_BYTES {
+            break;
+        }
+    }
+    Ok(body)
+}
+
+async fn read_anthropic_messages_as_responses(
+    mut response: reqwest::Response,
+    model: &str,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<Value> {
+    let upstream_is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_sse_content_type);
+    let message = if upstream_is_sse {
+        collect_anthropic_message_sse(&mut response, model).await?
+    } else {
+        let body = read_bounded_upstream_body(
+            response,
+            MAX_UPSTREAM_RESPONSE_BYTES,
+            "读取 Anthropic Messages 上游响应失败",
+        )
+        .await?;
+        match serde_json::from_slice::<Value>(&body) {
+            Ok(message) => message,
+            Err(json_error)
+                if body.starts_with(b"event:")
+                    || body.starts_with(b"data:")
+                    || body.windows(7).any(|window| window == b"\nevent:")
+                    || body.windows(6).any(|window| window == b"\ndata:") =>
+            {
+                parse_anthropic_message_sse_bytes(&body, model).with_context(|| {
+                    format!(
+                        "Anthropic Messages 上游响应既不是有效 JSON，也无法作为 SSE 解析：{json_error}"
+                    )
+                })?
+            }
+            Err(error) => {
+                return Err(error).context("Anthropic Messages 上游响应不是有效 JSON");
+            }
+        }
+    };
+    anthropic_message_to_responses_body_with_tool_bridge(&message, model, tool_bridge)
+}
+
+#[cfg(test)]
+fn anthropic_message_to_responses_body(message: &Value, fallback_model: &str) -> Result<Value> {
+    let tool_bridge = ResponsesToolBridge::default();
+    anthropic_message_to_responses_body_with_tool_bridge(message, fallback_model, &tool_bridge)
+}
+
+fn anthropic_message_to_responses_body_with_tool_bridge(
+    message: &Value,
+    fallback_model: &str,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<Value> {
+    if message.get("type").and_then(Value::as_str) == Some("error") {
+        let detail = message
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("未知错误");
+        anyhow::bail!("Anthropic Messages 返回错误：{detail}");
+    }
+    let content = message
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Anthropic message 缺少 content 数组"))?;
+    let mut output = Vec::new();
+    let mut message_content = Vec::new();
+    let mut output_text_parts = Vec::new();
+    for block in content {
+        let block_type = block
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Anthropic content block 缺少 type"))?;
+        match block_type {
+            "text" => {
+                let text = block
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic text block 缺少 text"))?;
+                output_text_parts.push(text.to_string());
+                message_content.push(json!({
+                    "type":"output_text",
+                    "text":text,
+                    "annotations":[],
+                }));
+            }
+            "refusal" => {
+                let refusal = block
+                    .get("refusal")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                message_content.push(json!({"type":"refusal","refusal":refusal}));
+            }
+            "tool_use" => {
+                let call_id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic tool_use 缺少 id"))?;
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic tool_use 缺少 name"))?;
+                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                if !input.is_object() {
+                    anyhow::bail!("Anthropic tool_use.input 必须是 JSON 对象");
+                }
+                let tool_name = tool_bridge.restore_upstream_name(name)?;
+                let mut function_call = serde_json::Map::from_iter([
+                    (
+                        "id".to_string(),
+                        Value::String(format!("fc_codey_{}", Uuid::new_v4())),
+                    ),
+                    (
+                        "type".to_string(),
+                        Value::String("function_call".to_string()),
+                    ),
+                    ("status".to_string(), Value::String("completed".to_string())),
+                    ("call_id".to_string(), Value::String(call_id.to_string())),
+                    (
+                        "arguments".to_string(),
+                        Value::String(
+                            serde_json::to_string(&input)
+                                .context("序列化 Anthropic tool_use.input 失败")?,
+                        ),
+                    ),
+                ]);
+                tool_name.insert_response_fields(&mut function_call);
+                output.push(Value::Object(function_call));
+            }
+            // Raw chain-of-thought must not be surfaced as assistant text.
+            // Signature/redacted blocks are provider state and have no safe
+            // stateless Responses representation.
+            "thinking" | "redacted_thinking" => {}
+            other => {
+                anyhow::bail!("Anthropic content block 类型 {other} 不能转换为 Responses output")
+            }
+        }
+    }
+    if !message_content.is_empty() {
+        output.insert(
+            0,
+            json!({
+                "id":format!("msg_codey_{}", Uuid::new_v4()),
+                "type":"message",
+                "status":"completed",
+                "role":"assistant",
+                "content":message_content,
+            }),
+        );
+    }
+    if output.is_empty() {
+        output.push(json!({
+            "id":format!("msg_codey_{}", Uuid::new_v4()),
+            "type":"message",
+            "status":"completed",
+            "role":"assistant",
+            "content":[{"type":"output_text","text":"","annotations":[]}],
+        }));
+    }
+    let stop_reason = message.get("stop_reason").and_then(Value::as_str);
+    let incomplete_reason = match stop_reason {
+        Some("max_tokens") => Some("max_output_tokens"),
+        Some("refusal") => Some("content_filter"),
+        _ => None,
+    };
+    let status = if incomplete_reason.is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    let model = message
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_model);
+    let mut responses = json!({
+        "id":format!("resp_codey_{}", Uuid::new_v4()),
+        "object":"response",
+        "created_at":current_unix_timestamp(),
+        "status":status,
+        "model":model,
+        "output":output,
+        "output_text":output_text_parts.join(""),
+        "error":Value::Null,
+        "incomplete_details":incomplete_reason.map(|reason| json!({"reason":reason})),
+    });
+    if let Some(usage) = message.get("usage") {
+        responses
+            .as_object_mut()
+            .expect("Responses wrapper must be an object")
+            .insert(
+                "usage".to_string(),
+                anthropic_usage_to_responses_usage(usage),
+            );
+    }
+    Ok(responses)
+}
+
+fn anthropic_usage_to_responses_usage(usage: &Value) -> Value {
+    let uncached_input_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_creation_tokens = usage
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached_tokens = usage
+        .get("cache_read_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let input_tokens = uncached_input_tokens
+        .saturating_add(cache_creation_tokens)
+        .saturating_add(cached_tokens);
+    let output_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({
+        "input_tokens":input_tokens,
+        "input_tokens_details":{"cached_tokens":cached_tokens},
+        "output_tokens":output_tokens,
+        "output_tokens_details":{"reasoning_tokens":0},
+        "total_tokens":input_tokens.saturating_add(output_tokens),
+    })
+}
+
+#[derive(Debug, Default)]
+struct AnthropicSseBlock {
+    block_type: String,
+    text: String,
+    id: String,
+    name: String,
+    input: Option<Value>,
+    partial_json: String,
+}
+
+#[derive(Debug)]
+struct AnthropicSseAccumulator {
+    id: String,
+    model: String,
+    blocks: BTreeMap<usize, AnthropicSseBlock>,
+    stop_reason: Option<String>,
+    usage: serde_json::Map<String, Value>,
+    stopped: bool,
+}
+
+impl AnthropicSseAccumulator {
+    fn new(model: &str) -> Self {
+        Self {
+            id: format!("msg_codey_{}", Uuid::new_v4()),
+            model: model.to_string(),
+            blocks: BTreeMap::new(),
+            stop_reason: None,
+            usage: serde_json::Map::new(),
+            stopped: false,
+        }
+    }
+
+    fn ingest(&mut self, event: &Value) -> Result<()> {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("Anthropic SSE 事件缺少 type"))?;
+        match event_type {
+            "ping" => {}
+            "error" => {
+                let detail = event
+                    .get("error")
+                    .and_then(|error| error.get("message"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("未知错误");
+                anyhow::bail!("Anthropic SSE 返回错误：{detail}");
+            }
+            "message_start" => {
+                let message = event
+                    .get("message")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| anyhow::anyhow!("message_start 缺少 message"))?;
+                if let Some(id) = message
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    self.id = id.to_string();
+                }
+                if let Some(model) = message
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    self.model = model.to_string();
+                }
+                if let Some(usage) = message.get("usage").and_then(Value::as_object) {
+                    self.usage.extend(usage.clone());
+                }
+                if let Some(content) = message.get("content").and_then(Value::as_array) {
+                    for (index, block) in content.iter().enumerate() {
+                        self.blocks
+                            .insert(index, anthropic_sse_block_from_value(block)?);
+                    }
+                }
+            }
+            "content_block_start" => {
+                let index = anthropic_sse_index(event)?;
+                let block = event
+                    .get("content_block")
+                    .ok_or_else(|| anyhow::anyhow!("content_block_start 缺少 content_block"))?;
+                self.blocks
+                    .insert(index, anthropic_sse_block_from_value(block)?);
+            }
+            "content_block_delta" => {
+                let index = anthropic_sse_index(event)?;
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| anyhow::anyhow!("content_block_delta 缺少 delta"))?;
+                let delta_type = delta
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("Anthropic content delta 缺少 type"))?;
+                let block = self.blocks.entry(index).or_default();
+                match delta_type {
+                    "text_delta" => {
+                        if block.block_type.is_empty() {
+                            block.block_type = "text".to_string();
+                        }
+                        block.text.push_str(
+                            delta
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    "input_json_delta" => {
+                        if block.block_type.is_empty() {
+                            block.block_type = "tool_use".to_string();
+                        }
+                        block.partial_json.push_str(
+                            delta
+                                .get("partial_json")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    "thinking_delta" => {
+                        if block.block_type.is_empty() {
+                            block.block_type = "thinking".to_string();
+                        }
+                        block.text.push_str(
+                            delta
+                                .get("thinking")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        );
+                    }
+                    "signature_delta" | "citations_delta" => {}
+                    other => anyhow::bail!("不支持的 Anthropic content delta 类型 {other}"),
+                }
+            }
+            "content_block_stop" => {}
+            "message_delta" => {
+                if let Some(stop_reason) = event
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                {
+                    self.stop_reason = Some(stop_reason.to_string());
+                }
+                if let Some(usage) = event.get("usage").and_then(Value::as_object) {
+                    self.usage.extend(usage.clone());
+                }
+            }
+            "message_stop" => self.stopped = true,
+            other => anyhow::bail!("不支持的 Anthropic SSE 事件类型 {other}"),
+        }
+        Ok(())
+    }
+
+    fn into_message(self) -> Result<Value> {
+        let content = self
+            .blocks
+            .into_values()
+            .map(anthropic_sse_block_into_value)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(json!({
+            "id":self.id,
+            "type":"message",
+            "role":"assistant",
+            "model":self.model,
+            "content":content,
+            "stop_reason":self.stop_reason,
+            "usage":Value::Object(self.usage),
+        }))
+    }
+}
+
+fn anthropic_sse_index(event: &Value) -> Result<usize> {
+    event
+        .get("index")
+        .and_then(Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| anyhow::anyhow!("Anthropic SSE 事件缺少有效 index"))
+}
+
+fn anthropic_sse_block_from_value(block: &Value) -> Result<AnthropicSseBlock> {
+    let block_type = block
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Anthropic content block 缺少 type"))?;
+    Ok(AnthropicSseBlock {
+        block_type: block_type.to_string(),
+        text: block
+            .get("text")
+            .or_else(|| block.get("thinking"))
+            .or_else(|| block.get("refusal"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        id: block
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        name: block
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        input: block.get("input").cloned(),
+        partial_json: String::new(),
+    })
+}
+
+fn anthropic_sse_block_into_value(block: AnthropicSseBlock) -> Result<Value> {
+    match block.block_type.as_str() {
+        "text" => Ok(json!({"type":"text","text":block.text})),
+        "refusal" => Ok(json!({"type":"refusal","refusal":block.text})),
+        "thinking" | "redacted_thinking" => {
+            Ok(json!({"type":block.block_type,"thinking":block.text}))
+        }
+        "tool_use" => {
+            if block.id.is_empty() || block.name.is_empty() {
+                anyhow::bail!("Anthropic 流式 tool_use 缺少 id 或 name");
+            }
+            let input = if block.partial_json.trim().is_empty() {
+                block.input.unwrap_or_else(|| json!({}))
+            } else {
+                serde_json::from_str::<Value>(&block.partial_json)
+                    .context("Anthropic 流式 tool_use 参数不是有效 JSON")?
+            };
+            if !input.is_object() {
+                anyhow::bail!("Anthropic 流式 tool_use.input 必须是 JSON 对象");
+            }
+            Ok(json!({
+                "type":"tool_use",
+                "id":block.id,
+                "name":block.name,
+                "input":input,
+            }))
+        }
+        other => anyhow::bail!("不支持的 Anthropic content block 类型 {other}"),
+    }
+}
+
+async fn collect_anthropic_message_sse(
+    response: &mut reqwest::Response,
+    model: &str,
+) -> Result<Value> {
+    let mut accumulator = AnthropicSseAccumulator::new(model);
+    let mut buffer = Vec::new();
+    let mut cursor = 0;
+    while let Some(chunk) =
+        read_upstream_chunk(response, "读取 Anthropic Messages SSE 流失败").await?
+    {
+        compact_sse_buffer(&mut buffer, &mut cursor);
+        buffer.extend_from_slice(&chunk);
+        ensure_sse_buffer_within_limit(&buffer, cursor)?;
+        while let Some(frame) = take_next_sse_frame(&buffer, &mut cursor) {
+            let Some(data) = sse_frame_data(frame)? else {
+                continue;
+            };
+            accumulator.ingest(
+                &serde_json::from_str::<Value>(&data)
+                    .context("Anthropic Messages SSE data 不是有效 JSON")?,
+            )?;
+        }
+        if accumulator.stopped {
+            break;
+        }
+    }
+    if !accumulator.stopped
+        && !buffer[cursor..].iter().all(u8::is_ascii_whitespace)
+        && let Some(data) = sse_frame_data(&buffer[cursor..])?
+    {
+        accumulator.ingest(
+            &serde_json::from_str::<Value>(&data)
+                .context("Anthropic Messages SSE 末尾 data 不是有效 JSON")?,
+        )?;
+    }
+    accumulator.into_message()
+}
+
+fn parse_anthropic_message_sse_bytes(bytes: &[u8], model: &str) -> Result<Value> {
+    let mut accumulator = AnthropicSseAccumulator::new(model);
+    let mut cursor = 0;
+    while let Some(frame) = take_next_sse_frame(bytes, &mut cursor) {
+        let Some(data) = sse_frame_data(frame)? else {
+            continue;
+        };
+        accumulator.ingest(
+            &serde_json::from_str::<Value>(&data)
+                .context("Anthropic Messages SSE data 不是有效 JSON")?,
+        )?;
+        if accumulator.stopped {
+            return accumulator.into_message();
+        }
+    }
+    if !bytes[cursor..].iter().all(u8::is_ascii_whitespace)
+        && let Some(data) = sse_frame_data(&bytes[cursor..])?
+    {
+        accumulator.ingest(
+            &serde_json::from_str::<Value>(&data)
+                .context("Anthropic Messages SSE 末尾 data 不是有效 JSON")?,
+        )?;
+    }
+    accumulator.into_message()
+}
+
+async fn stream_anthropic_messages_as_responses(
+    stream: &mut TcpStream,
+    mut response: reqwest::Response,
+    model: &str,
+    route: &RouteTarget,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    let mut output = ResponsesSseState::new(model, tool_bridge);
+    output.start(stream).await?;
+    let mut accumulator = AnthropicSseAccumulator::new(model);
+    let result: Result<()> = async {
+        let mut buffer = Vec::new();
+        let mut cursor = 0;
+        while let Some(chunk) =
+            read_upstream_chunk(&mut response, "读取 Anthropic Messages SSE 流失败").await?
+        {
+            compact_sse_buffer(&mut buffer, &mut cursor);
+            buffer.extend_from_slice(&chunk);
+            ensure_sse_buffer_within_limit(&buffer, cursor)?;
+            while let Some(frame) = take_next_sse_frame(&buffer, &mut cursor) {
+                let Some(data) = sse_frame_data(frame)? else {
+                    continue;
+                };
+                let event = serde_json::from_str::<Value>(&data)
+                    .context("Anthropic Messages SSE data 不是有效 JSON")?;
+                accumulator.ingest(&event)?;
+                emit_anthropic_stream_event(&mut output, stream, &event).await?;
+            }
+            if accumulator.stopped {
+                break;
+            }
+        }
+        if !accumulator.stopped
+            && !buffer[cursor..].iter().all(u8::is_ascii_whitespace)
+            && let Some(data) = sse_frame_data(&buffer[cursor..])?
+        {
+            let event = serde_json::from_str::<Value>(&data)
+                .context("Anthropic Messages SSE 末尾 data 不是有效 JSON")?;
+            accumulator.ingest(&event)?;
+            emit_anthropic_stream_event(&mut output, stream, &event).await?;
+        }
+        let message = accumulator.into_message()?;
+        let completed =
+            anthropic_message_to_responses_body_with_tool_bridge(&message, model, tool_bridge)?;
+        if output.output_order.is_empty() {
+            let events = output.ensure_message();
+            output.write_events(stream, events).await?;
+        }
+        let usage = completed.get("usage").cloned();
+        let incomplete_reason = completed
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str);
+        output.finish(stream, usage, incomplete_reason).await
+    }
+    .await;
+    if let Err(error) = result {
+        let (code, message) = streaming_failure_message(&error, route);
+        let _ = output.fail(stream, code, &message).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn emit_anthropic_stream_event(
+    output: &mut ResponsesSseState<'_>,
+    stream: &mut TcpStream,
+    event: &Value,
+) -> Result<()> {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Anthropic SSE 事件缺少 type"))?;
+    let mut events = Vec::new();
+    match event_type {
+        "message_start" => {
+            if let Some(content) = event
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_array)
+            {
+                for (index, block) in content.iter().enumerate() {
+                    events.extend(anthropic_stream_block_start(output, index, block)?);
+                }
+            }
+        }
+        "content_block_start" => {
+            let index = anthropic_sse_index(event)?;
+            let block = event
+                .get("content_block")
+                .ok_or_else(|| anyhow::anyhow!("content_block_start 缺少 content_block"))?;
+            events.extend(anthropic_stream_block_start(output, index, block)?);
+        }
+        "content_block_delta" => {
+            let index = anthropic_sse_index(event)?;
+            let delta = event
+                .get("delta")
+                .and_then(Value::as_object)
+                .ok_or_else(|| anyhow::anyhow!("content_block_delta 缺少 delta"))?;
+            match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") => events.extend(
+                    output.text_delta(
+                        delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                ),
+                Some("input_json_delta") => events.extend(output.tool_delta(
+                    index,
+                    None,
+                    None,
+                    delta.get("partial_json").and_then(Value::as_str),
+                    None,
+                )?),
+                Some("thinking_delta" | "signature_delta" | "citations_delta") => {}
+                Some(other) => anyhow::bail!("不支持的 Anthropic content delta 类型 {other}"),
+                None => anyhow::bail!("Anthropic content delta 缺少 type"),
+            }
+        }
+        "ping" | "content_block_stop" | "message_delta" | "message_stop" => {}
+        "error" => anyhow::bail!("Anthropic SSE 返回错误"),
+        other => anyhow::bail!("不支持的 Anthropic SSE 事件类型 {other}"),
+    }
+    output.write_events(stream, events).await
+}
+
+fn anthropic_stream_block_start(
+    output: &mut ResponsesSseState<'_>,
+    index: usize,
+    block: &Value,
+) -> Result<Vec<Value>> {
+    let block_type = block
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Anthropic content block 缺少 type"))?;
+    match block_type {
+        "text" => Ok(output.text_delta(
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )),
+        "refusal" => Ok(output.refusal_delta(
+            block
+                .get("refusal")
+                .or_else(|| block.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )),
+        "tool_use" => {
+            let fallback_arguments = block
+                .get("input")
+                .map(serde_json::to_string)
+                .transpose()
+                .context("序列化 Anthropic tool_use.input 失败")?;
+            output.tool_delta(
+                index,
+                block.get("id").and_then(Value::as_str),
+                block.get("name").and_then(Value::as_str),
+                None,
+                fallback_arguments,
+            )
+        }
+        "thinking" | "redacted_thinking" => Ok(Vec::new()),
+        other => anyhow::bail!("不支持的 Anthropic content block 类型 {other}"),
+    }
+}
+
+fn ensure_sse_buffer_within_limit(buffer: &[u8], cursor: usize) -> Result<()> {
+    if buffer.len().saturating_sub(cursor) > MAX_UPSTREAM_SSE_BUFFER_BYTES {
+        anyhow::bail!("上游 SSE 单帧超过 Codey 安全上限");
+    }
+    Ok(())
+}
+
+fn streaming_failure_message(error: &anyhow::Error, route: &RouteTarget) -> (&'static str, String) {
+    if error.downcast_ref::<UpstreamReadIdleTimeout>().is_some() {
+        (
+            "upstream_idle_timeout",
+            format!(
+                "线路「{}」的上游流长时间没有返回新数据",
+                route_display_name(route)
+            ),
+        )
+    } else {
+        (
+            "upstream_stream_error",
+            format!(
+                "线路「{}」返回了无法继续处理的流式响应",
+                route_display_name(route)
+            ),
+        )
+    }
+}
+
+fn chat_message_content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.as_object().and_then(|object| {
+                    object
+                        .get("text")
+                        .or_else(|| object.get("content"))
+                        .and_then(Value::as_str)
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+fn chat_completion_to_responses_body(chat: Value, model: &str) -> Result<Value> {
+    let tool_bridge = ResponsesToolBridge::default();
+    chat_completion_to_responses_body_with_tool_bridge(chat, model, &tool_bridge)
+}
+
+fn chat_completion_to_responses_body_with_tool_bridge(
+    mut chat: Value,
+    model: &str,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<Value> {
+    let response_id = chat
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("resp_codey_{}", Uuid::new_v4()));
+    let created_at = chat
+        .get("created")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(current_unix_timestamp);
+    let choice = chat
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Chat Completions 响应缺少 choices[0]"))?;
+    let message = choice
+        .get("message")
+        .or_else(|| choice.get("delta"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("Chat Completions 响应缺少 assistant message"))?;
+    let text = message
+        .get("content")
+        .map(chat_message_content_text)
+        .unwrap_or_default();
+    let refusal = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut output = Vec::new();
+    if !text.is_empty() || !refusal.is_empty() {
+        let mut content = Vec::new();
+        if !text.is_empty() {
+            content.push(json!({
+                "type": "output_text",
+                "text": text,
+                "annotations": []
+            }));
+        }
+        if !refusal.is_empty() {
+            content.push(json!({"type":"refusal","refusal":refusal}));
+        }
+        output.push(json!({
+            "id": format!("msg_codey_{}", Uuid::new_v4()),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": content,
+        }));
+    }
+    if let Some(tool_calls) = message.get("tool_calls") {
+        append_chat_tool_calls_to_responses_output(tool_calls, &mut output, tool_bridge)?;
+    }
+    if let Some(function_call) = message.get("function_call") {
+        append_legacy_chat_function_call_to_responses_output(
+            function_call,
+            &mut output,
+            tool_bridge,
+        )?;
+    }
+    if output.is_empty() {
+        output.push(json!({
+            "id": format!("msg_codey_{}", Uuid::new_v4()),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "",
+                "annotations": []
+            }]
+        }));
+    }
+    let finish_reason = choice.get("finish_reason").and_then(Value::as_str);
+    let incomplete_reason = match finish_reason {
+        Some("length") => Some("max_output_tokens"),
+        Some("content_filter") => Some("content_filter"),
+        _ => None,
+    };
+    let status = if incomplete_reason.is_some() {
+        "incomplete"
+    } else {
+        "completed"
+    };
+    let mut response = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": status,
+        "model": model,
+        "output": output,
+        "output_text": text,
+        "error": Value::Null,
+        "incomplete_details": incomplete_reason.map(|reason| json!({"reason":reason})),
+    });
+    if let Some(usage) = chat
+        .as_object_mut()
+        .and_then(|object| object.remove("usage"))
+    {
+        response
+            .as_object_mut()
+            .expect("Responses wrapper must be an object")
+            .insert("usage".to_string(), chat_usage_to_responses_usage(&usage));
+    }
+    Ok(response)
+}
+
+fn append_chat_tool_calls_to_responses_output(
+    tool_calls: &Value,
+    output: &mut Vec<Value>,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    let tool_calls = tool_calls
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Chat message.tool_calls 必须是数组"))?;
+    for tool_call in tool_calls {
+        let object = tool_call
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Chat tool_call 必须是对象"))?;
+        let call_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("function");
+        if call_type != "function" {
+            anyhow::bail!("Chat tool_call 类型 {call_type} 不能转换为 Responses item");
+        }
+        let function = object
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("Chat tool_call 缺少 function"))?;
+        let name = function
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("Chat tool_call.function 缺少 name"))?;
+        let arguments = json_value_as_chat_string(function.get("arguments"))
+            .unwrap_or_else(|| "{}".to_string());
+        let call_id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("call_codey_{}", Uuid::new_v4()));
+        let tool_name = tool_bridge.restore_upstream_name(name)?;
+        let mut function_call = serde_json::Map::from_iter([
+            (
+                "id".to_string(),
+                Value::String(format!("fc_codey_{}", Uuid::new_v4())),
+            ),
+            (
+                "type".to_string(),
+                Value::String("function_call".to_string()),
+            ),
+            ("status".to_string(), Value::String("completed".to_string())),
+            ("call_id".to_string(), Value::String(call_id)),
+            ("arguments".to_string(), Value::String(arguments)),
+        ]);
+        tool_name.insert_response_fields(&mut function_call);
+        output.push(Value::Object(function_call));
+    }
+    Ok(())
+}
+
+fn append_legacy_chat_function_call_to_responses_output(
+    function_call: &Value,
+    output: &mut Vec<Value>,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    let function = function_call
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("Chat message.function_call 必须是对象"))?;
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("Chat message.function_call 缺少 name"))?;
+    let tool_name = tool_bridge.restore_upstream_name(name)?;
+    let mut output_item = serde_json::Map::from_iter([
+        (
+            "id".to_string(),
+            Value::String(format!("fc_codey_{}", Uuid::new_v4())),
+        ),
+        (
+            "type".to_string(),
+            Value::String("function_call".to_string()),
+        ),
+        ("status".to_string(), Value::String("completed".to_string())),
+        (
+            "call_id".to_string(),
+            Value::String(format!("call_codey_{}", Uuid::new_v4())),
+        ),
+        (
+            "arguments".to_string(),
+            Value::String(
+                json_value_as_chat_string(function.get("arguments"))
+                    .unwrap_or_else(|| "{}".to_string()),
+            ),
+        ),
+    ]);
+    tool_name.insert_response_fields(&mut output_item);
+    output.push(Value::Object(output_item));
+    Ok(())
+}
+
+fn chat_usage_to_responses_usage(usage: &Value) -> Value {
+    let input_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(input_tokens.saturating_add(output_tokens));
+    let cached_tokens = usage
+        .get("prompt_tokens_details")
+        .or_else(|| usage.get("input_tokens_details"))
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_tokens = usage
+        .get("completion_tokens_details")
+        .or_else(|| usage.get("output_tokens_details"))
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    json!({
+        "input_tokens": input_tokens,
+        "input_tokens_details": {"cached_tokens": cached_tokens},
+        "output_tokens": output_tokens,
+        "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
+        "total_tokens": total_tokens,
+    })
+}
+
+#[derive(Debug, Default)]
+struct ChatSseToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug)]
+struct ChatSseAccumulator {
+    id: String,
+    created: i64,
+    model: String,
+    content: String,
+    refusal: String,
+    tool_calls: BTreeMap<usize, ChatSseToolCall>,
+    finish_reason: Option<String>,
+    usage: Option<Value>,
+}
+
+impl ChatSseAccumulator {
+    fn new(model: &str) -> Self {
+        Self {
+            id: format!("chatcmpl_codey_{}", Uuid::new_v4()),
+            created: current_unix_timestamp(),
+            model: model.to_string(),
+            content: String::new(),
+            refusal: String::new(),
+            tool_calls: BTreeMap::new(),
+            finish_reason: None,
+            usage: None,
+        }
+    }
+
+    fn ingest(&mut self, chunk: &Value) -> Result<()> {
+        if let Some(error) = chunk.get("error") {
+            anyhow::bail!("Chat Completions 流返回错误：{error}");
+        }
+        if let Some(id) = chunk
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.id = id.to_string();
+        }
+        if let Some(created) = chunk.get("created").and_then(Value::as_i64) {
+            self.created = created;
+        }
+        if let Some(model) = chunk
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+        {
+            self.model = model.to_string();
+        }
+        if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
+            self.usage = Some(usage.clone());
+        }
+        let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
+            return Ok(());
+        };
+        for choice in choices {
+            if choice.get("index").and_then(Value::as_u64).unwrap_or(0) != 0 {
+                continue;
+            }
+            if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.finish_reason = Some(finish_reason.to_string());
+            }
+            let Some(delta) = choice
+                .get("delta")
+                .or_else(|| choice.get("message"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            if let Some(content) = delta.get("content") {
+                self.content.push_str(&chat_message_content_text(content));
+            }
+            if let Some(refusal) = delta.get("refusal").and_then(Value::as_str) {
+                self.refusal.push_str(refusal);
+            }
+            if let Some(tool_calls) = delta.get("tool_calls") {
+                self.ingest_tool_calls(tool_calls)?;
+            }
+            if let Some(function_call) = delta.get("function_call") {
+                self.ingest_legacy_function_call(function_call)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ingest_tool_calls(&mut self, tool_calls: &Value) -> Result<()> {
+        let tool_calls = tool_calls
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Chat stream delta.tool_calls 必须是数组"))?;
+        for tool_call in tool_calls {
+            let object = tool_call
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("Chat stream tool_call delta 必须是对象"))?;
+            let index = object.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let state = self.tool_calls.entry(index).or_default();
+            if let Some(id) = object
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                state.id = id.to_string();
+            }
+            if let Some(call_type) = object.get("type").and_then(Value::as_str)
+                && call_type != "function"
+            {
+                anyhow::bail!("Chat stream tool_call 类型 {call_type} 不受支持");
+            }
+            if let Some(function) = object.get("function").and_then(Value::as_object) {
+                if let Some(name_delta) = function.get("name").and_then(Value::as_str) {
+                    state.name.push_str(name_delta);
+                }
+                if let Some(arguments_delta) = function.get("arguments") {
+                    state.arguments.push_str(
+                        &json_value_as_chat_string(Some(arguments_delta)).unwrap_or_default(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ingest_legacy_function_call(&mut self, function_call: &Value) -> Result<()> {
+        let function = function_call
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Chat stream function_call delta 必须是对象"))?;
+        let state = self.tool_calls.entry(0).or_default();
+        if let Some(name_delta) = function.get("name").and_then(Value::as_str) {
+            state.name.push_str(name_delta);
+        }
+        if let Some(arguments_delta) = function.get("arguments") {
+            state
+                .arguments
+                .push_str(&json_value_as_chat_string(Some(arguments_delta)).unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    fn into_chat_completion(self) -> Result<Value> {
+        let mut message = serde_json::Map::from_iter([(
+            "role".to_string(),
+            Value::String("assistant".to_string()),
+        )]);
+        if !self.content.is_empty() {
+            message.insert("content".to_string(), Value::String(self.content));
+        } else {
+            message.insert("content".to_string(), Value::Null);
+        }
+        if !self.refusal.is_empty() {
+            message.insert("refusal".to_string(), Value::String(self.refusal));
+        }
+        if !self.tool_calls.is_empty() {
+            let tool_calls = self
+                .tool_calls
+                .into_values()
+                .map(|tool_call| {
+                    if tool_call.name.is_empty() {
+                        anyhow::bail!("Chat stream tool_call 缺少 function.name");
+                    }
+                    Ok(json!({
+                        "id": if tool_call.id.is_empty() {
+                            format!("call_codey_{}", Uuid::new_v4())
+                        } else {
+                            tool_call.id
+                        },
+                        "type": "function",
+                        "function": {
+                            "name": tool_call.name,
+                            "arguments": tool_call.arguments,
+                        }
+                    }))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+        }
+        let mut chat = json!({
+            "id": self.id,
+            "object": "chat.completion",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "message": Value::Object(message),
+                "finish_reason": self.finish_reason,
+            }],
+        });
+        if let Some(usage) = self.usage {
+            chat.as_object_mut()
+                .expect("Chat completion wrapper must be an object")
+                .insert("usage".to_string(), usage);
+        }
+        Ok(chat)
+    }
+}
+
+async fn collect_chat_completion_sse(
+    response: &mut reqwest::Response,
+    model: &str,
+) -> Result<Value> {
+    let mut accumulator = ChatSseAccumulator::new(model);
+    let mut buffer = Vec::new();
+    let mut cursor = 0;
+    let mut done = false;
+    while let Some(chunk) =
+        read_upstream_chunk(response, "读取 Chat Completions SSE 流失败").await?
+    {
+        compact_sse_buffer(&mut buffer, &mut cursor);
+        buffer.extend_from_slice(&chunk);
+        ensure_sse_buffer_within_limit(&buffer, cursor)?;
+        while let Some(frame) = take_next_sse_frame(&buffer, &mut cursor) {
+            let Some(data) = sse_frame_data(frame)? else {
+                continue;
+            };
+            if data.trim() == "[DONE]" {
+                done = true;
+                break;
+            }
+            accumulator.ingest(
+                &serde_json::from_str::<Value>(&data)
+                    .context("Chat Completions SSE data 不是有效 JSON")?,
+            )?;
+        }
+        if done {
+            break;
+        }
+    }
+    if !done
+        && !buffer[cursor..].iter().all(u8::is_ascii_whitespace)
+        && let Some(data) = sse_frame_data(&buffer[cursor..])?
+        && data.trim() != "[DONE]"
+    {
+        accumulator.ingest(
+            &serde_json::from_str::<Value>(&data)
+                .context("Chat Completions SSE 末尾 data 不是有效 JSON")?,
+        )?;
+    }
+    accumulator.into_chat_completion()
+}
+
+async fn stream_chat_completions_as_responses(
+    stream: &mut TcpStream,
+    mut response: reqwest::Response,
+    model: &str,
+    route: &RouteTarget,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    let mut output = ResponsesSseState::new(model, tool_bridge);
+    output.start(stream).await?;
+    let mut accumulator = ChatSseAccumulator::new(model);
+    let result: Result<()> = async {
+        let mut buffer = Vec::new();
+        let mut cursor = 0;
+        let mut done = false;
+        while let Some(chunk) =
+            read_upstream_chunk(&mut response, "读取 Chat Completions SSE 流失败").await?
+        {
+            compact_sse_buffer(&mut buffer, &mut cursor);
+            buffer.extend_from_slice(&chunk);
+            ensure_sse_buffer_within_limit(&buffer, cursor)?;
+            while let Some(frame) = take_next_sse_frame(&buffer, &mut cursor) {
+                let Some(data) = sse_frame_data(frame)? else {
+                    continue;
+                };
+                if data.trim() == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                let event = serde_json::from_str::<Value>(&data)
+                    .context("Chat Completions SSE data 不是有效 JSON")?;
+                accumulator.ingest(&event)?;
+                emit_chat_stream_event(&mut output, stream, &event).await?;
+            }
+            if done {
+                break;
+            }
+        }
+        if !done
+            && !buffer[cursor..].iter().all(u8::is_ascii_whitespace)
+            && let Some(data) = sse_frame_data(&buffer[cursor..])?
+            && data.trim() != "[DONE]"
+        {
+            let event = serde_json::from_str::<Value>(&data)
+                .context("Chat Completions SSE 末尾 data 不是有效 JSON")?;
+            accumulator.ingest(&event)?;
+            emit_chat_stream_event(&mut output, stream, &event).await?;
+        }
+        let chat = accumulator.into_chat_completion()?;
+        let completed =
+            chat_completion_to_responses_body_with_tool_bridge(chat, model, tool_bridge)?;
+        if output.output_order.is_empty() {
+            let events = output.ensure_message();
+            output.write_events(stream, events).await?;
+        }
+        let usage = completed.get("usage").cloned();
+        let incomplete_reason = completed
+            .get("incomplete_details")
+            .and_then(|details| details.get("reason"))
+            .and_then(Value::as_str);
+        output.finish(stream, usage, incomplete_reason).await
+    }
+    .await;
+    if let Err(error) = result {
+        let (code, message) = streaming_failure_message(&error, route);
+        let _ = output.fail(stream, code, &message).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn emit_chat_stream_event(
+    output: &mut ResponsesSseState<'_>,
+    stream: &mut TcpStream,
+    event: &Value,
+) -> Result<()> {
+    let mut events = Vec::new();
+    let Some(choices) = event.get("choices").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for choice in choices {
+        if choice.get("index").and_then(Value::as_u64).unwrap_or(0) != 0 {
+            continue;
+        }
+        let Some(delta) = choice
+            .get("delta")
+            .or_else(|| choice.get("message"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        if let Some(content) = delta.get("content") {
+            events.extend(output.text_delta(&chat_message_content_text(content)));
+        }
+        if let Some(refusal) = delta.get("refusal").and_then(Value::as_str) {
+            events.extend(output.refusal_delta(refusal));
+        }
+        if let Some(tool_calls) = delta.get("tool_calls") {
+            let tool_calls = tool_calls
+                .as_array()
+                .ok_or_else(|| anyhow::anyhow!("Chat stream delta.tool_calls 必须是数组"))?;
+            for tool_call in tool_calls {
+                let tool_call = tool_call
+                    .as_object()
+                    .ok_or_else(|| anyhow::anyhow!("Chat stream tool_call delta 必须是对象"))?;
+                if let Some(call_type) = tool_call.get("type").and_then(Value::as_str)
+                    && call_type != "function"
+                {
+                    anyhow::bail!("Chat stream tool_call 类型 {call_type} 不受支持");
+                }
+                let index = tool_call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .unwrap_or(0);
+                let function = tool_call.get("function").and_then(Value::as_object);
+                let arguments_delta = function
+                    .and_then(|function| function.get("arguments"))
+                    .and_then(|arguments| json_value_as_chat_string(Some(arguments)));
+                events.extend(
+                    output.tool_delta(
+                        index,
+                        tool_call.get("id").and_then(Value::as_str),
+                        function
+                            .and_then(|function| function.get("name"))
+                            .and_then(Value::as_str),
+                        arguments_delta.as_deref(),
+                        None,
+                    )?,
+                );
+            }
+        }
+        if let Some(function_call) = delta.get("function_call") {
+            let function_call = function_call
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("Chat stream function_call delta 必须是对象"))?;
+            let arguments_delta = function_call
+                .get("arguments")
+                .and_then(|arguments| json_value_as_chat_string(Some(arguments)));
+            events.extend(output.tool_delta(
+                usize::MAX,
+                None,
+                function_call.get("name").and_then(Value::as_str),
+                arguments_delta.as_deref(),
+                None,
+            )?);
+        }
+    }
+    output.write_events(stream, events).await
+}
+
+fn parse_chat_completion_sse_bytes(bytes: &[u8], model: &str) -> Result<Value> {
+    let mut accumulator = ChatSseAccumulator::new(model);
+    let mut cursor = 0;
+    while let Some(frame) = take_next_sse_frame(bytes, &mut cursor) {
+        let Some(data) = sse_frame_data(frame)? else {
+            continue;
+        };
+        if data.trim() == "[DONE]" {
+            return accumulator.into_chat_completion();
+        }
+        accumulator.ingest(
+            &serde_json::from_str::<Value>(&data)
+                .context("Chat Completions SSE data 不是有效 JSON")?,
+        )?;
+    }
+    if !bytes[cursor..].iter().all(u8::is_ascii_whitespace)
+        && let Some(data) = sse_frame_data(&bytes[cursor..])?
+        && data.trim() != "[DONE]"
+    {
+        accumulator.ingest(
+            &serde_json::from_str::<Value>(&data)
+                .context("Chat Completions SSE 末尾 data 不是有效 JSON")?,
+        )?;
+    }
+    accumulator.into_chat_completion()
+}
+
+fn take_next_sse_frame<'a>(buffer: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let remaining = buffer.get(*cursor..)?;
+    let mut delimiter = None;
+    for index in 0..remaining.len() {
+        if remaining.get(index..index + 4) == Some(b"\r\n\r\n") {
+            delimiter = Some((index, 4));
+            break;
+        }
+        if remaining.get(index..index + 2) == Some(b"\n\n") {
+            delimiter = Some((index, 2));
+            break;
+        }
+    }
+    let (index, length) = delimiter?;
+    let frame_start = *cursor;
+    let frame_end = frame_start + index;
+    *cursor = frame_end + length;
+    Some(&buffer[frame_start..frame_end])
+}
+
+fn compact_sse_buffer(buffer: &mut Vec<u8>, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    if *cursor == buffer.len() {
+        buffer.clear();
+        *cursor = 0;
+        return;
+    }
+    if *cursor >= 64 * 1024 || cursor.saturating_mul(2) >= buffer.len() {
+        buffer.drain(..*cursor);
+        *cursor = 0;
+    }
+}
+
+fn sse_frame_data(frame: &[u8]) -> Result<Option<String>> {
+    let frame = std::str::from_utf8(frame).context("上游 SSE 不是 UTF-8")?;
+    let data = frame
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>();
+    Ok((!data.is_empty()).then(|| data.join("\n")))
+}
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+#[derive(Clone, Copy, Debug)]
+enum StreamOutputKind {
+    Message,
+    Tool(usize),
+}
+
+#[derive(Debug)]
+struct ResponsesStreamMessage {
+    item_id: String,
+    output_index: usize,
+    text: String,
+    refusal: String,
+    text_content_index: Option<usize>,
+    refusal_content_index: Option<usize>,
+    next_content_index: usize,
+}
+
+#[derive(Debug)]
+struct ResponsesStreamTool {
+    item_id: String,
+    output_index: usize,
+    call_id: String,
+    name: String,
+    response_name: Option<ResponsesToolName>,
+    arguments: String,
+    emitted_arguments: usize,
+    fallback_arguments: Option<String>,
+    added: bool,
+}
+
+#[derive(Debug)]
+struct ResponsesSseState<'a> {
+    response_id: String,
+    model: String,
+    tool_bridge: &'a ResponsesToolBridge,
+    created_at: i64,
+    next_output_index: usize,
+    message: Option<ResponsesStreamMessage>,
+    tools: BTreeMap<usize, ResponsesStreamTool>,
+    output_order: Vec<StreamOutputKind>,
+}
+
+impl<'a> ResponsesSseState<'a> {
+    fn new(model: &str, tool_bridge: &'a ResponsesToolBridge) -> Self {
+        Self {
+            response_id: format!("resp_codey_{}", Uuid::new_v4()),
+            model: model.to_string(),
+            tool_bridge,
+            created_at: current_unix_timestamp(),
+            next_output_index: 0,
+            message: None,
+            tools: BTreeMap::new(),
+            output_order: Vec::new(),
+        }
+    }
+
+    async fn start(&self, stream: &mut TcpStream) -> Result<()> {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\n{}connection: close\r\n\r\n",
+            router_request_id_header()
+        );
+        write_all_with_timeout(stream, header.as_bytes(), "写入 Responses SSE 响应头失败").await?;
+        write_responses_sse_event(
+            stream,
+            &json!({
+                "type":"response.created",
+                "response":{
+                    "id":self.response_id,
+                    "object":"response",
+                    "created_at":self.created_at,
+                    "status":"in_progress",
+                    "model":self.model,
+                    "output":[],
+                    "error":Value::Null,
+                    "incomplete_details":Value::Null,
+                }
+            }),
+        )
+        .await
+    }
+
+    fn ensure_message(&mut self) -> Vec<Value> {
+        if self.message.is_some() {
+            return Vec::new();
+        }
+        let output_index = self.next_output_index;
+        self.next_output_index += 1;
+        let item_id = format!("msg_codey_{}", Uuid::new_v4());
+        self.message = Some(ResponsesStreamMessage {
+            item_id: item_id.clone(),
+            output_index,
+            text: String::new(),
+            refusal: String::new(),
+            text_content_index: None,
+            refusal_content_index: None,
+            next_content_index: 0,
+        });
+        self.output_order.push(StreamOutputKind::Message);
+        vec![json!({
+            "type":"response.output_item.added",
+            "response_id":self.response_id,
+            "output_index":output_index,
+            "item":{
+                "id":item_id,
+                "type":"message",
+                "status":"in_progress",
+                "role":"assistant",
+                "content":[],
+            }
+        })]
+    }
+
+    fn text_delta(&mut self, delta: &str) -> Vec<Value> {
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        let mut events = self.ensure_message();
+        let response_id = self.response_id.clone();
+        let message = self
+            .message
+            .as_mut()
+            .expect("message state must exist after ensure_message");
+        let content_index = *message.text_content_index.get_or_insert_with(|| {
+            let index = message.next_content_index;
+            message.next_content_index += 1;
+            index
+        });
+        if message.text.is_empty() {
+            events.push(json!({
+                "type":"response.content_part.added",
+                "response_id":response_id,
+                "item_id":message.item_id,
+                "output_index":message.output_index,
+                "content_index":content_index,
+                "part":{"type":"output_text","text":"","annotations":[]},
+            }));
+        }
+        message.text.push_str(delta);
+        events.push(json!({
+            "type":"response.output_text.delta",
+            "response_id":response_id,
+            "item_id":message.item_id,
+            "output_index":message.output_index,
+            "content_index":content_index,
+            "delta":delta,
+        }));
+        events
+    }
+
+    fn refusal_delta(&mut self, delta: &str) -> Vec<Value> {
+        if delta.is_empty() {
+            return Vec::new();
+        }
+        let mut events = self.ensure_message();
+        let response_id = self.response_id.clone();
+        let message = self
+            .message
+            .as_mut()
+            .expect("message state must exist after ensure_message");
+        let content_index = *message.refusal_content_index.get_or_insert_with(|| {
+            let index = message.next_content_index;
+            message.next_content_index += 1;
+            index
+        });
+        if message.refusal.is_empty() {
+            events.push(json!({
+                "type":"response.content_part.added",
+                "response_id":response_id,
+                "item_id":message.item_id,
+                "output_index":message.output_index,
+                "content_index":content_index,
+                "part":{"type":"refusal","refusal":""},
+            }));
+        }
+        message.refusal.push_str(delta);
+        events.push(json!({
+            "type":"response.refusal.delta",
+            "response_id":response_id,
+            "item_id":message.item_id,
+            "output_index":message.output_index,
+            "content_index":content_index,
+            "delta":delta,
+        }));
+        events
+    }
+
+    fn tool_delta(
+        &mut self,
+        upstream_index: usize,
+        call_id: Option<&str>,
+        name_delta: Option<&str>,
+        arguments_delta: Option<&str>,
+        fallback_arguments: Option<String>,
+    ) -> Result<Vec<Value>> {
+        if !self.tools.contains_key(&upstream_index) {
+            let output_index = self.next_output_index;
+            self.next_output_index += 1;
+            self.tools.insert(
+                upstream_index,
+                ResponsesStreamTool {
+                    item_id: format!("fc_codey_{}", Uuid::new_v4()),
+                    output_index,
+                    call_id: String::new(),
+                    name: String::new(),
+                    response_name: None,
+                    arguments: String::new(),
+                    emitted_arguments: 0,
+                    fallback_arguments: None,
+                    added: false,
+                },
+            );
+            self.output_order
+                .push(StreamOutputKind::Tool(upstream_index));
+        }
+        let response_id = self.response_id.clone();
+        let tool = self
+            .tools
+            .get_mut(&upstream_index)
+            .expect("tool state must exist after insertion");
+        if tool.call_id.is_empty()
+            && let Some(call_id) = call_id.filter(|value| !value.is_empty())
+        {
+            tool.call_id = call_id.to_string();
+        }
+        if let Some(name_delta) = name_delta {
+            tool.name.push_str(name_delta);
+        }
+        if tool.fallback_arguments.is_none() {
+            tool.fallback_arguments = fallback_arguments;
+        }
+        if let Some(arguments_delta) = arguments_delta {
+            tool.arguments.push_str(arguments_delta);
+        }
+        if tool.response_name.is_none()
+            && !tool.name.is_empty()
+            && let Some(response_name) = self
+                .tool_bridge
+                .restore_stream_upstream_name(&tool.name, false)?
+        {
+            tool.response_name = Some(response_name);
+        }
+
+        let mut events = Vec::new();
+        if !tool.added
+            && let Some(response_name) = tool.response_name.as_ref()
+        {
+            if tool.call_id.is_empty() {
+                tool.call_id = format!("call_codey_{}", Uuid::new_v4());
+            }
+            tool.added = true;
+            let mut item = serde_json::Map::from_iter([
+                ("id".to_string(), Value::String(tool.item_id.clone())),
+                (
+                    "type".to_string(),
+                    Value::String("function_call".to_string()),
+                ),
+                (
+                    "status".to_string(),
+                    Value::String("in_progress".to_string()),
+                ),
+                ("call_id".to_string(), Value::String(tool.call_id.clone())),
+                ("arguments".to_string(), Value::String(String::new())),
+            ]);
+            response_name.insert_response_fields(&mut item);
+            events.push(json!({
+                "type":"response.output_item.added",
+                "response_id":response_id,
+                "output_index":tool.output_index,
+                "item":Value::Object(item)
+            }));
+        }
+        if tool.added && tool.emitted_arguments < tool.arguments.len() {
+            let delta = &tool.arguments[tool.emitted_arguments..];
+            events.push(json!({
+                "type":"response.function_call_arguments.delta",
+                "response_id":response_id,
+                "item_id":tool.item_id,
+                "output_index":tool.output_index,
+                "delta":delta,
+            }));
+            tool.emitted_arguments = tool.arguments.len();
+        }
+        Ok(events)
+    }
+
+    async fn write_events(&self, stream: &mut TcpStream, events: Vec<Value>) -> Result<()> {
+        for event in events {
+            write_responses_sse_event(stream, &event).await?;
+        }
+        Ok(())
+    }
+
+    async fn finish(
+        &mut self,
+        stream: &mut TcpStream,
+        usage: Option<Value>,
+        incomplete_reason: Option<&str>,
+    ) -> Result<()> {
+        let mut events = Vec::new();
+        if let Some(message) = self.message.as_ref() {
+            if let Some(content_index) = message.text_content_index {
+                events.push(json!({
+                    "type":"response.output_text.done",
+                    "response_id":self.response_id,
+                    "item_id":message.item_id,
+                    "output_index":message.output_index,
+                    "content_index":content_index,
+                    "text":message.text,
+                }));
+                events.push(json!({
+                    "type":"response.content_part.done",
+                    "response_id":self.response_id,
+                    "item_id":message.item_id,
+                    "output_index":message.output_index,
+                    "content_index":content_index,
+                    "part":{"type":"output_text","text":message.text,"annotations":[]},
+                }));
+            }
+            if let Some(content_index) = message.refusal_content_index {
+                events.push(json!({
+                    "type":"response.refusal.done",
+                    "response_id":self.response_id,
+                    "item_id":message.item_id,
+                    "output_index":message.output_index,
+                    "content_index":content_index,
+                    "refusal":message.refusal,
+                }));
+                events.push(json!({
+                    "type":"response.content_part.done",
+                    "response_id":self.response_id,
+                    "item_id":message.item_id,
+                    "output_index":message.output_index,
+                    "content_index":content_index,
+                    "part":{"type":"refusal","refusal":message.refusal},
+                }));
+            }
+            events.push(json!({
+                "type":"response.output_item.done",
+                "response_id":self.response_id,
+                "output_index":message.output_index,
+                "item":stream_message_item(message),
+            }));
+        }
+
+        for tool in self.tools.values_mut() {
+            if tool.arguments.is_empty()
+                && let Some(fallback) = tool.fallback_arguments.take()
+            {
+                tool.arguments = fallback;
+            }
+            if tool.name.is_empty() {
+                anyhow::bail!("流式 function_call 缺少 name");
+            }
+            if tool.response_name.is_none() {
+                tool.response_name = self
+                    .tool_bridge
+                    .restore_stream_upstream_name(&tool.name, true)?;
+            }
+            if tool.call_id.is_empty() {
+                tool.call_id = format!("call_codey_{}", Uuid::new_v4());
+            }
+            if !tool.added {
+                tool.added = true;
+                let response_name = tool
+                    .response_name
+                    .as_ref()
+                    .expect("response tool name must be restored before add");
+                let mut item = serde_json::Map::from_iter([
+                    ("id".to_string(), Value::String(tool.item_id.clone())),
+                    (
+                        "type".to_string(),
+                        Value::String("function_call".to_string()),
+                    ),
+                    (
+                        "status".to_string(),
+                        Value::String("in_progress".to_string()),
+                    ),
+                    ("call_id".to_string(), Value::String(tool.call_id.clone())),
+                    ("arguments".to_string(), Value::String(String::new())),
+                ]);
+                response_name.insert_response_fields(&mut item);
+                events.push(json!({
+                    "type":"response.output_item.added",
+                    "response_id":self.response_id,
+                    "output_index":tool.output_index,
+                    "item":Value::Object(item)
+                }));
+            }
+            if tool.emitted_arguments < tool.arguments.len() {
+                let delta = &tool.arguments[tool.emitted_arguments..];
+                events.push(json!({
+                    "type":"response.function_call_arguments.delta",
+                    "response_id":self.response_id,
+                    "item_id":tool.item_id,
+                    "output_index":tool.output_index,
+                    "delta":delta,
+                }));
+                tool.emitted_arguments = tool.arguments.len();
+            }
+            events.push(json!({
+                "type":"response.function_call_arguments.done",
+                "response_id":self.response_id,
+                "item_id":tool.item_id,
+                "output_index":tool.output_index,
+                "arguments":tool.arguments,
+            }));
+            events.push(json!({
+                "type":"response.output_item.done",
+                "response_id":self.response_id,
+                "output_index":tool.output_index,
+                "item":stream_tool_item(tool),
+            }));
+        }
+
+        let output = self
+            .output_order
+            .iter()
+            .filter_map(|kind| match kind {
+                StreamOutputKind::Message => self.message.as_ref().map(stream_message_item),
+                StreamOutputKind::Tool(index) => self.tools.get(index).map(stream_tool_item),
+            })
+            .collect::<Vec<_>>();
+        let status = if incomplete_reason.is_some() {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        let mut response = json!({
+            "id":self.response_id,
+            "object":"response",
+            "created_at":self.created_at,
+            "status":status,
+            "model":self.model,
+            "output":output,
+            "output_text":self.message.as_ref().map(|message| message.text.as_str()).unwrap_or(""),
+            "error":Value::Null,
+            "incomplete_details":incomplete_reason.map(|reason| json!({"reason":reason})),
+        });
+        if let Some(usage) = usage {
+            response
+                .as_object_mut()
+                .expect("streaming Responses wrapper must be an object")
+                .insert("usage".to_string(), usage);
+        }
+        let terminal_type = if incomplete_reason.is_some() {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        events.push(json!({"type":terminal_type,"response":response}));
+        self.write_events(stream, events).await?;
+        finish_chunked_response(stream).await
+    }
+
+    async fn fail(&self, stream: &mut TcpStream, code: &str, message: &str) -> Result<()> {
+        write_responses_sse_event(
+            stream,
+            &json!({
+                "type":"response.failed",
+                "response":{
+                    "id":self.response_id,
+                    "object":"response",
+                    "created_at":self.created_at,
+                    "status":"failed",
+                    "model":self.model,
+                    "output":[],
+                    "error":{
+                        "type":"codey_route_error",
+                        "code":code,
+                        "message":message,
+                    },
+                    "incomplete_details":Value::Null,
+                }
+            }),
+        )
+        .await?;
+        finish_chunked_response(stream).await
+    }
+}
+
+fn stream_message_item(message: &ResponsesStreamMessage) -> Value {
+    let mut content = Vec::new();
+    if message.text_content_index.is_some() {
+        content.push((
+            message.text_content_index.unwrap_or_default(),
+            json!({"type":"output_text","text":message.text,"annotations":[]}),
+        ));
+    }
+    if message.refusal_content_index.is_some() {
+        content.push((
+            message.refusal_content_index.unwrap_or_default(),
+            json!({"type":"refusal","refusal":message.refusal}),
+        ));
+    }
+    content.sort_by_key(|(index, _)| *index);
+    json!({
+        "id":message.item_id,
+        "type":"message",
+        "status":"completed",
+        "role":"assistant",
+        "content":content.into_iter().map(|(_, part)| part).collect::<Vec<_>>(),
+    })
+}
+
+fn stream_tool_item(tool: &ResponsesStreamTool) -> Value {
+    let mut item = serde_json::Map::from_iter([
+        ("id".to_string(), Value::String(tool.item_id.clone())),
+        (
+            "type".to_string(),
+            Value::String("function_call".to_string()),
+        ),
+        ("status".to_string(), Value::String("completed".to_string())),
+        ("call_id".to_string(), Value::String(tool.call_id.clone())),
+        (
+            "arguments".to_string(),
+            Value::String(tool.arguments.clone()),
+        ),
+    ]);
+    tool.response_name
+        .as_ref()
+        .expect("stream tool response name must be restored before serialization")
+        .insert_response_fields(&mut item);
+    Value::Object(item)
+}
+
+async fn write_responses_sse_event(stream: &mut TcpStream, event: &Value) -> Result<()> {
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("response.event");
+    let payload = format!(
+        "event: {event_type}\ndata: {}\n\n",
+        serde_json::to_string(event).context("序列化 Responses SSE 事件失败")?
+    );
+    write_all_with_timeout(
+        stream,
+        format!("{:x}\r\n", payload.len()).as_bytes(),
+        "写入 Responses SSE 事件长度失败",
+    )
+    .await?;
+    write_all_with_timeout(stream, payload.as_bytes(), "写入 Responses SSE 事件失败").await?;
+    write_all_with_timeout(stream, b"\r\n", "结束 Responses SSE 事件失败").await?;
+    tokio::time::timeout(DOWNSTREAM_WRITE_TIMEOUT, stream.flush())
+        .await
+        .context("刷新 Responses SSE 事件超过写入期限")?
+        .context("刷新 Responses SSE 事件失败")
+}
+
+async fn finish_chunked_response(stream: &mut TcpStream) -> Result<()> {
+    write_all_with_timeout(stream, b"0\r\n\r\n", "结束 Responses SSE 流失败").await
+}
+
+async fn write_responses_sse_response(stream: &mut TcpStream, response: &Value) -> Result<()> {
+    let response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("resp_codey");
+    let mut created = response.clone();
+    if let Some(created) = created.as_object_mut() {
+        created.insert(
+            "status".to_string(),
+            Value::String("in_progress".to_string()),
+        );
+        created.insert("output".to_string(), Value::Array(Vec::new()));
+        created.remove("usage");
+    }
+    let mut events = vec![json!({"type":"response.created","response":created})];
+    for (output_index, item) in response
+        .get("output")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let item_id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("item_codey");
+        let mut added_item = item.clone();
+        if let Some(added_item) = added_item.as_object_mut() {
+            added_item.insert(
+                "status".to_string(),
+                Value::String("in_progress".to_string()),
+            );
+            match added_item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    added_item.insert("content".to_string(), Value::Array(Vec::new()));
+                }
+                Some("function_call") => {
+                    added_item.insert("arguments".to_string(), Value::String(String::new()));
+                }
+                _ => {}
+            }
+        }
+        events.push(json!({
+            "type":"response.output_item.added",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": added_item,
+        }));
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                append_message_sse_events(&mut events, response_id, item_id, output_index, item)
+            }
+            Some("function_call") => {
+                let arguments = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                events.push(json!({
+                    "type":"response.function_call_arguments.delta",
+                    "response_id": response_id,
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "delta": arguments,
+                }));
+                events.push(json!({
+                    "type":"response.function_call_arguments.done",
+                    "response_id": response_id,
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "arguments": arguments,
+                }));
+            }
+            _ => {}
+        }
+        events.push(json!({
+            "type":"response.output_item.done",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": item,
+        }));
+    }
+    let terminal_event = if response.get("status").and_then(Value::as_str) == Some("incomplete") {
+        "response.incomplete"
+    } else {
+        "response.completed"
+    };
+    events.push(json!({"type":terminal_event,"response":response}));
+    let mut body = String::new();
+    for event in events {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("response.event");
+        body.push_str("event: ");
+        body.push_str(event_type);
+        body.push('\n');
+        body.push_str("data: ");
+        body.push_str(&serde_json::to_string(&event).context("序列化 Responses SSE 事件失败")?);
+        body.push_str("\n\n");
+    }
+    let header = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\ncontent-length: {}\r\n{}connection: close\r\n\r\n",
+        body.len(),
+        router_request_id_header()
+    );
+    write_all_with_timeout(stream, header.as_bytes(), "写入 Responses SSE 响应头失败").await?;
+    write_all_with_timeout(stream, body.as_bytes(), "写入 Responses SSE 响应失败").await?;
+    Ok(())
+}
+
+fn append_message_sse_events(
+    events: &mut Vec<Value>,
+    response_id: &str,
+    item_id: &str,
+    output_index: usize,
+    item: &Value,
+) {
+    for (content_index, part) in item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let part_type = part.get("type").and_then(Value::as_str);
+        let empty_part = match part_type {
+            Some("refusal") => json!({"type":"refusal","refusal":""}),
+            _ => json!({"type":"output_text","text":"","annotations":[]}),
+        };
+        events.push(json!({
+            "type":"response.content_part.added",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "part": empty_part,
+        }));
+        if part_type == Some("refusal") {
+            let refusal = part.get("refusal").and_then(Value::as_str).unwrap_or("");
+            events.push(json!({
+                "type":"response.refusal.delta",
+                "response_id": response_id,
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "delta": refusal,
+            }));
+            events.push(json!({
+                "type":"response.refusal.done",
+                "response_id": response_id,
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "refusal": refusal,
+            }));
+        } else {
+            let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+            events.push(json!({
+                "type":"response.output_text.delta",
+                "response_id": response_id,
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "delta": text,
+            }));
+            events.push(json!({
+                "type":"response.output_text.done",
+                "response_id": response_id,
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "text": text,
+            }));
+        }
+        events.push(json!({
+            "type":"response.content_part.done",
+            "response_id": response_id,
+            "item_id": item_id,
+            "output_index": output_index,
+            "content_index": content_index,
+            "part": part,
+        }));
+    }
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -779,7 +5653,9 @@ fn reason_phrase(status: u16) -> &'static str {
         400 => "Bad Request",
         401 => "Unauthorized",
         408 => "Request Timeout",
+        409 => "Conflict",
         404 => "Not Found",
+        424 => "Failed Dependency",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
         503 => "Service Unavailable",
@@ -813,6 +5689,87 @@ mod tests {
         (config, provider_id, model)
     }
 
+    async fn write_test_http_chunk(stream: &mut TcpStream, payload: &str) {
+        stream
+            .write_all(format!("{:x}\r\n", payload.len()).as_bytes())
+            .await
+            .unwrap();
+        stream.write_all(payload.as_bytes()).await.unwrap();
+        stream.write_all(b"\r\n").await.unwrap();
+        stream.flush().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_router_errors_expose_a_safe_request_id_for_correlation() {
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        ROUTER_REQUEST_ID
+            .scope("request-123".to_string(), async {
+                write_text_error_response(&mut writer, 504, "upstream_timeout", "上游响应超时")
+                    .await
+                    .unwrap();
+            })
+            .await;
+        drop(writer);
+        let mut response = String::new();
+        reader.read_to_string(&mut response).await.unwrap();
+
+        assert!(response.contains("x-codey-request-id: request-123\r\n"));
+        assert!(response.contains("请求 ID：request-123"));
+    }
+
+    #[test]
+    fn runtime_endpoint_validation_allows_http_but_rejects_url_credentials() {
+        assert!(responses_endpoint("http://api.example.com/v1").is_ok());
+        assert!(responses_endpoint("https://user:pass@api.example.com/v1").is_err());
+        assert!(responses_endpoint("http://127.0.0.1:11434/v1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn request_body_budget_rejects_before_allocating_the_declared_body() {
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        writer
+            .write_all(
+                b"POST /v1/responses HTTP/1.1\r\ncontent-length: 131072\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let budget = Arc::new(Semaphore::new(1));
+
+        let error = read_http_request_with_budget(&mut reader, Some(&budget))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<RequestBodyBudgetUnavailable>()
+                .is_some()
+        );
+        assert_eq!(budget.available_permits(), 1);
+    }
+
+    #[test]
+    fn route_bindings_refresh_in_amortized_constant_time_and_evict_stale_entries() {
+        let mut bindings = RouteBindings::default();
+        for index in 0..MAX_ROUTE_BINDINGS {
+            bindings.remember(&[format!("thread-id:{index}")], "route-a");
+        }
+        for _ in 0..(MAX_ROUTE_BINDINGS * 5) {
+            bindings.remember(&["thread-id:0".to_string()], "route-b");
+        }
+
+        assert!(bindings.order.len() <= MAX_ROUTE_BINDINGS * 4);
+        assert_eq!(
+            bindings.route_for_keys(&["thread-id:0".to_string()]),
+            Some("route-b".to_string())
+        );
+
+        bindings.remember(&["thread-id:new".to_string()], "route-c");
+        assert_eq!(bindings.routes.len(), MAX_ROUTE_BINDINGS);
+        assert!(bindings.routes.contains_key("thread-id:0"));
+        assert!(bindings.routes.contains_key("thread-id:new"));
+        assert!(!bindings.routes.contains_key("thread-id:1"));
+    }
+
     #[test]
     fn router_snapshot_maps_route_aliases_to_upstream_models() {
         let (config, provider_id, model) = router_config("https://relay.example/v1".to_string());
@@ -822,9 +5779,13 @@ mod tests {
             .target_for_model(&model_alias(&provider_id, &model))
             .unwrap();
 
-        assert_eq!(resolved.route.base_url, "https://relay.example/v1");
+        assert_eq!(
+            resolved.route.upstream_url.as_ref().unwrap(),
+            "https://relay.example/v1/responses"
+        );
         assert_eq!(resolved.upstream_model, model);
-        assert!(snapshot.target_for_model("provider-model").is_err());
+        let raw = snapshot.target_for_model("provider-model").unwrap();
+        assert_eq!(raw.route.provider_id, provider_id);
     }
 
     #[test]
@@ -851,9 +5812,88 @@ mod tests {
             .target_for_model(&model_alias(&provider_b, &model))
             .unwrap();
 
-        assert_eq!(resolved_a.route.base_url, "https://relay-a.example/v1");
-        assert_eq!(resolved_b.route.base_url, "https://relay-b.example/v1");
+        assert_eq!(
+            resolved_a.route.upstream_url.as_ref().unwrap(),
+            "https://relay-a.example/v1/responses"
+        );
+        assert_eq!(
+            resolved_b.route.upstream_url.as_ref().unwrap(),
+            "https://relay-b.example/v1/responses"
+        );
         assert_eq!(snapshot.model_aliases().len(), 2);
+        assert_eq!(snapshot.model_ids(), vec![model.clone()]);
+        assert!(snapshot.target_for_model(&model).is_err());
+        let hinted = snapshot
+            .target_for_request(&model, Some(&provider_b), None)
+            .unwrap();
+        assert_eq!(hinted.route.provider_id, provider_b);
+        let qualified_alias_with_stale_hint = snapshot
+            .target_for_request(&model_alias(&provider_a, &model), Some(&provider_b), None)
+            .unwrap();
+        assert_eq!(
+            qualified_alias_with_stale_hint.route.provider_id,
+            provider_a
+        );
+        assert_eq!(qualified_alias_with_stale_hint.upstream_model, model);
+    }
+
+    #[test]
+    fn stale_thread_binding_yields_to_only_an_unambiguous_new_model() {
+        let (mut config, provider_a, model_a) =
+            router_config("https://relay-a.example/v1".to_string());
+        let mut route_b = config.profiles[0].clone();
+        route_b.id = "route-b".into();
+        route_b.name = "Relay B".into();
+        route_b.base_url = "https://relay-b.example/v1".into();
+        route_b.api_key = "sk-route-b".into();
+        route_b.normalize();
+        let provider_b = route_b.provider_id().to_string();
+        let model_b = "new-model".to_string();
+        config.profiles.push(route_b);
+        config
+            .selected_models_by_provider
+            .insert(provider_b.clone(), vec![model_b.clone()]);
+
+        let snapshot = RouterSnapshot::from_config(&config);
+        let switched = snapshot
+            .target_for_request(&model_b, None, Some(&provider_a))
+            .unwrap();
+        assert_eq!(switched.route.provider_id, provider_b);
+        assert_eq!(switched.upstream_model, model_b);
+        let switched_with_replayed_hint = snapshot
+            .target_for_request(&model_b, Some(&provider_a), Some(&provider_a))
+            .unwrap();
+        assert_eq!(switched_with_replayed_hint.route.provider_id, provider_b);
+        assert_eq!(switched_with_replayed_hint.upstream_model, model_b);
+        let switched_with_unbound_replayed_hint = snapshot
+            .target_for_request("new-model", Some(&provider_a), None)
+            .unwrap();
+        assert_eq!(
+            switched_with_unbound_replayed_hint.route.provider_id,
+            provider_b
+        );
+
+        let mut route_c = config.profiles[0].clone();
+        route_c.id = "route-c".into();
+        route_c.name = "Relay C".into();
+        route_c.base_url = "https://relay-c.example/v1".into();
+        route_c.api_key = "sk-route-c".into();
+        route_c.normalize();
+        let provider_c = route_c.provider_id().to_string();
+        config.profiles.push(route_c);
+        config
+            .selected_models_by_provider
+            .insert(provider_c, vec!["new-model".into()]);
+        let ambiguous = RouterSnapshot::from_config(&config)
+            .target_for_request("new-model", Some(&provider_a), Some(&provider_a))
+            .unwrap_err()
+            .to_string();
+        assert!(ambiguous.contains("缺少明确"));
+
+        let unchanged = snapshot
+            .target_for_request(&model_a, None, Some(&provider_a))
+            .unwrap();
+        assert_eq!(unchanged.route.provider_id, provider_a);
     }
 
     #[test]
@@ -889,6 +5929,178 @@ mod tests {
     }
 
     #[test]
+    fn official_account_models_enter_the_router_only_when_login_is_available() {
+        let mut official = ProviderProfile::new("OpenAI 官方直登");
+        official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+        official.source_provider_id = Some("openai".into());
+        official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+        let mut config = CodeyConfig {
+            active_profile_id: official.id.clone(),
+            profiles: vec![official],
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        }
+        .normalize();
+        config
+            .selected_models_by_provider
+            .insert("openai".into(), vec!["gpt-5.6-sol".into()]);
+
+        let snapshot = RouterSnapshot::from_config(&config);
+        let official_alias = model_alias("openai", "gpt-5.6-sol");
+        let resolved = snapshot.target_for_model(&official_alias).unwrap();
+
+        assert_eq!(resolved.route.provider_id, "openai");
+        assert!(resolved.route.official_account);
+        assert_eq!(
+            resolved.route.upstream_url.as_ref().unwrap(),
+            &format!("{CHATGPT_CODEX_BASE_URL}/responses")
+        );
+        assert_eq!(resolved.upstream_model, "gpt-5.6-sol");
+        let raw = snapshot.target_for_model("gpt-5.6-sol").unwrap();
+        assert_eq!(raw.route.provider_id, "openai");
+
+        let mut api_key_launch = config;
+        api_key_launch.official_account_available_this_launch = false;
+        assert!(
+            RouterSnapshot::from_config(&api_key_launch)
+                .target_for_model(&official_alias)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn third_party_routes_do_not_inherit_chatgpt_account_headers() {
+        assert!(should_forward_incoming_header("chatgpt-account-id", true));
+        assert!(should_forward_incoming_header("x-openai-originator", true));
+        assert!(!should_forward_incoming_header("chatgpt-account-id", false));
+        assert!(!should_forward_incoming_header(
+            "x-openai-originator",
+            false
+        ));
+        assert!(!should_forward_incoming_header("authorization", true));
+        assert!(!should_forward_incoming_header(ROUTER_AUTH_HEADER, true));
+        assert!(!should_forward_incoming_header(ROUTE_METADATA_KEY, true));
+        assert!(should_forward_incoming_header("accept", false));
+    }
+
+    #[test]
+    fn protocol_tokens_are_case_insensitive_without_rewriting_endpoint_paths() {
+        assert!(is_hop_by_hop_header("Transfer-Encoding"));
+        assert!(!should_forward_incoming_header("ConNection", true));
+        assert!(is_sse_content_type("Text/Event-Stream; Charset=UTF-8"));
+
+        let base_url = "https://relay.example/API/V1/Responses?token=private#debug";
+        assert_eq!(
+            responses_endpoint(base_url).unwrap(),
+            "https://relay.example/API/V1/Responses"
+        );
+        assert_eq!(
+            chat_completions_endpoint(base_url).unwrap(),
+            "https://relay.example/API/V1/chat/completions"
+        );
+        assert_eq!(
+            anthropic_messages_endpoint(base_url).unwrap(),
+            "https://relay.example/API/V1/messages"
+        );
+    }
+
+    #[test]
+    fn router_snapshot_prepares_upstream_url_and_headers() {
+        let (mut config, provider_id, model) =
+            router_config("https://relay.example/v1".to_string());
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        config.profiles[0]
+            .model_request_headers
+            .insert("authorization".into(), "Bearer custom".into());
+        config.profiles[0]
+            .model_request_headers
+            .insert("accept".into(), "application/x-codey-test".into());
+
+        let resolved = RouterSnapshot::from_config(&config)
+            .target_for_model(&model_alias(&provider_id, &model))
+            .unwrap();
+        let headers = resolved.route.upstream_headers.as_ref().unwrap();
+
+        assert_eq!(
+            resolved.route.adapter,
+            UpstreamAdapter::OpenAiChatCompletions
+        );
+        assert_eq!(
+            resolved.route.upstream_url.as_ref().unwrap(),
+            "https://relay.example/v1/chat/completions"
+        );
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap().to_str().unwrap(),
+            "Bearer custom"
+        );
+        assert_eq!(
+            headers.get("accept").unwrap().to_str().unwrap(),
+            "application/x-codey-test"
+        );
+    }
+
+    #[test]
+    fn router_snapshot_rejects_unsafe_saved_headers_without_per_request_parsing() {
+        let (mut config, provider_id, model) =
+            router_config("https://relay.example/v1".to_string());
+        config.profiles[0]
+            .model_request_headers
+            .insert("connection".into(), "keep-alive".into());
+
+        let resolved = RouterSnapshot::from_config(&config)
+            .target_for_model(&model_alias(&provider_id, &model))
+            .unwrap();
+
+        assert!(
+            resolved
+                .route
+                .upstream_headers
+                .as_ref()
+                .unwrap_err()
+                .contains("不允许覆盖")
+        );
+    }
+
+    #[test]
+    fn codey_route_metadata_is_removed_without_dropping_other_turn_metadata() {
+        let mut request = HttpRequest {
+            method: "POST".into(),
+            path: "/v1/responses".into(),
+            headers: vec![(
+                TURN_METADATA_HEADER.into(),
+                json!({ROUTE_METADATA_KEY:"route-a","keep":"header"}).to_string(),
+            )],
+            body: Vec::new(),
+            _body_budget_permit: None,
+        };
+        let mut body = json!({
+            "client_metadata": {
+                "x-codex-turn-metadata": json!({
+                    ROUTE_METADATA_KEY: "route-a",
+                    "keep": "body"
+                }).to_string()
+            }
+        });
+
+        let route = take_codey_route_metadata(&mut request, &mut body).unwrap();
+
+        assert_eq!(route.as_deref(), Some("route-a"));
+        let header = serde_json::from_str::<Value>(&request.headers[0].1).unwrap();
+        assert!(header.get(ROUTE_METADATA_KEY).is_none());
+        assert_eq!(header["keep"], "header");
+        let nested = serde_json::from_str::<Value>(
+            body["client_metadata"][TURN_METADATA_HEADER]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(nested.get(ROUTE_METADATA_KEY).is_none());
+        assert_eq!(nested["keep"], "body");
+    }
+
+    #[test]
     fn responses_endpoint_reuses_explicit_responses_url() {
         assert_eq!(
             responses_endpoint("https://relay.example/v1/responses").unwrap(),
@@ -898,6 +6110,1023 @@ mod tests {
             responses_endpoint("https://relay.example/v1").unwrap(),
             "https://relay.example/v1/responses"
         );
+    }
+
+    #[test]
+    fn chat_completions_endpoint_accepts_root_version_and_explicit_paths() {
+        assert_eq!(
+            chat_completions_endpoint("https://relay.example").unwrap(),
+            "https://relay.example/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_endpoint("https://relay.example/v1").unwrap(),
+            "https://relay.example/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_endpoint("https://relay.example/v1/responses").unwrap(),
+            "https://relay.example/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_endpoint("https://relay.example/v1/chat/completions").unwrap(),
+            "https://relay.example/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn anthropic_messages_endpoint_accepts_root_version_and_explicit_paths() {
+        assert_eq!(
+            anthropic_messages_endpoint("https://api.anthropic.com").unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_endpoint("https://relay.example/v1").unwrap(),
+            "https://relay.example/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_endpoint("https://relay.example/v1/responses").unwrap(),
+            "https://relay.example/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_endpoint("https://relay.example/v1/messages").unwrap(),
+            "https://relay.example/v1/messages"
+        );
+    }
+
+    #[test]
+    fn responses_request_converts_messages_tools_images_and_structured_output_to_chat() {
+        let chat = responses_to_chat_completions_body(&json!({
+            "model": "provider-model",
+            "instructions": "Be concise",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type":"input_text","text":"inspect"},
+                        {"type":"input_image","image_url":"https://example.invalid/a.png","detail":"low"}
+                    ]
+                },
+                {"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{\"q\":1}"},
+                {"type":"function_call_output","call_id":"call-1","output":"done"}
+            ],
+            "tools": [{
+                "type": "function",
+                "name": "lookup",
+                "description": "lookup data",
+                "parameters": {"type":"object"},
+                "strict": true
+            }],
+            "tool_choice": {"type":"function","name":"lookup"},
+            "parallel_tool_calls": true,
+            "reasoning": {"effort":"high"},
+            "text": {"format": {
+                "type": "json_schema",
+                "name": "answer",
+                "schema": {"type":"object"},
+                "strict": true
+            }},
+            "stream": true
+        }))
+        .unwrap();
+
+        assert_eq!(chat["model"], "provider-model");
+        assert_eq!(chat["messages"][0]["role"], "system");
+        assert_eq!(chat["messages"][1]["content"][1]["type"], "image_url");
+        assert_eq!(chat["messages"][2]["tool_calls"][0]["id"], "call-1");
+        assert_eq!(chat["messages"][3]["tool_call_id"], "call-1");
+        assert_eq!(chat["tools"][0]["function"]["name"], "lookup");
+        assert_eq!(chat["tool_choice"]["function"]["name"], "lookup");
+        assert_eq!(chat["reasoning_effort"], "high");
+        assert_eq!(chat["response_format"]["type"], "json_schema");
+        assert_eq!(chat["response_format"]["json_schema"]["name"], "answer");
+        assert_eq!(chat["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn additional_tools_are_merged_without_becoming_chat_or_anthropic_messages() {
+        let body = json!({
+            "model":"provider-model",
+            "tools":[{
+                "type":"function",
+                "name":"always_available",
+                "parameters":{"type":"object","properties":{}}
+            }],
+            "input":[
+                {"type":"message","role":"user","content":"hello"},
+                {
+                    "type":"additional_tools",
+                    "role":"developer",
+                    "tools":[{
+                        "type":"function",
+                        "name":"loaded_later",
+                        "description":"Loaded at this point in the Responses input",
+                        "parameters":{"type":"object","properties":{"q":{"type":"string"}}}
+                    }]
+                }
+            ]
+        });
+
+        let chat = responses_to_chat_completions_body(&body).unwrap();
+        let anthropic = responses_to_anthropic_messages_body(&body).unwrap();
+
+        assert_eq!(chat["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["messages"][0]["content"], "hello");
+        assert_eq!(chat["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(chat["tools"][1]["function"]["name"], "loaded_later");
+        assert_eq!(anthropic["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(anthropic["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(anthropic["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(anthropic["tools"][1]["name"], "loaded_later");
+    }
+
+    #[test]
+    fn additional_tools_reject_conflicting_function_definitions() {
+        let error = responses_to_anthropic_messages_body(&json!({
+            "model":"provider-model",
+            "tools":[{
+                "type":"function",
+                "name":"lookup",
+                "parameters":{"type":"object","properties":{"id":{"type":"string"}}}
+            }],
+            "input":[
+                {"role":"user","content":"hello"},
+                {
+                    "type":"additional_tools",
+                    "role":"developer",
+                    "tools":[{
+                        "type":"function",
+                        "name":"lookup",
+                        "parameters":{"type":"object","properties":{"id":{"type":"number"}}}
+                    }]
+                }
+            ]
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("定义冲突的工具 function/lookup"));
+    }
+
+    #[test]
+    fn additional_tools_require_the_developer_role() {
+        let error = responses_to_chat_completions_body(&json!({
+            "model":"provider-model",
+            "input":[
+                {"role":"user","content":"hello"},
+                {"type":"additional_tools","role":"user","tools":[]}
+            ]
+        }))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("additional_tools.role 必须是 developer")
+        );
+    }
+
+    #[test]
+    fn namespace_tools_expand_to_stable_unique_function_names_and_choices() {
+        let body = json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[{
+                "type":"namespace",
+                "name":"mcp__codey_fastctx",
+                "tools":[{
+                    "type":"function",
+                    "name":"grep",
+                    "description":"search content",
+                    "parameters":{"type":"object","properties":{"pattern":{"type":"string"}}}
+                }],
+                "children":[{
+                    "type":"namespace",
+                    "name":"files",
+                    "tools":[{
+                        "type":"function",
+                        "name":"inspect_local_file_with_an_extremely_long_leaf_name",
+                        "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+                    }]
+                }]
+            }],
+            "tool_choice":{
+                "type":"function",
+                "namespace":"mcp__codey_fastctx.files",
+                "name":"inspect_local_file_with_an_extremely_long_leaf_name"
+            },
+            "function_call":{"namespace":"mcp__codey_fastctx","name":"grep"}
+        });
+
+        let converted = responses_to_chat_completions_request(&body).unwrap();
+        let repeated = responses_to_chat_completions_request(&body).unwrap();
+
+        let grep_name = converted.body["tools"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        let inspect_name = converted.body["tools"][1]["function"]["name"]
+            .as_str()
+            .unwrap();
+        assert!(grep_name.starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX));
+        assert!(inspect_name.starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX));
+        assert_ne!(grep_name, inspect_name);
+        assert_ne!(grep_name, "grep");
+        assert!(inspect_name.len() <= UPSTREAM_FUNCTION_NAME_MAX_BYTES);
+        assert_eq!(
+            repeated.body["tools"][0]["function"]["name"],
+            converted.body["tools"][0]["function"]["name"]
+        );
+        assert_eq!(
+            converted.body["tool_choice"]["function"]["name"],
+            inspect_name
+        );
+        assert_eq!(converted.body["function_call"]["name"], grep_name);
+    }
+
+    #[test]
+    fn namespace_children_alias_accepts_function_tools() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[{
+                "type":"namespace",
+                "name":"mcp_files",
+                "children":[{
+                    "type":"function",
+                    "name":"read",
+                    "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+                }]
+            }]
+        }))
+        .unwrap();
+
+        let upstream_name = converted.body["tools"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        assert!(upstream_name.starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX));
+        assert_eq!(
+            converted
+                .tool_bridge
+                .restore_upstream_name(upstream_name)
+                .unwrap(),
+            ResponsesToolName {
+                namespace: vec!["mcp_files".to_string()],
+                name: "read".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn namespace_additional_tools_rewrite_historical_function_calls() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":[
+                {"role":"user","content":"hello"},
+                {
+                    "type":"additional_tools",
+                    "role":"developer",
+                    "tools":[{
+                        "type":"namespace",
+                        "name":"fs",
+                        "tools":[{
+                            "type":"function",
+                            "name":"read_file",
+                            "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+                        }]
+                    }]
+                },
+                {"type":"function_call","call_id":"call-1","namespace":"fs","name":"read_file","arguments":{"path":"a.txt"}},
+                {"type":"message","role":"assistant","tool_calls":[{
+                    "id":"call-2",
+                    "type":"function",
+                    "namespace":"fs",
+                    "function":{"name":"read_file","arguments":"{}"}
+                }]},
+                {"type":"message","role":"assistant","function_call":{"namespace":["fs"],"name":"read_file"}}
+            ]
+        }))
+        .unwrap();
+
+        let upstream_name = converted.body["tools"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            converted.body["messages"][1]["tool_calls"][0]["function"]["name"],
+            upstream_name
+        );
+        assert_eq!(
+            converted.body["messages"][2]["tool_calls"][0]["function"]["name"],
+            upstream_name
+        );
+        assert_eq!(
+            converted.body["messages"][3]["function_call"]["name"],
+            upstream_name
+        );
+    }
+
+    #[test]
+    fn namespace_tools_fail_closed_on_conflicts_and_unsupported_tool_kinds() {
+        let duplicate = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[{
+                "type":"namespace",
+                "name":"fs",
+                "tools":[
+                    {"type":"function","name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}}}},
+                    {"type":"function","name":"read","parameters":{"type":"object","properties":{"path":{"type":"number"}}}}
+                ]
+            }]
+        }))
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("存在定义冲突"));
+
+        for tool_type in ["custom", "tool_search"] {
+            let error = responses_to_chat_completions_request(&json!({
+                "model":"provider-model",
+                "input":"hello",
+                "tools":[{"type":tool_type,"name":"lookup"}]
+            }))
+            .unwrap_err();
+            assert!(error.to_string().contains("不能安全转换"));
+        }
+    }
+
+    #[test]
+    fn namespace_expansion_rejects_collisions_with_plain_function_names() {
+        let generated = namespaced_upstream_tool_name(&["fs".to_string()], "read");
+
+        let error = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[
+                {"type":"function","name":generated,"parameters":{"type":"object","properties":{}}},
+                {"type":"namespace","name":"fs","tools":[
+                    {"type":"function","name":"read","parameters":{"type":"object","properties":{}}}
+                ]}
+            ]
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("冲突"));
+    }
+
+    #[test]
+    fn namespace_response_names_restore_for_chat_and_anthropic_outputs() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[{"type":"namespace","name":"fs","tools":[
+                {"type":"function","name":"read","parameters":{"type":"object","properties":{}}}
+            ]}]
+        }))
+        .unwrap();
+        let upstream_name = converted.body["tools"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+
+        let chat = chat_completion_to_responses_body_with_tool_bridge(
+            json!({
+                "choices":[{"message":{"role":"assistant","tool_calls":[{
+                    "id":"call-chat",
+                    "type":"function",
+                    "function":{"name":upstream_name,"arguments":"{\"path\":\"a.txt\"}"}
+                }]},"finish_reason":"tool_calls"}]
+            }),
+            "provider-model",
+            &converted.tool_bridge,
+        )
+        .unwrap();
+        assert_eq!(chat["output"][0]["name"], "read");
+        assert_eq!(chat["output"][0]["namespace"], "fs");
+
+        let anthropic = anthropic_message_to_responses_body_with_tool_bridge(
+            &json!({
+                "type":"message",
+                "content":[{"type":"tool_use","id":"call-anthropic","name":upstream_name,"input":{"path":"a.txt"}}]
+            }),
+            "provider-model",
+            &converted.tool_bridge,
+        )
+        .unwrap();
+        assert_eq!(anthropic["output"][0]["name"], "read");
+        assert_eq!(anthropic["output"][0]["namespace"], "fs");
+    }
+
+    #[test]
+    fn namespace_streaming_restores_added_and_done_items_after_complete_name() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[{"type":"namespace","name":"fs","tools":[
+                {"type":"function","name":"read","parameters":{"type":"object","properties":{}}}
+            ]}]
+        }))
+        .unwrap();
+        let upstream_name = converted.body["tools"][0]["function"]["name"]
+            .as_str()
+            .unwrap();
+        let split = 5;
+        let mut stream = ResponsesSseState::new("provider-model", &converted.tool_bridge);
+
+        let first = stream
+            .tool_delta(
+                0,
+                Some("call-stream"),
+                Some(&upstream_name[..split]),
+                Some("{"),
+                None,
+            )
+            .unwrap();
+        assert!(first.is_empty());
+
+        let second = stream
+            .tool_delta(
+                0,
+                None,
+                Some(&upstream_name[split..]),
+                Some("\"path\":\"a.txt\"}"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(second[0]["type"], "response.output_item.added");
+        assert_eq!(second[0]["item"]["name"], "read");
+        assert_eq!(second[0]["item"]["namespace"], "fs");
+        assert_eq!(second[1]["delta"], "{\"path\":\"a.txt\"}");
+
+        let done = stream_tool_item(stream.tools.get(&0).unwrap());
+        assert_eq!(done["name"], "read");
+        assert_eq!(done["namespace"], "fs");
+        assert_eq!(done["arguments"], "{\"path\":\"a.txt\"}");
+    }
+
+    #[test]
+    fn streaming_waits_for_a_complete_declared_function_name() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"hello",
+            "tools":[
+                {"type":"function","name":"look","parameters":{"type":"object"}},
+                {"type":"function","name":"lookup","parameters":{"type":"object"}}
+            ]
+        }))
+        .unwrap();
+        let mut stream = ResponsesSseState::new("provider-model", &converted.tool_bridge);
+
+        let first = stream
+            .tool_delta(0, Some("call-stream"), Some("look"), None, None)
+            .unwrap();
+        assert!(first.is_empty());
+
+        let second = stream
+            .tool_delta(0, None, Some("up"), Some("{}"), None)
+            .unwrap();
+        assert_eq!(second[0]["type"], "response.output_item.added");
+        assert_eq!(second[0]["item"]["name"], "lookup");
+        assert_eq!(second[1]["delta"], "{}");
+    }
+
+    #[test]
+    fn chat_response_converts_parallel_tools_and_usage_to_responses() {
+        let responses = chat_completion_to_responses_body(
+            json!({
+                "id": "chatcmpl-1",
+                "created": 123,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "checking",
+                        "tool_calls": [
+                            {"id":"call-a","type":"function","function":{"name":"first","arguments":"{\"a\":1}"}},
+                            {"id":"call-b","type":"function","function":{"name":"second","arguments":"{\"b\":2}"}}
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                    "completion_tokens_details": {"reasoning_tokens": 2}
+                }
+            }),
+            "provider-model",
+        )
+        .unwrap();
+
+        assert_eq!(responses["id"], "chatcmpl-1");
+        assert_eq!(responses["model"], "provider-model");
+        assert_eq!(responses["output"][0]["content"][0]["text"], "checking");
+        assert_eq!(responses["output"][1]["type"], "function_call");
+        assert_eq!(responses["output"][1]["call_id"], "call-a");
+        assert_eq!(responses["output"][2]["name"], "second");
+        assert_eq!(responses["usage"]["input_tokens"], 10);
+        assert_eq!(
+            responses["usage"]["input_tokens_details"]["cached_tokens"],
+            3
+        );
+        assert_eq!(
+            responses["usage"]["output_tokens_details"]["reasoning_tokens"],
+            2
+        );
+    }
+
+    #[test]
+    fn responses_request_converts_messages_images_tools_and_results_to_anthropic() {
+        let anthropic = responses_to_anthropic_messages_body(&json!({
+            "model":"claude-sonnet-test",
+            "instructions":"Be concise",
+            "input":[
+                {
+                    "type":"message",
+                    "role":"user",
+                    "content":[
+                        {"type":"input_text","text":"inspect"},
+                        {"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}
+                    ]
+                },
+                {"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{\"q\":1}"},
+                {"type":"function_call_output","call_id":"call-1","output":"done"}
+            ],
+            "tools":[{
+                "type":"function",
+                "name":"lookup",
+                "description":"lookup data",
+                "parameters":{"type":"object","properties":{"q":{"type":"number"}}}
+            }],
+            "tool_choice":{"type":"function","name":"lookup"},
+            "parallel_tool_calls":false,
+            "reasoning":{"effort":"high"},
+            "max_output_tokens":2048,
+            "stream":true
+        }))
+        .unwrap();
+
+        assert_eq!(anthropic["system"], "Be concise");
+        assert_eq!(anthropic["model"], "claude-sonnet-test");
+        assert_eq!(anthropic["max_tokens"], 2048);
+        assert_eq!(anthropic["messages"][0]["role"], "user");
+        assert_eq!(
+            anthropic["messages"][0]["content"][1]["source"]["type"],
+            "base64"
+        );
+        assert_eq!(anthropic["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(anthropic["messages"][1]["content"][0]["input"]["q"], 1);
+        assert_eq!(
+            anthropic["messages"][2]["content"][0]["type"],
+            "tool_result"
+        );
+        assert_eq!(anthropic["tools"][0]["name"], "lookup");
+        assert_eq!(anthropic["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(anthropic["tool_choice"]["type"], "tool");
+        assert_eq!(anthropic["tool_choice"]["name"], "lookup");
+        assert_eq!(anthropic["tool_choice"]["disable_parallel_tool_use"], true);
+        assert_eq!(anthropic["output_config"]["effort"], "high");
+        assert_eq!(anthropic["stream"], true);
+    }
+
+    #[test]
+    fn anthropic_response_converts_text_tools_and_cache_usage_to_responses() {
+        let responses = anthropic_message_to_responses_body(
+            &json!({
+                "id":"msg-anthropic",
+                "type":"message",
+                "role":"assistant",
+                "model":"claude-sonnet-test",
+                "content":[
+                    {"type":"thinking","thinking":"must stay private"},
+                    {"type":"text","text":"checking"},
+                    {"type":"tool_use","id":"tool-1","name":"lookup","input":{"q":1}}
+                ],
+                "stop_reason":"tool_use",
+                "usage":{
+                    "input_tokens":10,
+                    "cache_creation_input_tokens":2,
+                    "cache_read_input_tokens":3,
+                    "output_tokens":5
+                }
+            }),
+            "fallback-model",
+        )
+        .unwrap();
+
+        assert_eq!(responses["model"], "claude-sonnet-test");
+        assert_eq!(responses["output_text"], "checking");
+        assert_eq!(responses["output"][0]["content"][0]["text"], "checking");
+        assert_eq!(responses["output"][1]["type"], "function_call");
+        assert_eq!(responses["output"][1]["call_id"], "tool-1");
+        assert_eq!(responses["output"][1]["arguments"], "{\"q\":1}");
+        assert!(!responses.to_string().contains("must stay private"));
+        assert_eq!(responses["usage"]["input_tokens"], 15);
+        assert_eq!(
+            responses["usage"]["input_tokens_details"]["cached_tokens"],
+            3
+        );
+        assert_eq!(responses["usage"]["total_tokens"], 20);
+    }
+
+    #[test]
+    fn anthropic_sse_accumulates_text_tool_arguments_and_usage() {
+        let sse = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-stream\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-test\",\"content\":[],\"usage\":{\"input_tokens\":4}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool-stream\",\"name\":\"lookup\",\"input\":{}}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"q\\\":1}\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+        );
+
+        let message = parse_anthropic_message_sse_bytes(sse.as_bytes(), "fallback").unwrap();
+        let responses = anthropic_message_to_responses_body(&message, "fallback").unwrap();
+
+        assert_eq!(responses["output_text"], "hello");
+        assert_eq!(responses["output"][1]["call_id"], "tool-stream");
+        assert_eq!(responses["output"][1]["arguments"], "{\"q\":1}");
+        assert_eq!(responses["usage"]["input_tokens"], 4);
+        assert_eq!(responses["usage"]["output_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn chat_completions_route_uses_its_path_key_and_returns_responses_sse() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let authorization = incoming_header(&request, "authorization").map(str::to_string);
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            let sse = concat!(
+                "data: {\"id\":\"chatcmpl-stream\",\"created\":123,\"model\":\"provider-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello \"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-stream\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\":\"}}]},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"chatcmpl-stream\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"1}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                "data: {\"id\":\"chatcmpl-stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":3,\"total_tokens\":7}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            (request.path, authorization, body)
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "input": "hello",
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("text/event-stream")
+        );
+        let events = response.text().await.unwrap();
+        assert!(events.contains("response.output_text.delta"));
+        assert!(events.contains("response.function_call_arguments.delta"));
+        assert!(events.contains("\"call_id\":\"call-stream\""));
+        assert!(events.contains("\"input_tokens\":4"));
+        assert!(events.contains("response.completed"));
+
+        let (path, authorization, body) = upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(authorization.as_deref(), Some("Bearer sk-upstream"));
+        assert_eq!(body["model"], "provider-model");
+        assert_eq!(body["messages"][0]["content"], "hello");
+        assert_eq!(body["stream_options"]["include_usage"], true);
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_adapter_emits_text_before_the_upstream_stream_completes() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let (first_event_sent, first_event_observed) = oneshot::channel();
+        let (release_upstream, wait_for_release) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            write_test_http_chunk(
+                &mut stream,
+                "data: {\"id\":\"chatcmpl-progressive\",\"model\":\"provider-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"first-token\"},\"finish_reason\":null}]}\n\n",
+            )
+            .await;
+            first_event_sent.send(()).unwrap();
+            wait_for_release.await.unwrap();
+            write_test_http_chunk(
+                &mut stream,
+                "data: {\"id\":\"chatcmpl-progressive\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            )
+            .await;
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let mut response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":"hello",
+                "stream":true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        first_event_observed.await.unwrap();
+        let first_payload = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut payload = Vec::new();
+            loop {
+                let chunk = response.chunk().await.unwrap().unwrap();
+                payload.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&payload).contains("first-token") {
+                    break payload;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let first_payload = String::from_utf8_lossy(&first_payload);
+        assert!(first_payload.contains("response.output_text.delta"));
+        assert!(!first_payload.contains("response.completed"));
+
+        release_upstream.send(()).unwrap();
+        let mut remaining = Vec::new();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            remaining.extend_from_slice(&chunk);
+        }
+        assert!(String::from_utf8_lossy(&remaining).contains("response.completed"));
+
+        upstream_task.await.unwrap();
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_route_uses_messages_key_headers_and_returns_responses_sse() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let authorization = incoming_header(&request, "authorization").map(str::to_string);
+            let api_key = incoming_header(&request, "x-api-key").map(str::to_string);
+            let version = incoming_header(&request, "anthropic-version").map(str::to_string);
+            let account_id = incoming_header(&request, "chatgpt-account-id").map(str::to_string);
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            let upstream_tool_name = body["tools"][0]["name"].as_str().unwrap();
+            assert!(upstream_tool_name.starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX));
+            let sse = [
+                (
+                    "message_start",
+                    json!({
+                        "type":"message_start",
+                        "message":{
+                            "id":"msg-stream",
+                            "type":"message",
+                            "role":"assistant",
+                            "model":"claude-sonnet-test",
+                            "content":[],
+                            "usage":{"input_tokens":4}
+                        }
+                    }),
+                ),
+                (
+                    "content_block_start",
+                    json!({
+                        "type":"content_block_start",
+                        "index":0,
+                        "content_block":{"type":"text","text":""}
+                    }),
+                ),
+                (
+                    "content_block_delta",
+                    json!({
+                        "type":"content_block_delta",
+                        "index":0,
+                        "delta":{"type":"text_delta","text":"hello"}
+                    }),
+                ),
+                (
+                    "content_block_start",
+                    json!({
+                        "type":"content_block_start",
+                        "index":1,
+                        "content_block":{
+                            "type":"tool_use",
+                            "id":"call-read",
+                            "name":upstream_tool_name,
+                            "input":{"path":"a.txt"}
+                        }
+                    }),
+                ),
+                (
+                    "message_delta",
+                    json!({
+                        "type":"message_delta",
+                        "delta":{"stop_reason":"tool_use"},
+                        "usage":{"output_tokens":2}
+                    }),
+                ),
+                ("message_stop", json!({"type":"message_stop"})),
+            ]
+            .into_iter()
+            .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
+            .collect::<String>();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            (
+                request.path,
+                authorization,
+                api_key,
+                version,
+                account_id,
+                body,
+            )
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header("chatgpt-account-id", "must-not-leak")
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":"hello",
+                "stream":true,
+                "tools":[{
+                    "type":"namespace",
+                    "name":"fs",
+                    "tools":[{
+                        "type":"function",
+                        "name":"read",
+                        "description":"read a file",
+                        "parameters":{"type":"object","properties":{"path":{"type":"string"}}}
+                    }]
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let events = response.text().await.unwrap();
+        assert!(events.contains("response.output_text.delta"));
+        assert!(events.contains("\"delta\":\"hello\""));
+        assert!(events.contains("\"call_id\":\"call-read\""));
+        assert!(events.contains("\"namespace\":\"fs\""));
+        assert!(events.contains("\"name\":\"read\""));
+        assert!(events.contains("\"input_tokens\":4"));
+        assert!(events.contains("response.completed"));
+
+        let (path, authorization, api_key, version, account_id, body) =
+            upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/messages");
+        assert_eq!(authorization, None);
+        assert_eq!(api_key.as_deref(), Some("sk-upstream"));
+        assert_eq!(version.as_deref(), Some("2023-06-01"));
+        assert_eq!(account_id, None);
+        assert_eq!(body["model"], "provider-model");
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+        assert!(
+            body["tools"][0]["name"]
+                .as_str()
+                .unwrap()
+                .starts_with(NAMESPACE_UPSTREAM_TOOL_PREFIX)
+        );
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anthropic_adapter_emits_text_before_the_upstream_stream_completes() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let (first_event_sent, first_event_observed) = oneshot::channel();
+        let (release_upstream, wait_for_release) = oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let _request = read_http_request(&mut stream).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            write_test_http_chunk(
+                &mut stream,
+                concat!(
+                    "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg-progressive\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"provider-model\",\"content\":[],\"usage\":{\"input_tokens\":1}}}\n\n",
+                    "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                    "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"first-token\"}}\n\n"
+                ),
+            )
+            .await;
+            first_event_sent.send(()).unwrap();
+            wait_for_release.await.unwrap();
+            write_test_http_chunk(
+                &mut stream,
+                concat!(
+                    "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n",
+                    "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+                ),
+            )
+            .await;
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let mut response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":"hello",
+                "stream":true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        first_event_observed.await.unwrap();
+        let first_payload = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut payload = Vec::new();
+            loop {
+                let chunk = response.chunk().await.unwrap().unwrap();
+                payload.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&payload).contains("first-token") {
+                    break payload;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let first_payload = String::from_utf8_lossy(&first_payload);
+        assert!(first_payload.contains("response.output_text.delta"));
+        assert!(!first_payload.contains("response.completed"));
+
+        release_upstream.send(()).unwrap();
+        let mut remaining = Vec::new();
+        while let Some(chunk) = response.chunk().await.unwrap() {
+            remaining.extend_from_slice(&chunk);
+        }
+        assert!(String::from_utf8_lossy(&remaining).contains("response.completed"));
+
+        upstream_task.await.unwrap();
+        router.stop().await.unwrap();
     }
 
     #[test]
@@ -958,6 +7187,239 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_model_metadata_selects_an_ambiguous_route_and_binds_the_thread() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await.unwrap();
+                let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                assert_eq!(body["model"], "provider-model");
+                write_json_response(
+                    &mut stream,
+                    200,
+                    &json!({"object":"response","model":body["model"]}),
+                )
+                .await
+                .unwrap();
+                bodies.push(body);
+            }
+            bodies
+        });
+        let (mut config, _, model) = router_config("http://127.0.0.1:9/v1".into());
+        let mut route_b = config.profiles[0].clone();
+        route_b.id = "route-b".into();
+        route_b.name = "Relay B".into();
+        route_b.base_url = format!("http://{upstream_address}/v1");
+        route_b.api_key = "sk-route-b".into();
+        route_b.normalize();
+        let provider_b = route_b.provider_id().to_string();
+        config.profiles.push(route_b);
+        config
+            .selected_models_by_provider
+            .insert(provider_b.clone(), vec![model.clone()]);
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let client = reqwest::Client::new();
+        let turn_metadata = json!({
+            ROUTE_METADATA_KEY: provider_b,
+            "preserved": "yes"
+        })
+        .to_string();
+
+        let first = client
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header("thread-id", "thread-route-b")
+            .header(TURN_METADATA_HEADER, &turn_metadata)
+            .json(&json!({
+                "model": model,
+                "input": "first",
+                "client_metadata": {
+                    "x-codex-turn-metadata": turn_metadata,
+                    "preserved": "body"
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+        let second = client
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header("thread-id", "thread-route-b")
+            .json(&json!({"model":"provider-model","input":"second"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second.status(), reqwest::StatusCode::OK);
+
+        let ambiguous = client
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header("thread-id", "unbound-thread")
+            .json(&json!({"model":"provider-model","input":"ambiguous"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ambiguous.status(), reqwest::StatusCode::NOT_FOUND);
+        assert!(
+            ambiguous.json::<Value>().await.unwrap()["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("缺少明确")
+        );
+
+        let bodies = upstream_task.await.unwrap();
+        let nested = bodies[0]["client_metadata"][TURN_METADATA_HEADER]
+            .as_str()
+            .and_then(|metadata| serde_json::from_str::<Value>(metadata).ok())
+            .unwrap();
+        assert!(nested.get(ROUTE_METADATA_KEY).is_none());
+        assert_eq!(nested["preserved"], "yes");
+        assert_eq!(bodies[0]["client_metadata"]["preserved"], "body");
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn route_updates_affect_only_later_requests_and_keep_inflight_streams_pinned() {
+        let upstream_a = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_a_address = upstream_a.local_addr().unwrap();
+        let upstream_b = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_b_address = upstream_b.local_addr().unwrap();
+        let (release_a, wait_for_release_a) = tokio::sync::oneshot::channel();
+        let upstream_a_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream_a.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            assert_eq!(body["model"], "provider-model");
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let first = b"data: {\"source\":\"a\",\"phase\":1}\n\n";
+            stream
+                .write_all(format!("{:x}\r\n", first.len()).as_bytes())
+                .await
+                .unwrap();
+            stream.write_all(first).await.unwrap();
+            stream.write_all(b"\r\n").await.unwrap();
+            stream.flush().await.unwrap();
+            wait_for_release_a.await.unwrap();
+            let second = b"data: {\"source\":\"a\",\"phase\":2}\n\n";
+            stream
+                .write_all(format!("{:x}\r\n", second.len()).as_bytes())
+                .await
+                .unwrap();
+            stream.write_all(second).await.unwrap();
+            stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        });
+        let upstream_b_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream_b.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({"object":"response","source":"b","model":body["model"]}),
+            )
+            .await
+            .unwrap();
+        });
+        let (config, provider_id, model) = router_config(format!("http://{upstream_a_address}/v1"));
+        let alias = model_alias(&provider_id, &model);
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let client = reqwest::Client::new();
+
+        let mut first_response = client
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({"model":alias,"input":"first","stream":true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(first_response.status(), reqwest::StatusCode::OK);
+        let first_payload = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut payload = Vec::new();
+            loop {
+                let chunk = first_response.chunk().await.unwrap().unwrap();
+                payload.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&payload).contains("\"phase\":1") {
+                    break payload;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(String::from_utf8_lossy(&first_payload).contains("\"source\":\"a\""));
+
+        let mut updated = config.clone();
+        updated.profiles[0].base_url = format!("http://{upstream_b_address}/v1");
+        router.update_config(&updated);
+        let second_response = client
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({"model":alias,"input":"second","stream":false}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(second_response.status(), reqwest::StatusCode::OK);
+        let second_body = second_response.json::<Value>().await.unwrap();
+        assert_eq!(second_body["source"], "b");
+        assert_eq!(second_body["model"], "provider-model");
+
+        release_a.send(()).unwrap();
+        let mut remaining_first_payload = Vec::new();
+        while let Some(chunk) = first_response.chunk().await.unwrap() {
+            remaining_first_payload.extend_from_slice(&chunk);
+        }
+        let remaining_first_payload = String::from_utf8_lossy(&remaining_first_payload);
+        assert!(remaining_first_payload.contains("\"source\":\"a\""));
+        assert!(remaining_first_payload.contains("\"phase\":2"));
+        assert!(!remaining_first_payload.contains("\"source\":\"b\""));
+
+        upstream_a_task.await.unwrap();
+        upstream_b_task.await.unwrap();
+        router.stop().await.unwrap();
+    }
+
+    #[test]
+    fn upstream_authority_omits_credentials_paths_and_queries() {
+        assert_eq!(
+            upstream_authority("https://user:secret@relay.example:8443/private/v1?token=hidden"),
+            "relay.example:8443"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_error_response_is_plain_text_and_non_retryable() {
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+
+        write_text_error_response(
+            &mut writer,
+            424,
+            "upstream_unreachable",
+            "Codey 线路「Relay」无法连接上游 relay.example:8443",
+        )
+        .await
+        .unwrap();
+        drop(writer);
+
+        let mut response = String::new();
+        reader.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 424 Failed Dependency\r\n"));
+        assert!(response.contains("content-type: text/plain; charset=utf-8\r\n"));
+        assert!(response.contains("Codey 线路「Relay」无法连接上游 relay.example:8443"));
+        assert!(response.contains("错误码：upstream_unreachable"));
+    }
+
+    #[tokio::test]
     async fn router_rejects_unknown_raw_models_instead_of_guessing_a_route() {
         let (config, _, _) = router_config("http://127.0.0.1:9/v1".to_string());
         let router = LocalRouter::start(&config).await.unwrap();
@@ -966,7 +7428,7 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{}/responses", endpoint.base_url))
             .bearer_auth(&endpoint.token)
-            .json(&json!({"model":"provider-model","input":"hello"}))
+            .json(&json!({"model":"unknown-model","input":"hello"}))
             .send()
             .await
             .unwrap();
@@ -993,6 +7455,18 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
         let body = response.json::<Value>().await.unwrap();
         assert_eq!(body["error"]["code"], "invalid_router_token");
+
+        let gateway_root = endpoint.base_url.trim_end_matches("/v1");
+        let legacy_capability_response = reqwest::Client::new()
+            .post(format!("{gateway_root}/{}/v1/responses", endpoint.token))
+            .json(&json!({"model":model_alias(&provider_id, &model),"input":"hello"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy_capability_response.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
         router.stop().await.unwrap();
     }
 }

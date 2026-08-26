@@ -12,6 +12,10 @@ test("development preview fixtures cannot be mistaken for live credentials", () 
   assert.match(source, /apiKey: "preview-route-primary-key"/);
   assert.match(source, /apiKey: "preview-route-backup-key"/);
   assert.match(source, /apiKey: "preview-prompt-optimization-key"/);
+  assert.match(
+    source,
+    /kind: "telegram"[\s\S]*?botToken: ""[\s\S]*?botTokenConfigured: true/,
+  );
   assert.match(source, /preview-chat-id/);
   assert.doesNotMatch(source, /\bsk-(?:proj-)?[A-Za-z0-9._-]+/);
   assert.doesNotMatch(source, /api\.(?:openai|anthropic)\.com/);
@@ -55,4 +59,12 @@ test("development preview follows the current runtime-status contract", () => {
     /crashpadDiskProtectionActive:[\s\S]*?previewClientPlatform === "macos"[\s\S]*?previewConfig\.protectCrashpadPending/,
   );
   assert.doesNotMatch(source, /command === "refresh_injection_status"/);
+});
+
+test("development preview exercises cross-route subagent model selection", () => {
+  assert.match(
+    source,
+    /backup: \["claude-sonnet-4-5", "claude-opus-4-1"\]/,
+  );
+  assert.match(source, /model: "backup\/claude-sonnet-4-5"/);
 });

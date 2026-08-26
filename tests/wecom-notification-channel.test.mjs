@@ -23,7 +23,8 @@ test("enterprise wechat webhook is registered as a protected notification channe
   assert.match(typesSource, /"feishu" \| "wecom" \| "telegram"/);
   assert.match(registrySource, /wecom:\s*\{[\s\S]*?Editor: WecomChannelEditor/);
   assert.match(registrySource, /displayName: "企业微信机器人"/);
-  assert.match(sharedEditorSource, /type=\{revealSecrets \? "text" : "password"\}/);
+  assert.match(sharedEditorSource, /type="password"/);
+  assert.doesNotMatch(sharedEditorSource, /revealSecrets/);
   assert.match(sharedEditorSource, /clearUrl: true/);
   assert.match(editorSource, /qyapi\.weixin\.qq\.com\/cgi-bin\/webhook\/send\?key=/);
 });

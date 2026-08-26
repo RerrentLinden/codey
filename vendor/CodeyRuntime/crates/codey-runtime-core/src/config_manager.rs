@@ -16,98 +16,7 @@ use uuid::Uuid;
 
 use crate::diagnostic_log::append_diagnostic_log;
 
-/// Environment overrides intentionally use Codey-specific names so an
-/// unrelated provider SDK cannot silently change Codex's effective routing.
-pub const ENV_BASE_URL: &str = "CODEY_CONFIG_BASE_URL";
-pub const ENV_ROUTING_ENABLED: &str = "CODEY_CONFIG_ROUTING_ENABLED";
-pub const ENV_ACTIVE_ROUTE: &str = "CODEY_CONFIG_ACTIVE_ROUTE";
-pub const ENV_ACTIVE_PROVIDER: &str = "CODEY_CONFIG_ACTIVE_PROVIDER";
 pub const DEFAULT_BACKUP_LIMIT: usize = 5;
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldSource {
-    Cli,
-    Environment,
-    File,
-    #[default]
-    Default,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ConfigLayer {
-    pub base_url: Option<String>,
-    pub routing_enabled: Option<bool>,
-    pub active_route: Option<String>,
-    pub active_provider: Option<String>,
-}
-
-impl ConfigLayer {
-    pub fn from_process_environment() -> Result<Self> {
-        let base_url = non_empty_env(ENV_BASE_URL);
-        let active_route = non_empty_env(ENV_ACTIVE_ROUTE);
-        let active_provider = non_empty_env(ENV_ACTIVE_PROVIDER);
-        let routing_enabled = match non_empty_env(ENV_ROUTING_ENABLED) {
-            Some(value) => Some(parse_bool(&value).with_context(|| {
-                format!("环境变量 {ENV_ROUTING_ENABLED} 必须是 true/false 或 1/0")
-            })?),
-            None => None,
-        };
-        Ok(Self {
-            base_url,
-            routing_enabled,
-            active_route,
-            active_provider,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedField<T> {
-    pub value: T,
-    pub source: FieldSource,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ResolvedConfig {
-    pub base_url: ResolvedField<Option<String>>,
-    pub routing_enabled: ResolvedField<bool>,
-    pub active_route: ResolvedField<Option<String>>,
-    pub active_provider: ResolvedField<Option<String>>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RoutingConfig {
-    /// `None` means the file omitted the flag and the built-in default is used.
-    /// Keeping omission distinct from an explicit `false` is required for
-    /// accurate precedence/source reporting.
-    pub enabled: Option<bool>,
-    pub active_route: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct NonRoutingConfig {
-    pub active_provider: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct RouteConfig {
-    pub base_url: Option<String>,
-    pub wire_api: Option<String>,
-}
-
-/// Strongly typed view of the fields ConfigManager validates. The original
-/// `DocumentMut` remains authoritative for formatting, comments, and fields
-/// introduced by Codex, plugins, or users that Codey does not understand yet.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CodexConfigSchema {
-    pub base_url: Option<String>,
-    pub model_provider: Option<String>,
-    pub model_catalog_json: Option<String>,
-    pub routing: RoutingConfig,
-    pub non_routing: NonRoutingConfig,
-    pub routes: BTreeMap<String, RouteConfig>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigRevision([u8; 32]);
@@ -124,8 +33,6 @@ pub struct ConfigSnapshot {
     exists: bool,
     raw: Arc<[u8]>,
     document: Arc<DocumentMut>,
-    schema: Arc<CodexConfigSchema>,
-    resolved: Arc<ResolvedConfig>,
     revision: ConfigRevision,
 }
 
@@ -146,14 +53,6 @@ impl ConfigSnapshot {
         &self.document
     }
 
-    pub fn schema(&self) -> &CodexConfigSchema {
-        &self.schema
-    }
-
-    pub fn resolved(&self) -> &ResolvedConfig {
-        &self.resolved
-    }
-
     pub fn revision(&self) -> &ConfigRevision {
         &self.revision
     }
@@ -171,7 +70,6 @@ pub struct ConfigAuditEvent {
     pub caller: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
-    pub routing_enabled: bool,
     pub base_url_changed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -326,8 +224,6 @@ struct ConfigManagerInner {
     backup_limit: usize,
     fs: Arc<dyn ConfigFileSystem>,
     audit: Arc<dyn ConfigAuditSink>,
-    cli: ConfigLayer,
-    environment: Option<ConfigLayer>,
     snapshot: RwLock<Option<Arc<ConfigSnapshot>>>,
     process_lock: Arc<Mutex<()>>,
 }
@@ -341,8 +237,6 @@ impl ConfigManager {
             Arc::new(OsConfigFileSystem),
             Arc::new(DiagnosticConfigAuditSink),
             DEFAULT_BACKUP_LIMIT,
-            ConfigLayer::default(),
-            None,
         )
     }
 
@@ -355,8 +249,6 @@ impl ConfigManager {
         fs: Arc<dyn ConfigFileSystem>,
         audit: Arc<dyn ConfigAuditSink>,
         backup_limit: usize,
-        cli: ConfigLayer,
-        environment: Option<ConfigLayer>,
     ) -> Self {
         let path = path.into();
         let lock_path = lock_path_for(&path);
@@ -368,8 +260,6 @@ impl ConfigManager {
                 backup_limit,
                 fs,
                 audit,
-                cli,
-                environment,
                 snapshot: RwLock::new(None),
                 process_lock,
             }),
@@ -400,36 +290,6 @@ impl ConfigManager {
         self.load_operation("reload")
     }
 
-    /// Reads an immutable byte snapshot without parsing it. This narrow API is
-    /// reserved for observers (for example, a route-change watcher) that must
-    /// notice a transient malformed external write but must never persist it.
-    pub fn read_raw(&self) -> Result<Option<Arc<[u8]>>> {
-        let result = self.with_lock(|| {
-            self.inner
-                .fs
-                .read_optional(&self.inner.path)
-                .with_context(|| format!("读取 {} 失败", self.inner.path.display()))
-                .map(|bytes| bytes.map(Arc::from))
-        });
-        match &result {
-            Ok(bytes) => self.record(ConfigAuditEvent {
-                operation: "read_raw".to_string(),
-                path: self.inner.path.to_string_lossy().into_owned(),
-                status: "ok".to_string(),
-                reason: Some("observe external config changes".to_string()),
-                caller: None,
-                revision: bytes
-                    .as_deref()
-                    .map(|bytes| revision_for(true, bytes).as_hex()),
-                routing_enabled: false,
-                base_url_changed: false,
-                error: None,
-            }),
-            Err(error) => self.record_failure("read_raw", None, None, error),
-        }
-        result
-    }
-
     fn load_operation(&self, operation: &str) -> Result<Arc<ConfigSnapshot>> {
         let result = self.with_lock(|| self.load_locked());
         match &result {
@@ -440,7 +300,6 @@ impl ConfigManager {
                 reason: None,
                 caller: None,
                 revision: Some(snapshot.revision.as_hex()),
-                routing_enabled: snapshot.resolved.routing_enabled.value,
                 base_url_changed: false,
                 error: None,
             }),
@@ -470,16 +329,9 @@ impl ConfigManager {
             let mut editor = ConfigEditor::new((*current.document).clone());
             mutate(&mut editor)?;
             let base_url_changed = editor.base_url_changed();
-            let routing_mode_changed = editor.routing_mode_changed();
             let document = editor.finish()?;
             let raw = render_document(&document);
-            let candidate = build_snapshot(
-                &self.inner.path,
-                true,
-                raw.into_bytes(),
-                &self.inner.cli,
-                &self.environment_layer()?,
-            )?;
+            let candidate = build_snapshot(&self.inner.path, true, raw.into_bytes())?;
             self.commit_locked(&current, &candidate)?;
             let candidate = Arc::new(candidate);
             *self
@@ -488,9 +340,7 @@ impl ConfigManager {
                 .write()
                 .expect("config snapshot lock poisoned") = Some(candidate.clone());
             self.record(ConfigAuditEvent {
-                operation: if routing_mode_changed {
-                    "mode_switch".to_string()
-                } else if base_url_changed {
+                operation: if base_url_changed {
                     "base_url_change".to_string()
                 } else {
                     "save".to_string()
@@ -500,7 +350,6 @@ impl ConfigManager {
                 reason: Some(reason.clone()),
                 caller: Some(caller.clone()),
                 revision: Some(candidate.revision.as_hex()),
-                routing_enabled: candidate.resolved.routing_enabled.value,
                 base_url_changed,
                 error: None,
             });
@@ -540,18 +389,6 @@ impl ConfigManager {
         self.replace_document(expected_revision, document, reason, caller)
     }
 
-    pub fn set_routing_enabled(
-        &self,
-        expected_revision: Option<&ConfigRevision>,
-        enabled: bool,
-        reason: impl Into<String>,
-        caller: impl Into<String>,
-    ) -> Result<Arc<ConfigSnapshot>> {
-        self.update(expected_revision, reason, caller, |editor| {
-            editor.set_routing_enabled(enabled)
-        })
-    }
-
     pub fn set_root_base_url(
         &self,
         expected_revision: Option<&ConfigRevision>,
@@ -574,30 +411,6 @@ impl ConfigManager {
     ) -> Result<Arc<ConfigSnapshot>> {
         self.update(expected_revision, reason, caller, |editor| {
             editor.set_provider_base_url(provider_id, base_url)
-        })
-    }
-
-    pub fn set_active_route(
-        &self,
-        expected_revision: Option<&ConfigRevision>,
-        route: Option<&str>,
-        reason: impl Into<String>,
-        caller: impl Into<String>,
-    ) -> Result<Arc<ConfigSnapshot>> {
-        self.update(expected_revision, reason, caller, |editor| {
-            editor.set_active_route(route)
-        })
-    }
-
-    pub fn set_non_routing_provider(
-        &self,
-        expected_revision: Option<&ConfigRevision>,
-        provider: Option<&str>,
-        reason: impl Into<String>,
-        caller: impl Into<String>,
-    ) -> Result<Arc<ConfigSnapshot>> {
-        self.update(expected_revision, reason, caller, |editor| {
-            editor.set_non_routing_provider(provider)
         })
     }
 
@@ -626,14 +439,7 @@ impl ConfigManager {
                 self.inner.fs.remove_optional(&self.inner.path)?;
                 self.inner.fs.sync_parent(&self.inner.path)?;
             }
-            let environment = self.environment_layer()?;
-            let candidate = Arc::new(build_snapshot(
-                &self.inner.path,
-                false,
-                Vec::new(),
-                &self.inner.cli,
-                &environment,
-            )?);
+            let candidate = Arc::new(build_snapshot(&self.inner.path, false, Vec::new())?);
             *self
                 .inner
                 .snapshot
@@ -646,13 +452,7 @@ impl ConfigManager {
                 reason: Some(reason.clone()),
                 caller: Some(caller.clone()),
                 revision: Some(candidate.revision.as_hex()),
-                routing_enabled: candidate.resolved.routing_enabled.value,
-                base_url_changed: current.schema.base_url.is_some()
-                    || current
-                        .schema
-                        .routes
-                        .values()
-                        .any(|route| route.base_url.is_some()),
+                base_url_changed: !collect_base_urls(current.document()).is_empty(),
                 error: None,
             });
             Ok(candidate)
@@ -678,9 +478,7 @@ impl ConfigManager {
                 .fs
                 .read_optional(&backup)?
                 .ok_or_else(|| anyhow::anyhow!("没有可恢复的 config.toml.bak"))?;
-            let environment = self.environment_layer()?;
-            let candidate =
-                build_snapshot(&self.inner.path, true, bytes, &self.inner.cli, &environment)?;
+            let candidate = build_snapshot(&self.inner.path, true, bytes)?;
             let current = self.load_locked()?;
             self.commit_locked(&current, &candidate)?;
             let candidate = Arc::new(candidate);
@@ -699,7 +497,6 @@ impl ConfigManager {
                 reason: Some(reason),
                 caller: Some(caller),
                 revision: Some(snapshot.revision.as_hex()),
-                routing_enabled: snapshot.resolved.routing_enabled.value,
                 base_url_changed: false,
                 error: None,
             }),
@@ -715,13 +512,10 @@ impl ConfigManager {
             .read_optional(&self.inner.path)
             .with_context(|| format!("读取 {} 失败", self.inner.path.display()))?;
         let exists = bytes.is_some();
-        let environment = self.environment_layer()?;
         let snapshot = Arc::new(build_snapshot(
             &self.inner.path,
             exists,
             bytes.unwrap_or_default(),
-            &self.inner.cli,
-            &environment,
         )?);
         *self
             .inner
@@ -729,14 +523,6 @@ impl ConfigManager {
             .write()
             .expect("config snapshot lock poisoned") = Some(snapshot.clone());
         Ok(snapshot)
-    }
-
-    fn environment_layer(&self) -> Result<ConfigLayer> {
-        self.inner
-            .environment
-            .clone()
-            .map(Ok)
-            .unwrap_or_else(ConfigLayer::from_process_environment)
     }
 
     fn commit_locked(&self, current: &ConfigSnapshot, candidate: &ConfigSnapshot) -> Result<()> {
@@ -848,9 +634,6 @@ impl ConfigManager {
             revision: self
                 .cached_snapshot()
                 .map(|snapshot| snapshot.revision.as_hex()),
-            routing_enabled: self
-                .cached_snapshot()
-                .is_some_and(|snapshot| snapshot.resolved.routing_enabled.value),
             base_url_changed: false,
             error: Some(error.to_string()),
         });
@@ -861,7 +644,6 @@ pub struct ConfigEditor {
     document: DocumentMut,
     recorded_base_url_paths: BTreeSet<String>,
     original_base_urls: BTreeMap<String, Option<String>>,
-    routing_mode_changed: bool,
 }
 
 impl ConfigEditor {
@@ -871,12 +653,11 @@ impl ConfigEditor {
             document,
             recorded_base_url_paths: BTreeSet::new(),
             original_base_urls,
-            routing_mode_changed: false,
         }
     }
 
-    /// Edits non-routing fields while enforcing that no `base_url` value is
-    /// changed outside the dedicated setters below.
+    /// Edits fields while enforcing that no `base_url` value is changed outside
+    /// the dedicated setters below.
     pub fn edit_document(
         &mut self,
         edit: impl FnOnce(&mut DocumentMut) -> Result<()>,
@@ -890,14 +671,12 @@ impl ConfigEditor {
         Ok(())
     }
 
-    /// Complete-document setter used by migration and route-profile flows.
+    /// Complete-document setter used by callers that already build a full TOML
+    /// candidate.
     /// Unlike `edit_document`, this method explicitly records every base URL
     /// path that changes, so the final guard and structured audit can account
     /// for those changes without permitting direct filesystem replacement.
     pub fn set_complete_document(&mut self, document: DocumentMut) -> Result<()> {
-        let previous_routing = routing_enabled_from_document(&self.document)?;
-        let next_routing = routing_enabled_from_document(&document)?;
-        self.routing_mode_changed |= previous_routing != next_routing;
         let next_base_urls = collect_base_urls(&document);
         self.recorded_base_url_paths.extend(changed_base_url_paths(
             &collect_base_urls(&self.document),
@@ -958,42 +737,6 @@ impl ConfigEditor {
         Ok(())
     }
 
-    pub fn set_routing_enabled(&mut self, enabled: bool) -> Result<()> {
-        let codey = ensure_root_table(&mut self.document, "codey")?;
-        let routing = ensure_child_table(codey, "routing")?;
-        let previous = routing
-            .get("enabled")
-            .and_then(Item::as_bool)
-            .unwrap_or(false);
-        routing["enabled"] = value(enabled);
-        self.routing_mode_changed |= previous != enabled;
-        Ok(())
-    }
-
-    pub fn set_active_route(&mut self, route: Option<&str>) -> Result<()> {
-        let codey = ensure_root_table(&mut self.document, "codey")?;
-        let routing = ensure_child_table(codey, "routing")?;
-        match route.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(route) => routing["active_route"] = value(route),
-            None => {
-                routing.remove("active_route");
-            }
-        }
-        Ok(())
-    }
-
-    pub fn set_non_routing_provider(&mut self, provider: Option<&str>) -> Result<()> {
-        let codey = ensure_root_table(&mut self.document, "codey")?;
-        let non_routing = ensure_child_table(codey, "non_routing")?;
-        match provider.map(str::trim).filter(|value| !value.is_empty()) {
-            Some(provider) => non_routing["active_provider"] = value(provider),
-            None => {
-                non_routing.remove("active_provider");
-            }
-        }
-        Ok(())
-    }
-
     pub fn document(&self) -> &DocumentMut {
         &self.document
     }
@@ -1004,257 +747,70 @@ impl ConfigEditor {
         if !changed.is_subset(&self.recorded_base_url_paths) {
             bail!("检测到未通过 ConfigEditor setter 的 base_url 修改");
         }
-        parse_schema(&self.document)?.validate()?;
+        validate_document(&self.document)?;
         Ok(self.document)
     }
 
     fn base_url_changed(&self) -> bool {
         self.original_base_urls != collect_base_urls(&self.document)
     }
-
-    fn routing_mode_changed(&self) -> bool {
-        self.routing_mode_changed
-    }
 }
 
-impl CodexConfigSchema {
-    pub fn validate(&self) -> Result<()> {
-        if let Some(base_url) = self.base_url.as_deref() {
-            validate_base_url(base_url, "base_url")?;
-        }
-        for (route_id, route) in &self.routes {
-            if route_id.trim().is_empty() {
-                bail!("route id 不能为空");
-            }
-            if let Some(base_url) = route.base_url.as_deref() {
-                validate_base_url(base_url, &format!("routes.{route_id}.base_url"))?;
-            }
-        }
-        if self.routing.enabled.unwrap_or(false) {
-            let active = self
-                .routing
-                .active_route
-                .as_deref()
-                .or(self.model_provider.as_deref())
-                .ok_or_else(|| anyhow::anyhow!("routing.enabled=true 时必须指定活动 route"))?;
-            if !self.routes.contains_key(active) {
-                bail!("活动 route「{active}」不存在于 model_providers");
-            }
-        }
-        Ok(())
-    }
-}
-
-fn build_snapshot(
-    path: &Path,
-    exists: bool,
-    raw: Vec<u8>,
-    cli: &ConfigLayer,
-    environment: &ConfigLayer,
-) -> Result<ConfigSnapshot> {
+fn build_snapshot(path: &Path, exists: bool, raw: Vec<u8>) -> Result<ConfigSnapshot> {
     let text =
         std::str::from_utf8(&raw).with_context(|| format!("{} 不是 UTF-8", path.display()))?;
     let document = parse_document_text(text, path)?;
-    let schema = parse_schema(&document)?;
-    schema.validate()?;
-    let resolved = resolve_config(&schema, environment, cli)?;
+    validate_document(&document)?;
     let revision = revision_for(exists, &raw);
     Ok(ConfigSnapshot {
         path: path.to_path_buf(),
         exists,
         raw: Arc::from(raw),
         document: Arc::new(document),
-        schema: Arc::new(schema),
-        resolved: Arc::new(resolved),
         revision,
     })
 }
 
-fn parse_schema(document: &DocumentMut) -> Result<CodexConfigSchema> {
-    let base_url = optional_string(document.as_table(), "base_url", "base_url")?;
-    let model_provider = optional_string(document.as_table(), "model_provider", "model_provider")?;
-    let model_catalog_json = optional_string(
-        document.as_table(),
-        "model_catalog_json",
-        "model_catalog_json",
-    )?;
-    let routing = document
-        .get("codey")
-        .and_then(Item::as_table_like)
-        .and_then(|codey| codey.get("routing"))
-        .and_then(Item::as_table_like)
-        .map(parse_routing)
-        .transpose()?
-        .unwrap_or_default();
-    let non_routing = document
-        .get("codey")
-        .and_then(Item::as_table_like)
-        .and_then(|codey| codey.get("non_routing"))
-        .and_then(Item::as_table_like)
-        .map(parse_non_routing)
-        .transpose()?
-        .unwrap_or_default();
-    let mut routes = BTreeMap::new();
+fn validate_document(document: &DocumentMut) -> Result<()> {
+    let root = document.as_table();
+    if let Some(base_url) = optional_non_empty_string(root, "base_url", "base_url")? {
+        validate_base_url(base_url, "base_url")?;
+    }
+    optional_non_empty_string(root, "model_provider", "model_provider")?;
+    optional_non_empty_string(root, "model_catalog_json", "model_catalog_json")?;
+
     if let Some(providers) = document
         .get("model_providers")
         .and_then(Item::as_table_like)
     {
-        for (route_id, item) in providers.iter() {
-            let Some(route) = item.as_table_like() else {
+        for (provider_id, item) in providers.iter() {
+            if provider_id.trim().is_empty() {
+                bail!("provider id 不能为空");
+            }
+            let Some(provider) = item.as_table_like() else {
                 continue;
             };
-            routes.insert(
-                route_id.to_string(),
-                RouteConfig {
-                    base_url: optional_string_like(
-                        route,
-                        "base_url",
-                        &format!("model_providers.{route_id}.base_url"),
-                    )?,
-                    wire_api: optional_string_like(
-                        route,
-                        "wire_api",
-                        &format!("model_providers.{route_id}.wire_api"),
-                    )?,
-                },
-            );
+            let base_url_field = format!("model_providers.{provider_id}.base_url");
+            if let Some(base_url) =
+                optional_non_empty_string(provider, "base_url", &base_url_field)?
+            {
+                validate_base_url(base_url, &base_url_field)?;
+            }
+            optional_non_empty_string(
+                provider,
+                "wire_api",
+                &format!("model_providers.{provider_id}.wire_api"),
+            )?;
         }
     }
-    Ok(CodexConfigSchema {
-        base_url,
-        model_provider,
-        model_catalog_json,
-        routing,
-        non_routing,
-        routes,
-    })
-}
-
-fn parse_routing(table: &dyn toml_edit::TableLike) -> Result<RoutingConfig> {
-    let enabled = match table.get("enabled") {
-        Some(item) => Some(
-            item.as_bool()
-                .ok_or_else(|| anyhow::anyhow!("codey.routing.enabled 必须是 boolean"))?,
-        ),
-        None => None,
-    };
-    let active_route = optional_string_like(table, "active_route", "codey.routing.active_route")?;
-    Ok(RoutingConfig {
-        enabled,
-        active_route,
-    })
-}
-
-fn parse_non_routing(table: &dyn toml_edit::TableLike) -> Result<NonRoutingConfig> {
-    Ok(NonRoutingConfig {
-        active_provider: optional_string_like(
-            table,
-            "active_provider",
-            "codey.non_routing.active_provider",
-        )?,
-    })
-}
-
-fn resolve_config(
-    file: &CodexConfigSchema,
-    environment: &ConfigLayer,
-    cli: &ConfigLayer,
-) -> Result<ResolvedConfig> {
-    let base_url = resolve_optional_string(
-        file.base_url.clone(),
-        environment.base_url.clone(),
-        cli.base_url.clone(),
-    );
-    if let Some(value) = base_url.value.as_deref() {
-        validate_base_url(value, "effective base_url")?;
-    }
-    let routing_enabled = if let Some(value) = cli.routing_enabled {
-        ResolvedField {
-            value,
-            source: FieldSource::Cli,
-        }
-    } else if let Some(value) = environment.routing_enabled {
-        ResolvedField {
-            value,
-            source: FieldSource::Environment,
-        }
-    } else {
-        ResolvedField {
-            value: file.routing.enabled.unwrap_or(false),
-            source: if file.routing.enabled.is_some() {
-                FieldSource::File
-            } else {
-                FieldSource::Default
-            },
-        }
-    };
-    let active_route = resolve_optional_string(
-        file.routing
-            .active_route
-            .clone()
-            .or_else(|| file.model_provider.clone()),
-        environment.active_route.clone(),
-        cli.active_route.clone(),
-    );
-    let active_provider = resolve_optional_string(
-        file.non_routing
-            .active_provider
-            .clone()
-            .or_else(|| file.model_provider.clone()),
-        environment.active_provider.clone(),
-        cli.active_provider.clone(),
-    );
-    if routing_enabled.value {
-        let active = active_route
-            .value
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("有效 routing 配置缺少 active route"))?;
-        if !file.routes.contains_key(active) {
-            bail!("有效 active route「{active}」不存在于 model_providers");
-        }
-    }
-    Ok(ResolvedConfig {
-        base_url,
-        routing_enabled,
-        active_route,
-        active_provider,
-    })
-}
-
-fn resolve_optional_string(
-    file: Option<String>,
-    environment: Option<String>,
-    cli: Option<String>,
-) -> ResolvedField<Option<String>> {
-    if let Some(value) = cli {
-        return ResolvedField {
-            value: Some(value),
-            source: FieldSource::Cli,
-        };
-    }
-    if let Some(value) = environment {
-        return ResolvedField {
-            value: Some(value),
-            source: FieldSource::Environment,
-        };
-    }
-    if let Some(value) = file {
-        return ResolvedField {
-            value: Some(value),
-            source: FieldSource::File,
-        };
-    }
-    ResolvedField {
-        value: None,
-        source: FieldSource::Default,
-    }
+    Ok(())
 }
 
 fn validate_candidate(bytes: &[u8]) -> Result<()> {
     let text = std::str::from_utf8(bytes).context("待保存 config.toml 不是 UTF-8")?;
     let document = parse_document_text(text, Path::new("config.toml"))
         .context("待保存 config.toml 不是合法 TOML")?;
-    parse_schema(&document)?.validate()
+    validate_document(&document)
 }
 
 fn parse_document_text(text: &str, path: &Path) -> Result<DocumentMut> {
@@ -1267,17 +823,6 @@ fn parse_document_text(text: &str, path: &Path) -> Result<DocumentMut> {
     }
 }
 
-fn routing_enabled_from_document(document: &DocumentMut) -> Result<Option<bool>> {
-    document
-        .get("codey")
-        .and_then(Item::as_table_like)
-        .and_then(|codey| codey.get("routing"))
-        .and_then(Item::as_table_like)
-        .map(parse_routing)
-        .transpose()
-        .map(|routing| routing.and_then(|routing| routing.enabled))
-}
-
 fn validate_base_url(value: &str, field: &str) -> Result<()> {
     let parsed = reqwest::Url::parse(value).with_context(|| format!("{field} 不是合法 URL"))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
@@ -1286,19 +831,15 @@ fn validate_base_url(value: &str, field: &str) -> Result<()> {
     Ok(())
 }
 
-fn optional_string(table: &Table, key: &str, field: &str) -> Result<Option<String>> {
-    optional_string_like(table, key, field)
-}
-
-fn optional_string_like(
-    table: &dyn toml_edit::TableLike,
+fn optional_non_empty_string<'a>(
+    table: &'a dyn toml_edit::TableLike,
     key: &str,
     field: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<&'a str>> {
     match table.get(key) {
         Some(item) => item
             .as_str()
-            .map(|value| value.trim().to_string())
+            .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(Some)
             .ok_or_else(|| anyhow::anyhow!("{field} 必须是非空字符串")),
@@ -1311,16 +852,6 @@ fn ensure_root_table<'a>(document: &'a mut DocumentMut, key: &str) -> Result<&'a
         document[key] = Item::Table(Table::new());
     }
     document
-        .get_mut(key)
-        .and_then(Item::as_table_mut)
-        .ok_or_else(|| anyhow::anyhow!("{key} 必须是 table"))
-}
-
-fn ensure_child_table<'a>(table: &'a mut Table, key: &str) -> Result<&'a mut Table> {
-    if table.get(key).is_none() {
-        table[key] = Item::Table(Table::new());
-    }
-    table
         .get_mut(key)
         .and_then(Item::as_table_mut)
         .ok_or_else(|| anyhow::anyhow!("{key} 必须是 table"))
@@ -1432,21 +963,6 @@ fn process_lock_for(path: &Path) -> Arc<Mutex<()>> {
     lock
 }
 
-fn non_empty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn parse_bool(value: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(true),
-        "false" | "0" | "no" | "off" => Ok(false),
-        _ => bail!("invalid boolean"),
-    }
-}
-
 fn validate_audit_metadata(reason: &str, caller: &str) -> Result<()> {
     if reason.trim().is_empty() {
         bail!("配置变更 reason 不能为空");
@@ -1515,12 +1031,7 @@ mod tests {
         }
     }
 
-    fn manager(
-        path: &Path,
-        backup_limit: usize,
-        cli: ConfigLayer,
-        environment: ConfigLayer,
-    ) -> (ConfigManager, Arc<CollectingAudit>) {
+    fn manager(path: &Path, backup_limit: usize) -> (ConfigManager, Arc<CollectingAudit>) {
         let audit = Arc::new(CollectingAudit::default());
         (
             ConfigManager::with_components(
@@ -1528,8 +1039,6 @@ mod tests {
                 Arc::new(OsConfigFileSystem),
                 audit.clone(),
                 backup_limit,
-                cli,
-                Some(environment),
             ),
             audit,
         )
@@ -1538,90 +1047,11 @@ mod tests {
     #[test]
     fn loads_defaults_from_a_missing_file() {
         let temp = tempfile::tempdir().unwrap();
-        let (manager, _) = manager(
-            &temp.path().join("config.toml"),
-            3,
-            ConfigLayer::default(),
-            ConfigLayer::default(),
-        );
+        let (manager, _) = manager(&temp.path().join("config.toml"), 3);
         let snapshot = manager.load().unwrap();
         assert!(!snapshot.exists());
-        assert_eq!(snapshot.resolved().base_url.source, FieldSource::Default);
-        assert_eq!(
-            snapshot.resolved().routing_enabled,
-            ResolvedField {
-                value: false,
-                source: FieldSource::Default
-            }
-        );
-    }
-
-    #[test]
-    fn resolves_cli_before_environment_before_file() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(
-            &path,
-            "base_url = \"https://file.example/v1\"\n\n[model_providers.file]\nbase_url = \"https://route.example/v1\"\n\n[codey.routing]\nenabled = false\nactive_route = \"file\"\n",
-        )
-        .unwrap();
-        let (manager, _) = manager(
-            &path,
-            3,
-            ConfigLayer {
-                base_url: Some("https://cli.example/v1".into()),
-                routing_enabled: Some(true),
-                active_route: Some("file".into()),
-                active_provider: Some("file".into()),
-            },
-            ConfigLayer {
-                base_url: Some("https://env.example/v1".into()),
-                routing_enabled: Some(false),
-                active_route: None,
-                active_provider: None,
-            },
-        );
-        let snapshot = manager.load().unwrap();
-        assert_eq!(
-            snapshot.resolved().base_url,
-            ResolvedField {
-                value: Some("https://cli.example/v1".into()),
-                source: FieldSource::Cli
-            }
-        );
-        assert_eq!(snapshot.resolved().routing_enabled.source, FieldSource::Cli);
-        assert_eq!(snapshot.resolved().active_provider.source, FieldSource::Cli);
-    }
-
-    #[test]
-    fn mode_switch_preserves_routes_unknown_keys_and_comments() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("config.toml");
-        fs::write(
-            &path,
-            "# keep me\ncustom_key = \"value\"\nmodel_provider = \"route-a\"\n\n[model_providers.route-a]\nbase_url = \"https://route.example/v1\"\ncustom = 42\n\n[codey.non_routing]\nactive_provider = \"route-a\"\n",
-        )
-        .unwrap();
-        let (manager, _) = manager(&path, 3, ConfigLayer::default(), ConfigLayer::default());
-        let first = manager.load().unwrap();
-        let routed = manager
-            .set_routing_enabled(Some(first.revision()), true, "enable route mode", "test")
-            .unwrap();
-        manager
-            .set_routing_enabled(Some(routed.revision()), false, "disable route mode", "test")
-            .unwrap();
-        let text = fs::read_to_string(&path).unwrap();
-        assert!(text.contains("# keep me"));
-        assert!(text.contains("custom_key = \"value\""));
-        assert!(text.contains("custom = 42"));
-        assert!(text.contains("enabled = false"));
-        assert!(text.contains("model_provider = \"route-a\""));
-        assert!(text.contains("base_url = \"https://route.example/v1\""));
-        assert!(text.contains("active_provider = \"route-a\""));
-        assert_eq!(
-            manager.reload().unwrap().resolved().routing_enabled.source,
-            FieldSource::File
-        );
+        assert!(snapshot.raw().is_empty());
+        assert!(snapshot.document().is_empty());
     }
 
     #[test]
@@ -1629,7 +1059,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
         fs::write(&path, "base_url = \"https://old.example/v1\"\n").unwrap();
-        let (manager, audit) = manager(&path, 3, ConfigLayer::default(), ConfigLayer::default());
+        let (manager, audit) = manager(&path, 3);
         let snapshot = manager.load().unwrap();
         let error = manager
             .update(Some(snapshot.revision()), "bad edit", "test", |editor| {
@@ -1666,7 +1096,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
         fs::write(&path, "custom = 0\n").unwrap();
-        let (manager, _) = manager(&path, 3, ConfigLayer::default(), ConfigLayer::default());
+        let (manager, _) = manager(&path, 3);
         for next_value in 1..=4 {
             let snapshot = manager.reload().unwrap();
             manager
@@ -1698,7 +1128,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("config.toml");
         fs::write(&path, "custom = 0\n").unwrap();
-        let (manager, _) = manager(&path, 3, ConfigLayer::default(), ConfigLayer::default());
+        let (manager, _) = manager(&path, 3);
         let initial = manager.load().unwrap();
         let first = manager.clone();
         let second = manager.clone();
@@ -1743,14 +1173,7 @@ mod tests {
             target: path.clone(),
             fail: AtomicBool::new(true),
         });
-        let manager = ConfigManager::with_components(
-            &path,
-            filesystem,
-            audit,
-            3,
-            ConfigLayer::default(),
-            Some(ConfigLayer::default()),
-        );
+        let manager = ConfigManager::with_components(&path, filesystem, audit, 3);
         let snapshot = manager.load().unwrap();
         assert!(
             manager

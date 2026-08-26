@@ -537,6 +537,13 @@
   padding-right: 2px;
 }
 
+.prompt-optimization-field-control {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .prompt-optimization-fields .field.prompt-optimization-instruction-field {
   align-items: start;
 }
