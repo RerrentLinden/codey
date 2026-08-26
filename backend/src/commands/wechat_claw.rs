@@ -462,13 +462,13 @@ fn validate_activation_response(
     }
 
     for key in ["errcode", "err_code"] {
-        if let Some(errcode) = response_code(payload, key) {
-            if errcode != 0 {
-                return Err(format!(
-                    "微信 ClawBot {action}失败（{errcode}）：{}",
-                    bounded_remote_message(message)
-                ));
-            }
+        if let Some(errcode) = response_code(payload, key)
+            && errcode != 0
+        {
+            return Err(format!(
+                "微信 ClawBot {action}失败（{errcode}）：{}",
+                bounded_remote_message(message)
+            ));
         }
     }
     Ok(())
