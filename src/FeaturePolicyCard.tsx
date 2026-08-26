@@ -111,42 +111,32 @@ export function SubagentPolicyCardComponent({
             <p>基于 Codex 原生子代理的多角色调度与模型配置。</p>
           </div>
         </div>
+        <Switch
+          checked={config.subagentOptimization}
+          disabled={isBusy}
+          onCheckedChange={(checked) =>
+            onSubagentOptimizationChange(checked)
+          }
+          aria-label="启用 Codey 子代理角色与调度增强"
+        />
       </div>
       <Card className={`secondary-card subagent-card ${surfaceCardPaddingClass}`}>
-        <div className={`feature-card subagent-toggle-card ${config.subagentOptimization ? "active" : ""}`}>
-          <div className="feature-card-header">
-            <div className="feature-card-title">
-              <strong>启用 Codey 子代理角色与调度增强</strong>
-            </div>
-            <Switch
-              checked={config.subagentOptimization}
-              disabled={isBusy}
-              onCheckedChange={(checked) =>
-                onSubagentOptimizationChange(checked)
-              }
-              aria-label="启用 Codey 子代理角色与调度增强"
-            />
-          </div>
-        </div>
         <div className="subagent-policy-body">
           {config.subagentOptimization ? (
             <>
               <Table.ScrollContainer minWidth={360}>
                 <Table
-                  verticalSpacing="xs"
-                  horizontalSpacing="xs"
                   withRowBorders
-                  withTableBorder
-                  className="overflow-hidden rounded-[9px] border border-black/7 bg-[#f8f8fa]/72"
+                  className="subagent-table"
                 >
-                  <Table.Thead className="text-[#8e8e93] text-[11px] font-semibold tracking-[0.02em]">
+                  <Table.Thead>
                     <Table.Tr>
-                      <Table.Th style={{ width: "28%" }}>任务类型</Table.Th>
-                      <Table.Th style={{ width: "44%" }}>模型</Table.Th>
-                      <Table.Th style={{ width: "28%" }}>思考深度</Table.Th>
+                      <Table.Th style={{ width: "27%" }}>任务角色</Table.Th>
+                      <Table.Th style={{ width: "46%" }}>指定模型</Table.Th>
+                      <Table.Th style={{ width: "27%" }}>思考深度</Table.Th>
                     </Table.Tr>
                   </Table.Thead>
-                  <Table.Tbody className="[&_td]:align-middle [&_th]:align-middle">
+                  <Table.Tbody>
                     {SUBAGENT_TASK_TYPES.map((task) => {
                       const selection = config.subagentRoles[task.id] ?? {
                         model: config.subagentModel,
@@ -179,7 +169,7 @@ export function SubagentPolicyCardComponent({
                       return (
                         <Table.Tr key={task.id}>
                           <Table.Td>
-                            <div className="flex items-center gap-1 text-xs font-semibold text-[#3a3a3c] whitespace-nowrap">
+                            <div className="subagent-role-name">
                               <span>{task.name}</span>
                               <Tooltip
                                 content={task.description}
@@ -194,9 +184,10 @@ export function SubagentPolicyCardComponent({
                                   color="gray"
                                   size="xs"
                                   radius="sm"
+                                  className="subagent-role-info-btn"
                                   aria-label={`${task.name}：${task.description}`}
                                 >
-                                  <IconInfoCircle size={15} aria-hidden="true" />
+                                  <IconInfoCircle size={13} aria-hidden="true" />
                                 </ActionIcon>
                               </Tooltip>
                             </div>
@@ -269,14 +260,25 @@ export function SubagentPolicyCardComponent({
                   </Table.Tbody>
                 </Table>
               </Table.ScrollContainer>
-              <small>
-                {subagentModelOptions.length === 0
-                  ? "请先在模型管理中为任一可用线路启用模型"
-                  : "可搜索并选择任意可用线路的模型；首次开启需重启，保存后对下一次派生生效。角色权限仍受父任务权限模式约束"}
-              </small>
+              <div className="subagent-policy-callout">
+                <IconInfoCircle size={14} className="subagent-callout-icon" aria-hidden="true" />
+                <div className="subagent-callout-text">
+                  {subagentModelOptions.length === 0
+                    ? "请先在模型管理中为任一可用线路启用模型。"
+                    : "可搜索并选择任意可用线路模型；首次开启需重启，保存后对下次派生效。角色权限仍受父任务权限模式约束。"}
+                </div>
+              </div>
             </>
           ) : (
-            <small>开启后仅在宽范围、可并行或需要专门证据时选择性委派，并提供五类专用角色与汇合门禁；不会扩大父任务权限</small>
+            <div className="feature-disabled-placeholder">
+              <div className="feature-disabled-icon">
+                <IconUsersGroup size={22} aria-hidden="true" />
+              </div>
+              <div className="feature-disabled-text">
+                <strong>子代理角色与调度增强已关闭</strong>
+                <p>开启后仅在宽范围、可并行或需要专门证据时选择性委派，并提供五类专用角色与汇合门禁。</p>
+              </div>
+            </div>
           )}
         </div>
       </Card>

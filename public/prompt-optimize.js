@@ -679,7 +679,8 @@
           const optimization = config?.promptOptimization;
           applyEnabledState(
             optimization?.enabled === true &&
-              optimization.apiKeyConfigured === true,
+              (optimization?.mode === "codeyRoute" ||
+                optimization?.apiKeyConfigured === true),
           );
         } catch (error) {
           // A script-side error must not look like a missing bridge; report

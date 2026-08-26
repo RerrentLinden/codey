@@ -139,7 +139,7 @@ export function ModelCombobox({
           aria-label={ariaLabel}
           className="w-full min-w-0"
           classNames={{
-            input: `${compactSelectInputClass} flex! items-center pr-8! text-left!`,
+            input: `${compactSelectInputClass} flex! items-center pr-7! text-left!`,
             section: "text-[#6e6e73]",
           }}
           component="button"
@@ -148,8 +148,8 @@ export function ModelCombobox({
           pointer
           rightSection={
             unavailableValue
-              ? <IconAlertTriangle size={14} color="#b7791f" aria-hidden="true" />
-              : <Combobox.Chevron />
+              ? <IconAlertTriangle size={13} color="#b7791f" aria-hidden="true" />
+              : <Combobox.Chevron size="xs" />
           }
           rightSectionPointerEvents="none"
           title={triggerText}

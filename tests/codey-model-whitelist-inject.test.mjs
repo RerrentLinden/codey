@@ -19,6 +19,7 @@ async function loadPatch(
   const timers = new Map();
   const windowListeners = new Map();
   const documentListeners = new Map();
+  const mutationObserverOptions = [];
   const dispatchedEvents = [];
   let wildcardScanCount = 0;
   const body = documentBody || {};
@@ -97,6 +98,17 @@ async function loadPatch(
       }
       return true;
     },
+    MutationObserver: class MutationObserver {
+      constructor(callback) {
+        this.callback = callback;
+      }
+
+      observe(_target, options) {
+        mutationObserverOptions.push(options);
+      }
+
+      disconnect() {}
+    },
   };
   if (storage) window.localStorage = storage;
   if (bridgeReady) window.__codexSessionDeleteBridge = bridge;
@@ -132,6 +144,9 @@ async function loadPatch(
     },
     wildcardScanCount() {
       return wildcardScanCount;
+    },
+    mutationObserverOptions() {
+      return mutationObserverOptions;
     },
     async runNextTimer() {
       const next = timers.entries().next().value;
@@ -347,7 +362,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "30");
+  assert.equal(patch.version, "32");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -1087,6 +1102,20 @@ test("a legacy official task resumes through the HTTP-only local router carrier"
     },
   });
 
+  // The rollout still reports `openai` after a successful runtime migration.
+  // A later list refresh must not downgrade the live carrier back to `openai`.
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "official-thread-list-after-resume",
+        result: {
+          data: [{ id: "official-thread", modelProvider: "openai" }],
+        },
+      },
+    },
+  });
+
   const selected = {
     detail: {
       type: "mcp-request",
@@ -1257,6 +1286,94 @@ test("an unmigrated OpenAI thread can keep using an official route directly", as
   assert.equal(runtime.patch.isBlockedOutgoingMessage(nextTurn), false);
   assert.deepEqual(nextTurn.request.params, {
     threadId: "unmigrated-official-thread",
+    model: "gpt-5.6-sol",
+  });
+  runtime.patch.dispose();
+});
+
+test("a legacy local-official catalog route stays direct on an unmigrated OpenAI task", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["local-official/gpt-5.6-terra"],
+    default_model: "local-official/gpt-5.6-terra",
+    model_metadata: [{
+      model: "local-official/gpt-5.6-terra",
+      route_name: "OpenAI 官方直登",
+      provider_id: "codey_router",
+      source_model: "gpt-5.6-terra",
+      route_provider_id: "local-official",
+    }],
+  }, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "legacy-local-official-thread-list",
+        result: {
+          data: [{ id: "legacy-local-official-thread", modelProvider: "openai" }],
+        },
+      },
+    },
+  });
+
+  const turn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "legacy-local-official-default-turn",
+      method: "turn/start",
+      params: { threadId: "legacy-local-official-thread" },
+    },
+  });
+
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(turn), false);
+  assert.deepEqual(turn.request.params, {
+    threadId: "legacy-local-official-thread",
+    model: "gpt-5.6-terra",
+  });
+  runtime.patch.dispose();
+});
+
+test("official-account route metadata keeps a custom official route direct on an OpenAI task", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["chatgpt-account/gpt-5.6-sol"],
+    default_model: "chatgpt-account/gpt-5.6-sol",
+    model_metadata: [{
+      model: "chatgpt-account/gpt-5.6-sol",
+      route_name: "OpenAI 官方直登",
+      provider_id: "codey_router",
+      source_model: "gpt-5.6-sol",
+      route_provider_id: "chatgpt-account",
+      official_account: true,
+    }],
+  }, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "custom-official-thread-list",
+        result: {
+          data: [{ id: "custom-official-thread", modelProvider: "openai" }],
+        },
+      },
+    },
+  });
+
+  const selected = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "custom-official-settings",
+      method: "thread/settings/update",
+      params: {
+        threadId: "custom-official-thread",
+        model: "chatgpt-account/gpt-5.6-sol",
+      },
+    },
+  });
+
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(selected), false);
+  assert.deepEqual(selected.request.params, {
+    threadId: "custom-official-thread",
     model: "gpt-5.6-sol",
   });
   runtime.patch.dispose();
@@ -1849,6 +1966,30 @@ test("model picker menu groups models under route headings without changing mode
     model: "relay/gpt-5.6-sol",
     responsesapiClientMetadata: { codey_route: "relay" },
   });
+  runtime.patch.dispose();
+});
+
+test("model picker observes row text changes after a route rename", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["relay/gpt-5.6-sol"],
+    default_model: "relay/gpt-5.6-sol",
+    model_metadata: [{
+      model: "relay/gpt-5.6-sol",
+      display_name: "[新线] gpt-5.6-sol",
+      route_name: "新线路",
+      route_prefix: "新线",
+      provider_id: "relay",
+      source_model: "gpt-5.6-sol",
+    }],
+  }, [statsigClient()], { documentBody: body });
+
+  assert.deepEqual(runtime.mutationObserverOptions(), [{
+    childList: true,
+    characterData: true,
+    subtree: true,
+  }]);
   runtime.patch.dispose();
 });
 

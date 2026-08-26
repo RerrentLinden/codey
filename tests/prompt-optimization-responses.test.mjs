@@ -14,12 +14,20 @@ const backendSource = readFileSync(
   new URL("../backend/src/prompt_optimization.rs", import.meta.url),
   "utf8",
 );
+const commandSource = readFileSync(
+  new URL("../backend/src/commands/prompt_optimization.rs", import.meta.url),
+  "utf8",
+);
 
-test("prompt optimization exposes no upstream protocol selector", () => {
-  assert.doesNotMatch(cardSource, /上游格式/);
-  assert.doesNotMatch(cardSource, /PROMPT_OPTIMIZATION_PROTOCOL_OPTIONS/);
-  assert.doesNotMatch(cardSource, /optimization\.protocol/);
-  assert.doesNotMatch(cardSource, /Chat Completions/);
+test("prompt optimization switches between Codey routing and manual upstream configuration", () => {
+  assert.match(cardSource, /使用 Codey 路由/);
+  assert.match(cardSource, /手动配置/);
+  assert.match(cardSource, /OpenAI Responses/);
+  assert.match(cardSource, /OpenAI Chat Completions/);
+  assert.match(cardSource, /Anthropic Messages/);
+  assert.match(cardSource, /<ModelCombobox/);
+  assert.doesNotMatch(cardSource, /同步当前线路配置/);
+  assert.doesNotMatch(commandSource, /sync_prompt_optimization_current_provider/);
 });
 
 test("prompt optimization refreshes the creatable model picker without remounting", () => {
@@ -43,10 +51,12 @@ test("prompt optimization refreshes the creatable model picker without remountin
   assert.doesNotMatch(cardSource, /prompt-optimization-model-create-option/);
 });
 
-test("prompt optimization uses Responses without runtime converters", () => {
+test("prompt optimization supports all manual upstream request formats", () => {
   assert.match(backendSource, /fn responses_payload\(/);
-  assert.match(backendSource, /extract_responses_optimized_text\(&value\)/);
-  assert.doesNotMatch(backendSource, /responses_to_chat_completions/);
-  assert.doesNotMatch(backendSource, /chat_completion_to_response_with_request/);
-  assert.doesNotMatch(backendSource, /upstream_request_payload/);
+  assert.match(backendSource, /fn openai_chat_payload\(/);
+  assert.match(backendSource, /fn anthropic_payload\(/);
+  assert.match(backendSource, /extract_anthropic_optimized_text/);
+  assert.match(backendSource, /extract_responses_optimized_text\(response\)/);
+  assert.match(commandSource, /optimization\.uses_codey_route\(\)/);
+  assert.match(commandSource, /ROUTER_AUTH_HEADER/);
 });

@@ -1,8 +1,12 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "30";
+  const patchVersion = "32";
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
+  const legacyOfficialRouteProviderIds = new Set([
+    officialProviderId,
+    "local-official",
+  ]);
   const gatewayProviderIds = new Set([
     officialProviderId,
     localRouterProviderId,
@@ -83,7 +87,12 @@
   const patchedProviderKey = Symbol("codeyPatchedModelProvider");
   const patchedRouteKey = Symbol("codeyPatchedRoute");
   const blockedProviderRequestKey = Symbol("codeyBlockedProviderRequest");
-  const threadProviders = new Map();
+  // Codex persists a thread's original provider in rollout data, while Codey
+  // can resume that same thread through the local router for this process.
+  // Keep the two identities separate so a later thread/list response cannot
+  // erase a successful runtime migration.
+  const threadPersistedProviders = new Map();
+  const threadRuntimeProviders = new Map();
   const threadRoutes = new Map();
   const pendingThreadRequests = new Map();
   const maxTrackedThreadProviders = 2048;
@@ -117,9 +126,17 @@
       map.delete(map.keys().next().value);
     }
   };
-  const rememberBoundedThreadProvider = (threadId, providerId) => {
+  const rememberBoundedThreadPersistedProvider = (threadId, providerId) => {
     rememberBoundedMap(
-      threadProviders,
+      threadPersistedProviders,
+      threadId,
+      providerId,
+      maxTrackedThreadProviders,
+    );
+  };
+  const rememberBoundedThreadRuntimeProvider = (threadId, providerId) => {
+    rememberBoundedMap(
+      threadRuntimeProviders,
       threadId,
       providerId,
       maxTrackedThreadProviders,
@@ -225,6 +242,10 @@
   const isGatewayProviderId = (providerId) => (
     gatewayProviderIds.has(modelKey(providerId))
   );
+  const isOfficialRoute = (route) => (
+    route?.officialAccount === true
+    || legacyOfficialRouteProviderIds.has(modelKey(route?.routeProviderId))
+  );
   const providersAreCompatible = (method, currentProviderId, targetProviderId) => (
     modelKey(currentProviderId) === modelKey(targetProviderId)
     || (
@@ -260,7 +281,9 @@
   );
   const knownThreadProvider = (params) => {
     const threadId = threadIdFromParams(params);
-    return requestProviderId(threadProviders.get(threadId)) || paramsProviderId(params);
+    return requestProviderId(threadRuntimeProviders.get(threadId))
+      || requestProviderId(threadPersistedProviders.get(threadId))
+      || paramsProviderId(params);
   };
   const markBlockedProviderRequest = (params, detail) => {
     try {
@@ -286,7 +309,7 @@
     // id. Third-party routes remain blocked until the task is resumed.
     const preservesLegacyOfficialCarrier = method !== "thread/resume"
       && modelKey(currentProviderId) === officialProviderId
-      && modelKey(routeProviderId) === officialProviderId;
+      && isOfficialRoute(route);
     const routedProviderId = preservesLegacyOfficialCarrier
       ? officialProviderId
       : isGatewayProviderId(providerId)
@@ -358,6 +381,9 @@
   );
   const metadataText = (metadata, key) => cleanText(
     metadata && typeof metadata === "object" ? metadata[key] : "",
+  );
+  const metadataBoolean = (metadata, key) => (
+    Boolean(metadata && typeof metadata === "object" && metadata[key] === true)
   );
   const displayNameParts = (displayName) => {
     const separator = displayName.indexOf(" / ");
@@ -436,6 +462,7 @@
           routeProviderId,
           sourceModel,
           routeName,
+          officialAccount: metadataBoolean(metadata, "official_account"),
         }];
       }).filter(([, route]) => (
         route.providerId && route.routeProviderId && route.sourceModel
@@ -674,6 +701,7 @@
       && leftMetadata.provider_id === rightMetadata.provider_id
       && leftMetadata.source_model === rightMetadata.source_model
       && leftMetadata.route_provider_id === rightMetadata.route_provider_id
+      && leftMetadata.official_account === rightMetadata.official_account
       && leftMetadata.upstream_model === rightMetadata.upstream_model
       && sameReasoningEffortNames(
         leftMetadata.supported_reasoning_efforts,
@@ -1106,7 +1134,14 @@
       || !document.body
     ) return;
     groupedMenuObserver = new MutationObserver(scheduleGroupedModelMenuEnhancement);
-    groupedMenuObserver.observe(document.body, { childList: true, subtree: true });
+    // Route saves can make React update only a menu row's text node. Watching
+    // child-list mutations alone misses that repaint, so the new short-name
+    // label remains ungrouped until the picker is reopened.
+    groupedMenuObserver.observe(document.body, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
   };
 
   const reactFiberKeys = (element) =>
@@ -1483,6 +1518,7 @@
           providerId,
           routeProviderId,
           sourceModel,
+          officialAccount: metadataBoolean(metadata, "official_account"),
         }
       : null;
   };
@@ -1854,18 +1890,23 @@
   const providerFromThread = (thread) => requestProviderId(
     thread?.modelProvider || thread?.model_provider,
   );
-  const rememberThreadProvider = (
-    thread,
-    fallbackProvider = "",
-    preferFallback = false,
-  ) => {
+  const rememberThreadPersistedProvider = (thread, fallbackProvider = "") => {
     const threadId = typeof thread?.id === "string" ? thread.id.trim() : "";
     const fallback = requestProviderId(fallbackProvider);
-    const providerId = (preferFallback ? fallback : "")
-      || providerFromThread(thread)
+    const providerId = providerFromThread(thread)
       || fallback;
     if (!threadId || !providerId) return;
-    rememberBoundedThreadProvider(threadId, providerId);
+    rememberBoundedThreadPersistedProvider(threadId, providerId);
+  };
+  const rememberThreadRuntimeProvider = (thread, providerId) => {
+    const threadId = typeof thread === "string"
+      ? thread.trim()
+      : typeof thread?.id === "string"
+        ? thread.id.trim()
+        : "";
+    const provider = requestProviderId(providerId);
+    if (!threadId || !provider) return;
+    rememberBoundedThreadRuntimeProvider(threadId, provider);
   };
   const rememberThreadRoute = (thread, fallbackRoute = null) => {
     const threadId = typeof thread?.id === "string" ? thread.id.trim() : "";
@@ -1880,7 +1921,8 @@
     if (!message || typeof message !== "object") return;
     const notificationThread = message?.params?.thread;
     if (message.method === "thread/started") {
-      rememberThreadProvider(notificationThread);
+      rememberThreadPersistedProvider(notificationThread);
+      rememberThreadRuntimeProvider(notificationThread, providerFromThread(notificationThread));
       rememberThreadRoute(notificationThread);
     }
     const requestId = message.id == null ? "" : String(message.id);
@@ -1893,17 +1935,26 @@
       || pending?.method === "thread/fork"
       ? pending.providerId
       : pending?.threadId
-        ? threadProviders.get(pending.threadId)
+        ? threadPersistedProviders.get(pending.threadId)
         : "";
     const resultProvider = requestProviderId(result?.modelProvider) || fallbackProvider;
-    rememberThreadProvider(resultThread, resultProvider, Boolean(resultProvider));
+    const runtimeProvider = (
+      pending?.method === "thread/start"
+      || pending?.method === "thread/resume"
+      || pending?.method === "thread/fork"
+    ) ? pending.providerId : pending?.threadId
+      ? threadRuntimeProviders.get(pending.threadId)
+      : resultProvider;
+    rememberThreadPersistedProvider(resultThread, resultProvider);
+    rememberThreadRuntimeProvider(resultThread || pending?.threadId, runtimeProvider);
     rememberThreadRoute(resultThread, pending?.route);
     for (const thread of Array.isArray(result?.data) ? result.data : []) {
-      rememberThreadProvider(thread);
+      rememberThreadPersistedProvider(thread);
       rememberThreadRoute(thread);
     }
     const directThread = data?.thread;
-    rememberThreadProvider(directThread);
+    rememberThreadPersistedProvider(directThread, resultProvider);
+    rememberThreadRuntimeProvider(directThread || pending?.threadId, runtimeProvider);
     rememberThreadRoute(directThread, pending?.route);
   };
 
@@ -2128,7 +2179,8 @@
       knownModelQueryClients.clear();
       modelListRequestIds.clear();
       pendingThreadRequests.clear();
-      threadProviders.clear();
+      threadPersistedProviders.clear();
+      threadRuntimeProviders.clear();
       threadRoutes.clear();
       pendingRouteIntent = null;
     },

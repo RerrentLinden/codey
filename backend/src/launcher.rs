@@ -1314,6 +1314,10 @@ impl CodeyRuntime {
         self.local_router.update_config(config);
     }
 
+    pub(crate) fn local_router_endpoint(&self) -> RuntimeRouterEndpoint {
+        self.local_router.endpoint()
+    }
+
     pub async fn applied_subagent_config(&self) -> RuntimeSubagentConfig {
         self.applied_subagent_config.read().await.clone()
     }

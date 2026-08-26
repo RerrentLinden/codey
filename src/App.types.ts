@@ -24,11 +24,16 @@ export type Profile = {
 
 export type PromptOptimizationConfig = {
   enabled: boolean;
+  mode: "codeyRoute" | "manual";
   baseUrl: string;
   apiKey: string;
   apiKeyConfigured: boolean;
   clearApiKey?: boolean;
   model: string;
+  upstreamProtocol:
+    | "openaiResponses"
+    | "openaiChatCompletions"
+    | "anthropicMessages";
   instruction: string;
 };
 

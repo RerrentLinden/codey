@@ -8,9 +8,8 @@ use serde::Serialize;
 use serde_json::Value;
 use toml_edit::{DocumentMut, Item, TableLike};
 
+use crate::codex_config::BUILTIN_OPENAI_PROVIDER_ID;
 use crate::config::{CodeyConfig, DERIVED_OFFICIAL_PROFILE_ID, ProviderProfile};
-
-const LOCAL_OFFICIAL_PROVIDER_ID: &str = "local-official";
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -192,7 +191,7 @@ pub fn status_from_config(config: &CodeyConfig) -> ProviderStatus {
             base_url: profile.base_url.clone(),
         })
         .unwrap_or_else(|| CurrentProvider {
-            id: LOCAL_OFFICIAL_PROVIDER_ID.to_string(),
+            id: BUILTIN_OPENAI_PROVIDER_ID.to_string(),
             name: "OpenAI 官方直登".to_string(),
             official: true,
             supports_remote_compaction: true,
@@ -299,7 +298,7 @@ fn local_provider(codex_home: &Path) -> Result<LocalProviderSnapshot> {
             id: provider_id.to_string(),
             name: if official {
                 "OpenAI 官方直登".to_string()
-            } else if name == LOCAL_OFFICIAL_PROVIDER_ID {
+            } else if name == BUILTIN_OPENAI_PROVIDER_ID {
                 "OpenAI API".to_string()
             } else {
                 name.to_string()
@@ -324,7 +323,7 @@ fn active_provider_id(document: &DocumentMut) -> &str {
         .and_then(Item::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(LOCAL_OFFICIAL_PROVIDER_ID)
+        .unwrap_or(BUILTIN_OPENAI_PROVIDER_ID)
 }
 
 fn provider_table<'a>(document: &'a DocumentMut, provider_id: &str) -> Option<&'a dyn TableLike> {
@@ -564,6 +563,7 @@ experimental_bearer_token = "sk-relay"
             .unwrap()
             .unwrap();
         assert!(profile.official_account);
+        assert_eq!(profile.provider_id(), "openai");
         assert!(profile.api_key.is_empty());
 
         write_config(home.path(), &third_party_config("responses"));

@@ -121,6 +121,7 @@ const createEnvironment = (options = {}) => {
     promptOptimization: {
       enabled: options.enabled ?? true,
       apiKeyConfigured: options.apiKeyConfigured ?? true,
+      mode: options.mode ?? "manual",
     },
   };
   let composerQueryCount = 0;
@@ -473,6 +474,18 @@ test("mounts the optimize button when enabled and an API key is configured", asy
     disconnectCalls: 0,
     observeCalls: 1,
   });
+});
+
+test("mounts the optimize button for an enabled Codey route without a manual key", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: false,
+    mode: "codeyRoute",
+  });
+  await flush();
+
+  assert.ok(env.getElementById("codey-prompt-optimize-button"));
+  assert.equal(env.snapshot().enabled, true);
 });
 
 test("keeps the original dark treatment at a 26px height", async () => {

@@ -274,14 +274,12 @@ impl WebhookConfig {
                     if kind == NotificationChannelKind::WechatClaw
                         && channel.url.trim().is_empty()
                         && channel.url_configured
-                    {
-                        if let Some(existing) = previous
+                        && let Some(existing) = previous
                             .channels
                             .iter()
                             .find(|existing| existing.id == channel.id && existing.kind == kind)
-                        {
-                            channel.url = existing.url.clone();
-                        }
+                    {
+                        channel.url = existing.url.clone();
                     }
                     if channel.clear_bot_token {
                         channel.bot_token.clear();

@@ -5,7 +5,7 @@ export const insetInputClass =
   "h-9! min-w-0 w-full flex-1 border-0! bg-transparent! px-0! text-[13px] shadow-none! placeholder:text-[#8e8e93] focus:ring-0";
 
 export const compactSelectInputClass =
-  "h-8! rounded-[7px]! border-black/15! bg-white! text-xs font-medium placeholder:text-[#8e8e93] focus:border-blue-500/65! focus:ring-2 focus:ring-blue-500/12";
+  "h-8! min-h-[32px]! rounded-[7px]! border-black/15! bg-white! px-2.5! text-[12px] font-medium placeholder:text-[#8e8e93] focus:border-blue-500/65! focus:ring-2 focus:ring-blue-500/12";
 
 export const flushCardClass = "p-0!";
 

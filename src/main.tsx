@@ -115,11 +115,13 @@ if (import.meta.env.DEV) {
       },
       promptOptimization: {
         enabled: true,
+        mode: "codeyRoute",
         baseUrl: previewEndpoints.primary,
         apiKey: "preview-prompt-optimization-key",
         apiKeyConfigured: true,
         clearApiKey: false,
-        model: "gpt-5.6-sol",
+        model: "primary/provider-fast-coder",
+        upstreamProtocol: "openaiResponses",
         instruction: "",
       },
       codexAppPath: "/Applications/ChatGPT.app",
@@ -556,21 +558,6 @@ if (import.meta.env.DEV) {
           restartRequired: false,
           modelHotReloaded: true,
         };
-      }
-      if (command === "sync_prompt_optimization_current_provider") {
-        previewConfig = {
-          ...previewConfig,
-          settingsRevision: previewConfig.settingsRevision + 1,
-          promptOptimization: {
-            ...previewConfig.promptOptimization,
-            baseUrl: previewProviderStatus().provider.baseUrl,
-            apiKey: activePreviewProfile()?.apiKey || "",
-            apiKeyConfigured: Boolean(activePreviewProfile()?.apiKey.trim()),
-            clearApiKey: false,
-            model: previewModelState.defaultModel,
-          },
-        };
-        return { config: previewConfig };
       }
       if (command === "clear_codex_trace_logs") {
         return {

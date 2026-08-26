@@ -46,13 +46,15 @@
 }
 
 @media (max-width: 680px) {
-  .prompt-optimization-actions-row {
+  .prompt-optimization-toolbar {
     align-items: stretch;
-    flex-direction: column-reverse;
+    flex-direction: column;
+    gap: 8px;
   }
 
-  .prompt-optimization-action-buttons {
+  .prompt-optimization-toolbar-actions {
     justify-content: flex-start;
+    margin-left: 0;
     flex-wrap: wrap;
   }
 

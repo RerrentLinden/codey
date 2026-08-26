@@ -51,7 +51,7 @@ use models::{
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
 use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
-    sync_prompt_optimization_current_provider_command, test_prompt_optimization_command,
+    test_prompt_optimization_command,
 };
 #[cfg(test)]
 use runtime::{begin_shutdown, launch_codey_inner};
@@ -645,12 +645,6 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Err(error) => Err(error),
         },
         "sync_current_provider" => sync_current_provider_command(state).await,
-        "sync_prompt_optimization_current_provider" => {
-            match optional_argument::<PromptOptimizationConfig>(&args, "config") {
-                Ok(draft) => sync_prompt_optimization_current_provider_command(state, draft).await,
-                Err(error) => Err(error),
-            }
-        }
         "fetch_current_provider_models" => fetch_current_provider_models(state).await,
         "save_route" => match (
             argument::<ProviderProfile>(&args, "route"),

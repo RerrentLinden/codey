@@ -50,7 +50,7 @@ use runtime_role_transaction::refresh_runtime_subagent_roles_at;
 use subagent_control::{disable_subagent_control_mcp, enable_subagent_control_mcp};
 
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
+pub(crate) const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
 const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
 const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_ARG_MARKER: &str = "--codey-fastctx-mcp";

@@ -243,11 +243,16 @@ impl ProviderProfile {
 
 /// Prompt-optimization settings. The local renderer receives the API key and
 /// masks it with a password input; clearing still requires an explicit request.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptOptimizationConfig {
     #[serde(default)]
     pub enabled: bool,
+    /// Chooses whether optimization requests use an enabled Codey route or a
+    /// separately configured upstream service. Existing configurations keep
+    /// the manual mode so their connection settings remain usable.
+    #[serde(default = "default_prompt_optimization_mode")]
+    pub mode: String,
     #[serde(default)]
     pub base_url: String,
     #[serde(default)]
@@ -258,20 +263,45 @@ pub struct PromptOptimizationConfig {
     pub clear_api_key: bool,
     #[serde(default)]
     pub model: String,
+    #[serde(default = "default_prompt_optimization_upstream_protocol")]
+    pub upstream_protocol: String,
     /// Optional custom optimizer instructions. When empty the built-in
     /// default system prompt is used.
     #[serde(default)]
     pub instruction: String,
 }
 
+impl Default for PromptOptimizationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: default_prompt_optimization_mode(),
+            base_url: String::new(),
+            api_key: String::new(),
+            api_key_configured: false,
+            clear_api_key: false,
+            model: String::new(),
+            upstream_protocol: default_prompt_optimization_upstream_protocol(),
+            instruction: String::new(),
+        }
+    }
+}
+
 impl PromptOptimizationConfig {
     pub(crate) fn normalize(&mut self) {
+        self.mode = normalize_prompt_optimization_mode(&self.mode);
         self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
         self.api_key = self.api_key.trim().to_string();
         self.api_key_configured = !self.api_key.is_empty();
         self.clear_api_key = false;
         self.model = self.model.trim().to_string();
+        self.upstream_protocol =
+            normalize_prompt_optimization_upstream_protocol(&self.upstream_protocol);
         self.instruction = self.instruction.trim().to_string();
+    }
+
+    pub(crate) fn uses_codey_route(&self) -> bool {
+        self.mode == PROMPT_OPTIMIZATION_MODE_CODEY_ROUTE
     }
 
     pub fn merge_redacted_secrets(&mut self, previous: &Self) {
@@ -287,6 +317,12 @@ impl PromptOptimizationConfig {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.uses_codey_route() {
+            if self.enabled && self.model.trim().is_empty() {
+                return Err("启用提示词优化前，请选择 Codey 路由模型".to_string());
+            }
+            return Ok(());
+        }
         let base_url = self.base_url.trim();
         if base_url.is_empty() {
             return if self.enabled {
@@ -303,6 +339,33 @@ impl PromptOptimizationConfig {
             return Err("启用提示词优化前，请先选择或填写模型".to_string());
         }
         Ok(())
+    }
+}
+
+pub const PROMPT_OPTIMIZATION_MODE_CODEY_ROUTE: &str = "codeyRoute";
+pub const PROMPT_OPTIMIZATION_MODE_MANUAL: &str = "manual";
+
+fn default_prompt_optimization_mode() -> String {
+    PROMPT_OPTIMIZATION_MODE_MANUAL.to_string()
+}
+
+fn normalize_prompt_optimization_mode(value: &str) -> String {
+    match value.trim() {
+        PROMPT_OPTIMIZATION_MODE_CODEY_ROUTE => PROMPT_OPTIMIZATION_MODE_CODEY_ROUTE.to_string(),
+        _ => PROMPT_OPTIMIZATION_MODE_MANUAL.to_string(),
+    }
+}
+
+fn default_prompt_optimization_upstream_protocol() -> String {
+    UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string()
+}
+
+fn normalize_prompt_optimization_upstream_protocol(value: &str) -> String {
+    match value.trim() {
+        UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+        | UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS
+        | UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES => value.trim().to_string(),
+        _ => default_prompt_optimization_upstream_protocol(),
     }
 }
 
@@ -577,6 +640,12 @@ impl CodeyConfig {
         official_profile: Option<ProviderProfile>,
     ) {
         let previous_active_id = self.active_profile_id.clone();
+        let previous_official_provider_ids = self
+            .profiles
+            .iter()
+            .filter(|profile| profile.official_account)
+            .map(|profile| profile.provider_id().to_string())
+            .collect::<BTreeSet<_>>();
         let placeholder_provider_id = self
             .looks_like_empty_default_route()
             .then(|| self.profiles[0].provider_id().to_string());
@@ -600,6 +669,9 @@ impl CodeyConfig {
             official_profile.id = DERIVED_OFFICIAL_PROFILE_ID.to_string();
             official_profile.normalize();
             let official_provider_id = official_profile.provider_id().to_string();
+            for previous_provider_id in previous_official_provider_ids {
+                self.migrate_official_provider_state(&previous_provider_id, &official_provider_id);
+            }
             if let Some(existing) = self
                 .profiles
                 .iter_mut()
@@ -621,6 +693,58 @@ impl CodeyConfig {
             self.active_profile_id = previous_active_id;
         } else if let Some(profile) = self.profiles.first() {
             self.active_profile_id = profile.id.clone();
+        }
+    }
+
+    fn migrate_official_provider_state(
+        &mut self,
+        previous_provider_id: &str,
+        official_provider_id: &str,
+    ) {
+        if previous_provider_id == official_provider_id {
+            return;
+        }
+        migrate_provider_model_list(
+            &mut self.selected_models_by_provider,
+            previous_provider_id,
+            official_provider_id,
+        );
+        migrate_provider_model_list(
+            &mut self.manual_third_party_models_by_provider,
+            previous_provider_id,
+            official_provider_id,
+        );
+        migrate_provider_model_list(
+            &mut self.declared_official_models_by_provider,
+            previous_provider_id,
+            official_provider_id,
+        );
+        migrate_provider_model_list(
+            &mut self.upstream_models_by_provider,
+            previous_provider_id,
+            official_provider_id,
+        );
+        migrate_provider_default(
+            &mut self.default_model_by_provider,
+            previous_provider_id,
+            official_provider_id,
+        );
+        remap_model_provider_alias(
+            &mut self.default_model,
+            previous_provider_id,
+            official_provider_id,
+        );
+        remap_model_provider_alias(
+            &mut self.subagent_model,
+            previous_provider_id,
+            official_provider_id,
+        );
+        for selection in self.subagent_roles.values_mut() {
+            remap_model_provider_alias(
+                &mut selection.model,
+                previous_provider_id,
+                official_provider_id,
+            );
         }
     }
 
@@ -1040,6 +1164,63 @@ fn model_references_provider(model: &str, provider_id: &str) -> bool {
     model
         .get(..prefix.len())
         .is_some_and(|candidate| candidate.eq_ignore_ascii_case(&prefix))
+}
+
+fn migrate_provider_model_list(
+    models_by_provider: &mut BTreeMap<String, Vec<String>>,
+    previous_provider_id: &str,
+    official_provider_id: &str,
+) {
+    if previous_provider_id == official_provider_id {
+        return;
+    }
+    let Some(mut models) = models_by_provider.remove(previous_provider_id) else {
+        return;
+    };
+    let destination = models_by_provider
+        .entry(official_provider_id.to_string())
+        .or_default();
+    destination.append(&mut models);
+    normalize_model_list(destination);
+}
+
+fn migrate_provider_default(
+    defaults_by_provider: &mut BTreeMap<String, String>,
+    previous_provider_id: &str,
+    official_provider_id: &str,
+) {
+    if previous_provider_id == official_provider_id {
+        return;
+    }
+    let Some(model) = defaults_by_provider.remove(previous_provider_id) else {
+        return;
+    };
+    defaults_by_provider
+        .entry(official_provider_id.to_string())
+        .or_insert(model);
+}
+
+fn remap_model_provider_alias(
+    model: &mut String,
+    previous_provider_id: &str,
+    official_provider_id: &str,
+) {
+    if previous_provider_id == official_provider_id {
+        return;
+    }
+    let previous_prefix = local_router::model_alias(previous_provider_id, "");
+    if !model
+        .get(..previous_prefix.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&previous_prefix))
+    {
+        return;
+    }
+    let suffix = model[previous_prefix.len()..].to_string();
+    *model = format!(
+        "{}{}",
+        local_router::model_alias(official_provider_id, ""),
+        suffix
+    );
 }
 
 pub(crate) fn validate_provider_profiles(profiles: &[ProviderProfile]) -> Result<(), String> {
@@ -1573,6 +1754,11 @@ mod tests {
 
         optimization.model = "gpt-test".to_string();
         assert!(optimization.validate().is_ok());
+
+        optimization.mode = PROMPT_OPTIMIZATION_MODE_CODEY_ROUTE.to_string();
+        optimization.base_url.clear();
+        optimization.api_key.clear();
+        assert!(optimization.validate().is_ok());
     }
 
     #[test]
@@ -2049,6 +2235,104 @@ mod tests {
         assert_eq!(
             config.selected_models_by_provider["openai"],
             ["gpt-5.6-sol"],
+        );
+    }
+
+    #[test]
+    fn launch_official_profile_migrates_legacy_official_provider_state() {
+        let mut legacy = ProviderProfile::new("OpenAI 官方直登");
+        legacy.id = DERIVED_OFFICIAL_PROFILE_ID.into();
+        legacy.source_provider_id = Some("local-official".into());
+        legacy.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        legacy.normalize();
+
+        let mut launched = ProviderProfile::new("OpenAI 官方直登");
+        launched.id = "launch-openai".into();
+        launched.source_provider_id = Some("openai".into());
+        launched.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        launched.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: legacy.id.clone(),
+            profiles: vec![legacy],
+            initial_route_import_completed: true,
+            default_model: "local-official/gpt-5.6-terra".into(),
+            subagent_model: "local-official/gpt-5.6-luna".into(),
+            subagent_reasoning_effort: "high".into(),
+            subagent_roles: uniform_subagent_roles("local-official/gpt-5.6-luna", "high"),
+            ..CodeyConfig::default()
+        };
+        config
+            .selected_models_by_provider
+            .insert("local-official".into(), vec!["gpt-5.6-terra".into()]);
+        config
+            .manual_third_party_models_by_provider
+            .insert("local-official".into(), vec!["manual-model".into()]);
+        config
+            .declared_official_models_by_provider
+            .insert("local-official".into(), vec!["gpt-5.6-luna".into()]);
+        config
+            .upstream_models_by_provider
+            .insert("local-official".into(), vec!["gpt-5.6-terra".into()]);
+        config
+            .default_model_by_provider
+            .insert("local-official".into(), "gpt-5.6-terra".into());
+
+        config.apply_launch_official_profile(Some(launched));
+
+        assert_eq!(config.profiles.len(), 1);
+        assert_eq!(config.profiles[0].id, DERIVED_OFFICIAL_PROFILE_ID);
+        assert_eq!(config.profiles[0].provider_id(), "openai");
+        assert_eq!(config.active_profile_id, DERIVED_OFFICIAL_PROFILE_ID);
+        assert_eq!(
+            config.selected_models_by_provider["openai"],
+            ["gpt-5.6-terra"]
+        );
+        assert_eq!(
+            config.manual_third_party_models_by_provider["openai"],
+            ["manual-model"]
+        );
+        assert_eq!(
+            config.declared_official_models_by_provider["openai"],
+            ["gpt-5.6-luna"]
+        );
+        assert_eq!(
+            config.upstream_models_by_provider["openai"],
+            ["gpt-5.6-terra"]
+        );
+        assert_eq!(config.default_model_by_provider["openai"], "gpt-5.6-terra");
+        assert_eq!(config.default_model, "openai/gpt-5.6-terra");
+        assert_eq!(config.subagent_model, "openai/gpt-5.6-luna");
+        assert!(
+            config
+                .subagent_roles
+                .values()
+                .all(|selection| selection.model == "openai/gpt-5.6-luna")
+        );
+        assert!(
+            !config
+                .selected_models_by_provider
+                .contains_key("local-official")
+        );
+        assert!(
+            !config
+                .manual_third_party_models_by_provider
+                .contains_key("local-official")
+        );
+        assert!(
+            !config
+                .declared_official_models_by_provider
+                .contains_key("local-official")
+        );
+        assert!(
+            !config
+                .upstream_models_by_provider
+                .contains_key("local-official")
+        );
+        assert!(
+            !config
+                .default_model_by_provider
+                .contains_key("local-official")
         );
     }
 
@@ -2538,7 +2822,7 @@ mod tests {
 
     #[test]
     fn prompt_optimization_round_trips_without_persisting_clear_flag() {
-        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[],"promptOptimization":{"enabled":true,"baseUrl":" https://api.example.com/v1/ ","apiKey":"sk-secret","model":" gpt-x ","protocol":"responses","instruction":" 保持简洁 "}}"#)
+        let config = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[],"promptOptimization":{"enabled":true,"mode":"manual","baseUrl":" https://api.example.com/v1/ ","apiKey":"sk-secret","model":" gpt-x ","upstreamProtocol":"anthropicMessages","instruction":" 保持简洁 "}}"#)
             .unwrap()
             .normalize();
         let serialized = serde_json::to_value(&config).unwrap();
@@ -2551,8 +2835,19 @@ mod tests {
         assert_eq!(config.prompt_optimization.api_key, "sk-secret");
         assert!(config.prompt_optimization.api_key_configured);
         assert_eq!(config.prompt_optimization.model, "gpt-x");
+        assert_eq!(
+            config.prompt_optimization.mode,
+            PROMPT_OPTIMIZATION_MODE_MANUAL
+        );
+        assert_eq!(
+            config.prompt_optimization.upstream_protocol,
+            UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES
+        );
         assert_eq!(config.prompt_optimization.instruction, "保持简洁");
-        assert!(serialized["promptOptimization"].get("protocol").is_none());
+        assert_eq!(
+            serialized["promptOptimization"]["upstreamProtocol"],
+            UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES
+        );
         assert!(
             serialized["promptOptimization"]
                 .get("clearApiKey")

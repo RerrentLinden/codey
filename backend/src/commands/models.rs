@@ -1395,6 +1395,7 @@ pub(super) fn renderer_model_catalog_value(
                 "route_prefix": entry.route_prefix,
                 "provider_id": entry.request_provider_id,
                 "source_model": entry.request_model,
+                "official_account": entry.official_account,
                 "supported_reasoning_efforts": entry.supported_reasoning_efforts,
                 "default_reasoning_effort": entry.default_reasoning_effort,
             });
@@ -1441,6 +1442,7 @@ struct RendererRouteModelEntry {
     provider_id: String,
     request_provider_id: String,
     request_model: String,
+    official_account: bool,
     route_name: String,
     route_prefix: String,
     model: String,
@@ -1542,6 +1544,7 @@ fn renderer_route_model_catalog(
                 provider_id: provider_id.clone(),
                 request_provider_id,
                 request_model,
+                official_account: profile.official_account,
                 route_name: route_name.to_string(),
                 route_prefix: route_prefix.clone(),
                 is_default,
@@ -2255,10 +2258,18 @@ mod tests {
             official_metadata["route_provider_id"].as_str(),
             Some("openai")
         );
+        assert_eq!(official_metadata["official_account"], true);
         assert_eq!(
             official_metadata["upstream_model"].as_str(),
             Some("gpt-5.6-sol")
         );
+        let relay_metadata = catalog["model_metadata"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["model"].as_str() == Some("relay/gpt-5.6-sol"))
+            .unwrap();
+        assert_eq!(relay_metadata["official_account"], false);
     }
 
     #[test]

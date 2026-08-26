@@ -70,23 +70,6 @@ function localDateCacheKey(date: Date) {
   ].join("");
 }
 
-function configWithoutPromptOptimization(config: Config): Partial<Config> {
-  const comparable: Partial<Config> = { ...config };
-  delete comparable.settingsRevision;
-  delete comparable.promptOptimization;
-  return comparable;
-}
-
-function hasUnsavedConfigOutsidePromptOptimization(
-  current: Config,
-  persisted: Config,
-) {
-  return (
-    JSON.stringify(configWithoutPromptOptimization(current)) !==
-    JSON.stringify(configWithoutPromptOptimization(persisted))
-  );
-}
-
 function thirdPartyRouteModelState(
   config: Config,
   route: Profile,
@@ -690,41 +673,6 @@ export function App({
     });
   }
 
-  async function syncPromptOptimizationCurrentProvider() {
-    if (!config || isBusy) return false;
-    const currentConfig = config;
-    setBusy("sync-prompt-provider");
-    try {
-      const result = await invoke<{ config: Config }>(
-        "sync_prompt_optimization_current_provider",
-        { config: currentConfig.promptOptimization },
-      );
-      const hasOtherDraft = hasUnsavedConfigOutsidePromptOptimization(
-        currentConfig,
-        result.config,
-      );
-      persistedConfigRef.current = result.config;
-      setConfig(
-        hasOtherDraft
-          ? {
-              ...currentConfig,
-              settingsRevision: result.config.settingsRevision,
-              promptOptimization: result.config.promptOptimization,
-            }
-          : result.config,
-      );
-      setDirty(hasOtherDraft);
-      window.dispatchEvent(
-        new CustomEvent("codey:config-changed", {
-          detail: { config: result.config },
-        }),
-      );
-      return true;
-    } finally {
-      setBusy(null);
-    }
-  }
-
   async function saveCurrent() {
     if (!config) return;
     await runOperation("save", async () => {
@@ -955,9 +903,6 @@ export function App({
     (routeId: string, model: string) => {
       void setRouteDefaultModel(routeId, model);
     },
-  );
-  const handleSyncPromptOptimizationCurrentProvider = useStableEvent(
-    syncPromptOptimizationCurrentProvider,
   );
   const handleClearTraceLogs = useStableEvent(askClearTraceLogs);
   const handleRefreshTraceLogStats = useStableEvent(
@@ -1251,14 +1196,10 @@ export function App({
             <div className="prompt-column">
               <PromptOptimizationCard
                 config={config}
-                provider={provider}
-                busy={busy}
                 isBusy={isBusy}
                 popupContainer={popupContainer}
+                subagentModelOptions={subagentModelOptions}
                 onConfigChange={handleConfigChange}
-                onSyncCurrentProvider={
-                  handleSyncPromptOptimizationCurrentProvider
-                }
               />
             </div>
 

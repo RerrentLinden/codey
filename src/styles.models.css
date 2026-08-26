@@ -525,7 +525,7 @@
   padding: 3px 10px;
   border: 1px solid rgba(0, 0, 0, 0.08);
   border-radius: 7px;
-  background: #f7f7f9;
+  background: #f2f2f5;
   color: var(--mac-text-primary);
   font-size: 12px;
   font-weight: 500;
@@ -537,21 +537,19 @@
     border-color 130ms ease,
     background 130ms ease,
     box-shadow 130ms ease,
-    transform 130ms ease,
     color 130ms ease;
   line-height: 1.3;
 }
 
 .model-tag-pill:hover:not(:disabled) {
-  background: #ffffff;
-  border-color: rgba(0, 122, 255, 0.4);
-  color: var(--mac-blue);
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.04), 0 0 0 1px rgba(0, 122, 255, 0.12);
-  transform: translateY(-1px);
+  background: #e7e7eb;
+  border-color: rgba(0, 0, 0, 0.14);
+  color: var(--mac-text-primary);
 }
 
 .model-tag-pill:active:not(:disabled) {
-  transform: scale(0.97);
+  background: #dedee3;
+  transform: scale(0.98);
 }
 
 .model-tag-pill:disabled {
@@ -560,18 +558,15 @@
 
 /* Default Model Tag Pill */
 .model-tag-pill.is-default {
-  background: rgba(0, 122, 255, 0.08);
-  border-color: rgba(0, 122, 255, 0.32);
+  background: rgba(0, 122, 255, 0.09);
+  border-color: rgba(0, 122, 255, 0.28);
   color: var(--mac-blue);
   font-weight: 600;
-  box-shadow: 0 1px 3px rgba(0, 122, 255, 0.08);
 }
 
 .model-tag-pill.is-default:hover {
-  background: rgba(0, 122, 255, 0.12);
-  border-color: rgba(0, 122, 255, 0.45);
-  box-shadow: 0 2px 6px rgba(0, 122, 255, 0.14);
-  transform: none;
+  background: rgba(0, 122, 255, 0.14);
+  border-color: rgba(0, 122, 255, 0.4);
 }
 
 /* Indicator inside tag */
@@ -589,13 +584,12 @@
   width: 5px;
   height: 5px;
   border-radius: 50%;
-  background: rgba(0, 0, 0, 0.22);
-  transition: all 130ms ease;
+  background: rgba(0, 0, 0, 0.25);
+  transition: background 130ms ease;
 }
 
 .model-tag-pill:hover:not(:disabled) .model-tag-dot {
-  background: var(--mac-blue);
-  transform: scale(1.2);
+  background: rgba(0, 0, 0, 0.45);
 }
 
 .model-tag-name {
