@@ -886,12 +886,12 @@ async fn terminal_notification_was_sent(
 #[derive(Debug)]
 struct WebhookDispatchError {
     detail: String,
-    uncertain: bool,
+    settle_delivery: bool,
 }
 
 impl WebhookDispatchError {
-    fn is_uncertain(&self) -> bool {
-        self.uncertain
+    fn should_settle_delivery(&self) -> bool {
+        self.settle_delivery
     }
 }
 
@@ -929,7 +929,7 @@ async fn dispatch_webhook_channels(
     });
     let results = collect_webhook_deliveries(deliveries).await;
     let mut errors = Vec::new();
-    let mut uncertain = false;
+    let mut settle_delivery = false;
     let mut notifications = state.webhook_notifications.lock().await;
     for (delivery_key, result) in results {
         match result {
@@ -937,8 +937,8 @@ async fn dispatch_webhook_channels(
                 notifications.remember_settled(delivery_key);
             }
             Err(error) => {
-                if error.is_uncertain() {
-                    uncertain = true;
+                if error.should_settle_delivery() {
+                    settle_delivery = true;
                     notifications.remember_settled(delivery_key);
                 }
                 errors.push(error.to_string());
@@ -951,7 +951,7 @@ async fn dispatch_webhook_channels(
     } else {
         Err(WebhookDispatchError {
             detail: format!("部分通知渠道发送失败：{}", errors.join("；")),
-            uncertain,
+            settle_delivery,
         })
     }
 }
@@ -1013,7 +1013,7 @@ async fn dispatch_settled_webhook_failure(
     .with_reasoning_effort(reasoning_effort);
     if let Err(error) = dispatch_webhook_channels(state, channels, &event, &failed_key).await {
         let mut notifications = state.webhook_notifications.lock().await;
-        if error.is_uncertain() {
+        if error.should_settle_delivery() {
             notifications.settle(failed_key);
         } else {
             notifications.abandon(&failed_key);
@@ -1132,7 +1132,7 @@ async fn notify_webhook_completion(
     if let Err(error) = dispatch_webhook_channels(state, channels, &event, &notification_key).await
     {
         let mut notifications = state.webhook_notifications.lock().await;
-        if error.is_uncertain() {
+        if error.should_settle_delivery() {
             notifications.settle(notification_key);
         } else {
             notifications.abandon(&notification_key);
@@ -1243,7 +1243,7 @@ async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Resul
     .with_reasoning_effort(reasoning_effort);
     if let Err(error) = dispatch_webhook_channels(state, channels, &event, &notification_key).await
     {
-        if error.is_uncertain() {
+        if error.should_settle_delivery() {
             state
                 .webhook_notifications
                 .lock()

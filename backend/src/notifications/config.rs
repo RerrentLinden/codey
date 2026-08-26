@@ -152,6 +152,10 @@ impl NotificationChannelConfig {
             return Err("请先通过扫码登录微信 ClawBot");
         }
         let url = reqwest::Url::parse(value).map_err(|_| INVALID_URL)?;
+        #[cfg(test)]
+        if self.allow_insecure_test_url {
+            return Ok(url);
+        }
         let host = url.host_str().unwrap_or_default();
         let official_host = host == "ilinkai.weixin.qq.com" || host.ends_with(".weixin.qq.com");
         if url.scheme() != "https"

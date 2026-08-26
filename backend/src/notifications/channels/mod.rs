@@ -18,6 +18,9 @@ pub(super) trait NotificationChannelAdapter: Send + Sync {
         None
     }
     fn mark_prepared(&self) {}
+    fn settle_on_success_status_error(&self) -> bool {
+        false
+    }
     fn build_request(&self, client: &Client, event: &NotificationEvent) -> Result<RequestBuilder>;
     fn validate_response(&self, body: &str) -> std::result::Result<(), String>;
     fn sanitize_error(&self, error: &str) -> String;

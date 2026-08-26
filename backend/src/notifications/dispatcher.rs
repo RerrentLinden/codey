@@ -10,26 +10,26 @@ use super::{NotificationChannelConfig, NotificationEvent};
 #[derive(Debug)]
 pub struct NotificationDeliveryError {
     message: String,
-    uncertain: bool,
+    settle_delivery: bool,
 }
 
 impl NotificationDeliveryError {
-    fn definitive(message: String) -> Self {
+    fn retryable(message: String) -> Self {
         Self {
             message,
-            uncertain: false,
+            settle_delivery: false,
         }
     }
 
-    fn uncertain(message: String) -> Self {
+    fn settled(message: String) -> Self {
         Self {
             message,
-            uncertain: true,
+            settle_delivery: true,
         }
     }
 
-    pub fn is_uncertain(&self) -> bool {
-        self.uncertain
+    pub fn should_settle_delivery(&self) -> bool {
+        self.settle_delivery
     }
 }
 
@@ -62,25 +62,26 @@ impl NotificationDispatcher {
         &self,
         event: &NotificationEvent,
     ) -> std::result::Result<(), NotificationDeliveryError> {
-        self.send_with_attempts(event, 2).await
+        if !self.config.enabled || !self.config.is_configured() {
+            return Ok(());
+        }
+        let adapter = adapter_for(&self.config);
+        self.send_with_attempts(event, adapter.as_ref(), 2).await
     }
 
     async fn send_with_attempts(
         &self,
         event: &NotificationEvent,
+        adapter: &dyn NotificationChannelAdapter,
         attempts: u32,
     ) -> std::result::Result<(), NotificationDeliveryError> {
-        if !self.config.enabled || !self.config.is_configured() {
-            return Ok(());
-        }
-        let adapter = adapter_for(&self.config);
-        let preparation_error = self.prepare_channel(adapter.as_ref()).await;
+        let preparation_error = self.prepare_channel(adapter).await;
         let mut last_error = None;
         for attempt in 0..attempts.max(1) {
             let request = adapter
                 .build_request(&self.client, event)
                 .map_err(|error| {
-                    NotificationDeliveryError::definitive(format!(
+                    NotificationDeliveryError::retryable(format!(
                         "{}消息发送失败：{}",
                         adapter.display_name(),
                         adapter.sanitize_error(&error.to_string())
@@ -91,13 +92,23 @@ impl NotificationDispatcher {
                     let status = response.status();
                     match response.text().await {
                         Ok(response_body) => {
-                            match validate_http_response(adapter.as_ref(), status, &response_body) {
+                            match validate_http_response(adapter, status, &response_body) {
                                 Ok(()) => return Ok(()),
-                                Err(error) => last_error = Some(error),
+                                Err(error) => {
+                                    if status.is_success()
+                                        && adapter.settle_on_success_status_error()
+                                    {
+                                        return Err(NotificationDeliveryError::settled(format!(
+                                            "{}消息发送失败：{error}",
+                                            adapter.display_name()
+                                        )));
+                                    }
+                                    last_error = Some(error);
+                                }
                             }
                         }
                         Err(error) => {
-                            return Err(NotificationDeliveryError::uncertain(format!(
+                            return Err(NotificationDeliveryError::settled(format!(
                                 "{}消息发送结果不确定，已停止自动重试：{}",
                                 adapter.display_name(),
                                 adapter.sanitize_error(&format!(
@@ -110,7 +121,7 @@ impl NotificationDispatcher {
                 }
                 Err(error) => {
                     if error.is_timeout() || !error.is_connect() {
-                        return Err(NotificationDeliveryError::uncertain(format!(
+                        return Err(NotificationDeliveryError::settled(format!(
                             "{}消息发送结果不确定，已停止自动重试：{}",
                             adapter.display_name(),
                             adapter.sanitize_error(&error.to_string())
@@ -129,7 +140,7 @@ impl NotificationDispatcher {
             error.push_str(&preparation_error);
             error.push('）');
         }
-        Err(NotificationDeliveryError::definitive(format!(
+        Err(NotificationDeliveryError::retryable(format!(
             "{}消息发送失败：{}",
             adapter.display_name(),
             adapter.sanitize_error(&error)
@@ -141,8 +152,6 @@ impl NotificationDispatcher {
         if let Some(error) = adapter.configuration_error() {
             anyhow::bail!(error);
         }
-        drop(adapter);
-
         let event = NotificationEvent::new(
             "codey.test",
             "test-session",
@@ -157,8 +166,9 @@ impl NotificationDispatcher {
         tester.config.enabled = true;
         // A test click must finish promptly and report the real first error.
         // Background notifications only retry failures known not to be timeouts.
+        let adapter = adapter_for(&tester.config);
         tester
-            .send_with_attempts(&event, 1)
+            .send_with_attempts(&event, adapter.as_ref(), 1)
             .await
             .map_err(anyhow::Error::new)?;
         Ok(json!({"status":"ok", "eventId": event.event_id}))
@@ -287,10 +297,74 @@ mod tests {
 
         let error = dispatcher.send(&event).await.unwrap_err();
 
-        assert!(error.is_uncertain());
+        assert!(error.should_settle_delivery());
         assert!(error.to_string().contains("已停止自动重试"));
         server.await.unwrap();
         assert_eq!(request_count.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn clawbot_does_not_retry_after_an_ambiguous_success_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut send_requests = 0;
+            for response_body in [r#"{"ret":0}"#, "not json"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 8192];
+                let bytes_read = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..bytes_read]);
+                if request.contains("POST /ilink/bot/sendmessage ") {
+                    send_requests += 1;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+
+            if let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_millis(500), listener.accept()).await
+            {
+                let mut request = [0_u8; 8192];
+                let bytes_read = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..bytes_read]);
+                if request.contains("POST /ilink/bot/sendmessage ") {
+                    send_requests += 1;
+                }
+            }
+            send_requests
+        });
+        let config = NotificationChannelConfig {
+            id: "ambiguous-clawbot".to_string(),
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: format!("http://{address}"),
+            bot_token: "test-bot-token".to_string(),
+            context_token: "test-context-token".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        };
+        let dispatcher = NotificationDispatcher::new(config).unwrap();
+        let event = NotificationEvent::new(
+            "session.completed",
+            "session-clawbot",
+            "profile-clawbot",
+            "Codex",
+            0,
+            None,
+        );
+
+        let error = dispatcher.send(&event).await.unwrap_err();
+
+        assert!(error.should_settle_delivery());
+        assert!(error.to_string().contains("无法解析"));
+        assert_eq!(server.await.unwrap(), 1);
     }
 
     #[tokio::test]

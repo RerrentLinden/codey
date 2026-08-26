@@ -86,6 +86,10 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
         mark_wechat_claw_binding_started(self.config);
     }
 
+    fn settle_on_success_status_error(&self) -> bool {
+        true
+    }
+
     fn validate_response(&self, body: &str) -> std::result::Result<(), String> {
         validate_wechat_claw_response(body)
     }
@@ -224,34 +228,39 @@ fn truncate_text(text: &str) -> String {
 }
 
 fn validate_wechat_claw_response(body: &str) -> std::result::Result<(), String> {
+    if body.trim().is_empty() {
+        return Ok(());
+    }
     let value = serde_json::from_str::<Value>(body)
         .map_err(|_| "微信 ClawBot 返回了无法解析的响应".to_string())?;
-    let result = value
-        .get("ret")
-        .and_then(Value::as_i64)
-        .ok_or_else(|| "微信 ClawBot 没有返回明确的发送结果".to_string())?;
+    let Some(payload) = value.as_object() else {
+        return Err("微信 ClawBot 返回了无效的响应结构".to_string());
+    };
+    if payload.is_empty() {
+        return Ok(());
+    }
     let message = value
         .get("errmsg")
+        .or_else(|| value.get("err_msg"))
+        .or_else(|| value.get("message"))
         .and_then(Value::as_str)
         .unwrap_or("未知错误");
-    if result != 0 {
-        if result == -2 && message.trim().eq_ignore_ascii_case("prepare failed") {
-            return Err(
-                "微信 ClawBot 暂时无法准备投递。请重新扫码，并按提示先在微信中向 ClawBot 发送一条消息完成激活；若仍失败，请稍后重试".to_string(),
-            );
-        }
-        return Err(format!(
-            "微信 ClawBot 返回错误 {result}：{}",
-            bounded_remote_message(message)
-        ));
-    }
-    if let Some(errcode) = value.get("errcode") {
-        let errcode = errcode
+    for key in ["ret", "errcode", "err_code"] {
+        let Some(raw_result) = value.get(key) else {
+            continue;
+        };
+        let result = raw_result
             .as_i64()
+            .or_else(|| raw_result.as_str()?.trim().parse::<i64>().ok())
             .ok_or_else(|| "微信 ClawBot 返回了无效的业务状态".to_string())?;
-        if errcode != 0 {
+        if result != 0 {
+            if result == -2 && message.trim().eq_ignore_ascii_case("prepare failed") {
+                return Err(
+                    "微信 ClawBot 暂时无法准备投递。请重新扫码，并按提示先在微信中向 ClawBot 发送一条消息完成激活；若仍失败，请稍后重试".to_string(),
+                );
+            }
             return Err(format!(
-                "微信 ClawBot 返回错误 {errcode}：{}",
+                "微信 ClawBot 返回错误 {result}：{}",
                 bounded_remote_message(message)
             ));
         }
@@ -318,6 +327,12 @@ mod tests {
     }
 
     #[test]
+    fn clawbot_settles_an_ambiguous_success_response() {
+        let config = configured_channel();
+        assert!(WechatClawChannel::new(&config).settle_on_success_status_error());
+    }
+
+    #[test]
     fn channel_is_not_ready_until_activation_context_is_available() {
         let mut config = configured_channel();
         config.context_token.clear();
@@ -360,12 +375,19 @@ mod tests {
     }
 
     #[test]
-    fn response_requires_a_successful_ret_value() {
+    fn response_accepts_http_success_without_a_redundant_result_field() {
+        assert!(validate_wechat_claw_response("").is_ok());
+        assert!(validate_wechat_claw_response("{}").is_ok());
+        assert!(validate_wechat_claw_response("null").is_err());
         assert!(validate_wechat_claw_response(r#"{"ret":0}"#).is_ok());
         assert!(validate_wechat_claw_response(r#"{"ret":0,"errcode":0}"#).is_ok());
-        assert!(validate_wechat_claw_response("{}").is_err());
         assert!(validate_wechat_claw_response(r#"{"ret":0,"errcode":null}"#).is_err());
         assert!(validate_wechat_claw_response(r#"{"ret":0,"errcode":-1}"#).is_err());
+        assert!(validate_wechat_claw_response(r#"{"errcode":-1}"#).is_err());
+        assert!(
+            validate_wechat_claw_response(r#"{"err_code":"-2","err_msg":"prepare failed"}"#)
+                .is_err()
+        );
         assert!(
             validate_wechat_claw_response(r#"{"ret":-14,"errmsg":"token expired"}"#)
                 .unwrap_err()
@@ -377,6 +399,15 @@ mod tests {
                 .contains("重新扫码")
         );
         assert!(validate_wechat_claw_response("not json").is_err());
+    }
+
+    #[test]
+    fn each_outbound_message_uses_a_fresh_client_id() {
+        let event = NotificationEvent::new("session.completed", "s1", "p1", "Codex", 0, None);
+        let first = wechat_claw_body(&event, "recipient@im.wechat", "context-token");
+        let second = wechat_claw_body(&event, "recipient@im.wechat", "context-token");
+
+        assert_ne!(first["msg"]["client_id"], second["msg"]["client_id"]);
     }
 
     #[test]
