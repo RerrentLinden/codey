@@ -23,6 +23,7 @@ fn patch_expression(options: PatchOptions) -> String {
     patch_expression_with_runtime_overrides(options, &[])
 }
 
+#[cfg(test)]
 fn patch_expression_with_runtime_overrides(
     options: PatchOptions,
     runtime_config_overrides: &[String],
