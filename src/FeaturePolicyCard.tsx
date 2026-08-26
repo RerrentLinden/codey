@@ -9,7 +9,6 @@ import type {
 import {
   ActionIcon,
   Badge,
-  Button,
   Card,
   Select,
   Switch,
@@ -83,11 +82,6 @@ const WRITABLE_SUBAGENT_ROLE_IDS = [
   "codey_worker",
   "codey_visual_worker",
 ] as const satisfies ReadonlyArray<SubagentRoleId>;
-const READ_ONLY_SUBAGENT_ROLE_IDS = [
-  "codey_quick_scan",
-  "codey_deep_research",
-  "codey_visual_analysis",
-] as const satisfies ReadonlyArray<SubagentRoleId>;
 
 export type SubagentPolicyCardProps = {
   config: Config;
@@ -130,31 +124,6 @@ export function SubagentPolicyCardComponent({
       ? `可写子代理已全部关闭；${enabledReadOnlyRoleNames.join("、")}仍可使用。`
       : "可写子代理已全部关闭；请先启用至少一个只读角色。";
 
-  const disableWritableRoles = () => {
-    const subagentRoles = { ...config.subagentRoles };
-    for (const role of WRITABLE_SUBAGENT_ROLE_IDS) {
-      const selection = subagentRoles[role] ?? {
-        enabled: true,
-        model: config.subagentModel,
-        reasoningEffort: config.subagentReasoningEffort,
-      };
-      subagentRoles[role] = { ...selection, enabled: false };
-    }
-    if (
-      READ_ONLY_SUBAGENT_ROLE_IDS.every(
-        (role) => subagentRoles[role]?.enabled === false,
-      )
-    ) {
-      const quickScan = subagentRoles.codey_quick_scan ?? {
-        enabled: true,
-        model: config.subagentModel,
-        reasoningEffort: config.subagentReasoningEffort,
-      };
-      subagentRoles.codey_quick_scan = { ...quickScan, enabled: true };
-    }
-    onConfigChange({ ...config, subagentRoles });
-  };
-
   return (
     <section className="secondary-section subagent-section" aria-labelledby="subagent-title">
       <div className="section-title compact">
@@ -180,32 +149,17 @@ export function SubagentPolicyCardComponent({
         <div className="subagent-policy-body">
           {config.subagentOptimization ? (
             <>
-              <div className="subagent-role-actions">
-                <div>
-                  <strong>按角色启用</strong>
-                  <span>开关只控制角色是否可用；只读或写入权限由系统固定。</span>
-                </div>
-                <Button
-                  variant="outline"
-                  size="xs"
-                  disabled={subagentPolicyControlsDisabled || writableRolesDisabled}
-                  onClick={disableWritableRoles}
-                >
-                  关闭全部可写角色
-                </Button>
-              </div>
-              <Table.ScrollContainer minWidth={680}>
+              <div className="subagent-table-container">
                 <Table
                   withRowBorders
                   className="subagent-table"
                 >
                   <Table.Thead>
                     <Table.Tr>
-                      <Table.Th style={{ width: "10%" }}>启用</Table.Th>
-                      <Table.Th style={{ width: "21%" }}>任务角色</Table.Th>
-                      <Table.Th style={{ width: "15%" }}>权限</Table.Th>
-                      <Table.Th style={{ width: "34%" }}>指定模型</Table.Th>
-                      <Table.Th style={{ width: "20%" }}>思考深度</Table.Th>
+                      <Table.Th style={{ width: "44px" }}>启用</Table.Th>
+                      <Table.Th style={{ width: "135px" }}>任务角色</Table.Th>
+                      <Table.Th>指定模型</Table.Th>
+                      <Table.Th style={{ width: "115px" }}>思考深度</Table.Th>
                     </Table.Tr>
                   </Table.Thead>
                   <Table.Tbody>
@@ -258,6 +212,12 @@ export function SubagentPolicyCardComponent({
                           <Table.Td>
                             <div className="subagent-role-name">
                               <span>{task.name}</span>
+                              <Badge
+                                variant={task.access === "write" ? "warning" : "secondary"}
+                                size="xs"
+                              >
+                                {task.access === "write" ? "可写" : "只读"}
+                              </Badge>
                               <Tooltip
                                 content={task.description}
                                 getPopupContainer={() =>
@@ -278,14 +238,6 @@ export function SubagentPolicyCardComponent({
                                 </ActionIcon>
                               </Tooltip>
                             </div>
-                          </Table.Td>
-                          <Table.Td>
-                            <Badge
-                              variant={task.access === "write" ? "warning" : "secondary"}
-                              size="sm"
-                            >
-                              {task.access === "write" ? "可修改文件" : "只读"}
-                            </Badge>
                           </Table.Td>
                           <Table.Td>
                             <ModelCombobox
@@ -359,7 +311,7 @@ export function SubagentPolicyCardComponent({
                     })}
                   </Table.Tbody>
                 </Table>
-              </Table.ScrollContainer>
+              </div>
               <div className="subagent-policy-callout">
                 <IconInfoCircle size={14} className="subagent-callout-icon" aria-hidden="true" />
                 <div className="subagent-callout-text">

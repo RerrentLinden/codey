@@ -487,10 +487,10 @@
   white-space: nowrap;
 }
 
-/* Prompt Optimization + Subagent Policy Matrix Row: 各占一半 (50% / 50%) */
+/* Prompt Optimization + Subagent Policy Matrix Row: 4:6 布局 (40% / 60%) */
 .prompt-subagent-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 4fr) minmax(0, 6fr);
   gap: 24px;
   align-items: stretch;
   margin-bottom: 24px;

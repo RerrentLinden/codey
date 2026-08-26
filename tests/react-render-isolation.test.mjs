@@ -95,6 +95,7 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
     /disabled=\{isBusy \|\| dirty \|\| config\.profiles\.length <= 1\}/,
   );
   assert.match(sections, /统一模型目录/);
+  assert.doesNotMatch(sections, /catalog-search|searchQuery|搜索模型\.\.\./);
   assert.match(sections, /第三方线路同时接入统一路由/);
   assert.match(sections, /已接入路由/);
   assert.doesNotMatch(sections, /aria-pressed|route-list-select/);

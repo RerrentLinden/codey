@@ -8,12 +8,10 @@ import {
   IconInfoCircle,
   IconPlus as Plus,
   IconRefresh as RefreshCw,
-  IconSearch,
   IconServer as Server,
   IconShieldCheck,
   IconTrash as Trash,
   IconWorld,
-  IconX,
 } from "@tabler/icons-react";
 
 import type { Config, ModelState, Profile } from "./App.types";
@@ -150,7 +148,6 @@ function ModelSectionComponent({
   const [routeValidationAttempted, setRouteValidationAttempted] = useState(false);
   const [routeApiKeyVisible, setRouteApiKeyVisible] = useState(false);
   const [officialModelDraft, setOfficialModelDraft] = useState<string[]>([]);
-  const [searchQuery, setSearchQuery] = useState("");
   const [selectedProviderFilter, setSelectedProviderFilter] = useState<string>("all");
 
   const visibleProfiles = useMemo(
@@ -259,26 +256,10 @@ function ModelSectionComponent({
   };
 
   const displayedGroups = useMemo(() => {
-    const providerGroups = selectedProviderFilter === "all"
+    return selectedProviderFilter === "all"
       ? modelGroups
       : modelGroups.filter((group) => group.providerId === selectedProviderFilter);
-    const term = searchQuery.trim().toLowerCase();
-    if (!term) return providerGroups;
-    return providerGroups.map((group) => {
-      return {
-        ...group,
-        models: group.models.filter((model) => {
-          const displayName = group.official
-            ? officialDisplayNames.get(modelKey(model)) || model
-            : model;
-          return (
-            model.toLowerCase().includes(term) ||
-            displayName.toLowerCase().includes(term)
-          );
-        }),
-      };
-    });
-  }, [modelGroups, officialDisplayNames, searchQuery, selectedProviderFilter]);
+  }, [modelGroups, selectedProviderFilter]);
 
   const openNewRouteDialog = () => {
     setRouteDraft(createRoute(config.profiles));
@@ -502,28 +483,6 @@ function ModelSectionComponent({
                 </div>
                 <small>选择模型时，本地路由会自动分发到所属供应商</small>
               </div>
-              <div className="catalog-search-wrap">
-                <div className="catalog-search-input-box">
-                  <IconSearch size={13} className="catalog-search-icon" aria-hidden="true" />
-                  <input
-                    type="text"
-                    className="catalog-search-input"
-                    placeholder="搜索模型..."
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                  />
-                  {searchQuery && (
-                    <button
-                      type="button"
-                      className="catalog-search-clear"
-                      onClick={() => setSearchQuery("")}
-                      aria-label="清除搜索"
-                    >
-                      <IconX size={12} />
-                    </button>
-                  )}
-                </div>
-              </div>
             </div>
 
             {modelGroups.length > 1 && (
@@ -574,14 +533,12 @@ function ModelSectionComponent({
               className="provider-model-groups"
               role={modelGroups.length > 1 ? "tabpanel" : undefined}
             >
-              {displayedGroups.map((group) => {
-                const isSearching = searchQuery.trim().length > 0;
-                return (
-                  <section
-                    className="provider-model-group"
-                    key={group.providerId}
-                    aria-labelledby={`provider-model-${group.profile.id}`}
-                  >
+              {displayedGroups.map((group) => (
+                <section
+                  className="provider-model-group"
+                  key={group.providerId}
+                  aria-labelledby={`provider-model-${group.profile.id}`}
+                >
                     <div className="provider-model-group-heading">
                       <div className="provider-heading-main">
                         <div
@@ -674,13 +631,6 @@ function ModelSectionComponent({
                           );
                         })}
                       </div>
-                    ) : isSearching ? (
-                      <div className="provider-model-empty">
-                        <div className="provider-empty-content">
-                          <IconSearch size={16} className="provider-empty-icon" aria-hidden="true" />
-                          <span>未匹配到相关模型</span>
-                        </div>
-                      </div>
                     ) : (
                       <div className="provider-model-empty">
                         <div className="provider-empty-content">
@@ -704,19 +654,8 @@ function ModelSectionComponent({
                         </Button>
                       </div>
                     )}
-                  </section>
-                );
-              })}
-              {displayedGroups.every((g) => g.models.length === 0) && searchQuery && (
-                <div className="catalog-no-results">
-                  <IconSearch size={22} className="no-results-icon" aria-hidden="true" />
-                  <strong>未找到符合 &ldquo;{searchQuery}&rdquo; 的模型</strong>
-                  <p>请尝试搜索其他关键字，或检查供应商配置。</p>
-                  <Button variant="outline" size="xs" onClick={() => setSearchQuery("")}>
-                    清除搜索条件
-                  </Button>
-                </div>
-              )}
+                </section>
+              ))}
             </div>
           </div>
         </div>
