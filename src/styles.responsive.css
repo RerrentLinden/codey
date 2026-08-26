@@ -26,8 +26,8 @@
     border-bottom: 1px solid rgba(0, 0, 0, 0.06);
   }
 
-  .route-manager {
-    min-height: 0;
+  .route-list {
+    max-height: 320px;
   }
 
   .route-catalog-pane {
@@ -35,7 +35,7 @@
   }
 
   .provider-model-groups {
-    max-height: 440px;
+    max-height: 320px;
   }
 }
 
@@ -83,7 +83,8 @@
     grid-template-columns: 1fr;
   }
 
-  .route-form-grid {
+  .route-form-grid,
+  .route-editor-row-names {
     grid-template-columns: 1fr;
   }
 

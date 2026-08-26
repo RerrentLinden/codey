@@ -346,33 +346,6 @@ impl SubagentRoleConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SubagentProviderConfig {
-    #[serde(default = "default_subagent_model")]
-    pub model: String,
-    #[serde(default = "default_subagent_reasoning_effort")]
-    pub reasoning_effort: String,
-    #[serde(default)]
-    pub roles: BTreeMap<String, SubagentRoleConfig>,
-}
-
-impl Default for SubagentProviderConfig {
-    fn default() -> Self {
-        Self {
-            model: default_subagent_model(),
-            reasoning_effort: default_subagent_reasoning_effort(),
-            roles: default_subagent_roles(),
-        }
-    }
-}
-
-impl SubagentProviderConfig {
-    fn normalize(&mut self) {
-        normalize_subagent_config(&mut self.model, &mut self.reasoning_effort, &mut self.roles);
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeModelTarget {
     pub route_id: String,
@@ -461,15 +434,6 @@ pub struct CodeyConfig {
     /// `default` role so older Codey stores and Codex builds remain readable.
     #[serde(default)]
     pub subagent_roles: BTreeMap<String, SubagentRoleConfig>,
-    /// Legacy per-provider subagent selections are accepted only for one-time
-    /// migration. Codey persists the scalar and role fields above as the sole
-    /// authoritative subagent configuration.
-    #[serde(default, rename = "subagentConfigByProvider", skip_serializing)]
-    pub legacy_subagent_config_by_provider: BTreeMap<String, SubagentProviderConfig>,
-    /// Tracks the one-time migration that turns existing non-default role
-    /// selections into provider-scoped official-model declarations.
-    #[serde(default)]
-    pub subagent_role_model_support_migrated: bool,
     /// Tracks whether Codey has already consumed the one-time default route
     /// import window. Existing non-empty configs are treated as already
     /// initialized so later launches never overwrite saved third-party routes
@@ -525,8 +489,6 @@ impl Default for CodeyConfig {
             subagent_model: default_subagent_model(),
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
             subagent_roles: default_subagent_roles(),
-            legacy_subagent_config_by_provider: BTreeMap::new(),
-            subagent_role_model_support_migrated: true,
             initial_route_import_completed: false,
             hide_full_access_warning: false,
             show_account_usage_in_header: true,
@@ -601,20 +563,7 @@ impl CodeyConfig {
             &mut self.subagent_reasoning_effort,
             &mut self.subagent_roles,
         );
-        self.legacy_subagent_config_by_provider
-            .retain(|provider_id, selection| {
-                selection.normalize();
-                !provider_id.trim().is_empty()
-            });
-        if !self.subagent_role_model_support_migrated {
-            self.migrate_custom_subagent_role_model_support();
-            self.subagent_role_model_support_migrated = true;
-        }
-        self.normalize_global_default_model();
         self.normalize_subagent_model_references();
-        // The legacy map is input-only. Clearing it guarantees every subsequent
-        // save contains exactly one global subagent role matrix.
-        self.legacy_subagent_config_by_provider.clear();
         if !self.initial_route_import_completed && !self.looks_like_empty_default_route() {
             self.initial_route_import_completed = true;
         }
@@ -1009,53 +958,10 @@ impl CodeyConfig {
         normalize_model_list(upstream_models);
     }
 
-    fn migrate_custom_subagent_role_model_support(&mut self) {
-        let defaults = default_subagent_roles();
-        let legacy_uniform_defaults =
-            uniform_subagent_roles(DEFAULT_SUBAGENT_MODEL, DEFAULT_SUBAGENT_REASONING_EFFORT);
-        let mut migration_sources = self.legacy_subagent_config_by_provider.clone();
-        if let Some(provider_id) = self.current_provider_id().map(ToString::to_string) {
-            // Older stores could have only the global scalar/role fields for the
-            // active route. Preserve that one-time provenance migration without
-            // making the legacy provider map authoritative again.
-            migration_sources.insert(provider_id, self.active_subagent_config());
-        }
-        let migrations = migration_sources
-            .iter()
-            .filter_map(|(provider_id, config)| {
-                if config.roles == defaults || config.roles == legacy_uniform_defaults {
-                    return None;
-                }
-                let models = config
-                    .roles
-                    .iter()
-                    .filter(|(role, selection)| {
-                        defaults
-                            .get(*role)
-                            .is_none_or(|default| default != *selection)
-                    })
-                    .map(|(_, selection)| selection.model.clone())
-                    .collect::<Vec<_>>();
-                (!models.is_empty()).then(|| (provider_id.clone(), models))
-            })
-            .collect::<Vec<_>>();
-        for (provider_id, models) in migrations {
-            self.remember_provider_official_model_support(&provider_id, models);
-        }
-    }
-
     fn provider_is_official(&self, provider_id: &str) -> bool {
         self.profiles
             .iter()
             .any(|profile| profile.official_account && profile.provider_id() == provider_id)
-    }
-
-    fn active_subagent_config(&self) -> SubagentProviderConfig {
-        SubagentProviderConfig {
-            model: self.subagent_model.clone(),
-            reasoning_effort: self.subagent_reasoning_effort.clone(),
-            roles: self.subagent_roles.clone(),
-        }
     }
 
     fn normalize_subagent_model_references(&mut self) {
@@ -2489,92 +2395,6 @@ mod tests {
     }
 
     #[test]
-    fn existing_custom_role_models_are_migrated_once_without_changing_defaults() {
-        let mut profile = ProviderProfile::new("Third party");
-        profile.id = "third-party".into();
-        let mut roles = default_subagent_roles();
-        roles.get_mut(SUBAGENT_ROLE_QUICK_SCAN).unwrap().model = "gpt-5.6-luna".into();
-        roles.get_mut(SUBAGENT_ROLE_DEEP_RESEARCH).unwrap().model = "gpt-5.6-luna".into();
-        roles
-            .get_mut(SUBAGENT_ROLE_WORKER)
-            .unwrap()
-            .reasoning_effort = "max".into();
-        roles
-            .get_mut(SUBAGENT_ROLE_VISUAL_WORKER)
-            .unwrap()
-            .reasoning_effort = "max".into();
-        let mut config = CodeyConfig {
-            active_profile_id: profile.id.clone(),
-            profiles: vec![profile],
-            subagent_optimization: true,
-            subagent_roles: roles.clone(),
-            subagent_role_model_support_migrated: false,
-            ..CodeyConfig::default()
-        };
-        config
-            .upstream_models_by_provider
-            .insert("third-party".into(), vec!["provider-custom-model".into()]);
-
-        let normalized = config.normalize();
-
-        assert_eq!(normalized.subagent_roles, roles);
-        assert!(normalized.subagent_role_model_support_migrated);
-        assert_eq!(
-            normalized.declared_official_models_by_provider["third-party"],
-            ["gpt-5.6-luna", "gpt-5.6-terra"]
-        );
-        assert_eq!(
-            normalized.upstream_models_by_provider["third-party"],
-            ["provider-custom-model", "gpt-5.6-luna", "gpt-5.6-terra"]
-        );
-        assert_eq!(
-            default_subagent_roles()[SUBAGENT_ROLE_QUICK_SCAN],
-            SubagentRoleConfig::new(DEFAULT_SUBAGENT_MODEL, "low")
-        );
-
-        let mut after_explicit_removal = normalized;
-        after_explicit_removal
-            .declared_official_models_by_provider
-            .insert("third-party".into(), vec!["gpt-5.6-terra".into()]);
-        after_explicit_removal.upstream_models_by_provider.insert(
-            "third-party".into(),
-            vec!["provider-custom-model".into(), "gpt-5.6-terra".into()],
-        );
-        let after_explicit_removal = after_explicit_removal.normalize();
-
-        assert_eq!(
-            after_explicit_removal.declared_official_models_by_provider["third-party"],
-            ["gpt-5.6-terra"]
-        );
-        assert!(
-            !after_explicit_removal.upstream_models_by_provider["third-party"]
-                .iter()
-                .any(|model| model_id::equal(model, "gpt-5.6-luna"))
-        );
-    }
-
-    #[test]
-    fn custom_roles_do_not_declare_models_for_an_official_provider() {
-        let mut profile = ProviderProfile::new("Official");
-        profile.id = "openai".into();
-        profile.official_account = true;
-        let mut roles = default_subagent_roles();
-        roles.get_mut(SUBAGENT_ROLE_QUICK_SCAN).unwrap().model = "gpt-5.6-luna".into();
-        let config = CodeyConfig {
-            active_profile_id: profile.id.clone(),
-            profiles: vec![profile],
-            subagent_roles: roles.clone(),
-            subagent_role_model_support_migrated: false,
-            ..CodeyConfig::default()
-        }
-        .normalize();
-
-        assert_eq!(config.subagent_roles, roles);
-        assert!(config.declared_official_models_by_provider.is_empty());
-        assert!(config.upstream_models_by_provider.is_empty());
-    }
-
-    #[test]
     fn subagent_defaults_preserve_models_and_invalid_effort_falls_back() {
         let config = serde_json::from_str::<CodeyConfig>(
             r#"{"activeProfileId":"","profiles":[],"subagentModel":"  provider-coder  ","subagentReasoningEffort":"unsupported"}"#,
@@ -2635,7 +2455,7 @@ mod tests {
     }
 
     #[test]
-    fn subagent_config_is_global_and_legacy_provider_entries_are_not_persisted() {
+    fn subagent_config_is_global_and_obsolete_provider_entries_are_ignored() {
         let mut provider_a = ProviderProfile::new("A");
         provider_a.id = "provider-a".into();
         let mut provider_b = ProviderProfile::new("B");
@@ -2650,19 +2470,10 @@ mod tests {
             subagent_model: "provider-a/model-a".into(),
             subagent_reasoning_effort: "high".into(),
             subagent_roles: uniform_subagent_roles("provider-a/model-a", "high"),
-            legacy_subagent_config_by_provider: BTreeMap::from([(
-                "provider-b".into(),
-                SubagentProviderConfig {
-                    model: "provider-b/model-b".into(),
-                    reasoning_effort: "low".into(),
-                    roles: uniform_subagent_roles("provider-b/model-b", "low"),
-                },
-            )]),
             ..CodeyConfig::default()
         }
         .normalize();
 
-        assert!(config.legacy_subagent_config_by_provider.is_empty());
         assert_eq!(config.subagent_model, "provider-a/model-a");
 
         config.active_profile_id = "provider-b".into();
@@ -2677,6 +2488,24 @@ mod tests {
 
         let serialized = serde_json::to_value(&config).unwrap();
         assert!(serialized.get("subagentConfigByProvider").is_none());
+
+        let obsolete = serde_json::from_value::<CodeyConfig>(serde_json::json!({
+            "activeProfileId": "",
+            "profiles": [],
+            "subagentModel": "global-model",
+            "subagentReasoningEffort": "high",
+            "subagentConfigByProvider": {
+                "provider-b": {
+                    "model": "provider-b/model-b",
+                    "reasoningEffort": "low",
+                    "roles": {}
+                }
+            }
+        }))
+        .unwrap()
+        .normalize();
+        assert_eq!(obsolete.subagent_model, "global-model");
+        assert!(serde_json::to_value(obsolete).unwrap()["subagentConfigByProvider"].is_null());
     }
 
     #[test]

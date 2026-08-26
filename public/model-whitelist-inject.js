@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "29";
+  const patchVersion = "30";
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
   const gatewayProviderIds = new Set([
@@ -275,12 +275,29 @@
   };
   const routedRequestParams = (method, source, model, providerId, route) => {
     const usesCodeyRoute = Boolean(requestProviderId(route?.routeProviderId));
-    const routedProviderId = isGatewayProviderId(providerId)
-      && (usesCodeyRoute || method === "thread/resume")
-      ? localRouterProviderId
-      : providerId;
+    const routeProviderId = requestProviderId(route?.routeProviderId);
+    const threadId = threadIdFromParams(source);
+    const currentProviderId = providerBoundExistingThreadMethods.has(method)
+      ? (threadId ? knownThreadProvider(source) : paramsProviderId(source))
+      : "";
+    // A task that has not yet resumed through Codey's carrier can still use
+    // its original OpenAI provider for an official model. Keep that request
+    // direct and translate the renderer-only selector back to the real model
+    // id. Third-party routes remain blocked until the task is resumed.
+    const preservesLegacyOfficialCarrier = method !== "thread/resume"
+      && modelKey(currentProviderId) === officialProviderId
+      && modelKey(routeProviderId) === officialProviderId;
+    const routedProviderId = preservesLegacyOfficialCarrier
+      ? officialProviderId
+      : isGatewayProviderId(providerId)
+        && (usesCodeyRoute || method === "thread/resume")
+        ? localRouterProviderId
+        : providerId;
+    const routedModel = preservesLegacyOfficialCarrier
+      ? cleanText(route?.sourceModel) || model
+      : model;
     const next = { ...source };
-    if (model || Object.hasOwn(source, "model")) next.model = model;
+    if (routedModel || Object.hasOwn(source, "model")) next.model = routedModel;
     delete next.model_provider;
     if (threadProviderRequestMethods.has(method)) {
       if (routedProviderId) next.modelProvider = routedProviderId;
@@ -291,8 +308,7 @@
       // metadata remains untouched by a resume-time override.
       delete next.modelProvider;
     }
-    const routeProviderId = requestProviderId(route?.routeProviderId);
-    if (method === "turn/start" && routeProviderId) {
+    if (method === "turn/start" && routeProviderId && !preservesLegacyOfficialCarrier) {
       const existingMetadata = source[routeMetadataParam];
       next[routeMetadataParam] = {
         ...(existingMetadata && typeof existingMetadata === "object"
@@ -300,13 +316,17 @@
           : {}),
         [routeMetadataKey]: routeProviderId,
       };
+    } else if (preservesLegacyOfficialCarrier) {
+      const existingMetadata = source[routeMetadataParam];
+      if (existingMetadata && typeof existingMetadata === "object") {
+        const nextMetadata = { ...existingMetadata };
+        delete nextMetadata[routeMetadataKey];
+        if (Object.keys(nextMetadata).length > 0) next[routeMetadataParam] = nextMetadata;
+        else delete next[routeMetadataParam];
+      }
     }
-    const threadId = threadIdFromParams(source);
     let blocked = false;
     if (providerBoundExistingThreadMethods.has(method) && routedProviderId) {
-      const currentProviderId = threadId
-        ? knownThreadProvider(source)
-        : paramsProviderId(source);
       // `turn/start` has no modelProvider field, so a provider change is only
       // safe during `thread/resume`. In particular, an un-migrated built-in
       // OpenAI task must not send a third-party model directly to OpenAI.

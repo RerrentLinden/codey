@@ -114,7 +114,7 @@ function validateRouteDraft(route: Profile, profiles: readonly Profile[]): Route
   errors.baseUrl = validateOutboundApiUrl(route.baseUrl);
   const hasApiKey =
     route.apiKey.trim() !== "" ||
-    (route.apiKeyConfigured && !route.clearApiKey);
+    Boolean(route.apiKeyConfigured);
   if (!hasApiKey) errors.apiKey = "请输入 API Key";
   return errors;
 }
@@ -289,7 +289,7 @@ function ModelSectionComponent({
   };
   const openEditRouteDialog = (profile: Profile) => {
     const official = profile.authMode === "officialAccount";
-    setRouteDraft({ ...profile, clearApiKey: false });
+    setRouteDraft({ ...profile });
     setRouteValidationAttempted(false);
     setRouteApiKeyVisible(false);
     if (official) {
@@ -315,7 +315,7 @@ function ModelSectionComponent({
       setRouteValidationAttempted(true);
       requestAnimationFrame(() => {
         const firstInvalid = document.querySelector<HTMLInputElement>(
-          ".route-editor-fields [aria-invalid='true']",
+          ".route-editor-form [aria-invalid='true']",
         );
         firstInvalid?.focus();
       });
@@ -635,51 +635,41 @@ function ModelSectionComponent({
                     </div>
 
                     {group.models.length > 0 ? (
-                      <div className="provider-capsules-grid">
+                      <div className="provider-model-tags">
                         {group.models.map((model) => {
                           const isDefault = modelIdsEqual(group.defaultModel, model);
                           const displayName = group.official
                             ? officialDisplayNames.get(modelKey(model)) || model
                             : model;
-                          const showSlug = group.official && displayName !== model;
                           return (
                             <button
                               type="button"
                               key={`${group.providerId}:${model}`}
-                              className={`model-capsule${isDefault ? " is-default" : ""}`}
+                              className={`model-tag-pill${isDefault ? " is-default" : ""}`}
                               disabled={isBusy || dirty || isDefault}
                               onClick={() => onSetDefaultModel(group.profile.id, model)}
                               title={
                                 isDefault
-                                  ? `${displayName} (当前默认)`
-                                  : `点击设为默认模型: ${displayName}`
+                                  ? `${displayName}（当前默认模型）`
+                                  : `点击设为默认模型：${displayName}`
+                              }
+                              aria-label={
+                                isDefault
+                                  ? `${displayName}，当前默认模型`
+                                  : `设 ${displayName} 为默认模型`
                               }
                             >
-                              <div className="model-capsule-left">
-                                <div className={`model-capsule-indicator ${isDefault ? "default-indicator" : ""}`}>
-                                  {isDefault ? (
-                                    <Check size={11} aria-hidden="true" />
-                                  ) : (
-                                    <span className="indicator-dot" aria-hidden="true" />
-                                  )}
-                                </div>
-                                <div className="model-capsule-text">
-                                  <span className="model-capsule-name">{displayName}</span>
-                                  {showSlug && (
-                                    <span className="model-capsule-slug">{model}</span>
-                                  )}
-                                </div>
-                              </div>
-                                <div className="model-capsule-right">
-                                  {isDefault ? (
-                                    <span className="capsule-tag-default">
-                                      <Check size={10} strokeWidth={2.5} aria-hidden="true" />
-                                      默认
-                                    </span>
-                                  ) : (
-                                    <span className="capsule-tag-action">设为默认</span>
-                                  )}
-                                </div>
+                              <span className="model-tag-indicator" aria-hidden="true">
+                                {isDefault ? (
+                                  <Check size={11} strokeWidth={2.5} />
+                                ) : (
+                                  <span className="model-tag-dot" />
+                                )}
+                              </span>
+                              <span className="model-tag-name">{displayName}</span>
+                              {isDefault && (
+                                <span className="model-tag-badge">默认</span>
+                              )}
                             </button>
                           );
                         })}
@@ -834,67 +824,71 @@ function ModelSectionComponent({
               </div>
             ) : (
               <div className="route-editor-form">
-                <label className="route-field">
-                  <span>线路名</span>
-                  <Input
-                    id="route-name-input"
-                    aria-label="线路名"
-                    aria-invalid={Boolean(
-                      routeDraftErrors?.name &&
-                      (routeValidationAttempted || routeDraft.name.length > 0),
-                    )}
-                    aria-describedby={
-                      routeDraftErrors?.name &&
-                      (routeValidationAttempted || routeDraft.name.length > 0)
-                        ? "route-name-error"
-                        : undefined
-                    }
-                    value={routeDraft.name}
-                    disabled={isBusy}
-                    onChange={(event) => updateRouteDraft({ name: event.target.value })}
-                  />
-                  {routeDraftErrors?.name &&
-                  (routeValidationAttempted || routeDraft.name.length > 0) ? (
-                    <small id="route-name-error" className="text-[#d70015]" role="alert">
-                      {routeDraftErrors.name}
-                    </small>
-                  ) : null}
-                </label>
-                <label className="route-field">
-                  <span>短名称</span>
-                  <Input
-                    id="route-short-name-input"
-                    aria-label="短名称"
-                    error={Boolean(
-                      routeDraftErrors?.shortName &&
-                      (routeValidationAttempted || routeDraft.shortName.length > 0),
-                    )}
-                    aria-errormessage={
-                      routeDraftErrors?.shortName &&
-                      (routeValidationAttempted || routeDraft.shortName.length > 0)
-                        ? "route-short-name-error"
-                        : undefined
-                    }
-                    value={routeDraft.shortName}
-                    disabled={isBusy}
-                    placeholder="如：主、备、中转"
-                    onChange={(event) =>
-                      updateRouteDraft({ shortName: event.target.value })}
-                  />
-                  <small id="route-short-name-hint" className="route-field-hint">
+                <div className="route-editor-row route-editor-row-names">
+                  <label className="route-field">
+                    <span>线路名</span>
+                    <Input
+                      id="route-name-input"
+                      aria-label="线路名"
+                      aria-invalid={Boolean(
+                        routeDraftErrors?.name &&
+                        (routeValidationAttempted || routeDraft.name.length > 0),
+                      )}
+                      aria-describedby={
+                        routeDraftErrors?.name &&
+                        (routeValidationAttempted || routeDraft.name.length > 0)
+                          ? "route-name-error"
+                          : undefined
+                      }
+                      value={routeDraft.name}
+                      disabled={isBusy}
+                      placeholder="如：主线路、备用中转"
+                      onChange={(event) => updateRouteDraft({ name: event.target.value })}
+                    />
+                    {routeDraftErrors?.name &&
+                    (routeValidationAttempted || routeDraft.name.length > 0) ? (
+                      <small id="route-name-error" className="text-[#d70015]" role="alert">
+                        {routeDraftErrors.name}
+                      </small>
+                    ) : null}
+                  </label>
+                  <label className="route-field">
+                    <span>短名称</span>
+                    <Input
+                      id="route-short-name-input"
+                      aria-label="短名称"
+                      error={Boolean(
+                        routeDraftErrors?.shortName &&
+                        (routeValidationAttempted || routeDraft.shortName.length > 0),
+                      )}
+                      aria-errormessage={
+                        routeDraftErrors?.shortName &&
+                        (routeValidationAttempted || routeDraft.shortName.length > 0)
+                          ? "route-short-name-error"
+                          : undefined
+                      }
+                      value={routeDraft.shortName}
+                      disabled={isBusy}
+                      placeholder="如：主、备"
+                      onChange={(event) =>
+                        updateRouteDraft({ shortName: event.target.value })}
+                    />
+                    {routeDraftErrors?.shortName &&
+                    (routeValidationAttempted || routeDraft.shortName.length > 0) ? (
+                      <small
+                        id="route-short-name-error"
+                        className="text-[#d70015]"
+                        role="alert"
+                      >
+                        {routeDraftErrors.shortName}
+                      </small>
+                    ) : null}
+                  </label>
+                  <small id="route-short-name-hint" className="route-field-hint route-editor-span-all">
                     最多 2 个字符且不可重复，模型名称前会显示为 [短名称]
                   </small>
-                  {routeDraftErrors?.shortName &&
-                  (routeValidationAttempted || routeDraft.shortName.length > 0) ? (
-                    <small
-                      id="route-short-name-error"
-                      className="text-[#d70015]"
-                      role="alert"
-                    >
-                      {routeDraftErrors.shortName}
-                    </small>
-                  ) : null}
-                </label>
+                </div>
+
                 <div className="route-field">
                   <span id="route-protocol-label">上游协议</span>
                   <Select
@@ -914,6 +908,7 @@ function ModelSectionComponent({
                     请选择上游实际支持的接口协议；Chat Completions 与 Anthropic Messages 会由本地路由适配为 Codex 可用格式。
                   </small>
                 </div>
+
                 <label className="route-field">
                   <span>URL</span>
                   <Input
@@ -945,6 +940,7 @@ function ModelSectionComponent({
                     </small>
                   ) : null}
                 </label>
+
                 <label className="route-field">
                   <span>Key</span>
                   <PasswordInput
@@ -965,17 +961,13 @@ function ModelSectionComponent({
                     disabled={isBusy}
                     placeholder={
                       routeDraft.apiKeyConfigured
-                        ? "已保存（点击眼睛查看，或输入新 Key 替换）"
+                        ? "已保存（输入新 Key 替换）"
                         : routeDraft.upstreamProtocol === "anthropicMessages"
                           ? "sk-ant-..."
                           : "sk-..."
                     }
                     onChange={(event) => {
-                      const value = event.target.value;
-                      updateRouteDraft({
-                        apiKey: value,
-                        clearApiKey: value.trim() === "" ? routeDraft.clearApiKey : false,
-                      });
+                      updateRouteDraft({ apiKey: event.target.value });
                     }}
                     visibilityToggleIcon={({ reveal }) =>
                       reveal ? (
@@ -997,46 +989,11 @@ function ModelSectionComponent({
                       {routeDraftErrors.apiKey}
                     </small>
                   ) : null}
-                  {routeDraft.apiKeyConfigured && !routeDraft.clearApiKey && (
-                    <Button
-                      className="route-clear-key"
-                      type="button"
-                      variant="ghost"
-                      size="xs"
-                      disabled={isBusy}
-                      onClick={() => {
-                        setRouteApiKeyVisible(false);
-                        updateRouteDraft({
-                          apiKey: "",
-                          apiKeyConfigured: false,
-                          clearApiKey: true,
-                        });
-                      }}
-                    >
-                      清除已保存 Key
-                    </Button>
-                  )}
                 </label>
               </div>
             )}
 
             <DialogFooter className="route-editor-footer">
-              {routeDraft.authMode !== "officialAccount" &&
-                config.profiles.some((profile) => profile.id === routeDraft.id) && (
-                <Button
-                  className="catalog-model-delete route-editor-delete"
-                  variant="ghost"
-                  disabled={isBusy || config.profiles.length <= 1}
-                  onClick={() => {
-                    setRouteDialogOpen(false);
-                    setRouteDraft(null);
-                    onDeleteRoute(routeDraft.id);
-                  }}
-                >
-                  <Trash aria-hidden="true" />
-                  删除线路
-                </Button>
-                )}
               <Button
                 variant="outline"
                 disabled={isBusy}

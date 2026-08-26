@@ -12,10 +12,11 @@ use tokio::sync::{Mutex, oneshot};
 
 use super::AppState;
 use crate::codex_config::codex_home;
-use crate::config::{CodeyConfig, ConfigStore};
+use crate::config::{CodeyConfig, ConfigStore, OFFICIAL_ROUTE_SHORT_NAME};
 use crate::notifications::{NotificationChannelConfig, NotificationDispatcher, NotificationEvent};
 use crate::pending_approval;
 use crate::pending_approval::{CompletedTurn, RecentSessionEvents, SessionLifecycleStatus};
+use crate::{local_router, model_id};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -762,6 +763,65 @@ fn webhook_session_configuration(
     (model, reasoning_effort)
 }
 
+fn webhook_display_model(config: &CodeyConfig, requested_model: &str) -> String {
+    let requested_model = requested_model.trim();
+    if requested_model.is_empty() {
+        return "Codex".to_string();
+    }
+
+    let mut matching_raw_profile = None;
+    for profile in &config.profiles {
+        let provider_id = profile.provider_id().trim();
+        if provider_id.is_empty() {
+            continue;
+        }
+
+        let alias_prefix = local_router::model_alias(provider_id, "");
+        if let Some(model) = requested_model
+            .strip_prefix(&alias_prefix)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            return format_webhook_model_name(profile, model);
+        }
+
+        let enabled_models = if profile.official_account {
+            config.enabled_official_route_models(provider_id)
+        } else {
+            config.enabled_route_models(provider_id)
+        };
+        if enabled_models
+            .iter()
+            .any(|model| model_id::equal(model, requested_model))
+        {
+            if matching_raw_profile.is_some() {
+                // A raw model shared by multiple routes has no reliable route
+                // identity, so retain it instead of showing a misleading prefix.
+                matching_raw_profile = None;
+                break;
+            }
+            matching_raw_profile = Some(profile);
+        }
+    }
+
+    matching_raw_profile
+        .map(|profile| format_webhook_model_name(profile, requested_model))
+        .unwrap_or_else(|| requested_model.to_string())
+}
+
+fn format_webhook_model_name(profile: &crate::config::ProviderProfile, model: &str) -> String {
+    let prefix = if profile.official_account {
+        OFFICIAL_ROUTE_SHORT_NAME
+    } else {
+        profile.short_name.trim()
+    };
+    if prefix.is_empty() {
+        model.to_string()
+    } else {
+        format!("[{prefix}] {model}")
+    }
+}
+
 fn webhook_turn_configuration(
     events: &RecentSessionEvents,
     session_id: &str,
@@ -1007,22 +1067,6 @@ async fn notify_webhook_completion(
     if terminal_notification_was_sent(state, &session_id, &turn_id).await {
         return Ok(json!({"status":"duplicate"}));
     }
-    let (channels, profile_id) = {
-        let config = state.config.read().await;
-        (
-            config.webhook.channels.clone(),
-            config
-                .active_profile()
-                .map(|profile| profile.id)
-                .unwrap_or_default(),
-        )
-    };
-    if !channels
-        .iter()
-        .any(|channel| channel.enabled && channel.is_configured())
-    {
-        return Ok(json!({"status":"skipped","reason":"disabled"}));
-    }
     let requested_model = payload
         .get("model")
         .and_then(Value::as_str)
@@ -1034,6 +1078,23 @@ async fn notify_webhook_completion(
         .unwrap_or_default();
     let (model, reasoning_effort) =
         webhook_session_configuration(requested_model, requested_reasoning_effort);
+    let (channels, profile_id, model) = {
+        let config = state.config.read().await;
+        (
+            config.webhook.channels.clone(),
+            config
+                .active_profile()
+                .map(|profile| profile.id)
+                .unwrap_or_default(),
+            webhook_display_model(&config, &model),
+        )
+    };
+    if !channels
+        .iter()
+        .any(|channel| channel.enabled && channel.is_configured())
+    {
+        return Ok(json!({"status":"skipped","reason":"disabled"}));
+    }
     if let Some(error) = rollout_error {
         return dispatch_settled_webhook_failure(
             state,
@@ -1122,7 +1183,7 @@ async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Resul
         .unwrap_or_default();
     let (model, reasoning_effort) =
         webhook_session_configuration(requested_model, requested_reasoning_effort);
-    let (channels, profile_id) = {
+    let (channels, profile_id, model) = {
         let config = state.config.read().await;
         (
             config.webhook.channels.clone(),
@@ -1130,6 +1191,7 @@ async fn notify_webhook_waiting(state: &Arc<AppState>, payload: &Value) -> Resul
                 .active_profile()
                 .map(|profile| profile.id)
                 .unwrap_or_default(),
+            webhook_display_model(&config, &model),
         )
     };
     if !channels
@@ -1314,6 +1376,57 @@ mod tests {
             webhook_turn_configuration(&events, "session-1", "missing"),
             ("Codex".to_string(), "默认".to_string())
         );
+    }
+
+    #[test]
+    fn webhook_models_use_the_same_route_prefix_as_the_model_picker() {
+        let mut official = crate::config::ProviderProfile::new("官方线路");
+        official.id = "official".into();
+        official.official_account = true;
+        official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+
+        let mut relay = crate::config::ProviderProfile::new("中转线路");
+        relay.id = "relay".into();
+        relay.short_name = "中转".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "relay-key".into();
+        relay.normalize();
+
+        let mut config = CodeyConfig {
+            profiles: vec![official, relay],
+            active_profile_id: "relay".into(),
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        };
+        config
+            .selected_models_by_provider
+            .insert("relay".into(), vec!["claude-opus-4-8".into()]);
+        config = config.normalize();
+
+        assert_eq!(
+            webhook_display_model(
+                &config,
+                &local_router::model_alias("relay", "claude-opus-4-8"),
+            ),
+            "[中转] claude-opus-4-8"
+        );
+        assert_eq!(
+            webhook_display_model(
+                &config,
+                &local_router::model_alias("official", "gpt-5.6-sol"),
+            ),
+            "[官] gpt-5.6-sol"
+        );
+        assert_eq!(
+            webhook_display_model(&config, "claude-opus-4-8"),
+            "[中转] claude-opus-4-8"
+        );
+        assert_eq!(
+            webhook_display_model(&config, "unknown-model"),
+            "unknown-model"
+        );
+        assert_eq!(webhook_display_model(&config, ""), "Codex");
     }
 
     #[test]

@@ -347,7 +347,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "29");
+  assert.equal(patch.version, "30");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -1191,6 +1191,73 @@ test("an id-less app-server resume records its router migration after request cr
     threadId: "id-less-resume-thread",
     model: alias,
     responsesapiClientMetadata: { codey_route: "relay" },
+  });
+  runtime.patch.dispose();
+});
+
+test("an unmigrated OpenAI thread can keep using an official route directly", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["openai/gpt-5.6-sol", "relay/gpt-5.5"],
+    default_model: "relay/gpt-5.5",
+    model_metadata: [
+      {
+        model: "openai/gpt-5.6-sol",
+        route_name: "OpenAI 官方直登",
+        provider_id: "codey_router",
+        source_model: "gpt-5.6-sol",
+        route_provider_id: "openai",
+      },
+      {
+        model: "relay/gpt-5.5",
+        route_name: "中转线路",
+        provider_id: "codey_router",
+        source_model: "gpt-5.5",
+        route_provider_id: "relay",
+      },
+    ],
+  }, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "thread-list",
+        result: {
+          data: [{ id: "unmigrated-official-thread", modelProvider: "openai" }],
+        },
+      },
+    },
+  });
+
+  const selected = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "select-official-on-unmigrated-thread",
+      method: "thread/settings/update",
+      params: {
+        threadId: "unmigrated-official-thread",
+        model: "openai/gpt-5.6-sol",
+      },
+    },
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(selected), false);
+  assert.deepEqual(selected.request.params, {
+    threadId: "unmigrated-official-thread",
+    model: "gpt-5.6-sol",
+  });
+
+  const nextTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "turn-on-unmigrated-official-thread",
+      method: "turn/start",
+      params: { threadId: "unmigrated-official-thread" },
+    },
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(nextTurn), false);
+  assert.deepEqual(nextTurn.request.params, {
+    threadId: "unmigrated-official-thread",
+    model: "gpt-5.6-sol",
   });
   runtime.patch.dispose();
 });

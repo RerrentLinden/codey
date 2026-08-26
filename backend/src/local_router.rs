@@ -1341,10 +1341,10 @@ impl ResponsesToolName {
         }
     }
 
-    fn custom(name: &str) -> Self {
+    fn custom_in_namespace(namespace: &[String], name: &str) -> Self {
         Self {
             kind: ResponsesToolKind::Custom,
-            namespace: Vec::new(),
+            namespace: namespace.to_vec(),
             name: name.to_string(),
         }
     }
@@ -2438,17 +2438,13 @@ fn append_responses_custom_tool_call_item(
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())
         .ok_or_else(|| anyhow::anyhow!("custom_tool_call 缺少 name"))?;
-    if object
-        .get("namespace")
-        .is_some_and(|value| !value.is_null())
-    {
-        anyhow::bail!("custom_tool_call 不支持 namespace");
-    }
     let input = object
         .get("input")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow::anyhow!("custom_tool_call.input 必须是字符串"))?;
-    let tool_name = ResponsesToolName::custom(name);
+    let namespace =
+        responses_namespace_path(object.get("namespace"), "custom_tool_call.namespace")?;
+    let tool_name = ResponsesToolName::custom_in_namespace(&namespace, name);
     let upstream_name = tool_bridge.upstream_name_for_call(&tool_name)?;
     let arguments = wrap_custom_tool_input(input)?;
     append_chat_assistant_tool_call(messages, call_id, &upstream_name, &arguments)
@@ -2675,11 +2671,8 @@ fn append_responses_tool_to_chat_tools(
         );
     }
     if tool_type == Some("custom") {
-        if !namespace_path.is_empty() {
-            anyhow::bail!("namespace.tools 只支持 function 工具，不能包含 custom");
-        }
         let name = response_function_name(object, "custom tool")?.to_string();
-        let tool_name = ResponsesToolName::custom(&name);
+        let tool_name = ResponsesToolName::custom_in_namespace(namespace_path, &name);
         let original_definition = Value::Object(object.clone());
         let Some(upstream_name) = register_custom_tool_name(
             tool_name,
@@ -2718,7 +2711,7 @@ fn append_responses_tool_to_chat_tools(
     }
     if !namespace_path.is_empty() {
         let tool_name = tool_type.unwrap_or("unknown");
-        anyhow::bail!("namespace.tools 只支持 function 工具，不能包含 {tool_name}");
+        anyhow::bail!("namespace.tools 不支持工具类型 {tool_name}");
     }
     let tool_name = tool_type.unwrap_or("unknown");
     anyhow::bail!(
@@ -2865,9 +2858,16 @@ fn register_custom_tool_name(
         if existing_definition == original_definition {
             return Ok(None);
         }
-        anyhow::bail!("custom 工具 {} 存在定义冲突", tool_name.name);
+        anyhow::bail!(
+            "custom 工具 {}{} 存在定义冲突",
+            tool_name
+                .namespace_string()
+                .map(|namespace| format!("{namespace}."))
+                .unwrap_or_default(),
+            tool_name.name,
+        );
     }
-    let upstream_name = custom_upstream_tool_name(&tool_name.name);
+    let upstream_name = custom_upstream_tool_name(&tool_name.namespace, &tool_name.name);
     if let Some(existing) = upstream_names.get(&upstream_name)
         && existing != &tool_name
     {
@@ -2952,9 +2952,15 @@ fn namespaced_upstream_tool_name(namespace: &[String], name: &str) -> String {
     format!("{NAMESPACE_UPSTREAM_TOOL_PREFIX}{stem}{suffix}")
 }
 
-fn custom_upstream_tool_name(name: &str) -> String {
-    let hash = stable_tool_hash_hex(&format!("custom\u{1e}{name}"));
-    let stem = sanitize_upstream_tool_stem(name);
+fn custom_upstream_tool_name(namespace: &[String], name: &str) -> String {
+    let canonical = format!("custom\u{1e}{}\u{1e}{name}", namespace.join("\u{1f}"));
+    let hash = stable_tool_hash_hex(&canonical);
+    let stem_source = if namespace.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}__{name}", namespace.join("__"))
+    };
+    let stem = sanitize_upstream_tool_stem(&stem_source);
     let suffix = format!("__{hash}");
     let max_stem_len = UPSTREAM_FUNCTION_NAME_MAX_BYTES
         .saturating_sub(CUSTOM_UPSTREAM_TOOL_PREFIX.len())
@@ -3105,14 +3111,12 @@ fn responses_tool_choice_to_chat_tool_choice(
                     responses_tool_name_from_call_object(object, "function tool_choice")?
                 }
                 Some("custom") => {
-                    if object
-                        .get("namespace")
-                        .is_some_and(|value| !value.is_null())
-                    {
-                        anyhow::bail!("custom tool_choice 不支持 namespace");
-                    }
                     let name = response_function_name(object, "custom tool_choice")?;
-                    ResponsesToolName::custom(name)
+                    let namespace = responses_namespace_path(
+                        object.get("namespace"),
+                        "custom tool_choice.namespace",
+                    )?;
+                    ResponsesToolName::custom_in_namespace(&namespace, name)
                 }
                 _ => {
                     let tool_name = choice_type.unwrap_or("unknown");
@@ -6860,6 +6864,76 @@ mod tests {
     }
 
     #[test]
+    fn namespace_custom_tools_bridge_for_anthropic_requests_and_responses() {
+        let raw_input = "*** Begin Patch\n*** End Patch";
+        let converted = responses_to_anthropic_messages_request(&json!({
+            "model":"provider-model",
+            "input":[
+                "apply it",
+                {
+                    "type":"custom_tool_call",
+                    "call_id":"call-patch",
+                    "namespace":"workspace",
+                    "name":"apply_patch",
+                    "input":raw_input
+                }
+            ],
+            "tools":[{
+                "type":"namespace",
+                "name":"workspace",
+                "tools":[{
+                    "type":"custom",
+                    "name":"apply_patch",
+                    "description":"Apply a patch"
+                }]
+            }],
+            "tool_choice":{
+                "type":"custom",
+                "namespace":"workspace",
+                "name":"apply_patch"
+            }
+        }))
+        .unwrap();
+
+        let upstream_name = converted.body["tools"][0]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(upstream_name.starts_with(CUSTOM_UPSTREAM_TOOL_PREFIX));
+        assert_eq!(
+            converted.body["tool_choice"]["name"],
+            Value::String(upstream_name.clone())
+        );
+        assert_eq!(
+            converted.body["messages"][1]["content"][0]["name"],
+            Value::String(upstream_name.clone())
+        );
+        assert_eq!(
+            converted.body["messages"][1]["content"][0]["input"]["input"],
+            raw_input
+        );
+
+        let restored = anthropic_message_to_responses_body_with_tool_bridge(
+            &json!({
+                "type":"message",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"call-result",
+                    "name":upstream_name,
+                    "input":{"input":raw_input}
+                }]
+            }),
+            "provider-model",
+            &converted.tool_bridge,
+        )
+        .unwrap();
+        assert_eq!(restored["output"][0]["type"], "custom_tool_call");
+        assert_eq!(restored["output"][0]["namespace"], "workspace");
+        assert_eq!(restored["output"][0]["name"], "apply_patch");
+        assert_eq!(restored["output"][0]["input"], raw_input);
+    }
+
+    #[test]
     fn custom_tools_deduplicate_identical_definitions_and_reject_conflicts() {
         let definition = json!({
             "type":"custom",
@@ -6885,7 +6959,7 @@ mod tests {
         .unwrap_err();
         assert!(conflict.to_string().contains("定义冲突"));
 
-        let generated = custom_upstream_tool_name("apply_patch");
+        let generated = custom_upstream_tool_name(&[], "apply_patch");
         let collision = responses_to_chat_completions_request(&json!({
             "model":"provider-model",
             "input":"hello",

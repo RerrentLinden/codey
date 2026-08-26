@@ -1812,7 +1812,6 @@ mod tests {
                 .contains_key("route-b")
         );
         assert!(!next.upstream_models_by_provider.contains_key("route-b"));
-        assert!(next.legacy_subagent_config_by_provider.is_empty());
 
         let valid_aliases = next
             .runtime_model_targets()
