@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "32";
+  const patchVersion = "35";
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
   const legacyOfficialRouteProviderIds = new Set([
@@ -250,8 +250,7 @@
     modelKey(currentProviderId) === modelKey(targetProviderId)
     || (
       method === "thread/resume"
-      && isGatewayProviderId(currentProviderId)
-      && isGatewayProviderId(targetProviderId)
+      && modelKey(targetProviderId) === localRouterProviderId
     )
   );
   const markPatchedProvider = (params, providerId) => {
@@ -306,14 +305,16 @@
     // A task that has not yet resumed through Codey's carrier can still use
     // its original OpenAI provider for an official model. Keep that request
     // direct and translate the renderer-only selector back to the real model
-    // id. Third-party routes remain blocked until the task is resumed.
+    // id. Other cross-provider choices first migrate through `thread/resume`.
     const preservesLegacyOfficialCarrier = method !== "thread/resume"
       && modelKey(currentProviderId) === officialProviderId
       && isOfficialRoute(route);
     const routedProviderId = preservesLegacyOfficialCarrier
       ? officialProviderId
-      : isGatewayProviderId(providerId)
-        && (usesCodeyRoute || method === "thread/resume")
+      : (
+          usesCodeyRoute
+          || (method === "thread/resume" && Boolean(currentProviderId))
+        )
         ? localRouterProviderId
         : providerId;
     const routedModel = preservesLegacyOfficialCarrier
@@ -350,9 +351,9 @@
     }
     let blocked = false;
     if (providerBoundExistingThreadMethods.has(method) && routedProviderId) {
-      // `turn/start` has no modelProvider field, so a provider change is only
-      // safe during `thread/resume`. In particular, an un-migrated built-in
-      // OpenAI task must not send a third-party model directly to OpenAI.
+      // `turn/start` has no modelProvider field, so provider migration must
+      // happen during `thread/resume`. Resume may move any persisted provider
+      // onto Codey's runtime router; later turns can then switch routes safely.
       if (
         threadId
         && currentProviderId
@@ -366,7 +367,7 @@
           targetProviderId: routedProviderId,
           currentProviderId,
           routeName: cleanText(route?.routeName),
-          reason: "provider_mismatch",
+          reason: "provider_migration_required",
         });
       }
     }
@@ -1695,16 +1696,16 @@
     if (!catalog.loaded) {
       // Before the catalog arrives there is no safe way to distinguish a
       // legacy route alias from a legitimate upstream model containing `/`.
-      // Preserve the model byte-for-byte. A known legacy `openai` resume is
-      // still moved onto the HTTP-only Codey carrier so Codex cannot select its
-      // built-in Responses WebSocket transport for the loopback gateway.
+      // Preserve the model byte-for-byte. A resume with any known persisted
+      // provider is still moved onto the HTTP-only Codey carrier so later turns
+      // can switch routes without using the old provider transport.
       const safeSource = method === "turn/start"
         ? paramsWithoutUnverifiedRouteMetadata(source, requestedModel)
         : source;
       const resumeProvider = method === "thread/resume"
         ? knownThreadProvider(safeSource)
         : "";
-      const providerId = method === "thread/resume" && isGatewayProviderId(resumeProvider)
+      const providerId = method === "thread/resume" && resumeProvider
         ? localRouterProviderId
         : requestedProvider;
       return providerId && threadProviderRequestMethods.has(method)
@@ -1821,12 +1822,13 @@
         null,
       );
     }
-    // A legacy OpenAI task can be resumed through the HTTP-only Codey carrier
-    // without rewriting its rollout. Preserve an unknown model exactly so the
-    // gateway can report it rather than falling back to an unrelated default.
+    // Any task with a known persisted provider can be resumed through the
+    // HTTP-only Codey carrier without rewriting its rollout. Preserve an
+    // unknown model exactly so the gateway can report it rather than falling
+    // back to an unrelated default.
     if (method === "thread/resume") {
       const currentProviderId = knownThreadProvider(source);
-      return isGatewayProviderId(currentProviderId)
+      return currentProviderId
         ? routedRequestParams(
             method,
             source,
@@ -2005,10 +2007,10 @@
     if (!blocked) return false;
     const target = blocked.routeName || blocked.targetProviderId || "所选线路";
     const current = blocked.currentProviderId
-      ? `当前任务绑定的是 ${blocked.currentProviderId}`
-      : "当前任务的供应商身份无法确认";
-    const message = `${current}，不能在原任务中切换到「${target}」。本次消息已在本地拦截，未请求任何上游；请新建任务后使用该模型。`;
-    console.warn("[Codey] blocked cross-provider model request", blocked);
+      ? `当前任务仍绑定在 ${blocked.currentProviderId}`
+      : "当前任务的运行时供应商身份尚未确认";
+    const message = `${current}，尚未完成迁入 Codey 统一路由，暂时不能安全发送到「${target}」。请重新打开该任务后重试；恢复完成后即可跨供应商切换。本次消息已在本地拦截，未请求任何上游。`;
+    console.warn("[Codey] provider migration required before routed turn", blocked);
     try {
       const noticeId = "codey-provider-mismatch-notice";
       let notice = document.getElementById?.(noticeId);
