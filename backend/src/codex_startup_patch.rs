@@ -377,7 +377,7 @@ mod tests {
         assert!(expression.contains("writeCodeyPatchFailuresAsync"));
         assert!(expression.contains("optionalPatchFailureQueue"));
         assert!(expression.contains("--codey-record-error"));
-        assert!(expression.contains(
+        assert!(expression.replace("\r\n", "\n").contains(
             "setImmediate(() => {\n        try { process.getBuiltinModule(\"inspector\").close()"
         ));
         assert!(!expression.contains("__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__"));
