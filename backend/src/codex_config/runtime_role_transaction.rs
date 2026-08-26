@@ -32,6 +32,10 @@ pub(super) fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &P
         &config.subagent_model,
         &config.subagent_reasoning_effort,
     );
+    anyhow::ensure!(
+        state.subagent_roles.keys().eq(runtime_roles.keys()),
+        "Codey 子代理角色启用状态已变化，需要重启 Codex 以重新注册可用角色"
+    );
     let fastctx_instructions = runtime_fastctx_instructions(&constraints_dir, &state)?;
     let plans = plan_runtime_agent_files(
         &constraints_dir,
@@ -64,7 +68,7 @@ pub(super) fn refresh_runtime_subagent_roles_at(config: &CodeyConfig, marker: &P
             &runtime_roles,
             fastctx_instructions.as_deref(),
         )?;
-        verify_runtime_agent_files(&registrations)?;
+        verify_runtime_agent_files(&registrations, runtime_roles.len())?;
         state.subagent_model.clone_from(&config.subagent_model);
         state
             .subagent_reasoning_effort
@@ -105,9 +109,12 @@ fn snapshot_runtime_agent_files(constraints_dir: &Path) -> Result<Vec<RuntimeAge
         .collect()
 }
 
-fn verify_runtime_agent_files(registrations: &[RuntimeAgentRegistration]) -> Result<()> {
+fn verify_runtime_agent_files(
+    registrations: &[RuntimeAgentRegistration],
+    expected_count: usize,
+) -> Result<()> {
     anyhow::ensure!(
-        registrations.len() == SUBAGENT_ROLE_IDS.len(),
+        registrations.len() == expected_count,
         "Codey 子代理运行时文件数量不完整"
     );
     for registration in registrations {

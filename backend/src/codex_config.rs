@@ -632,12 +632,12 @@ fn runtime_subagent_roles(
         .unwrap_or_else(|| SubagentRoleConfig::new(legacy_model, legacy_reasoning_effort));
     SUBAGENT_ROLE_IDS
         .into_iter()
-        .map(|role| {
+        .filter_map(|role| {
             let selection = configured
                 .and_then(|roles| roles.get(role))
                 .cloned()
                 .unwrap_or_else(|| fallback.clone());
-            (role.to_string(), selection)
+            selection.enabled.then(|| (role.to_string(), selection))
         })
         .collect()
 }
@@ -656,7 +656,37 @@ fn prepare_runtime_agent_files(
         atomic_write(&plan.registration.config_file, &plan.contents)?;
         registrations.push(plan.registration);
     }
+    remove_unplanned_runtime_agent_files(constraints_dir, &registrations)?;
     Ok(registrations)
+}
+
+fn remove_unplanned_runtime_agent_files(
+    constraints_dir: &Path,
+    registrations: &[RuntimeAgentRegistration],
+) -> Result<()> {
+    let active_roles = registrations
+        .iter()
+        .map(|registration| registration.role.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    for role in SUBAGENT_ROLE_IDS {
+        if active_roles.contains(role) {
+            continue;
+        }
+        let path = runtime_agent_path(constraints_dir, role);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "清理已停用的 Codey 子代理运行时文件失败：{}",
+                        path.display()
+                    )
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn plan_runtime_agent_files(
@@ -664,11 +694,11 @@ fn plan_runtime_agent_files(
     roles: &BTreeMap<String, SubagentRoleConfig>,
     fastctx_instructions: Option<&str>,
 ) -> Result<Vec<RuntimeAgentPlan>> {
-    let mut plans = Vec::with_capacity(SUBAGENT_ROLE_IDS.len());
+    let mut plans = Vec::with_capacity(roles.len());
     for role in SUBAGENT_ROLE_IDS {
-        let selection = roles
-            .get(role)
-            .with_context(|| format!("缺少 Codey 子代理任务类型配置：{role}"))?;
+        let Some(selection) = roles.get(role) else {
+            continue;
+        };
         let default_source = subagent_source_config(role)
             .with_context(|| format!("缺少 Codey 子代理约束模板：{role}"))?;
         let source_path = if role == SUBAGENT_ROLE_DEFAULT {
@@ -1003,6 +1033,10 @@ fn reconcile_runtime_subagent_roles_at(
         Some(&config.subagent_roles),
         &config.subagent_model,
         &config.subagent_reasoning_effort,
+    );
+    anyhow::ensure!(
+        state.subagent_roles.keys().eq(runtime_roles.keys()),
+        "Codey 子代理角色启用状态已变化，需要重启 Codex 以重新注册可用角色"
     );
     let constraints_dir = marker.with_file_name(CODEY_CONSTRAINTS_DIR);
     let fastctx_instructions = runtime_fastctx_instructions(&constraints_dir, &state)?;

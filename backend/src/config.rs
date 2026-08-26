@@ -394,6 +394,8 @@ pub enum GpuLaunchMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentRoleConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default = "default_subagent_model")]
     pub model: String,
     #[serde(default = "default_subagent_reasoning_effort")]
@@ -403,6 +405,7 @@ pub struct SubagentRoleConfig {
 impl SubagentRoleConfig {
     pub fn new(model: impl Into<String>, reasoning_effort: impl Into<String>) -> Self {
         Self {
+            enabled: true,
             model: model.into(),
             reasoning_effort: reasoning_effort.into(),
         }
@@ -1492,6 +1495,12 @@ fn normalize_subagent_config(
     if let Some(default_role) = roles.get(SUBAGENT_ROLE_DEFAULT) {
         model.clone_from(&default_role.model);
         reasoning_effort.clone_from(&default_role.reasoning_effort);
+    }
+    if let Some(default_role) = roles.get_mut(SUBAGENT_ROLE_DEFAULT) {
+        // `default` is an internal compatibility fallback rather than a
+        // user-selectable role. Keep it available so omitted legacy agent
+        // types cannot produce an empty or inconsistent runtime mapping.
+        default_role.enabled = true;
     }
 }
 
@@ -2654,7 +2663,7 @@ mod tests {
             config
                 .subagent_roles
                 .values()
-                .all(|selection| selection.model == DEFAULT_SUBAGENT_MODEL)
+                .all(|selection| selection.enabled && selection.model == DEFAULT_SUBAGENT_MODEL)
         );
     }
 
@@ -2676,6 +2685,26 @@ mod tests {
             config.subagent_roles[SUBAGENT_ROLE_VISUAL_WORKER].reasoning_effort,
             "high"
         );
+    }
+
+    #[test]
+    fn legacy_subagent_roles_default_to_enabled_and_explicit_disables_survive_normalization() {
+        let config = serde_json::from_str::<CodeyConfig>(
+            r#"{
+                "activeProfileId":"",
+                "profiles":[],
+                "subagentRoles":{
+                    "codey_worker":{"enabled":false,"model":"worker-model","reasoningEffort":"high"},
+                    "default":{"model":"fallback-model","reasoningEffort":"medium"}
+                }
+            }"#,
+        )
+        .unwrap()
+        .normalize();
+
+        assert!(!config.subagent_roles[SUBAGENT_ROLE_WORKER].enabled);
+        assert!(config.subagent_roles[SUBAGENT_ROLE_QUICK_SCAN].enabled);
+        assert!(config.subagent_roles[SUBAGENT_ROLE_DEFAULT].enabled);
     }
 
     #[test]

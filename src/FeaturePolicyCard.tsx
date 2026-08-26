@@ -9,6 +9,7 @@ import type {
 import {
   ActionIcon,
   Badge,
+  Button,
   Card,
   Select,
   Switch,
@@ -44,33 +45,49 @@ const SUBAGENT_TASK_TYPES = [
   {
     id: "codey_quick_scan",
     name: "快速定位",
+    access: "readOnly",
     description: "默认只读；用于精确位置、重复性检查、低风险事实查找和小范围快速检索。",
   },
   {
     id: "codey_deep_research",
     name: "深度检索",
+    access: "readOnly",
     description: "默认只读；用于跨文件、日志、代码和文档的宽范围检索、归纳与架构探索。",
   },
   {
     id: "codey_visual_analysis",
     name: "视觉分析",
+    access: "readOnly",
     description: "默认只读；仅用于必须读取截图、页面、GUI、PDF 或渲染结果的视觉证据分析。",
   },
   {
     id: "codey_worker",
     name: "代码实施",
+    access: "write",
     description: "默认可写；用于边界清晰、可回滚、可测试的低到中等复杂度非视觉实现。",
   },
   {
     id: "codey_visual_worker",
     name: "视觉实施",
+    access: "write",
     description: "默认可写；用于页面、GUI、PDF 或其他依赖视觉证据和渲染验证的实现。",
   },
 ] as const satisfies ReadonlyArray<{
   id: SubagentRoleId;
   name: string;
+  access: "readOnly" | "write";
   description: string;
 }>;
+
+const WRITABLE_SUBAGENT_ROLE_IDS = [
+  "codey_worker",
+  "codey_visual_worker",
+] as const satisfies ReadonlyArray<SubagentRoleId>;
+const READ_ONLY_SUBAGENT_ROLE_IDS = [
+  "codey_quick_scan",
+  "codey_deep_research",
+  "codey_visual_analysis",
+] as const satisfies ReadonlyArray<SubagentRoleId>;
 
 export type SubagentPolicyCardProps = {
   config: Config;
@@ -98,6 +115,45 @@ export function SubagentPolicyCardComponent({
   const preferredProviderId = preferredProfile
     ? routeProviderId(preferredProfile)
     : undefined;
+  const enabledRoleCount = SUBAGENT_TASK_TYPES.filter(
+    ({ id }) => config.subagentRoles[id]?.enabled !== false,
+  ).length;
+  const writableRolesDisabled = WRITABLE_SUBAGENT_ROLE_IDS.every(
+    (role) => config.subagentRoles[role]?.enabled === false,
+  );
+  const enabledReadOnlyRoleNames = SUBAGENT_TASK_TYPES.filter(
+    ({ id, access }) =>
+      access === "readOnly" && config.subagentRoles[id]?.enabled !== false,
+  ).map(({ name }) => name);
+  const writableRolesDisabledMessage =
+    enabledReadOnlyRoleNames.length > 0
+      ? `可写子代理已全部关闭；${enabledReadOnlyRoleNames.join("、")}仍可使用。`
+      : "可写子代理已全部关闭；请先启用至少一个只读角色。";
+
+  const disableWritableRoles = () => {
+    const subagentRoles = { ...config.subagentRoles };
+    for (const role of WRITABLE_SUBAGENT_ROLE_IDS) {
+      const selection = subagentRoles[role] ?? {
+        enabled: true,
+        model: config.subagentModel,
+        reasoningEffort: config.subagentReasoningEffort,
+      };
+      subagentRoles[role] = { ...selection, enabled: false };
+    }
+    if (
+      READ_ONLY_SUBAGENT_ROLE_IDS.every(
+        (role) => subagentRoles[role]?.enabled === false,
+      )
+    ) {
+      const quickScan = subagentRoles.codey_quick_scan ?? {
+        enabled: true,
+        model: config.subagentModel,
+        reasoningEffort: config.subagentReasoningEffort,
+      };
+      subagentRoles.codey_quick_scan = { ...quickScan, enabled: true };
+    }
+    onConfigChange({ ...config, subagentRoles });
+  };
 
   return (
     <section className="secondary-section subagent-section" aria-labelledby="subagent-title">
@@ -124,21 +180,38 @@ export function SubagentPolicyCardComponent({
         <div className="subagent-policy-body">
           {config.subagentOptimization ? (
             <>
-              <Table.ScrollContainer minWidth={360}>
+              <div className="subagent-role-actions">
+                <div>
+                  <strong>按角色启用</strong>
+                  <span>开关只控制角色是否可用；只读或写入权限由系统固定。</span>
+                </div>
+                <Button
+                  variant="outline"
+                  size="xs"
+                  disabled={subagentPolicyControlsDisabled || writableRolesDisabled}
+                  onClick={disableWritableRoles}
+                >
+                  关闭全部可写角色
+                </Button>
+              </div>
+              <Table.ScrollContainer minWidth={680}>
                 <Table
                   withRowBorders
                   className="subagent-table"
                 >
                   <Table.Thead>
                     <Table.Tr>
-                      <Table.Th style={{ width: "27%" }}>任务角色</Table.Th>
-                      <Table.Th style={{ width: "46%" }}>指定模型</Table.Th>
-                      <Table.Th style={{ width: "27%" }}>思考深度</Table.Th>
+                      <Table.Th style={{ width: "10%" }}>启用</Table.Th>
+                      <Table.Th style={{ width: "21%" }}>任务角色</Table.Th>
+                      <Table.Th style={{ width: "15%" }}>权限</Table.Th>
+                      <Table.Th style={{ width: "34%" }}>指定模型</Table.Th>
+                      <Table.Th style={{ width: "20%" }}>思考深度</Table.Th>
                     </Table.Tr>
                   </Table.Thead>
                   <Table.Tbody>
                     {SUBAGENT_TASK_TYPES.map((task) => {
                       const selection = config.subagentRoles[task.id] ?? {
+                        enabled: true,
                         model: config.subagentModel,
                         reasoningEffort: config.subagentReasoningEffort,
                       };
@@ -154,20 +227,34 @@ export function SubagentPolicyCardComponent({
                         value: effort,
                       }));
                       const updateRole = (
-                        model: string,
-                        reasoningEffort: string,
+                        next: Partial<typeof selection>,
                       ) => {
                         onConfigChange({
                           ...config,
                           subagentRoles: {
                             ...config.subagentRoles,
-                            [task.id]: { model, reasoningEffort },
+                            [task.id]: { ...selection, ...next },
                           },
                         });
                       };
+                      const roleDisabled = !selection.enabled;
 
                       return (
-                        <Table.Tr key={task.id}>
+                        <Table.Tr
+                          key={task.id}
+                          className={roleDisabled ? "subagent-role-disabled" : undefined}
+                        >
+                          <Table.Td>
+                            <Switch
+                              checked={selection.enabled}
+                              disabled={
+                                subagentPolicyControlsDisabled ||
+                                (selection.enabled && enabledRoleCount <= 1)
+                              }
+                              onCheckedChange={(enabled) => updateRole({ enabled })}
+                              aria-label={`${selection.enabled ? "关闭" : "启用"}${task.name}角色`}
+                            />
+                          </Table.Td>
                           <Table.Td>
                             <div className="subagent-role-name">
                               <span>{task.name}</span>
@@ -193,6 +280,14 @@ export function SubagentPolicyCardComponent({
                             </div>
                           </Table.Td>
                           <Table.Td>
+                            <Badge
+                              variant={task.access === "write" ? "warning" : "secondary"}
+                              size="sm"
+                            >
+                              {task.access === "write" ? "可修改文件" : "只读"}
+                            </Badge>
+                          </Table.Td>
+                          <Table.Td>
                             <ModelCombobox
                               aria-label={`${task.name}模型`}
                               value={selection.model}
@@ -203,6 +298,7 @@ export function SubagentPolicyCardComponent({
                               }
                               disabled={
                                 subagentPolicyControlsDisabled ||
+                                roleDisabled ||
                                 subagentModelOptions.length === 0
                               }
                               options={subagentModelOptions}
@@ -220,7 +316,10 @@ export function SubagentPolicyCardComponent({
                                   )
                                     ? selection.reasoningEffort
                                     : option.defaultReasoningEffort;
-                                updateRole(option.value, reasoningEffort);
+                                updateRole({
+                                  model: option.value,
+                                  reasoningEffort,
+                                });
                               }}
                             />
                           </Table.Td>
@@ -238,6 +337,7 @@ export function SubagentPolicyCardComponent({
                               placeholder="暂无可选深度"
                               disabled={
                                 subagentPolicyControlsDisabled ||
+                                roleDisabled ||
                                 reasoningEfforts.length === 0
                               }
                               optionList={reasoningOptions}
@@ -247,10 +347,10 @@ export function SubagentPolicyCardComponent({
                               getPopupContainer={() => popupContainer ?? document.body}
                               zIndex={SETTINGS_OVERLAY_Z_INDEX}
                               onChange={(value) =>
-                                updateRole(
-                                  selectedModel?.value ?? selection.model,
-                                  String(value ?? ""),
-                                )
+                                updateRole({
+                                  model: selectedModel?.value ?? selection.model,
+                                  reasoningEffort: String(value ?? ""),
+                                })
                               }
                             />
                           </Table.Td>
@@ -265,7 +365,9 @@ export function SubagentPolicyCardComponent({
                 <div className="subagent-callout-text">
                   {subagentModelOptions.length === 0
                     ? "请先在模型管理中为任一可用线路启用模型。"
-                    : "可搜索并选择任意可用线路模型；首次开启需重启，保存后对下次派生效。角色权限仍受父任务权限模式约束。"}
+                    : writableRolesDisabled
+                      ? `${writableRolesDisabledMessage}角色启用状态变更需重启 Codex，模型和思考深度保存后对下次派生生效。`
+                      : "可搜索并选择任意可用线路模型；角色启用状态变更需重启 Codex，模型和思考深度保存后对下次派生生效。角色权限仍受父任务权限模式约束。"}
                 </div>
               </div>
             </>

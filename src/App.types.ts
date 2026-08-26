@@ -46,6 +46,7 @@ export type SubagentRoleId =
   | "default";
 
 export type SubagentRoleConfig = {
+  enabled: boolean;
   model: string;
   reasoningEffort: string;
 };

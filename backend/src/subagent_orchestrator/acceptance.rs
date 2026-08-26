@@ -143,7 +143,9 @@ pub(super) fn parse_plain_text_exit_code(value: &str) -> Option<i64> {
 }
 
 pub(super) fn reservation_has_pending_acceptance(reservation: &Reservation) -> bool {
-    !reservation.spawn_failed && reservation.acceptance.iter().any(acceptance_blocks_turn)
+    !reservation.spawn_failed
+        && reservation.side_effect_authorized
+        && reservation.acceptance.iter().any(acceptance_blocks_turn)
 }
 
 pub(super) fn acceptance_blocks_turn(check: &AcceptanceEntry) -> bool {

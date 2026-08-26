@@ -783,6 +783,11 @@ fn pre_tool_use_output(
         .as_deref()
         .is_some_and(is_prepare_delegation_tool)
     {
+        if let Some(role) = requested_spawn_role(input.tool_input.as_ref())
+            && let Some(reason) = runtime_role_admission_denial(state_root, role)?
+        {
+            return Ok(pre_tool_reason_denial(reason));
+        }
         let Some(root_turn_id) = nonempty(input.turn_id.as_deref()) else {
             return Ok(pre_tool_reason_denial(
                 "Codey 写入 sidecar 门禁：当前 PreToolUse 缺少根 turn_id，无法建立只限本回合消费的一次性写入授权。"
@@ -868,6 +873,11 @@ fn pre_tool_use_output(
                 "Codey Hook 协议兼容性门禁：{reason}。当前无法可靠区分根代理和子代理，已停止继续派生；请先调用不带筛选的 agents.list_agents 对账。"
             )));
         }
+        if let Some(role) = requested_spawn_role(input.tool_input.as_ref())
+            && let Some(reason) = runtime_role_admission_denial(state_root, role)?
+        {
+            return Ok(pre_tool_reason_denial(reason));
+        }
         let process_cwd = std::env::current_dir()
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
@@ -925,6 +935,57 @@ fn pre_tool_use_output(
     }
     let protocol_issue = protocol_issue_reason(state_root, runtime_id, &input.session_id)?;
     Ok(pre_tool_denial(active, protocol_issue.as_deref()))
+}
+
+fn requested_spawn_role(tool_input: Option<&Value>) -> Option<&str> {
+    let input = tool_input?.as_object()?;
+    let mut roles = ["agent_type", "agentType", "agent_role", "agentRole"]
+        .into_iter()
+        .filter_map(|key| input.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|role| !role.is_empty());
+    let role = roles.next()?;
+    roles.all(|candidate| candidate == role).then_some(role)
+}
+
+fn runtime_role_admission_denial(state_root: &Path, role: &str) -> Result<Option<String>> {
+    let pending_path = state_root.join(RUNTIME_SUBAGENT_POLICY_PENDING_FILE);
+    if read_optional_runtime_policy_file(&pending_path)?.is_some() {
+        return Ok(Some(
+            "CODEY_SUBAGENT_RUNTIME_UPDATE_IN_PROGRESS: 子代理角色策略正在切换；请等待设置保存完成后重新派发。未创建调度账本记录。"
+                .to_string(),
+        ));
+    }
+    let policy_path = state_root.join(RUNTIME_SUBAGENT_POLICY_FILE);
+    let Some(policy_bytes) = read_optional_runtime_policy_file(&policy_path)? else {
+        // Runtimes created before role attestation remain backward compatible.
+        return Ok(None);
+    };
+    let policy = match serde_json::from_slice::<RuntimeSubagentPolicy>(&policy_bytes) {
+        Ok(policy) if policy.schema_version == RUNTIME_SUBAGENT_POLICY_SCHEMA_VERSION => policy,
+        Ok(policy) => {
+            return Ok(Some(format!(
+                "CODEY_SUBAGENT_RUNTIME_POLICY_INVALID: 子代理运行时策略版本不受支持（实际 {}，预期 {}）；未创建调度账本记录。",
+                policy.schema_version, RUNTIME_SUBAGENT_POLICY_SCHEMA_VERSION
+            )));
+        }
+        Err(error) => {
+            return Ok(Some(format!(
+                "CODEY_SUBAGENT_RUNTIME_POLICY_INVALID: 子代理运行时策略无法解析（{error}）；未创建调度账本记录。"
+            )));
+        }
+    };
+    if policy.roles.contains_key(role) {
+        Ok(None)
+    } else if crate::config::SUBAGENT_ROLE_IDS.contains(&role) {
+        Ok(Some(format!(
+            "CODEY_SUBAGENT_ROLE_DISABLED: Codey 子代理角色 `{role}` 已关闭；请在设置中开启后重试，或改用已启用角色。未创建调度账本记录。"
+        )))
+    } else {
+        Ok(Some(format!(
+            "CODEY_SUBAGENT_ROLE_UNKNOWN: Codey 子代理角色 `{role}` 不在当前运行时可用角色集合中；未创建调度账本记录。"
+        )))
+    }
 }
 
 fn post_tool_use_output(
@@ -2189,6 +2250,79 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(unverified.contains("CODEY_SUBAGENT_RUNTIME_UNVERIFIED"));
+    }
+
+    #[test]
+    fn disabled_runtime_role_is_rejected_before_sidecar_or_spawn_reservation() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let state_root = home.join(STATE_DIRECTORY);
+        let mut roles = crate::config::default_subagent_roles();
+        roles.remove(crate::config::SUBAGENT_ROLE_WORKER);
+        write_runtime_subagent_policy(home, &roles, &BTreeMap::new()).unwrap();
+
+        let mut prepare = input("PreToolUse", "disabled-role-session");
+        prepare.turn_id = Some("root-turn-a".to_string());
+        prepare.tool_name =
+            Some(crate::subagent_control_mcp::PREPARE_DELEGATION_QUALIFIED_TOOL_NAME.to_string());
+        prepare.tool_input = Some(json!({
+            "task_name": "disabled_worker",
+            "agent_type": "codey_worker",
+            "preparation_id": "disabled-worker-preparation",
+            "contract": {
+                "id": "disabled_worker",
+                "root": "/repo"
+            }
+        }));
+        let denied = handle_hook_for_runtime_at(&prepare, &state_root, "runtime-a", 10).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("CODEY_SUBAGENT_ROLE_DISABLED"))
+        );
+
+        let mut spawn = input("PreToolUse", "disabled-role-session");
+        spawn.turn_id = Some("root-turn-a".to_string());
+        spawn.cwd = Some("/repo".to_string());
+        spawn.tool_name = Some("agents.spawn_agent".to_string());
+        spawn.tool_input = Some(json!({
+            "task_name": "disabled_worker",
+            "agent_type": "codey_worker",
+            "fork_turns": "none",
+            "message": delegation_message(json!({
+                "id": "disabled_worker",
+                "why": "implementation",
+                "visual": false,
+                "root": "/repo",
+                "read": [],
+                "write": ["backend/src"],
+                "checks": [{ "id": "tests", "cmd": "cargo test --lib" }]
+            }))
+        }));
+        let denied = handle_hook_for_runtime_at(&spawn, &state_root, "runtime-a", 20).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"].as_str(),
+            Some("deny")
+        );
+        assert!(
+            denied["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("未创建调度账本记录"))
+        );
+        assert_eq!(
+            crate::subagent_orchestrator::active_reservation_count(
+                &state_root,
+                "runtime-a",
+                "disabled-role-session",
+                30,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

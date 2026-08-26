@@ -28,7 +28,7 @@ use identity::*;
 pub(crate) const CONTRACT_PREFIX: &str = "CODEY_DELEGATION_V2=";
 pub(crate) const POST_TOOL_HOOK_MATCHER: &str = "*";
 
-const LEDGER_SCHEMA_VERSION: u32 = 13;
+const LEDGER_SCHEMA_VERSION: u32 = 14;
 const MIN_LEDGER_SCHEMA_VERSION: u32 = 1;
 const LEDGER_FILE: &str = "orchestrator-ledger-v1.json";
 const LEDGER_LOCK_FILE: &str = "orchestrator-ledger-v1.lock";
@@ -269,6 +269,8 @@ struct Reservation {
     fenced_at_ms: Option<u64>,
     #[serde(default)]
     spawn_failed: bool,
+    #[serde(default)]
+    side_effect_authorized: bool,
     #[serde(default)]
     pending_init_observed_at_ms: Option<u64>,
 }
@@ -967,6 +969,17 @@ fn migrate_ledger(ledger: &mut SessionLedger, source_schema_version: u32) -> Res
         // ephemeral permits instead of reinterpreting their root/read/write
         // claims; retain nonce history and existing reservations.
         ledger.prepared_delegations.clear();
+        changed = true;
+    }
+    if source_schema_version < 14 {
+        // Older ledgers did not distinguish a write-capable reservation from
+        // an attempt that actually passed a side-effecting tool admission.
+        // Preserve their acceptance debt conservatively; new reservations only
+        // acquire debt after a command or write tool is truly authorized.
+        for reservation in ledger.reservations.values_mut() {
+            reservation.side_effect_authorized =
+                reservation.write_capable && !reservation.spawn_failed;
+        }
         changed = true;
     }
     anyhow::ensure!(
@@ -1724,6 +1737,7 @@ pub(crate) fn pre_spawn_with_workspace_and_turn(
             policy_revision,
             fenced_at_ms: None,
             spawn_failed: false,
+            side_effect_authorized: false,
             pending_init_observed_at_ms: None,
         },
     );
@@ -3876,6 +3890,19 @@ pub(crate) fn authorize_child_tool_with_context(
             decision.rule_id, decision.priority, decision.explanation
         )));
     }
+    if matches!(tool_class, ToolClass::Command | ToolClass::Write)
+        && let Some(task_id) = bound_task.as_deref()
+        && let Some(current) = ledger.as_mut()
+        && let Some(reservation) = current.reservations.get_mut(task_id)
+        && !reservation.side_effect_authorized
+    {
+        // Mechanical acceptance debt begins only after the Hook has actually
+        // admitted a side-effecting tool. A command/write request rejected by
+        // capability or policy cannot leave a dead task blocking later batches.
+        reservation.side_effect_authorized = true;
+        reservation.updated_at_ms = now_ms;
+        store.save(current, now_ms)?;
+    }
     Ok(None)
 }
 
@@ -4015,7 +4042,10 @@ pub(crate) fn pending_acceptance_reason(
     let mut commands = Vec::new();
     let mut release_notices = Vec::new();
     for reservation in ledger.reservations.values_mut() {
-        if reservation.write_capable && !reservation.spawn_failed {
+        if reservation.write_capable
+            && !reservation.spawn_failed
+            && reservation.side_effect_authorized
+        {
             if !matches!(
                 reservation.state,
                 ReservationState::Terminal | ReservationState::Recovered
@@ -4351,6 +4381,27 @@ mod tests {
             "capabilities": ["command.execute", "files.read", "workspace.write"],
             "checks": [{ "id": "tests", "cmd": "cargo test -p codey --lib" }]
         })
+    }
+
+    fn authorize_worker_command_for_test(
+        state_root: &Path,
+        session_id: &str,
+        agent_id: &str,
+        now_ms: u64,
+    ) {
+        assert_eq!(
+            authorize_child_tool(
+                state_root,
+                "runtime-a",
+                session_id,
+                agent_id,
+                "Bash",
+                Some(&json!({ "command": "cargo test -p codey --lib" })),
+                now_ms,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     fn prepared_delegation_input(
@@ -6428,6 +6479,7 @@ mod tests {
             20,
         )
         .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 25);
         subagent_stopped(temp.path(), "runtime-a", "session-a", "agent-a", 30).unwrap();
 
         let second = contract_input(
@@ -9062,6 +9114,7 @@ mod tests {
             20,
         )
         .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 25);
         subagent_stopped(temp.path(), "runtime-a", "session-a", "agent-a", 30).unwrap();
         let command = json!({
             "command": "# codey-accept:worker_a:tests\ncargo test -p codey --lib"
@@ -9101,6 +9154,84 @@ mod tests {
     }
 
     #[test]
+    fn denied_side_effect_then_terminal_stop_does_not_leave_pending_init_or_acceptance_debt() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut contract = worker_contract("worker_denied", "backend/src");
+        contract["capabilities"] = json!(["files.read", "workspace.write"]);
+        let input = contract_input("worker_denied", "codey_worker", contract);
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({ "agent_id": "/root/worker_denied" })),
+            20,
+        )
+        .unwrap();
+
+        let denial = authorize_child_tool(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            "/root/worker_denied",
+            "Bash",
+            Some(&json!({ "command": "cargo test -p codey --lib" })),
+            30,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(denial.contains("command.execute"));
+        subagent_stopped(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            "/root/worker_denied",
+            40,
+        )
+        .unwrap();
+
+        let stale_pending = json!({
+            "agents": [
+                { "agent_name": "/root", "status": "running" },
+                { "agent_name": "/root/worker_denied", "status": "pending_init" }
+            ]
+        });
+        reconcile_pending_init_status_response(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&stale_pending),
+            50,
+            10 * 60 * 1_000,
+        )
+        .unwrap();
+
+        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
+        let ledger = store.load("runtime-a", "session-a", 60).unwrap().unwrap();
+        let reservation = &ledger.reservations["worker_denied"];
+        assert_eq!(reservation.state, ReservationState::Terminal);
+        assert_eq!(reservation.outcome, ExecutionOutcome::Unknown);
+        assert!(!reservation.side_effect_authorized);
+        assert_eq!(reservation.pending_init_observed_at_ms, None);
+        drop(ledger);
+        drop(store);
+
+        assert_eq!(
+            pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 70).unwrap(),
+            None
+        );
+        commit_batch_decision_for_test(
+            temp.path(),
+            "session-a",
+            1,
+            RootBatchDecision::Complete,
+            80,
+        );
+        settle_turn(temp.path(), "runtime-a", "session-a", 90).unwrap();
+    }
+
+    #[test]
     fn acceptance_cannot_pass_before_the_worker_settles() {
         let temp = tempfile::tempdir().unwrap();
         let input = contract_input(
@@ -9109,6 +9240,16 @@ mod tests {
             worker_contract("worker_a", "backend/src"),
         );
         pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({ "agent_id": "agent-a" })),
+            15,
+        )
+        .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 16);
         let command = json!({
             "command": "# codey-accept:worker_a:tests\ncargo test -p codey --lib"
         });
@@ -9173,6 +9314,7 @@ mod tests {
             20,
         )
         .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 25);
         subagent_stopped(temp.path(), "runtime-a", "session-a", "agent-a", 30).unwrap();
         let command = json!({
             "command": "# codey-accept:worker_a:tests\ncargo test -p codey --lib"
@@ -9253,6 +9395,16 @@ mod tests {
             worker_contract("worker_a", "backend/src"),
         );
         pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({ "agent_id": "agent-a" })),
+            11,
+        )
+        .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 12);
         observe_status_response(temp.path(), "runtime-a", "session-a", None, true, 15).unwrap();
         let command = json!({
             "command": "# codey-accept:worker_a:tests\ncargo test -p codey --lib"
@@ -9338,6 +9490,16 @@ mod tests {
             worker_contract("worker_a", "backend/src"),
         );
         pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({ "agent_id": "agent-a" })),
+            11,
+        )
+        .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 12);
 
         for now_ms in [20, 30] {
             let reason = pending_acceptance_reason(temp.path(), "runtime-a", "session-a", now_ms)
@@ -9364,6 +9526,16 @@ mod tests {
             worker_contract("worker_a", "backend/src"),
         );
         pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({ "agent_id": "agent-a" })),
+            11,
+        )
+        .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 12);
 
         assert!(
             pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 20)
@@ -9734,6 +9906,16 @@ mod tests {
             research_contract("research_a"),
         );
         pre_spawn(temp.path(), "runtime-a", "session-a", Some(&write), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&write),
+            Some(&json!({ "agent_id": "agent-a" })),
+            11,
+        )
+        .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 12);
         pre_spawn(temp.path(), "runtime-a", "session-a", Some(&read), 0, 20).unwrap();
         let reason = pending_acceptance_reason(temp.path(), "runtime-b", "session-a", 30)
             .unwrap()
@@ -9938,6 +10120,7 @@ mod tests {
             20,
         )
         .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 25);
         observe_status_response(temp.path(), "runtime-a", "session-a", None, true, 30).unwrap();
         let store = LedgerStore::open(temp.path(), "session-a").unwrap();
         let ledger = store.load("runtime-a", "session-a", 40).unwrap().unwrap();

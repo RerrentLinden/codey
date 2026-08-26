@@ -144,6 +144,45 @@ fn default_agent_source_exactly_migrates_to_read_only() {
 }
 
 #[test]
+fn disabled_subagent_roles_are_omitted_from_runtime_registration_and_policy_inputs() {
+    let temp = tempfile::tempdir().unwrap();
+    let constraints_dir = temp.path().join("codex-constraints");
+    let mut configured = crate::config::default_subagent_roles();
+    configured
+        .get_mut(crate::config::SUBAGENT_ROLE_WORKER)
+        .unwrap()
+        .enabled = false;
+
+    let runtime_roles = runtime_subagent_roles(
+        Some(&configured),
+        DEFAULT_SUBAGENT_MODEL,
+        DEFAULT_SUBAGENT_REASONING_EFFORT,
+    );
+    assert!(!runtime_roles.contains_key(crate::config::SUBAGENT_ROLE_WORKER));
+    assert!(runtime_roles.contains_key(crate::config::SUBAGENT_ROLE_QUICK_SCAN));
+    assert!(runtime_roles.contains_key(crate::config::SUBAGENT_ROLE_DEFAULT));
+
+    let plans = plan_runtime_agent_files(&constraints_dir, &runtime_roles, None).unwrap();
+    assert_eq!(plans.len(), runtime_roles.len());
+    assert!(
+        plans
+            .iter()
+            .all(|plan| plan.registration.role != crate::config::SUBAGENT_ROLE_WORKER)
+    );
+
+    let stale_worker_path =
+        runtime_agent_path(&constraints_dir, crate::config::SUBAGENT_ROLE_WORKER);
+    if let Some(parent) = stale_worker_path.parent() {
+        fs::create_dir_all(parent).unwrap();
+    }
+    fs::write(&stale_worker_path, b"stale worker runtime file").unwrap();
+    let registrations =
+        prepare_runtime_agent_files(&constraints_dir, &runtime_roles, None).unwrap();
+    assert_eq!(registrations.len(), runtime_roles.len());
+    assert!(!stale_worker_path.exists());
+}
+
+#[test]
 fn failed_lease_marker_removal_keeps_the_recovery_backup() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");

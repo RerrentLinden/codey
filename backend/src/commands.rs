@@ -1068,7 +1068,8 @@ async fn save_codey_config_locked(
         for (role, selection) in config_input.subagent_roles {
             if SUBAGENT_ROLE_IDS.contains(&role.as_str()) {
                 let selection_changed = config.subagent_roles.get(&role).is_none_or(|previous| {
-                    !model_id::equal(&previous.model, &selection.model)
+                    previous.enabled != selection.enabled
+                        || !model_id::equal(&previous.model, &selection.model)
                         || !previous
                             .reasoning_effort
                             .trim()
