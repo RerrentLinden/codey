@@ -354,7 +354,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "codey"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "codey-runtime-core"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "codey-runtime-data"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "anyhow",
  "base64",
