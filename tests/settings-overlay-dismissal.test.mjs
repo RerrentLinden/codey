@@ -7,10 +7,11 @@ import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 const root = new URL("../", import.meta.url);
 
 test("settings modal keeps dismissal and stacking inside the overlay", async () => {
-  const [appSource, shellSource, overlaySource, constants] = await Promise.all([
+  const [appSource, shellSource, overlaySource, stylesSource, constants] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
     readFile(new URL("src/SettingsModalShell.tsx", root), "utf8"),
     readFile(new URL("src/overlay.tsx", root), "utf8"),
+    readFile(new URL("src/styles.css", root), "utf8"),
     loadTypeScriptModule(new URL("../src/overlay.constants.ts", import.meta.url)),
   ]);
 
@@ -29,14 +30,10 @@ test("settings modal keeps dismissal and stacking inside the overlay", async () 
     /overlay:\s*"bg-black\/25|backdrop-blur|overlayProps=/,
   );
   assert.match(shellSource, /content:\s*\n\s*"[^"]*overflow-hidden!/);
+  assert.doesNotMatch(overlaySource, /addEventListener\("wheel"/);
   assert.match(
-    overlaySource,
-    /modalContainer\.addEventListener\("wheel", handleOverlayWheel, \{\s*capture: true,\s*passive: false,/,
-  );
-  assert.match(overlaySource, /hasActiveDialog/);
-  assert.match(
-    overlaySource,
-    /modalContainer\.querySelector<HTMLElement>\("\.page-scroll"\)/,
+    stylesSource,
+    /\.page-scroll\s*\{[\s\S]*overflow-y:\s*auto;[\s\S]*overscroll-behavior:\s*contain;/,
   );
   assert.match(appSource, /onCancel=\{handleCloseSettings\}/);
   assert.doesNotMatch(overlaySource, /codey-overlay-(?:backdrop|dialog)/);

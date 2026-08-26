@@ -31,22 +31,6 @@ declare global {
   }
 }
 
-function isElement(target: EventTarget): target is HTMLElement {
-  return target instanceof HTMLElement;
-}
-
-function canScrollVertically(element: HTMLElement, deltaY: number) {
-  const maxScrollTop = element.scrollHeight - element.clientHeight;
-  if (maxScrollTop <= 0 || deltaY === 0) return false;
-
-  const { overflowY } = window.getComputedStyle(element);
-  if (!/(auto|scroll|overlay)/.test(overflowY)) return false;
-
-  return deltaY < 0
-    ? element.scrollTop > 0
-    : element.scrollTop < maxScrollTop;
-}
-
 function getOverlayMountTarget() {
   return document.body ?? document.documentElement;
 }
@@ -106,79 +90,6 @@ if (!window.__codeySettingsOverlay) {
 
   let hideTimer: number | undefined;
   let visible = false;
-
-  const handleOverlayWheel = (event: WheelEvent) => {
-    if (!visible) return;
-
-    const path = event.composedPath();
-    const isInsideDialog = path.some(
-      (target) =>
-        isElement(target) &&
-        (target.hasAttribute("data-codey-dialog") ||
-          target.closest?.("[data-codey-dialog]") !== null ||
-          (target.getAttribute("role") === "dialog" &&
-            !target.hasAttribute("data-codey-settings-shell"))),
-    );
-    const hasActiveDialog =
-      isInsideDialog ||
-      Boolean(
-        shadow.querySelector(
-          '[data-codey-dialog], [role="dialog"]:not([data-codey-settings-shell])',
-        ),
-      );
-
-    if (hasActiveDialog) {
-      const nestedScrollable = path.find(
-        (target) =>
-          isElement(target) &&
-          !target.classList.contains("page-scroll") &&
-          canScrollVertically(target, event.deltaY),
-      );
-      if (nestedScrollable) {
-        event.stopPropagation();
-        return;
-      }
-
-      event.preventDefault();
-      event.stopPropagation();
-      return;
-    }
-
-    const nestedScrollable = path.find(
-      (target) =>
-        isElement(target) &&
-        !target.classList.contains("page-scroll") &&
-        canScrollVertically(target, event.deltaY),
-    );
-    if (nestedScrollable) {
-      event.stopPropagation();
-      return;
-    }
-
-    const scrollContainer =
-      path.find(
-        (target): target is HTMLElement =>
-          isElement(target) && target.classList.contains("page-scroll"),
-      ) ?? modalContainer.querySelector<HTMLElement>(".page-scroll");
-
-    event.stopPropagation();
-
-    if (!scrollContainer) return;
-
-    const maxScrollTop =
-      scrollContainer.scrollHeight - scrollContainer.clientHeight;
-    if (maxScrollTop <= 0) return;
-
-    event.preventDefault();
-    scrollContainer.scrollTop = Math.min(
-      maxScrollTop,
-      Math.max(0, scrollContainer.scrollTop + event.deltaY),
-    );
-  };
-  modalContainer.addEventListener("wheel", handleOverlayWheel, {
-    capture: true,
-    passive: false,
-  });
 
   const hide = () => {
     window.clearTimeout(hideTimer);
