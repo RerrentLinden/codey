@@ -1,12 +1,9 @@
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{NotificationChannelAdapter, bounded_remote_message};
@@ -14,7 +11,6 @@ use crate::notifications::formatting::{format_duration, format_timestamp, plain_
 use crate::notifications::{NotificationChannelConfig, NotificationEvent};
 
 const MAX_WECHAT_TEXT_CHARS: usize = 1_800;
-static STARTED_WECHAT_CLAW_BINDINGS: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
 
 pub(super) struct WechatClawChannel<'a> {
     config: &'a NotificationChannelConfig,
@@ -71,21 +67,6 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
         )
     }
 
-    fn prepare_request(&self, client: &Client) -> Option<Result<RequestBuilder>> {
-        if wechat_claw_binding_started(self.config) {
-            return None;
-        }
-        Some(self.ilink_post(
-            client,
-            "ilink/bot/msg/notifystart",
-            json!({ "base_info": wechat_claw_base_info() }),
-        ))
-    }
-
-    fn mark_prepared(&self) {
-        mark_wechat_claw_binding_started(self.config);
-    }
-
     fn settle_on_success_status_error(&self) -> bool {
         true
     }
@@ -114,30 +95,6 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
         }
         sanitized
     }
-}
-
-fn wechat_claw_binding_key(config: &NotificationChannelConfig) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(config.url.trim().as_bytes());
-    hasher.update([0]);
-    hasher.update(config.bot_token.trim().as_bytes());
-    hasher.finalize().into()
-}
-
-fn wechat_claw_binding_started(config: &NotificationChannelConfig) -> bool {
-    let bindings = STARTED_WECHAT_CLAW_BINDINGS.get_or_init(|| Mutex::new(HashSet::new()));
-    let bindings = bindings
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    bindings.contains(&wechat_claw_binding_key(config))
-}
-
-fn mark_wechat_claw_binding_started(config: &NotificationChannelConfig) {
-    let bindings = STARTED_WECHAT_CLAW_BINDINGS.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut bindings = bindings
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    bindings.insert(wechat_claw_binding_key(config));
 }
 
 fn random_wechat_uin() -> String {
@@ -342,36 +299,6 @@ mod tests {
             Some("请先在微信中向 ClawBot 发送一条消息完成激活")
         );
         assert!(!config.is_configured());
-    }
-
-    #[test]
-    fn successful_start_notification_is_cached_per_binding() {
-        let mut config = configured_channel();
-        config.bot_token = format!("{}-{}", config.bot_token, Uuid::new_v4());
-        let channel = WechatClawChannel::new(&config);
-        let request = channel
-            .prepare_request(&Client::new())
-            .expect("unprepared binding must request activation")
-            .unwrap()
-            .build()
-            .unwrap();
-
-        assert_eq!(
-            request.url().as_str(),
-            "https://ilinkai.weixin.qq.com/ilink/bot/msg/notifystart"
-        );
-        let body = request
-            .body()
-            .and_then(reqwest::Body::as_bytes)
-            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
-            .unwrap();
-        assert_eq!(
-            body["base_info"]["bot_agent"],
-            format!("Codey/{}", env!("CARGO_PKG_VERSION"))
-        );
-
-        channel.mark_prepared();
-        assert!(channel.prepare_request(&Client::new()).is_none());
     }
 
     #[test]

@@ -74,8 +74,8 @@ use webhooks::{
     sync_waiting_webhook_watcher, test_notification_channel, test_webhook,
 };
 use wechat_claw::{
-    WechatClawLoginState, poll_wechat_claw_login, start_wechat_claw_login,
-    wechat_claw_login_http_client,
+    WechatClawLoginState, WechatClawSyncHandle, poll_wechat_claw_login, start_wechat_claw_login,
+    stop_wechat_claw_service, sync_wechat_claw_service, wechat_claw_login_http_client,
 };
 
 use crate::account_usage;
@@ -143,6 +143,8 @@ pub struct AppState {
     persisted_waiting_notifications: Mutex<WaitingLedgerState>,
     recent_session_event_cache: Mutex<Option<pending_approval::RecentSessionEventCache>>,
     wechat_claw_logins: Mutex<WechatClawLoginState>,
+    wechat_claw_sync: Mutex<Option<WechatClawSyncHandle>>,
+    wechat_claw_sync_update: Mutex<()>,
     waiting_watcher_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     waiting_watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     waiting_watcher_sync: Mutex<()>,
@@ -234,6 +236,8 @@ impl Default for AppState {
                 pending_approval::RecentSessionEventCache::default(),
             )),
             wechat_claw_logins: Mutex::new(WechatClawLoginState::default()),
+            wechat_claw_sync: Mutex::new(None),
+            wechat_claw_sync_update: Mutex::new(()),
             waiting_watcher_shutdown: Mutex::new(None),
             waiting_watcher_task: Mutex::new(None),
             waiting_watcher_sync: Mutex::new(()),
@@ -1306,6 +1310,7 @@ async fn finish_codey_config_save(
     saved: SavedCodeyConfig,
 ) -> Result<Value, String> {
     sync_waiting_webhook_watcher(state).await;
+    sync_wechat_claw_service(state).await;
     if let Some(runtime) = state.runtime.lock().await.clone() {
         runtime.set_crashpad_pending_protection(saved.config.protect_crashpad_pending);
     }
@@ -1627,6 +1632,7 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
         channel.bot_token.clear();
         channel.context_token_configured = !channel.context_token.trim().is_empty();
         channel.context_token.clear();
+        channel.get_updates_buf.clear();
     }
     public.prompt_optimization.api_key_configured =
         !public.prompt_optimization.api_key.trim().is_empty();

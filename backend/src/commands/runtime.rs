@@ -375,6 +375,7 @@ async fn launch_codey_inner_locked(state: &Arc<AppState>) -> Result<Value, Strin
     }
     *state.runtime.lock().await = Some(Arc::new(runtime));
     let runtime_generation = state.runtime_generation.fetch_add(1, Ordering::AcqRel) + 1;
+    super::sync_wechat_claw_service(state).await;
     if let Some(initial_scan_task) = initial_scan_task {
         start_waiting_webhook_watcher(state, initial_scan_task).await;
     }
@@ -488,6 +489,7 @@ async fn run_scheduled_restart(restart_state: Arc<AppState>, mut cancel: oneshot
 }
 
 async fn stop_codey_runtime_locked(state: &Arc<AppState>) -> Result<Value, String> {
+    super::stop_wechat_claw_service(state).await;
     stop_waiting_webhook_watcher(state).await;
     let runtime = state.runtime.lock().await.take();
     if let Some(runtime) = runtime {

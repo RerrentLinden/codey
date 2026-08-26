@@ -184,6 +184,7 @@ export function createNotificationChannel(
     contextToken: "",
     contextTokenConfigured: false,
     clearContextToken: false,
+    getUpdatesBuf: "",
     chatId: "",
   };
 }

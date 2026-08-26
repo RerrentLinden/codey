@@ -312,20 +312,19 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let mut send_requests = 0;
-            for response_body in [r#"{"ret":0}"#, "not json"] {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0_u8; 8192];
-                let bytes_read = socket.read(&mut request).await.unwrap();
-                let request = String::from_utf8_lossy(&request[..bytes_read]);
-                if request.contains("POST /ilink/bot/sendmessage ") {
-                    send_requests += 1;
-                }
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                    response_body.len()
-                );
-                socket.write_all(response.as_bytes()).await.unwrap();
+            let response_body = "not json";
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            if request.contains("POST /ilink/bot/sendmessage ") {
+                send_requests += 1;
             }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
 
             if let Ok(Ok((mut socket, _))) =
                 tokio::time::timeout(Duration::from_millis(500), listener.accept()).await

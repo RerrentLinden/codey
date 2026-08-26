@@ -15,6 +15,7 @@ export type NotificationChannel = {
   contextToken: string;
   contextTokenConfigured: boolean;
   clearContextToken?: boolean;
+  getUpdatesBuf?: string;
   chatId: string;
 };
 

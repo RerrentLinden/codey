@@ -25,6 +25,7 @@ type WechatClawLoginPollResult = {
   botToken?: string;
   recipientId?: string;
   contextToken?: string;
+  getUpdatesBuf?: string;
 };
 
 type ActiveLogin = {
@@ -92,6 +93,7 @@ function WechatClawChannelEditorComponent({
             contextToken,
             contextTokenConfigured: true,
             clearContextToken: false,
+            getUpdatesBuf: result.getUpdatesBuf?.trim() ?? "",
             chatId: recipientId,
           });
           setLogin((current) => current?.loginId === loginId
@@ -260,6 +262,7 @@ function WechatClawChannelEditorComponent({
                 contextToken: "",
                 contextTokenConfigured: false,
                 clearContextToken: true,
+                getUpdatesBuf: "",
                 chatId: "",
               });
             }}
