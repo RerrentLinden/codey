@@ -1048,8 +1048,33 @@ fn should_forward_incoming_header(name: &str, official_account: bool) -> bool {
     }
     // ChatGPT-account headers are required by the official Codex endpoint but
     // must never cross into an API-key provider. Third-party routes receive
-    // only a harmless content-negotiation header plus their saved route headers.
-    official_account || name.eq_ignore_ascii_case("accept")
+    // only content negotiation, Codex client identity, and saved route headers.
+    official_account || name.eq_ignore_ascii_case("accept") || is_codex_client_identity_header(name)
+}
+
+fn is_codex_client_identity_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "user-agent"
+            | "originator"
+            | "version"
+            | "openai-beta"
+            | "x-openai-originator"
+            | "x-openai-client-user-agent"
+            | "x-client-request-id"
+            | "thread-id"
+            | "thread_id"
+            | "session-id"
+            | "session_id"
+            | "prompt-cache-key"
+            | "prompt_cache_key"
+            | "x-codex-installation-id"
+            | "x-codex-window-id"
+            | "x-codex-parent-thread-id"
+            | "x-codex-beta-features"
+            | "x-openai-subagent"
+    ) || lower.starts_with("x-stainless-")
 }
 
 fn incoming_header<'a>(request: &'a HttpRequest, header_name: &str) -> Option<&'a str> {
@@ -6267,17 +6292,25 @@ mod tests {
     }
 
     #[test]
-    fn third_party_routes_do_not_inherit_chatgpt_account_headers() {
+    fn third_party_routes_forward_codex_identity_without_chatgpt_account_headers() {
         assert!(should_forward_incoming_header("chatgpt-account-id", true));
         assert!(should_forward_incoming_header("x-openai-originator", true));
         assert!(!should_forward_incoming_header("chatgpt-account-id", false));
-        assert!(!should_forward_incoming_header(
-            "x-openai-originator",
+        assert!(should_forward_incoming_header("x-openai-originator", false));
+        assert!(should_forward_incoming_header("user-agent", false));
+        assert!(should_forward_incoming_header(
+            "x-codex-installation-id",
             false
         ));
+        assert!(should_forward_incoming_header("x-codex-window-id", false));
+        assert!(should_forward_incoming_header("originator", false));
+        assert!(should_forward_incoming_header("x-stainless-os", false));
+        assert!(should_forward_incoming_header("thread-id", false));
+        assert!(should_forward_incoming_header("session-id", false));
         assert!(!should_forward_incoming_header("authorization", true));
         assert!(!should_forward_incoming_header(ROUTER_AUTH_HEADER, true));
         assert!(!should_forward_incoming_header(ROUTE_METADATA_KEY, true));
+        assert!(!should_forward_incoming_header(TURN_METADATA_HEADER, false));
         assert!(should_forward_incoming_header("accept", false));
     }
 
@@ -7882,6 +7915,12 @@ mod tests {
                 .iter()
                 .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
                 .map(|(_, value)| value.clone());
+            let user_agent = incoming_header(&request, "user-agent").map(str::to_string);
+            let originator = incoming_header(&request, "originator").map(str::to_string);
+            let codex_window_id =
+                incoming_header(&request, "x-codex-window-id").map(str::to_string);
+            let account_id = incoming_header(&request, "chatgpt-account-id").map(str::to_string);
+            let router_token = incoming_header(&request, ROUTER_AUTH_HEADER).map(str::to_string);
             let body = serde_json::from_slice::<Value>(&request.body).unwrap();
             write_json_response(
                 &mut stream,
@@ -7890,7 +7929,16 @@ mod tests {
             )
             .await
             .unwrap();
-            (request.path, authorization, body)
+            (
+                request.path,
+                authorization,
+                user_agent,
+                originator,
+                codex_window_id,
+                account_id,
+                router_token,
+                body,
+            )
         });
         let (config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
         let router = LocalRouter::start(&config).await.unwrap();
@@ -7900,6 +7948,10 @@ mod tests {
         let response = reqwest::Client::new()
             .post(format!("{}/responses", endpoint.base_url))
             .bearer_auth(&endpoint.token)
+            .header("user-agent", "codex_cli_rs/0.114.0")
+            .header("originator", "codex_cli_rs")
+            .header("x-codex-window-id", "window-123")
+            .header("chatgpt-account-id", "must-not-leak")
             .json(&json!({"model":alias,"input":"hello","stream":true}))
             .send()
             .await
@@ -7907,9 +7959,23 @@ mod tests {
 
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.json::<Value>().await.unwrap()["model"], model);
-        let (path, authorization, body) = upstream_task.await.unwrap();
+        let (
+            path,
+            authorization,
+            user_agent,
+            originator,
+            codex_window_id,
+            account_id,
+            router_token,
+            body,
+        ) = upstream_task.await.unwrap();
         assert_eq!(path, "/v1/responses");
         assert_eq!(authorization.as_deref(), Some("Bearer sk-upstream"));
+        assert_eq!(user_agent.as_deref(), Some("codex_cli_rs/0.114.0"));
+        assert_eq!(originator.as_deref(), Some("codex_cli_rs"));
+        assert_eq!(codex_window_id.as_deref(), Some("window-123"));
+        assert_eq!(account_id, None);
+        assert_eq!(router_token, None);
         assert_eq!(body["model"], "provider-model");
         assert!(!body.to_string().contains(&endpoint.token));
         router.stop().await.unwrap();
