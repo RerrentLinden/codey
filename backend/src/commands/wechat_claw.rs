@@ -1358,8 +1358,10 @@ mod tests {
         });
 
         let directory = tempfile::tempdir().unwrap();
-        let mut config = CodeyConfig::default();
-        config.settings_revision = 12;
+        let mut config = CodeyConfig {
+            settings_revision: 12,
+            ..CodeyConfig::default()
+        };
         let mut channel = configured_wechat_claw_channel("restart-claw");
         channel.url = format!("http://{address}/");
         channel.allow_insecure_test_url = true;
@@ -1457,8 +1459,10 @@ mod tests {
         });
 
         let directory = tempfile::tempdir().unwrap();
-        let mut config = CodeyConfig::default();
-        config.settings_revision = 13;
+        let mut config = CodeyConfig {
+            settings_revision: 13,
+            ..CodeyConfig::default()
+        };
         let mut channel = configured_wechat_claw_channel("expired-claw");
         channel.url = format!("http://{address}/");
         channel.allow_insecure_test_url = true;

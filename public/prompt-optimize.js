@@ -186,11 +186,52 @@
     if (!isComposerInput(element)) return false;
     if (element.closest?.(ignoredComposerContainerSelector)) return false;
     if (element.closest?.("[hidden], [aria-hidden='true']")) return false;
-    if (element.disabled) return false;
+    if (element.disabled || element.readOnly) return false;
     const style = window.getComputedStyle(element);
     if (style.display === "none" || style.visibility === "hidden") return false;
     const rect = element.getBoundingClientRect();
     return rect.width > 0 && rect.height > 0;
+  };
+
+  const controlLooksLikeComposerAction = (control) =>
+    /(^|[^a-z])(model|send|submit|attach|upload|microphone|mic|voice|full access)([^a-z]|$)|模型|发送|提交|附件|上传|语音|麦克风|完全访问/i.test(
+      controlDescriptor(control),
+    );
+
+  const controlIsNearInput = (control, inputRect) => {
+    const rect = control.getBoundingClientRect();
+    if (rect.bottom <= inputRect.top) return false;
+    const controlMiddle = rect.top + rect.height / 2;
+    const inputMiddle = inputRect.top + inputRect.height / 2;
+    return Math.abs(controlMiddle - inputMiddle) <= Math.max(96, inputRect.height);
+  };
+
+  const scopeHasComposerActions = (scope, inputRect) =>
+    [...(scope?.querySelectorAll?.(composerControlSelector) || [])].some(
+      (control) =>
+        isVisibleControl(control) &&
+        controlIsNearInput(control, inputRect) &&
+        controlLooksLikeComposerAction(control),
+    );
+
+  const scopeHasVisibleControls = (scope, inputRect) =>
+    [...(scope?.querySelectorAll?.(composerControlSelector) || [])].some(
+      (control) =>
+        isVisibleControl(control) && controlIsNearInput(control, inputRect),
+    );
+
+  const hasComposerActionContext = (element) => {
+    if (!element?.parentElement) return false;
+    const inputRect = element.getBoundingClientRect();
+    let scope = element.parentElement;
+    let depth = 0;
+    while (scope && depth < 6) {
+      if (scopeHasComposerActions(scope, inputRect)) return true;
+      if (scopeHasVisibleControls(scope, inputRect)) return false;
+      scope = scope.parentElement;
+      depth += 1;
+    }
+    return false;
   };
 
   const findComposerInput = () => {
@@ -215,6 +256,7 @@
       composerFallbackSelector,
     )) {
       if (!isVisible(candidate)) continue;
+      if (!hasComposerActionContext(candidate)) continue;
       const rect = candidate.getBoundingClientRect();
       if (
         viewportHeight > 0 &&
@@ -259,6 +301,7 @@
   const modelControlScore = (control, inputRect) => {
     const rect = control.getBoundingClientRect();
     if (rect.bottom <= inputRect.top) return Number.NEGATIVE_INFINITY;
+    if (!controlIsNearInput(control, inputRect)) return Number.NEGATIVE_INFINITY;
     const descriptor = controlDescriptor(control);
     const visibleText = [control.textContent, control.innerText]
       .filter((value) => typeof value === "string" && value.trim())
@@ -266,7 +309,13 @@
       .replace(/\s+/g, " ")
       .trim();
     const hasModelHint = /(^|[^a-z])model([^a-z]|$)|模型/i.test(descriptor);
-    if (!hasModelHint && !visibleText) return Number.NEGATIVE_INFINITY;
+    const hasModelValueHint =
+      /(^|[^a-z])(gpt|codex|claude|gemini|grok|llama|qwen|deepseek|mistral|sonnet|opus|haiku|mini|sol|low|medium|high|xhigh|auto)([^a-z]|$)|\bo\d+\b|\d+(?:\.\d+)?|低|中|高|极高|自动/i.test(
+        visibleText,
+      );
+    if (!hasModelHint && !hasModelValueHint) {
+      return Number.NEGATIVE_INFINITY;
+    }
     if (
       !hasModelHint &&
       /完全访问|full access|附件|attach|上传|upload|优化/i.test(descriptor)
@@ -312,6 +361,7 @@
       depth += 1;
     }
     if (!bestControl) return null;
+    if (!hasComposerActionContext(inputElement)) return null;
 
     let anchor = bestControl;
     let host = bestControl.parentElement;
@@ -640,6 +690,7 @@
         "data-above-composer-conversation-id",
         "disabled",
         "hidden",
+        "readonly",
         "role",
         "style",
       ],

@@ -237,21 +237,56 @@ const createEnvironment = (options = {}) => {
     },
   });
   slashGoalCommand.textContent = "目标";
+  const settingsPanel = new FakeElement("section");
+  settingsPanel.setAttribute("data-testid", "settings-panel");
+  const settingsInput = new FakeElement("div", {
+    rect: {
+      bottom: 300,
+      height: 120,
+      left: 100,
+      right: 800,
+      top: 180,
+      width: 700,
+    },
+  });
+  settingsInput.setAttribute("contenteditable", "true");
+  settingsInput.setAttribute("role", "textbox");
+  settingsInput.innerText = options.settingsInitialText ?? "自定义语气";
+  const settingsToneControl = new FakeElement("button", {
+    rect: {
+      bottom: 290,
+      height: 36,
+      left: 980,
+      right: 1120,
+      top: 254,
+      width: 140,
+    },
+  });
+  settingsToneControl.textContent = "亲和";
+  settingsToneControl.setAttribute("aria-haspopup", "menu");
+  settingsPanel.appendChild(settingsInput);
+  settingsPanel.appendChild(settingsToneControl);
   slashCommandList.appendChild(slashModelCommand);
   slashCommandList.appendChild(slashGoalCommand);
   let slashCommandsOpen = options.slashCommands === true;
+  const includeComposer = options.composerDom !== false;
   documentElement.appendChild(body);
   body.appendChild(scope);
-  scope.appendChild(anchor);
-  scope.appendChild(textarea);
-  scope.appendChild(newChatInput);
-  scope.appendChild(toolbar);
-  toolbar.appendChild(accessButton);
-  toolbar.appendChild(modelButton);
-  toolbar.appendChild(microphoneButton);
-  toolbar.appendChild(sendButton);
+  if (includeComposer) {
+    scope.appendChild(anchor);
+    scope.appendChild(textarea);
+    scope.appendChild(newChatInput);
+    scope.appendChild(toolbar);
+    toolbar.appendChild(accessButton);
+    toolbar.appendChild(modelButton);
+    toolbar.appendChild(microphoneButton);
+    toolbar.appendChild(sendButton);
+  }
   if (slashCommandsOpen) {
     scope.appendChild(slashCommandList);
+  }
+  if (options.settingsPanel) {
+    scope.appendChild(settingsPanel);
   }
   if (options.dialogComposer || options.dialogControl) {
     scope.appendChild(dialog);
@@ -263,7 +298,16 @@ const createEnvironment = (options = {}) => {
     dialog.appendChild(dialogToolbar);
     dialogToolbar.appendChild(dialogControl);
   }
-  let fallbackInputs = options.newChatComposer ? [newChatInput] : [textarea];
+  let fallbackInputs = options.newChatComposer
+    ? [newChatInput]
+    : includeComposer
+      ? [textarea]
+      : [];
+  if (options.settingsPanel) {
+    fallbackInputs = options.onlySettingsPanel
+      ? [settingsInput]
+      : [...fallbackInputs, settingsInput];
+  }
   if (options.dialogComposer) {
     fallbackInputs = options.onlyDialogComposer
       ? [dialogInput]
@@ -271,16 +315,14 @@ const createEnvironment = (options = {}) => {
   }
   scope.querySelectorAll = (selector) => {
     if (selector === "textarea, [contenteditable='true'], [role='textbox']") {
-      return [textarea];
+      return includeComposer ? [textarea] : [];
     }
     if (selector === "button, [role='button']") {
-      const controls = [
-        accessButton,
-        modelButton,
-        microphoneButton,
-        sendButton,
-      ];
+      const controls = includeComposer
+        ? [accessButton, modelButton, microphoneButton, sendButton]
+        : [];
       if (options.dialogControl) controls.push(dialogControl);
+      if (options.settingsPanel) controls.push(settingsToneControl);
       if (slashCommandsOpen) {
         controls.push(slashModelCommand, slashGoalCommand);
       }
@@ -389,6 +431,9 @@ const createEnvironment = (options = {}) => {
     injectionStatus: window.__codeyInjectionStatus["prompt-optimize"],
     statusEvents,
     newChatInput,
+    settingsPanel,
+    settingsInput,
+    settingsToneControl,
     textarea,
     toolbar,
     accessButton,
@@ -575,6 +620,36 @@ test("keeps the button hidden when no composer input is found", async () => {
   await flush();
 
   assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
+});
+
+test("does not mount the button for settings textboxes", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    anchors: false,
+    composerDom: false,
+    settingsPanel: true,
+    onlySettingsPanel: true,
+  });
+  await flush();
+
+  assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
+  assert.equal(env.snapshot().hasInput, false);
+});
+
+test("does not use settings controls as insertion targets", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    settingsPanel: true,
+  });
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.ok(button, "the normal composer should still receive the button");
+  assert.equal(button.parentElement, env.toolbar);
+  assert.equal(env.settingsToneControl.parentElement, env.settingsPanel);
+  assert.equal(env.settingsToneControl.parentElement.contains(button), false);
 });
 
 test("ignores Git commit textboxes inside modal dialogs", async () => {
