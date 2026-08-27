@@ -24,6 +24,9 @@ pub(super) trait NotificationChannelAdapter: Send + Sync {
     fn retry_with_fresh_context_on_success_status_error(&self, _body: &str) -> bool {
         false
     }
+    fn pause_on_stale_token_success_status_error(&self, _body: &str) -> bool {
+        false
+    }
     fn build_request(&self, client: &Client, event: &NotificationEvent) -> Result<RequestBuilder>;
     fn validate_response(&self, body: &str) -> std::result::Result<(), String>;
     fn sanitize_error(&self, error: &str) -> String;

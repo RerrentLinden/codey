@@ -79,6 +79,10 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
         wechat_claw_response_needs_context_refresh(body)
     }
 
+    fn pause_on_stale_token_success_status_error(&self, body: &str) -> bool {
+        wechat_claw_response_has_code(body, -14)
+    }
+
     fn validate_response(&self, body: &str) -> std::result::Result<(), String> {
         validate_wechat_claw_response(body)
     }
@@ -260,6 +264,17 @@ fn wechat_claw_response_needs_context_refresh(body: &str) -> bool {
         .any(|result| result == -2 && message.eq_ignore_ascii_case("prepare failed"))
 }
 
+fn wechat_claw_response_has_code(body: &str, expected: i64) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    ["ret", "errcode", "err_code"]
+        .into_iter()
+        .filter_map(|key| value.get(key))
+        .filter_map(wechat_claw_response_code)
+        .any(|result| result == expected)
+}
+
 fn wechat_claw_response_code(value: &Value) -> Option<i64> {
     value
         .as_i64()
@@ -339,6 +354,16 @@ mod tests {
         assert!(!channel.retry_with_fresh_context_on_success_status_error(
             r#"{"ret":-14,"errmsg":"token expired"}"#
         ));
+        assert!(
+            channel.pause_on_stale_token_success_status_error(
+                r#"{"ret":-14,"errmsg":"token expired"}"#
+            )
+        );
+        assert!(
+            !channel.pause_on_stale_token_success_status_error(
+                r#"{"ret":-2,"errmsg":"prepare failed"}"#
+            )
+        );
     }
 
     #[test]

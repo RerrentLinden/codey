@@ -14,6 +14,7 @@ pub struct NotificationDeliveryError {
     message: String,
     settle_delivery: bool,
     retry_with_fresh_context: bool,
+    stale_token: bool,
 }
 
 impl NotificationDeliveryError {
@@ -22,6 +23,7 @@ impl NotificationDeliveryError {
             message,
             settle_delivery: false,
             retry_with_fresh_context: false,
+            stale_token: false,
         }
     }
 
@@ -30,6 +32,7 @@ impl NotificationDeliveryError {
             message,
             settle_delivery: true,
             retry_with_fresh_context: false,
+            stale_token: false,
         }
     }
 
@@ -38,6 +41,16 @@ impl NotificationDeliveryError {
             message,
             settle_delivery: false,
             retry_with_fresh_context: true,
+            stale_token: false,
+        }
+    }
+
+    fn stale_token(message: String) -> Self {
+        Self {
+            message,
+            settle_delivery: false,
+            retry_with_fresh_context: false,
+            stale_token: true,
         }
     }
 
@@ -47,6 +60,10 @@ impl NotificationDeliveryError {
 
     pub fn should_retry_with_fresh_context(&self) -> bool {
         self.retry_with_fresh_context
+    }
+
+    pub fn indicates_stale_token(&self) -> bool {
+        self.stale_token
     }
 }
 
@@ -119,6 +136,18 @@ impl NotificationDispatcher {
                             match validate_http_response(adapter, status, &response_body) {
                                 Ok(()) => return Ok(()),
                                 Err(error) => {
+                                    if status.is_success()
+                                        && adapter.pause_on_stale_token_success_status_error(
+                                            &response_body,
+                                        )
+                                    {
+                                        return Err(NotificationDeliveryError::stale_token(
+                                            format!(
+                                                "{}消息发送失败：{error}",
+                                                adapter.display_name()
+                                            ),
+                                        ));
+                                    }
                                     if status.is_success()
                                         && adapter.retry_with_fresh_context_on_success_status_error(
                                             &response_body,
@@ -408,6 +437,59 @@ mod tests {
         assert!(error.should_settle_delivery());
         assert!(error.to_string().contains("无法解析"));
         assert_eq!(server.await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn clawbot_surfaces_stale_token_without_retrying_the_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let response_body = r#"{"errcode":-14,"errmsg":"token expired"}"#;
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let bytes_read = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..bytes_read]);
+            assert!(request.contains("POST /ilink/bot/sendmessage "));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+
+            tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .is_err()
+        });
+        let config = NotificationChannelConfig {
+            id: "stale-clawbot".to_string(),
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: format!("http://{address}"),
+            bot_token: "test-bot-token".to_string(),
+            context_token: "test-context-token".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        };
+        let dispatcher = NotificationDispatcher::new(config).unwrap();
+        let event = NotificationEvent::new(
+            "session.completed",
+            "session-clawbot",
+            "profile-clawbot",
+            "Codex",
+            0,
+            None,
+        );
+
+        let error = dispatcher.send(&event).await.unwrap_err();
+
+        assert!(error.indicates_stale_token());
+        assert!(!error.should_settle_delivery());
+        assert!(error.to_string().contains("-14"));
+        assert!(server.await.unwrap());
     }
 
     #[tokio::test]

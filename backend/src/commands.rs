@@ -73,9 +73,11 @@ use webhooks::{
     sync_waiting_webhook_watcher, test_notification_channel,
 };
 use wechat_claw::{
-    WechatClawLoginState, WechatClawSyncHandle, poll_wechat_claw_login,
+    WechatClawLoginState, WechatClawSessionGuard, WechatClawSyncHandle,
+    pause_wechat_claw_notification_channel, poll_wechat_claw_login,
     refresh_wechat_claw_channel_context, start_wechat_claw_login, stop_wechat_claw_service,
     sync_wechat_claw_service, wechat_claw_login_http_client,
+    wechat_claw_notification_cooldown_remaining,
 };
 
 use crate::account_usage;
@@ -146,6 +148,7 @@ pub struct AppState {
     wechat_claw_logins: Mutex<WechatClawLoginState>,
     wechat_claw_sync: Mutex<Option<WechatClawSyncHandle>>,
     wechat_claw_sync_update: Mutex<()>,
+    wechat_claw_session_guard: Mutex<WechatClawSessionGuard>,
     waiting_watcher_shutdown: Mutex<Option<oneshot::Sender<()>>>,
     waiting_watcher_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     waiting_watcher_sync: Mutex<()>,
@@ -239,6 +242,7 @@ impl Default for AppState {
             wechat_claw_logins: Mutex::new(WechatClawLoginState::default()),
             wechat_claw_sync: Mutex::new(None),
             wechat_claw_sync_update: Mutex::new(()),
+            wechat_claw_session_guard: Mutex::new(WechatClawSessionGuard::default()),
             waiting_watcher_shutdown: Mutex::new(None),
             waiting_watcher_task: Mutex::new(None),
             waiting_watcher_sync: Mutex::new(()),
