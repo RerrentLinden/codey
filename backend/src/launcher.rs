@@ -1409,11 +1409,13 @@ impl CodeyRuntime {
         let startup_profile = resolve_startup_profile(config)?;
         // Threads created or resumed under Codey persist `codey_router` in
         // rollout headers and the Codex thread index. Codex Desktop resolves
-        // that id from disk config; process `-c` overlays only exist while
-        // Codey is running. Install a non-loopback disk shim first so those
-        // threads remain loadable, then still sync records back to the
-        // user's persistent provider for official and third-party routes.
-        prepare_persistent_router_resume_shim(home).await?;
+        // that id from disk config; process `-c` overlays do not replace that
+        // lookup. Sync records back to the user's persistent provider so
+        // threads remain loadable outside Codey. Do not install the ChatGPT
+        // resume shim here: that table is ChatGPT-account transport and would
+        // send third-party catalog aliases to chatgpt.com for the whole live
+        // session. The live loopback table is written after the local router
+        // binds, inside apply_runtime_router_config.
         let persistent_session_provider = resolve_persistent_session_provider(home).await?;
         let session_provider_sync_target = Some(persistent_session_provider.as_str());
         let storage = prepare_startup_storage(
@@ -1429,7 +1431,12 @@ impl CodeyRuntime {
         let PreparedProviderState {
             runtime_config,
             runtime_config_overrides,
-        } = prepare_runtime_provider_state(home, config, &startup_profile, &local_router).await?;
+        } = match prepare_runtime_provider_state(home, config, &startup_profile, &local_router)
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => return Err(restore_runtime_config_after_error(home, error).await),
+        };
         let patch = prepare_startup_patches(home, config).await?;
         let SpawnedRenderer {
             app_dir,

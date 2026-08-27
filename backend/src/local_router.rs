@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +21,7 @@ pub(crate) const ROUTER_PROVIDER_ID: &str = "codey_router";
 pub(crate) const ROUTER_AUTH_HEADER: &str = "x-codey-router-token";
 const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const ROUTE_METADATA_KEY: &str = "codey_route";
+const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -47,6 +49,10 @@ tokio::task_local! {
 pub(crate) struct RuntimeRouterEndpoint {
     pub base_url: String,
     pub token: String,
+    /// Official ChatGPT routes are available this launch. Codex itself still
+    /// authenticates to this loopback provider with the router bearer token;
+    /// the gateway loads ChatGPT OAuth from `auth.json` when forwarding those
+    /// routes.
     pub requires_openai_auth: bool,
 }
 
@@ -74,6 +80,7 @@ impl LocalRouter {
         };
         let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let official_auth_path = crate::codex_config::codex_home().join("auth.json");
         let server = RouterServer {
             token: endpoint.token.clone(),
             bearer_token: format!("Bearer {}", endpoint.token),
@@ -88,6 +95,7 @@ impl LocalRouter {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .context("创建 Codey 本地路由 HTTP 客户端失败")?,
+            official_auth_path,
         };
         let task = tokio::spawn(async move {
             loop {
@@ -222,6 +230,7 @@ struct RouterServer {
     request_body_budget: Arc<Semaphore>,
     bindings: Arc<Mutex<RouteBindings>>,
     client: reqwest::Client,
+    official_auth_path: PathBuf,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -837,8 +846,11 @@ impl RouterServer {
             headers.insert(HeaderName::from_static("x-codey-request-id"), value);
         }
         if resolved.route.official_account {
-            let Some(authorization) = incoming_openai_authorization(&request, &self.bearer_token)
-            else {
+            let Some(official_auth) = resolve_official_upstream_auth(
+                &request,
+                &self.bearer_token,
+                &self.official_auth_path,
+            ) else {
                 write_error_response(
                     &mut stream,
                     401,
@@ -849,7 +861,7 @@ impl RouterServer {
                 .await?;
                 return Ok(());
             };
-            let Ok(value) = HeaderValue::from_str(authorization) else {
+            let Ok(value) = HeaderValue::from_str(&official_auth.authorization) else {
                 write_error_response(
                     &mut stream,
                     401,
@@ -861,6 +873,12 @@ impl RouterServer {
                 return Ok(());
             };
             headers.insert(AUTHORIZATION, value);
+            if let Some(account_id) = official_auth.account_id.as_deref()
+                && !headers.contains_key(CHATGPT_ACCOUNT_ID_HEADER)
+                && let Ok(value) = HeaderValue::from_str(account_id)
+            {
+                headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
+            }
         }
         let mut request_builder = self.client.post(upstream_url).headers(headers);
         request_builder = if should_passthrough_native_responses(
@@ -1165,6 +1183,41 @@ fn incoming_openai_authorization<'a>(
         return None;
     }
     Some(authorization)
+}
+
+struct OfficialUpstreamAuth {
+    authorization: String,
+    account_id: Option<String>,
+}
+
+fn incoming_chatgpt_account_id(request: &HttpRequest) -> Option<String> {
+    incoming_header(request, CHATGPT_ACCOUNT_ID_HEADER)
+        .map(str::trim)
+        .filter(|account_id| !account_id.is_empty())
+        .map(ToString::to_string)
+}
+
+fn resolve_official_upstream_auth(
+    request: &HttpRequest,
+    router_bearer_token: &str,
+    auth_path: &Path,
+) -> Option<OfficialUpstreamAuth> {
+    if let Some(authorization) = incoming_openai_authorization(request, router_bearer_token) {
+        return Some(OfficialUpstreamAuth {
+            authorization: authorization.to_string(),
+            account_id: incoming_chatgpt_account_id(request).or_else(|| {
+                crate::account_usage::read_official_auth(auth_path)
+                    .ok()
+                    .and_then(|auth| auth.account_id)
+            }),
+        });
+    }
+
+    let auth = crate::account_usage::read_official_auth(auth_path).ok()?;
+    Some(OfficialUpstreamAuth {
+        authorization: format!("Bearer {}", auth.access_token),
+        account_id: incoming_chatgpt_account_id(request).or(auth.account_id),
+    })
 }
 
 fn route_display_name(route: &RouteTarget) -> &str {
@@ -6930,6 +6983,85 @@ mod tests {
         assert_eq!(
             incoming_openai_authorization(&request, "Bearer another-router-token"),
             Some("Bearer codey-router-token")
+        );
+    }
+
+    #[test]
+    fn official_upstream_auth_prefers_incoming_oauth_over_auth_json() {
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            headers: vec![
+                (
+                    "authorization".to_string(),
+                    "Bearer chatgpt-oauth".to_string(),
+                ),
+                (
+                    CHATGPT_ACCOUNT_ID_HEADER.to_string(),
+                    "acct-incoming".to_string(),
+                ),
+            ],
+            body: Vec::new(),
+            _body_budget_permit: None,
+        };
+
+        let auth = resolve_official_upstream_auth(
+            &request,
+            "Bearer codey-router-token",
+            Path::new("/missing-auth.json"),
+        )
+        .unwrap();
+        assert_eq!(auth.authorization, "Bearer chatgpt-oauth");
+        assert_eq!(auth.account_id.as_deref(), Some("acct-incoming"));
+    }
+
+    #[test]
+    fn official_upstream_auth_loads_codex_auth_json_when_codex_uses_the_router_bearer() {
+        let directory = tempfile::tempdir().unwrap();
+        let auth_path = directory.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"chatgpt-access","account_id":"acct-9"}}"#,
+        )
+        .unwrap();
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            headers: vec![(
+                "authorization".to_string(),
+                "Bearer codey-router-token".to_string(),
+            )],
+            body: Vec::new(),
+            _body_budget_permit: None,
+        };
+
+        let auth =
+            resolve_official_upstream_auth(&request, "Bearer codey-router-token", &auth_path)
+                .unwrap();
+        assert_eq!(auth.authorization, "Bearer chatgpt-access");
+        assert_eq!(auth.account_id.as_deref(), Some("acct-9"));
+    }
+
+    #[test]
+    fn official_upstream_auth_is_missing_without_oauth_or_auth_json() {
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            headers: vec![(
+                "authorization".to_string(),
+                "Bearer codey-router-token".to_string(),
+            )],
+            body: Vec::new(),
+            _body_budget_permit: None,
+        };
+
+        assert!(
+            resolve_official_upstream_auth(
+                &request,
+                "Bearer codey-router-token",
+                Path::new("/missing-auth.json"),
+            )
+            .is_none()
         );
     }
 

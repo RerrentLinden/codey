@@ -44,6 +44,46 @@ fn assert_resume_shim(document: &DocumentMut, base_url: &str, requires_openai_au
     );
 }
 
+fn assert_runtime_disk_provider(document: &DocumentMut, base_url: &str, token: &str) {
+    let router = document["model_providers"][local_router::ROUTER_PROVIDER_ID]
+        .as_table_like()
+        .expect("codey_router runtime disk provider");
+    assert_eq!(
+        router.get("name").and_then(Item::as_str),
+        Some("Codey Local Router")
+    );
+    assert_eq!(
+        router.get("base_url").and_then(Item::as_str),
+        Some(base_url)
+    );
+    assert_eq!(
+        router.get("wire_api").and_then(Item::as_str),
+        Some("responses")
+    );
+    assert_eq!(
+        router.get("requires_openai_auth").and_then(Item::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        router.get("supports_websockets").and_then(Item::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        router
+            .get("experimental_bearer_token")
+            .and_then(Item::as_str),
+        Some(token)
+    );
+    assert_eq!(
+        router
+            .get("http_headers")
+            .and_then(Item::as_table_like)
+            .and_then(|headers| headers.get(local_router::ROUTER_AUTH_HEADER))
+            .and_then(Item::as_str),
+        Some(token)
+    );
+}
+
 #[test]
 fn codex_home_is_resolved_once_per_process() {
     assert!(std::ptr::eq(codex_home(), codex_home()));
@@ -364,6 +404,140 @@ fn prepare_resume_shim_replaces_a_loopback_owned_router() {
         Some(LEGACY_GLOBAL_PROVIDER_ID)
     );
     assert_resume_shim(&document, CHATGPT_CODEX_BASE_URL, true);
+}
+
+#[test]
+fn runtime_disk_provider_replaces_chatgpt_resume_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "model_provider = \"{LEGACY_GLOBAL_PROVIDER_ID}\"\n\
+             \n\
+             [model_providers.{LEGACY_GLOBAL_PROVIDER_ID}]\n\
+             name = \"OpenAI\"\n\
+             base_url = \"{CHATGPT_CODEX_BASE_URL}\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n\
+             \n\
+             [model_providers.codey_router]\n\
+             name = \"Codey Local Router\"\n\
+             base_url = \"{CHATGPT_CODEX_BASE_URL}\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n\
+             supports_websockets = false\n"
+        ),
+    )
+    .unwrap();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+        requires_openai_auth: true,
+    };
+
+    assert!(prepare_runtime_router_disk_provider_at(&home, &endpoint).unwrap());
+    let document = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        document["model_provider"].as_str(),
+        Some(LEGACY_GLOBAL_PROVIDER_ID)
+    );
+    assert_runtime_disk_provider(
+        &document,
+        "http://127.0.0.1:43127/v1",
+        "launch-only-router-token",
+    );
+    assert!(!prepare_runtime_router_disk_provider_at(&home, &endpoint).unwrap());
+}
+
+#[test]
+fn runtime_disk_provider_leaves_a_user_owned_codey_router_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let original = br#"model_provider = "codey_router"
+
+[model_providers.codey_router]
+name = "User-Owned Router"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+"#;
+    fs::write(home.join("config.toml"), original).unwrap();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+        requires_openai_auth: false,
+    };
+
+    assert!(!prepare_runtime_router_disk_provider_at(&home, &endpoint).unwrap());
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+}
+
+#[test]
+fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey-state/codex-lease.json");
+    let backup_root = temp.path().join("codey-state/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original_config = format!(
+        "model_provider = \"relay\"\n\
+         \n\
+         [model_providers.relay]\n\
+         name = \"Relay\"\n\
+         base_url = \"https://relay.example/v1\"\n\
+         wire_api = \"responses\"\n"
+    );
+    fs::write(home.join("config.toml"), &original_config).unwrap();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+        requires_openai_auth: true,
+    };
+
+    apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            local_router: &endpoint,
+            use_official_catalog: false,
+            default_model: Some("route-a/hy3"),
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backup_root,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        original_config
+    );
+    assert!(prepare_runtime_router_disk_provider_at(&home, &endpoint).unwrap());
+    let live = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(live["model_provider"].as_str(), Some("relay"));
+    assert_runtime_disk_provider(
+        &live,
+        "http://127.0.0.1:43127/v1",
+        "launch-only-router-token",
+    );
+
+    assert!(restore_runtime_config_at(&home, &marker).unwrap());
+    let restored = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(restored["model_provider"].as_str(), Some("relay"));
+    assert_resume_shim(&restored, "https://relay.example/v1", false);
 }
 
 #[test]
@@ -2348,11 +2522,12 @@ fn official_login_uses_the_http_only_router_without_overriding_builtin_openai() 
     let rendered = applied.runtime_config_overrides.join("\n");
     assert!(rendered.contains("model_provider=\"codey_router\""));
     assert!(rendered.contains("model=\"openai/gpt-5.6-sol\""));
-    assert!(rendered.contains("model_providers.codey_router.requires_openai_auth=true"));
+    assert!(rendered.contains("model_providers.codey_router.requires_openai_auth=false"));
     assert!(rendered.contains("model_providers.codey_router.supports_websockets=false"));
     assert!(rendered.contains("x-codey-router-token"));
-    assert!(rendered.contains("launch-only-router-token"));
-    assert!(!rendered.contains("model_providers.codey_router.experimental_bearer_token"));
+    assert!(rendered.contains(
+        "model_providers.codey_router.experimental_bearer_token=\"launch-only-router-token\""
+    ));
     assert!(!rendered.contains("openai_base_url="));
 }
 

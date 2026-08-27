@@ -265,9 +265,10 @@ pub(crate) fn apply_runtime_router_config(
             "当前平台尚不能把 Codey Provider 配置限定到单次 Codex 进程；为避免修改用户 config.toml，已取消启动"
         );
     }
-    // The startup patch injects these values into every managed app-server as
-    // command-local `-c` overrides. Never fall back to rewriting config.toml.
-    apply_isolated_runtime_router_config(
+    // Most runtime values stay command-local `-c` overlays. Codex Desktop still
+    // looks up a thread's saved `model_provider` from disk, so persist only the
+    // live loopback `codey_router` table after the isolated overlay is ready.
+    let applied = apply_isolated_runtime_router_config(
         home,
         RouterApplyOptions {
             local_router: options.local_router,
@@ -281,7 +282,25 @@ pub(crate) fn apply_runtime_router_config(
             marker: &marker,
             backup_root: &backup_root,
         },
-    )
+    )?;
+    persist_runtime_router_disk_provider_or_rollback(home, &marker, options.local_router)?;
+    Ok(applied)
+}
+
+fn persist_runtime_router_disk_provider_or_rollback(
+    home: &Path,
+    marker: &Path,
+    endpoint: &RuntimeRouterEndpoint,
+) -> Result<()> {
+    if let Err(error) = prepare_runtime_router_disk_provider_at(home, endpoint) {
+        return match restore_runtime_config_at(home, marker) {
+            Ok(_) => Err(error).context("写入运行时 codey_router 磁盘表失败，已回滚隔离运行配置"),
+            Err(rollback_error) => anyhow::bail!(
+                "写入运行时 codey_router 磁盘表失败：{error:#}；回滚隔离运行配置也失败：{rollback_error:#}"
+            ),
+        };
+    }
+    Ok(())
 }
 
 const FASTCTX_SERVER_BINARY: &str = if cfg!(windows) {
@@ -1194,11 +1213,14 @@ fn repair_persistent_codey_runtime_config(home: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Codex Desktop looks up a thread's saved `model_provider` in disk config
-/// (process `-c` overlays only exist while Codey is running). Older releases
-/// stamped launch-only `codey_router` into rollout/SQLite, then deleted that
-/// provider table on repair. A non-loopback, non-secret disk shim keeps those
-/// threads loadable without selecting `codey_router` as the user's provider.
+/// Idle/restore disk table for `codey_router`. Codex Desktop looks up a
+/// thread's saved `model_provider` in `config.toml`; older releases stamped
+/// launch-only `codey_router` into rollout/SQLite, then deleted that table on
+/// repair. A non-loopback, non-secret shim keeps those threads loadable when
+/// Codey is not running, without selecting `codey_router` as the user's
+/// provider. While the local router is up, [`prepare_runtime_router_disk_provider_at`]
+/// replaces this with the live loopback API-key table so third-party catalog
+/// aliases are not sent to ChatGPT-account transport.
 pub fn prepare_persistent_router_resume_shim(home: &Path) -> Result<bool> {
     let marker = lease_marker_path();
     let _runtime_config_lock = RuntimeConfigLock::acquire(&marker)?;
@@ -1224,6 +1246,38 @@ pub(crate) fn prepare_persistent_router_resume_shim_at(home: &Path) -> Result<bo
         document,
         "install persistent codey_router resume shim",
         "codex_config.prepare_persistent_router_resume_shim",
+    )?;
+    Ok(true)
+}
+
+/// Persist the live loopback API-key `codey_router` table while the local
+/// router is running. Desktop and config reload resolve that id from disk;
+/// process `-c` overlays do not stop ChatGPT-account transport when the disk
+/// table still says `requires_openai_auth = true`.
+pub(crate) fn prepare_runtime_router_disk_provider_at(
+    home: &Path,
+    endpoint: &RuntimeRouterEndpoint,
+) -> Result<bool> {
+    let config_path = home.join("config.toml");
+    let manager = ConfigManager::new(&config_path);
+    let snapshot = manager.load()?;
+    if !snapshot.exists() {
+        return Ok(false);
+    }
+    let mut document = snapshot.document().clone();
+    if user_owned_router_provider_occupies_id(&document) {
+        return Ok(false);
+    }
+    let desired = local_router_provider_table(endpoint);
+    if runtime_router_disk_provider_matches(&document, &desired) {
+        return Ok(false);
+    }
+    write_persistent_router_shim(&mut document, desired)?;
+    manager.replace_document(
+        Some(snapshot.revision()),
+        document,
+        "install runtime codey_router loopback provider",
+        "codex_config.prepare_runtime_router_disk_provider",
     )?;
     Ok(true)
 }
@@ -1351,6 +1405,31 @@ fn unique_non_router_provider_table(doc: &DocumentMut) -> Option<&dyn TableLike>
         other = Some(provider);
     }
     other
+}
+
+fn runtime_router_disk_provider_matches(doc: &DocumentMut, desired: &Table) -> bool {
+    let Some(existing) = document_provider_table(doc, local_router::ROUTER_PROVIDER_ID) else {
+        return false;
+    };
+    if !codey_router_provider_table_is_codey_owned(existing) {
+        return false;
+    }
+    table_like_str(existing, "name") == table_str(desired, "name")
+        && table_like_str(existing, "base_url") == table_str(desired, "base_url")
+        && table_like_str(existing, "wire_api") == table_str(desired, "wire_api")
+        && table_like_bool(existing, "requires_openai_auth") == Some(false)
+        && table_like_bool(existing, "supports_websockets") == Some(false)
+        && table_like_str(existing, "experimental_bearer_token")
+            == table_str(desired, "experimental_bearer_token")
+        && provider_header_str(existing, local_router::ROUTER_AUTH_HEADER)
+            == provider_header_str(desired, local_router::ROUTER_AUTH_HEADER)
+}
+
+fn provider_header_str<'a>(provider: &'a dyn TableLike, key: &str) -> Option<&'a str> {
+    provider
+        .get("http_headers")
+        .and_then(Item::as_table_like)
+        .and_then(|headers| table_like_str(headers, key))
 }
 
 fn persistent_router_shim_matches(doc: &DocumentMut, desired: &Table) -> bool {
@@ -2239,6 +2318,7 @@ fn build_isolated_runtime_overrides(
         "requires_openai_auth",
         "supports_websockets",
         "http_headers",
+        "experimental_bearer_token",
     ] {
         push_required_document_override(
             &mut overrides,
@@ -2247,12 +2327,6 @@ fn build_isolated_runtime_overrides(
             &format!("model_providers.{provider_segment}.{field}"),
         )?;
     }
-    push_document_override(
-        &mut overrides,
-        effective,
-        &["model_providers", provider_id, "experimental_bearer_token"],
-        &format!("model_providers.{provider_segment}.experimental_bearer_token"),
-    )?;
 
     if fastctx_namespace.is_some() {
         for (path, key) in [
@@ -2605,6 +2679,7 @@ fn validate_runtime_router_overrides(overrides: &[String], provider_id: &str) ->
         format!("model_providers.{provider_segment}.wire_api"),
         format!("model_providers.{provider_segment}.requires_openai_auth"),
         format!("model_providers.{provider_segment}.supports_websockets"),
+        format!("model_providers.{provider_segment}.experimental_bearer_token"),
     ];
     let missing = required_keys
         .iter()
@@ -3031,7 +3106,12 @@ fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
     provider["name"] = value(LOCAL_ROUTER_PROVIDER_NAME);
     provider["base_url"] = value(endpoint.base_url.trim_end_matches('/'));
     provider["wire_api"] = value("responses");
-    provider["requires_openai_auth"] = value(endpoint.requires_openai_auth);
+    // Codex 0.150+ treats `requires_openai_auth = true` as ChatGPT-account
+    // transport and sends catalog aliases such as `route-*/mimo-v2.5` to
+    // chatgpt.com instead of the loopback gateway. The provider Codex sees is
+    // always an API-key local router; official OAuth is attached by the
+    // gateway when forwarding official routes.
+    provider["requires_openai_auth"] = value(false);
     provider["supports_websockets"] = value(false);
     let mut headers = InlineTable::new();
     headers.insert(
@@ -3039,9 +3119,7 @@ fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
         Value::from(endpoint.token.as_str()),
     );
     provider["http_headers"] = Item::Value(Value::InlineTable(headers));
-    if !endpoint.requires_openai_auth {
-        provider["experimental_bearer_token"] = value(endpoint.token.as_str());
-    }
+    provider["experimental_bearer_token"] = value(endpoint.token.as_str());
     provider
 }
 

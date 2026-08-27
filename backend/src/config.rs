@@ -815,6 +815,12 @@ impl CodeyConfig {
             .unwrap_or_else(model_catalog::default_official_model_slugs)
     }
 
+    /// Whether official ChatGPT routes can be served this launch.
+    ///
+    /// This does **not** put Codex into ChatGPT-account transport. The
+    /// loopback `codey_router` provider always uses a bearer token; the
+    /// gateway loads ChatGPT OAuth from `auth.json` only when forwarding
+    /// official routes.
     pub(crate) fn router_requires_openai_auth(&self) -> bool {
         self.official_account_available_this_launch
             && self.profiles.iter().any(|profile| profile.official_account)
