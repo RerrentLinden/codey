@@ -2506,7 +2506,7 @@ fn local_router_runtime_override_validation_rejects_dangling_provider_selection(
 }
 
 #[test]
-fn official_login_uses_the_http_only_router_without_overriding_builtin_openai() {
+fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
     let marker = temp.path().join("codey-state/codex-lease.json");
@@ -2517,7 +2517,7 @@ fn official_login_uses_the_http_only_router_without_overriding_builtin_openai() 
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
-        supports_websockets: false,
+        supports_websockets: true,
         requires_openai_auth: true,
     };
 
@@ -2542,7 +2542,7 @@ fn official_login_uses_the_http_only_router_without_overriding_builtin_openai() 
     assert!(rendered.contains("model_provider=\"codey_router\""));
     assert!(rendered.contains("model=\"openai/gpt-5.6-sol\""));
     assert!(rendered.contains("model_providers.codey_router.requires_openai_auth=false"));
-    assert!(rendered.contains("model_providers.codey_router.supports_websockets=false"));
+    assert!(rendered.contains("model_providers.codey_router.supports_websockets=true"));
     assert!(rendered.contains("x-codey-router-token"));
     assert!(rendered.contains(
         "model_providers.codey_router.experimental_bearer_token=\"launch-only-router-token\""

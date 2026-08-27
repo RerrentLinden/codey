@@ -452,7 +452,7 @@ function ModelSectionComponent({
                             {group?.models.length ? "已接入路由" : "待配置模型"}
                           </Badge>
                         )}
-                        {!isOfficial && profile.supportsWebsockets && (
+                        {(isOfficial || profile.supportsWebsockets) && (
                           <Badge variant="brand" size="xs">
                             WS
                           </Badge>
@@ -861,21 +861,18 @@ function ModelSectionComponent({
                   </small>
                 </div>
 
-                <div className="route-websocket-option route-editor-span-all">
-                  <div>
+                {routeDraft.upstreamProtocol === "openaiResponses" && (
+                  <div className="route-websocket-option route-editor-span-all">
                     <strong>WebSocket</strong>
-                    <small>
-                      仅在线路明确支持 Responses WebSocket 时开启；连接失败会自动回退 HTTP/SSE。
-                    </small>
+                    <Switch
+                      checked={Boolean(routeDraft.supportsWebsockets)}
+                      disabled={isBusy}
+                      onCheckedChange={(checked) =>
+                        updateRouteDraft({ supportsWebsockets: checked })}
+                      aria-label="WebSocket"
+                    />
                   </div>
-                  <Switch
-                    checked={Boolean(routeDraft.supportsWebsockets)}
-                    disabled={isBusy || routeDraft.upstreamProtocol !== "openaiResponses"}
-                    onCheckedChange={(checked) =>
-                      updateRouteDraft({ supportsWebsockets: checked })}
-                    aria-label="声明线路支持 WebSocket"
-                  />
-                </div>
+                )}
 
                 <label className="route-field">
                   <span>URL</span>

@@ -1083,7 +1083,7 @@ test("an external-provider task resumes on the HTTP router before catalog load",
   runtime.patch.dispose();
 });
 
-test("a legacy official task resumes through the HTTP-only local router carrier", async () => {
+test("a legacy official task resumes through the local router carrier", async () => {
   const runtime = await loadPatch({
     status: "ok",
     models: ["gpt-5.6-sol", "relay/shared-model"],

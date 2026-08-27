@@ -47,9 +47,9 @@ pub struct ProviderProfile {
     /// compaction when it was explicitly enabled by the source configuration.
     #[serde(default)]
     pub supports_remote_compaction: bool,
-    /// Whether this third-party OpenAI Responses route explicitly supports
-    /// the Responses WebSocket transport. Disabled by default so existing
-    /// routes retain their HTTP/SSE behavior.
+    /// Whether this route supports the Responses WebSocket transport.
+    /// Official ChatGPT-account routes normalize to enabled; third-party
+    /// routes remain disabled unless the user explicitly opts in.
     #[serde(default)]
     pub supports_websockets: bool,
 }
@@ -177,7 +177,7 @@ impl ProviderProfile {
             self.short_name = OFFICIAL_ROUTE_SHORT_NAME.to_string();
             self.api_key.clear();
             self.supports_remote_compaction = true;
-            self.supports_websockets = false;
+            self.supports_websockets = true;
             self.upstream_protocol = UPSTREAM_PROTOCOL_OFFICIAL.to_string();
             self.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
         } else {
@@ -218,7 +218,9 @@ impl ProviderProfile {
         if name.is_empty() {
             return Err("线路名称不能为空".to_string());
         }
-        if self.supports_websockets && self.upstream_protocol != UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+        if self.supports_websockets
+            && !self.official_account
+            && self.upstream_protocol != UPSTREAM_PROTOCOL_OPENAI_RESPONSES
         {
             return Err(format!(
                 "线路「{name}」只有 OpenAI Responses 协议可以启用 WebSocket"
@@ -843,20 +845,32 @@ impl CodeyConfig {
         local_router::ROUTER_PROVIDER_ID
     }
 
-    /// Route-qualified catalog model IDs that explicitly opt into Responses
-    /// WebSocket transport. Keeping this list model-scoped prevents one WS
-    /// route from changing transport for every model on the shared provider.
+    /// Whether a route can use upstream Responses WebSocket this launch.
+    /// Official ChatGPT-account routes enable it automatically once login is
+    /// available; third-party routes must explicitly declare Responses WS.
+    pub(crate) fn route_supports_websockets_this_launch(&self, profile: &ProviderProfile) -> bool {
+        if profile.official_account {
+            return self.official_account_available_this_launch;
+        }
+        profile.supports_websockets
+            && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+    }
+
+    /// Route-qualified catalog model IDs that use Responses WebSocket.
+    /// Keeping this list model-scoped prevents one WS route from changing the
+    /// upstream transport selected for every route on the shared provider.
     pub(crate) fn runtime_websocket_model_aliases(&self) -> Vec<String> {
         self.profiles
             .iter()
-            .filter(|profile| {
-                !profile.official_account
-                    && profile.supports_websockets
-                    && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
-            })
+            .filter(|profile| self.route_supports_websockets_this_launch(profile))
             .flat_map(|profile| {
                 let provider_id = profile.provider_id();
-                self.enabled_route_models(provider_id)
+                let models = if profile.official_account {
+                    self.enabled_official_route_models(provider_id)
+                } else {
+                    self.enabled_route_models(provider_id)
+                };
+                models
                     .into_iter()
                     .map(move |model| local_router::model_alias(provider_id, &model))
             })
@@ -1977,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn route_websocket_support_defaults_off_and_only_allows_responses() {
+    fn third_party_websocket_support_defaults_off_and_only_allows_responses() {
         let legacy = serde_json::from_value::<ProviderProfile>(serde_json::json!({
             "id": "legacy-provider",
             "name": "Legacy Provider",
@@ -2007,6 +2021,14 @@ mod tests {
         responses.supports_websockets = true;
         responses.normalize();
         assert!(responses.validate().is_ok());
+
+        let mut official = ProviderProfile::new("OpenAI 官方直登");
+        official.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+        assert!(official.official_account);
+        assert!(official.supports_websockets);
+        assert_eq!(official.upstream_protocol, UPSTREAM_PROTOCOL_OFFICIAL);
+        assert!(official.validate().is_ok());
     }
 
     #[test]
@@ -2253,6 +2275,36 @@ mod tests {
                 local_router::model_alias("route-ws", "ws-only"),
             ]
         );
+    }
+
+    #[test]
+    fn official_websocket_models_enable_automatically_only_when_login_is_available() {
+        let mut official = ProviderProfile::new("OpenAI 官方直登");
+        official.id = DERIVED_OFFICIAL_PROFILE_ID.into();
+        official.source_provider_id = Some("openai".into());
+        official.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: official.id.clone(),
+            profiles: vec![official],
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        }
+        .normalize();
+        config
+            .selected_models_by_provider
+            .insert("openai".into(), vec!["gpt-5.6-sol".into()]);
+
+        assert!(config.runtime_supports_websockets());
+        assert_eq!(
+            config.runtime_websocket_model_aliases(),
+            vec![local_router::model_alias("openai", "gpt-5.6-sol")]
+        );
+
+        config.official_account_available_this_launch = false;
+        assert!(!config.runtime_supports_websockets());
+        assert!(config.runtime_websocket_model_aliases().is_empty());
     }
 
     #[test]

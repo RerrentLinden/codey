@@ -1184,11 +1184,7 @@ fn websocket_route_ids(config: &CodeyConfig) -> BTreeSet<String> {
     config
         .profiles
         .iter()
-        .filter(|profile| {
-            !profile.official_account
-                && profile.supports_websockets
-                && profile.upstream_protocol == crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES
-        })
+        .filter(|profile| config.route_supports_websockets_this_launch(profile))
         .map(|profile| profile.provider_id().to_string())
         .collect()
 }
@@ -2299,6 +2295,48 @@ mod tests {
         assert!(websocket_transport_requires_restart(&enabled, &applied));
         assert!(!runtime_supports_current_routes_for_hot_reload(
             &enabled, &applied
+        ));
+    }
+
+    #[test]
+    fn official_websocket_transport_is_automatic_and_login_scoped() {
+        let mut official = crate::config::ProviderProfile::new("OpenAI 官方直登");
+        official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+        official.source_provider_id = Some("openai".into());
+        official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+
+        let mut available = CodeyConfig {
+            active_profile_id: official.id.clone(),
+            profiles: vec![official],
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        }
+        .normalize();
+        available
+            .selected_models_by_provider
+            .insert("openai".into(), vec!["gpt-5.6-sol".into()]);
+
+        assert_eq!(
+            websocket_route_ids(&available),
+            BTreeSet::from(["openai".into()])
+        );
+        assert_eq!(
+            available.runtime_websocket_model_aliases(),
+            vec![crate::local_router::model_alias("openai", "gpt-5.6-sol")]
+        );
+
+        let mut unavailable = available.clone();
+        unavailable.official_account_available_this_launch = false;
+        assert!(websocket_route_ids(&unavailable).is_empty());
+        assert!(unavailable.runtime_websocket_model_aliases().is_empty());
+        assert!(websocket_transport_requires_restart(
+            &available,
+            &unavailable
+        ));
+        assert!(!runtime_supports_current_routes_for_hot_reload(
+            &available,
+            &unavailable
         ));
     }
 }

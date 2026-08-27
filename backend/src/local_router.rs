@@ -12,7 +12,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
-use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse as WebSocketErrorResponse, Request as WebSocketRequest,
@@ -20,6 +19,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use tokio_tungstenite::tungstenite::http::StatusCode as WebSocketStatusCode;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{Message as WebSocketMessage, Utf8Bytes as WebSocketText};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config, connect_async_with_config,
 };
@@ -58,8 +58,18 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const DOWNSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const UPSTREAM_TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
+const UPSTREAM_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+const UPSTREAM_TCP_KEEPALIVE_RETRIES: u32 = 3;
 const UPSTREAM_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-const UPSTREAM_WEBSOCKET_BACKOFF: Duration = Duration::from_secs(60);
+const UPSTREAM_WEBSOCKET_BACKOFF_STEPS: [Duration; 3] = [
+    Duration::from_secs(60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(15 * 60),
+];
+const UPSTREAM_WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(25);
+const UPSTREAM_WEBSOCKET_PONG_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_WEBSOCKET_MAX_REUSE_AGE: Duration = Duration::from_secs(55 * 60);
 const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
 const RESPONSES_WEBSOCKET_PATHS: [&str; 2] = ["/v1/responses", "/responses"];
@@ -121,6 +131,13 @@ impl LocalRouter {
             client: reqwest::Client::builder()
                 .user_agent(format!("Codey-Router/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
+                // Reuse a warm TLS connection across normal tool turns while
+                // TCP probes evict half-open sockets before the next request.
+                .pool_idle_timeout(Some(UPSTREAM_HTTP_POOL_IDLE_TIMEOUT))
+                .tcp_nodelay(true)
+                .tcp_keepalive(Some(UPSTREAM_TCP_KEEPALIVE_IDLE))
+                .tcp_keepalive_interval(Some(UPSTREAM_TCP_KEEPALIVE_INTERVAL))
+                .tcp_keepalive_retries(Some(UPSTREAM_TCP_KEEPALIVE_RETRIES))
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .context("创建 Codey 本地路由 HTTP 客户端失败")?,
@@ -413,9 +430,8 @@ impl RouterSnapshot {
                 upstream_authority: upstream_authority(&base_url),
                 protocol,
                 official_account: profile.official_account,
-                supports_websockets: !profile.official_account
-                    && protocol == UpstreamProtocol::OpenAiResponses
-                    && profile.supports_websockets,
+                supports_websockets: protocol == UpstreamProtocol::OpenAiResponses
+                    && config.route_supports_websockets_this_launch(profile),
                 models: HashSet::new(),
             };
             for model in route_models(config, profile, provider_id) {
@@ -1012,13 +1028,10 @@ impl RouterServer {
         D: ResponsesDownstream + ?Sized,
     {
         let downstream_websocket = downstream.is_websocket();
-        let websocket_stream_id = if downstream_websocket {
-            body.as_object_mut()
-                .and_then(|body| body.remove("stream_id"))
-        } else {
-            None
-        };
         if downstream_websocket {
+            body.as_object_mut()
+                .expect("validated Responses body must remain an object")
+                .remove("stream_id");
             // HTTP/SSE is the deterministic fallback for a downstream WS
             // request, so the shared proxy path always asks an HTTP upstream
             // to stream. `stream_id` remains WS-only and is reattached only
@@ -1129,7 +1142,7 @@ impl RouterServer {
             }
         };
         let mut tool_bridge = ResponsesToolBridge::default();
-        let upstream_body = match bridge.convert_responses_body(&body) {
+        let mut upstream_body = match bridge.convert_responses_body(&body) {
             Ok(converted) => {
                 if let Some(converted) = converted {
                     tool_bridge = converted.tool_bridge;
@@ -1224,24 +1237,16 @@ impl RouterServer {
                 headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
             }
         }
-        if stream_requested
+        if downstream_websocket
+            && stream_requested
             && bridge == ProtocolBridge::NativeResponses
             && resolved.route.supports_websockets
-        {
-            let mut websocket_body = upstream_body.clone();
-            if let Some(stream_id) = websocket_stream_id.clone() {
-                websocket_body
-                    .as_object_mut()
-                    .expect("native Responses body must remain an object")
-                    .insert("stream_id".to_string(), stream_id);
-            }
-            if downstream
-                .try_proxy_upstream_websocket(&resolved.route, &headers, &websocket_body)
+            && downstream
+                .try_proxy_upstream_websocket(&resolved.route, &headers, &mut upstream_body)
                 .await?
                 == UpstreamWebSocketAttempt::Completed
-            {
-                return Ok(());
-            }
+        {
+            return Ok(());
         }
         let mut request_builder = self.client.post(upstream_url).headers(headers);
         request_builder = if should_passthrough_native_responses(
@@ -4579,16 +4584,118 @@ enum UpstreamWebSocketAttempt {
     Completed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpstreamWebSocketMaintenanceAction {
+    None,
+    SendPing,
+    Drop,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UpstreamWebSocketLiveness {
+    connected_at: Instant,
+    last_activity_at: Instant,
+    heartbeat_sent_at: Option<Instant>,
+}
+
+impl UpstreamWebSocketLiveness {
+    fn new(now: Instant) -> Self {
+        Self {
+            connected_at: now,
+            last_activity_at: now,
+            heartbeat_sent_at: None,
+        }
+    }
+
+    fn record_activity(&mut self, now: Instant) {
+        self.last_activity_at = now;
+    }
+
+    fn record_pong(&mut self, now: Instant) {
+        self.last_activity_at = now;
+        self.heartbeat_sent_at = None;
+    }
+
+    fn record_heartbeat_sent(&mut self, now: Instant) {
+        self.heartbeat_sent_at = Some(now);
+    }
+
+    fn maintenance_deadline(&self) -> Instant {
+        let liveness_deadline = self
+            .heartbeat_sent_at
+            .map(|sent_at| sent_at + UPSTREAM_WEBSOCKET_PONG_TIMEOUT)
+            .unwrap_or(self.last_activity_at + UPSTREAM_WEBSOCKET_HEARTBEAT_INTERVAL);
+        std::cmp::min(
+            self.connected_at + UPSTREAM_WEBSOCKET_MAX_REUSE_AGE,
+            liveness_deadline,
+        )
+    }
+
+    fn maintenance_action(&self, now: Instant) -> UpstreamWebSocketMaintenanceAction {
+        if now >= self.connected_at + UPSTREAM_WEBSOCKET_MAX_REUSE_AGE {
+            return UpstreamWebSocketMaintenanceAction::Drop;
+        }
+        if let Some(sent_at) = self.heartbeat_sent_at {
+            return if now >= sent_at + UPSTREAM_WEBSOCKET_PONG_TIMEOUT {
+                UpstreamWebSocketMaintenanceAction::Drop
+            } else {
+                UpstreamWebSocketMaintenanceAction::None
+            };
+        }
+        if now >= self.last_activity_at + UPSTREAM_WEBSOCKET_HEARTBEAT_INTERVAL {
+            UpstreamWebSocketMaintenanceAction::SendPing
+        } else {
+            UpstreamWebSocketMaintenanceAction::None
+        }
+    }
+}
+
 struct CachedUpstreamWebSocket {
     route_id: String,
     url: String,
-    connected_at: Instant,
+    liveness: UpstreamWebSocketLiveness,
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
+#[derive(Debug)]
 struct UpstreamWebSocketBackoff {
     route_id: String,
+    url: String,
+    failure_count: u32,
     until: Instant,
+}
+
+impl UpstreamWebSocketBackoff {
+    fn matches(&self, route_id: &str, url: &str) -> bool {
+        self.route_id == route_id && self.url == url
+    }
+}
+
+fn upstream_websocket_backoff_duration(failure_count: u32) -> Duration {
+    let index = failure_count.saturating_sub(1) as usize;
+    UPSTREAM_WEBSOCKET_BACKOFF_STEPS[index.min(UPSTREAM_WEBSOCKET_BACKOFF_STEPS.len() - 1)]
+}
+
+fn next_upstream_websocket_backoff(
+    previous: Option<&UpstreamWebSocketBackoff>,
+    route_id: &str,
+    url: &str,
+    now: Instant,
+) -> (UpstreamWebSocketBackoff, Duration) {
+    let failure_count = previous
+        .filter(|backoff| backoff.matches(route_id, url))
+        .map(|backoff| backoff.failure_count.saturating_add(1))
+        .unwrap_or(1);
+    let duration = upstream_websocket_backoff_duration(failure_count);
+    (
+        UpstreamWebSocketBackoff {
+            route_id: route_id.to_string(),
+            url: url.to_string(),
+            failure_count,
+            until: now + duration,
+        },
+        duration,
+    )
 }
 
 #[async_trait]
@@ -4619,7 +4726,7 @@ trait ResponsesDownstream: Send {
         &mut self,
         _route: &RouteTarget,
         _headers: &HeaderMap,
-        _body: &Value,
+        _body: &mut Value,
     ) -> Result<UpstreamWebSocketAttempt> {
         Ok(UpstreamWebSocketAttempt::UseHttp)
     }
@@ -4688,6 +4795,14 @@ struct WebSocketResponsesDownstream {
     stream_id: Option<String>,
 }
 
+enum IdleWebSocketEvent {
+    Downstream(
+        Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>,
+    ),
+    Upstream(Option<std::result::Result<WebSocketMessage, tokio_tungstenite::tungstenite::Error>>),
+    MaintainUpstream,
+}
+
 impl WebSocketResponsesDownstream {
     fn new(socket: WebSocketStream<TcpStream>) -> Self {
         Self {
@@ -4707,17 +4822,133 @@ impl WebSocketResponsesDownstream {
     }
 
     async fn next_message(&mut self) -> Result<Option<WebSocketMessage>> {
-        self.socket
-            .next()
-            .await
-            .transpose()
-            .context("读取 Codey Responses WebSocket 消息失败")
+        loop {
+            let Some(upstream) = self.upstream.as_ref() else {
+                return self
+                    .socket
+                    .next()
+                    .await
+                    .transpose()
+                    .context("读取 Codey Responses WebSocket 消息失败");
+            };
+            let maintenance_deadline = upstream.liveness.maintenance_deadline();
+            let event = {
+                let downstream_socket = &mut self.socket;
+                let upstream_socket = &mut self
+                    .upstream
+                    .as_mut()
+                    .expect("cached upstream must exist while it is polled")
+                    .socket;
+                let maintenance =
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(maintenance_deadline));
+                tokio::pin!(maintenance);
+                tokio::select! {
+                    // Prefer already-ready liveness work before accepting a
+                    // new request, so a stale socket is never used merely
+                    // because the request and heartbeat deadline raced.
+                    biased;
+                    message = upstream_socket.next() => IdleWebSocketEvent::Upstream(message),
+                    _ = &mut maintenance => IdleWebSocketEvent::MaintainUpstream,
+                    message = downstream_socket.next() => IdleWebSocketEvent::Downstream(message),
+                }
+            };
+
+            match event {
+                IdleWebSocketEvent::Downstream(message) => {
+                    let message = message
+                        .transpose()
+                        .context("读取 Codey Responses WebSocket 消息失败")?;
+                    if matches!(&message, Some(WebSocketMessage::Text(_)))
+                        && self
+                            .upstream
+                            .as_ref()
+                            .is_some_and(|upstream| upstream.liveness.heartbeat_sent_at.is_some())
+                    {
+                        // A user request must not be committed while a liveness
+                        // probe is unresolved. Reconnect before attempting it;
+                        // the deterministic HTTP fallback remains available if
+                        // that fresh handshake fails.
+                        self.upstream.take();
+                    }
+                    return Ok(message);
+                }
+                IdleWebSocketEvent::Upstream(Some(Ok(WebSocketMessage::Ping(payload)))) => {
+                    let pong = self
+                        .upstream
+                        .as_mut()
+                        .expect("cached upstream must exist while replying to Ping")
+                        .socket
+                        .send(WebSocketMessage::Pong(payload));
+                    match tokio::time::timeout(UPSTREAM_WEBSOCKET_PONG_TIMEOUT, pong).await {
+                        Ok(Ok(())) => self
+                            .upstream
+                            .as_mut()
+                            .expect("cached upstream must exist after Pong write")
+                            .liveness
+                            .record_activity(Instant::now()),
+                        Ok(Err(_)) | Err(_) => {
+                            self.upstream.take();
+                        }
+                    }
+                }
+                IdleWebSocketEvent::Upstream(Some(Ok(WebSocketMessage::Pong(_)))) => {
+                    self.upstream
+                        .as_mut()
+                        .expect("cached upstream must exist after Pong read")
+                        .liveness
+                        .record_pong(Instant::now());
+                }
+                IdleWebSocketEvent::Upstream(Some(Ok(_)))
+                | IdleWebSocketEvent::Upstream(Some(Err(_)))
+                | IdleWebSocketEvent::Upstream(None) => {
+                    // No application events are valid between responses. A
+                    // Close, EOF, read failure, or unexpected data frame makes
+                    // the cache ineligible without affecting the downstream.
+                    self.upstream.take();
+                }
+                IdleWebSocketEvent::MaintainUpstream => {
+                    let now = Instant::now();
+                    let action = self
+                        .upstream
+                        .as_ref()
+                        .expect("cached upstream must exist during maintenance")
+                        .liveness
+                        .maintenance_action(now);
+                    match action {
+                        UpstreamWebSocketMaintenanceAction::None => {}
+                        UpstreamWebSocketMaintenanceAction::Drop => {
+                            self.upstream.take();
+                        }
+                        UpstreamWebSocketMaintenanceAction::SendPing => {
+                            let ping = self
+                                .upstream
+                                .as_mut()
+                                .expect("cached upstream must exist while sending Ping")
+                                .socket
+                                .send(WebSocketMessage::Ping(Default::default()));
+                            match tokio::time::timeout(UPSTREAM_WEBSOCKET_PONG_TIMEOUT, ping).await
+                            {
+                                Ok(Ok(())) => self
+                                    .upstream
+                                    .as_mut()
+                                    .expect("cached upstream must exist after Ping write")
+                                    .liveness
+                                    .record_heartbeat_sent(now),
+                                Ok(Err(_)) | Err(_) => {
+                                    self.upstream.take();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    async fn write_text(&mut self, text: impl Into<String>) -> Result<()> {
+    async fn write_text(&mut self, text: impl Into<WebSocketText>) -> Result<()> {
         tokio::time::timeout(
             DOWNSTREAM_WRITE_TIMEOUT,
-            self.socket.send(WebSocketMessage::Text(text.into().into())),
+            self.socket.send(WebSocketMessage::Text(text.into())),
         )
         .await
         .context("写入 Codey Responses WebSocket 消息超时")?
@@ -4738,7 +4969,7 @@ impl WebSocketResponsesDownstream {
         &mut self,
         route: &RouteTarget,
         headers: &HeaderMap,
-        body: &Value,
+        body: &mut Value,
     ) -> Result<UpstreamWebSocketAttempt> {
         if !route.supports_websockets {
             return Ok(UpstreamWebSocketAttempt::UseHttp);
@@ -4747,23 +4978,26 @@ impl WebSocketResponsesDownstream {
             .upstream_websocket_url
             .as_ref()
             .map_err(|error| anyhow::anyhow!(error.clone()))?;
-        if self.upstream_backoff.as_ref().is_some_and(|backoff| {
-            backoff.route_id == route.provider_id && backoff.until > Instant::now()
-        }) {
-            return Ok(UpstreamWebSocketAttempt::UseHttp);
-        }
+        let now = Instant::now();
         if self
             .upstream_backoff
             .as_ref()
-            .is_some_and(|backoff| backoff.until <= Instant::now())
+            .is_some_and(|backoff| !backoff.matches(&route.provider_id, upstream_url))
         {
             self.upstream_backoff = None;
+        }
+        if self.upstream_backoff.as_ref().is_some_and(|backoff| {
+            backoff.matches(&route.provider_id, upstream_url) && backoff.until > now
+        }) {
+            return Ok(UpstreamWebSocketAttempt::UseHttp);
         }
 
         let cached_matches = self.upstream.as_ref().is_some_and(|cached| {
             cached.route_id == route.provider_id
                 && cached.url == *upstream_url
-                && cached.connected_at.elapsed() < UPSTREAM_WEBSOCKET_MAX_REUSE_AGE
+                && cached.liveness.heartbeat_sent_at.is_none()
+                && cached.liveness.maintenance_action(now)
+                    != UpstreamWebSocketMaintenanceAction::Drop
         });
         if !cached_matches {
             self.upstream.take();
@@ -4772,17 +5006,24 @@ impl WebSocketResponsesDownstream {
             cached
         } else {
             match connect_upstream_responses_websocket(upstream_url, headers).await {
-                Ok(socket) => CachedUpstreamWebSocket {
-                    route_id: route.provider_id.clone(),
-                    url: upstream_url.clone(),
-                    connected_at: Instant::now(),
-                    socket,
-                },
-                Err(error) => {
-                    self.upstream_backoff = Some(UpstreamWebSocketBackoff {
+                Ok(socket) => {
+                    self.upstream_backoff = None;
+                    CachedUpstreamWebSocket {
                         route_id: route.provider_id.clone(),
-                        until: Instant::now() + UPSTREAM_WEBSOCKET_BACKOFF,
-                    });
+                        url: upstream_url.clone(),
+                        liveness: UpstreamWebSocketLiveness::new(Instant::now()),
+                        socket,
+                    }
+                }
+                Err(error) => {
+                    let (backoff, backoff_duration) = next_upstream_websocket_backoff(
+                        self.upstream_backoff.as_ref(),
+                        &route.provider_id,
+                        upstream_url,
+                        Instant::now(),
+                    );
+                    let failure_count = backoff.failure_count;
+                    self.upstream_backoff = Some(backoff);
                     crate::error_log::record_failure(
                         "local_router_upstream_websocket_degraded",
                         "connect_responses_websocket",
@@ -4792,7 +5033,8 @@ impl WebSocketResponsesDownstream {
                             "routeName": route.route_name.as_str(),
                             "upstream": route.upstream_authority.as_str(),
                             "fallback": "http_sse",
-                            "backoffSeconds": UPSTREAM_WEBSOCKET_BACKOFF.as_secs(),
+                            "failureCount": failure_count,
+                            "backoffSeconds": backoff_duration.as_secs(),
                             "requestId": current_router_request_id(),
                         }),
                     );
@@ -4801,18 +5043,23 @@ impl WebSocketResponsesDownstream {
             }
         };
 
-        let mut message = body.clone();
-        let message_body = message
+        let message_body = body
             .as_object_mut()
             .context("Responses WebSocket 上游请求必须是 JSON 对象")?;
         message_body.remove("stream");
         message_body.remove("background");
+        if let Some(stream_id) = self.stream_id.as_deref() {
+            message_body.insert(
+                "stream_id".to_string(),
+                Value::String(stream_id.to_string()),
+            );
+        }
         message_body.insert(
             "type".to_string(),
             Value::String("response.create".to_string()),
         );
         let message =
-            serde_json::to_string(&message).context("序列化 Responses WebSocket 上游请求失败")?;
+            serde_json::to_string(body).context("序列化 Responses WebSocket 上游请求失败")?;
 
         // Once send is attempted the request may have reached the upstream.
         // Any later failure is surfaced to the caller and is never replayed
@@ -4834,12 +5081,22 @@ impl WebSocketResponsesDownstream {
             };
             match message.context("读取 Responses WebSocket 上游事件失败")? {
                 WebSocketMessage::Text(text) => {
+                    upstream.liveness.record_activity(Instant::now());
                     let event = serde_json::from_str::<Value>(text.as_str())
                         .context("Responses WebSocket 上游事件不是有效 JSON")?;
                     let terminal = responses_event_is_terminal(&event);
-                    self.write_event(&event).await?;
+                    if self.event_needs_stream_id(&event) {
+                        self.write_event(&event).await?;
+                    } else {
+                        // Preserve the already-validated UTF-8 frame instead
+                        // of cloning and serializing the whole JSON event on
+                        // the latency-sensitive first-event path.
+                        self.write_text(text).await?;
+                    }
                     if terminal {
-                        self.upstream = Some(upstream);
+                        if responses_websocket_connection_is_reusable(&event) {
+                            self.upstream = Some(upstream);
+                        }
                         self.upstream_backoff = None;
                         return Ok(UpstreamWebSocketAttempt::Completed);
                     }
@@ -4852,8 +5109,9 @@ impl WebSocketResponsesDownstream {
                     .await
                     .context("回复 Responses WebSocket 上游 Ping 超时")?
                     .context("回复 Responses WebSocket 上游 Ping 失败")?;
+                    upstream.liveness.record_activity(Instant::now());
                 }
-                WebSocketMessage::Pong(_) => {}
+                WebSocketMessage::Pong(_) => upstream.liveness.record_pong(Instant::now()),
                 WebSocketMessage::Close(_) => {
                     anyhow::bail!("Responses WebSocket 上游在终态事件前关闭连接");
                 }
@@ -4862,6 +5120,12 @@ impl WebSocketResponsesDownstream {
                 }
             }
         }
+    }
+
+    fn event_needs_stream_id(&self, event: &Value) -> bool {
+        self.stream_id.is_some()
+            && event.get("stream_id").is_none()
+            && responses_websocket_connection_is_reusable(event)
     }
 
     async fn close(
@@ -4881,8 +5145,16 @@ impl WebSocketResponsesDownstream {
 fn responses_event_is_terminal(event: &Value) -> bool {
     matches!(
         event.get("type").and_then(Value::as_str),
-        Some("response.completed" | "response.failed" | "response.incomplete")
+        Some("response.completed" | "response.failed" | "response.incomplete" | "error")
     )
+}
+
+fn responses_websocket_connection_is_reusable(event: &Value) -> bool {
+    event
+        .get("error")
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        != Some("websocket_connection_limit_reached")
 }
 
 fn upstream_websocket_request(url: &str, headers: &HeaderMap) -> Result<WebSocketRequest> {
@@ -4935,7 +5207,9 @@ async fn connect_upstream_responses_websocket(
         .max_frame_size(Some(MAX_UPSTREAM_RESPONSE_BYTES));
     let (socket, _) = tokio::time::timeout(
         UPSTREAM_WEBSOCKET_CONNECT_TIMEOUT,
-        connect_async_with_config(request, Some(config), false),
+        // Responses events are small and latency-sensitive. Disable Nagle on
+        // the underlying upstream TCP socket before the TLS/WS handshake.
+        connect_async_with_config(request, Some(config), true),
     )
     .await
     .context("连接 Responses WebSocket 上游超时")?
@@ -4986,22 +5260,25 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
     }
 
     async fn write_event(&mut self, event: &Value) -> Result<()> {
-        let mut event = event.clone();
-        if let Some(stream_id) = self.stream_id.as_deref()
-            && event.get("stream_id").is_none()
-        {
+        let encoded = if self.event_needs_stream_id(event) {
+            let mut event = event.clone();
             event
                 .as_object_mut()
                 .context("Responses WebSocket 事件必须是 JSON 对象")?
                 .insert(
                     "stream_id".to_string(),
-                    Value::String(stream_id.to_string()),
+                    Value::String(
+                        self.stream_id
+                            .as_deref()
+                            .expect("stream id must exist when insertion is required")
+                            .to_string(),
+                    ),
                 );
-        }
-        self.write_text(
-            serde_json::to_string(&event).context("序列化 Responses WebSocket 事件失败")?,
-        )
-        .await
+            serde_json::to_string(&event).context("序列化 Responses WebSocket 事件失败")?
+        } else {
+            serde_json::to_string(event).context("序列化 Responses WebSocket 事件失败")?
+        };
+        self.write_text(encoded).await
     }
 
     async fn finish_event_stream(&mut self) -> Result<()> {
@@ -5016,7 +5293,7 @@ impl ResponsesDownstream for WebSocketResponsesDownstream {
         &mut self,
         route: &RouteTarget,
         headers: &HeaderMap,
-        body: &Value,
+        body: &mut Value,
     ) -> Result<UpstreamWebSocketAttempt> {
         self.proxy_upstream_websocket(route, headers, body).await
     }
@@ -7823,6 +8100,25 @@ mod tests {
             .0
     }
 
+    async fn local_websocket_pair() -> (
+        WebSocketStream<TcpStream>,
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        };
+        let client = async {
+            connect_async_with_config(format!("ws://{address}/responses"), None, false)
+                .await
+                .unwrap()
+                .0
+        };
+        tokio::join!(server, client)
+    }
+
     async fn send_router_websocket_request(
         socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
         model: &str,
@@ -7921,6 +8217,10 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer route-key"));
         headers.insert(
+            HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+            HeaderValue::from_static("account-test"),
+        );
+        headers.insert(
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("another_feature=v1"),
         );
@@ -7930,9 +8230,234 @@ mod tests {
 
         assert_eq!(request.uri().path(), "/v1/responses");
         assert_eq!(request.headers()[AUTHORIZATION], "Bearer route-key");
+        assert_eq!(request.headers()[CHATGPT_ACCOUNT_ID_HEADER], "account-test");
         let beta = request.headers()["openai-beta"].to_str().unwrap();
         assert!(beta.contains("another_feature=v1"));
         assert!(beta.contains(RESPONSES_WEBSOCKET_BETA));
+    }
+
+    #[tokio::test]
+    async fn upstream_websocket_connection_disables_nagle() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let _ = socket.next().await;
+        });
+
+        let mut socket = connect_upstream_responses_websocket(
+            &format!("ws://{address}/v1/responses"),
+            &HeaderMap::new(),
+        )
+        .await
+        .unwrap();
+        let MaybeTlsStream::Plain(stream) = socket.get_ref() else {
+            panic!("loopback WebSocket must use a plain TCP stream");
+        };
+        assert!(stream.nodelay().unwrap());
+
+        socket.close(None).await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn websocket_error_events_are_terminal_and_connection_limits_force_reconnect() {
+        let request_error = json!({
+            "type":"error",
+            "error":{"code":"invalid_stream_id"},
+        });
+        assert!(responses_event_is_terminal(&request_error));
+        assert!(responses_websocket_connection_is_reusable(&request_error));
+
+        let connection_limit = json!({
+            "type":"error",
+            "error":{"code":"websocket_connection_limit_reached"},
+        });
+        assert!(responses_event_is_terminal(&connection_limit));
+        assert!(!responses_websocket_connection_is_reusable(
+            &connection_limit
+        ));
+    }
+
+    #[test]
+    fn upstream_websocket_liveness_sends_heartbeat_and_expires_missing_pong() {
+        let connected_at = Instant::now();
+        let mut liveness = UpstreamWebSocketLiveness::new(connected_at);
+
+        assert_eq!(
+            liveness.maintenance_deadline(),
+            connected_at + UPSTREAM_WEBSOCKET_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            liveness.maintenance_action(
+                connected_at + UPSTREAM_WEBSOCKET_HEARTBEAT_INTERVAL - Duration::from_millis(1)
+            ),
+            UpstreamWebSocketMaintenanceAction::None
+        );
+        let heartbeat_at = connected_at + UPSTREAM_WEBSOCKET_HEARTBEAT_INTERVAL;
+        assert_eq!(
+            liveness.maintenance_action(heartbeat_at),
+            UpstreamWebSocketMaintenanceAction::SendPing
+        );
+
+        liveness.record_heartbeat_sent(heartbeat_at);
+        liveness.record_activity(heartbeat_at + Duration::from_secs(1));
+        assert_eq!(liveness.heartbeat_sent_at, Some(heartbeat_at));
+        assert_eq!(
+            liveness.maintenance_deadline(),
+            heartbeat_at + UPSTREAM_WEBSOCKET_PONG_TIMEOUT
+        );
+        assert_eq!(
+            liveness.maintenance_action(
+                heartbeat_at + UPSTREAM_WEBSOCKET_PONG_TIMEOUT - Duration::from_millis(1)
+            ),
+            UpstreamWebSocketMaintenanceAction::None
+        );
+        assert_eq!(
+            liveness.maintenance_action(heartbeat_at + UPSTREAM_WEBSOCKET_PONG_TIMEOUT),
+            UpstreamWebSocketMaintenanceAction::Drop
+        );
+
+        let pong_at = heartbeat_at + Duration::from_secs(1);
+        liveness.record_pong(pong_at);
+        assert!(liveness.heartbeat_sent_at.is_none());
+        assert_eq!(
+            liveness.maintenance_deadline(),
+            pong_at + UPSTREAM_WEBSOCKET_HEARTBEAT_INTERVAL
+        );
+        assert_eq!(
+            liveness.maintenance_action(connected_at + UPSTREAM_WEBSOCKET_MAX_REUSE_AGE),
+            UpstreamWebSocketMaintenanceAction::Drop
+        );
+    }
+
+    #[test]
+    fn upstream_websocket_backoff_escalates_and_resets_by_route_identity() {
+        let now = Instant::now();
+        let (first, first_duration) =
+            next_upstream_websocket_backoff(None, "route-a", "wss://a.example/responses", now);
+        assert_eq!(first.failure_count, 1);
+        assert_eq!(first_duration, Duration::from_secs(60));
+
+        let (second, second_duration) = next_upstream_websocket_backoff(
+            Some(&first),
+            "route-a",
+            "wss://a.example/responses",
+            now,
+        );
+        assert_eq!(second.failure_count, 2);
+        assert_eq!(second_duration, Duration::from_secs(5 * 60));
+
+        let (third, third_duration) = next_upstream_websocket_backoff(
+            Some(&second),
+            "route-a",
+            "wss://a.example/responses",
+            now,
+        );
+        assert_eq!(third.failure_count, 3);
+        assert_eq!(third_duration, Duration::from_secs(15 * 60));
+        let (fourth, fourth_duration) = next_upstream_websocket_backoff(
+            Some(&third),
+            "route-a",
+            "wss://a.example/responses",
+            now,
+        );
+        assert_eq!(fourth.failure_count, 4);
+        assert_eq!(fourth_duration, Duration::from_secs(15 * 60));
+
+        let (changed_url, changed_url_duration) = next_upstream_websocket_backoff(
+            Some(&fourth),
+            "route-a",
+            "wss://b.example/responses",
+            now,
+        );
+        assert_eq!(changed_url.failure_count, 1);
+        assert_eq!(changed_url_duration, Duration::from_secs(60));
+        let (changed_route, changed_route_duration) = next_upstream_websocket_backoff(
+            Some(&fourth),
+            "route-b",
+            "wss://a.example/responses",
+            now,
+        );
+        assert_eq!(changed_route.failure_count, 1);
+        assert_eq!(changed_route_duration, Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn idle_cached_upstream_heartbeat_confirms_socket_before_next_request() {
+        let (downstream_socket, mut downstream_peer) = local_websocket_pair().await;
+        let (mut upstream_peer, upstream_socket) = local_websocket_pair().await;
+        let heartbeat_due_at = Instant::now() - UPSTREAM_WEBSOCKET_HEARTBEAT_INTERVAL;
+        let mut downstream = WebSocketResponsesDownstream::new(downstream_socket);
+        downstream.upstream = Some(CachedUpstreamWebSocket {
+            route_id: "route-a".to_string(),
+            url: "ws://upstream.example/responses".to_string(),
+            liveness: UpstreamWebSocketLiveness::new(heartbeat_due_at),
+            socket: upstream_socket,
+        });
+
+        let next_message = tokio::spawn(async move {
+            let message = downstream.next_message().await.unwrap();
+            (message, downstream)
+        });
+        let heartbeat = tokio::time::timeout(Duration::from_secs(1), upstream_peer.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WebSocketMessage::Ping(payload) = heartbeat else {
+            panic!("expected an idle upstream Ping");
+        };
+        upstream_peer
+            .send(WebSocketMessage::Pong(payload))
+            .await
+            .unwrap();
+        downstream_peer
+            .send(WebSocketMessage::Text("next request".into()))
+            .await
+            .unwrap();
+
+        let (message, downstream) = tokio::time::timeout(Duration::from_secs(1), next_message)
+            .await
+            .unwrap()
+            .unwrap();
+        let Some(WebSocketMessage::Text(text)) = message else {
+            panic!("expected the downstream request after Pong");
+        };
+        assert_eq!(text, "next request");
+        let cached = downstream
+            .upstream
+            .expect("confirmed socket must stay cached");
+        assert!(cached.liveness.heartbeat_sent_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_cached_upstream_pong_timeout_drops_socket_before_next_request() {
+        let (downstream_socket, mut downstream_peer) = local_websocket_pair().await;
+        let (_upstream_peer, upstream_socket) = local_websocket_pair().await;
+        let now = Instant::now();
+        let mut liveness = UpstreamWebSocketLiveness::new(now - Duration::from_secs(20));
+        liveness.heartbeat_sent_at = Some(now - UPSTREAM_WEBSOCKET_PONG_TIMEOUT);
+        let mut downstream = WebSocketResponsesDownstream::new(downstream_socket);
+        downstream.upstream = Some(CachedUpstreamWebSocket {
+            route_id: "route-a".to_string(),
+            url: "ws://upstream.example/responses".to_string(),
+            liveness,
+            socket: upstream_socket,
+        });
+
+        downstream_peer
+            .send(WebSocketMessage::Text("next request".into()))
+            .await
+            .unwrap();
+        let message = tokio::time::timeout(Duration::from_secs(1), downstream.next_message())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(message, Some(WebSocketMessage::Text(_))));
+        assert!(downstream.upstream.is_none());
     }
 
     #[test]
@@ -8539,9 +9064,17 @@ mod tests {
 
         assert_eq!(resolved.route.provider_id, "openai");
         assert!(resolved.route.official_account);
+        assert!(resolved.route.supports_websockets);
         assert_eq!(
             resolved.route.upstream_url.as_ref().unwrap(),
             &format!("{CHATGPT_CODEX_BASE_URL}/responses")
+        );
+        assert_eq!(
+            resolved.route.upstream_websocket_url.as_ref().unwrap(),
+            &format!(
+                "{}/responses",
+                CHATGPT_CODEX_BASE_URL.replacen("https://", "wss://", 1)
+            )
         );
         assert_eq!(resolved.upstream_model, "gpt-5.6-sol");
         let raw = snapshot.target_for_model("gpt-5.6-sol").unwrap();
@@ -8549,6 +9082,7 @@ mod tests {
 
         let mut api_key_launch = config;
         api_key_launch.official_account_available_this_launch = false;
+        assert!(!api_key_launch.runtime_supports_websockets());
         assert!(
             RouterSnapshot::from_config(&api_key_launch)
                 .target_for_model(&official_alias)

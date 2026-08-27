@@ -327,7 +327,7 @@ fn profile_from_provider(
         source_provider_id: None,
         official_account: provider.official,
         supports_remote_compaction: provider.supports_remote_compaction,
-        supports_websockets: false,
+        supports_websockets: provider.official,
     }
 }
 
@@ -983,6 +983,7 @@ experimental_bearer_token = "sk-relay"
             panic!("auth.json ChatGPT tokens should make official auth available");
         };
         assert!(profile.official_account);
+        assert!(profile.supports_websockets);
         assert_eq!(profile.provider_id(), "openai");
         assert!(profile.api_key.is_empty());
 
@@ -1022,6 +1023,7 @@ experimental_bearer_token = "sk-relay"
             panic!("missing auth.json under auto store should be unknown");
         };
         assert!(profile.official_account);
+        assert!(profile.supports_websockets);
         assert_eq!(profile.provider_id(), "openai");
         assert!(reason.contains("auth.json"));
     }
@@ -1189,6 +1191,7 @@ experimental_bearer_token = "sk-relay"
         };
 
         assert!(profile.official_account);
+        assert!(profile.supports_websockets);
         assert_eq!(profile.provider_id(), "openai");
         assert!(profile.api_key.is_empty());
 
