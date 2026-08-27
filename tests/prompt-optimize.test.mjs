@@ -142,6 +142,19 @@ const createEnvironment = (options = {}) => {
   const newChatInput = new FakeElement("div");
   newChatInput.setAttribute("contenteditable", "true");
   newChatInput.setAttribute("role", "textbox");
+  newChatInput.innerText = options.newChatInitialText ?? "";
+  const composerInnerControl = new FakeElement("button", {
+    rect: {
+      bottom: 290,
+      height: 30,
+      left: 650,
+      right: 790,
+      top: 260,
+      width: 140,
+    },
+  });
+  composerInnerControl.textContent = "model-2026 链接";
+  composerInnerControl.setAttribute("aria-haspopup", "menu");
   const toolbar = new FakeElement("div");
   const accessButton = new FakeElement("button", {
     rect: {
@@ -281,6 +294,9 @@ const createEnvironment = (options = {}) => {
     toolbar.appendChild(modelButton);
     toolbar.appendChild(microphoneButton);
     toolbar.appendChild(sendButton);
+    if (options.composerInnerControl) {
+      newChatInput.appendChild(composerInnerControl);
+    }
   }
   if (slashCommandsOpen) {
     scope.appendChild(slashCommandList);
@@ -321,6 +337,7 @@ const createEnvironment = (options = {}) => {
       const controls = includeComposer
         ? [accessButton, modelButton, microphoneButton, sendButton]
         : [];
+      if (options.composerInnerControl) controls.push(composerInnerControl);
       if (options.dialogControl) controls.push(dialogControl);
       if (options.settingsPanel) controls.push(settingsToneControl);
       if (slashCommandsOpen) {
@@ -431,6 +448,7 @@ const createEnvironment = (options = {}) => {
     injectionStatus: window.__codeyInjectionStatus["prompt-optimize"],
     statusEvents,
     newChatInput,
+    composerInnerControl,
     settingsPanel,
     settingsInput,
     settingsToneControl,
@@ -726,7 +744,57 @@ test("mounts the optimize button for a new-chat contenteditable composer", async
   const button = env.getElementById("codey-prompt-optimize-button");
   assert.ok(button, "new-chat composer should receive the optimize button");
   assert.equal(button.style.display, "inline-flex");
+  assert.equal(button.getAttribute("contenteditable"), "false");
   assert.equal(env.snapshot().hasInput, true);
+});
+
+test("does not insert the optimize button into contenteditable link controls", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    anchors: false,
+    newChatComposer: true,
+    newChatInitialText: "第一段\n第二段\nhttps://example.com/model-2026",
+    composerInnerControl: true,
+  });
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.ok(button, "contenteditable composer should still receive the button");
+  assert.equal(button.parentElement, env.toolbar);
+  assert.equal(env.newChatInput.contains(button), false);
+  assert.equal(env.composerInnerControl.parentElement, env.newChatInput);
+});
+
+test("removes the optimize button if rich paste moves its toolbar into the contenteditable composer", async () => {
+  const env = createEnvironment({
+    enabled: true,
+    apiKeyConfigured: true,
+    anchors: false,
+    newChatComposer: true,
+    newChatInitialText: "第一段\n第二段\nhttps://example.com/model-2026",
+  });
+  await flush();
+
+  const button = env.getElementById("codey-prompt-optimize-button");
+  assert.ok(button, "button starts in the safe composer toolbar");
+  assert.equal(button.parentElement, env.toolbar);
+  assert.equal(env.newChatInput.contains(button), false);
+
+  env.newChatInput.appendChild(env.toolbar);
+  env.emitMutation([
+    {
+      type: "childList",
+      target: env.newChatInput,
+      addedNodes: [env.toolbar],
+      removedNodes: [],
+    },
+  ]);
+  await new Promise((resolve) => setTimeout(resolve, 280));
+
+  assert.equal(env.getElementById("codey-prompt-optimize-button"), null);
+  assert.equal(env.newChatInput.contains(button), false);
+  assert.equal(env.snapshot().hasButton, false);
 });
 
 test("rescans when a connected composer is replaced during navigation", async () => {

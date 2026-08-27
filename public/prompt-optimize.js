@@ -136,6 +136,7 @@
     element.id = buttonId;
     element.type = "button";
     element.dataset.codeyPromptOptimize = "true";
+    element.setAttribute("contenteditable", "false");
     element.setAttribute("aria-label", "优化提示词");
     element.setAttribute("aria-disabled", "true");
     element.setAttribute("aria-busy", "false");
@@ -348,6 +349,7 @@
     while (scope && depth < 8) {
       for (const control of scope.querySelectorAll?.(composerControlSelector) ||
         []) {
+        if (inputElement.contains?.(control)) continue;
         if (seen.has(control) || !isVisibleControl(control)) continue;
         seen.add(control);
         const score = modelControlScore(control, inputRect);
@@ -379,6 +381,19 @@
     return children.indexOf(element) + 1 === children.indexOf(anchor);
   };
 
+  const nodeIsInsideInputElement = (node) =>
+    Boolean(
+      inputElement &&
+        node &&
+        (node === inputElement || inputElement.contains?.(node)),
+    );
+
+  const removeButtonFromEditableInput = () => {
+    if (button && nodeIsInsideInputElement(button)) {
+      button.remove();
+    }
+  };
+
   const updateButtonPosition = () => {
     if (!button || !inputElement) return;
     if (!isVisible(inputElement)) {
@@ -389,6 +404,15 @@
     }
     const target = findModelInsertionTarget();
     if (!target) {
+      removeButtonFromEditableInput();
+      button.style.display = "none";
+      return;
+    }
+    if (
+      nodeIsInsideInputElement(target.host) ||
+      nodeIsInsideInputElement(target.anchor)
+    ) {
+      removeButtonFromEditableInput();
       button.style.display = "none";
       return;
     }
