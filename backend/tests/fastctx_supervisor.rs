@@ -114,15 +114,20 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
 
     let first_host = wait_for_host_starts(&event_log, 1)[0];
     terminate_process(first_host, true);
-    // FastCtx 在下一次 MCP 请求读写时也可能才观察到 control center 链路断开。
-    // 用只读请求驱动恢复；如果断链恰好发生在请求执行中，该请求允许返回结果未知错误。
+    wait_for_process_gone(first_host);
+    // FastCtx 在下一次实际工具读写时也可能才观察到 control center 链路断开。
+    // `tools/list` 可以由 MCP 代理本地回答，不能稳定驱动 runtime host 恢复。
+    // 用只读工具请求驱动恢复；如果断链恰好发生在请求执行中，该请求允许返回结果未知错误。
     send(
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
             "id": 3,
-            "method": "tools/list",
-            "params": {}
+            "method": "tools/call",
+            "params": {
+                "name": "glob",
+                "arguments": {"pattern": "**/*"}
+            }
         }),
     );
     let _recovery_probe = response_with_id(&responses_rx, 3);
@@ -623,9 +628,32 @@ fn wait_for_process_gone(pid: u32) {
         }
         assert!(
             Instant::now() < deadline,
-            "FastCtx worker {pid} survived supervisor shutdown"
+            "FastCtx process {pid} survived supervisor shutdown"
         );
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(windows)]
+fn wait_for_process_gone(pid: u32) {
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }) else {
+        return;
+    };
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    loop {
+        if unsafe { WaitForSingleObject(handle, 20) } == WAIT_OBJECT_0 {
+            let _ = unsafe { CloseHandle(handle) };
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "FastCtx process {pid} survived supervisor shutdown"
+        );
     }
 }
 

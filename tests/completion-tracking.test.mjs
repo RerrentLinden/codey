@@ -25,9 +25,8 @@ class FakeElement extends FakeElementCore {
   }
 
   querySelector(selector) {
-    if (selector === "[data-codey-message-select]") return {};
     if (selector === "[data-local-conversation-final-assistant]") return {};
-    return null;
+    return super.querySelector(selector);
   }
 
   querySelectorAll(selector) {
@@ -39,7 +38,18 @@ class FakeElement extends FakeElementCore {
   }
 
   matches(selector) {
-    return selector === "[data-turn-key]" && this.hasAttribute("data-turn-key");
+    const selectors = String(selector).split(",").map((candidate) => candidate.trim());
+    return selectors.some((candidate) => (
+      candidate === "[data-turn-key]" && this.hasAttribute("data-turn-key")
+    ) || (
+      candidate === "[data-message-author-role]" && this.hasAttribute("data-message-author-role")
+    ) || (
+      candidate === "[data-testid=conversation-turn]" && this.getAttribute("data-testid") === "conversation-turn"
+    ) || (
+      candidate === "[data-testid=\"conversation-turn\"]" && this.getAttribute("data-testid") === "conversation-turn"
+    ) || (
+      candidate === "[data-message-id]" && this.hasAttribute("data-message-id")
+    ));
   }
 
   closest() {
@@ -103,7 +113,12 @@ function loadInjection({
       return null;
     },
     querySelectorAll(selector) {
-      if (selector === "[data-turn-key]") return rows.filter((row) => !row.removed);
+      if (selector === "[data-turn-key]") {
+        return rows.filter((row) => !row.removed && row.hasAttribute("data-turn-key"));
+      }
+      if (selector === "[data-turn-key], [data-message-author-role], [data-testid=conversation-turn], [data-message-id]") {
+        return rows.filter((row) => !row.removed && row.matches(selector));
+      }
       if (selector === "[data-codey-message-id]") {
         return rows.filter((row) => !row.removed && row.dataset.codeyMessageId);
       }
@@ -187,6 +202,10 @@ function loadInjection({
   return {
     appendTurn: (turnId) => {
       const row = new FakeElement({ "data-turn-key": turnId });
+      rows.push(row);
+      return row;
+    },
+    appendExistingRow: (row) => {
       rows.push(row);
       return row;
     },
@@ -496,6 +515,63 @@ test("rescans a direct turn boundary without enumerating its subtree", () => {
   runtime.window.__codeyInstallMessageSelection(row);
 
   assert.equal(row.querySelectorAllCalls.includes("[data-turn-key]"), false);
+});
+
+test("installs selection on mixed Codex turn row shapes", () => {
+  const runtime = loadInjection({
+    turnIds: ["turn-keyed"],
+  });
+  const reactOnlyRow = new FakeElement({
+    "data-testid": "conversation-turn",
+  });
+  reactOnlyRow.__reactFiber$test = {
+    memoizedProps: {
+      turn: { id: "history-content:turn:react-turn" },
+    },
+    return: null,
+  };
+  runtime.appendExistingRow(reactOnlyRow);
+
+  runtime.window.__codeyInstallMessageSelection();
+
+  assert.equal(reactOnlyRow.dataset.codeyMessageId, "react-turn");
+});
+
+test("extracts message ids from React turn state when DOM attributes omit ids", () => {
+  const runtime = loadInjection();
+  const row = new FakeElement({
+    "data-testid": "conversation-turn",
+  });
+  row.__reactFiber$test = {
+    memoizedProps: {
+      children: {
+        props: {
+          message: {
+            id: "history-content:turn:react-message",
+          },
+        },
+      },
+    },
+    return: null,
+  };
+
+  assert.equal(runtime.window.__codeyGetMessageId(row), "react-message");
+});
+
+test("prefers React turn ids over response object ids", () => {
+  const runtime = loadInjection();
+  const row = new FakeElement({
+    "data-testid": "conversation-turn",
+  });
+  row.__reactFiber$test = {
+    memoizedProps: {
+      response: { id: "resp-wrong-layer" },
+      turn: { id: "history-content:turn:turn-right-layer" },
+    },
+    return: null,
+  };
+
+  assert.equal(runtime.window.__codeyGetMessageId(row), "turn-right-layer");
 });
 
 test("syncs Codex sidebar titles to the notification backend", async () => {

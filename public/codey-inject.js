@@ -228,18 +228,83 @@
       : normalized;
   };
 
+  const usableMessageId = (value) => {
+    const normalized = normalizeMessageId(value);
+    if (!normalized || normalized === "conversation-turn") return "";
+    return normalized;
+  };
+
+  const reactStateKeys = (element) => Object.keys(element).filter((key) => (
+    key.startsWith("__reactFiber")
+    || key.startsWith("__reactInternalInstance")
+    || key.startsWith("__reactProps")
+  ));
+
+  const messageIdFromReactState = (element) => {
+    const visited = new WeakSet();
+    const stack = reactStateKeys(element).map((key) => ({
+      value: element[key],
+      depth: 0,
+      path: key.toLowerCase(),
+    }));
+    const candidates = [];
+    const addCandidate = (value, score) => {
+      const messageId = usableMessageId(value);
+      if (messageId) candidates.push({ messageId, score });
+    };
+    let scanned = 0;
+    while (stack.length && candidates.length < 32 && scanned < 240) {
+      const { value, depth, path } = stack.pop();
+      if (!value || typeof value !== "object" || visited.has(value) || depth > 7) continue;
+      if (value instanceof HTMLElement || value === window || value === document) continue;
+      visited.add(value);
+      scanned += 1;
+      for (const key of Object.keys(value).slice(0, 80)) {
+        let child;
+        try {
+          child = value[key];
+        } catch {
+          continue;
+        }
+        const loweredKey = key.toLowerCase();
+        const nextPath = `${path}.${loweredKey}`;
+        const keyLooksLikeTurnId = /^(turnkey|turn_key|turnid|turn_id)$/.test(loweredKey);
+        const keyLooksLikeMessageId = /^(messageid|message_id|itemid|item_id)$/.test(loweredKey);
+        const genericIdScore = path.includes("turn")
+          ? 4
+          : /(message|item)/.test(path)
+            ? 2
+            : /(response|entry)/.test(path)
+              ? 1
+              : 0;
+        if (typeof child === "string" || typeof child === "number") {
+          if (keyLooksLikeTurnId) addCandidate(child, 5);
+          else if (keyLooksLikeMessageId) addCandidate(child, 3);
+          else if (loweredKey === "id" && genericIdScore) addCandidate(child, genericIdScore);
+          else if (loweredKey === "key" && genericIdScore) addCandidate(child, genericIdScore);
+          continue;
+        }
+        if (child && typeof child === "object") {
+          stack.push({ value: child, depth: depth + 1, path: nextPath });
+        }
+      }
+    }
+    candidates.sort((left, right) => right.score - left.score);
+    return candidates[0]?.messageId || "";
+  };
+
   const getMessageId = (row) => {
     const direct = ["data-turn-key", "data-message-id", "data-messageid", "data-item-id", "data-id"]
       .map((key) => row.getAttribute(key)).find(Boolean);
-    if (direct) return normalizeMessageId(direct);
+    if (direct) return usableMessageId(direct);
     const child = row.querySelector("[data-turn-key], [data-message-id], [data-item-id], [data-id]");
-    return normalizeMessageId(
+    return usableMessageId(
       child?.getAttribute("data-turn-key")
       || child?.getAttribute("data-message-id")
       || child?.getAttribute("data-item-id")
       || child?.getAttribute("data-id")
       || "",
-    );
+    ) || messageIdFromReactState(row);
   };
 
   const hardDeletedMessageKey = (sessionId, messageId) => {
@@ -282,7 +347,7 @@
       .${selectedClass}[data-codey-selected-next="true"]::before { border-bottom: 0; border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
       [data-codey-message-id] { overflow: visible !important; }
       [data-codey-message-select] { -webkit-app-region: no-drag !important; position: absolute; left: -48px; top: 8px; z-index: 30; display: grid; place-items: center; width: 24px; height: 24px; border: 1px solid rgba(139, 151, 255, .42); border-radius: 999px; padding: 0; background: rgba(22, 26, 39, .66); color: #dce2ff; cursor: pointer; font: 700 13px/1 system-ui, sans-serif; opacity: .24; pointer-events: auto !important; transition: opacity .15s ease, background .15s ease, transform .15s ease; }
-      [data-turn-key]:hover > [data-codey-message-select], [data-codey-message-select]:focus-visible, [data-codey-message-select][aria-pressed="true"] { opacity: 1; }
+      [data-codey-message-row]:hover > [data-codey-message-select], [data-codey-message-select]:focus-visible, [data-codey-message-select][aria-pressed="true"] { opacity: 1; }
       [data-codey-message-select]:hover { transform: scale(1.06); }
       [data-codey-message-select][aria-pressed="true"] { background: #5968de; border-color: #a5aeff; color: white; }
       ${conversationRichTooltipSelector} { overflow-x: hidden !important; overflow-y: auto !important; overscroll-behavior: contain; }
@@ -2492,15 +2557,19 @@
     // Incremental scans already hand us the nearest turn boundary. Avoid
     // enumerating that entire subtree again when the boundary itself carries
     // Codex's canonical turn key; document/container scans retain the fallback.
-    const currentTurnRows = (
+    const rows = (
       root instanceof HTMLElement
-      && root.matches?.("[data-turn-key]")
+      && root.matches?.(conversationTurnSelector)
     )
       ? [root]
-      : queryWithin(root, "[data-turn-key]");
-    const rows = currentTurnRows.length
-      ? currentTurnRows
-      : queryWithin(root, "[data-message-author-role], [data-testid=conversation-turn], [data-message-id]");
+      : queryWithin(root, conversationTurnSelector).filter((row, _index, all) => {
+        let parent = row.parentElement;
+        while (parent) {
+          if (all.includes(parent)) return false;
+          parent = parent.parentElement;
+        }
+        return true;
+      });
     let installed = false;
     // getSessionId() probes several document-wide attribute selectors, and its
     // only consumer here is the hard-delete filter, which stays empty until the

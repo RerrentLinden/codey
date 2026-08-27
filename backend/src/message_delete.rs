@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
-use codey_runtime_core::codex_sqlite::codex_session_db_paths_from_home;
+use codey_runtime_core::codex_sqlite::{
+    codex_session_db_paths_from_home, codex_sqlite_sidecar_paths,
+};
 use fs2::FileExt;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -97,20 +99,36 @@ pub(crate) fn reapply_persisted_deletions(home: &Path) -> Result<MessageDeleteRe
                     Err(error) => summary.failures.push((session_id, format!("{error:#}"))),
                 }
             }
-            Ok(result) => summary.failures.push((
-                session_id,
-                format!(
-                    "无法确认消息删除是否已落地；{} 个数据库结构不受支持（{}）；且未找到匹配的会话记录文件",
-                    result.unsupported_databases.len(),
-                    result
-                        .unsupported_databases
-                        .iter()
-                        .filter_map(|path| Path::new(path).file_name())
-                        .map(|name| name.to_string_lossy().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ),
-            )),
+            Ok(result) => {
+                // 未识别结构的库可能只是目录型 catalog。只有 rollout 文件和所有
+                // 数据库（含原始字节层面）都找不到该会话时，才认定整条会话已被
+                // 整体删除：删除意图已经无从落地，清掉失效墓碑，不再每次启动
+                // 重复报 patch_failed。任一存储仍引用该会话时保持保守失败。
+                if session_absent_from_every_store(home, &session_id) {
+                    match remove_delete_tombstones(&paths) {
+                        Ok(()) => {
+                            summary.cleared_sessions += 1;
+                            eprintln!("会话已不存在，清理了失效的消息删除墓碑：{session_id}");
+                        }
+                        Err(error) => summary.failures.push((session_id, format!("{error:#}"))),
+                    }
+                } else {
+                    summary.failures.push((
+                        session_id,
+                        format!(
+                            "无法确认消息删除是否已落地；{} 个数据库结构不受支持（{}）；且未找到匹配的会话记录文件",
+                            result.unsupported_databases.len(),
+                            result
+                                .unsupported_databases
+                                .iter()
+                                .filter_map(|path| Path::new(path).file_name())
+                                .map(|name| name.to_string_lossy().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        ),
+                    ));
+                }
+            }
             Err(error) => summary.failures.push((session_id, format!("{error:#}"))),
         }
     }
@@ -513,27 +531,33 @@ fn find_rollout_path(home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
 }
 
 fn find_rollout_file_by_session_id(home: &Path, session_id: &str) -> Option<PathBuf> {
-    let mut files = Vec::new();
     for dirname in ROLLOUT_SEARCH_DIRS {
         let root = home.join(dirname);
         if !root.exists() {
             continue;
         }
+        let mut files = Vec::new();
         if let Err(error) = collect_rollout_files(&root, &mut files) {
             // A broken fallback must not fail the whole delete; the SQLite path
             // above is still authoritative whenever it can answer.
             eprintln!("扫描会话目录失败：{error:#}");
         }
+        // 目录顺序即优先级：活跃会话目录命中后才看归档目录，同一目录内按
+        // 路径排序保证确定性（日期分片下最早文件优先）。
+        files.sort();
+        let matched = files.into_iter().find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    rollout_thread_id_from_filename(name)
+                        .is_some_and(|thread_id| thread_id.eq_ignore_ascii_case(session_id))
+                })
+        });
+        if matched.is_some() {
+            return matched;
+        }
     }
-    files.sort();
-    files.into_iter().find(|path| {
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                rollout_thread_id_from_filename(name)
-                    .is_some_and(|thread_id| thread_id.eq_ignore_ascii_case(session_id))
-            })
-    })
+    None
 }
 
 fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
@@ -568,6 +592,45 @@ fn rollout_thread_id_from_filename(name: &str) -> Option<String> {
             _ => ch.is_ascii_hexdigit(),
         });
     valid.then(|| candidate.to_string())
+}
+
+/// 扫描字节时的上限。超大文件宁可保留墓碑保守失败，也不在启动路径上全文扫描。
+const MAX_SESSION_SCAN_BYTES: usize = 256 * 1024 * 1024;
+
+/// 仅当整条会话在所有已知存储中都找不到时才返回 true：
+/// 文件名兜底扫描一无所获，且每个候选数据库（含 wal/shm）的原始字节里都不出现
+/// 该会话 id。非 uuid 形态的 id 无法通过文件名匹配验证，一律保持保守（false）。
+fn session_absent_from_every_store(home: &Path, session_id: &str) -> bool {
+    if rollout_thread_id_from_filename(&format!("rollout-anchor-{session_id}.jsonl"))
+        .is_none_or(|thread_id| thread_id != session_id)
+    {
+        return false;
+    }
+    if find_rollout_file_by_session_id(home, session_id).is_some() {
+        return false;
+    }
+    !databases_reference_session(home, session_id)
+}
+
+/// 未知结构的库仍可能藏着这段历史，因此按原始字节查证会话 id 是否被引用。
+/// SQLite 的 TEXT/blob 值不压缩存储，会话 id 会以明文出现在文件或 wal 中；
+/// 查不到只说明「没有证据表明它存在」，误报方向是继续保守失败而非丢墓碑。
+fn databases_reference_session(home: &Path, session_id: &str) -> bool {
+    let needle = session_id.as_bytes();
+    for db_path in codex_session_db_paths_from_home(home) {
+        for path in codex_sqlite_sidecar_paths(&db_path) {
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            if bytes.len() > MAX_SESSION_SCAN_BYTES {
+                continue;
+            }
+            if bytes.windows(needle.len()).any(|window| window == needle) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn delete_turns_from_rollout(
@@ -1421,6 +1484,80 @@ mod tests {
         let remaining = fs::read_to_string(&rollout).unwrap();
         assert!(!remaining.contains("t1"));
         assert!(remaining.contains("t2"));
+    }
+
+    #[test]
+    fn drops_a_tombstone_once_the_whole_session_vanishes_from_every_store() {
+        let home = tempdir().unwrap();
+        let session_id = "019ff8aa-0b6e-7a01-a605-7a717a7795e3";
+        let sqlite_dir = home.path().join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        let catalog = Connection::open(sqlite_dir.join("codex.db")).unwrap();
+        catalog
+            .execute("CREATE TABLE automation_runs (id TEXT PRIMARY KEY)", [])
+            .unwrap();
+        drop(catalog);
+
+        let directory = tombstone_directory(home.path());
+        create_private_directory(&directory).unwrap();
+        let tombstone = tombstone_path(&directory, session_id, "history-content:turn:t1");
+        write_private_file(
+            &tombstone,
+            &serde_json::to_vec(&MessageDeleteTombstone {
+                version: TOMBSTONE_VERSION,
+                session_id: session_id.into(),
+                message_id: "history-content:turn:t1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let replay = reapply_persisted_deletions(home.path()).unwrap();
+
+        assert_eq!(replay.deleted, 0);
+        assert_eq!(replay.cleared_sessions, 1);
+        assert!(replay.failures.is_empty());
+        assert!(!tombstone.exists());
+    }
+
+    #[test]
+    fn keeps_a_tombstone_while_any_store_still_mentions_the_session() {
+        let home = tempdir().unwrap();
+        let session_id = "019ff8aa-0b6e-7a01-a605-7a717a7795e3";
+        let sqlite_dir = home.path().join("sqlite");
+        fs::create_dir_all(&sqlite_dir).unwrap();
+        let catalog = Connection::open(sqlite_dir.join("codex.db")).unwrap();
+        catalog
+            .execute(
+                "CREATE TABLE local_thread_catalog (thread_id TEXT NOT NULL)",
+                [],
+            )
+            .unwrap();
+        catalog
+            .execute("INSERT INTO local_thread_catalog VALUES (?1)", [session_id])
+            .unwrap();
+        drop(catalog);
+
+        let directory = tombstone_directory(home.path());
+        create_private_directory(&directory).unwrap();
+        let tombstone = tombstone_path(&directory, session_id, "history-content:turn:t1");
+        write_private_file(
+            &tombstone,
+            &serde_json::to_vec(&MessageDeleteTombstone {
+                version: TOMBSTONE_VERSION,
+                session_id: session_id.into(),
+                message_id: "history-content:turn:t1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let replay = reapply_persisted_deletions(home.path()).unwrap();
+
+        assert_eq!(replay.cleared_sessions, 0);
+        assert_eq!(replay.failures.len(), 1);
+        assert!(replay.failures[0].1.contains("无法确认消息删除是否已落地"));
+        assert!(tombstone.exists());
     }
 
     #[test]

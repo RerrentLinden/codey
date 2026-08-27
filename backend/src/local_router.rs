@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::codex_config::CHATGPT_CODEX_BASE_URL;
 use crate::config::{
     CodeyConfig, UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES, UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+    UPSTREAM_PROTOCOL_OPENAI_RESPONSES,
 };
 
 pub(crate) const ROUTER_PROVIDER_ID: &str = "codey_router";
@@ -320,14 +321,17 @@ impl RouterSnapshot {
             if base_url.is_empty() {
                 continue;
             }
-            let adapter = upstream_adapter(profile.official_account, &profile.upstream_protocol);
+            let protocol = UpstreamProtocol::from_profile(
+                profile.official_account,
+                &profile.upstream_protocol,
+            );
             let mut target = RouteTarget {
                 provider_id: provider_id.to_string(),
                 route_name: profile.name.trim().to_string(),
-                upstream_url: prepare_upstream_url(adapter, &base_url),
-                upstream_headers: prepare_upstream_headers(profile, adapter),
+                upstream_url: prepare_upstream_url(protocol, &base_url),
+                upstream_headers: prepare_upstream_headers(profile, protocol),
                 upstream_authority: upstream_authority(&base_url),
-                adapter,
+                protocol,
                 official_account: profile.official_account,
                 models: HashSet::new(),
             };
@@ -360,8 +364,16 @@ impl RouterSnapshot {
         requested_model: &str,
         route_hint: Option<&str>,
         bound_route: Option<&str>,
-    ) -> Result<ResolvedTarget> {
-        let requested_model = requested_model.trim();
+    ) -> Result<RouteSelection> {
+        RouteResolver::new(self).resolve(RouteRequest {
+            requested_model,
+            route_hint,
+            bound_route,
+        })
+    }
+
+    fn resolve_request(&self, request: RouteRequest<'_>) -> Result<RouteSelection> {
+        let requested_model = request.requested_model.trim();
         if requested_model.is_empty() {
             anyhow::bail!("请求缺少 model 字段");
         }
@@ -369,28 +381,28 @@ impl RouterSnapshot {
             // A qualified `provider/model` selector already identifies the
             // route. Codex can replay client metadata from an earlier turn, so
             // an independent route hint must not redirect an explicit alias.
-            return self.target_for_route_model(&alias.provider_id, &alias.model);
+            return self.target_for_route_model(&alias.provider_id, &alias.model, requested_model);
         }
-        if let Some(route_hint) = route_hint
+        if let Some(route_hint) = request.route_hint
             && self
                 .routes
                 .get(route_hint)
                 .is_some_and(|target| target.models.contains(requested_model))
         {
-            return self.target_for_route_model(route_hint, requested_model);
+            return self.target_for_route_model(route_hint, requested_model, requested_model);
         }
         // Codex can replay Responses client metadata from an earlier turn
         // after the sticky model has changed. An invalid hint therefore is
         // not sufficient evidence of a current route choice. Continue into
         // the bound/unique lookup; valid hints still win above, and equal
         // raw model ids on multiple routes still fail closed below.
-        if let Some(bound_route) = bound_route
+        if let Some(bound_route) = request.bound_route
             && self
                 .routes
                 .get(bound_route)
                 .is_some_and(|target| target.models.contains(requested_model))
         {
-            return self.target_for_route_model(bound_route, requested_model);
+            return self.target_for_route_model(bound_route, requested_model, requested_model);
         }
         // A thread binding describes the route used by its previous turn,
         // not an explicit choice for every future model. When the user
@@ -404,7 +416,11 @@ impl RouterSnapshot {
             .unwrap_or_default();
         if candidates.len() == 1 {
             let candidate = &candidates[0];
-            return self.target_for_route_model(&candidate.provider_id, &candidate.model);
+            return self.target_for_route_model(
+                &candidate.provider_id,
+                &candidate.model,
+                requested_model,
+            );
         }
         if candidates.len() > 1 {
             anyhow::bail!("模型 {requested_model} 同时存在于多条线路，缺少明确的 Codey 线路元数据");
@@ -413,11 +429,16 @@ impl RouterSnapshot {
     }
 
     #[cfg(test)]
-    fn target_for_model(&self, requested_model: &str) -> Result<ResolvedTarget> {
+    fn target_for_model(&self, requested_model: &str) -> Result<RouteSelection> {
         self.target_for_request(requested_model, None, None)
     }
 
-    fn target_for_route_model(&self, provider_id: &str, model: &str) -> Result<ResolvedTarget> {
+    fn target_for_route_model(
+        &self,
+        provider_id: &str,
+        model: &str,
+        requested_model: &str,
+    ) -> Result<RouteSelection> {
         let target = self
             .routes
             .get(provider_id)
@@ -425,7 +446,10 @@ impl RouterSnapshot {
         if !target.models.contains(model) {
             anyhow::bail!("线路「{}」未启用模型 {model}", route_display_name(target));
         }
-        Ok(ResolvedTarget {
+        Ok(RouteSelection {
+            provider_id: target.provider_id.clone(),
+            protocol: target.protocol,
+            requested_model: requested_model.to_string(),
             route: Arc::clone(target),
             upstream_model: model.to_string(),
         })
@@ -450,7 +474,7 @@ struct RouteTarget {
     upstream_url: std::result::Result<String, String>,
     upstream_headers: std::result::Result<HeaderMap, String>,
     upstream_authority: String,
-    adapter: UpstreamAdapter,
+    protocol: UpstreamProtocol,
     official_account: bool,
     models: HashSet<String>,
 }
@@ -462,9 +486,33 @@ struct AliasTarget {
 }
 
 #[derive(Clone, Debug)]
-struct ResolvedTarget {
+struct RouteSelection {
+    provider_id: String,
+    protocol: UpstreamProtocol,
+    requested_model: String,
     route: Arc<RouteTarget>,
     upstream_model: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RouteRequest<'a> {
+    requested_model: &'a str,
+    route_hint: Option<&'a str>,
+    bound_route: Option<&'a str>,
+}
+
+struct RouteResolver<'a> {
+    snapshot: &'a RouterSnapshot,
+}
+
+impl<'a> RouteResolver<'a> {
+    fn new(snapshot: &'a RouterSnapshot) -> Self {
+        Self { snapshot }
+    }
+
+    fn resolve(&self, request: RouteRequest<'_>) -> Result<RouteSelection> {
+        self.snapshot.resolve_request(request)
+    }
 }
 
 fn route_models(
@@ -679,7 +727,7 @@ impl RouterServer {
             let resolved =
                 snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref());
             if let Ok(resolved) = &resolved {
-                bindings.remember(&binding_keys, &resolved.route.provider_id);
+                bindings.remember(&binding_keys, &resolved.provider_id);
             }
             resolved
         };
@@ -710,7 +758,7 @@ impl RouterServer {
             .and_then(|body| body.get("stream"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let adapter = resolved.route.adapter;
+        let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
         let upstream_url = match &resolved.route.upstream_url {
             Ok(upstream_url) => upstream_url.as_str(),
             Err(error) => {
@@ -726,52 +774,30 @@ impl RouterServer {
             }
         };
         let mut tool_bridge = ResponsesToolBridge::default();
-        let upstream_body = match adapter {
-            UpstreamAdapter::OpenAiChatCompletions => {
-                match responses_to_chat_completions_request(&body) {
-                    Ok(converted) => {
-                        tool_bridge = converted.tool_bridge;
-                        converted.body
-                    }
-                    Err(error) => {
-                        write_error_response(
-                            &mut stream,
-                            400,
-                            "unsupported_responses_payload",
-                            format!(
-                                "线路「{}」选择了 OpenAI Chat Completions，但当前请求无法转换：{error:#}",
-                                route_display_name(&resolved.route)
-                            ),
-                            Some(&resolved.route),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
+        let upstream_body = match bridge.convert_responses_body(&body) {
+            Ok(converted) => {
+                if let Some(converted) = converted {
+                    tool_bridge = converted.tool_bridge;
+                    converted.body
+                } else {
+                    body
                 }
             }
-            UpstreamAdapter::AnthropicMessages => {
-                match responses_to_anthropic_messages_request(&body) {
-                    Ok(converted) => {
-                        tool_bridge = converted.tool_bridge;
-                        converted.body
-                    }
-                    Err(error) => {
-                        write_error_response(
-                            &mut stream,
-                            400,
-                            "unsupported_responses_payload",
-                            format!(
-                                "线路「{}」选择了 Anthropic Messages，但当前请求无法转换：{error:#}",
-                                route_display_name(&resolved.route)
-                            ),
-                            Some(&resolved.route),
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                }
+            Err(error) => {
+                write_error_response(
+                    &mut stream,
+                    400,
+                    "unsupported_responses_payload",
+                    format!(
+                        "线路「{}」选择了 {}，但当前请求无法转换：{error:#}",
+                        route_display_name(&resolved.route),
+                        bridge.upstream_protocol().label()
+                    ),
+                    Some(&resolved.route),
+                )
+                .await?;
+                return Ok(());
             }
-            UpstreamAdapter::Responses => body,
         };
         let prepared_headers = match &resolved.route.upstream_headers {
             Ok(headers) => headers,
@@ -853,12 +879,15 @@ impl RouterServer {
                     "proxy_local_router_request",
                     sanitized_error,
                     serde_json::json!({
-                        "routeId": resolved.route.provider_id.as_str(),
+                        "routeId": resolved.provider_id.as_str(),
                         "routeName": resolved.route.route_name.as_str(),
+                        "requestedModel": resolved.requested_model.as_str(),
                         "model": resolved.upstream_model.as_str(),
                         "timeout": timeout,
                         "connect": connect,
                         "upstream": resolved.route.upstream_authority.as_str(),
+                        "upstreamProtocol": bridge.upstream_protocol().label(),
+                        "protocolBridge": bridge.label(),
                         "requestId": current_router_request_id(),
                     }),
                 );
@@ -895,12 +924,15 @@ impl RouterServer {
                     "wait_for_local_router_upstream_headers",
                     "等待上游响应头超时",
                     serde_json::json!({
-                        "routeId": resolved.route.provider_id.as_str(),
+                        "routeId": resolved.provider_id.as_str(),
                         "routeName": resolved.route.route_name.as_str(),
+                        "requestedModel": resolved.requested_model.as_str(),
                         "model": resolved.upstream_model.as_str(),
                         "timeout": true,
                         "stage": "response_headers",
                         "upstream": resolved.route.upstream_authority.as_str(),
+                        "upstreamProtocol": bridge.upstream_protocol().label(),
+                        "protocolBridge": bridge.label(),
                         "requestId": current_router_request_id(),
                     }),
                 );
@@ -918,8 +950,8 @@ impl RouterServer {
                 return Ok(());
             }
         };
-        match adapter {
-            UpstreamAdapter::OpenAiChatCompletions if response.status().is_success() => {
+        match bridge {
+            ProtocolBridge::ResponsesToChatCompletions if response.status().is_success() => {
                 write_chat_completions_as_responses(
                     &mut stream,
                     response,
@@ -930,7 +962,7 @@ impl RouterServer {
                 )
                 .await
             }
-            UpstreamAdapter::AnthropicMessages => {
+            ProtocolBridge::ResponsesToAnthropicMessages => {
                 write_anthropic_messages_as_responses(
                     &mut stream,
                     response,
@@ -1113,20 +1145,84 @@ fn upstream_authority(base_url: &str) -> String {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UpstreamAdapter {
-    Responses,
+enum UpstreamProtocol {
+    OpenAiResponses,
     OpenAiChatCompletions,
     AnthropicMessages,
 }
 
-fn upstream_adapter(official_account: bool, upstream_protocol: &str) -> UpstreamAdapter {
-    if official_account {
-        return UpstreamAdapter::Responses;
+impl UpstreamProtocol {
+    fn from_profile(official_account: bool, upstream_protocol: &str) -> Self {
+        if official_account {
+            return Self::OpenAiResponses;
+        }
+        match upstream_protocol {
+            UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS => Self::OpenAiChatCompletions,
+            UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES => Self::AnthropicMessages,
+            UPSTREAM_PROTOCOL_OPENAI_RESPONSES => Self::OpenAiResponses,
+            _ => Self::OpenAiResponses,
+        }
     }
-    match upstream_protocol {
-        UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS => UpstreamAdapter::OpenAiChatCompletions,
-        UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES => UpstreamAdapter::AnthropicMessages,
-        _ => UpstreamAdapter::Responses,
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::OpenAiResponses => "OpenAI Responses",
+            Self::OpenAiChatCompletions => "OpenAI Chat Completions",
+            Self::AnthropicMessages => "Anthropic Messages",
+        }
+    }
+
+    fn endpoint_label(self) -> &'static str {
+        match self {
+            Self::OpenAiResponses => "API URL",
+            Self::OpenAiChatCompletions => "Chat Completions API URL",
+            Self::AnthropicMessages => "Anthropic Messages API URL",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProtocolBridge {
+    NativeResponses,
+    ResponsesToChatCompletions,
+    ResponsesToAnthropicMessages,
+}
+
+impl ProtocolBridge {
+    fn from_upstream_protocol(protocol: UpstreamProtocol) -> Self {
+        match protocol {
+            UpstreamProtocol::OpenAiResponses => Self::NativeResponses,
+            UpstreamProtocol::OpenAiChatCompletions => Self::ResponsesToChatCompletions,
+            UpstreamProtocol::AnthropicMessages => Self::ResponsesToAnthropicMessages,
+        }
+    }
+
+    fn upstream_protocol(self) -> UpstreamProtocol {
+        match self {
+            Self::NativeResponses => UpstreamProtocol::OpenAiResponses,
+            Self::ResponsesToChatCompletions => UpstreamProtocol::OpenAiChatCompletions,
+            Self::ResponsesToAnthropicMessages => UpstreamProtocol::AnthropicMessages,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::NativeResponses => "Responses passthrough",
+            Self::ResponsesToChatCompletions => "Responses -> Chat Completions",
+            Self::ResponsesToAnthropicMessages => "Responses -> Anthropic Messages",
+        }
+    }
+
+    fn convert_responses_body(self, body: &Value) -> Result<Option<ConvertedResponsesRequest>> {
+        match self {
+            Self::NativeResponses => Ok(None),
+            Self::ResponsesToChatCompletions => {
+                responses_to_chat_completions_request(body).map(Some)
+            }
+            Self::ResponsesToAnthropicMessages => {
+                responses_to_anthropic_messages_request(body).map(Some)
+            }
+        }
     }
 }
 
@@ -1251,27 +1347,23 @@ fn anthropic_messages_endpoint(base_url: &str) -> Result<String> {
 }
 
 fn prepare_upstream_url(
-    adapter: UpstreamAdapter,
+    protocol: UpstreamProtocol,
     base_url: &str,
 ) -> std::result::Result<String, String> {
-    let result = match adapter {
-        UpstreamAdapter::Responses => responses_endpoint(base_url),
-        UpstreamAdapter::OpenAiChatCompletions => chat_completions_endpoint(base_url),
-        UpstreamAdapter::AnthropicMessages => anthropic_messages_endpoint(base_url),
+    let result = match protocol {
+        UpstreamProtocol::OpenAiResponses => responses_endpoint(base_url),
+        UpstreamProtocol::OpenAiChatCompletions => chat_completions_endpoint(base_url),
+        UpstreamProtocol::AnthropicMessages => anthropic_messages_endpoint(base_url),
     };
     result.map_err(|error| {
-        let endpoint = match adapter {
-            UpstreamAdapter::Responses => "API URL",
-            UpstreamAdapter::OpenAiChatCompletions => "Chat Completions API URL",
-            UpstreamAdapter::AnthropicMessages => "Anthropic Messages API URL",
-        };
+        let endpoint = protocol.endpoint_label();
         format!("{endpoint} 无效：{error:#}")
     })
 }
 
 fn prepare_upstream_headers(
     profile: &crate::config::ProviderProfile,
-    adapter: UpstreamAdapter,
+    protocol: UpstreamProtocol,
 ) -> std::result::Result<HeaderMap, String> {
     let route_name = profile.name.trim();
     let mut headers = HeaderMap::with_capacity(profile.model_request_headers.len() + 2);
@@ -1290,19 +1382,19 @@ fn prepare_upstream_headers(
     }
 
     let has_custom_authorization = headers.contains_key(AUTHORIZATION);
-    if adapter == UpstreamAdapter::AnthropicMessages && has_custom_authorization {
+    if protocol == UpstreamProtocol::AnthropicMessages && has_custom_authorization {
         return Err(format!(
             "线路「{route_name}」使用 Anthropic Messages 时不允许配置 Authorization；请使用该线路的 Key 字段或 x-api-key"
         ));
     }
     if !profile.official_account && !profile.api_key.trim().is_empty() {
-        let header_name = if adapter == UpstreamAdapter::AnthropicMessages {
+        let header_name = if protocol == UpstreamProtocol::AnthropicMessages {
             HeaderName::from_static("x-api-key")
         } else {
             AUTHORIZATION
         };
         if !headers.contains_key(&header_name) {
-            let header_value = if adapter == UpstreamAdapter::AnthropicMessages {
+            let header_value = if protocol == UpstreamProtocol::AnthropicMessages {
                 profile.api_key.trim().to_string()
             } else {
                 format!("Bearer {}", profile.api_key.trim())
@@ -1312,7 +1404,7 @@ fn prepare_upstream_headers(
             headers.insert(header_name, value);
         }
     }
-    if adapter == UpstreamAdapter::AnthropicMessages
+    if protocol == UpstreamProtocol::AnthropicMessages
         && !headers.contains_key(HeaderName::from_static("anthropic-version"))
     {
         headers.insert(
@@ -1591,14 +1683,38 @@ fn responses_to_chat_completions_request(body: &Value) -> Result<ConvertedRespon
     {
         chat.insert("max_tokens".to_string(), max_tokens);
     }
-    if let Some(tools) = chat_tools {
+    if let Some(web_search_options) = chat_tools.as_ref().and_then(|tools| {
+        chat_web_search_options_for_tool_choice(
+            tools.web_search_options.as_ref(),
+            object.get("tool_choice"),
+        )
+        .transpose()
+    }) {
+        chat.insert("web_search_options".to_string(), web_search_options?);
+    }
+    let web_search_enabled = chat.contains_key("web_search_options");
+    let web_search_tool_seen = chat_tools
+        .as_ref()
+        .is_some_and(|tools| tools.web_search_tool_seen);
+    let has_chat_tools = chat_tools
+        .as_ref()
+        .and_then(|tools| tools.tools.as_ref())
+        .is_some();
+    if let Some(tools) = chat_tools.and_then(|tools| tools.tools) {
         chat.insert("tools".to_string(), tools);
     }
     if let Some(tool_choice) = object.get("tool_choice") {
-        chat.insert(
-            "tool_choice".to_string(),
-            responses_tool_choice_to_chat_tool_choice(tool_choice, &tool_bridge)?,
-        );
+        if !should_omit_chat_tool_choice_for_web_search(
+            tool_choice,
+            has_chat_tools,
+            web_search_tool_seen,
+            web_search_enabled,
+        )? {
+            chat.insert(
+                "tool_choice".to_string(),
+                responses_tool_choice_to_chat_tool_choice(tool_choice, &tool_bridge)?,
+            );
+        }
     }
     if let Some(parallel_tool_calls) = object.get("parallel_tool_calls") {
         if !parallel_tool_calls.is_boolean() {
@@ -1719,6 +1835,9 @@ fn responses_tool_identity(tool: &Value) -> Option<String> {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("function");
+    if matches!(tool_type, "web_search" | "web_search_preview") {
+        return Some("web_search".to_string());
+    }
     if tool_type == "tool_search" {
         let execution = object
             .get("execution")
@@ -1736,6 +1855,84 @@ fn responses_tool_identity(tool: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|name| !name.is_empty())?;
     Some(format!("{tool_type}/{name}"))
+}
+
+fn chat_web_search_options_for_tool_choice(
+    options: Option<&Value>,
+    tool_choice: Option<&Value>,
+) -> Result<Option<Value>> {
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    if responses_tool_choice_disables_web_search(tool_choice)? {
+        return Ok(None);
+    }
+    Ok(Some(options.clone()))
+}
+
+fn responses_tool_choice_disables_web_search(tool_choice: Option<&Value>) -> Result<bool> {
+    let Some(tool_choice) = tool_choice else {
+        return Ok(false);
+    };
+    match tool_choice {
+        Value::String(choice) if choice == "none" => Ok(true),
+        Value::String(choice) if matches!(choice.as_str(), "auto" | "required") => Ok(false),
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("web_search" | "web_search_preview") => Ok(false),
+            Some("function" | "custom" | "tool_search") => Ok(true),
+            Some(tool_type) => anyhow::bail!(
+                "Responses tool_choice 类型 {tool_type} 不能转换为 Chat Completions tool_choice"
+            ),
+            None => anyhow::bail!("Responses tool_choice 缺少 type"),
+        },
+        _ => anyhow::bail!("tool_choice 必须是 auto/none/required 或对象"),
+    }
+}
+
+fn responses_tool_choice_targets_web_search(tool_choice: &Value) -> Result<bool> {
+    match tool_choice {
+        Value::Object(object) => match object.get("type").and_then(Value::as_str) {
+            Some("web_search" | "web_search_preview") => Ok(true),
+            Some("function" | "custom" | "tool_search") => Ok(false),
+            Some(tool_type) => anyhow::bail!(
+                "Responses tool_choice 类型 {tool_type} 不能转换为 Chat Completions tool_choice"
+            ),
+            None => anyhow::bail!("Responses tool_choice 缺少 type"),
+        },
+        _ => Ok(false),
+    }
+}
+
+fn should_omit_chat_tool_choice_for_web_search(
+    tool_choice: &Value,
+    has_chat_tools: bool,
+    web_search_tool_seen: bool,
+    web_search_enabled: bool,
+) -> Result<bool> {
+    if !web_search_tool_seen {
+        return responses_tool_choice_targets_web_search(tool_choice);
+    }
+    if !has_chat_tools {
+        return match tool_choice {
+            Value::String(choice) if matches!(choice.as_str(), "auto" | "none" | "required") => {
+                Ok(true)
+            }
+            Value::Object(object)
+                if matches!(
+                    object.get("type").and_then(Value::as_str),
+                    Some("web_search" | "web_search_preview")
+                ) =>
+            {
+                Ok(true)
+            }
+            _ => responses_tool_choice_targets_web_search(tool_choice),
+        };
+    }
+    if web_search_enabled {
+        responses_tool_choice_targets_web_search(tool_choice)
+    } else {
+        Ok(false)
+    }
 }
 
 const DEFAULT_ANTHROPIC_MAX_TOKENS: u64 = 8192;
@@ -1763,6 +1960,7 @@ fn responses_to_anthropic_messages_request(body: &Value) -> Result<ConvertedResp
         "logit_bias",
         "logprobs",
         "top_logprobs",
+        "web_search_options",
     ] {
         if chat.contains_key(unsupported) {
             anyhow::bail!("Anthropic Messages 不支持 Responses 字段 {unsupported}");
@@ -2736,14 +2934,23 @@ const TOOL_SEARCH_UPSTREAM_TOOL_NAME: &str = "codey_tool_search__client__bridge_
 const UPSTREAM_FUNCTION_NAME_MAX_BYTES: usize = 64;
 const MAX_RESPONSES_NAMESPACE_DEPTH: usize = 8;
 
+#[derive(Default)]
+struct ResponsesChatTools {
+    tools: Option<Value>,
+    web_search_options: Option<Value>,
+    web_search_tool_seen: bool,
+}
+
 fn responses_tools_to_chat_tools_with_bridge(
     tools: &Value,
     tool_bridge: &mut ResponsesToolBridge,
-) -> Result<Value> {
+) -> Result<ResponsesChatTools> {
     let tools = tools
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("tools 必须是数组"))?;
     let mut converted = Vec::new();
+    let mut web_search_options = None;
+    let mut web_search_tool_seen = false;
     let mut upstream_names = HashMap::<String, ResponsesToolName>::new();
     let mut bridged_definitions = HashMap::<ResponsesToolName, Value>::new();
     for tool in tools {
@@ -2754,9 +2961,15 @@ fn responses_tools_to_chat_tools_with_bridge(
             &mut upstream_names,
             &mut bridged_definitions,
             &mut converted,
+            &mut web_search_options,
+            &mut web_search_tool_seen,
         )?;
     }
-    Ok(Value::Array(converted))
+    Ok(ResponsesChatTools {
+        tools: (!converted.is_empty()).then_some(Value::Array(converted)),
+        web_search_options,
+        web_search_tool_seen,
+    })
 }
 
 fn append_responses_tool_to_chat_tools(
@@ -2766,6 +2979,8 @@ fn append_responses_tool_to_chat_tools(
     upstream_names: &mut HashMap<String, ResponsesToolName>,
     bridged_definitions: &mut HashMap<ResponsesToolName, Value>,
     converted: &mut Vec<Value>,
+    web_search_options: &mut Option<Value>,
+    web_search_tool_seen: &mut bool,
 ) -> Result<()> {
     let object = tool
         .as_object()
@@ -2817,6 +3032,8 @@ fn append_responses_tool_to_chat_tools(
             upstream_names,
             bridged_definitions,
             converted,
+            web_search_options,
+            web_search_tool_seen,
         );
     }
     if tool_type == Some("custom") {
@@ -2917,6 +3134,22 @@ fn append_responses_tool_to_chat_tools(
         }));
         return Ok(());
     }
+    if matches!(tool_type, Some("web_search" | "web_search_preview")) {
+        *web_search_tool_seen = true;
+        if !namespace_path.is_empty() {
+            let tool_name = tool_type.unwrap_or("unknown");
+            anyhow::bail!("namespace.tools 不支持工具类型 {tool_name}");
+        }
+        let options = responses_web_search_tool_to_chat_options(object)?;
+        if let Some(existing) = web_search_options.as_ref() {
+            if existing == &options {
+                return Ok(());
+            }
+            anyhow::bail!("Responses web_search 工具存在定义冲突");
+        }
+        *web_search_options = Some(options);
+        return Ok(());
+    }
     if !namespace_path.is_empty() {
         let tool_name = tool_type.unwrap_or("unknown");
         anyhow::bail!("namespace.tools 不支持工具类型 {tool_name}");
@@ -2927,6 +3160,85 @@ fn append_responses_tool_to_chat_tools(
     )
 }
 
+fn responses_web_search_tool_to_chat_options(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Value> {
+    if let Some(filters) = object.get("filters")
+        && !filters.is_null()
+    {
+        anyhow::bail!("Chat Completions web_search_options 不支持 Responses web_search.filters");
+    }
+    if let Some(return_token_budget) = object.get("return_token_budget")
+        && !return_token_budget.is_null()
+    {
+        anyhow::bail!(
+            "Chat Completions web_search_options 不支持 Responses web_search.return_token_budget"
+        );
+    }
+    if object.get("external_web_access").and_then(Value::as_bool) == Some(false) {
+        anyhow::bail!("Chat Completions web_search_options 不能表达 external_web_access=false");
+    }
+
+    let mut options = serde_json::Map::new();
+    if let Some(search_context_size) = object.get("search_context_size") {
+        let size = search_context_size
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("web_search.search_context_size 必须是字符串"))?;
+        if !matches!(size, "low" | "medium" | "high") {
+            anyhow::bail!("web_search.search_context_size 必须是 low/medium/high");
+        }
+        options.insert(
+            "search_context_size".to_string(),
+            Value::String(size.to_string()),
+        );
+    }
+    if let Some(user_location) = object.get("user_location")
+        && !user_location.is_null()
+    {
+        options.insert(
+            "user_location".to_string(),
+            responses_web_search_user_location_to_chat(user_location)?,
+        );
+    }
+    Ok(Value::Object(options))
+}
+
+fn responses_web_search_user_location_to_chat(user_location: &Value) -> Result<Value> {
+    let object = user_location
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("web_search.user_location 必须是对象"))?;
+    let location_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("web_search.user_location 缺少 type"))?;
+    if location_type != "approximate" {
+        anyhow::bail!("web_search.user_location.type 只能是 approximate");
+    }
+    let approximate = if let Some(approximate) = object.get("approximate") {
+        approximate
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("web_search.user_location.approximate 必须是对象"))?
+            .clone()
+    } else {
+        let mut approximate = serde_json::Map::new();
+        for key in ["city", "country", "region", "timezone"] {
+            if let Some(value) = object.get(key) {
+                if !value.is_string() && !value.is_null() {
+                    anyhow::bail!("web_search.user_location.{key} 必须是字符串");
+                }
+                if !value.is_null() {
+                    approximate.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+        approximate
+    };
+    Ok(json!({
+        "type":"approximate",
+        "approximate":Value::Object(approximate),
+    }))
+}
+
 fn append_responses_namespace_tools(
     object: &serde_json::Map<String, Value>,
     parent_namespace: &[String],
@@ -2934,6 +3246,8 @@ fn append_responses_namespace_tools(
     upstream_names: &mut HashMap<String, ResponsesToolName>,
     bridged_definitions: &mut HashMap<ResponsesToolName, Value>,
     converted: &mut Vec<Value>,
+    web_search_options: &mut Option<Value>,
+    web_search_tool_seen: &mut bool,
 ) -> Result<()> {
     let namespace = responses_namespace_name(object)?;
     let mut namespace_path = parent_namespace.to_vec();
@@ -2958,6 +3272,8 @@ fn append_responses_namespace_tools(
                 upstream_names,
                 bridged_definitions,
                 converted,
+                web_search_options,
+                web_search_tool_seen,
             )?;
         }
     }
@@ -2973,6 +3289,8 @@ fn append_responses_namespace_tools(
                 upstream_names,
                 bridged_definitions,
                 converted,
+                web_search_options,
+                web_search_tool_seen,
             )?;
         }
     }
@@ -4684,6 +5002,14 @@ fn chat_message_content_text(content: &Value) -> String {
     }
 }
 
+fn chat_message_annotations(message: &serde_json::Map<String, Value>) -> Value {
+    message
+        .get("annotations")
+        .filter(|annotations| annotations.is_array())
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()))
+}
+
 #[cfg(test)]
 fn chat_completion_to_responses_body(chat: Value, model: &str) -> Result<Value> {
     let tool_bridge = ResponsesToolBridge::default();
@@ -4724,6 +5050,7 @@ fn chat_completion_to_responses_body_with_tool_bridge(
         .get("refusal")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let annotations = chat_message_annotations(message);
     let mut output = Vec::new();
     if !text.is_empty() || !refusal.is_empty() {
         let mut content = Vec::new();
@@ -4731,7 +5058,7 @@ fn chat_completion_to_responses_body_with_tool_bridge(
             content.push(json!({
                 "type": "output_text",
                 "text": text,
-                "annotations": []
+                "annotations": annotations
             }));
         }
         if !refusal.is_empty() {
@@ -6585,10 +6912,7 @@ mod tests {
             .unwrap();
         let headers = resolved.route.upstream_headers.as_ref().unwrap();
 
-        assert_eq!(
-            resolved.route.adapter,
-            UpstreamAdapter::OpenAiChatCompletions
-        );
+        assert_eq!(resolved.protocol, UpstreamProtocol::OpenAiChatCompletions);
         assert_eq!(
             resolved.route.upstream_url.as_ref().unwrap(),
             "https://relay.example/v1/chat/completions"
@@ -6601,6 +6925,102 @@ mod tests {
             headers.get("accept").unwrap().to_str().unwrap(),
             "application/x-codey-test"
         );
+    }
+
+    #[test]
+    fn route_resolver_keeps_provider_protocol_and_model_selection_explicit() {
+        let (mut config, provider_a, model) =
+            router_config("https://responses.example/v1".to_string());
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.into();
+
+        let mut route_b = config.profiles[0].clone();
+        route_b.id = "route-b".into();
+        route_b.name = "Chat Relay".into();
+        route_b.base_url = "https://chat.example/v1".into();
+        route_b.upstream_protocol = crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        route_b.normalize();
+        let provider_b = route_b.provider_id().to_string();
+
+        let mut route_c = config.profiles[0].clone();
+        route_c.id = "route-c".into();
+        route_c.name = "Anthropic Relay".into();
+        route_c.base_url = "https://anthropic.example/v1".into();
+        route_c.upstream_protocol = crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES.into();
+        route_c.normalize();
+        let provider_c = route_c.provider_id().to_string();
+
+        config.profiles.extend([route_b, route_c]);
+        config
+            .selected_models_by_provider
+            .insert(provider_b.clone(), vec![model.clone()]);
+        config
+            .selected_models_by_provider
+            .insert(provider_c.clone(), vec![model.clone()]);
+
+        let snapshot = RouterSnapshot::from_config(&config);
+        let selections = [
+            (
+                provider_a.as_str(),
+                UpstreamProtocol::OpenAiResponses,
+                "https://responses.example/v1/responses",
+            ),
+            (
+                provider_b.as_str(),
+                UpstreamProtocol::OpenAiChatCompletions,
+                "https://chat.example/v1/chat/completions",
+            ),
+            (
+                provider_c.as_str(),
+                UpstreamProtocol::AnthropicMessages,
+                "https://anthropic.example/v1/messages",
+            ),
+        ];
+
+        for (provider_id, protocol, upstream_url) in selections {
+            let requested_model = model_alias(provider_id, &model);
+            let resolved = RouteResolver::new(&snapshot)
+                .resolve(RouteRequest {
+                    requested_model: &requested_model,
+                    route_hint: None,
+                    bound_route: None,
+                })
+                .unwrap();
+
+            assert_eq!(resolved.provider_id, provider_id);
+            assert_eq!(resolved.protocol, protocol);
+            assert_eq!(resolved.requested_model, requested_model);
+            assert_eq!(resolved.upstream_model, model);
+            assert_eq!(resolved.route.upstream_url.as_ref().unwrap(), upstream_url);
+        }
+
+        assert!(snapshot.target_for_model(&model).is_err());
+    }
+
+    #[test]
+    fn protocol_bridge_converts_only_when_the_upstream_protocol_differs() {
+        assert_eq!(
+            ProtocolBridge::from_upstream_protocol(UpstreamProtocol::OpenAiResponses),
+            ProtocolBridge::NativeResponses
+        );
+        assert_eq!(
+            ProtocolBridge::from_upstream_protocol(UpstreamProtocol::OpenAiChatCompletions),
+            ProtocolBridge::ResponsesToChatCompletions
+        );
+        assert_eq!(
+            ProtocolBridge::from_upstream_protocol(UpstreamProtocol::AnthropicMessages),
+            ProtocolBridge::ResponsesToAnthropicMessages
+        );
+
+        let native = ProtocolBridge::NativeResponses
+            .convert_responses_body(&json!({
+                "model":"provider-model",
+                "input":"search",
+                "tools":[{"type":"web_search"}]
+            }))
+            .unwrap();
+
+        assert!(native.is_none());
     }
 
     #[test]
@@ -7642,6 +8062,149 @@ mod tests {
     }
 
     #[test]
+    fn responses_web_search_maps_to_chat_web_search_options() {
+        let auto = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"search the web",
+            "tools":[{"type":"web_search"}],
+            "tool_choice":"auto"
+        }))
+        .unwrap();
+        assert_eq!(auto.body["web_search_options"], json!({}));
+        assert!(auto.body.get("tools").is_none());
+        assert!(auto.body.get("tool_choice").is_none());
+
+        let chat = responses_to_chat_completions_request(&json!({
+            "model":"gpt-5-search-api",
+            "input":"search the web",
+            "tools":[{
+                "type":"web_search_preview",
+                "search_context_size":"low",
+                "user_location":{
+                    "type":"approximate",
+                    "country":"US",
+                    "city":"San Francisco",
+                    "region":"California",
+                    "timezone":"America/Los_Angeles"
+                }
+            }],
+            "tool_choice":{"type":"web_search_preview"}
+        }))
+        .unwrap();
+
+        assert!(chat.body.get("tools").is_none());
+        assert!(chat.body.get("tool_choice").is_none());
+        assert_eq!(
+            chat.body["web_search_options"],
+            json!({
+                "search_context_size":"low",
+                "user_location":{
+                    "type":"approximate",
+                    "approximate":{
+                        "country":"US",
+                        "city":"San Francisco",
+                        "region":"California",
+                        "timezone":"America/Los_Angeles"
+                    }
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn responses_web_search_respects_none_and_function_tool_choice() {
+        let tools = json!([
+            {"type":"web_search"},
+            {"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}
+        ]);
+        let none = responses_to_chat_completions_request(&json!({
+            "model":"gpt-5-search-api",
+            "input":"search disabled",
+            "tools":tools,
+            "tool_choice":"none"
+        }))
+        .unwrap();
+        assert!(none.body.get("web_search_options").is_none());
+        assert_eq!(none.body["tool_choice"], "none");
+        assert_eq!(none.body["tools"].as_array().unwrap().len(), 1);
+
+        let function = responses_to_chat_completions_request(&json!({
+            "model":"gpt-5-search-api",
+            "input":"call lookup",
+            "tools":tools,
+            "tool_choice":{"type":"function","name":"lookup"}
+        }))
+        .unwrap();
+        assert!(function.body.get("web_search_options").is_none());
+        assert_eq!(function.body["tool_choice"]["function"]["name"], "lookup");
+    }
+
+    #[test]
+    fn responses_web_search_rejects_unsupported_chat_options_and_anthropic() {
+        for tool in [
+            json!({"type":"web_search","filters":{"allowed_domains":["example.com"]}}),
+            json!({"type":"web_search","return_token_budget":2048}),
+            json!({"type":"web_search","external_web_access":false}),
+            json!({"type":"web_search","search_context_size":"tiny"}),
+        ] {
+            let error = responses_to_chat_completions_request(&json!({
+                "model":"gpt-5-search-api",
+                "input":"search",
+                "tools":[tool]
+            }))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("web_search")
+                    || error.to_string().contains("external_web_access")
+            );
+        }
+
+        let error = responses_to_anthropic_messages_request(&json!({
+            "model":"claude-test",
+            "input":"search",
+            "tools":[{"type":"web_search"}]
+        }))
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("web_search_options")
+                || error.to_string().contains("支持 Responses 的线路")
+        );
+    }
+
+    #[test]
+    fn chat_search_annotations_are_preserved_in_responses_output_text() {
+        let body = chat_completion_to_responses_body(
+            json!({
+                "id":"chatcmpl-search",
+                "created":123,
+                "choices":[{
+                    "message":{
+                        "role":"assistant",
+                        "content":"OpenAI released a search model.",
+                        "annotations":[{
+                            "type":"url_citation",
+                            "url_citation":{
+                                "url":"https://openai.com/",
+                                "title":"OpenAI",
+                                "start_index":0,
+                                "end_index":6
+                            }
+                        }]
+                    },
+                    "finish_reason":"stop"
+                }]
+            }),
+            "gpt-5-search-api",
+        )
+        .unwrap();
+
+        assert_eq!(
+            body["output"][0]["content"][0]["annotations"][0]["url_citation"]["url"],
+            "https://openai.com/"
+        );
+    }
+
+    #[test]
     fn namespace_tools_fail_closed_on_conflicts_and_unsupported_tool_kinds() {
         let duplicate = responses_to_chat_completions_request(&json!({
             "model":"provider-model",
@@ -7661,7 +8224,6 @@ mod tests {
         for tool in [
             json!({"type":"tool_search"}),
             json!({"type":"tool_search","execution":"server"}),
-            json!({"type":"web_search_preview","name":"lookup"}),
         ] {
             let error = responses_to_chat_completions_request(&json!({
                 "model":"provider-model",
@@ -7974,6 +8536,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responses_route_passes_hosted_web_search_through_natively() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            let response = json!({
+                "id":"resp-search",
+                "object":"response",
+                "output":[{
+                    "type":"message",
+                    "role":"assistant",
+                    "content":[{
+                        "type":"output_text",
+                        "text":"search result",
+                        "annotations":[]
+                    }]
+                }]
+            })
+            .to_string();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                        response.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            (request.path, body)
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":"search the web",
+                "tools":[{
+                    "type":"web_search",
+                    "search_context_size":"high",
+                    "filters":{"allowed_domains":["example.com"]},
+                    "return_token_budget":2048,
+                    "external_web_access":false
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let (path, body) = upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(body["model"], model);
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert_eq!(
+            body["tools"][0]["filters"]["allowed_domains"][0],
+            "example.com"
+        );
+        assert_eq!(body["tools"][0]["return_token_budget"], 2048);
+        assert_eq!(body["tools"][0]["external_web_access"], false);
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn chat_completions_route_uses_its_path_key_and_returns_responses_sse() {
         let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let upstream_address = upstream.local_addr().unwrap();
@@ -8044,6 +8680,125 @@ mod tests {
         assert_eq!(body["model"], "provider-model");
         assert_eq!(body["messages"][0]["content"], "hello");
         assert_eq!(body["stream_options"]["include_usage"], true);
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_route_maps_web_search_for_provider_scoped_model_without_model_name_gate() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({
+                    "id":"chatcmpl-search",
+                    "created":123,
+                    "model":body["model"],
+                    "choices":[{
+                        "message":{"role":"assistant","content":"search result"},
+                        "finish_reason":"stop"
+                    }],
+                    "usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}
+                }),
+            )
+            .await
+            .unwrap();
+            (request.path, body)
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":"search the web",
+                "tools":[{
+                    "type":"web_search",
+                    "search_context_size":"high"
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["output_text"],
+            "search result"
+        );
+        let (path, body) = upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(body["model"], "provider-model");
+        assert_eq!(
+            body["web_search_options"],
+            json!({"search_context_size":"high"})
+        );
+        assert!(body.get("tools").is_none());
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_route_passes_web_search_through_without_chat_conversion() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({
+                    "id":"resp-search",
+                    "object":"response",
+                    "model":body["model"],
+                    "output_text":"native search"
+                }),
+            )
+            .await
+            .unwrap();
+            (request.path, body)
+        });
+        let (config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":"search the web",
+                "tools":[{
+                    "type":"web_search",
+                    "search_context_size":"high"
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["output_text"],
+            "native search"
+        );
+        let (path, body) = upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(body["model"], "provider-model");
+        assert_eq!(body["tools"][0]["type"], "web_search");
+        assert!(body.get("web_search_options").is_none());
         router.stop().await.unwrap();
     }
 
