@@ -4,6 +4,29 @@ import { routeModelAlias, routeProviderId } from "./modelRoutes";
 import { routeDisplayPrefix } from "./routeShortNames";
 
 const THIRD_PARTY_REASONING_EFFORTS = ["low", "medium", "high", "xhigh"];
+const THIRD_PARTY_REASONING_EFFORT_ALLOWLIST = [
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+];
+
+function thirdPartyReasoningEfforts(efforts?: readonly string[]) {
+  const supported = (efforts || []).filter((effort) =>
+    THIRD_PARTY_REASONING_EFFORT_ALLOWLIST.includes(effort)
+  );
+  return supported.length > 0 ? supported : THIRD_PARTY_REASONING_EFFORTS;
+}
+
+function metadataForModel<T>(metadata: ReadonlyMap<string, T>, modelId: string) {
+  const exact = metadata.get(modelKey(modelId));
+  if (exact) return exact;
+  const separator = modelId.indexOf("/");
+  return separator >= 0
+    ? metadata.get(modelKey(modelId.slice(separator + 1)))
+    : undefined;
+}
 
 export type SubagentModelOption = {
   value: string;
@@ -49,6 +72,12 @@ export function buildSubagentModelOptions(
   const officialMetadata = new Map(
     modelState.officialModels.map((model) => [modelKey(model.slug), model]),
   );
+  const thirdPartyMetadata = new Map(
+    (modelState.thirdPartyModelMetadata || []).map((model) => [
+      modelKey(model.slug),
+      model,
+    ]),
+  );
   const seenAliases = new Set<string>();
   const options: SubagentModelOption[] = [];
 
@@ -63,19 +92,25 @@ export function buildSubagentModelOptions(
       if (seenAliases.has(valueKey)) continue;
       seenAliases.add(valueKey);
 
-      const metadata = officialMetadata.get(modelKey(modelId));
+      const officialModelMetadata = metadataForModel(officialMetadata, modelId);
+      const thirdPartyModelMetadata = metadataForModel(thirdPartyMetadata, modelId);
       const usesOfficialMetadata = official;
-      const efforts = usesOfficialMetadata && metadata
-        ? metadata.supportedReasoningEfforts
-        : THIRD_PARTY_REASONING_EFFORTS;
+      const efforts = usesOfficialMetadata && officialModelMetadata
+        ? officialModelMetadata.supportedReasoningEfforts
+        : thirdPartyReasoningEfforts(
+          thirdPartyModelMetadata?.supportedReasoningEfforts ??
+            officialModelMetadata?.supportedReasoningEfforts,
+        );
       const supportedReasoningEfforts = efforts.length > 0 ? efforts : ["low"];
       const requestedDefaultEffort =
-        usesOfficialMetadata && metadata
-          ? metadata.defaultReasoningEffort || supportedReasoningEfforts[0]
-          : "low";
+        usesOfficialMetadata && officialModelMetadata
+          ? officialModelMetadata.defaultReasoningEffort || supportedReasoningEfforts[0]
+          : thirdPartyModelMetadata?.defaultReasoningEffort || "low";
       options.push({
         value,
-        label: usesOfficialMetadata && metadata ? metadata.displayName : modelId,
+        label: usesOfficialMetadata && officialModelMetadata
+          ? officialModelMetadata.displayName
+          : modelId,
         modelId,
         routeId: profile.id,
         providerId,

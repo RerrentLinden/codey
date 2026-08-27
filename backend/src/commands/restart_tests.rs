@@ -261,6 +261,7 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
             .collect(),
         official_models,
         third_party_models: vec!["provider-fast-coder".into()],
+        third_party_model_metadata: Vec::new(),
         manual_third_party_models: vec!["provider-fast-coder".into()],
         upstream_models: vec!["provider-fast-coder".into()],
         default_model: "gpt-5.6-sol".into(),
@@ -316,6 +317,59 @@ fn renderer_model_catalog_keeps_supported_models_before_configured_models() {
         })
     );
     assert_eq!(catalog["model_metadata"].as_array().unwrap().len(), 6);
+}
+
+#[test]
+fn renderer_model_catalog_uses_per_third_party_reasoning_metadata() {
+    let mut config = CodeyConfig::default();
+    config.profiles[0].source_provider_id = Some("source-provider".into());
+    let model_state = model_catalog::ModelSelectionState {
+        third_party_models: vec!["gpt-5.6-sol".into(), "provider-fast-coder".into()],
+        third_party_model_metadata: vec![
+            model_catalog::ThirdPartyModelAvailability {
+                slug: "gpt-5.6-sol".into(),
+                supported_reasoning_efforts: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                    "max".into(),
+                ],
+                default_reasoning_effort: "low".into(),
+            },
+            model_catalog::ThirdPartyModelAvailability {
+                slug: "provider-fast-coder".into(),
+                supported_reasoning_efforts: vec![
+                    "low".into(),
+                    "medium".into(),
+                    "high".into(),
+                    "xhigh".into(),
+                ],
+                default_reasoning_effort: "low".into(),
+            },
+        ],
+        default_model: "gpt-5.6-sol".into(),
+        ..model_catalog::ModelSelectionState::default()
+    };
+
+    let catalog = renderer_model_catalog_value(&config, &model_state);
+    let metadata = catalog["model_metadata"].as_array().unwrap();
+    let sol = metadata
+        .iter()
+        .find(|entry| entry["model"] == "source-provider/gpt-5.6-sol")
+        .unwrap();
+    assert_eq!(
+        sol["supported_reasoning_efforts"],
+        json!(["low", "medium", "high", "xhigh", "max"])
+    );
+    let custom = metadata
+        .iter()
+        .find(|entry| entry["model"] == "source-provider/provider-fast-coder")
+        .unwrap();
+    assert_eq!(
+        custom["supported_reasoning_efforts"],
+        json!(["low", "medium", "high", "xhigh"])
+    );
 }
 
 #[test]

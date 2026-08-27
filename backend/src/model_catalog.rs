@@ -13,8 +13,9 @@ use crate::model_id;
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 pub(crate) const THIRD_PARTY_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
+const THIRD_PARTY_REASONING_EFFORT_ALLOWLIST: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 pub(crate) const THIRD_PARTY_DEFAULT_REASONING_EFFORT: &str = "low";
-const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 4] = [
+const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 5] = [
     ("low", "Fast responses with lighter reasoning"),
     (
         "medium",
@@ -22,6 +23,7 @@ const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 4] = [
     ),
     ("high", "Greater reasoning depth for complex problems"),
     ("xhigh", "Extra high reasoning depth for complex problems"),
+    ("max", "Maximum reasoning depth for the toughest tasks"),
 ];
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
@@ -66,12 +68,21 @@ pub struct OfficialModelAvailability {
     pub default_reasoning_effort: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThirdPartyModelAvailability {
+    pub slug: String,
+    pub supported_reasoning_efforts: Vec<String>,
+    pub default_reasoning_effort: String,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelSelectionState {
     pub official_models: Vec<OfficialModelAvailability>,
     pub official_model_ids: Vec<String>,
     pub third_party_models: Vec<String>,
+    pub third_party_model_metadata: Vec<ThirdPartyModelAvailability>,
     pub manual_third_party_models: Vec<String>,
     pub upstream_models: Vec<String>,
     pub default_model: String,
@@ -276,10 +287,10 @@ pub fn selection_state_with_manual_models(
     // provider may legitimately expose a model whose id also appears in the
     // official catalog; it must remain a route-scoped model and go through the
     // local router instead of acquiring official-account semantics.
-    let official_entries = if official_provider {
-        read_official_entries(home)?
-    } else {
-        Arc::new(Vec::new())
+    let official_entries = match read_official_entries(home) {
+        Ok(entries) => entries,
+        Err(error) if official_provider => return Err(error),
+        Err(_) => Arc::new(Vec::new()),
     };
     let official_model_ids = official_entries
         .iter()
@@ -297,24 +308,28 @@ pub fn selection_state_with_manual_models(
         .iter()
         .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
-    let official_models: Vec<OfficialModelAvailability> = official_entries
-        .iter()
-        .filter_map(|model| {
-            let supported_reasoning_efforts = reasoning_efforts_from_value(model);
-            let default_reasoning_effort =
-                default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
-            let model = official_model_from_value(model)?;
-            let supported = !filter_official_selection
-                || selected_official_keys.contains(&model_id::key(&model.slug));
-            Some(OfficialModelAvailability {
-                slug: model.slug,
-                display_name: model.display_name,
-                supported,
-                supported_reasoning_efforts,
-                default_reasoning_effort,
+    let official_models: Vec<OfficialModelAvailability> = if official_provider {
+        official_entries
+            .iter()
+            .filter_map(|model| {
+                let supported_reasoning_efforts = reasoning_efforts_from_value(model);
+                let default_reasoning_effort =
+                    default_reasoning_effort_from_value(model, &supported_reasoning_efforts);
+                let model = official_model_from_value(model)?;
+                let supported = !filter_official_selection
+                    || selected_official_keys.contains(&model_id::key(&model.slug));
+                Some(OfficialModelAvailability {
+                    slug: model.slug,
+                    display_name: model.display_name,
+                    supported,
+                    supported_reasoning_efforts,
+                    default_reasoning_effort,
+                })
             })
-        })
-        .collect();
+            .collect()
+    } else {
+        Vec::new()
+    };
     let third_party_models = if official_provider {
         Vec::new()
     } else {
@@ -352,10 +367,16 @@ pub fn selection_state_with_manual_models(
         &third_party_models,
         requested_default_model,
     );
+    let third_party_model_metadata = if official_provider {
+        Vec::new()
+    } else {
+        third_party_model_metadata_from_entries(&official_entries, &third_party_models)
+    };
     Ok(ModelSelectionState {
         official_models,
         official_model_ids,
         third_party_models,
+        third_party_model_metadata,
         manual_third_party_models,
         upstream_models: if official_provider {
             Vec::new()
@@ -706,6 +727,17 @@ fn reasoning_efforts_from_value(model: &Value) -> Vec<String> {
         })
 }
 
+fn third_party_reasoning_efforts_from_value(model: &Value) -> Vec<String> {
+    let mut efforts = fallback_third_party_reasoning_efforts();
+    if reasoning_efforts_from_value(model)
+        .iter()
+        .any(|effort| effort == "max")
+    {
+        efforts.push("max".to_string());
+    }
+    efforts
+}
+
 fn default_reasoning_effort_from_value(model: &Value, supported: &[String]) -> String {
     let configured = model
         .get("default_reasoning_level")
@@ -722,6 +754,74 @@ fn default_reasoning_effort_from_value(model: &Value, supported: &[String]) -> S
         })
         .or_else(|| supported.first().cloned())
         .unwrap_or_else(|| "low".to_string())
+}
+
+fn fallback_third_party_reasoning_efforts() -> Vec<String> {
+    THIRD_PARTY_REASONING_EFFORTS
+        .iter()
+        .map(|effort| (*effort).to_string())
+        .collect()
+}
+
+fn route_scoped_upstream_model_id(model_id: &str) -> &str {
+    let model_id = model_id.trim();
+    model_id
+        .split_once('/')
+        .map(|(_, upstream_model_id)| upstream_model_id.trim())
+        .filter(|upstream_model_id| !upstream_model_id.is_empty())
+        .unwrap_or(model_id)
+}
+
+fn official_entry_for_route_model<'a>(
+    official_models: &'a [Value],
+    route_model_id: &str,
+) -> Option<&'a Value> {
+    let upstream_model_id = route_scoped_upstream_model_id(route_model_id);
+    official_models.iter().find(|model| {
+        model
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|slug| model_id::equal(slug, upstream_model_id))
+    })
+}
+
+fn third_party_model_metadata_from_entries(
+    official_entries: &[Value],
+    third_party_models: &[String],
+) -> Vec<ThirdPartyModelAvailability> {
+    let availability = |slug: String, entry: Option<&Value>| {
+        let supported_reasoning_efforts = entry
+            .map(third_party_reasoning_efforts_from_value)
+            .unwrap_or_else(fallback_third_party_reasoning_efforts);
+        ThirdPartyModelAvailability {
+            slug,
+            supported_reasoning_efforts,
+            default_reasoning_effort: THIRD_PARTY_DEFAULT_REASONING_EFFORT.to_string(),
+        }
+    };
+    let mut metadata = official_entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("slug")
+                .and_then(Value::as_str)
+                .map(|slug| availability(slug.to_string(), Some(entry)))
+        })
+        .collect::<Vec<_>>();
+    let mut seen = metadata
+        .iter()
+        .map(|model| model_id::key(&model.slug))
+        .collect::<HashSet<_>>();
+    for model in third_party_models {
+        if !seen.insert(model_id::key(model)) {
+            continue;
+        }
+        metadata.push(availability(
+            model.clone(),
+            official_entry_for_route_model(official_entries, model),
+        ));
+    }
+    metadata
 }
 
 fn official_models_from_value(value: &Value) -> Vec<Value> {
@@ -851,15 +951,23 @@ fn clamp_reasoning_efforts(model: &mut Value) {
             level
                 .get("effort")
                 .and_then(Value::as_str)
-                .is_some_and(|effort| THIRD_PARTY_REASONING_EFFORTS.contains(&effort))
+                .is_some_and(|effort| THIRD_PARTY_REASONING_EFFORT_ALLOWLIST.contains(&effort))
         });
     }
+    let supported = reasoning_efforts_from_value(model);
     let default = model
         .get("default_reasoning_level")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if !THIRD_PARTY_REASONING_EFFORTS.contains(&default) {
-        model["default_reasoning_level"] = json!("xhigh");
+    if !supported.iter().any(|effort| effort == default) {
+        model["default_reasoning_level"] = json!(
+            supported
+                .iter()
+                .find(|effort| effort.as_str() == THIRD_PARTY_DEFAULT_REASONING_EFFORT)
+                .or_else(|| supported.first())
+                .map(String::as_str)
+                .unwrap_or(THIRD_PARTY_DEFAULT_REASONING_EFFORT)
+        );
     }
 }
 
@@ -964,17 +1072,24 @@ fn official_template_for_route_alias<'a>(
     official_models: &'a [Value],
     route_model_id: &str,
 ) -> Option<&'a Value> {
-    let (_, upstream_model_id) = route_model_id.split_once('/')?;
-    let upstream_model_id = upstream_model_id.trim();
-    if upstream_model_id.is_empty() {
+    if !route_model_id.contains('/') {
         return None;
     }
-    official_models.iter().find(|model| {
-        model
-            .get("slug")
-            .and_then(Value::as_str)
-            .is_some_and(|slug| model_id::equal(slug, upstream_model_id))
-    })
+    official_entry_for_route_model(official_models, route_model_id)
+}
+
+fn third_party_reasoning_levels(template: &Value, use_template_metadata: bool) -> Value {
+    let efforts = if use_template_metadata {
+        third_party_reasoning_efforts_from_value(template)
+    } else {
+        fallback_third_party_reasoning_efforts()
+    };
+    Value::Array(
+        efforts
+            .iter()
+            .map(|effort| json!({ "effort": effort, "description": reasoning_level_description(effort) }))
+            .collect(),
+    )
 }
 
 fn synthetic_model(
@@ -995,14 +1110,8 @@ fn synthetic_model(
     model["supported_in_api"] = json!(true);
     model["codey_source"] = json!("third_party");
     model["default_reasoning_level"] = json!(THIRD_PARTY_DEFAULT_REASONING_EFFORT);
-    model["supported_reasoning_levels"] = Value::Array(
-        THIRD_PARTY_REASONING_EFFORTS
-            .iter()
-            .map(|effort| {
-                json!({ "effort": effort, "description": reasoning_level_description(effort) })
-            })
-            .collect(),
-    );
+    model["supported_reasoning_levels"] =
+        third_party_reasoning_levels(template, preserve_source_runtime_metadata);
     if let Some(object) = model.as_object_mut() {
         object.remove("availability_nux");
         object.remove("upgrade");
@@ -1812,6 +1921,10 @@ mod tests {
             gpt_56["experimental_supported_tools"],
             json!(["gpt-5.6-only-tool"])
         );
+        assert_eq!(
+            reasoning_efforts_from_value(gpt_56),
+            ["low", "medium", "high", "xhigh", "max"]
+        );
         assert!(gpt_56.get("multi_agent_version").is_none());
         assert_eq!(
             gpt_56["base_instructions"],
@@ -1827,6 +1940,10 @@ mod tests {
         assert_eq!(gpt_55["comp_hash"], "2911");
         assert_eq!(gpt_55["include_skills_usage_instructions"], true);
         assert_eq!(gpt_55["experimental_supported_tools"], json!([]));
+        assert_eq!(
+            reasoning_efforts_from_value(gpt_55),
+            ["low", "medium", "high", "xhigh"]
+        );
         assert!(gpt_55.get("multi_agent_version").is_none());
         assert_eq!(
             gpt_55["base_instructions"],
@@ -1858,6 +1975,10 @@ mod tests {
         assert_eq!(custom["include_plugin_usage_instructions"], true);
         assert_eq!(custom["include_apps_usage_instructions"], true);
         assert_eq!(custom["experimental_supported_tools"], json!([]));
+        assert_eq!(
+            reasoning_efforts_from_value(custom),
+            ["low", "medium", "high", "xhigh"]
+        );
         assert!(custom["auto_compact_token_limit"].is_null());
     }
 
@@ -2119,6 +2240,24 @@ mod tests {
 
         assert!(state.official_models.is_empty());
         assert_eq!(state.third_party_models, ["gpt-5.6-sol", "third-model"]);
+        let sol_metadata = state
+            .third_party_model_metadata
+            .iter()
+            .find(|model| model.slug == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(
+            sol_metadata.supported_reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
+        let custom_metadata = state
+            .third_party_model_metadata
+            .iter()
+            .find(|model| model.slug == "third-model")
+            .unwrap();
+        assert_eq!(
+            custom_metadata.supported_reasoning_efforts,
+            ["low", "medium", "high", "xhigh"]
+        );
         assert_eq!(state.manual_third_party_models, ["third-model"]);
         assert_eq!(state.default_model, "gpt-5.6-sol");
     }
@@ -2173,6 +2312,24 @@ mod tests {
 
         assert!(state.official_models.is_empty());
         assert_eq!(state.third_party_models, ["gpt-5.3-codex-spark"]);
+        let spark_metadata = state
+            .third_party_model_metadata
+            .iter()
+            .find(|model| model.slug == "gpt-5.3-codex-spark")
+            .unwrap();
+        assert_eq!(
+            spark_metadata.supported_reasoning_efforts,
+            ["low", "medium", "high", "xhigh"]
+        );
+        let sol_metadata = state
+            .third_party_model_metadata
+            .iter()
+            .find(|model| model.slug == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(
+            sol_metadata.supported_reasoning_efforts,
+            ["low", "medium", "high", "xhigh", "max"]
+        );
         assert_eq!(state.default_model, "gpt-5.3-codex-spark");
     }
 

@@ -86,10 +86,17 @@ export type OfficialModelState = {
   defaultReasoningEffort: string;
 };
 
+export type ThirdPartyModelState = {
+  slug: string;
+  supportedReasoningEfforts: string[];
+  defaultReasoningEffort: string;
+};
+
 export type ModelState = {
   officialModels: OfficialModelState[];
   officialModelIds: string[];
   thirdPartyModels: string[];
+  thirdPartyModelMetadata?: ThirdPartyModelState[];
   manualThirdPartyModels: string[];
   upstreamModels: string[];
   defaultModel: string;

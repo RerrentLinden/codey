@@ -1515,14 +1515,28 @@ fn renderer_route_model_catalog(
                     model.default_reasoning_effort.clone(),
                 )
             });
+        let third_party_metadata = state
+            .third_party_model_metadata
+            .iter()
+            .map(|model| (crate::model_id::key(&model.slug), model))
+            .collect::<std::collections::HashMap<_, _>>();
         let third_party_models = state.third_party_models.iter().map(|model| {
+            let metadata = third_party_metadata.get(&crate::model_id::key(model));
             (
                 model.clone(),
-                model_catalog::THIRD_PARTY_REASONING_EFFORTS
-                    .iter()
-                    .map(|effort| effort.to_string())
-                    .collect::<Vec<_>>(),
-                model_catalog::THIRD_PARTY_DEFAULT_REASONING_EFFORT.to_string(),
+                metadata
+                    .map(|metadata| metadata.supported_reasoning_efforts.clone())
+                    .unwrap_or_else(|| {
+                        model_catalog::THIRD_PARTY_REASONING_EFFORTS
+                            .iter()
+                            .map(|effort| effort.to_string())
+                            .collect::<Vec<_>>()
+                    }),
+                metadata
+                    .map(|metadata| metadata.default_reasoning_effort.clone())
+                    .unwrap_or_else(|| {
+                        model_catalog::THIRD_PARTY_DEFAULT_REASONING_EFFORT.to_string()
+                    }),
             )
         });
         for (model, supported_reasoning_efforts, default_reasoning_effort) in
@@ -2212,6 +2226,7 @@ mod tests {
             }],
             official_model_ids: vec!["gpt-5.6-sol".into()],
             third_party_models: Vec::new(),
+            third_party_model_metadata: Vec::new(),
             manual_third_party_models: Vec::new(),
             upstream_models: Vec::new(),
             default_model: "gpt-5.6-sol".into(),

@@ -84,6 +84,7 @@ function thirdPartyRouteModelState(
     officialModels: [],
     officialModelIds: catalog.officialModelIds,
     thirdPartyModels: selectedModels,
+    thirdPartyModelMetadata: catalog.thirdPartyModelMetadata,
     manualThirdPartyModels:
       config.manualThirdPartyModelsByProvider[providerId] || [],
     upstreamModels: uniqueModelIds([

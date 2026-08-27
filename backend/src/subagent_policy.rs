@@ -169,10 +169,41 @@ pub(crate) fn reasoning_effort_for_model(
         .third_party_models
         .iter()
         .any(|candidate| model_id::equal(candidate, model))
-        && model_catalog::THIRD_PARTY_REASONING_EFFORTS
-            .contains(&preferred_reasoning_effort.as_str())
     {
-        return preferred_reasoning_effort;
+        let metadata = state
+            .third_party_model_metadata
+            .iter()
+            .find(|candidate| model_id::equal(&candidate.slug, model));
+        let fallback_efforts = model_catalog::THIRD_PARTY_REASONING_EFFORTS
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let supported_reasoning_efforts = metadata
+            .map(|metadata| {
+                metadata
+                    .supported_reasoning_efforts
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or(fallback_efforts);
+        if supported_reasoning_efforts
+            .iter()
+            .any(|effort| effort.eq_ignore_ascii_case(&preferred_reasoning_effort))
+        {
+            return preferred_reasoning_effort;
+        }
+        if supported_reasoning_efforts
+            .iter()
+            .any(|effort| *effort == DEFAULT_SUBAGENT_REASONING_EFFORT)
+        {
+            return DEFAULT_SUBAGENT_REASONING_EFFORT.to_string();
+        }
+        if let Some(metadata) = metadata
+            && !metadata.default_reasoning_effort.trim().is_empty()
+        {
+            return metadata.default_reasoning_effort.clone();
+        }
     }
     DEFAULT_SUBAGENT_REASONING_EFFORT.to_string()
 }

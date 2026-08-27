@@ -45,7 +45,15 @@ test("subagent settings expose the five supported role controls", async () => {
   assert.match(modelOptionsSource, /for \(const profile of config\.profiles\)/);
   assert.match(modelOptionsSource, /value = routeModelAlias\(profile, modelId\)/);
   assert.match(modelOptionsSource, /const usesOfficialMetadata = official/);
-  assert.match(modelOptionsSource, /THIRD_PARTY_REASONING_EFFORTS/);
+  assert.match(
+    modelOptionsSource,
+    /THIRD_PARTY_REASONING_EFFORTS\s*=\s*\["low",\s*"medium",\s*"high",\s*"xhigh"\]/,
+  );
+  assert.match(
+    modelOptionsSource,
+    /THIRD_PARTY_REASONING_EFFORT_ALLOWLIST\s*=\s*\[\s*"low",\s*"medium",\s*"high",\s*"xhigh",\s*"max"/,
+  );
+  assert.match(modelOptionsSource, /modelState\.thirdPartyModelMetadata/);
   assert.match(modelOptionsSource, /resolveSubagentModelOption/);
   assert.match(comboboxSource, /<Combobox\.Search/);
   assert.match(comboboxSource, /搜索模型或线路/);
