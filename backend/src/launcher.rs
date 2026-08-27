@@ -9,6 +9,7 @@ use std::{collections::HashSet, path::Path};
 
 use anyhow::{Context, Result};
 use codey_runtime_core::app_paths::resolve_codex_app_dir_with_saved;
+use codey_runtime_core::config_manager::ConfigManager;
 use codey_runtime_core::launcher::build_codex_command;
 use codey_runtime_data::{ProviderSyncResult, ProviderSyncStatus};
 use serde::Serialize;
@@ -19,8 +20,8 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 
 use crate::cdp;
 use crate::codex_config::{
-    RuntimeRouterConfigOptions, apply_runtime_router_config, codex_home, current_model_provider,
-    restore_runtime_config as restore_codex_runtime_config,
+    BUILTIN_OPENAI_PROVIDER_ID, RuntimeRouterConfigOptions, apply_runtime_router_config,
+    codex_home, restore_runtime_config as restore_codex_runtime_config,
 };
 use crate::config::{CodeyConfig, GpuLaunchMode, ProviderProfile};
 use crate::crashpad_pending_guard::{self, CrashpadPendingStatsHandle};
@@ -162,7 +163,36 @@ pub struct CodeyRuntime {
 }
 
 fn persistent_session_provider(home: &std::path::Path) -> Result<String> {
-    current_model_provider(home).context("读取 Codex 持久 model_provider 失败")
+    let config_path = home.join("config.toml");
+    let snapshot = ConfigManager::new(&config_path)
+        .load()
+        .context("读取 Codex 持久配置失败")?;
+    let document = snapshot.document();
+    if document
+        .get("model_providers")
+        .and_then(toml_edit::Item::as_table_like)
+        .and_then(|providers| providers.get(ROUTER_PROVIDER_ID))
+        .is_some()
+    {
+        // Runtime setup rejects this reserved id too, but session maintenance
+        // is permanent and therefore must not run before the same validation.
+        anyhow::bail!(
+            "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
+            ROUTER_PROVIDER_ID
+        );
+    }
+    let provider = document
+        .get("model_provider")
+        .and_then(toml_edit::Item::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .unwrap_or(BUILTIN_OPENAI_PROVIDER_ID);
+    if provider == ROUTER_PROVIDER_ID {
+        // Legacy releases could leave the launch-only router id selected in
+        // the persistent config; thread records must never sync toward it.
+        return Ok(BUILTIN_OPENAI_PROVIDER_ID.to_string());
+    }
+    Ok(provider.to_string())
 }
 
 async fn resolve_persistent_session_provider(home: &std::path::Path) -> Result<String> {
@@ -1380,14 +1410,16 @@ impl CodeyRuntime {
         );
         let initial_storage_guards = spawn_initial_storage_guards(home, config);
         let startup_profile = resolve_startup_profile(config)?;
-        // Official-login tasks still need Codex's persistent provider repair;
-        // API-key-only tasks keep the stable Codey router id across launches.
-        let persistent_session_provider = if config.router_requires_openai_auth() {
-            Some(resolve_persistent_session_provider(home).await?)
-        } else {
-            None
-        };
-        let session_provider_sync_target = persistent_session_provider.as_deref();
+        // Threads created or resumed under Codey persist the launch-only
+        // `codey_router` provider id in rollout headers and the Codex thread
+        // index. Codex resolves that id only from Codey's process-level
+        // overrides, so any Codex started outside Codey (the user's own
+        // ChatGPT desktop app, or a relaunch after a failed Codey start)
+        // refuses those threads with "Model provider `codey_router` not
+        // found". Every launch therefore syncs thread records back to a
+        // persistent provider, for official and third-party routes alike.
+        let persistent_session_provider = resolve_persistent_session_provider(home).await?;
+        let session_provider_sync_target = Some(persistent_session_provider.as_str());
         let storage = prepare_startup_storage(
             home,
             config,

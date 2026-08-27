@@ -400,6 +400,124 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       );
     }
 
+    // Electron 151 hoists the toggle gate into a memoized variable and can
+    // place over 2KB of memo-cache code between the `availableOptions`
+    // assignment and the `composer.toggleFastMode` registration.
+    const memoizedGap = "t[99]===e?t[100]:(d(e),t[99]=e,t[100]=1),".repeat(90);
+    const electron151ServiceTierSource = [
+      "const isServiceTierAllowed=!0;",
+      "let{isServiceTierAllowed:I}=G7o(F),N={availableOptions:[{value:`fast`}]};",
+      "let w=!1,q=!1,Se=`fast`,Re=()=>{};",
+      `let De=!w&&I&&N.availableOptions.length>1,${memoizedGap}`,
+      "let ze=!w&&I&&!q&&Se!=null,Be;",
+      "t[45]===ze?Be=t[46]:(Be={enabled:ze},t[45]=ze,t[46]=Be),",
+      "U$(`composer.toggleFastMode`,Re,Be);",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(electron151ServiceTierSource),
+    );
+    const electron151Response = await installedHandler({
+      url: "app://-/assets/app-initial-electron151-service-tier.js",
+    });
+    const patchedElectron151Source = await electron151Response.text();
+    assert.match(
+      patchedElectron151Source,
+      /De=!w&&N\.availableOptions\.length>1/,
+    );
+    assert.doesNotMatch(
+      patchedElectron151Source,
+      /De=[^,]*&&I&&/,
+      "the entitlement flag must be dropped from the model-aware gate",
+    );
+    assert.match(patchedElectron151Source, /ze=!w&&!q&&Se!=null/);
+    assert.match(patchedElectron151Source, /\{enabled:ze\}/);
+    assert.equal(
+      patchErrors.length,
+      2,
+      "Electron 151 memoized service-tier gates must patch without compatibility errors",
+    );
+
+    // The wider Electron 151 window can also contain an unrelated, earlier
+    // assignment with the same minified shape. Only the gate nearest the unique
+    // toggle registration belongs to that control.
+    const scopedMemoizedGap =
+      "cache[99]===model?cache[100]:(touch(model),cache[99]=model,cache[100]=1);"
+        .repeat(48);
+    assert.ok(scopedMemoizedGap.length > 2048);
+    const scopedServiceTierSource = [
+      "const isServiceTierAllowed=!1;",
+      "function unrelatedComposer(){",
+      "let draft=!1,allowed=!1,settings={availableOptions:[1,2]};",
+      "let unrelated=!draft&&allowed&&settings.availableOptions.length>1;",
+      "return unrelated}",
+      "function scopedComposer(OQ){",
+      "let draft=!1,allowed=isServiceTierAllowed,settings={availableOptions:[1,2]};",
+      "let show=!draft&&allowed&&settings.availableOptions.length>1;",
+      "const cache=[],model={},touch=()=>{};",
+      scopedMemoizedGap,
+      "OQ(`composer.toggleFastMode`,()=>{},{enabled:show});return show}",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(scopedServiceTierSource),
+    );
+    const scopedServiceTierResponse = await installedHandler({
+      url: "app://-/assets/app-initial-scoped-service-tier.js",
+    });
+    const patchedScopedServiceTierSource =
+      await scopedServiceTierResponse.text();
+    assert.match(
+      patchedScopedServiceTierSource,
+      /unrelated=!draft&&allowed&&settings\.availableOptions\.length>1/,
+    );
+    assert.match(
+      patchedScopedServiceTierSource,
+      /show=!draft&&settings\.availableOptions\.length>1/,
+    );
+    assert.doesNotThrow(() => Function(patchedScopedServiceTierSource));
+    const scopedServiceTierResults = Function(
+      `${patchedScopedServiceTierSource};return [` +
+        "unrelatedComposer(),scopedComposer(()=>{})]",
+    )();
+    assert.deepEqual(scopedServiceTierResults, [false, true]);
+    assert.equal(
+      patchErrors.length,
+      2,
+      "an earlier same-shaped gate must not make the scoped Fast patch ambiguous",
+    );
+
+    // Electron 151 minifies `return!1` without a space and interleaves the
+    // entitlement cache write between the chatgpt check and the fast_mode
+    // requirement lookup.
+    const electron151EntitlementSource = [
+      "zp.error(`Failed to read service tier for request`,{safe:{},sensitive:{}});",
+      "async function YHr(e,t){",
+      "let n=await KHr(e,t);",
+      "if(n!==`chatgpt`)return!1;",
+      "let r=await N2t(e,t,{priority:`critical`});",
+      "return e.query.setData(rx,{authMethod:n,hostId:t},r),",
+      "r.requirements?.featureRequirements?.fast_mode!==!1}",
+    ].join("");
+    electron.protocol.handle(
+      "app",
+      async () => new Response(electron151EntitlementSource),
+    );
+    const entitlementResponse = await installedHandler({
+      url: "app://-/assets/app-initial-electron151-entitlement.js",
+    });
+    const patchedEntitlementSource = await entitlementResponse.text();
+    assert.match(
+      patchedEntitlementSource,
+      /async function YHr\(e,t\)\{return!0\}/,
+    );
+    assert.doesNotMatch(patchedEntitlementSource, /chatgpt/);
+    assert.equal(
+      patchErrors.length,
+      2,
+      "the minified entitlement probe must patch without compatibility errors",
+    );
+
     const routeBridgeSource = [
       "const routeLog={warning(){}};",
       "const routeTransport={postMessage:e=>{let t=!1,n=window.electronBridge;",

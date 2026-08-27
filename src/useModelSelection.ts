@@ -48,6 +48,7 @@ type UseModelSelectionOptions = {
 type ModelRuntimeUpdate = {
   restartRequired?: boolean;
   modelHotReloaded?: boolean;
+  modelHotReloadDeferred?: boolean;
   modelHotReloadError?: string;
   subagentConfigHotReloaded?: boolean;
   subagentConfigRepaired?: boolean;
@@ -340,17 +341,26 @@ export function useModelSelection({
       ? "；已校验并修复受影响的子代理运行配置"
       : result.subagentConfigHotReloaded
         ? "；受影响的子代理角色也已同步"
-      : "";
+        : "";
+    const modelReloadNotice = result.modelHotReloaded
+      ? result.modelHotReloadDeferred
+        ? result.restartRequired
+          ? "；Codex 模型列表将在打开模型选择器时更新，其他设置仍需重启"
+          : `；Codex 模型列表将在打开模型选择器时更新${subagentSuffix}`
+        : result.restartRequired
+          ? "；Codex 模型列表已立即更新，其他设置仍需重启"
+          : `；Codex 模型列表已立即更新${subagentSuffix}`
+      : hotReloadFailed || result.restartRequired
+        ? "；当前 Codex 模型列表暂未能刷新，重启 Codex 后生效"
+        : "";
     setNotice({
       tone:
-        hotReloadFailed || result.restartRequired ? "info" : "success",
-      text: result.modelHotReloaded
-        ? result.restartRequired
-          ? `${summary}；Codex 模型列表已立即更新，其他设置仍需重启`
-          : `${summary}；Codex 模型列表已立即更新${subagentSuffix}`
-        : hotReloadFailed || result.restartRequired
-          ? `${summary}；当前 Codex 模型列表暂未能刷新，重启 Codex 后生效`
-          : summary,
+        hotReloadFailed ||
+        result.restartRequired ||
+        result.modelHotReloadDeferred
+          ? "info"
+          : "success",
+      text: `${summary}${modelReloadNotice}`,
     });
   }, [
     setNotice,

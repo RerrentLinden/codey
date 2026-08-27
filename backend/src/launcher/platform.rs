@@ -1,4 +1,3 @@
-#[cfg(unix)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -389,6 +388,15 @@ pub(super) async fn terminate_windows_codex_processes(
         }
         std::cmp::Reverse(depth)
     });
+    let expected_creation_times = process_ids
+        .iter()
+        .filter_map(|process_id| {
+            processes
+                .iter()
+                .find(|process| process.process_id == *process_id)
+                .map(|process| (*process_id, process.creation_time))
+        })
+        .collect::<HashMap<_, _>>();
     for process_id in ordered_process_ids {
         let _terminated_natively = processes
             .iter()
@@ -412,31 +420,89 @@ pub(super) async fn terminate_windows_codex_processes(
                 },
             );
     }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
     loop {
         let current_processes = codey_runtime_core::windows_enumerate_processes();
-        let remaining = current_processes
+        let current = current_processes
             .iter()
-            .filter(|process| {
-                process_ids.contains(&process.process_id)
-                    && processes
-                        .iter()
-                        .find(|expected| expected.process_id == process.process_id)
-                        .is_some_and(|expected| {
-                            process_creation_identity_matches(
-                                expected.creation_time,
-                                process.creation_time,
-                            )
-                        })
+            .map(|process| {
+                (
+                    process.process_id,
+                    process.exe_file.clone(),
+                    process.creation_time,
+                )
             })
-            .map(|process| process.process_id)
             .collect::<Vec<_>>();
+        let remaining = windows_stop_survivors(&expected_creation_times, &current, &process_ids);
         if remaining.is_empty() {
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("无法安全停止 Windows Codex 进程：{remaining:?}");
+        if tokio::time::Instant::now() < deadline {
+            // Windows exits lag behind TerminateProcess (pending I/O,
+            // throttled children, antivirus scans) and a first attempt can
+            // race with process teardown. Re-issue creation-identity-checked
+            // terminations while waiting instead of giving up on survivors.
+            for (process_id, _, expected_creation_time) in &remaining {
+                if let Some(expected_creation_time) = expected_creation_time {
+                    let _terminated_again =
+                        codey_runtime_core::windows_terminate_process_if_creation_matches(
+                            *process_id,
+                            *expected_creation_time,
+                        );
+                }
+            }
+        } else {
+            anyhow::bail!(
+                "无法安全停止 Windows Codex 进程：{}",
+                windows_stop_failure_summary(&remaining),
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_stop_survivors(
+    expected_creation_times: &HashMap<u32, Option<u64>>,
+    current: &[(u32, String, Option<u64>)],
+    targets: &HashSet<u32>,
+) -> Vec<(u32, String, Option<u64>)> {
+    current
+        .iter()
+        .filter(|(process_id, _, creation_time)| {
+            targets.contains(process_id)
+                && expected_creation_times
+                    .get(process_id)
+                    .is_some_and(|expected| {
+                        process_creation_identity_matches(*expected, *creation_time)
+                    })
+        })
+        .map(|(process_id, exe_file, _)| {
+            // Retry termination must retain the identity captured before the
+            // first attempt. A timestamp learned only after that attempt could
+            // belong to a different process that has reused the target pid.
+            let expected_creation_time = expected_creation_times.get(process_id).copied().flatten();
+            (*process_id, exe_file.clone(), expected_creation_time)
+        })
+        .collect()
+}
+
+#[cfg(any(windows, test))]
+pub(super) fn windows_stop_failure_summary(remaining: &[(u32, String, Option<u64>)]) -> String {
+    const MAX_LISTED: usize = 5;
+    let listed = remaining
+        .iter()
+        .take(MAX_LISTED)
+        .map(|(process_id, exe_file, _)| format!("{exe_file}({process_id})"))
+        .collect::<Vec<_>>()
+        .join("、");
+    if remaining.len() > MAX_LISTED {
+        format!(
+            "{} 个进程仍在运行：{listed} 等共 {} 个",
+            remaining.len(),
+            remaining.len()
+        )
+    } else {
+        format!("{} 个进程仍在运行：{listed}", remaining.len())
     }
 }

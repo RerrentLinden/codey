@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 #[test]
 fn packaged_activation_detects_a_reused_process_id() {
@@ -20,6 +21,53 @@ fn process_creation_identity_rejects_pid_reuse_when_timestamps_are_available() {
     assert!(!process_creation_identity_matches(Some(100), Some(101)));
     assert!(process_creation_identity_matches(Some(100), None));
     assert!(process_creation_identity_matches(None, Some(101)));
+}
+
+#[test]
+fn windows_stop_survivors_match_targets_by_creation_identity() {
+    let mut expected = HashMap::new();
+    expected.insert(10, Some(100));
+    expected.insert(11, Some(101));
+    expected.insert(12, None);
+    let targets = HashSet::from([10, 11, 12, 13]);
+    let current = vec![
+        (10, "ChatGPT.exe".to_string(), Some(100)),
+        // A recycled pid no longer matches the process we tried to stop.
+        (11, "ChatGPT.exe".to_string(), Some(999)),
+        // The snapshot had no identity. Even if a timestamp is now available,
+        // keep waiting without passing that new identity to retry termination.
+        (12, "codex.exe".to_string(), Some(777)),
+        // Processes outside the pre-termination snapshot are never ours.
+        (13, "unrelated.exe".to_string(), None),
+    ];
+
+    let survivors = windows_stop_survivors(&expected, &current, &targets);
+    assert_eq!(
+        survivors,
+        vec![
+            (10, "ChatGPT.exe".to_string(), Some(100)),
+            (12, "codex.exe".to_string(), None),
+        ]
+    );
+}
+
+#[test]
+fn windows_stop_failure_summary_lists_surviving_executables() {
+    let remaining = vec![
+        (10, "ChatGPT.exe".to_string(), Some(100)),
+        (11, "codex.exe".to_string(), Some(101)),
+    ];
+    assert_eq!(
+        windows_stop_failure_summary(&remaining),
+        "2 个进程仍在运行：ChatGPT.exe(10)、codex.exe(11)",
+    );
+
+    let many = (0..7)
+        .map(|index| (100 + index, "helper.exe".to_string(), None))
+        .collect::<Vec<_>>();
+    let summary = windows_stop_failure_summary(&many);
+    assert!(summary.starts_with("7 个进程仍在运行："));
+    assert!(summary.ends_with("等共 7 个"));
 }
 
 #[test]
@@ -70,6 +118,76 @@ fn subagent_runtime_models_use_route_aware_aliases() {
         route_subagent_model("route-a", "route-b/shared-model", &route_aliases),
         "route-b/shared-model"
     );
+}
+
+#[test]
+fn persistent_session_provider_never_targets_the_launch_only_router_id() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        format!("model_provider = \"{ROUTER_PROVIDER_ID}\"\n"),
+    )
+    .unwrap();
+
+    assert_eq!(persistent_session_provider(temp.path()).unwrap(), "openai");
+}
+
+#[test]
+fn persistent_session_provider_rejects_a_user_owned_router_before_sync() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        format!(
+            "[model_providers.{ROUTER_PROVIDER_ID}]\n\
+             name = \"User Router\"\n\
+             base_url = \"https://example.com/v1\"\n"
+        ),
+    )
+    .unwrap();
+
+    let error = persistent_session_provider(temp.path()).unwrap_err();
+    assert!(error.to_string().contains("已占用 Codey 内部 Provider ID"));
+}
+
+#[test]
+fn session_maintenance_repairs_router_stamped_threads_for_third_party_launches() {
+    // Third-party users may never set `model_provider` in config.toml, and a
+    // Codex started outside Codey cannot resolve the launch-only router id
+    // that Codey stamped into their thread records.
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "model = \"gpt-5.6-terra\"\n",
+    )
+    .unwrap();
+    let sessions = temp.path().join("sessions/2026/08/27");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let rollout = sessions.join("rollout-thread-1.jsonl");
+    std::fs::write(
+        &rollout,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": "thread-1",
+                    "model_provider": ROUTER_PROVIDER_ID
+                }
+            })
+        ),
+    )
+    .unwrap();
+
+    let provider = persistent_session_provider(temp.path()).unwrap();
+    assert_eq!(provider, "openai");
+    let result =
+        codey_runtime_data::run_provider_sync_with_target(Some(temp.path()), Some(&provider));
+
+    assert_eq!(result.status, ProviderSyncStatus::Synced);
+    assert_eq!(result.target_provider, "openai");
+    let repaired = std::fs::read_to_string(&rollout).unwrap();
+    assert!(repaired.contains("\"model_provider\":\"openai\""));
+    assert!(!repaired.contains(ROUTER_PROVIDER_ID));
 }
 
 #[test]

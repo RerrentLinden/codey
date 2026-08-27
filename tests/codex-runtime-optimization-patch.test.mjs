@@ -710,6 +710,7 @@ test("startup patch fails closed when app-server runtime override injection is n
     'model_provider="codey_router"',
     'model_providers.codey_router.name="Codey Local Router"',
     'model_providers.codey_router.base_url="http://127.0.0.1:61818/v1"',
+    'model_providers.codey_router.http_headers={ x-codey-router-token = "codey-router-secret-token-1234" }',
   ];
   const runtime = await loadPatchInIsolatedContext(runtimeConfigOverrides, {
     setTimeout(callback) {
@@ -727,7 +728,15 @@ test("startup patch fails closed when app-server runtime override injection is n
     );
     await assert.rejects(
       runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__(),
-      /当前 Codex 版本的 app-server 启动参数结构与 Codey 不兼容/,
+      (error) => {
+        assert.match(
+          error.message,
+          /当前 Codex 版本的 app-server 启动参数结构与 Codey 不兼容/,
+        );
+        assert.match(error.message, /model_providers\.codey_router\.http_headers/);
+        assert.doesNotMatch(error.message, /secret-token-1234/);
+        return true;
+      },
     );
   } finally {
     runtime.restore();
@@ -761,6 +770,81 @@ test("startup patch resolves app-server runtime override validation after the ma
       runtime.context.__CODEY_CODEX_STARTUP_PATCH__.appServerRuntimeOverrides.complete,
       true,
     );
+  } finally {
+    runtime.restore();
+  }
+});
+
+test("startup patch tolerates duplicate Codex analytics flags while injecting runtime overrides", async () => {
+  const childProcess = process.getBuiltinModule("child_process");
+  const runtimeConfigOverrides = [
+    'model_provider="codey_router"',
+    'model_providers.codey_router.name="Codey Local Router"',
+    'model_providers.codey_router.base_url="http://127.0.0.1:61818/v1"',
+  ];
+  const runtime = await loadPatchInIsolatedContext(runtimeConfigOverrides);
+
+  try {
+    const pending =
+      runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__();
+    childProcess.spawn("codex", [
+      "app-server",
+      "--analytics-default-enabled",
+      "--analytics-default-enabled",
+    ]);
+    assert.equal(
+      await pending,
+      "codey-app-server-runtime-overrides-verified",
+    );
+    assert.deepEqual(Array.from(runtime.spawnCalls.at(-1)[1]), [
+      "-c",
+      "analytics.enabled=false",
+      ...runtimeConfigOverrides.flatMap((config) => ["-c", config]),
+      "app-server",
+    ]);
+    assert.equal(
+      runtime.context.__CODEY_CODEX_STARTUP_PATCH__.appServerRuntimeOverrides.complete,
+      true,
+    );
+  } finally {
+    runtime.restore();
+  }
+});
+
+test("startup patch tolerates duplicate analytics flags in WSL app-server commands", async () => {
+  const childProcess = process.getBuiltinModule("child_process");
+  const runtimeConfigOverrides = [
+    'model_provider="codey_router"',
+    'model_providers.codey_router.name="Codey Local Router"',
+    'model_providers.codey_router.base_url="http://127.0.0.1:61818/v1"',
+  ];
+  const runtime = await loadPatchInIsolatedContext(runtimeConfigOverrides);
+
+  try {
+    const pending =
+      runtime.context.__CODEY_AWAIT_CODEX_APP_SERVER_RUNTIME_OVERRIDES__();
+    childProcess.spawn("wsl.exe", [
+      "-d",
+      "Ubuntu",
+      "--",
+      "/usr/bin/bash",
+      "-lc",
+      [
+        "source /etc/profile;",
+        "exec /usr/bin/codex app-server",
+        "--analytics-default-enabled --analytics-default-enabled",
+      ].join(" "),
+    ]);
+    assert.equal(
+      await pending,
+      "codey-app-server-runtime-overrides-verified",
+    );
+    const patchedCommand = runtime.spawnCalls.at(-1)[1].at(-1);
+    assert.doesNotMatch(patchedCommand, /--analytics-default-enabled/);
+    assert.match(patchedCommand, /-c 'analytics\.enabled=false'/);
+    for (const config of runtimeConfigOverrides) {
+      assert.ok(patchedCommand.includes(`-c '${config}'`), patchedCommand);
+    }
   } finally {
     runtime.restore();
   }

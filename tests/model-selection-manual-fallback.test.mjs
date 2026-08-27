@@ -63,7 +63,10 @@ test("third-party model sync can fall back to manual model support configuration
   );
   assert.match(modelCommandSource, /cdp::refresh_model_whitelist/);
   assert.match(modelCommandSource, /"modelHotReloaded"/);
+  assert.match(modelCommandSource, /"modelHotReloadDeferred"/);
   assert.match(hookSource, /modelHotReloaded/);
+  assert.match(hookSource, /modelHotReloadDeferred/);
   assert.match(hookSource, /Codex 模型列表已立即更新/);
+  assert.match(hookSource, /Codex 模型列表将在打开模型选择器时更新/);
   assert.match(hookSource, /重启 Codex 后生效/);
 });

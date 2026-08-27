@@ -2570,6 +2570,30 @@ test("unchanged catalog retries and interactions do not repeat full React discov
   runtime.patch.dispose();
 });
 
+test("query client discovery reaches deep provider stacks", async () => {
+  const queryClient = activeModelQueryClient(["gpt-5.6-sol"]);
+  // Current renderer builds memoize the host fiber far below the provider
+  // stack holding the query client, so discovery must survive the hops up
+  // the return chain before reaching the client context value.
+  let fiber = { memoizedProps: { queryClient } };
+  for (let index = 0; index < 10; index += 1) {
+    fiber = { memoizedProps: {}, return: fiber };
+  }
+  const body = new FakeElementCore("body");
+  body.__reactFiber$codeyTest = fiber;
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+  }, [statsigClient()], { documentBody: body });
+
+  const delivery = runtime.patch.delivery();
+  assert.equal(delivery.queryClients, 1);
+  assert.equal(delivery.queryEntries, 1);
+  assert.deepEqual(queryClient.models(), ["gpt-5.6-sol"]);
+  runtime.patch.dispose();
+});
+
 test("configured third-party models survive direct and wrapped requests", async () => {
   const runtime = await loadPatch({
     status: "ok",

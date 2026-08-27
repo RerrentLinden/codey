@@ -25,6 +25,7 @@ use crate::subagent_policy;
 #[derive(Default)]
 pub(super) struct ModelHotReloadOutcome {
     reloaded: bool,
+    deferred: bool,
     error: Option<String>,
 }
 
@@ -32,6 +33,9 @@ impl ModelHotReloadOutcome {
     pub(super) fn add_to_response(self, mut response: Value) -> Value {
         if let Some(object) = response.as_object_mut() {
             object.insert("modelHotReloaded".into(), Value::Bool(self.reloaded));
+            if self.deferred {
+                object.insert("modelHotReloadDeferred".into(), Value::Bool(true));
+            }
             if let Some(error) = self.error {
                 object.insert("modelHotReloadError".into(), Value::String(error));
             }
@@ -1230,10 +1234,11 @@ pub(super) async fn hot_reload_runtime_models(
     runtime.sync_local_router_routes(config);
     let websocket_url = runtime.renderer_websocket_url().await;
     match cdp::refresh_model_whitelist(&websocket_url, &expected_catalog).await {
-        Ok(()) => {
+        Ok(refresh) => {
             runtime.mark_model_config_applied(config).await;
             ModelHotReloadOutcome {
                 reloaded: true,
+                deferred: refresh.deferred,
                 error: None,
             }
         }
@@ -1250,6 +1255,7 @@ pub(super) async fn hot_reload_runtime_models(
             );
             ModelHotReloadOutcome {
                 reloaded: false,
+                deferred: false,
                 error: Some(error),
             }
         }

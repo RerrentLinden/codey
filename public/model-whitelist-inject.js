@@ -1181,7 +1181,9 @@
         || (typeof value !== "object" && typeof value !== "function")
         || visited.has(value)
         || visitedCount >= 30_000
-        || depth > 8
+        // Current renderer builds wrap the query client in deep provider
+        // stacks; the visited cap above keeps the wider hop budget bounded.
+        || depth > 12
       ) return;
       visited.add(value);
       visitedCount += 1;

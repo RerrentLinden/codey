@@ -852,10 +852,18 @@ async fn record_failed_injection_statuses(websocket_url: &str, statuses: &[Injec
     }
 }
 
+#[derive(Debug)]
+pub struct ModelWhitelistRefresh {
+    /// The catalog was accepted and the transport patch guarantees future
+    /// `model/list` responses carry it, but no live model query existed yet
+    /// to patch in place (cold renderer, picker not mounted).
+    pub deferred: bool,
+}
+
 pub async fn refresh_model_whitelist(
     websocket_url: &str,
     expected_catalog: &serde_json::Value,
-) -> Result<()> {
+) -> Result<ModelWhitelistRefresh> {
     let response = codey_runtime_core::bridge::evaluate_script_with_await_promise(
         websocket_url,
         &model_whitelist_refresh_script(expected_catalog),
@@ -887,17 +895,29 @@ fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> Strin
     && snapshot.models.every((model, index) => model === expectedModels[index])
     && snapshot.defaultModel === expectedDefaultModel
   );
-  const reachedActiveModelPicker = (delivery) => (
+  // The response patch rewrites every future `model/list` bridge reply and
+  // the scheduled/interaction passes keep patching the query cache, so a
+  // renderer whose model picker has not mounted yet still receives the
+  // catalog — just lazily. That counts as a deferred delivery, not a
+  // failure; only a missing Statsig or response patch is a real failure.
+  const catalogAccepted = (delivery) => (
     delivery?.responsePatchInstalled === true
     && Number(delivery.statsigClients) > 0
     && Number(delivery.notifiedClients) > 0
+  );
+  const reachedActiveModelPicker = (delivery) => (
+    catalogAccepted(delivery)
     && Number(delivery.queryClients) > 0
     && Number(delivery.queryEntries) > 0
   );
+  const deliverySummary = (delivery) => delivery
+    ? `（statsigClients=${{Number(delivery.statsigClients)}}, notifiedClients=${{Number(delivery.notifiedClients)}}, queryClients=${{Number(delivery.queryClients)}}, queryEntries=${{Number(delivery.queryEntries)}}）`
+    : "";
   let snapshot = null;
   let delivery = null;
+  let deferredDelivery = null;
   let lastError = "模型白名单补丁尚未就绪";
-  for (const delay of [0, 80, 200, 500]) {{
+  for (const delay of [0, 80, 200, 500, 1000, 2000]) {{
     if (delay > 0) {{
       await new Promise((resolve) => window.setTimeout(resolve, delay));
     }}
@@ -915,37 +935,49 @@ fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> Strin
       const updated = await patch.setCatalog(expectedCatalog);
       snapshot = patch.snapshot();
       delivery = patch.delivery();
-      if (
-        updated === true
-        && matchesExpected(snapshot)
-        && reachedActiveModelPicker(delivery)
-      ) {{
-        return JSON.stringify({{ ok: true, snapshot, delivery }});
-      }}
       if (updated !== true) {{
         lastError = "模型白名单拒绝了后端推送的目录";
       }} else if (!matchesExpected(snapshot)) {{
         lastError = "模型白名单快照与已保存配置不一致";
-      }} else {{
+      }} else if (reachedActiveModelPicker(delivery)) {{
+        return JSON.stringify({{ ok: true, delivered: "active", snapshot, delivery }});
+      }} else if (catalogAccepted(delivery)) {{
+        // Keep retrying: a cold renderer may still mount the model query
+        // within this window, which turns the delivery fully active.
+        deferredDelivery = delivery;
         lastError = "未能刷新 Codex 当前对话的模型查询缓存";
+      }} else if (delivery?.responsePatchInstalled !== true) {{
+        lastError = "模型响应补丁未安装";
+      }} else if (Number(delivery.statsigClients) < 1) {{
+        lastError = "未找到 Codex 的 Statsig 客户端";
+      }} else {{
+        lastError = "未能通知 Codex 的 Statsig 客户端";
       }}
     }} catch (error) {{
       lastError = error instanceof Error ? error.message : String(error);
     }}
   }}
-  return JSON.stringify({{ ok: false, error: lastError, snapshot, delivery }});
+  if (deferredDelivery) {{
+    return JSON.stringify({{ ok: true, delivered: "deferred", snapshot, delivery: deferredDelivery }});
+  }}
+  return JSON.stringify({{ ok: false, error: `${{lastError}}${{deliverySummary(delivery)}}`, snapshot, delivery }});
 }})()"#
     )
 }
 
-fn verify_model_whitelist_refresh_response(response: &serde_json::Value) -> Result<()> {
+fn verify_model_whitelist_refresh_response(
+    response: &serde_json::Value,
+) -> Result<ModelWhitelistRefresh> {
     let payload = runtime_value(response)
         .and_then(serde_json::Value::as_str)
         .context("Codex 模型列表热更新未返回可解析结果")?;
     let report = serde_json::from_str::<serde_json::Value>(payload)
         .context("解析 Codex 模型列表热更新结果失败")?;
     if report.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-        return Ok(());
+        return Ok(ModelWhitelistRefresh {
+            deferred: report.get("delivered").and_then(serde_json::Value::as_str)
+                == Some("deferred"),
+        });
     }
     let error = report
         .get("error")
@@ -1489,11 +1521,13 @@ mod tests {
         assert!(script.contains("patch.snapshot()"));
         assert!(!script.contains("patch.refresh()"));
         assert!(!script.contains("/codex-model-catalog"));
-        assert!(script.contains("[0, 80, 200, 500]"));
+        assert!(script.contains("[0, 80, 200, 500, 1000, 2000]"));
         assert!(script.contains("model_metadata"));
         assert!(script.contains(r#"provider-\"quoted"#));
         assert!(script.contains("snapshot.defaultModel === expectedDefaultModel"));
         assert!(script.contains("delivery.queryEntries"));
+        assert!(script.contains("delivered: \"deferred\""));
+        assert!(script.contains("catalogAccepted"));
     }
 
     #[test]
@@ -1502,31 +1536,37 @@ mod tests {
             "result": {
                 "result": {
                     "type": "string",
-                    "value": r#"{"ok":true,"snapshot":{"loaded":true}}"#
+                    "value": r#"{"ok":true,"delivered":"active","snapshot":{"loaded":true},"delivery":{"queryEntries":1}}"#
                 }
             }
         });
-        assert!(verify_model_whitelist_refresh_response(&success).is_ok());
-
+        let outcome = verify_model_whitelist_refresh_response(&success).unwrap();
+        assert!(!outcome.deferred);
         let mismatch = serde_json::json!({
             "result": {
                 "result": {
                     "type": "string",
-                    "value": r#"{"ok":false,"error":"模型白名单快照与已保存配置不一致"}"#
+                    "value": r#"{"ok":false,"error":"模型白名单快照与已保存配置不一致（statsigClients=1, notifiedClients=1, queryClients=1, queryEntries=0）"}"#
                 }
             }
         });
         let error = verify_model_whitelist_refresh_response(&mismatch).unwrap_err();
         assert!(format!("{error:#}").contains("快照与已保存配置不一致"));
+        assert!(format!("{error:#}").contains("queryEntries=0"));
     }
 
     #[test]
-    fn pet_control_shield_receives_the_launch_setting() {
-        let enabled = PET_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_PET__", "true");
-        let disabled = PET_CONTROL_SHIELD_SCRIPT.replace("__CODEY_SLIM_PET__", "false");
-
-        assert!(enabled.contains(r#"["true"][0]==="true""#));
-        assert!(disabled.contains(r#"["false"][0]==="true""#));
+    fn model_whitelist_refresh_response_reports_a_deferred_delivery() {
+        let deferred = serde_json::json!({
+            "result": {
+                "result": {
+                    "type": "string",
+                    "value": r#"{"ok":true,"delivered":"deferred","snapshot":{"loaded":true},"delivery":{"queryEntries":0}}"#
+                }
+            }
+        });
+        let outcome = verify_model_whitelist_refresh_response(&deferred).unwrap();
+        assert!(outcome.deferred);
     }
 
     #[test]

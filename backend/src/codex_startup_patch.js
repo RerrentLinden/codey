@@ -624,6 +624,19 @@
     }
     return excerpts;
   };
+  const recordIncompatibleRendererGate = (source, name, matchCount) => {
+    activeRendererPatchFailures?.add(name);
+    const message =
+      `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${matchCount} times`;
+    const context = { matchCount };
+    const excerpts = rendererGateFailureExcerpts(source);
+    if (excerpts.length) context.excerpts = excerpts;
+    recordCodeyPatchFailure(`renderer_patch:${name}`, message, context);
+    try {
+      console.error(message);
+    } catch {}
+    return source;
+  };
   const replaceUniqueRendererGate = (source, pattern, replacement, name) => {
     // app:// assets can be requested repeatedly during reloads or renderer
     // recovery. A gate already known to be incompatible with the exact same
@@ -645,19 +658,67 @@
       matchCount += gateCount;
     }
     if (matchCount !== 1) {
-      activeRendererPatchFailures?.add(name);
-      const message =
-        `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${matchCount} times`;
-      const context = { matchCount };
-      const excerpts = rendererGateFailureExcerpts(source);
-      if (excerpts.length) context.excerpts = excerpts;
-      recordCodeyPatchFailure(`renderer_patch:${name}`, message, context);
-      try {
-        console.error(message);
-      } catch {}
-      return source;
+      return recordIncompatibleRendererGate(source, name, matchCount);
     }
     return patched;
+  };
+  const replaceNearestRendererGateBeforeAnchor = (
+    source,
+    pattern,
+    replacement,
+    name,
+    anchor,
+    maximumDistance,
+  ) => {
+    if (activeRendererPatchFailures?.has(name)) return source;
+    const anchorIndexes = [];
+    for (
+      let index = source.indexOf(anchor);
+      index >= 0;
+      index = source.indexOf(anchor, index + anchor.length)
+    ) anchorIndexes.push(index);
+    if (anchorIndexes.length !== 1) {
+      return recordIncompatibleRendererGate(source, name, anchorIndexes.length);
+    }
+
+    const anchorIndex = anchorIndexes[0];
+    const scopeStart = Math.max(0, anchorIndex - maximumDistance);
+    const scope = source.slice(scopeStart, anchorIndex + anchor.length);
+    const gates = Array.isArray(pattern) ? pattern : [{ pattern, replacement }];
+    const candidates = [];
+    for (const gate of gates) {
+      scope.replace(gate.pattern, (...args) => {
+        candidates.push({ args, gate, offset: args.at(-2) });
+        return args[0];
+      });
+    }
+    if (candidates.length === 0) {
+      return recordIncompatibleRendererGate(source, name, 0);
+    }
+
+    const nearestOffset = Math.max(
+      ...candidates.map((candidate) => candidate.offset),
+    );
+    const nearestCandidates = candidates.filter(
+      (candidate) => candidate.offset === nearestOffset,
+    );
+    if (nearestCandidates.length !== 1) {
+      return recordIncompatibleRendererGate(
+        source,
+        name,
+        nearestCandidates.length,
+      );
+    }
+
+    const [{ args, gate, offset }] = nearestCandidates;
+    const effectiveReplacement = gate.replacement ?? replacement;
+    const replaced = typeof effectiveReplacement === "function"
+      ? effectiveReplacement(...args)
+      : effectiveReplacement;
+    const absoluteOffset = scopeStart + offset;
+    return source.slice(0, absoluteOffset) +
+      replaced +
+      source.slice(absoluteOffset + args[0].length);
   };
   const rendererHasNativeCustomProviderModelAccess = (source) =>
     /function\s+[$A-Z_a-z][$\w]*\(\{[^}]*isCustomModelProvider\s*:\s*([$A-Z_a-z][$\w]*)[^}]*model\s*:\s*([$A-Z_a-z][$\w]*)[^}]*useHiddenModels\s*:\s*([$A-Z_a-z][$\w]*)[^}]*\}\)\s*\{\s*return[\s\S]{0,512}?\3\s*&&\s*!\s*\1\s*&&[\s\S]{0,256}?\?\s*[$A-Z_a-z][$\w]*\.has\(\s*\2\.model\s*\)\s*:\s*!\s*\2\.hidden\s*\)*\s*\}/.test(
@@ -954,26 +1015,26 @@
       source.includes("availableOptions.length")
     ) {
       // The current model's options decide whether the speed control exists.
-      patched = replaceUniqueRendererGate(
+      patched = replaceNearestRendererGateBeforeAnchor(
         patched,
         [
           {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
             replacement: (_match, assignment, _resultName, settingsName, draftName) =>
               `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
           },
           {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
             replacement: (_match, assignment, _resultName, settingsName, draftName) =>
               `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
           },
           {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?!\s*&&\s*!)(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?!\s*&&\s*!)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
             replacement: (_match, assignment, _resultName, settingsName) =>
               `${assignment}${settingsName}.availableOptions.length>1`,
           },
           {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
             replacement: (
               _match,
               preservedPrefix,
@@ -983,7 +1044,7 @@
             ) => `${preservedPrefix}${settingsName}.availableOptions.length>1`,
           },
           {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
             replacement: (
               _match,
               assignment,
@@ -993,7 +1054,7 @@
             ) => `${assignment}!${draftName}&&${settingsName}.availableOptions.length>1`,
           },
           {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
             replacement: (
               _match,
               assignment,
@@ -1003,12 +1064,12 @@
             ) => `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
           },
           {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
             replacement: (_match, assignment, _resultName, settingsName) =>
               `${assignment}${settingsName}.availableOptions.length>1`,
           },
           {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,8192}?`composer\.toggleFastMode`)/g,
             replacement: (
               _match,
               preservedPrefix,
@@ -1020,18 +1081,20 @@
         ],
         undefined,
         "model-aware service tier control",
+        "`composer.toggleFastMode`",
+        8192,
       );
       if (source.includes("!=null")) {
         patched = replaceUniqueRendererGate(
           patched,
           [
             {
-              pattern: /(`composer\.toggleFastMode`[\s\S]{0,512}?\{\s*enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null/g,
+              pattern: /(`composer\.toggleFastMode`[\s\S]{0,4096}?\{\s*enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null/g,
               replacement: (_match, prefix, loadingName, fastOptionName) =>
                 `${prefix}!${loadingName}&&${fastOptionName}!=null`,
             },
             {
-              pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null(?=\s*[,;][\s\S]{0,512}?\{\s*enabled\s*:\s*\2\s*\}[\s\S]{0,512}?`composer\.toggleFastMode`)/g,
+              pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null(?=\s*[,;][\s\S]{0,4096}?\{\s*enabled\s*:\s*\2\s*\}[\s\S]{0,4096}?`composer\.toggleFastMode`)/g,
               replacement: (
                 _match,
                 preservedPrefix,
@@ -1358,6 +1421,7 @@
     attempts: 0,
     mode: "",
     command: "",
+    argumentCount: 0,
     missingRuntimeConfigs: [...appServerRuntimeConfigs],
     requiredRuntimeConfigs: [...appServerRuntimeConfigs],
   };
@@ -1367,11 +1431,16 @@
   });
   const formatAppServerRuntimeOverrideError = (status) => {
     const missing = status.missingRuntimeConfigs?.length
-      ? `；缺失：${status.missingRuntimeConfigs.join(", ")}`
+      ? `；缺失：${status.missingRuntimeConfigs
+          .map(runtimeOverrideKey)
+          .join(", ")}`
       : "";
+    const observed = status.observed
+      ? `；已观察到 ${status.mode || "unknown"} 启动：${status.command || ""}（参数 ${status.argumentCount ?? 0} 个）`
+      : "；未观察到 app-server 启动调用";
     return (
       "当前 Codex 版本的 app-server 启动参数结构与 Codey 不兼容，" +
-      `未能确认注入 model_provider=codey_router 与 model_providers.codey_router.*${missing}`
+      `未能确认注入 model_provider=codey_router 与 model_providers.codey_router.*${missing}${observed}`
     );
   };
   const finishAppServerRuntimeOverrideValidation = (status) => {
@@ -1419,6 +1488,7 @@
       attempts: appServerRuntimeOverrideEvidence.attempts + 1,
       mode: status.mode,
       command: String(status.command ?? "").slice(0, 512),
+      argumentCount: Array.isArray(status.args) ? status.args.length : 0,
       missingRuntimeConfigs: status.missingRuntimeConfigs,
       requiredRuntimeConfigs: [...status.requiredRuntimeConfigs],
     };
@@ -1441,6 +1511,7 @@
       return {
         mode: "argv",
         command,
+        args,
         requiredRuntimeConfigs: appServerRuntimeConfigs,
         missingRuntimeConfigs: validateRuntimeConfigSet(
           configs,
@@ -1493,6 +1564,7 @@
     return {
       mode: "wsl-shell",
       command,
+      args,
       requiredRuntimeConfigs,
       missingRuntimeConfigs: requiredRuntimeConfigs.filter(
         (config) => !hasShellConfigArg(beforeAppServer, config),
@@ -1573,10 +1645,7 @@
     const appServerIndexes = args
       .map((argument, index) => argument === "app-server" ? index : -1)
       .filter((index) => index >= 0);
-    const analyticsFlagCount = args
-      .filter((argument) => argument === "--analytics-default-enabled")
-      .length;
-    if (appServerIndexes.length !== 1 || analyticsFlagCount > 1) return args;
+    if (appServerIndexes.length !== 1) return args;
 
     const managedConfigKeys = new Set(
       appServerRuntimeConfigs.map(runtimeOverrideKey),
@@ -1654,10 +1723,7 @@
     }
 
     const appServerMatches = execCommand.match(/\bapp-server\b/g);
-    const analyticsFlagMatches = execCommand.match(
-      /(?:^|[\s;])--analytics-default-enabled(?=$|[\s;&|])/g,
-    );
-    if (appServerMatches?.length !== 1 || (analyticsFlagMatches?.length ?? 0) > 1) {
+    if (appServerMatches?.length !== 1) {
       return command;
     }
 
