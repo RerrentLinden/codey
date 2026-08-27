@@ -1683,16 +1683,6 @@ fn responses_to_chat_completions_request(body: &Value) -> Result<ConvertedRespon
     {
         chat.insert("max_tokens".to_string(), max_tokens);
     }
-    if let Some(web_search_options) = chat_tools.as_ref().and_then(|tools| {
-        chat_web_search_options_for_tool_choice(
-            tools.web_search_options.as_ref(),
-            object.get("tool_choice"),
-        )
-        .transpose()
-    }) {
-        chat.insert("web_search_options".to_string(), web_search_options?);
-    }
-    let web_search_enabled = chat.contains_key("web_search_options");
     let web_search_tool_seen = chat_tools
         .as_ref()
         .is_some_and(|tools| tools.web_search_tool_seen);
@@ -1700,6 +1690,16 @@ fn responses_to_chat_completions_request(body: &Value) -> Result<ConvertedRespon
         .as_ref()
         .and_then(|tools| tools.tools.as_ref())
         .is_some();
+    if let Some(web_search_options) = chat_web_search_options_for_tool_choice(
+        chat_tools
+            .as_ref()
+            .and_then(|tools| tools.web_search_options.as_ref()),
+        object.get("tool_choice"),
+        has_chat_tools,
+    )? {
+        chat.insert("web_search_options".to_string(), web_search_options);
+    }
+    let web_search_enabled = chat.contains_key("web_search_options");
     if let Some(tools) = chat_tools.and_then(|tools| tools.tools) {
         chat.insert("tools".to_string(), tools);
     }
@@ -1860,26 +1860,36 @@ fn responses_tool_identity(tool: &Value) -> Option<String> {
 fn chat_web_search_options_for_tool_choice(
     options: Option<&Value>,
     tool_choice: Option<&Value>,
+    has_chat_tools: bool,
 ) -> Result<Option<Value>> {
-    let Some(options) = options else {
-        return Ok(None);
-    };
-    if responses_tool_choice_disables_web_search(tool_choice)? {
-        return Ok(None);
-    }
-    Ok(Some(options.clone()))
-}
-
-fn responses_tool_choice_disables_web_search(tool_choice: Option<&Value>) -> Result<bool> {
     let Some(tool_choice) = tool_choice else {
-        return Ok(false);
+        // Responses treats an omitted tool_choice as auto, while Chat search
+        // models always search when web_search_options is present. Dropping the
+        // optional search tool is the only conversion that does not turn a
+        // normal prompt into a mandatory web request.
+        return Ok(None);
     };
     match tool_choice {
-        Value::String(choice) if choice == "none" => Ok(true),
-        Value::String(choice) if matches!(choice.as_str(), "auto" | "required") => Ok(false),
+        Value::String(choice) if matches!(choice.as_str(), "auto" | "none") => Ok(None),
+        Value::String(choice) if choice == "required" => {
+            let Some(options) = options else {
+                return Ok(None);
+            };
+            if has_chat_tools {
+                anyhow::bail!(
+                    "Responses tool_choice=required 同时包含 web_search 和其他工具，Chat Completions 无法无损表达"
+                );
+            }
+            Ok(Some(options.clone()))
+        }
         Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-            Some("web_search" | "web_search_preview") => Ok(false),
-            Some("function" | "custom" | "tool_search") => Ok(true),
+            Some("web_search" | "web_search_preview") => {
+                let options = options.ok_or_else(|| {
+                    anyhow::anyhow!("Responses tool_choice 选择了未在 tools 中声明的 web_search")
+                })?;
+                Ok(Some(options.clone()))
+            }
+            Some("function" | "custom" | "tool_search") => Ok(None),
             Some(tool_type) => anyhow::bail!(
                 "Responses tool_choice 类型 {tool_type} 不能转换为 Chat Completions tool_choice"
             ),
@@ -8062,7 +8072,17 @@ mod tests {
     }
 
     #[test]
-    fn responses_web_search_maps_to_chat_web_search_options() {
+    fn responses_web_search_requires_explicit_chat_selection() {
+        let omitted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"normal conversation",
+            "tools":[{"type":"web_search"}]
+        }))
+        .unwrap();
+        assert!(omitted.body.get("web_search_options").is_none());
+        assert!(omitted.body.get("tools").is_none());
+        assert!(omitted.body.get("tool_choice").is_none());
+
         let auto = responses_to_chat_completions_request(&json!({
             "model":"provider-model",
             "input":"search the web",
@@ -8070,7 +8090,7 @@ mod tests {
             "tool_choice":"auto"
         }))
         .unwrap();
-        assert_eq!(auto.body["web_search_options"], json!({}));
+        assert!(auto.body.get("web_search_options").is_none());
         assert!(auto.body.get("tools").is_none());
         assert!(auto.body.get("tool_choice").is_none());
 
@@ -8109,6 +8129,47 @@ mod tests {
                 }
             })
         );
+    }
+
+    #[test]
+    fn responses_web_search_required_only_maps_and_required_mixed_fails_closed() {
+        let required = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"search the web",
+            "tools":[{"type":"web_search","search_context_size":"medium"}],
+            "tool_choice":"required"
+        }))
+        .unwrap();
+        assert_eq!(
+            required.body["web_search_options"],
+            json!({"search_context_size":"medium"})
+        );
+        assert!(required.body.get("tools").is_none());
+        assert!(required.body.get("tool_choice").is_none());
+
+        let error = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"use a required tool",
+            "tools":[
+                {"type":"web_search"},
+                {"type":"function","name":"lookup","parameters":{"type":"object","properties":{}}}
+            ],
+            "tool_choice":"required"
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("tool_choice=required"));
+        assert!(error.to_string().contains("无法无损表达"));
+    }
+
+    #[test]
+    fn responses_explicit_web_search_requires_a_declared_search_tool() {
+        let error = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"search the web",
+            "tool_choice":{"type":"web_search"}
+        }))
+        .unwrap_err();
+        assert!(error.to_string().contains("未在 tools 中声明的 web_search"));
     }
 
     #[test]
@@ -8162,7 +8223,8 @@ mod tests {
         let error = responses_to_anthropic_messages_request(&json!({
             "model":"claude-test",
             "input":"search",
-            "tools":[{"type":"web_search"}]
+            "tools":[{"type":"web_search"}],
+            "tool_choice":{"type":"web_search"}
         }))
         .unwrap_err();
         assert!(
@@ -8726,7 +8788,8 @@ mod tests {
                 "tools":[{
                     "type":"web_search",
                     "search_context_size":"high"
-                }]
+                }],
+                "tool_choice":{"type":"web_search"}
             }))
             .send()
             .await
@@ -8745,6 +8808,67 @@ mod tests {
             json!({"search_context_size":"high"})
         );
         assert!(body.get("tools").is_none());
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn chat_route_omits_optional_web_search_for_regular_provider_model() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({
+                    "id":"chatcmpl-regular",
+                    "created":123,
+                    "model":body["model"],
+                    "choices":[{
+                        "message":{"role":"assistant","content":"normal response"},
+                        "finish_reason":"stop"
+                    }],
+                    "usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}
+                }),
+            )
+            .await
+            .unwrap();
+            (request.path, body)
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":"1",
+                "tools":[{"type":"web_search"}],
+                "tool_choice":"auto"
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["output_text"],
+            "normal response"
+        );
+        let (path, body) = upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(body["model"], "provider-model");
+        assert!(body.get("web_search_options").is_none());
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
         router.stop().await.unwrap();
     }
 
