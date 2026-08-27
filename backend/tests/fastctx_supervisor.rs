@@ -115,9 +115,7 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
     let first_host = wait_for_host_starts(&event_log, 1)[0];
     terminate_process(first_host, true);
     wait_for_process_gone(first_host);
-    let (hosts, next_request_id) =
-        drive_runtime_host_recovery(&event_log, &mut stdin, &responses_rx, 3);
-    assert_ne!(hosts[0], hosts[1]);
+    let next_request_id = drive_mcp_connection_recovery(&mut stdin, &responses_rx, 3);
 
     send(
         &mut stdin,
@@ -138,7 +136,11 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
     let status = wait_for_child(&mut child);
     let stderr = captured_stderr.lock().unwrap().clone();
     assert!(status.success(), "sidecar failed with {status}: {stderr}");
-    terminate_process(hosts[1], false);
+    for host in host_start_pids(&event_log) {
+        if host != first_host {
+            terminate_process(host, false);
+        }
+    }
 }
 
 fn assert_portable_tool_schema(value: &Value) {
@@ -211,29 +213,22 @@ fn response_with_id_before(
     }
 }
 
-fn drive_runtime_host_recovery(
-    path: &Path,
+fn drive_mcp_connection_recovery(
     stdin: &mut impl Write,
     responses_rx: &mpsc::Receiver<std::io::Result<String>>,
     first_request_id: i64,
-) -> (Vec<u32>, i64) {
+) -> i64 {
     let deadline = Instant::now() + PROCESS_TIMEOUT;
     let mut request_id = first_request_id;
     let mut last_probe = Value::Null;
     loop {
-        let pids = host_start_pids(path);
-        if pids.len() >= 2 {
-            return (pids, request_id);
-        }
         assert!(
             Instant::now() < deadline,
-            "only {} FastCtx host starts observed after recovery probes; last response: {}",
-            pids.len(),
-            last_probe
+            "FastCtx MCP connection did not recover; last response: {last_probe}"
         );
         // FastCtx 在下一次实际工具读写时也可能才观察到 control center 链路断开。
-        // `tools/list` 可以由 MCP 代理本地回答，不能稳定驱动 runtime host 恢复。
-        // 用只读工具请求驱动恢复；第一个探测请求允许只关闭断开的旧链路。
+        // `tools/list` 可以由 MCP 代理本地回答，不能稳定驱动引擎恢复。共享 host
+        // 重启失败时允许退回进程内引擎，因此这里只验证同一条 MCP 连接重新可用。
         send(
             stdin,
             json!({
@@ -248,6 +243,9 @@ fn drive_runtime_host_recovery(
         );
         last_probe = response_with_id_before(responses_rx, request_id, deadline);
         request_id += 1;
+        if last_probe["result"]["isError"].as_bool() == Some(false) {
+            return request_id;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
