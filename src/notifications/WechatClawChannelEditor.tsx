@@ -95,6 +95,7 @@ function WechatClawChannelEditorComponent({
             clearContextToken: false,
             getUpdatesBuf: result.getUpdatesBuf?.trim() ?? "",
             chatId: recipientId,
+            sessionStatus: "active",
           });
           setLogin((current) => current?.loginId === loginId
             ? { ...current, phase: "confirmed", message: "绑定并激活成功，保存后即可接收通知。" }
@@ -173,24 +174,36 @@ function WechatClawChannelEditorComponent({
     }
   }
 
-  const hasBinding = Boolean(channel.botToken.trim() || channel.botTokenConfigured);
+  const sessionExpired = channel.sessionStatus === "expired";
+  const hasBinding = Boolean(
+    sessionExpired || channel.botToken.trim() || channel.botTokenConfigured,
+  );
   const isActivated = Boolean(
     hasBinding &&
+      !sessionExpired &&
       (channel.contextToken.trim() || channel.contextTokenConfigured) &&
       channel.chatId.trim(),
   );
-  const loginMessage = login?.message || (isActivated
-    ? "当前已完成绑定和激活。重新扫码会替换已保存的凭据。"
-    : hasBinding
-      ? "当前绑定缺少激活上下文，请重新扫码并按提示向 ClawBot 发送一条消息。"
-      : "扫码确认后，需要在微信中向 ClawBot 发送一条消息完成激活。二维码 10 分钟内有效。");
+  const loginMessage = login?.message || (sessionExpired
+    ? "微信 ClawBot 登录已失效，请重新扫码后保存配置。"
+    : isActivated
+      ? "当前已完成绑定和激活。重新扫码会替换已保存的凭据。"
+      : hasBinding
+        ? "当前绑定缺少激活上下文，请重新扫码并按提示向 ClawBot 发送一条消息。"
+        : "扫码确认后，需要在微信中向 ClawBot 发送一条消息完成激活。二维码 10 分钟内有效。");
+  const bindingCardClass = sessionExpired
+    ? "rounded-[10px] border border-[#f59e0b]/35 bg-[#fff8eb] p-3"
+    : "rounded-[10px] border border-[#07c160]/25 bg-[#f2fff5] p-3";
+  const bindingIconClass = sessionExpired
+    ? "grid size-7 place-items-center rounded-full bg-[#f59e0b]/12 text-[#a15c00]"
+    : "grid size-7 place-items-center rounded-full bg-[#07c160]/12 text-[#07a854]";
 
   return (
     <>
-      <div className="rounded-[10px] border border-[#07c160]/25 bg-[#f2fff5] p-3">
+      <div className={bindingCardClass}>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
-            <span className="grid size-7 place-items-center rounded-full bg-[#07c160]/12 text-[#07a854]">
+            <span className={bindingIconClass}>
               <IconQrcode size={17} aria-hidden="true" />
             </span>
             <div>
@@ -205,7 +218,7 @@ function WechatClawChannelEditorComponent({
             onClick={() => void startLogin()}
           >
             {isStarting ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <IconBrandWechat aria-hidden="true" />}
-            {isStarting ? "正在生成" : hasBinding ? "重新扫码" : "扫码绑定"}
+            {isStarting ? "正在生成" : sessionExpired || hasBinding ? "重新扫码" : "扫码绑定"}
           </Button>
         </div>
         <p className="mt-2 text-[11px] leading-5 text-[#526158]" role="status" aria-live="polite">
@@ -264,6 +277,7 @@ function WechatClawChannelEditorComponent({
                 clearContextToken: true,
                 getUpdatesBuf: "",
                 chatId: "",
+                sessionStatus: "active",
               });
             }}
           >

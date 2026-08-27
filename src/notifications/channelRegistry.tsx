@@ -147,7 +147,8 @@ const CHANNEL_DEFINITIONS: Record<
     Editor: WechatClawChannelEditor,
     isConfigured: (channel) =>
       Boolean(
-        (channel.botToken.trim() || channel.botTokenConfigured) &&
+        channel.sessionStatus !== "expired" &&
+          (channel.botToken.trim() || channel.botTokenConfigured) &&
           (channel.contextToken.trim() || channel.contextTokenConfigured) &&
           (channel.url.trim() || channel.urlConfigured) &&
           channel.chatId.trim(),
@@ -186,5 +187,6 @@ export function createNotificationChannel(
     clearContextToken: false,
     getUpdatesBuf: "",
     chatId: "",
+    sessionStatus: "active",
   };
 }

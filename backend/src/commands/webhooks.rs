@@ -13,7 +13,9 @@ use tokio::sync::{Mutex, oneshot};
 use super::AppState;
 use crate::codex_config::codex_home;
 use crate::config::{CodeyConfig, ConfigStore, OFFICIAL_ROUTE_SHORT_NAME};
-use crate::notifications::{NotificationChannelConfig, NotificationDispatcher, NotificationEvent};
+use crate::notifications::{
+    NotificationChannelConfig, NotificationChannelKind, NotificationDispatcher, NotificationEvent,
+};
 use crate::pending_approval;
 use crate::pending_approval::{CompletedTurn, RecentSessionEvents, SessionLifecycleStatus};
 use crate::{local_router, model_id};
@@ -922,9 +924,12 @@ async fn dispatch_webhook_channels(
     let deliveries = deliveries.into_iter().map(|(channel, delivery_key)| {
         let client = state.webhook_http_client.clone();
         let event = event.clone();
+        let state = Arc::clone(state);
         async move {
-            let dispatcher = NotificationDispatcher::with_client(client, channel);
-            (delivery_key, dispatcher.send(&event).await)
+            (
+                delivery_key,
+                dispatch_webhook_channel(&state, client, channel, &event).await,
+            )
         }
     });
     let results = collect_webhook_deliveries(deliveries).await;
@@ -954,6 +959,77 @@ async fn dispatch_webhook_channels(
             settle_delivery,
         })
     }
+}
+
+async fn dispatch_webhook_channel(
+    state: &Arc<AppState>,
+    client: reqwest::Client,
+    channel: NotificationChannelConfig,
+    event: &NotificationEvent,
+) -> Result<(), WebhookDispatchError> {
+    let channel = latest_channel_for_delivery(state, &channel).await;
+    let dispatcher = NotificationDispatcher::with_client(client.clone(), channel.clone());
+    match dispatcher.send(event).await {
+        Ok(()) => Ok(()),
+        Err(error)
+            if channel.kind == NotificationChannelKind::WechatClaw
+                && error.should_retry_with_fresh_context() =>
+        {
+            let fresh_channel = latest_channel_for_delivery(state, &channel).await;
+            if !fresh_channel.enabled || !fresh_channel.is_configured() {
+                return Ok(());
+            }
+            if fresh_channel.context_token.trim() == channel.context_token.trim() {
+                return Err(WebhookDispatchError {
+                    detail: error.to_string(),
+                    settle_delivery: false,
+                });
+            }
+            let dispatcher = NotificationDispatcher::with_client(client, fresh_channel);
+            match dispatcher.send(event).await {
+                Ok(()) => Ok(()),
+                Err(error) => Err(WebhookDispatchError {
+                    detail: error.to_string(),
+                    settle_delivery: error.should_settle_delivery(),
+                }),
+            }
+        }
+        Err(error) => Err(WebhookDispatchError {
+            detail: error.to_string(),
+            settle_delivery: error.should_settle_delivery(),
+        }),
+    }
+}
+
+async fn latest_channel_for_delivery(
+    state: &Arc<AppState>,
+    channel: &NotificationChannelConfig,
+) -> NotificationChannelConfig {
+    if channel.kind != NotificationChannelKind::WechatClaw {
+        return channel.clone();
+    }
+    let mut delivery = channel.clone();
+    let config = state.config.read().await;
+    let Some(saved) =
+        config.webhook.channels.iter().find(|saved| {
+            saved.id == channel.id && saved.kind == NotificationChannelKind::WechatClaw
+        })
+    else {
+        delivery.enabled = false;
+        return delivery;
+    };
+    let same_binding = saved.enabled
+        && saved.bot_token.trim() == channel.bot_token.trim()
+        && saved.chat_id.trim() == channel.chat_id.trim()
+        && saved.wechat_claw_base_url().ok() == channel.wechat_claw_base_url().ok();
+    if !same_binding {
+        delivery.enabled = false;
+        return delivery;
+    }
+    delivery.context_token = saved.context_token.clone();
+    delivery.context_token_configured = saved.context_token_configured;
+    delivery.get_updates_buf = saved.get_updates_buf.clone();
+    delivery
 }
 
 async fn collect_webhook_deliveries<F, T>(deliveries: impl IntoIterator<Item = F>) -> Vec<T>
@@ -1282,8 +1358,54 @@ mod tests {
     use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 
     use super::*;
-    use crate::notifications::NotificationChannelKind;
     use crate::pending_approval::{AbortedTurn, PendingApproval, StartedTurn};
+
+    async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+
+        let mut request = Vec::new();
+        let mut body_start = None;
+        let mut content_length = 0_usize;
+        loop {
+            let mut chunk = [0_u8; 1024];
+            let read = socket.read(&mut chunk).await.unwrap();
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..read]);
+            if body_start.is_none()
+                && let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                body_start = Some(index + 4);
+                let headers = String::from_utf8_lossy(&request[..index]);
+                content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+            }
+            if let Some(body_start) = body_start
+                && request.len() >= body_start + content_length
+            {
+                break;
+            }
+        }
+        String::from_utf8(request).unwrap()
+    }
+
+    async fn write_json_response(socket: &mut tokio::net::TcpStream, body: &str) {
+        use tokio::io::AsyncWriteExt;
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
 
     fn lifecycle(started: &[(&str, &str)], completed: &[(&str, &str)]) -> RecentSessionEvents {
         RecentSessionEvents {
@@ -1350,6 +1472,135 @@ mod tests {
         gate.add_permits(delivery_count);
         delivery_task.await.unwrap();
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn clawbot_delivery_uses_the_latest_saved_context_token() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut socket).await;
+            write_json_response(&mut socket, r#"{"ret":0}"#).await;
+            request
+        });
+        let fresh_channel = NotificationChannelConfig {
+            id: "fresh-claw".to_string(),
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: format!("http://{address}"),
+            bot_token: "bot-token".to_string(),
+            context_token: "fresh-context".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        };
+        let mut stale_channel = fresh_channel.clone();
+        stale_channel.context_token = "stale-context".to_string();
+        let state = Arc::new(AppState {
+            config: RwLock::new(CodeyConfig {
+                webhook: crate::notifications::WebhookConfig {
+                    channels: vec![fresh_channel],
+                    ..crate::notifications::WebhookConfig::default()
+                },
+                ..CodeyConfig::default()
+            }),
+            ..AppState::default()
+        });
+        let event = NotificationEvent::new(
+            "session.completed",
+            "session-claw",
+            "profile-claw",
+            "Codex",
+            0,
+            None,
+        );
+
+        dispatch_webhook_channels(
+            &state,
+            vec![stale_channel],
+            &event,
+            "completed:session:turn",
+        )
+        .await
+        .unwrap();
+
+        let request = server.await.unwrap();
+        assert!(request.contains("POST /ilink/bot/sendmessage "));
+        assert!(request.contains(r#""context_token":"fresh-context""#));
+        assert!(!request.contains("stale-context"));
+    }
+
+    #[tokio::test]
+    async fn clawbot_prepare_failure_retries_only_after_context_refresh() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let channel = NotificationChannelConfig {
+            id: "refresh-claw".to_string(),
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: format!("http://{address}"),
+            bot_token: "bot-token".to_string(),
+            context_token: "stale-context".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        };
+        let state = Arc::new(AppState {
+            config: RwLock::new(CodeyConfig {
+                webhook: crate::notifications::WebhookConfig {
+                    channels: vec![channel.clone()],
+                    ..crate::notifications::WebhookConfig::default()
+                },
+                ..CodeyConfig::default()
+            }),
+            ..AppState::default()
+        });
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut first_socket).await);
+            {
+                let mut config = server_state.config.write().await;
+                config.webhook.channels[0].context_token = "fresh-context".to_string();
+                config.webhook.channels[0].context_token_configured = true;
+            }
+            write_json_response(&mut first_socket, r#"{"ret":-2,"errmsg":"prepare failed"}"#).await;
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            requests.push(read_http_request(&mut second_socket).await);
+            write_json_response(&mut second_socket, r#"{"ret":0}"#).await;
+            requests
+        });
+        let event = NotificationEvent::new(
+            "session.completed",
+            "session-claw",
+            "profile-claw",
+            "Codex",
+            0,
+            None,
+        );
+
+        dispatch_webhook_channels(&state, vec![channel], &event, "completed:session:turn")
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("POST /ilink/bot/sendmessage "));
+        assert!(requests[0].contains(r#""context_token":"stale-context""#));
+        assert!(requests[1].starts_with("POST /ilink/bot/sendmessage "));
+        assert!(requests[1].contains(r#""context_token":"fresh-context""#));
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.contains("notifystart"))
+        );
     }
 
     #[test]

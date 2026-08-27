@@ -13,7 +13,9 @@ use uuid::Uuid;
 
 use super::{AppState, save_config_to_store};
 use crate::config::CodeyConfig;
-use crate::notifications::{NotificationChannelConfig, NotificationChannelKind};
+use crate::notifications::{
+    NotificationChannelConfig, NotificationChannelKind, NotificationChannelSessionStatus,
+};
 
 const ILINK_BASE_URL: &str = "https://ilinkai.weixin.qq.com";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -73,6 +75,8 @@ struct WechatClawSyncSuccess {
 #[derive(Debug)]
 struct WechatClawSyncFailure {
     message: String,
+    notify_started: bool,
+    session_expired: bool,
 }
 
 pub(super) async fn sync_wechat_claw_service(state: &Arc<AppState>) {
@@ -216,9 +220,19 @@ async fn run_wechat_claw_sync_channel(state: Arc<AppState>, channel: WechatClawS
                 }
             }
             Err(error) => {
-                // A failed long poll may mean the remote sync session was
-                // discarded. Re-run notifystart before the next attempt.
-                channel_state.notify_started = false;
+                if error.session_expired {
+                    if let Err(clear_error) =
+                        clear_expired_wechat_claw_session(&state, &channel_state.channel).await
+                    {
+                        eprintln!("Codey 微信 ClawBot 失效登录状态清理失败：{clear_error}");
+                    }
+                    eprintln!(
+                        "Codey 微信 ClawBot 登录已失效，请重新扫码：{}",
+                        error.message
+                    );
+                    return;
+                }
+                channel_state.notify_started = error.notify_started;
                 channel_state.failure_count = channel_state.failure_count.saturating_add(1);
                 channel_state.next_attempt =
                     Instant::now() + sync_backoff(channel_state.failure_count);
@@ -233,7 +247,7 @@ async fn sync_wechat_claw_channel(
     channel: WechatClawSyncChannel,
     notify_started: bool,
 ) -> Result<WechatClawSyncSuccess, WechatClawSyncFailure> {
-    if !notify_started {
+    let notify_started = if !notify_started {
         let request = sync_ilink_post_request(
             client,
             &channel.base_url,
@@ -246,8 +260,12 @@ async fn sync_wechat_claw_channel(
             "后台同步启动",
             ActivationResponseContract::GetUpdates,
         )
-        .await?;
-    }
+        .await
+        .map_err(|error| WechatClawSyncFailure::from_activation(error, false))?;
+        true
+    } else {
+        true
+    };
 
     let request = sync_ilink_post_request(
         client,
@@ -258,7 +276,8 @@ async fn sync_wechat_claw_channel(
             "get_updates_buf": channel.get_updates_buf,
             "base_info": wechat_claw_base_info(),
         }),
-    )?;
+    )
+    .map_err(|error| error.with_notify_started(notify_started))?;
     let payload = match activation_response_json(
         request,
         "后台消息同步",
@@ -268,9 +287,10 @@ async fn sync_wechat_claw_channel(
     {
         Ok(payload) => payload,
         Err(error) => {
-            return Err(WechatClawSyncFailure {
-                message: activation_request_error_message(error),
-            });
+            return Err(WechatClawSyncFailure::from_activation(
+                error,
+                notify_started,
+            ));
         }
     };
     let get_updates_buf = response_updates_buffer(&payload)
@@ -287,22 +307,41 @@ async fn sync_wechat_claw_channel(
 
 impl From<String> for WechatClawSyncFailure {
     fn from(message: String) -> Self {
-        Self { message }
+        Self {
+            message,
+            notify_started: false,
+            session_expired: false,
+        }
     }
 }
 
 impl From<ActivationRequestError> for WechatClawSyncFailure {
     fn from(error: ActivationRequestError) -> Self {
+        Self::from_activation(error, false)
+    }
+}
+
+impl WechatClawSyncFailure {
+    fn from_activation(error: ActivationRequestError, notify_started: bool) -> Self {
+        let session_expired = matches!(&error, ActivationRequestError::SessionExpired(_));
         Self {
             message: activation_request_error_message(error),
+            notify_started,
+            session_expired,
         }
+    }
+
+    fn with_notify_started(mut self, notify_started: bool) -> Self {
+        self.notify_started = notify_started;
+        self
     }
 }
 
 fn activation_request_error_message(error: ActivationRequestError) -> String {
     match error {
         ActivationRequestError::Retryable => "微信 ClawBot 同步服务暂时无响应".to_string(),
-        ActivationRequestError::Fatal(message) => message,
+        ActivationRequestError::Fatal(message)
+        | ActivationRequestError::SessionExpired(message) => message,
     }
 }
 
@@ -359,11 +398,43 @@ async fn persist_wechat_claw_sync_update(
     {
         saved_channel.context_token = context_token;
         saved_channel.context_token_configured = true;
+        saved_channel.session_status = NotificationChannelSessionStatus::Active;
         changed = true;
     }
     if !changed {
         return Ok(());
     }
+    save_config_to_store(state, &config).await?;
+    *state.config.write().await = config;
+    Ok(())
+}
+
+async fn clear_expired_wechat_claw_session(
+    state: &Arc<AppState>,
+    channel: &WechatClawSyncChannel,
+) -> Result<(), String> {
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let mut config = state.config.read().await.clone();
+    let Some(saved_channel) = config.webhook.channels.iter_mut().find(|saved| {
+        saved.id == channel.id
+            && saved.kind == NotificationChannelKind::WechatClaw
+            && saved.bot_token.trim() == channel.bot_token
+            && saved.chat_id.trim() == channel.chat_id
+            && saved.context_token.trim() == channel.context_token
+            && saved
+                .wechat_claw_base_url()
+                .is_ok_and(|base_url| base_url == channel.base_url)
+    }) else {
+        return Ok(());
+    };
+
+    saved_channel.bot_token.clear();
+    saved_channel.bot_token_configured = false;
+    saved_channel.context_token.clear();
+    saved_channel.context_token_configured = false;
+    saved_channel.chat_id.clear();
+    saved_channel.get_updates_buf.clear();
+    saved_channel.session_status = NotificationChannelSessionStatus::Expired;
     save_config_to_store(state, &config).await?;
     *state.config.write().await = config;
     Ok(())
@@ -597,6 +668,7 @@ fn pending_login_response(phase: &WechatClawLoginPhase) -> Value {
 enum ActivationRequestError {
     Retryable,
     Fatal(String),
+    SessionExpired(String),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -632,7 +704,10 @@ async fn poll_wechat_claw_activation(
             Err(ActivationRequestError::Retryable) => {
                 return Ok(activation_retry_response());
             }
-            Err(ActivationRequestError::Fatal(message)) => {
+            Err(
+                ActivationRequestError::Fatal(message)
+                | ActivationRequestError::SessionExpired(message),
+            ) => {
                 return Ok(fail_activation(state, login_id, message).await);
             }
         }
@@ -650,7 +725,10 @@ async fn poll_wechat_claw_activation(
         {
             Ok(payload) => payload,
             Err(ActivationRequestError::Retryable) => return Ok(activation_retry_response()),
-            Err(ActivationRequestError::Fatal(message)) => {
+            Err(
+                ActivationRequestError::Fatal(message)
+                | ActivationRequestError::SessionExpired(message),
+            ) => {
                 return Ok(fail_activation(state, login_id, message).await);
             }
         };
@@ -776,6 +854,12 @@ async fn activation_response_json(
         .await
         .map_err(|_| ActivationRequestError::Retryable)?;
     let payload = parse_activation_response_body(&body, action, contract)?;
+    if wechat_claw_session_expired(&payload) {
+        let message = validate_activation_response(&payload, action, contract)
+            .err()
+            .unwrap_or_else(|| "微信 ClawBot 登录会话已过期，请重新扫码".to_string());
+        return Err(ActivationRequestError::SessionExpired(message));
+    }
     validate_activation_response(&payload, action, contract)
         .map_err(ActivationRequestError::Fatal)?;
     Ok(payload)
@@ -826,6 +910,12 @@ fn validate_activation_response(
         }
     }
     Ok(())
+}
+
+fn wechat_claw_session_expired(payload: &Value) -> bool {
+    ["ret", "errcode", "err_code"]
+        .into_iter()
+        .any(|key| response_code(payload, key) == Some(-14))
 }
 
 fn activation_context(payload: &Value, expected_recipient_id: &str) -> Option<(String, String)> {
@@ -1316,6 +1406,112 @@ mod tests {
             disk.webhook.channels[0].get_updates_buf,
             "cursor-after-restart"
         );
+    }
+
+    #[tokio::test]
+    async fn clawbot_sync_keeps_the_started_session_after_a_regular_poll_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for body in ["{}", r#"{"ret":-2,"errmsg":"prepare failed"}"#] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                paths.push(read_test_request_path(&mut stream).await);
+                write_test_json_response(&mut stream, body).await;
+            }
+            paths
+        });
+        let channel = WechatClawSyncChannel {
+            id: "retry-claw".to_string(),
+            base_url: Url::parse(&format!("http://{address}/")).unwrap(),
+            bot_token: "bot-token".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            context_token: "context-token".to_string(),
+            get_updates_buf: "cursor".to_string(),
+        };
+
+        let error = sync_wechat_claw_channel(&Client::new(), channel, false)
+            .await
+            .unwrap_err();
+
+        assert!(error.notify_started);
+        assert!(!error.session_expired);
+        assert_eq!(
+            server.await.unwrap(),
+            ["/ilink/bot/msg/notifystart", "/ilink/bot/getupdates"]
+        );
+    }
+
+    #[tokio::test]
+    async fn clawbot_sync_session_timeout_clears_the_expired_login_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut paths = Vec::new();
+            for body in ["{}", r#"{"errcode":-14,"errmsg":"token expired"}"#] {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                paths.push(read_test_request_path(&mut stream).await);
+                write_test_json_response(&mut stream, body).await;
+            }
+            paths
+        });
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = CodeyConfig::default();
+        config.settings_revision = 13;
+        let mut channel = configured_wechat_claw_channel("expired-claw");
+        channel.url = format!("http://{address}/");
+        channel.allow_insecure_test_url = true;
+        channel.bot_token_configured = true;
+        channel.context_token_configured = true;
+        channel.get_updates_buf = "expired-cursor".to_string();
+        config.webhook.channels = vec![channel];
+        let state = Arc::new(AppState {
+            store: crate::config::ConfigStore::new(directory.path().join("config.json")),
+            config: tokio::sync::RwLock::new(config),
+            ..AppState::default()
+        });
+
+        sync_wechat_claw_service(&state).await;
+        let paths = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("sync timeout response should complete")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.config.read().await.webhook.channels[0]
+                    .bot_token
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("expired login state should be cleared");
+        stop_wechat_claw_service(&state).await;
+
+        assert_eq!(
+            paths,
+            ["/ilink/bot/msg/notifystart", "/ilink/bot/getupdates"]
+        );
+        let memory = state.config.read().await.clone();
+        let disk = state.store.load().unwrap();
+        for saved in [&memory.webhook.channels[0], &disk.webhook.channels[0]] {
+            assert!(saved.bot_token.is_empty());
+            assert!(!saved.bot_token_configured);
+            assert!(saved.context_token.is_empty());
+            assert!(!saved.context_token_configured);
+            assert!(saved.chat_id.is_empty());
+            assert!(saved.get_updates_buf.is_empty());
+            assert_eq!(
+                saved.session_status,
+                NotificationChannelSessionStatus::Expired
+            );
+        }
+        assert_eq!(memory.settings_revision, 13);
+        assert_eq!(disk.settings_revision, 13);
     }
 
     #[test]

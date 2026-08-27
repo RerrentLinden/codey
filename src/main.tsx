@@ -272,7 +272,9 @@ if (import.meta.env.DEV) {
                 ? channel.botTokenConfigured &&
                   Boolean(channel.chatId.trim()) &&
                   (channel.kind !== "wechatClaw" ||
-                    (channel.urlConfigured && channel.contextTokenConfigured))
+                    (channel.sessionStatus !== "expired" &&
+                      channel.urlConfigured &&
+                      channel.contextTokenConfigured))
                 : channel.urlConfigured),
           ).length;
         return {

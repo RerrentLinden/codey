@@ -18,7 +18,10 @@ pub(super) trait NotificationChannelAdapter: Send + Sync {
         None
     }
     fn mark_prepared(&self) {}
-    fn settle_on_success_status_error(&self) -> bool {
+    fn settle_on_success_status_error(&self, _body: &str) -> bool {
+        false
+    }
+    fn retry_with_fresh_context_on_success_status_error(&self, _body: &str) -> bool {
         false
     }
     fn build_request(&self, client: &Client, event: &NotificationEvent) -> Result<RequestBuilder>;

@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use super::{NotificationChannelAdapter, bounded_remote_message};
 use crate::notifications::formatting::{format_duration, format_timestamp, plain_text_value};
-use crate::notifications::{NotificationChannelConfig, NotificationEvent};
+use crate::notifications::{
+    NotificationChannelConfig, NotificationChannelSessionStatus, NotificationEvent,
+};
 
 const MAX_WECHAT_TEXT_CHARS: usize = 1_800;
 
@@ -48,7 +50,9 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
     }
 
     fn configuration_error(&self) -> Option<&'static str> {
-        if self.config.bot_token.trim().is_empty() {
+        if self.config.session_status == NotificationChannelSessionStatus::Expired {
+            Some("微信 ClawBot 登录已失效，请重新扫码")
+        } else if self.config.bot_token.trim().is_empty() {
             Some("请先通过扫码登录微信 ClawBot")
         } else if self.config.context_token.trim().is_empty() {
             Some("请先在微信中向 ClawBot 发送一条消息完成激活")
@@ -67,8 +71,12 @@ impl NotificationChannelAdapter for WechatClawChannel<'_> {
         )
     }
 
-    fn settle_on_success_status_error(&self) -> bool {
-        true
+    fn settle_on_success_status_error(&self, body: &str) -> bool {
+        !wechat_claw_response_has_explicit_failure(body)
+    }
+
+    fn retry_with_fresh_context_on_success_status_error(&self, body: &str) -> bool {
+        wechat_claw_response_needs_context_refresh(body)
     }
 
     fn validate_response(&self, body: &str) -> std::result::Result<(), String> {
@@ -206,9 +214,7 @@ fn validate_wechat_claw_response(body: &str) -> std::result::Result<(), String> 
         let Some(raw_result) = value.get(key) else {
             continue;
         };
-        let result = raw_result
-            .as_i64()
-            .or_else(|| raw_result.as_str()?.trim().parse::<i64>().ok())
+        let result = wechat_claw_response_code(raw_result)
             .ok_or_else(|| "微信 ClawBot 返回了无效的业务状态".to_string())?;
         if result != 0 {
             if result == -2 && message.trim().eq_ignore_ascii_case("prepare failed") {
@@ -223,6 +229,41 @@ fn validate_wechat_claw_response(body: &str) -> std::result::Result<(), String> 
         }
     }
     Ok(())
+}
+
+fn wechat_claw_response_has_explicit_failure(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    ["ret", "errcode", "err_code"]
+        .into_iter()
+        .filter_map(|key| value.get(key))
+        .filter_map(wechat_claw_response_code)
+        .any(|result| result != 0)
+}
+
+fn wechat_claw_response_needs_context_refresh(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let message = value
+        .get("errmsg")
+        .or_else(|| value.get("err_msg"))
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    ["ret", "errcode", "err_code"]
+        .into_iter()
+        .filter_map(|key| value.get(key))
+        .filter_map(wechat_claw_response_code)
+        .any(|result| result == -2 && message.eq_ignore_ascii_case("prepare failed"))
+}
+
+fn wechat_claw_response_code(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
 }
 
 #[cfg(test)]
@@ -286,7 +327,18 @@ mod tests {
     #[test]
     fn clawbot_settles_an_ambiguous_success_response() {
         let config = configured_channel();
-        assert!(WechatClawChannel::new(&config).settle_on_success_status_error());
+        let channel = WechatClawChannel::new(&config);
+
+        assert!(channel.settle_on_success_status_error("not json"));
+        assert!(channel.settle_on_success_status_error("null"));
+        assert!(!channel.settle_on_success_status_error(r#"{"ret":-2,"errmsg":"prepare failed"}"#));
+        assert!(!channel.settle_on_success_status_error(r#"{"ret":-14,"errmsg":"token expired"}"#));
+        assert!(channel.retry_with_fresh_context_on_success_status_error(
+            r#"{"ret":-2,"errmsg":"prepare failed"}"#
+        ));
+        assert!(!channel.retry_with_fresh_context_on_success_status_error(
+            r#"{"ret":-14,"errmsg":"token expired"}"#
+        ));
     }
 
     #[test]
@@ -297,6 +349,20 @@ mod tests {
         assert_eq!(
             WechatClawChannel::new(&config).configuration_error(),
             Some("请先在微信中向 ClawBot 发送一条消息完成激活")
+        );
+        assert!(!config.is_configured());
+    }
+
+    #[test]
+    fn expired_session_reports_rebind_instead_of_missing_secret() {
+        let mut config = configured_channel();
+        config.session_status = NotificationChannelSessionStatus::Expired;
+        config.bot_token.clear();
+        config.context_token.clear();
+
+        assert_eq!(
+            WechatClawChannel::new(&config).configuration_error(),
+            Some("微信 ClawBot 登录已失效，请重新扫码")
         );
         assert!(!config.is_configured());
     }

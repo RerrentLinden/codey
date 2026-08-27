@@ -15,6 +15,20 @@ pub enum NotificationChannelKind {
     WechatClaw,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum NotificationChannelSessionStatus {
+    #[default]
+    Active,
+    Expired,
+}
+
+impl NotificationChannelSessionStatus {
+    fn is_active(&self) -> bool {
+        *self == Self::Active
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationChannelConfig {
@@ -46,6 +60,11 @@ pub struct NotificationChannelConfig {
     pub get_updates_buf: String,
     #[serde(default)]
     pub chat_id: String,
+    #[serde(
+        default,
+        skip_serializing_if = "NotificationChannelSessionStatus::is_active"
+    )]
+    pub session_status: NotificationChannelSessionStatus,
     #[cfg(test)]
     #[serde(skip)]
     pub allow_insecure_test_url: bool,
@@ -68,6 +87,7 @@ impl Default for NotificationChannelConfig {
             clear_context_token: false,
             get_updates_buf: String::new(),
             chat_id: String::new(),
+            session_status: NotificationChannelSessionStatus::Active,
             #[cfg(test)]
             allow_insecure_test_url: false,
         }
@@ -83,7 +103,8 @@ impl NotificationChannelConfig {
                 !self.bot_token.trim().is_empty() && !self.chat_id.trim().is_empty()
             }
             NotificationChannelKind::WechatClaw => {
-                !self.bot_token.trim().is_empty()
+                self.session_status != NotificationChannelSessionStatus::Expired
+                    && !self.bot_token.trim().is_empty()
                     && !self.context_token.trim().is_empty()
                     && !self.chat_id.trim().is_empty()
                     && self.wechat_claw_base_url().is_ok()
@@ -225,6 +246,9 @@ impl WebhookConfig {
             channel.clear_bot_token = false;
             channel.context_token_configured = !channel.context_token.is_empty();
             channel.clear_context_token = false;
+            if channel.kind != NotificationChannelKind::WechatClaw {
+                channel.session_status = NotificationChannelSessionStatus::Active;
+            }
         }
     }
 
@@ -313,6 +337,15 @@ impl WebhookConfig {
                         existing.id == channel.id
                             && existing.kind == NotificationChannelKind::WechatClaw
                     });
+                    let has_fresh_binding = !channel.bot_token.trim().is_empty()
+                        && !channel.context_token.trim().is_empty()
+                        && !channel.chat_id.trim().is_empty();
+                    let preserve_existing_expired_status = existing.is_some_and(|existing| {
+                        existing.session_status == NotificationChannelSessionStatus::Expired
+                    }) && !channel.clear_url
+                        && !channel.clear_bot_token
+                        && !channel.clear_context_token
+                        && !has_fresh_binding;
 
                     if channel.clear_url {
                         channel.url.clear();
@@ -346,6 +379,7 @@ impl WebhookConfig {
 
                     if channel.clear_bot_token || channel.clear_context_token {
                         channel.get_updates_buf.clear();
+                        channel.session_status = NotificationChannelSessionStatus::Active;
                         continue;
                     }
                     if channel.get_updates_buf.trim().is_empty()
@@ -353,6 +387,14 @@ impl WebhookConfig {
                         && same_wechat_claw_binding(channel, existing)
                     {
                         channel.get_updates_buf = existing.get_updates_buf.clone();
+                    }
+                    if preserve_existing_expired_status {
+                        channel.session_status = NotificationChannelSessionStatus::Expired;
+                    } else if !channel.bot_token.trim().is_empty()
+                        && !channel.context_token.trim().is_empty()
+                        && !channel.chat_id.trim().is_empty()
+                    {
+                        channel.session_status = NotificationChannelSessionStatus::Active;
                     }
                 }
             }
@@ -697,6 +739,60 @@ mod tests {
             serde_json::to_value(&incoming).unwrap()["channels"][0]
                 .get("clearContextToken")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn expired_wechat_claw_session_is_not_configured_and_is_serialized() {
+        let channel = NotificationChannelConfig {
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: "https://ilinkai.weixin.qq.com".to_string(),
+            bot_token: "ilink-secret".to_string(),
+            context_token: "context-secret".to_string(),
+            chat_id: "user@im.wechat".to_string(),
+            session_status: NotificationChannelSessionStatus::Expired,
+            ..NotificationChannelConfig::default()
+        };
+
+        assert!(!channel.is_configured());
+        let value = serde_json::to_value(&channel).unwrap();
+        assert_eq!(value["sessionStatus"], "expired");
+    }
+
+    #[test]
+    fn expired_wechat_claw_status_survives_redacted_saves_until_rebound_or_cleared() {
+        let previous = WebhookConfig {
+            channels: vec![NotificationChannelConfig {
+                id: "wechat-claw-1".to_string(),
+                kind: NotificationChannelKind::WechatClaw,
+                enabled: true,
+                session_status: NotificationChannelSessionStatus::Expired,
+                ..NotificationChannelConfig::default()
+            }],
+            ..WebhookConfig::default()
+        };
+        let mut redacted_save = previous.clone();
+        redacted_save.channels[0].session_status = NotificationChannelSessionStatus::Active;
+        redacted_save.channels[0].url_configured = true;
+        redacted_save.channels[0].bot_token_configured = true;
+        redacted_save.channels[0].context_token_configured = true;
+        redacted_save.channels[0].chat_id = "stale-user@im.wechat".to_string();
+        redacted_save.merge_redacted_secrets(&previous);
+        assert_eq!(
+            redacted_save.channels[0].session_status,
+            NotificationChannelSessionStatus::Expired
+        );
+
+        let mut rebound = previous.clone();
+        rebound.channels[0].url = "https://ilinkai.weixin.qq.com".to_string();
+        rebound.channels[0].bot_token = "new-ilink-secret".to_string();
+        rebound.channels[0].context_token = "new-context-secret".to_string();
+        rebound.channels[0].chat_id = "user@im.wechat".to_string();
+        rebound.merge_redacted_secrets(&previous);
+        assert_eq!(
+            rebound.channels[0].session_status,
+            NotificationChannelSessionStatus::Active
         );
     }
 
