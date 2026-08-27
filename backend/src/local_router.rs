@@ -1703,18 +1703,18 @@ fn responses_to_chat_completions_request(body: &Value) -> Result<ConvertedRespon
     if let Some(tools) = chat_tools.and_then(|tools| tools.tools) {
         chat.insert("tools".to_string(), tools);
     }
-    if let Some(tool_choice) = object.get("tool_choice") {
-        if !should_omit_chat_tool_choice_for_web_search(
+    if let Some(tool_choice) = object.get("tool_choice")
+        && !should_omit_chat_tool_choice_for_web_search(
             tool_choice,
             has_chat_tools,
             web_search_tool_seen,
             web_search_enabled,
-        )? {
-            chat.insert(
-                "tool_choice".to_string(),
-                responses_tool_choice_to_chat_tool_choice(tool_choice, &tool_bridge)?,
-            );
-        }
+        )?
+    {
+        chat.insert(
+            "tool_choice".to_string(),
+            responses_tool_choice_to_chat_tool_choice(tool_choice, &tool_bridge)?,
+        );
     }
     if let Some(parallel_tool_calls) = object.get("parallel_tool_calls") {
         if !parallel_tool_calls.is_boolean() {
@@ -2951,6 +2951,15 @@ struct ResponsesChatTools {
     web_search_tool_seen: bool,
 }
 
+struct ResponsesChatToolsConversion<'a> {
+    tool_bridge: &'a mut ResponsesToolBridge,
+    upstream_names: HashMap<String, ResponsesToolName>,
+    bridged_definitions: HashMap<ResponsesToolName, Value>,
+    converted: Vec<Value>,
+    web_search_options: Option<Value>,
+    web_search_tool_seen: bool,
+}
+
 fn responses_tools_to_chat_tools_with_bridge(
     tools: &Value,
     tool_bridge: &mut ResponsesToolBridge,
@@ -2958,39 +2967,28 @@ fn responses_tools_to_chat_tools_with_bridge(
     let tools = tools
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("tools 必须是数组"))?;
-    let mut converted = Vec::new();
-    let mut web_search_options = None;
-    let mut web_search_tool_seen = false;
-    let mut upstream_names = HashMap::<String, ResponsesToolName>::new();
-    let mut bridged_definitions = HashMap::<ResponsesToolName, Value>::new();
+    let mut conversion = ResponsesChatToolsConversion {
+        tool_bridge,
+        upstream_names: HashMap::new(),
+        bridged_definitions: HashMap::new(),
+        converted: Vec::new(),
+        web_search_options: None,
+        web_search_tool_seen: false,
+    };
     for tool in tools {
-        append_responses_tool_to_chat_tools(
-            tool,
-            &[],
-            tool_bridge,
-            &mut upstream_names,
-            &mut bridged_definitions,
-            &mut converted,
-            &mut web_search_options,
-            &mut web_search_tool_seen,
-        )?;
+        append_responses_tool_to_chat_tools(tool, &[], &mut conversion)?;
     }
     Ok(ResponsesChatTools {
-        tools: (!converted.is_empty()).then_some(Value::Array(converted)),
-        web_search_options,
-        web_search_tool_seen,
+        tools: (!conversion.converted.is_empty()).then_some(Value::Array(conversion.converted)),
+        web_search_options: conversion.web_search_options,
+        web_search_tool_seen: conversion.web_search_tool_seen,
     })
 }
 
 fn append_responses_tool_to_chat_tools(
     tool: &Value,
     namespace_path: &[String],
-    tool_bridge: &mut ResponsesToolBridge,
-    upstream_names: &mut HashMap<String, ResponsesToolName>,
-    bridged_definitions: &mut HashMap<ResponsesToolName, Value>,
-    converted: &mut Vec<Value>,
-    web_search_options: &mut Option<Value>,
-    web_search_tool_seen: &mut bool,
+    conversion: &mut ResponsesChatToolsConversion<'_>,
 ) -> Result<()> {
     let object = tool
         .as_object()
@@ -3007,7 +3005,11 @@ fn append_responses_tool_to_chat_tools(
             name: name.clone(),
         };
         let should_push = if namespace_path.is_empty() {
-            register_plain_tool_name(&name, tool_bridge, upstream_names)?;
+            register_plain_tool_name(
+                &name,
+                conversion.tool_bridge,
+                &mut conversion.upstream_names,
+            )?;
             true
         } else {
             validate_namespaced_function_name(&name)?;
@@ -3015,9 +3017,9 @@ fn append_responses_tool_to_chat_tools(
             match register_namespaced_tool_name(
                 tool_name,
                 &original_definition,
-                tool_bridge,
-                upstream_names,
-                bridged_definitions,
+                conversion.tool_bridge,
+                &mut conversion.upstream_names,
+                &mut conversion.bridged_definitions,
             )? {
                 Some(upstream_name) => {
                     function.insert("name".to_string(), Value::String(upstream_name));
@@ -3030,21 +3032,14 @@ fn append_responses_tool_to_chat_tools(
             if namespace_path.is_empty() {
                 function.insert("name".to_string(), Value::String(name));
             }
-            converted.push(json!({"type":"function","function":Value::Object(function)}));
+            conversion
+                .converted
+                .push(json!({"type":"function","function":Value::Object(function)}));
         }
         return Ok(());
     }
     if tool_type == Some("namespace") {
-        return append_responses_namespace_tools(
-            object,
-            namespace_path,
-            tool_bridge,
-            upstream_names,
-            bridged_definitions,
-            converted,
-            web_search_options,
-            web_search_tool_seen,
-        );
+        return append_responses_namespace_tools(object, namespace_path, conversion);
     }
     if tool_type == Some("custom") {
         let name = response_function_name(object, "custom tool")?.to_string();
@@ -3053,14 +3048,14 @@ fn append_responses_tool_to_chat_tools(
         let Some(upstream_name) = register_custom_tool_name(
             tool_name,
             &original_definition,
-            tool_bridge,
-            upstream_names,
-            bridged_definitions,
+            conversion.tool_bridge,
+            &mut conversion.upstream_names,
+            &mut conversion.bridged_definitions,
         )?
         else {
             return Ok(());
         };
-        converted.push(json!({
+        conversion.converted.push(json!({
             "type":"function",
             "function":{
                 "name":upstream_name,
@@ -3108,7 +3103,9 @@ fn append_responses_tool_to_chat_tools(
                 anyhow::anyhow!("execution=client tool_search.parameters 必须是 JSON 对象")
             })?;
         let tool_name = ResponsesToolName::tool_search();
-        if let Some(existing) = upstream_names.get(TOOL_SEARCH_UPSTREAM_TOOL_NAME)
+        if let Some(existing) = conversion
+            .upstream_names
+            .get(TOOL_SEARCH_UPSTREAM_TOOL_NAME)
             && existing != &tool_name
         {
             anyhow::bail!(
@@ -3116,25 +3113,28 @@ fn append_responses_tool_to_chat_tools(
             );
         }
         let original_definition = Value::Object(object.clone());
-        if let Some(existing_definition) = bridged_definitions.get(&tool_name) {
+        if let Some(existing_definition) = conversion.bridged_definitions.get(&tool_name) {
             if existing_definition == &original_definition {
                 return Ok(());
             }
             anyhow::bail!("客户端 tool_search 存在定义冲突");
         }
-        bridged_definitions.insert(tool_name.clone(), original_definition);
-        upstream_names.insert(
+        conversion
+            .bridged_definitions
+            .insert(tool_name.clone(), original_definition);
+        conversion.upstream_names.insert(
             TOOL_SEARCH_UPSTREAM_TOOL_NAME.to_string(),
             tool_name.clone(),
         );
-        tool_bridge.response_to_upstream.insert(
+        conversion.tool_bridge.response_to_upstream.insert(
             tool_name.clone(),
             TOOL_SEARCH_UPSTREAM_TOOL_NAME.to_string(),
         );
-        tool_bridge
+        conversion
+            .tool_bridge
             .upstream_to_response
             .insert(TOOL_SEARCH_UPSTREAM_TOOL_NAME.to_string(), tool_name);
-        converted.push(json!({
+        conversion.converted.push(json!({
             "type":"function",
             "function":{
                 "name":TOOL_SEARCH_UPSTREAM_TOOL_NAME,
@@ -3145,19 +3145,19 @@ fn append_responses_tool_to_chat_tools(
         return Ok(());
     }
     if matches!(tool_type, Some("web_search" | "web_search_preview")) {
-        *web_search_tool_seen = true;
+        conversion.web_search_tool_seen = true;
         if !namespace_path.is_empty() {
             let tool_name = tool_type.unwrap_or("unknown");
             anyhow::bail!("namespace.tools 不支持工具类型 {tool_name}");
         }
         let options = responses_web_search_tool_to_chat_options(object)?;
-        if let Some(existing) = web_search_options.as_ref() {
+        if let Some(existing) = conversion.web_search_options.as_ref() {
             if existing == &options {
                 return Ok(());
             }
             anyhow::bail!("Responses web_search 工具存在定义冲突");
         }
-        *web_search_options = Some(options);
+        conversion.web_search_options = Some(options);
         return Ok(());
     }
     if !namespace_path.is_empty() {
@@ -3252,12 +3252,7 @@ fn responses_web_search_user_location_to_chat(user_location: &Value) -> Result<V
 fn append_responses_namespace_tools(
     object: &serde_json::Map<String, Value>,
     parent_namespace: &[String],
-    tool_bridge: &mut ResponsesToolBridge,
-    upstream_names: &mut HashMap<String, ResponsesToolName>,
-    bridged_definitions: &mut HashMap<ResponsesToolName, Value>,
-    converted: &mut Vec<Value>,
-    web_search_options: &mut Option<Value>,
-    web_search_tool_seen: &mut bool,
+    conversion: &mut ResponsesChatToolsConversion<'_>,
 ) -> Result<()> {
     let namespace = responses_namespace_name(object)?;
     let mut namespace_path = parent_namespace.to_vec();
@@ -3275,16 +3270,7 @@ fn append_responses_namespace_tools(
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("namespace.tools 必须是数组"))?;
         for tool in tools {
-            append_responses_tool_to_chat_tools(
-                tool,
-                &namespace_path,
-                tool_bridge,
-                upstream_names,
-                bridged_definitions,
-                converted,
-                web_search_options,
-                web_search_tool_seen,
-            )?;
+            append_responses_tool_to_chat_tools(tool, &namespace_path, conversion)?;
         }
     }
     if let Some(children) = children {
@@ -3292,16 +3278,7 @@ fn append_responses_namespace_tools(
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("namespace.children 必须是数组"))?;
         for child in children {
-            append_responses_tool_to_chat_tools(
-                child,
-                &namespace_path,
-                tool_bridge,
-                upstream_names,
-                bridged_definitions,
-                converted,
-                web_search_options,
-                web_search_tool_seen,
-            )?;
+            append_responses_tool_to_chat_tools(child, &namespace_path, conversion)?;
         }
     }
     Ok(())
