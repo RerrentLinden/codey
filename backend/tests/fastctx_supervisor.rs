@@ -115,30 +115,15 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
     let first_host = wait_for_host_starts(&event_log, 1)[0];
     terminate_process(first_host, true);
     wait_for_process_gone(first_host);
-    // FastCtx 在下一次实际工具读写时也可能才观察到 control center 链路断开。
-    // `tools/list` 可以由 MCP 代理本地回答，不能稳定驱动 runtime host 恢复。
-    // 用只读工具请求驱动恢复；如果断链恰好发生在请求执行中，该请求允许返回结果未知错误。
-    send(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
-            "params": {
-                "name": "glob",
-                "arguments": {"pattern": "**/*"}
-            }
-        }),
-    );
-    let _recovery_probe = response_with_id(&responses_rx, 3);
-    let hosts = wait_for_host_starts(&event_log, 2);
+    let (hosts, next_request_id) =
+        drive_runtime_host_recovery(&event_log, &mut stdin, &responses_rx, 3);
     assert_ne!(hosts[0], hosts[1]);
 
     send(
         &mut stdin,
         json!({
             "jsonrpc": "2.0",
-            "id": 4,
+            "id": next_request_id,
             "method": "tools/call",
             "params": {
                 "name": "glob",
@@ -146,7 +131,7 @@ fn control_center_crash_keeps_the_mcp_connection_usable() {
             }
         }),
     );
-    let response = response_with_id(&responses_rx, 4);
+    let response = response_with_id(&responses_rx, next_request_id);
     assert_eq!(response["result"]["isError"], false, "{response}");
 
     drop(stdin);
@@ -201,6 +186,14 @@ fn send(stdin: &mut impl Write, value: Value) {
 
 fn response_with_id(receiver: &mpsc::Receiver<std::io::Result<String>>, id: i64) -> Value {
     let deadline = Instant::now() + PROCESS_TIMEOUT;
+    response_with_id_before(receiver, id, deadline)
+}
+
+fn response_with_id_before(
+    receiver: &mpsc::Receiver<std::io::Result<String>>,
+    id: i64,
+    deadline: Instant,
+) -> Value {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
@@ -218,14 +211,51 @@ fn response_with_id(receiver: &mpsc::Receiver<std::io::Result<String>>, id: i64)
     }
 }
 
+fn drive_runtime_host_recovery(
+    path: &Path,
+    stdin: &mut impl Write,
+    responses_rx: &mpsc::Receiver<std::io::Result<String>>,
+    first_request_id: i64,
+) -> (Vec<u32>, i64) {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    let mut request_id = first_request_id;
+    let mut last_probe = Value::Null;
+    loop {
+        let pids = host_start_pids(path);
+        if pids.len() >= 2 {
+            return (pids, request_id);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "only {} FastCtx host starts observed after recovery probes; last response: {}",
+            pids.len(),
+            last_probe
+        );
+        // FastCtx 在下一次实际工具读写时也可能才观察到 control center 链路断开。
+        // `tools/list` 可以由 MCP 代理本地回答，不能稳定驱动 runtime host 恢复。
+        // 用只读工具请求驱动恢复；第一个探测请求允许只关闭断开的旧链路。
+        send(
+            stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "glob",
+                    "arguments": {"pattern": "**/*"}
+                }
+            }),
+        );
+        last_probe = response_with_id_before(responses_rx, request_id, deadline);
+        request_id += 1;
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn wait_for_host_starts(path: &Path, count: usize) -> Vec<u32> {
     let deadline = Instant::now() + PROCESS_TIMEOUT;
     loop {
-        let pids = std::fs::read_to_string(path)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| line.strip_prefix("START ")?.parse().ok())
-            .collect::<Vec<_>>();
+        let pids = host_start_pids(path);
         if pids.len() >= count {
             return pids;
         }
@@ -236,6 +266,14 @@ fn wait_for_host_starts(path: &Path, count: usize) -> Vec<u32> {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn host_start_pids(path: &Path) -> Vec<u32> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.strip_prefix("START ")?.parse().ok())
+        .collect()
 }
 
 fn wait_for_child(child: &mut Child) -> std::process::ExitStatus {
