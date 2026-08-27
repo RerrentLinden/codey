@@ -1189,6 +1189,12 @@ fn repair_persistent_codey_runtime_config(home: &Path) -> Result<bool> {
 fn remove_persistent_codey_runtime_config(doc: &mut DocumentMut, home: &Path) -> bool {
     let before = doc.to_string();
     let codey_router_owned = codey_router_provider_is_codey_owned(doc);
+    let codey_router_defined = doc
+        .get("model_providers")
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(local_router::ROUTER_PROVIDER_ID))
+        .and_then(Item::as_table_like)
+        .is_some();
     let codey_subagent_owned = persistent_codey_subagent_config_is_owned(doc);
     let codey_router_selected = doc
         .get("model_provider")
@@ -1196,7 +1202,8 @@ fn remove_persistent_codey_runtime_config(doc: &mut DocumentMut, home: &Path) ->
         .is_some_and(|provider| provider.trim() == local_router::ROUTER_PROVIDER_ID);
     let codey_router_runtime_selected =
         codey_router_selected && (codey_router_owned || codey_subagent_owned);
-    if codey_router_runtime_selected {
+    let codey_router_dangling = codey_router_selected && !codey_router_defined;
+    if codey_router_runtime_selected || codey_router_dangling {
         doc.as_table_mut().remove("model_provider");
     }
     if codey_router_owned
@@ -1210,11 +1217,11 @@ fn remove_persistent_codey_runtime_config(doc: &mut DocumentMut, home: &Path) ->
     if doc
         .get("model")
         .and_then(Item::as_str)
-        .is_some_and(|_| codey_router_runtime_selected)
+        .is_some_and(|_| codey_router_runtime_selected || codey_router_dangling)
     {
         doc.as_table_mut().remove("model");
     }
-    if codey_router_owned || codey_subagent_owned {
+    if codey_router_owned || codey_router_dangling || codey_subagent_owned {
         remove_codey_model_catalog_reference(doc, home);
     }
     remove_codey_owned_agents_config(doc, codey_subagent_owned);
@@ -2023,22 +2030,21 @@ fn build_isolated_runtime_overrides(
         "wire_api",
         "requires_openai_auth",
         "supports_websockets",
-        "experimental_bearer_token",
         "http_headers",
     ] {
-        if field == "http_headers"
-            && document_item_at(effective, &["model_providers", provider_id, field])
-                .is_some_and(|item| item.as_value().is_none())
-        {
-            continue;
-        }
-        push_document_override(
+        push_required_document_override(
             &mut overrides,
             effective,
             &["model_providers", provider_id, field],
             &format!("model_providers.{provider_segment}.{field}"),
         )?;
     }
+    push_document_override(
+        &mut overrides,
+        effective,
+        &["model_providers", provider_id, "experimental_bearer_token"],
+        &format!("model_providers.{provider_segment}.experimental_bearer_token"),
+    )?;
 
     if fastctx_namespace.is_some() {
         for (path, key) in [
@@ -2317,6 +2323,7 @@ fn build_isolated_runtime_overrides(
             }
         }
     }
+    validate_runtime_router_overrides(&overrides, provider_id)?;
     Ok(overrides)
 }
 
@@ -2362,6 +2369,50 @@ fn push_runtime_override_value(overrides: &mut Vec<String>, key: &str, value: &V
     let mut value = value.clone();
     value.decor_mut().clear();
     overrides.push(format!("{key}={value}"));
+}
+
+fn runtime_override_key(config: &str) -> &str {
+    config
+        .split_once('=')
+        .map(|(key, _)| key)
+        .unwrap_or(config)
+        .trim()
+}
+
+fn validate_runtime_router_overrides(overrides: &[String], provider_id: &str) -> Result<()> {
+    let provider_segment = codex_config_override_bare_segment(provider_id, "Codex Provider ID")?;
+    let selected_router = overrides.iter().any(|entry| {
+        runtime_override_key(entry) == "model_provider"
+            && entry
+                .split_once('=')
+                .is_some_and(|(_, value)| value.trim() == toml_string_literal(provider_id))
+    });
+    if !selected_router {
+        return Ok(());
+    }
+
+    let required_keys = [
+        format!("model_providers.{provider_segment}.name"),
+        format!("model_providers.{provider_segment}.base_url"),
+        format!("model_providers.{provider_segment}.wire_api"),
+        format!("model_providers.{provider_segment}.requires_openai_auth"),
+        format!("model_providers.{provider_segment}.supports_websockets"),
+    ];
+    let missing = required_keys
+        .iter()
+        .filter(|key| {
+            !overrides
+                .iter()
+                .any(|entry| runtime_override_key(entry) == key.as_str())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "Codey 运行时 Provider 覆盖项不完整：model_provider 选择了 {provider_id}，但缺少 {}",
+        missing.join(", ")
+    );
+    Ok(())
 }
 
 fn toml_string_literal(value: &str) -> String {

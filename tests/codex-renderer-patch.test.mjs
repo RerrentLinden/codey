@@ -338,6 +338,52 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
       "native-compatible model access and current Fast controls must not log skips",
     );
 
+    const serviceTierControlGateOrderings = [
+      "settings.availableOptions.length>1&&!draft&&allowed",
+      "settings.availableOptions.length>1&&allowed&&!draft",
+      "!draft&&settings.availableOptions.length>1&&allowed",
+      "!draft&&allowed&&settings.availableOptions.length>1",
+      "allowed&&!draft&&settings.availableOptions.length>1",
+      "allowed&&settings.availableOptions.length>1&&!draft",
+    ];
+    for (const [index, gate] of serviceTierControlGateOrderings.entries()) {
+      const reorderedServiceTierControlSource = [
+        "const isServiceTierAllowed=!0;",
+        "function nextComposer(){",
+        "let draft=!1,allowed=!0,settings={availableOptions:[{value:`fast`},{value:`auto`}]};",
+        "let loading=!1,fastOption=`fast`;",
+        `let show=${gate};`,
+        "OQ(`composer.toggleFastMode`,()=>{},{enabled:allowed&&!loading&&fastOption!=null});",
+        "return show}",
+      ].join("");
+      electron.protocol.handle(
+        "app",
+        async () => new Response(reorderedServiceTierControlSource),
+      );
+      const reorderedServiceTierControlResponse = await installedHandler({
+        url: `app://-/assets/app-initial-reordered-service-tier-control-${index}.js`,
+      });
+      const patchedReorderedServiceTierControlSource =
+        await reorderedServiceTierControlResponse.text();
+      assert.match(
+        patchedReorderedServiceTierControlSource,
+        /show=(?:settings\.availableOptions\.length>1&&!draft|!draft&&settings\.availableOptions\.length>1)/,
+      );
+      assert.doesNotMatch(
+        patchedReorderedServiceTierControlSource,
+        /show=[^;]*allowed/,
+      );
+      assert.match(
+        patchedReorderedServiceTierControlSource,
+        /enabled:!loading&&fastOption!=null/,
+      );
+      assert.equal(
+        patchErrors.length,
+        2,
+        "reordered service-tier control gates must patch without compatibility errors",
+      );
+    }
+
     const routeBridgeSource = [
       "const routeLog={warning(){}};",
       "const routeTransport={postMessage:e=>{let t=!1,n=window.electronBridge;",

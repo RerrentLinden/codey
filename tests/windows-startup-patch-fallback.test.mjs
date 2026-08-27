@@ -44,3 +44,20 @@ test("Windows startup patch failure cleans the paused process before compatible 
   assert.match(cleanup, /terminate_windows_codex_processes\(app_dir, process_id\)\.await/);
   assert.match(cleanup, /-> Result<\(\)>/);
 });
+
+test("Windows startup patch requires app-server runtime override validation", async () => {
+  const { windowsSpawn } = await loadWindowsStartupSource();
+
+  assert.match(
+    windowsSpawn,
+    /codex_startup_patch::install\(\s*inspector_port,\s*patch_options,\s*runtime_config_overrides,\s*!runtime_config_overrides\.is_empty\(\),\s*\)/,
+  );
+  assert.doesNotMatch(
+    windowsSpawn,
+    /codex_startup_patch::install\(\s*inspector_port,\s*patch_options,\s*runtime_config_overrides,\s*false,\s*\)/,
+  );
+  assert.match(
+    windowsSpawn,
+    /if !runtime_config_overrides\.is_empty\(\) \{[\s\S]*?Codex 启动补丁未能确认 app-server 运行时覆盖/,
+  );
+});

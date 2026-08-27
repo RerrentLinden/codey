@@ -204,6 +204,35 @@ default_subagent_reasoning_effort = "max"
 }
 
 #[test]
+fn restore_without_a_lease_repairs_dangling_codey_router_selection() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let original = br#"model_provider = "codey_router"
+model = "route-a/gpt-5.6-terra"
+model_catalog_json = "model-catalogs/codey-official.json"
+
+[model_providers.relay]
+name = "Relay"
+base_url = "https://relay.example/v1"
+"#;
+    fs::write(home.join("config.toml"), original).unwrap();
+
+    assert!(restore_runtime_config_at(&home, &temp.path().join("missing-lease.json")).unwrap());
+    let repaired = fs::read_to_string(home.join("config.toml")).unwrap();
+    let document = repaired.parse::<DocumentMut>().unwrap();
+
+    assert!(document.get("model_provider").is_none());
+    assert!(document.get("model").is_none());
+    assert!(document.get("model_catalog_json").is_none());
+    assert_eq!(
+        document["model_providers"]["relay"]["base_url"].as_str(),
+        Some("https://relay.example/v1")
+    );
+    assert_eq!(fs::read(home.join("config.toml.bak")).unwrap(), original);
+}
+
+#[test]
 fn legacy_repair_keeps_a_user_owned_codey_router_provider() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
@@ -215,6 +244,21 @@ model = "user-model"
 name = "User-Owned Router"
 base_url = "http://127.0.0.1:9876/v1"
 wire_api = "responses"
+"#;
+    fs::write(home.join("config.toml"), original).unwrap();
+
+    assert!(!restore_runtime_config_at(&home, &temp.path().join("missing-lease.json")).unwrap());
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+}
+
+#[test]
+fn legacy_repair_keeps_an_inline_user_owned_codey_router_provider() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let original = br#"model_provider = "codey_router"
+model = "user-model"
+model_providers = { codey_router = { name = "User-Owned Router", base_url = "https://relay.example/v1", wire_api = "responses" } }
 "#;
     fs::write(home.join("config.toml"), original).unwrap();
 
@@ -2058,6 +2102,22 @@ experimental_bearer_token = "upstream-secret-token"
     assert!(!rendered.contains("upstream-secret.example"));
     assert!(!rendered.contains("upstream-secret-token"));
     assert!(!rendered.contains("openai_base_url="));
+}
+
+#[test]
+fn local_router_runtime_override_validation_rejects_dangling_provider_selection() {
+    let overrides = vec![
+        "model_provider=\"codey_router\"".to_string(),
+        "model_providers.codey_router.name=\"Codey Local Router\"".to_string(),
+        "model_providers.codey_router.wire_api=\"responses\"".to_string(),
+        "model_providers.codey_router.requires_openai_auth=false".to_string(),
+        "model_providers.codey_router.supports_websockets=false".to_string(),
+    ];
+
+    let error = validate_runtime_router_overrides(&overrides, local_router::ROUTER_PROVIDER_ID)
+        .unwrap_err();
+
+    assert!(format!("{error:#}").contains("model_providers.codey_router.base_url"));
 }
 
 #[test]

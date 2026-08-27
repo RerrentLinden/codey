@@ -277,7 +277,7 @@ pub(super) async fn spawn_codex(
             inspector_port,
             patch_options,
             runtime_config_overrides,
-            false,
+            !runtime_config_overrides.is_empty(),
         )
         .await
         {

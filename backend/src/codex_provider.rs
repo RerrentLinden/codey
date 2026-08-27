@@ -80,7 +80,7 @@ pub fn current_official_account_profile_status_for_launch(
 ) -> Result<OfficialAccountProfileStatus> {
     let executable = resolve_native_status_executable(configured_codex_app_path);
     current_official_account_profile_status_with_probe(codex_home, |home| {
-        native_login_status(home, Some(&executable))
+        native_login_status_with_path_fallback(home, &executable)
     })
 }
 
@@ -685,6 +685,48 @@ fn native_login_status(codex_home: &Path, executable: Option<&Path>) -> NativeLo
     }
 }
 
+fn native_login_status_with_path_fallback(
+    codex_home: &Path,
+    primary_executable: &Path,
+) -> NativeLoginStatus {
+    let primary_status = native_login_status(codex_home, Some(primary_executable));
+    native_login_status_with_path_fallback_result(primary_executable, primary_status, || {
+        native_login_status(codex_home, Some(Path::new("codex")))
+    })
+}
+
+fn native_login_status_with_path_fallback_result(
+    primary_executable: &Path,
+    primary_status: NativeLoginStatus,
+    fallback_probe: impl FnOnce() -> NativeLoginStatus,
+) -> NativeLoginStatus {
+    if !should_try_path_login_status_fallback(&primary_status, primary_executable) {
+        return primary_status;
+    }
+    let primary_reason = match primary_status {
+        NativeLoginStatus::Unknown(reason) => reason,
+        status => return status,
+    };
+    match fallback_probe() {
+        NativeLoginStatus::Unknown(fallback_reason) => NativeLoginStatus::Unknown(format!(
+            "{primary_reason}；PATH codex 回退也无法确认官方登录状态：{fallback_reason}"
+        )),
+        status => status,
+    }
+}
+
+fn should_try_path_login_status_fallback(status: &NativeLoginStatus, executable: &Path) -> bool {
+    let NativeLoginStatus::Unknown(reason) = status else {
+        return false;
+    };
+    if !(reason.contains("无法运行 codex login status")
+        || reason.contains("could not run codex login status"))
+    {
+        return false;
+    }
+    executable != Path::new("codex")
+}
+
 fn parse_native_login_status_output(
     success: bool,
     stdout: &str,
@@ -1041,6 +1083,28 @@ experimental_bearer_token = "sk-relay"
             parse_native_login_status_output(true, "Unexpected auth mode", "", "exit status: 0"),
             NativeLoginStatus::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn native_login_status_tries_path_fallback_after_spawn_access_denied() {
+        let status = native_login_status_with_path_fallback_result(
+            Path::new(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.820.7780.0_x64__2p2nqsd0c76g0\app\resources\codex.exe",
+            ),
+            NativeLoginStatus::Unknown(
+                "无法运行 codex login status：拒绝访问。 (os error 5)".into(),
+            ),
+            || NativeLoginStatus::ChatGpt,
+        );
+
+        assert_eq!(status, NativeLoginStatus::ChatGpt);
+
+        let status = native_login_status_with_path_fallback_result(
+            Path::new("codex"),
+            NativeLoginStatus::Unknown("无法运行 codex login status：not found".into()),
+            || panic!("PATH fallback must not retry an identical codex executable"),
+        );
+        assert!(matches!(status, NativeLoginStatus::Unknown(_)));
     }
 
     #[test]

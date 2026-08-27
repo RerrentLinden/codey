@@ -273,6 +273,49 @@ fn account_usage_requires_both_the_display_setting_and_an_official_route() {
     assert!(!account_usage_enabled_for_config(&disabled));
 }
 
+#[test]
+fn inconclusive_official_auth_probe_keeps_active_third_party_route() {
+    let mut third_party = ProviderProfile::new("第三方线路");
+    third_party.id = "custom".to_string();
+    third_party.base_url = "https://relay.example/v1".to_string();
+    third_party.api_key = "sk-relay".to_string();
+    third_party.normalize();
+    let mut official = ProviderProfile::new("OpenAI 官方直登");
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.source_provider_id = Some("openai".to_string());
+    official.normalize();
+    let previous = CodeyConfig {
+        active_profile_id: third_party.id.clone(),
+        profiles: vec![third_party.clone()],
+        default_model: "custom/gpt-5.6-sol".to_string(),
+        initial_route_import_completed: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+
+    let next = route_config_for_official_probe(
+        &previous,
+        OfficialAccountProfileStatus::Unknown {
+            profile: official,
+            reason: "probe unavailable".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(next.active_profile_id, third_party.id);
+    assert!(
+        next.profiles
+            .iter()
+            .all(|profile| !profile.official_account)
+    );
+    assert!(!next.official_account_available_this_launch);
+    assert_eq!(
+        next.official_account_status_this_launch,
+        LaunchOfficialAccountStatus::Unknown
+    );
+    assert_eq!(next.default_model, "custom/gpt-5.6-sol");
+}
+
 #[tokio::test]
 async fn settings_bridge_matches_the_redacted_config_contract() {
     let state = Arc::new(AppState::default());

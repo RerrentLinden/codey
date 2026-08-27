@@ -925,6 +925,51 @@
         patched,
         [
           {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            replacement: (_match, assignment, _resultName, settingsName, draftName) =>
+              `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            replacement: (_match, assignment, _resultName, settingsName, draftName) =>
+              `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?!\s*&&\s*!)(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            replacement: (_match, assignment, _resultName, settingsName) =>
+              `${assignment}${settingsName}.availableOptions.length>1`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*[$A-Z_a-z][$\w]*(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            replacement: (
+              _match,
+              preservedPrefix,
+              _resultName,
+              _draftName,
+              settingsName,
+            ) => `${preservedPrefix}${settingsName}.availableOptions.length>1`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            replacement: (
+              _match,
+              assignment,
+              _resultName,
+              draftName,
+              settingsName,
+            ) => `${assignment}!${draftName}&&${settingsName}.availableOptions.length>1`,
+          },
+          {
+            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*\(?\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1\s*\)?\s*&&\s*!\s*([$A-Z_a-z][$\w]*)(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
+            replacement: (
+              _match,
+              assignment,
+              _resultName,
+              settingsName,
+              draftName,
+            ) => `${assignment}${settingsName}.availableOptions.length>1&&!${draftName}`,
+          },
+          {
             pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*)[$A-Z_a-z][$\w]*\s*&&\s*([$A-Z_a-z][$\w]*)\.availableOptions\.length\s*>\s*1(?=\s*[,;][\s\S]{0,2048}?`composer\.toggleFastMode`)/g,
             replacement: (_match, assignment, _resultName, settingsName) =>
               `${assignment}${settingsName}.availableOptions.length>1`,
@@ -943,29 +988,31 @@
         undefined,
         "model-aware service tier control",
       );
-      patched = replaceUniqueRendererGate(
-        patched,
-        [
-          {
-            pattern: /(`composer\.toggleFastMode`[\s\S]{0,512}?\{\s*enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null/g,
-            replacement: (_match, prefix, loadingName, fastOptionName) =>
-              `${prefix}!${loadingName}&&${fastOptionName}!=null`,
-          },
-          {
-            pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null(?=\s*[,;][\s\S]{0,512}?\{\s*enabled\s*:\s*\2\s*\}[\s\S]{0,512}?`composer\.toggleFastMode`)/g,
-            replacement: (
-              _match,
-              preservedPrefix,
-              _resultName,
-              _draftName,
-              loadingName,
-              fastOptionName,
-            ) => `${preservedPrefix}!${loadingName}&&${fastOptionName}!=null`,
-          },
-        ],
-        undefined,
-        "model-aware Fast toggle",
-      );
+      if (source.includes("!=null")) {
+        patched = replaceUniqueRendererGate(
+          patched,
+          [
+            {
+              pattern: /(`composer\.toggleFastMode`[\s\S]{0,512}?\{\s*enabled\s*:\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null/g,
+              replacement: (_match, prefix, loadingName, fastOptionName) =>
+                `${prefix}!${loadingName}&&${fastOptionName}!=null`,
+            },
+            {
+              pattern: /(\b([$A-Z_a-z][$\w]*)\s*=\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*)[$A-Z_a-z][$\w]*\s*&&\s*!\s*([$A-Z_a-z][$\w]*)\s*&&\s*([$A-Z_a-z][$\w]*)\s*!=\s*null(?=\s*[,;][\s\S]{0,512}?\{\s*enabled\s*:\s*\2\s*\}[\s\S]{0,512}?`composer\.toggleFastMode`)/g,
+              replacement: (
+                _match,
+                preservedPrefix,
+                _resultName,
+                _draftName,
+                loadingName,
+                fastOptionName,
+              ) => `${preservedPrefix}!${loadingName}&&${fastOptionName}!=null`,
+            },
+          ],
+          undefined,
+          "model-aware Fast toggle",
+        );
+      }
     }
     if (
       source.includes("composer.speedSlashCommand.disableDescription") &&
