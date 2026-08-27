@@ -723,9 +723,22 @@ pub(super) async fn test_notification_channel(
         .channels
         .pop()
         .expect("notification test draft must contain one channel");
-    let dispatcher =
-        NotificationDispatcher::with_client(state.webhook_http_client.clone(), channel);
+    let client = current_notification_http_client(state)?;
+    let dispatcher = NotificationDispatcher::with_client(client, channel);
     dispatcher.test().await.map_err(|error| error.to_string())
+}
+
+fn current_notification_http_client(_state: &AppState) -> Result<reqwest::Client, String> {
+    #[cfg(test)]
+    if let Some(client) = &_state.webhook_http_client_override {
+        return Ok(client.clone());
+    }
+
+    // reqwest snapshots the operating system proxy configuration when a client
+    // is built. Notifications are infrequent, so create one client per test or
+    // delivery batch instead of retaining stale proxy settings for the entire
+    // Codey process lifetime.
+    crate::notifications::notification_http_client().map_err(|error| error.to_string())
 }
 
 fn webhook_session_configuration(
@@ -901,8 +914,16 @@ async fn dispatch_webhook_channels(
         let notifications = state.webhook_notifications.lock().await;
         deliveries.retain(|(_, delivery_key)| !notifications.was_settled(delivery_key));
     }
+    if deliveries.is_empty() {
+        return Ok(());
+    }
+    let client =
+        current_notification_http_client(state).map_err(|detail| WebhookDispatchError {
+            detail: format!("创建通知网络客户端失败：{detail}"),
+            settle_delivery: false,
+        })?;
     let deliveries = deliveries.into_iter().map(|(channel, delivery_key)| {
-        let client = state.webhook_http_client.clone();
+        let client = client.clone();
         let event = event.clone();
         let state = Arc::clone(state);
         async move {
@@ -2144,11 +2165,13 @@ mod tests {
         let state = Arc::new(AppState {
             store: ConfigStore::new(directory.path().join("config.json")),
             config: RwLock::new(config),
-            webhook_http_client: reqwest::Client::builder()
-                .timeout(Duration::from_millis(50))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
+            webhook_http_client_override: Some(
+                reqwest::Client::builder()
+                    .timeout(Duration::from_millis(50))
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+            ),
             webhook_notifications: Mutex::new(WebhookNotificationState::default()),
             persisted_waiting_notifications: Mutex::new(WaitingLedgerState::default()),
             ..AppState::default()

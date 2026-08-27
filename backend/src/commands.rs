@@ -121,7 +121,8 @@ pub struct AppState {
     config_write_lock: Mutex<()>,
     provider_model_sync_lock: Mutex<()>,
     pub http_client: reqwest::Client,
-    pub webhook_http_client: reqwest::Client,
+    #[cfg(test)]
+    pub webhook_http_client_override: Option<reqwest::Client>,
     wechat_claw_login_http_client: reqwest::Client,
     account_usage_cache: Mutex<account_usage::AccountUsageCache>,
     pub runtime: Mutex<Option<Arc<CodeyRuntime>>>,
@@ -208,8 +209,8 @@ impl Default for AppState {
                 .connect_timeout(Duration::from_secs(5))
                 .build()
                 .expect("shared Codey HTTP client should be constructible"),
-            webhook_http_client: crate::notifications::notification_http_client()
-                .expect("notification HTTP client should be constructible"),
+            #[cfg(test)]
+            webhook_http_client_override: None,
             wechat_claw_login_http_client: wechat_claw_login_http_client(),
             account_usage_cache: Mutex::new(account_usage::AccountUsageCache::default()),
             runtime: Mutex::new(None),
