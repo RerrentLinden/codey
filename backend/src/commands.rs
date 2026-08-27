@@ -1792,16 +1792,18 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
 }
 
 async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
-    let config = state.config.read().await.clone();
-    if !config.show_account_usage_in_header {
-        return json!({"status": "disabled"});
-    }
-    if !account_usage_enabled_for_config(&config) {
-        return json!({
-            "status": "unavailable",
-            "reason": "official_account_missing",
-            "message": "当前线路列表中没有可用的官方账号线路",
-        });
+    {
+        let config = state.config.read().await;
+        if !config.show_account_usage_in_header {
+            return json!({"status": "disabled"});
+        }
+        if !account_usage_enabled_for_config(&config) {
+            return json!({
+                "status": "unavailable",
+                "reason": "official_account_missing",
+                "message": "当前线路列表中没有可用的官方账号线路",
+            });
+        }
     }
 
     let home = codex_home();

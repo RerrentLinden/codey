@@ -6,18 +6,12 @@
   font-synthesis: none;
   --mac-blue: #007aff;
   --mac-green: #34c759;
-  --mac-orange: #ff9500;
   --mac-red: #ff3b30;
   --mac-gray-bg: #f5f5f7;
   --mac-card-bg: #ffffff;
-  --mac-border: rgba(0, 0, 0, 0.08);
-  --mac-border-subtle: rgba(0, 0, 0, 0.04);
   --mac-text-primary: #1d1d1f;
   --mac-text-secondary: #6e6e73;
   --mac-text-tertiary: #8e8e93;
-  --success: #34c759;
-  --success-bg: rgba(52, 199, 89, 0.1);
-  --success-border: rgba(52, 199, 89, 0.25);
 }
 
 :host {
@@ -66,21 +60,7 @@ input:focus-visible,
 }
 
 .app-shell {
-  --background: #f5f5f7;
   --foreground: #1d1d1f;
-  --card: #ffffff;
-  --card-foreground: #1d1d1f;
-  --primary: #1c1c1e;
-  --primary-foreground: #ffffff;
-  --secondary: #ebebef;
-  --secondary-foreground: #3a3a3c;
-  --muted: #f2f2f7;
-  --muted-foreground: #6e6e73;
-  --accent: #e5e5ea;
-  --accent-foreground: #1d1d1f;
-  --destructive: #ff3b30;
-  --border: rgba(0, 0, 0, 0.08);
-  --input: #ffffff;
   --ring: #007aff;
   position: relative;
   display: flex;

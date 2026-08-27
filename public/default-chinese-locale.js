@@ -7,13 +7,13 @@
 
   const installDefaultChineseLocale = () => {
     const existing = window.__codeyDefaultChineseLocale;
-    if (existing?.version === 4 && existing.locale === defaultChineseLocale) {
+    if (existing?.version === 5 && existing.locale === defaultChineseLocale) {
       existing.ensureSynced?.();
       return;
     }
 
     const state = {
-      version: 4,
+      version: 5,
       locale: defaultChineseLocale,
       navigatorPatched: false,
       statsigClientsPatched: 0,
@@ -125,9 +125,67 @@
       }
     };
 
+    const wrapStatsigInstances = (instances) => {
+      if (!instances || typeof instances !== "object") return instances;
+      if (instances.__codeyDefaultChineseLocaleInstancesPatched) return instances;
+      try {
+        Object.defineProperty(instances, "__codeyDefaultChineseLocaleInstancesPatched", {
+          configurable: true,
+          enumerable: false,
+          value: true,
+        });
+      } catch {
+        return instances;
+      }
+      if (typeof Proxy !== "function") return instances;
+      try {
+        return new Proxy(instances, {
+          set(target, property, value) {
+            target[property] = value;
+            if (property !== "__codeyDefaultChineseLocaleInstancesPatched") {
+              patchStatsigClient(value);
+            }
+            return true;
+          },
+        });
+      } catch {
+        return instances;
+      }
+    };
+
+    const wrapStatsigRootInstances = (root) => {
+      let instances;
+      try {
+        instances = root.instances;
+      } catch {
+        return;
+      }
+      const assignInstances = (next) => {
+        instances = wrapStatsigInstances(next);
+        if (!instances || typeof instances !== "object") return;
+        try {
+          for (const client of Object.values(instances)) patchStatsigClient(client);
+        } catch {
+        }
+      };
+      assignInstances(instances);
+      try {
+        Object.defineProperty(root, "instances", {
+          configurable: true,
+          get: () => instances,
+          set: assignInstances,
+        });
+      } catch {
+      }
+    };
+
     const patchStatsigRoot = (root) => {
       if (!root || typeof root !== "object") return;
-      if (root.__codeyDefaultChineseLocaleRootPatched) return;
+      if (root.__codeyDefaultChineseLocaleRootPatched) {
+        state.statsigRootPatched = true;
+        wrapStatsigRootInstances(root);
+        return;
+      }
       root.__codeyDefaultChineseLocaleRootPatched = true;
       state.statsigRootPatched = true;
       for (const key of ["firstInstance", "instance"]) {
@@ -150,6 +208,7 @@
         } catch {
         }
       }
+      wrapStatsigRootInstances(root);
     };
 
     const installStatsigRootSetter = () => {
@@ -335,11 +394,10 @@
     const startedAt = Date.now();
     const scanStatsigUntilReady = () => {
       patchStatsigClients();
-      const elapsed = Date.now() - startedAt;
-      if (elapsed >= 15000) return;
-      window.setTimeout?.(scanStatsigUntilReady, elapsed < 1000 ? 50 : 250);
+      if (Date.now() - startedAt >= 15000) return;
+      window.setTimeout?.(scanStatsigUntilReady, 250);
     };
-    window.setTimeout?.(scanStatsigUntilReady, 50);
+    window.setTimeout?.(scanStatsigUntilReady, 250);
   };
 
   installDefaultChineseLocale();

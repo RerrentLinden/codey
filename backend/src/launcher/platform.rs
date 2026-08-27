@@ -425,6 +425,7 @@ pub(super) async fn terminate_windows_codex_processes(
         let current_processes = codey_runtime_core::windows_enumerate_processes();
         let current = current_processes
             .iter()
+            .filter(|process| process_ids.contains(&process.process_id))
             .map(|process| {
                 (
                     process.process_id,

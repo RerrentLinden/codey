@@ -99,6 +99,10 @@ export class FakeElementCore {
   matches(selector) {
     const candidate = String(selector).trim();
     if (!candidate) return false;
+    const alternatives = candidate.split(",").map((part) => part.trim()).filter(Boolean);
+    if (alternatives.length > 1) {
+      return alternatives.some((part) => this.matches(part));
+    }
     if (candidate.startsWith("#")) return this.id === candidate.slice(1);
     const classContains = candidate.match(/^\[class\*=(['"]?)([^\]'"]+)\1\]$/)?.[2];
     if (classContains) return String(this.className || "").includes(classContains);

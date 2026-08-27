@@ -88,6 +88,7 @@ test("renderer core waits for sidebar interaction before loading session tools",
     /attributeFilter:\s*\[([\s\S]*?)\],\s*childList:\s*true/,
   )?.[1] ?? "";
   assert.match(sessionObserverFilter, /"class"/);
+  assert.match(sessionObserverFilter, /"aria-describedby"/);
   assert.doesNotMatch(sessionObserverFilter, /"style"/);
   assert.doesNotMatch(
     sessionTools,
@@ -97,6 +98,7 @@ test("renderer core waits for sidebar interaction before loading session tools",
     /new MutationObserver\(\(mutations\) => \{([\s\S]*?)\}\)\.observe\(document\.documentElement/,
   )?.[1] ?? "";
   assert.match(sessionObserverBody, /addPendingScanRoot\(threadRow\)/);
+  assert.match(sessionObserverBody, /syncConversationRichTooltipOpen\(target\)/);
   assert.doesNotMatch(sessionObserverBody, /syncSidebarThreadTimeState\(threadRow\)/);
   const modelWhitelist = await readFile(
     new URL("public/model-whitelist-inject.js", root),
@@ -105,6 +107,13 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(modelWhitelist, /const maxTrackedModelListRequests = 256/);
   assert.match(modelWhitelist, /const maxKnownModelQueryClients = 8/);
   assert.match(modelWhitelist, /knownModelQueryClients\.delete\(client\)/);
+  assert.match(modelWhitelist, /dispatcher\.subscribe\(handleGroupedMenuMutations/);
+  assert.match(modelWhitelist, /groupedMenuObserver\.observe\(document\.body, \{/);
+  assert.doesNotMatch(
+    modelWhitelist,
+    /groupedMenuObserver\.observe\(document\.body, \{[\s\S]*?characterData:\s*true/,
+  );
+  assert.match(modelWhitelist, /characterData:\s*true/);
   assert.doesNotMatch(inject, /__codeyBlockNativePetControls/);
   assert.match(petShield, /const block = \(root = document\)/);
   assert.match(petShield, /if \(!enabled\) \{/);
@@ -159,10 +168,59 @@ test("locale bootstrap patches navigator and Statsig independently from renderer
   assert.equal(dynamicConfig.get("locale_source", ""), "SYSTEM");
   assert.equal(firstState.snapshot().locale, "zh-CN");
   assert.equal(firstState.snapshot().statsigClientsPatched, 1);
+  assert.match(localeSource, /window\.setTimeout\?\.\(scanStatsigUntilReady, 250\)/);
+  assert.doesNotMatch(localeSource, /elapsed < 1000 \? 50/);
+  assert.match(localeSource, /wrapStatsigRootInstances/);
 
   vm.runInNewContext(localeSource, sandbox);
   assert.equal(window.__codeyDefaultChineseLocale, firstState);
   assert.equal(firstState.snapshot().statsigClientsPatched, 1);
+});
+
+test("locale bootstrap patches Statsig instances added in place without a 50ms burst", async () => {
+  const localeSource = await readFile(new URL("public/default-chinese-locale.js", root), "utf8");
+
+  function Navigator() {}
+  const dynamicConfig = {
+    value: {},
+    get(key, fallback) {
+      return this.value[key] ?? fallback;
+    },
+  };
+  const statsigClient = {
+    getDynamicConfig() {
+      return dynamicConfig;
+    },
+  };
+  const lateClient = {
+    getDynamicConfig() {
+      return dynamicConfig;
+    },
+  };
+  const instances = {};
+  const window = {
+    __codeySharedRuntime: {
+      statsigClients: () => [statsigClient, ...Object.values(instances).filter(Boolean)],
+    },
+    addEventListener() {},
+    navigator: Object.create(Navigator.prototype),
+    __STATSIG__: {
+      firstInstance: statsigClient,
+      instances,
+    },
+  };
+  window.window = window;
+  const sandbox = {
+    console: { warn() {} },
+    Navigator,
+    Proxy,
+    window,
+  };
+
+  vm.runInNewContext(localeSource, sandbox);
+  window.__STATSIG__.instances.late = lateClient;
+  assert.equal(lateClient.__codeyDefaultChineseLocalePatched, true);
+  assert.equal(window.__codeyDefaultChineseLocale.snapshot().statsigClientsPatched, 2);
 });
 
 test("plugin bridge fast-paths unrelated IPC payloads without a DOM observer", async () => {

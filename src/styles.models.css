@@ -632,7 +632,6 @@
 }
 
 .official-route-summary,
-.official-usage-setting,
 .official-model-editor-heading,
 .official-model-option {
   display: flex;
@@ -641,8 +640,7 @@
   gap: 12px;
 }
 
-.official-route-summary,
-.official-usage-setting {
+.official-route-summary {
   min-height: 56px;
   border: 1px solid rgba(0, 0, 0, 0.07);
   border-radius: 10px;
@@ -651,7 +649,6 @@
 }
 
 .official-route-summary > span,
-.official-usage-setting > span,
 .official-model-editor-heading > span,
 .official-model-option > span {
   display: grid;
@@ -660,7 +657,6 @@
 }
 
 .official-route-summary strong,
-.official-usage-setting strong,
 .official-model-editor-heading strong,
 .official-model-option strong {
   color: var(--mac-text-primary);
@@ -669,7 +665,6 @@
 }
 
 .official-route-summary small,
-.official-usage-setting small,
 .official-model-editor-heading small,
 .official-model-option small {
   color: var(--mac-text-secondary);
@@ -720,15 +715,6 @@
 
 .route-editor-footer {
   margin-top: 16px;
-}
-
-.catalog-model-delete {
-  color: #d70015;
-}
-
-.catalog-model-delete svg {
-  width: 14px;
-  height: 14px;
 }
 
 .readonly-note {

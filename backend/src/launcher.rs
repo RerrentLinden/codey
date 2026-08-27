@@ -21,7 +21,8 @@ use tokio::sync::{Mutex, RwLock, oneshot};
 use crate::cdp;
 use crate::codex_config::{
     BUILTIN_OPENAI_PROVIDER_ID, RuntimeRouterConfigOptions, apply_runtime_router_config,
-    codex_home, restore_runtime_config as restore_codex_runtime_config,
+    codex_home, prepare_persistent_router_resume_shim as prepare_codex_router_resume_shim,
+    restore_runtime_config as restore_codex_runtime_config, user_owned_router_provider_occupies_id,
 };
 use crate::config::{CodeyConfig, GpuLaunchMode, ProviderProfile};
 use crate::crashpad_pending_guard::{self, CrashpadPendingStatsHandle};
@@ -168,14 +169,10 @@ fn persistent_session_provider(home: &std::path::Path) -> Result<String> {
         .load()
         .context("读取 Codex 持久配置失败")?;
     let document = snapshot.document();
-    if document
-        .get("model_providers")
-        .and_then(toml_edit::Item::as_table_like)
-        .and_then(|providers| providers.get(ROUTER_PROVIDER_ID))
-        .is_some()
-    {
-        // Runtime setup rejects this reserved id too, but session maintenance
-        // is permanent and therefore must not run before the same validation.
+    if user_owned_router_provider_occupies_id(document) {
+        // Runtime setup rejects a user-owned collision too, but session
+        // maintenance is permanent and therefore must not run before the
+        // same validation. Codey-owned resume shims are not occupancy.
         anyhow::bail!(
             "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
             ROUTER_PROVIDER_ID
@@ -1410,14 +1407,13 @@ impl CodeyRuntime {
         );
         let initial_storage_guards = spawn_initial_storage_guards(home, config);
         let startup_profile = resolve_startup_profile(config)?;
-        // Threads created or resumed under Codey persist the launch-only
-        // `codey_router` provider id in rollout headers and the Codex thread
-        // index. Codex resolves that id only from Codey's process-level
-        // overrides, so any Codex started outside Codey (the user's own
-        // ChatGPT desktop app, or a relaunch after a failed Codey start)
-        // refuses those threads with "Model provider `codey_router` not
-        // found". Every launch therefore syncs thread records back to a
-        // persistent provider, for official and third-party routes alike.
+        // Threads created or resumed under Codey persist `codey_router` in
+        // rollout headers and the Codex thread index. Codex Desktop resolves
+        // that id from disk config; process `-c` overlays only exist while
+        // Codey is running. Install a non-loopback disk shim first so those
+        // threads remain loadable, then still sync records back to the
+        // user's persistent provider for official and third-party routes.
+        prepare_persistent_router_resume_shim(home).await?;
         let persistent_session_provider = resolve_persistent_session_provider(home).await?;
         let session_provider_sync_target = Some(persistent_session_provider.as_str());
         let storage = prepare_startup_storage(
@@ -1688,6 +1684,30 @@ mod maintenance_status_tests;
 
 pub async fn restore_previous_runtime_state(home: &std::path::Path) -> Result<()> {
     restore_runtime_config(home).await
+}
+
+pub async fn prepare_persistent_router_resume_shim(home: &std::path::Path) -> Result<()> {
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || prepare_persistent_router_resume_shim_blocking(&home))
+        .await
+        .context("写入 codey_router 恢复兼容桩任务异常退出")?
+}
+
+fn prepare_persistent_router_resume_shim_blocking(home: &std::path::Path) -> Result<()> {
+    let result = prepare_codex_router_resume_shim(home)
+        .map(|_| ())
+        .context("写入 codey_router 恢复兼容桩失败");
+    if let Err(error) = &result {
+        error_log::record_failure(
+            "patch_failed",
+            "prepare_persistent_router_resume_shim",
+            format!("{error:#}"),
+            serde_json::json!({
+                "codexHome": home,
+            }),
+        );
+    }
+    result
 }
 
 pub async fn restore_runtime_config(home: &std::path::Path) -> Result<()> {

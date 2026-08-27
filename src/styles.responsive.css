@@ -9,14 +9,6 @@
 }
 
 @media (max-width: 900px) {
-  .provider-summary {
-    grid-template-columns: 1fr;
-  }
-
-  .provider-meta {
-    grid-template-columns: repeat(2, 1fr);
-  }
-
   .route-manager {
     grid-template-columns: 1fr;
   }
@@ -81,17 +73,8 @@
     flex-wrap: wrap;
   }
 
-  .model-groups {
-    grid-template-columns: 1fr;
-  }
-
-  .route-form-grid,
   .route-editor-row-names {
     grid-template-columns: 1fr;
-  }
-
-  .route-field-wide {
-    grid-column: span 1;
   }
 
   .route-heading-actions,

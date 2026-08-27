@@ -19,7 +19,7 @@ async function loadPatch(
   const timers = new Map();
   const windowListeners = new Map();
   const documentListeners = new Map();
-  const mutationObserverOptions = [];
+  const mutationObserverInstalls = [];
   const dispatchedEvents = [];
   let wildcardScanCount = 0;
   const body = documentBody || {};
@@ -101,13 +101,21 @@ async function loadPatch(
     MutationObserver: class MutationObserver {
       constructor(callback) {
         this.callback = callback;
+        this.disconnected = false;
       }
 
-      observe(_target, options) {
-        mutationObserverOptions.push(options);
+      observe(target, options) {
+        mutationObserverInstalls.push({
+          callback: this.callback,
+          observer: this,
+          options,
+          target,
+        });
       }
 
-      disconnect() {}
+      disconnect() {
+        this.disconnected = true;
+      }
     },
   };
   if (storage) window.localStorage = storage;
@@ -145,8 +153,17 @@ async function loadPatch(
     wildcardScanCount() {
       return wildcardScanCount;
     },
+    mutationObserverInstalls() {
+      return mutationObserverInstalls;
+    },
     mutationObserverOptions() {
-      return mutationObserverOptions;
+      return mutationObserverInstalls.map((install) => install.options);
+    },
+    dispatchObserverMutations(target, mutations) {
+      for (const install of mutationObserverInstalls) {
+        if (install.observer.disconnected || install.target !== target) continue;
+        install.callback(mutations);
+      }
     },
     async runNextTimer() {
       const next = timers.entries().next().value;
@@ -362,7 +379,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "35");
+  assert.equal(patch.version, "37");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -2175,6 +2192,9 @@ test("model picker menu groups models under route headings without changing mode
 
 test("model picker observes row text changes after a route rename", async () => {
   const body = new FakeElementCore("body", { connected: true });
+  const menu = body.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
   const runtime = await loadPatch({
     status: "ok",
     models: ["relay/gpt-5.6-sol"],
@@ -2189,11 +2209,83 @@ test("model picker observes row text changes after a route rename", async () => 
     }],
   }, [statsigClient()], { documentBody: body });
 
-  assert.deepEqual(runtime.mutationObserverOptions(), [{
+  const installs = runtime.mutationObserverInstalls();
+  assert.equal(installs.length, 2);
+  assert.equal(installs[0].target, body);
+  assert.deepEqual(installs[0].options, {
+    childList: true,
+    subtree: true,
+  });
+  assert.equal(installs[1].target, menu);
+  assert.deepEqual(installs[1].options, {
     childList: true,
     characterData: true,
     subtree: true,
+  });
+  runtime.patch.dispose();
+});
+
+test("model picker attaches text observers when a menu mounts later", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["relay/gpt-5.6-sol"],
+    default_model: "relay/gpt-5.6-sol",
+    model_metadata: [{
+      model: "relay/gpt-5.6-sol",
+      display_name: "[新线] gpt-5.6-sol",
+      route_name: "新线路",
+      route_prefix: "新线",
+      provider_id: "relay",
+      source_model: "gpt-5.6-sol",
+    }],
+  }, [statsigClient()], { documentBody: body });
+
+  assert.equal(runtime.mutationObserverInstalls().length, 1);
+  const menu = new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  });
+  body.appendChild(menu);
+  runtime.dispatchObserverMutations(body, [{
+    addedNodes: [menu],
+    removedNodes: [],
+    target: body,
+    type: "childList",
   }]);
+  const installs = runtime.mutationObserverInstalls();
+  assert.equal(installs.length, 2);
+  assert.equal(installs[1].target, menu);
+  assert.equal(installs[1].options.characterData, true);
+  runtime.patch.dispose();
+});
+
+test("model picker ignores streaming mutations outside the picker", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const turn = body.appendChild(new FakeElementCore("div", {
+    attributes: { "data-turn-key": "t1" },
+  }));
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["relay/gpt-5.6-sol"],
+    default_model: "relay/gpt-5.6-sol",
+    model_metadata: [{
+      model: "relay/gpt-5.6-sol",
+      display_name: "[新线] gpt-5.6-sol",
+      route_name: "新线路",
+      route_prefix: "新线",
+      provider_id: "relay",
+      source_model: "gpt-5.6-sol",
+    }],
+  }, [statsigClient()], { documentBody: body });
+
+  assert.equal(runtime.mutationObserverInstalls().length, 1);
+  runtime.dispatchObserverMutations(body, [{
+    addedNodes: [new FakeElementCore("span")],
+    removedNodes: [],
+    target: turn,
+    type: "childList",
+  }]);
+  assert.equal(runtime.mutationObserverInstalls().length, 1);
   runtime.patch.dispose();
 });
 

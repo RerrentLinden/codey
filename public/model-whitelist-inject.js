@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "35";
+  const patchVersion = "37";
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
   const legacyOfficialRouteProviderIds = new Set([
@@ -84,6 +84,7 @@
   let patchedDispatchEvent = null;
   let groupedMenuTimer = 0;
   let groupedMenuObserver = null;
+  const groupedMenuTextObservers = new Map();
   const patchedProviderKey = Symbol("codeyPatchedModelProvider");
   const patchedRouteKey = Symbol("codeyPatchedRoute");
   const blockedProviderRequestKey = Symbol("codeyBlockedProviderRequest");
@@ -1127,22 +1128,113 @@
     }, 0);
   };
 
-  const installGroupedModelMenuObserver = () => {
+  const groupedMenuElement = (node) => {
+    if (node && typeof node.matches === "function") return node;
+    const parent = node?.parentElement;
+    return parent && typeof parent.matches === "function" ? parent : null;
+  };
+
+  const groupedMenuContainer = (node) => {
+    const element = groupedMenuElement(node);
+    if (!element) return null;
+    if (element.matches?.(groupedMenuSelector)) return element;
+    return element.closest?.(groupedMenuSelector) || null;
+  };
+
+  const menusWithin = (node) => {
+    const element = groupedMenuElement(node);
+    if (!element) return [];
+    const menus = [];
+    if (element.matches?.(groupedMenuSelector)) menus.push(element);
+    if (typeof element.querySelectorAll === "function") {
+      menus.push(...element.querySelectorAll(groupedMenuSelector));
+    }
+    return menus;
+  };
+
+  const stopGroupedMenuTextObserver = (container) => {
+    const observer = groupedMenuTextObservers.get(container);
+    if (!observer) return;
+    observer.disconnect?.();
+    groupedMenuTextObservers.delete(container);
+  };
+
+  const observeGroupedMenuText = (container) => {
+    if (!container || disposed || groupedMenuTextObservers.has(container)) return;
     const MutationObserver = window.MutationObserver || globalThis.MutationObserver;
-    if (
-      groupedMenuObserver
-      || typeof MutationObserver !== "function"
-      || !document.body
-    ) return;
-    groupedMenuObserver = new MutationObserver(scheduleGroupedModelMenuEnhancement);
-    // Route saves can make React update only a menu row's text node. Watching
-    // child-list mutations alone misses that repaint, so the new short-name
-    // label remains ungrouped until the picker is reopened.
-    groupedMenuObserver.observe(document.body, {
+    if (typeof MutationObserver !== "function") return;
+    const observer = new MutationObserver(scheduleGroupedModelMenuEnhancement);
+    // Route saves can rewrite only a menu row's text node. CharacterData has
+    // to stay on the open picker, otherwise the short-name label stays
+    // ungrouped until the menu is reopened.
+    observer.observe(container, {
       childList: true,
       characterData: true,
       subtree: true,
     });
+    groupedMenuTextObservers.set(container, observer);
+  };
+
+  const syncGroupedMenuTextObservers = (roots = []) => {
+    if (disposed) return;
+    const menus = roots.length > 0
+      ? roots.flatMap(menusWithin)
+      : Array.from(document.querySelectorAll?.(groupedMenuSelector) || []);
+    for (const menu of menus) observeGroupedMenuText(menu);
+  };
+
+  const handleGroupedMenuMutations = (mutations) => {
+    if (disposed) return;
+    const discoveredMenus = [];
+    let relevant = false;
+    for (const mutation of mutations) {
+      const targetMenu = groupedMenuContainer(mutation.target);
+      if (targetMenu) {
+        relevant = true;
+        discoveredMenus.push(targetMenu);
+      }
+      if (mutation.type === "characterData") continue;
+      for (const node of mutation.addedNodes || []) {
+        const menus = menusWithin(node);
+        if (menus.length === 0) continue;
+        relevant = true;
+        discoveredMenus.push(...menus);
+      }
+      for (const node of mutation.removedNodes || []) {
+        for (const menu of menusWithin(node)) {
+          stopGroupedMenuTextObserver(menu);
+        }
+      }
+    }
+    if (discoveredMenus.length) syncGroupedMenuTextObservers(discoveredMenus);
+    for (const container of [...groupedMenuTextObservers.keys()]) {
+      if (container.isConnected === false) stopGroupedMenuTextObserver(container);
+    }
+    if (relevant) scheduleGroupedModelMenuEnhancement();
+  };
+
+  const installGroupedModelMenuObserver = () => {
+    if (groupedMenuObserver || !document.body) return;
+    const dispatcher = window.__codeyMutationDispatcher;
+    if (typeof dispatcher?.subscribe === "function") {
+      const unsubscribe = dispatcher.subscribe(handleGroupedMenuMutations, {
+        childList: true,
+      });
+      if (dispatcher.snapshot?.().observerInstalled) {
+        groupedMenuObserver = { disconnect: unsubscribe };
+        syncGroupedMenuTextObservers();
+        return;
+      }
+      unsubscribe?.();
+    }
+    const MutationObserver = window.MutationObserver || globalThis.MutationObserver;
+    if (typeof MutationObserver !== "function") return;
+    groupedMenuObserver = new MutationObserver(handleGroupedMenuMutations);
+    groupedMenuObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+    });
+    syncGroupedMenuTextObservers();
   };
 
   const reactFiberKeys = (element) =>
@@ -2169,6 +2261,10 @@
       document.getElementById?.("codey-provider-mismatch-notice")?.remove?.();
       groupedMenuObserver?.disconnect?.();
       groupedMenuObserver = null;
+      for (const observer of groupedMenuTextObservers.values()) {
+        observer.disconnect?.();
+      }
+      groupedMenuTextObservers.clear();
       interactionEvents.forEach((eventName) => {
         document.removeEventListener(eventName, handleInteraction, true);
       });

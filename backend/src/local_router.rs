@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -694,20 +694,21 @@ impl RouterServer {
             .await?;
             return Ok(());
         }
-        let route_hint = match take_codey_route_metadata(&mut request, &mut body) {
-            Ok(route_hint) => route_hint,
-            Err(error) => {
-                write_error_response(
-                    &mut stream,
-                    400,
-                    "route_metadata_invalid",
-                    format!("Codey 线路元数据无效：{error:#}"),
-                    None,
-                )
-                .await?;
-                return Ok(());
-            }
-        };
+        let (route_hint, mut body_mutated) =
+            match take_codey_route_metadata(&mut request, &mut body) {
+                Ok(extracted) => extracted,
+                Err(error) => {
+                    write_error_response(
+                        &mut stream,
+                        400,
+                        "route_metadata_invalid",
+                        format!("Codey 线路元数据无效：{error:#}"),
+                        None,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
         let binding_keys = request_binding_keys(&request);
         let snapshot = Arc::clone(
             &self
@@ -752,6 +753,7 @@ impl RouterServer {
                     "model".to_string(),
                     Value::String(resolved.upstream_model.clone()),
                 );
+            body_mutated = true;
         }
         let stream_requested = body
             .as_object()
@@ -860,13 +862,22 @@ impl RouterServer {
             };
             headers.insert(AUTHORIZATION, value);
         }
+        let mut request_builder = self.client.post(upstream_url).headers(headers);
+        request_builder = if should_passthrough_native_responses(
+            bridge,
+            &model,
+            resolved.upstream_model.as_str(),
+            body_mutated,
+        ) {
+            request_builder
+                .header(CONTENT_TYPE, "application/json")
+                .body(std::mem::take(&mut request.body))
+        } else {
+            request_builder.json(&upstream_body)
+        };
         let response = match tokio::time::timeout(
             UPSTREAM_RESPONSE_HEADER_TIMEOUT,
-            self.client
-                .post(upstream_url)
-                .headers(headers)
-                .json(&upstream_body)
-                .send(),
+            request_builder.send(),
         )
         .await
         {
@@ -993,8 +1004,9 @@ fn request_binding_keys(request: &HttpRequest) -> Vec<String> {
 fn take_codey_route_metadata(
     request: &mut HttpRequest,
     body: &mut Value,
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, bool)> {
     let mut route_hint = None;
+    let mut body_mutated = false;
     for (name, value) in &mut request.headers {
         if !name.eq_ignore_ascii_case(TURN_METADATA_HEADER) {
             continue;
@@ -1013,9 +1025,12 @@ fn take_codey_route_metadata(
         .and_then(|body| body.get_mut("client_metadata"))
         .and_then(Value::as_object_mut)
     else {
-        return Ok(route_hint);
+        return Ok((route_hint, false));
     };
     let direct = client_metadata.remove(ROUTE_METADATA_KEY);
+    if direct.is_some() {
+        body_mutated = true;
+    }
     merge_route_hint(
         &mut route_hint,
         direct.map(validated_route_hint_value).transpose()?,
@@ -1024,19 +1039,39 @@ fn take_codey_route_metadata(
         let extracted = match metadata {
             Value::String(serialized) => {
                 let Ok(mut parsed) = serde_json::from_str::<Value>(serialized) else {
-                    return Ok(route_hint);
+                    return Ok((route_hint, body_mutated));
                 };
                 let extracted = take_route_hint_from_metadata_value(&mut parsed)?;
-                *serialized = serde_json::to_string(&parsed)
-                    .context("序列化清理后的 Responses client metadata 失败")?;
+                if extracted.is_some() {
+                    *serialized = serde_json::to_string(&parsed)
+                        .context("序列化清理后的 Responses client metadata 失败")?;
+                    body_mutated = true;
+                }
                 extracted
             }
-            Value::Object(_) => take_route_hint_from_metadata_value(metadata)?,
+            Value::Object(_) => {
+                let extracted = take_route_hint_from_metadata_value(metadata)?;
+                if extracted.is_some() {
+                    body_mutated = true;
+                }
+                extracted
+            }
             _ => None,
         };
         merge_route_hint(&mut route_hint, extracted)?;
     }
-    Ok(route_hint)
+    Ok((route_hint, body_mutated))
+}
+
+fn should_passthrough_native_responses(
+    bridge: ProtocolBridge,
+    requested_model: &str,
+    upstream_model: &str,
+    body_mutated: bool,
+) -> bool {
+    matches!(bridge, ProtocolBridge::NativeResponses)
+        && requested_model == upstream_model
+        && !body_mutated
 }
 
 fn take_route_hint_from_metadata_value(metadata: &mut Value) -> Result<Option<String>> {
@@ -7091,9 +7126,10 @@ mod tests {
             }
         });
 
-        let route = take_codey_route_metadata(&mut request, &mut body).unwrap();
+        let (route, body_mutated) = take_codey_route_metadata(&mut request, &mut body).unwrap();
 
         assert_eq!(route.as_deref(), Some("route-a"));
+        assert!(body_mutated);
         let header = serde_json::from_str::<Value>(&request.headers[0].1).unwrap();
         assert!(header.get(ROUTE_METADATA_KEY).is_none());
         assert_eq!(header["keep"], "header");
@@ -7105,6 +7141,60 @@ mod tests {
         .unwrap();
         assert!(nested.get(ROUTE_METADATA_KEY).is_none());
         assert_eq!(nested["keep"], "body");
+    }
+
+    #[test]
+    fn codey_route_metadata_header_only_does_not_mark_the_body_mutated() {
+        let mut request = HttpRequest {
+            method: "POST".into(),
+            path: "/v1/responses".into(),
+            headers: vec![(
+                TURN_METADATA_HEADER.into(),
+                json!({ROUTE_METADATA_KEY:"route-a","keep":"header"}).to_string(),
+            )],
+            body: Vec::new(),
+            _body_budget_permit: None,
+        };
+        let mut body = json!({
+            "model": "gpt-5.4",
+            "client_metadata": {
+                "keep": "body"
+            }
+        });
+
+        let (route, body_mutated) = take_codey_route_metadata(&mut request, &mut body).unwrap();
+
+        assert_eq!(route.as_deref(), Some("route-a"));
+        assert!(!body_mutated);
+        assert_eq!(body["client_metadata"]["keep"], "body");
+    }
+
+    #[test]
+    fn native_responses_passthrough_skips_reserialize_when_unmodified() {
+        assert!(should_passthrough_native_responses(
+            ProtocolBridge::NativeResponses,
+            "gpt-5.4",
+            "gpt-5.4",
+            false,
+        ));
+        assert!(!should_passthrough_native_responses(
+            ProtocolBridge::NativeResponses,
+            "alias/gpt-5.4",
+            "gpt-5.4",
+            false,
+        ));
+        assert!(!should_passthrough_native_responses(
+            ProtocolBridge::NativeResponses,
+            "gpt-5.4",
+            "gpt-5.4",
+            true,
+        ));
+        assert!(!should_passthrough_native_responses(
+            ProtocolBridge::ResponsesToChatCompletions,
+            "gpt-5.4",
+            "gpt-5.4",
+            false,
+        ));
     }
 
     #[test]

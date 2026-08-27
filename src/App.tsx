@@ -217,7 +217,6 @@ export function App({
   } = useModelSelection({
     config,
     officialAccountAvailable: status.officialAccountAvailable === true,
-    provider,
     runOperation,
     setPersistedConfig,
     setStatus,

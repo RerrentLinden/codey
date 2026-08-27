@@ -915,7 +915,6 @@ fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> Strin
     : "";
   let snapshot = null;
   let delivery = null;
-  let deferredDelivery = null;
   let lastError = "模型白名单补丁尚未就绪";
   for (const delay of [0, 80, 200, 500, 1000, 2000]) {{
     if (delay > 0) {{
@@ -942,10 +941,9 @@ fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> Strin
       }} else if (reachedActiveModelPicker(delivery)) {{
         return JSON.stringify({{ ok: true, delivered: "active", snapshot, delivery }});
       }} else if (catalogAccepted(delivery)) {{
-        // Keep retrying: a cold renderer may still mount the model query
-        // within this window, which turns the delivery fully active.
-        deferredDelivery = delivery;
-        lastError = "未能刷新 Codex 当前对话的模型查询缓存";
+        // Catalog is on the transport patch; waiting for a mounted picker
+        // would only upgrade deferred to active while holding evaluate open.
+        return JSON.stringify({{ ok: true, delivered: "deferred", snapshot, delivery }});
       }} else if (delivery?.responsePatchInstalled !== true) {{
         lastError = "模型响应补丁未安装";
       }} else if (Number(delivery.statsigClients) < 1) {{
@@ -956,9 +954,6 @@ fn model_whitelist_refresh_script(expected_catalog: &serde_json::Value) -> Strin
     }} catch (error) {{
       lastError = error instanceof Error ? error.message : String(error);
     }}
-  }}
-  if (deferredDelivery) {{
-    return JSON.stringify({{ ok: true, delivered: "deferred", snapshot, delivery: deferredDelivery }});
   }}
   return JSON.stringify({{ ok: false, error: `${{lastError}}${{deliverySummary(delivery)}}`, snapshot, delivery }});
 }})()"#
@@ -1526,8 +1521,13 @@ mod tests {
         assert!(script.contains(r#"provider-\"quoted"#));
         assert!(script.contains("snapshot.defaultModel === expectedDefaultModel"));
         assert!(script.contains("delivery.queryEntries"));
-        assert!(script.contains("delivered: \"deferred\""));
         assert!(script.contains("catalogAccepted"));
+        assert!(script.contains("} else if (catalogAccepted(delivery)) {"));
+        assert!(script.contains(
+            "return JSON.stringify({ ok: true, delivered: \"deferred\", snapshot, delivery });"
+        ));
+        assert!(!script.contains("deferredDelivery"));
+        assert!(!script.contains("Keep retrying"));
     }
 
     #[test]

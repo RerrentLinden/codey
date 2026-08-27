@@ -547,26 +547,6 @@
   line-height: 1.45;
 }
 
-.notification-reveal-loading {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  min-height: 100px;
-  margin-top: 16px;
-  border: 1px dashed rgba(0, 0, 0, 0.14);
-  border-radius: 10px;
-  color: #6e6e73;
-  font-size: 12px;
-}
-
-.notification-reveal-error {
-  margin: 12px 0 0;
-  color: #d70015;
-  font-size: 11px;
-  line-height: 1.5;
-}
-
 .inline-result {
   font-size: 11px;
   color: #6e6e73;

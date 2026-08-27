@@ -11,7 +11,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use anyhow::{Context, Result, bail};
 use codey_runtime_core::config_manager::ConfigManager;
 use serde::{Deserialize, Serialize};
-use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, Value, value};
+use toml_edit::{
+    Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value, value,
+};
 
 #[cfg(test)]
 use crate::codex_config_guidance::PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT;
@@ -51,6 +53,7 @@ use subagent_control::{disable_subagent_control_mcp, enable_subagent_control_mcp
 
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(crate) const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
+const LOCAL_ROUTER_PROVIDER_NAME: &str = "Codey Local Router";
 const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
 const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_ARG_MARKER: &str = "--codey-fastctx-mcp";
@@ -344,12 +347,7 @@ fn apply_isolated_runtime_router_config(
     let existing = str::from_utf8(original_config.as_deref().unwrap_or_default())
         .context("Codex config.toml 不是 UTF-8")?;
     let persistent = parse_document(existing).context("解析 Codex config.toml 失败")?;
-    if persistent
-        .get("model_providers")
-        .and_then(Item::as_table)
-        .and_then(|providers| providers.get(local_router::ROUTER_PROVIDER_ID))
-        .is_some()
-    {
+    if user_owned_router_provider_occupies_id(&persistent) {
         anyhow::bail!(
             "Codex config.toml 已占用 Codey 内部 Provider ID「{}」；请先重命名该自定义 Provider",
             local_router::ROUTER_PROVIDER_ID
@@ -1174,7 +1172,17 @@ fn repair_persistent_codey_runtime_config(home: &Path) -> Result<bool> {
         return Ok(false);
     }
     let mut document = snapshot.document().clone();
-    if !remove_persistent_codey_runtime_config(&mut document, home) {
+    let codey_router_owned = codey_router_provider_is_codey_owned(&document);
+    let codey_router_dangling = persistent_codey_router_selection_is_dangling(&document);
+    let removed = remove_persistent_codey_runtime_config(&mut document, home);
+    let shimmed = if user_owned_router_provider_occupies_id(&document) {
+        false
+    } else if codey_router_owned || codey_router_dangling {
+        ensure_persistent_router_resume_shim(&mut document)?
+    } else {
+        false
+    };
+    if !removed && !shimmed {
         return Ok(false);
     }
     manager.replace_document(
@@ -1186,33 +1194,50 @@ fn repair_persistent_codey_runtime_config(home: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Codex Desktop looks up a thread's saved `model_provider` in disk config
+/// (process `-c` overlays only exist while Codey is running). Older releases
+/// stamped launch-only `codey_router` into rollout/SQLite, then deleted that
+/// provider table on repair. A non-loopback, non-secret disk shim keeps those
+/// threads loadable without selecting `codey_router` as the user's provider.
+pub fn prepare_persistent_router_resume_shim(home: &Path) -> Result<bool> {
+    let marker = lease_marker_path();
+    let _runtime_config_lock = RuntimeConfigLock::acquire(&marker)?;
+    prepare_persistent_router_resume_shim_at(home)
+}
+
+pub(crate) fn prepare_persistent_router_resume_shim_at(home: &Path) -> Result<bool> {
+    let config_path = home.join("config.toml");
+    let manager = ConfigManager::new(&config_path);
+    let snapshot = manager.load()?;
+    if !snapshot.exists() {
+        return Ok(false);
+    }
+    let mut document = snapshot.document().clone();
+    if user_owned_router_provider_occupies_id(&document) {
+        return Ok(false);
+    }
+    if !ensure_persistent_router_resume_shim(&mut document)? {
+        return Ok(false);
+    }
+    manager.replace_document(
+        Some(snapshot.revision()),
+        document,
+        "install persistent codey_router resume shim",
+        "codex_config.prepare_persistent_router_resume_shim",
+    )?;
+    Ok(true)
+}
+
 fn remove_persistent_codey_runtime_config(doc: &mut DocumentMut, home: &Path) -> bool {
     let before = doc.to_string();
     let codey_router_owned = codey_router_provider_is_codey_owned(doc);
-    let codey_router_defined = doc
-        .get("model_providers")
-        .and_then(Item::as_table_like)
-        .and_then(|providers| providers.get(local_router::ROUTER_PROVIDER_ID))
-        .and_then(Item::as_table_like)
-        .is_some();
     let codey_subagent_owned = persistent_codey_subagent_config_is_owned(doc);
-    let codey_router_selected = doc
-        .get("model_provider")
-        .and_then(Item::as_str)
-        .is_some_and(|provider| provider.trim() == local_router::ROUTER_PROVIDER_ID);
+    let codey_router_selected = persistent_codey_router_is_selected(doc);
     let codey_router_runtime_selected =
         codey_router_selected && (codey_router_owned || codey_subagent_owned);
-    let codey_router_dangling = codey_router_selected && !codey_router_defined;
+    let codey_router_dangling = persistent_codey_router_selection_is_dangling(doc);
     if codey_router_runtime_selected || codey_router_dangling {
         doc.as_table_mut().remove("model_provider");
-    }
-    if codey_router_owned
-        && let Some(providers) = doc.get_mut("model_providers").and_then(Item::as_table_mut)
-    {
-        providers.remove(local_router::ROUTER_PROVIDER_ID);
-        if providers.is_empty() {
-            doc.as_table_mut().remove("model_providers");
-        }
     }
     if doc
         .get("model")
@@ -1229,28 +1254,211 @@ fn remove_persistent_codey_runtime_config(doc: &mut DocumentMut, home: &Path) ->
     doc.to_string() != before
 }
 
+pub(crate) fn user_owned_router_provider_occupies_id(document: &DocumentMut) -> bool {
+    let Some(item) = document_provider_item(document, local_router::ROUTER_PROVIDER_ID) else {
+        return false;
+    };
+    match item.as_table_like() {
+        Some(provider) => !codey_router_provider_table_is_codey_owned(provider),
+        None => true,
+    }
+}
+
 fn codey_router_provider_is_codey_owned(doc: &DocumentMut) -> bool {
+    document_provider_table(doc, local_router::ROUTER_PROVIDER_ID)
+        .is_some_and(codey_router_provider_table_is_codey_owned)
+}
+
+fn codey_router_provider_table_is_codey_owned(provider: &dyn TableLike) -> bool {
+    let has_codey_token_header = provider
+        .get("http_headers")
+        .and_then(Item::as_table_like)
+        .is_some_and(|headers| headers.contains_key(local_router::ROUTER_AUTH_HEADER));
+    let has_codey_name = table_like_str(provider, "name") == Some(LOCAL_ROUTER_PROVIDER_NAME);
+    has_codey_token_header || has_codey_name
+}
+
+fn persistent_codey_router_is_selected(doc: &DocumentMut) -> bool {
+    doc.get("model_provider")
+        .and_then(Item::as_str)
+        .is_some_and(|provider| provider.trim() == local_router::ROUTER_PROVIDER_ID)
+}
+
+fn persistent_codey_router_selection_is_dangling(doc: &DocumentMut) -> bool {
+    persistent_codey_router_is_selected(doc)
+        && document_provider_table(doc, local_router::ROUTER_PROVIDER_ID).is_none()
+}
+
+fn ensure_persistent_router_resume_shim(doc: &mut DocumentMut) -> Result<bool> {
+    if user_owned_router_provider_occupies_id(doc) {
+        return Ok(false);
+    }
+    let desired = persistent_router_shim_table(doc);
+    if persistent_router_shim_matches(doc, &desired) {
+        return Ok(false);
+    }
+    write_persistent_router_shim(doc, desired)?;
+    Ok(true)
+}
+
+fn persistent_router_shim_table(doc: &DocumentMut) -> Table {
+    let source = persistent_router_shim_source(doc);
+    let source_base_url = source
+        .and_then(|provider| table_like_str(provider, "base_url"))
+        .filter(|url| !is_loopback_http_url(url));
+    let base_url = source_base_url.unwrap_or(CHATGPT_CODEX_BASE_URL);
+    let requires_openai_auth = source
+        .and_then(|provider| table_like_bool(provider, "requires_openai_auth"))
+        .unwrap_or(base_url == CHATGPT_CODEX_BASE_URL);
+    let mut provider = Table::new();
+    provider["name"] = value(LOCAL_ROUTER_PROVIDER_NAME);
+    provider["base_url"] = value(base_url);
+    provider["wire_api"] = value("responses");
+    provider["requires_openai_auth"] = value(requires_openai_auth);
+    provider["supports_websockets"] = value(false);
+    provider
+}
+
+fn persistent_router_shim_source(doc: &DocumentMut) -> Option<&dyn TableLike> {
+    if let Some(selected) = persistent_non_router_provider_id(doc)
+        && let Some(provider) = document_provider_table(doc, selected)
+    {
+        return Some(provider);
+    }
+    unique_non_router_provider_table(doc)
+}
+
+fn persistent_non_router_provider_id(doc: &DocumentMut) -> Option<&str> {
+    doc.get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty() && *provider != local_router::ROUTER_PROVIDER_ID)
+}
+
+fn unique_non_router_provider_table(doc: &DocumentMut) -> Option<&dyn TableLike> {
+    let providers = doc.get("model_providers").and_then(Item::as_table_like)?;
+    let mut other = None;
+    for (key, item) in providers.iter() {
+        if key == local_router::ROUTER_PROVIDER_ID {
+            continue;
+        }
+        let Some(provider) = item.as_table_like() else {
+            continue;
+        };
+        if other.is_some() {
+            return None;
+        }
+        other = Some(provider);
+    }
+    other
+}
+
+fn persistent_router_shim_matches(doc: &DocumentMut, desired: &Table) -> bool {
+    let Some(existing) = document_provider_table(doc, local_router::ROUTER_PROVIDER_ID) else {
+        return false;
+    };
+    if !codey_router_provider_table_is_codey_owned(existing) {
+        return false;
+    }
+    if provider_has_router_secret(existing) {
+        return false;
+    }
+    let existing_url = table_like_str(existing, "base_url").unwrap_or_default();
+    if is_loopback_http_url(existing_url) {
+        return false;
+    }
+    table_like_str(existing, "name") == table_str(desired, "name")
+        && table_like_str(existing, "base_url") == table_str(desired, "base_url")
+        && table_like_str(existing, "wire_api") == table_str(desired, "wire_api")
+        && table_like_bool(existing, "requires_openai_auth")
+            == table_bool(desired, "requires_openai_auth")
+        && table_like_bool(existing, "supports_websockets") == Some(false)
+}
+
+fn provider_has_router_secret(provider: &dyn TableLike) -> bool {
+    let has_token_header = provider
+        .get("http_headers")
+        .and_then(Item::as_table_like)
+        .is_some_and(|headers| headers.contains_key(local_router::ROUTER_AUTH_HEADER));
+    let has_bearer = table_like_str(provider, "experimental_bearer_token").is_some();
+    has_token_header || has_bearer
+}
+
+fn write_persistent_router_shim(doc: &mut DocumentMut, table: Table) -> Result<()> {
+    match doc.get_mut("model_providers") {
+        None => {
+            let mut providers = Table::new();
+            providers.insert(local_router::ROUTER_PROVIDER_ID, Item::Table(table));
+            doc["model_providers"] = Item::Table(providers);
+        }
+        Some(item) => {
+            if let Some(providers) = item.as_table_mut() {
+                providers.insert(local_router::ROUTER_PROVIDER_ID, Item::Table(table));
+            } else if let Some(providers) = item.as_inline_table_mut() {
+                providers.insert(
+                    local_router::ROUTER_PROVIDER_ID,
+                    Value::InlineTable(table_values_to_inline(&table)),
+                );
+            } else {
+                bail!("model_providers 必须是 TOML table");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn table_values_to_inline(table: &Table) -> InlineTable {
+    let mut inline = InlineTable::new();
+    for (key, item) in table.iter() {
+        if let Some(value) = item.as_value() {
+            inline.insert(key, value.clone());
+        }
+    }
+    inline
+}
+
+fn document_provider_item<'a>(doc: &'a DocumentMut, id: &str) -> Option<&'a Item> {
     doc.get("model_providers")
-        .and_then(Item::as_table)
-        .and_then(|providers| providers.get(local_router::ROUTER_PROVIDER_ID))
-        .and_then(Item::as_table)
-        .is_some_and(|provider| {
-            let has_codey_token_header = provider
-                .get("http_headers")
-                .and_then(Item::as_inline_table)
-                .is_some_and(|headers| headers.contains_key(local_router::ROUTER_AUTH_HEADER));
-            let has_codey_name =
-                provider.get("name").and_then(Item::as_str) == Some("Codey Local Router");
-            let uses_loopback =
-                provider
-                    .get("base_url")
-                    .and_then(Item::as_str)
-                    .is_some_and(|base_url| {
-                        base_url.starts_with("http://127.0.0.1:")
-                            || base_url.starts_with("http://localhost:")
-                    });
-            has_codey_token_header || (has_codey_name && uses_loopback)
-        })
+        .and_then(Item::as_table_like)
+        .and_then(|providers| providers.get(id))
+}
+
+fn document_provider_table<'a>(doc: &'a DocumentMut, id: &str) -> Option<&'a dyn TableLike> {
+    document_provider_item(doc, id).and_then(Item::as_table_like)
+}
+
+fn table_like_str<'a>(table: &'a dyn TableLike, key: &str) -> Option<&'a str> {
+    table
+        .get(key)
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn table_like_bool(table: &dyn TableLike, key: &str) -> Option<bool> {
+    table.get(key).and_then(Item::as_bool)
+}
+
+fn table_str<'a>(table: &'a Table, key: &str) -> Option<&'a str> {
+    table
+        .get(key)
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn table_bool(table: &Table, key: &str) -> Option<bool> {
+    table.get(key).and_then(Item::as_bool)
+}
+
+fn is_loopback_http_url(url: &str) -> bool {
+    let url = url.trim();
+    url.starts_with("http://127.0.0.1:")
+        || url.starts_with("http://localhost:")
+        || url.starts_with("http://[::1]:")
+        || url.starts_with("https://127.0.0.1:")
+        || url.starts_with("https://localhost:")
+        || url.starts_with("https://[::1]:")
 }
 
 fn is_route_qualified_model(model: &str) -> bool {
@@ -2820,7 +3028,7 @@ fn codey_hook_inline_table(
 
 fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
     let mut provider = Table::new();
-    provider["name"] = value("Codey Local Router");
+    provider["name"] = value(LOCAL_ROUTER_PROVIDER_NAME);
     provider["base_url"] = value(endpoint.base_url.trim_end_matches('/'));
     provider["wire_api"] = value("responses");
     provider["requires_openai_auth"] = value(endpoint.requires_openai_auth);

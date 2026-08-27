@@ -150,6 +150,60 @@ fn persistent_session_provider_rejects_a_user_owned_router_before_sync() {
 }
 
 #[test]
+fn persistent_session_provider_allows_a_codey_owned_resume_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        format!(
+            "model_provider = \"codey_global\"\n\
+             \n\
+             [model_providers.codey_global]\n\
+             name = \"OpenAI\"\n\
+             base_url = \"https://chatgpt.com/backend-api/codex\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n\
+             \n\
+             [model_providers.{ROUTER_PROVIDER_ID}]\n\
+             name = \"Codey Local Router\"\n\
+             base_url = \"https://chatgpt.com/backend-api/codex\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n\
+             supports_websockets = false\n"
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(
+        persistent_session_provider(temp.path()).unwrap(),
+        "codey_global"
+    );
+}
+
+#[test]
+fn persistent_session_provider_reads_legacy_codey_global_after_resume_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        temp.path().join("config.toml"),
+        "model_provider = \"codey_global\"\n\
+         \n\
+         [model_providers]\n\
+         \n\
+         [model_providers.codey_global]\n\
+         name = \"OpenAI\"\n\
+         base_url = \"https://chatgpt.com/backend-api/codex\"\n\
+         wire_api = \"responses\"\n\
+         requires_openai_auth = true\n",
+    )
+    .unwrap();
+
+    assert!(crate::codex_config::prepare_persistent_router_resume_shim_at(temp.path()).unwrap());
+    assert_eq!(
+        persistent_session_provider(temp.path()).unwrap(),
+        "codey_global"
+    );
+}
+
+#[test]
 fn session_maintenance_repairs_router_stamped_threads_for_third_party_launches() {
     // Third-party users may never set `model_provider` in config.toml, and a
     // Codex started outside Codey cannot resolve the launch-only router id

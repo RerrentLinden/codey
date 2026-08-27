@@ -6,6 +6,44 @@ use crate::codex_config_guidance::{
 };
 const LEGACY_GLOBAL_PROVIDER_ID: &str = "codey_global";
 
+fn assert_resume_shim(document: &DocumentMut, base_url: &str, requires_openai_auth: bool) {
+    let router = document["model_providers"][local_router::ROUTER_PROVIDER_ID]
+        .as_table_like()
+        .expect("codey_router resume shim");
+    assert_eq!(
+        router.get("name").and_then(Item::as_str),
+        Some("Codey Local Router")
+    );
+    assert_eq!(
+        router.get("base_url").and_then(Item::as_str),
+        Some(base_url)
+    );
+    assert_eq!(
+        router.get("wire_api").and_then(Item::as_str),
+        Some("responses")
+    );
+    assert_eq!(
+        router.get("requires_openai_auth").and_then(Item::as_bool),
+        Some(requires_openai_auth)
+    );
+    assert_eq!(
+        router.get("supports_websockets").and_then(Item::as_bool),
+        Some(false)
+    );
+    assert!(
+        router
+            .get("http_headers")
+            .and_then(Item::as_table_like)
+            .is_none_or(|headers| !headers.contains_key(local_router::ROUTER_AUTH_HEADER))
+    );
+    assert!(
+        router
+            .get("experimental_bearer_token")
+            .and_then(Item::as_str)
+            .is_none_or(|token| token.trim().is_empty())
+    );
+}
+
 #[test]
 fn codex_home_is_resolved_once_per_process() {
     assert!(std::ptr::eq(codex_home(), codex_home()));
@@ -169,7 +207,7 @@ default_subagent_reasoning_effort = "max"
     assert!(document.get("model").is_none());
     assert!(document.get("model_provider").is_none());
     assert!(document.get("model_catalog_json").is_none());
-    assert!(document["model_providers"].get("codey_router").is_none());
+    assert_resume_shim(&document, "https://relay.example/v1", false);
     assert_eq!(
         document["model_providers"]["user_relay"]["base_url"].as_str(),
         Some("https://relay.example/v1")
@@ -225,11 +263,166 @@ base_url = "https://relay.example/v1"
     assert!(document.get("model_provider").is_none());
     assert!(document.get("model").is_none());
     assert!(document.get("model_catalog_json").is_none());
+    assert_resume_shim(&document, "https://relay.example/v1", false);
     assert_eq!(
         document["model_providers"]["relay"]["base_url"].as_str(),
         Some("https://relay.example/v1")
     );
     assert_eq!(fs::read(home.join("config.toml.bak")).unwrap(), original);
+}
+
+#[test]
+fn prepare_resume_shim_clones_legacy_codey_global_without_selecting_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "model_provider = \"{LEGACY_GLOBAL_PROVIDER_ID}\"\n\
+             \n\
+             [model_providers]\n\
+             \n\
+             [model_providers.{LEGACY_GLOBAL_PROVIDER_ID}]\n\
+             name = \"OpenAI\"\n\
+             base_url = \"{CHATGPT_CODEX_BASE_URL}\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n"
+        ),
+    )
+    .unwrap();
+
+    assert!(prepare_persistent_router_resume_shim_at(&home).unwrap());
+    let document = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        document["model_provider"].as_str(),
+        Some(LEGACY_GLOBAL_PROVIDER_ID)
+    );
+    assert_resume_shim(&document, CHATGPT_CODEX_BASE_URL, true);
+    assert_eq!(
+        document["model_providers"][LEGACY_GLOBAL_PROVIDER_ID]["base_url"].as_str(),
+        Some(CHATGPT_CODEX_BASE_URL)
+    );
+
+    assert!(!prepare_persistent_router_resume_shim_at(&home).unwrap());
+}
+
+#[test]
+fn prepare_resume_shim_leaves_a_user_owned_codey_router_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let original = br#"model_provider = "codey_router"
+
+[model_providers.codey_router]
+name = "User-Owned Router"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+"#;
+    fs::write(home.join("config.toml"), original).unwrap();
+
+    assert!(!prepare_persistent_router_resume_shim_at(&home).unwrap());
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+}
+
+#[test]
+fn prepare_resume_shim_replaces_a_loopback_owned_router() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        format!(
+            "model_provider = \"{LEGACY_GLOBAL_PROVIDER_ID}\"\n\
+             \n\
+             [model_providers.codey_router]\n\
+             name = \"Codey Local Router\"\n\
+             base_url = \"http://127.0.0.1:43127/v1\"\n\
+             wire_api = \"responses\"\n\
+             experimental_bearer_token = \"runtime-token\"\n\
+             http_headers = {{ x-codey-router-token = \"runtime-token\" }}\n\
+             \n\
+             [model_providers.{LEGACY_GLOBAL_PROVIDER_ID}]\n\
+             name = \"OpenAI\"\n\
+             base_url = \"{CHATGPT_CODEX_BASE_URL}\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = true\n"
+        ),
+    )
+    .unwrap();
+
+    assert!(prepare_persistent_router_resume_shim_at(&home).unwrap());
+    let document = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        document["model_provider"].as_str(),
+        Some(LEGACY_GLOBAL_PROVIDER_ID)
+    );
+    assert_resume_shim(&document, CHATGPT_CODEX_BASE_URL, true);
+}
+
+#[test]
+fn local_router_accepts_a_codey_owned_resume_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey-state/codex-lease.json");
+    let backup_root = temp.path().join("codey-state/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    let original_config = format!(
+        "model_provider = \"{LEGACY_GLOBAL_PROVIDER_ID}\"\n\
+         \n\
+         [model_providers.{LEGACY_GLOBAL_PROVIDER_ID}]\n\
+         name = \"OpenAI\"\n\
+         base_url = \"{CHATGPT_CODEX_BASE_URL}\"\n\
+         wire_api = \"responses\"\n\
+         requires_openai_auth = true\n\
+         \n\
+         [model_providers.codey_router]\n\
+         name = \"Codey Local Router\"\n\
+         base_url = \"{CHATGPT_CODEX_BASE_URL}\"\n\
+         wire_api = \"responses\"\n\
+         requires_openai_auth = true\n\
+         supports_websockets = false\n"
+    );
+    fs::write(home.join("config.toml"), &original_config).unwrap();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+        requires_openai_auth: true,
+    };
+
+    let applied = apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            local_router: &endpoint,
+            use_official_catalog: true,
+            default_model: Some("openai/gpt-5.6-sol"),
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backup_root,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        original_config
+    );
+    let rendered = applied.runtime_config_overrides.join("\n");
+    assert!(rendered.contains("model_provider=\"codey_router\""));
+    assert!(
+        rendered.contains("model_providers.codey_router.base_url=\"http://127.0.0.1:43127/v1\"")
+    );
+    assert!(!rendered.contains("openai_base_url="));
 }
 
 #[test]

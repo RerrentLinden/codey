@@ -150,6 +150,19 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
         );
         eprintln!("Codey 启动前恢复上次临时配置失败：{error:#}");
     }
+    if let Err(error) = launcher::prepare_persistent_router_resume_shim(codex_home).await {
+        error_log::record_failure_with_metadata(
+            "patch_failed",
+            "prepare_persistent_router_resume_shim_at_startup",
+            format!("{error:#}"),
+            error_log::FailureMetadata {
+                stage: Some("startup.prepare_router_resume_shim".to_string()),
+                recoverable: Some(true),
+            },
+            serde_json::json!({}),
+        );
+        eprintln!("Codey 启动前写入 codey_router 恢复兼容桩失败：{error:#}");
+    }
     match repair_legacy_model_catalog(codex_home).await {
         Ok(true) => eprintln!("已修复旧版 Codey 模型目录缺失的 description 字段"),
         Ok(false) => {}
