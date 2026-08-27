@@ -73,6 +73,17 @@ pub struct ResolvedPromptOptimizationConfig {
     pub base_url: String,
     pub api_key: String,
     pub request_headers: BTreeMap<String, String>,
+    /// Overrides the Responses API `store` field when the selected upstream
+    /// requires an explicit value. Manual and third-party routes leave this
+    /// unset so their existing payload contract is unchanged.
+    pub response_store: Option<bool>,
+    /// Overrides the Responses API `stream` field when the selected upstream
+    /// requires streaming. Manual and third-party routes keep the historical
+    /// non-streaming payload.
+    pub response_stream: Option<bool>,
+    /// Omits Responses API `max_output_tokens` for selected upstreams with a
+    /// narrower request schema. Manual and third-party routes keep sending it.
+    pub response_omit_max_output_tokens: bool,
     pub model: String,
     pub upstream_protocol: String,
     pub instruction: String,
@@ -84,6 +95,9 @@ impl ResolvedPromptOptimizationConfig {
             base_url: config.base_url.clone(),
             api_key: config.api_key.clone(),
             request_headers: BTreeMap::new(),
+            response_store: None,
+            response_stream: None,
+            response_omit_max_output_tokens: false,
             model: config.model.clone(),
             upstream_protocol: config.upstream_protocol.clone(),
             instruction: config.instruction.clone(),
@@ -329,6 +343,9 @@ pub fn optimizer_payload(config: &PromptOptimizationConfig, text: &str) -> Value
         text,
         optimization_upstream_protocol(&ResolvedPromptOptimizationConfig::from_custom(config))
             .expect("test config must use a supported protocol"),
+        None,
+        None,
+        false,
     )
 }
 
@@ -396,8 +413,11 @@ fn optimization_payload(
     instruction: &str,
     text: &str,
     protocol: OptimizationUpstreamProtocol,
+    response_store: Option<bool>,
+    response_stream: Option<bool>,
+    response_omit_max_output_tokens: bool,
 ) -> Value {
-    match protocol {
+    let mut payload = match protocol {
         OptimizationUpstreamProtocol::OpenAiResponses => {
             responses_payload(model, instruction, text)
         }
@@ -407,11 +427,32 @@ fn optimization_payload(
         OptimizationUpstreamProtocol::AnthropicMessages => {
             anthropic_payload(model, instruction, text, MAX_TOKENS)
         }
+    };
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses && response_omit_max_output_tokens
+    {
+        payload.as_object_mut().unwrap().remove("max_output_tokens");
     }
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && let Some(store) = response_store
+    {
+        payload["store"] = Value::Bool(store);
+    }
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && let Some(stream) = response_stream
+    {
+        payload["stream"] = Value::Bool(stream);
+    }
+    payload
 }
 
-fn configuration_test_payload(model: &str, protocol: OptimizationUpstreamProtocol) -> Value {
-    match protocol {
+fn configuration_test_payload(
+    model: &str,
+    protocol: OptimizationUpstreamProtocol,
+    response_store: Option<bool>,
+    response_stream: Option<bool>,
+    response_omit_max_output_tokens: bool,
+) -> Value {
+    let mut payload = match protocol {
         OptimizationUpstreamProtocol::OpenAiResponses => json!({
             "model": model,
             "input": responses_user_input("hi"),
@@ -422,7 +463,22 @@ fn configuration_test_payload(model: &str, protocol: OptimizationUpstreamProtoco
             openai_chat_payload(model, "", "hi", 16)
         }
         OptimizationUpstreamProtocol::AnthropicMessages => anthropic_payload(model, "", "hi", 16),
+    };
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses && response_omit_max_output_tokens
+    {
+        payload.as_object_mut().unwrap().remove("max_output_tokens");
     }
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && let Some(store) = response_store
+    {
+        payload["store"] = Value::Bool(store);
+    }
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && let Some(stream) = response_stream
+    {
+        payload["stream"] = Value::Bool(stream);
+    }
+    payload
 }
 
 /// Optimizes a user prompt through a Responses API and returns the rewritten
@@ -463,7 +519,15 @@ pub async fn optimize_prompt_resolved(
         return Err("请先配置优化模型".to_string());
     }
 
-    let payload = optimization_payload(&config.model, &config.instruction, text, protocol);
+    let payload = optimization_payload(
+        &config.model,
+        &config.instruction,
+        text,
+        protocol,
+        config.response_store,
+        config.response_stream,
+        config.response_omit_max_output_tokens,
+    );
     let response = post_optimization_request(client, &endpoint, config, &payload).await?;
     let status = response.status().as_u16();
 
@@ -521,7 +585,13 @@ pub async fn test_configuration_resolved(
     if model.is_empty() {
         return Err("请先配置优化模型".to_string());
     }
-    let payload = configuration_test_payload(model, protocol);
+    let payload = configuration_test_payload(
+        model,
+        protocol,
+        config.response_store,
+        config.response_stream,
+        config.response_omit_max_output_tokens,
+    );
     let response = post_optimization_request(client, &endpoint, config, &payload).await?;
     let status = response.status().as_u16();
 
@@ -646,6 +716,24 @@ async fn parse_optimized_response(
     )
     .await
     .map_err(OptimizedResponseError::fatal)?;
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && config.response_stream == Some(true)
+    {
+        let optimized = extract_responses_stream_optimized_text(&body).map_err(|error| {
+            let preview = sanitize_resolved_error(&error, config);
+            OptimizedResponseError::retryable(format!(
+                "优化 API 流式响应无法解析（{endpoint}）：{preview}"
+            ))
+        })?;
+        let optimized = optimized.trim();
+        if optimized.is_empty() {
+            return Err(OptimizedResponseError::fatal(
+                "优化 API 返回了空的优化结果".to_string(),
+            ));
+        }
+        return Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect());
+    }
+
     let value: Value = serde_json::from_slice(&body).map_err(|_| {
         let preview = sanitize_resolved_error(String::from_utf8_lossy(&body).trim(), config);
         let preview: String = preview.chars().take(200).collect();
@@ -668,6 +756,120 @@ async fn parse_optimized_response(
         ));
     }
     Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect())
+}
+
+fn extract_responses_stream_optimized_text(body: &[u8]) -> Result<String, String> {
+    let mut cursor = 0;
+    let mut text = String::new();
+    let mut final_text = None;
+    while let Some(frame) = take_next_sse_frame(body, &mut cursor) {
+        let Some(data) = sse_frame_data(frame)? else {
+            continue;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        let event: Value = serde_json::from_str(data)
+            .map_err(|error| format!("Responses SSE data 不是有效 JSON：{error}"))?;
+        if let Some(message) = responses_stream_error_message(&event) {
+            return Err(message);
+        }
+        match event.get("type").and_then(Value::as_str) {
+            Some("response.output_text.delta") => {
+                if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                    text.push_str(delta);
+                }
+            }
+            Some("response.output_text.done") => {
+                if text.is_empty()
+                    && let Some(done_text) = event.get("text").and_then(Value::as_str)
+                {
+                    final_text = Some(done_text.to_string());
+                }
+            }
+            Some("response.completed") => {
+                if let Some(response) = event.get("response")
+                    && let Some(completed_text) = extract_responses_optimized_text(response)
+                {
+                    final_text = Some(completed_text);
+                }
+            }
+            _ => {}
+        }
+    }
+    if !body[cursor..].iter().all(u8::is_ascii_whitespace)
+        && let Some(data) = sse_frame_data(&body[cursor..])?
+    {
+        let data = data.trim();
+        if !data.is_empty() && data != "[DONE]" {
+            let event: Value = serde_json::from_str(data)
+                .map_err(|error| format!("Responses SSE 末尾 data 不是有效 JSON：{error}"))?;
+            if let Some(message) = responses_stream_error_message(&event) {
+                return Err(message);
+            }
+            if event.get("type").and_then(Value::as_str) == Some("response.output_text.delta")
+                && let Some(delta) = event.get("delta").and_then(Value::as_str)
+            {
+                text.push_str(delta);
+            }
+        }
+    }
+    if text.is_empty() {
+        Ok(final_text.unwrap_or_default())
+    } else {
+        Ok(text)
+    }
+}
+
+fn responses_stream_error_message(event: &Value) -> Option<String> {
+    if !matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("error" | "response.failed" | "response.incomplete")
+    ) {
+        return None;
+    }
+    [
+        event.pointer("/error/message"),
+        event.pointer("/response/error/message"),
+        event.pointer("/response/incomplete_details/reason"),
+        event.get("message"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .map(str::to_string)
+    .or_else(|| Some(event.to_string()))
+}
+
+fn take_next_sse_frame<'a>(buffer: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let remaining = buffer.get(*cursor..)?;
+    let mut delimiter = None;
+    for index in 0..remaining.len() {
+        if remaining.get(index..index + 4) == Some(b"\r\n\r\n") {
+            delimiter = Some((index, 4));
+            break;
+        }
+        if remaining.get(index..index + 2) == Some(b"\n\n") {
+            delimiter = Some((index, 2));
+            break;
+        }
+    }
+    let (index, length) = delimiter?;
+    let frame_start = *cursor;
+    let frame_end = frame_start + index;
+    *cursor = frame_end + length;
+    Some(&buffer[frame_start..frame_end])
+}
+
+fn sse_frame_data(frame: &[u8]) -> Result<Option<String>, String> {
+    let frame = std::str::from_utf8(frame).map_err(|_| "Responses SSE 不是 UTF-8".to_string())?;
+    let data = frame
+        .lines()
+        .filter_map(|line| line.trim_end_matches('\r').strip_prefix("data:"))
+        .map(str::trim_start)
+        .collect::<Vec<_>>();
+    Ok((!data.is_empty()).then(|| data.join("\n")))
 }
 
 fn extract_responses_optimized_text(response: &Value) -> Option<String> {
@@ -1203,11 +1405,88 @@ mod tests {
 
     #[test]
     fn configuration_test_payload_uses_a_responses_input_list() {
-        let payload =
-            configuration_test_payload("gpt-test", OptimizationUpstreamProtocol::OpenAiResponses);
+        let payload = configuration_test_payload(
+            "gpt-test",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            None,
+            None,
+            false,
+        );
         assert!(payload["input"].is_array());
         assert_eq!(payload["input"][0]["role"], "user");
         assert_eq!(payload["input"][0]["content"][0]["text"], "hi");
+        assert!(payload.get("store").is_none());
+    }
+
+    #[test]
+    fn response_overrides_apply_only_to_responses_payloads() {
+        let test_payload = configuration_test_payload(
+            "gpt-test",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            Some(false),
+            Some(true),
+            true,
+        );
+        assert_eq!(test_payload["store"], false);
+        assert_eq!(test_payload["stream"], true);
+        assert!(test_payload.get("max_output_tokens").is_none());
+
+        let optimization_payload = optimization_payload(
+            "gpt-test",
+            "保持原意",
+            "写个博客",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            Some(false),
+            Some(true),
+            true,
+        );
+        assert_eq!(optimization_payload["store"], false);
+        assert_eq!(optimization_payload["stream"], true);
+        assert!(optimization_payload.get("max_output_tokens").is_none());
+
+        let chat_payload = configuration_test_payload(
+            "gpt-test",
+            OptimizationUpstreamProtocol::OpenAiChatCompletions,
+            Some(false),
+            Some(true),
+            true,
+        );
+        let anthropic_payload = configuration_test_payload(
+            "claude-test",
+            OptimizationUpstreamProtocol::AnthropicMessages,
+            Some(false),
+            Some(true),
+            true,
+        );
+        assert!(chat_payload.get("store").is_none());
+        assert!(anthropic_payload.get("store").is_none());
+        assert!(chat_payload.get("max_output_tokens").is_none());
+        assert!(anthropic_payload.get("max_output_tokens").is_none());
+        assert_eq!(chat_payload["stream"], false);
+        assert_eq!(anthropic_payload["stream"], false);
+    }
+
+    #[test]
+    fn third_party_responses_payloads_keep_max_output_tokens() {
+        let test_payload = configuration_test_payload(
+            "gpt-test",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(test_payload["max_output_tokens"], 16);
+
+        let optimization_payload = optimization_payload(
+            "gpt-test",
+            "保持原意",
+            "写个博客",
+            OptimizationUpstreamProtocol::OpenAiResponses,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(optimization_payload["max_output_tokens"], MAX_TOKENS);
     }
 
     #[test]
@@ -1217,6 +1496,9 @@ mod tests {
             "保持原意",
             "写个博客",
             OptimizationUpstreamProtocol::OpenAiChatCompletions,
+            None,
+            None,
+            false,
         );
         assert_eq!(chat["messages"][0]["role"], "system");
         assert_eq!(chat["messages"][1]["content"], "写个博客");
@@ -1234,6 +1516,9 @@ mod tests {
             "保持原意",
             "写个博客",
             OptimizationUpstreamProtocol::AnthropicMessages,
+            None,
+            None,
+            false,
         );
         assert_eq!(anthropic["system"], "保持原意");
         assert_eq!(anthropic["messages"][0]["content"], "写个博客");
@@ -1269,6 +1554,39 @@ mod tests {
     }
 
     #[test]
+    fn extracts_responses_stream_text_and_errors() {
+        let sse = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"优化\"}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"结果\"}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert_eq!(
+            extract_responses_stream_optimized_text(sse.as_bytes()).unwrap(),
+            "优化结果"
+        );
+
+        let completed = concat!(
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"最终结果\"}}\n\n"
+        );
+        assert_eq!(
+            extract_responses_stream_optimized_text(completed.as_bytes()).unwrap(),
+            "最终结果"
+        );
+
+        let error = concat!(
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"stream rejected\"}}}\n\n"
+        );
+        assert_eq!(
+            extract_responses_stream_optimized_text(error.as_bytes()).unwrap_err(),
+            "stream rejected"
+        );
+    }
+
+    #[test]
     fn sanitize_error_hides_the_api_key() {
         assert_eq!(
             sanitize_error("401 unauthorized for sk-test-key", "sk-test-key"),
@@ -1288,6 +1606,9 @@ mod tests {
             base_url: "https://provider.example/v1".to_string(),
             api_key: "provider-api-secret".to_string(),
             request_headers,
+            response_store: None,
+            response_stream: None,
+            response_omit_max_output_tokens: false,
             model: "gpt-provider".to_string(),
             upstream_protocol: UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
             instruction: String::new(),
@@ -1522,6 +1843,7 @@ mod tests {
             let body: Value = serde_json::from_str(body).unwrap();
             assert!(body["input"].is_array(), "{body}");
             assert_eq!(body["input"][0]["content"][0]["text"], "写个博客");
+            assert!(body.get("store").is_none(), "{body}");
 
             let body = r#"{"output":[{"content":[{"type":"output_text","text":"优化后的响应"}]}]}"#;
             let response = format!(
@@ -1545,6 +1867,9 @@ mod tests {
             base_url: format!("http://{address}/v1"),
             api_key: "ignored-key".to_string(),
             request_headers,
+            response_store: None,
+            response_stream: None,
+            response_omit_max_output_tokens: false,
             model: "gpt-responses".to_string(),
             upstream_protocol: UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
             instruction: "保持原意".to_string(),
@@ -1553,6 +1878,97 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "优化后的响应");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolved_official_responses_request_uses_streaming_overrides() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let bytes_read = socket.read(&mut chunk).await.unwrap();
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..bytes_read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /v1/responses "), "{request}");
+            let request_lower = request.to_ascii_lowercase();
+            assert!(
+                request_lower.contains("authorization: bearer official-access-token"),
+                "{request}"
+            );
+            assert!(
+                request_lower.contains("chatgpt-account-id: account-123"),
+                "{request}"
+            );
+            let (_, body) = request.split_once("\r\n\r\n").unwrap();
+            let body: Value = serde_json::from_str(body).unwrap();
+            assert_eq!(body["store"], false);
+            assert_eq!(body["stream"], true);
+            assert!(body.get("max_output_tokens").is_none(), "{body}");
+
+            let body = concat!(
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"官方\"}\n\n",
+                "event: response.output_text.delta\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"优化\"}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut request_headers = BTreeMap::new();
+        request_headers.insert(
+            "Authorization".to_string(),
+            "Bearer official-access-token".to_string(),
+        );
+        request_headers.insert("chatgpt-account-id".to_string(), "account-123".to_string());
+        let config = ResolvedPromptOptimizationConfig {
+            base_url: format!("http://{address}/v1"),
+            api_key: String::new(),
+            request_headers,
+            response_store: Some(false),
+            response_stream: Some(true),
+            response_omit_max_output_tokens: true,
+            model: "gpt-official".to_string(),
+            upstream_protocol: UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
+            instruction: "保持原意".to_string(),
+        };
+        let result = optimize_prompt_resolved(&Client::new(), &config, "写个博客")
+            .await
+            .unwrap();
+        assert_eq!(result, "官方优化");
         server.await.unwrap();
     }
 

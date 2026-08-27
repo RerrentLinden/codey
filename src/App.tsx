@@ -1201,6 +1201,7 @@ export function App({
                 popupContainer={popupContainer}
                 subagentModelOptions={subagentModelOptions}
                 onConfigChange={handleConfigChange}
+                onNotice={setNotice}
               />
             </div>
 

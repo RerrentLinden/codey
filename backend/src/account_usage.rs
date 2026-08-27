@@ -20,9 +20,9 @@ const ACCOUNT_USAGE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 const ACCOUNT_USAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq)]
-struct OfficialAuth {
-    access_token: String,
-    account_id: Option<String>,
+pub(crate) struct OfficialAuth {
+    pub(crate) access_token: String,
+    pub(crate) account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -192,7 +192,7 @@ pub async fn fetch_official_account_usage(
     )
 }
 
-fn read_official_auth(path: &Path) -> Result<OfficialAuth> {
+pub(crate) fn read_official_auth(path: &Path) -> Result<OfficialAuth> {
     let bytes = fs::read(path).with_context(|| "未找到 Codex 官方登录信息")?;
     let value: Value = serde_json::from_slice(&bytes).with_context(|| "Codex 登录信息格式无效")?;
     let is_chatgpt = value

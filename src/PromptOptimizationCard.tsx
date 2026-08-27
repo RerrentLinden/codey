@@ -9,7 +9,7 @@ import {
   IconWorld,
 } from "@tabler/icons-react";
 
-import type { Config, InlineResult } from "./App.types";
+import type { Config, InlineResult, Notice } from "./App.types";
 import { invoke } from "./api";
 import { errorText, withTimeout } from "./appUtils";
 import { ManualModelCombobox } from "./components/ManualModelCombobox";
@@ -41,6 +41,7 @@ type PromptOptimizationCardProps = {
   popupContainer: HTMLElement | null;
   subagentModelOptions: SubagentModelOption[];
   onConfigChange: (config: Config) => void;
+  onNotice: (notice: Notice) => void;
 };
 
 type TestResult = {
@@ -54,6 +55,7 @@ function PromptOptimizationCardComponent({
   popupContainer,
   subagentModelOptions,
   onConfigChange,
+  onNotice,
 }: PromptOptimizationCardProps) {
   const optimization = config.promptOptimization;
   const controlId = useId();
@@ -61,10 +63,6 @@ function PromptOptimizationCardComponent({
   const activeOperationRef = useRef<"models" | "test" | null>(null);
   const [apiKeyVisible, setApiKeyVisible] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<InlineResult>({
-    tone: "idle",
-    text: "",
-  });
   const [cloudModels, setCloudModels] = useState<string[]>([]);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [modelsResult, setModelsResult] = useState<InlineResult>({
@@ -115,8 +113,12 @@ function PromptOptimizationCardComponent({
   const changeMode = (mode: "codeyRoute" | "manual") => {
     if (optimization.mode === mode) return;
     clearModelSuggestions();
-    setTestResult({ tone: "idle", text: "" });
+    onNotice({ tone: "info", text: "" });
     updateOptimization({ mode });
+  };
+
+  const showTestNotice = (tone: "success" | "error", text: string) => {
+    onNotice({ tone, text });
   };
 
   const handleApiKeyChange = (value: string) => {
@@ -177,7 +179,7 @@ function PromptOptimizationCardComponent({
     const requestId = requestSequenceRef.current + 1;
     requestSequenceRef.current = requestId;
     setTesting(true);
-    setTestResult({ tone: "pending", text: "正在测试 API 连通性…" });
+    onNotice({ tone: "info", text: "" });
     try {
       const result = await withTimeout(
         invoke<{ result?: TestResult }>("test_prompt_optimization", {
@@ -190,24 +192,23 @@ function PromptOptimizationCardComponent({
       const httpStatus = result?.result?.httpStatus;
       const responsePreview = result?.result?.responsePreview?.trim();
       if (typeof httpStatus === "number" && httpStatus >= 400) {
-        setTestResult({
-          tone: "error",
-          text: responsePreview
+        showTestNotice(
+          "error",
+          responsePreview
             ? "连接失败（HTTP " + httpStatus + "）：" + responsePreview
             : "连接失败（HTTP " + httpStatus + "）",
-        });
+        );
         return;
       }
-      setTestResult({
-        tone: "success",
-        text:
-          typeof httpStatus === "number"
-            ? "连接成功（HTTP " + httpStatus + "）"
-            : "连接成功",
-      });
+      showTestNotice(
+        "success",
+        typeof httpStatus === "number"
+          ? "连接成功（HTTP " + httpStatus + "）"
+          : "连接成功",
+      );
     } catch (error) {
       if (requestSequenceRef.current === requestId) {
-        setTestResult({ tone: "error", text: errorText(error) });
+        showTestNotice("error", errorText(error));
       }
     } finally {
       if (requestSequenceRef.current === requestId) {
@@ -275,11 +276,6 @@ function PromptOptimizationCardComponent({
               </div>
 
               <div className="prompt-optimization-toolbar-actions">
-                {testResult.text ? (
-                  <span className={"inline-result " + testResult.tone}>
-                    {testResult.text}
-                  </span>
-                ) : null}
                 <Button
                   variant="light"
                   size="xs"

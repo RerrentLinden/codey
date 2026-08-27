@@ -835,7 +835,8 @@ impl RouterServer {
             headers.insert(HeaderName::from_static("x-codey-request-id"), value);
         }
         if resolved.route.official_account {
-            let Some(authorization) = incoming_header(&request, "authorization") else {
+            let Some(authorization) = incoming_openai_authorization(&request, &self.bearer_token)
+            else {
                 write_error_response(
                     &mut stream,
                     401,
@@ -1115,6 +1116,20 @@ fn incoming_header<'a>(request: &'a HttpRequest, header_name: &str) -> Option<&'
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case(header_name))
         .map(|(_, value)| value.as_str())
+}
+
+fn incoming_openai_authorization<'a>(
+    request: &'a HttpRequest,
+    router_bearer_token: &str,
+) -> Option<&'a str> {
+    let authorization = incoming_header(request, "authorization")?;
+    if constant_time_eq(
+        authorization.trim().as_bytes(),
+        router_bearer_token.as_bytes(),
+    ) {
+        return None;
+    }
+    Some(authorization)
 }
 
 fn route_display_name(route: &RouteTarget) -> &str {
@@ -6858,6 +6873,29 @@ mod tests {
         assert!(!should_forward_incoming_header(ROUTE_METADATA_KEY, true));
         assert!(!should_forward_incoming_header(TURN_METADATA_HEADER, false));
         assert!(should_forward_incoming_header("accept", false));
+    }
+
+    #[test]
+    fn local_router_bearer_token_is_not_reused_as_openai_oauth() {
+        let request = HttpRequest {
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            headers: vec![(
+                "authorization".to_string(),
+                "Bearer codey-router-token".to_string(),
+            )],
+            body: Vec::new(),
+            _body_budget_permit: None,
+        };
+
+        assert_eq!(
+            incoming_openai_authorization(&request, "Bearer codey-router-token"),
+            None
+        );
+        assert_eq!(
+            incoming_openai_authorization(&request, "Bearer another-router-token"),
+            Some("Bearer codey-router-token")
+        );
     }
 
     #[test]

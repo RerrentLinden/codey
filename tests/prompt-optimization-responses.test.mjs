@@ -18,6 +18,10 @@ const commandSource = readFileSync(
   new URL("../backend/src/commands/prompt_optimization.rs", import.meta.url),
   "utf8",
 );
+const appSource = readFileSync(
+  new URL("../src/App.tsx", import.meta.url),
+  "utf8",
+);
 
 test("prompt optimization switches between Codey routing and manual upstream configuration", () => {
   assert.match(cardSource, /使用 Codey 路由/);
@@ -62,6 +66,20 @@ test("prompt optimization supports all manual upstream request formats", () => {
   assert.match(backendSource, /fn anthropic_payload\(/);
   assert.match(backendSource, /extract_anthropic_optimized_text/);
   assert.match(backendSource, /extract_responses_optimized_text\(response\)/);
+  assert.match(backendSource, /extract_responses_stream_optimized_text/);
   assert.match(commandSource, /optimization\.uses_codey_route\(\)/);
   assert.match(commandSource, /ROUTER_AUTH_HEADER/);
+  assert.match(commandSource, /response_store: uses_official_account\.then_some\(false\)/);
+  assert.match(commandSource, /response_stream: uses_official_account\.then_some\(true\)/);
+  assert.match(commandSource, /response_omit_max_output_tokens: uses_official_account/);
+  assert.match(backendSource, /remove\("max_output_tokens"\)/);
+});
+
+test("prompt optimization connection tests use the shared toast instead of inline results", () => {
+  assert.match(appSource, /<PromptOptimizationCard[\s\S]*?onNotice=\{setNotice\}/);
+  assert.match(cardSource, /onNotice: \(notice: Notice\) => void/);
+  assert.match(cardSource, /showTestNotice\(\s*"success"/);
+  assert.match(cardSource, /showTestNotice\(\s*"error"/);
+  assert.doesNotMatch(cardSource, /<NoticeToast/);
+  assert.doesNotMatch(cardSource, /\btestResult\b/);
 });
