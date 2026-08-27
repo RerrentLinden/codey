@@ -4712,8 +4712,7 @@ mod tests {
     }
 
     #[test]
-    fn contract_schemas_and_acceptance_limits_are_validated_and_persisted() {
-        let temp = tempfile::tempdir().unwrap();
+    fn unsupported_contract_semantics_are_rejected_instead_of_only_persisted() {
         let input_schema = json!({
             "type": "object",
             "required": ["query"],
@@ -4725,23 +4724,23 @@ mod tests {
             "items": { "type": "object", "required": ["path"] }
         });
         let mut contract = research_contract("schema_task");
-        contract["input_schema"] = input_schema.clone();
-        contract["output_schema"] = output_schema.clone();
+        contract["input_schema"] = input_schema;
+        contract["output_schema"] = output_schema;
         let input = contract_input("schema_task", "codey_deep_research", contract);
-        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        assert!(
+            prepare_contract(Some(&input))
+                .unwrap_err()
+                .contains("尚未接入真实输入输出校验")
+        );
 
-        let store = LedgerStore::open(temp.path(), "session-a").unwrap();
-        let ledger = store.load("runtime-a", "session-a", 20).unwrap().unwrap();
-        assert_eq!(
-            ledger.reservations["schema_task"].input_schema.as_ref(),
-            Some(&input_schema)
+        let mut stream_contract = research_contract("stream_task");
+        stream_contract["mode"] = json!("stream");
+        let stream = contract_input("stream_task", "codey_deep_research", stream_contract);
+        assert!(
+            prepare_contract(Some(&stream))
+                .unwrap_err()
+                .contains("当前只支持 async")
         );
-        assert_eq!(
-            ledger.reservations["schema_task"].output_schema.as_ref(),
-            Some(&output_schema)
-        );
-        drop(ledger);
-        drop(store);
 
         let invalid_schema = contract_input(
             "invalid_schema",

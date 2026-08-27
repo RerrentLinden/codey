@@ -25,6 +25,7 @@ const SYNC_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const SYNC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const SYNC_RECOVERY_PREPARE_TIMEOUT: Duration = Duration::from_secs(8);
 const SYNC_RECOVERY_POLL_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_ILINK_RESPONSE_BYTES: usize = 1024 * 1024;
 
 /// QR status is an iLink long-poll endpoint. Keep its client separate from
 /// notification delivery so a temporary scan can wait efficiently without
@@ -1064,10 +1065,14 @@ async fn activation_response_json(
             "微信 ClawBot {action}服务返回 HTTP {status}，请重新扫码"
         )));
     }
-    let body = response
-        .text()
-        .await
-        .map_err(|_| ActivationRequestError::Retryable)?;
+    let body = crate::http_response::read_bounded_body(
+        response,
+        MAX_ILINK_RESPONSE_BYTES,
+        "微信 ClawBot 服务响应",
+    )
+    .await
+    .map_err(|_| ActivationRequestError::Retryable)?;
+    let body = String::from_utf8_lossy(&body);
     let payload = parse_activation_response_body(&body, action, contract)?;
     if wechat_claw_session_expired(&payload) {
         let message = validate_activation_response(&payload, action, contract)

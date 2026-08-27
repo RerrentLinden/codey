@@ -23,9 +23,14 @@ const SESSION_BUNDLE_VERSION: u32 = 1;
 const BINARY_VALUE_KEY: &str = "$codeyBase64";
 const SESSION_TRANSFER_DIR: &str = "tmp/codey-session-transfers";
 const SESSION_TRANSFER_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const SESSION_TRANSFER_TOTAL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const SESSION_TRANSFER_MAX_ACTIVE_FILES: usize = 16;
 const SESSION_TRANSFER_MAX_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+const SESSION_BUNDLE_METADATA_MAX_BYTES: usize = 1024 * 1024;
+const SESSION_ROLLOUT_RECORD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const SESSION_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 static IMPORT_TRANSFER_LOCKS: OnceLock<Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> = OnceLock::new();
+static TRANSFER_DIRECTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 struct LimitedWriter<W> {
     inner: W,
@@ -66,14 +71,12 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SessionBundle {
+struct SessionBundleMetadata {
     format: String,
     version: u32,
-    exported_at_ms: u128,
     thread: Map<String, Value>,
-    rollout: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,7 +137,10 @@ struct SessionExportSource {
 }
 
 pub fn start_export_transfer(home: &Path, session_id: &str) -> Result<SessionExportStartResult> {
-    prepare_transfer_directory(home)?;
+    let _directory_guard = transfer_directory_lock();
+    let directory = prepare_transfer_directory(home)?;
+    let usage = transfer_directory_usage(&directory)?;
+    ensure_transfer_capacity(usage, 1, 0)?;
     let source = session_export_source(home, session_id)?;
     rollout_transfer_size(&source.rollout_path)?;
 
@@ -149,7 +155,8 @@ pub fn start_export_transfer(home: &Path, session_id: &str) -> Result<SessionExp
         let size = {
             let mut writer = LimitedWriter::new(
                 std::io::BufWriter::with_capacity(64 * 1024, &mut file),
-                SESSION_TRANSFER_MAX_BYTES,
+                SESSION_TRANSFER_MAX_BYTES
+                    .min(SESSION_TRANSFER_TOTAL_MAX_BYTES.saturating_sub(usage.bytes)),
             );
             write_session_bundle(&mut writer, &source.thread, &source.rollout_path)?;
             writer
@@ -210,7 +217,10 @@ pub fn finish_export_transfer(home: &Path, transfer_id: &str) -> Result<()> {
 }
 
 pub fn start_import_transfer(home: &Path) -> Result<SessionImportStartResult> {
-    prepare_transfer_directory(home)?;
+    let _directory_guard = transfer_directory_lock();
+    let directory = prepare_transfer_directory(home)?;
+    let usage = transfer_directory_usage(&directory)?;
+    ensure_transfer_capacity(usage, 1, 0)?;
     let transfer_id = Uuid::new_v4().to_string();
     let path = transfer_path(home, TransferKind::Import, &transfer_id)?;
     fs::OpenOptions::new()
@@ -222,7 +232,8 @@ pub fn start_import_transfer(home: &Path) -> Result<SessionImportStartResult> {
         status: "ready",
         transfer_id,
         chunk_size: SESSION_TRANSFER_CHUNK_BYTES,
-        max_bytes: SESSION_TRANSFER_MAX_BYTES,
+        max_bytes: SESSION_TRANSFER_MAX_BYTES
+            .min(SESSION_TRANSFER_TOTAL_MAX_BYTES.saturating_sub(usage.bytes)),
     })
 }
 
@@ -256,6 +267,9 @@ pub fn append_import_transfer_chunk(
     let _transfer_guard = transfer_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _directory_guard = transfer_directory_lock();
+    let directory = prepare_transfer_directory(home)?;
+    ensure_transfer_capacity(transfer_directory_usage(&directory)?, 0, bytes.len() as u64)?;
     let path = transfer_path(home, TransferKind::Import, transfer_id)?;
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -300,9 +314,10 @@ pub fn finish_import_transfer(
         }
         file.sync_all()
             .with_context(|| format!("保存会话导入临时文件失败：{}", path.display()))?;
-        let bundle: SessionBundle = serde_json::from_reader(BufReader::new(file))
+        let mut reader = BufReader::with_capacity(64 * 1024, file);
+        let bundle = read_session_bundle_metadata(&mut reader)
             .context("数据文件不是有效的 Codey 会话 JSON")?;
-        import_session_bundle(home, project_path, bundle)
+        import_session_bundle(home, project_path, bundle, JsonStringReader::new(reader))
     })();
     let _ = fs::remove_file(&path);
     result
@@ -354,10 +369,11 @@ fn session_export_source(home: &Path, session_id: &str) -> Result<SessionExportS
     })
 }
 
-fn import_session_bundle(
+fn import_session_bundle<R: BufRead>(
     home: &Path,
     project_path: &str,
-    bundle: SessionBundle,
+    bundle: SessionBundleMetadata,
+    rollout: JsonStringReader<R>,
 ) -> Result<SessionImportResult> {
     if bundle.format != SESSION_BUNDLE_FORMAT {
         anyhow::bail!("不支持的数据文件：缺少 Codey 会话格式标记");
@@ -420,14 +436,19 @@ fn import_session_bundle(
             .with_context(|| format!("创建导入会话文件失败：{}", rollout_path.display()))?;
         {
             let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut rollout_file);
-            rewrite_rollout_to(
+            let mut rollout = BufReader::with_capacity(64 * 1024, rollout);
+            rewrite_rollout_reader_to(
                 &mut writer,
-                &bundle.rollout,
+                &mut rollout,
                 original_id,
                 &session_id,
                 &project.to_string_lossy(),
                 &provider_id,
             )?;
+            rollout
+                .into_inner()
+                .finish_document()
+                .context("会话数据在 rollout 后包含无效内容")?;
             writer
                 .flush()
                 .with_context(|| format!("写入导入会话文件失败：{}", rollout_path.display()))?;
@@ -786,6 +807,7 @@ fn rollout_transfer_size(rollout_path: &Path) -> Result<u64> {
     Ok(source_bytes)
 }
 
+#[cfg(test)]
 fn rewrite_rollout_to(
     writer: &mut impl Write,
     rollout: &str,
@@ -794,14 +816,48 @@ fn rewrite_rollout_to(
     project_path: &str,
     provider_id: &str,
 ) -> Result<()> {
+    let mut reader = BufReader::new(rollout.as_bytes());
+    rewrite_rollout_reader_to(
+        writer,
+        &mut reader,
+        original_id,
+        session_id,
+        project_path,
+        provider_id,
+    )
+}
+
+fn rewrite_rollout_reader_to(
+    writer: &mut impl Write,
+    reader: &mut impl BufRead,
+    original_id: &str,
+    session_id: &str,
+    project_path: &str,
+    provider_id: &str,
+) -> Result<()> {
     let mut found_session_meta = false;
     let mut records = 0usize;
-    for line in rollout.lines() {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let read = reader
+            .take(SESSION_ROLLOUT_RECORD_MAX_BYTES + 1)
+            .read_line(&mut line)
+            .context("读取会话 rollout 记录失败")?;
+        if read == 0 {
+            break;
+        }
+        if read as u64 > SESSION_ROLLOUT_RECORD_MAX_BYTES {
+            anyhow::bail!(
+                "会话 rollout 单条记录超过安全上限（{} MB）",
+                SESSION_ROLLOUT_RECORD_MAX_BYTES / 1024 / 1024
+            );
+        }
         if line.trim().is_empty() {
             continue;
         }
         let mut value: Value =
-            serde_json::from_str(line).context("会话 rollout 包含无效的 JSONL 记录")?;
+            serde_json::from_str(&line).context("会话 rollout 包含无效的 JSONL 记录")?;
         replace_exact_string(&mut value, original_id, session_id);
         if value.get("type").and_then(Value::as_str) == Some("session_meta") {
             found_session_meta = true;
@@ -818,6 +874,223 @@ fn rewrite_rollout_to(
         writer.write_all(b"\n")?;
     }
     validate_rollout_summary(records, found_session_meta)
+}
+
+fn read_session_bundle_metadata<R: BufRead>(reader: &mut R) -> Result<SessionBundleMetadata> {
+    let mut prefix = Vec::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut top_level_string_start = None;
+    let mut candidate_key = None::<String>;
+    let mut awaiting_rollout_string = false;
+
+    loop {
+        let mut byte = [0_u8; 1];
+        reader
+            .read_exact(&mut byte)
+            .context("会话数据缺少 rollout 字段")?;
+        let byte = byte[0];
+        prefix.push(byte);
+        if prefix.len() > SESSION_BUNDLE_METADATA_MAX_BYTES {
+            anyhow::bail!(
+                "会话元数据超过安全上限（{} MB）",
+                SESSION_BUNDLE_METADATA_MAX_BYTES / 1024 / 1024
+            );
+        }
+
+        if awaiting_rollout_string {
+            if byte.is_ascii_whitespace() {
+                continue;
+            }
+            if byte != b'"' {
+                anyhow::bail!("会话数据的 rollout 字段必须是字符串");
+            }
+            prefix.pop();
+            prefix.extend_from_slice(b"null}");
+            return serde_json::from_slice(&prefix).context("会话元数据格式无效");
+        }
+
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => {
+                    in_string = false;
+                    if depth == 1
+                        && let Some(start) = top_level_string_start.take()
+                    {
+                        candidate_key = serde_json::from_slice::<String>(&prefix[start..]).ok();
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        match byte {
+            b'{' | b'[' => {
+                depth = depth.saturating_add(1);
+                candidate_key = None;
+            }
+            b'}' | b']' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| anyhow::anyhow!("会话元数据括号不匹配"))?;
+                candidate_key = None;
+            }
+            b'"' => {
+                in_string = true;
+                if depth == 1 {
+                    top_level_string_start = Some(prefix.len() - 1);
+                }
+            }
+            b':' if depth == 1 => {
+                if candidate_key.take().as_deref() == Some("rollout") {
+                    awaiting_rollout_string = true;
+                }
+            }
+            byte if byte.is_ascii_whitespace() => {}
+            _ => candidate_key = None,
+        }
+    }
+}
+
+struct JsonStringReader<R> {
+    inner: R,
+    pending: std::collections::VecDeque<u8>,
+    finished: bool,
+}
+
+impl<R> JsonStringReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            pending: std::collections::VecDeque::new(),
+            finished: false,
+        }
+    }
+}
+
+impl<R: Read> JsonStringReader<R> {
+    fn read_byte(&mut self) -> std::io::Result<u8> {
+        let mut byte = [0_u8; 1];
+        self.inner.read_exact(&mut byte)?;
+        Ok(byte[0])
+    }
+
+    fn read_hex_quad(&mut self) -> std::io::Result<u16> {
+        let mut value = 0_u16;
+        for _ in 0..4 {
+            let digit = self.read_byte()?;
+            let digit = match digit {
+                b'0'..=b'9' => u16::from(digit - b'0'),
+                b'a'..=b'f' => u16::from(digit - b'a' + 10),
+                b'A'..=b'F' => u16::from(digit - b'A' + 10),
+                _ => return Err(invalid_json_string("rollout 包含无效 Unicode 转义")),
+            };
+            value = (value << 4) | digit;
+        }
+        Ok(value)
+    }
+
+    fn push_unicode_escape(&mut self) -> std::io::Result<()> {
+        let first = self.read_hex_quad()?;
+        let scalar = if (0xD800..=0xDBFF).contains(&first) {
+            if self.read_byte()? != b'\\' || self.read_byte()? != b'u' {
+                return Err(invalid_json_string("rollout 包含不完整 Unicode 代理对"));
+            }
+            let second = self.read_hex_quad()?;
+            if !(0xDC00..=0xDFFF).contains(&second) {
+                return Err(invalid_json_string("rollout 包含无效 Unicode 代理对"));
+            }
+            0x10000 + ((u32::from(first) - 0xD800) << 10) + (u32::from(second) - 0xDC00)
+        } else if (0xDC00..=0xDFFF).contains(&first) {
+            return Err(invalid_json_string("rollout 包含孤立 Unicode 低代理项"));
+        } else {
+            u32::from(first)
+        };
+        let character = char::from_u32(scalar)
+            .ok_or_else(|| invalid_json_string("rollout 包含无效 Unicode 标量"))?;
+        let mut encoded = [0_u8; 4];
+        self.pending
+            .extend(character.encode_utf8(&mut encoded).as_bytes());
+        Ok(())
+    }
+
+    fn finish_document(mut self) -> Result<()> {
+        if !self.finished {
+            anyhow::bail!("rollout 字符串没有完整结束");
+        }
+        let mut found_object_end = false;
+        let mut byte = [0_u8; 1];
+        loop {
+            match self.inner.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) if byte[0].is_ascii_whitespace() => {}
+                Ok(_) if byte[0] == b'}' && !found_object_end => found_object_end = true,
+                Ok(_) => anyhow::bail!("rollout 后存在不支持的额外字段或内容"),
+                Err(error) => return Err(error).context("读取会话数据结尾失败"),
+            }
+        }
+        if !found_object_end {
+            anyhow::bail!("会话数据缺少对象结束符");
+        }
+        Ok(())
+    }
+}
+
+impl<R: Read> Read for JsonStringReader<R> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() || (self.finished && self.pending.is_empty()) {
+            return Ok(0);
+        }
+        let mut written = 0usize;
+        while written < output.len() {
+            if let Some(byte) = self.pending.pop_front() {
+                output[written] = byte;
+                written += 1;
+                continue;
+            }
+            if self.finished {
+                break;
+            }
+            let byte = self.read_byte().map_err(|error| {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    invalid_json_string("rollout 字符串没有完整结束")
+                } else {
+                    error
+                }
+            })?;
+            match byte {
+                b'"' => self.finished = true,
+                b'\\' => match self.read_byte()? {
+                    b'"' => self.pending.push_back(b'"'),
+                    b'\\' => self.pending.push_back(b'\\'),
+                    b'/' => self.pending.push_back(b'/'),
+                    b'b' => self.pending.push_back(0x08),
+                    b'f' => self.pending.push_back(0x0c),
+                    b'n' => self.pending.push_back(b'\n'),
+                    b'r' => self.pending.push_back(b'\r'),
+                    b't' => self.pending.push_back(b'\t'),
+                    b'u' => self.push_unicode_escape()?,
+                    _ => return Err(invalid_json_string("rollout 包含无效转义")),
+                },
+                0x00..=0x1f => {
+                    return Err(invalid_json_string("rollout 包含未转义控制字符"));
+                }
+                byte => self.pending.push_back(byte),
+            }
+        }
+        Ok(written)
+    }
+}
+
+fn invalid_json_string(message: &str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
 fn replace_exact_string(value: &mut Value, old: &str, new: &str) {
@@ -903,6 +1176,57 @@ fn prepare_transfer_directory(home: &Path) -> Result<PathBuf> {
         }
     }
     Ok(directory)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TransferDirectoryUsage {
+    files: usize,
+    bytes: u64,
+}
+
+fn transfer_directory_lock() -> std::sync::MutexGuard<'static, ()> {
+    TRANSFER_DIRECTORY_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn transfer_directory_usage(directory: &Path) -> Result<TransferDirectoryUsage> {
+    let mut usage = TransferDirectoryUsage::default();
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("扫描会话传输目录失败：{}", directory.display()))?
+        .filter_map(Result::ok)
+    {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        usage.files = usage.files.saturating_add(1);
+        usage.bytes = usage.bytes.saturating_add(metadata.len());
+    }
+    Ok(usage)
+}
+
+fn ensure_transfer_capacity(
+    usage: TransferDirectoryUsage,
+    additional_files: usize,
+    additional_bytes: u64,
+) -> Result<()> {
+    if usage.files.saturating_add(additional_files) > SESSION_TRANSFER_MAX_ACTIVE_FILES {
+        anyhow::bail!(
+            "同时进行的会话传输过多（上限 {} 个），请稍后重试",
+            SESSION_TRANSFER_MAX_ACTIVE_FILES
+        );
+    }
+    if usage.bytes.saturating_add(additional_bytes) > SESSION_TRANSFER_TOTAL_MAX_BYTES {
+        anyhow::bail!(
+            "会话传输临时数据超过总上限（{} MB），请完成或取消已有传输",
+            SESSION_TRANSFER_TOTAL_MAX_BYTES / 1024 / 1024
+        );
+    }
+    Ok(())
 }
 
 fn transfer_path(home: &Path, kind: TransferKind, transfer_id: &str) -> Result<PathBuf> {
@@ -1007,6 +1331,37 @@ mod tests {
     use base64::Engine;
     use rusqlite::params;
     use tempfile::tempdir;
+
+    #[test]
+    fn streaming_bundle_reader_keeps_rollout_out_of_the_metadata_allocation() {
+        let data = br#"{"format":"codey.session","version":1,"exportedAtMs":0,"thread":{"id":"session","rollout":"nested-value"},"rollout":"first\nquote: \"ok\"\nunicode: \ud83d\ude80"}"#;
+        let mut input = BufReader::new(data.as_slice());
+
+        let metadata = read_session_bundle_metadata(&mut input).unwrap();
+        let mut rollout = JsonStringReader::new(input);
+        let mut decoded = String::new();
+        rollout.read_to_string(&mut decoded).unwrap();
+
+        assert_eq!(metadata.thread["rollout"], "nested-value");
+        assert_eq!(decoded, "first\nquote: \"ok\"\nunicode: 🚀");
+        rollout.finish_document().unwrap();
+    }
+
+    #[test]
+    fn transfer_directory_capacity_bounds_files_and_total_bytes() {
+        let too_many = TransferDirectoryUsage {
+            files: SESSION_TRANSFER_MAX_ACTIVE_FILES,
+            bytes: 0,
+        };
+        assert!(ensure_transfer_capacity(too_many, 1, 0).is_err());
+
+        let nearly_full = TransferDirectoryUsage {
+            files: 1,
+            bytes: SESSION_TRANSFER_TOTAL_MAX_BYTES - 1,
+        };
+        assert!(ensure_transfer_capacity(nearly_full, 0, 1).is_ok());
+        assert!(ensure_transfer_capacity(nearly_full, 0, 2).is_err());
+    }
 
     fn create_thread_db(home: &Path, session_id: &str, cwd: &Path, title: &str) -> PathBuf {
         fs::create_dir_all(home).unwrap();

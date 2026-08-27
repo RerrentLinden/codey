@@ -89,6 +89,7 @@ function createRoute(profiles: Profile[]): Profile {
     clearApiKey: false,
     officialAccount: false,
     supportsRemoteCompaction: false,
+    supportsWebsockets: false,
   };
 }
 
@@ -449,6 +450,11 @@ function ModelSectionComponent({
                             size="xs"
                           >
                             {group?.models.length ? "已接入路由" : "待配置模型"}
+                          </Badge>
+                        )}
+                        {!isOfficial && profile.supportsWebsockets && (
+                          <Badge variant="brand" size="xs">
+                            WS
                           </Badge>
                         )}
                       </div>
@@ -837,15 +843,38 @@ function ModelSectionComponent({
                     disabled={isBusy}
                     getPopupContainer={() => popupContainer ?? document.body}
                     zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                    onChange={(value) => value != null &&
+                    onChange={(value) => {
+                      if (value == null) return;
+                      const upstreamProtocol = value as Profile["upstreamProtocol"];
                       updateRouteDraft({
-                        upstreamProtocol: value as Profile["upstreamProtocol"],
-                      })}
+                        upstreamProtocol,
+                        supportsWebsockets:
+                          upstreamProtocol === "openaiResponses"
+                            ? Boolean(routeDraft.supportsWebsockets)
+                            : false,
+                      });
+                    }}
                     optionList={routeProtocolOptions}
                   />
                   <small className="route-field-hint">
                     请选择上游实际支持的接口协议；Chat Completions 与 Anthropic Messages 会由本地路由适配为 Codex 可用格式。
                   </small>
+                </div>
+
+                <div className="route-websocket-option route-editor-span-all">
+                  <div>
+                    <strong>WebSocket</strong>
+                    <small>
+                      仅在线路明确支持 Responses WebSocket 时开启；连接失败会自动回退 HTTP/SSE。
+                    </small>
+                  </div>
+                  <Switch
+                    checked={Boolean(routeDraft.supportsWebsockets)}
+                    disabled={isBusy || routeDraft.upstreamProtocol !== "openaiResponses"}
+                    onCheckedChange={(checked) =>
+                      updateRouteDraft({ supportsWebsockets: checked })}
+                    aria-label="声明线路支持 WebSocket"
+                  />
                 </div>
 
                 <label className="route-field">

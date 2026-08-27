@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -22,6 +22,7 @@ const MAX_LOG_ERROR_BYTES: usize = 16 * 1024;
 const MAX_LOG_CONTEXT_BYTES: usize = 64 * 1024;
 const MAX_LOG_CONTEXT_DEPTH: usize = 12;
 const MAX_LOG_COLLECTION_ITEMS: usize = 128;
+const MAX_LOG_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const REDACTED_VALUE: &str = "[REDACTED]";
 const TRUNCATED_VALUE: &str = "[TRUNCATED]";
 const BEIJING_OFFSET_SECONDS: i32 = 8 * 60 * 60;
@@ -544,7 +545,13 @@ impl ErrorLogWriter {
 
     fn append(&mut self, path: &Path, today: NaiveDate, line: &str) -> std::io::Result<()> {
         with_log_file_lock(path, || {
-            let truncate = file_is_from_different_day(path, today)?;
+            let incoming_bytes = u64::try_from(line.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(1);
+            let size_limit_reached = fs::metadata(path)
+                .map(|metadata| metadata.len().saturating_add(incoming_bytes) > MAX_LOG_FILE_BYTES)
+                .unwrap_or(false);
+            let truncate = file_is_from_different_day(path, today)? || size_limit_reached;
             if !truncate {
                 repair_incomplete_tail(path)?;
             }
@@ -1216,6 +1223,22 @@ mod tests {
         writer
             .append(&path, next_day, r#"{"error":"new"}"#)
             .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "{\"error\":\"new\"}\n"
+        );
+    }
+
+    #[test]
+    fn same_day_log_restarts_when_the_file_size_cap_is_reached() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(ERROR_LOG_FILE);
+        std::fs::write(&path, vec![b'x'; MAX_LOG_FILE_BYTES as usize]).unwrap();
+        let today = beijing_now().date_naive();
+        let mut writer = ErrorLogWriter;
+
+        writer.append(&path, today, r#"{"error":"new"}"#).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),

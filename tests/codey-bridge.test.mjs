@@ -47,6 +47,7 @@ test("mutation dispatcher unions subscriptions and tears down only when empty", 
     (mutations) => calls.push(["pet", ...mutations]),
     {
       attributes: true,
+      attributeOldValue: true,
       attributeFilter: ["aria-label", "role", "title"],
       childList: true,
     },
@@ -70,6 +71,7 @@ test("mutation dispatcher unions subscriptions and tears down only when empty", 
     ["aria-label", "role", "title", "src"],
   );
   assert.equal(activeObserver.options.attributes, true);
+  assert.equal(activeObserver.options.attributeOldValue, true);
   assert.equal(activeObserver.options.childList, true);
   assert.equal(activeObserver.options.subtree, true);
   assert.equal(dispatcher.snapshot().observerInstalled, true);

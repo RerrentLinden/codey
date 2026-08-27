@@ -434,6 +434,7 @@ fn runtime_disk_provider_replaces_chatgpt_resume_shim() {
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
+        supports_websockets: false,
         requires_openai_auth: true,
     };
 
@@ -470,6 +471,7 @@ wire_api = "responses"
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
+        supports_websockets: false,
         requires_openai_auth: false,
     };
 
@@ -484,18 +486,19 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
     let marker = temp.path().join("codey-state/codex-lease.json");
     let backup_root = temp.path().join("codey-state/codex-backups");
     fs::create_dir_all(&home).unwrap();
-    let original_config = format!(
+    let original_config = String::from(
         "model_provider = \"relay\"\n\
          \n\
          [model_providers.relay]\n\
          name = \"Relay\"\n\
          base_url = \"https://relay.example/v1\"\n\
-         wire_api = \"responses\"\n"
+         wire_api = \"responses\"\n",
     );
     fs::write(home.join("config.toml"), &original_config).unwrap();
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
+        supports_websockets: false,
         requires_openai_auth: true,
     };
 
@@ -567,6 +570,7 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
+        supports_websockets: false,
         requires_openai_auth: true,
     };
 
@@ -813,6 +817,19 @@ experimental_bearer_token = "user-secret"
         root_key_string(&result, "model_catalog_json").as_deref(),
         Some("/user/catalog.json")
     );
+}
+
+#[test]
+fn runtime_router_provider_advertises_websockets_only_when_enabled() {
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "test-router-token".into(),
+        supports_websockets: true,
+        requires_openai_auth: false,
+    };
+
+    let provider = local_router_provider_table(&endpoint);
+    assert_eq!(provider["supports_websockets"].as_bool(), Some(true));
 }
 
 #[test]
@@ -2418,6 +2435,7 @@ experimental_bearer_token = "upstream-secret-token"
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
+        supports_websockets: false,
         requires_openai_auth: false,
     };
 
@@ -2499,6 +2517,7 @@ fn official_login_uses_the_http_only_router_without_overriding_builtin_openai() 
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
+        supports_websockets: false,
         requires_openai_auth: true,
     };
 
@@ -2546,6 +2565,7 @@ wire_api = "responses"
     let endpoint = crate::local_router::RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
+        supports_websockets: false,
         requires_openai_auth: false,
     };
 

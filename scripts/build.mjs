@@ -6,6 +6,15 @@ import { spawnSync } from "node:child_process";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const { version } = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 
+const overlay = spawnSync(
+  process.execPath,
+  [join(root, "scripts", "build-overlay.mjs")],
+  { cwd: root, stdio: "inherit" },
+);
+
+if (overlay.error) throw overlay.error;
+if (overlay.status !== 0) process.exit(overlay.status ?? 1);
+
 const cargo = spawnSync(
   "cargo",
   ["build", "--release", "--manifest-path", join(root, "Cargo.toml")],

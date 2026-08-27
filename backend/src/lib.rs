@@ -11,6 +11,7 @@ mod error_log;
 pub mod fastctx;
 mod fastctx_route_gate;
 mod fs_util;
+mod http_response;
 mod launcher;
 mod local_router;
 mod maintenance_lock;

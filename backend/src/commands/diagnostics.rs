@@ -9,48 +9,6 @@ use crate::error_log;
 use crate::trace_log_guard;
 use crate::trace_log_stats::{self, TraceLogStatsSnapshot};
 
-pub(super) async fn clear_codex_trace_logs(state: &Arc<AppState>) -> Result<Value, String> {
-    let _operation = state.diagnostic_storage_operation.lock().await;
-    let home = codex_home();
-    let disable_writes = state.config.read().await.disable_trace_log_writes;
-    let result = tokio::task::spawn_blocking(move || {
-        let guard = trace_log_guard::configure(home, disable_writes)?;
-        let cleanup = trace_log_guard::clear(home)?;
-        Ok::<_, anyhow::Error>((guard, cleanup))
-    })
-    .await
-    .map_err(|error| format!("Trace 日志库清理任务异常退出：{error}"))
-    .and_then(|result| result.map_err(|error| error.to_string()));
-    let (guard_report, report) = match result {
-        Ok(report) => report,
-        Err(error) => {
-            state
-                .trace_log_write_protection_active
-                .store(false, std::sync::atomic::Ordering::Release);
-            error_log::record_failure(
-                "patch_failed",
-                "clear_codex_trace_logs",
-                error.clone(),
-                json!({
-                    "protectionEnabled": disable_writes,
-                }),
-            );
-            return Err(error);
-        }
-    };
-    let trace_log_write_protection_active = guard_report.protection_active(disable_writes);
-    state.trace_log_write_protection_active.store(
-        trace_log_write_protection_active,
-        std::sync::atomic::Ordering::Release,
-    );
-    Ok(json!({
-        "status":"ok",
-        "cleanup":report,
-        "protectionEnabled":disable_writes,
-        "traceLogWriteProtectionActive":trace_log_write_protection_active,
-    }))
-}
-
 pub(super) async fn clear_diagnostic_storage(state: &Arc<AppState>) -> Result<Value, String> {
     let _operation = state.diagnostic_storage_operation.lock().await;
     let config = state.config.read().await;

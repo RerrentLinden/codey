@@ -7,6 +7,8 @@ use serde_json::{Value, json};
 use super::channels::{NotificationChannelAdapter, adapter_for};
 use super::{NotificationChannelConfig, NotificationEvent};
 
+const MAX_NOTIFICATION_RESPONSE_BYTES: usize = 256 * 1024;
+
 #[derive(Debug)]
 pub struct NotificationDeliveryError {
     message: String,
@@ -105,8 +107,15 @@ impl NotificationDispatcher {
             match request.send().await {
                 Ok(response) => {
                     let status = response.status();
-                    match response.text().await {
+                    match crate::http_response::read_bounded_body(
+                        response,
+                        MAX_NOTIFICATION_RESPONSE_BYTES,
+                        "通知服务响应",
+                    )
+                    .await
+                    {
                         Ok(response_body) => {
+                            let response_body = String::from_utf8_lossy(&response_body);
                             match validate_http_response(adapter, status, &response_body) {
                                 Ok(()) => return Ok(()),
                                 Err(error) => {
@@ -214,8 +223,14 @@ impl NotificationDispatcher {
             Err(error) => return Some(adapter.sanitize_error(&error.to_string())),
         };
         let status = response.status();
-        let body = match response.text().await {
-            Ok(body) => body,
+        let body = match crate::http_response::read_bounded_body(
+            response,
+            MAX_NOTIFICATION_RESPONSE_BYTES,
+            "通知渠道准备响应",
+        )
+        .await
+        {
+            Ok(body) => String::from_utf8_lossy(&body).into_owned(),
             Err(error) => return Some(adapter.sanitize_error(&error.to_string())),
         };
         match validate_http_response(adapter, status, &body) {

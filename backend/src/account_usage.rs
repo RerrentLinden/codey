@@ -18,6 +18,7 @@ const ACCOUNT_USAGE_CACHE_TTL: Duration = Duration::from_secs(30);
 const ACCOUNT_USAGE_FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(60);
 const ACCOUNT_USAGE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 const ACCOUNT_USAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_ACCOUNT_USAGE_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OfficialAuth {
@@ -178,10 +179,14 @@ pub async fn fetch_official_account_usage(
             bail!("官方额度接口返回 {status}");
         }
 
-        let payload = response
-            .json::<Value>()
-            .await
-            .with_context(|| "官方额度响应格式无效")?;
+        let response = crate::http_response::read_bounded_body(
+            response,
+            MAX_ACCOUNT_USAGE_RESPONSE_BYTES,
+            "官方额度响应",
+        )
+        .await?;
+        let payload =
+            serde_json::from_slice::<Value>(&response).with_context(|| "官方额度响应格式无效")?;
         LAST_GOOD_USAGE_ENDPOINT.store(index, std::sync::atomic::Ordering::Relaxed);
         return parse_account_usage(&payload, unix_timestamp());
     }

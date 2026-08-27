@@ -620,6 +620,34 @@
   margin-top: -2px;
 }
 
+.route-websocket-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 12px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 9px;
+  background: rgba(0, 0, 0, 0.018);
+}
+
+.route-websocket-option > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.route-websocket-option strong {
+  color: var(--mac-text-primary);
+  font-size: 12px;
+}
+
+.route-websocket-option small {
+  color: var(--mac-text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .route-editor-dialog .mantine-Select-option,
 .route-editor-dialog .mantine-Combobox-option {
   white-space: nowrap;

@@ -5,6 +5,7 @@ use anyhow::Result;
 const PATCH_RESULT: &str = "codey-startup-patch-installed-v37";
 const APP_SERVER_RUNTIME_OVERRIDES_VERIFIED_RESULT: &str =
     "codey-app-server-runtime-overrides-verified";
+const MAX_INSPECTOR_TARGET_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PatchOptions {
@@ -124,7 +125,17 @@ async fn wait_for_inspector(port: u16) -> Result<String> {
     while tokio::time::Instant::now() < deadline {
         match client.get(&endpoint).send().await {
             Ok(response) if response.status().is_success() => {
-                match response.json::<Vec<serde_json::Value>>().await {
+                let targets = crate::http_response::read_bounded_body(
+                    response,
+                    MAX_INSPECTOR_TARGET_RESPONSE_BYTES,
+                    "Codex Inspector 目标响应",
+                )
+                .await
+                .and_then(|body| {
+                    serde_json::from_slice::<Vec<serde_json::Value>>(&body)
+                        .map_err(anyhow::Error::from)
+                });
+                match targets {
                     Ok(targets) => {
                         if let Some(url) = targets.iter().find_map(|target| {
                             target

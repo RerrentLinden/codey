@@ -443,12 +443,7 @@ if (import.meta.env.DEV) {
           restartRequired: false,
         };
       }
-      if (
-        command === "save_route" ||
-        command === "activate_route" ||
-        command === "delete_route" ||
-        command === "fetch_route_models"
-      ) {
+      if (command === "delete_route" || command === "fetch_route_models") {
         const expectedRevision = Number(args.expectedRevision);
         if (expectedRevision !== previewConfig.settingsRevision) {
           return {
@@ -456,60 +451,6 @@ if (import.meta.env.DEV) {
             message: "Codey 设置已被其他操作更新，请重新载入后再操作线路",
           };
         }
-      }
-      if (command === "save_route") {
-        const route = args.route as Profile;
-        const existing = previewConfig.profiles.find(
-          (profile) => profile.id === route.id,
-        );
-        const savedApiKey = route.clearApiKey
-          ? ""
-          : route.apiKey || existing?.apiKey || "";
-        const savedRoute: Profile = {
-          ...route,
-          apiKey: savedApiKey,
-          apiKeyConfigured: Boolean(savedApiKey.trim()),
-          clearApiKey: false,
-        };
-        previewConfig = {
-          ...previewConfig,
-          settingsRevision: previewConfig.settingsRevision + 1,
-          activeProfileId: savedRoute.id,
-          profiles: existing
-            ? previewConfig.profiles.map((profile) =>
-                profile.id === savedRoute.id ? savedRoute : profile,
-              )
-            : [...previewConfig.profiles, savedRoute],
-        };
-        refreshPreviewModelState();
-        return {
-          status: "ok",
-          config: previewConfig,
-          modelState: previewModelState,
-          providerStatus: previewProviderStatus(),
-          restartRequired: !existing,
-          modelHotReloaded: Boolean(existing),
-        };
-      }
-      if (command === "activate_route") {
-        const routeId = String(args.routeId || "");
-        if (!previewConfig.profiles.some((profile) => profile.id === routeId)) {
-          return { status: "failed", message: "找不到要启用的线路" };
-        }
-        previewConfig = {
-          ...previewConfig,
-          settingsRevision: previewConfig.settingsRevision + 1,
-          activeProfileId: routeId,
-        };
-        refreshPreviewModelState();
-        return {
-          status: "ok",
-          config: previewConfig,
-          modelState: previewModelState,
-          providerStatus: previewProviderStatus(),
-          restartRequired: false,
-          modelHotReloaded: true,
-        };
       }
       if (command === "delete_route") {
         const routeId = String(args.routeId || "");
@@ -572,20 +513,6 @@ if (import.meta.env.DEV) {
           modelHotReloaded: true,
         };
       }
-      if (command === "clear_codex_trace_logs") {
-        return {
-          status: "ok",
-          protectionEnabled: previewConfig.disableTraceLogWrites,
-          cleanup: {
-            databasesFound: 1,
-            databasesCleaned: 1,
-            rowsDeleted: 30141,
-            bytesBefore: 406921216,
-            bytesAfter: 49152,
-            bytesReclaimed: 406872064,
-          },
-        };
-      }
       if (command === "clear_diagnostic_storage") {
         previewTraceStats = {
           ...previewTraceLogStats,
@@ -635,38 +562,6 @@ if (import.meta.env.DEV) {
           },
           traceLogStats: previewTraceStats,
           crashpadPendingStats: previewCrashpadStats,
-        };
-      }
-      if (command === "fetch_current_provider_models") {
-        const activeProfile = activePreviewProfile();
-        const providerId = activeProfile ? routeProviderId(activeProfile) : "primary";
-        const declaredOfficialModels =
-          previewConfig.declaredOfficialModelsByProvider[providerId] || [];
-        const effectiveModels = uniqueModelIds([
-          ...previewUpstreamModels,
-          ...declaredOfficialModels,
-        ]);
-        previewModelState = {
-          ...previewModelState,
-          officialModels: previewOfficialModels.map((model) => ({
-            ...model,
-            supported: includesModelId(effectiveModels, model.slug),
-          })),
-          thirdPartyModels: previewModelState.thirdPartyModels.filter((model) =>
-            includesModelId(effectiveModels, model)
-          ),
-          manualThirdPartyModels: previewModelState.manualThirdPartyModels.filter((model) =>
-            !includesModelId(previewUpstreamModels, model)
-          ),
-          upstreamModels: effectiveModels,
-        };
-        return {
-          status: "ok",
-          config: previewConfig,
-          models: previewUpstreamModels,
-          modelState: previewModelState,
-          restartRequired: false,
-          modelHotReloaded: true,
         };
       }
       if (command === "save_selected_models") {
@@ -824,9 +719,6 @@ if (import.meta.env.DEV) {
       }
       if (command === "install_downloaded_update") {
         return { status: "installing" };
-      }
-      if (command === "test_webhook") {
-        return { status: 200 };
       }
       if (command === "test_notification_channel") {
         const channel = args.channel as {

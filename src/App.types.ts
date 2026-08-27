@@ -20,6 +20,7 @@ export type Profile = {
   sourceProviderId?: string;
   officialAccount: boolean;
   supportsRemoteCompaction?: boolean;
+  supportsWebsockets?: boolean;
 };
 
 export type PromptOptimizationConfig = {

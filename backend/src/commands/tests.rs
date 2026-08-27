@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::ProviderProfile;
 
 #[test]
 fn bridge_field_helpers_preserve_existing_payload_semantics() {

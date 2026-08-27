@@ -228,6 +228,16 @@ pub(super) fn prepare_contract_with_rules(
             validate_contract_schema(name, schema)?;
         }
     }
+    if contract.mode != InvocationMode::Async {
+        return Err(contract_error(
+            "mode 当前只支持 async；sync/stream 尚无对应执行语义",
+        ));
+    }
+    if contract.input_schema.is_some() || contract.output_schema.is_some() {
+        return Err(contract_error(
+            "input_schema/output_schema 尚未接入真实输入输出校验，不能声明为已执行契约",
+        ));
+    }
     let trace =
         TraceContext::normalized(contract.trace_id.as_deref(), contract.parent_id.as_deref())
             .map_err(|error| contract_error(&error))?;

@@ -327,6 +327,7 @@ fn profile_from_provider(
         source_provider_id: None,
         official_account: provider.official,
         supports_remote_compaction: provider.supports_remote_compaction,
+        supports_websockets: false,
     }
 }
 

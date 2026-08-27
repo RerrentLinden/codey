@@ -706,26 +706,6 @@ pub(super) async fn stop_waiting_webhook_watcher(state: &Arc<AppState>) {
     }
 }
 
-pub(super) async fn test_webhook(
-    state: &Arc<AppState>,
-    channel_id: Option<String>,
-) -> Result<Value, String> {
-    let webhook = state.config.read().await.webhook.clone();
-    let channel = match channel_id.as_deref().map(str::trim) {
-        Some(channel_id) if !channel_id.is_empty() => webhook
-            .channels
-            .into_iter()
-            .find(|channel| channel.id == channel_id)
-            .ok_or_else(|| "找不到要测试的通知渠道".to_string())?,
-        _ => webhook
-            .channels
-            .into_iter()
-            .next()
-            .ok_or_else(|| "请先添加通知渠道".to_string())?,
-    };
-    test_notification_channel(state, channel).await
-}
-
 pub(super) async fn test_notification_channel(
     state: &Arc<AppState>,
     channel: NotificationChannelConfig,

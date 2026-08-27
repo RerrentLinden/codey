@@ -218,12 +218,14 @@
     }
 
     let attributes = false;
+    let attributeOldValue = false;
     let childList = false;
     let observeAllAttributes = false;
     const attributeFilter = new Set();
     for (const subscriber of mutationSubscribers.values()) {
       childList ||= subscriber.childList;
       attributes ||= subscriber.attributes;
+      attributeOldValue ||= subscriber.attributeOldValue;
       if (!subscriber.attributes) continue;
       if (subscriber.attributeFilter === null) {
         observeAllAttributes = true;
@@ -234,6 +236,7 @@
     if (!attributes && !childList) return;
 
     const options = { attributes, childList, subtree: true };
+    if (attributes && attributeOldValue) options.attributeOldValue = true;
     if (attributes && !observeAllAttributes && attributeFilter.size) {
       options.attributeFilter = [...attributeFilter];
     }
@@ -249,6 +252,7 @@
     mutationSubscribers.set(id, {
       callback,
       attributes,
+      attributeOldValue: attributes && options.attributeOldValue === true,
       childList: options.childList === true,
       attributeFilter: attributes && Array.isArray(options.attributeFilter)
         ? [...new Set(options.attributeFilter.map(String))]

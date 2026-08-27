@@ -1,14 +1,28 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
+use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::task::JoinSet;
+use tokio_tungstenite::tungstenite::Message as WebSocketMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse as WebSocketErrorResponse, Request as WebSocketRequest,
+    Response as WebSocketResponse,
+};
+use tokio_tungstenite::tungstenite::http::StatusCode as WebSocketStatusCode;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config, connect_async_with_config,
+};
 use uuid::Uuid;
 
 use crate::codex_config::CHATGPT_CODEX_BASE_URL;
@@ -32,6 +46,10 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const MAX_CONCURRENT_REJECTIONS: usize = 4;
 const REQUEST_BODY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 const REQUEST_BODY_BUDGET_UNIT_BYTES: usize = 64 * 1024;
+// serde_json trees and protocol conversion buffers live alongside the encoded
+// request. Reserve a conservative multiple of the wire size so the semaphore
+// represents the request's working set instead of only its first Vec<u8>.
+const REQUEST_MEMORY_BUDGET_MULTIPLIER: usize = 4;
 const REQUEST_BODY_BUDGET_PERMITS: usize =
     REQUEST_BODY_BUDGET_BYTES / REQUEST_BODY_BUDGET_UNIT_BYTES;
 const MAX_ROUTE_BINDINGS: usize = 4096;
@@ -40,6 +58,15 @@ const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const DOWNSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+const UPSTREAM_WEBSOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const UPSTREAM_WEBSOCKET_BACKOFF: Duration = Duration::from_secs(60);
+const UPSTREAM_WEBSOCKET_MAX_REUSE_AGE: Duration = Duration::from_secs(55 * 60);
+const RESPONSES_WEBSOCKET_BETA: &str = "responses_websockets=2026-02-06";
+const RESPONSES_WEBSOCKET_PATHS: [&str; 2] = ["/v1/responses", "/responses"];
+#[cfg(not(test))]
+const ROUTER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const ROUTER_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 tokio::task_local! {
     static ROUTER_REQUEST_ID: String;
@@ -49,6 +76,7 @@ tokio::task_local! {
 pub(crate) struct RuntimeRouterEndpoint {
     pub base_url: String,
     pub token: String,
+    pub supports_websockets: bool,
     /// Official ChatGPT routes are available this launch. Codex itself still
     /// authenticates to this loopback provider with the router bearer token;
     /// the gateway loads ChatGPT OAuth from `auth.json` when forwarding those
@@ -76,6 +104,7 @@ impl LocalRouter {
         let endpoint = RuntimeRouterEndpoint {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             token,
+            supports_websockets: config.runtime_supports_websockets(),
             requires_openai_auth: config.router_requires_openai_auth(),
         };
         let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));
@@ -98,11 +127,30 @@ impl LocalRouter {
             official_auth_path,
         };
         let task = tokio::spawn(async move {
+            let mut connections = JoinSet::new();
             loop {
                 tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    joined = connections.join_next(), if !connections.is_empty() => {
+                        if let Some(Err(error)) = joined
+                            && error.is_panic()
+                        {
+                            crate::error_log::record_failure(
+                                "local_router_connection_task_failed",
+                                "join_local_router_connection",
+                                error.to_string(),
+                                serde_json::json!({}),
+                            );
+                        }
+                    }
                     result = listener.accept() => {
                         match result {
                             Ok((stream, _)) => {
+                                // Chunked SSE writes each event as three small
+                                // writes (size line, payload, CRLF). Nagle would
+                                // hold those back waiting on delayed ACKs and add
+                                // latency to every streamed token.
+                                let _ = stream.set_nodelay(true);
                                 let server = server.clone();
                                 let permit = match Arc::clone(&server.connection_limit)
                                     .try_acquire_owned()
@@ -115,7 +163,7 @@ impl LocalRouter {
                                         .try_acquire_owned()
                                         {
                                             let request_id = Uuid::new_v4().simple().to_string();
-                                            tokio::spawn(async move {
+                                            connections.spawn(async move {
                                                 ROUTER_REQUEST_ID.scope(request_id, async move {
                                                     let _rejection_permit = rejection_permit;
                                                     let mut stream = stream;
@@ -137,7 +185,7 @@ impl LocalRouter {
                                     }
                                 };
                                 let request_id = Uuid::new_v4().simple().to_string();
-                                tokio::spawn(ROUTER_REQUEST_ID.scope(request_id.clone(), async move {
+                                connections.spawn(ROUTER_REQUEST_ID.scope(request_id.clone(), async move {
                                     let _permit = permit;
                                     if let Err(error) = server.handle_connection(stream).await {
                                         crate::error_log::record_failure(
@@ -160,8 +208,27 @@ impl LocalRouter {
                             }
                         }
                     }
-                    _ = &mut shutdown_rx => break,
                 }
+            }
+            drop(listener);
+            let drained = tokio::time::timeout(ROUTER_SHUTDOWN_DRAIN_TIMEOUT, async {
+                while let Some(joined) = connections.join_next().await {
+                    if let Err(error) = joined
+                        && error.is_panic()
+                    {
+                        crate::error_log::record_failure(
+                            "local_router_connection_task_failed",
+                            "drain_local_router_connection",
+                            error.to_string(),
+                            serde_json::json!({}),
+                        );
+                    }
+                }
+            })
+            .await;
+            if drained.is_err() {
+                connections.abort_all();
+                while connections.join_next().await.is_some() {}
             }
         });
         Ok(Self {
@@ -258,9 +325,12 @@ impl RouteBindings {
         })
     }
 
-    fn remember(&mut self, keys: &[String], provider_id: &str) {
+    fn remember(&mut self, keys: &[String], provider_id: &str, refresh_session_binding: bool) {
         for key in keys {
-            if key.starts_with("session-id:") && self.routes.contains_key(key) {
+            if key.starts_with("session-id:")
+                && self.routes.contains_key(key)
+                && !refresh_session_binding
+            {
                 continue;
             }
             self.next_generation = self.next_generation.wrapping_add(1);
@@ -338,10 +408,14 @@ impl RouterSnapshot {
                 provider_id: provider_id.to_string(),
                 route_name: profile.name.trim().to_string(),
                 upstream_url: prepare_upstream_url(protocol, &base_url),
+                upstream_websocket_url: prepare_upstream_websocket_url(protocol, &base_url),
                 upstream_headers: prepare_upstream_headers(profile, protocol),
                 upstream_authority: upstream_authority(&base_url),
                 protocol,
                 official_account: profile.official_account,
+                supports_websockets: !profile.official_account
+                    && protocol == UpstreamProtocol::OpenAiResponses
+                    && profile.supports_websockets,
                 models: HashSet::new(),
             };
             for model in route_models(config, profile, provider_id) {
@@ -481,10 +555,12 @@ struct RouteTarget {
     provider_id: String,
     route_name: String,
     upstream_url: std::result::Result<String, String>,
+    upstream_websocket_url: std::result::Result<String, String>,
     upstream_headers: std::result::Result<HeaderMap, String>,
     upstream_authority: String,
     protocol: UpstreamProtocol,
     official_account: bool,
+    supports_websockets: bool,
     models: HashSet<String>,
 }
 
@@ -556,6 +632,9 @@ fn encode_alias_component(value: &str) -> String {
 
 impl RouterServer {
     async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
+        if request_looks_like_responses_websocket(&stream).await? {
+            return self.handle_responses_websocket(stream).await;
+        }
         let request = match tokio::time::timeout(
             REQUEST_READ_TIMEOUT,
             read_http_request_with_budget(&mut stream, Some(&self.request_body_budget)),
@@ -659,32 +738,295 @@ impl RouterServer {
         })
     }
 
-    async fn proxy_responses(&self, mut request: HttpRequest, mut stream: TcpStream) -> Result<()> {
-        let mut body = match serde_json::from_slice::<Value>(&request.body) {
+    // Tungstenite's handshake callback fixes the error type to an HTTP
+    // response value; its size is imposed by the external Callback contract.
+    #[allow(clippy::result_large_err)]
+    async fn handle_responses_websocket(&self, stream: TcpStream) -> Result<()> {
+        let handshake_context = Arc::new(Mutex::new(None));
+        let captured_context = Arc::clone(&handshake_context);
+        let token = self.token.clone();
+        let bearer_token = self.bearer_token.clone();
+        let request_id = current_router_request_id();
+        let websocket_config = WebSocketConfig::default()
+            // Responses events are latency-sensitive and already framed. Do
+            // not wait for tungstenite's default 128 KiB write threshold.
+            .write_buffer_size(0)
+            .max_write_buffer_size(MAX_UPSTREAM_RESPONSE_BYTES)
+            .max_message_size(Some(MAX_REQUEST_BYTES))
+            .max_frame_size(Some(MAX_REQUEST_BYTES));
+        let socket = tokio::time::timeout(
+            REQUEST_READ_TIMEOUT,
+            accept_hdr_async_with_config(
+                stream,
+                move |request: &WebSocketRequest, mut response: WebSocketResponse| {
+                    if !RESPONSES_WEBSOCKET_PATHS.contains(&request.uri().path()) {
+                        return Err(websocket_handshake_error(
+                            WebSocketStatusCode::NOT_FOUND,
+                            "Codey 本地路由不支持该 WebSocket 路径",
+                        ));
+                    }
+                    if !websocket_request_authorized(request, &token, &bearer_token) {
+                        return Err(websocket_handshake_error(
+                            WebSocketStatusCode::UNAUTHORIZED,
+                            "Codey 本地路由 WebSocket 认证失败",
+                        ));
+                    }
+                    *captured_context
+                        .lock()
+                        .expect("local router websocket handshake context poisoned") =
+                        Some(WebSocketRequestContext {
+                            headers: websocket_forward_headers(request),
+                        });
+                    if let Some(request_id) = request_id.as_deref()
+                        && let Ok(value) = request_id.parse()
+                    {
+                        response.headers_mut().insert("x-codey-request-id", value);
+                    }
+                    response.headers_mut().insert(
+                        "openai-beta",
+                        HeaderValue::from_static(RESPONSES_WEBSOCKET_BETA),
+                    );
+                    Ok(response)
+                },
+                Some(websocket_config),
+            ),
+        )
+        .await
+        .context("Codey Responses WebSocket 握手超时")?
+        .context("Codey Responses WebSocket 握手失败")?;
+        let context = handshake_context
+            .lock()
+            .expect("local router websocket handshake context poisoned")
+            .take()
+            .context("Codey Responses WebSocket 缺少握手上下文")?;
+        let mut downstream = WebSocketResponsesDownstream::new(socket);
+
+        while let Some(message) = downstream.next_message().await? {
+            match message {
+                WebSocketMessage::Text(text) => {
+                    let body_budget_permit =
+                        match acquire_request_body_budget(&self.request_body_budget, text.len()) {
+                            Ok(permit) => permit,
+                            Err(error)
+                                if error
+                                    .downcast_ref::<RequestBodyBudgetUnavailable>()
+                                    .is_some() =>
+                            {
+                                downstream
+                                    .write_error(
+                                        503,
+                                        "router_memory_busy",
+                                        "Codey 本地路由请求缓冲区已满，请稍后重试".to_string(),
+                                        None,
+                                    )
+                                    .await?;
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
+                    let mut body = match serde_json::from_str::<Value>(text.as_str()) {
+                        Ok(Value::Object(body)) => Value::Object(body),
+                        Ok(_) => {
+                            downstream
+                                .write_error(
+                                    400,
+                                    "invalid_request_body",
+                                    "Responses WebSocket 消息必须是 JSON 对象".to_string(),
+                                    None,
+                                )
+                                .await?;
+                            continue;
+                        }
+                        Err(error) => {
+                            downstream
+                                .write_error(
+                                    400,
+                                    "invalid_request_body",
+                                    format!("Responses WebSocket 消息不是有效 JSON：{error}"),
+                                    None,
+                                )
+                                .await?;
+                            continue;
+                        }
+                    };
+                    let message_type = body
+                        .as_object_mut()
+                        .and_then(|body| body.remove("type"))
+                        .and_then(|value| value.as_str().map(str::to_string));
+                    if message_type.as_deref() != Some("response.create") {
+                        downstream
+                            .write_error(
+                                400,
+                                "unsupported_websocket_message",
+                                "Codey Responses WebSocket 仅支持 response.create".to_string(),
+                                None,
+                            )
+                            .await?;
+                        continue;
+                    }
+                    let stream_id = match responses_websocket_stream_id(&body) {
+                        Ok(stream_id) => stream_id,
+                        Err(error) => {
+                            downstream
+                                .write_error(
+                                    400,
+                                    "invalid_stream_id",
+                                    format!("Responses WebSocket stream_id 无效：{error:#}"),
+                                    None,
+                                )
+                                .await?;
+                            continue;
+                        }
+                    };
+                    if body
+                        .get("stream")
+                        .is_some_and(|stream| stream.as_bool() != Some(true))
+                    {
+                        downstream
+                            .write_error(
+                                400,
+                                "websocket_stream_required",
+                                "Responses WebSocket 的 stream 字段只能省略或设为 true".to_string(),
+                                None,
+                            )
+                            .await?;
+                        continue;
+                    }
+                    if body
+                        .get("background")
+                        .is_some_and(|background| background.as_bool() != Some(false))
+                    {
+                        downstream
+                            .write_error(
+                                400,
+                                "websocket_background_unsupported",
+                                "Responses WebSocket 不支持 background 模式".to_string(),
+                                None,
+                            )
+                            .await?;
+                        continue;
+                    }
+                    if let Some(body) = body.as_object_mut() {
+                        // These are HTTP transport fields. The shared proxy
+                        // path restores `stream = true` only for an HTTP/SSE
+                        // fallback and never forwards either field over WS.
+                        body.remove("stream");
+                        body.remove("background");
+                    }
+                    downstream.set_stream_id(stream_id);
+                    let request = HttpRequest {
+                        method: "POST".to_string(),
+                        path: "/v1/responses".to_string(),
+                        headers: context.headers.clone(),
+                        body: Vec::new(),
+                        _body_budget_permit: body_budget_permit,
+                    };
+                    let request_id = Uuid::new_v4().simple().to_string();
+                    let result = ROUTER_REQUEST_ID
+                        .scope(
+                            request_id.clone(),
+                            self.proxy_parsed_responses(request, body, None, &mut downstream),
+                        )
+                        .await;
+                    if let Err(error) = result {
+                        crate::error_log::record_failure(
+                            "local_router_websocket_request_failed",
+                            "proxy_local_router_websocket_request",
+                            format!("{error:#}"),
+                            serde_json::json!({ "requestId": request_id }),
+                        );
+                        downstream
+                            .write_error(
+                                502,
+                                "websocket_proxy_failed",
+                                "Codey 本地路由处理 WebSocket 请求失败".to_string(),
+                                None,
+                            )
+                            .await?;
+                    }
+                    downstream.clear_stream_id();
+                }
+                WebSocketMessage::Ping(payload) => downstream.write_pong(payload).await?,
+                WebSocketMessage::Pong(_) => {}
+                WebSocketMessage::Close(frame) => {
+                    downstream.close(frame).await?;
+                    break;
+                }
+                WebSocketMessage::Binary(_) | WebSocketMessage::Frame(_) => {
+                    downstream
+                        .write_error(
+                            400,
+                            "unsupported_websocket_message",
+                            "Codey Responses WebSocket 仅接受 JSON 文本消息".to_string(),
+                            None,
+                        )
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn proxy_responses(&self, mut request: HttpRequest, stream: TcpStream) -> Result<()> {
+        let encoded_body = std::mem::take(&mut request.body);
+        let body = match serde_json::from_slice::<Value>(&encoded_body) {
             Ok(body) if body.is_object() => body,
             Ok(_) => {
-                write_error_response(
-                    &mut stream,
-                    400,
-                    "invalid_request_body",
-                    "Responses 请求体必须是 JSON 对象",
-                    None,
-                )
-                .await?;
+                let mut downstream = HttpResponsesDownstream::new(stream);
+                downstream
+                    .write_error(
+                        400,
+                        "invalid_request_body",
+                        "Responses 请求体必须是 JSON 对象".to_string(),
+                        None,
+                    )
+                    .await?;
                 return Ok(());
             }
             Err(error) => {
-                write_error_response(
-                    &mut stream,
-                    400,
-                    "invalid_request_body",
-                    format!("Responses 请求体不是有效 JSON：{error}"),
-                    None,
-                )
-                .await?;
+                let mut downstream = HttpResponsesDownstream::new(stream);
+                downstream
+                    .write_error(
+                        400,
+                        "invalid_request_body",
+                        format!("Responses 请求体不是有效 JSON：{error}"),
+                        None,
+                    )
+                    .await?;
                 return Ok(());
             }
         };
+        let mut downstream = HttpResponsesDownstream::new(stream);
+        self.proxy_parsed_responses(request, body, Some(encoded_body), &mut downstream)
+            .await
+    }
+
+    async fn proxy_parsed_responses<D>(
+        &self,
+        mut request: HttpRequest,
+        mut body: Value,
+        mut encoded_body: Option<Vec<u8>>,
+        downstream: &mut D,
+    ) -> Result<()>
+    where
+        D: ResponsesDownstream + ?Sized,
+    {
+        let downstream_websocket = downstream.is_websocket();
+        let websocket_stream_id = if downstream_websocket {
+            body.as_object_mut()
+                .and_then(|body| body.remove("stream_id"))
+        } else {
+            None
+        };
+        if downstream_websocket {
+            // HTTP/SSE is the deterministic fallback for a downstream WS
+            // request, so the shared proxy path always asks an HTTP upstream
+            // to stream. `stream_id` remains WS-only and is reattached only
+            // when an upstream WS connection is actually used.
+            body.as_object_mut()
+                .expect("validated Responses body must remain an object")
+                .insert("stream".to_string(), Value::Bool(true));
+        }
         let model = body
             .as_object()
             .and_then(|body| body.get("model"))
@@ -693,28 +1035,28 @@ impl RouterServer {
             .trim()
             .to_string();
         if model.is_empty() {
-            write_error_response(
-                &mut stream,
-                400,
-                "model_required",
-                "Responses 请求缺少有效的 model 字段",
-                None,
-            )
-            .await?;
+            downstream
+                .write_error(
+                    400,
+                    "model_required",
+                    "Responses 请求缺少有效的 model 字段".to_string(),
+                    None,
+                )
+                .await?;
             return Ok(());
         }
         let (route_hint, mut body_mutated) =
             match take_codey_route_metadata(&mut request, &mut body) {
                 Ok(extracted) => extracted,
                 Err(error) => {
-                    write_error_response(
-                        &mut stream,
-                        400,
-                        "route_metadata_invalid",
-                        format!("Codey 线路元数据无效：{error:#}"),
-                        None,
-                    )
-                    .await?;
+                    downstream
+                        .write_error(
+                            400,
+                            "route_metadata_invalid",
+                            format!("Codey 线路元数据无效：{error:#}"),
+                            None,
+                        )
+                        .await?;
                     return Ok(());
                 }
             };
@@ -737,21 +1079,23 @@ impl RouterServer {
             let resolved =
                 snapshot.target_for_request(&model, route_hint.as_deref(), bound_route.as_deref());
             if let Ok(resolved) = &resolved {
-                bindings.remember(&binding_keys, &resolved.provider_id);
+                let refresh_session_binding = route_hint.is_some()
+                    && incoming_header(&request, "x-openai-subagent").is_none()
+                    && incoming_header(&request, "x-codex-parent-thread-id").is_none();
+                bindings.remember(
+                    &binding_keys,
+                    &resolved.provider_id,
+                    refresh_session_binding,
+                );
             }
             resolved
         };
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
-                write_error_response(
-                    &mut stream,
-                    404,
-                    "model_not_enabled",
-                    format!("{error:#}"),
-                    None,
-                )
-                .await?;
+                downstream
+                    .write_error(404, "model_not_enabled", format!("{error:#}"), None)
+                    .await?;
                 return Ok(());
             }
         };
@@ -773,14 +1117,14 @@ impl RouterServer {
         let upstream_url = match &resolved.route.upstream_url {
             Ok(upstream_url) => upstream_url.as_str(),
             Err(error) => {
-                write_error_response(
-                    &mut stream,
-                    502,
-                    "route_configuration_error",
-                    format!("线路「{}」的 {error}", route_display_name(&resolved.route)),
-                    Some(&resolved.route),
-                )
-                .await?;
+                downstream
+                    .write_error(
+                        502,
+                        "route_configuration_error",
+                        format!("线路「{}」的 {error}", route_display_name(&resolved.route)),
+                        Some(&resolved.route),
+                    )
+                    .await?;
                 return Ok(());
             }
         };
@@ -795,32 +1139,32 @@ impl RouterServer {
                 }
             }
             Err(error) => {
-                write_error_response(
-                    &mut stream,
-                    400,
-                    "unsupported_responses_payload",
-                    format!(
-                        "线路「{}」选择了 {}，但当前请求无法转换：{error:#}",
-                        route_display_name(&resolved.route),
-                        bridge.upstream_protocol().label()
-                    ),
-                    Some(&resolved.route),
-                )
-                .await?;
+                downstream
+                    .write_error(
+                        400,
+                        "unsupported_responses_payload",
+                        format!(
+                            "线路「{}」选择了 {}，但当前请求无法转换：{error:#}",
+                            route_display_name(&resolved.route),
+                            bridge.upstream_protocol().label()
+                        ),
+                        Some(&resolved.route),
+                    )
+                    .await?;
                 return Ok(());
             }
         };
         let prepared_headers = match &resolved.route.upstream_headers {
             Ok(headers) => headers,
             Err(error) => {
-                write_error_response(
-                    &mut stream,
-                    502,
-                    "route_configuration_error",
-                    error,
-                    Some(&resolved.route),
-                )
-                .await?;
+                downstream
+                    .write_error(
+                        502,
+                        "route_configuration_error",
+                        error.clone(),
+                        Some(&resolved.route),
+                    )
+                    .await?;
                 return Ok(());
             }
         };
@@ -851,25 +1195,25 @@ impl RouterServer {
                 &self.bearer_token,
                 &self.official_auth_path,
             ) else {
-                write_error_response(
-                    &mut stream,
-                    401,
-                    "openai_auth_missing",
-                    "官方账号线路缺少 Codex OpenAI 登录态，请重新登录后重试",
-                    Some(&resolved.route),
-                )
-                .await?;
+                downstream
+                    .write_error(
+                        401,
+                        "openai_auth_missing",
+                        "官方账号线路缺少 Codex OpenAI 登录态，请重新登录后重试".to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await?;
                 return Ok(());
             };
             let Ok(value) = HeaderValue::from_str(&official_auth.authorization) else {
-                write_error_response(
-                    &mut stream,
-                    401,
-                    "openai_auth_invalid",
-                    "官方账号线路的 Codex OpenAI 登录态无效，请重新登录后重试",
-                    Some(&resolved.route),
-                )
-                .await?;
+                downstream
+                    .write_error(
+                        401,
+                        "openai_auth_invalid",
+                        "官方账号线路的 Codex OpenAI 登录态无效，请重新登录后重试".to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await?;
                 return Ok(());
             };
             headers.insert(AUTHORIZATION, value);
@@ -880,6 +1224,25 @@ impl RouterServer {
                 headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
             }
         }
+        if stream_requested
+            && bridge == ProtocolBridge::NativeResponses
+            && resolved.route.supports_websockets
+        {
+            let mut websocket_body = upstream_body.clone();
+            if let Some(stream_id) = websocket_stream_id.clone() {
+                websocket_body
+                    .as_object_mut()
+                    .expect("native Responses body must remain an object")
+                    .insert("stream_id".to_string(), stream_id);
+            }
+            if downstream
+                .try_proxy_upstream_websocket(&resolved.route, &headers, &websocket_body)
+                .await?
+                == UpstreamWebSocketAttempt::Completed
+            {
+                return Ok(());
+            }
+        }
         let mut request_builder = self.client.post(upstream_url).headers(headers);
         request_builder = if should_passthrough_native_responses(
             bridge,
@@ -887,10 +1250,19 @@ impl RouterServer {
             resolved.upstream_model.as_str(),
             body_mutated,
         ) {
+            // HTTP can reuse the exact encoded body when no rewrite was
+            // needed. WebSocket requests have no original byte buffer, so
+            // serialize the validated object once for native passthrough.
+            let passthrough_body = match encoded_body.take() {
+                Some(body) => body,
+                None => serde_json::to_vec(&upstream_body)
+                    .context("序列化 Responses WebSocket 上游请求失败")?,
+            };
             request_builder
                 .header(CONTENT_TYPE, "application/json")
-                .body(std::mem::take(&mut request.body))
+                .body(passthrough_body)
         } else {
+            drop(encoded_body.take());
             request_builder.json(&upstream_body)
         };
         let response = match tokio::time::timeout(
@@ -945,7 +1317,7 @@ impl RouterServer {
                 // preserved in its surfaced `unexpected status` message. A
                 // transport setup failure uses non-retryable 424 so Codex does
                 // not repeat the same deterministic failure four more times.
-                write_text_error_response(&mut stream, status, code, message).await?;
+                downstream.write_text_error(status, code, message).await?;
                 return Ok(());
             }
             Err(_) => {
@@ -966,24 +1338,24 @@ impl RouterServer {
                         "requestId": current_router_request_id(),
                     }),
                 );
-                write_text_error_response(
-                    &mut stream,
-                    504,
-                    "upstream_header_timeout",
-                    format!(
-                        "Codey 线路「{}」等待上游 {} 返回响应头超时",
-                        route_display_name(&resolved.route),
-                        resolved.route.upstream_authority
-                    ),
-                )
-                .await?;
+                downstream
+                    .write_text_error(
+                        504,
+                        "upstream_header_timeout",
+                        format!(
+                            "Codey 线路「{}」等待上游 {} 返回响应头超时",
+                            route_display_name(&resolved.route),
+                            resolved.route.upstream_authority
+                        ),
+                    )
+                    .await?;
                 return Ok(());
             }
         };
         match bridge {
             ProtocolBridge::ResponsesToChatCompletions if response.status().is_success() => {
                 write_chat_completions_as_responses(
-                    &mut stream,
+                    downstream,
                     response,
                     &resolved.upstream_model,
                     stream_requested,
@@ -994,7 +1366,7 @@ impl RouterServer {
             }
             ProtocolBridge::ResponsesToAnthropicMessages => {
                 write_anthropic_messages_as_responses(
-                    &mut stream,
+                    downstream,
                     response,
                     &resolved.upstream_model,
                     stream_requested,
@@ -1003,7 +1375,7 @@ impl RouterServer {
                 )
                 .await
             }
-            _ => write_proxy_response(&mut stream, response).await,
+            _ => downstream.proxy_response(response).await,
         }
     }
 }
@@ -1403,6 +1775,19 @@ fn responses_endpoint(base_url: &str) -> Result<String> {
     }
 }
 
+fn responses_websocket_endpoint(base_url: &str) -> Result<String> {
+    let endpoint = responses_endpoint(base_url)?;
+    let mut url = reqwest::Url::parse(&endpoint).context("解析 Responses WebSocket URL 失败")?;
+    let websocket_scheme = match url.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        scheme => anyhow::bail!("Responses WebSocket 不支持 URL scheme {scheme}"),
+    };
+    url.set_scheme(websocket_scheme)
+        .map_err(|_| anyhow::anyhow!("转换 Responses WebSocket URL scheme 失败"))?;
+    Ok(url.to_string())
+}
+
 fn chat_completions_endpoint(base_url: &str) -> Result<String> {
     let url = normalized_endpoint_url(base_url)?;
     let base = url.as_str().trim_end_matches('/');
@@ -1462,6 +1847,17 @@ fn prepare_upstream_url(
         let endpoint = protocol.endpoint_label();
         format!("{endpoint} 无效：{error:#}")
     })
+}
+
+fn prepare_upstream_websocket_url(
+    protocol: UpstreamProtocol,
+    base_url: &str,
+) -> std::result::Result<String, String> {
+    if protocol != UpstreamProtocol::OpenAiResponses {
+        return Err(format!("{} 不支持 Responses WebSocket", protocol.label()));
+    }
+    responses_websocket_endpoint(base_url)
+        .map_err(|error| format!("Responses WebSocket API URL 无效：{error:#}"))
 }
 
 fn prepare_upstream_headers(
@@ -3941,11 +4337,17 @@ where
             anyhow::bail!("请求在 HTTP 头读取完成前断开");
         }
         buffer.extend_from_slice(&chunk[..read]);
-        if buffer.len() > MAX_HEADER_BYTES {
-            anyhow::bail!("HTTP 请求头超过 Codey 本地路由安全上限");
-        }
         if let Some(index) = find_header_end(&buffer) {
+            if index > MAX_HEADER_BYTES {
+                anyhow::bail!("HTTP 请求头超过 Codey 本地路由安全上限");
+            }
             break index;
+        }
+        // Keep at most the three bytes that may be the beginning of the
+        // terminating CRLFCRLF sequence beyond the header byte limit. A read
+        // may also contain body bytes, which must not count as header bytes.
+        if buffer.len() > MAX_HEADER_BYTES.saturating_add(3) {
+            anyhow::bail!("HTTP 请求头超过 Codey 本地路由安全上限");
         }
     };
     let header_text = std::str::from_utf8(&buffer[..header_end]).context("HTTP 头不是 UTF-8")?;
@@ -3989,21 +4391,10 @@ where
     if content_length > MAX_REQUEST_BYTES {
         anyhow::bail!("请求体超过 Codey 本地路由安全上限");
     }
-    let body_budget_permit = if let Some(body_budget) = body_budget {
-        let permits = content_length.div_ceil(REQUEST_BODY_BUDGET_UNIT_BYTES);
-        if permits == 0 {
-            None
-        } else {
-            let permits = u32::try_from(permits).context("请求体缓冲预算超出内部上限")?;
-            Some(
-                Arc::clone(body_budget)
-                    .try_acquire_many_owned(permits)
-                    .map_err(|_| anyhow::Error::new(RequestBodyBudgetUnavailable))?,
-            )
-        }
-    } else {
-        None
-    };
+    let body_budget_permit = body_budget
+        .map(|body_budget| acquire_request_body_budget(body_budget, content_length))
+        .transpose()?
+        .flatten();
     let body_start = header_end + 4;
     let buffered_body = buffer.get(body_start..).unwrap_or_default();
     let mut body = Vec::with_capacity(content_length);
@@ -4033,6 +4424,731 @@ where
 
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn acquire_request_body_budget(
+    body_budget: &Arc<Semaphore>,
+    wire_bytes: usize,
+) -> Result<Option<OwnedSemaphorePermit>> {
+    if wire_bytes > MAX_REQUEST_BYTES {
+        anyhow::bail!("请求体超过 Codey 本地路由安全上限");
+    }
+    let estimated_memory = wire_bytes.saturating_mul(REQUEST_MEMORY_BUDGET_MULTIPLIER);
+    let permits = estimated_memory.div_ceil(REQUEST_BODY_BUDGET_UNIT_BYTES);
+    if permits == 0 {
+        return Ok(None);
+    }
+    let permits = u32::try_from(permits).context("请求体缓冲预算超出内部上限")?;
+    Arc::clone(body_budget)
+        .try_acquire_many_owned(permits)
+        .map(Some)
+        .map_err(|_| anyhow::Error::new(RequestBodyBudgetUnavailable))
+}
+
+#[derive(Debug)]
+struct WebSocketRequestContext {
+    headers: Vec<(String, String)>,
+}
+
+async fn request_looks_like_responses_websocket(stream: &TcpStream) -> Result<bool> {
+    tokio::time::timeout(REQUEST_READ_TIMEOUT, async {
+        let mut peek = vec![0_u8; 4096];
+        loop {
+            let read = stream
+                .peek(&mut peek)
+                .await
+                .context("探测 Codey Responses WebSocket 请求失败")?;
+            if read == 0 {
+                return Ok(false);
+            }
+            let bytes = &peek[..read];
+            let Some(request_line_end) = bytes.windows(2).position(|window| window == b"\r\n")
+            else {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                continue;
+            };
+            let request_line = std::str::from_utf8(&bytes[..request_line_end])
+                .context("WebSocket HTTP 请求行不是 UTF-8")?;
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or_default();
+            let raw_path = parts.next().unwrap_or_default();
+            let path = raw_path.split('?').next().unwrap_or(raw_path);
+            if method != "GET" || !RESPONSES_WEBSOCKET_PATHS.contains(&path) {
+                return Ok(false);
+            }
+            if let Some(header_end) = find_header_end(bytes) {
+                let headers = String::from_utf8_lossy(&bytes[request_line_end + 2..header_end]);
+                let mut connection_upgrade = false;
+                let mut websocket_upgrade = false;
+                for line in headers.split("\r\n") {
+                    let Some((name, value)) = line.split_once(':') else {
+                        continue;
+                    };
+                    if name.trim().eq_ignore_ascii_case("connection") {
+                        connection_upgrade = value
+                            .split([',', ' '])
+                            .any(|part| part.trim().eq_ignore_ascii_case("upgrade"));
+                    } else if name.trim().eq_ignore_ascii_case("upgrade") {
+                        websocket_upgrade = value.trim().eq_ignore_ascii_case("websocket");
+                    }
+                }
+                return Ok(connection_upgrade && websocket_upgrade);
+            }
+            if read == peek.len() {
+                if peek.len() >= MAX_HEADER_BYTES.saturating_add(4) {
+                    return Ok(false);
+                }
+                peek.resize(
+                    peek.len()
+                        .saturating_mul(2)
+                        .min(MAX_HEADER_BYTES.saturating_add(4)),
+                    0,
+                );
+            } else {
+                // `peek` leaves the current bytes readable, so wait briefly
+                // for another packet instead of spinning on the same prefix.
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+    })
+    .await
+    .context("探测 Codey Responses WebSocket 请求超时")?
+}
+
+fn websocket_request_authorized(
+    request: &WebSocketRequest,
+    token: &str,
+    bearer_token: &str,
+) -> bool {
+    request.headers().iter().any(|(name, value)| {
+        let Ok(value) = value.to_str() else {
+            return false;
+        };
+        (name.as_str().eq_ignore_ascii_case(ROUTER_AUTH_HEADER)
+            && constant_time_eq(value.trim().as_bytes(), token.as_bytes()))
+            || (name.as_str().eq_ignore_ascii_case("authorization")
+                && constant_time_eq(value.trim().as_bytes(), bearer_token.as_bytes()))
+    })
+}
+
+fn websocket_forward_headers(request: &WebSocketRequest) -> Vec<(String, String)> {
+    request
+        .headers()
+        .iter()
+        .filter(|(name, _)| {
+            let name = name.as_str();
+            !is_hop_by_hop_header(name) && !name.to_ascii_lowercase().starts_with("sec-websocket-")
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+fn websocket_handshake_error(status: WebSocketStatusCode, message: &str) -> WebSocketErrorResponse {
+    WebSocketResponse::builder()
+        .status(status)
+        .header("content-type", "text/plain; charset=utf-8")
+        .header("content-length", message.len())
+        .body(Some(message.to_string()))
+        .expect("static WebSocket handshake error response must be valid")
+}
+
+fn responses_websocket_stream_id(body: &Value) -> Result<Option<String>> {
+    let Some(stream_id) = body.get("stream_id") else {
+        return Ok(None);
+    };
+    let stream_id = stream_id.as_str().context("stream_id 必须是字符串")?;
+    if stream_id.is_empty()
+        || stream_id.len() > 256
+        || !stream_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        anyhow::bail!("必须为 1–256 个字母、数字、下划线、连字符或句点");
+    }
+    Ok(Some(stream_id.to_string()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpstreamWebSocketAttempt {
+    UseHttp,
+    Completed,
+}
+
+struct CachedUpstreamWebSocket {
+    route_id: String,
+    url: String,
+    connected_at: Instant,
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+}
+
+struct UpstreamWebSocketBackoff {
+    route_id: String,
+    until: Instant,
+}
+
+#[async_trait]
+trait ResponsesDownstream: Send {
+    fn is_websocket(&self) -> bool {
+        false
+    }
+
+    async fn write_error(
+        &mut self,
+        status: u16,
+        code: &str,
+        message: String,
+        route: Option<&RouteTarget>,
+    ) -> Result<()>;
+
+    async fn write_text_error(&mut self, status: u16, code: &str, message: String) -> Result<()> {
+        self.write_error(status, code, message, None).await
+    }
+
+    async fn write_json(&mut self, status: u16, value: &Value) -> Result<()>;
+    async fn start_event_stream(&mut self) -> Result<()>;
+    async fn write_event(&mut self, event: &Value) -> Result<()>;
+    async fn finish_event_stream(&mut self) -> Result<()>;
+    async fn proxy_response(&mut self, response: reqwest::Response) -> Result<()>;
+
+    async fn try_proxy_upstream_websocket(
+        &mut self,
+        _route: &RouteTarget,
+        _headers: &HeaderMap,
+        _body: &Value,
+    ) -> Result<UpstreamWebSocketAttempt> {
+        Ok(UpstreamWebSocketAttempt::UseHttp)
+    }
+}
+
+struct HttpResponsesDownstream {
+    stream: TcpStream,
+}
+
+impl HttpResponsesDownstream {
+    fn new(stream: TcpStream) -> Self {
+        Self { stream }
+    }
+}
+
+#[async_trait]
+impl ResponsesDownstream for HttpResponsesDownstream {
+    async fn write_error(
+        &mut self,
+        status: u16,
+        code: &str,
+        message: String,
+        route: Option<&RouteTarget>,
+    ) -> Result<()> {
+        write_error_response(&mut self.stream, status, code, message, route).await
+    }
+
+    async fn write_text_error(&mut self, status: u16, code: &str, message: String) -> Result<()> {
+        write_text_error_response(&mut self.stream, status, code, message).await
+    }
+
+    async fn write_json(&mut self, status: u16, value: &Value) -> Result<()> {
+        write_json_response(&mut self.stream, status, value).await
+    }
+
+    async fn start_event_stream(&mut self) -> Result<()> {
+        let header = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\n{}connection: close\r\n\r\n",
+            router_request_id_header()
+        );
+        write_all_with_timeout(
+            &mut self.stream,
+            header.as_bytes(),
+            "写入 Responses SSE 响应头失败",
+        )
+        .await
+    }
+
+    async fn write_event(&mut self, event: &Value) -> Result<()> {
+        write_responses_sse_event(&mut self.stream, event).await
+    }
+
+    async fn finish_event_stream(&mut self) -> Result<()> {
+        finish_chunked_response(&mut self.stream).await
+    }
+
+    async fn proxy_response(&mut self, response: reqwest::Response) -> Result<()> {
+        write_proxy_response(&mut self.stream, response).await
+    }
+}
+
+struct WebSocketResponsesDownstream {
+    socket: WebSocketStream<TcpStream>,
+    upstream: Option<CachedUpstreamWebSocket>,
+    upstream_backoff: Option<UpstreamWebSocketBackoff>,
+    stream_id: Option<String>,
+}
+
+impl WebSocketResponsesDownstream {
+    fn new(socket: WebSocketStream<TcpStream>) -> Self {
+        Self {
+            socket,
+            upstream: None,
+            upstream_backoff: None,
+            stream_id: None,
+        }
+    }
+
+    fn set_stream_id(&mut self, stream_id: Option<String>) {
+        self.stream_id = stream_id;
+    }
+
+    fn clear_stream_id(&mut self) {
+        self.stream_id = None;
+    }
+
+    async fn next_message(&mut self) -> Result<Option<WebSocketMessage>> {
+        self.socket
+            .next()
+            .await
+            .transpose()
+            .context("读取 Codey Responses WebSocket 消息失败")
+    }
+
+    async fn write_text(&mut self, text: impl Into<String>) -> Result<()> {
+        tokio::time::timeout(
+            DOWNSTREAM_WRITE_TIMEOUT,
+            self.socket.send(WebSocketMessage::Text(text.into().into())),
+        )
+        .await
+        .context("写入 Codey Responses WebSocket 消息超时")?
+        .context("写入 Codey Responses WebSocket 消息失败")
+    }
+
+    async fn write_pong(&mut self, payload: tokio_tungstenite::tungstenite::Bytes) -> Result<()> {
+        tokio::time::timeout(
+            DOWNSTREAM_WRITE_TIMEOUT,
+            self.socket.send(WebSocketMessage::Pong(payload)),
+        )
+        .await
+        .context("写入 Codey Responses WebSocket Pong 超时")?
+        .context("写入 Codey Responses WebSocket Pong 失败")
+    }
+
+    async fn proxy_upstream_websocket(
+        &mut self,
+        route: &RouteTarget,
+        headers: &HeaderMap,
+        body: &Value,
+    ) -> Result<UpstreamWebSocketAttempt> {
+        if !route.supports_websockets {
+            return Ok(UpstreamWebSocketAttempt::UseHttp);
+        }
+        let upstream_url = route
+            .upstream_websocket_url
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!(error.clone()))?;
+        if self.upstream_backoff.as_ref().is_some_and(|backoff| {
+            backoff.route_id == route.provider_id && backoff.until > Instant::now()
+        }) {
+            return Ok(UpstreamWebSocketAttempt::UseHttp);
+        }
+        if self
+            .upstream_backoff
+            .as_ref()
+            .is_some_and(|backoff| backoff.until <= Instant::now())
+        {
+            self.upstream_backoff = None;
+        }
+
+        let cached_matches = self.upstream.as_ref().is_some_and(|cached| {
+            cached.route_id == route.provider_id
+                && cached.url == *upstream_url
+                && cached.connected_at.elapsed() < UPSTREAM_WEBSOCKET_MAX_REUSE_AGE
+        });
+        if !cached_matches {
+            self.upstream.take();
+        }
+        let mut upstream = if let Some(cached) = self.upstream.take() {
+            cached
+        } else {
+            match connect_upstream_responses_websocket(upstream_url, headers).await {
+                Ok(socket) => CachedUpstreamWebSocket {
+                    route_id: route.provider_id.clone(),
+                    url: upstream_url.clone(),
+                    connected_at: Instant::now(),
+                    socket,
+                },
+                Err(error) => {
+                    self.upstream_backoff = Some(UpstreamWebSocketBackoff {
+                        route_id: route.provider_id.clone(),
+                        until: Instant::now() + UPSTREAM_WEBSOCKET_BACKOFF,
+                    });
+                    crate::error_log::record_failure(
+                        "local_router_upstream_websocket_degraded",
+                        "connect_responses_websocket",
+                        format!("{error:#}"),
+                        serde_json::json!({
+                            "routeId": route.provider_id.as_str(),
+                            "routeName": route.route_name.as_str(),
+                            "upstream": route.upstream_authority.as_str(),
+                            "fallback": "http_sse",
+                            "backoffSeconds": UPSTREAM_WEBSOCKET_BACKOFF.as_secs(),
+                            "requestId": current_router_request_id(),
+                        }),
+                    );
+                    return Ok(UpstreamWebSocketAttempt::UseHttp);
+                }
+            }
+        };
+
+        let mut message = body.clone();
+        let message_body = message
+            .as_object_mut()
+            .context("Responses WebSocket 上游请求必须是 JSON 对象")?;
+        message_body.remove("stream");
+        message_body.remove("background");
+        message_body.insert(
+            "type".to_string(),
+            Value::String("response.create".to_string()),
+        );
+        let message =
+            serde_json::to_string(&message).context("序列化 Responses WebSocket 上游请求失败")?;
+
+        // Once send is attempted the request may have reached the upstream.
+        // Any later failure is surfaced to the caller and is never replayed
+        // over HTTP, avoiding duplicate tool calls and other side effects.
+        tokio::time::timeout(
+            DOWNSTREAM_WRITE_TIMEOUT,
+            upstream.socket.send(WebSocketMessage::Text(message.into())),
+        )
+        .await
+        .context("发送 Responses WebSocket 上游请求超时")?
+        .context("发送 Responses WebSocket 上游请求失败")?;
+
+        loop {
+            let next = tokio::time::timeout(UPSTREAM_READ_IDLE_TIMEOUT, upstream.socket.next())
+                .await
+                .context("读取 Responses WebSocket 上游事件超时")?;
+            let Some(message) = next else {
+                anyhow::bail!("Responses WebSocket 上游在终态事件前断开");
+            };
+            match message.context("读取 Responses WebSocket 上游事件失败")? {
+                WebSocketMessage::Text(text) => {
+                    let event = serde_json::from_str::<Value>(text.as_str())
+                        .context("Responses WebSocket 上游事件不是有效 JSON")?;
+                    let terminal = responses_event_is_terminal(&event);
+                    self.write_event(&event).await?;
+                    if terminal {
+                        self.upstream = Some(upstream);
+                        self.upstream_backoff = None;
+                        return Ok(UpstreamWebSocketAttempt::Completed);
+                    }
+                }
+                WebSocketMessage::Ping(payload) => {
+                    tokio::time::timeout(
+                        DOWNSTREAM_WRITE_TIMEOUT,
+                        upstream.socket.send(WebSocketMessage::Pong(payload)),
+                    )
+                    .await
+                    .context("回复 Responses WebSocket 上游 Ping 超时")?
+                    .context("回复 Responses WebSocket 上游 Ping 失败")?;
+                }
+                WebSocketMessage::Pong(_) => {}
+                WebSocketMessage::Close(_) => {
+                    anyhow::bail!("Responses WebSocket 上游在终态事件前关闭连接");
+                }
+                WebSocketMessage::Binary(_) | WebSocketMessage::Frame(_) => {
+                    anyhow::bail!("Responses WebSocket 上游返回了不支持的二进制消息");
+                }
+            }
+        }
+    }
+
+    async fn close(
+        &mut self,
+        frame: Option<tokio_tungstenite::tungstenite::protocol::CloseFrame>,
+    ) -> Result<()> {
+        // Dropping the upstream socket is enough to reclaim it immediately;
+        // do not delay the client close handshake on a remote peer.
+        self.upstream.take();
+        tokio::time::timeout(DOWNSTREAM_WRITE_TIMEOUT, self.socket.close(frame))
+            .await
+            .context("关闭 Codey Responses WebSocket 超时")?
+            .context("关闭 Codey Responses WebSocket 失败")
+    }
+}
+
+fn responses_event_is_terminal(event: &Value) -> bool {
+    matches!(
+        event.get("type").and_then(Value::as_str),
+        Some("response.completed" | "response.failed" | "response.incomplete")
+    )
+}
+
+fn upstream_websocket_request(url: &str, headers: &HeaderMap) -> Result<WebSocketRequest> {
+    let mut request = url
+        .into_client_request()
+        .context("创建 Responses WebSocket 上游握手请求失败")?;
+    for (name, value) in headers {
+        if is_hop_by_hop_header(name.as_str())
+            || name
+                .as_str()
+                .to_ascii_lowercase()
+                .starts_with("sec-websocket-")
+        {
+            continue;
+        }
+        request.headers_mut().insert(name.clone(), value.clone());
+    }
+    let beta_name = HeaderName::from_static("openai-beta");
+    let current_beta = request
+        .headers()
+        .get(&beta_name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if !current_beta
+        .split(',')
+        .any(|token| token.trim() == RESPONSES_WEBSOCKET_BETA)
+    {
+        let beta = if current_beta.trim().is_empty() {
+            RESPONSES_WEBSOCKET_BETA.to_string()
+        } else {
+            format!("{current_beta}, {RESPONSES_WEBSOCKET_BETA}")
+        };
+        request.headers_mut().insert(
+            beta_name,
+            HeaderValue::from_str(&beta).context("构造 Responses WebSocket Beta 请求头失败")?,
+        );
+    }
+    Ok(request)
+}
+
+async fn connect_upstream_responses_websocket(
+    url: &str,
+    headers: &HeaderMap,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let request = upstream_websocket_request(url, headers)?;
+    let config = WebSocketConfig::default()
+        .write_buffer_size(0)
+        .max_write_buffer_size(MAX_REQUEST_BYTES)
+        .max_message_size(Some(MAX_UPSTREAM_RESPONSE_BYTES))
+        .max_frame_size(Some(MAX_UPSTREAM_RESPONSE_BYTES));
+    let (socket, _) = tokio::time::timeout(
+        UPSTREAM_WEBSOCKET_CONNECT_TIMEOUT,
+        connect_async_with_config(request, Some(config), false),
+    )
+    .await
+    .context("连接 Responses WebSocket 上游超时")?
+    .context("连接 Responses WebSocket 上游失败")?;
+    Ok(socket)
+}
+
+#[async_trait]
+impl ResponsesDownstream for WebSocketResponsesDownstream {
+    fn is_websocket(&self) -> bool {
+        true
+    }
+
+    async fn write_error(
+        &mut self,
+        status: u16,
+        code: &str,
+        message: String,
+        route: Option<&RouteTarget>,
+    ) -> Result<()> {
+        self.write_event(&websocket_response_failed_event(
+            status, code, message, route,
+        ))
+        .await
+    }
+
+    async fn write_json(&mut self, status: u16, value: &Value) -> Result<()> {
+        if !(200..300).contains(&status) {
+            let message = value
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .unwrap_or("Codey 本地路由返回错误")
+                .to_string();
+            return self
+                .write_error(status, "local_router_error", message, None)
+                .await;
+        }
+        self.start_event_stream().await?;
+        for event in responses_event_sequence(value)? {
+            self.write_event(&event).await?;
+        }
+        self.finish_event_stream().await
+    }
+
+    async fn start_event_stream(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn write_event(&mut self, event: &Value) -> Result<()> {
+        let mut event = event.clone();
+        if let Some(stream_id) = self.stream_id.as_deref()
+            && event.get("stream_id").is_none()
+        {
+            event
+                .as_object_mut()
+                .context("Responses WebSocket 事件必须是 JSON 对象")?
+                .insert(
+                    "stream_id".to_string(),
+                    Value::String(stream_id.to_string()),
+                );
+        }
+        self.write_text(
+            serde_json::to_string(&event).context("序列化 Responses WebSocket 事件失败")?,
+        )
+        .await
+    }
+
+    async fn finish_event_stream(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn proxy_response(&mut self, response: reqwest::Response) -> Result<()> {
+        proxy_native_response_to_websocket(self, response).await
+    }
+
+    async fn try_proxy_upstream_websocket(
+        &mut self,
+        route: &RouteTarget,
+        headers: &HeaderMap,
+        body: &Value,
+    ) -> Result<UpstreamWebSocketAttempt> {
+        self.proxy_upstream_websocket(route, headers, body).await
+    }
+}
+
+fn websocket_response_failed_event(
+    status: u16,
+    code: &str,
+    message: String,
+    route: Option<&RouteTarget>,
+) -> Value {
+    let mut codey =
+        serde_json::Map::from_iter([("httpStatus".to_string(), Value::Number(status.into()))]);
+    if let Some(route) = route {
+        codey.insert(
+            "routeId".to_string(),
+            Value::String(route.provider_id.clone()),
+        );
+        codey.insert(
+            "routeName".to_string(),
+            Value::String(route.route_name.clone()),
+        );
+    }
+    if let Some(request_id) = current_router_request_id() {
+        codey.insert("requestId".to_string(), Value::String(request_id));
+    }
+    json!({
+        "type":"response.failed",
+        "response":{
+            "id":format!("resp_codey_{}", Uuid::new_v4()),
+            "object":"response",
+            "created_at":current_unix_timestamp(),
+            "status":"failed",
+            "output":[],
+            "error":{
+                "type":"codey_route_error",
+                "code":code,
+                "message":message,
+                "codey":codey,
+            },
+            "incomplete_details":Value::Null,
+        }
+    })
+}
+
+async fn proxy_native_response_to_websocket(
+    downstream: &mut WebSocketResponsesDownstream,
+    mut response: reqwest::Response,
+) -> Result<()> {
+    let status = response.status().as_u16();
+    let upstream_is_sse = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_sse_content_type);
+    if upstream_is_sse {
+        downstream.start_event_stream().await?;
+        let mut buffer = Vec::new();
+        let mut cursor = 0;
+        let mut done = false;
+        let mut terminal = false;
+        while let Some(chunk) =
+            read_upstream_chunk(&mut response, "读取 Responses WebSocket 上游 SSE 流失败").await?
+        {
+            compact_sse_buffer(&mut buffer, &mut cursor);
+            buffer.extend_from_slice(&chunk);
+            ensure_sse_buffer_within_limit(&buffer, cursor)?;
+            while let Some(frame) = take_next_sse_frame(&buffer, &mut cursor) {
+                let Some(data) = sse_frame_data(frame)? else {
+                    continue;
+                };
+                if data.trim() == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                let event = serde_json::from_str::<Value>(&data)
+                    .context("Responses WebSocket 上游 SSE data 不是有效 JSON")?;
+                terminal |= responses_event_is_terminal(&event);
+                downstream.write_event(&event).await?;
+            }
+            if done {
+                break;
+            }
+        }
+        if !done
+            && !buffer[cursor..].iter().all(u8::is_ascii_whitespace)
+            && let Some(data) = sse_frame_data(&buffer[cursor..])?
+            && data.trim() != "[DONE]"
+        {
+            let event = serde_json::from_str::<Value>(&data)
+                .context("Responses WebSocket 上游 SSE 末尾 data 不是有效 JSON")?;
+            terminal |= responses_event_is_terminal(&event);
+            downstream.write_event(&event).await?;
+        }
+        if !terminal {
+            anyhow::bail!("Responses HTTP/SSE 降级流在终态事件前断开");
+        }
+        return downstream.finish_event_stream().await;
+    }
+
+    let limit = if (200..300).contains(&status) {
+        MAX_UPSTREAM_RESPONSE_BYTES
+    } else {
+        MAX_UPSTREAM_ERROR_BYTES
+    };
+    let body = read_bounded_upstream_body(response, limit, "读取 Responses WebSocket 上游响应失败")
+        .await?;
+    match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => downstream.write_json(status, &value).await,
+        Err(error) => {
+            let detail = String::from_utf8_lossy(&body);
+            downstream
+                .write_error(
+                    if (200..300).contains(&status) {
+                        502
+                    } else {
+                        status
+                    },
+                    "upstream_protocol_error",
+                    if detail.trim().is_empty() {
+                        format!("Responses WebSocket 上游响应不是有效 JSON：{error}")
+                    } else {
+                        format!(
+                            "Responses WebSocket 上游返回无法解析的响应：{}",
+                            detail.trim().chars().take(512).collect::<String>()
+                        )
+                    },
+                    None,
+                )
+                .await
+        }
+    }
 }
 
 async fn write_error_response(
@@ -4156,6 +5272,24 @@ where
         .with_context(|| operation)
 }
 
+/// Writes one `transfer-encoding: chunked` frame with a single `write_all`.
+/// Emitting the size line, payload and trailing CRLF as three separate writes
+/// produced three small TCP segments for every streamed event.
+async fn write_chunked_frame<W>(
+    stream: &mut W,
+    payload: &[u8],
+    operation: &'static str,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut frame = Vec::with_capacity(payload.len() + 16);
+    frame.extend_from_slice(format!("{:x}\r\n", payload.len()).as_bytes());
+    frame.extend_from_slice(payload);
+    frame.extend_from_slice(b"\r\n");
+    write_all_with_timeout(stream, &frame, operation).await
+}
+
 async fn write_proxy_response(
     stream: &mut TcpStream,
     mut response: reqwest::Response,
@@ -4181,56 +5315,58 @@ async fn write_proxy_response(
         if chunk.is_empty() {
             continue;
         }
-        write_all_with_timeout(
-            stream,
-            format!("{:x}\r\n", chunk.len()).as_bytes(),
-            "写入上游响应块长度失败",
-        )
-        .await?;
-        write_all_with_timeout(stream, &chunk, "写入上游响应块失败").await?;
-        write_all_with_timeout(stream, b"\r\n", "结束上游响应块失败").await?;
+        write_chunked_frame(stream, &chunk, "写入上游响应块失败").await?;
     }
     write_all_with_timeout(stream, b"0\r\n\r\n", "结束上游响应流失败").await?;
     Ok(())
 }
 
-async fn write_chat_completions_as_responses(
-    stream: &mut TcpStream,
+async fn write_chat_completions_as_responses<D>(
+    downstream: &mut D,
     response: reqwest::Response,
     model: &str,
     stream_requested: bool,
     route: &RouteTarget,
     tool_bridge: &ResponsesToolBridge,
-) -> Result<()> {
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
     let upstream_is_sse = response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(is_sse_content_type);
     if stream_requested && upstream_is_sse {
-        return stream_chat_completions_as_responses(stream, response, model, route, tool_bridge)
-            .await;
+        return stream_chat_completions_as_responses(
+            downstream,
+            response,
+            model,
+            route,
+            tool_bridge,
+        )
+        .await;
     }
     let responses = match read_chat_completions_as_responses(response, model, tool_bridge).await {
         Ok(responses) => responses,
         Err(error) => {
-            return write_error_response(
-                stream,
-                502,
-                "upstream_protocol_error",
-                format!(
-                    "线路「{}」的 Chat Completions 响应无法转换为 Responses：{error:#}",
-                    route_display_name(route)
-                ),
-                Some(route),
-            )
-            .await;
+            return downstream
+                .write_error(
+                    502,
+                    "upstream_protocol_error",
+                    format!(
+                        "线路「{}」的 Chat Completions 响应无法转换为 Responses：{error:#}",
+                        route_display_name(route)
+                    ),
+                    Some(route),
+                )
+                .await;
         }
     };
     if stream_requested {
-        write_responses_sse_response(stream, &responses).await
+        write_responses_response_as_events(downstream, &responses).await
     } else {
-        write_json_response(stream, 200, &responses).await
+        downstream.write_json(200, &responses).await
     }
 }
 
@@ -4266,34 +5402,37 @@ async fn read_chat_completions_as_responses(
     chat_completion_to_responses_body_with_tool_bridge(chat, model, tool_bridge)
 }
 
-async fn write_anthropic_messages_as_responses(
-    stream: &mut TcpStream,
+async fn write_anthropic_messages_as_responses<D>(
+    downstream: &mut D,
     response: reqwest::Response,
     model: &str,
     stream_requested: bool,
     route: &RouteTarget,
     tool_bridge: &ResponsesToolBridge,
-) -> Result<()> {
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
     if !response.status().is_success() {
         let status = response.status();
         let body = read_bounded_upstream_error_body(response).await?;
         let detail = anthropic_upstream_error_detail(&body);
-        return write_error_response(
-            stream,
-            502,
-            "anthropic_upstream_error",
-            format!(
-                "线路「{}」的 Anthropic Messages 上游返回 HTTP {}{}",
-                route_display_name(route),
-                status.as_u16(),
-                detail
-                    .as_deref()
-                    .map(|detail| format!("：{detail}"))
-                    .unwrap_or_default()
-            ),
-            Some(route),
-        )
-        .await;
+        return downstream
+            .write_error(
+                502,
+                "anthropic_upstream_error",
+                format!(
+                    "线路「{}」的 Anthropic Messages 上游返回 HTTP {}{}",
+                    route_display_name(route),
+                    status.as_u16(),
+                    detail
+                        .as_deref()
+                        .map(|detail| format!("：{detail}"))
+                        .unwrap_or_default()
+                ),
+                Some(route),
+            )
+            .await;
     }
     let upstream_is_sse = response
         .headers()
@@ -4301,29 +5440,35 @@ async fn write_anthropic_messages_as_responses(
         .and_then(|value| value.to_str().ok())
         .is_some_and(is_sse_content_type);
     if stream_requested && upstream_is_sse {
-        return stream_anthropic_messages_as_responses(stream, response, model, route, tool_bridge)
-            .await;
+        return stream_anthropic_messages_as_responses(
+            downstream,
+            response,
+            model,
+            route,
+            tool_bridge,
+        )
+        .await;
     }
     let responses = match read_anthropic_messages_as_responses(response, model, tool_bridge).await {
         Ok(responses) => responses,
         Err(error) => {
-            return write_error_response(
-                stream,
-                502,
-                "upstream_protocol_error",
-                format!(
-                    "线路「{}」的 Anthropic Messages 响应无法转换为 Responses：{error:#}",
-                    route_display_name(route)
-                ),
-                Some(route),
-            )
-            .await;
+            return downstream
+                .write_error(
+                    502,
+                    "upstream_protocol_error",
+                    format!(
+                        "线路「{}」的 Anthropic Messages 响应无法转换为 Responses：{error:#}",
+                        route_display_name(route)
+                    ),
+                    Some(route),
+                )
+                .await;
         }
     };
     if stream_requested {
-        write_responses_sse_response(stream, &responses).await
+        write_responses_response_as_events(downstream, &responses).await
     } else {
-        write_json_response(stream, 200, &responses).await
+        downstream.write_json(200, &responses).await
     }
 }
 
@@ -4877,15 +6022,18 @@ fn parse_anthropic_message_sse_bytes(bytes: &[u8], model: &str) -> Result<Value>
     accumulator.into_message()
 }
 
-async fn stream_anthropic_messages_as_responses(
-    stream: &mut TcpStream,
+async fn stream_anthropic_messages_as_responses<D>(
+    downstream: &mut D,
     mut response: reqwest::Response,
     model: &str,
     route: &RouteTarget,
     tool_bridge: &ResponsesToolBridge,
-) -> Result<()> {
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
     let mut output = ResponsesSseState::new(model, tool_bridge);
-    output.start(stream).await?;
+    output.start(downstream).await?;
     let mut accumulator = AnthropicSseAccumulator::new(model);
     let result: Result<()> = async {
         let mut buffer = Vec::new();
@@ -4903,7 +6051,7 @@ async fn stream_anthropic_messages_as_responses(
                 let event = serde_json::from_str::<Value>(&data)
                     .context("Anthropic Messages SSE data 不是有效 JSON")?;
                 accumulator.ingest(&event)?;
-                emit_anthropic_stream_event(&mut output, stream, &event).await?;
+                emit_anthropic_stream_event(&mut output, downstream, &event).await?;
             }
             if accumulator.stopped {
                 break;
@@ -4916,36 +6064,39 @@ async fn stream_anthropic_messages_as_responses(
             let event = serde_json::from_str::<Value>(&data)
                 .context("Anthropic Messages SSE 末尾 data 不是有效 JSON")?;
             accumulator.ingest(&event)?;
-            emit_anthropic_stream_event(&mut output, stream, &event).await?;
+            emit_anthropic_stream_event(&mut output, downstream, &event).await?;
         }
         let message = accumulator.into_message()?;
         let completed =
             anthropic_message_to_responses_body_with_tool_bridge(&message, model, tool_bridge)?;
         if output.output_order.is_empty() {
             let events = output.ensure_message();
-            output.write_events(stream, events).await?;
+            output.write_events(downstream, events).await?;
         }
         let usage = completed.get("usage").cloned();
         let incomplete_reason = completed
             .get("incomplete_details")
             .and_then(|details| details.get("reason"))
             .and_then(Value::as_str);
-        output.finish(stream, usage, incomplete_reason).await
+        output.finish(downstream, usage, incomplete_reason).await
     }
     .await;
     if let Err(error) = result {
         let (code, message) = streaming_failure_message(&error, route);
-        let _ = output.fail(stream, code, &message).await;
+        let _ = output.fail(downstream, code, &message).await;
         return Err(error);
     }
     Ok(())
 }
 
-async fn emit_anthropic_stream_event(
+async fn emit_anthropic_stream_event<D>(
     output: &mut ResponsesSseState<'_>,
-    stream: &mut TcpStream,
+    downstream: &mut D,
     event: &Value,
-) -> Result<()> {
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
     let event_type = event
         .get("type")
         .and_then(Value::as_str)
@@ -5001,7 +6152,7 @@ async fn emit_anthropic_stream_event(
         "error" => anyhow::bail!("Anthropic SSE 返回错误"),
         other => anyhow::bail!("不支持的 Anthropic SSE 事件类型 {other}"),
     }
-    output.write_events(stream, events).await
+    output.write_events(downstream, events).await
 }
 
 fn anthropic_stream_block_start(
@@ -5570,15 +6721,18 @@ async fn collect_chat_completion_sse(
     accumulator.into_chat_completion()
 }
 
-async fn stream_chat_completions_as_responses(
-    stream: &mut TcpStream,
+async fn stream_chat_completions_as_responses<D>(
+    downstream: &mut D,
     mut response: reqwest::Response,
     model: &str,
     route: &RouteTarget,
     tool_bridge: &ResponsesToolBridge,
-) -> Result<()> {
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
     let mut output = ResponsesSseState::new(model, tool_bridge);
-    output.start(stream).await?;
+    output.start(downstream).await?;
     let mut accumulator = ChatSseAccumulator::new(model);
     let result: Result<()> = async {
         let mut buffer = Vec::new();
@@ -5601,7 +6755,7 @@ async fn stream_chat_completions_as_responses(
                 let event = serde_json::from_str::<Value>(&data)
                     .context("Chat Completions SSE data 不是有效 JSON")?;
                 accumulator.ingest(&event)?;
-                emit_chat_stream_event(&mut output, stream, &event).await?;
+                emit_chat_stream_event(&mut output, downstream, &event).await?;
             }
             if done {
                 break;
@@ -5615,36 +6769,39 @@ async fn stream_chat_completions_as_responses(
             let event = serde_json::from_str::<Value>(&data)
                 .context("Chat Completions SSE 末尾 data 不是有效 JSON")?;
             accumulator.ingest(&event)?;
-            emit_chat_stream_event(&mut output, stream, &event).await?;
+            emit_chat_stream_event(&mut output, downstream, &event).await?;
         }
         let chat = accumulator.into_chat_completion()?;
         let completed =
             chat_completion_to_responses_body_with_tool_bridge(chat, model, tool_bridge)?;
         if output.output_order.is_empty() {
             let events = output.ensure_message();
-            output.write_events(stream, events).await?;
+            output.write_events(downstream, events).await?;
         }
         let usage = completed.get("usage").cloned();
         let incomplete_reason = completed
             .get("incomplete_details")
             .and_then(|details| details.get("reason"))
             .and_then(Value::as_str);
-        output.finish(stream, usage, incomplete_reason).await
+        output.finish(downstream, usage, incomplete_reason).await
     }
     .await;
     if let Err(error) = result {
         let (code, message) = streaming_failure_message(&error, route);
-        let _ = output.fail(stream, code, &message).await;
+        let _ = output.fail(downstream, code, &message).await;
         return Err(error);
     }
     Ok(())
 }
 
-async fn emit_chat_stream_event(
+async fn emit_chat_stream_event<D>(
     output: &mut ResponsesSseState<'_>,
-    stream: &mut TcpStream,
+    downstream: &mut D,
     event: &Value,
-) -> Result<()> {
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
     let mut events = Vec::new();
     let Some(choices) = event.get("choices").and_then(Value::as_array) else {
         return Ok(());
@@ -5717,7 +6874,7 @@ async fn emit_chat_stream_event(
             )?);
         }
     }
-    output.write_events(stream, events).await
+    output.write_events(downstream, events).await
 }
 
 fn parse_chat_completion_sse_bytes(bytes: &[u8], model: &str) -> Result<Value> {
@@ -5856,15 +7013,13 @@ impl<'a> ResponsesSseState<'a> {
         }
     }
 
-    async fn start(&self, stream: &mut TcpStream) -> Result<()> {
-        let header = format!(
-            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\ntransfer-encoding: chunked\r\n{}connection: close\r\n\r\n",
-            router_request_id_header()
-        );
-        write_all_with_timeout(stream, header.as_bytes(), "写入 Responses SSE 响应头失败").await?;
-        write_responses_sse_event(
-            stream,
-            &json!({
+    async fn start<D>(&self, downstream: &mut D) -> Result<()>
+    where
+        D: ResponsesDownstream + ?Sized,
+    {
+        downstream.start_event_stream().await?;
+        downstream
+            .write_event(&json!({
                 "type":"response.created",
                 "response":{
                     "id":self.response_id,
@@ -5876,9 +7031,8 @@ impl<'a> ResponsesSseState<'a> {
                     "error":Value::Null,
                     "incomplete_details":Value::Null,
                 }
-            }),
-        )
-        .await
+            }))
+            .await
     }
 
     fn ensure_message(&mut self) -> Vec<Value> {
@@ -6087,19 +7241,25 @@ impl<'a> ResponsesSseState<'a> {
         Ok(events)
     }
 
-    async fn write_events(&self, stream: &mut TcpStream, events: Vec<Value>) -> Result<()> {
+    async fn write_events<D>(&self, downstream: &mut D, events: Vec<Value>) -> Result<()>
+    where
+        D: ResponsesDownstream + ?Sized,
+    {
         for event in events {
-            write_responses_sse_event(stream, &event).await?;
+            downstream.write_event(&event).await?;
         }
         Ok(())
     }
 
-    async fn finish(
+    async fn finish<D>(
         &mut self,
-        stream: &mut TcpStream,
+        downstream: &mut D,
         usage: Option<Value>,
         incomplete_reason: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        D: ResponsesDownstream + ?Sized,
+    {
         let mut events = Vec::new();
         if let Some(message) = self.message.as_ref() {
             if let Some(content_index) = message.text_content_index {
@@ -6276,14 +7436,16 @@ impl<'a> ResponsesSseState<'a> {
             "response.completed"
         };
         events.push(json!({"type":terminal_type,"response":response}));
-        self.write_events(stream, events).await?;
-        finish_chunked_response(stream).await
+        self.write_events(downstream, events).await?;
+        downstream.finish_event_stream().await
     }
 
-    async fn fail(&self, stream: &mut TcpStream, code: &str, message: &str) -> Result<()> {
-        write_responses_sse_event(
-            stream,
-            &json!({
+    async fn fail<D>(&self, downstream: &mut D, code: &str, message: &str) -> Result<()>
+    where
+        D: ResponsesDownstream + ?Sized,
+    {
+        downstream
+            .write_event(&json!({
                 "type":"response.failed",
                 "response":{
                     "id":self.response_id,
@@ -6299,10 +7461,9 @@ impl<'a> ResponsesSseState<'a> {
                     },
                     "incomplete_details":Value::Null,
                 }
-            }),
-        )
-        .await?;
-        finish_chunked_response(stream).await
+            }))
+            .await?;
+        downstream.finish_event_stream().await
     }
 }
 
@@ -6373,14 +7534,7 @@ async fn write_responses_sse_event(stream: &mut TcpStream, event: &Value) -> Res
         "event: {event_type}\ndata: {}\n\n",
         serde_json::to_string(event).context("序列化 Responses SSE 事件失败")?
     );
-    write_all_with_timeout(
-        stream,
-        format!("{:x}\r\n", payload.len()).as_bytes(),
-        "写入 Responses SSE 事件长度失败",
-    )
-    .await?;
-    write_all_with_timeout(stream, payload.as_bytes(), "写入 Responses SSE 事件失败").await?;
-    write_all_with_timeout(stream, b"\r\n", "结束 Responses SSE 事件失败").await?;
+    write_chunked_frame(stream, payload.as_bytes(), "写入 Responses SSE 事件失败").await?;
     tokio::time::timeout(DOWNSTREAM_WRITE_TIMEOUT, stream.flush())
         .await
         .context("刷新 Responses SSE 事件超过写入期限")?
@@ -6391,7 +7545,7 @@ async fn finish_chunked_response(stream: &mut TcpStream) -> Result<()> {
     write_all_with_timeout(stream, b"0\r\n\r\n", "结束 Responses SSE 流失败").await
 }
 
-async fn write_responses_sse_response(stream: &mut TcpStream, response: &Value) -> Result<()> {
+fn responses_event_sequence(response: &Value) -> Result<Vec<Value>> {
     let response_id = response
         .get("id")
         .and_then(Value::as_str)
@@ -6506,27 +7660,18 @@ async fn write_responses_sse_response(stream: &mut TcpStream, response: &Value) 
         "response.completed"
     };
     events.push(json!({"type":terminal_event,"response":response}));
-    let mut body = String::new();
-    for event in events {
-        let event_type = event
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("response.event");
-        body.push_str("event: ");
-        body.push_str(event_type);
-        body.push('\n');
-        body.push_str("data: ");
-        body.push_str(&serde_json::to_string(&event).context("序列化 Responses SSE 事件失败")?);
-        body.push_str("\n\n");
+    Ok(events)
+}
+
+async fn write_responses_response_as_events<D>(downstream: &mut D, response: &Value) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
+    downstream.start_event_stream().await?;
+    for event in responses_event_sequence(response)? {
+        downstream.write_event(&event).await?;
     }
-    let header = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream; charset=utf-8\r\ncache-control: no-cache\r\ncontent-length: {}\r\n{}connection: close\r\n\r\n",
-        body.len(),
-        router_request_id_header()
-    );
-    write_all_with_timeout(stream, header.as_bytes(), "写入 Responses SSE 响应头失败").await?;
-    write_all_with_timeout(stream, body.as_bytes(), "写入 Responses SSE 响应失败").await?;
-    Ok(())
+    downstream.finish_event_stream().await
 }
 
 fn append_message_sse_events(
@@ -6660,6 +7805,74 @@ mod tests {
         (config, provider_id, model)
     }
 
+    async fn connect_router_websocket(
+        endpoint: &RuntimeRouterEndpoint,
+    ) -> WebSocketStream<MaybeTlsStream<TcpStream>> {
+        let url = format!(
+            "{}/responses",
+            endpoint.base_url.replacen("http://", "ws://", 1)
+        );
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", endpoint.token)).unwrap(),
+        );
+        connect_async_with_config(request, None, false)
+            .await
+            .unwrap()
+            .0
+    }
+
+    async fn send_router_websocket_request(
+        socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+        model: &str,
+        input: &str,
+    ) -> Vec<Value> {
+        send_router_websocket_request_on_stream(socket, model, input, None).await
+    }
+
+    async fn send_router_websocket_request_on_stream(
+        socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+        model: &str,
+        input: &str,
+        stream_id: Option<&str>,
+    ) -> Vec<Value> {
+        let mut request = json!({
+            "type":"response.create",
+            "model":model,
+            "input":input,
+        });
+        if let Some(stream_id) = stream_id {
+            request
+                .as_object_mut()
+                .unwrap()
+                .insert("stream_id".into(), Value::String(stream_id.into()));
+        }
+        socket
+            .send(WebSocketMessage::Text(
+                serde_json::to_string(&request).unwrap().into(),
+            ))
+            .await
+            .unwrap();
+        let mut events = Vec::new();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let WebSocketMessage::Text(text) = message else {
+                continue;
+            };
+            let event = serde_json::from_str::<Value>(text.as_str()).unwrap();
+            let terminal = responses_event_is_terminal(&event);
+            events.push(event);
+            if terminal {
+                return events;
+            }
+        }
+    }
+
     async fn write_test_http_chunk(stream: &mut TcpStream, payload: &str) {
         stream
             .write_all(format!("{:x}\r\n", payload.len()).as_bytes())
@@ -6693,6 +7906,306 @@ mod tests {
         assert!(responses_endpoint("http://api.example.com/v1").is_ok());
         assert!(responses_endpoint("https://user:pass@api.example.com/v1").is_err());
         assert!(responses_endpoint("http://127.0.0.1:11434/v1").is_ok());
+        assert_eq!(
+            responses_websocket_endpoint("https://api.example.com/v1").unwrap(),
+            "wss://api.example.com/v1/responses"
+        );
+        assert_eq!(
+            responses_websocket_endpoint("http://127.0.0.1:11434/v1").unwrap(),
+            "ws://127.0.0.1:11434/v1/responses"
+        );
+    }
+
+    #[test]
+    fn upstream_websocket_handshake_carries_route_auth_and_beta_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer route-key"));
+        headers.insert(
+            HeaderName::from_static("openai-beta"),
+            HeaderValue::from_static("another_feature=v1"),
+        );
+
+        let request =
+            upstream_websocket_request("wss://relay.example/v1/responses", &headers).unwrap();
+
+        assert_eq!(request.uri().path(), "/v1/responses");
+        assert_eq!(request.headers()[AUTHORIZATION], "Bearer route-key");
+        let beta = request.headers()["openai-beta"].to_str().unwrap();
+        assert!(beta.contains("another_feature=v1"));
+        assert!(beta.contains(RESPONSES_WEBSOCKET_BETA));
+    }
+
+    #[test]
+    fn router_snapshot_enables_websocket_only_for_declared_responses_routes() {
+        let (mut config, _, _) = router_config("https://relay.example/v1".into());
+        config.profiles[0].supports_websockets = true;
+        let responses = RouterSnapshot::from_config(&config);
+        assert!(responses.routes["route-a"].supports_websockets);
+
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        let chat = RouterSnapshot::from_config(&config);
+        assert!(!chat.routes["route-a"].supports_websockets);
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn declared_responses_route_reuses_upstream_websocket() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let handshake = Arc::new(Mutex::new(None));
+        let captured_handshake = Arc::clone(&handshake);
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let mut socket = accept_hdr_async_with_config(
+                stream,
+                move |request: &WebSocketRequest, response: WebSocketResponse| {
+                    *captured_handshake.lock().unwrap() = Some((
+                        request.uri().path().to_string(),
+                        request
+                            .headers()
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                        request
+                            .headers()
+                            .get("openai-beta")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string),
+                    ));
+                    Ok(response)
+                },
+                None,
+            )
+            .await
+            .unwrap();
+            let mut requests = Vec::new();
+            for sequence in 1..=2 {
+                let message = socket.next().await.unwrap().unwrap();
+                let WebSocketMessage::Text(text) = message else {
+                    panic!("expected text response.create");
+                };
+                let request = serde_json::from_str::<Value>(text.as_str()).unwrap();
+                requests.push(request.clone());
+                let response = json!({
+                    "id":format!("resp-{sequence}"),
+                    "object":"response",
+                    "status":"completed",
+                    "model":request["model"],
+                    "output":[],
+                });
+                socket
+                    .send(WebSocketMessage::Text(
+                        serde_json::to_string(&json!({
+                            "type":"response.created",
+                            "response":{
+                                "id":format!("resp-{sequence}"),
+                                "object":"response",
+                                "status":"in_progress",
+                                "model":request["model"],
+                                "output":[],
+                            }
+                        }))
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                socket
+                    .send(WebSocketMessage::Text(
+                        serde_json::to_string(&json!({
+                            "type":"response.completed",
+                            "response":response,
+                        }))
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        assert!(endpoint.supports_websockets);
+        let alias = model_alias(&provider_id, &model);
+        let mut socket = connect_router_websocket(&endpoint).await;
+
+        let first =
+            send_router_websocket_request_on_stream(&mut socket, &alias, "first", Some("main"))
+                .await;
+        let second = send_router_websocket_request(&mut socket, &alias, "second").await;
+        assert_eq!(first.last().unwrap()["type"], "response.completed");
+        assert_eq!(second.last().unwrap()["type"], "response.completed");
+        assert!(first.iter().all(|event| event["stream_id"] == "main"));
+
+        socket.close(None).await.unwrap();
+        let requests = upstream_task.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["type"], "response.create");
+        assert_eq!(requests[0]["model"], model);
+        assert!(requests[0].get("stream").is_none());
+        assert!(requests[0].get("background").is_none());
+        assert_eq!(requests[1]["input"], "second");
+        let handshake = handshake.lock().unwrap().clone().unwrap();
+        assert_eq!(handshake.0, "/v1/responses");
+        assert_eq!(handshake.1.as_deref(), Some("Bearer sk-upstream"));
+        assert!(
+            handshake
+                .2
+                .as_deref()
+                .unwrap_or_default()
+                .contains(RESPONSES_WEBSOCKET_BETA)
+        );
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_responses_websocket_rejects_missing_router_token() {
+        let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let url = format!(
+            "{}/responses",
+            endpoint.base_url.replacen("http://", "ws://", 1)
+        );
+
+        let error = connect_async_with_config(url, None, false)
+            .await
+            .unwrap_err();
+        let tokio_tungstenite::tungstenite::Error::Http(response) = error else {
+            panic!("expected HTTP handshake rejection");
+        };
+        assert_eq!(response.status(), WebSocketStatusCode::UNAUTHORIZED);
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_failure_falls_back_to_http_and_enters_backoff() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut handshake_stream, _) = upstream.accept().await.unwrap();
+            let mut handshake_bytes = Vec::new();
+            let mut chunk = [0_u8; 2048];
+            loop {
+                let read = handshake_stream.read(&mut chunk).await.unwrap();
+                assert!(read > 0);
+                handshake_bytes.extend_from_slice(&chunk[..read]);
+                if find_header_end(&handshake_bytes).is_some() {
+                    break;
+                }
+            }
+            handshake_stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            drop(handshake_stream);
+
+            let mut requests = Vec::new();
+            for sequence in 1..=2 {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await.unwrap();
+                let request_body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                let response = json!({
+                    "id":format!("resp-http-{sequence}"),
+                    "object":"response",
+                    "status":"completed",
+                    "model":request_body["model"],
+                    "output":[],
+                })
+                .to_string();
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                            response.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                requests.push((request.method, request.path, request_body));
+            }
+            (String::from_utf8(handshake_bytes).unwrap(), requests)
+        });
+
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let alias = model_alias(&provider_id, &model);
+        let mut socket = connect_router_websocket(&endpoint).await;
+
+        let first =
+            send_router_websocket_request_on_stream(&mut socket, &alias, "first", Some("main"))
+                .await;
+        let second = send_router_websocket_request(&mut socket, &alias, "second").await;
+        assert_eq!(first.last().unwrap()["type"], "response.completed");
+        assert_eq!(second.last().unwrap()["type"], "response.completed");
+        assert!(first.iter().all(|event| event["stream_id"] == "main"));
+
+        socket.close(None).await.unwrap();
+        let (handshake, requests) = upstream_task.await.unwrap();
+        assert!(handshake.starts_with("GET /v1/responses HTTP/1.1\r\n"));
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.0 == "POST"));
+        assert!(requests.iter().all(|request| request.1 == "/v1/responses"));
+        assert_eq!(requests[0].2["model"], model);
+        assert_eq!(requests[0].2["stream"], true);
+        assert!(requests[0].2.get("stream_id").is_none());
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_disconnect_after_response_create_is_not_replayed_over_http() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let message = socket.next().await.unwrap().unwrap();
+            let WebSocketMessage::Text(text) = message else {
+                panic!("expected response.create text message");
+            };
+            let request = serde_json::from_str::<Value>(text.as_str()).unwrap();
+            socket.close(None).await.unwrap();
+            let replayed = tokio::time::timeout(Duration::from_millis(500), upstream.accept())
+                .await
+                .is_ok();
+            (request, replayed)
+        });
+
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let alias = model_alias(&provider_id, &model);
+        let mut socket = connect_router_websocket(&endpoint).await;
+
+        let events = send_router_websocket_request(&mut socket, &alias, "side effect").await;
+        assert_eq!(events.last().unwrap()["type"], "response.failed");
+        assert_eq!(
+            events.last().unwrap()["response"]["error"]["code"],
+            "websocket_proxy_failed"
+        );
+
+        let (request, replayed) = upstream_task.await.unwrap();
+        assert_eq!(request["type"], "response.create");
+        assert!(
+            !replayed,
+            "committed WebSocket request must not be replayed"
+        );
+        socket.close(None).await.unwrap();
+        router.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -6718,14 +8231,94 @@ mod tests {
         assert_eq!(budget.available_permits(), 1);
     }
 
+    #[tokio::test]
+    async fn request_budget_accounts_for_json_and_conversion_working_memory() {
+        let (mut reader, mut writer) = tokio::io::duplex(4096);
+        writer
+            .write_all(
+                b"POST /v1/responses HTTP/1.1\r\ncontent-length: 65536\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let budget = Arc::new(Semaphore::new(REQUEST_MEMORY_BUDGET_MULTIPLIER - 1));
+
+        let error = read_http_request_with_budget(&mut reader, Some(&budget))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<RequestBodyBudgetUnavailable>()
+                .is_some()
+        );
+        assert_eq!(
+            budget.available_permits(),
+            REQUEST_MEMORY_BUDGET_MULTIPLIER - 1
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_router_aborts_connections_that_outlive_the_drain_deadline() {
+        let router = LocalRouter::start(&CodeyConfig::default()).await.unwrap();
+        let port = router
+            .endpoint()
+            .base_url
+            .strip_prefix("http://127.0.0.1:")
+            .and_then(|value| value.split('/').next())
+            .unwrap()
+            .parse::<u16>()
+            .unwrap();
+        let mut connection = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        connection
+            .write_all(b"POST /v1/responses HTTP/1.1\r\ncontent-length: 1024\r\n\r\n{")
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(Duration::from_secs(1), router.stop())
+            .await
+            .expect("router shutdown should have a bounded drain")
+            .unwrap();
+
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), connection.read(&mut byte))
+            .await
+            .expect("managed connection should close with the router");
+        assert!(matches!(read, Ok(0) | Err(_)));
+    }
+
+    #[tokio::test]
+    async fn header_limit_does_not_count_body_buffered_by_the_same_read() {
+        let prefix = b"POST /v1/responses HTTP/1.1\r\ncontent-length: 2\r\nx-pad: ";
+        let padding = "a".repeat(MAX_HEADER_BYTES - prefix.len());
+        let request = format!("{}{}\r\n\r\nok", String::from_utf8_lossy(prefix), padding);
+        let mut reader = request.as_bytes();
+
+        let parsed = read_http_request(&mut reader).await.unwrap();
+
+        assert_eq!(parsed.body, b"ok");
+    }
+
+    #[tokio::test]
+    async fn header_limit_still_rejects_an_oversized_header() {
+        let prefix = b"GET /health HTTP/1.1\r\nx-pad: ";
+        let padding = "a".repeat(MAX_HEADER_BYTES + 1 - prefix.len());
+        let request = format!("{}{}\r\n\r\n", String::from_utf8_lossy(prefix), padding);
+        let mut reader = request.as_bytes();
+
+        let error = read_http_request(&mut reader).await.unwrap_err();
+
+        assert!(error.to_string().contains("HTTP 请求头超过"));
+    }
+
     #[test]
     fn route_bindings_refresh_in_amortized_constant_time_and_evict_stale_entries() {
         let mut bindings = RouteBindings::default();
         for index in 0..MAX_ROUTE_BINDINGS {
-            bindings.remember(&[format!("thread-id:{index}")], "route-a");
+            bindings.remember(&[format!("thread-id:{index}")], "route-a", false);
         }
         for _ in 0..(MAX_ROUTE_BINDINGS * 5) {
-            bindings.remember(&["thread-id:0".to_string()], "route-b");
+            bindings.remember(&["thread-id:0".to_string()], "route-b", false);
         }
 
         assert!(bindings.order.len() <= MAX_ROUTE_BINDINGS * 4);
@@ -6734,11 +8327,34 @@ mod tests {
             Some("route-b".to_string())
         );
 
-        bindings.remember(&["thread-id:new".to_string()], "route-c");
+        bindings.remember(&["thread-id:new".to_string()], "route-c", false);
         assert_eq!(bindings.routes.len(), MAX_ROUTE_BINDINGS);
         assert!(bindings.routes.contains_key("thread-id:0"));
         assert!(bindings.routes.contains_key("thread-id:new"));
         assert!(!bindings.routes.contains_key("thread-id:1"));
+    }
+
+    #[test]
+    fn explicit_parent_switch_refreshes_session_fallback_without_child_overwrite() {
+        let mut bindings = RouteBindings::default();
+        let keys = [
+            "thread-id:parent".to_string(),
+            "session-id:tree".to_string(),
+        ];
+        bindings.remember(&keys, "route-a", false);
+        bindings.remember(&keys, "route-b", false);
+
+        assert_eq!(
+            bindings.route_for_keys(&["session-id:tree".to_string()]),
+            Some("route-a".to_string())
+        );
+
+        bindings.remember(&keys, "route-b", true);
+
+        assert_eq!(
+            bindings.route_for_keys(&["session-id:tree".to_string()]),
+            Some("route-b".to_string())
+        );
     }
 
     #[test]

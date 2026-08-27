@@ -2819,7 +2819,7 @@
     body.classList.toggle(conversationRichTooltipOpenClass, conversationHasOpenRichTooltip());
   };
 
-  new MutationObserver((mutations) => {
+  const handleSessionToolMutations = (mutations) => {
     for (const mutation of mutations) {
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
@@ -2885,7 +2885,8 @@
     if (pendingScanRoots.size) {
       scheduleIncrementalScan(null);
     }
-  }).observe(document.documentElement, {
+  };
+  const sessionToolMutationOptions = {
     attributes: true,
     attributeOldValue: true,
     attributeFilter: [
@@ -2910,7 +2911,24 @@
     ],
     childList: true,
     subtree: true,
-  });
+  };
+  const mutationDispatcher = window.__codeyMutationDispatcher;
+  let sessionToolObserver = null;
+  if (typeof mutationDispatcher?.subscribe === "function") {
+    const unsubscribe = mutationDispatcher.subscribe(
+      handleSessionToolMutations,
+      sessionToolMutationOptions,
+    );
+    if (mutationDispatcher.snapshot?.().observerInstalled) {
+      sessionToolObserver = { disconnect: unsubscribe };
+    } else {
+      unsubscribe?.();
+    }
+  }
+  if (!sessionToolObserver) {
+    sessionToolObserver = new MutationObserver(handleSessionToolMutations);
+    sessionToolObserver.observe(document.documentElement, sessionToolMutationOptions);
+  }
   syncConversationRichTooltipOpen();
   // forceRefresh bypasses the per-session throttle and re-fetches official
   // thread metadata for every sidebar row, so alt-tabbing must stay debounced.

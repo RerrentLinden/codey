@@ -67,6 +67,7 @@
   let configLoadAttempts = 0;
   let observer = null;
   let observerActive = false;
+  let unsubscribeMutations = null;
   const pendingOptimizations = new Map();
 
   const MAX_CONFIG_LOAD_ATTEMPTS = 10;
@@ -684,47 +685,68 @@
     );
   };
 
-  const installObserver = () => {
-    observer = new MutationObserver((mutations) => {
-      if (!enabled) return;
-      const hasExternalMutation = mutations.some((mutation) => {
-        const target = mutation.target;
-        if (!target) return true;
-        if (target === button || target.id === toastId) return false;
-        if (target.id === styleId) return false;
-        return (
-          !target.closest?.(`#${buttonId}, #${toastId}`) &&
-          mutationRequiresComposerScan(mutation)
-        );
-      });
-      if (hasExternalMutation) scheduleScan();
+  const handleComposerMutations = (mutations) => {
+    if (!enabled) return;
+    const hasExternalMutation = mutations.some((mutation) => {
+      const target = mutation.target;
+      if (!target) return true;
+      if (target === button || target.id === toastId) return false;
+      if (target.id === styleId) return false;
+      return (
+        !target.closest?.(`#${buttonId}, #${toastId}`) &&
+        mutationRequiresComposerScan(mutation)
+      );
     });
+    if (hasExternalMutation) scheduleScan();
+  };
+
+  const composerMutationOptions = {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: [
+      "aria-hidden",
+      "class",
+      "contenteditable",
+      "data-above-composer-conversation-id",
+      "disabled",
+      "hidden",
+      "readonly",
+      "role",
+      "style",
+    ],
+  };
+
+  const installObserver = () => {
+    if (typeof window.__codeyMutationDispatcher?.subscribe === "function") return;
+    observer = new MutationObserver(handleComposerMutations);
   };
 
   const observeComposerMutations = () => {
-    if (!observer || observerActive || !enabled) return;
-    observer.observe(document.documentElement, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: [
-        "aria-hidden",
-        "class",
-        "contenteditable",
-        "data-above-composer-conversation-id",
-        "disabled",
-        "hidden",
-        "readonly",
-        "role",
-        "style",
-      ],
-    });
+    if (observerActive || !enabled) return;
+    const mutationDispatcher = window.__codeyMutationDispatcher;
+    if (typeof mutationDispatcher?.subscribe === "function") {
+      const unsubscribe = mutationDispatcher.subscribe(
+        handleComposerMutations,
+        composerMutationOptions,
+      );
+      if (mutationDispatcher.snapshot?.().observerInstalled) {
+        unsubscribeMutations = unsubscribe;
+        observerActive = true;
+        return;
+      }
+      unsubscribe?.();
+    }
+    observer ||= new MutationObserver(handleComposerMutations);
+    observer.observe(document.documentElement, composerMutationOptions);
     observerActive = true;
   };
 
   const disconnectComposerObserver = () => {
-    if (!observer || !observerActive) return;
-    observer.disconnect();
+    if (!observerActive) return;
+    unsubscribeMutations?.();
+    unsubscribeMutations = null;
+    observer?.disconnect();
     observerActive = false;
   };
 

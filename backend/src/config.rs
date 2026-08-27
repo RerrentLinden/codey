@@ -47,6 +47,11 @@ pub struct ProviderProfile {
     /// compaction when it was explicitly enabled by the source configuration.
     #[serde(default)]
     pub supports_remote_compaction: bool,
+    /// Whether this third-party OpenAI Responses route explicitly supports
+    /// the Responses WebSocket transport. Disabled by default so existing
+    /// routes retain their HTTP/SSE behavior.
+    #[serde(default)]
+    pub supports_websockets: bool,
 }
 
 pub const DERIVED_OFFICIAL_PROFILE_ID: &str = "codey-official-account";
@@ -113,6 +118,7 @@ impl ProviderProfile {
             source_provider_id: None,
             official_account: false,
             supports_remote_compaction: false,
+            supports_websockets: false,
         }
     }
 
@@ -171,6 +177,7 @@ impl ProviderProfile {
             self.short_name = OFFICIAL_ROUTE_SHORT_NAME.to_string();
             self.api_key.clear();
             self.supports_remote_compaction = true;
+            self.supports_websockets = false;
             self.upstream_protocol = UPSTREAM_PROTOCOL_OFFICIAL.to_string();
             self.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
         } else {
@@ -210,6 +217,12 @@ impl ProviderProfile {
         let name = self.name.trim();
         if name.is_empty() {
             return Err("线路名称不能为空".to_string());
+        }
+        if self.supports_websockets && self.upstream_protocol != UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+        {
+            return Err(format!(
+                "线路「{name}」只有 OpenAI Responses 协议可以启用 WebSocket"
+            ));
         }
         if self.auth_mode == AUTH_MODE_OFFICIAL_ACCOUNT || self.official_account {
             return Ok(());
@@ -828,6 +841,30 @@ impl CodeyConfig {
 
     pub(crate) fn runtime_gateway_provider_id(&self) -> &'static str {
         local_router::ROUTER_PROVIDER_ID
+    }
+
+    /// Route-qualified catalog model IDs that explicitly opt into Responses
+    /// WebSocket transport. Keeping this list model-scoped prevents one WS
+    /// route from changing transport for every model on the shared provider.
+    pub(crate) fn runtime_websocket_model_aliases(&self) -> Vec<String> {
+        self.profiles
+            .iter()
+            .filter(|profile| {
+                !profile.official_account
+                    && profile.supports_websockets
+                    && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+            })
+            .flat_map(|profile| {
+                let provider_id = profile.provider_id();
+                self.enabled_route_models(provider_id)
+                    .into_iter()
+                    .map(move |model| local_router::model_alias(provider_id, &model))
+            })
+            .collect()
+    }
+
+    pub(crate) fn runtime_supports_websockets(&self) -> bool {
+        !self.runtime_websocket_model_aliases().is_empty()
     }
 
     pub fn manual_third_party_models(&self) -> &[String] {
@@ -1940,6 +1977,39 @@ mod tests {
     }
 
     #[test]
+    fn route_websocket_support_defaults_off_and_only_allows_responses() {
+        let legacy = serde_json::from_value::<ProviderProfile>(serde_json::json!({
+            "id": "legacy-provider",
+            "name": "Legacy Provider",
+            "shortName": "旧",
+            "baseUrl": "https://gateway.example/v1",
+            "apiKey": "sk-test",
+            "upstreamProtocol": "openaiResponses"
+        }))
+        .unwrap();
+        assert!(!legacy.supports_websockets);
+
+        let mut chat = ProviderProfile::new("Chat Relay");
+        chat.base_url = "https://gateway.example/v1".into();
+        chat.api_key = "sk-test".into();
+        chat.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        chat.supports_websockets = true;
+        chat.normalize();
+        assert!(
+            chat.validate()
+                .unwrap_err()
+                .contains("只有 OpenAI Responses")
+        );
+
+        let mut responses = ProviderProfile::new("Responses Relay");
+        responses.base_url = "https://gateway.example/v1".into();
+        responses.api_key = "sk-test".into();
+        responses.supports_websockets = true;
+        responses.normalize();
+        assert!(responses.validate().is_ok());
+    }
+
+    #[test]
     fn chat_completions_protocol_still_exposes_responses_to_codex() {
         let mut profile = ProviderProfile::new("Chat Relay");
         profile.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.to_string();
@@ -2142,6 +2212,45 @@ mod tests {
                 "openai/gpt-5.3-codex-spark",
                 "relay/shared-model",
                 "relay/manual-model",
+            ]
+        );
+    }
+
+    #[test]
+    fn websocket_model_aliases_are_scoped_to_the_declaring_route() {
+        let mut websocket_route = ProviderProfile::new("WS Route");
+        websocket_route.id = "route-ws".into();
+        websocket_route.base_url = "https://ws.example/v1".into();
+        websocket_route.api_key = "ws-key".into();
+        websocket_route.supports_websockets = true;
+        websocket_route.normalize();
+
+        let mut http_route = ProviderProfile::new("HTTP Route");
+        http_route.id = "route-http".into();
+        http_route.base_url = "https://http.example/v1".into();
+        http_route.api_key = "http-key".into();
+        http_route.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: websocket_route.id.clone(),
+            profiles: vec![websocket_route, http_route],
+            ..CodeyConfig::default()
+        }
+        .normalize();
+        config.selected_models_by_provider.insert(
+            "route-ws".into(),
+            vec!["shared-model".into(), "ws-only".into()],
+        );
+        config
+            .selected_models_by_provider
+            .insert("route-http".into(), vec!["shared-model".into()]);
+
+        assert!(config.runtime_supports_websockets());
+        assert_eq!(
+            config.runtime_websocket_model_aliases(),
+            vec![
+                local_router::model_alias("route-ws", "shared-model"),
+                local_router::model_alias("route-ws", "ws-only"),
             ]
         );
     }

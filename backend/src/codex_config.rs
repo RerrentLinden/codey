@@ -1418,7 +1418,8 @@ fn runtime_router_disk_provider_matches(doc: &DocumentMut, desired: &Table) -> b
         && table_like_str(existing, "base_url") == table_str(desired, "base_url")
         && table_like_str(existing, "wire_api") == table_str(desired, "wire_api")
         && table_like_bool(existing, "requires_openai_auth") == Some(false)
-        && table_like_bool(existing, "supports_websockets") == Some(false)
+        && table_like_bool(existing, "supports_websockets")
+            == table_bool(desired, "supports_websockets")
         && table_like_str(existing, "experimental_bearer_token")
             == table_str(desired, "experimental_bearer_token")
         && provider_header_str(existing, local_router::ROUTER_AUTH_HEADER)
@@ -1885,6 +1886,7 @@ fn test_runtime_router_endpoint() -> &'static RuntimeRouterEndpoint {
     ENDPOINT.get_or_init(|| RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".to_string(),
         token: "test-router-token".to_string(),
+        supports_websockets: false,
         requires_openai_auth: false,
     })
 }
@@ -3112,7 +3114,7 @@ fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
     // always an API-key local router; official OAuth is attached by the
     // gateway when forwarding official routes.
     provider["requires_openai_auth"] = value(false);
-    provider["supports_websockets"] = value(false);
+    provider["supports_websockets"] = value(endpoint.supports_websockets);
     let mut headers = InlineTable::new();
     headers.insert(
         local_router::ROUTER_AUTH_HEADER,

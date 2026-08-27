@@ -158,11 +158,44 @@ pub fn default_official_model_slugs() -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 pub fn refresh_for_provider(
     home: &Path,
     official_provider: bool,
     upstream_models: Option<&[String]>,
     selected_models: &[String],
+) -> Result<usize> {
+    refresh_for_provider_with_transport_preferences(
+        home,
+        official_provider,
+        upstream_models,
+        selected_models,
+        None,
+    )
+}
+
+pub(crate) fn refresh_for_provider_with_websocket_models(
+    home: &Path,
+    official_provider: bool,
+    upstream_models: Option<&[String]>,
+    selected_models: &[String],
+    websocket_models: &[String],
+) -> Result<usize> {
+    refresh_for_provider_with_transport_preferences(
+        home,
+        official_provider,
+        upstream_models,
+        selected_models,
+        Some(websocket_models),
+    )
+}
+
+fn refresh_for_provider_with_transport_preferences(
+    home: &Path,
+    official_provider: bool,
+    upstream_models: Option<&[String]>,
+    selected_models: &[String],
+    websocket_models: Option<&[String]>,
 ) -> Result<usize> {
     let official_models = read_official_entries(home)?;
     ensure_runtime_compatible_models(&official_models)?;
@@ -237,6 +270,19 @@ pub fn refresh_for_provider(
                 index,
                 preserve_source_runtime_metadata,
             ));
+        }
+    }
+    if let Some(websocket_models) = websocket_models {
+        let websocket_model_keys = websocket_models
+            .iter()
+            .map(|model| model_id::key(model))
+            .collect::<HashSet<_>>();
+        for model in &mut catalog_models {
+            let prefer_websockets = model
+                .get("slug")
+                .and_then(Value::as_str)
+                .is_some_and(|slug| websocket_model_keys.contains(&model_id::key(slug)));
+            model["prefer_websockets"] = json!(prefer_websockets);
         }
     }
     write_catalog(home, &catalog_models)?;
@@ -1980,6 +2026,42 @@ mod tests {
             ["low", "medium", "high", "xhigh"]
         );
         assert!(custom["auto_compact_token_limit"].is_null());
+    }
+
+    #[test]
+    fn websocket_preference_is_isolated_per_route_model_alias() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec![
+            "route-ws/gpt-5.6-sol".to_string(),
+            "route-http/gpt-5.6-sol".to_string(),
+        ];
+        let websocket_models = vec!["route-ws/gpt-5.6-sol".to_string()];
+
+        refresh_for_provider_with_websocket_models(
+            home.path(),
+            false,
+            Some(&selected),
+            &selected,
+            &websocket_models,
+        )
+        .unwrap();
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        let websocket = models
+            .iter()
+            .find(|model| model["slug"] == "route-ws/gpt-5.6-sol")
+            .unwrap();
+        let http = models
+            .iter()
+            .find(|model| model["slug"] == "route-http/gpt-5.6-sol")
+            .unwrap();
+
+        assert_eq!(websocket["prefer_websockets"], true);
+        assert_eq!(http["prefer_websockets"], false);
     }
 
     #[test]

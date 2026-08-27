@@ -457,6 +457,7 @@ async fn prepare_startup_model_catalog(
         current_profile.official_account && config.official_account_available_this_launch;
     let has_third_party_route = config.has_third_party_route();
     let (runtime_upstream_models, runtime_selected_models) = config.runtime_catalog_models();
+    let runtime_websocket_models = config.runtime_websocket_model_aliases();
     let refresh_official_provider =
         config.official_account_available_this_launch && !has_third_party_route;
     let refresh_upstream_models = has_third_party_route.then_some(runtime_upstream_models);
@@ -482,11 +483,12 @@ async fn prepare_startup_model_catalog(
     let requested_default_model = config.default_model_for_profile(current_profile);
     let (refresh_result, catalog_available, selection_result) =
         tokio::task::spawn_blocking(move || {
-            let refresh = model_catalog::refresh_for_provider(
+            let refresh = model_catalog::refresh_for_provider_with_websocket_models(
                 &catalog_home,
                 refresh_official_provider,
                 refresh_upstream_models.as_deref(),
                 &runtime_selected_models,
+                &runtime_websocket_models,
             );
             let catalog_available = refresh.is_err() && model_catalog::is_available(&catalog_home);
             let selection = model_catalog::selection_state_with_manual_models(

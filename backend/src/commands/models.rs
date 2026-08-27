@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use super::{
     AppState, STARTUP_PROVIDER_MODEL_SYNC_TIMEOUT, SubagentHotReloadOutcome,
     hot_reload_runtime_subagent_config, redacted_config, runtime_config_requires_restart,
-    save_config_to_store, validate_official_account_config_change,
+    save_config_to_store,
 };
 use crate::cdp;
 use crate::codex_config::codex_home;
@@ -446,179 +446,6 @@ async fn commit_startup_model_sync(
     }
     *state.config.write().await = next.clone();
     next
-}
-
-pub async fn fetch_current_provider_models(state: &Arc<AppState>) -> Result<Value, String> {
-    let _provider_model_sync_guard = state.provider_model_sync_lock.lock().await;
-    let config = state.config.read().await.clone();
-    let profile = config
-        .profiles
-        .iter()
-        .find(|profile| profile.id == config.active_profile_id)
-        .cloned()
-        .ok_or_else(|| "找不到当前线路".to_string())?;
-    if profile.official_account {
-        return Err("官方线路使用官方模型目录，无需同步第三方模型".to_string());
-    }
-    let provider_id = config
-        .current_provider_id()
-        .ok_or_else(|| "当前线路缺少标识".to_string())?
-        .to_string();
-    let fetched_models = fetch_provider_models(profile, &state.http_client)
-        .await
-        .map_err(|error| error.to_string())?;
-    let _config_write_guard = state.config_write_lock.lock().await;
-    let latest = state.config.read().await.clone();
-    if latest.current_provider_id() != Some(provider_id.as_str()) {
-        return Err("同步模型期间当前线路已变化，请重试".to_string());
-    }
-    let mut next = config_with_current_provider_model_sync(
-        &latest,
-        fetched_models.clone(),
-        true,
-        codex_home(),
-    );
-    let (catalog_refresh, model_state) = refreshed_model_state_async(&next, true).await?;
-    subagent_policy::reconcile_with_model_state(&mut next, Some(&model_state));
-    next = next.normalize();
-    if let Err(error) = save_config_to_store(state, &next).await {
-        return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
-    }
-    let model_catalog_fallback = catalog_refresh
-        .as_ref()
-        .is_some_and(|refresh| refresh.fallback);
-    *state.config.write().await = next.clone();
-    drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state, &next, &model_state).await;
-    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &next).await;
-    let restart_required = runtime_config_requires_restart(state, &next).await;
-    Ok(add_subagent_hot_reload_to_response(
-        hot_reload.add_to_response(json!({
-            "status":"ok",
-            "models":fetched_models,
-            "modelState":model_state,
-            "modelCatalogFallback":model_catalog_fallback,
-            "restartRequired":restart_required,
-        })),
-        subagent_hot_reload,
-    ))
-}
-
-pub async fn save_route(
-    state: &Arc<AppState>,
-    mut route: ProviderProfile,
-    expected_revision: u64,
-) -> Result<Value, String> {
-    let _config_write_guard = state.config_write_lock.lock().await;
-    let previous = state.config.read().await.clone();
-    ensure_route_revision(&previous, expected_revision)?;
-    if route.id.trim() == DERIVED_OFFICIAL_PROFILE_ID {
-        return Err("官方账号线路由当前 Codex 登录状态管理，不能手动修改".to_string());
-    }
-    if route.id.trim().is_empty() {
-        route.id = uuid::Uuid::new_v4().to_string();
-    }
-    let previous_route = previous
-        .profiles
-        .iter()
-        .find(|profile| profile.id == route.id)
-        .cloned();
-    if let Some(previous_route) = previous_route.as_ref() {
-        route.model_request_headers = previous_route.model_request_headers.clone();
-        route.source_provider_id = previous_route.source_provider_id.clone();
-        route.official_account = previous_route.official_account;
-        route.supports_remote_compaction = previous_route.supports_remote_compaction;
-    }
-    route.merge_redacted_secret(previous_route.as_ref());
-    route.normalize();
-    route.validate()?;
-    let mut config = previous.clone();
-    let is_new = config.profiles.iter().all(|profile| profile.id != route.id);
-    if is_new {
-        config.active_profile_id = route.id.clone();
-        config.profiles.push(route);
-    } else {
-        for profile in &mut config.profiles {
-            if profile.id == route.id {
-                *profile = route.clone();
-                break;
-            }
-        }
-    }
-    config = config.normalize();
-    validate_official_account_config_change(&previous, &config)?;
-    validate_provider_profiles(&config.profiles)?;
-    config.settings_revision = previous.settings_revision.saturating_add(1);
-    save_config_to_store(state, &config).await?;
-    *state.config.write().await = config.clone();
-    let model_state = current_model_state_async(&config).await?;
-    drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
-    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
-    let restart_required = runtime_config_requires_restart(state, &config).await;
-    Ok(add_subagent_hot_reload_to_response(
-        hot_reload.add_to_response(json!({
-            "status":"ok",
-            "config": redacted_config(&config),
-            "providerStatus": codex_provider::status_from_config(&config),
-            "modelState": model_state,
-            "restartRequired": restart_required,
-        })),
-        subagent_hot_reload,
-    ))
-}
-
-pub async fn activate_route(
-    state: &Arc<AppState>,
-    route_id: String,
-    expected_revision: u64,
-) -> Result<Value, String> {
-    let _config_write_guard = state.config_write_lock.lock().await;
-    let previous = state.config.read().await.clone();
-    ensure_route_revision(&previous, expected_revision)?;
-    let route_id = route_id.trim();
-    let target_route = previous
-        .profiles
-        .iter()
-        .find(|profile| profile.id == route_id)
-        .ok_or_else(|| "找不到要启用的线路".to_string())?;
-    if target_route.official_account && !previous.official_account_available_this_launch {
-        return Err(
-            "本次 Codex 由 API Key 线路启动，不能启用官方账号线路；请先在 Codex 中完成官方账号登录并重新启动 Codey"
-                .to_string(),
-        );
-    }
-    let mut config = previous.clone();
-    config.active_profile_id = route_id.to_string();
-    config = config.normalize();
-    if config == previous {
-        let model_state = current_model_state_async(&config).await?;
-        return Ok(json!({
-            "status":"ok",
-            "config": redacted_config(&config),
-            "providerStatus": codex_provider::status_from_config(&config),
-            "modelState": model_state,
-            "restartRequired": runtime_config_requires_restart(state, &config).await,
-        }));
-    }
-    config.settings_revision = previous.settings_revision.saturating_add(1);
-    save_config_to_store(state, &config).await?;
-    *state.config.write().await = config.clone();
-    let model_state = current_model_state_async(&config).await?;
-    drop(_config_write_guard);
-    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
-    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
-    let restart_required = runtime_config_requires_restart(state, &config).await;
-    Ok(add_subagent_hot_reload_to_response(
-        hot_reload.add_to_response(json!({
-            "status":"ok",
-            "config": redacted_config(&config),
-            "providerStatus": codex_provider::status_from_config(&config),
-            "modelState": model_state,
-            "restartRequired": restart_required,
-        })),
-        subagent_hot_reload,
-    ))
 }
 
 pub async fn delete_route(
@@ -1329,16 +1156,41 @@ pub(super) fn provider_route_requires_restart(
     current: &CodeyConfig,
 ) -> bool {
     provider_route_snapshots(applied) != provider_route_snapshots(current)
+        || websocket_transport_requires_restart(applied, current)
+}
+
+pub(super) fn websocket_transport_requires_restart(
+    applied: &CodeyConfig,
+    current: &CodeyConfig,
+) -> bool {
+    websocket_route_ids(applied) != websocket_route_ids(current)
+        || applied.runtime_websocket_model_aliases() != current.runtime_websocket_model_aliases()
 }
 
 pub(super) fn runtime_supports_current_routes_for_hot_reload(
     applied: &CodeyConfig,
     current: &CodeyConfig,
 ) -> bool {
+    if websocket_transport_requires_restart(applied, current) {
+        return false;
+    }
     let applied = official_route_snapshots(applied);
     official_route_snapshots(current)
         .into_iter()
         .all(|(provider_id, route)| applied.get(&provider_id) == Some(&route))
+}
+
+fn websocket_route_ids(config: &CodeyConfig) -> BTreeSet<String> {
+    config
+        .profiles
+        .iter()
+        .filter(|profile| {
+            !profile.official_account
+                && profile.supports_websockets
+                && profile.upstream_protocol == crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+        })
+        .map(|profile| profile.provider_id().to_string())
+        .collect()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1349,6 +1201,7 @@ pub(super) struct ProviderRouteSnapshot {
     auth_mode: String,
     official_account: bool,
     supports_remote_compaction: bool,
+    supports_websockets: bool,
     model_request_headers: BTreeMap<String, String>,
 }
 
@@ -1366,6 +1219,7 @@ fn provider_route_snapshots(config: &CodeyConfig) -> BTreeMap<String, ProviderRo
                     auth_mode: profile.auth_mode.clone(),
                     official_account: profile.official_account,
                     supports_remote_compaction: profile.supports_remote_compaction,
+                    supports_websockets: profile.supports_websockets,
                     model_request_headers: profile.model_request_headers.clone(),
                 },
             )
@@ -1734,11 +1588,13 @@ fn model_catalog_fallback(
 fn try_refresh_model_catalog(config: &CodeyConfig) -> anyhow::Result<()> {
     let has_third_party_route = config.has_third_party_route();
     let (upstream_models, selected_models) = config.runtime_catalog_models();
-    model_catalog::refresh_for_provider(
+    let websocket_models = config.runtime_websocket_model_aliases();
+    model_catalog::refresh_for_provider_with_websocket_models(
         codex_home(),
         config.official_account_available_this_launch && !has_third_party_route,
         has_third_party_route.then_some(upstream_models).as_deref(),
         &selected_models,
+        &websocket_models,
     )
     .map(|_| ())
 }
@@ -2317,6 +2173,10 @@ mod tests {
             .insert("route-a".into(), vec!["route-a-model".into()]);
 
         assert!(!provider_route_requires_restart(&applied, &current));
+        assert!(!websocket_transport_requires_restart(&applied, &current));
+        assert!(runtime_supports_current_routes_for_hot_reload(
+            &applied, &current
+        ));
     }
 
     #[test]
@@ -2366,6 +2226,79 @@ mod tests {
         assert!(provider_route_requires_restart(&applied, &after_add));
         assert!(runtime_supports_current_routes_for_hot_reload(
             &applied, &after_add
+        ));
+    }
+
+    #[test]
+    fn websocket_model_changes_require_restart_and_stop_hot_reload() {
+        let mut route = crate::config::ProviderProfile::new("WS Route");
+        route.id = "route-ws".into();
+        route.base_url = "https://route-ws.example/v1".into();
+        route.api_key = "route-ws-secret".into();
+        route.supports_websockets = true;
+        route.normalize();
+        let mut applied = CodeyConfig {
+            active_profile_id: route.id.clone(),
+            profiles: vec![route],
+            ..CodeyConfig::default()
+        };
+        applied
+            .selected_models_by_provider
+            .insert("route-ws".into(), vec!["model-a".into()]);
+
+        let mut after_add = applied.clone();
+        after_add
+            .selected_models_by_provider
+            .get_mut("route-ws")
+            .unwrap()
+            .push("model-b".into());
+        assert!(websocket_transport_requires_restart(&applied, &after_add));
+        assert!(provider_route_requires_restart(&applied, &after_add));
+        assert!(!runtime_supports_current_routes_for_hot_reload(
+            &applied, &after_add
+        ));
+
+        let mut after_delete = applied.clone();
+        after_delete
+            .selected_models_by_provider
+            .insert("route-ws".into(), vec!["model-b".into()]);
+        assert!(websocket_transport_requires_restart(
+            &applied,
+            &after_delete
+        ));
+        assert!(!runtime_supports_current_routes_for_hot_reload(
+            &applied,
+            &after_delete
+        ));
+    }
+
+    #[test]
+    fn websocket_switch_changes_require_restart_and_stop_hot_reload() {
+        let mut route = crate::config::ProviderProfile::new("Responses Route");
+        route.id = "route-a".into();
+        route.base_url = "https://route-a.example/v1".into();
+        route.api_key = "route-a-secret".into();
+        route.normalize();
+        let mut applied = CodeyConfig {
+            active_profile_id: route.id.clone(),
+            profiles: vec![route],
+            ..CodeyConfig::default()
+        };
+        applied
+            .selected_models_by_provider
+            .insert("route-a".into(), vec!["model-a".into()]);
+
+        let mut enabled = applied.clone();
+        enabled.profiles[0].supports_websockets = true;
+        assert!(websocket_transport_requires_restart(&applied, &enabled));
+        assert!(provider_route_requires_restart(&applied, &enabled));
+        assert!(!runtime_supports_current_routes_for_hot_reload(
+            &applied, &enabled
+        ));
+
+        assert!(websocket_transport_requires_restart(&enabled, &applied));
+        assert!(!runtime_supports_current_routes_for_hot_reload(
+            &enabled, &applied
         ));
     }
 }

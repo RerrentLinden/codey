@@ -28,13 +28,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, RwLock, oneshot, watch};
 
 use diagnostics::{
-    clear_codex_trace_logs, clear_diagnostic_storage, refresh_diagnostic_storage_stats,
-    refresh_trace_log_stats,
-};
-pub use models::{
-    activate_route, delete_route, fetch_current_provider_models, fetch_route_models,
-    save_default_model, save_official_route_models, save_route, save_selected_models,
-    sync_current_provider_command,
+    clear_diagnostic_storage, refresh_diagnostic_storage_stats, refresh_trace_log_stats,
 };
 #[cfg(test)]
 use models::{
@@ -47,18 +41,23 @@ use models::{
     current_model_state_async, current_renderer_model_catalog_async, hot_reload_runtime_models,
     official_route_snapshots, provider_route_requires_restart,
     sync_current_third_party_provider_state, sync_provider_models_for_launch,
+    websocket_transport_requires_restart,
+};
+pub use models::{
+    delete_route, fetch_route_models, save_default_model, save_official_route_models,
+    save_selected_models, sync_current_provider_command,
 };
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
 use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
     test_prompt_optimization_command,
 };
+use runtime::runtime_status_with_options;
 #[cfg(test)]
 use runtime::{begin_shutdown, launch_codey_inner};
 pub use runtime::{
     launch_codey_runtime, runtime_status, schedule_restart_codey_runtime, stop_codey_runtime,
 };
-use runtime::{refresh_injection_status, runtime_status_with_options};
 use updates::current_update_platform;
 #[cfg(test)]
 pub(crate) use updates::{UpdateAssetInfo, UpdateCheck};
@@ -71,7 +70,7 @@ use updates::{UpdateManifest, assess_update_manifest, current_update_arch};
 pub use updates::{check_for_updates, download_update, install_downloaded_update};
 use webhooks::{
     WaitingLedgerState, WebhookNotificationState, initial_waiting_notifications,
-    sync_waiting_webhook_watcher, test_notification_channel, test_webhook,
+    sync_waiting_webhook_watcher, test_notification_channel,
 };
 use wechat_claw::{
     WechatClawLoginState, WechatClawSyncHandle, poll_wechat_claw_login,
@@ -88,8 +87,7 @@ use crate::codex_provider;
 use crate::codex_provider::OfficialAccountProfileStatus;
 use crate::config::{
     CodeyConfig, ConfigStore, LaunchOfficialAccountStatus, PromptOptimizationConfig,
-    ProviderProfile, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SubagentRoleConfig,
-    validate_provider_profiles,
+    SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SubagentRoleConfig, validate_provider_profiles,
 };
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
@@ -800,29 +798,12 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Err(error) => Err(error),
         },
         "sync_current_provider" => sync_current_provider_command(state).await,
-        "fetch_current_provider_models" => fetch_current_provider_models(state).await,
-        "save_route" => match (
-            argument::<ProviderProfile>(&args, "route"),
-            argument::<u64>(&args, "expectedRevision"),
-        ) {
-            (Ok(route), Ok(expected_revision)) => save_route(state, route, expected_revision).await,
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        },
         "delete_route" => match (
             string_argument(&args, "routeId"),
             argument::<u64>(&args, "expectedRevision"),
         ) {
             (Ok(route_id), Ok(expected_revision)) => {
                 delete_route(state, route_id, expected_revision).await
-            }
-            (Err(error), _) | (_, Err(error)) => Err(error),
-        },
-        "activate_route" => match (
-            string_argument(&args, "routeId"),
-            argument::<u64>(&args, "expectedRevision"),
-        ) {
-            (Ok(route_id), Ok(expected_revision)) => {
-                activate_route(state, route_id, expected_revision).await
             }
             (Err(error), _) | (_, Err(error)) => Err(error),
         },
@@ -886,20 +867,10 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 .unwrap_or(false);
             runtime_status_with_options(state, refresh_injection_status).await
         }
-        "refresh_injection_status" => refresh_injection_status(state).await,
         "refresh_diagnostic_storage_stats" => refresh_diagnostic_storage_stats(state).await,
         "refresh_trace_log_stats" => refresh_trace_log_stats(state).await,
-        "launch_codey" => launch_codey_runtime(state).await,
         "restart_codey" => schedule_restart_codey_runtime(state).await,
         "clear_diagnostic_storage" => clear_diagnostic_storage(state).await,
-        "clear_codex_trace_logs" => clear_codex_trace_logs(state).await,
-        "test_webhook" => {
-            let channel_id = args
-                .get("channelId")
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            test_webhook(state, channel_id).await
-        }
         "test_notification_channel" => {
             match argument::<NotificationChannelConfig>(&args, "channel") {
                 Ok(channel) => test_notification_channel(state, channel).await,
@@ -1872,6 +1843,7 @@ pub(super) fn provider_route_restart_required_for_runtime(
     current: &CodeyConfig,
 ) -> bool {
     official_route_snapshots(&runtime.applied_config) != official_route_snapshots(current)
+        || websocket_transport_requires_restart(&runtime.applied_config, current)
 }
 
 #[cfg(test)]

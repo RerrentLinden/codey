@@ -19,11 +19,12 @@ use crate::sqlite_util::table_columns;
 
 const MARKER_VERSION: u32 = 1;
 const MARKER_FILE: &str = "provider-sync-marker-v1.json";
-const ROLLOUT_HEADER_CACHE_VERSION: u32 = 1;
+const ROLLOUT_HEADER_CACHE_VERSION: u32 = 2;
 const ROLLOUT_HEADER_CACHE_FILE: &str = "provider-sync-rollout-headers-v1.json";
 const PROVIDER_SYNC_MANAGED_BY: &str = "Codey provider sync";
 const SESSION_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const MAX_ROLLOUT_HEADER_BYTES: u64 = 256 * 1024;
+const ROLLOUT_DIRECTORY_FAST_PATH_MAX_AGE_MS: u128 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderSyncPlan {
@@ -53,12 +54,20 @@ struct RolloutHeaderCacheEntry {
     signature: RolloutHeaderSignature,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RolloutDirectoryCacheEntry {
+    path: PathBuf,
+    modified_ns: Option<u64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RolloutHeaderCache {
     version: u32,
     target_provider: String,
     entries: Vec<RolloutHeaderCacheEntry>,
+    directories: Vec<RolloutDirectoryCacheEntry>,
     validated_at_ms: u128,
 }
 
@@ -200,16 +209,36 @@ fn validate_rollout_headers_at(
     target_provider: &str,
     cache_path: &Path,
 ) -> Result<RolloutHeaderValidation> {
+    let cached_record = read_rollout_header_cache_record(cache_path, target_provider);
+    if cached_record.as_ref().is_some_and(|cache| {
+        timestamp_millis().saturating_sub(cache.validated_at_ms)
+            < ROLLOUT_DIRECTORY_FAST_PATH_MAX_AGE_MS
+            && rollout_directories_match(home, &cache.directories)
+    }) {
+        return Ok(RolloutHeaderValidation {
+            matches: true,
+            headers_read: 0,
+        });
+    }
+
     let mut files = Vec::new();
+    let mut directories = Vec::new();
     for dirname in SESSION_DIRS {
         let root = home.join(dirname);
         if root.exists() {
-            collect_rollout_files(home, &root, &mut files)?;
+            collect_rollout_files(home, &root, &mut files, &mut directories)?;
         }
     }
     files.sort_by(|left, right| left.cache_key.cmp(&right.cache_key));
+    directories.sort_by(|left, right| left.path.cmp(&right.path));
 
-    let cached = read_rollout_header_cache(cache_path, target_provider);
+    let cached = cached_record.map(|cache| {
+        cache
+            .entries
+            .into_iter()
+            .map(|entry| (entry.path, entry.signature))
+            .collect::<BTreeMap<_, _>>()
+    });
     let changed = files
         .iter()
         .filter(|file| {
@@ -245,6 +274,7 @@ fn validate_rollout_headers_at(
         version: ROLLOUT_HEADER_CACHE_VERSION,
         target_provider: target_provider.to_string(),
         entries,
+        directories,
         validated_at_ms: timestamp_millis(),
     };
     // This cache only avoids repeat reads. Failing to persist it must not turn
@@ -310,13 +340,19 @@ fn rollout_file_headers_match(files: &[PathBuf], target_provider: &str) -> Resul
     Ok(!mismatch.load(Ordering::Relaxed))
 }
 
-fn collect_rollout_files(home: &Path, root: &Path, files: &mut Vec<RolloutFile>) -> Result<()> {
+fn collect_rollout_files(
+    home: &Path,
+    root: &Path,
+    files: &mut Vec<RolloutFile>,
+    directories: &mut Vec<RolloutDirectoryCacheEntry>,
+) -> Result<()> {
+    let modified_before = directory_modified_ns(root);
     for entry in
         fs::read_dir(root).with_context(|| format!("扫描会话目录失败：{}", root.display()))?
     {
         let path = entry?.path();
         if path.is_dir() {
-            collect_rollout_files(home, &path, files)?;
+            collect_rollout_files(home, &path, files, directories)?;
             continue;
         }
         if !path
@@ -342,7 +378,38 @@ fn collect_rollout_files(home: &Path, root: &Path, files: &mut Vec<RolloutFile>)
             },
         });
     }
+    let modified_after = directory_modified_ns(root);
+    directories.push(RolloutDirectoryCacheEntry {
+        path: root.strip_prefix(home).unwrap_or(root).to_path_buf(),
+        modified_ns: (modified_before == modified_after)
+            .then_some(modified_after)
+            .flatten(),
+    });
     Ok(())
+}
+
+fn directory_modified_ns(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+}
+
+fn rollout_directories_match(home: &Path, cached: &[RolloutDirectoryCacheEntry]) -> bool {
+    for dirname in SESSION_DIRS {
+        let exists = home.join(dirname).is_dir();
+        let was_present = cached.iter().any(|entry| entry.path == Path::new(dirname));
+        if exists != was_present {
+            return false;
+        }
+    }
+    cached.iter().all(|entry| {
+        entry.modified_ns.is_some()
+            && directory_modified_ns(&home.join(&entry.path)) == entry.modified_ns
+    })
 }
 
 fn rollout_header_matches(path: &Path, target_provider: &str) -> Result<Option<bool>> {
@@ -371,19 +438,12 @@ fn rollout_header_matches(path: &Path, target_provider: &str) -> Result<Option<b
     Ok(None)
 }
 
+#[cfg(test)]
 fn read_rollout_header_cache(
     path: &Path,
     target_provider: &str,
 ) -> Option<BTreeMap<PathBuf, RolloutHeaderSignature>> {
-    let Ok(bytes) = fs::read(path) else {
-        return None;
-    };
-    let Ok(cache) = serde_json::from_slice::<RolloutHeaderCache>(&bytes) else {
-        return None;
-    };
-    if cache.version != ROLLOUT_HEADER_CACHE_VERSION || cache.target_provider != target_provider {
-        return None;
-    }
+    let cache = read_rollout_header_cache_record(path, target_provider)?;
     Some(
         cache
             .entries
@@ -391,6 +451,16 @@ fn read_rollout_header_cache(
             .map(|entry| (entry.path, entry.signature))
             .collect(),
     )
+}
+
+fn read_rollout_header_cache_record(
+    path: &Path,
+    target_provider: &str,
+) -> Option<RolloutHeaderCache> {
+    let bytes = fs::read(path).ok()?;
+    let cache = serde_json::from_slice::<RolloutHeaderCache>(&bytes).ok()?;
+    (cache.version == ROLLOUT_HEADER_CACHE_VERSION && cache.target_provider == target_provider)
+        .then_some(cache)
 }
 
 fn write_rollout_header_cache(path: &Path, cache: &RolloutHeaderCache) -> Result<()> {
@@ -600,6 +670,23 @@ mod tests {
             }
         );
         assert_eq!(second_cache, first_cache);
+    }
+
+    #[test]
+    fn expired_directory_fast_path_revalidates_modified_rollout_headers() {
+        let temp = tempfile::tempdir().unwrap();
+        write_rollout(temp.path(), "rollout-thread-1.jsonl", "codey_global");
+        let cache = temp.path().join("codey/rollout-headers.json");
+        validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+        let mut cached: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+        cached["validatedAtMs"] = Value::from(0);
+        fs::write(&cache, serde_json::to_vec(&cached).unwrap()).unwrap();
+        write_rollout(temp.path(), "rollout-thread-1.jsonl", "openai");
+
+        let validation = validate_rollout_headers_at(temp.path(), "codey_global", &cache).unwrap();
+
+        assert!(!validation.matches);
+        assert_eq!(validation.headers_read, 1);
     }
 
     #[test]

@@ -3,7 +3,6 @@
 // only after Codex's sidebar is present.
 (() => {
   const rendererCoreAlreadyLoaded = window.__codeyRendererCoreLoaded === true;
-  window.__codeyRendererCoreLoaded = true;
   window.__codeyRendererModuleReady = true;
 
   const sessionToolsLoadPath = "/internal/codey/session-tools/load";
@@ -971,7 +970,7 @@
     return false;
   };
 
-  bootstrapObserver = new MutationObserver((mutations) => {
+  const handleBootstrapMutations = (mutations) => {
     for (const mutation of mutations) {
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
@@ -1035,8 +1034,8 @@
         return;
       }
     }
-  });
-  bootstrapObserver.observe(document.documentElement, {
+  };
+  const bootstrapMutationOptions = {
     attributes: true,
     attributeFilter: [
       "data-app-action-sidebar-scroll",
@@ -1050,7 +1049,23 @@
     ],
     childList: true,
     subtree: true,
-  });
+  };
+  const mutationDispatcher = window.__codeyMutationDispatcher;
+  if (typeof mutationDispatcher?.subscribe === "function") {
+    const unsubscribe = mutationDispatcher.subscribe(
+      handleBootstrapMutations,
+      bootstrapMutationOptions,
+    );
+    if (mutationDispatcher.snapshot?.().observerInstalled) {
+      bootstrapObserver = { disconnect: unsubscribe };
+    } else {
+      unsubscribe?.();
+    }
+  }
+  if (!bootstrapObserver) {
+    bootstrapObserver = new MutationObserver(handleBootstrapMutations);
+    bootstrapObserver.observe(document.documentElement, bootstrapMutationOptions);
+  }
 
   window.__codeyLoadSessionTools = loadSessionTools;
   window.__codeyRendererScan = scan;
@@ -1071,4 +1086,7 @@
     scan();
     scheduleRuntimeHealthCheck(0);
   });
+  // Commit the idempotency marker only after every synchronous bootstrap step
+  // succeeded. If an earlier step throws, CDP can inject this module again.
+  window.__codeyRendererCoreLoaded = true;
 })();

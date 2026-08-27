@@ -17,6 +17,7 @@ use crate::config::ConfigStore;
 
 const UPDATE_CHECK_CACHE_TTL: Duration = Duration::from_secs(30);
 const UPDATE_DOWNLOAD_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_UPDATE_MANIFEST_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 pub(super) struct UpdateManifest {
@@ -242,9 +243,14 @@ async fn fetch_configured_update_manifest(
         return Err("更新地址重定向到了非 HTTPS 地址".to_string());
     }
 
-    let manifest = response
-        .json::<UpdateManifest>()
-        .await
+    let body = crate::http_response::read_bounded_body(
+        response,
+        MAX_UPDATE_MANIFEST_BYTES,
+        "更新清单响应",
+    )
+    .await
+    .map_err(|error| format!("读取更新清单失败：{error:#}"))?;
+    let manifest = serde_json::from_slice::<UpdateManifest>(&body)
         .map_err(|error| format!("更新清单格式无效：{error}"))?;
     Ok(manifest)
 }
@@ -621,9 +627,18 @@ app_parent="$(dirname "$app_bundle")"
 app_name="$(basename "$app_bundle")"
 stage_dir=""
 tmp_dir=""
+backup_bundle=""
+replacement_committed=0
 cleanup() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$replacement_committed" -ne 1 ] && [ -n "$backup_bundle" ] && [ -e "$backup_bundle" ]; then
+    rm -rf "$app_bundle"
+    /bin/mv "$backup_bundle" "$app_bundle" || true
+  fi
   if [ -n "$stage_dir" ]; then rm -rf "$stage_dir"; fi
   if [ -n "$tmp_dir" ]; then rm -rf "$tmp_dir"; fi
+  exit "$status"
 }
 trap cleanup EXIT HUP INT TERM
 while kill -0 "$parent_pid" 2>/dev/null; do
@@ -647,9 +662,19 @@ rm -rf "$tmp_dir"
 mkdir -p "$tmp_dir"
 /usr/bin/ditto -x -k "$staged_archive" "$tmp_dir"
 test -d "$tmp_dir/$app_name"
-rm -rf "$app_bundle"
-mv "$tmp_dir/$app_name" "$app_bundle"
-/usr/bin/open "$app_bundle"
+backup_bundle="$app_parent/.${app_name}.codey-backup.$$"
+rm -rf "$backup_bundle"
+if [ -e "$app_bundle" ]; then
+  /bin/mv "$app_bundle" "$backup_bundle"
+fi
+if ! /bin/mv "$tmp_dir/$app_name" "$app_bundle"; then
+  exit 1
+fi
+if ! /usr/bin/open "$app_bundle"; then
+  exit 1
+fi
+replacement_committed=1
+if [ -e "$backup_bundle" ]; then rm -rf "$backup_bundle"; fi
 "#
         .as_bytes(),
     ) {

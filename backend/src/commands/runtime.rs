@@ -272,15 +272,6 @@ async fn codex_app_version_for_status(
     version
 }
 
-pub(super) async fn refresh_injection_status(state: &Arc<AppState>) -> Result<Value, String> {
-    let runtime = state.runtime.lock().await.clone();
-    let Some(runtime) = runtime else {
-        return Ok(json!([]));
-    };
-    let statuses = runtime.refresh_injection_statuses().await;
-    serde_json::to_value(statuses.as_ref()).map_err(|error| error.to_string())
-}
-
 fn ensure_runtime_can_start(state: &AppState) -> Result<(), String> {
     if state.is_shutting_down() {
         Err("Codey 正在退出，无法启动 Codex".to_string())

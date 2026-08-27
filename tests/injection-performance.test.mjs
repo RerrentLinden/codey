@@ -6,18 +6,24 @@ import vm from "node:vm";
 const root = new URL("../", import.meta.url);
 
 test("renderer core waits for sidebar interaction before loading session tools", async () => {
-  const [inject, sessionTools, bridge, petShield, securityShield] = await Promise.all([
+  const [inject, sessionTools, bridge, petShield, securityShield, promptOptimize] = await Promise.all([
     readFile(new URL("public/renderer-inject.js", root), "utf8"),
     readFile(new URL("public/codey-inject.js", root), "utf8"),
     readFile(new URL("public/codey-bridge.js", root), "utf8"),
     readFile(new URL("public/pet-control-shield.js", root), "utf8"),
     readFile(new URL("public/security-warning-shield.js", root), "utf8"),
+    readFile(new URL("public/prompt-optimize.js", root), "utf8"),
   ]);
 
   assert.match(inject, /const queryWithin = \(root, selector\)/);
   assert.match(inject, /const sessionToolsLoadPath = "\/internal\/codey\/session-tools\/load"/);
   assert.match(inject, /const sidebarSelector = \[/);
   assert.match(inject, /const loadSessionTools = \(\) =>/);
+  assert.ok(
+    inject.lastIndexOf("window.__codeyRendererCoreLoaded = true")
+      > inject.indexOf("bootstrapObserver.observe"),
+    "renderer loaded state must be committed only after bootstrap succeeds",
+  );
   assert.doesNotMatch(inject, /const sidebarDetected =/);
   assert.match(
     inject,
@@ -28,7 +34,8 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(inject, /document\.addEventListener\("pointerover", loadSessionToolsFromInteraction/);
   assert.match(inject, /document\.addEventListener\("focusin", loadSessionToolsFromInteraction/);
   assert.match(inject, /bootstrapObserver\?\.disconnect\(\)/);
-  assert.match(inject, /new MutationObserver\(\(mutations\) =>/);
+  assert.match(inject, /mutationDispatcher\.subscribe\(\s*handleBootstrapMutations/);
+  assert.match(inject, /new MutationObserver\(handleBootstrapMutations\)/);
   assert.match(inject, /scheduleScan\(element\)/);
   assert.match(inject, /const mountedButtonIsUsable = \(button\) =>/);
   assert.match(inject, /if \(mountedButtonIsUsable\(existingButton\)\) return;/);
@@ -95,11 +102,14 @@ test("renderer core waits for sidebar interaction before loading session tools",
     /flushThreadUpdatedAtFetch[\s\S]*queryWithin\(document, "\[data-app-action-sidebar-thread-row\]"\)/,
   );
   const sessionObserverBody = sessionTools.match(
-    /new MutationObserver\(\(mutations\) => \{([\s\S]*?)\}\)\.observe\(document\.documentElement/,
+    /const handleSessionToolMutations = \(mutations\) => \{([\s\S]*?)\n  \};\n  const sessionToolMutationOptions/,
   )?.[1] ?? "";
   assert.match(sessionObserverBody, /addPendingScanRoot\(threadRow\)/);
   assert.match(sessionObserverBody, /syncConversationRichTooltipOpen\(target\)/);
   assert.doesNotMatch(sessionObserverBody, /syncSidebarThreadTimeState\(threadRow\)/);
+  assert.match(sessionTools, /mutationDispatcher\.subscribe\(\s*handleSessionToolMutations/);
+  assert.match(sessionTools, /new MutationObserver\(handleSessionToolMutations\)/);
+  assert.match(promptOptimize, /mutationDispatcher\.subscribe\(\s*handleComposerMutations/);
   const modelWhitelist = await readFile(
     new URL("public/model-whitelist-inject.js", root),
     "utf8",
