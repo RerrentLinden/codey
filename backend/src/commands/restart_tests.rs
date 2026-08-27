@@ -58,6 +58,113 @@ fn official_account_launch_allows_official_routes() {
 }
 
 #[test]
+fn unknown_official_auth_allows_official_only_launch_to_reach_runtime() {
+    let mut official = crate::config::ProviderProfile::new("OpenAI 官方直登");
+    official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+    official.source_provider_id = Some("openai".into());
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.normalize();
+    let previous = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official.clone()],
+        initial_route_import_completed: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+
+    let next = route_config_for_official_probe(
+        &previous,
+        crate::codex_provider::OfficialAccountProfileStatus::Unknown {
+            profile: official.clone(),
+            reason: "system credential store cannot be probed".into(),
+        },
+    )
+    .unwrap();
+
+    assert!(next.official_account_available_this_launch);
+    assert_eq!(
+        next.official_account_status_this_launch,
+        crate::config::LaunchOfficialAccountStatus::Unknown
+    );
+    assert!(next.router_requires_openai_auth());
+    assert!(next.profiles.iter().any(|profile| profile.official_account));
+}
+
+#[test]
+fn unknown_official_auth_does_not_force_openai_auth_for_third_party_launches() {
+    let mut relay = crate::config::ProviderProfile::new("Relay");
+    relay.id = "relay".into();
+    relay.base_url = "https://relay.example/v1".into();
+    relay.api_key = "secret".into();
+    relay.normalize();
+    let mut official = crate::config::ProviderProfile::new("OpenAI 官方直登");
+    official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+    official.source_provider_id = Some("openai".into());
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.normalize();
+    let previous = CodeyConfig {
+        active_profile_id: relay.id.clone(),
+        profiles: vec![official.clone(), relay.clone()],
+        default_model: crate::local_router::model_alias("relay", "gpt-5.6-sol"),
+        selected_models_by_provider: std::collections::BTreeMap::from([(
+            "relay".into(),
+            vec!["gpt-5.6-sol".into()],
+        )]),
+        initial_route_import_completed: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+
+    let next = route_config_for_official_probe(
+        &previous,
+        crate::codex_provider::OfficialAccountProfileStatus::Unknown {
+            profile: official.clone(),
+            reason: "auth.json not found under auto store".into(),
+        },
+    )
+    .unwrap();
+
+    assert!(!next.official_account_available_this_launch);
+    assert_eq!(
+        next.official_account_status_this_launch,
+        crate::config::LaunchOfficialAccountStatus::Unknown
+    );
+    assert!(!next.router_requires_openai_auth());
+    assert_eq!(next.profiles, vec![official, relay]);
+    assert_eq!(next.active_profile_id, "relay");
+}
+
+#[test]
+fn unavailable_official_auth_error_keeps_safe_probe_diagnostics() {
+    let mut official = crate::config::ProviderProfile::new("OpenAI 官方直登");
+    official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+    official.source_provider_id = Some("openai".into());
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.normalize();
+    let previous = CodeyConfig {
+        active_profile_id: official.id.clone(),
+        profiles: vec![official],
+        initial_route_import_completed: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+
+    let error = route_config_for_official_probe(
+        &previous,
+        crate::codex_provider::OfficialAccountProfileStatus::Unavailable {
+            reason: "nativeStatus=not_logged_in; executable=codex.exe; credentialsIncluded=false"
+                .into(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(error.contains("没有可用的官方账号登录"));
+    assert!(error.contains("nativeStatus=not_logged_in"));
+    assert!(error.contains("executable=codex.exe"));
+    assert!(error.contains("credentialsIncluded=false"));
+}
+
+#[test]
 fn full_config_save_restores_route_secrets_and_source_owned_identity() {
     let mut saved = crate::config::ProviderProfile::new("Imported Relay");
     saved.id = "route-profile".into();

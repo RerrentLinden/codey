@@ -83,6 +83,7 @@ pub(super) async fn runtime_status_with_options(
         .unwrap_or_default();
     let configured_codex_app_path = config.codex_app_path.clone();
     let official_account_available = config.official_account_available_this_launch;
+    let official_account_status = config.official_account_status_this_launch;
     let runtime_codex_app_path = runtime
         .as_ref()
         .map(|runtime| runtime.codex_app_path.clone());
@@ -132,6 +133,7 @@ pub(super) async fn runtime_status_with_options(
         "activeProfileId": active_profile_id,
         "activeProfileName": active_profile_name,
         "officialAccountAvailable": official_account_available,
+        "officialAccountStatus": official_account_status,
         "restartRequired": restart_required,
         "restartInProgress": state.restart_in_progress.load(Ordering::Acquire),
     });
@@ -407,12 +409,55 @@ pub async fn launch_codey_runtime(state: &Arc<AppState>) -> Result<Value, String
                 stage: Some("startup.runtime".to_string()),
                 recoverable: Some(false),
             },
-            json!({
-                "restart": false,
-            }),
+            runtime_start_failure_context(state, false, error).await,
         );
     }
     result
+}
+
+async fn runtime_start_failure_context(state: &Arc<AppState>, restart: bool, error: &str) -> Value {
+    let config = state.config.read().await;
+    let active_profile = config.active_profile();
+    let official_profile_count = config
+        .profiles
+        .iter()
+        .filter(|profile| profile.official_account)
+        .count();
+    let third_party_profile_count = config
+        .profiles
+        .iter()
+        .filter(|profile| !profile.official_account && !profile.is_unconfigured_default())
+        .count();
+    json!({
+        "restart": restart,
+        "errorClass": classify_runtime_start_error(error),
+        "codexHome": codex_home().to_string_lossy(),
+        "codeyConfigPath": state.store.path().to_string_lossy(),
+        "configuredCodexAppPath": config.codex_app_path.as_str(),
+        "activeProfileId": active_profile.as_ref().map(|profile| profile.id.clone()),
+        "activeProfileName": active_profile.as_ref().map(|profile| profile.name.clone()),
+        "activeProfileOfficial": active_profile.as_ref().map(|profile| profile.official_account),
+        "profileCount": config.profiles.len(),
+        "officialProfileCount": official_profile_count,
+        "thirdPartyProfileCount": third_party_profile_count,
+        "hasThirdPartyRoute": config.has_third_party_route(),
+        "routerRequiresOpenaiAuth": config.router_requires_openai_auth(),
+        "officialAccountAvailable": config.official_account_available_this_launch,
+        "officialAccountStatus": config.official_account_status_this_launch,
+        "credentialsIncluded": false,
+    })
+}
+
+fn classify_runtime_start_error(error: &str) -> &'static str {
+    if error.contains("认证诊断：") || error.contains("没有可用的官方账号登录") {
+        "official_auth_unavailable"
+    } else if error.contains("Codex App") || error.contains("codex.exe") {
+        "codex_app_unavailable"
+    } else if error.contains("Provider") || error.contains("线路") {
+        "provider_route_invalid"
+    } else {
+        "runtime_start_failed"
+    }
 }
 
 pub async fn schedule_restart_codey_runtime(state: &Arc<AppState>) -> Result<Value, String> {
@@ -478,11 +523,15 @@ async fn run_scheduled_restart(restart_state: Arc<AppState>, mut cancel: oneshot
     let Err(error) = launch else {
         return;
     };
-    error_log::record_failure(
+    error_log::record_failure_with_metadata(
         "runtime_restart_failed",
         "launch_runtime_after_restart",
         error.clone(),
-        json!({}),
+        error_log::FailureMetadata {
+            stage: Some("startup.runtime".to_string()),
+            recoverable: Some(false),
+        },
+        runtime_start_failure_context(&restart_state, true, &error).await,
     );
     eprintln!("Codey 自动重启 Codex 失败：{error}");
     restart_state.request_shutdown();
@@ -536,8 +585,12 @@ mod tests {
 
     use tokio::sync::oneshot;
 
-    use super::{forward_codex_exit_to_codey_shutdown, runtime_feature_status_value};
+    use super::{
+        classify_runtime_start_error, forward_codex_exit_to_codey_shutdown,
+        runtime_feature_status_value, runtime_start_failure_context,
+    };
     use crate::commands::{AppShutdownReason, AppState};
+    use crate::config::{CodeyConfig, ProviderProfile};
 
     #[test]
     fn runtime_feature_status_has_a_stable_public_json_contract() {
@@ -556,6 +609,57 @@ mod tests {
             runtime_feature_status_value(false, true, 0, false, true)["notificationChannelsActive"],
             serde_json::Value::Bool(false)
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_start_failure_context_is_complete_and_does_not_include_credentials() {
+        let state = Arc::new(AppState::default());
+        let mut relay = ProviderProfile::new("Relay");
+        relay.id = "relay".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "sk-private-runtime-key".into();
+        relay.normalize();
+        *state.config.write().await = CodeyConfig {
+            active_profile_id: relay.id.clone(),
+            profiles: vec![relay],
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        let context = runtime_start_failure_context(
+            &state,
+            true,
+            "当前 Codex 没有可用的官方账号登录。认证诊断：not logged in",
+        )
+        .await;
+        let serialized = serde_json::to_string(&context).unwrap();
+
+        assert_eq!(context["restart"], true);
+        assert_eq!(context["errorClass"], "official_auth_unavailable");
+        assert_eq!(context["activeProfileId"], "relay");
+        assert_eq!(context["thirdPartyProfileCount"], 1);
+        assert_eq!(context["credentialsIncluded"], false);
+        assert!(context["codexHome"].is_string());
+        assert!(context["codeyConfigPath"].is_string());
+        assert!(!serialized.contains("sk-private-runtime-key"));
+        assert!(!serialized.contains("relay.example"));
+    }
+
+    #[test]
+    fn runtime_start_error_classification_is_stable() {
+        assert_eq!(
+            classify_runtime_start_error("没有可用的官方账号登录"),
+            "official_auth_unavailable"
+        );
+        assert_eq!(
+            classify_runtime_start_error("找不到 Codex App"),
+            "codex_app_unavailable"
+        );
+        assert_eq!(
+            classify_runtime_start_error("线路配置无效"),
+            "provider_route_invalid"
+        );
+        assert_eq!(classify_runtime_start_error("boom"), "runtime_start_failed");
     }
 
     #[tokio::test]

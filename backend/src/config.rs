@@ -391,6 +391,15 @@ pub enum GpuLaunchMode {
     DisableGpuRasterization,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchOfficialAccountStatus {
+    Authenticated,
+    #[default]
+    Unauthenticated,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SubagentRoleConfig {
@@ -519,6 +528,11 @@ pub struct CodeyConfig {
     /// never persisted or exposed as part of the editable configuration.
     #[serde(skip)]
     pub official_account_available_this_launch: bool,
+    /// Three-state launch-scoped result for official account detection. The
+    /// boolean above remains the runtime routing capability flag; this field
+    /// preserves whether the preflight was authoritative or inconclusive.
+    #[serde(skip)]
+    pub official_account_status_this_launch: LaunchOfficialAccountStatus,
     /// Public HTTPS endpoint for the version manifest published to Cloudflare R2.
     /// This is build-time configuration, not a user setting.
     #[serde(
@@ -559,6 +573,7 @@ impl Default for CodeyConfig {
             hide_full_access_warning: false,
             show_account_usage_in_header: true,
             official_account_available_this_launch: false,
+            official_account_status_this_launch: LaunchOfficialAccountStatus::Unauthenticated,
             update_manifest_url: default_update_manifest_url(),
         }
     }

@@ -84,9 +84,11 @@ use crate::codex_config::{
     FastContextToolsStatus, codex_home, fast_context_tools_status, reconcile_runtime_subagent_roles,
 };
 use crate::codex_provider;
+use crate::codex_provider::OfficialAccountProfileStatus;
 use crate::config::{
-    CodeyConfig, ConfigStore, PromptOptimizationConfig, ProviderProfile, SUBAGENT_ROLE_DEFAULT,
-    SUBAGENT_ROLE_IDS, SubagentRoleConfig, validate_provider_profiles,
+    CodeyConfig, ConfigStore, LaunchOfficialAccountStatus, PromptOptimizationConfig,
+    ProviderProfile, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SubagentRoleConfig,
+    validate_provider_profiles,
 };
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
@@ -580,8 +582,12 @@ pub(super) fn validate_official_account_config_change(
 
 pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> Result<(), String> {
     let home = codex_home().to_path_buf();
-    let official_profile = tokio::task::spawn_blocking(move || {
-        crate::codex_provider::current_official_account_profile(&home)
+    let configured_codex_app_path = state.config.read().await.codex_app_path.clone();
+    let official_status = tokio::task::spawn_blocking(move || {
+        crate::codex_provider::current_official_account_profile_status_for_launch(
+            &home,
+            &configured_codex_app_path,
+        )
     })
     .await
     .map_err(|error| format!("检测 Codex 官方账号登录状态的任务异常退出：{error}"))?
@@ -589,25 +595,7 @@ pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> 
 
     let _config_write_guard = state.config_write_lock.lock().await;
     let previous = state.config.read().await.clone();
-    let mut next = previous.clone();
-    if let Some(official_profile) = official_profile {
-        next.apply_launch_official_profile(Some(official_profile));
-        next.initial_route_import_completed = true;
-        next = next.normalize();
-        next.official_account_available_this_launch = true;
-    } else {
-        if next.profiles.iter().any(|profile| profile.official_account) {
-            if !next.has_third_party_route() {
-                return Err(
-                    "当前 Codex 没有可用的官方账号登录，也没有已保存的 API Key 线路；请先在 Codex 中完成官方账号登录，或在 Codey 中添加第三方 API 线路"
-                        .to_string(),
-                );
-            }
-            next.apply_launch_official_profile(None);
-            next = next.normalize();
-        }
-        next.official_account_available_this_launch = false;
-    }
+    let mut next = route_config_for_official_probe(&previous, official_status)?;
 
     if persisted_config_changed(&previous, &next) {
         if next.settings_revision == previous.settings_revision {
@@ -621,11 +609,173 @@ pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> 
     Ok(())
 }
 
+fn route_config_for_official_probe(
+    previous: &CodeyConfig,
+    official_status: OfficialAccountProfileStatus,
+) -> Result<CodeyConfig, String> {
+    let mut next = previous.clone();
+    match official_status {
+        OfficialAccountProfileStatus::Available(official_profile) => {
+            next.apply_launch_official_profile(Some(official_profile));
+            next.initial_route_import_completed = true;
+            next = next.normalize();
+            next.official_account_available_this_launch = true;
+            next.official_account_status_this_launch = LaunchOfficialAccountStatus::Authenticated;
+        }
+        OfficialAccountProfileStatus::Unavailable { reason } => {
+            next = apply_unavailable_official_probe(next, reason)?;
+        }
+        OfficialAccountProfileStatus::Unknown { profile, reason } => {
+            if should_attempt_official_launch_when_auth_unknown(previous) {
+                next.apply_launch_official_profile(Some(profile));
+                next.initial_route_import_completed = true;
+                next = next.normalize();
+                next.official_account_available_this_launch = true;
+                next.official_account_status_this_launch = LaunchOfficialAccountStatus::Unknown;
+                error_log::record_failure_with_metadata(
+                    "official_auth_probe_inconclusive",
+                    "prepare_routes_for_current_launch",
+                    reason,
+                    error_log::FailureMetadata {
+                        stage: Some("startup.auth_probe".to_string()),
+                        recoverable: Some(true),
+                    },
+                    official_auth_route_diagnostics(
+                        previous,
+                        "unknown",
+                        "launch_with_official_auth",
+                    ),
+                );
+            } else {
+                next.official_account_available_this_launch = false;
+                next.official_account_status_this_launch = LaunchOfficialAccountStatus::Unknown;
+                error_log::record_failure_with_metadata(
+                    "official_auth_probe_inconclusive",
+                    "prepare_routes_for_current_launch",
+                    reason,
+                    error_log::FailureMetadata {
+                        stage: Some("startup.auth_probe".to_string()),
+                        recoverable: Some(true),
+                    },
+                    official_auth_route_diagnostics(previous, "unknown", "third_party_route"),
+                );
+            }
+        }
+    }
+    Ok(next)
+}
+
+fn apply_unavailable_official_probe(
+    mut next: CodeyConfig,
+    reason: String,
+) -> Result<CodeyConfig, String> {
+    let has_official_route = next.profiles.iter().any(|profile| profile.official_account);
+    let fallback = if next.has_third_party_route() {
+        "third_party_route"
+    } else if has_official_route {
+        "startup_blocked"
+    } else {
+        "no_official_route_configured"
+    };
+    let diagnostics = official_auth_route_diagnostics(&next, "unauthenticated", fallback);
+    if has_official_route {
+        if !next.has_third_party_route() {
+            let error = format!(
+                "当前 Codex 没有可用的官方账号登录，也没有已保存的 API Key 线路；请先在 Codex 中完成官方账号登录，或在 Codey 中添加第三方 API 线路。认证诊断：{reason}"
+            );
+            error_log::record_failure_with_metadata(
+                "official_auth_unavailable",
+                "prepare_routes_for_current_launch",
+                error.clone(),
+                error_log::FailureMetadata {
+                    stage: Some("startup.auth_probe".to_string()),
+                    recoverable: Some(true),
+                },
+                diagnostics,
+            );
+            return Err(error);
+        }
+        next.apply_launch_official_profile(None);
+        next = next.normalize();
+    }
+    error_log::record_failure_with_metadata(
+        "official_auth_unavailable",
+        "prepare_routes_for_current_launch",
+        reason,
+        error_log::FailureMetadata {
+            stage: Some("startup.auth_probe".to_string()),
+            recoverable: Some(true),
+        },
+        diagnostics,
+    );
+    next.official_account_available_this_launch = false;
+    next.official_account_status_this_launch = LaunchOfficialAccountStatus::Unauthenticated;
+    Ok(next)
+}
+
+fn official_auth_route_diagnostics(
+    config: &CodeyConfig,
+    probe_status: &str,
+    fallback: &str,
+) -> serde_json::Value {
+    let active_profile = config.active_profile();
+    let official_profile_count = config
+        .profiles
+        .iter()
+        .filter(|profile| profile.official_account)
+        .count();
+    let third_party_profile_count = config
+        .profiles
+        .iter()
+        .filter(|profile| !profile.official_account && !profile.is_unconfigured_default())
+        .count();
+    serde_json::json!({
+        "probeStatus": probe_status,
+        "fallback": fallback,
+        "activeProfileId": active_profile.as_ref().map(|profile| profile.id.clone()),
+        "activeProfileOfficial": active_profile.as_ref().map(|profile| profile.official_account),
+        "profileCount": config.profiles.len(),
+        "officialProfileCount": official_profile_count,
+        "thirdPartyProfileCount": third_party_profile_count,
+        "hasThirdPartyRoute": config.has_third_party_route(),
+        "routerRequiresOpenaiAuth": config.router_requires_openai_auth(),
+        "initialRouteImportCompleted": config.initial_route_import_completed,
+        "officialAccountAvailableBeforeProbe": config.official_account_available_this_launch,
+        "officialAccountStatusBeforeProbe": config.official_account_status_this_launch,
+        "credentialsIncluded": false,
+    })
+}
+
+fn should_attempt_official_launch_when_auth_unknown(config: &CodeyConfig) -> bool {
+    if config.looks_like_empty_default_route() {
+        return true;
+    }
+    if config
+        .active_profile()
+        .is_some_and(|profile| profile.official_account)
+    {
+        return true;
+    }
+    if !config.has_third_party_route() {
+        return true;
+    }
+    let Some(default_model) = config.default_model() else {
+        return false;
+    };
+    config.profiles.iter().any(|profile| {
+        profile.official_account
+            && default_model
+                .starts_with(&crate::local_router::model_alias(profile.provider_id(), ""))
+    })
+}
+
 fn persisted_config_changed(previous: &CodeyConfig, next: &CodeyConfig) -> bool {
     let mut previous = previous.clone();
     let mut next = next.clone();
     previous.official_account_available_this_launch = false;
     next.official_account_available_this_launch = false;
+    previous.official_account_status_this_launch = LaunchOfficialAccountStatus::Unauthenticated;
+    next.official_account_status_this_launch = LaunchOfficialAccountStatus::Unauthenticated;
     previous != next
 }
 
@@ -819,6 +969,7 @@ pub async fn load_codey_config(state: &Arc<AppState>) -> Result<Value, String> {
         "path": state.store.path().to_string_lossy(),
         "startupError": startup_error,
         "officialAccountAvailable": config.official_account_available_this_launch,
+        "officialAccountStatus": config.official_account_status_this_launch,
         "providerStatus": provider_status,
         "modelState": model_state,
         "fastContextToolsStatus": fast_context_tools_status,
