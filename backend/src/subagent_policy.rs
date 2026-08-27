@@ -174,10 +174,7 @@ pub(crate) fn reasoning_effort_for_model(
             .third_party_model_metadata
             .iter()
             .find(|candidate| model_id::equal(&candidate.slug, model));
-        let fallback_efforts = model_catalog::THIRD_PARTY_REASONING_EFFORTS
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
+        let fallback_efforts = model_catalog::THIRD_PARTY_REASONING_EFFORTS.to_vec();
         let supported_reasoning_efforts = metadata
             .map(|metadata| {
                 metadata
@@ -193,10 +190,7 @@ pub(crate) fn reasoning_effort_for_model(
         {
             return preferred_reasoning_effort;
         }
-        if supported_reasoning_efforts
-            .iter()
-            .any(|effort| *effort == DEFAULT_SUBAGENT_REASONING_EFFORT)
-        {
+        if supported_reasoning_efforts.contains(&DEFAULT_SUBAGENT_REASONING_EFFORT) {
             return DEFAULT_SUBAGENT_REASONING_EFFORT.to_string();
         }
         if let Some(metadata) = metadata

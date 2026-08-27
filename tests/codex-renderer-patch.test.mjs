@@ -282,6 +282,22 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
         "renderer_patch:model visibility",
       ],
     );
+    // Every skipped gate must carry printable excerpts around its neighborhood
+    // anchors so an incompatible field bundle can be adapted without access to
+    // that exact build.
+    for (const record of JSON.parse(asyncLogSpawns[0].input)) {
+      assert.equal(record.context.matchCount, 0);
+      assert.ok(
+        Array.isArray(record.context.excerpts) &&
+          record.context.excerpts.length > 0 &&
+          record.context.excerpts.every((excerpt) => excerpt.length > 0),
+        `${record.operation} must carry anchor excerpts for field diagnosis`,
+      );
+      assert.match(
+        record.context.excerpts.join("\n"),
+        /useHiddenModels|includeUltraReasoningEffort/,
+      );
+    }
 
     const repeatedResponse = await installedHandler({
       url: "app://-/assets/app-initial-new-codex-build.js",

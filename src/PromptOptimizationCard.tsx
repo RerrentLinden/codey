@@ -1,12 +1,10 @@
-import { memo, useEffect, useId, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useId, useRef, useState } from "react";
 
 import {
   IconEye,
   IconEyeOff,
   IconKey,
-  IconPlus,
   IconPlugConnected,
-  IconRobot,
   IconSparkles,
   IconWorld,
 } from "@tabler/icons-react";
@@ -14,6 +12,7 @@ import {
 import type { Config, InlineResult } from "./App.types";
 import { invoke } from "./api";
 import { errorText, withTimeout } from "./appUtils";
+import { ManualModelCombobox } from "./components/ManualModelCombobox";
 import { ModelCombobox } from "./components/ModelCombobox";
 import { Button, Card, Input, PasswordInput, Select, Switch } from "./components/mantine";
 import { SETTINGS_OVERLAY_Z_INDEX } from "./overlay.constants";
@@ -103,16 +102,6 @@ function PromptOptimizationCardComponent({
       : "";
   const connectionDraftValid = usesCodeyRoute || (!baseUrlError && !apiKeyError);
   const testDraftValid = connectionDraftValid && !modelError;
-  const modelSelectOptions = useMemo(
-    () => [
-      ...(optimization.model.trim() !== "" &&
-      !cloudModels.includes(optimization.model)
-        ? [{ label: optimization.model, value: optimization.model }]
-        : []),
-      ...cloudModels.map((model) => ({ label: model, value: model })),
-    ],
-    [cloudModels, optimization.model],
-  );
 
   useEffect(() => {
     setApiKeyVisible(false);
@@ -493,62 +482,19 @@ function PromptOptimizationCardComponent({
                     <div className="field-control">
                       <div className="flex min-w-0 items-center gap-2 max-[680px]:flex-col max-[680px]:items-stretch">
                         <div className="relative min-w-0 flex-1 max-[680px]:w-full">
-                          <div className={inputShellClass + " w-full flex-1"}>
-                            <IconRobot size={15} aria-hidden="true" />
-                            <Select
-                              id={modelInputId}
-                              className="min-w-0 flex-1"
-                              inputClassName={insetInputClass + " font-medium"}
-                              optionClassName="min-w-0 truncate"
-                              sectionClassName="w-6 text-[#1d1d1f]"
-                              value={optimization.model || undefined}
-                              disabled={isBusy || fetchingModels}
-                              aria-label="提示词优化模型"
-                              aria-invalid={Boolean(modelError)}
-                              aria-describedby={modelError ? modelInputId + "-error" : undefined}
-                              optionList={modelSelectOptions}
-                              placeholder="gpt-4o-mini"
-                              dropdownClassName="rounded-[10px]"
-                              emptyContent={
-                                cloudModels.length > 0
-                                  ? "没有匹配模型"
-                                  : "暂无模型列表，可输入后回车创建"
-                              }
-                              showClear={false}
-                              filter
-                              allowCreate
-                              searchPosition="trigger"
-                              getPopupContainer={() => popupContainer ?? document.body}
-                              zIndex={SETTINGS_OVERLAY_Z_INDEX}
-                              renderCreateItem={(inputValue, focused, style) =>
-                                inputValue ? (
-                                  <div
-                                    className={
-                                      "flex min-h-[34px] w-full items-center gap-[7px] rounded-md px-3 py-[7px] text-[13px] leading-5 text-[#1d1d1f] " +
-                                      (focused ? "bg-blue-500/8" : "")
-                                    }
-                                    style={style}
-                                  >
-                                    <IconPlus size={14} aria-hidden="true" />
-                                    <span className="shrink-0 text-[#6e6e73]">
-                                      使用
-                                    </span>
-                                    <span className="min-w-0 truncate font-semibold text-[#1d1d1f]">
-                                      {String(inputValue)}
-                                    </span>
-                                  </div>
-                                ) : null
-                              }
-                              onChange={(value) =>
-                                updateOptimization({ model: String(value ?? "") })
-                              }
-                              onCreate={(option) =>
-                                updateOptimization({
-                                  model: String(option.value ?? ""),
-                                })
-                              }
-                            />
-                          </div>
+                          <ManualModelCombobox
+                            id={modelInputId}
+                            value={optimization.model}
+                            disabled={isBusy || fetchingModels}
+                            ariaLabel="提示词优化模型"
+                            ariaInvalid={Boolean(modelError)}
+                            ariaDescribedBy={modelError ? modelInputId + "-error" : undefined}
+                            options={cloudModels}
+                            placeholder="例如 gpt-4o-mini 或 deepseek-chat"
+                            getPopupContainer={() => popupContainer ?? document.body}
+                            zIndex={SETTINGS_OVERLAY_Z_INDEX}
+                            onChange={(model) => updateOptimization({ model })}
+                          />
                         </div>
                         <Button
                           className="h-[38px]! min-w-[76px] shrink-0 max-[680px]:w-full!"

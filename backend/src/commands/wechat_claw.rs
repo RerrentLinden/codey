@@ -22,6 +22,9 @@ const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SYNC_IDLE_DELAY: Duration = Duration::from_millis(750);
 const SYNC_INITIAL_BACKOFF: Duration = Duration::from_secs(2);
 const SYNC_MAX_BACKOFF: Duration = Duration::from_secs(60);
+const SYNC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const SYNC_RECOVERY_PREPARE_TIMEOUT: Duration = Duration::from_secs(8);
+const SYNC_RECOVERY_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// QR status is an iLink long-poll endpoint. Keep its client separate from
 /// notification delivery so a temporary scan can wait efficiently without
@@ -58,6 +61,25 @@ struct WechatClawSyncChannel {
     get_updates_buf: String,
 }
 
+#[derive(Debug, Clone)]
+struct WechatClawPreparedBinding {
+    id: String,
+    fingerprint: [u8; 32],
+}
+
+impl WechatClawPreparedBinding {
+    fn new(channel: &WechatClawSyncChannel) -> Self {
+        Self {
+            id: channel.id.clone(),
+            fingerprint: wechat_claw_sync_binding_fingerprint(channel),
+        }
+    }
+
+    fn matches(&self, channel: &WechatClawSyncChannel) -> bool {
+        self.id == channel.id && self.fingerprint == wechat_claw_sync_binding_fingerprint(channel)
+    }
+}
+
 #[derive(Debug)]
 struct WechatClawSyncChannelState {
     channel: WechatClawSyncChannel,
@@ -81,6 +103,13 @@ struct WechatClawSyncFailure {
 
 pub(super) async fn sync_wechat_claw_service(state: &Arc<AppState>) {
     let _sync_guard = state.wechat_claw_sync_update.lock().await;
+    start_wechat_claw_service_locked(state, None).await;
+}
+
+async fn start_wechat_claw_service_locked(
+    state: &Arc<AppState>,
+    prepared_binding: Option<&WechatClawPreparedBinding>,
+) {
     let channels = {
         let config = state.config.read().await;
         configured_wechat_claw_sync_channels(&config)
@@ -105,8 +134,9 @@ pub(super) async fn sync_wechat_claw_service(state: &Arc<AppState>) {
 
     let (shutdown, shutdown_rx) = oneshot::channel();
     let sync_state = Arc::clone(state);
+    let prepared_binding = prepared_binding.cloned();
     let task = tokio::spawn(async move {
-        run_wechat_claw_sync_service(sync_state, channels, shutdown_rx).await;
+        run_wechat_claw_sync_service(sync_state, channels, prepared_binding, shutdown_rx).await;
     });
     *state.wechat_claw_sync.lock().await = Some(WechatClawSyncHandle {
         fingerprint,
@@ -172,26 +202,71 @@ fn wechat_claw_sync_fingerprint(channels: &[WechatClawSyncChannel]) -> [u8; 32] 
     hasher.finalize().into()
 }
 
+fn wechat_claw_sync_binding_fingerprint(channel: &WechatClawSyncChannel) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for value in [
+        channel.id.as_str(),
+        channel.base_url.as_str(),
+        channel.bot_token.as_str(),
+        channel.chat_id.as_str(),
+    ] {
+        hasher.update(value.len().to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
 async fn run_wechat_claw_sync_service(
     state: Arc<AppState>,
     channels: Vec<WechatClawSyncChannel>,
+    prepared_binding: Option<WechatClawPreparedBinding>,
     mut shutdown: oneshot::Receiver<()>,
 ) {
-    let workers = stream::iter(channels).for_each_concurrent(None, |channel| {
+    let stop_channels = channels.clone();
+    let mut workers = tokio::task::JoinSet::new();
+    for channel in channels {
         let state = Arc::clone(&state);
-        async move { run_wechat_claw_sync_channel(state, channel).await }
-    });
-    tokio::pin!(workers);
-    tokio::select! {
-        _ = &mut shutdown => {}
-        _ = &mut workers => {}
+        let notify_started = prepared_binding
+            .as_ref()
+            .is_some_and(|prepared| prepared.matches(&channel));
+        workers.spawn(
+            async move { run_wechat_claw_sync_channel(state, channel, notify_started).await },
+        );
+    }
+
+    let stopped = loop {
+        if workers.is_empty() {
+            break false;
+        }
+        tokio::select! {
+            _ = &mut shutdown => {
+                workers.abort_all();
+                while workers.join_next().await.is_some() {}
+                break true;
+            }
+            result = workers.join_next() => {
+                if let Some(Err(error)) = result
+                    && !error.is_cancelled()
+                {
+                    eprintln!("Codey 微信 ClawBot 同步 worker 异常退出：{error}");
+                }
+            }
+        }
+    };
+
+    if stopped {
+        notify_stop_wechat_claw_channels(&state.wechat_claw_login_http_client, stop_channels).await;
     }
 }
 
-async fn run_wechat_claw_sync_channel(state: Arc<AppState>, channel: WechatClawSyncChannel) {
+async fn run_wechat_claw_sync_channel(
+    state: Arc<AppState>,
+    channel: WechatClawSyncChannel,
+    notify_started: bool,
+) {
     let mut channel_state = WechatClawSyncChannelState {
         channel,
-        notify_started: false,
+        notify_started,
         next_attempt: Instant::now(),
         failure_count: 0,
     };
@@ -240,6 +315,35 @@ async fn run_wechat_claw_sync_channel(state: Arc<AppState>, channel: WechatClawS
             }
         }
     }
+}
+
+async fn notify_stop_wechat_claw_channels(client: &Client, channels: Vec<WechatClawSyncChannel>) {
+    stream::iter(channels)
+        .for_each_concurrent(None, |channel| async move {
+            let result = async {
+                let request = sync_ilink_post_request(
+                    client,
+                    &channel.base_url,
+                    &channel.bot_token,
+                    "ilink/bot/msg/notifystop",
+                    json!({"base_info": wechat_claw_base_info()}),
+                )?
+                .timeout(SYNC_STOP_TIMEOUT);
+                activation_response_json(
+                    request,
+                    "后台同步停止",
+                    ActivationResponseContract::GetUpdates,
+                )
+                .await
+                .map_err(WechatClawSyncFailure::from)?;
+                Ok::<(), WechatClawSyncFailure>(())
+            }
+            .await;
+            if let Err(error) = result {
+                eprintln!("Codey 微信 ClawBot 停止同步握手失败：{}", error.message);
+            }
+        })
+        .await;
 }
 
 async fn sync_wechat_claw_channel(
@@ -438,6 +542,117 @@ async fn clear_expired_wechat_claw_session(
     save_config_to_store(state, &config).await?;
     *state.config.write().await = config;
     Ok(())
+}
+
+pub(super) async fn refresh_wechat_claw_channel_context(
+    state: &Arc<AppState>,
+    channel: &NotificationChannelConfig,
+) -> Result<bool, String> {
+    if channel.kind != NotificationChannelKind::WechatClaw {
+        return Ok(false);
+    }
+    let _sync_guard = state.wechat_claw_sync_update.lock().await;
+    stop_wechat_claw_service_locked(state).await;
+    let result = refresh_wechat_claw_channel_context_locked(state, channel).await;
+    let prepared_binding = result
+        .as_ref()
+        .ok()
+        .map(|(_, sync_channel)| WechatClawPreparedBinding::new(sync_channel));
+    start_wechat_claw_service_locked(state, prepared_binding.as_ref()).await;
+    result.map(|(context_changed, _)| context_changed)
+}
+
+async fn refresh_wechat_claw_channel_context_locked(
+    state: &Arc<AppState>,
+    channel: &NotificationChannelConfig,
+) -> Result<(bool, WechatClawSyncChannel), String> {
+    let sync_channel = {
+        let config = state.config.read().await;
+        let Some(saved) = config.webhook.channels.iter().find(|saved| {
+            saved.id == channel.id && saved.kind == NotificationChannelKind::WechatClaw
+        }) else {
+            return Err("微信 ClawBot 渠道已不存在".to_string());
+        };
+        if !saved.enabled || !saved.is_configured() {
+            return Err("微信 ClawBot 渠道当前不可用".to_string());
+        }
+        if saved.bot_token.trim() != channel.bot_token.trim()
+            || saved.chat_id.trim() != channel.chat_id.trim()
+            || saved.wechat_claw_base_url().ok() != channel.wechat_claw_base_url().ok()
+        {
+            return Err("微信 ClawBot 渠道绑定已变更".to_string());
+        }
+        WechatClawSyncChannel {
+            id: saved.id.clone(),
+            base_url: saved.wechat_claw_base_url().map_err(ToString::to_string)?,
+            bot_token: saved.bot_token.trim().to_string(),
+            chat_id: saved.chat_id.trim().to_string(),
+            context_token: saved.context_token.trim().to_string(),
+            get_updates_buf: saved.get_updates_buf.trim().to_string(),
+        }
+    };
+    let notify_request = sync_ilink_post_request(
+        &state.wechat_claw_login_http_client,
+        &sync_channel.base_url,
+        &sync_channel.bot_token,
+        "ilink/bot/msg/notifystart",
+        json!({"base_info": wechat_claw_base_info()}),
+    )
+    .map_err(|error| error.message)?
+    .timeout(SYNC_RECOVERY_PREPARE_TIMEOUT);
+    match activation_response_json(
+        notify_request,
+        "同步重建",
+        ActivationResponseContract::GetUpdates,
+    )
+    .await
+    {
+        Ok(_) => {}
+        Err(ActivationRequestError::SessionExpired(message)) => {
+            clear_expired_wechat_claw_session(state, &sync_channel).await?;
+            return Err(message);
+        }
+        Err(ActivationRequestError::Retryable) => {
+            return Err("微信 ClawBot 同步重建暂时无响应".to_string());
+        }
+        Err(error) => return Err(activation_request_error_message(error)),
+    }
+
+    let previous_context = sync_channel.context_token.trim().to_string();
+    let update = match tokio::time::timeout(
+        SYNC_RECOVERY_POLL_TIMEOUT,
+        sync_wechat_claw_channel(
+            &state.wechat_claw_login_http_client,
+            sync_channel.clone(),
+            true,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(update)) => Some(update),
+        Ok(Err(error)) if error.session_expired => {
+            clear_expired_wechat_claw_session(state, &sync_channel).await?;
+            return Err(error.message);
+        }
+        Ok(Err(error)) => {
+            eprintln!(
+                "Codey 微信 ClawBot 同步重建后的即时轮询失败，将直接验证消息投递：{}",
+                error.message
+            );
+            None
+        }
+        Err(_) => None,
+    };
+    let context_changed = update
+        .as_ref()
+        .and_then(|update| update.context_token.as_deref())
+        .map(str::trim)
+        .filter(|context_token| !context_token.is_empty())
+        .is_some_and(|context_token| context_token != previous_context);
+    if let Some(update) = update {
+        persist_wechat_claw_sync_update(state, &sync_channel, update).await?;
+    }
+    Ok((context_changed, sync_channel))
 }
 
 #[derive(Debug)]
@@ -1349,7 +1564,7 @@ mod tests {
         .to_string();
         let server = tokio::spawn(async move {
             let mut paths = Vec::new();
-            for body in ["{}".to_string(), next_update] {
+            for body in ["{}".to_string(), next_update, "{}".to_string()] {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 paths.push(read_test_request_path(&mut stream).await);
                 write_test_json_response(&mut stream, &body).await;
@@ -1374,10 +1589,6 @@ mod tests {
         });
 
         sync_wechat_claw_service(&state).await;
-        let paths = tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .expect("sync requests should complete")
-            .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if state.config.read().await.webhook.channels[0].get_updates_buf
@@ -1391,10 +1602,18 @@ mod tests {
         .await
         .expect("sync progress should be persisted");
         stop_wechat_claw_service(&state).await;
+        let paths = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("sync start, poll, and stop requests should complete")
+            .unwrap();
 
         assert_eq!(
             paths,
-            ["/ilink/bot/msg/notifystart", "/ilink/bot/getupdates"]
+            [
+                "/ilink/bot/msg/notifystart",
+                "/ilink/bot/getupdates",
+                "/ilink/bot/msg/notifystop"
+            ]
         );
         let memory = state.config.read().await.clone();
         let disk = state.store.load().unwrap();

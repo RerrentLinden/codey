@@ -30,23 +30,28 @@ test("prompt optimization switches between Codey routing and manual upstream con
   assert.doesNotMatch(commandSource, /sync_prompt_optimization_current_provider/);
 });
 
-test("prompt optimization refreshes the creatable model picker without remounting", () => {
+const manualComboboxSource = readFileSync(
+  new URL("../src/components/ManualModelCombobox.tsx", import.meta.url),
+  "utf8",
+);
+
+test("prompt optimization renders the searchable manual model combobox without remounting", () => {
   assert.doesNotMatch(cardSource, /modelSelectKey/);
   assert.match(
     cardSource,
-    /<Select[\s\S]*?optionList=\{modelSelectOptions\}[\s\S]*?allowCreate/,
+    /<ManualModelCombobox[\s\S]*?options=\{cloudModels\}/,
   );
   assert.match(
-    mantineWrapperSource,
-    /React\.useEffect\(\(\) => \{\s*setSearch\(selectedValue\);\s*\}, \[selectedValue\]\)/,
+    manualComboboxSource,
+    /useCombobox\(/,
   );
   assert.match(
-    cardSource,
-    /renderCreateItem=\{\(inputValue, focused, style\) =>/,
+    manualComboboxSource,
+    /Combobox\.EventsTarget/,
   );
   assert.match(
-    cardSource,
-    /focused \? "bg-blue-500\/8" : ""/,
+    manualComboboxSource,
+    /使用自定义模型/,
   );
   assert.doesNotMatch(cardSource, /prompt-optimization-model-create-option/);
 });

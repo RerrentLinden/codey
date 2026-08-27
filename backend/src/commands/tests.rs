@@ -697,13 +697,14 @@ async fn provider_sync_does_not_block_config_writes_or_commit_a_stale_result() {
 
     let mut settings = initial;
     settings.slim_codex_pet = !settings.slim_codex_pet;
-    tokio::time::timeout(
-        Duration::from_millis(500),
-        save_codey_config(&state, settings),
-    )
-    .await
-    .expect("provider inspection must not hold the config write lock")
-    .unwrap();
+    let config_guard =
+        tokio::time::timeout(Duration::from_millis(500), state.config_write_lock.lock())
+            .await
+            .expect("provider inspection must not hold the config write lock");
+    save_codey_config_locked(&state, CodeyConfigSaveInput::complete(settings))
+        .await
+        .unwrap();
+    drop(config_guard);
     release_tx.send(()).unwrap();
 
     let error = sync_task.await.unwrap().unwrap_err();

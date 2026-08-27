@@ -594,6 +594,36 @@
   // is what previously hid the whole Fast/service-tier control on the builds
   // where one unrelated anchor moved: an exception here aborted every gate on
   // the asset. Log and return the source unchanged so the rest still apply.
+  // Field builds ship minified bundles whose shapes drift between platforms
+  // and releases. When a gate matches nothing, these are the neighborhood
+  // markers every gate sits near; capturing printable windows around them lets
+  // a field diagnostic log be turned into the next compatible variant without
+  // reproducing that exact bundle locally.
+  const rendererGateDiagnosticAnchors = [
+    "`composer.toggleFastMode`",
+    "composer.speedSlashCommand.disableDescription",
+    "isServiceTierAllowed",
+    "selectedServiceTier",
+    "featureRequirements?.fast_mode",
+    "useHiddenModels",
+    "availableOptions.length",
+    "includeUltraReasoningEffort",
+    "isCustomModelProvider",
+  ];
+  const rendererGateFailureExcerpts = (source) => {
+    const excerpts = [];
+    for (const anchor of rendererGateDiagnosticAnchors) {
+      if (excerpts.length >= 2) break;
+      const index = source.indexOf(anchor);
+      if (index < 0) continue;
+      excerpts.push(
+        source
+          .slice(Math.max(0, index - 150), index + anchor.length + 190)
+          .replace(/[^\x20-\x7E]/g, "?"),
+      );
+    }
+    return excerpts;
+  };
   const replaceUniqueRendererGate = (source, pattern, replacement, name) => {
     // app:// assets can be requested repeatedly during reloads or renderer
     // recovery. A gate already known to be incompatible with the exact same
@@ -618,7 +648,10 @@
       activeRendererPatchFailures?.add(name);
       const message =
         `Codey skipped an incompatible Codex renderer patch: ${name} gate matched ${matchCount} times`;
-      recordCodeyPatchFailure(`renderer_patch:${name}`, message, { matchCount });
+      const context = { matchCount };
+      const excerpts = rendererGateFailureExcerpts(source);
+      if (excerpts.length) context.excerpts = excerpts;
+      recordCodeyPatchFailure(`renderer_patch:${name}`, message, context);
       try {
         console.error(message);
       } catch {}

@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+// Rollout JSONL lives under date-sharded folders; archived threads move to the
+// sibling folder but keep the same rollout-<timestamp>-<thread-id>.jsonl name.
+const ROLLOUT_SEARCH_DIRS: [&str; 2] = ["sessions", "archived_sessions"];
 const TOMBSTONE_VERSION: u32 = 1;
 const TOMBSTONE_DIR: &str = ".codey-message-delete-tombstones-v1";
 const TOMBSTONE_LOCK_FILE: &str = ".codey-message-delete-tombstones-v1.lock";
@@ -97,8 +100,15 @@ pub(crate) fn reapply_persisted_deletions(home: &Path) -> Result<MessageDeleteRe
             Ok(result) => summary.failures.push((
                 session_id,
                 format!(
-                    "无法确认消息删除是否已落地；{} 个数据库结构不受支持",
-                    result.unsupported_databases.len()
+                    "无法确认消息删除是否已落地；{} 个数据库结构不受支持（{}）；且未找到匹配的会话记录文件",
+                    result.unsupported_databases.len(),
+                    result
+                        .unsupported_databases
+                        .iter()
+                        .filter_map(|path| Path::new(path).file_name())
+                        .map(|name| name.to_string_lossy().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
                 ),
             )),
             Err(error) => summary.failures.push((session_id, format!("{error:#}"))),
@@ -496,7 +506,68 @@ fn find_rollout_path(home: &Path, session_id: &str) -> Result<Option<PathBuf>> {
             }));
         }
     }
-    Ok(None)
+    // Some Codex builds only keep a catalog row (or none at all) and never map
+    // the thread to its rollout file. The filename itself embeds the thread id,
+    // so the rollout can still be located without any database cooperation.
+    Ok(find_rollout_file_by_session_id(home, session_id))
+}
+
+fn find_rollout_file_by_session_id(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    for dirname in ROLLOUT_SEARCH_DIRS {
+        let root = home.join(dirname);
+        if !root.exists() {
+            continue;
+        }
+        if let Err(error) = collect_rollout_files(&root, &mut files) {
+            // A broken fallback must not fail the whole delete; the SQLite path
+            // above is still authoritative whenever it can answer.
+            eprintln!("扫描会话目录失败：{error:#}");
+        }
+    }
+    files.sort();
+    files.into_iter().find(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                rollout_thread_id_from_filename(name)
+                    .is_some_and(|thread_id| thread_id.eq_ignore_ascii_case(session_id))
+            })
+    })
+}
+
+fn collect_rollout_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in
+        fs::read_dir(root).with_context(|| format!("扫描会话目录失败：{}", root.display()))?
+    {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_rollout_files(&path, files)?;
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(".jsonl"))
+        {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn rollout_thread_id_from_filename(name: &str) -> Option<String> {
+    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    if stem.len() < 36 {
+        return None;
+    }
+    let candidate = &stem[stem.len() - 36..];
+    let valid = candidate
+        .chars()
+        .enumerate()
+        .all(|(index, ch)| match index {
+            8 | 13 | 18 | 23 => ch == '-',
+            _ => ch.is_ascii_hexdigit(),
+        });
+    valid.then(|| candidate.to_string())
 }
 
 fn delete_turns_from_rollout(
@@ -1306,6 +1377,50 @@ mod tests {
         assert_eq!(replay.cleared_sessions, 0);
         assert_eq!(replay.failures.len(), 1);
         assert!(tombstone_path.exists());
+    }
+
+    #[test]
+    fn replays_a_tombstone_when_only_the_rollout_filename_knows_the_session() {
+        let home = tempdir().unwrap();
+        let session_id = "019ff8aa-0b6e-7a01-a605-7a717a7795e3";
+        let rollout_dir = home.path().join("sessions/2026/08/27");
+        fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join(format!("rollout-2026-08-27T09-08-00-{session_id}.jsonl"));
+        let original = concat!(
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019ff8aa\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t1\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\",\"turn_id\":\"t2\"}}\n",
+            "{\"type\":\"turn_context\",\"payload\":{\"turn_id\":\"t2\"}}\n",
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\"}}\n",
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\",\"turn_id\":\"t2\"}}\n",
+        );
+        fs::write(&rollout, original).unwrap();
+
+        let directory = tombstone_directory(home.path());
+        create_private_directory(&directory).unwrap();
+        write_private_file(
+            &tombstone_path(&directory, session_id, "history-content:turn:t1"),
+            &serde_json::to_vec(&MessageDeleteTombstone {
+                version: TOMBSTONE_VERSION,
+                session_id: session_id.into(),
+                message_id: "history-content:turn:t1".into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let replay = reapply_persisted_deletions(home.path()).unwrap();
+
+        assert_eq!(replay.deleted, 1);
+        assert_eq!(replay.cleared_sessions, 1);
+        assert!(replay.failures.is_empty());
+        assert!(!tombstone_path(&directory, session_id, "history-content:turn:t1").exists());
+        let remaining = fs::read_to_string(&rollout).unwrap();
+        assert!(!remaining.contains("t1"));
+        assert!(remaining.contains("t2"));
     }
 
     #[test]

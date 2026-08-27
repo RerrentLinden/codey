@@ -74,8 +74,9 @@ use webhooks::{
     sync_waiting_webhook_watcher, test_notification_channel, test_webhook,
 };
 use wechat_claw::{
-    WechatClawLoginState, WechatClawSyncHandle, poll_wechat_claw_login, start_wechat_claw_login,
-    stop_wechat_claw_service, sync_wechat_claw_service, wechat_claw_login_http_client,
+    WechatClawLoginState, WechatClawSyncHandle, poll_wechat_claw_login,
+    refresh_wechat_claw_channel_context, start_wechat_claw_login, stop_wechat_claw_service,
+    sync_wechat_claw_service, wechat_claw_login_http_client,
 };
 
 use crate::account_usage;

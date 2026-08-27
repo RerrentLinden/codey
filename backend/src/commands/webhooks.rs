@@ -975,15 +975,29 @@ async fn dispatch_webhook_channel(
             if channel.kind == NotificationChannelKind::WechatClaw
                 && error.should_retry_with_fresh_context() =>
         {
-            let fresh_channel = latest_channel_for_delivery(state, &channel).await;
+            let mut fresh_channel = latest_channel_for_delivery(state, &channel).await;
             if !fresh_channel.enabled || !fresh_channel.is_configured() {
                 return Ok(());
             }
             if fresh_channel.context_token.trim() == channel.context_token.trim() {
-                return Err(WebhookDispatchError {
-                    detail: error.to_string(),
-                    settle_delivery: false,
-                });
+                let refresh_result =
+                    super::refresh_wechat_claw_channel_context(state, &channel).await;
+                fresh_channel = latest_channel_for_delivery(state, &channel).await;
+                if !fresh_channel.enabled || !fresh_channel.is_configured() {
+                    if let Err(refresh_error) = refresh_result {
+                        return Err(WebhookDispatchError {
+                            detail: format!("{error}（ClawBot 同步刷新失败：{refresh_error}）"),
+                            settle_delivery: false,
+                        });
+                    }
+                    return Ok(());
+                }
+                if let Err(refresh_error) = refresh_result {
+                    return Err(WebhookDispatchError {
+                        detail: format!("{error}（ClawBot 同步重建失败：{refresh_error}）"),
+                        settle_delivery: false,
+                    });
+                }
             }
             let dispatcher = NotificationDispatcher::with_client(client, fresh_channel);
             match dispatcher.send(event).await {
@@ -1358,6 +1372,7 @@ mod tests {
     use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 
     use super::*;
+    use crate::config::ConfigStore;
     use crate::pending_approval::{AbortedTurn, PendingApproval, StartedTurn};
 
     async fn read_http_request(socket: &mut tokio::net::TcpStream) -> String {
@@ -1601,6 +1616,86 @@ mod tests {
                 .iter()
                 .all(|request| !request.contains("notifystart"))
         );
+    }
+
+    #[tokio::test]
+    async fn clawbot_prepare_failure_reprepares_session_before_retrying_delivery() {
+        use tokio::net::TcpListener;
+
+        let directory = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let channel = NotificationChannelConfig {
+            id: "self-heal-claw".to_string(),
+            kind: NotificationChannelKind::WechatClaw,
+            enabled: true,
+            url: format!("http://{address}"),
+            bot_token: "bot-token".to_string(),
+            context_token: "stale-context".to_string(),
+            chat_id: "recipient@im.wechat".to_string(),
+            allow_insecure_test_url: true,
+            ..NotificationChannelConfig::default()
+        };
+        let state = Arc::new(AppState {
+            store: ConfigStore::new(directory.path().join("config.json")),
+            config: RwLock::new(CodeyConfig {
+                webhook: crate::notifications::WebhookConfig {
+                    channels: vec![channel.clone()],
+                    ..crate::notifications::WebhookConfig::default()
+                },
+                ..CodeyConfig::default()
+            }),
+            shutting_down: std::sync::atomic::AtomicBool::new(true),
+            ..AppState::default()
+        });
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            let responses = [
+                r#"{"ret":-2,"errmsg":"prepare failed"}"#.to_string(),
+                r#"{"ret":0}"#.to_string(),
+                json!({
+                    "ret": 0,
+                    "get_updates_buf": "fresh-cursor",
+                    "msgs": [{
+                        "from_user_id": "recipient@im.wechat",
+                        "context_token": "stale-context",
+                    }]
+                })
+                .to_string(),
+                r#"{"ret":0}"#.to_string(),
+            ];
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                requests.push(read_http_request(&mut socket).await);
+                write_json_response(&mut socket, &response).await;
+            }
+            requests
+        });
+        let event = NotificationEvent::new(
+            "session.completed",
+            "session-claw",
+            "profile-claw",
+            "Codex",
+            0,
+            None,
+        );
+
+        dispatch_webhook_channels(&state, vec![channel], &event, "completed:session:turn")
+            .await
+            .unwrap();
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].starts_with("POST /ilink/bot/sendmessage "));
+        assert!(requests[0].contains(r#""context_token":"stale-context""#));
+        assert!(requests[1].starts_with("POST /ilink/bot/msg/notifystart "));
+        assert!(requests[2].starts_with("POST /ilink/bot/getupdates "));
+        assert!(requests[3].starts_with("POST /ilink/bot/sendmessage "));
+        assert!(requests[3].contains(r#""context_token":"stale-context""#));
+        let memory = state.config.read().await.clone();
+        let disk = state.store.load().unwrap();
+        assert_eq!(memory.webhook.channels[0].context_token, "stale-context");
+        assert_eq!(disk.webhook.channels[0].get_updates_buf, "fresh-cursor");
     }
 
     #[test]

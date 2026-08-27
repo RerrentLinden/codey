@@ -1348,6 +1348,7 @@ struct ResponsesToolBridge {
 enum ResponsesToolKind {
     Function,
     Custom,
+    ToolSearch,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -1374,8 +1375,24 @@ impl ResponsesToolName {
         }
     }
 
+    fn tool_search() -> Self {
+        Self {
+            kind: ResponsesToolKind::ToolSearch,
+            namespace: Vec::new(),
+            name: "tool_search".to_string(),
+        }
+    }
+
     fn is_custom(&self) -> bool {
         self.kind == ResponsesToolKind::Custom
+    }
+
+    fn is_function(&self) -> bool {
+        self.kind == ResponsesToolKind::Function
+    }
+
+    fn is_tool_search(&self) -> bool {
+        self.kind == ResponsesToolKind::ToolSearch
     }
 
     fn namespace_string(&self) -> Option<String> {
@@ -1383,6 +1400,12 @@ impl ResponsesToolName {
     }
 
     fn insert_response_fields(&self, object: &mut serde_json::Map<String, Value>) {
+        if self.is_tool_search() {
+            object.remove("name");
+            object.remove("namespace");
+            object.insert("execution".to_string(), Value::String("client".to_string()));
+            return;
+        }
         object.insert("name".to_string(), Value::String(self.name.clone()));
         if let Some(namespace) = self.namespace_string() {
             object.insert("namespace".to_string(), Value::String(namespace));
@@ -1397,7 +1420,7 @@ impl ResponsesToolBridge {
         if let Some(upstream_name) = self.response_to_upstream.get(tool_name) {
             return Ok(upstream_name.clone());
         }
-        if tool_name.kind == ResponsesToolKind::Function && tool_name.namespace.is_empty() {
+        if tool_name.is_function() && tool_name.namespace.is_empty() {
             return Ok(tool_name.name.clone());
         }
         if tool_name.is_custom() {
@@ -1405,6 +1428,9 @@ impl ResponsesToolBridge {
                 "custom_tool_call 指向未声明的 custom 工具 {}",
                 tool_name.name
             )
+        }
+        if tool_name.is_tool_search() {
+            anyhow::bail!("tool_search_call 指向未声明的 execution=client tool_search 工具")
         }
         anyhow::bail!(
             "function_call 指向未声明的 namespace 工具 {}.{}",
@@ -1606,17 +1632,39 @@ fn responses_input_without_additional_tools(
         Value::Array(items) => {
             let mut normalized = Vec::with_capacity(items.len());
             for item in items {
-                if !append_responses_additional_tools(item, &mut additional_tools)? {
-                    normalized.push(item.clone());
+                if append_responses_additional_tools(item, &mut additional_tools)? {
+                    continue;
                 }
+                append_responses_tool_search_output_tools(item, &mut additional_tools)?;
+                normalized.push(item.clone());
             }
             Ok((Some(Value::Array(normalized)), additional_tools))
         }
         Value::Object(_) if append_responses_additional_tools(input, &mut additional_tools)? => {
             Ok((None, additional_tools))
         }
+        Value::Object(_) => {
+            append_responses_tool_search_output_tools(input, &mut additional_tools)?;
+            Ok((Some(input.clone()), additional_tools))
+        }
         _ => Ok((Some(input.clone()), additional_tools)),
     }
+}
+
+fn append_responses_tool_search_output_tools(item: &Value, tools: &mut Vec<Value>) -> Result<()> {
+    let Some(object) = item.as_object() else {
+        return Ok(());
+    };
+    if object.get("type").and_then(Value::as_str) != Some("tool_search_output") {
+        return Ok(());
+    }
+    validate_client_tool_search_execution(object, "tool_search_output")?;
+    let loaded = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("tool_search_output.tools 必须是数组"))?;
+    tools.extend(loaded.iter().cloned());
+    Ok(())
 }
 
 fn append_responses_additional_tools(item: &Value, tools: &mut Vec<Value>) -> Result<bool> {
@@ -1671,6 +1719,13 @@ fn responses_tool_identity(tool: &Value) -> Option<String> {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("function");
+    if tool_type == "tool_search" {
+        let execution = object
+            .get("execution")
+            .and_then(Value::as_str)
+            .unwrap_or("server");
+        return Some(format!("tool_search/{execution}"));
+    }
     let name = object
         .get("name")
         .or_else(|| {
@@ -2231,6 +2286,12 @@ fn append_chat_message_item(
             Some("custom_tool_call_output") => {
                 append_responses_tool_call_output_item(object, messages, "custom_tool_call_output")
             }
+            Some("tool_search_call") => {
+                append_responses_tool_search_call_item(object, messages, tool_bridge)
+            }
+            Some("tool_search_output") => {
+                append_responses_tool_search_output_item(object, messages)
+            }
             Some("input_text" | "output_text" | "text" | "input_image" | "image_url") => {
                 append_single_content_part_as_user_message(item, messages)
             }
@@ -2475,6 +2536,68 @@ fn append_responses_custom_tool_call_item(
     append_chat_assistant_tool_call(messages, call_id, &upstream_name, &arguments)
 }
 
+fn append_responses_tool_search_call_item(
+    object: &serde_json::Map<String, Value>,
+    messages: &mut Vec<Value>,
+    tool_bridge: &ResponsesToolBridge,
+) -> Result<()> {
+    if object.get("execution").and_then(Value::as_str) != Some("client") {
+        anyhow::bail!("tool_search_call 只允许 execution=client 的历史调用");
+    }
+    let call_id = object
+        .get("call_id")
+        .or_else(|| object.get("id"))
+        .and_then(Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("tool_search_call 缺少 call_id"))?;
+    let upstream_name = tool_bridge.upstream_name_for_call(&ResponsesToolName::tool_search())?;
+    let arguments = object
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !arguments.is_object() {
+        anyhow::bail!("tool_search_call.arguments 必须是 JSON 对象");
+    }
+    let arguments =
+        serde_json::to_string(&arguments).context("序列化 tool_search_call.arguments 失败")?;
+    append_chat_assistant_tool_call(messages, call_id, &upstream_name, &arguments)
+}
+
+fn append_responses_tool_search_output_item(
+    object: &serde_json::Map<String, Value>,
+    messages: &mut Vec<Value>,
+) -> Result<()> {
+    validate_client_tool_search_execution(object, "tool_search_output")?;
+    let call_id = object
+        .get("call_id")
+        .and_then(Value::as_str)
+        .filter(|call_id| !call_id.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("tool_search_output 缺少 call_id"))?;
+    let tools = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("tool_search_output.tools 必须是数组"))?;
+    let content = serde_json::to_string(&json!({"tools":tools}))
+        .context("序列化 tool_search_output.tools 失败")?;
+    messages.push(json!({
+        "role":"tool",
+        "tool_call_id":call_id,
+        "content":content,
+    }));
+    Ok(())
+}
+
+fn validate_client_tool_search_execution(
+    object: &serde_json::Map<String, Value>,
+    context: &str,
+) -> Result<()> {
+    match object.get("execution").and_then(Value::as_str) {
+        Some("client") => Ok(()),
+        Some(execution) => anyhow::bail!("{context}.execution={execution} 不受支持；必须是 client"),
+        None => anyhow::bail!("{context} 缺少 execution=client"),
+    }
+}
+
 fn append_chat_assistant_tool_call(
     messages: &mut Vec<Value>,
     call_id: &str,
@@ -2609,6 +2732,7 @@ fn normalize_chat_legacy_function_call(
 
 const NAMESPACE_UPSTREAM_TOOL_PREFIX: &str = "codey_ns__";
 const CUSTOM_UPSTREAM_TOOL_PREFIX: &str = "codey_custom__";
+const TOOL_SEARCH_UPSTREAM_TOOL_NAME: &str = "codey_tool_search__client__bridge_v1";
 const UPSTREAM_FUNCTION_NAME_MAX_BYTES: usize = 64;
 const MAX_RESPONSES_NAMESPACE_DEPTH: usize = 8;
 
@@ -2730,9 +2854,68 @@ fn append_responses_tool_to_chat_tools(
         return Ok(());
     }
     if tool_type == Some("tool_search") {
-        anyhow::bail!(
-            "Responses 工具 tool_search 不能安全转换为 Chat/Anthropic function 工具；请改用支持 Responses 的线路"
+        if !namespace_path.is_empty() {
+            anyhow::bail!("namespace.tools 不支持工具类型 tool_search");
+        }
+        match object.get("execution").and_then(Value::as_str) {
+            Some("client") => {}
+            Some("server") | None => anyhow::bail!(
+                "Responses 托管工具 tool_search 不能转换为 Chat/Anthropic function 工具；仅 execution=client 可桥接"
+            ),
+            Some(execution) => {
+                anyhow::bail!("tool_search.execution={execution} 不受支持；仅 client 可桥接")
+            }
+        }
+        let description = object
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|description| !description.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("execution=client tool_search.description 必须是非空字符串")
+            })?;
+        let parameters = object
+            .get("parameters")
+            .filter(|parameters| parameters.is_object())
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!("execution=client tool_search.parameters 必须是 JSON 对象")
+            })?;
+        let tool_name = ResponsesToolName::tool_search();
+        if let Some(existing) = upstream_names.get(TOOL_SEARCH_UPSTREAM_TOOL_NAME)
+            && existing != &tool_name
+        {
+            anyhow::bail!(
+                "客户端 tool_search 保留函数名 {TOOL_SEARCH_UPSTREAM_TOOL_NAME} 与 function 工具冲突"
+            );
+        }
+        let original_definition = Value::Object(object.clone());
+        if let Some(existing_definition) = bridged_definitions.get(&tool_name) {
+            if existing_definition == &original_definition {
+                return Ok(());
+            }
+            anyhow::bail!("客户端 tool_search 存在定义冲突");
+        }
+        bridged_definitions.insert(tool_name.clone(), original_definition);
+        upstream_names.insert(
+            TOOL_SEARCH_UPSTREAM_TOOL_NAME.to_string(),
+            tool_name.clone(),
         );
+        tool_bridge.response_to_upstream.insert(
+            tool_name.clone(),
+            TOOL_SEARCH_UPSTREAM_TOOL_NAME.to_string(),
+        );
+        tool_bridge
+            .upstream_to_response
+            .insert(TOOL_SEARCH_UPSTREAM_TOOL_NAME.to_string(), tool_name);
+        converted.push(json!({
+            "type":"function",
+            "function":{
+                "name":TOOL_SEARCH_UPSTREAM_TOOL_NAME,
+                "description":description,
+                "parameters":parameters,
+            }
+        }));
+        return Ok(());
     }
     if !namespace_path.is_empty() {
         let tool_name = tool_type.unwrap_or("unknown");
@@ -2804,10 +2987,11 @@ fn responses_function_tool_map(
     } else {
         object
             .iter()
-            .filter(|(key, _)| key.as_str() != "type")
+            .filter(|(key, _)| !matches!(key.as_str(), "type" | "defer_loading"))
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<serde_json::Map<_, _>>()
     };
+    function.remove("defer_loading");
     let name = response_function_name(&function, "function tool")?.to_string();
     function.insert("name".to_string(), Value::String(name));
     Ok(function)
@@ -3143,6 +3327,7 @@ fn responses_tool_choice_to_chat_tool_choice(
                     )?;
                     ResponsesToolName::custom_in_namespace(&namespace, name)
                 }
+                Some("tool_search") => ResponsesToolName::tool_search(),
                 _ => {
                     let tool_name = choice_type.unwrap_or("unknown");
                     anyhow::bail!(
@@ -3210,9 +3395,16 @@ fn responses_tool_call_item_from_upstream_arguments(
     context: &str,
 ) -> Result<Value> {
     let payload = if tool_name.is_custom() {
-        custom_tool_input_from_arguments(&arguments, context)?
-    } else {
+        Value::String(custom_tool_input_from_arguments(&arguments, context)?)
+    } else if tool_name.is_tool_search() {
+        let arguments = serde_json::from_str::<Value>(&arguments)
+            .with_context(|| format!("{context} 不是有效 JSON"))?;
+        if !arguments.is_object() {
+            anyhow::bail!("{context} 必须是 JSON 对象");
+        }
         arguments
+    } else {
+        Value::String(arguments)
     };
     Ok(responses_tool_call_item_from_payload(
         tool_name, call_id, payload, status,
@@ -3222,7 +3414,7 @@ fn responses_tool_call_item_from_upstream_arguments(
 fn responses_tool_call_item_from_payload(
     tool_name: &ResponsesToolName,
     call_id: String,
-    payload: String,
+    payload: Value,
     status: &str,
 ) -> Value {
     let item_id = responses_tool_call_item_id(tool_name);
@@ -3232,6 +3424,8 @@ fn responses_tool_call_item_from_payload(
 fn responses_tool_call_item_id(tool_name: &ResponsesToolName) -> String {
     let prefix = if tool_name.is_custom() {
         "ctc_codey_"
+    } else if tool_name.is_tool_search() {
+        "tsc_codey_"
     } else {
         "fc_codey_"
     };
@@ -3242,20 +3436,20 @@ fn responses_tool_call_item_with_id(
     tool_name: &ResponsesToolName,
     item_id: String,
     call_id: String,
-    payload: String,
+    payload: Value,
     status: &str,
 ) -> Value {
-    let (item_type, payload_field) = if tool_name.is_custom() {
-        ("custom_tool_call", "input")
-    } else {
-        ("function_call", "arguments")
+    let (item_type, payload_field) = match tool_name.kind {
+        ResponsesToolKind::Function => ("function_call", "arguments"),
+        ResponsesToolKind::Custom => ("custom_tool_call", "input"),
+        ResponsesToolKind::ToolSearch => ("tool_search_call", "arguments"),
     };
     let mut item = serde_json::Map::from_iter([
         ("id".to_string(), Value::String(item_id)),
         ("type".to_string(), Value::String(item_type.to_string())),
         ("status".to_string(), Value::String(status.to_string())),
         ("call_id".to_string(), Value::String(call_id)),
-        (payload_field.to_string(), Value::String(payload)),
+        (payload_field.to_string(), payload),
     ]);
     tool_name.insert_response_fields(&mut item);
     Value::Object(item)
@@ -5451,7 +5645,7 @@ impl<'a> ResponsesSseState<'a> {
                     response_name,
                     tool.item_id.clone(),
                     tool.call_id.clone(),
-                    String::new(),
+                    responses_tool_call_initial_payload(response_name),
                     "in_progress",
                 )
             }));
@@ -5460,7 +5654,7 @@ impl<'a> ResponsesSseState<'a> {
             && tool
                 .response_name
                 .as_ref()
-                .is_some_and(|response_name| !response_name.is_custom())
+                .is_some_and(ResponsesToolName::is_function)
             && tool.emitted_arguments < tool.arguments.len()
         {
             let delta = &tool.arguments[tool.emitted_arguments..];
@@ -5575,7 +5769,7 @@ impl<'a> ResponsesSseState<'a> {
                         response_name,
                         tool.item_id.clone(),
                         tool.call_id.clone(),
-                        String::new(),
+                        responses_tool_call_initial_payload(response_name),
                         "in_progress",
                     )
                 }));
@@ -5598,7 +5792,7 @@ impl<'a> ResponsesSseState<'a> {
                     "output_index":tool.output_index,
                     "input":input,
                 }));
-            } else {
+            } else if response_name.is_function() {
                 if tool.emitted_arguments < tool.arguments.len() {
                     let delta = &tool.arguments[tool.emitted_arguments..];
                     events.push(json!({
@@ -5622,7 +5816,7 @@ impl<'a> ResponsesSseState<'a> {
                 "type":"response.output_item.done",
                 "response_id":self.response_id,
                 "output_index":tool.output_index,
-                "item":stream_tool_item(tool),
+                "item":stream_tool_item(tool)?,
             }));
         }
 
@@ -5630,10 +5824,13 @@ impl<'a> ResponsesSseState<'a> {
             .output_order
             .iter()
             .filter_map(|kind| match kind {
-                StreamOutputKind::Message => self.message.as_ref().map(stream_message_item),
+                StreamOutputKind::Message => self
+                    .message
+                    .as_ref()
+                    .map(|message| Ok(stream_message_item(message))),
                 StreamOutputKind::Tool(index) => self.tools.get(index).map(stream_tool_item),
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let status = if incomplete_reason.is_some() {
             "incomplete"
         } else {
@@ -5716,23 +5913,38 @@ fn stream_message_item(message: &ResponsesStreamMessage) -> Value {
     })
 }
 
-fn stream_tool_item(tool: &ResponsesStreamTool) -> Value {
+fn responses_tool_call_initial_payload(tool_name: &ResponsesToolName) -> Value {
+    if tool_name.is_tool_search() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        Value::String(String::new())
+    }
+}
+
+fn stream_tool_item(tool: &ResponsesStreamTool) -> Result<Value> {
     let response_name = tool
         .response_name
         .as_ref()
         .expect("stream tool response name must be restored before serialization");
     let payload = if response_name.is_custom() {
-        tool.response_input.clone().unwrap_or_default()
+        Value::String(tool.response_input.clone().unwrap_or_default())
+    } else if response_name.is_tool_search() {
+        let arguments = serde_json::from_str::<Value>(&tool.arguments)
+            .context("流式 tool_search function arguments 不是有效 JSON")?;
+        if !arguments.is_object() {
+            anyhow::bail!("流式 tool_search function arguments 必须是 JSON 对象");
+        }
+        arguments
     } else {
-        tool.arguments.clone()
+        Value::String(tool.arguments.clone())
     };
-    responses_tool_call_item_with_id(
+    Ok(responses_tool_call_item_with_id(
         response_name,
         tool.item_id.clone(),
         tool.call_id.clone(),
         payload,
         "completed",
-    )
+    ))
 }
 
 async fn write_responses_sse_event(stream: &mut TcpStream, event: &Value) -> Result<()> {
@@ -5800,6 +6012,12 @@ async fn write_responses_sse_response(stream: &mut TcpStream, response: &Value) 
                 }
                 Some("function_call") => {
                     added_item.insert("arguments".to_string(), Value::String(String::new()));
+                }
+                Some("tool_search_call") => {
+                    added_item.insert(
+                        "arguments".to_string(),
+                        Value::Object(serde_json::Map::new()),
+                    );
                 }
                 Some("custom_tool_call") => {
                     added_item.insert("input".to_string(), Value::String(String::new()));
@@ -5990,6 +6208,20 @@ fn reason_phrase(status: u16) -> &'static str {
 mod tests {
     use super::*;
     use crate::config::ProviderProfile;
+
+    fn client_tool_search_definition() -> Value {
+        json!({
+            "type":"tool_search",
+            "execution":"client",
+            "description":"Search the client tool catalog",
+            "parameters":{
+                "type":"object",
+                "properties":{"goal":{"type":"string"}},
+                "required":["goal"],
+                "additionalProperties":false
+            }
+        })
+    }
 
     fn router_config(base_url: String) -> (CodeyConfig, String, String) {
         let mut route = ProviderProfile::new("Relay");
@@ -7048,6 +7280,368 @@ mod tests {
     }
 
     #[test]
+    fn client_tool_search_bridges_to_stable_chat_and_anthropic_functions() {
+        let body = json!({
+            "model":"provider-model",
+            "input":"find a filesystem tool",
+            "tools":[client_tool_search_definition()],
+            "tool_choice":{"type":"tool_search"}
+        });
+
+        let chat = responses_to_chat_completions_request(&body).unwrap();
+        let repeated = responses_to_chat_completions_request(&body).unwrap();
+        assert_eq!(
+            chat.body["tools"][0]["function"]["name"],
+            TOOL_SEARCH_UPSTREAM_TOOL_NAME
+        );
+        assert_eq!(
+            repeated.body["tools"][0]["function"]["name"],
+            chat.body["tools"][0]["function"]["name"]
+        );
+        assert_eq!(
+            chat.body["tools"][0]["function"]["description"],
+            "Search the client tool catalog"
+        );
+        assert_eq!(
+            chat.body["tools"][0]["function"]["parameters"],
+            client_tool_search_definition()["parameters"]
+        );
+        assert_eq!(
+            chat.body["tool_choice"]["function"]["name"],
+            TOOL_SEARCH_UPSTREAM_TOOL_NAME
+        );
+        assert_eq!(
+            chat.tool_bridge
+                .restore_upstream_name(TOOL_SEARCH_UPSTREAM_TOOL_NAME)
+                .unwrap(),
+            ResponsesToolName::tool_search()
+        );
+
+        let anthropic = responses_to_anthropic_messages_request(&body).unwrap();
+        assert_eq!(
+            anthropic.body["tools"][0]["name"],
+            TOOL_SEARCH_UPSTREAM_TOOL_NAME
+        );
+        assert_eq!(
+            anthropic.body["tools"][0]["description"],
+            "Search the client tool catalog"
+        );
+        assert_eq!(
+            anthropic.body["tools"][0]["input_schema"],
+            client_tool_search_definition()["parameters"]
+        );
+        assert_eq!(
+            anthropic.body["tool_choice"]["name"],
+            TOOL_SEARCH_UPSTREAM_TOOL_NAME
+        );
+    }
+
+    #[test]
+    fn client_tool_search_requires_description_and_object_parameters() {
+        for tool in [
+            json!({
+                "type":"tool_search",
+                "execution":"client",
+                "parameters":{"type":"object"}
+            }),
+            json!({
+                "type":"tool_search",
+                "execution":"client",
+                "description":"Search the client tool catalog"
+            }),
+            json!({
+                "type":"tool_search",
+                "execution":"client",
+                "description":"Search the client tool catalog",
+                "parameters":[]
+            }),
+        ] {
+            let error = responses_to_chat_completions_request(&json!({
+                "model":"provider-model",
+                "input":"find a tool",
+                "tools":[tool]
+            }))
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("tool_search.description")
+                    || error.to_string().contains("tool_search.parameters")
+            );
+        }
+
+        let conflict = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"find a tool",
+            "tools":[
+                client_tool_search_definition(),
+                {
+                    "type":"tool_search",
+                    "execution":"client",
+                    "description":"A conflicting search definition",
+                    "parameters":{"type":"object","properties":{}}
+                }
+            ]
+        }))
+        .unwrap_err();
+        assert!(conflict.to_string().contains("tool_search 存在定义冲突"));
+    }
+
+    #[test]
+    fn client_tool_search_history_requires_client_execution_and_object_arguments() {
+        for output in [
+            json!({
+                "type":"tool_search_output",
+                "call_id":"call-search-history",
+                "tools":[]
+            }),
+            json!({
+                "type":"tool_search_output",
+                "execution":"server",
+                "call_id":"call-search-history",
+                "tools":[]
+            }),
+        ] {
+            let error = responses_to_chat_completions_request(&json!({
+                "model":"provider-model",
+                "tools":[client_tool_search_definition()],
+                "input":[output]
+            }))
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("tool_search_output 缺少 execution=client")
+                    || error
+                        .to_string()
+                        .contains("tool_search_output.execution=server 不受支持")
+            );
+        }
+
+        for arguments in [json!([]), json!("not an object")] {
+            let error = responses_to_chat_completions_request(&json!({
+                "model":"provider-model",
+                "tools":[client_tool_search_definition()],
+                "input":[{
+                    "type":"tool_search_call",
+                    "execution":"client",
+                    "call_id":"call-search-history",
+                    "arguments":arguments
+                }]
+            }))
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("tool_search_call.arguments 必须是 JSON 对象")
+            );
+        }
+    }
+
+    #[test]
+    fn client_tool_search_calls_restore_for_chat_and_anthropic() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"find a tool",
+            "tools":[client_tool_search_definition()]
+        }))
+        .unwrap();
+        let arguments = "{\"goal\":\"filesystem access\"}";
+
+        let chat = chat_completion_to_responses_body_with_tool_bridge(
+            json!({
+                "choices":[{"message":{"role":"assistant","tool_calls":[{
+                    "id":"call-search-chat",
+                    "type":"function",
+                    "function":{"name":TOOL_SEARCH_UPSTREAM_TOOL_NAME,"arguments":arguments}
+                }]},"finish_reason":"tool_calls"}]
+            }),
+            "provider-model",
+            &converted.tool_bridge,
+        )
+        .unwrap();
+        assert_eq!(chat["output"][0]["type"], "tool_search_call");
+        assert_eq!(chat["output"][0]["execution"], "client");
+        assert_eq!(chat["output"][0]["call_id"], "call-search-chat");
+        assert_eq!(chat["output"][0]["status"], "completed");
+        assert_eq!(
+            chat["output"][0]["arguments"],
+            json!({"goal":"filesystem access"})
+        );
+        assert!(chat["output"][0].get("name").is_none());
+
+        let anthropic = anthropic_message_to_responses_body_with_tool_bridge(
+            &json!({
+                "type":"message",
+                "content":[{
+                    "type":"tool_use",
+                    "id":"call-search-anthropic",
+                    "name":TOOL_SEARCH_UPSTREAM_TOOL_NAME,
+                    "input":{"goal":"calendar tools"}
+                }]
+            }),
+            "provider-model",
+            &converted.tool_bridge,
+        )
+        .unwrap();
+        assert_eq!(anthropic["output"][0]["type"], "tool_search_call");
+        assert_eq!(anthropic["output"][0]["execution"], "client");
+        assert_eq!(anthropic["output"][0]["call_id"], "call-search-anthropic");
+        assert_eq!(
+            anthropic["output"][0]["arguments"],
+            json!({"goal":"calendar tools"})
+        );
+    }
+
+    #[test]
+    fn client_tool_search_history_round_trips_and_promotes_loaded_tools() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "tools":[client_tool_search_definition()],
+            "input":[
+                {"type":"message","role":"user","content":"find a tool"},
+                {
+                    "type":"tool_search_call",
+                    "execution":"client",
+                    "call_id":"call-search-history",
+                    "status":"completed",
+                    "arguments":{"goal":"read files"}
+                },
+                {
+                    "type":"tool_search_output",
+                    "execution":"client",
+                    "call_id":"call-search-history",
+                    "status":"completed",
+                    "tools":[{
+                        "type":"function",
+                        "name":"read_file",
+                        "description":"Read a file",
+                        "defer_loading":true,
+                        "parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+                    },{
+                        "type":"namespace",
+                        "name":"filesystem",
+                        "tools":[{
+                            "type":"function",
+                            "name":"list_files",
+                            "description":"List files",
+                            "defer_loading":true,
+                            "parameters":{"type":"object","properties":{}}
+                        }]
+                    }]
+                }
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(converted.body["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            converted.body["tools"][0]["function"]["name"],
+            TOOL_SEARCH_UPSTREAM_TOOL_NAME
+        );
+        assert_eq!(converted.body["tools"][1]["function"]["name"], "read_file");
+        assert!(
+            converted.body["tools"][1]["function"]
+                .get("defer_loading")
+                .is_none()
+        );
+        assert_eq!(
+            converted.body["tools"][2]["function"]["name"],
+            namespaced_upstream_tool_name(&["filesystem".to_string()], "list_files")
+        );
+        assert!(
+            converted.body["tools"][2]["function"]
+                .get("defer_loading")
+                .is_none()
+        );
+        assert_eq!(
+            converted.body["messages"][1]["tool_calls"][0]["function"]["name"],
+            TOOL_SEARCH_UPSTREAM_TOOL_NAME
+        );
+        assert_eq!(
+            converted.body["messages"][1]["tool_calls"][0]["id"],
+            "call-search-history"
+        );
+        assert_eq!(
+            converted.body["messages"][1]["tool_calls"][0]["function"]["arguments"],
+            "{\"goal\":\"read files\"}"
+        );
+        assert_eq!(converted.body["messages"][2]["role"], "tool");
+        assert_eq!(
+            converted.body["messages"][2]["tool_call_id"],
+            "call-search-history"
+        );
+        let result = serde_json::from_str::<Value>(
+            converted.body["messages"][2]["content"].as_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(result["tools"][0]["name"], "read_file");
+
+        let anthropic = responses_to_anthropic_messages_request(&json!({
+            "model":"provider-model",
+            "tools":[client_tool_search_definition()],
+            "input":[
+                {"role":"user","content":"find a tool"},
+                {"type":"tool_search_call","execution":"client","call_id":"call-search-history","arguments":{"goal":"read files"}},
+                {"type":"tool_search_output","execution":"client","call_id":"call-search-history","tools":[{"type":"function","name":"read_file","defer_loading":true,"parameters":{"type":"object"}}]}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(anthropic.body["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            anthropic.body["messages"][1]["content"][0]["type"],
+            "tool_use"
+        );
+        assert_eq!(
+            anthropic.body["messages"][1]["content"][0]["input"],
+            json!({"goal":"read files"})
+        );
+        assert_eq!(
+            anthropic.body["messages"][2]["content"][0]["type"],
+            "tool_result"
+        );
+    }
+
+    #[test]
+    fn client_tool_search_streaming_restores_native_items_without_function_events() {
+        let converted = responses_to_chat_completions_request(&json!({
+            "model":"provider-model",
+            "input":"find a tool",
+            "tools":[client_tool_search_definition()]
+        }))
+        .unwrap();
+        let mut stream = ResponsesSseState::new("provider-model", &converted.tool_bridge);
+
+        let first = stream
+            .tool_delta(
+                0,
+                Some("call-search-stream"),
+                Some(TOOL_SEARCH_UPSTREAM_TOOL_NAME),
+                Some("{\"goal\":"),
+                None,
+            )
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["type"], "response.output_item.added");
+        assert_eq!(first[0]["item"]["type"], "tool_search_call");
+        assert_eq!(first[0]["item"]["execution"], "client");
+        assert_eq!(first[0]["item"]["arguments"], json!({}));
+        assert!(
+            !serde_json::to_string(&first)
+                .unwrap()
+                .contains("function_call_arguments")
+        );
+
+        let second = stream
+            .tool_delta(0, None, None, Some("\"filesystem\"}"), None)
+            .unwrap();
+        assert!(second.is_empty());
+        let done = stream_tool_item(stream.tools.get(&0).unwrap()).unwrap();
+        assert_eq!(done["type"], "tool_search_call");
+        assert_eq!(done["execution"], "client");
+        assert_eq!(done["call_id"], "call-search-stream");
+        assert_eq!(done["arguments"], json!({"goal":"filesystem"}));
+    }
+
+    #[test]
     fn namespace_tools_fail_closed_on_conflicts_and_unsupported_tool_kinds() {
         let duplicate = responses_to_chat_completions_request(&json!({
             "model":"provider-model",
@@ -7064,14 +7658,21 @@ mod tests {
         .unwrap_err();
         assert!(duplicate.to_string().contains("存在定义冲突"));
 
-        for tool_type in ["tool_search", "web_search_preview"] {
+        for tool in [
+            json!({"type":"tool_search"}),
+            json!({"type":"tool_search","execution":"server"}),
+            json!({"type":"web_search_preview","name":"lookup"}),
+        ] {
             let error = responses_to_chat_completions_request(&json!({
                 "model":"provider-model",
                 "input":"hello",
-                "tools":[{"type":tool_type,"name":"lookup"}]
+                "tools":[tool]
             }))
             .unwrap_err();
-            assert!(error.to_string().contains("请改用支持 Responses 的线路"));
+            assert!(
+                error.to_string().contains("支持 Responses 的线路")
+                    || error.to_string().contains("仅 execution=client 可桥接")
+            );
         }
     }
 
@@ -7177,7 +7778,7 @@ mod tests {
         assert_eq!(second[0]["item"]["namespace"], "fs");
         assert_eq!(second[1]["delta"], "{\"path\":\"a.txt\"}");
 
-        let done = stream_tool_item(stream.tools.get(&0).unwrap());
+        let done = stream_tool_item(stream.tools.get(&0).unwrap()).unwrap();
         assert_eq!(done["name"], "read");
         assert_eq!(done["namespace"], "fs");
         assert_eq!(done["arguments"], "{\"path\":\"a.txt\"}");
