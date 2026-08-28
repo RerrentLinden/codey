@@ -123,6 +123,7 @@ pub(super) fn parse_plain_text_exit_code(value: &str) -> Option<i64> {
     parse_exit_code_line(trimmed.lines().next()?.trim())
 }
 
+#[allow(clippy::collapsible_if)]
 fn parse_unified_exec_envelope_exit_code(value: &str) -> Option<i64> {
     let mut lines = value.lines().map(str::trim);
     let first = lines.next()?;
