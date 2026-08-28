@@ -107,6 +107,8 @@ pub(super) fn collect_exit_status(
                 collect_exit_status(&parsed, exit_codes, error, depth + 1, false);
             } else if let Some(exit_code) = parse_plain_text_exit_code(value) {
                 exit_codes.push(exit_code);
+            } else if let Some(exit_code) = parse_unified_exec_envelope_exit_code(value) {
+                exit_codes.push(exit_code);
             }
         }
         _ => {}
@@ -118,7 +120,31 @@ pub(super) fn parse_plain_text_exit_code(value: &str) -> Option<i64> {
     if trimmed.is_empty() || trimmed.len() > 1024 {
         return None;
     }
-    let first_line = trimmed.lines().next()?.trim().to_ascii_lowercase();
+    parse_exit_code_line(trimmed.lines().next()?.trim())
+}
+
+fn parse_unified_exec_envelope_exit_code(value: &str) -> Option<i64> {
+    let mut lines = value.lines().map(str::trim);
+    let first = lines.next()?;
+    if !first.strip_prefix("Chunk ID: ").is_some_and(valid_chunk_id) {
+        return None;
+    }
+    let mut exit_code = None;
+    for line in lines.take(6) {
+        if line == "Output:" {
+            return exit_code;
+        }
+        if let Some(code) = parse_exit_code_line(line) {
+            if exit_code.replace(code).is_some() {
+                return None;
+            }
+        }
+    }
+    None
+}
+
+fn parse_exit_code_line(line: &str) -> Option<i64> {
+    let line = line.trim().to_ascii_lowercase();
     for prefix in [
         "exit_code",
         "exit code",
@@ -128,7 +154,7 @@ pub(super) fn parse_plain_text_exit_code(value: &str) -> Option<i64> {
         "script exited with code",
         "command finished with exit code",
     ] {
-        if let Some(remainder) = first_line.strip_prefix(prefix) {
+        if let Some(remainder) = line.strip_prefix(prefix) {
             let token = remainder
                 .trim_start_matches(|character: char| {
                     character.is_ascii_whitespace() || matches!(character, ':' | '=')
@@ -140,6 +166,14 @@ pub(super) fn parse_plain_text_exit_code(value: &str) -> Option<i64> {
         }
     }
     None
+}
+
+fn valid_chunk_id(value: &str) -> bool {
+    let value = value.trim();
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 pub(super) fn reservation_has_pending_acceptance(reservation: &Reservation) -> bool {

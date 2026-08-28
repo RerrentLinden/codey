@@ -574,7 +574,7 @@ async fn with_completion_probe_cache(
             .completion_probe_cache
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let events = cache.refresh_session(&codex_home(), &session_id);
+        let events = cache.refresh_session(codex_home(), &session_id);
         completion_state_response(&events, &session_id, &turn_id)
     })
     .await

@@ -4110,10 +4110,10 @@ pub(crate) fn pending_acceptance_reason(
                     continue;
                 }
 
-                commands.push(format!(
+                commands.push(markdown_code_block(&format!(
                     "# codey-accept:{}:{}\n{}",
                     reservation.task_id, check.id, check.command
-                ));
+                )));
             }
         }
     }
@@ -4140,6 +4140,25 @@ pub(crate) fn pending_acceptance_reason(
         "Codey 机械验收门禁：{}",
         sections.join("\n\n")
     )))
+}
+
+fn markdown_code_block(value: &str) -> String {
+    let fence = markdown_fence_for(value);
+    format!("{fence}\n{value}\n{fence}")
+}
+
+fn markdown_fence_for(value: &str) -> String {
+    let mut longest_backtick_run = 0usize;
+    let mut current_run = 0usize;
+    for character in value.chars() {
+        if character == '`' {
+            current_run += 1;
+            longest_backtick_run = longest_backtick_run.max(current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    "`".repeat(3.max(longest_backtick_run + 1))
 }
 
 pub(crate) fn settle_turn(
@@ -9368,6 +9387,40 @@ mod tests {
             AcceptanceEvidence::Passed
         );
         assert_eq!(
+            classify_acceptance_evidence(Some(&Value::String(
+                "Chunk ID: 335d2b\nWall time: 0.0000 seconds\nProcess exited with code 0\nOriginal token count: 1\nOutput:\nTrue\n"
+                    .to_string()
+            ))),
+            AcceptanceEvidence::Passed
+        );
+        assert_eq!(
+            classify_acceptance_evidence(Some(&Value::String(
+                "Chunk ID: 335d2b\nWall time: 0.0000 seconds\nProcess exited with code 1\nOriginal token count: 1\nOutput:\nFalse\n"
+                    .to_string()
+            ))),
+            AcceptanceEvidence::CommandFailed
+        );
+        assert_eq!(
+            classify_acceptance_evidence(Some(&Value::String(
+                "Chunk ID: 335d2b\nWall time: 0.0000 seconds\nOutput:\nProcess exited with code 0\n"
+                    .to_string()
+            ))),
+            AcceptanceEvidence::MissingExitStatus
+        );
+        assert_eq!(
+            classify_acceptance_evidence(Some(&Value::String(
+                "Chunk ID: 335d2b\nProcess exited with code 0\n".to_string()
+            ))),
+            AcceptanceEvidence::MissingExitStatus
+        );
+        assert_eq!(
+            classify_acceptance_evidence(Some(&Value::String(
+                "Chunk ID: chunk_335d2b\nProcess exited with code 0\nProcess exited with code 1\nOutput:\n"
+                    .to_string()
+            ))),
+            AcceptanceEvidence::MissingExitStatus
+        );
+        assert_eq!(
             classify_acceptance_evidence(Some(&json!({ "output": "exit_code = 0" }))),
             AcceptanceEvidence::MissingExitStatus
         );
@@ -9513,6 +9566,39 @@ mod tests {
         assert_eq!(
             pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 50).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn pending_acceptance_reason_renders_acceptance_commands_as_literal_markdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = contract_input(
+            "worker_a",
+            "codey_worker",
+            worker_contract("worker_a", "backend/src"),
+        );
+        pre_spawn(temp.path(), "runtime-a", "session-a", Some(&input), 0, 10).unwrap();
+        post_spawn(
+            temp.path(),
+            "runtime-a",
+            "session-a",
+            Some(&input),
+            Some(&json!({ "agent_id": "agent-a" })),
+            11,
+        )
+        .unwrap();
+        authorize_worker_command_for_test(temp.path(), "session-a", "agent-a", 12);
+
+        let reason = pending_acceptance_reason(temp.path(), "runtime-a", "session-a", 20)
+            .unwrap()
+            .unwrap();
+        assert!(
+            reason.contains("```\n# codey-accept:worker_a:tests\ncargo test -p codey --lib\n```")
+        );
+        assert!(!reason.contains("\n# codey-accept:worker_a:tests\ncargo test -p codey --lib\n\n"));
+        assert_eq!(
+            markdown_code_block("# codey-accept:worker_a:tests\nprintf '```'"),
+            "````\n# codey-accept:worker_a:tests\nprintf '```'\n````"
         );
     }
 
