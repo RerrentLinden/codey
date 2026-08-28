@@ -892,9 +892,9 @@ impl CodeyConfig {
         !self.runtime_websocket_model_aliases().is_empty()
     }
 
-    /// Whether one route can use the standalone Responses compact endpoint in
-    /// this launch. Adapted Chat/Anthropic routes cannot emulate the compacted
-    /// Responses window without changing its semantics.
+    /// Whether one route natively supports the Responses compaction contract
+    /// this launch, including the current `/responses` trigger flow and the
+    /// legacy standalone compact endpoint.
     pub(crate) fn route_supports_remote_compaction_this_launch(
         &self,
         profile: &ProviderProfile,
@@ -2369,7 +2369,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_compaction_is_advertised_only_when_every_runtime_route_supports_it() {
+    fn third_party_remote_compaction_is_advertised_only_when_every_runtime_route_supports_it() {
         let mut capable = ProviderProfile::new("Responses Route");
         capable.id = "route-capable".into();
         capable.base_url = "https://responses.example/v1".into();

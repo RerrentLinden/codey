@@ -1251,10 +1251,10 @@ pub(crate) fn prepare_persistent_router_resume_shim_at(home: &Path) -> Result<bo
     Ok(true)
 }
 
-/// Persist the live loopback API-key `codey_router` table while the local
-/// router is running. Desktop and config reload resolve that id from disk;
-/// process `-c` overlays do not stop ChatGPT-account transport when the disk
-/// table still says `requires_openai_auth = true`.
+/// Persist the live loopback `codey_router` table while the local router is
+/// running. Official routing uses CC Switch's OpenAI-authenticated provider
+/// shape; third-party-only routing uses the API-key shape. Desktop and config
+/// reload resolve that id from disk, so it must match the process `-c` overlay.
 pub(crate) fn prepare_runtime_router_disk_provider_at(
     home: &Path,
     endpoint: &RuntimeRouterEndpoint,
