@@ -2093,13 +2093,34 @@
   const patchCodexAvatarOverlayPrewarm = (source) => {
     if (!disablePet) return source;
     let count = 0;
-    const patched = source.replace(
-      /async prewarm\(([$A-Z_a-z][$\w]*)\)\{if\(this\.window!=null\|\|this\.openingWindowPromise!=null\|\|this\.isAppQuitting\)return;let ([$A-Z_a-z][$\w]*)=this\.windowVisibilitySequence,([$A-Z_a-z][$\w]*)=await this\.ensureWindow\(\2\);/g,
-      (match) => {
-        count += 1;
-        return match.replace("{", "{return;");
-      },
-    );
+    let patched = "";
+    let lastIndex = 0;
+    const prewarmMethodPattern = /async\s+prewarm\s*\([^)]*\)\s*\{/g;
+    for (const match of source.matchAll(prewarmMethodPattern)) {
+      const bodyStart = match.index + match[0].length;
+      // The native prewarm body is a flat minified method. Stop at its first
+      // closing brace so an unrelated prewarm method cannot borrow semantic
+      // anchors from a later class in the monolithic bundle.
+      const bodyEnd = source.indexOf("}", bodyStart);
+      if (bodyEnd < 0) continue;
+      const bodyPreview = source.slice(
+        bodyStart,
+        Math.min(bodyEnd, bodyStart + 1600),
+      );
+      if (
+        !bodyPreview.includes("this.windowVisibilitySequence") ||
+        !bodyPreview.includes("this.openingWindowPromise") ||
+        !bodyPreview.includes("this.isAppQuitting") ||
+        !bodyPreview.includes("this.ensureWindow(") ||
+        !bodyPreview.includes("this.positionWindow(")
+      ) {
+        continue;
+      }
+      count += 1;
+      patched += source.slice(lastIndex, bodyStart) + "return;";
+      lastIndex = bodyStart;
+    }
+    patched += source.slice(lastIndex);
     if (count !== 1) {
       throw new Error(`Codey avatar overlay prewarm matches ${count}`);
     }

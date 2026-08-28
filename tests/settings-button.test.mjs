@@ -123,6 +123,7 @@ test("moves the Codey button beside the visible header's trailing action region"
     HTMLElement: FakeElement,
     location: { pathname: "/", search: "" },
     MutationObserver: class {
+      disconnect() {}
       observe() {}
     },
     URLSearchParams,
@@ -258,8 +259,40 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
     },
   };
   let accountUsageCalls = 0;
+  let appServerUsageCalls = 0;
+  const appServerUsageResult = {
+    rateLimits: {
+      limitId: "codex",
+      primary: {
+        usedPercent: 20,
+        windowDurationMins: 10_080,
+        resetsAt: Math.floor(tomorrowResetAt.getTime() / 1000),
+      },
+      credits: {
+        hasCredits: true,
+        unlimited: false,
+        balance: "77",
+      },
+      planType: "plus",
+    },
+    rateLimitsByLimitId: {
+      codex_bengalfox: {
+        limitId: "codex_bengalfox",
+        primary: {
+          usedPercent: 35,
+          windowDurationMins: 300,
+          resetsAt: Math.floor(todayResetAt.getTime() / 1000),
+        },
+      },
+    },
+  };
   const scheduledDelays = [];
   const window = {
+    __codeyReadAccountRateLimits: async () => {
+      appServerUsageCalls += 1;
+      return appServerUsageResult;
+    },
+    __codeySessionToolsInjectLoaded: true,
     __codexSessionDeleteBridge: async (path) => {
       if (path === "/account/usage") {
         accountUsageCalls += 1;
@@ -291,6 +324,7 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
     HTMLElement: FakeElement,
     location: { pathname: "/", search: "" },
     MutationObserver: class {
+      disconnect() {}
       observe() {}
     },
     URLSearchParams,
@@ -363,6 +397,14 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   assert.match(usage.innerHTML, /周额度/);
   assert.doesNotMatch(usage.innerHTML, /5 小时/);
 
+  accountUsageResult = { status: "error", message: "官方额度接口返回 401" };
+  await window.__codeyRefreshAccountUsage();
+  assert.equal(appServerUsageCalls, 1);
+  assert.equal(usage.dataset.windowCount, "2");
+  assert.match(usage.innerHTML, /周额度[\s\S]*?80%[\s\S]*?5 小时[\s\S]*?65%/);
+  assert.match(usage.innerHTML, /Credits 余额[\s\S]*?77/);
+  assert.match(usage.innerHTML, /class="codey-usage-plan-tag">Plus<\/span>/);
+
   accountUsageResult = { status: "unavailable", reason: "third_party" };
   const refreshSchedulesBeforeUnavailable = scheduledDelays.filter(
     (delay) => delay === 60_000,
@@ -388,7 +430,8 @@ test("renders weekly and optional five-hour usage above the sidebar account", as
   await window.__codeyRefreshAccountUsage();
   const remountedUsage = findById("codey-account-usage");
   assert.ok(remountedUsage);
-  assert.equal(accountUsageCalls, 5);
+  assert.equal(accountUsageCalls, 6);
+  assert.equal(appServerUsageCalls, 1);
   assert.equal(remountedUsage.parentElement, sidebarFooterHost);
   assert.equal(remountedUsage.nextElementSibling, nativeProfileFooter);
   assert.match(remountedUsage.innerHTML, /周额度/);

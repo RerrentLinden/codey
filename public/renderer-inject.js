@@ -349,6 +349,71 @@
     return null;
   };
 
+  const normalizeAppServerUsageWindow = (window) => {
+    const usedPercent = Number(window?.usedPercent);
+    const windowMinutes = Number(window?.windowDurationMins);
+    if (!Number.isFinite(usedPercent) || !Number.isFinite(windowMinutes) || windowMinutes <= 0) {
+      return null;
+    }
+    const resetsAtValue = Number(window?.resetsAt);
+    const resetsAt = Number.isFinite(resetsAtValue) && resetsAtValue > 0
+      ? Math.round(resetsAtValue > 10_000_000_000 ? resetsAtValue / 1000 : resetsAtValue)
+      : undefined;
+    return {
+      usedPercent: Math.max(0, Math.min(100, usedPercent)),
+      windowMinutes: Math.max(1, Math.round(windowMinutes)),
+      ...(resetsAt ? { resetsAt } : {}),
+    };
+  };
+
+  const normalizeAppServerAccountUsage = (response) => {
+    const payload = response?.result && typeof response.result === "object"
+      ? response.result
+      : response;
+    if (!payload || typeof payload !== "object") {
+      throw new Error("Codex 官方额度响应格式无效");
+    }
+    const buckets = [];
+    if (payload.rateLimits && typeof payload.rateLimits === "object") {
+      buckets.push(payload.rateLimits);
+    }
+    if (payload.rateLimitsByLimitId && typeof payload.rateLimitsByLimitId === "object") {
+      for (const bucket of Object.values(payload.rateLimitsByLimitId)) {
+        if (bucket && typeof bucket === "object" && !buckets.includes(bucket)) {
+          buckets.push(bucket);
+        }
+      }
+    }
+    const windowsByKind = new Map();
+    for (const bucket of buckets) {
+      for (const rawWindow of [bucket.primary, bucket.secondary]) {
+        const window = normalizeAppServerUsageWindow(rawWindow);
+        const kind = accountUsageWindowKind(window);
+        if (kind && !windowsByKind.has(kind)) windowsByKind.set(kind, window);
+      }
+    }
+    const primary = windowsByKind.get("weekly") || windowsByKind.get("five-hour") || null;
+    const secondary = primary === windowsByKind.get("weekly")
+      ? windowsByKind.get("five-hour") || null
+      : windowsByKind.get("weekly") || null;
+    const credits = buckets.find((bucket) => bucket.credits)?.credits || payload.credits || null;
+    if (!primary && !secondary && !credits) {
+      throw new Error("Codex 官方额度响应中没有可展示的信息");
+    }
+    const planType = buckets
+      .map((bucket) => bucket.planType)
+      .find((value) => typeof value === "string" && value.trim())
+      || (typeof payload.planType === "string" ? payload.planType : undefined);
+    return {
+      status: "ok",
+      ...(planType ? { planType } : {}),
+      ...(primary ? { primary } : {}),
+      ...(secondary ? { secondary } : {}),
+      ...(credits ? { credits } : {}),
+      fetchedAt: Math.floor(Date.now() / 1000),
+    };
+  };
+
   const escapeAccountUsageText = (value) => String(value ?? "")
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
@@ -685,14 +750,36 @@
     }, delayMs);
   };
 
+  const readAccountUsageFromAppServer = async () => {
+    const loaded = await loadSessionTools();
+    if (!loaded || typeof window.__codeyReadAccountRateLimits !== "function") {
+      throw new Error("Codex 官方额度读取接口不可用");
+    }
+    const response = await window.__codeyReadAccountRateLimits();
+    return normalizeAppServerAccountUsage(response);
+  };
+
   const checkAccountUsage = async () => {
     if (accountUsageCheckInFlight || document.visibilityState === "hidden") return null;
     accountUsageCheckInFlight = true;
     try {
-      const result = await withTimeout(
+      let result = await withTimeout(
         callBridge(accountUsagePath, {}, { timeoutMs: accountUsageTimeoutMs }),
         accountUsageTimeoutMs,
+        "读取官方账号额度超时",
       );
+      if (result?.status === "error") {
+        try {
+          result = await withTimeout(
+            readAccountUsageFromAppServer(),
+            accountUsageTimeoutMs,
+            "读取 Codex 官方额度超时",
+          );
+        } catch {
+          // Preserve the original backend error. It is normally more actionable
+          // when the current Codex asset does not expose AppServerManager yet.
+        }
+      }
       renderAccountUsage(result);
       return result;
     } catch (error) {

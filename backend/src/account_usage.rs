@@ -3,6 +3,10 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
+};
 use reqwest::{Client, StatusCode, header::ACCEPT};
 use serde::Serialize;
 use serde_json::Value;
@@ -19,6 +23,8 @@ const ACCOUNT_USAGE_FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(60);
 const ACCOUNT_USAGE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 const ACCOUNT_USAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_ACCOUNT_USAGE_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_JWT_PAYLOAD_BYTES: usize = 64 * 1024;
+const MAX_JWT_PAYLOAD_ENCODED_BYTES: usize = 96 * 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OfficialAuth {
@@ -32,6 +38,14 @@ struct OfficialAuthFingerprint {
     modified: SystemTime,
 }
 
+fn official_auth_fingerprint(path: &Path) -> Option<OfficialAuthFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(OfficialAuthFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok()?,
+    })
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct OfficialAuthCache {
     cached: Option<(OfficialAuthFingerprint, OfficialAuth)>,
@@ -39,12 +53,7 @@ pub(crate) struct OfficialAuthCache {
 
 impl OfficialAuthCache {
     pub(crate) fn read(&mut self, path: &Path) -> Result<OfficialAuth> {
-        let fingerprint = fs::metadata(path).ok().and_then(|metadata| {
-            Some(OfficialAuthFingerprint {
-                len: metadata.len(),
-                modified: metadata.modified().ok()?,
-            })
-        });
+        let fingerprint = official_auth_fingerprint(path);
         if let Some(fingerprint) = fingerprint.as_ref()
             && let Some((cached_fingerprint, cached_auth)) = self.cached.as_ref()
             && cached_fingerprint == fingerprint
@@ -105,10 +114,13 @@ pub struct AccountUsageCache {
     expires_at: Option<Instant>,
     consecutive_failures: u32,
     retry: Option<(Instant, String)>,
+    auth_fingerprint_initialized: bool,
+    auth_fingerprint: Option<OfficialAuthFingerprint>,
 }
 
 impl AccountUsageCache {
     pub async fn fetch(&mut self, codex_home: &Path) -> Result<AccountUsageSnapshot> {
+        self.observe_auth_fingerprint(official_auth_fingerprint(&codex_home.join("auth.json")));
         if let Some(cached) = self.cached_result(Instant::now()) {
             return cached.map_err(anyhow::Error::msg);
         }
@@ -161,6 +173,22 @@ impl AccountUsageCache {
             now + account_usage_failure_backoff(self.consecutive_failures),
             error,
         ));
+    }
+
+    fn observe_auth_fingerprint(&mut self, fingerprint: Option<OfficialAuthFingerprint>) {
+        if !self.auth_fingerprint_initialized {
+            self.auth_fingerprint_initialized = true;
+            self.auth_fingerprint = fingerprint;
+            return;
+        }
+        if self.auth_fingerprint == fingerprint {
+            return;
+        }
+        self.auth_fingerprint = fingerprint;
+        self.snapshot = None;
+        self.expires_at = None;
+        self.consecutive_failures = 0;
+        self.retry = None;
     }
 }
 
@@ -265,12 +293,62 @@ pub(crate) fn read_official_auth(path: &Path) -> Result<OfficialAuth> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|account_id| !account_id.is_empty())
-        .map(ToString::to_string);
+        .map(ToString::to_string)
+        .or_else(|| {
+            ["id_token", "access_token"].iter().find_map(|key| {
+                tokens
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .and_then(account_id_from_jwt)
+            })
+        });
 
     Ok(OfficialAuth {
         access_token,
         account_id,
     })
+}
+
+fn account_id_from_jwt(token: &str) -> Option<String> {
+    let mut parts = token.split('.');
+    let _header = parts.next()?;
+    let payload = parts.next()?;
+    let _signature = parts.next()?;
+    if parts.next().is_some() || payload.len() > MAX_JWT_PAYLOAD_ENCODED_BYTES {
+        return None;
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| URL_SAFE.decode(payload))
+        .ok()?;
+    if decoded.len() > MAX_JWT_PAYLOAD_BYTES {
+        return None;
+    }
+    let claims = serde_json::from_slice::<Value>(&decoded).ok()?;
+    account_id_from_claims(&claims)
+}
+
+fn account_id_from_claims(claims: &Value) -> Option<String> {
+    let auth_claims = claims.get("https://api.openai.com/auth");
+    string_field(
+        claims,
+        &[
+            "chatgpt_account_id",
+            "https://api.openai.com/auth.chatgpt_account_id",
+        ],
+    )
+    .or_else(|| auth_claims.and_then(|value| string_field(value, &["chatgpt_account_id"])))
+    .or_else(|| organization_account_id(claims))
+    .or_else(|| auth_claims.and_then(organization_account_id))
+    .filter(|account_id| account_id.len() <= 1024)
+}
+
+fn organization_account_id(value: &Value) -> Option<String> {
+    value
+        .get("organizations")?
+        .as_array()?
+        .iter()
+        .find_map(|organization| string_field(organization, &["id"]))
 }
 
 fn parse_account_usage(value: &Value, fetched_at: u64) -> Result<AccountUsageSnapshot> {
@@ -318,7 +396,16 @@ fn parse_window(value: &Value, keys: &[&str], fetched_at: u64) -> Option<Account
         number_field(window, &["remaining_percent", "remainingPercent"])
             .map(|remaining| 100.0 - remaining)
     })?;
-    let window_minutes = u64_field(window, &["window_minutes", "windowMinutes"]).or_else(|| {
+    let window_minutes = u64_field(
+        window,
+        &[
+            "window_minutes",
+            "windowMinutes",
+            "window_duration_mins",
+            "windowDurationMins",
+        ],
+    )
+    .or_else(|| {
         u64_field(window, &["limit_window_seconds", "limitWindowSeconds"])
             .map(|seconds| seconds.div_ceil(60))
     })?;
@@ -415,6 +502,12 @@ fn unix_timestamp() -> u64 {
 mod tests {
     use super::*;
 
+    fn unsigned_jwt(payload: Value) -> String {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());
+        format!("{header}.{payload}.signature")
+    }
+
     fn sample_snapshot() -> AccountUsageSnapshot {
         AccountUsageSnapshot {
             plan_type: Some("plus".to_string()),
@@ -495,6 +588,71 @@ mod tests {
     }
 
     #[test]
+    fn derives_account_id_from_jwt_without_overriding_an_explicit_value() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let id_token = unsigned_jwt(serde_json::json!({
+            "https://api.openai.com/auth": {
+                "chatgpt_account_id": "account-from-jwt"
+            }
+        }));
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "access-token",
+                    "id_token": id_token
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_official_auth(&path).unwrap().account_id.as_deref(),
+            Some("account-from-jwt")
+        );
+
+        let explicit = serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": "access-token",
+                "account_id": "explicit-account",
+                "id_token": unsigned_jwt(serde_json::json!({
+                    "chatgpt_account_id": "account-from-jwt"
+                }))
+            }
+        });
+        fs::write(&path, serde_json::to_vec(&explicit).unwrap()).unwrap();
+        assert_eq!(
+            read_official_auth(&path).unwrap().account_id.as_deref(),
+            Some("explicit-account")
+        );
+    }
+
+    #[test]
+    fn derives_account_id_from_access_token_organization_fallback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        let access_token = unsigned_jwt(serde_json::json!({
+            "organizations": [{"id": "organization-account"}]
+        }));
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {"access_token": access_token}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_official_auth(&path).unwrap().account_id.as_deref(),
+            Some("organization-account")
+        );
+    }
+
+    #[test]
     fn official_auth_cache_refreshes_when_the_file_changes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("auth.json");
@@ -530,6 +688,38 @@ mod tests {
 
         fs::remove_file(&path).unwrap();
         assert!(cache.read(&path).is_err());
+    }
+
+    #[test]
+    fn usage_cache_clears_backoff_when_auth_changes() {
+        let started_at = Instant::now();
+        let mut cache = AccountUsageCache::default();
+        let first = OfficialAuthFingerprint {
+            len: 10,
+            modified: UNIX_EPOCH + Duration::from_secs(1),
+        };
+        let second = OfficialAuthFingerprint {
+            len: 11,
+            modified: UNIX_EPOCH + Duration::from_secs(2),
+        };
+        cache.observe_auth_fingerprint(Some(first.clone()));
+        cache.record_failure("expired token".to_string(), started_at);
+        assert!(
+            cache
+                .cached_result(started_at + Duration::from_secs(1))
+                .is_some()
+        );
+
+        cache.observe_auth_fingerprint(Some(first));
+        assert!(cache.retry.is_some());
+        cache.observe_auth_fingerprint(Some(second));
+        assert!(cache.retry.is_none());
+        assert_eq!(cache.consecutive_failures, 0);
+        assert!(
+            cache
+                .cached_result(started_at + Duration::from_secs(1))
+                .is_none()
+        );
     }
 
     #[test]
@@ -585,5 +775,29 @@ mod tests {
         let secondary = snapshot.secondary.unwrap();
         assert_eq!(secondary.used_percent, 28.0);
         assert_eq!(secondary.resets_at, Some(1_700_086_400));
+    }
+
+    #[test]
+    fn parses_app_server_window_duration_fields() {
+        let value = serde_json::json!({
+            "rateLimits": {
+                "primary": {
+                    "usedPercent": 25,
+                    "windowDurationMins": 300,
+                    "resetsAt": 1_800_000_000
+                },
+                "secondary": {
+                    "usedPercent": 50,
+                    "windowDurationMins": 10_080,
+                    "resetsAt": 1_800_500_000
+                },
+                "planType": "plus"
+            }
+        });
+
+        let snapshot = parse_account_usage(&value, 1_700_000_000).unwrap();
+        assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
+        assert_eq!(snapshot.primary.unwrap().window_minutes, 300);
+        assert_eq!(snapshot.secondary.unwrap().window_minutes, 10_080);
     }
 }

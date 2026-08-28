@@ -1164,12 +1164,16 @@ test("accepts only a unique direct app-server request wrapper", () => {
 test("discovers the current app-initial asset and resolves AppServerManager from React scope", async () => {
   const entryUrl = "app://-/assets/index-BZNttYfb.js";
   const appInitialUrl = "app://-/assets/app-initial-BCLYDefw.js";
+  const appServerRequests = [];
   const manager = {
     discardConversationFromCache() {},
     handleThreadDeletion() {},
     refreshRecentConversations() {},
     resumeConversation() {},
-    sendRequest() {},
+    sendRequest(...args) {
+      appServerRequests.push(args);
+      return { rateLimits: { limitId: "codex" } };
+    },
   };
   const AppServerManagerRpc = Symbol("AppServerManagerRpc");
   const managerRpc = { forHost: (hostId) => (hostId === "local" ? manager : null) };
@@ -1204,6 +1208,11 @@ test("discovers the current app-initial asset and resolves AppServerManager from
 
   assert.equal(controller.kind, "manager");
   assert.equal(controller.manager, manager);
+  assert.deepEqual(
+    await window.__codeyReadAccountRateLimits(),
+    { rateLimits: { limitId: "codex" } },
+  );
+  assert.deepEqual(appServerRequests, [["account/rateLimits/read"]]);
 });
 
 test("accepts only a unique semantic AppServerManager resolver", () => {

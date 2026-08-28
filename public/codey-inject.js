@@ -1930,6 +1930,20 @@
     return codexSessionControllerPromise;
   };
 
+  const readAccountRateLimits = async () => {
+    const controller = await getCodexSessionController();
+    if (
+      controller?.kind !== "manager"
+      || typeof controller.manager?.sendRequest !== "function"
+    ) {
+      throw new Error("当前 Codex 不支持官方额度读取接口");
+    }
+    // Managed ChatGPT authentication, token refresh, credential-store access,
+    // and request serialization stay inside Codex's own AppServerManager.
+    return controller.manager.sendRequest("account/rateLimits/read");
+  };
+  window.__codeyReadAccountRateLimits = readAccountRateLimits;
+
   const completionProbeTargetStillCurrent = (sessionId, turnId) => (
     document.visibilityState !== "hidden"
     && isTaskRunning()

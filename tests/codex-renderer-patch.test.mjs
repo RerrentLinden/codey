@@ -243,6 +243,42 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     assert.equal(avatarOverlayManager.ensureWindowCalls, 0);
     await avatarOverlayManager.prepareRealtimePresentation();
     assert.equal(avatarOverlayManager.ensureWindowCalls, 1);
+    const splitPrewarmManagerSource = [
+      "class UnrelatedPrewarmCache{async prewarm(){return 42}}",
+      "class SplitPrewarmAvatarOverlayManager{",
+      "constructor(){this.window=null;this.openingWindowPromise=null;",
+      "this.isAppQuitting=false;this.windowVisibilitySequence=1;",
+      "this.ensureWindowCalls=0}",
+      "async ensureWindow(){this.ensureWindowCalls+=1;return {}}",
+      "async prewarm(e){",
+      "if(this.window!=null||this.openingWindowPromise!=null||this.isAppQuitting)return;",
+      "let t=this.windowVisibilitySequence;",
+      "let n=await this.ensureWindow(t);",
+      "n==null||t!==this.windowVisibilitySequence||this.positionWindow(n,e)}",
+      "positionWindow(){}",
+      "async prepareRealtimePresentation(){return this.ensureWindow()}",
+      "}",
+    ].join("");
+    const patchedSplitPrewarmManagerSource =
+      globalThis.__CODEY_PATCH_CODEX_AVATAR_OVERLAY_PREWARM__(
+        splitPrewarmManagerSource,
+      );
+    assert.match(
+      patchedSplitPrewarmManagerSource,
+      /async prewarm\(e\)\{return;if\(this\.window!=null/,
+    );
+    assert.match(
+      patchedSplitPrewarmManagerSource,
+      /class UnrelatedPrewarmCache\{async prewarm\(\)\{return 42\}\}/,
+    );
+    const SplitPrewarmAvatarOverlayManager = Function(
+      `${patchedSplitPrewarmManagerSource};return SplitPrewarmAvatarOverlayManager`,
+    )();
+    const splitPrewarmManager = new SplitPrewarmAvatarOverlayManager();
+    await splitPrewarmManager.prewarm({ x: 0, y: 0 });
+    assert.equal(splitPrewarmManager.ensureWindowCalls, 0);
+    await splitPrewarmManager.prepareRealtimePresentation();
+    assert.equal(splitPrewarmManager.ensureWindowCalls, 1);
     assert.equal(globalThis.__CODEY_CODEX_STARTUP_PATCH__.disablePet, true);
     assert.equal(
       Object.hasOwn(globalThis.__CODEY_CODEX_STARTUP_PATCH__, "petManagerSourceRemoved"),
