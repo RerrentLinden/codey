@@ -379,7 +379,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "38");
+  assert.equal(patch.version, "39");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -2229,6 +2229,82 @@ test("model picker menu groups models under route headings without changing mode
     model: "relay/gpt-5.6-sol",
     responsesapiClientMetadata: { codey_route: "relay" },
   });
+  runtime.patch.dispose();
+});
+
+test("an open model picker hides a route row removed by a hot catalog update", async () => {
+  const body = new FakeElementCore("body", { connected: true });
+  const menu = body.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menu" },
+  }));
+  const officialItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  officialItem.textContent = "[官] gpt-5.6-sol";
+  const deletedRouteItem = menu.appendChild(new FakeElementCore("div", {
+    attributes: { role: "menuitemradio" },
+  }));
+  deletedRouteItem.textContent = "[1] DeepSeek-V4-Flash-0731";
+
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "route-1/DeepSeek-V4-Flash-0731"],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [
+      {
+        model: "gpt-5.6-sol",
+        display_name: "[官] gpt-5.6-sol",
+        route_name: "OpenAI 官方直登",
+        provider_id: "openai",
+        source_model: "gpt-5.6-sol",
+      },
+      {
+        model: "route-1/DeepSeek-V4-Flash-0731",
+        display_name: "[1] DeepSeek-V4-Flash-0731",
+        route_name: "待删除线路",
+        provider_id: "codey_router",
+        route_provider_id: "route-1",
+        source_model: "DeepSeek-V4-Flash-0731",
+      },
+    ],
+  }, [statsigClient()], { documentBody: body });
+  runtime.patch.enhanceModelMenus();
+  assert.equal(deletedRouteItem.hasAttribute("hidden"), false);
+
+  // Simulate the native menu retaining its already-mounted row while the
+  // backend pushes the post-deletion catalog.
+  deletedRouteItem.textContent = "[1] DeepSeek-V4-Flash-0731";
+  delete deletedRouteItem.dataset.codeyRouteModel;
+  delete deletedRouteItem.dataset.codeyRouteName;
+  await runtime.patch.setCatalog({
+    status: "ok",
+    models: ["gpt-5.6-sol"],
+    default_model: "gpt-5.6-sol",
+    model_metadata: [{
+      model: "gpt-5.6-sol",
+      display_name: "[官] gpt-5.6-sol",
+      route_name: "OpenAI 官方直登",
+      provider_id: "openai",
+      source_model: "gpt-5.6-sol",
+    }],
+  });
+  runtime.patch.enhanceModelMenus();
+
+  assert.equal(officialItem.hasAttribute("hidden"), false);
+  assert.equal(deletedRouteItem.hasAttribute("hidden"), true);
+  assert.equal(deletedRouteItem.dataset.codeySupersededModel, "route-1/DeepSeek-V4-Flash-0731");
+  assert.deepEqual(
+    menu.children.filter((child) => child.dataset.codeyRouteHeading)
+      .map((heading) => heading.textContent),
+    ["OpenAI 官方直登"],
+  );
+
+  // A virtualized native row can be reused for a current model later. The
+  // stale marker must not leave that recycled row hidden.
+  deletedRouteItem.textContent = "[官] gpt-5.6-sol";
+  runtime.patch.enhanceModelMenus();
+  assert.equal(deletedRouteItem.hasAttribute("hidden"), false);
+  assert.equal(deletedRouteItem.dataset.codeyRouteModel, "gpt-5.6-sol");
   runtime.patch.dispose();
 });
 

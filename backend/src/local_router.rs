@@ -45,7 +45,7 @@ const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 const PROMPT_CACHE_KEY_HEADER: &str = "prompt-cache-key";
 const PROMPT_CACHE_KEY_COMPAT_HEADER: &str = "prompt_cache_key";
 const PROMPT_CACHE_KEY_BODY_FIELD: &str = "prompt_cache_key";
-const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
+pub(crate) const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -98,10 +98,10 @@ pub(crate) struct RuntimeRouterEndpoint {
     pub base_url: String,
     pub token: String,
     pub supports_websockets: bool,
-    /// Official ChatGPT routes are available this launch. Codex itself still
-    /// authenticates to this loopback provider with the router bearer token;
-    /// the gateway loads ChatGPT OAuth from `auth.json` when forwarding those
-    /// routes.
+    pub supports_remote_compaction: bool,
+    /// Official ChatGPT routes are available this launch. Codex keeps its
+    /// native OpenAI login for this provider; the independent router header
+    /// authenticates the loopback hop and the gateway isolates upstream auth.
     pub requires_openai_auth: bool,
 }
 
@@ -127,6 +127,7 @@ impl LocalRouter {
             base_url: format!("http://127.0.0.1:{port}/v1"),
             token,
             supports_websockets: config.runtime_supports_websockets(),
+            supports_remote_compaction: config.runtime_supports_remote_compaction(),
             requires_openai_auth: config.router_requires_openai_auth(),
         };
         let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));
@@ -342,6 +343,21 @@ struct RouterServer {
     official_auth_cache: Arc<Mutex<crate::account_usage::OfficialAuthCache>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponsesRequestKind {
+    Create,
+    Compact,
+}
+
+impl ResponsesRequestKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Create => "responses",
+            Self::Compact => "responses_compact",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct RouteBindings {
     routes: HashMap<String, RouteBinding>,
@@ -451,6 +467,7 @@ impl RouterSnapshot {
                 provider_id: provider_id.to_string(),
                 route_name: profile.name.trim().to_string(),
                 upstream_url: prepare_upstream_url(protocol, &base_url),
+                upstream_compact_url: prepare_upstream_compact_url(protocol, &base_url),
                 upstream_websocket_url: prepare_upstream_websocket_url(protocol, &base_url),
                 upstream_headers: prepare_upstream_headers(profile, protocol),
                 upstream_authority: upstream_authority(&base_url),
@@ -614,6 +631,7 @@ struct RouteTarget {
     provider_id: String,
     route_name: String,
     upstream_url: std::result::Result<String, String>,
+    upstream_compact_url: std::result::Result<String, String>,
     upstream_websocket_url: std::result::Result<String, String>,
     upstream_headers: std::result::Result<HeaderMap, String>,
     upstream_authority: String,
@@ -669,15 +687,7 @@ fn route_models(
     } else {
         config.enabled_route_models(provider_id)
     };
-    let supports_auto_review = profile.official_account
-        || config
-            .upstream_models_by_provider
-            .get(provider_id)
-            .is_some_and(|upstream_models| {
-                upstream_models
-                    .iter()
-                    .any(|model| model.eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL))
-            });
+    let supports_auto_review = profile.official_account || profile.supports_auto_review;
     if supports_auto_review
         && !models
             .iter()
@@ -790,7 +800,15 @@ impl RouterServer {
                     .await?;
             }
             ("POST", "/v1/responses") | ("POST", "/responses") => {
-                self.proxy_responses(request, stream).await?;
+                self.proxy_responses(request, stream, ResponsesRequestKind::Create)
+                    .await?;
+            }
+            ("POST", "/v1/responses/compact")
+            | ("POST", "/responses/compact")
+            | ("POST", "/v1/v1/responses/compact")
+            | ("POST", "/codex/v1/responses/compact") => {
+                self.proxy_responses(request, stream, ResponsesRequestKind::Compact)
+                    .await?;
             }
             _ => {
                 write_error_response(
@@ -1005,7 +1023,13 @@ impl RouterServer {
                     let result = ROUTER_REQUEST_ID
                         .scope(
                             request_id.clone(),
-                            self.proxy_parsed_responses(request, body, None, &mut downstream),
+                            self.proxy_parsed_responses(
+                                request,
+                                body,
+                                None,
+                                ResponsesRequestKind::Create,
+                                &mut downstream,
+                            ),
                         )
                         .await;
                     if let Err(error) = result {
@@ -1047,7 +1071,12 @@ impl RouterServer {
         Ok(())
     }
 
-    async fn proxy_responses(&self, mut request: HttpRequest, stream: TcpStream) -> Result<()> {
+    async fn proxy_responses(
+        &self,
+        mut request: HttpRequest,
+        stream: TcpStream,
+        request_kind: ResponsesRequestKind,
+    ) -> Result<()> {
         let encoded_body = std::mem::take(&mut request.body);
         let body = match serde_json::from_slice::<Value>(&encoded_body) {
             Ok(body) if body.is_object() => body,
@@ -1077,8 +1106,14 @@ impl RouterServer {
             }
         };
         let mut downstream = HttpResponsesDownstream::new(stream);
-        self.proxy_parsed_responses(request, body, Some(encoded_body), &mut downstream)
-            .await
+        self.proxy_parsed_responses(
+            request,
+            body,
+            Some(encoded_body),
+            request_kind,
+            &mut downstream,
+        )
+        .await
     }
 
     async fn proxy_parsed_responses<D>(
@@ -1086,6 +1121,7 @@ impl RouterServer {
         mut request: HttpRequest,
         mut body: Value,
         mut encoded_body: Option<Vec<u8>>,
+        request_kind: ResponsesRequestKind,
         downstream: &mut D,
     ) -> Result<()>
     where
@@ -1093,6 +1129,7 @@ impl RouterServer {
     {
         let downstream_websocket = downstream.is_websocket();
         if downstream_websocket {
+            debug_assert_eq!(request_kind, ResponsesRequestKind::Create);
             body.as_object_mut()
                 .expect("validated Responses body must remain an object")
                 .remove("stream_id");
@@ -1203,7 +1240,11 @@ impl RouterServer {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
-        let upstream_url = match &resolved.route.upstream_url {
+        let upstream_url = match request_kind {
+            ResponsesRequestKind::Create => &resolved.route.upstream_url,
+            ResponsesRequestKind::Compact => &resolved.route.upstream_compact_url,
+        };
+        let upstream_url = match upstream_url {
             Ok(upstream_url) => upstream_url.as_str(),
             Err(error) => {
                 downstream
@@ -1335,6 +1376,7 @@ impl RouterServer {
             );
         }
         if downstream_websocket
+            && request_kind == ResponsesRequestKind::Create
             && stream_requested
             && bridge == ProtocolBridge::NativeResponses
             && resolved.route.supports_websockets
@@ -1398,6 +1440,7 @@ impl RouterServer {
                         "upstream": resolved.route.upstream_authority.as_str(),
                         "upstreamProtocol": bridge.upstream_protocol().label(),
                         "protocolBridge": bridge.label(),
+                        "requestKind": request_kind.label(),
                         "requestId": current_router_request_id(),
                     }),
                 );
@@ -1443,6 +1486,7 @@ impl RouterServer {
                         "upstream": resolved.route.upstream_authority.as_str(),
                         "upstreamProtocol": bridge.upstream_protocol().label(),
                         "protocolBridge": bridge.label(),
+                        "requestKind": request_kind.label(),
                         "requestId": current_router_request_id(),
                     }),
                 );
@@ -2043,6 +2087,11 @@ fn responses_endpoint(base_url: &str) -> Result<String> {
     }
 }
 
+fn responses_compact_endpoint(base_url: &str) -> Result<String> {
+    let endpoint = responses_endpoint(base_url)?;
+    Ok(format!("{}/compact", endpoint.trim_end_matches('/')))
+}
+
 fn responses_websocket_endpoint(base_url: &str) -> Result<String> {
     let endpoint = responses_endpoint(base_url)?;
     let mut url = reqwest::Url::parse(&endpoint).context("解析 Responses WebSocket URL 失败")?;
@@ -2115,6 +2164,21 @@ fn prepare_upstream_url(
         let endpoint = protocol.endpoint_label();
         format!("{endpoint} 无效：{error:#}")
     })
+}
+
+fn prepare_upstream_compact_url(
+    protocol: UpstreamProtocol,
+    base_url: &str,
+) -> std::result::Result<String, String> {
+    if protocol == UpstreamProtocol::OpenAiResponses {
+        responses_compact_endpoint(base_url)
+            .map_err(|error| format!("Responses Compact API URL 无效：{error:#}"))
+    } else {
+        // CC Switch sends legacy compact requests through the same conversion
+        // and upstream endpoint as a normal Responses request for adapted
+        // Chat Completions and Anthropic routes.
+        prepare_upstream_url(protocol, base_url)
+    }
 }
 
 fn prepare_upstream_websocket_url(
@@ -8968,16 +9032,41 @@ mod tests {
     }
 
     #[test]
-    fn router_snapshot_enables_websocket_only_for_declared_responses_routes() {
+    fn router_snapshot_routes_compact_through_each_protocol_endpoint() {
         let (mut config, _, _) = router_config("https://relay.example/v1".into());
         config.profiles[0].supports_websockets = true;
         let responses = RouterSnapshot::from_config(&config);
         assert!(responses.routes["route-a"].supports_websockets);
+        assert_eq!(
+            responses.routes["route-a"]
+                .upstream_compact_url
+                .as_ref()
+                .unwrap(),
+            "https://relay.example/v1/responses/compact"
+        );
 
         config.profiles[0].upstream_protocol =
             crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
         let chat = RouterSnapshot::from_config(&config);
         assert!(!chat.routes["route-a"].supports_websockets);
+        assert_eq!(
+            chat.routes["route-a"]
+                .upstream_compact_url
+                .as_ref()
+                .unwrap(),
+            "https://relay.example/v1/chat/completions"
+        );
+
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES.into();
+        let anthropic = RouterSnapshot::from_config(&config);
+        assert_eq!(
+            anthropic.routes["route-a"]
+                .upstream_compact_url
+                .as_ref()
+                .unwrap(),
+            "https://relay.example/v1/messages"
+        );
     }
 
     #[allow(clippy::result_large_err)]
@@ -9854,6 +9943,10 @@ mod tests {
             &format!("{CHATGPT_CODEX_BASE_URL}/responses")
         );
         assert_eq!(
+            resolved.route.upstream_compact_url.as_ref().unwrap(),
+            &format!("{CHATGPT_CODEX_BASE_URL}/responses/compact")
+        );
+        assert_eq!(
             resolved.route.upstream_websocket_url.as_ref().unwrap(),
             &format!(
                 "{}/responses",
@@ -9886,10 +9979,7 @@ mod tests {
     fn auto_review_uses_a_capable_bound_route_and_otherwise_prefers_official() {
         let (mut config, third_party_provider, _) =
             router_config("https://relay.example/v1".to_string());
-        config.upstream_models_by_provider.insert(
-            third_party_provider.clone(),
-            vec![CODEX_AUTO_REVIEW_MODEL.into()],
-        );
+        config.profiles[0].supports_auto_review = true;
         let mut official = ProviderProfile::new("OpenAI 官方直登");
         official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
         official.source_provider_id = Some("openai".into());
@@ -9915,7 +10005,10 @@ mod tests {
 
     #[test]
     fn auto_review_is_not_invented_for_an_unsupported_third_party_route() {
-        let (config, _, _) = router_config("https://relay.example/v1".to_string());
+        let (mut config, provider_id, _) = router_config("https://relay.example/v1".to_string());
+        config
+            .upstream_models_by_provider
+            .insert(provider_id, vec![CODEX_AUTO_REVIEW_MODEL.into()]);
 
         assert!(
             RouterSnapshot::from_config(&config)
@@ -10513,6 +10606,14 @@ mod tests {
         assert_eq!(
             responses_endpoint("https://relay.example/v1").unwrap(),
             "https://relay.example/v1/responses"
+        );
+        assert_eq!(
+            responses_compact_endpoint("https://relay.example/v1/responses").unwrap(),
+            "https://relay.example/v1/responses/compact"
+        );
+        assert_eq!(
+            responses_compact_endpoint("https://relay.example/v1").unwrap(),
+            "https://relay.example/v1/responses/compact"
         );
     }
 
@@ -12007,6 +12108,179 @@ mod tests {
         assert_eq!(responses["output"][1]["arguments"], "{\"q\":1}");
         assert_eq!(responses["usage"]["input_tokens"], 4);
         assert_eq!(responses["usage"]["output_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn responses_compact_restores_route_identity_and_proxies_the_window_unchanged() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let compacted_window = br#"{ "model":"provider-model", "input":[{"type":"compaction","encrypted_content":"opaque-window"}] }"#.to_vec();
+        let expected_window = compacted_window.clone();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let authorization = incoming_header(&request, "authorization").map(str::to_string);
+            let account_id =
+                incoming_header(&request, CHATGPT_ACCOUNT_ID_HEADER).map(str::to_string);
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        compacted_window.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&compacted_window).await.unwrap();
+            (request.path, authorization, account_id, body)
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1/responses"));
+        config.profiles[0].supports_remote_compaction = true;
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        assert!(endpoint.supports_remote_compaction);
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses/compact", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .header(CHATGPT_ACCOUNT_ID_HEADER, "acct-must-not-leak")
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "input": [{"role":"user","content":"full context"}],
+                "client_metadata": {
+                    ROUTE_METADATA_KEY: provider_id,
+                    "keep": "metadata"
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), expected_window);
+        let (path, authorization, account_id, body) = upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/responses/compact");
+        assert_eq!(authorization.as_deref(), Some("Bearer sk-upstream"));
+        assert!(account_id.is_none());
+        assert_eq!(body["model"], model);
+        assert_eq!(body["client_metadata"]["keep"], "metadata");
+        assert!(body["client_metadata"].get(ROUTE_METADATA_KEY).is_none());
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_v2_compaction_trigger_passes_through_the_native_route() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"compaction\",\"id\":\"cmp_1\",\"encrypted_content\":\"opaque-window\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compact\",\"object\":\"response\",\"output\":[{\"type\":\"compaction\",\"id\":\"cmp_1\",\"encrypted_content\":\"opaque-window\"}]}}\n\n"
+        );
+        let expected_sse = sse.to_string();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            (request.path, body)
+        });
+        let (config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1/responses"));
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "input": [
+                    {"role":"user","content":"full context"},
+                    {"type":"compaction_trigger"}
+                ],
+                "stream": true
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), expected_sse);
+        let (path, body) = upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/responses");
+        assert_eq!(body["model"], model);
+        assert_eq!(body["input"][1]["type"], "compaction_trigger");
+        router.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn responses_compact_uses_the_chat_conversion_pipeline() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+            write_json_response(
+                &mut stream,
+                200,
+                &json!({
+                    "id":"chatcmpl-compact",
+                    "created":123,
+                    "model":body["model"],
+                    "choices":[{
+                        "message":{"role":"assistant","content":"compacted context"},
+                        "finish_reason":"stop"
+                    }],
+                    "usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}
+                }),
+            )
+            .await
+            .unwrap();
+            (request.path, body)
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        assert!(!endpoint.supports_remote_compaction);
+
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses/compact", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model": model_alias(&provider_id, &model),
+                "input": "full context"
+            }))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["output_text"],
+            "compacted context"
+        );
+        let (path, body) = upstream_task.await.unwrap();
+        assert_eq!(path, "/v1/chat/completions");
+        assert_eq!(body["model"], model);
+        assert_eq!(body["messages"][0]["content"], "full context");
+        router.stop().await.unwrap();
     }
 
     #[tokio::test]

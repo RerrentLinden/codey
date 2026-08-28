@@ -205,6 +205,8 @@ export function App({
     customModelInput,
     modelInputError,
     modelSyncWarning,
+    draftAutoReviewSupported,
+    setDraftAutoReviewSupported,
     draftModelSet,
     draftManualThirdPartyModelKeys,
     thirdPartyModelOptions,
@@ -580,6 +582,8 @@ export function App({
           { ...result.routeModelState, officialModels: [] },
           "",
           savedRoute.id,
+          result.config.profiles.find((profile) => profile.id === savedRoute.id)
+            ?.supportsAutoReview === true,
         );
         setNotice({
           tone: "success",
@@ -591,6 +595,7 @@ export function App({
           thirdPartyRouteModelState(savedConfig, savedRoute, modelState),
           warning,
           savedRoute.id,
+          savedRoute.supportsAutoReview === true,
         );
         setNotice({
           tone: "error",
@@ -1276,6 +1281,7 @@ export function App({
         customModelInput={customModelInput}
         modelInputError={modelInputError}
         modelSyncWarning={modelSyncWarning}
+        autoReviewSupported={draftAutoReviewSupported}
         thirdPartyModelOptions={thirdPartyModelOptions}
         modelState={modelEditorState}
         draftModelSet={draftModelSet}
@@ -1285,6 +1291,7 @@ export function App({
         onAddCustomModel={addCustomModel}
         onToggleDraftModel={toggleDraftModel}
         onDeleteThirdPartyModel={deleteDraftThirdPartyModel}
+        onAutoReviewSupportedChange={setDraftAutoReviewSupported}
         onSave={saveModelSelection}
       />
 

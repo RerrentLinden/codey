@@ -14,6 +14,7 @@ import type {
   RuntimeStatus,
 } from "./App.types";
 import {
+  AUTO_REVIEW_MODEL,
   includesModelId,
   modelKey,
   partitionModelIdsByKey,
@@ -25,13 +26,15 @@ import { buildSubagentModelOptions } from "./subagentModels";
 const MAX_MODEL_ID_BYTES = 512;
 const MAX_MODEL_COUNT = 10_000;
 const modelIdEncoder = new TextEncoder();
+const AUTO_REVIEW_MODEL_KEY = modelKey(AUTO_REVIEW_MODEL);
 
-const pickerSelection = (state: ModelState) => [
-  ...state.officialModels
-    .filter((model) => model.supported)
-    .map((model) => model.slug),
-  ...state.thirdPartyModels,
-];
+const pickerSelection = (state: ModelState) =>
+  [
+    ...state.officialModels
+      .filter((model) => model.supported)
+      .map((model) => model.slug),
+    ...state.thirdPartyModels,
+  ].filter((model) => modelKey(model) !== AUTO_REVIEW_MODEL_KEY);
 
 type UseModelSelectionOptions = {
   config: Config | null;
@@ -78,6 +81,7 @@ export function useModelSelection({
   const [customModelInput, setCustomModelInput] = useState("");
   const [modelInputError, setModelInputError] = useState("");
   const [modelSyncWarning, setModelSyncWarning] = useState("");
+  const [draftAutoReviewSupported, setDraftAutoReviewSupported] = useState(false);
 
   const modelEditorState = modelPickerState ?? modelState;
   const officialSlugKeys = useMemo(
@@ -115,6 +119,7 @@ export function useModelSelection({
         const key = modelKey(normalized);
         if (
           normalized &&
+          key !== AUTO_REVIEW_MODEL_KEY &&
           !officialSlugKeys.has(key) &&
           !deletedThirdPartyModelKeys.has(key) &&
           !seenKeys.has(key)
@@ -147,6 +152,7 @@ export function useModelSelection({
     state: ModelState,
     warning = "",
     routeId: string | null = null,
+    autoReviewSupported = false,
   ) => {
     setDraftModels(pickerSelection(state));
     setDraftManualThirdPartyModels(state.manualThirdPartyModels);
@@ -156,6 +162,7 @@ export function useModelSelection({
     setModelSyncWarning(warning);
     setModelPickerRouteId(routeId);
     setModelPickerState(state);
+    setDraftAutoReviewSupported(autoReviewSupported);
     setModelPickerVisible(true);
   }, []);
 
@@ -188,6 +195,12 @@ export function useModelSelection({
     const model = customModelInput.trim();
     if (!model) {
       setModelInputError("请输入要添加的模型 ID");
+      return;
+    }
+    if (modelKey(model) === AUTO_REVIEW_MODEL_KEY) {
+      setModelInputError(
+        `${AUTO_REVIEW_MODEL} 是线路能力，请使用上方 Auto Review 开关`,
+      );
       return;
     }
     if (modelIdEncoder.encode(model).byteLength > MAX_MODEL_ID_BYTES) {
@@ -268,6 +281,7 @@ export function useModelSelection({
     thirdPartyModels: string[],
     manualThirdPartyModels: string[],
     deletedModels: string[],
+    supportsAutoReview: boolean,
     summary: string,
     closePicker: boolean,
   ) => {
@@ -279,6 +293,7 @@ export function useModelSelection({
       thirdPartyModels,
       manualThirdPartyModels,
       deletedThirdPartyModels: deletedModels,
+      supportsAutoReview,
       routeId: modelPickerRouteId,
     });
     setPersistedConfig(result.config);
@@ -344,6 +359,7 @@ export function useModelSelection({
         thirdPartyModels,
         manualThirdPartyModels,
         deletedThirdPartyModels,
+        draftAutoReviewSupported,
         `已更新模型声明：${thirdPartyModels.length} 个线路模型`,
         true,
       );
@@ -353,6 +369,7 @@ export function useModelSelection({
     deletedThirdPartyModels,
     draftManualThirdPartyModels,
     draftModels,
+    draftAutoReviewSupported,
     officialSlugKeys,
     runOperation,
   ]);
@@ -367,6 +384,8 @@ export function useModelSelection({
     customModelInput,
     modelInputError,
     modelSyncWarning,
+    draftAutoReviewSupported,
+    setDraftAutoReviewSupported,
     draftModelSet,
     draftManualThirdPartyModelKeys,
     manualThirdPartyModelKeys,

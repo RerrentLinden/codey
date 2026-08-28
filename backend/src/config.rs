@@ -52,6 +52,11 @@ pub struct ProviderProfile {
     /// routes remain disabled unless the user explicitly opts in.
     #[serde(default)]
     pub supports_websockets: bool,
+    /// Whether this route can serve Codex's hidden automatic review model.
+    /// Official ChatGPT-account routes normalize to enabled; third-party
+    /// routes remain disabled unless synchronization or the user enables it.
+    #[serde(default)]
+    pub supports_auto_review: bool,
 }
 
 pub const DERIVED_OFFICIAL_PROFILE_ID: &str = "codey-official-account";
@@ -119,6 +124,7 @@ impl ProviderProfile {
             official_account: false,
             supports_remote_compaction: false,
             supports_websockets: false,
+            supports_auto_review: false,
         }
     }
 
@@ -178,6 +184,7 @@ impl ProviderProfile {
             self.api_key.clear();
             self.supports_remote_compaction = true;
             self.supports_websockets = true;
+            self.supports_auto_review = true;
             self.upstream_protocol = UPSTREAM_PROTOCOL_OFFICIAL.to_string();
             self.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
         } else {
@@ -818,7 +825,11 @@ impl CodeyConfig {
             .map(Vec::as_slice)
             .unwrap_or_default();
         model_id::dedupe_preserving_first(
-            selected.iter().chain(declared.iter()).map(String::as_str),
+            selected
+                .iter()
+                .chain(declared.iter())
+                .map(String::as_str)
+                .filter(|model| !model_id::equal(model, local_router::CODEX_AUTO_REVIEW_MODEL)),
         )
     }
 
@@ -832,10 +843,10 @@ impl CodeyConfig {
 
     /// Whether official ChatGPT routes can be served this launch.
     ///
-    /// This does **not** put Codex into ChatGPT-account transport. The
-    /// loopback `codey_router` provider always uses a bearer token; the
-    /// gateway loads ChatGPT OAuth from `auth.json` only when forwarding
-    /// official routes.
+    /// The loopback provider keeps Codex's native OpenAI authentication when
+    /// an official route is available. A separate Codey-only header protects
+    /// the local gateway, which still replaces authentication per route before
+    /// forwarding third-party traffic.
     pub(crate) fn router_requires_openai_auth(&self) -> bool {
         self.official_account_available_this_launch
             && self.profiles.iter().any(|profile| profile.official_account)
@@ -879,6 +890,48 @@ impl CodeyConfig {
 
     pub(crate) fn runtime_supports_websockets(&self) -> bool {
         !self.runtime_websocket_model_aliases().is_empty()
+    }
+
+    /// Whether one route can use the standalone Responses compact endpoint in
+    /// this launch. Adapted Chat/Anthropic routes cannot emulate the compacted
+    /// Responses window without changing its semantics.
+    pub(crate) fn route_supports_remote_compaction_this_launch(
+        &self,
+        profile: &ProviderProfile,
+    ) -> bool {
+        if profile.official_account {
+            return self.official_account_available_this_launch;
+        }
+        profile.supports_remote_compaction
+            && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+    }
+
+    /// For a third-party-only router, advertise the OpenAI provider identity
+    /// only when every runtime route explicitly supports native compaction.
+    /// Official-account routing follows Codex's native OpenAI capability path
+    /// independently via `router_requires_openai_auth`.
+    pub(crate) fn runtime_supports_remote_compaction(&self) -> bool {
+        if self.router_requires_openai_auth() {
+            return true;
+        }
+        let mut has_runtime_route = false;
+        for profile in &self.profiles {
+            if profile.provider_id().trim().is_empty() {
+                continue;
+            }
+            if profile.official_account {
+                if !self.official_account_available_this_launch {
+                    continue;
+                }
+            } else if profile.normalized_base_url().is_empty() {
+                continue;
+            }
+            has_runtime_route = true;
+            if !self.route_supports_remote_compaction_this_launch(profile) {
+                return false;
+            }
+        }
+        has_runtime_route
     }
 
     pub fn manual_third_party_models(&self) -> &[String] {
@@ -1347,7 +1400,12 @@ fn normalize_upstream_model_lists(lists: &mut BTreeMap<String, Vec<String>>) {
 }
 
 fn normalize_model_list(models: &mut Vec<String>) {
-    *models = model_id::dedupe_preserving_first(models.iter().map(String::as_str));
+    *models = model_id::dedupe_preserving_first(
+        models
+            .iter()
+            .map(String::as_str)
+            .filter(|model| !model_id::equal(model, local_router::CODEX_AUTO_REVIEW_MODEL)),
+    );
 }
 
 fn official_models_by_key() -> BTreeMap<String, String> {
@@ -2002,6 +2060,7 @@ mod tests {
         }))
         .unwrap();
         assert!(!legacy.supports_websockets);
+        assert!(!legacy.supports_auto_review);
 
         let mut chat = ProviderProfile::new("Chat Relay");
         chat.base_url = "https://gateway.example/v1".into();
@@ -2027,8 +2086,40 @@ mod tests {
         official.normalize();
         assert!(official.official_account);
         assert!(official.supports_websockets);
+        assert!(official.supports_auto_review);
         assert_eq!(official.upstream_protocol, UPSTREAM_PROTOCOL_OFFICIAL);
         assert!(official.validate().is_ok());
+    }
+
+    #[test]
+    fn auto_review_is_filtered_from_regular_model_state() {
+        let mut config = CodeyConfig::default();
+        let provider_id = config.current_provider_id().unwrap().to_string();
+        let models = vec![
+            "provider-model".to_string(),
+            local_router::CODEX_AUTO_REVIEW_MODEL.to_string(),
+        ];
+        config
+            .selected_models_by_provider
+            .insert(provider_id.clone(), models.clone());
+        config
+            .manual_third_party_models_by_provider
+            .insert(provider_id.clone(), models.clone());
+        config
+            .upstream_models_by_provider
+            .insert(provider_id.clone(), models);
+
+        let normalized = config.normalize();
+
+        assert_eq!(
+            normalized.enabled_route_models(&provider_id),
+            ["provider-model"]
+        );
+        assert_eq!(
+            normalized.upstream_models_by_provider[&provider_id],
+            ["provider-model"]
+        );
+        assert!(!normalized.profiles[0].supports_auto_review);
     }
 
     #[test]
@@ -2275,6 +2366,67 @@ mod tests {
                 local_router::model_alias("route-ws", "ws-only"),
             ]
         );
+    }
+
+    #[test]
+    fn remote_compaction_is_advertised_only_when_every_runtime_route_supports_it() {
+        let mut capable = ProviderProfile::new("Responses Route");
+        capable.id = "route-capable".into();
+        capable.base_url = "https://responses.example/v1".into();
+        capable.api_key = "responses-key".into();
+        capable.supports_remote_compaction = true;
+        capable.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: capable.id.clone(),
+            profiles: vec![capable],
+            ..CodeyConfig::default()
+        }
+        .normalize();
+        assert!(config.runtime_supports_remote_compaction());
+
+        let mut unsupported = ProviderProfile::new("Chat Route");
+        unsupported.id = "route-chat".into();
+        unsupported.base_url = "https://chat.example/v1".into();
+        unsupported.api_key = "chat-key".into();
+        unsupported.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        unsupported.supports_remote_compaction = true;
+        unsupported.normalize();
+        config.profiles.push(unsupported);
+        assert!(!config.runtime_supports_remote_compaction());
+    }
+
+    #[test]
+    fn official_remote_compaction_requires_the_account_this_launch() {
+        let mut official = ProviderProfile::new("OpenAI 官方直登");
+        official.id = DERIVED_OFFICIAL_PROFILE_ID.into();
+        official.source_provider_id = Some("openai".into());
+        official.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+        let mut config = CodeyConfig {
+            active_profile_id: official.id.clone(),
+            profiles: vec![official],
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        }
+        .normalize();
+
+        assert!(config.runtime_supports_remote_compaction());
+
+        let mut chat = ProviderProfile::new("Chat Relay");
+        chat.id = "chat-route".into();
+        chat.base_url = "https://chat.example/v1".into();
+        chat.api_key = "chat-key".into();
+        chat.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        chat.normalize();
+        config.profiles.push(chat);
+        assert!(
+            config.runtime_supports_remote_compaction(),
+            "CC Switch-compatible official identity must survive mixed routes"
+        );
+
+        config.official_account_available_this_launch = false;
+        assert!(!config.runtime_supports_remote_compaction());
     }
 
     #[test]

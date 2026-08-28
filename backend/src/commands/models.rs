@@ -203,6 +203,29 @@ fn selected_models_not_in_upstream(
         .collect()
 }
 
+fn models_support_auto_review(models: &[String]) -> bool {
+    models
+        .iter()
+        .any(|model| model_id::equal(model, local_router::CODEX_AUTO_REVIEW_MODEL))
+}
+
+fn regular_route_models(models: Vec<String>) -> Vec<String> {
+    models
+        .into_iter()
+        .filter(|model| !model_id::equal(model, local_router::CODEX_AUTO_REVIEW_MODEL))
+        .collect()
+}
+
+fn set_provider_auto_review_support(config: &mut CodeyConfig, provider_id: &str, supported: bool) {
+    if let Some(profile) = config
+        .profiles
+        .iter_mut()
+        .find(|profile| profile.provider_id() == provider_id && !profile.official_account)
+    {
+        profile.supports_auto_review = supported;
+    }
+}
+
 fn config_with_current_provider_model_sync(
     config: &CodeyConfig,
     provider_models: Vec<String>,
@@ -212,6 +235,8 @@ fn config_with_current_provider_model_sync(
     let Some(provider_id) = config.current_provider_id().map(ToString::to_string) else {
         return config.clone();
     };
+    let supports_auto_review = models_support_auto_review(&provider_models);
+    let provider_models = regular_route_models(provider_models);
     let manual_models = if synced {
         selected_models_not_in_upstream(config.selected_models(), &provider_models)
     } else {
@@ -224,6 +249,9 @@ fn config_with_current_provider_model_sync(
     };
     preserve_declared_official_models(&mut supported_models, config.declared_official_models());
     let mut next = config.clone();
+    if synced {
+        set_provider_auto_review_support(&mut next, &provider_id, supports_auto_review);
+    }
     next.upstream_models_by_provider
         .insert(provider_id.clone(), supported_models);
     if manual_models.is_empty() {
@@ -543,6 +571,7 @@ pub async fn fetch_route_models(
     let fetched_models = fetch_provider_models(profile, &state.http_client)
         .await
         .map_err(|error| error.to_string())?;
+    let visible_fetched_models = regular_route_models(fetched_models.clone());
     let _config_write_guard = state.config_write_lock.lock().await;
     let mut latest = state.config.read().await.clone();
     ensure_route_revision(&latest, expected_revision)?;
@@ -576,7 +605,7 @@ pub async fn fetch_route_models(
             "status":"ok",
             "config": redacted_config(&latest),
             "providerStatus": codex_provider::status_from_config(&latest),
-            "models": fetched_models,
+            "models": visible_fetched_models,
             "modelState": model_state,
             "routeModelState": route_model_state,
             "restartRequired": restart_required,
@@ -598,6 +627,8 @@ fn config_with_provider_model_sync(
     provider_models: Vec<String>,
     codex_home: &std::path::Path,
 ) -> CodeyConfig {
+    let supports_auto_review = models_support_auto_review(&provider_models);
+    let provider_models = regular_route_models(provider_models);
     let selected_models = config
         .selected_models_by_provider
         .get(provider_id)
@@ -614,6 +645,7 @@ fn config_with_provider_model_sync(
     preserve_declared_official_models(&mut supported_models, declared_models);
 
     let mut next = config.clone();
+    set_provider_auto_review_support(&mut next, provider_id, supports_auto_review);
     next.upstream_models_by_provider
         .insert(provider_id.to_string(), supported_models);
     if manual_models.is_empty() {
@@ -636,6 +668,7 @@ pub async fn save_selected_models(
     requested_third_party_models: Vec<String>,
     requested_manual_third_party_models: Vec<String>,
     requested_deleted_third_party_models: Vec<String>,
+    requested_supports_auto_review: Option<bool>,
     requested_route_id: Option<String>,
 ) -> Result<Value, String> {
     validate_requested_model_list_bounds("官方模型", &requested_official_models)?;
@@ -648,6 +681,10 @@ pub async fn save_selected_models(
         "待删除的其他模型",
         &requested_deleted_third_party_models,
     )?;
+    validate_regular_route_model_list("官方模型", &requested_official_models)?;
+    validate_regular_route_model_list("其他模型", &requested_third_party_models)?;
+    validate_regular_route_model_list("手动添加的其他模型", &requested_manual_third_party_models)?;
+    validate_regular_route_model_list("待删除的其他模型", &requested_deleted_third_party_models)?;
     let _config_write_guard = state.config_write_lock.lock().await;
     let mut config = state.config.read().await.clone();
     let target_route_id = requested_route_id
@@ -711,6 +748,9 @@ pub async fn save_selected_models(
         &deleted_third_party_model_keys,
     );
     preserve_selected_third_party_models_except(&mut supported_models, &selected, &HashSet::new());
+    if let Some(supported) = requested_supports_auto_review {
+        set_provider_auto_review_support(&mut config, &provider_id, supported);
+    }
     config
         .upstream_models_by_provider
         .insert(provider_id.clone(), supported_models);
@@ -785,6 +825,19 @@ fn validate_requested_model_list_bounds(label: &str, models: &[String]) -> Resul
         return Err(format!(
             "{label} ID 超过安全上限 {} 字节",
             provider_models::MAX_PROVIDER_MODEL_ID_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn validate_regular_route_model_list(label: &str, models: &[String]) -> Result<(), String> {
+    if models
+        .iter()
+        .any(|model| model_id::equal(model, local_router::CODEX_AUTO_REVIEW_MODEL))
+    {
+        return Err(format!(
+            "{label}不能包含 {}；请使用 Auto Review 线路能力开关",
+            local_router::CODEX_AUTO_REVIEW_MODEL
         ));
     }
     Ok(())
@@ -1157,6 +1210,7 @@ pub(super) fn provider_route_requires_restart(
 ) -> bool {
     provider_route_snapshots(applied) != provider_route_snapshots(current)
         || websocket_transport_requires_restart(applied, current)
+        || remote_compaction_transport_requires_restart(applied, current)
 }
 
 pub(super) fn websocket_transport_requires_restart(
@@ -1167,11 +1221,20 @@ pub(super) fn websocket_transport_requires_restart(
         || applied.runtime_websocket_model_aliases() != current.runtime_websocket_model_aliases()
 }
 
+pub(super) fn remote_compaction_transport_requires_restart(
+    applied: &CodeyConfig,
+    current: &CodeyConfig,
+) -> bool {
+    applied.runtime_supports_remote_compaction() != current.runtime_supports_remote_compaction()
+}
+
 pub(super) fn runtime_supports_current_routes_for_hot_reload(
     applied: &CodeyConfig,
     current: &CodeyConfig,
 ) -> bool {
-    if websocket_transport_requires_restart(applied, current) {
+    if websocket_transport_requires_restart(applied, current)
+        || remote_compaction_transport_requires_restart(applied, current)
+    {
         return false;
     }
     let applied = official_route_snapshots(applied);
@@ -1942,6 +2005,68 @@ mod tests {
     }
 
     #[test]
+    fn successful_provider_sync_replaces_auto_review_capability() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = CodeyConfig::default();
+        let provider_id = config.current_provider_id().unwrap().to_string();
+
+        let supported = config_with_current_provider_model_sync(
+            &config,
+            vec![
+                "provider-model".into(),
+                local_router::CODEX_AUTO_REVIEW_MODEL.into(),
+            ],
+            true,
+            home.path(),
+        );
+        assert!(supported.profiles[0].supports_auto_review);
+        assert_eq!(
+            supported.upstream_models_by_provider[&provider_id],
+            ["provider-model"]
+        );
+
+        config = supported;
+        let unsupported = config_with_current_provider_model_sync(
+            &config,
+            vec!["provider-model".into()],
+            true,
+            home.path(),
+        );
+        assert!(!unsupported.profiles[0].supports_auto_review);
+    }
+
+    #[test]
+    fn failed_provider_sync_preserves_auto_review_capability() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = CodeyConfig::default();
+        let provider_id = config.current_provider_id().unwrap().to_string();
+        config.profiles[0].supports_auto_review = true;
+        config
+            .upstream_models_by_provider
+            .insert(provider_id, vec!["saved-model".into()]);
+
+        let fallback = config_with_current_provider_model_sync(
+            &config,
+            vec!["saved-model".into()],
+            false,
+            home.path(),
+        );
+
+        assert!(fallback.profiles[0].supports_auto_review);
+    }
+
+    #[test]
+    fn auto_review_cannot_be_saved_as_a_regular_model() {
+        let error = validate_regular_route_model_list(
+            "其他模型",
+            &[local_router::CODEX_AUTO_REVIEW_MODEL.into()],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("Auto Review 线路能力开关"));
+    }
+
+    #[test]
     fn provider_sync_preserves_only_user_declared_official_models() {
         let home = tempfile::tempdir().unwrap();
         let mut config = CodeyConfig::default();
@@ -2294,6 +2419,33 @@ mod tests {
 
         assert!(websocket_transport_requires_restart(&enabled, &applied));
         assert!(!runtime_supports_current_routes_for_hot_reload(
+            &enabled, &applied
+        ));
+    }
+
+    #[test]
+    fn remote_compaction_identity_changes_require_restart_and_stop_hot_reload() {
+        let mut route = crate::config::ProviderProfile::new("Responses Route");
+        route.id = "route-a".into();
+        route.base_url = "https://route-a.example/v1".into();
+        route.api_key = "route-a-secret".into();
+        route.normalize();
+        let applied = CodeyConfig {
+            active_profile_id: route.id.clone(),
+            profiles: vec![route],
+            ..CodeyConfig::default()
+        };
+        let mut enabled = applied.clone();
+        enabled.profiles[0].supports_remote_compaction = true;
+
+        assert!(remote_compaction_transport_requires_restart(
+            &applied, &enabled
+        ));
+        assert!(provider_route_requires_restart(&applied, &enabled));
+        assert!(!runtime_supports_current_routes_for_hot_reload(
+            &applied, &enabled
+        ));
+        assert!(remote_compaction_transport_requires_restart(
             &enabled, &applied
         ));
     }

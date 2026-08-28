@@ -21,6 +21,7 @@ export type Profile = {
   officialAccount: boolean;
   supportsRemoteCompaction?: boolean;
   supportsWebsockets?: boolean;
+  supportsAutoReview?: boolean;
 };
 
 export type PromptOptimizationConfig = {

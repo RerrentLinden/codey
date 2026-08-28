@@ -5,6 +5,7 @@ import "@mantine/core/styles.css";
 import { App } from "./App";
 import type { ProviderStatus, Config, ModelState, Profile } from "./App.types";
 import {
+  AUTO_REVIEW_MODEL,
   includesModelId,
   modelIdsEqual,
   modelKey,
@@ -57,6 +58,7 @@ if (import.meta.env.DEV) {
           sourceProviderId: "primary",
           officialAccount: false,
           supportsRemoteCompaction: false,
+          supportsAutoReview: false,
         },
         {
           id: "backup",
@@ -71,6 +73,7 @@ if (import.meta.env.DEV) {
           sourceProviderId: "backup",
           officialAccount: false,
           supportsRemoteCompaction: false,
+          supportsAutoReview: false,
         },
       ],
       webhook: {
@@ -489,13 +492,25 @@ if (import.meta.env.DEV) {
         const route = previewConfig.profiles.find((profile) => profile.id === routeId);
         if (!route) return { status: "failed", message: "找不到要同步模型的线路" };
         const providerId = routeProviderId(route);
-        const models = uniqueModelIds([
+        const fetchedModels = uniqueModelIds([
           ...previewUpstreamModels,
           ...(providerId === "backup" ? ["claude-sonnet-4-5"] : []),
         ]);
+        const supportsAutoReview = includesModelId(
+          fetchedModels,
+          AUTO_REVIEW_MODEL,
+        );
+        const models = fetchedModels.filter(
+          (model) => !modelIdsEqual(model, AUTO_REVIEW_MODEL),
+        );
         previewConfig = {
           ...previewConfig,
           settingsRevision: previewConfig.settingsRevision + 1,
+          profiles: previewConfig.profiles.map((profile) =>
+            profile.id === routeId
+              ? { ...profile, supportsAutoReview }
+              : profile,
+          ),
           upstreamModelsByProvider: {
             ...previewConfig.upstreamModelsByProvider,
             [providerId]: models,
@@ -573,19 +588,32 @@ if (import.meta.env.DEV) {
         const officialModels = (args.officialModels as string[]) || [];
         const thirdPartyModels = (args.thirdPartyModels as string[]) || [];
         const manualThirdPartyModels = (args.manualThirdPartyModels as string[]) || [];
+        const supportsAutoReview =
+          typeof args.supportsAutoReview === "boolean"
+            ? args.supportsAutoReview
+            : targetProfile?.supportsAutoReview === true;
         const supportedModels = uniqueModelIds([
           ...officialModels,
           ...thirdPartyModels,
-        ]);
+        ]).filter((model) => !modelIdsEqual(model, AUTO_REVIEW_MODEL));
         previewConfig = {
           ...previewConfig,
+          profiles: previewConfig.profiles.map((profile) =>
+            profile.id === targetProfile?.id
+              ? { ...profile, supportsAutoReview }
+              : profile,
+          ),
           selectedModelsByProvider: {
             ...previewConfig.selectedModelsByProvider,
-            [providerId]: thirdPartyModels,
+            [providerId]: thirdPartyModels.filter(
+              (model) => !modelIdsEqual(model, AUTO_REVIEW_MODEL),
+            ),
           },
           manualThirdPartyModelsByProvider: {
             ...previewConfig.manualThirdPartyModelsByProvider,
-            [providerId]: manualThirdPartyModels,
+            [providerId]: manualThirdPartyModels.filter(
+              (model) => !modelIdsEqual(model, AUTO_REVIEW_MODEL),
+            ),
           },
           declaredOfficialModelsByProvider: {
             ...previewConfig.declaredOfficialModelsByProvider,

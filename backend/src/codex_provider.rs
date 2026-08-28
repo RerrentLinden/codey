@@ -328,6 +328,7 @@ fn profile_from_provider(
         official_account: provider.official,
         supports_remote_compaction: provider.supports_remote_compaction,
         supports_websockets: provider.official,
+        supports_auto_review: provider.official,
     }
 }
 

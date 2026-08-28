@@ -279,7 +279,9 @@ fn session_event_state_changed(
             .iter()
             .zip(current.aborted_turns.iter())
             .any(|(left, right)| {
-                left.session_id != right.session_id || left.turn_id != right.turn_id
+                left.session_id != right.session_id
+                    || left.turn_id != right.turn_id
+                    || left.is_snapshot_replay != right.is_snapshot_replay
             })
         || previous.completed_turns.len() != current.completed_turns.len()
         || previous
@@ -2446,6 +2448,7 @@ mod tests {
             aborted_turns: Arc::new(vec![AbortedTurn {
                 session_id: "session-1".to_string(),
                 turn_id: "turn-1".to_string(),
+                is_snapshot_replay: false,
             }]),
             ..RecentSessionEvents::default()
         };

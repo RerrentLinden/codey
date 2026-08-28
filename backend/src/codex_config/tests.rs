@@ -48,10 +48,7 @@ fn assert_runtime_disk_provider(document: &DocumentMut, base_url: &str, token: &
     let router = document["model_providers"][local_router::ROUTER_PROVIDER_ID]
         .as_table_like()
         .expect("codey_router runtime disk provider");
-    assert_eq!(
-        router.get("name").and_then(Item::as_str),
-        Some("Codey Local Router")
-    );
+    assert_eq!(router.get("name").and_then(Item::as_str), Some("OpenAI"));
     assert_eq!(
         router.get("base_url").and_then(Item::as_str),
         Some(base_url)
@@ -62,18 +59,13 @@ fn assert_runtime_disk_provider(document: &DocumentMut, base_url: &str, token: &
     );
     assert_eq!(
         router.get("requires_openai_auth").and_then(Item::as_bool),
-        Some(false)
+        Some(true)
     );
     assert_eq!(
         router.get("supports_websockets").and_then(Item::as_bool),
         Some(false)
     );
-    assert_eq!(
-        router
-            .get("experimental_bearer_token")
-            .and_then(Item::as_str),
-        Some(token)
-    );
+    assert!(router.get("experimental_bearer_token").is_none());
     assert_eq!(
         router
             .get("http_headers")
@@ -435,6 +427,7 @@ fn runtime_disk_provider_replaces_chatgpt_resume_shim() {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
         supports_websockets: false,
+        supports_remote_compaction: false,
         requires_openai_auth: true,
     };
 
@@ -472,6 +465,7 @@ wire_api = "responses"
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
         supports_websockets: false,
+        supports_remote_compaction: false,
         requires_openai_auth: false,
     };
 
@@ -499,6 +493,7 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
         supports_websockets: false,
+        supports_remote_compaction: false,
         requires_openai_auth: true,
     };
 
@@ -544,6 +539,42 @@ fn isolated_runtime_restores_live_disk_provider_to_resume_shim() {
 }
 
 #[test]
+fn remote_compaction_runtime_identity_returns_to_a_secret_free_resume_shim() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "model_provider = \"relay\"\n\n[model_providers.relay]\nname = \"Relay\"\nbase_url = \"https://relay.example/v1\"\nwire_api = \"responses\"\n",
+    )
+    .unwrap();
+    let endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "launch-only-router-token".into(),
+        supports_websockets: false,
+        supports_remote_compaction: true,
+        requires_openai_auth: false,
+    };
+
+    assert!(prepare_runtime_router_disk_provider_at(&home, &endpoint).unwrap());
+    let live = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        live["model_providers"][local_router::ROUTER_PROVIDER_ID]["name"].as_str(),
+        Some("OpenAI")
+    );
+
+    assert!(prepare_persistent_router_resume_shim_at(&home).unwrap());
+    let restored = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_resume_shim(&restored, "https://relay.example/v1", false);
+}
+
+#[test]
 fn local_router_accepts_a_codey_owned_resume_shim() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("codex-home");
@@ -571,6 +602,7 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
         supports_websockets: false,
+        supports_remote_compaction: false,
         requires_openai_auth: true,
     };
 
@@ -825,11 +857,50 @@ fn runtime_router_provider_advertises_websockets_only_when_enabled() {
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "test-router-token".into(),
         supports_websockets: true,
+        supports_remote_compaction: false,
         requires_openai_auth: false,
     };
 
     let provider = local_router_provider_table(&endpoint);
     assert_eq!(provider["supports_websockets"].as_bool(), Some(true));
+}
+
+#[test]
+fn runtime_router_matches_cc_switch_openai_identity_and_auth_shape() {
+    let mut endpoint = crate::local_router::RuntimeRouterEndpoint {
+        base_url: "http://127.0.0.1:43127/v1".into(),
+        token: "test-router-token".into(),
+        supports_websockets: false,
+        supports_remote_compaction: false,
+        requires_openai_auth: true,
+    };
+
+    let provider = local_router_provider_table(&endpoint);
+    assert_eq!(provider["name"].as_str(), Some("OpenAI"));
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+    assert!(provider.get("experimental_bearer_token").is_none());
+    assert_eq!(
+        provider["http_headers"][local_router::ROUTER_AUTH_HEADER].as_str(),
+        Some("test-router-token")
+    );
+    assert_eq!(
+        provider["base_url"].as_str(),
+        Some("http://127.0.0.1:43127/v1")
+    );
+
+    endpoint.requires_openai_auth = false;
+    let provider = local_router_provider_table(&endpoint);
+    assert_eq!(provider["name"].as_str(), Some("Codey Local Router"));
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+    assert_eq!(
+        provider["experimental_bearer_token"].as_str(),
+        Some("test-router-token")
+    );
+
+    endpoint.supports_remote_compaction = true;
+    let provider = local_router_provider_table(&endpoint);
+    assert_eq!(provider["name"].as_str(), Some("OpenAI"));
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
 }
 
 #[test]
@@ -2436,6 +2507,7 @@ experimental_bearer_token = "upstream-secret-token"
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
         supports_websockets: false,
+        supports_remote_compaction: false,
         requires_openai_auth: false,
     };
 
@@ -2518,6 +2590,7 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
         supports_websockets: true,
+        supports_remote_compaction: false,
         requires_openai_auth: true,
     };
 
@@ -2541,12 +2614,11 @@ fn official_login_uses_the_websocket_router_without_overriding_builtin_openai() 
     let rendered = applied.runtime_config_overrides.join("\n");
     assert!(rendered.contains("model_provider=\"codey_router\""));
     assert!(rendered.contains("model=\"openai/gpt-5.6-sol\""));
-    assert!(rendered.contains("model_providers.codey_router.requires_openai_auth=false"));
+    assert!(rendered.contains("model_providers.codey_router.name=\"OpenAI\""));
+    assert!(rendered.contains("model_providers.codey_router.requires_openai_auth=true"));
     assert!(rendered.contains("model_providers.codey_router.supports_websockets=true"));
     assert!(rendered.contains("x-codey-router-token"));
-    assert!(rendered.contains(
-        "model_providers.codey_router.experimental_bearer_token=\"launch-only-router-token\""
-    ));
+    assert!(!rendered.contains("model_providers.codey_router.experimental_bearer_token="));
     assert!(!rendered.contains("openai_base_url="));
 }
 
@@ -2566,6 +2638,7 @@ wire_api = "responses"
         base_url: "http://127.0.0.1:43127/v1".into(),
         token: "launch-only-router-token".into(),
         supports_websockets: false,
+        supports_remote_compaction: false,
         requires_openai_auth: false,
     };
 

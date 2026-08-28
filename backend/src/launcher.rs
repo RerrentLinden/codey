@@ -86,7 +86,7 @@ struct SessionMaintenanceSummary {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeModelConfig {
-    routes: Vec<(String, String, bool)>,
+    routes: Vec<(String, String, bool, bool)>,
     selected_models_by_provider: std::collections::BTreeMap<String, Vec<String>>,
     manual_third_party_models_by_provider: std::collections::BTreeMap<String, Vec<String>>,
     declared_official_models_by_provider: std::collections::BTreeMap<String, Vec<String>>,
@@ -105,6 +105,7 @@ impl RuntimeModelConfig {
                         profile.provider_id().to_string(),
                         profile.name.clone(),
                         profile.official_account,
+                        profile.supports_auto_review,
                     )
                 })
                 .collect(),

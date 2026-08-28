@@ -1,3 +1,5 @@
+export const AUTO_REVIEW_MODEL = "codex-auto-review";
+
 export const modelKey = (model: string) => model.trim().toLowerCase();
 
 export const modelIdsEqual = (left: string, right: string) =>

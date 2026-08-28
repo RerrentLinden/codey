@@ -54,6 +54,7 @@ use subagent_control::{disable_subagent_control_mcp, enable_subagent_control_mcp
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(crate) const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
 const LOCAL_ROUTER_PROVIDER_NAME: &str = "Codey Local Router";
+const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
 const CODEY_FASTCTX_NAMESPACE: &str = "mcp__codey_fastctx";
 const CODEY_FASTCTX_ARG_MARKER: &str = "--codey-fastctx-mcp";
@@ -1417,7 +1418,8 @@ fn runtime_router_disk_provider_matches(doc: &DocumentMut, desired: &Table) -> b
     table_like_str(existing, "name") == table_str(desired, "name")
         && table_like_str(existing, "base_url") == table_str(desired, "base_url")
         && table_like_str(existing, "wire_api") == table_str(desired, "wire_api")
-        && table_like_bool(existing, "requires_openai_auth") == Some(false)
+        && table_like_bool(existing, "requires_openai_auth")
+            == table_bool(desired, "requires_openai_auth")
         && table_like_bool(existing, "supports_websockets")
             == table_bool(desired, "supports_websockets")
         && table_like_str(existing, "experimental_bearer_token")
@@ -1887,6 +1889,7 @@ fn test_runtime_router_endpoint() -> &'static RuntimeRouterEndpoint {
         base_url: "http://127.0.0.1:43127/v1".to_string(),
         token: "test-router-token".to_string(),
         supports_websockets: false,
+        supports_remote_compaction: false,
         requires_openai_auth: false,
     })
 }
@@ -2320,7 +2323,6 @@ fn build_isolated_runtime_overrides(
         "requires_openai_auth",
         "supports_websockets",
         "http_headers",
-        "experimental_bearer_token",
     ] {
         push_required_document_override(
             &mut overrides,
@@ -2329,6 +2331,12 @@ fn build_isolated_runtime_overrides(
             &format!("model_providers.{provider_segment}.{field}"),
         )?;
     }
+    push_document_override(
+        &mut overrides,
+        effective,
+        &["model_providers", provider_id, "experimental_bearer_token"],
+        &format!("model_providers.{provider_segment}.experimental_bearer_token"),
+    )?;
 
     if fastctx_namespace.is_some() {
         for (path, key) in [
@@ -2681,7 +2689,7 @@ fn validate_runtime_router_overrides(overrides: &[String], provider_id: &str) ->
         format!("model_providers.{provider_segment}.wire_api"),
         format!("model_providers.{provider_segment}.requires_openai_auth"),
         format!("model_providers.{provider_segment}.supports_websockets"),
-        format!("model_providers.{provider_segment}.experimental_bearer_token"),
+        format!("model_providers.{provider_segment}.http_headers"),
     ];
     let missing = required_keys
         .iter()
@@ -3105,15 +3113,19 @@ fn codey_hook_inline_table(
 
 fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
     let mut provider = Table::new();
-    provider["name"] = value(LOCAL_ROUTER_PROVIDER_NAME);
+    provider["name"] = value(
+        if endpoint.requires_openai_auth || endpoint.supports_remote_compaction {
+            // Match CC Switch's official proxy route: Codex derives the OpenAI
+            // capability set (including remote compaction) from this exact name,
+            // while base_url still points every request at the loopback gateway.
+            OPENAI_PROVIDER_NAME
+        } else {
+            LOCAL_ROUTER_PROVIDER_NAME
+        },
+    );
     provider["base_url"] = value(endpoint.base_url.trim_end_matches('/'));
     provider["wire_api"] = value("responses");
-    // Codex 0.150+ treats `requires_openai_auth = true` as ChatGPT-account
-    // transport and sends catalog aliases such as `route-*/mimo-v2.5` to
-    // chatgpt.com instead of the loopback gateway. The provider Codex sees is
-    // always an API-key local router; official OAuth is attached by the
-    // gateway when forwarding official routes.
-    provider["requires_openai_auth"] = value(false);
+    provider["requires_openai_auth"] = value(endpoint.requires_openai_auth);
     provider["supports_websockets"] = value(endpoint.supports_websockets);
     let mut headers = InlineTable::new();
     headers.insert(
@@ -3121,7 +3133,9 @@ fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
         Value::from(endpoint.token.as_str()),
     );
     provider["http_headers"] = Item::Value(Value::InlineTable(headers));
-    provider["experimental_bearer_token"] = value(endpoint.token.as_str());
+    if !endpoint.requires_openai_auth {
+        provider["experimental_bearer_token"] = value(endpoint.token.as_str());
+    }
     provider
 }
 

@@ -27,6 +27,7 @@ import {
   DialogHeader,
   DialogTitle,
   Input,
+  Switch,
 } from "./components/mantine";
 
 type ModelPickerDialogProps = {
@@ -37,6 +38,7 @@ type ModelPickerDialogProps = {
   customModelInput: string;
   modelInputError: string;
   modelSyncWarning: string;
+  autoReviewSupported: boolean;
   thirdPartyModelOptions: string[];
   modelState: ModelState;
   draftModelSet: Set<string>;
@@ -46,6 +48,7 @@ type ModelPickerDialogProps = {
   onAddCustomModel: () => void;
   onToggleDraftModel: (model: string, checked: boolean) => void;
   onDeleteThirdPartyModel: (model: string) => void;
+  onAutoReviewSupportedChange: (checked: boolean) => void;
   onSave: () => void;
 };
 
@@ -57,6 +60,7 @@ function ModelPickerDialogComponent({
   customModelInput,
   modelInputError,
   modelSyncWarning,
+  autoReviewSupported,
   thirdPartyModelOptions,
   modelState,
   draftModelSet,
@@ -66,6 +70,7 @@ function ModelPickerDialogComponent({
   onAddCustomModel,
   onToggleDraftModel,
   onDeleteThirdPartyModel,
+  onAutoReviewSupportedChange,
   onSave,
 }: ModelPickerDialogProps) {
   const [modelQuery, setModelQuery] = useState("");
@@ -150,6 +155,21 @@ function ModelPickerDialogComponent({
         {modelInputError && (
           <p className="mt-1.5 text-[11px] leading-[1.45] text-[#d70015]" role="alert">{modelInputError}</p>
         )}
+        <div className="mt-3 flex items-center justify-between gap-4 rounded-[9px] border border-black/8 bg-[#f7f7f8] px-3 py-2.5">
+          <div className="grid min-w-0 gap-0.5">
+            <strong className="text-xs font-semibold text-[#1d1d1f]">Auto Review</strong>
+            <small className="text-[10px] leading-[1.45] text-[#6e6e73]">
+              同步会按最新模型列表自动更新；仅在线路真实支持 codex-auto-review 时手动开启
+            </small>
+          </div>
+          <Switch
+            size="sm"
+            checked={autoReviewSupported}
+            disabled={isBusy}
+            onCheckedChange={onAutoReviewSupportedChange}
+            aria-label="当前线路支持 auto-review"
+          />
+        </div>
         <div className="my-3 max-h-[360px] overflow-y-auto rounded-[10px] border border-black/8 bg-[#fbfbfc] py-1 pl-1 pr-0.5 [scrollbar-color:rgba(99,99,104,0.46)_transparent] [scrollbar-gutter:stable] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-button]:hidden [&::-webkit-scrollbar-thumb]:min-h-11 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:border-2 [&::-webkit-scrollbar-thumb]:border-transparent [&::-webkit-scrollbar-thumb]:bg-black/40 [&::-webkit-scrollbar-thumb]:bg-clip-padding">
           {modelState.officialModels.length > 0 && (
             <>

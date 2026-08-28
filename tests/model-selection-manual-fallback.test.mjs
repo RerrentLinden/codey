@@ -16,6 +16,8 @@ test("third-party model sync can fall back to manual model support configuration
   assert.match(dialogSource, /本次官方账号登录可用的模型/);
   assert.match(dialogSource, /modelState\.officialModels\.map/);
   assert.match(dialogSource, /placeholder="输入当前线路模型 ID/);
+  assert.match(dialogSource, /当前线路支持 auto-review/);
+  assert.match(dialogSource, /<Switch/);
   assert.match(dialogSource, /manualThirdPartyModelKeys\.has/);
   assert.match(dialogSource, /aria-label=\{`删除其他模型 \$\{model\}`\}/);
   assert.match(dialogSource, /onDeleteThirdPartyModel\(model\)/);
@@ -26,6 +28,8 @@ test("third-party model sync can fall back to manual model support configuration
   assert.doesNotMatch(hookSource, /deleteThirdPartyModel/);
   assert.doesNotMatch(hookSource, /setDefaultModel/);
   assert.match(hookSource, /manualThirdPartyModels/);
+  assert.match(hookSource, /supportsAutoReview/);
+  assert.match(hookSource, /AUTO_REVIEW_MODEL.*线路能力/s);
   assert.match(hookSource, /deletedThirdPartyModels: deletedModels/);
   assert.match(
     hookSource,
@@ -35,6 +39,7 @@ test("third-party model sync can fall back to manual model support configuration
   assert.match(commandSource, /argument::<Vec<String>>\(&args, "thirdPartyModels"\)/);
   assert.match(commandSource, /optional_argument::<Vec<String>>\(&args, "manualThirdPartyModels"\)/);
   assert.match(commandSource, /optional_argument::<Vec<String>>\(&args, "deletedThirdPartyModels"\)/);
+  assert.match(commandSource, /optional_argument::<bool>\(&args, "supportsAutoReview"\)/);
   assert.match(
     modelCommandSource,
     /已在官方模型列表中，请直接勾选，不可作为其他模型手动添加/,
@@ -42,6 +47,7 @@ test("third-party model sync can fall back to manual model support configuration
   assert.match(modelCommandSource, /官方模型 \{model\} 不能作为其他模型删除/);
   assert.match(modelCommandSource, /不是手动添加的其他模型，不能删除/);
   assert.match(modelCommandSource, /validate_manual_third_party_model_sources/);
+  assert.match(modelCommandSource, /validate_regular_route_model_list/);
   assert.match(modelCommandSource, /preserve_selected_third_party_models_except/);
   assert.match(
     modelCommandSource,

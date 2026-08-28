@@ -40,8 +40,8 @@ use models::{
 use models::{
     current_model_state_async, current_renderer_model_catalog_async, hot_reload_runtime_models,
     official_route_snapshots, provider_route_requires_restart,
-    sync_current_third_party_provider_state, sync_provider_models_for_launch,
-    websocket_transport_requires_restart,
+    remote_compaction_transport_requires_restart, sync_current_third_party_provider_state,
+    sync_provider_models_for_launch, websocket_transport_requires_restart,
 };
 pub use models::{
     delete_route, fetch_route_models, save_default_model, save_official_route_models,
@@ -925,6 +925,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             argument::<Vec<String>>(&args, "thirdPartyModels"),
             optional_argument::<Vec<String>>(&args, "manualThirdPartyModels"),
             optional_argument::<Vec<String>>(&args, "deletedThirdPartyModels"),
+            optional_argument::<bool>(&args, "supportsAutoReview"),
             optional_argument::<String>(&args, "routeId"),
         ) {
             (
@@ -932,6 +933,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Ok(third_party_models),
                 Ok(manual_third_party_models),
                 Ok(deleted_third_party_models),
+                Ok(supports_auto_review),
                 Ok(route_id),
             ) => {
                 save_selected_models(
@@ -940,15 +942,17 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                     third_party_models,
                     manual_third_party_models.unwrap_or_default(),
                     deleted_third_party_models.unwrap_or_default(),
+                    supports_auto_review,
                     route_id,
                 )
                 .await
             }
-            (Err(error), _, _, _, _)
-            | (_, Err(error), _, _, _)
-            | (_, _, Err(error), _, _)
-            | (_, _, _, Err(error), _)
-            | (_, _, _, _, Err(error)) => Err(error),
+            (Err(error), _, _, _, _, _)
+            | (_, Err(error), _, _, _, _)
+            | (_, _, Err(error), _, _, _)
+            | (_, _, _, Err(error), _, _)
+            | (_, _, _, _, Err(error), _)
+            | (_, _, _, _, _, Err(error)) => Err(error),
         },
         "save_default_model" => match (
             string_argument(&args, "model"),
@@ -1440,6 +1444,7 @@ fn merge_profile_secrets(
                 // not carry that derived capability into a newly converted
                 // API-key route; third-party WebSocket remains explicit opt-in.
                 profile.supports_websockets = false;
+                profile.supports_auto_review = false;
                 if profile.auth_mode.trim() == crate::config::AUTH_MODE_API_KEY {
                     profile.official_account = false;
                 }
@@ -1952,6 +1957,7 @@ pub(super) fn provider_route_restart_required_for_runtime(
 ) -> bool {
     official_route_snapshots(&runtime.applied_config) != official_route_snapshots(current)
         || websocket_transport_requires_restart(&runtime.applied_config, current)
+        || remote_compaction_transport_requires_restart(&runtime.applied_config, current)
 }
 
 #[cfg(test)]

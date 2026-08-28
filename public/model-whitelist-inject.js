@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "38";
+  const patchVersion = "39";
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
   const legacyOfficialRouteProviderIds = new Set([
@@ -100,6 +100,8 @@
   const maxPendingThreadRequests = 256;
   const pendingRouteIntentMaxAgeMs = 5 * 60 * 1000;
   let pendingRouteIntent = null;
+  const supersededModelMenuLabels = new Map();
+  const maxSupersededModelMenuLabels = 512;
   const supersededDefaultRoutes = [];
   const maxSupersededDefaultRoutes = 8;
   let providerMismatchNoticeTimer = 0;
@@ -588,9 +590,9 @@
     return tiers.includes(fastSpeedTierId) ? tiers : [...tiers, fastSpeedTierId];
   };
 
-  const modelPresentation = (modelName, current = null) => {
-    const metadata = catalog.modelMetadata[modelName];
-    const route = catalog.routeMetadata[modelName];
+  const modelPresentationFromCatalog = (sourceCatalog, modelName, current = null) => {
+    const metadata = sourceCatalog.modelMetadata[modelName];
+    const route = sourceCatalog.routeMetadata[modelName];
     const metadataDisplayName = metadataText(metadata, "display_name");
     const displayParts = displayNameParts(metadataDisplayName);
     const routeName = metadataText(metadata, "route_name")
@@ -616,6 +618,10 @@
       sourceModel: sourceModel || modelName,
     };
   };
+
+  const modelPresentation = (modelName, current = null) => (
+    modelPresentationFromCatalog(catalog, modelName, current)
+  );
 
   const modelDescriptor = (modelName, current = null) => {
     const metadata = catalog.modelMetadata[modelName];
@@ -1039,6 +1045,19 @@
   const directRouteHeadings = (parent) => Array.from(parent?.children || [])
     .filter((child) => Boolean(child?.dataset?.codeyRouteHeading));
 
+  const restoreSupersededModelMenuItem = (item) => {
+    if (!item?.dataset?.codeySupersededModel) return;
+    item.removeAttribute?.("hidden");
+    delete item.dataset.codeySupersededModel;
+    delete item.dataset.codeySupersededLabel;
+  };
+
+  const hideSupersededModelMenuItem = (item, modelName, itemText) => {
+    item.dataset.codeySupersededModel = modelName;
+    item.dataset.codeySupersededLabel = itemText;
+    item.setAttribute?.("hidden", "");
+  };
+
   const reconcileRouteHeadings = (parent, items) => {
     const routeStarts = [];
     let previousRoute = "";
@@ -1074,23 +1093,53 @@
       if (!displayName || !presentation.routeName || !presentation.modelName) continue;
       byDisplayName.set(displayName, { modelName, presentation });
     }
-    if (byDisplayName.size === 0) return;
     const containers = Array.from(document.querySelectorAll(groupedMenuSelector) || []);
     for (const container of containers) {
       const items = Array.from(container.querySelectorAll?.(groupedMenuItemSelector) || []);
       const enhancedItems = [];
+      const existingHeadings = directRouteHeadings(container);
+      const looksLikeModelMenu = existingHeadings.length > 0 || items.some((item) => (
+        Boolean(item.dataset?.codeyRouteModel)
+        || Boolean(item.dataset?.codeySupersededModel)
+        || byDisplayName.has(cleanText(item.textContent))
+      ));
+      if (!looksLikeModelMenu) continue;
+      const itemParents = new Set(existingHeadings.length > 0 ? [container] : []);
       for (const item of items) {
         const itemText = cleanText(item.textContent);
+        const supersededLabel = cleanText(item.dataset?.codeySupersededLabel);
+        if (supersededLabel && supersededLabel !== itemText) {
+          restoreSupersededModelMenuItem(item);
+          delete item.dataset.codeyRouteModel;
+          delete item.dataset.codeyRouteName;
+          item.classList?.remove?.("codey-model-route-item");
+          item.removeAttribute?.("aria-label");
+        }
         const existingModel = item.dataset?.codeyRouteModel || "";
         const existingPresentation = existingModel ? modelPresentation(existingModel) : null;
         const existingPresentationStillMatches = existingPresentation?.routeName
+          && catalog.modelNamesByKey.has(modelKey(existingModel))
           && [existingPresentation.displayName, existingPresentation.modelName]
             .map(cleanText)
             .includes(itemText);
         const matched = existingPresentationStillMatches
           ? { modelName: existingModel, presentation: existingPresentation }
           : byDisplayName.get(itemText);
-        if (!matched?.presentation?.routeName || !matched.presentation.modelName) continue;
+        if (!matched?.presentation?.routeName || !matched.presentation.modelName) {
+          const supersededModel = (
+            existingModel && !catalog.modelNamesByKey.has(modelKey(existingModel))
+              ? existingModel
+              : supersededModelMenuLabels.get(itemText)
+          );
+          if (supersededModel) {
+            hideSupersededModelMenuItem(item, supersededModel, itemText);
+            itemParents.add(item.parentElement || container);
+          } else {
+            restoreSupersededModelMenuItem(item);
+          }
+          continue;
+        }
+        restoreSupersededModelMenuItem(item);
         item.dataset.codeyRouteModel = matched.modelName;
         item.dataset.codeyRouteName = matched.presentation.routeName;
         item.classList?.add?.("codey-model-route-item");
@@ -1104,8 +1153,8 @@
           matched.presentation.modelName,
         );
         enhancedItems.push({ item, routeName: matched.presentation.routeName });
+        itemParents.add(item.parentElement || container);
       }
-      if (enhancedItems.length === 0) continue;
       const itemsByParent = new Map();
       for (const entry of enhancedItems) {
         const { item } = entry;
@@ -1114,8 +1163,8 @@
         siblings.push(entry);
         itemsByParent.set(parent, siblings);
       }
-      for (const [parent, groupedItems] of itemsByParent) {
-        reconcileRouteHeadings(parent, groupedItems);
+      for (const parent of itemParents) {
+        reconcileRouteHeadings(parent, itemsByParent.get(parent) || []);
       }
     }
   };
@@ -1557,6 +1606,7 @@
           scheduleRefresh(1000);
           return true;
         }
+        rememberSupersededModelMenuItems(catalog, nextCatalog);
         rememberSupersededDefaultRoute(catalog, nextCatalog);
         catalogRevision += 1;
         catalog = nextCatalog;
@@ -1582,6 +1632,7 @@
       scheduleRefresh(1000);
       return Promise.resolve(true);
     }
+    rememberSupersededModelMenuItems(catalog, nextCatalog);
     rememberSupersededDefaultRoute(catalog, nextCatalog);
     catalogRevision += 1;
     catalog = nextCatalog;
@@ -1616,6 +1667,29 @@
           officialAccount: metadataBoolean(metadata, "official_account"),
         }
       : null;
+  };
+
+  const rememberSupersededModelMenuItems = (previousCatalog, nextCatalog) => {
+    if (!previousCatalog?.loaded) return;
+    const nextModelKeys = new Set(nextCatalog.models.map(modelKey));
+    for (const modelName of previousCatalog.models) {
+      if (nextModelKeys.has(modelKey(modelName))) continue;
+      const displayName = cleanText(
+        modelPresentationFromCatalog(previousCatalog, modelName).displayName,
+      );
+      if (!displayName) continue;
+      supersededModelMenuLabels.delete(displayName);
+      supersededModelMenuLabels.set(displayName, modelName);
+    }
+    for (const modelName of nextCatalog.models) {
+      const displayName = cleanText(
+        modelPresentationFromCatalog(nextCatalog, modelName).displayName,
+      );
+      if (displayName) supersededModelMenuLabels.delete(displayName);
+    }
+    while (supersededModelMenuLabels.size > maxSupersededModelMenuLabels) {
+      supersededModelMenuLabels.delete(supersededModelMenuLabels.keys().next().value);
+    }
   };
 
   const rememberSupersededDefaultRoute = (previousCatalog, nextCatalog) => {
