@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "37";
+  const patchVersion = "38";
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
   const legacyOfficialRouteProviderIds = new Set([
@@ -2054,6 +2054,23 @@
     rememberThreadRoute(directThread, pending?.route);
   };
 
+  const rememberOutgoingModelListRequest = (detail) => {
+    const request = detail?.request;
+    if (
+      !routableOutgoingMessageTypes.has(detail?.type)
+      || !request
+      || typeof request !== "object"
+      || request.id == null
+    ) return;
+    const { method } = outgoingRequestParts(request);
+    if (method !== "model/list") return;
+    rememberBounded(
+      modelListRequestIds,
+      String(request.id),
+      maxTrackedModelListRequests,
+    );
+  };
+
   const rewrittenOutgoingMessage = (detail) => {
     const request = detail?.request;
     if (
@@ -2061,13 +2078,7 @@
       || !request
       || typeof request !== "object"
     ) return detail;
-    if (request.method === "model/list" && request.id != null) {
-      rememberBounded(
-        modelListRequestIds,
-        String(request.id),
-        maxTrackedModelListRequests,
-      );
-    }
+    rememberOutgoingModelListRequest(detail);
 
     const { wrappedMethod, method, params } = outgoingRequestParts(request);
     const nextParams = patchedRequestParams(method, params);
@@ -2238,6 +2249,11 @@
     // real transport boundary so thread/start receives modelProvider in time.
     rewriteOutgoingMessage: rewrittenOutgoingMessage,
     trackOutgoingMessage: (detail) => {
+      // AppServerRequestClient runs rewriteOutgoingMessage before createRequest
+      // assigns an id. Track the concrete request too, otherwise a later native
+      // model/list reply can bypass the response patch and replace Codey's hot
+      // catalog after a completed turn.
+      rememberOutgoingModelListRequest(detail);
       rememberOutgoingThreadRequest(detail);
       return detail;
     },

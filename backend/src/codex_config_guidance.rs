@@ -387,7 +387,7 @@ Codey 在 attempt 身份和角色 capability 校验通过后，不再解析、�
 - 用户新输入使旧批次失效时，先完成对账；只有可信根 turn 绑定仍有效时才中断活动代理。中断成功后立即接管并忽略迟到结果，不再等待上游把 `interrupted` 另行改成终态；否则让受控恢复路径接管。编排账本、未清偿验收债和未验证结算证据按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
 "#;
 
-pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V13: &str = r#"## 子代理使用
 
 子代理用于隔离较宽的上下文、并行处理真正独立的工作，或取得有价值的独立证据。默认由主代理直接处理短而明确的工作；当只读检索可以减少主线程上下文、或并行收益清晰时，应主动考虑子代理，不要为了形式分工而派生。
 
@@ -436,6 +436,37 @@ Codey 在 attempt 身份和角色 capability 校验通过后，不再解析、�
 - `MESSAGE` 或不完整结果只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`running`、`pending_init` 和 `interrupted` 不是终态。
 - `pending_init` 或运行累计 10 分钟无终态时，先用无筛选的 `agents.list_agents` 对账；仍无终态且根 turn 绑定有效时只中断一次。成功的 `agents.interrupt_agent` 表示根代理永久放弃该 attempt，Codey 会立即 fence 并核销本地活动状态；不要再等待或追派该 target，直接接管。中断失败或目标无法唯一匹配时才继续对账，并依赖 Stop 的受控恢复路径。禁止无限 wait、无限重试或静默重派。
 - 用户新输入使旧批次失效时，先完成对账；只有可信根 turn 绑定仍有效时才中断活动代理。中断成功后立即接管并忽略迟到结果，不再等待上游把 `interrupted` 另行改成终态；否则让受控恢复路径接管。编排账本、未清偿验收债和未验证结算证据按运行代次与会话恢复；协作工具不可用时不要循环调用不存在的工具。
+"#;
+
+pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+
+默认由主代理直接处理短而明确、步骤互相依赖或即将修改关键代码/文档的任务；不要为了形式分工而派生。以下情况才积极考虑子代理：`multi_lookup` 表示至少 2 次彼此独立的定位或事实检索，`parallel` 表示至少 2 个互不依赖的分支、每支预计至少 2 次实质调用且合计至少 5 次，`breadth` 表示至少 2 个目录或 4 个候选文件，`context` 表示大量日志或文档会污染主线程，`independent_work` 表示不在主代理关键路径上的独立实现，`high_risk` 表示高风险结论缺少确定性检查，`user_requested` 仅在用户明确要求子代理或大规模并行时使用。不超过 2 个小文件和 3 次本地工具调用的精确任务通常由主代理完成。这些数量只是软路由参考。
+
+纯只读批次最多同时运行 3 个子代理；存在写入型或身份未确认的代理时最多同时运行 2 个。Codey 不再按角色成本点设置预算上限，也不限制后续批次或累计派发次数，但并发、生命周期和验收门禁始终有效。
+
+### 派发契约
+
+- 按任务选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 仅兼容旧配置，主代理不得主动选择。实际权限仍受父任务约束。
+- 每个 `agents.spawn_agent` 必须使用 `fork_turns="none"`，`task_name` 只含小写字母、数字和下划线，并把下面的单行 JSON 作为消息最后一个非空行：
+
+`CODEY_DELEGATION_V2={"id":"task_name","why":"breadth","visual":false,"root":"/absolute/workspace","read":["relevant/path"],"write":[],"capabilities":["files.read"],"checks":[]}`
+
+- `id` 必须等于 `task_name`；路由规模只在派发判断中说明。`root`、`read`、`write` 是 ownership/冲突协调元数据，不是 Codey 的运行时文件路径 ACL；绝对路径可位于 `root` 外。实际文件与网络权限完全由其继承的 Codex sandbox、approval policy、permission profile 和 writable roots 决定，Codey 不再解析、比较或拒绝读取、写入和命令中的目标路径。
+- 所有角色声明 `files.read`。Git 状态、差异或其他终端读取额外声明 `command.execute`；`command.execute` 只表示允许调用命令工具，只读角色可在 `write=[]`、`checks=[]` 时声明它；只读兼容 reservation 会保留 `files.read` 与 `command.execute`。Network 类网页搜索、打开和截图属于只读检索，声明 `files.read` 即可使用，不要求额外网络 capability。
+- 写入角色还必须声明 `workspace.write`、非空 `write` 和 1–3 个精确 `checks`，不要求 `write` 覆盖完整 root。派发写入角色前先调用 `mcp__codey_subagent_control__prepare_delegation`，使用相同 task、角色、V2 契约和唯一 preparation ID；accepted 后立即 spawn。密文任务缺少匹配 sidecar 时交回主代理。
+
+### 返回与验收
+
+- 每个子代理只执行一轮且不得继续派生。返回首行必须是 `status: completed | partial | blocked`，正文只保留影响决策的结论、最多 5 条带 `file:line`/符号/链接的证据和明确 gaps；多代理证据冲突时比较出处。
+- 写入结果由主代理按 Stop 给出的 `# codey-accept:<task>:<check>` 原样重跑。只有可信的退出状态 `0` 才清偿验收债；连续 3 次失败、连续 3 次无新证据或持续 10 分钟仍无法验证时，该批次只能以 `blocked` 结算并如实报告。
+
+### 批次生命周期
+
+- 同一批独立任务先全部派发，再进入等待。Hook 用本批首个根派生调用的可信 `turn_id` 绑定编排主体；child 或不匹配的 turn 只能使用 `agents.wait_agent` 和无筛选的 `agents.list_agents` 对账。活动代理全部结算前不得恢复普通本地工作。
+- `MESSAGE` 只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`pending_init`、`running`、`interrupted` 仍按非终态处理，除非根代理成功中断并永久放弃该 attempt。
+- 成功的 `agents.interrupt_agent` 表示根代理永久放弃并 fence 该 attempt；不要再等待或追派该 target，直接接管。`pending_init` 或运行 10 分钟仍无终态时先 list 对账，仍卡住且根绑定有效时只中断一次。
+- 重复 task ID 时只 list 对账一次：原代理存在则等待/消费结果，不存在则主代理接管。失败后默认接管；只有缩小或改变范围后仍值得独立委派，才用全新 task ID 最多重派一次。follow-up 被拒绝表示旧 attempt 未唤醒，不得循环重试。
+- 用户新输入使旧批次失效时先对账；仅在可信根绑定有效时中断活动代理。协作工具不可用时不循环调用不存在的工具。
 "#;
 
 pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V10: &str = r#"## 子代理使用
@@ -579,6 +610,7 @@ pub(crate) const PREVIOUS_SUBAGENT_GUIDANCE_V8: &str = r#"## 子代理使用
 
 pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[
     SUBAGENT_GUIDANCE,
+    PREVIOUS_SUBAGENT_GUIDANCE_V13,
     PREVIOUS_SUBAGENT_GUIDANCE_V12,
     PREVIOUS_SUBAGENT_GUIDANCE_V11,
     PREVIOUS_SUBAGENT_GUIDANCE_V10,
@@ -681,7 +713,7 @@ subagents are active, Codey's runtime gate denies non-collaboration local tools 
 from finishing. The `functions.exec` tool world is a separate route and does not contain collaboration \
 tools.";
 
-pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V10: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
 commentary tools. Call them only through their declared direct tool schemas. Dispatch every independent \
 agent planned for the current batch before the first wait, then call `agents.wait_agent` before any \
@@ -710,34 +742,38 @@ stale-state recovery. While spawned subagents are active, Codey's runtime gate d
 local tools and prevents the root turn from finishing. The `functions.exec` tool world is a separate route \
 and does not contain collaboration tools.";
 
+pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools are direct commentary \
+tools; never call them through `functions.exec`. Dispatch every independent agent planned for the current \
+batch before the first wait. While any attempt is active, use \
+only the relevant `agents.send_message`, `agents.followup_task`, `agents.interrupt_agent`, \
+`agents.list_agents`, or `agents.wait_agent`, then return to `agents.wait_agent` with \
+`timeout_ms <= 120000`; `MESSAGE` and mailbox updates are not completion. Use `followup_task` only for a \
+bound nonterminal attempt. If `CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT` is denied, do not retry \
+or wait for that target; take over or use a fresh `task_name` for a materially changed task. Treat \
+`FINAL_ANSWER`, `task_complete`, `completed`, `errored`, `error`, `failed`, `shutdown`, and `not_found` \
+as terminal. A successful root interrupt permanently abandons and fences that attempt, settles it for \
+the batch, and makes later active-looking provider state stale; do not wait for or follow up that target. \
+If wait output lacks per-agent terminal details, call unfiltered `agents.list_agents` and reconcile until \
+every attempt is terminal or fenced. Then call `mcp__codey_subagent_control__resolve_batch` with the batch \
+number, unique decision ID, reason, and exactly one of `spawn_next_batch`, `continue_root`, `complete`, or \
+`blocked`; spawn the next batch immediately after `spawn_next_batch`, and replace `continue_root` with a \
+terminal decision before Stop. While a batch is active, Codey's gate blocks non-collaboration tools and \
+Stop. If collaboration tools are unavailable, do not loop on an unregistered tool.";
+
 pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Proactive multi-agent delegation is \
 active. Any earlier instruction requiring an explicit user request before spawning sub-agents no \
-longer applies. Analyze the user's request and use sub-agents when independent parallel work, broad \
-context isolation, or specialized evidence would materially improve speed or quality. Keep short, \
-sequential, or low-benefit work with the root agent. Codey has no fixed per-batch or per-root-turn spawn \
-budget. It admits up to three concurrent agents only when the candidate and every active agent are \
-verified read-only; any write-capable or unverified mix is limited to two. A \
-`CODEY_SUBAGENT_CONCURRENCY_LIMIT` denial only means all safe concurrent slots are occupied: wait for an \
-active agent to become terminal, then continue normally. If agents remain nonterminal, continue direct \
-`agents.*` reconciliation. If a nonterminal child reports that its task body could not be decrypted, use \
-`agents.send_message` exactly once to restate the self-contained objective, inputs, scope, constraints, \
-and acceptance context to that active child; do not interrupt or respawn it, then return to \
-`agents.wait_agent`. If the restatement cannot be delivered, also fails, or the child is already terminal, \
-the root takes over instead of retrying in a loop. After at least one admitted agent \
-completes and all agents settle, submit the required structured batch decision; only \
-`spawn_next_batch` authorizes the next direct spawn and starts a new batch in the same response. Use \
-`continue_root` before direct root work, then submit `complete`, `blocked`, or `spawn_next_batch` before \
-Stop. If every spawn in the batch failed before creating an agent, the root agent must take over instead \
-of immediately retrying the same task. A `CODEY_SUBAGENT_DUPLICATE_TASK_ID` denial is a recovery event, \
-not task completion: \
-never retry the old `task_name` or Stop immediately. Call unfiltered `agents.list_agents` once. If the \
-original agent exists, wait for its terminal state or consume its terminal result; if it does not exist, \
-the root agent takes over. Only a materially changed task that still merits delegation may retry once \
-with a fresh `task_name` and an exactly matching `CODEY_DELEGATION_V2.id`. `followup_task` may only \
-continue a currently bound nonterminal attempt. A `CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT` \
-denial means no child was woken; do not retry it or wait for the old target. Use a fresh `task_name` via \
-`spawn_agent` when a new independent attempt is still justified, otherwise take over directly. This mode \
-remains active until a later multi-agent mode developer message changes it.";
+longer applies. Delegate only when independent parallel work, context isolation, or specialized evidence \
+materially helps; keep short, sequential, or low-benefit work with the root. There is no fixed spawn \
+budget: up to three concurrent agents are allowed only when all are verified read-only, otherwise the \
+limit is two. `CODEY_SUBAGENT_CONCURRENCY_LIMIT` means wait for a slot, not failure. If an active child \
+cannot decrypt its task body, use `agents.send_message` exactly once to restate the complete task; do not \
+interrupt or respawn it. If that fails, take over. After the batch settles, submit the required structured \
+decision; `spawn_next_batch` alone authorizes another batch, `continue_root` precedes root work and must be \
+replaced before Stop. If every spawn fails, take over. On `CODEY_SUBAGENT_DUPLICATE_TASK_ID`, call \
+unfiltered `agents.list_agents` once: wait for the original if present, otherwise take over. Only a \
+materially changed task may retry once with a fresh `task_name` matching `CODEY_DELEGATION_V2.id`. This \
+mode remains active until a later multi-agent mode developer message changes it.";
 
 pub(crate) const PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V6: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and every other `agents` collaboration tool are direct \
@@ -782,6 +818,7 @@ route and does not contain collaboration tools.";
 
 pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
     ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V10,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V9,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V8,
     PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V7,
@@ -915,7 +952,7 @@ pub(crate) fn subagent_source_config(role: &str) -> Option<&'static str> {
     }
 }
 
-pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled as direct \
+pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE_V9: &str = "Codey FastCtx context tools are enabled as direct \
 tools. Route local workspace work by task: use `mcp__codey_fastctx__inspect_local_file` for focused \
 inspection, `mcp__codey_fastctx__grep` for content search, `mcp__codey_fastctx__glob` for path \
 discovery, and `mcp__codey_fastctx__replace` only for deterministic mechanical replacement. Batch \
@@ -936,6 +973,22 @@ commands for builds, tests, Git, package managers, metadata beyond glob details,
 operations, advanced shell semantics, or after the applicable FastCtx tool is unavailable or fails. Use CodeGraph only for \
 semantic code understanding such as symbols, callers, callees, and call paths. Every tool call must \
 advance the requested task; put progress and corrections in commentary.";
+
+pub(crate) const CODEY_FASTCTX_GUIDANCE: &str = "Codey FastCtx context tools are enabled as direct \
+tools. Use `mcp__codey_fastctx__inspect_local_file` for focused inspection, \
+`mcp__codey_fastctx__grep` for search, `mcp__codey_fastctx__glob` for discovery, and \
+`mcp__codey_fastctx__replace` only for deterministic replacement. Batch 2-32 known text files or ranges \
+per inspect call; limit large files to needed ranges. A top-level `limit` applies to entries without one. \
+Pass plain absolute filesystem paths; convert local URIs and Windows paths to a drive-letter path such as \
+`E:/repo/file.ts`. Start broad grep with `files_with_matches`, then request minimal `content`; use summary \
+or count only for totals. Glob with `filter_mode=ignore`, stable sorting, and `output_mode=details` only \
+when metadata matters. Run replace as dry-run first with `max_replacements`, then inspect and test; never \
+transparently retry a write after transport failure. Follow every Complete or Partial continuation without \
+parallel page speculation. FastCtx is a direct-only tool namespace, not an MCP Resources server or \
+code-mode aggregate; call tools directly and use `tool_search` when deferred. Use terminal commands for \
+builds, tests, Git, package managers, advanced shell/streaming operations, unsupported metadata, or after \
+the applicable FastCtx tool is unavailable or fails. Use CodeGraph only for semantic symbols and call \
+paths. Every tool call must advance the task; put progress and corrections in commentary.";
 
 pub(crate) const PREVIOUS_CODEY_FASTCTX_GUIDANCE_V8: &str = "Codey FastCtx context tools are enabled as direct \
 tools. Route local workspace work by task: use `mcp__codey_fastctx__inspect_local_file` for focused \
@@ -1090,6 +1143,7 @@ follow every Complete or Partial pagination note exactly.";
 
 pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
     CODEY_FASTCTX_GUIDANCE,
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V9,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V8,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V7,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V6,
@@ -1104,6 +1158,7 @@ pub(crate) const CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
 
 #[cfg(test)]
 const PREVIOUS_CODEY_FASTCTX_GUIDANCE_VERSIONS: &[&str] = &[
+    PREVIOUS_CODEY_FASTCTX_GUIDANCE_V9,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V8,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V7,
     PREVIOUS_CODEY_FASTCTX_GUIDANCE_V6,
@@ -1327,21 +1382,19 @@ mod tests {
             CODEY_FASTCTX_GUIDANCE
         );
         assert!(CODEY_FASTCTX_GUIDANCE.contains("enabled as direct tools"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("Batch 2-32 already-known text files"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Batch 2-32 known text files or ranges"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("top-level `limit`"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("grep's `files_with_matches`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("grep with `files_with_matches`"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("`filter_mode=ignore`"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("`output_mode=details`"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Run replace as dry-run first"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("never transparently retry a write"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("Complete or Partial continuation"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains(
-            "Use CodeGraph only for semantic code understanding such as symbols, callers, callees, and call paths"
-        ));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("call the tools directly"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Use CodeGraph only for semantic symbols"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("call tools directly"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("a direct-only tool namespace"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("using `tool_search`"));
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("URI-shaped local references"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("use `tool_search`"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("convert local URIs"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("plain absolute filesystem paths"));
         assert!(CODEY_FASTCTX_GUIDANCE.contains("drive-letter path such as `E:/repo/file.ts`"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("inspect `ALL_TOOLS`"));
@@ -1354,7 +1407,8 @@ mod tests {
         ] {
             assert!(!CODEY_FASTCTX_GUIDANCE.contains(resource_helper));
         }
-        assert!(CODEY_FASTCTX_GUIDANCE.contains("Every tool call must advance the requested task"));
+        assert!(CODEY_FASTCTX_GUIDANCE.contains("Every tool call must advance the task"));
+        assert!(CODEY_FASTCTX_GUIDANCE.len() < PREVIOUS_CODEY_FASTCTX_GUIDANCE_V9.len());
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("no separate tool discovery is needed"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("Write-Output"));
         assert!(!CODEY_FASTCTX_GUIDANCE.contains("file:///"));
@@ -1369,10 +1423,10 @@ mod tests {
         assert!(config.contains("`mcp__fastctx__grep`"));
         assert!(config.contains("`mcp__fastctx__glob`"));
         assert!(config.contains("`mcp__fastctx__replace`"));
-        assert!(config.contains("Batch 2-32 already-known text files"));
-        assert!(config.contains("Use CodeGraph only for semantic code understanding"));
+        assert!(config.contains("Batch 2-32 known text files or ranges"));
+        assert!(config.contains("Use CodeGraph only for semantic symbols"));
         assert!(config.contains("a direct-only tool namespace"));
-        assert!(config.contains("using `tool_search`"));
+        assert!(config.contains("use `tool_search`"));
         assert!(!config.contains("inspect `ALL_TOOLS`"));
         assert!(!config.contains("list_mcp_resources"));
         assert!(!config.contains("read_mcp_resource"));
@@ -1401,16 +1455,16 @@ mod tests {
 
         assert!(combined.contains(custom));
         assert!(combined.contains("`agents.spawn_agent`"));
-        assert!(combined.contains("`agents.wait_agent` before any"));
+        assert!(combined.contains("before the first wait"));
         assert!(combined.contains("direct commentary tools"));
         assert!(combined.contains("`timeout_ms <= 120000`"));
-        assert!(combined.contains("mailbox update is not completion"));
+        assert!(combined.contains("mailbox updates are not completion"));
         assert!(combined.contains("`MESSAGE`"));
         assert!(
             combined.contains("Dispatch every independent agent planned for the current batch")
         );
         assert!(combined.contains("`agents.send_message`"));
-        assert!(combined.contains("`followup_task` only while"));
+        assert!(combined.contains("Use `followup_task` only for"));
         assert!(combined.contains("`CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT`"));
         assert!(combined.contains("use a fresh `task_name`"));
         assert!(combined.contains("`FINAL_ANSWER`"));
@@ -1421,13 +1475,17 @@ mod tests {
         assert!(combined.contains("`shutdown`"));
         assert!(combined.contains("`not_found`"));
         assert!(combined.contains("successful root interrupt permanently abandons and fences"));
-        assert!(combined.contains("counts as settled for the batch"));
+        assert!(combined.contains("settles it for the batch"));
         assert!(combined.contains("do not wait for or follow up that target"));
-        assert!(combined.contains("treat it as lagging state rather than a reason to wait again"));
-        assert!(combined.contains("terminal or has been successfully abandoned and fenced"));
+        assert!(combined.contains("active-looking provider state stale"));
+        assert!(combined.contains("terminal or fenced"));
         assert!(combined.contains("unfiltered `agents.list_agents`"));
         assert!(combined.contains("do not loop on an unregistered tool"));
-        assert!(combined.contains("`functions.exec` tool world is a separate route"));
+        assert!(combined.contains("never call them through `functions.exec`"));
+        assert!(
+            ROOT_AGENT_COLLABORATION_USAGE_HINT.len()
+                < PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V10.len()
+        );
         assert!(!combined.contains("Write-Output"));
         assert!(!combined.contains("Write-Error"));
         assert_eq!(
@@ -1444,14 +1502,11 @@ mod tests {
 
     #[test]
     fn multi_agent_mode_hint_uses_role_aware_concurrency_without_spawn_budgets() {
-        assert!(
-            ROOT_AGENT_MULTI_AGENT_MODE_HINT
-                .contains("no fixed per-batch or per-root-turn spawn budget")
-        );
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("There is no fixed spawn budget"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("up to three concurrent agents"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("limited to two"));
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("limit is two"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("`CODEY_SUBAGENT_CONCURRENCY_LIMIT`"));
-        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("task body could not be decrypted"));
+        assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("cannot decrypt its task body"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("`agents.send_message` exactly once"));
         assert!(ROOT_AGENT_MULTI_AGENT_MODE_HINT.contains("do not interrupt or respawn it"));
         assert!(
@@ -1463,6 +1518,7 @@ mod tests {
     #[test]
     fn root_agent_usage_hint_migrates_only_complete_owned_paragraphs() {
         for previous in [
+            PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V10,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V9,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V8,
             PREVIOUS_ROOT_AGENT_COLLABORATION_USAGE_HINT_V7,
@@ -1495,6 +1551,7 @@ mod tests {
     #[test]
     fn subagent_guidance_migrates_the_previous_owned_block() {
         for previous in [
+            PREVIOUS_SUBAGENT_GUIDANCE_V13,
             PREVIOUS_SUBAGENT_GUIDANCE_V12,
             PREVIOUS_SUBAGENT_GUIDANCE_V11,
             PREVIOUS_SUBAGENT_GUIDANCE_V10,
@@ -1573,6 +1630,7 @@ mod tests {
         assert!(SUBAGENT_GUIDANCE.contains("可信的退出状态 `0`"));
         assert!(SUBAGENT_GUIDANCE.contains("连续 3 次失败"));
         assert!(SUBAGENT_GUIDANCE.contains("`completed`、`errored`、`error`、`failed`"));
+        assert!(SUBAGENT_GUIDANCE.len() < PREVIOUS_SUBAGENT_GUIDANCE_V13.len());
     }
 
     #[test]
@@ -1618,7 +1676,7 @@ mod tests {
     #[test]
     fn previous_fastctx_guidance_cleanup_keeps_the_current_version() {
         let configured =
-            format!("{CODEY_FASTCTX_GUIDANCE}\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V8}");
+            format!("{CODEY_FASTCTX_GUIDANCE}\n\n{PREVIOUS_CODEY_FASTCTX_GUIDANCE_V9}");
 
         assert_eq!(
             remove_previous_codey_fastctx_guidance(&configured).as_deref(),

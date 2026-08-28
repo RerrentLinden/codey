@@ -379,7 +379,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "37");
+  assert.equal(patch.version, "38");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -440,6 +440,48 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
     ["gpt-5.6-sol", "provider-hot-pushed"],
   );
   patch.dispose();
+});
+
+test("an app-server model refresh after a turn keeps newly added route models", async () => {
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["gpt-5.6-sol", "new-route/GLM-5.3-Flash"],
+    default_model: "gpt-5.6-sol",
+  }, [statsigClient()]);
+
+  const preflight = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: { method: "model/list", params: { limit: 100 } },
+  });
+  assert.equal(preflight.request.id, undefined);
+
+  runtime.patch.trackOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "model-list-after-turn",
+      method: preflight.request.method,
+      params: preflight.request.params,
+    },
+  });
+  const response = {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "model-list-after-turn",
+        result: {
+          data: [modelDescriptor("gpt-5.6-sol")],
+          nextCursor: null,
+        },
+      },
+    },
+  };
+  runtime.dispatchWindowEvent("message", response);
+
+  assert.deepEqual(
+    response.data.message.result.data.map((model) => model.model),
+    ["gpt-5.6-sol", "new-route/GLM-5.3-Flash"],
+  );
+  runtime.patch.dispose();
 });
 
 test("explicit unknown thread and turn models are never replaced by a default", async () => {

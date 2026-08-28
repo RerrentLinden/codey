@@ -23,7 +23,9 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use tokio_tungstenite::tungstenite::http::StatusCode as WebSocketStatusCode;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
-use tokio_tungstenite::tungstenite::{Message as WebSocketMessage, Utf8Bytes as WebSocketText};
+use tokio_tungstenite::tungstenite::{
+    Error as WebSocketError, Message as WebSocketMessage, Utf8Bytes as WebSocketText,
+};
 use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, accept_hdr_async_with_config, connect_async_with_config,
 };
@@ -40,6 +42,10 @@ pub(crate) const ROUTER_AUTH_HEADER: &str = "x-codey-router-token";
 const TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
 const ROUTE_METADATA_KEY: &str = "codey_route";
 const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
+const PROMPT_CACHE_KEY_HEADER: &str = "prompt-cache-key";
+const PROMPT_CACHE_KEY_COMPAT_HEADER: &str = "prompt_cache_key";
+const PROMPT_CACHE_KEY_BODY_FIELD: &str = "prompt_cache_key";
+const CODEX_AUTO_REVIEW_MODEL: &str = "codex-auto-review";
 
 const MAX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -102,6 +108,7 @@ pub(crate) struct RuntimeRouterEndpoint {
 pub(crate) struct LocalRouter {
     endpoint: RuntimeRouterEndpoint,
     snapshot: Arc<RwLock<Arc<RouterSnapshot>>>,
+    websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     shutdown: Mutex<Option<oneshot::Sender<()>>>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -125,6 +132,7 @@ impl LocalRouter {
         let snapshot = Arc::new(RwLock::new(Arc::new(RouterSnapshot::from_config(config))));
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let official_auth_path = crate::codex_config::codex_home().join("auth.json");
+        let websocket_backoffs = Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default()));
         let server = RouterServer {
             token: endpoint.token.clone(),
             bearer_token: format!("Bearer {}", endpoint.token),
@@ -133,7 +141,7 @@ impl LocalRouter {
             rejection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REJECTIONS)),
             request_body_budget: Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
             bindings: Arc::new(Mutex::new(RouteBindings::default())),
-            websocket_backoffs: Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default())),
+            websocket_backoffs: Arc::clone(&websocket_backoffs),
             client: reqwest::Client::builder()
                 .user_agent(format!("Codey-Router/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
@@ -261,6 +269,7 @@ impl LocalRouter {
         Ok(Self {
             endpoint,
             snapshot,
+            websocket_backoffs,
             shutdown: Mutex::new(Some(shutdown_tx)),
             task: Mutex::new(Some(task)),
         })
@@ -276,6 +285,10 @@ impl LocalRouter {
             .snapshot
             .write()
             .expect("local router snapshot lock poisoned") = next;
+        self.websocket_backoffs
+            .lock()
+            .expect("upstream WebSocket backoff mutex poisoned")
+            .clear();
     }
 
     pub(crate) async fn stop(&self) -> Result<()> {
@@ -517,6 +530,22 @@ impl RouterSnapshot {
         {
             return self.target_for_route_model(bound_route, requested_model, requested_model);
         }
+        // Codex starts automatic approval review as a separate request with a
+        // fixed hidden model. Some builds omit turn route metadata on that
+        // request, so prefer the official route when no capable hint or thread
+        // binding identified a route above. A capable bound third-party route
+        // still wins before this fallback.
+        if requested_model == CODEX_AUTO_REVIEW_MODEL
+            && let Some(official_route) = self.routes.values().find(|target| {
+                target.official_account && target.models.contains(CODEX_AUTO_REVIEW_MODEL)
+            })
+        {
+            return self.target_for_route_model(
+                &official_route.provider_id,
+                CODEX_AUTO_REVIEW_MODEL,
+                requested_model,
+            );
+        }
         // A thread binding describes the route used by its previous turn,
         // not an explicit choice for every future model. When the user
         // changes models and the old route cannot serve it, continue into
@@ -635,10 +664,28 @@ fn route_models(
     profile: &crate::config::ProviderProfile,
     provider_id: &str,
 ) -> Vec<String> {
-    if profile.official_account {
-        return config.enabled_official_route_models(provider_id);
+    let mut models = if profile.official_account {
+        config.enabled_official_route_models(provider_id)
+    } else {
+        config.enabled_route_models(provider_id)
+    };
+    let supports_auto_review = profile.official_account
+        || config
+            .upstream_models_by_provider
+            .get(provider_id)
+            .is_some_and(|upstream_models| {
+                upstream_models
+                    .iter()
+                    .any(|model| model.eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL))
+            });
+    if supports_auto_review
+        && !models
+            .iter()
+            .any(|model| model.eq_ignore_ascii_case(CODEX_AUTO_REVIEW_MODEL))
+    {
+        models.push(CODEX_AUTO_REVIEW_MODEL.to_string());
     }
-    config.enabled_route_models(provider_id)
+    models
 }
 
 pub(crate) fn model_alias(provider_id: &str, model: &str) -> String {
@@ -1278,6 +1325,15 @@ impl RouterServer {
                 headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
             }
         }
+        if bridge == ProtocolBridge::NativeResponses {
+            ensure_native_prompt_cache_key(
+                &mut headers,
+                &upstream_body,
+                &resolved.provider_id,
+                upstream_url,
+                &resolved.upstream_model,
+            );
+        }
         if downstream_websocket
             && stream_requested
             && bridge == ProtocolBridge::NativeResponses
@@ -1654,6 +1710,65 @@ fn should_forward_incoming_header(name: &str, official_account: bool) -> bool {
     // must never cross into an API-key provider. Third-party routes receive
     // only content negotiation, Codex client identity, and saved route headers.
     official_account || name.eq_ignore_ascii_case("accept") || is_codex_client_identity_header(name)
+}
+
+fn ensure_native_prompt_cache_key(
+    headers: &mut HeaderMap,
+    body: &Value,
+    route_id: &str,
+    upstream_url: &str,
+    upstream_model: &str,
+) -> bool {
+    if headers.contains_key(PROMPT_CACHE_KEY_HEADER)
+        || headers.contains_key(PROMPT_CACHE_KEY_COMPAT_HEADER)
+        || body
+            .as_object()
+            .is_some_and(|body| body.contains_key(PROMPT_CACHE_KEY_BODY_FIELD))
+    {
+        return false;
+    }
+    let key = stable_prompt_cache_key(route_id, upstream_url, upstream_model, headers);
+    headers.insert(
+        HeaderName::from_static(PROMPT_CACHE_KEY_HEADER),
+        HeaderValue::from_str(&key)
+            .expect("generated prompt cache key must be a valid header value"),
+    );
+    true
+}
+
+fn stable_prompt_cache_key(
+    route_id: &str,
+    upstream_url: &str,
+    upstream_model: &str,
+    headers: &HeaderMap,
+) -> String {
+    let mut hasher = Sha256::new();
+    for component in [
+        b"codey-prompt-cache-v1".as_slice(),
+        route_id.as_bytes(),
+        upstream_url.as_bytes(),
+        upstream_model.as_bytes(),
+    ] {
+        update_length_prefixed_digest(&mut hasher, component);
+    }
+    let (identity_kind, identity) = headers
+        .get(CHATGPT_ACCOUNT_ID_HEADER)
+        .map(|value| (b"account".as_slice(), value.as_bytes()))
+        .or_else(|| {
+            headers
+                .get(AUTHORIZATION)
+                .map(|value| (b"authorization".as_slice(), value.as_bytes()))
+        })
+        .unwrap_or((b"anonymous".as_slice(), b"".as_slice()));
+    update_length_prefixed_digest(&mut hasher, identity_kind);
+    update_length_prefixed_digest(&mut hasher, &Sha256::digest(identity));
+    let digest = format!("{:x}", hasher.finalize());
+    format!("codey-{}", &digest[..48])
+}
+
+fn update_length_prefixed_digest(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
 }
 
 fn is_codex_client_identity_header(name: &str) -> bool {
@@ -4848,6 +4963,7 @@ impl UpstreamWebSocketBackoffKey {
 struct UpstreamWebSocketBackoff {
     failure_count: u32,
     until: Instant,
+    permanent: bool,
     generation: u64,
 }
 
@@ -4862,7 +4978,7 @@ impl UpstreamWebSocketBackoffs {
     fn is_backing_off(&self, key: &UpstreamWebSocketBackoffKey, now: Instant) -> bool {
         self.entries
             .get(key)
-            .is_some_and(|backoff| backoff.until > now)
+            .is_some_and(|backoff| backoff.permanent || backoff.until > now)
     }
 
     fn record_failure(
@@ -4876,7 +4992,7 @@ impl UpstreamWebSocketBackoffs {
         let failure_count = self
             .entries
             .get(&key)
-            .filter(|backoff| now <= backoff.until + reset_after)
+            .filter(|backoff| !backoff.permanent && now <= backoff.until + reset_after)
             .map(|backoff| backoff.failure_count.saturating_add(1))
             .unwrap_or(1);
         let duration = upstream_websocket_backoff_duration(failure_count);
@@ -4887,6 +5003,7 @@ impl UpstreamWebSocketBackoffs {
             UpstreamWebSocketBackoff {
                 failure_count,
                 until: now + duration,
+                permanent: false,
                 generation,
             },
         );
@@ -4895,8 +5012,29 @@ impl UpstreamWebSocketBackoffs {
         (failure_count, duration)
     }
 
+    fn record_unsupported(&mut self, key: UpstreamWebSocketBackoffKey, now: Instant) {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.entries.insert(
+            key.clone(),
+            UpstreamWebSocketBackoff {
+                failure_count: 0,
+                until: now,
+                permanent: true,
+                generation,
+            },
+        );
+        self.order.push_back((key, generation));
+        self.enforce_limit();
+    }
+
     fn record_success(&mut self, key: &UpstreamWebSocketBackoffKey) {
         self.entries.remove(key);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
     }
 
     fn enforce_limit(&mut self) {
@@ -5269,6 +5407,26 @@ impl WebSocketResponsesDownstream {
                     }
                 }
                 Err(error) => {
+                    if upstream_websocket_endpoint_is_unsupported(&error) {
+                        self.websocket_backoffs
+                            .lock()
+                            .expect("upstream WebSocket backoff mutex poisoned")
+                            .record_unsupported(backoff_key, Instant::now());
+                        crate::error_log::record_failure(
+                            "local_router_upstream_websocket_degraded",
+                            "connect_responses_websocket",
+                            format!("{error:#}"),
+                            serde_json::json!({
+                                "routeId": route.provider_id.as_str(),
+                                "routeName": route.route_name.as_str(),
+                                "upstream": route.upstream_authority.as_str(),
+                                "fallback": "http_sse",
+                                "unsupportedEndpoint": true,
+                                "requestId": current_router_request_id(),
+                            }),
+                        );
+                        return Ok(UpstreamWebSocketAttempt::UseHttp);
+                    }
                     let (failure_count, backoff_duration) = self
                         .websocket_backoffs
                         .lock()
@@ -5473,6 +5631,25 @@ async fn connect_upstream_responses_websocket(
     .context("连接 Responses WebSocket 上游超时")?
     .context("连接 Responses WebSocket 上游失败")?;
     Ok(socket)
+}
+
+fn upstream_websocket_endpoint_is_unsupported(error: &anyhow::Error) -> bool {
+    error.chain().any(|source| {
+        source
+            .downcast_ref::<WebSocketError>()
+            .is_some_and(|error| {
+                let WebSocketError::Http(response) = error else {
+                    return false;
+                };
+                matches!(
+                    response.status(),
+                    WebSocketStatusCode::NOT_FOUND
+                        | WebSocketStatusCode::METHOD_NOT_ALLOWED
+                        | WebSocketStatusCode::GONE
+                        | WebSocketStatusCode::NOT_IMPLEMENTED
+                )
+            })
+    })
 }
 
 #[async_trait]
@@ -8639,6 +8816,77 @@ mod tests {
 
         backoffs.record_success(&key);
         assert!(!backoffs.is_backing_off(&key, now));
+
+        backoffs.record_unsupported(key.clone(), now);
+        assert!(backoffs.is_backing_off(&key, now + Duration::from_secs(365 * 24 * 60 * 60)));
+        backoffs.clear();
+        assert!(!backoffs.is_backing_off(&key, now));
+    }
+
+    #[test]
+    fn only_endpoint_capability_statuses_make_websocket_degradation_permanent() {
+        for status in [
+            WebSocketStatusCode::NOT_FOUND,
+            WebSocketStatusCode::METHOD_NOT_ALLOWED,
+            WebSocketStatusCode::GONE,
+            WebSocketStatusCode::NOT_IMPLEMENTED,
+        ] {
+            let response = tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(status)
+                .body(None::<Vec<u8>>)
+                .unwrap();
+            let error = anyhow::Error::new(WebSocketError::Http(response))
+                .context("wrapped websocket failure");
+            assert!(upstream_websocket_endpoint_is_unsupported(&error));
+        }
+        for status in [
+            WebSocketStatusCode::UNAUTHORIZED,
+            WebSocketStatusCode::FORBIDDEN,
+            WebSocketStatusCode::TOO_MANY_REQUESTS,
+            WebSocketStatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let response = tokio_tungstenite::tungstenite::http::Response::builder()
+                .status(status)
+                .body(None::<Vec<u8>>)
+                .unwrap();
+            let error = anyhow::Error::new(WebSocketError::Http(response));
+            assert!(!upstream_websocket_endpoint_is_unsupported(&error));
+        }
+    }
+
+    #[tokio::test]
+    async fn router_config_update_clears_websocket_negative_cache() {
+        let (config, provider_id, _) = router_config("http://127.0.0.1:9/v1".into());
+        let router = LocalRouter::start(&config).await.unwrap();
+        let now = Instant::now();
+        let key = UpstreamWebSocketBackoffKey::new(
+            &provider_id,
+            "ws://127.0.0.1:9/v1/responses",
+            UpstreamWebSocketAuthIdentity::default(),
+        );
+        router
+            .websocket_backoffs
+            .lock()
+            .unwrap()
+            .record_unsupported(key.clone(), now);
+        assert!(
+            router
+                .websocket_backoffs
+                .lock()
+                .unwrap()
+                .is_backing_off(&key, now + Duration::from_secs(24 * 60 * 60))
+        );
+
+        router.update_config(&config);
+
+        assert!(
+            !router
+                .websocket_backoffs
+                .lock()
+                .unwrap()
+                .is_backing_off(&key, now)
+        );
+        router.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -9133,7 +9381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_handshake_failure_falls_back_to_http_and_enters_backoff() {
+    async fn unsupported_websocket_handshake_falls_back_to_http_until_config_changes() {
         let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let upstream_address = upstream.local_addr().unwrap();
         let upstream_task = tokio::spawn(async move {
@@ -9195,6 +9443,16 @@ mod tests {
         let first =
             send_router_websocket_request_on_stream(&mut socket, &alias, "first", Some("main"))
                 .await;
+        assert!(
+            router
+                .websocket_backoffs
+                .lock()
+                .unwrap()
+                .entries
+                .values()
+                .any(|backoff| backoff.permanent),
+            "404 handshake should permanently suppress WebSocket retries for this config"
+        );
         socket.close(None).await.unwrap();
         let mut second_socket = connect_router_websocket(&endpoint).await;
         let second = send_router_websocket_request(&mut second_socket, &alias, "second").await;
@@ -9605,6 +9863,9 @@ mod tests {
         assert_eq!(resolved.upstream_model, "gpt-5.6-sol");
         let raw = snapshot.target_for_model("gpt-5.6-sol").unwrap();
         assert_eq!(raw.route.provider_id, "openai");
+        let auto_review = snapshot.target_for_model(CODEX_AUTO_REVIEW_MODEL).unwrap();
+        assert_eq!(auto_review.route.provider_id, "openai");
+        assert_eq!(auto_review.upstream_model, CODEX_AUTO_REVIEW_MODEL);
 
         let mut api_key_launch = config;
         api_key_launch.official_account_available_this_launch = false;
@@ -9612,6 +9873,53 @@ mod tests {
         assert!(
             RouterSnapshot::from_config(&api_key_launch)
                 .target_for_model(&official_alias)
+                .is_err()
+        );
+        assert!(
+            RouterSnapshot::from_config(&api_key_launch)
+                .target_for_model(CODEX_AUTO_REVIEW_MODEL)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn auto_review_uses_a_capable_bound_route_and_otherwise_prefers_official() {
+        let (mut config, third_party_provider, _) =
+            router_config("https://relay.example/v1".to_string());
+        config.upstream_models_by_provider.insert(
+            third_party_provider.clone(),
+            vec![CODEX_AUTO_REVIEW_MODEL.into()],
+        );
+        let mut official = ProviderProfile::new("OpenAI 官方直登");
+        official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
+        official.source_provider_id = Some("openai".into());
+        official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+        config.profiles.push(official);
+        config.official_account_available_this_launch = true;
+        config
+            .selected_models_by_provider
+            .insert("openai".into(), vec!["gpt-5.6-sol".into()]);
+        let snapshot = RouterSnapshot::from_config(&config);
+
+        let bound = snapshot
+            .target_for_request(CODEX_AUTO_REVIEW_MODEL, None, Some(&third_party_provider))
+            .unwrap();
+        assert_eq!(bound.route.provider_id, third_party_provider);
+
+        let unbound = snapshot
+            .target_for_request(CODEX_AUTO_REVIEW_MODEL, None, None)
+            .unwrap();
+        assert_eq!(unbound.route.provider_id, "openai");
+    }
+
+    #[test]
+    fn auto_review_is_not_invented_for_an_unsupported_third_party_route() {
+        let (config, _, _) = router_config("https://relay.example/v1".to_string());
+
+        assert!(
+            RouterSnapshot::from_config(&config)
+                .target_for_model(CODEX_AUTO_REVIEW_MODEL)
                 .is_err()
         );
     }
@@ -9639,6 +9947,137 @@ mod tests {
         assert!(!should_forward_incoming_header(ROUTE_METADATA_KEY, true));
         assert!(!should_forward_incoming_header(TURN_METADATA_HEADER, false));
         assert!(should_forward_incoming_header("accept", false));
+    }
+
+    #[test]
+    fn generated_prompt_cache_key_is_stable_and_scoped() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-a"));
+        headers.insert(
+            HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+            HeaderValue::from_static("acct-a"),
+        );
+        let key = stable_prompt_cache_key(
+            "route-a",
+            "https://api.example/v1/responses",
+            "model-a",
+            &headers,
+        );
+        assert_eq!(
+            key,
+            stable_prompt_cache_key(
+                "route-a",
+                "https://api.example/v1/responses",
+                "model-a",
+                &headers,
+            )
+        );
+        assert!(key.starts_with("codey-"));
+        assert_eq!(key.len(), "codey-".len() + 48);
+
+        let mut refreshed_auth = headers.clone();
+        refreshed_auth.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-b"));
+        assert_eq!(
+            key,
+            stable_prompt_cache_key(
+                "route-a",
+                "https://api.example/v1/responses",
+                "model-a",
+                &refreshed_auth,
+            ),
+            "account identity should keep the key stable across token refreshes"
+        );
+        assert_ne!(
+            key,
+            stable_prompt_cache_key(
+                "route-b",
+                "https://api.example/v1/responses",
+                "model-a",
+                &headers,
+            )
+        );
+        assert_ne!(
+            key,
+            stable_prompt_cache_key(
+                "route-a",
+                "https://api.example/v1/responses",
+                "model-b",
+                &headers,
+            )
+        );
+        let mut changed_account = headers;
+        changed_account.insert(
+            HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+            HeaderValue::from_static("acct-b"),
+        );
+        assert_ne!(
+            key,
+            stable_prompt_cache_key(
+                "route-a",
+                "https://api.example/v1/responses",
+                "model-a",
+                &changed_account,
+            )
+        );
+        let mut api_key_headers = HeaderMap::new();
+        api_key_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-a"));
+        let api_key_identity = stable_prompt_cache_key(
+            "route-a",
+            "https://api.example/v1/responses",
+            "model-a",
+            &api_key_headers,
+        );
+        api_key_headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer token-b"));
+        assert_ne!(
+            api_key_identity,
+            stable_prompt_cache_key(
+                "route-a",
+                "https://api.example/v1/responses",
+                "model-a",
+                &api_key_headers,
+            )
+        );
+    }
+
+    #[test]
+    fn generated_prompt_cache_key_never_overrides_caller_input() {
+        let body = json!({"model":"model-a","input":"hello"});
+        let mut generated_headers = HeaderMap::new();
+        assert!(ensure_native_prompt_cache_key(
+            &mut generated_headers,
+            &body,
+            "route-a",
+            "https://api.example/v1/responses",
+            "model-a",
+        ));
+        assert!(generated_headers.contains_key(PROMPT_CACHE_KEY_HEADER));
+
+        let mut caller_headers = HeaderMap::new();
+        caller_headers.insert(
+            HeaderName::from_static(PROMPT_CACHE_KEY_HEADER),
+            HeaderValue::from_static("caller-key"),
+        );
+        assert!(!ensure_native_prompt_cache_key(
+            &mut caller_headers,
+            &body,
+            "route-a",
+            "https://api.example/v1/responses",
+            "model-a",
+        ));
+        assert_eq!(
+            caller_headers[PROMPT_CACHE_KEY_HEADER],
+            HeaderValue::from_static("caller-key")
+        );
+
+        let mut body_key_headers = HeaderMap::new();
+        assert!(!ensure_native_prompt_cache_key(
+            &mut body_key_headers,
+            &json!({"model":"model-a","prompt_cache_key":"body-key"}),
+            "route-a",
+            "https://api.example/v1/responses",
+            "model-a",
+        ));
+        assert!(!body_key_headers.contains_key(PROMPT_CACHE_KEY_HEADER));
     }
 
     #[test]

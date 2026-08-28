@@ -1588,12 +1588,12 @@ direct_only_tool_namespaces = ["mcp__existing", "mcp__codey_fastctx", "mcp__code
     assert!(guidance.contains("`mcp__codey_fastctx__grep`"));
     assert!(guidance.contains("`mcp__codey_fastctx__glob`"));
     assert!(guidance.contains("`mcp__codey_fastctx__replace`"));
-    assert!(guidance.contains("Use CodeGraph only for semantic code understanding"));
-    assert!(guidance.contains("Batch 2-32 already-known text files"));
-    assert!(guidance.contains("Start broad searches with grep's `files_with_matches`"));
+    assert!(guidance.contains("Use CodeGraph only for semantic symbols"));
+    assert!(guidance.contains("Batch 2-32 known text files or ranges"));
+    assert!(guidance.contains("Start broad grep with `files_with_matches`"));
     assert!(guidance.contains("FastCtx is a direct-only tool namespace"));
     assert!(guidance.contains("never transparently retry a write"));
-    assert!(guidance.contains("using `tool_search` when a direct tool is deferred"));
+    assert!(guidance.contains("use `tool_search` when deferred"));
     assert!(!guidance.contains("list_mcp_resources"));
     assert!(!guidance.contains("read_mcp_resource"));
     assert!(!guidance.contains("Write-Output"));
