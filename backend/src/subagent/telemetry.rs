@@ -119,6 +119,14 @@ impl<'a> TraceRecorder<'a> {
     }
 
     pub(crate) fn record(&self, event: &SubagentTraceEvent) -> Result<()> {
+        self.record_with_lock_timeout(event, Duration::from_millis(TRACE_LOCK_TIMEOUT_MILLIS))
+    }
+
+    fn record_with_lock_timeout(
+        &self,
+        event: &SubagentTraceEvent,
+        lock_timeout: Duration,
+    ) -> Result<()> {
         let mut encoded = serde_json::to_vec(event).context("序列化子代理 trace 失败")?;
         encoded.push(b'\n');
         fs::create_dir_all(self.state_root)
@@ -131,7 +139,7 @@ impl<'a> TraceRecorder<'a> {
             .read(true)
             .open(&lock_path)
             .with_context(|| format!("打开子代理 trace 锁失败：{}", lock_path.display()))?;
-        acquire_trace_lock(&lock, &lock_path)?;
+        acquire_trace_lock(&lock, &lock_path, lock_timeout)?;
         let write_result = (|| -> Result<()> {
             let path = trace_file(self.state_root);
             rotate_if_needed(self.state_root, &path, encoded.len() as u64)?;
@@ -155,16 +163,16 @@ impl<'a> TraceRecorder<'a> {
     }
 }
 
-fn acquire_trace_lock(lock: &std::fs::File, lock_path: &Path) -> Result<()> {
+fn acquire_trace_lock(lock: &std::fs::File, lock_path: &Path, timeout: Duration) -> Result<()> {
     let started = Instant::now();
     loop {
         match lock.try_lock_exclusive() {
             Ok(()) => return Ok(()),
             Err(error) if trace_lock_is_contended(&error) => {
-                if started.elapsed() >= Duration::from_millis(TRACE_LOCK_TIMEOUT_MILLIS) {
+                if started.elapsed() >= timeout {
                     anyhow::bail!(
                         "获取子代理 trace 锁超时（{} ms，遥测已丢弃）：{}",
-                        TRACE_LOCK_TIMEOUT_MILLIS,
+                        timeout.as_millis(),
                         lock_path.display()
                     );
                 }
@@ -366,7 +374,9 @@ mod tests {
                     None,
                     Some("codey_worker"),
                 );
-                TraceRecorder::new(&root).record(&event).unwrap();
+                TraceRecorder::new(&root)
+                    .record_with_lock_timeout(&event, Duration::from_secs(5))
+                    .unwrap();
             }));
         }
         for handle in handles {
