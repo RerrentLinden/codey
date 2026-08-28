@@ -4,15 +4,17 @@ import test from "node:test";
 import vm from "node:vm";
 
 const root = new URL("../", import.meta.url);
+const readSource = async (path) =>
+  (await readFile(new URL(path, root), "utf8")).replace(/\r\n/g, "\n");
 
 test("renderer core waits for sidebar interaction before loading session tools", async () => {
   const [inject, sessionTools, bridge, petShield, securityShield, promptOptimize] = await Promise.all([
-    readFile(new URL("public/renderer-inject.js", root), "utf8"),
-    readFile(new URL("public/codey-inject.js", root), "utf8"),
-    readFile(new URL("public/codey-bridge.js", root), "utf8"),
-    readFile(new URL("public/pet-control-shield.js", root), "utf8"),
-    readFile(new URL("public/security-warning-shield.js", root), "utf8"),
-    readFile(new URL("public/prompt-optimize.js", root), "utf8"),
+    readSource("public/renderer-inject.js"),
+    readSource("public/codey-inject.js"),
+    readSource("public/codey-bridge.js"),
+    readSource("public/pet-control-shield.js"),
+    readSource("public/security-warning-shield.js"),
+    readSource("public/prompt-optimize.js"),
   ]);
 
   assert.match(inject, /const queryWithin = \(root, selector\)/);
@@ -131,10 +133,7 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(sessionTools, /mutationDispatcher\.subscribe\(\s*handleSessionToolMutations/);
   assert.match(sessionTools, /new MutationObserver\(handleSessionToolMutations\)/);
   assert.match(promptOptimize, /mutationDispatcher\.subscribe\(\s*handleComposerMutations/);
-  const modelWhitelist = await readFile(
-    new URL("public/model-whitelist-inject.js", root),
-    "utf8",
-  );
+  const modelWhitelist = await readSource("public/model-whitelist-inject.js");
   assert.match(modelWhitelist, /const maxTrackedModelListRequests = 256/);
   assert.match(modelWhitelist, /const maxKnownModelQueryClients = 8/);
   assert.match(modelWhitelist, /knownModelQueryClients\.delete\(client\)/);
@@ -160,8 +159,8 @@ test("renderer core waits for sidebar interaction before loading session tools",
 
 test("locale bootstrap patches navigator and Statsig independently from renderer controls", async () => {
   const [localeSource, rendererSource] = await Promise.all([
-    readFile(new URL("public/default-chinese-locale.js", root), "utf8"),
-    readFile(new URL("public/renderer-inject.js", root), "utf8"),
+    readSource("public/default-chinese-locale.js"),
+    readSource("public/renderer-inject.js"),
   ]);
   assert.doesNotMatch(rendererSource, /installDefaultChineseLocale/);
 
@@ -209,7 +208,7 @@ test("locale bootstrap patches navigator and Statsig independently from renderer
 });
 
 test("locale bootstrap patches Statsig instances added in place without a 50ms burst", async () => {
-  const localeSource = await readFile(new URL("public/default-chinese-locale.js", root), "utf8");
+  const localeSource = await readSource("public/default-chinese-locale.js");
 
   function Navigator() {}
   const dynamicConfig = {
@@ -255,7 +254,7 @@ test("locale bootstrap patches Statsig instances added in place without a 50ms b
 });
 
 test("plugin bridge fast-paths unrelated IPC payloads without a DOM observer", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const nativeCalls = [];
   const localCalls = [];
   const window = {
@@ -391,8 +390,8 @@ test("plugin bridge fast-paths unrelated IPC payloads without a DOM observer", a
 
 test("plugin fetch wrapper returns unrelated native requests without promise or header work", async () => {
   const [bridgeSource, source] = await Promise.all([
-    readFile(new URL("public/codey-bridge.js", root), "utf8"),
-    readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8"),
+    readSource("public/codey-bridge.js"),
+    readSource("public/plugin-marketplace-fix.js"),
   ]);
   const nativeResponse = {
     headers: {
@@ -448,7 +447,7 @@ test("plugin fetch wrapper returns unrelated native requests without promise or 
 });
 
 test("plugin bridge reports effective only after the runtime method is patched", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const events = [];
   const window = {
     __codeyInjectionStatus: {
@@ -495,7 +494,7 @@ test("plugin bridge reports effective only after the runtime method is patched",
 });
 
 test("a stalled local plugin refresh cannot block the native marketplace list", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   let timeoutCallback;
   const window = {
     __codeyCall() {
@@ -532,7 +531,7 @@ test("a stalled local plugin refresh cannot block the native marketplace list", 
 });
 
 test("ordinary conversation app requests do not refresh the local plugin marketplace", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const localCalls = [];
   const window = {
     __codeyCall(...args) {
@@ -573,7 +572,7 @@ test("ordinary conversation app requests do not refresh the local plugin marketp
 });
 
 test("plugin response normalization handles cyclic bridge payloads", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const window = {
     __codeyLocalPlugins: [],
     clearTimeout() {},
@@ -603,7 +602,7 @@ test("plugin response normalization handles cyclic bridge payloads", async () =>
 });
 
 test("plugin mutations queue one trailing list refresh while a refresh is in flight", async () => {
-  const source = await readFile(new URL("public/plugin-marketplace-fix.js", root), "utf8");
+  const source = await readSource("public/plugin-marketplace-fix.js");
   const listResolvers = [];
   let listCalls = 0;
   const window = {

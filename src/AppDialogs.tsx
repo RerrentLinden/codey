@@ -159,7 +159,7 @@ function ModelPickerDialogComponent({
           <div className="grid min-w-0 gap-0.5">
             <strong className="text-xs font-semibold text-[#1d1d1f]">Auto Review</strong>
             <small className="text-[10px] leading-[1.45] text-[#6e6e73]">
-              同步会按最新模型列表自动更新；仅在线路真实支持 codex-auto-review 时手动开启
+              请确认是否支持<code>codex-auto-review</code>模型再进行修改
             </small>
           </div>
           <Switch
