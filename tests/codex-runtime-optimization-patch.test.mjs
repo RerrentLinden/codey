@@ -297,21 +297,35 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.equal(mainGitGuardStatus.guard.statusHandlerPatched, true);
     assert.equal(mainGitGuardStatus.guard.strategy, "main-process-ipc");
 
+    const desktopMcpConfig =
+      'mcp_servers.codex_app={ command = "/opt/codex-app-mcp", args = ["server.mjs"] }';
     const directArgs = [
       "-c",
       "features.code_mode_host=true",
       "app-server",
       "--analytics-default-enabled",
+      "-c",
+      desktopMcpConfig,
     ];
     childProcess.spawn("/Applications/ChatGPT.app/Contents/Resources/codex", directArgs);
     assert.deepEqual(spawnCalls.at(-1)[1], [
       "-c",
       "features.code_mode_host=true",
+      "app-server",
       "-c",
       "analytics.enabled=false",
       ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
-      "app-server",
+      "-c",
+      desktopMcpConfig,
     ]);
+    const fastctxRuntimeConfig = nativeRuntimeConfigOverrides.find((config) =>
+      config.startsWith("mcp_servers.codey_fastctx.command="),
+    );
+    assert.ok(fastctxRuntimeConfig);
+    assert.ok(
+      spawnCalls.at(-1)[1].indexOf(fastctxRuntimeConfig) <
+        spawnCalls.at(-1)[1].indexOf(desktopMcpConfig),
+    );
     assert.equal(
       spawnCalls.at(-1)[2].env.CODEY_SUBAGENT_GATE_ACTIVE,
       "1",
@@ -344,10 +358,10 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     const patchedWrappedAppServerArgs = spawnCalls.at(-1)[1];
     assert.deepEqual(patchedWrappedAppServerArgs, [
       "/opt/codey/codex.js",
+      "app-server",
       "-c",
       "analytics.enabled=false",
       ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
-      "app-server",
     ]);
     assert.equal(
       patchedWrappedAppServerArgs.filter(
@@ -375,25 +389,26 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     ];
     childProcess.spawn("codex", configuredArgs);
     assert.deepEqual(spawnCalls.at(-1)[1], [
+      "app-server",
       "-c",
       "analytics.enabled=false",
       ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
-      "app-server",
     ]);
 
     const argsWithoutLegacyAnalyticsFlag = ["app-server"];
     childProcess.spawn("codex", argsWithoutLegacyAnalyticsFlag);
     assert.deepEqual(spawnCalls.at(-1)[1], [
+      "app-server",
       "-c",
       "analytics.enabled=false",
       ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
-      "app-server",
     ]);
 
     const shellCommand = [
       "source /etc/profile;",
       "exec /usr/bin/codex -c features.code_mode_host=true",
       "app-server --analytics-default-enabled",
+      `-c '${desktopMcpConfig}'`,
     ].join(" ");
     childProcess.spawn("wsl.exe", [
       "-d",
@@ -419,6 +434,14 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     assert.match(
       patchedShellCommand,
       /-c 'mcp_servers\.codey_fastctx\.command="\/mnt\/c\/Program Files\/Codey\/codey-fastctx\.exe"'/,
+    );
+    assert.ok(
+      patchedShellCommand.indexOf("app-server") <
+        patchedShellCommand.indexOf("mcp_servers.codey_fastctx.command="),
+    );
+    assert.ok(
+      patchedShellCommand.indexOf("mcp_servers.codey_fastctx.command=") <
+        patchedShellCommand.indexOf(desktopMcpConfig),
     );
     assert.match(
       patchedShellCommand,
@@ -458,7 +481,7 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     );
     assert.match(
       patchedConfiguredShellCommand,
-      /--config=analytics\.enabled=false/,
+      /-c 'analytics\.enabled=false'/,
     );
     assert.equal(
       patchedConfiguredShellCommand.match(/analytics\.enabled=false/g)?.length,
@@ -507,10 +530,10 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
     const runtimeManagedAppServerArgs = ["app-server", "--analytics-default-enabled"];
     childProcess.spawn("node", runtimeManagedAppServerArgs);
     assert.deepEqual(spawnCalls.at(-1)[1], [
+      "app-server",
       "-c",
       "analytics.enabled=false",
       ...nativeRuntimeConfigOverrides.flatMap((config) => ["-c", config]),
-      "app-server",
     ]);
 
     const spawnOptions = { cwd: "/tmp" };
@@ -743,6 +766,51 @@ test("startup patch fails closed when app-server runtime override injection is n
   }
 });
 
+test("startup patch keeps Codey MCP servers in the app-server config layer", async () => {
+  const childProcess = process.getBuiltinModule("child_process");
+  const runtimeConfigOverrides = [
+    'mcp_servers.codey_fastctx.command="/opt/codey-fastctx"',
+    'mcp_servers.codey_fastctx.args=["--codey-fastctx-mcp"]',
+    'mcp_servers.codey_subagent_control.command="/opt/codey"',
+  ];
+  const desktopMcpConfig =
+    'mcp_servers.codex_app={ command = "/opt/codex-app-mcp", args = ["server.mjs"] }';
+  const runtime = await loadPatchInIsolatedContext(runtimeConfigOverrides);
+
+  try {
+    childProcess.spawn("codex", [
+      "-c",
+      "features.code_mode_host=true",
+      "app-server",
+      "-c",
+      desktopMcpConfig,
+    ]);
+    const rewritten = Array.from(runtime.spawnCalls.at(-1)[1]);
+    const appServerIndex = rewritten.indexOf("app-server");
+    const desktopMcpIndex = rewritten.indexOf(desktopMcpConfig);
+
+    assert.ok(appServerIndex >= 0);
+    assert.ok(desktopMcpIndex > appServerIndex);
+    for (const config of runtimeConfigOverrides) {
+      const configIndex = rewritten.indexOf(config);
+      assert.ok(
+        configIndex > appServerIndex,
+        `${config} must follow app-server`,
+      );
+      assert.ok(
+        configIndex < desktopMcpIndex,
+        `${config} must share the desktop MCP layer`,
+      );
+    }
+    assert.equal(
+      runtime.context.__CODEY_CODEX_STARTUP_PATCH__.appServerRuntimeOverrides.complete,
+      true,
+    );
+  } finally {
+    runtime.restore();
+  }
+});
+
 test("startup patch resolves app-server runtime override validation after the matching spawn", async () => {
   const childProcess = process.getBuiltinModule("child_process");
   const runtimeConfigOverrides = [
@@ -761,10 +829,10 @@ test("startup patch resolves app-server runtime override validation after the ma
       "codey-app-server-runtime-overrides-verified",
     );
     assert.deepEqual(Array.from(runtime.spawnCalls.at(-1)[1]), [
+      "app-server",
       "-c",
       "analytics.enabled=false",
       ...runtimeConfigOverrides.flatMap((config) => ["-c", config]),
-      "app-server",
     ]);
     assert.equal(
       runtime.context.__CODEY_CODEX_STARTUP_PATCH__.appServerRuntimeOverrides.complete,
@@ -797,10 +865,10 @@ test("startup patch tolerates duplicate Codex analytics flags while injecting ru
       "codey-app-server-runtime-overrides-verified",
     );
     assert.deepEqual(Array.from(runtime.spawnCalls.at(-1)[1]), [
+      "app-server",
       "-c",
       "analytics.enabled=false",
       ...runtimeConfigOverrides.flatMap((config) => ["-c", config]),
-      "app-server",
     ]);
     assert.equal(
       runtime.context.__CODEY_CODEX_STARTUP_PATCH__.appServerRuntimeOverrides.complete,
@@ -857,6 +925,8 @@ test("startup patch validates runtime overrides injected into a WSL app-server c
     'model_providers.codey_router.name="Codey Local Router"',
     'model_providers.codey_router.base_url="http://127.0.0.1:61818/v1"',
   ];
+  const desktopMcpConfig =
+    'mcp_servers.codex_app={ command = "/opt/codex-app-mcp" }';
   const runtime = await loadPatchInIsolatedContext(runtimeConfigOverrides);
 
   try {
@@ -868,7 +938,7 @@ test("startup patch validates runtime overrides injected into a WSL app-server c
       "--",
       "/usr/bin/bash",
       "-lc",
-      "source /etc/profile; exec /usr/bin/codex app-server",
+      `source /etc/profile; exec /usr/bin/codex app-server -c '${desktopMcpConfig}'`,
     ]);
     assert.equal(
       await pending,
@@ -876,8 +946,12 @@ test("startup patch validates runtime overrides injected into a WSL app-server c
     );
     const patchedCommand = runtime.spawnCalls.at(-1)[1].at(-1);
     assert.match(patchedCommand, /-c 'analytics\.enabled=false'/);
+    const appServerIndex = patchedCommand.indexOf("app-server");
+    const desktopMcpIndex = patchedCommand.indexOf(desktopMcpConfig);
     for (const config of runtimeConfigOverrides) {
       assert.ok(patchedCommand.includes(`-c '${config}'`), patchedCommand);
+      assert.ok(patchedCommand.indexOf(config) > appServerIndex, patchedCommand);
+      assert.ok(patchedCommand.indexOf(config) < desktopMcpIndex, patchedCommand);
     }
     assert.equal(
       runtime.context.__CODEY_CODEX_STARTUP_PATCH__.appServerRuntimeOverrides.mode,

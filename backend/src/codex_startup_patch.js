@@ -1455,16 +1455,15 @@
     }
     resolveAppServerRuntimeOverrideValidation?.(status);
   };
-  const collectRuntimeConfigArgsBeforeAppServer = (args) => {
+  const collectRuntimeConfigArgsAfterAppServer = (args) => {
     const appServerIndex = args.indexOf("app-server");
     if (appServerIndex < 0) return [];
     const configs = [];
-    for (let index = 0; index < appServerIndex; index += 1) {
+    for (let index = appServerIndex + 1; index < args.length; index += 1) {
       const argument = args[index];
       if (
         (argument === "-c" || argument === "--config") &&
-        typeof args[index + 1] === "string" &&
-        index + 1 < appServerIndex
+        typeof args[index + 1] === "string"
       ) {
         configs.push(args[index + 1]);
         index += 1;
@@ -1507,7 +1506,7 @@
       appServerArgCount === 1 &&
       (directCodexCommand || runtimeManagedAppServer)
     ) {
-      const configs = collectRuntimeConfigArgsBeforeAppServer(args);
+      const configs = collectRuntimeConfigArgsAfterAppServer(args);
       return {
         mode: "argv",
         command,
@@ -1548,7 +1547,9 @@
     }
     const appServerOffset = execCommand.search(/\bapp-server\b/);
     if (appServerOffset < 0) return null;
-    const beforeAppServer = execCommand.slice(0, appServerOffset);
+    const afterAppServer = execCommand.slice(
+      appServerOffset + "app-server".length,
+    );
     const wslReplacementKeys = new Set(
       wslOnlyRuntimeConfigOverrides.map(runtimeOverrideKey),
     );
@@ -1567,7 +1568,7 @@
       args,
       requiredRuntimeConfigs,
       missingRuntimeConfigs: requiredRuntimeConfigs.filter(
-        (config) => !hasShellConfigArg(beforeAppServer, config),
+        (config) => !hasShellConfigArg(afterAppServer, config),
       ),
     };
   };
@@ -1674,8 +1675,12 @@
       rewritten.push(argument);
     }
     const appServerIndex = rewritten.indexOf("app-server");
+    // Keep Codey's overrides in the app-server command's own config layer.
+    // The desktop app appends mcp_servers.codex_app after the subcommand; placing
+    // Codey's mcp_servers entries in the global layer lets that later table mask
+    // FastCtx and the subagent-control server.
     rewritten.splice(
-      appServerIndex,
+      appServerIndex + 1,
       0,
       ...appServerRuntimeConfigs.flatMap((config) => ["-c", config]),
     );
@@ -1727,41 +1732,29 @@
       return command;
     }
 
-    let hasAnalyticsConfig = hasShellConfigArg(
-      execCommand,
-      appServerAnalyticsConfig,
-    );
     let rewritten = execCommand.replace(
       /(^|[\s;])(-c|--config)\s+analytics\.enabled=[^\s;&|]+(?=$|[\s;&|])/g,
-      (_match, prefix, configFlag) => {
-        hasAnalyticsConfig = true;
-        return `${prefix}${configFlag} ${appServerAnalyticsConfig}`;
-      },
+      (_match, prefix) => prefix,
     );
     rewritten = rewritten.replace(
       /(^|[\s;])--config=analytics\.enabled=[^\s;&|]+(?=$|[\s;&|])/g,
-      (_match, prefix) => {
-        hasAnalyticsConfig = true;
-        return `${prefix}--config=${appServerAnalyticsConfig}`;
-      },
+      (_match, prefix) => prefix,
     );
     rewritten = rewritten.replace(
       /(^|[\s;])--analytics-default-enabled(?=$|[\s;&|])/g,
       (_match, prefix) => prefix,
     );
-    const missingRuntimeConfigs = runtimeConfigs.filter(
-      (config) =>
-        config !== appServerAnalyticsConfig &&
-        !hasShellConfigArg(rewritten, config),
+    const rewrittenAppServerOffset = rewritten.search(/\bapp-server\b/);
+    const afterAppServer = rewritten.slice(
+      rewrittenAppServerOffset + "app-server".length,
     );
-    const injectedConfigs = [
-      ...(!hasAnalyticsConfig ? [appServerAnalyticsConfig] : []),
-      ...missingRuntimeConfigs,
-    ];
+    const injectedConfigs = runtimeConfigs.filter(
+      (config) => !hasShellConfigArg(afterAppServer, config),
+    );
     if (injectedConfigs.length > 0) {
       rewritten = rewritten.replace(
         /\bapp-server\b/,
-        `${injectedConfigs.map((config) => `-c ${shellQuote(config)}`).join(" ")} app-server`,
+        `app-server ${injectedConfigs.map((config) => `-c ${shellQuote(config)}`).join(" ")}`,
       );
     }
     let commandPrefix = command.slice(0, execCommandOffset);
