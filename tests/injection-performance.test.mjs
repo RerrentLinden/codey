@@ -68,6 +68,26 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(sessionTools, /fallbackSessionExportMaxBytes = 64 \* 1024 \* 1024/);
   assert.match(sessionTools, /exportSize > fallbackSessionExportMaxBytes/);
   assert.match(sessionTools, /watcherWakeTimer = window\.setTimeout\(\(\) => \{[\s\S]*\}, 30_000\)/);
+  assert.match(sessionTools, /const stuckCompletionGraceMs = 30_000/);
+  assert.match(sessionTools, /const stuckCompletionProbeIntervalMs = 15_000/);
+  assert.match(sessionTools, /const stuckCompletionProbeTimeoutMs = 10_000/);
+  assert.match(sessionTools, /const stuckCompletionRecoveryRetryMs = 30_000/);
+  assert.match(sessionTools, /const stuckCompletionRecoveryCooldownMs = 60_000/);
+  assert.match(sessionTools, /const stuckCompletionRecoveryResetMs = 5 \* 60_000/);
+  assert.match(sessionTools, /const stuckCompletionRecoveryMaxAttempts = 3/);
+  assert.match(sessionTools, /const stuckCompletionBridgePath = "\/session\/completion-state"/);
+  assert.match(sessionTools, /const completionRecoveryStateByKey = new Map\(\)/);
+  assert.doesNotMatch(sessionTools, /recoveredCompletionKeys|completionRecoveryCooldownUntil/);
+  assert.match(
+    sessionTools,
+    /\{ timeoutMs: stuckCompletionProbeTimeoutMs \}/,
+  );
+  assert.match(
+    sessionTools,
+    /window\.setInterval\(\(\) => \{\s*void probeStuckTaskCompletion\(\);\s*\}, stuckCompletionProbeIntervalMs\)/,
+  );
+  assert.match(sessionTools, /window\.addEventListener\("focus", probeStuckTaskCompletion\)/);
+  assert.match(sessionTools, /window\.addEventListener\("pageshow", probeStuckTaskCompletion\)/);
   assert.match(sessionTools, /window\.__codeyRendererInvalidateHeaderMount\?\.\(root\)/);
   assert.doesNotMatch(sessionTools, /headerMountDirty/);
   assert.match(sessionTools, /const threadUpdatedAtRows = new Set\(\)/);
@@ -77,7 +97,7 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(sessionTools, /window\.requestIdleCallback\(run\)/);
   assert.match(
     sessionTools,
-    /window\.__codeySessionToolsInjectLoaded = true;\s*window\.__codeySessionToolsInjectLoading = false;\s*scheduleInitialScan\(\)/,
+    /window\.__codeySessionToolsInjectLoaded = true;\s*window\.__codeySessionToolsInjectLoading = false;\s*void probeStuckTaskCompletion\(\);\s*scheduleInitialScan\(\)/,
   );
   assert.doesNotMatch(sessionTools, /addStyle\(\);\s*scan\(\)/);
   assert.doesNotMatch(sessionTools, /installThreadUpdatedTimes\(document(?:, true)?\)/);
@@ -107,6 +127,7 @@ test("renderer core waits for sidebar interaction before loading session tools",
   assert.match(sessionObserverBody, /addPendingScanRoot\(threadRow\)/);
   assert.match(sessionObserverBody, /syncConversationRichTooltipOpen\(target\)/);
   assert.doesNotMatch(sessionObserverBody, /syncSidebarThreadTimeState\(threadRow\)/);
+  assert.doesNotMatch(sessionObserverBody, /probeStuckTaskCompletion/);
   assert.match(sessionTools, /mutationDispatcher\.subscribe\(\s*handleSessionToolMutations/);
   assert.match(sessionTools, /new MutationObserver\(handleSessionToolMutations\)/);
   assert.match(promptOptimize, /mutationDispatcher\.subscribe\(\s*handleComposerMutations/);

@@ -555,6 +555,7 @@ fn bridge_path_can_run_concurrently(path: &str) -> bool {
             | "/backend/status"
             | "/backend/health"
             | "/account/usage"
+            | "/session/completion-state"
             | "/api/check_for_updates"
             | "/session/wake-watcher"
             | "/plugins/list"

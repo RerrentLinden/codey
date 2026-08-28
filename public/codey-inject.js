@@ -52,6 +52,9 @@
   let watcherWakeTimer = 0;
   let deletePopoverCleanup = null;
   let codexSessionControllerPromise = null;
+  let completionRunningObservation = null;
+  let completionProbeInFlight = false;
+  let completionNextProbeAt = 0;
   let sidebarActionTooltipTimer = 0;
   let sidebarActionTooltipAnchor = null;
   let threadUpdatedAtFetchTimer = 0;
@@ -72,6 +75,7 @@
   const deletedSidebarSessionIds = new Set();
   const pendingSidebarSessionDeleteIds = new Set();
   const hardDeletedMessageKeys = new Set();
+  const completionRecoveryStateByKey = new Map();
   const messageSelectButtons = new WeakMap();
   const conversationTurnSelector = [
     "[data-turn-key]",
@@ -103,11 +107,20 @@
   const taskListSectionHeadings = new Set(["task", "tasks", "recent", "recents", "任务", "最近"]);
   const threadRunningLossGraceMs = 2_000;
   const threadTimestampRefreshIntervalMs = 60_000;
+  const stuckCompletionGraceMs = 30_000;
+  const stuckCompletionProbeIntervalMs = 15_000;
+  const stuckCompletionProbeTimeoutMs = 10_000;
+  const stuckCompletionRecoveryRetryMs = 30_000;
+  const stuckCompletionRecoveryCooldownMs = 60_000;
+  const stuckCompletionRecoveryResetMs = 5 * 60_000;
+  const stuckCompletionRecoveryMaxAttempts = 3;
   const threadTimestampBridgePath = "/session/timestamps";
+  const stuckCompletionBridgePath = "/session/completion-state";
   const maxPendingThreadTimestampRefs = 200;
   const fallbackSessionExportMaxBytes = 64 * 1024 * 1024;
   const maxSessionCacheEntries = 2_048;
   const maxHardDeletedMessageKeys = 10_000;
+  const maxCompletionRecoveryKeys = 512;
   const maxPendingScanRoots = 64;
   const projectRunningRecoveryClickCooldownMs = 1_000;
   const rememberBoundedMapValue = (cache, key, value, limit = maxSessionCacheEntries) => {
@@ -135,9 +148,9 @@
     return matches;
   };
 
-  const callBridge = (path, payload = {}) => {
+  const callBridge = (path, payload = {}, options = {}) => {
     if (typeof window.__codexSessionDeleteBridge === "function") {
-      return window.__codexSessionDeleteBridge(path, payload);
+      return window.__codexSessionDeleteBridge(path, payload, options);
     }
     return Promise.resolve({ status: "failed", message: "Codey bridge unavailable" });
   };
@@ -304,6 +317,25 @@
       || child?.getAttribute("data-id")
       || "",
     ) || messageIdFromReactState(row);
+  };
+
+  const getCurrentTurnId = () => {
+    const rows = Array.from(document.querySelectorAll?.(conversationTurnSelector) || []);
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      let parent = rows[index].parentElement;
+      let nested = false;
+      while (parent) {
+        if (parent.matches?.(conversationTurnSelector)) {
+          nested = true;
+          break;
+        }
+        parent = parent.parentElement;
+      }
+      if (nested) continue;
+      const turnId = getMessageId(rows[index]);
+      if (turnId) return turnId;
+    }
+    return "";
   };
 
   const hardDeletedMessageKey = (sessionId, messageId) => {
@@ -1898,6 +1930,129 @@
     return codexSessionControllerPromise;
   };
 
+  const completionProbeTargetStillCurrent = (sessionId, turnId) => (
+    document.visibilityState !== "hidden"
+    && isTaskRunning()
+    && getSessionId() === sessionId
+    && getCurrentTurnId() === turnId
+  );
+
+  const completionRecoveryIsBlocked = (completionKey, now) => (
+    now < (completionRecoveryStateByKey.get(completionKey)?.retryAt || 0)
+  );
+
+  const rememberCompletionRecoveryAttempt = (completionKey, retryDelayMs) => {
+    const previousAttempts = completionRecoveryStateByKey.get(completionKey)?.attempts || 0;
+    const attempts = previousAttempts + 1;
+    const attemptsExhausted = attempts >= stuckCompletionRecoveryMaxAttempts;
+    rememberBoundedMapValue(
+      completionRecoveryStateByKey,
+      completionKey,
+      {
+        attempts: attemptsExhausted ? 0 : attempts,
+        retryAt: Date.now() + (
+          attemptsExhausted ? stuckCompletionRecoveryResetMs : retryDelayMs
+        ),
+      },
+      maxCompletionRecoveryKeys,
+    );
+  };
+
+  const probeStuckTaskCompletion = async () => {
+    if (document.visibilityState === "hidden") return false;
+    const now = Date.now();
+    if (!isTaskRunning()) {
+      if (completionRunningObservation?.key) {
+        completionRecoveryStateByKey.delete(completionRunningObservation.key);
+      }
+      completionRunningObservation = null;
+      return false;
+    }
+    const sessionId = getSessionId();
+    const turnId = getCurrentTurnId();
+    if (!sessionId || !turnId) {
+      completionRunningObservation = null;
+      return false;
+    }
+    const completionKey = `${sessionId}\u0000${turnId}`;
+    if (completionRunningObservation?.key !== completionKey) {
+      completionRunningObservation = { key: completionKey, since: now };
+      return false;
+    }
+    if (now - completionRunningObservation.since < stuckCompletionGraceMs) return false;
+    if (
+      completionProbeInFlight
+      || now < completionNextProbeAt
+      || completionRecoveryIsBlocked(completionKey, now)
+    ) return false;
+
+    completionProbeInFlight = true;
+    completionNextProbeAt = now + stuckCompletionProbeIntervalMs;
+    let recoveryAttempted = false;
+    try {
+      const result = await callBridge(
+        stuckCompletionBridgePath,
+        { sessionId, turnId },
+        { timeoutMs: stuckCompletionProbeTimeoutMs },
+      );
+      if (result?.status !== "ok") {
+        rememberCompletionRecoveryAttempt(
+          completionKey,
+          stuckCompletionRecoveryCooldownMs,
+        );
+        return false;
+      }
+      const lifecycleIsTerminal = result?.lifecycle === "idle" || result?.lifecycle === "error";
+      const terminalKindIsKnown = result?.terminalKind === "completed"
+        || result?.terminalKind === "aborted";
+      if (
+        result.sessionId !== sessionId
+        || result.turnId !== turnId
+        || result.sessionKnown !== true
+        || result.turnKnown !== true
+        || result.terminal !== true
+        || !terminalKindIsKnown
+        || !lifecycleIsTerminal
+        || !completionProbeTargetStillCurrent(sessionId, turnId)
+      ) return false;
+
+      recoveryAttempted = true;
+      const controller = await getCodexSessionController();
+      // Controller discovery can import renderer assets. Recheck the exact
+      // task and turn immediately before the first native state mutation.
+      if (!completionProbeTargetStillCurrent(sessionId, turnId)) return false;
+      await controller.discardConversation(sessionId);
+      await controller.resumeConversation({
+        conversationId: sessionId,
+        model: null,
+        serviceTier: null,
+        reasoningEffort: null,
+        workspaceRoots: [],
+        collaborationMode: null,
+        showThreadGoalResumeConfirmation: false,
+      });
+      await controller.refreshRecentConversations();
+      // Native refresh promises can resolve before React drops the stale Stop
+      // state. Revisit the same exact task after a short grace period; clearing
+      // the Stop state removes this retry record at the top of the next probe.
+      rememberCompletionRecoveryAttempt(
+        completionKey,
+        stuckCompletionRecoveryRetryMs,
+      );
+      return true;
+    } catch {
+      rememberCompletionRecoveryAttempt(
+        completionKey,
+        recoveryAttempted
+          ? stuckCompletionRecoveryCooldownMs
+          : stuckCompletionProbeIntervalMs,
+      );
+      return false;
+    } finally {
+      completionProbeInFlight = false;
+    }
+  };
+
   const refreshRecentLocalSessions = async () => {
     try {
       const controller = await getCodexSessionController();
@@ -2650,6 +2805,7 @@
   window.__codeyGetSessionTitle = getSessionTitle;
   window.__codeySyncSidebarTitles = syncSidebarTitles;
   window.__codeyGetMessageId = getMessageId;
+  window.__codeyProbeStuckTaskCompletion = probeStuckTaskCompletion;
   window.__codeyProjectPathFromRow = projectPathFromRow;
   window.__codeyFormatRelativeThreadTime = formatRelativeThreadTime;
   window.__codeyThreadTimestampMsFromPayload = threadTimestampMsFromPayload;
@@ -2943,7 +3099,10 @@
   if (typeof document.addEventListener === "function") {
     document.addEventListener("visibilitychange", wakeSessionWatcher);
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState !== "hidden") refreshThreadUpdatedTimesOnReturn();
+      if (document.visibilityState !== "hidden") {
+        refreshThreadUpdatedTimesOnReturn();
+        void probeStuckTaskCompletion();
+      }
     });
     document.addEventListener("pointerdown", wakeSessionWatcher, { capture: true, passive: true });
     document.addEventListener("keydown", wakeSessionWatcherFromKey, true);
@@ -2951,10 +3110,15 @@
   if (typeof window.addEventListener === "function") {
     window.addEventListener("focus", wakeSessionWatcher);
     window.addEventListener("focus", refreshThreadUpdatedTimesOnReturn);
+    window.addEventListener("focus", probeStuckTaskCompletion);
     window.addEventListener("pageshow", wakeSessionWatcher);
     window.addEventListener("pageshow", refreshThreadUpdatedTimesOnReturn);
+    window.addEventListener("pageshow", probeStuckTaskCompletion);
   }
   if (typeof window.setInterval === "function") {
+    window.setInterval(() => {
+      void probeStuckTaskCompletion();
+    }, stuckCompletionProbeIntervalMs);
     window.setInterval(() => {
       if (document.visibilityState === "hidden") return;
       refreshTrackedThreadUpdatedTimes(false);
@@ -2963,5 +3127,6 @@
   window.__codeyRendererInjectLoaded = true;
   window.__codeySessionToolsInjectLoaded = true;
   window.__codeySessionToolsInjectLoading = false;
+  void probeStuckTaskCompletion();
   scheduleInitialScan();
 })();

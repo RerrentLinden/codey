@@ -71,6 +71,7 @@ class FakeElement extends FakeElementCore {
 
 function loadInjection({
   initialRunning = true,
+  initialNow = 1_000_000,
   turnIds = ["turn-1"],
   sessionTitle = "排查飞书通知",
   bridgeHandler = null,
@@ -91,6 +92,8 @@ function loadInjection({
   });
   const stopButton = new FakeElement({ "aria-label": "停止" });
   let running = initialRunning;
+  let now = initialNow;
+  let sessionId = "session-1";
   const bridgeCalls = [];
   const alerts = [];
   let reloadCount = 0;
@@ -101,6 +104,7 @@ function loadInjection({
   const document = {
     documentElement,
     body: new FakeElement(),
+    visibilityState: "visible",
     getElementById(id) {
       if (id === "codey-injected-style" || id === "codey-settings-button") return placeholder;
       if (id === "codey-message-toolbar") return toolbar;
@@ -108,7 +112,7 @@ function loadInjection({
     },
     querySelector(selector) {
       if (selector === "[data-session-id]") {
-        return new FakeElement({ "data-session-id": "session-1" });
+        return new FakeElement({ "data-session-id": sessionId });
       }
       return null;
     },
@@ -140,9 +144,9 @@ function loadInjection({
     },
   };
   const window = {
-    __codexSessionDeleteBridge: async (path, payload) => {
-      bridgeCalls.push({ path, payload });
-      if (bridgeHandler) return bridgeHandler(path, payload);
+    __codexSessionDeleteBridge: async (path, payload, options = {}) => {
+      bridgeCalls.push({ options, path, payload });
+      if (bridgeHandler) return bridgeHandler(path, payload, options);
       return { status: "ok" };
     },
     __codeyCodexSessionController: codexSessionController,
@@ -172,6 +176,15 @@ function loadInjection({
   const MutationObserver = class {
     observe() {}
   };
+  class ControlledDate extends Date {
+    constructor(...args) {
+      super(...(args.length ? args : [now]));
+    }
+
+    static now() {
+      return now;
+    }
+  }
   vm.runInNewContext(source, {
     atob: (value) => Buffer.from(value, "base64").toString("binary"),
     btoa: (value) => Buffer.from(value, "binary").toString("base64"),
@@ -182,6 +195,7 @@ function loadInjection({
         this.detail = options.detail;
       }
     },
+    Date: ControlledDate,
     document,
     HTMLElement: FakeElement,
     location: {
@@ -200,6 +214,9 @@ function loadInjection({
     row.dataset.codeyMessageId = window.__codeyGetMessageId(row);
   });
   return {
+    advanceTime: (milliseconds) => {
+      now += milliseconds;
+    },
     appendTurn: (turnId) => {
       const row = new FakeElement({ "data-turn-key": turnId });
       rows.push(row);
@@ -216,9 +233,293 @@ function loadInjection({
     getVisibleTurnIds: () => rows
       .filter((row) => !row.removed)
       .map((row) => row.getAttribute("data-turn-key")),
+    setRunning: (value) => {
+      running = Boolean(value);
+    },
+    setSessionId: (value) => {
+      sessionId = String(value);
+    },
     window,
   };
 }
+
+const completedProbeResult = (overrides = {}) => ({
+  status: "ok",
+  sessionId: "session-1",
+  turnId: "turn-1",
+  sessionKnown: true,
+  turnKnown: true,
+  lifecycle: "idle",
+  terminal: true,
+  terminalKind: "completed",
+  completedAt: 42,
+  ...overrides,
+});
+
+const createRecoveryController = (events, overrides = {}) => ({
+  kind: "manager",
+  async discardConversation(sessionId) {
+    events.push(`discard:${sessionId}`);
+  },
+  async notifyConversationDeleted() {},
+  async refreshRecentConversations() {
+    events.push("refresh");
+  },
+  async resumeConversation(payload) {
+    events.push(`resume:${payload.conversationId}`);
+  },
+  ...overrides,
+});
+
+test("waits for the stuck-running grace period before probing completion", async () => {
+  const runtime = loadInjection({
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult({ lifecycle: "running", terminal: false, terminalKind: null })
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(29_999);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.equal(
+    runtime.bridgeCalls.filter((call) => call.path === "/session/completion-state").length,
+    0,
+  );
+
+  runtime.advanceTime(1);
+  await runtime.window.__codeyProbeStuckTaskCompletion();
+  assert.equal(
+    runtime.bridgeCalls.filter((call) => call.path === "/session/completion-state").length,
+    1,
+  );
+});
+
+test("probes the outer conversation turn instead of a nested activity turn", async () => {
+  const runtime = loadInjection({
+    turnIds: ["turn-outer"],
+    bridgeHandler: async () => ({
+      status: "ok",
+      sessionId: "session-1",
+      turnId: "turn-outer",
+      sessionKnown: true,
+      turnKnown: true,
+      lifecycle: "running",
+      terminal: false,
+      terminalKind: null,
+    }),
+  });
+  const nested = new FakeElement({ "data-turn-key": "turn-nested" });
+  nested.parentElement = runtime.getTurnRow();
+  runtime.appendExistingRow(nested);
+
+  runtime.advanceTime(30_000);
+  await runtime.window.__codeyProbeStuckTaskCompletion();
+
+  const probe = runtime.bridgeCalls.find((call) => call.path === "/session/completion-state");
+  assert.deepEqual(JSON.parse(JSON.stringify(probe?.payload)), {
+    sessionId: "session-1",
+    turnId: "turn-outer",
+  });
+  assert.deepEqual(JSON.parse(JSON.stringify(probe?.options)), { timeoutMs: 10_000 });
+});
+
+test("does not recover while the authoritative lifecycle is running or waiting", async () => {
+  const events = [];
+  let lifecycle = "running";
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult({ lifecycle, terminal: false, terminalKind: null })
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  lifecycle = "waiting";
+  runtime.advanceTime(15_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.deepEqual(events, []);
+});
+
+test("retries a completed task when native recovery resolves but the Stop state remains", async () => {
+  const events = [];
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult()
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.deepEqual(events, ["discard:session-1", "resume:session-1", "refresh"]);
+
+  runtime.advanceTime(29_999);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  runtime.advanceTime(1);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.deepEqual(events, [
+    "discard:session-1", "resume:session-1", "refresh",
+    "discard:session-1", "resume:session-1", "refresh",
+  ]);
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  runtime.advanceTime(299_999);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  runtime.advanceTime(1);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.equal(events.filter((event) => event === "refresh").length, 4);
+});
+
+test("clears completed-task retry history after the native Stop state disappears", async () => {
+  const events = [];
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult()
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  runtime.setRunning(false);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+
+  runtime.setRunning(true);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.equal(events.filter((event) => event === "refresh").length, 2);
+});
+
+test("rejects mismatched completion confirmation", async () => {
+  const events = [];
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult({ turnId: "turn-other" })
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.deepEqual(events, []);
+});
+
+test("cancels recovery when the visible task changes during confirmation", async () => {
+  const events = [];
+  let resolveCompletion;
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => {
+      if (path !== "/session/completion-state") return { status: "ok" };
+      return new Promise((resolve) => {
+        resolveCompletion = resolve;
+      });
+    },
+  });
+
+  runtime.advanceTime(30_000);
+  const probe = runtime.window.__codeyProbeStuckTaskCompletion();
+  await Promise.resolve();
+  runtime.setSessionId("session-2");
+  resolveCompletion(completedProbeResult());
+
+  assert.equal(await probe, false);
+  assert.deepEqual(events, []);
+});
+
+test("cancels recovery when Codex clears its native running state", async () => {
+  const events = [];
+  let resolveCompletion;
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events),
+    bridgeHandler: async (path) => {
+      if (path !== "/session/completion-state") return { status: "ok" };
+      return new Promise((resolve) => {
+        resolveCompletion = resolve;
+      });
+    },
+  });
+
+  runtime.advanceTime(30_000);
+  const probe = runtime.window.__codeyProbeStuckTaskCompletion();
+  await Promise.resolve();
+  runtime.setRunning(false);
+  resolveCompletion(completedProbeResult());
+
+  assert.equal(await probe, false);
+  assert.deepEqual(events, []);
+});
+
+test("backs off after a native recovery failure without reloading", async () => {
+  let discardCalls = 0;
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController([], {
+      async discardConversation() {
+        discardCalls += 1;
+        throw new Error("controller failed");
+      },
+    }),
+    bridgeHandler: async (path) => (
+      path === "/session/completion-state"
+        ? completedProbeResult()
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.equal(discardCalls, 1);
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.equal(discardCalls, 1);
+  runtime.advanceTime(31_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  assert.equal(discardCalls, 2);
+  assert.equal(runtime.getReloadCount(), 0);
+});
+
+test("scopes native recovery cooldown to the failed task", async () => {
+  const events = [];
+  let failNextDiscard = true;
+  const runtime = loadInjection({
+    codexSessionController: createRecoveryController(events, {
+      async discardConversation(sessionId) {
+        if (failNextDiscard) {
+          failNextDiscard = false;
+          throw new Error("controller failed");
+        }
+        events.push(`discard:${sessionId}`);
+      },
+    }),
+    bridgeHandler: async (path, payload) => (
+      path === "/session/completion-state"
+        ? completedProbeResult({ sessionId: payload.sessionId, turnId: payload.turnId })
+        : { status: "ok" }
+    ),
+  });
+
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+
+  runtime.setSessionId("session-2");
+  runtime.appendTurn("turn-2");
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), false);
+  runtime.advanceTime(30_000);
+  assert.equal(await runtime.window.__codeyProbeStuckTaskCompletion(), true);
+  assert.deepEqual(events, ["discard:session-2", "resume:session-2", "refresh"]);
+});
 
 test("unloads Codex memory without discarding the active conversation", async () => {
   const dispatcherCalls = [];
