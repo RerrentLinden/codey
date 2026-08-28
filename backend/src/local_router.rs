@@ -5,9 +5,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
@@ -53,6 +57,7 @@ const REQUEST_MEMORY_BUDGET_MULTIPLIER: usize = 4;
 const REQUEST_BODY_BUDGET_PERMITS: usize =
     REQUEST_BODY_BUDGET_BYTES / REQUEST_BODY_BUDGET_UNIT_BYTES;
 const MAX_ROUTE_BINDINGS: usize = 4096;
+const MAX_UPSTREAM_WEBSOCKET_BACKOFFS: usize = 128;
 const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
@@ -128,12 +133,14 @@ impl LocalRouter {
             rejection_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_REJECTIONS)),
             request_body_budget: Arc::new(Semaphore::new(REQUEST_BODY_BUDGET_PERMITS)),
             bindings: Arc::new(Mutex::new(RouteBindings::default())),
+            websocket_backoffs: Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default())),
             client: reqwest::Client::builder()
                 .user_agent(format!("Codey-Router/{}", env!("CARGO_PKG_VERSION")))
                 .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
                 // Reuse a warm TLS connection across normal tool turns while
                 // TCP probes evict half-open sockets before the next request.
                 .pool_idle_timeout(Some(UPSTREAM_HTTP_POOL_IDLE_TIMEOUT))
+                .http2_adaptive_window(true)
                 .tcp_nodelay(true)
                 .tcp_keepalive(Some(UPSTREAM_TCP_KEEPALIVE_IDLE))
                 .tcp_keepalive_interval(Some(UPSTREAM_TCP_KEEPALIVE_INTERVAL))
@@ -142,6 +149,9 @@ impl LocalRouter {
                 .build()
                 .context("创建 Codey 本地路由 HTTP 客户端失败")?,
             official_auth_path,
+            official_auth_cache: Arc::new(Mutex::new(
+                crate::account_usage::OfficialAuthCache::default(),
+            )),
         };
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
@@ -313,8 +323,10 @@ struct RouterServer {
     rejection_limit: Arc<Semaphore>,
     request_body_budget: Arc<Semaphore>,
     bindings: Arc<Mutex<RouteBindings>>,
+    websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     client: reqwest::Client,
     official_auth_path: PathBuf,
+    official_auth_cache: Arc<Mutex<crate::account_usage::OfficialAuthCache>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -394,6 +406,7 @@ struct RouterSnapshot {
     aliases: HashMap<String, AliasTarget>,
     raw_models: HashMap<String, Vec<AliasTarget>>,
     model_ids: Vec<String>,
+    default_model: String,
 }
 
 impl RouterSnapshot {
@@ -455,6 +468,7 @@ impl RouterSnapshot {
             aliases,
             raw_models,
             model_ids,
+            default_model: config.default_model().unwrap_or_default().to_string(),
         }
     }
 
@@ -815,7 +829,10 @@ impl RouterServer {
             .expect("local router websocket handshake context poisoned")
             .take()
             .context("Codey Responses WebSocket 缺少握手上下文")?;
-        let mut downstream = WebSocketResponsesDownstream::new(socket);
+        let mut downstream = WebSocketResponsesDownstream::with_shared_backoffs(
+            socket,
+            Arc::clone(&self.websocket_backoffs),
+        );
 
         while let Some(message) = downstream.next_message().await? {
             match message {
@@ -1040,13 +1057,25 @@ impl RouterServer {
                 .expect("validated Responses body must remain an object")
                 .insert("stream".to_string(), Value::Bool(true));
         }
-        let model = body
+        let snapshot = Arc::clone(
+            &self
+                .snapshot
+                .read()
+                .expect("local router snapshot lock poisoned"),
+        );
+        let requested_model = body
             .as_object()
             .and_then(|body| body.get("model"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .trim()
             .to_string();
+        let model_was_defaulted = requested_model.is_empty();
+        let model = if model_was_defaulted {
+            snapshot.default_model.trim().to_string()
+        } else {
+            requested_model
+        };
         if model.is_empty() {
             downstream
                 .write_error(
@@ -1057,6 +1086,11 @@ impl RouterServer {
                 )
                 .await?;
             return Ok(());
+        }
+        if model_was_defaulted {
+            body.as_object_mut()
+                .expect("validated Responses body must remain an object")
+                .insert("model".to_string(), Value::String(model.clone()));
         }
         let (route_hint, mut body_mutated) =
             match take_codey_route_metadata(&mut request, &mut body) {
@@ -1073,13 +1107,8 @@ impl RouterServer {
                     return Ok(());
                 }
             };
+        body_mutated |= model_was_defaulted;
         let binding_keys = request_binding_keys(&request);
-        let snapshot = Arc::clone(
-            &self
-                .snapshot
-                .read()
-                .expect("local router snapshot lock poisoned"),
-        );
         // Route lookup and binding refresh are both synchronous hash lookups.
         // Keeping them under one short critical section halves mutex traffic on
         // the request hot path without holding the lock across any I/O.
@@ -1203,11 +1232,19 @@ impl RouterServer {
             headers.insert(HeaderName::from_static("x-codey-request-id"), value);
         }
         if resolved.route.official_account {
-            let Some(official_auth) = resolve_official_upstream_auth(
-                &request,
-                &self.bearer_token,
-                &self.official_auth_path,
-            ) else {
+            let official_auth = {
+                let mut auth_cache = self
+                    .official_auth_cache
+                    .lock()
+                    .expect("official auth cache mutex poisoned");
+                resolve_official_upstream_auth(
+                    &request,
+                    &self.bearer_token,
+                    &self.official_auth_path,
+                    &mut auth_cache,
+                )
+            };
+            let Some(official_auth) = official_auth else {
                 downstream
                     .write_error(
                         401,
@@ -1230,8 +1267,12 @@ impl RouterServer {
                 return Ok(());
             };
             headers.insert(AUTHORIZATION, value);
+            // The downstream WebSocket handshake headers can outlive a Codex
+            // account switch. Keep the account header paired with the OAuth
+            // identity resolved for this request instead of forwarding a
+            // stale value captured when the downstream socket was opened.
+            headers.remove(CHATGPT_ACCOUNT_ID_HEADER);
             if let Some(account_id) = official_auth.account_id.as_deref()
-                && !headers.contains_key(CHATGPT_ACCOUNT_ID_HEADER)
                 && let Ok(value) = HeaderValue::from_str(account_id)
             {
                 headers.insert(HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER), value);
@@ -1249,17 +1290,23 @@ impl RouterServer {
             return Ok(());
         }
         let mut request_builder = self.client.post(upstream_url).headers(headers);
-        request_builder = if should_passthrough_native_responses(
-            bridge,
-            &model,
-            resolved.upstream_model.as_str(),
-            body_mutated,
-        ) {
-            // HTTP can reuse the exact encoded body when no rewrite was
-            // needed. WebSocket requests have no original byte buffer, so
-            // serialize the validated object once for native passthrough.
+        request_builder = if bridge == ProtocolBridge::NativeResponses {
+            // Native HTTP requests keep large input/tool fields as their raw
+            // JSON slices. Only the small top-level fields that Codey can
+            // legitimately change are re-encoded, avoiding a full second
+            // serialization of long conversations.
             let passthrough_body = match encoded_body.take() {
-                Some(body) => body,
+                Some(body)
+                    if should_passthrough_native_responses(
+                        bridge,
+                        &model,
+                        resolved.upstream_model.as_str(),
+                        body_mutated,
+                    ) =>
+                {
+                    body
+                }
+                Some(body) => rewrite_native_responses_encoded_body(&body, &upstream_body)?,
                 None => serde_json::to_vec(&upstream_body)
                     .context("序列化 Responses WebSocket 上游请求失败")?,
             };
@@ -1469,6 +1516,100 @@ fn should_passthrough_native_responses(
         && !body_mutated
 }
 
+struct RawTopLevelObject<'a>(Vec<(String, &'a RawValue)>);
+
+struct RawTopLevelObjectVisitor;
+
+impl<'de> Visitor<'de> for RawTopLevelObjectVisitor {
+    type Value = RawTopLevelObject<'de>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = Vec::with_capacity(map.size_hint().unwrap_or_default());
+        while let Some(field) = map.next_entry::<String, &'de RawValue>()? {
+            fields.push(field);
+        }
+        Ok(RawTopLevelObject(fields))
+    }
+}
+
+impl<'de> Deserialize<'de> for RawTopLevelObject<'de> {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(RawTopLevelObjectVisitor)
+    }
+}
+
+fn begin_encoded_json_field(output: &mut Vec<u8>, first: &mut bool, name: &str) -> Result<()> {
+    if !*first {
+        output.push(b',');
+    }
+    *first = false;
+    serde_json::to_writer(&mut *output, name).context("序列化 Responses 请求字段名失败")?;
+    output.push(b':');
+    Ok(())
+}
+
+fn rewrite_native_responses_encoded_body(original: &[u8], updated: &Value) -> Result<Vec<u8>> {
+    let RawTopLevelObject(fields) = serde_json::from_slice::<RawTopLevelObject>(original)
+        .context("解析 Responses 原始请求字段失败")?;
+    let updated = updated
+        .as_object()
+        .context("Responses 上游请求必须是 JSON 对象")?;
+    let mut output = Vec::with_capacity(original.len());
+    output.push(b'{');
+    let mut first = true;
+    let mut saw_model = false;
+    let mut saw_client_metadata = false;
+    for (name, raw) in fields {
+        let replacement = match name.as_str() {
+            "model" => {
+                saw_model = true;
+                Some(updated.get("model"))
+            }
+            "client_metadata" => {
+                saw_client_metadata = true;
+                Some(updated.get("client_metadata"))
+            }
+            _ => None,
+        };
+        if let Some(replacement) = replacement {
+            let Some(replacement) = replacement else {
+                continue;
+            };
+            begin_encoded_json_field(&mut output, &mut first, &name)?;
+            serde_json::to_writer(&mut output, replacement)
+                .context("序列化 Responses 已更新请求字段失败")?;
+        } else {
+            begin_encoded_json_field(&mut output, &mut first, &name)?;
+            output.extend_from_slice(raw.get().as_bytes());
+        }
+    }
+    for (name, saw_field) in [
+        ("model", saw_model),
+        ("client_metadata", saw_client_metadata),
+    ] {
+        if saw_field {
+            continue;
+        }
+        let Some(value) = updated.get(name) else {
+            continue;
+        };
+        begin_encoded_json_field(&mut output, &mut first, name)?;
+        serde_json::to_writer(&mut output, value).context("序列化 Responses 新增请求字段失败")?;
+    }
+    output.push(b'}');
+    Ok(output)
+}
+
 fn take_route_hint_from_metadata_value(metadata: &mut Value) -> Result<Option<String>> {
     let Some(metadata) = metadata.as_object_mut() else {
         return Ok(None);
@@ -1578,22 +1719,29 @@ fn resolve_official_upstream_auth(
     request: &HttpRequest,
     router_bearer_token: &str,
     auth_path: &Path,
+    auth_cache: &mut crate::account_usage::OfficialAuthCache,
 ) -> Option<OfficialUpstreamAuth> {
     if let Some(authorization) = incoming_openai_authorization(request, router_bearer_token) {
         return Some(OfficialUpstreamAuth {
             authorization: authorization.to_string(),
             account_id: incoming_chatgpt_account_id(request).or_else(|| {
-                crate::account_usage::read_official_auth(auth_path)
+                auth_cache
+                    .read(auth_path)
                     .ok()
                     .and_then(|auth| auth.account_id)
             }),
         });
     }
 
-    let auth = crate::account_usage::read_official_auth(auth_path).ok()?;
+    let auth = auth_cache.read(auth_path).ok()?;
     Some(OfficialUpstreamAuth {
         authorization: format!("Bearer {}", auth.access_token),
-        account_id: incoming_chatgpt_account_id(request).or(auth.account_id),
+        // The account ID stored with the selected OAuth token is authoritative.
+        // An incoming value may have been captured by a long-lived downstream
+        // WebSocket before the user switched accounts.
+        account_id: auth
+            .account_id
+            .or_else(|| incoming_chatgpt_account_id(request)),
     })
 }
 
@@ -4653,49 +4801,130 @@ impl UpstreamWebSocketLiveness {
 struct CachedUpstreamWebSocket {
     route_id: String,
     url: String,
+    auth_identity: UpstreamWebSocketAuthIdentity,
     liveness: UpstreamWebSocketLiveness,
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
 }
 
-#[derive(Debug)]
-struct UpstreamWebSocketBackoff {
-    route_id: String,
-    url: String,
-    failure_count: u32,
-    until: Instant,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+struct UpstreamWebSocketAuthIdentity {
+    authorization: Option<[u8; 32]>,
+    account_id: Option<[u8; 32]>,
 }
 
-impl UpstreamWebSocketBackoff {
-    fn matches(&self, route_id: &str, url: &str) -> bool {
-        self.route_id == route_id && self.url == url
+impl UpstreamWebSocketAuthIdentity {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            authorization: websocket_header_fingerprint(headers, AUTHORIZATION.as_str()),
+            account_id: websocket_header_fingerprint(headers, CHATGPT_ACCOUNT_ID_HEADER),
+        }
+    }
+}
+
+fn websocket_header_fingerprint(headers: &HeaderMap, name: &str) -> Option<[u8; 32]> {
+    headers
+        .get(name)
+        .map(|value| Sha256::digest(value.as_bytes()).into())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct UpstreamWebSocketBackoffKey {
+    route_id: String,
+    url: String,
+    auth_identity: UpstreamWebSocketAuthIdentity,
+}
+
+impl UpstreamWebSocketBackoffKey {
+    fn new(route_id: &str, url: &str, auth_identity: UpstreamWebSocketAuthIdentity) -> Self {
+        Self {
+            route_id: route_id.to_string(),
+            url: url.to_string(),
+            auth_identity,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct UpstreamWebSocketBackoff {
+    failure_count: u32,
+    until: Instant,
+    generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct UpstreamWebSocketBackoffs {
+    entries: HashMap<UpstreamWebSocketBackoffKey, UpstreamWebSocketBackoff>,
+    order: VecDeque<(UpstreamWebSocketBackoffKey, u64)>,
+    next_generation: u64,
+}
+
+impl UpstreamWebSocketBackoffs {
+    fn is_backing_off(&self, key: &UpstreamWebSocketBackoffKey, now: Instant) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|backoff| backoff.until > now)
+    }
+
+    fn record_failure(
+        &mut self,
+        key: UpstreamWebSocketBackoffKey,
+        now: Instant,
+    ) -> (u32, Duration) {
+        let reset_after = *UPSTREAM_WEBSOCKET_BACKOFF_STEPS
+            .last()
+            .expect("WebSocket backoff steps must not be empty");
+        let failure_count = self
+            .entries
+            .get(&key)
+            .filter(|backoff| now <= backoff.until + reset_after)
+            .map(|backoff| backoff.failure_count.saturating_add(1))
+            .unwrap_or(1);
+        let duration = upstream_websocket_backoff_duration(failure_count);
+        self.next_generation = self.next_generation.wrapping_add(1);
+        let generation = self.next_generation;
+        self.entries.insert(
+            key.clone(),
+            UpstreamWebSocketBackoff {
+                failure_count,
+                until: now + duration,
+                generation,
+            },
+        );
+        self.order.push_back((key, generation));
+        self.enforce_limit();
+        (failure_count, duration)
+    }
+
+    fn record_success(&mut self, key: &UpstreamWebSocketBackoffKey) {
+        self.entries.remove(key);
+    }
+
+    fn enforce_limit(&mut self) {
+        while self.entries.len() > MAX_UPSTREAM_WEBSOCKET_BACKOFFS {
+            let Some((key, generation)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                self.entries.remove(&key);
+            }
+        }
+        if self.order.len() > MAX_UPSTREAM_WEBSOCKET_BACKOFFS * 4 {
+            self.order.retain(|(key, generation)| {
+                self.entries
+                    .get(key)
+                    .is_some_and(|entry| entry.generation == *generation)
+            });
+        }
     }
 }
 
 fn upstream_websocket_backoff_duration(failure_count: u32) -> Duration {
     let index = failure_count.saturating_sub(1) as usize;
     UPSTREAM_WEBSOCKET_BACKOFF_STEPS[index.min(UPSTREAM_WEBSOCKET_BACKOFF_STEPS.len() - 1)]
-}
-
-fn next_upstream_websocket_backoff(
-    previous: Option<&UpstreamWebSocketBackoff>,
-    route_id: &str,
-    url: &str,
-    now: Instant,
-) -> (UpstreamWebSocketBackoff, Duration) {
-    let failure_count = previous
-        .filter(|backoff| backoff.matches(route_id, url))
-        .map(|backoff| backoff.failure_count.saturating_add(1))
-        .unwrap_or(1);
-    let duration = upstream_websocket_backoff_duration(failure_count);
-    (
-        UpstreamWebSocketBackoff {
-            route_id: route_id.to_string(),
-            url: url.to_string(),
-            failure_count,
-            until: now + duration,
-        },
-        duration,
-    )
 }
 
 #[async_trait]
@@ -4791,7 +5020,7 @@ impl ResponsesDownstream for HttpResponsesDownstream {
 struct WebSocketResponsesDownstream {
     socket: WebSocketStream<TcpStream>,
     upstream: Option<CachedUpstreamWebSocket>,
-    upstream_backoff: Option<UpstreamWebSocketBackoff>,
+    websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
     stream_id: Option<String>,
 }
 
@@ -4804,11 +5033,22 @@ enum IdleWebSocketEvent {
 }
 
 impl WebSocketResponsesDownstream {
+    #[cfg(test)]
     fn new(socket: WebSocketStream<TcpStream>) -> Self {
+        Self::with_shared_backoffs(
+            socket,
+            Arc::new(Mutex::new(UpstreamWebSocketBackoffs::default())),
+        )
+    }
+
+    fn with_shared_backoffs(
+        socket: WebSocketStream<TcpStream>,
+        websocket_backoffs: Arc<Mutex<UpstreamWebSocketBackoffs>>,
+    ) -> Self {
         Self {
             socket,
             upstream: None,
-            upstream_backoff: None,
+            websocket_backoffs,
             stream_id: None,
         }
     }
@@ -4979,22 +5219,22 @@ impl WebSocketResponsesDownstream {
             .as_ref()
             .map_err(|error| anyhow::anyhow!(error.clone()))?;
         let now = Instant::now();
-        if self
-            .upstream_backoff
-            .as_ref()
-            .is_some_and(|backoff| !backoff.matches(&route.provider_id, upstream_url))
-        {
-            self.upstream_backoff = None;
-        }
-        if self.upstream_backoff.as_ref().is_some_and(|backoff| {
-            backoff.matches(&route.provider_id, upstream_url) && backoff.until > now
-        }) {
-            return Ok(UpstreamWebSocketAttempt::UseHttp);
-        }
-
+        let auth_identity = UpstreamWebSocketAuthIdentity::from_headers(headers);
+        let backoff_key =
+            UpstreamWebSocketBackoffKey::new(&route.provider_id, upstream_url, auth_identity);
+        let continues_existing_response = body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .is_some_and(|response_id| !response_id.trim().is_empty());
         let cached_matches = self.upstream.as_ref().is_some_and(|cached| {
             cached.route_id == route.provider_id
                 && cached.url == *upstream_url
+                // A WebSocket previous_response_id is meaningful only on the
+                // connection that produced it. Token refreshes and account
+                // changes must affect new response chains, but must not move
+                // an in-flight continuation onto a fresh connection where the
+                // upstream would reject its parent response ID.
+                && (cached.auth_identity == auth_identity || continues_existing_response)
                 && cached.liveness.heartbeat_sent_at.is_none()
                 && cached.liveness.maintenance_action(now)
                     != UpstreamWebSocketMaintenanceAction::Drop
@@ -5002,28 +5242,38 @@ impl WebSocketResponsesDownstream {
         if !cached_matches {
             self.upstream.take();
         }
+        if self.upstream.is_none()
+            && self
+                .websocket_backoffs
+                .lock()
+                .expect("upstream WebSocket backoff mutex poisoned")
+                .is_backing_off(&backoff_key, now)
+        {
+            return Ok(UpstreamWebSocketAttempt::UseHttp);
+        }
         let mut upstream = if let Some(cached) = self.upstream.take() {
             cached
         } else {
             match connect_upstream_responses_websocket(upstream_url, headers).await {
                 Ok(socket) => {
-                    self.upstream_backoff = None;
+                    self.websocket_backoffs
+                        .lock()
+                        .expect("upstream WebSocket backoff mutex poisoned")
+                        .record_success(&backoff_key);
                     CachedUpstreamWebSocket {
                         route_id: route.provider_id.clone(),
                         url: upstream_url.clone(),
+                        auth_identity,
                         liveness: UpstreamWebSocketLiveness::new(Instant::now()),
                         socket,
                     }
                 }
                 Err(error) => {
-                    let (backoff, backoff_duration) = next_upstream_websocket_backoff(
-                        self.upstream_backoff.as_ref(),
-                        &route.provider_id,
-                        upstream_url,
-                        Instant::now(),
-                    );
-                    let failure_count = backoff.failure_count;
-                    self.upstream_backoff = Some(backoff);
+                    let (failure_count, backoff_duration) = self
+                        .websocket_backoffs
+                        .lock()
+                        .expect("upstream WebSocket backoff mutex poisoned")
+                        .record_failure(backoff_key.clone(), Instant::now());
                     crate::error_log::record_failure(
                         "local_router_upstream_websocket_degraded",
                         "connect_responses_websocket",
@@ -5094,10 +5344,18 @@ impl WebSocketResponsesDownstream {
                         self.write_text(text).await?;
                     }
                     if terminal {
+                        let successful_backoff_key = UpstreamWebSocketBackoffKey::new(
+                            &route.provider_id,
+                            upstream_url,
+                            upstream.auth_identity,
+                        );
                         if responses_websocket_connection_is_reusable(&event) {
                             self.upstream = Some(upstream);
                         }
-                        self.upstream_backoff = None;
+                        self.websocket_backoffs
+                            .lock()
+                            .expect("upstream WebSocket backoff mutex poisoned")
+                            .record_success(&successful_backoff_key);
                         return Ok(UpstreamWebSocketAttempt::Completed);
                     }
                 }
@@ -5512,12 +5770,12 @@ impl std::error::Error for UpstreamReadIdleTimeout {}
 async fn read_upstream_chunk(
     response: &mut reqwest::Response,
     operation: &'static str,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<Bytes>> {
     let chunk = tokio::time::timeout(UPSTREAM_READ_IDLE_TIMEOUT, response.chunk())
         .await
         .map_err(|_| anyhow::Error::new(UpstreamReadIdleTimeout { operation }))?
         .with_context(|| operation)?;
-    Ok(chunk.map(|chunk| chunk.to_vec()))
+    Ok(chunk)
 }
 
 async fn read_bounded_upstream_body(
@@ -8333,55 +8591,54 @@ mod tests {
     }
 
     #[test]
-    fn upstream_websocket_backoff_escalates_and_resets_by_route_identity() {
+    fn upstream_websocket_backoff_is_shared_and_scoped_to_route_and_auth() {
         let now = Instant::now();
-        let (first, first_duration) =
-            next_upstream_websocket_backoff(None, "route-a", "wss://a.example/responses", now);
-        assert_eq!(first.failure_count, 1);
-        assert_eq!(first_duration, Duration::from_secs(60));
-
-        let (second, second_duration) = next_upstream_websocket_backoff(
-            Some(&first),
+        let mut backoffs = UpstreamWebSocketBackoffs::default();
+        let key = UpstreamWebSocketBackoffKey::new(
             "route-a",
             "wss://a.example/responses",
-            now,
+            UpstreamWebSocketAuthIdentity::default(),
         );
-        assert_eq!(second.failure_count, 2);
+        let (first_count, first_duration) = backoffs.record_failure(key.clone(), now);
+        assert_eq!(first_count, 1);
+        assert_eq!(first_duration, Duration::from_secs(60));
+        assert!(backoffs.is_backing_off(&key, now));
+
+        let (second_count, second_duration) = backoffs.record_failure(key.clone(), now);
+        assert_eq!(second_count, 2);
         assert_eq!(second_duration, Duration::from_secs(5 * 60));
 
-        let (third, third_duration) = next_upstream_websocket_backoff(
-            Some(&second),
-            "route-a",
-            "wss://a.example/responses",
-            now,
-        );
-        assert_eq!(third.failure_count, 3);
+        let (third_count, third_duration) = backoffs.record_failure(key.clone(), now);
+        assert_eq!(third_count, 3);
         assert_eq!(third_duration, Duration::from_secs(15 * 60));
-        let (fourth, fourth_duration) = next_upstream_websocket_backoff(
-            Some(&third),
-            "route-a",
-            "wss://a.example/responses",
-            now,
-        );
-        assert_eq!(fourth.failure_count, 4);
+        let (fourth_count, fourth_duration) = backoffs.record_failure(key.clone(), now);
+        assert_eq!(fourth_count, 4);
         assert_eq!(fourth_duration, Duration::from_secs(15 * 60));
 
-        let (changed_url, changed_url_duration) = next_upstream_websocket_backoff(
-            Some(&fourth),
+        let changed_url = UpstreamWebSocketBackoffKey::new(
             "route-a",
             "wss://b.example/responses",
-            now,
+            UpstreamWebSocketAuthIdentity::default(),
         );
-        assert_eq!(changed_url.failure_count, 1);
-        assert_eq!(changed_url_duration, Duration::from_secs(60));
-        let (changed_route, changed_route_duration) = next_upstream_websocket_backoff(
-            Some(&fourth),
+        assert!(!backoffs.is_backing_off(&changed_url, now));
+        let changed_route = UpstreamWebSocketBackoffKey::new(
             "route-b",
             "wss://a.example/responses",
-            now,
+            UpstreamWebSocketAuthIdentity::default(),
         );
-        assert_eq!(changed_route.failure_count, 1);
-        assert_eq!(changed_route_duration, Duration::from_secs(60));
+        assert!(!backoffs.is_backing_off(&changed_route, now));
+        let changed_auth = UpstreamWebSocketBackoffKey::new(
+            "route-a",
+            "wss://a.example/responses",
+            UpstreamWebSocketAuthIdentity {
+                authorization: Some([7; 32]),
+                account_id: Some([9; 32]),
+            },
+        );
+        assert!(!backoffs.is_backing_off(&changed_auth, now));
+
+        backoffs.record_success(&key);
+        assert!(!backoffs.is_backing_off(&key, now));
     }
 
     #[tokio::test]
@@ -8393,6 +8650,7 @@ mod tests {
         downstream.upstream = Some(CachedUpstreamWebSocket {
             route_id: "route-a".to_string(),
             url: "ws://upstream.example/responses".to_string(),
+            auth_identity: UpstreamWebSocketAuthIdentity::default(),
             liveness: UpstreamWebSocketLiveness::new(heartbeat_due_at),
             socket: upstream_socket,
         });
@@ -8443,6 +8701,7 @@ mod tests {
         downstream.upstream = Some(CachedUpstreamWebSocket {
             route_id: "route-a".to_string(),
             url: "ws://upstream.example/responses".to_string(),
+            auth_identity: UpstreamWebSocketAuthIdentity::default(),
             liveness,
             socket: upstream_socket,
         });
@@ -8567,6 +8826,7 @@ mod tests {
         assert_eq!(first.last().unwrap()["type"], "response.completed");
         assert_eq!(second.last().unwrap()["type"], "response.completed");
         assert!(first.iter().all(|event| event["stream_id"] == "main"));
+        assert!(second.iter().all(|event| event.get("stream_id").is_none()));
 
         socket.close(None).await.unwrap();
         let requests = upstream_task.await.unwrap();
@@ -8587,6 +8847,269 @@ mod tests {
                 .contains(RESPONSES_WEBSOCKET_BETA)
         );
         router.stop().await.unwrap();
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn websocket_request_without_model_uses_configured_default() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let WebSocketMessage::Text(text) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected response.create text message");
+            };
+            let request = serde_json::from_str::<Value>(text.as_str()).unwrap();
+            socket
+                .send(WebSocketMessage::Text(
+                    serde_json::to_string(&json!({
+                        "type":"response.completed",
+                        "response":{
+                            "id":"resp-default-model",
+                            "object":"response",
+                            "status":"completed",
+                            "model":request["model"],
+                            "output":[],
+                        }
+                    }))
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            request
+        });
+
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        config.default_model = model_alias(&provider_id, &model);
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let mut socket = connect_router_websocket(&endpoint).await;
+        socket
+            .send(WebSocketMessage::Text(
+                serde_json::to_string(&json!({
+                    "type":"response.create",
+                    "input":"resume without an explicit model",
+                }))
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let WebSocketMessage::Text(text) = event else {
+            panic!("expected response.completed text message");
+        };
+        let event = serde_json::from_str::<Value>(text.as_str()).unwrap();
+        assert_eq!(event["type"], "response.completed");
+
+        socket.close(None).await.unwrap();
+        let request = upstream_task.await.unwrap();
+        assert_eq!(request["model"], model);
+        assert_eq!(request["input"], "resume without an explicit model");
+        router.stop().await.unwrap();
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn upstream_websocket_reconnects_when_account_identity_changes() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let captured_accounts = Arc::new(Mutex::new(Vec::new()));
+        let server_accounts = Arc::clone(&captured_accounts);
+        let upstream_task = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            for sequence in 1..=2 {
+                let (stream, _) = tokio::time::timeout(Duration::from_secs(1), upstream.accept())
+                    .await
+                    .expect("changed account identity must open a new upstream connection")
+                    .unwrap();
+                let server_accounts = Arc::clone(&server_accounts);
+                let mut socket = accept_hdr_async_with_config(
+                    stream,
+                    move |request: &WebSocketRequest, response: WebSocketResponse| {
+                        server_accounts.lock().unwrap().push(
+                            request
+                                .headers()
+                                .get(CHATGPT_ACCOUNT_ID_HEADER)
+                                .and_then(|value| value.to_str().ok())
+                                .unwrap_or_default()
+                                .to_string(),
+                        );
+                        Ok(response)
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+                let message = socket.next().await.unwrap().unwrap();
+                assert!(matches!(message, WebSocketMessage::Text(_)));
+                socket
+                    .send(WebSocketMessage::Text(
+                        serde_json::to_string(&json!({
+                            "type":"response.completed",
+                            "response":{
+                                "id":format!("resp-{sequence}"),
+                                "object":"response",
+                                "status":"completed",
+                                "output":[],
+                            }
+                        }))
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                // Keep the first socket alive so the second handshake proves
+                // that identity matching, rather than EOF detection, forced
+                // the reconnect.
+                sockets.push(socket);
+            }
+            server_accounts.lock().unwrap().clone()
+        });
+
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let snapshot = RouterSnapshot::from_config(&config);
+        let route = Arc::clone(&snapshot.routes[&provider_id]);
+        let (downstream_socket, mut downstream_peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(downstream_socket);
+
+        for (account_id, input) in [("acct-first", "first"), ("acct-second", "second")] {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer same-token"));
+            headers.insert(
+                HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+                HeaderValue::from_str(account_id).unwrap(),
+            );
+            let mut body = json!({"model":model,"input":input});
+            assert_eq!(
+                downstream
+                    .proxy_upstream_websocket(&route, &headers, &mut body)
+                    .await
+                    .unwrap(),
+                UpstreamWebSocketAttempt::Completed
+            );
+            let event = downstream_peer.next().await.unwrap().unwrap();
+            assert!(matches!(event, WebSocketMessage::Text(_)));
+        }
+
+        assert_eq!(
+            upstream_task.await.unwrap(),
+            vec!["acct-first".to_string(), "acct-second".to_string()]
+        );
+    }
+
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn upstream_websocket_keeps_continuation_on_original_account_connection() {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream.accept().await.unwrap();
+            let captured_account = Arc::new(Mutex::new(String::new()));
+            let server_account = Arc::clone(&captured_account);
+            let mut socket = accept_hdr_async_with_config(
+                stream,
+                move |request: &WebSocketRequest, response: WebSocketResponse| {
+                    *server_account.lock().unwrap() = request
+                        .headers()
+                        .get(CHATGPT_ACCOUNT_ID_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    Ok(response)
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+            let mut requests = Vec::new();
+            for sequence in 1..=2 {
+                let WebSocketMessage::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected response.create text message");
+                };
+                let request = serde_json::from_str::<Value>(text.as_str()).unwrap();
+                requests.push(request);
+                socket
+                    .send(WebSocketMessage::Text(
+                        serde_json::to_string(&json!({
+                            "type":"response.completed",
+                            "response":{
+                                "id":format!("resp-{sequence}"),
+                                "object":"response",
+                                "status":"completed",
+                                "output":[],
+                            }
+                        }))
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+
+            let opened_replacement =
+                tokio::time::timeout(Duration::from_millis(200), upstream.accept())
+                    .await
+                    .is_ok();
+            (
+                captured_account.lock().unwrap().clone(),
+                requests,
+                opened_replacement,
+            )
+        });
+
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].supports_websockets = true;
+        let snapshot = RouterSnapshot::from_config(&config);
+        let route = Arc::clone(&snapshot.routes[&provider_id]);
+        let (downstream_socket, mut downstream_peer) = local_websocket_pair().await;
+        let mut downstream = WebSocketResponsesDownstream::new(downstream_socket);
+
+        for (account_id, previous_response_id) in
+            [("acct-first", None), ("acct-second", Some("resp-1"))]
+        {
+            let mut headers = HeaderMap::new();
+            headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer same-token"));
+            headers.insert(
+                HeaderName::from_static(CHATGPT_ACCOUNT_ID_HEADER),
+                HeaderValue::from_str(account_id).unwrap(),
+            );
+            let mut body = json!({"model":model,"input":account_id});
+            if let Some(previous_response_id) = previous_response_id {
+                body.as_object_mut().unwrap().insert(
+                    "previous_response_id".to_string(),
+                    Value::String(previous_response_id.to_string()),
+                );
+            }
+            assert_eq!(
+                downstream
+                    .proxy_upstream_websocket(&route, &headers, &mut body)
+                    .await
+                    .unwrap(),
+                UpstreamWebSocketAttempt::Completed
+            );
+            let event = downstream_peer.next().await.unwrap().unwrap();
+            assert!(matches!(event, WebSocketMessage::Text(_)));
+        }
+
+        let (captured_account, requests, opened_replacement) = upstream_task.await.unwrap();
+        assert_eq!(captured_account, "acct-first");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["previous_response_id"], "resp-1");
+        assert!(!opened_replacement);
     }
 
     #[tokio::test]
@@ -8672,12 +9195,15 @@ mod tests {
         let first =
             send_router_websocket_request_on_stream(&mut socket, &alias, "first", Some("main"))
                 .await;
-        let second = send_router_websocket_request(&mut socket, &alias, "second").await;
+        socket.close(None).await.unwrap();
+        let mut second_socket = connect_router_websocket(&endpoint).await;
+        let second = send_router_websocket_request(&mut second_socket, &alias, "second").await;
         assert_eq!(first.last().unwrap()["type"], "response.completed");
         assert_eq!(second.last().unwrap()["type"], "response.completed");
         assert!(first.iter().all(|event| event["stream_id"] == "main"));
+        assert!(second.iter().all(|event| event.get("stream_id").is_none()));
 
-        socket.close(None).await.unwrap();
+        second_socket.close(None).await.unwrap();
         let (handshake, requests) = upstream_task.await.unwrap();
         assert!(handshake.starts_with("GET /v1/responses HTTP/1.1\r\n"));
         assert_eq!(requests.len(), 2);
@@ -9106,6 +9632,8 @@ mod tests {
         assert!(should_forward_incoming_header("x-stainless-os", false));
         assert!(should_forward_incoming_header("thread-id", false));
         assert!(should_forward_incoming_header("session-id", false));
+        assert!(should_forward_incoming_header("prompt-cache-key", false));
+        assert!(should_forward_incoming_header("prompt_cache_key", false));
         assert!(!should_forward_incoming_header("authorization", true));
         assert!(!should_forward_incoming_header(ROUTER_AUTH_HEADER, true));
         assert!(!should_forward_incoming_header(ROUTE_METADATA_KEY, true));
@@ -9118,10 +9646,16 @@ mod tests {
         let request = HttpRequest {
             method: "POST".to_string(),
             path: "/v1/responses".to_string(),
-            headers: vec![(
-                "authorization".to_string(),
-                "Bearer codey-router-token".to_string(),
-            )],
+            headers: vec![
+                (
+                    "authorization".to_string(),
+                    "Bearer codey-router-token".to_string(),
+                ),
+                (
+                    CHATGPT_ACCOUNT_ID_HEADER.to_string(),
+                    "acct-stale-downstream".to_string(),
+                ),
+            ],
             body: Vec::new(),
             _body_budget_permit: None,
         };
@@ -9155,10 +9689,12 @@ mod tests {
             _body_budget_permit: None,
         };
 
+        let mut auth_cache = crate::account_usage::OfficialAuthCache::default();
         let auth = resolve_official_upstream_auth(
             &request,
             "Bearer codey-router-token",
             Path::new("/missing-auth.json"),
+            &mut auth_cache,
         )
         .unwrap();
         assert_eq!(auth.authorization, "Bearer chatgpt-oauth");
@@ -9185,9 +9721,14 @@ mod tests {
             _body_budget_permit: None,
         };
 
-        let auth =
-            resolve_official_upstream_auth(&request, "Bearer codey-router-token", &auth_path)
-                .unwrap();
+        let mut auth_cache = crate::account_usage::OfficialAuthCache::default();
+        let auth = resolve_official_upstream_auth(
+            &request,
+            "Bearer codey-router-token",
+            &auth_path,
+            &mut auth_cache,
+        )
+        .unwrap();
         assert_eq!(auth.authorization, "Bearer chatgpt-access");
         assert_eq!(auth.account_id.as_deref(), Some("acct-9"));
     }
@@ -9205,11 +9746,13 @@ mod tests {
             _body_budget_permit: None,
         };
 
+        let mut auth_cache = crate::account_usage::OfficialAuthCache::default();
         assert!(
             resolve_official_upstream_auth(
                 &request,
                 "Bearer codey-router-token",
                 Path::new("/missing-auth.json"),
+                &mut auth_cache,
             )
             .is_none()
         );
@@ -9477,6 +10020,49 @@ mod tests {
             "gpt-5.4",
             false,
         ));
+    }
+
+    #[test]
+    fn native_responses_rewrite_preserves_large_raw_fields() {
+        let original = br#"{
+            "model" : "route-a/gpt-5.4",
+            "input" : [ { "role" : "user", "content" : "keep raw spacing" } ],
+            "client_metadata" : {"codey_route":"route-a","keep":"yes"},
+            "tools" : [ { "type" : "function", "name" : "lookup" } ]
+        }"#;
+        let updated = json!({
+            "model":"gpt-5.4",
+            "input":[{"role":"user","content":"keep raw spacing"}],
+            "client_metadata":{"keep":"yes"},
+            "tools":[{"type":"function","name":"lookup"}],
+        });
+
+        let rewritten = rewrite_native_responses_encoded_body(original, &updated).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rewritten).unwrap(),
+            updated
+        );
+        let rewritten = String::from_utf8(rewritten).unwrap();
+        assert!(rewritten.contains(r#"[ { "role" : "user", "content" : "keep raw spacing" } ]"#));
+        assert!(rewritten.contains(r#"[ { "type" : "function", "name" : "lookup" } ]"#));
+        assert!(!rewritten.contains(ROUTE_METADATA_KEY));
+    }
+
+    #[test]
+    fn native_responses_rewrite_adds_a_defaulted_model_and_can_remove_metadata() {
+        let original = br#"{"input":"hello","client_metadata":{"codey_route":"route-a"}}"#;
+        let updated = json!({"model":"gpt-5.6-sol","input":"hello"});
+
+        let rewritten = rewrite_native_responses_encoded_body(original, &updated).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&rewritten).unwrap(),
+            updated
+        );
+        assert!(
+            !String::from_utf8(rewritten)
+                .unwrap()
+                .contains(ROUTE_METADATA_KEY)
+        );
     }
 
     #[test]

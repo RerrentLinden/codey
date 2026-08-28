@@ -221,6 +221,7 @@ fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
     assert!(!route.official_account);
     assert!(route.source_provider_id.is_none());
     assert!(!route.supports_remote_compaction);
+    assert!(!route.supports_websockets);
 }
 
 #[test]

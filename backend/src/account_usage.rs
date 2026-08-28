@@ -26,6 +26,47 @@ pub(crate) struct OfficialAuth {
     pub(crate) account_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OfficialAuthFingerprint {
+    len: u64,
+    modified: SystemTime,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct OfficialAuthCache {
+    cached: Option<(OfficialAuthFingerprint, OfficialAuth)>,
+}
+
+impl OfficialAuthCache {
+    pub(crate) fn read(&mut self, path: &Path) -> Result<OfficialAuth> {
+        let fingerprint = fs::metadata(path).ok().and_then(|metadata| {
+            Some(OfficialAuthFingerprint {
+                len: metadata.len(),
+                modified: metadata.modified().ok()?,
+            })
+        });
+        if let Some(fingerprint) = fingerprint.as_ref()
+            && let Some((cached_fingerprint, cached_auth)) = self.cached.as_ref()
+            && cached_fingerprint == fingerprint
+        {
+            return Ok(cached_auth.clone());
+        }
+
+        if fingerprint.is_none() {
+            self.cached = None;
+        }
+        let auth = match read_official_auth(path) {
+            Ok(auth) => auth,
+            Err(error) => {
+                self.cached = None;
+                return Err(error);
+            }
+        };
+        self.cached = fingerprint.map(|fingerprint| (fingerprint, auth.clone()));
+        Ok(auth)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountUsageSnapshot {
@@ -451,6 +492,44 @@ mod tests {
                 account_id: Some("account-value".into()),
             }
         );
+    }
+
+    #[test]
+    fn official_auth_cache_refreshes_when_the_file_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"first","account_id":"acct-1"}}"#,
+        )
+        .unwrap();
+        let mut cache = OfficialAuthCache::default();
+        assert_eq!(cache.read(&path).unwrap().access_token, "first");
+
+        fs::write(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"second-token","account_id":"acct-2"}}"#,
+        )
+        .unwrap();
+        let refreshed = cache.read(&path).unwrap();
+        assert_eq!(refreshed.access_token, "second-token");
+        assert_eq!(refreshed.account_id.as_deref(), Some("acct-2"));
+    }
+
+    #[test]
+    fn official_auth_cache_does_not_serve_a_removed_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("auth.json");
+        fs::write(
+            &path,
+            r#"{"auth_mode":"chatgpt","tokens":{"access_token":"first"}}"#,
+        )
+        .unwrap();
+        let mut cache = OfficialAuthCache::default();
+        assert_eq!(cache.read(&path).unwrap().access_token, "first");
+
+        fs::remove_file(&path).unwrap();
+        assert!(cache.read(&path).is_err());
     }
 
     #[test]

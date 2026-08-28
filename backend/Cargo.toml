@@ -24,6 +24,7 @@ path = "src/bin/codey-fastctx.rs"
 anyhow = "1"
 async-trait = "0.1"
 base64 = "0.22"
+bytes.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 codey-runtime-core = { path = "../vendor/CodeyRuntime/crates/codey-runtime-core" }
 codey-runtime-data = { path = "../vendor/CodeyRuntime/crates/codey-runtime-data" }
@@ -32,7 +33,7 @@ fastctx = { git = "https://github.com/yc-duan/fastctx", rev = "22b40ea324a186a92
 fs2 = "0.4"
 futures-util.workspace = true
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"], default-features = false }
+reqwest = { version = "0.12", features = ["http2", "json", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"], default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }

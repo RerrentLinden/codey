@@ -1337,6 +1337,10 @@ fn merge_profile_secrets(
                 profile.model_request_headers.clear();
                 profile.source_provider_id = None;
                 profile.supports_remote_compaction = false;
+                // Official routes derive WebSocket support automatically. Do
+                // not carry that derived capability into a newly converted
+                // API-key route; third-party WebSocket remains explicit opt-in.
+                profile.supports_websockets = false;
                 if profile.auth_mode.trim() == crate::config::AUTH_MODE_API_KEY {
                     profile.official_account = false;
                 }
