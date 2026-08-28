@@ -58,7 +58,7 @@ fn official_account_launch_allows_official_routes() {
 }
 
 #[test]
-fn unknown_official_auth_allows_official_only_launch_to_reach_runtime() {
+fn unknown_official_auth_from_auto_store_allows_official_only_launch_to_reach_runtime() {
     let mut official = crate::config::ProviderProfile::new("OpenAI 官方直登");
     official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.into();
     official.source_provider_id = Some("openai".into());
@@ -76,7 +76,14 @@ fn unknown_official_auth_allows_official_only_launch_to_reach_runtime() {
         &previous,
         crate::codex_provider::OfficialAccountProfileStatus::Unknown {
             profile: official.clone(),
-            reason: "system credential store cannot be probed".into(),
+            reason: concat!(
+                "无法运行 codex login status：拒绝访问。 (os error 5)；",
+                "Codex auth.json 未包含 ChatGPT token（authMode=missing, ",
+                "chatgptTokenFields=[\"access_token\", \"id_token\", \"refresh_token\"], ",
+                "openaiApiKeyPresent=false），当前凭据存储为 auto，",
+                "可能由系统凭据存储接管"
+            )
+            .into(),
         },
     )
     .unwrap();
