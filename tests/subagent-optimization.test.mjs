@@ -51,7 +51,7 @@ test("subagent settings expose the five supported role controls", async () => {
   );
   assert.match(
     modelOptionsSource,
-    /THIRD_PARTY_REASONING_EFFORT_ALLOWLIST\s*=\s*\[\s*"low",\s*"medium",\s*"high",\s*"xhigh",\s*"max"/,
+    /THIRD_PARTY_REASONING_EFFORT_ALLOWLIST\s*=\s*\[\s*"low",\s*"medium",\s*"high",\s*"xhigh",\s*"max",\s*"ultra"/,
   );
   assert.match(modelOptionsSource, /modelState\.thirdPartyModelMetadata/);
   assert.match(modelOptionsSource, /resolveSubagentModelOption/);

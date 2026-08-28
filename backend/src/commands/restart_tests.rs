@@ -334,6 +334,7 @@ fn renderer_model_catalog_uses_per_third_party_reasoning_metadata() {
                     "high".into(),
                     "xhigh".into(),
                     "max".into(),
+                    "ultra".into(),
                 ],
                 default_reasoning_effort: "low".into(),
             },
@@ -360,7 +361,7 @@ fn renderer_model_catalog_uses_per_third_party_reasoning_metadata() {
         .unwrap();
     assert_eq!(
         sol["supported_reasoning_efforts"],
-        json!(["low", "medium", "high", "xhigh", "max"])
+        json!(["low", "medium", "high", "xhigh", "max", "ultra"])
     );
     let custom = metadata
         .iter()

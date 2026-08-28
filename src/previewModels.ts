@@ -2,19 +2,19 @@ export const previewOfficialModels = [
   {
     slug: "gpt-5.6-sol",
     displayName: "GPT-5.6-Sol",
-    supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
     defaultReasoningEffort: "medium",
   },
   {
     slug: "gpt-5.6-terra",
     displayName: "GPT-5.6-Terra",
-    supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
     defaultReasoningEffort: "medium",
   },
   {
     slug: "gpt-5.6-luna",
     displayName: "GPT-5.6-Luna",
-    supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
     defaultReasoningEffort: "medium",
   },
   {

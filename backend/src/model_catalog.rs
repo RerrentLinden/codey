@@ -13,9 +13,10 @@ use crate::model_id;
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 pub(crate) const THIRD_PARTY_REASONING_EFFORTS: [&str; 4] = ["low", "medium", "high", "xhigh"];
-const THIRD_PARTY_REASONING_EFFORT_ALLOWLIST: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+const THIRD_PARTY_REASONING_EFFORT_ALLOWLIST: [&str; 6] =
+    ["low", "medium", "high", "xhigh", "max", "ultra"];
 pub(crate) const THIRD_PARTY_DEFAULT_REASONING_EFFORT: &str = "low";
-const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 5] = [
+const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 6] = [
     ("low", "Fast responses with lighter reasoning"),
     (
         "medium",
@@ -24,6 +25,7 @@ const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 5] = [
     ("high", "Greater reasoning depth for complex problems"),
     ("xhigh", "Extra high reasoning depth for complex problems"),
     ("max", "Maximum reasoning depth for the toughest tasks"),
+    ("ultra", "Maximum reasoning with automatic task delegation"),
 ];
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
@@ -775,13 +777,37 @@ fn reasoning_efforts_from_value(model: &Value) -> Vec<String> {
 
 fn third_party_reasoning_efforts_from_value(model: &Value) -> Vec<String> {
     let mut efforts = fallback_third_party_reasoning_efforts();
-    if reasoning_efforts_from_value(model)
-        .iter()
-        .any(|effort| effort == "max")
-    {
-        efforts.push("max".to_string());
+    let allow_ultra = third_party_gpt_5_6_template_supports_ultra(model);
+    for effort in reasoning_efforts_from_value(model) {
+        let allowed = effort == "max" || (effort == "ultra" && allow_ultra);
+        if allowed && !efforts.iter().any(|existing| existing == &effort) {
+            efforts.push(effort);
+        }
     }
     efforts
+}
+
+fn third_party_gpt_5_6_template_supports_ultra(model: &Value) -> bool {
+    let is_gpt_5_6 = model
+        .get("slug")
+        .and_then(Value::as_str)
+        .is_some_and(|slug| {
+            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+                .iter()
+                .any(|candidate| model_id::equal(slug, candidate))
+        });
+    is_gpt_5_6
+        && reasoning_efforts_from_value(model)
+            .iter()
+            .any(|effort| effort == "ultra")
+}
+
+fn third_party_gpt_5_6_template_supports_coordination(model: &Value) -> bool {
+    third_party_gpt_5_6_template_supports_ultra(model)
+        && model
+            .get("multi_agent_version")
+            .and_then(Value::as_str)
+            .is_some_and(|version| matches!(version, "v1" | "v2"))
 }
 
 fn default_reasoning_effort_from_value(model: &Value, supported: &[String]) -> String {
@@ -1144,6 +1170,8 @@ fn synthetic_model(
     index: usize,
     preserve_source_runtime_metadata: bool,
 ) -> Value {
+    let preserve_multi_agent_version = preserve_source_runtime_metadata
+        && third_party_gpt_5_6_template_supports_coordination(template);
     let mut model = template.clone();
     if !preserve_source_runtime_metadata {
         codey_runtime_core::model_suffix::sanitize_generic_model_metadata(&mut model);
@@ -1161,9 +1189,12 @@ fn synthetic_model(
     if let Some(object) = model.as_object_mut() {
         object.remove("availability_nux");
         object.remove("upgrade");
-        // Provider-defined models are leaf candidates in current Codex releases,
-        // but they must not inherit the template model's coordinator capability.
-        object.remove("multi_agent_version");
+        // Only route aliases that exactly reuse a GPT-5.6 template with native
+        // Ultra support may coordinate delegated work. Generic provider models
+        // remain leaf candidates and must not inherit that capability.
+        if !preserve_multi_agent_version {
+            object.remove("multi_agent_version");
+        }
     }
     model["service_tiers"] = json!([]);
     model["additional_speed_tiers"] = json!([]);
@@ -1969,9 +2000,9 @@ mod tests {
         );
         assert_eq!(
             reasoning_efforts_from_value(gpt_56),
-            ["low", "medium", "high", "xhigh", "max"]
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
         );
-        assert!(gpt_56.get("multi_agent_version").is_none());
+        assert_eq!(gpt_56["multi_agent_version"], "v2");
         assert_eq!(
             gpt_56["base_instructions"],
             "test-only instructions for gpt-5.6-sol"
@@ -2329,7 +2360,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sol_metadata.supported_reasoning_efforts,
-            ["low", "medium", "high", "xhigh", "max"]
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
         );
         let custom_metadata = state
             .third_party_model_metadata
@@ -2410,7 +2441,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sol_metadata.supported_reasoning_efforts,
-            ["low", "medium", "high", "xhigh", "max"]
+            ["low", "medium", "high", "xhigh", "max", "ultra"]
         );
         assert_eq!(state.default_model, "gpt-5.3-codex-spark");
     }

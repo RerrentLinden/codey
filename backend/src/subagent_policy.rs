@@ -284,9 +284,9 @@ mod tests {
             },
             Case {
                 upstream_models: &["gpt-5.6-sol"],
-                saved_effort: "xhigh",
+                saved_effort: "ultra",
                 expected_model: "gpt-5.6-sol",
-                expected_effort: "xhigh",
+                expected_effort: "ultra",
                 optimization_enabled: true,
             },
             Case {

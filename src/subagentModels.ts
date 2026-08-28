@@ -10,6 +10,7 @@ const THIRD_PARTY_REASONING_EFFORT_ALLOWLIST = [
   "high",
   "xhigh",
   "max",
+  "ultra",
 ];
 
 function thirdPartyReasoningEfforts(efforts?: readonly string[]) {
