@@ -15,6 +15,8 @@ import { ModelPickerDialog } from "./AppDialogs";
 import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
 import { ModelSection } from "./ModelSection";
 import { OperationsPanel } from "./OperationsPanel";
+import { canRepairMainProcessInjection, isMainProcessInjectionConfirmed } from "./runtimeStatusPresentation";
+import { repairOperationResult } from "./injectionRepair";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
 import {
   getNotificationChannelDefinition,
@@ -114,7 +116,7 @@ export function App({
     `${FEEDBACK_GROUP_QR_BASE_URL}?date=${localDateCacheKey(new Date())}`;
   const [config, setConfig] = useState<Config | null>(null);
   const persistedConfigRef = useRef<Config | null>(null);
-  const { status, setStatus, refreshStatus, refreshStatusForLoad,
+  const { status, setStatus, markRestartInProgress, refreshStatus, refreshStatusForLoad,
     restartStatusError, setRestartStatusError } =
     useRuntimeStatus({
       active: !embedded || modalVisible,
@@ -129,6 +131,7 @@ export function App({
     useState<FastContextToolsStatus>(UNKNOWN_FAST_CONTEXT_TOOLS_STATUS);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [injectionRepairRequested, setInjectionRepairRequested] = useState(false);
   const popupContainer = modalContainer ?? null;
   const noticeController = useAppNoticeController();
   // 诊断清理结果用 HeroUI Toast 展示；同一次清理的“进行中 / 结果”共用一条提示，后者替换前者。
@@ -141,7 +144,18 @@ export function App({
   }, [restartStatusError, setNotice]);
 
   const provider = providerStatus?.provider;
-  const isBusy = busy !== null;
+  const isBusy = busy !== null || (injectionRepairRequested && !restartStatusError);
+  useEffect(() => {
+    if (!injectionRepairRequested || status.restartInProgress) return;
+    setInjectionRepairRequested(false);
+    const confirmed = isMainProcessInjectionConfirmed(status);
+    setNotice({
+      tone: status.startupError || !confirmed ? "error" : "success",
+      text: status.startupError || (confirmed
+        ? "主进程注入已修复，Codex 已自动重启"
+        : "尚未确认主进程注入修复成功，请查看运行状态或失败提示"),
+    });
+  }, [injectionRepairRequested, status.restartInProgress, status.startupError, status.running, status.maintenance, setNotice]);
   const configLoaded = config !== null;
   const pendingNativeRouterToggle = Boolean(
     config &&
@@ -905,6 +919,25 @@ export function App({
     });
   }
 
+  async function repairMainProcessInjection() {
+    if (!config || restartStatusError || !canRepairMainProcessInjection(status)) return;
+    await runOperation("repair-main-process-injection", async () => {
+      if (dirty) await persist(config);
+      setNotice({ tone: "info", text: "正在退出 Codex 并修复主进程注入，成功后将自动重启…" });
+      try {
+        await withTimeout(invoke("repair_main_process_injection"), 10_000,
+          "修复请求暂未确认，请稍后重新查询状态");
+        setInjectionRepairRequested(true);
+      } catch (error) {
+        const result = repairOperationResult(error);
+        setNotice({ tone: result.tone, text: result.text });
+        // 退出客户端会断开内嵌页面连接；后端明确拒绝才不会开始修复。
+        if (!result.unconfirmed) return;
+      }
+      markRestartInProgress();
+    });
+  }
+
   async function analyzeDiagnosticStorage(target: DiagnosticStorageTarget) {
     await runOperation("clear-diagnostic-storage", async () => {
       const title = target === "trace" ? "Trace 日志" : "Crashpad";
@@ -944,6 +977,9 @@ export function App({
     () => void repairPluginMarketplace(),
   );
   const handleRestartCodex = useStableEvent(askRestartCodex);
+  const handleRepairMainProcessInjection = useStableEvent(
+    () => void repairMainProcessInjection(),
+  );
   const handleCheckForUpdates = useStableEvent(() => void checkForUpdates());
   const handleDownloadUpdate = useStableEvent(() => void downloadUpdate());
   const handleInstallDownloadedUpdate = useStableEvent(
@@ -1281,6 +1317,8 @@ export function App({
             isBusy={isBusy}
             pluginMarketplaceStatus={pluginMarketplaceStatus}
             onRepairPluginMarketplace={handleRepairPluginMarketplace}
+            onRepairMainProcessInjection={handleRepairMainProcessInjection}
+            injectionRepairing={injectionRepairRequested || busy === "repair-main-process-injection"}
             onRestart={handleRestartCodex}
             restartStatusUnknown={Boolean(restartStatusError)}
             showRestartAction={!embedded}

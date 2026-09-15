@@ -36,6 +36,7 @@ export const CODEY_API_COMMANDS = [
   "install_downloaded_update",
   "plugin_marketplace_status",
   "repair_plugin_marketplace",
+  "repair_main_process_injection",
 ] as const;
 
 export type CodeyApiCommand = (typeof CODEY_API_COMMANDS)[number];
@@ -62,6 +63,23 @@ declare global {
   }
 }
 
+/** Cross-module marker: ESM loaders can hand different instances the class. */
+export const CodeyApiErrorMarker: unique symbol = Symbol.for("codey.api.error");
+
+/** A request the Codey bridge answered with an explicit failure. */
+export class CodeyApiError extends Error {
+  readonly [CodeyApiErrorMarker] = true;
+
+  constructor(message: string) {
+    super(message);
+    this.name = "CodeyApiError";
+  }
+}
+
+export function isCodeyApiError(error: unknown): error is CodeyApiError {
+  return typeof error === "object" && error !== null && CodeyApiErrorMarker in error;
+}
+
 export async function invoke<T>(
   command: CodeyApiCommand,
   args: Record<string, unknown> = {},
@@ -70,6 +88,8 @@ export async function invoke<T>(
     throw new Error("Codey bridge 尚未连接，请退出 Codex 后重新启动 Codey");
   }
   const value = await window.__codeyInvokeApi(command, args) as { status?: string; message?: string };
-  if (value?.status === "failed") throw new Error(value.message || "Codey bridge 请求失败");
+  if (value?.status === "failed") {
+    throw new CodeyApiError(value.message || "Codey bridge 请求失败");
+  }
   return value as T;
 }
