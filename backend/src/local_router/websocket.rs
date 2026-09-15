@@ -431,7 +431,7 @@ impl WebSocketResponsesDownstream {
         let mut response_bytes = 0_usize;
         loop {
             if tokio::time::Instant::now() >= response_deadline {
-                anyhow::bail!("上游响应超过总时限");
+                return Err(anyhow::Error::new(UpstreamResponseDeadline));
             }
             let next = match self
                 .wait_for_upstream(tokio::time::timeout_at(

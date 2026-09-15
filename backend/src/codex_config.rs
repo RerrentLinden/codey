@@ -2174,6 +2174,15 @@ fn build_isolated_runtime_overrides(
         &format!("model_providers.{provider_segment}.stream_max_retries"),
         &Value::from(stream_max_retries as i64),
     );
+    if provider_id.is_some() {
+        // 压缩期间 Codey 要等上游完整生成并通过校验才写回下游，客户端默认
+        // 的 5 分钟流空闲期限会先判定连接失效；这里按 Codey 的上游预算放宽。
+        push_runtime_override_value(
+            &mut overrides,
+            &format!("model_providers.{provider_segment}.stream_idle_timeout_ms"),
+            &Value::from(local_router::COMPACTION_CLIENT_STREAM_IDLE_TIMEOUT.as_millis() as i64),
+        );
+    }
     push_required_document_override(
         &mut overrides,
         effective,

@@ -1669,9 +1669,9 @@ impl RouterServer {
             }
         };
         let mut request_builder = upstream_client.post(upstream_url).headers(headers);
-        if compacting {
-            request_builder = request_builder.timeout(COMPACTION_TIMEOUT);
-        }
+        // 压缩请求不设置 reqwest 总期限:该期限从建连算到响应体读完,会把耗时较长的
+        // 压缩中途截断。等待响应头由 response_header_timeout 约束,响应体读取由
+        // PreparedUpstreamResponse 的总期限与空闲期限约束。
         request_builder = if bridge == ProtocolBridge::NativeResponses {
             // Native HTTP requests keep large input/tool fields as their raw
             // JSON slices. Only the small top-level fields that Codey can
@@ -1708,7 +1708,13 @@ impl RouterServer {
         };
         drop(upstream_body);
         let response_header_timeout = if compacting {
-            COMPACTION_TIMEOUT
+            // 流式压缩在生成期间持续返回事件，非流式压缩要到生成结束后才返回
+            // 响应头，两者的等待期限不同，都只约束响应头。
+            if upstream_stream_requested {
+                COMPACTION_RESPONSE_HEADER_TIMEOUT
+            } else {
+                UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT
+            }
         } else if upstream_stream_requested {
             UPSTREAM_RESPONSE_HEADER_TIMEOUT
         } else {
@@ -1819,17 +1825,33 @@ impl RouterServer {
                         "requestId": current_router_request_id(),
                     }),
                 );
-                downstream
-                    .write_text_error(
-                        504,
-                        "upstream_header_timeout",
-                        format!(
-                            "Codey 线路「{}」等待上游 {} 返回响应头超时",
-                            route_display_name(&resolved.route),
-                            resolved.route.upstream_authority
-                        ),
-                    )
-                    .await?;
+                if compacting {
+                    // 压缩的等待期限与普通请求不同，失败保持压缩专用的结构化
+                    // 错误码，客户端据此显示可重试的压缩超时提示。
+                    downstream
+                        .write_error(
+                            504,
+                            "compaction_timeout",
+                            format!(
+                                "远程压缩等待上游 {} 返回响应头超时，原始会话历史未被 Codey 修改，请稍后重试",
+                                resolved.route.upstream_authority
+                            ),
+                            Some(&resolved.route),
+                        )
+                        .await?;
+                } else {
+                    downstream
+                        .write_text_error(
+                            504,
+                            "upstream_header_timeout",
+                            format!(
+                                "Codey 线路「{}」等待上游 {} 返回响应头超时",
+                                route_display_name(&resolved.route),
+                                resolved.route.upstream_authority
+                            ),
+                        )
+                        .await?;
+                }
                 return Ok(());
             }
         };

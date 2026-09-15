@@ -5826,7 +5826,9 @@ async fn compaction_timeout_releases_session_and_model_switch_keeps_request_snap
         "compaction_in_progress"
     );
     tokio::time::pause();
-    tokio::time::advance(Duration::from_secs(121)).await;
+    // 非流式压缩的响应头可能要等生成结束才返回,等待期限与普通非流式请求一致。
+    tokio::time::advance(UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT + Duration::from_secs(1))
+        .await;
     tokio::time::resume();
     let timeout = tokio::time::timeout(Duration::from_secs(2), pending)
         .await
@@ -5847,6 +5849,100 @@ async fn compaction_timeout_releases_session_and_model_switch_keeps_request_snap
         .unwrap();
     assert_ne!(retry.status().as_u16(), 409);
     upstream_task.abort();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_waits_past_the_removed_request_deadline() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (mut config, provider_id, model) = router_config(format!(
+        "http://{}/v1/responses",
+        upstream.local_addr().unwrap()
+    ));
+    config.profiles[0].supports_remote_compaction = true;
+    let (received, upstream_received) = oneshot::channel();
+    let (release, upstream_release) = oneshot::channel();
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut socket).await.unwrap();
+        received.send(()).unwrap();
+        upstream_release.await.unwrap();
+        write_json_response(
+            &mut socket,
+            200,
+            &json!({"status":"completed","output":[{"type":"compaction","encrypted_content":"opaque"}]}),
+        )
+        .await
+        .unwrap();
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let request = reqwest::Client::new()
+        .post(format!("{}/responses/compact", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({"model":model_alias(&provider_id, &model),"input":"full context"}));
+    let mut pending = tokio::spawn(async move { request.send().await.unwrap() });
+    upstream_received.await.unwrap();
+    // 旧的压缩请求带 120 秒请求总期限,会在这里被截断;现在等待响应头只用
+    // 响应头期限,上游在该期限之后返回即可成功。
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(150)).await;
+    tokio::time::resume();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut pending)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    let response = pending.await.unwrap();
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("opaque"), "{body}");
+    upstream_task.await.unwrap();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_upstream_disconnect_reports_the_read_failure() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (mut config, provider_id, model) = router_config(format!(
+        "http://{}/v1/responses",
+        upstream.local_addr().unwrap()
+    ));
+    config.profiles[0].supports_remote_compaction = true;
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut socket).await.unwrap();
+        // 响应头之后写出不完整的 SSE 帧并断开:读取得到传输层错误,不是超时。
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n5\r\ndata:",
+            )
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model":model_alias(&provider_id, &model),
+            "stream":true,
+            "input":[{"type":"compaction_trigger"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 502);
+    let value = response.json::<Value>().await.unwrap();
+    assert_eq!(value["error"]["code"], "invalid_compaction_response");
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(!message.contains("超时"), "{message}");
+    assert!(message.contains("读取远程压缩响应失败"), "{message}");
+    upstream_task.await.unwrap();
     router.stop().await.unwrap();
 }
 

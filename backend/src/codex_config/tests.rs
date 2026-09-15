@@ -797,6 +797,10 @@ fn local_router_accepts_a_codey_owned_resume_shim() {
     let rendered = applied.runtime_config_overrides.join("\n");
     assert!(rendered.contains("model_provider=\"codey_router\""));
     assert!(rendered.contains("model_providers.codey_router.stream_max_retries=5"));
+    assert!(rendered.contains(&format!(
+        "model_providers.codey_router.stream_idle_timeout_ms={}",
+        local_router::COMPACTION_CLIENT_STREAM_IDLE_TIMEOUT.as_millis()
+    )));
     assert!(
         rendered.contains("model_providers.codey_router.base_url=\"http://127.0.0.1:43127/v1\"")
     );

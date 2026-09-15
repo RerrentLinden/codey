@@ -2,7 +2,9 @@ use base64::Engine as _;
 
 use super::*;
 
-pub(crate) const COMPACTION_TIMEOUT: Duration = Duration::from_secs(120);
+// 压缩请求只在等待响应头时使用固定期限；响应体读取沿用上游响应的总期限
+// 与空闲期限，避免把耗时较长的压缩在请求总期限处截断。
+pub(crate) const COMPACTION_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 
 // Codex 运行时的协作任务载荷使用 Fernet 令牌：版本字节、时间戳、初始向量、
 // 按 16 字节分组且至少一组的密文、HMAC。Codey 不持有解密密钥，只能在发送
@@ -259,9 +261,8 @@ impl RouterServer {
                     .await;
             }
         };
-        // The reqwest deadline covers sending through reading the last upstream
-        // byte. Never time out the downstream replay and append a JSON error to
-        // an already-started SSE/HTTP response.
+        // 压缩结果必须完整校验后才能写回下游：等待上游期间不能先开始 SSE 或
+        // HTTP 响应，否则失败时只能在已经开始的响应里追加 JSON 错误。
         self.proxy_parsed_responses_inner(request, body, encoded_body, kind, downstream)
             .await
     }
@@ -779,6 +780,7 @@ pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
             let timeout = error
                 .downcast_ref::<reqwest::Error>()
                 .is_some_and(reqwest::Error::is_timeout)
+                || error.is::<UpstreamResponseDeadline>()
                 || error.is::<UpstreamReadIdleTimeout>();
             let (status, code) = if timeout {
                 (504, "compaction_timeout")
@@ -787,8 +789,21 @@ pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
             } else {
                 (502, "invalid_compaction_response")
             };
+            // 上游断流、超时与本地校验失败此前都只打印最外层上下文，压缩失败
+            // 因此难以定位；这里保留脱敏后的完整原因链。
+            let detail = sanitize_upstream_error_text(&format!("{error:#}"), route, 512)
+                .unwrap_or_else(|| "上游未返回可用的压缩结果".to_string());
+            let message = if timeout {
+                format!(
+                    "远程压缩读取上游响应超时（{detail}），原始会话历史未被 Codey 修改，请稍后重试"
+                )
+            } else if status == 400 {
+                error.to_string()
+            } else {
+                format!("远程压缩上游响应未能完成：{detail}")
+            };
             downstream
-                .write_error(status, code, error.to_string(), Some(route))
+                .write_error(status, code, message, Some(route))
                 .await
         }
     }

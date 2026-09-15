@@ -92,6 +92,12 @@ const UPSTREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 const UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UPSTREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 const UPSTREAM_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+// 压缩请求在写出下游响应前要等上游完整生成并通过校验，等待期间下游收不到任何
+// 事件。Codex 客户端默认只容忍 5 分钟流空闲，运行时会按这个预算放宽其等待期限，
+// 覆盖响应头等待加上响应体读取的最坏情况，再留出请求排队与写回的余量。
+pub(crate) const COMPACTION_CLIENT_STREAM_IDLE_TIMEOUT: Duration = UPSTREAM_RESPONSE_TIMEOUT
+    .saturating_add(UPSTREAM_NON_STREAM_RESPONSE_HEADER_TIMEOUT)
+    .saturating_add(Duration::from_secs(3 * 60));
 const DOWNSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UPSTREAM_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);

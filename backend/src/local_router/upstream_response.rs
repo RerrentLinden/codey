@@ -13,6 +13,17 @@ impl std::fmt::Display for UpstreamReadIdleTimeout {
 
 impl std::error::Error for UpstreamReadIdleTimeout {}
 
+#[derive(Debug)]
+pub(crate) struct UpstreamResponseDeadline;
+
+impl std::fmt::Display for UpstreamResponseDeadline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("上游响应超过总时限")
+    }
+}
+
+impl std::error::Error for UpstreamResponseDeadline {}
+
 pub(crate) struct PreparedUpstreamResponse {
     pub(crate) response: reqwest::Response,
     pub(crate) prefix: VecDeque<Bytes>,
@@ -52,7 +63,7 @@ pub(crate) async fn prepare_upstream_response(
             read_upstream_chunk(&mut response, operation, probe),
         )
         .await
-        .context("上游响应超过总时限")??
+        .map_err(|_| anyhow::Error::new(UpstreamResponseDeadline))??
         else {
             return Ok(PreparedUpstreamResponse {
                 response,
@@ -124,7 +135,7 @@ pub(crate) async fn read_prepared_upstream_chunk(
     probe: Option<&RouteRequestLogProbe>,
 ) -> Result<Option<Bytes>> {
     if tokio::time::Instant::now() >= prepared.deadline {
-        anyhow::bail!("上游响应超过总时限");
+        return Err(anyhow::Error::new(UpstreamResponseDeadline));
     }
     let chunk = if let Some(chunk) = prepared.prefix.pop_front() {
         Some(chunk)
@@ -134,7 +145,7 @@ pub(crate) async fn read_prepared_upstream_chunk(
             read_upstream_chunk(&mut prepared.response, operation, probe),
         )
         .await
-        .context("上游响应超过总时限")??
+        .map_err(|_| anyhow::Error::new(UpstreamResponseDeadline))??
     };
     if let Some(chunk) = &chunk {
         let total = prepared.bytes_read.saturating_add(chunk.len());
