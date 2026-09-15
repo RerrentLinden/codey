@@ -4,6 +4,7 @@ import { IconBrandOpenai, IconCheck, IconLogin2 as IconLogin, IconPlus, IconRefr
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
 import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, Tooltip } from "./components/ui";
+import { maskEmail } from "./sensitiveText";
 import type { Confirmation, OfficialAccount, OfficialAccountsResult } from "./App.types";
 import type { AccountUsageSnapshot } from "./quotaEstimate";
 
@@ -139,6 +140,7 @@ function UsageLine({ snapshot }: { snapshot: AccountUsageSnapshot | null }) {
 export type OfficialAccountsPanelProps = {
   officialAccountAvailable: boolean;
   isBusy: boolean;
+  maskSensitive?: boolean;
   popupContainer: HTMLElement | null;
   onAccountsChanged: (result: OfficialAccountsResult) => void;
   onNotice: (notice: { tone: "success" | "info" | "error"; text: string }) => void;
@@ -148,6 +150,7 @@ export type OfficialAccountsPanelProps = {
 export function OfficialAccountsPanel({
   officialAccountAvailable,
   isBusy,
+  maskSensitive = false,
   popupContainer,
   onAccountsChanged,
   onNotice,
@@ -309,6 +312,16 @@ export function OfficialAccountsPanel({
     }
   }
 
+  // 页面开启脱敏时，账号标签与提示统一使用脱敏后的邮箱。
+  const accountLabel = useCallback(
+    (account: OfficialAccount) => {
+      const email = account.email?.trim();
+      if (!email) return account.accountId || account.id;
+      return maskSensitive ? maskEmail(email) : email;
+    },
+    [maskSensitive],
+  );
+
   async function executeRemove(account: OfficialAccount) {
     setPending(`remove:${account.id}`);
     try {
@@ -323,7 +336,7 @@ export function OfficialAccountsPanel({
   }
 
   function handleRemove(account: OfficialAccount) {
-    const label = account.email || account.accountId || account.id;
+    const label = accountLabel(account);
     const title = `移除官方账号「${label}」？`;
     const description = account.isDefault
       ? "它是当前默认账号，移除后 Codex 将退出该账号登录。"
@@ -369,7 +382,7 @@ export function OfficialAccountsPanel({
       {accounts && accounts.length > 0 && (
         <ul className="official-account-list">
           {accounts.map((account) => {
-            const label = account.email || account.accountId || account.id;
+            const label = accountLabel(account);
             const plan = formatPlan(account.planType);
             return (
               <li key={account.id} className={`official-account-item${account.isDefault ? " is-default" : ""}`}>
@@ -460,7 +473,7 @@ export function OfficialAccountsPanel({
         <DialogContent className="confirmation-dialog" container={popupContainer}>
           <DialogHeader>
             <DialogTitle>
-              {confirmAccount ? `移除官方账号「${confirmAccount.email || confirmAccount.accountId || confirmAccount.id}」？` : "移除官方账号？"}
+              {confirmAccount ? `移除官方账号「${accountLabel(confirmAccount)}」？` : "移除官方账号？"}
             </DialogTitle>
             <DialogDescription>
               {confirmAccount?.isDefault

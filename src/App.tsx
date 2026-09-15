@@ -671,6 +671,11 @@ export function App({
     enabled: boolean,
     modelContexts: Record<string, import("./App.types").ModelContextConfig>,
     upstreamProxy?: string,
+    routeSettings?: {
+      accountId: string;
+      routeName: string;
+      routeShortName: string;
+    },
   ) {
     if (!config) return false;
     const profile = config.profiles.find((candidate) => candidate.id === routeId);
@@ -697,6 +702,19 @@ export function App({
         ...(upstreamProxy === undefined ? {} : { upstreamProxy }),
       });
       applyRouteResult(modelResult);
+      // 官方线路的线路名、短名称和代理存放在默认账号记录里，重启派生时会重新读回。
+      if (routeSettings) {
+        const settingsResult = await invoke<import("./App.types").OfficialAccountsResult>(
+          "save_official_account_route_settings",
+          {
+            accountId: routeSettings.accountId,
+            routeName: routeSettings.routeName,
+            routeShortName: routeSettings.routeShortName,
+            upstreamProxy: (upstreamProxy ?? "").trim(),
+          },
+        );
+        handleOfficialAccountsChanged(settingsResult);
+      }
       saved = true;
       const restartNote = modelResult.restartRequired
         ? "，重启 Codex 后完全生效"
@@ -1292,6 +1310,7 @@ export function App({
               onSaveOfficialRouteSettings={handleSaveOfficialRouteSettings}
               onSetDefaultModel={handleSetRouteDefaultModel}
               onConfigChange={handleConfigChange}
+              onRequestConfirmation={setConfirmation}
             />
           </div>
 

@@ -1,8 +1,10 @@
-import { memo, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   IconCheck as Check,
   IconCpu,
   IconEdit as Edit,
+  IconEye,
+  IconEyeOff,
   IconGripVertical,
   IconInfoCircle,
   IconListDetails,
@@ -13,7 +15,7 @@ import {
   IconTrash as Trash,
 } from "@tabler/icons-react";
 
-import type { Config, ModelContextConfig, ModelState, OfficialAccountsResult, Profile, ProviderStatus } from "./App.types";
+import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAccount, OfficialAccountsResult, Profile, ProviderStatus } from "./App.types";
 import { OfficialAccountsPanel } from "./OfficialAccountsPanel";
 import { Card } from "@heroui/react";
 import {
@@ -34,8 +36,13 @@ import {
   Tooltip,
 } from "./components/ui";
 import { modelIdsEqual, modelKey, uniqueModelIds } from "./modelIds";
+import {
+  validateOfficialRouteSettings,
+  type OfficialRouteSettingsDraft,
+} from "./officialRouteSettings";
 import { headersTextFromMap, parseHeadersText } from "./requestHeaders";
 import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
+import { maskEmail, maskUrl } from "./sensitiveText";
 import {
   MAX_ROUTE_SHORT_NAME_CHARACTERS,
   validateThirdPartyRouteShortName,
@@ -70,9 +77,15 @@ type ModelSectionProps = {
     enabled: boolean,
     modelContexts: Record<string, ModelContextConfig>,
     upstreamProxy?: string,
+    routeSettings?: {
+      accountId: string;
+      routeName: string;
+      routeShortName: string;
+    },
   ) => Promise<boolean>;
   onSetDefaultModel: (routeId: string, model: string) => void;
   onConfigChange?: (config: Config) => void;
+  onRequestConfirmation?: (confirmation: Confirmation) => void;
 };
 
 type RouteModelGroup = {
@@ -119,6 +132,9 @@ type RouteDraftErrors = {
   apiKey: string;
   upstreamProxy: string;
 };
+
+// 官方线路的编辑入口只改线路名、短名称和代理，模型列举交给同步入口。
+type OfficialRouteDialogScope = "settings" | "models";
 
 function validateRouteDraft(route: Profile, profiles: readonly Profile[]): RouteDraftErrors {
   if (route.authMode === "officialAccount") {
@@ -173,6 +189,7 @@ function ModelSectionComponent({
   onSaveOfficialRouteSettings,
   onSetDefaultModel,
   onConfigChange,
+  onRequestConfirmation,
 }: ModelSectionProps) {
   const [routeDialogOpen, setRouteDialogOpen] = useState(false);
   const [draggedRouteId, setDraggedRouteId] = useState<string | null>(null);
@@ -184,14 +201,67 @@ function ModelSectionComponent({
   const [headerDialogProfile, setHeaderDialogProfile] = useState<Profile | null>(null);
   const [headerError, setHeaderError] = useState("");
   const [officialModelDraft, setOfficialModelDraft] = useState<string[]>([]);
+  const [officialAccounts, setOfficialAccounts] = useState<OfficialAccount[] | null>(null);
+  // 脱敏只作用于当前页面显示，每次进入页面默认关闭。
+  const [maskSensitive, setMaskSensitive] = useState(false);
+  const [officialRouteDraft, setOfficialRouteDraft] =
+    useState<OfficialRouteSettingsDraft | null>(null);
+  const [officialDialogScope, setOfficialDialogScope] =
+    useState<OfficialRouteDialogScope | null>(null);
   const routeConfigReadOnly = !config.localRouterEnabled;
 
   useEffect(() => {
     if (!routeConfigReadOnly) return;
     setRouteDialogOpen(false);
     setRouteDraft(null);
+    setOfficialRouteDraft(null);
+    setOfficialDialogScope(null);
     setRouteApiKeyVisible(false);
   }, [routeConfigReadOnly]);
+
+  // 官方线路的线路名、短名称和代理保存在默认账号记录里，保存入口在线路卡片上。
+  const refreshOfficialAccounts = useCallback(async () => {
+    try {
+      const result = await invoke<OfficialAccountsResult>("list_official_accounts");
+      setOfficialAccounts(result.accounts ?? []);
+    } catch {
+      setOfficialAccounts(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshOfficialAccounts();
+  }, [refreshOfficialAccounts]);
+
+  const handleOfficialAccountsChanged = useCallback(
+    (result: OfficialAccountsResult) => {
+      if (Array.isArray(result.accounts)) setOfficialAccounts(result.accounts);
+      onOfficialAccountsChanged(result);
+    },
+    [onOfficialAccountsChanged],
+  );
+
+  const defaultOfficialAccount = useMemo(
+    () => officialAccounts?.find((account) => account.isDefault) ?? null,
+    [officialAccounts],
+  );
+  const officialLoginLabel = useMemo(() => {
+    const email = defaultOfficialAccount?.email?.trim();
+    return email ? `官方账号登录 · ${email}` : "官方账号登录";
+  }, [defaultOfficialAccount]);
+  const displayedOfficialEmail = useMemo(() => {
+    const email = defaultOfficialAccount?.email?.trim();
+    if (!email) return "";
+    return maskSensitive ? maskEmail(email) : email;
+  }, [defaultOfficialAccount, maskSensitive]);
+  const displayedOfficialLoginLabel = useMemo(
+    () => (displayedOfficialEmail ? `官方账号登录 · ${displayedOfficialEmail}` : officialLoginLabel),
+    [displayedOfficialEmail, officialLoginLabel],
+  );
+  const hideUrl = useCallback(
+    (value: string) => (maskSensitive ? maskUrl(value) : value),
+    [maskSensitive],
+  );
 
   const nativeProfile = useMemo<Profile | null>(() => {
     if (!routeConfigReadOnly || !currentProvider) return null;
@@ -312,6 +382,18 @@ function ModelSectionComponent({
   const routeDraftHasErrors = Boolean(
     routeDraftErrors && Object.values(routeDraftErrors).some(Boolean),
   );
+  const officialRouteDraftErrors = useMemo(
+    () =>
+      officialRouteDraft
+        ? validateOfficialRouteSettings(
+            officialRouteDraft,
+            config.profiles,
+            officialAccounts,
+            defaultOfficialAccount?.id ?? "",
+          )
+        : null,
+    [config.profiles, defaultOfficialAccount, officialAccounts, officialRouteDraft],
+  );
 
   const openNewRouteDialog = () => {
     setRouteDraft(createRoute(config.profiles));
@@ -320,16 +402,29 @@ function ModelSectionComponent({
     setRouteHeadersText(JSON.stringify({}, null, 2));
     setHeaderError("");
     setOfficialModelDraft([]);
+    setOfficialDialogScope(null);
     setRouteDialogOpen(true);
   };
-  const openEditRouteDialog = (profile: Profile) => {
+  const openRouteDialog = (
+    profile: Profile,
+    officialScope: OfficialRouteDialogScope | null = null,
+  ) => {
     const official = profile.authMode === "officialAccount";
     setRouteDraft({ ...profile });
     setRouteValidationAttempted(false);
     setRouteApiKeyVisible(false);
     setRouteHeadersText(headersTextFromMap(profile.modelRequestHeaders));
     setHeaderError("");
-    if (official) {
+    setOfficialRouteDraft(
+      official && officialScope === "settings"
+        ? {
+            routeName: defaultOfficialAccount?.routeName ?? "",
+            routeShortName: defaultOfficialAccount?.routeShortName ?? "",
+            upstreamProxy: profile.upstreamProxy ?? "",
+          }
+        : null,
+    );
+    if (official && officialScope === "models") {
       const providerId = routeProviderId(profile);
       const configuredModels = config.selectedModelsByProvider[providerId] || [];
       setOfficialModelDraft(
@@ -337,11 +432,17 @@ function ModelSectionComponent({
           ? configuredModels
           : officialCatalog,
       );
+    } else {
+      setOfficialModelDraft([]);
     }
+    setOfficialDialogScope(official ? officialScope : null);
     setRouteDialogOpen(true);
   };
   const updateRouteDraft = (patch: Partial<Profile>) => {
     setRouteDraft((current) => current ? { ...current, ...patch } : current);
+  };
+  const updateOfficialRouteDraft = (patch: Partial<OfficialRouteSettingsDraft>) => {
+    setOfficialRouteDraft((current) => current ? { ...current, ...patch } : current);
   };
   const openHeadersDialog = (profile: Profile) => {
     setHeaderDialogProfile(profile);
@@ -374,11 +475,20 @@ function ModelSectionComponent({
       setRouteValidationAttempted(true);
       return;
     }
-    if (routeDraft.authMode === "officialAccount" && routeDraftErrors?.upstreamProxy) {
-      setRouteValidationAttempted(true);
-      return;
-    }
-    if (routeDraft.authMode !== "officialAccount" && routeDraftHasErrors) {
+    if (routeDraft.authMode === "officialAccount") {
+      if (officialDialogScope === "models") {
+        if (officialModelDraft.length === 0) return;
+      } else if (officialRouteDraftErrors && Object.values(officialRouteDraftErrors).some(Boolean)) {
+        setRouteValidationAttempted(true);
+        requestAnimationFrame(() => {
+          const firstInvalid = document.querySelector<HTMLInputElement>(
+            ".official-route-editor [aria-invalid='true']",
+          );
+          firstInvalid?.focus();
+        });
+        return;
+      }
+    } else if (routeDraftHasErrors) {
       setRouteValidationAttempted(true);
       requestAnimationFrame(() => {
         const firstInvalid = document.querySelector<HTMLInputElement>(
@@ -388,21 +498,43 @@ function ModelSectionComponent({
       });
       return;
     }
+    const accountId = defaultOfficialAccount?.id ?? "";
+    const officialProviderId = routeProviderId(routeDraft);
+    const configuredOfficialModels = config.selectedModelsByProvider[officialProviderId] || [];
+    const currentOfficialModels = configuredOfficialModels.length > 0
+      ? configuredOfficialModels
+      : officialCatalog;
+    const savingOfficialSettings =
+      routeDraft.authMode === "officialAccount" && officialDialogScope === "settings";
+    // 同步入口只改模型，代理等设置保持现状，因此不传代理值。
+    const upstreamProxy = savingOfficialSettings
+      ? officialRouteDraft?.upstreamProxy ?? routeDraft.upstreamProxy ?? ""
+      : undefined;
     const saved = routeDraft.authMode === "officialAccount"
       ? (onSaveOfficialRouteSettings
           ? await onSaveOfficialRouteSettings(
               routeDraft.id,
-              officialModelDraft,
+              officialDialogScope === "models" ? officialModelDraft : currentOfficialModels,
               showAccountUsageInHeader,
               routeDraft.enabled !== false,
               {},
-              routeDraft.upstreamProxy ?? "",
+              upstreamProxy,
+              savingOfficialSettings && accountId && officialRouteDraft
+                ? {
+                    accountId,
+                    routeName: officialRouteDraft.routeName.trim(),
+                    routeShortName: officialRouteDraft.routeShortName.trim(),
+                  }
+                : undefined,
             )
           : true)
       : await onSaveRoute({ ...routeDraft, modelRequestHeaders });
     if (saved) {
+      if (routeDraft.authMode === "officialAccount") void refreshOfficialAccounts();
       setRouteDialogOpen(false);
       setRouteDraft(null);
+      setOfficialRouteDraft(null);
+      setOfficialDialogScope(null);
     }
   };
 
@@ -433,7 +565,22 @@ function ModelSectionComponent({
             <Server size={15} />
           </span>
           <div>
-            <h2 id="route-title">线路与模型</h2>
+            <div className="route-title-line">
+              <h2 id="route-title">线路与模型</h2>
+              <Button
+                variant="link"
+                size="icon-sm"
+                aria-label={maskSensitive ? "显示线路 URL 与邮箱" : "隐藏线路 URL 与邮箱"}
+                title={maskSensitive ? "显示线路 URL 与邮箱" : "隐藏线路 URL 与邮箱"}
+                onClick={() => setMaskSensitive((previous) => !previous)}
+              >
+                {maskSensitive ? (
+                  <IconEyeOff size={15} aria-hidden="true" />
+                ) : (
+                  <IconEye size={15} aria-hidden="true" />
+                )}
+              </Button>
+            </div>
             <p>
               {routeConfigReadOnly
                 ? "查看 Codex 当前线路并同步原始模型目录"
@@ -529,9 +676,11 @@ function ModelSectionComponent({
             <OfficialAccountsPanel
               officialAccountAvailable={officialAccountAvailable}
               isBusy={isBusy}
+              maskSensitive={maskSensitive}
               popupContainer={popupContainer}
-              onAccountsChanged={onOfficialAccountsChanged}
+              onAccountsChanged={handleOfficialAccountsChanged}
               onNotice={onNotice}
+              onRequestConfirmation={onRequestConfirmation}
             />
 
             <div id="provider-model-groups" className="provider-model-groups" role="region" aria-label="供应商与模型列表" tabIndex={0}>
@@ -549,7 +698,7 @@ function ModelSectionComponent({
                 const isOfficial = profile.authMode === "officialAccount";
                 const disabled = profile.enabled === false;
                 const syncModels = () => {
-                  if (isOfficial && !routeConfigReadOnly) openEditRouteDialog(profile);
+                  if (isOfficial && !routeConfigReadOnly) openRouteDialog(profile, "models");
                   else onFetchRouteModels(profile);
                 };
                 return (
@@ -638,8 +787,18 @@ function ModelSectionComponent({
                               {disabled && <span className="route-disabled-hint">启用后可使用此线路的模型</span>}
                             </div>
                           </div>
-                          <small title={isOfficial ? "官方账号登录" : profile.baseUrl}>
-                            {isOfficial ? "官方账号登录" : profile.baseUrl || "待填写 URL"}
+                          <small
+                            title={
+                              isOfficial
+                                ? displayedOfficialLoginLabel
+                                : hideUrl(profile.baseUrl)
+                            }
+                          >
+                            {isOfficial
+                              ? displayedOfficialLoginLabel
+                              : profile.baseUrl
+                                ? hideUrl(profile.baseUrl)
+                                : "待填写 URL"}
                           </small>
                         </div>
                       </div>
@@ -700,31 +859,30 @@ function ModelSectionComponent({
                             >
                               <IconListDetails size={14} aria-hidden="true" />
                             </Button>
+                            <Button
+                              variant="link"
+                              color="primary"
+                              size="icon-sm"
+                              disabled={isBusy || dirty}
+                              onClick={() =>
+                                openRouteDialog(profile, isOfficial ? "settings" : null)}
+                              aria-label={`编辑线路 ${profile.name}`}
+                              title={`编辑线路 ${profile.name}`}
+                            >
+                              <Edit size={14} aria-hidden="true" />
+                            </Button>
                             {!isOfficial && (
-                              <>
-                                <Button
-                                  variant="link"
-                                  color="primary"
-                                  size="icon-sm"
-                                  disabled={isBusy || dirty}
-                                  onClick={() => openEditRouteDialog(profile)}
-                                  aria-label={`编辑线路 ${profile.name}`}
-                                  title={`编辑线路 ${profile.name}`}
-                                >
-                                  <Edit size={14} aria-hidden="true" />
-                                </Button>
-                                <Button
-                                  variant="link"
-                                  color="danger"
-                                  size="icon-sm"
-                                  disabled={routeConfigReadOnly || isBusy || dirty || config.profiles.length <= 1}
-                                  onClick={() => onDeleteRoute(profile.id)}
-                                  aria-label={`删除线路 ${profile.name}`}
-                                  title={config.profiles.length <= 1 ? "至少需要保留一条线路" : `删除线路 ${profile.name}`}
-                                >
-                                  <Trash size={14} aria-hidden="true" />
-                                </Button>
-                              </>
+                              <Button
+                                variant="link"
+                                color="danger"
+                                size="icon-sm"
+                                disabled={routeConfigReadOnly || isBusy || dirty || config.profiles.length <= 1}
+                                onClick={() => onDeleteRoute(profile.id)}
+                                aria-label={`删除线路 ${profile.name}`}
+                                title={config.profiles.length <= 1 ? "至少需要保留一条线路" : `删除线路 ${profile.name}`}
+                              >
+                                <Trash size={14} aria-hidden="true" />
+                              </Button>
                             )}
                           </div>
                         )}
@@ -776,6 +934,8 @@ function ModelSectionComponent({
             setRouteDialogOpen(open);
             if (!open) {
               setRouteDraft(null);
+              setOfficialRouteDraft(null);
+              setOfficialDialogScope(null);
               setRouteApiKeyVisible(false);
             }
           }
@@ -796,7 +956,9 @@ function ModelSectionComponent({
               <div className="route-editor-dialog-title-row">
                 <DialogTitle>
                   {routeDraft.authMode === "officialAccount"
-                    ? "配置官方账号模型"
+                    ? officialDialogScope === "models"
+                      ? "同步官方模型"
+                      : "编辑官方线路"
                     : config.profiles.some((profile) => profile.id === routeDraft.id)
                       ? "编辑线路"
                       : "新增线路"}
@@ -804,90 +966,184 @@ function ModelSectionComponent({
               </div>
               <DialogDescription>
                 {routeDraft.authMode === "officialAccount"
-                  ? "选择允许在 Codex 中使用的官方候选模型。未勾选的模型不会在模型目录和选择器中出现。"
+                  ? officialDialogScope === "models"
+                    ? defaultOfficialAccount
+                      ? `当前官方账号：${displayedOfficialEmail || defaultOfficialAccount.id}。未勾选的模型不会在模型目录和选择器中显示。`
+                      : "未勾选的模型不会在模型目录和选择器中显示。"
+                    : defaultOfficialAccount
+                      ? `当前官方账号：${displayedOfficialEmail || defaultOfficialAccount.id}。此处只调整线路名、短名称和上游代理，模型列表请使用线路卡片上的同步按钮。`
+                      : "此处只调整线路名、短名称和上游代理，模型列表请使用线路卡片上的同步按钮。"
                   : "配置第三方服务的接入信息。保存后可在模型目录中同步模型。"}
               </DialogDescription>
             </DialogHeader>
 
             {routeDraft.authMode === "officialAccount" ? (
               <div className="official-route-editor">
-                <div className="official-route-summary">
-                  <span>
-                    <strong>{routeDraft.name}</strong>
-                    <small>使用当前 Codex 官方账号登录状态</small>
-                  </span>
-                  <Badge variant="info">官方账号</Badge>
-                </div>
+                {officialDialogScope !== "models" && (
+                  <>
+                    <div className="route-editor-row route-editor-row-names">
+                      <label className="route-field">
+                        <span>线路名</span>
+                        <Input
+                          id="official-route-name-input"
+                          aria-label="线路名"
+                          aria-invalid={Boolean(
+                            officialRouteDraftErrors?.routeName &&
+                            (routeValidationAttempted ||
+                              (officialRouteDraft?.routeName.length ?? 0) > 0),
+                          )}
+                          aria-describedby={
+                            officialRouteDraftErrors?.routeName &&
+                            (routeValidationAttempted ||
+                              (officialRouteDraft?.routeName.length ?? 0) > 0)
+                              ? "official-route-name-error"
+                              : undefined
+                          }
+                          value={officialRouteDraft?.routeName ?? ""}
+                          disabled={isBusy || !defaultOfficialAccount}
+                          placeholder={routeDraft.name || "OpenAI 官方直登"}
+                          onChange={(event) =>
+                            updateOfficialRouteDraft({ routeName: event.target.value })}
+                        />
+                        {officialRouteDraftErrors?.routeName &&
+                        (routeValidationAttempted ||
+                          (officialRouteDraft?.routeName.length ?? 0) > 0) ? (
+                          <small
+                            id="official-route-name-error"
+                            className="text-[#d70015]"
+                            role="alert"
+                          >
+                            {officialRouteDraftErrors.routeName}
+                          </small>
+                        ) : (
+                          <small className="route-field-hint">
+                            {defaultOfficialAccount
+                              ? "留空则沿用 Codex 提供的线路名。"
+                              : "添加并设为默认的官方账号后才能编辑。"}
+                          </small>
+                        )}
+                      </label>
+                      <label className="route-field">
+                        <span>短名称</span>
+                        <Input
+                          id="official-route-short-name-input"
+                          aria-label="短名称"
+                          error={Boolean(
+                            officialRouteDraftErrors?.shortName &&
+                            (routeValidationAttempted ||
+                              (officialRouteDraft?.routeShortName.length ?? 0) > 0),
+                          )}
+                          aria-errormessage={
+                            officialRouteDraftErrors?.shortName &&
+                            (routeValidationAttempted ||
+                              (officialRouteDraft?.routeShortName.length ?? 0) > 0)
+                              ? "official-route-short-name-error"
+                              : undefined
+                          }
+                          value={officialRouteDraft?.routeShortName ?? ""}
+                          disabled={isBusy || !defaultOfficialAccount}
+                          placeholder="官"
+                          maxLength={MAX_ROUTE_SHORT_NAME_CHARACTERS}
+                          onChange={(event) =>
+                            updateOfficialRouteDraft({ routeShortName: event.target.value })}
+                        />
+                        {officialRouteDraftErrors?.shortName &&
+                        (routeValidationAttempted ||
+                          (officialRouteDraft?.routeShortName.length ?? 0) > 0) ? (
+                          <small
+                            id="official-route-short-name-error"
+                            className="text-[#d70015]"
+                            role="alert"
+                          >
+                            {officialRouteDraftErrors.shortName}
+                          </small>
+                        ) : (
+                          <small className="route-field-hint">留空使用默认的「官」。</small>
+                        )}
+                      </label>
+                      <small
+                        id="official-route-short-name-hint"
+                        className="route-field-hint route-editor-span-all"
+                      >
+                        最多 2 个字符且不可重复，模型名称前会显示为 [短名称]
+                      </small>
+                    </div>
 
-                <label className="route-field">
-                  <span>上游代理（可选）</span>
-                  <Input
-                    id="official-route-proxy-input"
-                    aria-label="上游代理（可选）"
-                    aria-invalid={Boolean(routeDraftErrors?.upstreamProxy)}
-                    aria-describedby={
-                      routeDraftErrors?.upstreamProxy
-                        ? "official-route-proxy-error"
-                        : undefined
-                    }
-                    value={routeDraft.upstreamProxy || ""}
-                    disabled={isBusy}
-                    placeholder="http://127.0.0.1:7890 或 socks5://…，留空使用系统代理"
-                    onChange={(event) =>
-                      updateRouteDraft({ upstreamProxy: event.target.value })}
-                  />
-                  {routeDraftErrors?.upstreamProxy ? (
-                    <small id="official-route-proxy-error" className="text-[#d70015]" role="alert">
-                      {routeDraftErrors.upstreamProxy}
-                    </small>
-                  ) : (
-                    <small className="route-field-hint">
-                      本线路的上游流量（含额度查询）改走此代理，可用于指定出口地区；设置后该线路改用流式 HTTP 传输。
-                    </small>
-                  )}
-                </label>
+                    <label className="route-field">
+                      <span>上游代理（可选）</span>
+                      <Input
+                        id="official-route-proxy-input"
+                        aria-label="上游代理（可选）"
+                        aria-invalid={Boolean(officialRouteDraftErrors?.upstreamProxy)}
+                        aria-describedby={
+                          officialRouteDraftErrors?.upstreamProxy
+                            ? "official-route-proxy-error"
+                            : undefined
+                        }
+                        value={officialRouteDraft?.upstreamProxy ?? routeDraft.upstreamProxy ?? ""}
+                        disabled={isBusy}
+                        placeholder="http://127.0.0.1:7890 或 socks5://…，留空使用系统代理"
+                        onChange={(event) =>
+                          updateOfficialRouteDraft({ upstreamProxy: event.target.value })}
+                      />
+                      {officialRouteDraftErrors?.upstreamProxy ? (
+                        <small id="official-route-proxy-error" className="text-[#d70015]" role="alert">
+                          {officialRouteDraftErrors.upstreamProxy}
+                        </small>
+                      ) : (
+                        <small className="route-field-hint">
+                          本线路的上游流量（含额度查询）改走此代理，可用于指定出口地区；设置后该线路改用流式 HTTP 传输。
+                        </small>
+                      )}
+                    </label>
+                  </>
+                )}
 
-                <div className="official-model-editor">
-                  <div className="official-model-editor-heading">
-                    <span>
-                      <strong>支持的模型</strong>
-                      <small>已启用 {officialModelDraft.length} 个，至少保留一个。</small>
-                    </span>
-                    <Badge variant="secondary">
-                      {officialModelDraft.length} / {officialCatalog.length}
-                    </Badge>
-                  </div>
-                  <div className="official-model-options">
-                    {officialCatalog.map((model) => {
-                      const checked = officialModelDraftKeys.has(modelKey(model));
-                      return (
-                        <div className="official-model-option" style={{ flexWrap: "wrap" }} key={model}>
-                          <Checkbox
-                            checked={checked}
-                            disabled={isBusy || (checked && officialModelDraft.length <= 1)}
-                            onCheckedChange={(nextChecked) => {
-                              setOfficialModelDraft((current) =>
-                                nextChecked === true
-                                  ? uniqueModelIds([...current, model])
-                                  : current.filter(
-                                      (candidate) => !modelIdsEqual(candidate, model),
-                                    ),
-                              );
-                            }}
-                            aria-label={`${checked ? "停用" : "启用"}官方模型 ${model}`}
-                          />
-                          <span>
-                            <strong>
-                              {officialDisplayNames.get(modelKey(model)) || model}
-                            </strong>
-                            <small>{model}</small>
-                          </span>
+                {officialDialogScope !== "settings" && (
+                  <>
+                    <div className="official-model-editor">
+                      <div className="official-model-editor-heading">
+                        <span>
+                          <strong>支持的模型</strong>
+                          <small>已启用 {officialModelDraft.length} 个，至少保留一个。</small>
+                        </span>
+                        <Badge variant="secondary">
+                          {officialModelDraft.length} / {officialCatalog.length}
+                        </Badge>
+                      </div>
+                      <div className="official-model-options">
+                        {officialCatalog.map((model) => {
+                          const checked = officialModelDraftKeys.has(modelKey(model));
+                          return (
+                            <div className="official-model-option" style={{ flexWrap: "wrap" }} key={model}>
+                              <Checkbox
+                                checked={checked}
+                                disabled={isBusy || (checked && officialModelDraft.length <= 1)}
+                                onCheckedChange={(nextChecked) => {
+                                  setOfficialModelDraft((current) =>
+                                    nextChecked === true
+                                      ? uniqueModelIds([...current, model])
+                                      : current.filter(
+                                          (candidate) => !modelIdsEqual(candidate, model),
+                                        ),
+                                  );
+                                }}
+                                aria-label={`${checked ? "停用" : "启用"}官方模型 ${model}`}
+                              />
+                              <span>
+                                <strong>
+                                  {officialDisplayNames.get(modelKey(model)) || model}
+                                </strong>
+                                <small>{model}</small>
+                              </span>
 
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </>
+                )}
               </div>
             ) : (
               <div className="route-editor-form">
@@ -1134,6 +1390,8 @@ function ModelSectionComponent({
                 onClick={() => {
                   setRouteDialogOpen(false);
                   setRouteDraft(null);
+                  setOfficialRouteDraft(null);
+                  setOfficialDialogScope(null);
                   setRouteValidationAttempted(false);
                   setRouteApiKeyVisible(false);
                 }}
@@ -1143,13 +1401,15 @@ function ModelSectionComponent({
               <Button
                 disabled={isBusy || (
                   routeDraft.authMode === "officialAccount"
-                    ? officialModelDraft.length === 0
+                    ? officialDialogScope === "models" && officialModelDraft.length === 0
                     : routeValidationAttempted && routeDraftHasErrors
                 )}
                 onClick={() => void saveRouteDraft()}
               >
                 <Check aria-hidden="true" />
-                {routeDraft.authMode === "officialAccount" ? "保存模型" : "保存线路"}
+                {routeDraft.authMode === "officialAccount" && officialDialogScope === "models"
+                  ? "保存模型"
+                  : "保存线路"}
               </Button>
             </DialogFooter>
           </DialogContent>

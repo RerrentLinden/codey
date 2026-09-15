@@ -174,11 +174,15 @@ export type OfficialAccount = {
   accountId?: string;
   addedAt: number;
   lastRefresh?: string;
+  routeName?: string;
+  routeShortName?: string;
+  upstreamProxy?: string;
   isDefault: boolean;
 };
 
 export type OfficialAccountsResult = {
   accounts?: OfficialAccount[];
+  accountId?: string;
   defaultAccountId?: string | null;
   officialAccountAvailable?: boolean;
   officialAccountStatus?: string;

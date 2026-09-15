@@ -30,12 +30,18 @@ test("third-party route short names are required and limited to two characters",
   );
 });
 
-test("model labels use the fixed official prefix or a route short name", () => {
-  const official = {
+test("model labels use the default official prefix or a custom route short name", () => {
+  const officialDefault = {
     authMode: "officialAccount",
     officialAccount: true,
     name: "OpenAI 官方直登",
-    shortName: "ignored",
+    shortName: "",
+  };
+  const officialCustom = {
+    authMode: "officialAccount",
+    officialAccount: true,
+    name: "OpenAI 官方直登",
+    shortName: "官1",
   };
   const relay = {
     authMode: "apiKey",
@@ -44,7 +50,8 @@ test("model labels use the fixed official prefix or a route short name", () => {
     shortName: "备",
   };
 
-  assert.equal(shortNames.prefixedRouteModelName(official, "gpt-5.6-sol"), "[官] gpt-5.6-sol");
+  assert.equal(shortNames.prefixedRouteModelName(officialDefault, "gpt-5.6-sol"), "[官] gpt-5.6-sol");
+  assert.equal(shortNames.prefixedRouteModelName(officialCustom, "gpt-5.6-sol"), "[官1] gpt-5.6-sol");
   assert.equal(shortNames.prefixedRouteModelName(relay, "claude-opus"), "[备] claude-opus");
   assert.equal(shortNames.fallbackRouteShortName(" 备用中转 "), "备用");
 });
@@ -62,4 +69,63 @@ test("the third-party route editor exposes the short-name field and validation h
     source,
     /validateThirdPartyRouteShortName\(route\.shortName, profiles, route\.id\)/,
   );
+});
+
+test("official route short names may stay empty and only conflict with third-party routes", () => {
+  const profiles = [
+    {
+      id: "official",
+      authMode: "officialAccount",
+      officialAccount: true,
+      name: "官方线路",
+      shortName: "官",
+    },
+    {
+      id: "relay",
+      authMode: "apiKey",
+      officialAccount: false,
+      name: "中转线路",
+      shortName: "中转",
+    },
+  ];
+
+  assert.equal(shortNames.validateOfficialRouteShortName(""), "");
+  assert.equal(shortNames.validateOfficialRouteShortName("   "), "");
+  assert.equal(shortNames.validateOfficialRouteShortName("自"), "");
+  assert.equal(
+    shortNames.validateOfficialRouteShortName("官方线"),
+    "短名称最多 2 个字符",
+  );
+  assert.equal(
+    shortNames.validateOfficialRouteShortName("中转", profiles),
+    "短名称「中转」已被其他线路使用",
+  );
+});
+
+test("official route settings are edited on the route card instead of the account row", async () => {
+  const [modelSection, panel, app] = await Promise.all([
+    readFile(new URL("../src/ModelSection.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/OfficialAccountsPanel.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/App.tsx", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(modelSection, /id="official-route-name-input"/);
+  assert.match(modelSection, /id="official-route-short-name-input"/);
+  assert.match(modelSection, /maxLength=\{MAX_ROUTE_SHORT_NAME_CHARACTERS\}/);
+  assert.match(modelSection, /validateOfficialRouteSettings\(/);
+  assert.match(modelSection, /官方账号登录 · \$\{email\}/);
+  // 编辑按钮对所有线路渲染，只有第三方线路才有删除按钮。
+  const editButton = modelSection.indexOf("aria-label={`编辑线路 ${profile.name}`}");
+  const deleteGuard = modelSection.indexOf("{!isOfficial && (");
+  assert.ok(editButton > 0 && deleteGuard > editButton);
+  // 编辑只改线路名、短名称和代理，模型列举交给同步入口。
+  assert.match(modelSection, /openRouteDialog\(profile, isOfficial \? "settings" : null\)/);
+  assert.match(modelSection, /openRouteDialog\(profile, "models"\)/);
+  assert.match(modelSection, /\{officialDialogScope !== "models" && \(/);
+  assert.match(modelSection, /\{officialDialogScope !== "settings" && \(/);
+
+  assert.match(panel, /aria-label=\{`移除官方账号 \$\{label\}`\}/);
+  assert.doesNotMatch(panel, /IconPencil|validateOutboundProxyUrl/);
+
+  assert.match(app, /"save_official_account_route_settings"/);
 });

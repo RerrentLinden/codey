@@ -9,6 +9,12 @@
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
 }
 
+.route-title-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .route-manager {
   min-width: 0;
   background: #ffffff;
@@ -553,7 +559,6 @@
   margin-top: 16px;
 }
 
-.official-route-summary,
 .official-model-editor-heading,
 .official-model-option {
   display: flex;
@@ -562,15 +567,6 @@
   gap: 12px;
 }
 
-.official-route-summary {
-  min-height: 56px;
-  border: 1px solid rgba(0, 0, 0, 0.07);
-  border-radius: 10px;
-  padding: 10px 14px;
-  background: #f8f8fa;
-}
-
-.official-route-summary > span,
 .official-model-editor-heading > span,
 .official-model-option > span {
   display: grid;
@@ -578,7 +574,6 @@
   gap: 2px;
 }
 
-.official-route-summary strong,
 .official-model-editor-heading strong,
 .official-model-option strong {
   color: var(--mac-text-primary);
@@ -586,7 +581,6 @@
   font-weight: 650;
 }
 
-.official-route-summary small,
 .official-model-editor-heading small,
 .official-model-option small {
   color: var(--mac-text-secondary);

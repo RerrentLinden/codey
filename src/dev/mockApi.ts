@@ -30,6 +30,8 @@ if (import.meta.env.DEV) {
       feishu: "https://webhook.example.invalid/feishu/preview-only",
       wecom: "https://webhook.example.invalid/wecom/preview-only?key=preview",
     } as const;
+    // 官方线路由启动时的默认账号派生，账号没有自定义线路名时使用该名称。
+    const previewOfficialDerivedRouteName = "OpenAI 官方直登";
     let previewConfig: Config = {
       settingsRevision: 0,
       localRouterEnabled: true,
@@ -49,6 +51,25 @@ if (import.meta.env.DEV) {
       activeProfileId: "primary",
       initialRouteImportCompleted: true,
       profiles: [
+        {
+          id: "codey-official-account",
+          enabled: true,
+          name: previewOfficialDerivedRouteName,
+          shortName: "官",
+          baseUrl: "",
+          apiKey: "",
+          upstreamProtocol: "official",
+          authMode: "officialAccount",
+          apiKeyConfigured: false,
+          clearApiKey: false,
+          sourceProviderId: "openai",
+          officialAccount: true,
+          supportsRemoteCompaction: false,
+          supportsWebsockets: true,
+          supportsNativeWebSearch: true,
+          supportsAutoReview: true,
+          upstreamProxy: "",
+        },
         {
           id: "primary",
           enabled: true,
@@ -147,6 +168,7 @@ if (import.meta.env.DEV) {
       codexAppPath: "/Applications/ChatGPT.app",
       userScripts: [],
       selectedModelsByProvider: {
+        openai: previewOfficialModels.map((model) => model.slug),
         primary: ["provider-fast-coder", "claude-sonnet-4-5"],
         backup: ["claude-sonnet-4-5", "claude-opus-4-1"],
       },
@@ -186,7 +208,7 @@ if (import.meta.env.DEV) {
     };
     let previewOfficialAccounts: OfficialAccount[] = [
       { id: "acct_preview_1", email: "preview@example.com", planType: "pro", accountId: "acct_preview_1", addedAt: 1_757_000_000, isDefault: true },
-      { id: "acct_preview_2", email: "backup@example.com", planType: "plus", accountId: "acct_preview_2", addedAt: 1_757_100_000, isDefault: false },
+      { id: "acct_preview_2", email: "backup@example.com", planType: "plus", accountId: "acct_preview_2", addedAt: 1_757_100_000, isDefault: false, routeName: "备用官方线路", routeShortName: "备2" },
     ];
     let previewOfficialLoginPolls = 0;
     const previewDefaultOfficialAccountId = () => previewOfficialAccounts.find((account) => account.isDefault)?.id ?? null;
@@ -368,6 +390,9 @@ if (import.meta.env.DEV) {
           config: previewConfig,
           modelState: previewModelState,
           startupError: undefined,
+          officialAccountAvailable: previewOfficialAccounts.some(
+            (account) => account.isDefault,
+          ),
           providerStatus: previewProviderStatus(),
           fastContextToolsStatus: {
             userConfigured: false,
@@ -394,6 +419,9 @@ if (import.meta.env.DEV) {
           appVersion: "0.2.0",
           codexAppVersion: "26.601.21317",
           clientPlatform: previewClientPlatform,
+          officialAccountAvailable: previewOfficialAccounts.some(
+            (account) => account.isDefault,
+          ),
           restartRequired: false,
           restartInProgress: false,
           activeProfileId: previewConfig.activeProfileId,
@@ -510,6 +538,42 @@ if (import.meta.env.DEV) {
         previewOfficialAccounts = previewOfficialAccounts.filter((account) => account.id !== args.accountId);
         const available = previewOfficialAccounts.some((account) => account.isDefault);
         return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: available, config: previewConfig, modelState: previewModelState, restartRequired: false, ...(removed?.isDefault ? { warning: "当前没有默认官方账号，官方线路已停用" } : {}) };
+      }
+      if (command === "save_official_account_route_settings") {
+        const account = previewOfficialAccounts.find((item) => item.id === args.accountId);
+        if (!account) return { status: "failed", message: "找不到官方账号" };
+        const routeOverride = (value: unknown) => {
+          const text = String(value ?? "").trim();
+          return text ? text : undefined;
+        };
+        account.routeName = routeOverride(args.routeName);
+        account.routeShortName = routeOverride(args.routeShortName);
+        account.upstreamProxy = routeOverride(args.upstreamProxy);
+        if (account.isDefault) {
+          previewConfig = {
+            ...previewConfig,
+            profiles: previewConfig.profiles.map((profile) =>
+              profile.authMode === "officialAccount"
+                ? {
+                    ...profile,
+                    name: account.routeName ?? previewOfficialDerivedRouteName,
+                    shortName: account.routeShortName ?? "官",
+                    upstreamProxy: account.upstreamProxy ?? "",
+                  }
+                : profile,
+            ),
+          };
+        }
+        return {
+          status: "ok",
+          accounts: previewOfficialAccounts,
+          defaultAccountId: previewDefaultOfficialAccountId(),
+          officialAccountAvailable: true,
+          accountId: account.id,
+          ...(account.isDefault
+            ? { config: previewConfig, modelState: previewModelState, restartRequired: false }
+            : {}),
+        };
       }
       if (command === "query_official_account_usage") {
         const fetchedAt = Math.floor(Date.now() / 1000);
