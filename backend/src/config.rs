@@ -782,11 +782,10 @@ impl ModelContextConfig {
 
 /// Selectable thinking levels for third-party models. The level identifies the
 /// user's intent; `value` is what Codex declares and sends upstream.
-pub(crate) const MODEL_REASONING_EFFORT_LEVELS: [&str; 8] = [
-    "off", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-];
+pub(crate) const MODEL_REASONING_EFFORT_LEVELS: [&str; 6] =
+    ["low", "medium", "high", "xhigh", "max", "ultra"];
 pub(crate) const MAX_MODEL_REASONING_EFFORT_VALUE_BYTES: usize = 32;
-pub(crate) const MAX_MODEL_REASONING_EFFORTS: usize = 8;
+pub(crate) const MAX_MODEL_REASONING_EFFORTS: usize = 6;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

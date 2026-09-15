@@ -463,7 +463,7 @@ pub(crate) fn anthropic_stop_sequences(stop: &Value) -> Result<Value> {
 
 pub(crate) fn normalize_anthropic_effort(effort: &str) -> &'static str {
     let effort = effort.trim();
-    if effort.eq_ignore_ascii_case("low") || effort.eq_ignore_ascii_case("minimal") {
+    if effort.eq_ignore_ascii_case("low") {
         "low"
     } else if effort.eq_ignore_ascii_case("medium") {
         "medium"

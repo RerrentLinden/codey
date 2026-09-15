@@ -190,7 +190,7 @@ export function ModelSettingsFields({
                 {followsTemplate ? "自动适配" : "恢复自动适配"}
               </button>
             </div>
-            <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+            <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
               {/* 保留 MODEL_REASONING_EFFORT_COLUMNS 引用以维持契约测试 */}
               {(MODEL_REASONING_EFFORT_COLUMNS && MODEL_REASONING_EFFORT_LEVELS).map((level) => {
                 const isChecked = selectedLevels.has(level);
