@@ -4001,6 +4001,115 @@ fn namespace_additional_tools_rewrite_historical_function_calls() {
 }
 
 #[test]
+fn undeclared_namespace_history_calls_rebuild_flat_function_names() {
+    let declared = responses_to_chat_completions_request(&json!({
+        "model":"provider-model",
+        "input":"hello",
+        "tools":[{
+            "type":"namespace",
+            "name":"mcp__codey_fastctx",
+            "tools":[{
+                "type":"function",
+                "name":"glob",
+                "parameters":{"type":"object","properties":{"pattern":{"type":"string"}}}
+            }]
+        }]
+    }))
+    .unwrap();
+    let glob_name = declared.body["tools"][0]["function"]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 压缩请求和后续轮次不再携带工具声明，历史调用仍按声明时的规则展开。
+    let converted = responses_to_chat_completions_request(&json!({
+        "model":"provider-model",
+        "input":[
+            {"role":"user","content":"continue"},
+            {
+                "type":"function_call",
+                "call_id":"call-glob",
+                "namespace":"mcp__codey_fastctx",
+                "name":"glob",
+                "arguments":"{\"pattern\":\"**/*.rs\"}"
+            },
+            {"type":"function_call_output","call_id":"call-glob","output":"src/lib.rs"},
+            {
+                "type":"function_call",
+                "call_id":"call-js",
+                "namespace":["mcp__node_repl"],
+                "name":"js",
+                "arguments":"{\"code\":\"1+1\"}"
+            },
+            {"type":"function_call_output","call_id":"call-js","output":"2"}
+        ]
+    }))
+    .unwrap();
+
+    assert_eq!(
+        converted.body["messages"][1]["tool_calls"][0]["function"]["name"],
+        Value::String(glob_name)
+    );
+    assert_eq!(
+        converted.body["messages"][3]["tool_calls"][0]["function"]["name"],
+        Value::String(namespaced_upstream_tool_name(
+            &["mcp__node_repl".to_string()],
+            "js"
+        ))
+    );
+    assert_eq!(converted.body["messages"][2]["role"], "tool");
+    assert_eq!(converted.body["messages"][2]["tool_call_id"], "call-glob");
+    assert_eq!(converted.body["messages"][4]["tool_call_id"], "call-js");
+    assert!(converted.body.get("tools").is_none());
+}
+
+#[test]
+fn undeclared_custom_and_tool_search_history_calls_rebuild_flat_names() {
+    let custom = responses_to_chat_completions_request(&json!({
+        "model":"provider-model",
+        "input":[
+            {"role":"user","content":"apply it"},
+            {
+                "type":"custom_tool_call",
+                "call_id":"call-patch",
+                "name":"apply_patch",
+                "input":"*** Begin Patch\n*** End Patch"
+            },
+            {"type":"custom_tool_call_output","call_id":"call-patch","output":"Done!"}
+        ]
+    }))
+    .unwrap();
+    assert_eq!(
+        custom.body["messages"][1]["tool_calls"][0]["function"]["name"],
+        Value::String(custom_upstream_tool_name(&[], "apply_patch"))
+    );
+
+    let tool_search = responses_to_chat_completions_request(&json!({
+        "model":"provider-model",
+        "input":[
+            {"role":"user","content":"find a tool"},
+            {
+                "type":"tool_search_call",
+                "execution":"client",
+                "call_id":"call-search",
+                "arguments":{"goal":"read files"}
+            },
+            {
+                "type":"tool_search_output",
+                "execution":"client",
+                "call_id":"call-search",
+                "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}]
+            }
+        ]
+    }))
+    .unwrap();
+    assert_eq!(
+        tool_search.body["messages"][1]["tool_calls"][0]["function"]["name"],
+        TOOL_SEARCH_UPSTREAM_TOOL_NAME
+    );
+}
+
+#[test]
 fn custom_tools_wrap_definition_choice_history_and_result() {
     let patch = "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch";
     let converted = responses_to_chat_completions_request(&json!({

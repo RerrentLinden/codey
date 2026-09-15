@@ -545,23 +545,24 @@ impl ResponsesToolBridge {
         if let Some(upstream_name) = self.response_to_upstream.get(tool_name) {
             return Ok(upstream_name.clone());
         }
-        if tool_name.is_function() && tool_name.namespace.is_empty() {
-            return Ok(tool_name.name.clone());
+        // 压缩请求和后续轮次可能不再携带工具声明，历史 function_call 仍会
+        // 引用当时声明过的 namespace 或 custom 工具。展开名称只由 namespace
+        // 和叶子名决定，这里按同一规则重建，保持与已声明时完全一致。
+        let upstream_name = if tool_name.is_function() && tool_name.namespace.is_empty() {
+            tool_name.name.clone()
+        } else if tool_name.is_function() {
+            namespaced_upstream_tool_name(&tool_name.namespace, &tool_name.name)
+        } else if tool_name.is_custom() {
+            custom_upstream_tool_name(&tool_name.namespace, &tool_name.name)
+        } else {
+            TOOL_SEARCH_UPSTREAM_TOOL_NAME.to_string()
+        };
+        if let Some(existing) = self.upstream_to_response.get(&upstream_name)
+            && existing != tool_name
+        {
+            anyhow::bail!("历史调用重建的桥接名称 {upstream_name} 与当前请求声明的工具冲突");
         }
-        if tool_name.is_custom() {
-            anyhow::bail!(
-                "custom_tool_call 指向未声明的 custom 工具 {}",
-                tool_name.name
-            )
-        }
-        if tool_name.is_tool_search() {
-            anyhow::bail!("tool_search_call 指向未声明的 execution=client tool_search 工具")
-        }
-        anyhow::bail!(
-            "function_call 指向未声明的 namespace 工具 {}.{}",
-            tool_name.namespace.join("."),
-            tool_name.name
-        )
+        Ok(upstream_name)
     }
 
     pub(crate) fn restore_upstream_name(&self, upstream_name: &str) -> Result<ResponsesToolName> {
