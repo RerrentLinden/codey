@@ -609,37 +609,42 @@ function ModelSectionComponent({
               aria-label="会话错误重试次数"
             />
           </div>
-          <div className="local-router-toggle">
-            <strong>本地路由</strong>
-            <Switch
-              size="sm"
-              checked={config.localRouterEnabled}
-              disabled={isBusy}
-              onCheckedChange={onToggleLocalRouter}
-              aria-label="启用本地路由"
-            />
+          <div className="local-router-toggle local-router-toggle-group">
+            <div className="local-router-toggle-item">
+              <strong>本地路由</strong>
+              <Switch
+                size="sm"
+                checked={config.localRouterEnabled}
+                disabled={isBusy}
+                onCheckedChange={onToggleLocalRouter}
+                aria-label="启用本地路由"
+              />
+            </div>
+            {config.localRouterEnabled && (
+              <>
+                <span className="local-router-toggle-divider" aria-hidden="true" />
+                <div className="local-router-toggle-item route-request-log-toggle">
+                  <strong>开启日志记录</strong>
+                  <Switch
+                    size="sm"
+                    checked={config.routeRequestLog.enabled}
+                    disabled={isBusy}
+                    onCheckedChange={onToggleRouteRequestLog}
+                    aria-label="开启请求日志记录"
+                  />
+                </div>
+              </>
+            )}
           </div>
           {config.localRouterEnabled && (
-            <>
-              <div className="local-router-toggle route-request-log-toggle">
-                <strong>开启日志记录</strong>
-                <Switch
-                  size="sm"
-                  checked={config.routeRequestLog.enabled}
-                  disabled={isBusy}
-                  onCheckedChange={onToggleRouteRequestLog}
-                  aria-label="开启请求日志记录"
-                />
-              </div>
-              <Button
-                color="primary"
-                variant="filled"
-                onClick={() => void invoke("open_route_request_logs")}
-              >
-                <IconListDetails size={14} aria-hidden="true" />
-                <span>查看请求日志</span>
-              </Button>
-            </>
+            <Button
+              color="primary"
+              variant="filled"
+              onClick={() => void invoke("open_route_request_logs")}
+            >
+              <IconListDetails size={14} aria-hidden="true" />
+              <span>查看请求日志</span>
+            </Button>
           )}
         </div>
       </div>
@@ -651,8 +656,9 @@ function ModelSectionComponent({
               <div className="catalog-aggregate-title-wrap">
                 <div className="catalog-aggregate-title">
                   <strong>{routeConfigReadOnly ? "当前线路模型" : "供应商与模型"}</strong>
-                  <Badge variant="info">{visibleProfiles.length} 条线路</Badge>
-                  <Badge variant="info">{totalModelCount} 个模型</Badge>
+                  <Badge variant="info">
+                    {visibleProfiles.length} 条线路 · {totalModelCount} 个模型
+                  </Badge>
                 </div>
                 <small>
                   {routeConfigReadOnly
@@ -776,10 +782,8 @@ function ModelSectionComponent({
                               {disabled ? <Badge variant="destructive">已禁用</Badge> : (
                                 <>
                                   <Badge variant="info">{group?.models.length || 0} 模型</Badge>
-                                  {!routeConfigReadOnly && !isOfficial && (
-                                    <Badge variant={group?.models.length ? "brand" : "secondary"}>
-                                      {group?.models.length ? "已接入路由" : "待配置模型"}
-                                    </Badge>
+                                  {!routeConfigReadOnly && !isOfficial && !group?.models.length && (
+                                    <Badge variant="secondary">待配置模型</Badge>
                                   )}
                                   {(isOfficial || profile.supportsWebsockets) && <Badge variant="brand">WS</Badge>}
                                 </>
@@ -1245,36 +1249,50 @@ function ModelSectionComponent({
                 {routeDraft.upstreamProtocol === "openaiResponses" && (
                   <div className="route-protocol-options route-editor-span-all">
                     <div className="route-option-item">
-                      <div className="route-option-content">
-                        <strong className="route-option-title">WebSocket</strong>
-                        <small className="route-field-hint">
-                          优先尝试复用长连接；使用代理或连接失败时转为流式 HTTP。能力变更需重启 Codex，实际速度取决于上游和网络。
-                        </small>
+                      <div className="route-option-header">
+                        <div className="route-option-title-group">
+                          <strong className="route-option-title">WebSocket</strong>
+                          <Tooltip content="优先尝试复用长连接；使用代理或连接失败时转为流式 HTTP。能力变更需重启 Codex，实际速度取决于上游和网络。">
+                            <span className="route-option-info-trigger" aria-label="WebSocket 详细说明">
+                              <IconInfoCircle size={13} />
+                            </span>
+                          </Tooltip>
+                        </div>
+                        <Switch
+                          size="sm"
+                          checked={Boolean(routeDraft.supportsWebsockets)}
+                          disabled={isBusy}
+                          onCheckedChange={(checked) =>
+                            updateRouteDraft({ supportsWebsockets: checked })}
+                          aria-label="WebSocket"
+                        />
                       </div>
-                      <Switch
-                        size="sm"
-                        checked={Boolean(routeDraft.supportsWebsockets)}
-                        disabled={isBusy}
-                        onCheckedChange={(checked) =>
-                          updateRouteDraft({ supportsWebsockets: checked })}
-                        aria-label="WebSocket"
-                      />
+                      <small className="route-field-hint">
+                        优先长连接，失败转流式 HTTP
+                      </small>
                     </div>
                     <div className="route-option-item">
-                      <div className="route-option-content">
-                        <strong className="route-option-title">原生网页搜索</strong>
-                        <small className="route-field-hint">
-                          仅在上游和所选模型都明确支持时开启
-                        </small>
+                      <div className="route-option-header">
+                        <div className="route-option-title-group">
+                          <strong className="route-option-title">原生网页搜索</strong>
+                          <Tooltip content="仅在上游和所选模型都明确支持时开启。">
+                            <span className="route-option-info-trigger" aria-label="原生网页搜索详细说明">
+                              <IconInfoCircle size={13} />
+                            </span>
+                          </Tooltip>
+                        </div>
+                        <Switch
+                          size="sm"
+                          checked={Boolean(routeDraft.supportsNativeWebSearch)}
+                          disabled={isBusy}
+                          onCheckedChange={(checked) =>
+                            updateRouteDraft({ supportsNativeWebSearch: checked })}
+                          aria-label="原生网页搜索"
+                        />
                       </div>
-                      <Switch
-                        size="sm"
-                        checked={Boolean(routeDraft.supportsNativeWebSearch)}
-                        disabled={isBusy}
-                        onCheckedChange={(checked) =>
-                          updateRouteDraft({ supportsNativeWebSearch: checked })}
-                        aria-label="原生网页搜索"
-                      />
+                      <small className="route-field-hint">
+                        仅在上游与模型支持时开启
+                      </small>
                     </div>
                   </div>
                 )}
@@ -1312,39 +1330,6 @@ function ModelSectionComponent({
                 </label>
 
                 <label className="route-field">
-                  <span>上游代理（可选）</span>
-                  <Input
-                    id="route-proxy-input"
-                    aria-label="上游代理（可选）"
-                    aria-invalid={Boolean(
-                      routeDraftErrors?.upstreamProxy &&
-                      (routeValidationAttempted || (routeDraft.upstreamProxy || "").trim()),
-                    )}
-                    aria-describedby={
-                      routeDraftErrors?.upstreamProxy &&
-                      (routeValidationAttempted || (routeDraft.upstreamProxy || "").trim())
-                        ? "route-proxy-error"
-                        : undefined
-                    }
-                    value={routeDraft.upstreamProxy || ""}
-                    disabled={isBusy}
-                    placeholder="http://127.0.0.1:7890 或 socks5://…，留空使用系统代理"
-                    onChange={(event) =>
-                      updateRouteDraft({ upstreamProxy: event.target.value })}
-                  />
-                  {routeDraftErrors?.upstreamProxy &&
-                  (routeValidationAttempted || (routeDraft.upstreamProxy || "").trim()) ? (
-                    <small id="route-proxy-error" className="text-[#d70015]" role="alert">
-                      {routeDraftErrors.upstreamProxy}
-                    </small>
-                  ) : (
-                    <small className="route-field-hint">
-                      本线路的上游流量改走此代理，可用于指定出口地区；设置后该线路改用流式 HTTP 传输。
-                    </small>
-                  )}
-                </label>
-
-                <label className="route-field">
                   <span>Key</span>
                   <PasswordInput
                     id="route-key-input"
@@ -1378,6 +1363,39 @@ function ModelSectionComponent({
                       {routeDraftErrors.apiKey}
                     </small>
                   ) : null}
+                </label>
+
+                <label className="route-field">
+                  <span>上游代理（可选）</span>
+                  <Input
+                    id="route-proxy-input"
+                    aria-label="上游代理（可选）"
+                    aria-invalid={Boolean(
+                      routeDraftErrors?.upstreamProxy &&
+                      (routeValidationAttempted || (routeDraft.upstreamProxy || "").trim()),
+                    )}
+                    aria-describedby={
+                      routeDraftErrors?.upstreamProxy &&
+                      (routeValidationAttempted || (routeDraft.upstreamProxy || "").trim())
+                        ? "route-proxy-error"
+                        : undefined
+                    }
+                    value={routeDraft.upstreamProxy || ""}
+                    disabled={isBusy}
+                    placeholder="http://127.0.0.1:7890 或 socks5://…，留空使用系统代理"
+                    onChange={(event) =>
+                      updateRouteDraft({ upstreamProxy: event.target.value })}
+                  />
+                  {routeDraftErrors?.upstreamProxy &&
+                  (routeValidationAttempted || (routeDraft.upstreamProxy || "").trim()) ? (
+                    <small id="route-proxy-error" className="text-[#d70015]" role="alert">
+                      {routeDraftErrors.upstreamProxy}
+                    </small>
+                  ) : (
+                    <small className="route-field-hint">
+                      本线路的上游流量改走此代理，可用于指定出口地区；设置后该线路改用流式 HTTP 传输。
+                    </small>
+                  )}
                 </label>
               </div>
             )}

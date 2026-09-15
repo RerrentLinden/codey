@@ -113,7 +113,7 @@ test("settings panels keep stable handlers and skip unrelated parent renders", a
   assert.match(sections, /供应商与模型/);
   assert.doesNotMatch(sections, /catalog-search|searchQuery|搜索模型\.\.\./);
   assert.match(sections, /点击模型设为全局默认/);
-  assert.match(sections, /已接入路由/);
+  assert.match(sections, /待配置模型/);
   assert.doesNotMatch(sections, /aria-pressed|route-list-select/);
   assert.doesNotMatch(sections, /role="radiogroup"/);
 

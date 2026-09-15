@@ -512,8 +512,8 @@
 }
 
 .route-protocol-options {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   border: 1px solid rgba(0, 0, 0, 0.08);
   border-radius: 10px;
   background: rgba(0, 0, 0, 0.02);
@@ -522,15 +522,34 @@
 
 .route-option-item {
   display: flex;
-  align-items: center;
+  flex-direction: column;
   justify-content: space-between;
-  gap: 16px;
+  gap: 4px;
   padding: 9px 12px;
+  min-width: 0;
   transition: background 0.15s ease;
 }
 
+.route-option-item:hover {
+  background: rgba(0, 0, 0, 0.025);
+}
+
 .route-option-item + .route-option-item {
-  border-top: 1px solid rgba(0, 0, 0, 0.06);
+  border-left: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.route-option-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.route-option-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
 }
 
 .route-option-content {
@@ -545,12 +564,29 @@
   font-size: 12px;
   font-weight: 600;
   line-height: 1.35;
+  white-space: nowrap;
 }
 
-.route-option-content .route-field-hint {
+.route-option-info-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--mac-text-tertiary);
+  cursor: help;
+  transition: color 0.15s ease;
+}
+
+.route-option-info-trigger:hover {
+  color: var(--mac-text-secondary);
+}
+
+.route-option-item .route-field-hint {
   color: var(--mac-text-secondary);
   font-size: 11px;
   line-height: 1.35;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .official-route-editor {
