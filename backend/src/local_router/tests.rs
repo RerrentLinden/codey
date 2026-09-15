@@ -7326,6 +7326,147 @@ async fn router_rewrites_alias_and_keeps_upstream_credentials_private() {
 }
 
 #[tokio::test]
+async fn native_passthrough_rewrites_plaintext_agent_payload_before_send() {
+    let task = "只读冒烟任务（第 1 轮）。禁止写入、创建或删除任何文件。";
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+        write_json_response(
+            &mut stream,
+            200,
+            &json!({"object":"response","model":body["model"]}),
+        )
+        .await
+        .unwrap();
+        body
+    });
+    let (config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+
+    // 原始模型名加线路提示头不触发模型改写和正文元数据清理，请求因此走
+    // 原生直通的原始字节路径，发送前仍必须完成任务载荷归一化。
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .header(
+            TURN_METADATA_HEADER,
+            json!({ROUTE_METADATA_KEY:provider_id}).to_string(),
+        )
+        .json(&json!({
+            "model":model,
+            "stream":true,
+            "input":[
+                {"role":"user","content":"continue"},
+                {
+                    "type":"agent_message",
+                    "id":"amsg_1",
+                    "author":"/root",
+                    "recipient":"/root/child",
+                    "content":[
+                        {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                        {"type":"encrypted_content","encrypted_content":task}
+                    ]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let body = upstream_task.await.unwrap();
+    assert_eq!(body["model"], model);
+    assert_eq!(
+        body["input"][1]["content"][1],
+        json!({"type":"input_text","text":task})
+    );
+    assert_eq!(
+        body["input"][0],
+        json!({"role":"user","content":"continue"})
+    );
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn upstream_websocket_requests_rewrite_plaintext_agent_payloads() {
+    let task = "只读研究任务（第 2 轮）。禁止派生任何子代理。";
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (stream, _) = upstream.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let message = socket.next().await.unwrap().unwrap();
+        let WebSocketMessage::Text(text) = message else {
+            panic!("上游 WebSocket 应收到 response.create 文本消息");
+        };
+        socket
+            .send(WebSocketMessage::Text(
+                json!({
+                    "type":"response.completed",
+                    "response":{"id":"resp-1","object":"response","status":"completed","output":[]}
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        serde_json::from_str::<Value>(&text).unwrap()
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].supports_websockets = true;
+    let router = LocalRouter::start(&config).await.unwrap();
+    let mut client = connect_router_websocket(&router.endpoint()).await;
+
+    client
+        .send(WebSocketMessage::Text(
+            json!({
+                "type":"response.create",
+                "model":model_alias(&provider_id, &model),
+                "input":[
+                    {"role":"user","content":"continue"},
+                    {
+                        "type":"agent_message",
+                        "id":"amsg_2",
+                        "author":"/root",
+                        "recipient":"/root/child",
+                        "content":[
+                            {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                            {"type":"encrypted_content","encrypted_content":task}
+                        ]
+                    }
+                ]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let mut terminal = false;
+    while !terminal {
+        let message = tokio::time::timeout(Duration::from_secs(5), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let WebSocketMessage::Text(text) = message {
+            terminal = responses_event_is_terminal(&serde_json::from_str::<Value>(&text).unwrap());
+        }
+    }
+
+    let body = upstream_task.await.unwrap();
+    assert_eq!(
+        body["input"][1]["content"][1],
+        json!({"type":"input_text","text":task})
+    );
+    client.close(None).await.unwrap();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn route_header_overrides_replace_and_remove_forwarded_headers() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();

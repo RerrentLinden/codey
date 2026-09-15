@@ -1,6 +1,21 @@
+use base64::Engine as _;
+
 use super::*;
 
 pub(crate) const COMPACTION_TIMEOUT: Duration = Duration::from_secs(120);
+
+// Codex 运行时的协作任务载荷使用 Fernet 令牌：版本字节、时间戳、初始向量、
+// 按 16 字节分组且至少一组的密文、HMAC。Codey 不持有解密密钥，只能在发送
+// 前做结构校验。
+const FERNET_PREFIX_BYTES: usize = 1 + 8 + 16;
+const FERNET_SUFFIX_BYTES: usize = 32;
+const FERNET_BLOCK_BYTES: usize = 16;
+
+enum EncryptedContentRewrite {
+    Keep,
+    Replace(Value),
+    Drop,
+}
 
 fn input_items(body: &Value) -> &[Value] {
     match body.get("input") {
@@ -60,14 +75,107 @@ pub(crate) fn validate_cross_route_context(body: &Value) -> Result<()> {
     Ok(())
 }
 
+/// 协作任务正文由 Codex 运行时刻写成密文并交给持有密钥的上游解密，线路本身
+/// 不判断内容。第三方线路可能把这个字段直接写成明文，接收方解密失败会拒绝
+/// 整条请求，因此发送前按结构识别：令牌形态原样保留，其余形态改写为可见
+/// 文本，避免历史内容丢失。
 pub(crate) fn normalize_native_responses_context(
     body: &mut Value,
     discard_opaque_reasoning: bool,
 ) -> bool {
+    let mut changed = normalize_encrypted_agent_payloads(body);
     // 同一线路必须原样回传 reasoning，包括第三方 thinking 模式需要的明文内容。
-    if !discard_opaque_reasoning {
+    if discard_opaque_reasoning {
+        changed |= discard_reasoning_history(body);
+    }
+    changed
+}
+
+fn normalize_encrypted_agent_payloads(body: &mut Value) -> bool {
+    match body.get_mut("input") {
+        Some(Value::Array(items)) => {
+            let mut changed = false;
+            for item in items {
+                changed |= normalize_agent_message_item(item);
+            }
+            changed
+        }
+        Some(item @ Value::Object(_)) => normalize_agent_message_item(item),
+        _ => false,
+    }
+}
+
+fn normalize_agent_message_item(item: &mut Value) -> bool {
+    if item.get("type").and_then(Value::as_str) != Some("agent_message") {
         return false;
     }
+    let Some(object) = item.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    let mut drop_content = false;
+    match object.get_mut("content") {
+        Some(Value::Array(parts)) => {
+            parts.retain_mut(|part| match encrypted_content_rewrite(part) {
+                EncryptedContentRewrite::Keep => true,
+                EncryptedContentRewrite::Replace(replacement) => {
+                    *part = replacement;
+                    changed = true;
+                    true
+                }
+                EncryptedContentRewrite::Drop => {
+                    changed = true;
+                    false
+                }
+            })
+        }
+        Some(part @ Value::Object(_)) => match encrypted_content_rewrite(part) {
+            EncryptedContentRewrite::Keep => {}
+            EncryptedContentRewrite::Replace(replacement) => {
+                *part = replacement;
+                changed = true;
+            }
+            EncryptedContentRewrite::Drop => {
+                changed = true;
+                drop_content = true;
+            }
+        },
+        _ => {}
+    }
+    if drop_content {
+        object.remove("content");
+    }
+    changed
+}
+
+fn encrypted_content_rewrite(part: &Value) -> EncryptedContentRewrite {
+    if part.get("type").and_then(Value::as_str) != Some("encrypted_content") {
+        return EncryptedContentRewrite::Keep;
+    }
+    let Some(payload) = part.get("encrypted_content").and_then(Value::as_str) else {
+        return EncryptedContentRewrite::Drop;
+    };
+    if is_codex_encrypted_payload(payload) {
+        return EncryptedContentRewrite::Keep;
+    }
+    if payload.trim().is_empty() {
+        return EncryptedContentRewrite::Drop;
+    }
+    EncryptedContentRewrite::Replace(json!({"type":"input_text","text":payload}))
+}
+
+fn is_codex_encrypted_payload(value: &str) -> bool {
+    let encoded = value.trim().trim_end_matches('=');
+    let Ok(decoded) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded) else {
+        return false;
+    };
+    decoded.first() == Some(&0x80)
+        && decoded.len() >= FERNET_PREFIX_BYTES + FERNET_SUFFIX_BYTES + FERNET_BLOCK_BYTES
+        && (decoded.len() - FERNET_PREFIX_BYTES - FERNET_SUFFIX_BYTES)
+            .is_multiple_of(FERNET_BLOCK_BYTES)
+}
+
+fn discard_reasoning_history(body: &mut Value) -> bool {
     let Some(input) = body.get_mut("input") else {
         return false;
     };
@@ -196,7 +304,28 @@ pub(crate) fn validate_compaction_result(value: &Value, v2: bool) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
+    use base64::Engine as _;
+
     use super::*;
+
+    fn fernet_token(ciphertext: &[u8]) -> String {
+        let mut token = vec![0x80];
+        token.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+        token.extend_from_slice(&[0x11; 16]);
+        token.extend_from_slice(ciphertext);
+        token.extend_from_slice(&[0x22; 32]);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token)
+    }
+
+    fn agent_message(content: Value) -> Value {
+        json!({
+            "type":"agent_message",
+            "id":"amsg_test",
+            "author":"/root",
+            "recipient":"/root/child",
+            "content":content
+        })
+    }
 
     #[test]
     fn native_reasoning_normalization_preserves_same_route_history() {
@@ -227,6 +356,100 @@ mod tests {
                 assert!(!normalize_native_responses_context(&mut body, true));
             }
         }
+    }
+
+    #[test]
+    fn plaintext_agent_payloads_become_visible_text_without_route_change() {
+        let task = "只读冒烟任务（第 1 轮）。禁止派生任何子代理。";
+        let mut body = json!({
+            "input":[
+                {"role":"user","content":"continue"},
+                agent_message(json!([
+                    {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                    {"type":"encrypted_content","encrypted_content":task}
+                ]))
+            ]
+        });
+        let expected_content = json!([
+            {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+            {"type":"input_text","text":task}
+        ]);
+
+        assert!(normalize_native_responses_context(&mut body, false));
+        assert_eq!(body["input"][1]["content"], expected_content);
+        assert_eq!(
+            body["input"][0],
+            json!({"role":"user","content":"continue"})
+        );
+        assert!(!normalize_native_responses_context(&mut body, false));
+
+        // 线路切换会额外丢弃 reasoning，但已经改写的任务正文保持不变。
+        assert!(!normalize_native_responses_context(&mut body, true));
+        assert_eq!(body["input"][1]["content"], expected_content);
+    }
+
+    #[test]
+    fn encrypted_agent_payloads_are_preserved_byte_for_byte() {
+        let mut body = json!({
+            "input":[agent_message(json!([
+                {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                {"type":"encrypted_content","encrypted_content":fernet_token(&[0x33; 16])}
+            ]))]
+        });
+        let original = body.clone();
+
+        assert!(!normalize_native_responses_context(&mut body, false));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn empty_or_unreadable_agent_payloads_are_dropped() {
+        for payload in [json!(""), json!("   "), json!(17), json!(null)] {
+            let mut body = json!({"input":[agent_message(json!([
+                {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                {"type":"encrypted_content","encrypted_content":payload}
+            ]))]});
+            assert!(normalize_native_responses_context(&mut body, false));
+            assert_eq!(
+                body["input"][0]["content"],
+                json!([{"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"}])
+            );
+        }
+    }
+
+    #[test]
+    fn single_object_agent_content_keeps_the_rewritten_payload() {
+        let mut plaintext = json!({
+            "input":[agent_message(json!({
+                "type":"encrypted_content","encrypted_content":"独立验证任务：只读。"
+            }))]
+        });
+        assert!(normalize_native_responses_context(&mut plaintext, false));
+        // 单个对象形态只替换内容本身，不额外改变内容结构。
+        assert_eq!(
+            plaintext["input"][0]["content"],
+            json!({"type":"input_text","text":"独立验证任务：只读。"})
+        );
+
+        let mut empty = json!({
+            "input":[agent_message(json!({"type":"encrypted_content","encrypted_content":""}))]
+        });
+        assert!(normalize_native_responses_context(&mut empty, false));
+        assert!(empty["input"][0].get("content").is_none());
+    }
+
+    #[test]
+    fn non_agent_items_keep_their_encrypted_state() {
+        let mut body = json!({
+            "input":[
+                {"type":"reasoning","id":"rs_1","encrypted_content":"第三方线路的推理状态"},
+                {"role":"user","content":[{"type":"encrypted_content","encrypted_content":"未识别的普通内容"}]}
+            ]
+        });
+        let original = body.clone();
+
+        assert!(!normalize_native_responses_context(&mut body, false));
+        assert_eq!(body, original);
     }
 
     #[test]
