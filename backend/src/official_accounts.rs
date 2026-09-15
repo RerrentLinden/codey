@@ -53,6 +53,15 @@ pub struct OfficialAccountRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
     pub added_at: u64,
+    /// Route overrides Codey keeps for this account. They shape the derived
+    /// official route while the account is the default; `None` keeps the value
+    /// derived from the Codex configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_short_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy: Option<String>,
     /// Complete Codex `auth.json` document for this account.
     pub auth: Value,
 }
@@ -71,6 +80,12 @@ pub struct OfficialAccountSummary {
     pub added_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_refresh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub route_short_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_proxy: Option<String>,
     pub is_default: bool,
 }
 
@@ -148,6 +163,11 @@ impl OfficialAccountRecord {
             plan_type,
             account_id,
             added_at,
+            // A document rebuilt from `auth.json` carries credentials only;
+            // `OfficialAccountStore::upsert` keeps the saved route settings.
+            route_name: None,
+            route_short_name: None,
+            upstream_proxy: None,
             auth,
         })
     }
@@ -184,6 +204,9 @@ impl OfficialAccountRecord {
             account_id: self.account_id.clone(),
             added_at: self.added_at,
             last_refresh: self.last_refresh(),
+            route_name: self.route_name.clone(),
+            route_short_name: self.route_short_name.clone(),
+            upstream_proxy: self.upstream_proxy.clone(),
             is_default: default_id == Some(self.id.as_str()),
         }
     }
@@ -296,6 +319,13 @@ pub(crate) fn unix_timestamp() -> u64 {
 
 fn rfc3339_now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+/// Route overrides are stored trimmed, and a blank value means "no override".
+fn route_setting(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 // ---------------------------------------------------------------------------
@@ -411,7 +441,38 @@ impl OfficialAccountStore {
             .context("保存默认官方账号记录失败")
     }
 
+    /// Stores the credentials of an account. Route settings belong to Codey
+    /// rather than to the credential document, so the saved ones survive a
+    /// re-login or a token refresh, which both arrive without them.
     pub fn upsert(&self, record: &OfficialAccountRecord) -> Result<()> {
+        let mut record = record.clone();
+        if let Some(saved) = self.get(&record.id)? {
+            record.route_name = record.route_name.or(saved.route_name);
+            record.route_short_name = record.route_short_name.or(saved.route_short_name);
+            record.upstream_proxy = record.upstream_proxy.or(saved.upstream_proxy);
+        }
+        self.write(&record)
+    }
+
+    /// Replaces the route overrides of one account; `None` restores the value
+    /// derived from the Codex configuration.
+    pub fn update_route_settings(
+        &self,
+        id: &str,
+        route_name: Option<String>,
+        route_short_name: Option<String>,
+        upstream_proxy: Option<String>,
+    ) -> Result<()> {
+        let mut record = self
+            .get(id)?
+            .ok_or_else(|| anyhow!("找不到官方账号：{id}"))?;
+        record.route_name = route_setting(route_name);
+        record.route_short_name = route_setting(route_short_name);
+        record.upstream_proxy = route_setting(upstream_proxy);
+        self.write(&record)
+    }
+
+    fn write(&self, record: &OfficialAccountRecord) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(record)?;
         crate::fs_util::atomic_write_private_with_parent(&self.account_path(&record.id), &bytes)
             .with_context(|| format!("保存官方账号失败：{}", record.id))
@@ -617,7 +678,8 @@ fn apply_token_response(record: &mut OfficialAccountRecord, payload: &Value) -> 
 #[derive(Debug, Clone)]
 pub enum LoginPhase {
     Waiting,
-    Completed(OfficialAccountRecord),
+    /// Boxed so a waiting session, which is the common phase, stays small.
+    Completed(Box<OfficialAccountRecord>),
     Failed(String),
 }
 
@@ -741,7 +803,7 @@ pub async fn start_login(client: reqwest::Client) -> Result<LoginSession> {
         )
         .await;
         let next = match outcome {
-            Ok(Ok(record)) => LoginPhase::Completed(record),
+            Ok(Ok(record)) => LoginPhase::Completed(Box::new(record)),
             Ok(Err(error)) => LoginPhase::Failed(format!("{error:#}")),
             Err(_) => LoginPhase::Failed("登录等待超时，请重新开始添加账号".to_string()),
         };
@@ -1044,6 +1106,60 @@ mod tests {
         store.remove("acct_2").unwrap();
         assert_eq!(store.default_account_id().unwrap(), None);
         assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn route_settings_outlive_credential_updates_and_can_be_cleared() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join(ACCOUNTS_DIR_NAME));
+        let record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_1", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&record).unwrap();
+        store
+            .update_route_settings(
+                "acct_1",
+                Some("  主力官方号  ".into()),
+                Some("主".into()),
+                // A blank value means "no override", not an empty proxy.
+                Some("   ".into()),
+            )
+            .unwrap();
+        let saved = store.get("acct_1").unwrap().unwrap();
+        assert_eq!(saved.route_name.as_deref(), Some("主力官方号"));
+        assert_eq!(saved.route_short_name.as_deref(), Some("主"));
+        assert_eq!(saved.upstream_proxy, None);
+
+        // Re-logging in rebuilds the record from `auth.json`, which carries
+        // credentials only; the saved route must stay.
+        let relogin = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_1", "a@example.com", "2026-02-01T00:00:00Z"),
+            2,
+        )
+        .unwrap();
+        store.upsert(&relogin).unwrap();
+        let summary = store
+            .summaries()
+            .unwrap()
+            .into_iter()
+            .find(|summary| summary.id == "acct_1")
+            .unwrap();
+        assert_eq!(summary.route_name.as_deref(), Some("主力官方号"));
+        assert_eq!(summary.route_short_name.as_deref(), Some("主"));
+
+        store
+            .update_route_settings("acct_1", None, None, None)
+            .unwrap();
+        let cleared = store.get("acct_1").unwrap().unwrap();
+        assert_eq!(cleared.route_name, None);
+        assert_eq!(cleared.route_short_name, None);
+
+        let error = store
+            .update_route_settings("acct_missing", None, None, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("acct_missing"));
     }
 
     #[test]

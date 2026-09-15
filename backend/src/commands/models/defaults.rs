@@ -79,8 +79,11 @@ pub async fn save_official_route_models(
         config.profiles[profile_index].enabled = enabled;
     }
     // 参数缺席表示保持现状；空字符串表示清除代理。地址合法性由配置校验把关。
+    let mut mirrored_proxy: Option<String> = None;
     if let Some(upstream_proxy) = requested_upstream_proxy {
-        config.profiles[profile_index].upstream_proxy = upstream_proxy.trim().to_string();
+        let upstream_proxy = upstream_proxy.trim().to_string();
+        config.profiles[profile_index].upstream_proxy = upstream_proxy.clone();
+        mirrored_proxy = Some(upstream_proxy);
     }
     if let Some(show_usage) = requested_show_account_usage {
         config.show_account_usage_in_header = show_usage;
@@ -129,22 +132,62 @@ pub async fn save_official_route_models(
     if let Err(error) = save_config_to_store(state, &config).await {
         return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
     }
+    // 官方线路在每次启动准备时按默认账号重新派生，因此代理还要写回账号记录，
+    // 否则重启后会被派生结果覆盖。失败只降级为提示，不影响已经生效的配置。
+    let mut account_override_warning: Option<String> = None;
+    if let Some(upstream_proxy) = mirrored_proxy
+        && let Err(error) = persist_official_account_proxy(state, upstream_proxy).await
+    {
+        account_override_warning = Some(format!("线路代理未能写入官方账号记录：{error}"));
+    }
     *state.config.write().await = config.clone();
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
     let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
     let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
     let restart_required = runtime_config_requires_restart(state, &config).await;
+    let mut response = hot_reload.add_to_response(json!({
+        "status":"ok",
+        "config":public_config,
+        "modelState":model_state,
+        "customContextsRestored":custom_contexts_restored,
+        "restartRequired":restart_required,
+    }));
+    if let Some(warning) = account_override_warning
+        && let Some(object) = response.as_object_mut()
+    {
+        object.insert("warning".to_string(), Value::String(warning));
+    }
     Ok(add_subagent_hot_reload_to_response(
-        hot_reload.add_to_response(json!({
-            "status":"ok",
-            "config":public_config,
-            "modelState":model_state,
-            "customContextsRestored":custom_contexts_restored,
-            "restartRequired":restart_required,
-        })),
+        response,
         subagent_hot_reload,
     ))
+}
+
+/// Keeps the official-account store in step with the proxy edited on the
+/// official route card.
+async fn persist_official_account_proxy(
+    state: &Arc<AppState>,
+    upstream_proxy: String,
+) -> Result<(), String> {
+    let store = state.official_accounts();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let Some(record) = store.default_account()? else {
+            return Ok(());
+        };
+        let upstream_proxy = upstream_proxy.trim();
+        let upstream_proxy = (!upstream_proxy.is_empty()).then(|| upstream_proxy.to_string());
+        store.update_route_settings(
+            &record.id,
+            record.route_name.clone(),
+            record.route_short_name.clone(),
+            upstream_proxy,
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("保存官方账号线路代理任务异常退出：{error}"))?
+    .map_err(|error| format!("{error:#}"))
 }
 
 pub(crate) async fn hot_reload_runtime_models(

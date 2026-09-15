@@ -412,6 +412,7 @@ fn renderer_model_catalog_routes_official_account_models_through_the_codey_route
     };
     config.profiles[0].source_provider_id = Some("openai".into());
     config.profiles[0].auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    config.profiles[0].short_name.clear();
     config.profiles[0].normalize();
     let model_state = model_catalog::ModelSelectionState {
         official_models: vec![model_catalog::OfficialModelAvailability {

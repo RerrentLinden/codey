@@ -383,10 +383,9 @@ pub(crate) fn renderer_route_model_catalog(
         } else {
             route_name
         };
-        let route_prefix = if profile.official_account {
-            OFFICIAL_ROUTE_SHORT_NAME.to_string()
-        } else {
-            profile.short_name.trim().to_string()
+        let route_prefix = match profile.short_name.trim() {
+            "" if profile.official_account => OFFICIAL_ROUTE_SHORT_NAME.to_string(),
+            short_name => short_name.to_string(),
         };
         let official_models = state
             .official_models

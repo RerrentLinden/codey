@@ -1011,6 +1011,7 @@ fn renderer_catalog_routes_every_model_through_the_codey_router_carrier() {
     official.id = "official-profile".into();
     official.source_provider_id = Some("openai".into());
     official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    official.short_name.clear();
     official.normalize();
 
     let mut relay = ProviderProfile::new("中转线路");

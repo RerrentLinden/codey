@@ -12,9 +12,14 @@ use super::{
     redacted_config, runtime_config_requires_restart, save_config_to_store,
 };
 use crate::codex_config::codex_home;
+use crate::config::{MAX_ROUTE_SHORT_NAME_CHARS, validate_outbound_proxy_url};
 use crate::official_accounts::{
     LoginPhase, OfficialAccountRecord, OfficialAccountStore, refresh_if_stale, start_login,
 };
+
+/// Keeps the route name readable in the route list and the model picker; the
+/// renderer applies the same limit before saving.
+const MAX_OFFICIAL_ROUTE_NAME_CHARS: usize = 60;
 
 fn accounts_payload(store: &OfficialAccountStore) -> Result<Value, String> {
     let default_account_id = store
@@ -118,7 +123,7 @@ pub(super) async fn poll_official_account_login(
         LoginPhase::Waiting => Ok(json!({ "status": "wait" })),
         LoginPhase::Failed(message) => Ok(json!({ "status": "failed", "message": message })),
         LoginPhase::Completed(record) => {
-            let payload = add_account(state, record).await?;
+            let payload = add_account(state, *record).await?;
             Ok(merge(payload, json!({ "status": "ok" })))
         }
     }
@@ -269,6 +274,91 @@ pub(super) async fn remove_official_account(
         .await
         .map_err(|error| format!("读取官方账号列表任务异常退出：{error}"))??;
     Ok(merge(payload, json!({ "status": "ok" })))
+}
+
+/// Saves the route name, short name and upstream proxy of one official
+/// account. The derived official route reads them back from the default
+/// account, so editing the default account also re-derives that route; the
+/// settings of the other accounts take effect once they become the default.
+pub(super) async fn save_official_account_route_settings(
+    state: &Arc<AppState>,
+    account_id: String,
+    route_name: String,
+    route_short_name: String,
+    upstream_proxy: String,
+) -> Result<Value, String> {
+    let account_id = account_id.trim().to_string();
+    if account_id.is_empty() {
+        return Err("缺少要保存线路设置的官方账号".to_string());
+    }
+    let route_name = route_name.trim().to_string();
+    let route_short_name = route_short_name.trim().to_string();
+    let upstream_proxy = upstream_proxy.trim().to_string();
+    if route_name.chars().count() > MAX_OFFICIAL_ROUTE_NAME_CHARS {
+        return Err(format!("线路名最多 {MAX_OFFICIAL_ROUTE_NAME_CHARS} 个字符"));
+    }
+    if route_short_name.chars().count() > MAX_ROUTE_SHORT_NAME_CHARS {
+        return Err(format!("短名称最多 {MAX_ROUTE_SHORT_NAME_CHARS} 个字符"));
+    }
+    if !upstream_proxy.is_empty() {
+        validate_outbound_proxy_url(&upstream_proxy, "官方账号线路的上游代理")?;
+    }
+    // Official and third-party routes share one short-name namespace because the
+    // short name prefixes every route-scoped model name.
+    if !route_short_name.is_empty()
+        && let Some(conflict) = state
+            .config
+            .read()
+            .await
+            .profiles
+            .iter()
+            .find(|profile| {
+                !profile.official_account && profile.short_name.trim() == route_short_name
+            })
+            .map(|profile| profile.name.clone())
+    {
+        return Err(format!(
+            "短名称「{route_short_name}」已被线路「{conflict}」使用"
+        ));
+    }
+
+    let store = state.official_accounts();
+    let saved_id = account_id.clone();
+    let saved_name = (!route_name.is_empty()).then_some(route_name);
+    let saved_short_name = (!route_short_name.is_empty()).then_some(route_short_name);
+    let saved_proxy = (!upstream_proxy.is_empty()).then_some(upstream_proxy);
+    let is_default = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let accounts = store.list()?;
+        if !accounts.iter().any(|record| record.id == saved_id) {
+            anyhow::bail!("找不到官方账号：{saved_id}");
+        }
+        if let Some(short_name) = saved_short_name.as_deref()
+            && let Some(other) = accounts.iter().find(|record| {
+                record.id != saved_id && record.route_short_name.as_deref() == Some(short_name)
+            })
+        {
+            let label = other.email.as_deref().unwrap_or(other.id.as_str());
+            anyhow::bail!("短名称「{short_name}」已被官方账号 {label} 使用");
+        }
+        store.update_route_settings(&saved_id, saved_name, saved_short_name, saved_proxy)?;
+        Ok(store.default_account_id()?.as_deref() == Some(saved_id.as_str()))
+    })
+    .await
+    .map_err(|error| format!("保存官方账号线路设置任务异常退出：{error}"))?
+    .map_err(|error| format!("{error:#}"))?;
+
+    if is_default {
+        let payload = refresh_official_route_after_account_change(state).await?;
+        return Ok(merge(payload, json!({ "accountId": account_id })));
+    }
+    let store = state.official_accounts();
+    let payload = tokio::task::spawn_blocking(move || accounts_payload(&store))
+        .await
+        .map_err(|error| format!("读取官方账号列表任务异常退出：{error}"))??;
+    Ok(merge(
+        payload,
+        json!({ "status": "ok", "accountId": account_id }),
+    ))
 }
 
 /// Re-runs the launch-time route preparation against the account store and

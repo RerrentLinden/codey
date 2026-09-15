@@ -819,10 +819,11 @@ fn webhook_display_model(config: &CodeyConfig, requested_model: &str) -> String 
 }
 
 fn format_webhook_model_name(profile: &crate::config::ProviderProfile, model: &str) -> String {
-    let prefix = if profile.official_account {
+    let short_name = profile.short_name.trim();
+    let prefix = if short_name.is_empty() && profile.official_account {
         OFFICIAL_ROUTE_SHORT_NAME
     } else {
-        profile.short_name.trim()
+        short_name
     };
     if prefix.is_empty() {
         model.to_string()
@@ -1847,6 +1848,7 @@ mod tests {
         official.id = "official".into();
         official.official_account = true;
         official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.short_name.clear();
         official.normalize();
 
         let mut relay = crate::config::ProviderProfile::new("中转线路");

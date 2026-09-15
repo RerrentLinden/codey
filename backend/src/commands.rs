@@ -52,8 +52,8 @@ pub use models::{
 };
 use official_accounts::{
     cancel_official_account_login, import_current_codex_login, list_official_accounts,
-    poll_official_account_login, remove_official_account, set_default_official_account,
-    start_official_account_login,
+    poll_official_account_login, remove_official_account, save_official_account_route_settings,
+    set_default_official_account, start_official_account_login,
 };
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
 use prompt_optimization::{
@@ -1184,6 +1184,27 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "remove_official_account" => match string_argument(&args, "accountId") {
             Ok(account_id) => remove_official_account(state, account_id).await,
             Err(error) => Err(error),
+        },
+        "save_official_account_route_settings" => match (
+            string_argument(&args, "accountId"),
+            optional_argument::<String>(&args, "routeName"),
+            optional_argument::<String>(&args, "routeShortName"),
+            optional_argument::<String>(&args, "upstreamProxy"),
+        ) {
+            (Ok(account_id), Ok(route_name), Ok(route_short_name), Ok(upstream_proxy)) => {
+                save_official_account_route_settings(
+                    state,
+                    account_id,
+                    route_name.unwrap_or_default(),
+                    route_short_name.unwrap_or_default(),
+                    upstream_proxy.unwrap_or_default(),
+                )
+                .await
+            }
+            (Err(error), _, _, _)
+            | (_, Err(error), _, _)
+            | (_, _, Err(error), _)
+            | (_, _, _, Err(error)) => Err(error),
         },
         "start_wechat_claw_login" => start_wechat_claw_login(state).await,
         "poll_wechat_claw_login" => match string_argument(&args, "loginId") {

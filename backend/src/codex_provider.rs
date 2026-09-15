@@ -71,7 +71,10 @@ pub fn current_official_account_profile_status_for_launch(
 ) -> Result<OfficialAccountProfileStatus> {
     let resolution = accounts.resolve_launch_login(codex_home);
     let snapshot = local_provider_with_auth_policy(codex_home, AuthProbePolicy::Lenient)?;
-    let profile = official_profile_from_snapshot(&snapshot);
+    let mut profile = official_profile_from_snapshot(&snapshot);
+    if let Some(record) = accounts.default_account()? {
+        apply_account_route_overrides(&mut profile, &record);
+    }
     let file_reason = match &snapshot.official_account_auth {
         OfficialAccountAuthProbe::Available(reason)
         | OfficialAccountAuthProbe::Unavailable(reason)
@@ -93,6 +96,27 @@ pub fn current_official_account_profile_status_for_launch(
             ),
         },
     })
+}
+
+/// The official-account editor stores its route name, short name and proxy per
+/// account; the default account owns the single derived official route.
+fn apply_account_route_overrides(
+    profile: &mut ProviderProfile,
+    record: &crate::official_accounts::OfficialAccountRecord,
+) {
+    if let Some(name) = trimmed(record.route_name.as_deref()) {
+        profile.name = name.to_string();
+    }
+    if let Some(short_name) = trimmed(record.route_short_name.as_deref()) {
+        profile.short_name = short_name.to_string();
+    }
+    if let Some(proxy) = trimmed(record.upstream_proxy.as_deref()) {
+        profile.upstream_proxy = proxy.to_string();
+    }
+}
+
+fn trimmed(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 fn official_profile_from_snapshot(snapshot: &LocalProviderSnapshot) -> ProviderProfile {
@@ -814,6 +838,58 @@ experimental_bearer_token = "sk-relay"
             assert!(!config.profiles[0].supports_native_web_search);
             assert_eq!(status.provider.id, "relay");
         }
+    }
+
+    #[test]
+    fn official_route_uses_the_default_account_route_overrides() {
+        let home = TempDir::new().unwrap();
+        write_config(home.path(), "");
+        write_auth(
+            home.path(),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": { "access_token": "token" }
+            }),
+        );
+        let (_dir, store) = empty_store();
+        let OfficialAccountProfileStatus::Available(profile) =
+            current_official_account_profile_status_for_launch(home.path(), &store).unwrap()
+        else {
+            panic!("the existing ChatGPT login should supply the official route");
+        };
+        let default_name = profile.name.clone();
+        assert_eq!(profile.short_name, crate::config::OFFICIAL_ROUTE_SHORT_NAME);
+        assert!(profile.upstream_proxy.is_empty());
+
+        let account_id = store.default_account_id().unwrap().unwrap();
+        store
+            .update_route_settings(
+                &account_id,
+                Some("主力官方号".into()),
+                Some("主".into()),
+                Some("http://127.0.0.1:7890".into()),
+            )
+            .unwrap();
+        let OfficialAccountProfileStatus::Available(profile) =
+            current_official_account_profile_status_for_launch(home.path(), &store).unwrap()
+        else {
+            panic!("the official route should stay available");
+        };
+        assert_eq!(profile.name, "主力官方号");
+        assert_eq!(profile.short_name, "主");
+        assert_eq!(profile.upstream_proxy, "http://127.0.0.1:7890");
+
+        store
+            .update_route_settings(&account_id, None, None, None)
+            .unwrap();
+        let OfficialAccountProfileStatus::Available(profile) =
+            current_official_account_profile_status_for_launch(home.path(), &store).unwrap()
+        else {
+            panic!("the official route should stay available");
+        };
+        assert_eq!(profile.name, default_name);
+        assert_eq!(profile.short_name, crate::config::OFFICIAL_ROUTE_SHORT_NAME);
+        assert!(profile.upstream_proxy.is_empty());
     }
 
     #[test]

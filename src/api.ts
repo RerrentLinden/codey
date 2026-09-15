@@ -20,6 +20,7 @@ export const CODEY_API_COMMANDS = [
   "import_current_codex_login",
   "set_default_official_account",
   "remove_official_account",
+  "save_official_account_route_settings",
   "clear_route_request_logs",
   "restart_codey",
   "clear_diagnostic_storage",
