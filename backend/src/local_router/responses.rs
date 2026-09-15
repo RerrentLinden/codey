@@ -1903,7 +1903,8 @@ impl RouterServer {
                 format!("{error:#}"),
                 json!({ "routeId": resolved.provider_id, "requestId": current_router_request_id() }),
             );
-            let detail = sanitize_upstream_error_text(&error.to_string(), &resolved.route, 512)
+            // 取完整错误链，最外层信息不足以定位传输层原因。
+            let detail = sanitize_upstream_error_text(&format!("{error:#}"), &resolved.route, 512)
                 .unwrap_or_else(|| "上游响应未能完成".to_string());
             return downstream
                 .write_error(

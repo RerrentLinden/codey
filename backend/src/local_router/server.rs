@@ -377,7 +377,11 @@ pub(crate) fn upstream_http_client_builder() -> reqwest::ClientBuilder {
         // Reuse a warm TLS connection across normal tool turns while
         // TCP probes evict half-open sockets before the next request.
         .pool_idle_timeout(Some(UPSTREAM_HTTP_POOL_IDLE_TIMEOUT))
-        .http2_adaptive_window(true)
+        // 自适应窗口与下面的固定窗口互斥：它会覆盖两者并把初始连接窗口重置为
+        // 65535，使 h2 的小 DATA 帧预算降到 32 KiB，见
+        // UPSTREAM_HTTP2_INITIAL_STREAM_WINDOW_BYTES 附近的说明。
+        .http2_initial_stream_window_size(UPSTREAM_HTTP2_INITIAL_STREAM_WINDOW_BYTES)
+        .http2_initial_connection_window_size(UPSTREAM_HTTP2_INITIAL_CONNECTION_WINDOW_BYTES)
         // Pooled HTTP/2 connections can die silently behind NAT or
         // provider load balancers. PING frames while idle detect that
         // before the next request instead of spending its first

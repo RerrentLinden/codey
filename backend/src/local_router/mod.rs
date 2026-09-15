@@ -102,6 +102,13 @@ const DOWNSTREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const UPSTREAM_HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UPSTREAM_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const UPSTREAM_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+// h2 从 0.4.16 起对连接级的小 DATA 帧记账，预算取连接窗口的一半。自适应窗口
+// 会把初始连接窗口重置为 65535，预算随之只剩 32 KiB，逐 token 输出的 SSE
+// 上游会被判成 DATA 帧洪水，h2 主动发送 GOAWAY 断开连接，现象是上游返回 200
+// 之后读取中断。改用固定窗口把预算抬到 MiB 级；窗口只是流量控制信用额度，
+// 不是预先分配的内存。撤销条件：h2 开放预算配置，或上游不再拆出大量小帧。
+const UPSTREAM_HTTP2_INITIAL_STREAM_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
+const UPSTREAM_HTTP2_INITIAL_CONNECTION_WINDOW_BYTES: u32 = 16 * 1024 * 1024;
 const UPSTREAM_TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(15);
 const UPSTREAM_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const UPSTREAM_TCP_KEEPALIVE_RETRIES: u32 = 3;
