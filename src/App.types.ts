@@ -249,7 +249,8 @@ export type Confirmation = {
     | "restart"
     | "install-update"
     | "delete-notification-channel"
-    | "delete-route";
+    | "delete-route"
+    | "delete-official-account";
   title: string;
   description: string;
   confirmLabel: string;

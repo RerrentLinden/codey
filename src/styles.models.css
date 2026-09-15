@@ -744,6 +744,52 @@
 .official-account-avatar {
   flex-shrink: 0;
   color: var(--mac-text-secondary);
+  transition: color 0.15s ease;
+}
+
+.official-account-item.is-default .official-account-avatar {
+  color: #10a37f;
+}
+
+.official-account-plan-badge {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  box-sizing: border-box;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  padding: 0 7px;
+  height: 20px;
+  line-height: 18px;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.official-account-plan-badge.is-plus {
+  background: rgba(147, 51, 234, 0.09);
+  color: #7c3aed;
+  border-color: rgba(147, 51, 234, 0.25);
+}
+
+.official-account-plan-badge.is-pro {
+  background: rgba(15, 23, 42, 0.07);
+  color: #0f172a;
+  border-color: rgba(15, 23, 42, 0.2);
+}
+
+.official-account-plan-badge.is-team {
+  background: rgba(2, 132, 199, 0.09);
+  color: #0284c7;
+  border-color: rgba(2, 132, 199, 0.22);
+}
+
+.official-account-plan-badge.is-default {
+  background: rgba(0, 0, 0, 0.05);
+  color: var(--mac-text-secondary);
+  border-color: rgba(0, 0, 0, 0.1);
 }
 
 .official-account-main {
@@ -782,6 +828,75 @@
 .official-account-usage.is-muted,
 .official-account-usage .is-muted {
   opacity: 0.75;
+}
+
+.official-account-usage-row {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  min-width: 0;
+}
+
+.official-account-usage-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--mac-text-secondary);
+}
+
+.official-account-usage-window {
+  font-weight: 500;
+  color: var(--mac-text-primary);
+  white-space: nowrap;
+}
+
+.official-account-progress-track {
+  width: 52px;
+  height: 5px;
+  background: rgba(0, 0, 0, 0.08);
+  border-radius: 9999px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.official-account-progress-fill {
+  height: 100%;
+  border-radius: 9999px;
+  transition: width 0.3s ease;
+}
+
+.official-account-progress-fill.is-normal {
+  background: #34c759;
+}
+
+.official-account-progress-fill.is-warning {
+  background: #ff9500;
+}
+
+.official-account-progress-fill.is-danger {
+  background: #ff3b30;
+}
+
+.official-account-usage-percent {
+  font-weight: 600;
+  color: var(--mac-text-primary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.official-account-usage-reset {
+  color: var(--mac-text-secondary);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.official-account-usage-stale {
+  color: var(--mac-text-tertiary);
+  font-size: 10.5px;
+  white-space: nowrap;
 }
 
 .official-account-controls {

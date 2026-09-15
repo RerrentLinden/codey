@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { IconCheck, IconLogin2 as IconLogin, IconPlus, IconRefresh, IconTrash, IconUserCircle } from "@tabler/icons-react";
+import { IconBrandOpenai, IconCheck, IconLogin2 as IconLogin, IconPlus, IconRefresh, IconTrash } from "@tabler/icons-react";
 
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
 import { Badge, Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, Tooltip } from "./components/ui";
-import type { OfficialAccount, OfficialAccountsResult } from "./App.types";
+import type { Confirmation, OfficialAccount, OfficialAccountsResult } from "./App.types";
 import type { AccountUsageSnapshot } from "./quotaEstimate";
 
 type LoginStart = { loginId: string; authUrl: string; browserOpened?: boolean };
@@ -18,14 +18,66 @@ function formatPlan(plan?: string) {
   return known[plan.toLowerCase()] || plan;
 }
 
-function formatResetTime(resetsAt?: number) {
-  if (!resetsAt) return "";
+function planTagClass(plan?: string) {
+  const p = plan?.toLowerCase();
+  if (p === "plus") return "official-account-plan-badge is-plus";
+  if (p === "pro") return "official-account-plan-badge is-pro";
+  if (p === "team" || p === "business" || p === "enterprise") return "official-account-plan-badge is-team";
+  return "official-account-plan-badge is-default";
+}
+
+function formatSpecificResetTime(resetsAt?: number): { full: string; short: string; exact: string; relative: string } | null {
+  if (!resetsAt) return null;
+  const date = new Date(resetsAt * 1000);
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+
   const remaining = resetsAt * 1000 - Date.now();
-  if (remaining <= 0) return "即将重置";
-  const hours = Math.floor(remaining / 3_600_000);
-  if (hours >= 48) return `${Math.floor(hours / 24)} 天后重置`;
-  if (hours >= 1) return `${hours} 小时后重置`;
-  return `${Math.max(1, Math.floor(remaining / 60_000))} 分钟后重置`;
+  let relative = "";
+  if (remaining <= 0) {
+    relative = "即将重置";
+  } else {
+    const hours = Math.floor(remaining / 3_600_000);
+    if (hours >= 48) {
+      relative = `${Math.floor(hours / 24)} 天后`;
+    } else if (hours >= 1) {
+      relative = `${hours} 小时后`;
+    } else {
+      relative = `${Math.max(1, Math.floor(remaining / 60_000))} 分钟后`;
+    }
+  }
+
+  const isToday =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+
+  const tomorrow = new Date(now);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  const isTomorrow =
+    date.getFullYear() === tomorrow.getFullYear() &&
+    date.getMonth() === tomorrow.getMonth() &&
+    date.getDate() === tomorrow.getDate();
+
+  let dateLabel = "";
+  if (isToday) {
+    dateLabel = "今天 ";
+  } else if (isTomorrow) {
+    dateLabel = "明天 ";
+  } else if (date.getFullYear() === now.getFullYear()) {
+    dateLabel = `${date.getMonth() + 1}月${date.getDate()}日 `;
+  } else {
+    dateLabel = `${date.getFullYear()}/${date.getMonth() + 1}/${date.getDate()} `;
+  }
+
+  const exact = `${dateLabel}${time}`;
+  return {
+    exact,
+    relative,
+    short: `${exact} 重置`,
+    full: `${exact} 重置${relative ? `（${relative}）` : ""}`,
+  };
 }
 
 function windowLabel(minutes: number) {
@@ -46,15 +98,41 @@ function UsageLine({ snapshot }: { snapshot: AccountUsageSnapshot | null }) {
   );
   if (windows.length === 0) return <small className="official-account-usage is-muted">官方未返回额度窗口</small>;
   return (
-    <small className="official-account-usage">
-      {windows.map((window, index) => (
-        <span key={`${window.windowMinutes}-${index}`}>
-          {windowLabel(window.windowMinutes)} 剩余 {Math.max(0, 100 - Math.round(window.usedPercent))}%
-          {window.resetsAt ? `（${formatResetTime(window.resetsAt)}）` : ""}
-        </span>
-      ))}
-      {snapshot.stale ? <span className="is-muted">（上次成功数据）</span> : null}
-    </small>
+    <div className="official-account-usage-row">
+      {windows.map((window, index) => {
+        const remainingPercent = Math.max(0, Math.min(100, 100 - Math.round(window.usedPercent)));
+        const resetInfo = formatSpecificResetTime(window.resetsAt);
+        const toneClass =
+          remainingPercent <= 10
+            ? "is-danger"
+            : remainingPercent <= 30
+              ? "is-warning"
+              : "is-normal";
+        const fullTimeTitle = window.resetsAt
+          ? `重置时间：${new Date(window.resetsAt * 1000).toLocaleString("zh-CN")}（已消耗 ${Math.round(window.usedPercent)}%，剩余 ${remainingPercent}%）`
+          : `已消耗 ${Math.round(window.usedPercent)}%，剩余 ${remainingPercent}%`;
+        return (
+          <div
+            key={`${window.windowMinutes}-${index}`}
+            className="official-account-usage-item"
+            title={fullTimeTitle}
+          >
+            <span className="official-account-usage-window">{windowLabel(window.windowMinutes)}</span>
+            <div className="official-account-progress-track" aria-hidden="true">
+              <div
+                className={`official-account-progress-fill ${toneClass}`}
+                style={{ width: `${remainingPercent}%` }}
+              />
+            </div>
+            <span className="official-account-usage-percent">剩余 {remainingPercent}%</span>
+            {resetInfo && (
+              <span className="official-account-usage-reset">{resetInfo.full}</span>
+            )}
+          </div>
+        );
+      })}
+      {snapshot.stale ? <span className="official-account-usage-stale">（上次成功数据）</span> : null}
+    </div>
   );
 }
 
@@ -64,6 +142,7 @@ export type OfficialAccountsPanelProps = {
   popupContainer: HTMLElement | null;
   onAccountsChanged: (result: OfficialAccountsResult) => void;
   onNotice: (notice: { tone: "success" | "info" | "error"; text: string }) => void;
+  onRequestConfirmation?: (confirmation: Confirmation) => void;
 };
 
 export function OfficialAccountsPanel({
@@ -72,10 +151,12 @@ export function OfficialAccountsPanel({
   popupContainer,
   onAccountsChanged,
   onNotice,
+  onRequestConfirmation,
 }: OfficialAccountsPanelProps) {
   const [accounts, setAccounts] = useState<OfficialAccount[] | null>(null);
   const [loadError, setLoadError] = useState("");
   const [pending, setPending] = useState<string | null>(null);
+  const [confirmAccount, setConfirmAccount] = useState<OfficialAccount | null>(null);
   const [usage, setUsage] = useState<AccountUsageSnapshot | null>(null);
   const [login, setLogin] = useState<LoginStart | null>(null);
   const [loginError, setLoginError] = useState("");
@@ -228,9 +309,7 @@ export function OfficialAccountsPanel({
     }
   }
 
-  async function remove(account: OfficialAccount) {
-    const label = account.email || account.accountId || account.id;
-    if (!window.confirm(`移除官方账号 ${label}？${account.isDefault ? "它是当前默认账号，移除后 Codex 将退出该账号登录。" : ""}`)) return;
+  async function executeRemove(account: OfficialAccount) {
     setPending(`remove:${account.id}`);
     try {
       const result = await invoke<OfficialAccountsResult>("remove_official_account", { accountId: account.id });
@@ -241,6 +320,25 @@ export function OfficialAccountsPanel({
     } finally {
       setPending(null);
     }
+  }
+
+  function handleRemove(account: OfficialAccount) {
+    const label = account.email || account.accountId || account.id;
+    const title = `移除官方账号「${label}」？`;
+    const description = account.isDefault
+      ? "它是当前默认账号，移除后 Codex 将退出该账号登录。"
+      : "确定要移除该官方账号吗？移除后将无法继续使用该账号。";
+    if (onRequestConfirmation) {
+      onRequestConfirmation({
+        action: "delete-official-account",
+        title,
+        description,
+        confirmLabel: "移除账号",
+        run: () => void executeRemove(account),
+      });
+      return;
+    }
+    setConfirmAccount(account);
   }
 
   const disabled = isBusy || pending !== null;
@@ -275,11 +373,11 @@ export function OfficialAccountsPanel({
             const plan = formatPlan(account.planType);
             return (
               <li key={account.id} className={`official-account-item${account.isDefault ? " is-default" : ""}`}>
-                <IconUserCircle size={18} className="official-account-avatar" aria-hidden="true" />
+                <IconBrandOpenai size={18} className="official-account-avatar" aria-hidden="true" />
                 <div className="official-account-main">
                   <div className="official-account-line">
                     <strong title={label}>{label}</strong>
-                    {plan && <Badge variant="outline">{plan}</Badge>}
+                    {plan && <span className={planTagClass(account.planType)}>{plan}</span>}
                     {account.isDefault && (
                       <Badge variant={officialAccountAvailable ? "success" : "warning"}>
                         {officialAccountAvailable ? "默认 · 已启用" : "默认 · 待重启"}
@@ -316,7 +414,7 @@ export function OfficialAccountsPanel({
                     size="icon-sm"
                     disabled={disabled}
                     loading={pending === `remove:${account.id}`}
-                    onClick={() => void remove(account)}
+                    onClick={() => void handleRemove(account)}
                     aria-label={`移除官方账号 ${label}`}
                     title="移除账号"
                   >
@@ -354,6 +452,37 @@ export function OfficialAccountsPanel({
             ) : (
               <Button variant="secondary" size="sm" onClick={() => void closeLogin()}>取消</Button>
             )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={confirmAccount !== null} onOpenChange={(open) => { if (!open) setConfirmAccount(null); }}>
+        <DialogContent className="confirmation-dialog" container={popupContainer}>
+          <DialogHeader>
+            <DialogTitle>
+              {confirmAccount ? `移除官方账号「${confirmAccount.email || confirmAccount.accountId || confirmAccount.id}」？` : "移除官方账号？"}
+            </DialogTitle>
+            <DialogDescription>
+              {confirmAccount?.isDefault
+                ? "它是当前默认账号，移除后 Codex 将退出该账号登录。"
+                : "确定要移除该官方账号吗？移除后将无法继续使用该账号。"}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmAccount(null)}>取消</Button>
+            <Button
+              variant="destructive"
+              disabled={disabled}
+              loading={confirmAccount ? pending === `remove:${confirmAccount.id}` : false}
+              onClick={() => {
+                const target = confirmAccount;
+                setConfirmAccount(null);
+                if (target) void executeRemove(target);
+              }}
+            >
+              <IconTrash aria-hidden="true" />
+              移除账号
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

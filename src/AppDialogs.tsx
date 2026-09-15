@@ -417,7 +417,9 @@ function ConfirmationDialogComponent({
   onConfirm,
 }: ConfirmationDialogProps) {
   const destructive =
-    confirmation?.action === "delete-notification-channel";
+    confirmation?.action === "delete-notification-channel" ||
+    confirmation?.action === "delete-route" ||
+    confirmation?.action === "delete-official-account";
   return (
     <Dialog open={Boolean(confirmation)} onOpenChange={(open) => !open && onClose()}>
       <DialogContent className="confirmation-dialog" container={container}>
