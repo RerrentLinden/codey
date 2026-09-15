@@ -9,6 +9,7 @@
 /vendor/CodeyRuntime/target/
 /dist/
 /dist-overlay/
+/output/
 /coverage/
 /.vite/
 
@@ -19,6 +20,7 @@
 !.env.example
 
 # Logs and temporary files
+/.playwright-cli/
 *.log
 *.tmp
 *.temp

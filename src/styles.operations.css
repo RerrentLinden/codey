@@ -370,6 +370,66 @@
   min-width: 0;
 }
 
+.injection-mode-panel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px 24px;
+  padding: 14px 16px;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  border-radius: 10px;
+  background: #f7f7f9;
+}
+
+.injection-mode-copy {
+  min-width: 0;
+}
+
+.injection-mode-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.injection-mode-heading h4 {
+  margin: 0;
+  color: #1d1d1f;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 20px;
+}
+
+.injection-mode-description {
+  margin: 6px 0 0;
+  color: #6e6e73;
+  font-size: 11px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.injection-mode-action {
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.injection-mode-repair {
+  min-width: 72px;
+  background: #ffffff;
+}
+
+@media (max-width: 540px) {
+  .injection-mode-panel {
+    flex-wrap: wrap;
+    gap: 12px;
+    padding: 12px;
+  }
+
+  .injection-mode-copy {
+    flex-basis: 100%;
+  }
+}
+
 .injection-status-header {
   display: flex;
   align-items: flex-start;

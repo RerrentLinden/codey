@@ -1,0 +1,13 @@
+diff --git a/dist/components/checkbox.css b/dist/components/checkbox.css
+--- a/dist/components/checkbox.css
++++ b/dist/components/checkbox.css
+@@ -108,7 +108,8 @@
+       scale 100ms var(--ease-linear),
+       opacity 200ms var(--ease-linear),
+       background-color 200ms var(--ease-out);
+-    @apply motion-reduce:transition-none;
++    /* The control's motion-reduce variant already targets ::before.
++       Applying it here creates invalid pseudo-element attribute selectors. */
+   }
+ 
+   /* Interactive states */
