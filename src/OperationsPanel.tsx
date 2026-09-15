@@ -584,36 +584,41 @@ function OperationsPanelComponent({
 
                   {expandedStatusCard.showInjectionScripts && (
                     <section
-                      className="injection-status-section"
+                      className="injection-status-section injection-mode-panel"
                       aria-labelledby="injection-mode-title"
                     >
-                      <div className="injection-status-header">
-                        <div>
-                          <div className="flex items-center gap-2">
-                            <h4 id="injection-mode-title">主进程注入</h4>
-                            <Button
-                              variant="outline"
-                              size="xs"
-                              disabled={isBusy || restartStatusUnknown || !injectionRepairAvailable}
-                              onClick={onRepairMainProcessInjection}
-                              aria-label="修复主进程注入"
-                              title="自动退出 Codex，修复成功后重新启动"
-                            >
-                              {injectionRepairing && <LoaderCircle className="animate-spin" aria-hidden="true" />}
-                              {injectionRepairing ? "修复中" : "修复"}
-                            </Button>
-                          </div>
-                          <span className="injection-script-detail">
-                            {injectionRepairing
-                              ? "正在退出 Codex 并修复，成功后将自动重启…"
-                              : injectionRepairAvailable
-                                ? `${injectionModeCard.description} 点击修复将退出 Codex，成功后自动重启。`
-                                : injectionModeCard.description}
-                          </span>
+                      <div className="injection-mode-copy">
+                        <div className="injection-mode-heading">
+                          <h4 id="injection-mode-title">主进程注入</h4>
+                          <Badge variant={injectionModeCard.tone}>
+                            {injectionModeCard.label}
+                          </Badge>
                         </div>
-                        <Badge variant={injectionModeCard.tone}>
-                          {injectionModeCard.label}
-                        </Badge>
+                        <p className="injection-mode-description">
+                          {injectionRepairing
+                            ? "正在退出 Codex 并修复，成功后将自动重启…"
+                            : injectionRepairAvailable
+                              ? `${injectionModeCard.description} 点击修复将退出 Codex，成功后自动重启。`
+                              : injectionModeCard.description}
+                        </p>
+                      </div>
+                      <div className="injection-mode-action">
+                        <Button
+                          className="injection-mode-repair"
+                          variant="outline"
+                          size="xs"
+                          disabled={isBusy || restartStatusUnknown || !injectionRepairAvailable}
+                          onClick={onRepairMainProcessInjection}
+                          aria-label="修复主进程注入"
+                          title="自动退出 Codex，修复成功后重新启动"
+                        >
+                          {injectionRepairing ? (
+                            <LoaderCircle className="animate-spin" aria-hidden="true" />
+                          ) : (
+                            <RefreshCw aria-hidden="true" />
+                          )}
+                          {injectionRepairing ? "修复中" : "修复"}
+                        </Button>
                       </div>
                     </section>
                   )}
