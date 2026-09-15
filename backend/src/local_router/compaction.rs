@@ -304,8 +304,6 @@ pub(crate) fn validate_compaction_result(value: &Value, v2: bool) -> Result<()> 
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
-
     use super::*;
 
     fn fernet_token(ciphertext: &[u8]) -> String {
