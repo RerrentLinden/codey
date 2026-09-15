@@ -64,8 +64,9 @@ test("prompt optimization supports all manual upstream request formats", () => {
   assert.match(commandSource, /optimization\.uses_codey_route\(\)/);
   assert.match(commandSource, /ROUTER_AUTH_HEADER/);
   assert.match(commandSource, /response_store: uses_official_account\.then_some\(false\)/);
-  assert.match(commandSource, /response_stream: uses_official_account\.then_some\(true\)/);
+  assert.match(commandSource, /response_stream: Some\(true\)/);
   assert.match(commandSource, /response_omit_max_output_tokens: uses_official_account/);
+  assert.match(backendSource, /fn responses_stream_body_is_json\(/);
   assert.match(backendSource, /remove\("max_output_tokens"\)/);
 });
 

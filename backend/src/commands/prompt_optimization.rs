@@ -66,7 +66,10 @@ async fn resolve_request_config(
             api_key: String::new(),
             request_headers,
             response_store: uses_official_account.then_some(false),
-            response_stream: uses_official_account.then_some(true),
+            // Codey routes always ask for a streamed Responses body: some
+            // third-party relays only fill `output` for streamed requests and
+            // answer non-streamed ones with a billed but empty result.
+            response_stream: Some(true),
             response_omit_max_output_tokens: uses_official_account,
             model: optimization.model.clone(),
             upstream_protocol: crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),

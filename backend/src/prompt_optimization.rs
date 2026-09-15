@@ -67,8 +67,8 @@ pub struct ResolvedPromptOptimizationConfig {
     /// unset so their existing payload contract is unchanged.
     pub response_store: Option<bool>,
     /// Overrides the Responses API `stream` field when the selected upstream
-    /// requires streaming. Manual and third-party routes keep the historical
-    /// non-streaming payload.
+    /// requires streaming. Manual configurations leave this unset and keep
+    /// their historical non-streaming payload.
     pub response_stream: Option<bool>,
     /// Omits Responses API `max_output_tokens` for selected upstreams with a
     /// narrower request schema. Manual and third-party routes keep sending it.
@@ -722,6 +722,7 @@ async fn parse_optimized_response(
     .map_err(OptimizedResponseError::fatal)?;
     if protocol == OptimizationUpstreamProtocol::OpenAiResponses
         && config.response_stream == Some(true)
+        && !responses_stream_body_is_json(&body)
     {
         let optimized = extract_responses_stream_optimized_text(&body).map_err(|error| {
             let preview = sanitize_resolved_error(&error, config);
@@ -731,15 +732,35 @@ async fn parse_optimized_response(
         })?;
         let optimized = optimized.trim();
         if optimized.is_empty() {
-            return Err(OptimizedResponseError::fatal(
-                "优化 API 返回了空的优化结果".to_string(),
-            ));
+            return Err(OptimizedResponseError::fatal(format!(
+                "优化 API 流式响应没有返回文本内容（{endpoint}）"
+            )));
         }
         return Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect());
     }
 
-    let value: Value = serde_json::from_slice(&body).map_err(|_| {
-        let preview = sanitize_resolved_error(String::from_utf8_lossy(&body).trim(), config);
+    optimized_text_from_json_body(&body, endpoint, config, protocol)
+}
+
+/// Streaming requests normally answer with SSE frames, but some relays ignore
+/// `stream: true` and return a single JSON body. Both shapes carry the same
+/// output contract, so a JSON body is handed to the JSON parser instead of
+/// being reported as an unreadable stream.
+fn responses_stream_body_is_json(body: &[u8]) -> bool {
+    let body = body.strip_prefix(b"\xef\xbb\xbf").unwrap_or(body);
+    body.iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .is_some_and(|byte| *byte == b'{')
+}
+
+fn optimized_text_from_json_body(
+    body: &[u8],
+    endpoint: &str,
+    config: &ResolvedPromptOptimizationConfig,
+    protocol: OptimizationUpstreamProtocol,
+) -> Result<String, OptimizedResponseError> {
+    let value: Value = serde_json::from_slice(body).map_err(|_| {
+        let preview = sanitize_resolved_error(String::from_utf8_lossy(body).trim(), config);
         let preview: String = preview.chars().take(200).collect();
         let preview = if preview.is_empty() {
             "空响应".to_string()
@@ -751,14 +772,75 @@ async fn parse_optimized_response(
         ))
     })?;
     let optimized = extract_optimized_text(&value, protocol)
-        .ok_or_else(|| OptimizedResponseError::fatal("优化 API 响应中缺少优化结果".to_string()))?;
+        .ok_or_else(|| missing_optimized_text_error(&value, endpoint, protocol, config))?;
     let optimized = optimized.trim();
     if optimized.is_empty() {
-        return Err(OptimizedResponseError::fatal(
-            "优化 API 返回了空的优化结果".to_string(),
-        ));
+        return Err(OptimizedResponseError::fatal(format!(
+            "优化 API 返回了空的优化结果（{endpoint}）"
+        )));
     }
     Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect())
+}
+
+/// Reports what the upstream actually returned when a successful HTTP response
+/// carries no readable text. An empty `output` array next to billed output
+/// tokens is the signature of relays that only assemble content for streamed
+/// requests, so the message names those facts instead of only stating that the
+/// result is missing.
+fn missing_optimized_text_error(
+    value: &Value,
+    endpoint: &str,
+    protocol: OptimizationUpstreamProtocol,
+    config: &ResolvedPromptOptimizationConfig,
+) -> OptimizedResponseError {
+    let detail = sanitize_resolved_error(&missing_text_detail(value, protocol), config);
+    OptimizedResponseError::fatal(format!(
+        "优化 API 响应中缺少优化结果（{endpoint}）：{detail}"
+    ))
+}
+
+fn missing_text_detail(value: &Value, protocol: OptimizationUpstreamProtocol) -> String {
+    match protocol {
+        OptimizationUpstreamProtocol::OpenAiResponses => {
+            let status = value
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("未知");
+            let status: String = status.chars().take(40).collect();
+            match value.get("output") {
+                None => format!("上游响应里没有 output 字段（status={status}）"),
+                Some(Value::Array(items)) if items.is_empty() => {
+                    match value
+                        .pointer("/usage/output_tokens")
+                        .and_then(Value::as_u64)
+                    {
+                        Some(tokens) if tokens > 0 => format!(
+                            "上游返回 status={status}，按 {tokens} 个输出 token 计费，但 output 为空；该上游可能只在流式请求下返回内容"
+                        ),
+                        _ => format!("上游返回 status={status}，但 output 为空"),
+                    }
+                }
+                Some(Value::Array(items)) => format!(
+                    "上游返回了 {} 个 output 项，但没有可读取的 output_text 文本",
+                    items.len()
+                ),
+                Some(_) => format!("上游返回 status={status}，但 output 不是数组"),
+            }
+        }
+        OptimizationUpstreamProtocol::OpenAiChatCompletions => {
+            if value.pointer("/choices/0/message/content").is_some() {
+                "上游返回的 message.content 里没有可读取的文本".to_string()
+            } else {
+                "上游响应里没有 choices[0].message.content".to_string()
+            }
+        }
+        OptimizationUpstreamProtocol::AnthropicMessages => match value.get("content") {
+            None => "上游响应里没有 content 字段".to_string(),
+            Some(Value::Array(items)) if items.is_empty() => "上游返回的 content 为空".to_string(),
+            Some(Value::Array(_)) => "上游返回的 content 里没有 text 部分".to_string(),
+            Some(_) => "上游返回的 content 不是数组".to_string(),
+        },
+    }
 }
 
 fn extract_responses_stream_optimized_text(body: &[u8]) -> Result<String, String> {
@@ -2144,6 +2226,95 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, "官方优化");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn streamed_responses_request_accepts_a_plain_json_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let bytes_read = socket.read(&mut chunk).await.unwrap();
+                if bytes_read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..bytes_read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or_default();
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains(r#""stream":true"#), "{request}");
+            let body = r#"{"output_text":"忽略流式的正文"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = configured();
+        config.base_url = format!("http://{address}");
+        let mut resolved = ResolvedPromptOptimizationConfig::from_custom(&config);
+        resolved.response_stream = Some(true);
+        let result = optimize_prompt_resolved(&test_client(), &resolved, "写个博客")
+            .await
+            .unwrap();
+        assert_eq!(result, "忽略流式的正文");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_output_response_reports_the_billed_tokens_and_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = r#"{"status":"completed","output":[],"usage":{"output_tokens":538}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut config = configured();
+        config.base_url = format!("http://{address}");
+        let error = optimize_prompt(&test_client(), &config, "写个博客")
+            .await
+            .unwrap_err();
+        assert!(error.contains("缺少优化结果"), "{error}");
+        assert!(error.contains("output 为空"), "{error}");
+        assert!(error.contains("538"), "{error}");
+        assert!(error.contains("/responses"), "{error}");
         server.await.unwrap();
     }
 
