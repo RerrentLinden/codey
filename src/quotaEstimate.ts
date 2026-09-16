@@ -57,6 +57,7 @@ export const MODEL_PRICES: Record<string, Partial<Record<Tier, Rates>>> = {
 
 export type QuotaUsage = {
   model?: string | null; requestedModel?: string;
+  officialAccountId?: string | null; timestampUnixMs?: number;
   serviceTier?: string | null; requestedServiceTier?: string | null;
   inputTokens?: number | null; outputTokens?: number | null; totalTokens?: number | null;
   cachedInputTokens?: number | null; cacheCreationInputTokens?: number | null;
@@ -144,7 +145,7 @@ export function sumQuotaRows(rows: QuotaRow[]) {
   return total;
 }
 export type AccountUsageSnapshot = {
-  status: string; message?: string; fetchedAt?: number; stale?: boolean;
+  status: string; message?: string; reason?: string; fetchedAt?: number; stale?: boolean;
   primary?: { usedPercent: number; windowMinutes: number; resetsAt?: number } | null;
   secondary?: { usedPercent: number; windowMinutes: number; resetsAt?: number } | null;
 };
@@ -181,23 +182,61 @@ export function projectQuota(cost: number, durationMs: number, usedPercent: numb
   return { weekly, limit, remaining: limit == null ? null : limit - cost };
 }
 
+// 一个账号只能用自己的记录和自己的已用比例推算周限，多个账号的消耗合并后再
+// 除以单个账号的比例会得到错误结果。
+export function periodRows(
+  items: readonly QuotaUsage[],
+  fromUnixMs: number,
+  toUnixMs: number,
+) {
+  return items.filter(item => item.timestampUnixMs == null
+    || (item.timestampUnixMs >= fromUnixMs && item.timestampUnixMs < toUnixMs));
+}
+
+export type QuotaEstimate = {
+  period: QuotaPeriod;
+  total: QuotaRow;
+  result: ReturnType<typeof projectQuota> | null;
+};
+
+export function quotaRows(items: readonly QuotaUsage[]) {
+  const rows = new Map<string, QuotaRow>();
+  for (const item of items) addQuotaUsage(rows, item);
+  return [...rows.values()].sort((a, b) => b.cost - a.cost || a.key.localeCompare(b.key));
+}
+
+/** 只传入单个账号的记录，用该账号的官方已用比例推算它自己的周限。 */
+export function estimateQuota(
+  snapshot: AccountUsageSnapshot,
+  items: readonly QuotaUsage[],
+  now = Date.now(),
+): QuotaEstimate {
+  const period = quotaPeriod(snapshot, now);
+  const total = sumQuotaRows(quotaRows(periodRows(items, period.fromUnixMs, period.toUnixMs)));
+  const result = total.calls > total.unpriced
+    ? projectQuota(total.cost, period.toUnixMs - period.fromUnixMs, period.usedPercent)
+    : null;
+  return { period, total, result };
+}
+
 type Cursor = { timestampUnixMs: number; requestId: string };
 export type QuotaPage = { queryable: boolean; items: QuotaUsage[]; hasMore: boolean; nextCursor: Cursor | null };
-export async function loadQuotaRows(
+/// 读取原始记录，供按账号分别统计时先按各自周期筛选再汇总。
+export async function loadQuotaUsage(
   query: (cursor: Cursor | null) => Promise<QuotaPage>,
   active: () => boolean,
   progress: (count: number) => void,
 ) {
-  const rows = new Map<string, QuotaRow>();
+  const items: QuotaUsage[] = [];
   let cursor: Cursor | null = null, loaded = 0;
   // ponytail: sequential 100-row pages reuse the existing API; move aggregation to SQL if large histories become slow.
   while (active()) {
     const page = await query(cursor);
     if (!active()) return null;
     if (!page.queryable) throw new Error("当前日志暂不可查询，请开启请求日志记录后重试。");
-    for (const item of page.items) addQuotaUsage(rows, item);
+    items.push(...page.items);
     loaded += page.items.length; progress(loaded);
-    if (!page.hasMore) return [...rows.values()].sort((a, b) => b.cost - a.cost || a.key.localeCompare(b.key));
+    if (!page.hasMore) return items;
     const next = page.nextCursor;
     if (!next || !page.items.length || (cursor && (next.timestampUnixMs > cursor.timestampUnixMs
       || (next.timestampUnixMs === cursor.timestampUnixMs && next.requestId >= cursor.requestId)))) {
@@ -206,4 +245,13 @@ export async function loadQuotaRows(
     cursor = next;
   }
   return null;
+}
+
+export async function loadQuotaRows(
+  query: (cursor: Cursor | null) => Promise<QuotaPage>,
+  active: () => boolean,
+  progress: (count: number) => void,
+) {
+  const items = await loadQuotaUsage(query, active, progress);
+  return items === null ? null : quotaRows(items);
 }

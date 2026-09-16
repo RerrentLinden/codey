@@ -1721,6 +1721,30 @@ async fn local_responses_websocket_rejects_missing_router_token() {
 }
 
 #[tokio::test]
+async fn idle_connection_receives_a_request_timeout_without_a_router_failure() {
+    let (config, _, _) = router_config("http://127.0.0.1:9/v1".into());
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = reqwest::Url::parse(&endpoint.base_url).unwrap();
+    let mut stream = TcpStream::connect((url.host_str().unwrap(), url.port().unwrap()))
+        .await
+        .unwrap();
+
+    // 连接后不发请求：探测超时按请求超时收尾，不能变成路由失败事件。
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_string(&mut response))
+        .await
+        .expect("空闲连接应在探测限期内收到超时响应")
+        .unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 408 Request Timeout\r\n"),
+        "{response}"
+    );
+    assert!(response.contains("request_timeout"), "{response}");
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn unsupported_websocket_handshake_falls_back_to_http_until_config_changes() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();
@@ -2018,6 +2042,98 @@ async fn zstd_compressed_responses_request_is_decoded_and_forwarded_as_json() {
     assert_eq!(content_types, ["application/json"]);
     assert_eq!(body["model"], model);
     assert_eq!(body["input"][0]["content"][0]["text"], "compressed");
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn native_route_retries_once_with_a_reasoning_text_placeholder() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let mut attempts = Vec::new();
+        'connections: loop {
+            let Ok((mut stream, _)) = upstream.accept().await else {
+                break;
+            };
+            loop {
+                let Ok(request) = read_http_request(&mut stream).await else {
+                    continue 'connections;
+                };
+                let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+                attempts.push(body.clone());
+                if attempts.len() == 1 {
+                    write_json_response(
+                        &mut stream,
+                        400,
+                        &json!({
+                            "error": {
+                                "message": "Upstream request failed: [invalid_request_error] \
+                                    The `reasoning_text` in the thinking mode must be passed back to the API.",
+                                "type": "invalid_request_error",
+                                "code": "invalid_request_error",
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        200,
+                        &json!({
+                            "id":"resp-reasoning-retry",
+                            "object":"response",
+                            "status":"completed",
+                            "model":body["model"],
+                            "output":[],
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                    break 'connections;
+                }
+            }
+        }
+        attempts
+    });
+    let (config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model":model_alias(&provider_id, &model),
+            "input":[
+                {
+                    "type":"reasoning",
+                    "id":"rs_provider",
+                    "summary":[],
+                    "encrypted_content":"opaque-state",
+                },
+                {"role":"user","content":[{"type":"input_text","text":"继续"}]},
+            ],
+            "store":false,
+            "stream":false,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["id"],
+        "resp-reasoning-retry"
+    );
+    let attempts = upstream_task.await.unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts[0]["input"][0].get("content").is_none());
+    assert_eq!(
+        attempts[1]["input"][0]["content"],
+        json!([{"type":"reasoning_text","text":"(thinking unavailable)"}])
+    );
+    assert_eq!(attempts[0]["input"][1], attempts[1]["input"][1]);
     router.stop().await.unwrap();
 }
 
@@ -2569,6 +2685,113 @@ fn official_account_models_enter_the_router_only_when_login_is_available() {
 }
 
 #[test]
+fn stored_official_account_routes_serve_requests_without_the_default_login() {
+    let mut first = ProviderProfile::new("主力账号");
+    first.id = crate::config::official_profile_id("acct-one");
+    first.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    first.official_account_id = Some("acct-one".into());
+    first.normalize();
+    let mut second = ProviderProfile::new("备用账号");
+    second.id = crate::config::official_profile_id("acct-two");
+    second.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    second.official_account_id = Some("acct-two".into());
+    second.normalize();
+    let first_id = first.provider_id().to_string();
+    let second_id = second.provider_id().to_string();
+
+    let mut config = CodeyConfig {
+        active_profile_id: first_id.clone(),
+        profiles: vec![first, second],
+        // 默认登录缺失时，存储账号的线路仍然由本地路由直接转发。
+        official_account_available_this_launch: false,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    for provider_id in [&first_id, &second_id] {
+        config
+            .selected_models_by_provider
+            .insert(provider_id.clone(), vec!["gpt-5.6-sol".into()]);
+    }
+
+    let snapshot = RouterSnapshot::from_config(&config);
+    let first_target = snapshot
+        .target_for_model(&model_alias(&first_id, "gpt-5.6-sol"))
+        .unwrap();
+    let second_target = snapshot
+        .target_for_model(&model_alias(&second_id, "gpt-5.6-sol"))
+        .unwrap();
+
+    assert_eq!(first_target.route.provider_id, first_id);
+    assert_eq!(second_target.route.provider_id, second_id);
+    assert!(first_target.route.official_account);
+    assert!(second_target.route.official_account);
+    assert_eq!(first_target.upstream_model, "gpt-5.6-sol");
+    // 每个账号使用独立的连接池身份，登录状态不会互相影响。
+    assert_ne!(
+        first_target.route.context_config,
+        second_target.route.context_config
+    );
+}
+
+#[test]
+fn codex_login_route_outranks_stored_accounts_for_default_quota() {
+    let login = OfficialRouteAuth {
+        account_id: "test-default".into(),
+        path: std::path::PathBuf::from("/codex/home/auth.json"),
+        accepts_incoming_authorization: true,
+    };
+    let idle = OfficialRouteAuth {
+        account_id: "test-idle".into(),
+        path: std::path::PathBuf::from("/codey/accounts/test-idle.json"),
+        accepts_incoming_authorization: false,
+    };
+    assert!(default_route_rank(Some(&login)) < default_route_rank(Some(&idle)));
+    // 升级前没有账号记录时，官方线路直接复用 Codex 登录。
+    assert_eq!(default_route_rank(None), default_route_rank(Some(&login)));
+}
+
+#[test]
+fn unqualified_official_requests_use_one_deterministic_account() {
+    let mut first = ProviderProfile::new("备用账号");
+    first.id = crate::config::official_profile_id("test-route-a");
+    first.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    first.official_account_id = Some("test-route-a".into());
+    first.normalize();
+    let mut second = ProviderProfile::new("主力账号");
+    second.id = crate::config::official_profile_id("test-route-b");
+    second.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    second.official_account_id = Some("test-route-b".into());
+    second.normalize();
+    let first_id = first.provider_id().to_string();
+    let second_id = second.provider_id().to_string();
+
+    let mut config = CodeyConfig {
+        active_profile_id: first_id.clone(),
+        profiles: vec![first, second],
+        official_account_available_this_launch: false,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    for provider_id in [&first_id, &second_id] {
+        config
+            .selected_models_by_provider
+            .insert(provider_id.clone(), vec!["gpt-5.6-sol".into()]);
+    }
+
+    let snapshot = RouterSnapshot::from_config(&config);
+    // 没有账号信息的请求固定落到第一条官方线路，不依赖哈希表顺序。
+    assert_eq!(
+        snapshot.default_official_provider.as_deref(),
+        Some(first_id.as_str())
+    );
+    let target = snapshot
+        .target_for_request("gpt-5.6-sol", None, None)
+        .unwrap();
+    assert_eq!(target.route.provider_id, first_id);
+    assert_eq!(target.upstream_model, "gpt-5.6-sol");
+}
+
+#[test]
 fn auto_review_uses_a_capable_bound_route_and_otherwise_prefers_official() {
     let (mut config, third_party_provider, _) =
         router_config("https://relay.example/v1".to_string());
@@ -2864,17 +3087,73 @@ async fn official_upstream_auth_prefers_incoming_oauth_over_auth_json() {
         _body_budget_permit: None,
     };
 
-    let auth_cache = Mutex::new(crate::account_usage::OfficialAuthCache::default());
+    let auth_cache = Mutex::new(crate::account_usage::OfficialAuthCaches::default());
     let auth = resolve_official_upstream_auth(
         &request,
         "Bearer codey-router-token",
         Path::new("/missing-auth.json"),
         &auth_cache,
+        true,
     )
     .await
     .unwrap();
     assert_eq!(auth.authorization, "Bearer chatgpt-oauth");
     assert_eq!(auth.account_id.as_deref(), Some("acct-incoming"));
+}
+
+#[tokio::test]
+async fn idle_official_account_reads_its_own_credential_instead_of_the_codex_login() {
+    let directory = tempfile::tempdir().unwrap();
+    let auth_path = directory.path().join("acct-idle.json");
+    // 非默认账号的凭据文档就是账号记录本身，auth.json 原文位于 auth 字段。
+    std::fs::write(
+        &auth_path,
+        serde_json::to_vec(&serde_json::json!({
+            "id": "acct-idle",
+            "email": "idle@example.com",
+            "planType": "plus",
+            "accountId": "acct-idle",
+            "addedAt": 2,
+            "auth": {
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "idle-access",
+                    "account_id": "acct-idle"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        path: "/v1/responses".to_string(),
+        headers: vec![
+            (
+                "authorization".to_string(),
+                "Bearer chatgpt-default-oauth".to_string(),
+            ),
+            (
+                CHATGPT_ACCOUNT_ID_HEADER.to_string(),
+                "acct-default".to_string(),
+            ),
+        ],
+        body: Vec::new(),
+        _body_budget_permit: None,
+    };
+
+    let auth_cache = Mutex::new(crate::account_usage::OfficialAuthCaches::default());
+    let auth = resolve_official_upstream_auth(
+        &request,
+        "Bearer codey-router-token",
+        &auth_path,
+        &auth_cache,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(auth.authorization, "Bearer idle-access");
+    assert_eq!(auth.account_id.as_deref(), Some("acct-idle"));
 }
 
 #[tokio::test]
@@ -2897,12 +3176,13 @@ async fn official_upstream_auth_loads_codex_auth_json_when_codex_uses_the_router
         _body_budget_permit: None,
     };
 
-    let auth_cache = Mutex::new(crate::account_usage::OfficialAuthCache::default());
+    let auth_cache = Mutex::new(crate::account_usage::OfficialAuthCaches::default());
     let auth = resolve_official_upstream_auth(
         &request,
         "Bearer codey-router-token",
         &auth_path,
         &auth_cache,
+        true,
     )
     .await
     .unwrap();
@@ -2923,13 +3203,14 @@ async fn official_upstream_auth_is_missing_without_oauth_or_auth_json() {
         _body_budget_permit: None,
     };
 
-    let auth_cache = Mutex::new(crate::account_usage::OfficialAuthCache::default());
+    let auth_cache = Mutex::new(crate::account_usage::OfficialAuthCaches::default());
     assert!(
         resolve_official_upstream_auth(
             &request,
             "Bearer codey-router-token",
             Path::new("/missing-auth.json"),
             &auth_cache,
+            true,
         )
         .await
         .is_none()
@@ -8423,6 +8704,7 @@ async fn request_log_page_is_public_but_its_api_requires_the_launch_token() {
         "query_route_request_logs",
         "query_route_request_log_stats",
         "query_official_account_usage",
+        "list_official_accounts",
     ] {
         let unauthorized = client
             .post(format!("{gateway_root}/codey/api/{command}"))
@@ -8464,6 +8746,20 @@ async fn request_log_page_is_public_but_its_api_requires_the_launch_token() {
         usage.json::<Value>().await.unwrap()["status"],
         "unavailable"
     );
+
+    // 系统浏览器里的请求日志页无法走 Codey 应用桥，账号筛选、账号名显示和按
+    // 账号推算额度都要靠本地路由提供同一份账号目录。
+    let accounts = client
+        .post(format!("{gateway_root}/codey/api/list_official_accounts"))
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accounts.status(), reqwest::StatusCode::OK);
+    let accounts = accounts.json::<Value>().await.unwrap();
+    assert_eq!(accounts["status"], "ok");
+    assert!(accounts["accounts"].is_array());
 
     router.stop().await.unwrap();
 }

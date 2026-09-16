@@ -5,8 +5,27 @@ pub(crate) struct WebSocketRequestContext {
     pub(crate) headers: Vec<(String, String)>,
 }
 
-pub(crate) async fn request_looks_like_responses_websocket(stream: &TcpStream) -> Result<bool> {
-    tokio::time::timeout(REQUEST_READ_TIMEOUT, async {
+/// Responses WebSocket 探测结果。空闲连接与半开连接在限期内不会发出请求行，
+/// 这与普通 HTTP 路径读取请求头超时同源，按请求超时处理即可。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResponsesWebSocketProbe {
+    /// 请求行与请求头构成 Responses WebSocket 升级。
+    Upgrade,
+    /// 请求明确是普通 HTTP 请求。
+    Http,
+    /// 对端在探测限期内没有发出可识别的请求行。
+    Silent,
+}
+
+#[cfg(not(test))]
+const RESPONSES_WEBSOCKET_PROBE_TIMEOUT: Duration = REQUEST_READ_TIMEOUT;
+#[cfg(test)]
+const RESPONSES_WEBSOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+pub(crate) async fn probe_responses_websocket(
+    stream: &TcpStream,
+) -> Result<ResponsesWebSocketProbe> {
+    let detected = tokio::time::timeout(RESPONSES_WEBSOCKET_PROBE_TIMEOUT, async {
         let mut peek = vec![0_u8; 4096];
         loop {
             let read = stream
@@ -66,8 +85,13 @@ pub(crate) async fn request_looks_like_responses_websocket(stream: &TcpStream) -
             }
         }
     })
-    .await
-    .context("探测 Codey Responses WebSocket 请求超时")?
+    .await;
+    match detected {
+        Ok(Ok(true)) => Ok(ResponsesWebSocketProbe::Upgrade),
+        Ok(Ok(false)) => Ok(ResponsesWebSocketProbe::Http),
+        Ok(Err(error)) => Err(error),
+        Err(_) => Ok(ResponsesWebSocketProbe::Silent),
+    }
 }
 
 pub(crate) fn websocket_request_authorized(

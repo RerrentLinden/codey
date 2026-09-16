@@ -111,7 +111,7 @@ impl LocalRouter {
 
     pub(crate) async fn start_with_usage(
         config: &CodeyConfig,
-        account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCache>>,
+        account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     ) -> Result<Self> {
         Self::start_with_logger_and_usage(
             config,
@@ -124,7 +124,7 @@ impl LocalRouter {
     async fn start_with_logger_and_usage(
         config: &CodeyConfig,
         request_log: Arc<RouteRequestLogController>,
-        account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCache>>,
+        account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     ) -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -174,7 +174,7 @@ impl LocalRouter {
             official_auth_path,
             account_usage_cache,
             official_auth_cache: Arc::new(Mutex::new(
-                crate::account_usage::OfficialAuthCache::default(),
+                crate::account_usage::OfficialAuthCaches::default(),
             )),
             request_log: Arc::clone(&request_log),
         };
@@ -456,8 +456,8 @@ pub(crate) struct RouterServer {
     pub(crate) proxied_clients: Mutex<HashMap<String, reqwest::Client>>,
     pub(crate) official_auth_path: PathBuf,
     pub(crate) account_usage_cache:
-        Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCache>>,
-    pub(crate) official_auth_cache: Arc<Mutex<crate::account_usage::OfficialAuthCache>>,
+        Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
+    pub(crate) official_auth_cache: Arc<Mutex<crate::account_usage::OfficialAuthCaches>>,
     pub(crate) request_log: Arc<RouteRequestLogController>,
 }
 
@@ -602,6 +602,11 @@ pub(crate) struct RouterSnapshot {
     pub(crate) raw_models: HashMap<String, Vec<AliasTarget>>,
     pub(crate) model_alias_history: BTreeMap<String, String>,
     pub(crate) model_ids: Vec<String>,
+    /// 默认账号所在官方线路。线路列表按默认账号在前的顺序派生，这里记住它
+    /// 是为了让页头额度、审批复核这类没有账号信息的请求落到固定账号，而不是
+    /// 在哈希表里随机挑一条官方线路。判定依据是凭据文档：默认账号的凭据就是
+    /// Codex 登录本身，用户调整线路顺序不会改变这里的选择。
+    pub(crate) default_official_provider: Option<String>,
     pub(crate) default_model: String,
     pub(crate) request_log_backend: RouteRequestLogBackend,
     pub(crate) request_log_catalog: RequestLogCatalog,
@@ -612,11 +617,15 @@ impl RouterSnapshot {
         let mut routes = HashMap::new();
         let mut aliases = HashMap::new();
         let mut raw_models = HashMap::<String, Vec<AliasTarget>>::new();
+        let mut default_official_provider = None;
+        let mut default_official_rank = None;
         for profile in &config.profiles {
             if !profile.enabled {
                 continue;
             }
-            if profile.official_account && !config.official_account_available_this_launch {
+            // 存储账号的官方线路自带凭据，本地路由可以独立转发，不再依赖
+            // 本次启动的默认登录。
+            if profile.official_account && !config.official_route_usable(profile) {
                 continue;
             }
             let provider_id = profile.provider_id().trim();
@@ -647,6 +656,9 @@ impl RouterSnapshot {
                     .filter(|proxy| !proxy.is_empty()),
                 protocol,
                 official_account: profile.official_account,
+                // Each stored account reads its own credential document, so
+                // several official routes never share one login.
+                official_auth: official_route_auth(profile),
                 supports_websockets: protocol == UpstreamProtocol::OpenAiResponses
                     && config.route_supports_websockets_this_launch(profile),
                 supports_remote_compaction: config
@@ -672,7 +684,16 @@ impl RouterSnapshot {
                     .push(alias_target.clone());
                 target.models.insert(model.clone());
             }
+            let route_rank = target
+                .official_account
+                .then(|| default_route_rank(target.official_auth.as_ref()));
             routes.insert(provider_id.to_string(), Arc::new(target));
+            if let Some(rank) = route_rank
+                && default_official_rank.is_none_or(|best| rank < best)
+            {
+                default_official_rank = Some(rank);
+                default_official_provider = Some(provider_id.to_string());
+            }
         }
         let mut model_ids = raw_models
             .values()
@@ -685,6 +706,7 @@ impl RouterSnapshot {
             raw_models,
             model_alias_history: config.model_alias_history.clone(),
             model_ids,
+            default_official_provider,
             default_model: config.default_model().unwrap_or_default().to_string(),
             request_log_backend: config.route_request_log.backend,
             request_log_catalog: RequestLogCatalog::from_config(config),
@@ -781,12 +803,28 @@ impl RouterSnapshot {
         // Raw ids in the mixed runtime catalog are native OpenAI entries;
         // third-party selections remain route-qualified. An explicit hint
         // above can still select a third-party route with the same model.
+        // 同名模型在多条官方线路并存时优先给默认账号，避免随机消耗其它账号额度。
         if !model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
-            && let Some(official) = candidates.iter().find(|candidate| {
-                self.routes
-                    .get(&candidate.provider_id)
-                    .is_some_and(|route| route.official_account)
-            })
+            && let Some(official) = self
+                .default_official_provider
+                .as_deref()
+                .and_then(|provider_id| {
+                    candidates
+                        .iter()
+                        .find(|candidate| candidate.provider_id == provider_id)
+                })
+                .filter(|candidate| {
+                    self.routes
+                        .get(&candidate.provider_id)
+                        .is_some_and(|route| route.official_account)
+                })
+                .or_else(|| {
+                    candidates.iter().find(|candidate| {
+                        self.routes
+                            .get(&candidate.provider_id)
+                            .is_some_and(|route| route.official_account)
+                    })
+                })
         {
             return self.target_for_route_model(
                 &official.provider_id,
@@ -811,10 +849,21 @@ impl RouterSnapshot {
         // request, so prefer the official route when no capable hint or thread
         // binding identified a route above. A capable bound third-party route
         // still wins before this fallback.
-        if model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
-            && let Some(official_route) = self.routes.values().find(|target| {
+        // 多账号并存时优先用默认账号，避免复核请求随机消耗其它账号的额度。
+        let auto_review_route = self
+            .default_official_provider
+            .as_deref()
+            .and_then(|provider_id| self.routes.get(provider_id))
+            .filter(|target| {
                 target.official_account && target.models.contains(CODEX_AUTO_REVIEW_MODEL)
             })
+            .or_else(|| {
+                self.routes.values().find(|target| {
+                    target.official_account && target.models.contains(CODEX_AUTO_REVIEW_MODEL)
+                })
+            });
+        if model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
+            && let Some(official_route) = auto_review_route
         {
             return self.target_for_route_model(
                 &official_route.provider_id,
@@ -892,11 +941,52 @@ pub(crate) struct RouteTarget {
     pub(crate) upstream_proxy: Option<String>,
     pub(crate) protocol: UpstreamProtocol,
     pub(crate) official_account: bool,
+    pub(crate) official_auth: Option<OfficialRouteAuth>,
     pub(crate) supports_websockets: bool,
     pub(crate) supports_remote_compaction: bool,
     pub(crate) models: HashSet<String>,
     pub(crate) websocket_config: [u8; 32],
     pub(crate) context_config: [u8; 32],
+}
+
+/// Where one derived official route reads its ChatGPT credential, and whether
+/// that document is the Codex home login Codex refreshes itself.
+#[derive(Clone, Debug)]
+pub(crate) struct OfficialRouteAuth {
+    pub(crate) account_id: String,
+    pub(crate) path: PathBuf,
+    pub(crate) accepts_incoming_authorization: bool,
+}
+
+fn official_route_auth(profile: &crate::config::ProviderProfile) -> Option<OfficialRouteAuth> {
+    if !profile.official_account {
+        return None;
+    }
+    let account_id = profile.official_account_id.clone()?;
+    let codex_home = crate::codex_config::codex_home();
+    let store = crate::official_accounts::OfficialAccountStore::for_config_path(
+        &crate::config::default_config_path(),
+    );
+    let path = store.credential_path(codex_home, &account_id);
+    // Codex refreshes the default account's copy in place and sends its token
+    // with every request; idle accounts keep their own stored document.
+    let accepts_incoming_authorization = path == codex_home.join("auth.json");
+    Some(OfficialRouteAuth {
+        account_id,
+        path,
+        accepts_incoming_authorization,
+    })
+}
+
+/// 排序默认账号所在的官方线路。凭据文档就是 Codex 登录本身的那条线路，以及
+/// 升级前直接复用 Codex 登录的旧线路，都代表客户端当前的身份；其余存储账号
+/// 的线路排在后面，页头额度和审批复核只认第一条。
+pub(crate) fn default_route_rank(auth: Option<&OfficialRouteAuth>) -> u8 {
+    match auth {
+        Some(auth) if auth.accepts_incoming_authorization => 0,
+        None => 0,
+        Some(_) => 1,
+    }
 }
 
 impl RouteTarget {
@@ -910,6 +1000,10 @@ impl RouteTarget {
     fn context_config_fingerprint(&self) -> [u8; 32] {
         let mut digest = Sha256::new();
         digest.update([u8::from(self.official_account)]);
+        // 每个官方账号使用独立的连接池身份，避免不同账号的登录态互相影响。
+        if let Some(auth) = &self.official_auth {
+            update_length_prefixed_digest(&mut digest, auth.account_id.as_bytes());
+        }
         if let Some(proxy) = &self.upstream_proxy {
             update_length_prefixed_digest(&mut digest, proxy.as_bytes());
         }

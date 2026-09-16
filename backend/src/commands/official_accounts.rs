@@ -14,7 +14,8 @@ use super::{
 use crate::codex_config::codex_home;
 use crate::config::{MAX_ROUTE_SHORT_NAME_CHARS, validate_outbound_proxy_url};
 use crate::official_accounts::{
-    LoginPhase, OfficialAccountRecord, OfficialAccountStore, refresh_if_stale, start_login,
+    LoginPhase, OfficialAccountInvalid, OfficialAccountRecord, OfficialAccountStore,
+    refresh_if_stale, start_login,
 };
 
 /// Keeps the route name readable in the route list and the model picker; the
@@ -161,6 +162,9 @@ async fn add_account(
     let make_default = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
         let had_default = store.default_account_id()?.is_some();
         store.upsert(&record)?;
+        // 新账号立刻带上按添加顺序生成的默认线路名和短名称（官方账号1 / 官1），
+        // 之后仍可在官方线路卡片上改成别的名称。
+        store.ensure_generated_route_settings()?;
         Ok(!had_default)
     })
     .await
@@ -169,11 +173,102 @@ async fn add_account(
     if make_default {
         return set_default_official_account(state, account_id).await;
     }
-    let store = state.official_accounts();
-    let payload = tokio::task::spawn_blocking(move || accounts_payload(&store))
-        .await
-        .map_err(|error| format!("读取官方账号列表任务异常退出：{error}"))??;
+    // 每个账号都有自己的线路，新增后立刻重算，避免要等到下次启动才出现。
+    let payload = refresh_official_route_after_account_change(state).await?;
     Ok(merge(payload, json!({ "accountId": account_id })))
+}
+
+/// Refreshes one stored account's tokens when they are expired or old enough
+/// to matter, and writes the refreshed document back. Idle accounts keep
+/// working this way without being switched to the default first.
+///
+/// 默认账号的凭据文档由 Codex 自己维护在 Codex home 的 auth.json：这里只把
+/// 它同步回账号记录，不主动轮换 refresh token，避免 Codex 手里那份凭据失效。
+pub(super) async fn refresh_official_account_tokens(
+    state: &Arc<AppState>,
+    account_id: &str,
+) -> Result<OfficialAccountRecord, String> {
+    // 刷新统一串行执行：并发轮换同一个 refresh token 会让先写回的凭据立刻失效。
+    let _refresh_guard = state.official_account_refresh_lock.lock().await;
+    let store = state.official_accounts();
+    let lookup_store = store.clone();
+    let lookup_id = account_id.to_string();
+    let lookup_home = codex_home().to_path_buf();
+    let (mut record, is_default) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(OfficialAccountRecord, bool)> {
+            let is_default =
+                lookup_store.default_account_id()?.as_deref() == Some(lookup_id.as_str());
+            if is_default {
+                // Codex 会在运行期间替换 auth.json，先把最新副本取回来，
+                // 账号记录才不会停留在启动时的旧令牌上。
+                lookup_store.sync_default_from_codex_home(&lookup_home)?;
+            }
+            let record = lookup_store
+                .get(&lookup_id)?
+                .ok_or_else(|| anyhow::anyhow!("找不到官方账号：{lookup_id}"))?;
+            Ok((record, is_default))
+        })
+        .await
+        .map_err(|error| format!("读取官方账号任务异常退出：{error}"))?
+        .map_err(|error| format!("{error:#}"))?;
+    if is_default {
+        return Ok(record);
+    }
+    // 已确认失效的账号不再尝试刷新令牌：官方每次都会拒绝，重复轮询只会
+    // 反复请求官方接口、抬高风控概率。额度查询拿到本地原因后直接返回失效
+    // 状态，重新添加账号会写入新凭据并清除标记。
+    if record.invalid() {
+        return Ok(record);
+    }
+    match refresh_if_stale(&state.http_client, &mut record).await {
+        Ok(true) => {
+            let refreshed_store = store.clone();
+            let refreshed = record.clone();
+            tokio::task::spawn_blocking(move || refreshed_store.upsert(&refreshed))
+                .await
+                .map_err(|error| format!("保存官方账号任务异常退出：{error}"))?
+                .map_err(|error| format!("{error:#}"))?;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            // 官方明确拒绝凭据时把失效状态写回账号记录，账号列表和额度查询
+            // 都以它为准；网络故障等其他错误只记日志，不改账号状态。
+            if let Some(invalid) = error.downcast_ref::<OfficialAccountInvalid>() {
+                record.mark_invalid(invalid.reason());
+                let marked_store = store.clone();
+                let marked = record.clone();
+                tokio::task::spawn_blocking(move || marked_store.upsert(&marked))
+                    .await
+                    .map_err(|error| format!("保存官方账号任务异常退出：{error}"))?
+                    .map_err(|error| format!("{error:#}"))?;
+                error_log::record_failure(
+                    "official_account_invalid",
+                    "refresh_official_account_tokens",
+                    format!("{error:#}"),
+                    json!({
+                        "accountId": account_id,
+                        "detail": invalid.detail(),
+                    }),
+                );
+                // 失效账号的线路要立刻从配置里下线，避免本地路由继续把它
+                // 当成可用线路展示。
+                refresh_official_routes_after_invalid_account(
+                    state,
+                    "refresh_official_account_tokens",
+                    account_id,
+                )
+                .await;
+            } else {
+                error_log::record_failure(
+                    "official_account_refresh_failed",
+                    "refresh_official_account_tokens",
+                    format!("{error:#}"),
+                    json!({ "accountId": account_id }),
+                );
+            }
+        }
+    }
+    Ok(record)
 }
 
 pub(super) async fn set_default_official_account(
@@ -185,33 +280,27 @@ pub(super) async fn set_default_official_account(
         return Err("缺少要设为默认的官方账号".to_string());
     }
     let store = state.official_accounts();
-    let lookup_store = store.clone();
-    let lookup_id = account_id.clone();
-    let mut record = tokio::task::spawn_blocking(move || lookup_store.get(&lookup_id))
-        .await
-        .map_err(|error| format!("读取官方账号任务异常退出：{error}"))?
-        .map_err(|error| format!("{error:#}"))?
-        .ok_or_else(|| format!("找不到官方账号：{account_id}"))?;
-
     // Stored tokens may be days old when switching accounts. Refresh them
     // best-effort so Codex starts with a live session; a failure still hands
     // over the stored copy, which Codex can refresh itself.
-    match refresh_if_stale(&state.http_client, &mut record).await {
-        Ok(true) => {
-            let refreshed_store = store.clone();
-            let refreshed = record.clone();
-            tokio::task::spawn_blocking(move || refreshed_store.upsert(&refreshed))
-                .await
-                .map_err(|error| format!("保存官方账号任务异常退出：{error}"))?
-                .map_err(|error| format!("{error:#}"))?;
+    let record = refresh_official_account_tokens(state, &account_id).await?;
+    if record.invalid() {
+        let label = record.email.clone().unwrap_or_else(|| account_id.clone());
+        return Err(format!(
+            "官方账号「{label}」已失效，无法设为默认；请重新添加该账号"
+        ));
+    }
+
+    // 页头额度跟随默认账号，切换后确保额度显示处于开启状态。
+    {
+        let _guard = state.config_write_lock.lock().await;
+        let mut config = state.config.read().await.clone();
+        if !config.show_account_usage_in_header {
+            config.show_account_usage_in_header = true;
+            config.settings_revision = config.settings_revision.saturating_add(1);
+            save_config_to_store(state, &config).await?;
+            *state.config.write().await = config;
         }
-        Ok(false) => {}
-        Err(error) => error_log::record_failure(
-            "official_account_refresh_failed",
-            "set_default_official_account",
-            format!("{error:#}"),
-            json!({ "accountId": account_id }),
-        ),
     }
 
     let home = codex_home().to_path_buf();
@@ -225,18 +314,6 @@ pub(super) async fn set_default_official_account(
     .await
     .map_err(|error| format!("切换默认官方账号任务异常退出：{error}"))?
     .map_err(|error| format!("{error:#}"))?;
-
-    // "设为默认并显示额度": the default account's usage shows in the header.
-    {
-        let _guard = state.config_write_lock.lock().await;
-        let mut config = state.config.read().await.clone();
-        if !config.show_account_usage_in_header {
-            config.show_account_usage_in_header = true;
-            config.settings_revision = config.settings_revision.saturating_add(1);
-            save_config_to_store(state, &config).await?;
-            *state.config.write().await = config;
-        }
-    }
 
     // Usage is cached per auth file fingerprint; the file just changed, so the
     // next read reflects the new account. Route availability is recomputed
@@ -255,31 +332,74 @@ pub(super) async fn remove_official_account(
     }
     let store = state.official_accounts();
     let home = codex_home().to_path_buf();
-    let removed_default = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-        let was_default = store.default_account_id()?.as_deref() == Some(account_id.as_str());
-        if was_default && let Some(record) = store.get(&account_id)? {
-            OfficialAccountStore::clear_codex_login_if_matches(&home, &record)?;
-        }
-        store.remove(&account_id)?;
-        Ok(was_default)
-    })
-    .await
-    .map_err(|error| format!("移除官方账号任务异常退出：{error}"))?
-    .map_err(|error| format!("{error:#}"))?;
-    if removed_default {
-        return refresh_official_route_after_account_change(state).await;
-    }
-    let store = state.official_accounts();
-    let payload = tokio::task::spawn_blocking(move || accounts_payload(&store))
+    let (removed_default, promoted, accounts_left) =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, Option<String>, bool)> {
+            let was_default = store.default_account_id()?.as_deref() == Some(account_id.as_str());
+            if was_default && let Some(record) = store.get(&account_id)? {
+                OfficialAccountStore::clear_codex_login_if_matches(&home, &record)?;
+            }
+            store.remove(&account_id)?;
+            let mut remaining = store.list()?;
+            // 默认账号被移除后把剩下最早的可用账号补上，Codex 仍然有可用的登录
+            // 身份；失效账号必须跳过，否则补位会因凭据被拒绝而整个失败。
+            let promoted = if was_default {
+                remaining.sort_by(|left, right| {
+                    left.added_at
+                        .cmp(&right.added_at)
+                        .then_with(|| left.id.cmp(&right.id))
+                });
+                remaining
+                    .iter()
+                    .find(|record| !record.invalid())
+                    .map(|record| record.id.clone())
+            } else {
+                None
+            };
+            Ok((was_default, promoted, !remaining.is_empty()))
+        })
         .await
-        .map_err(|error| format!("读取官方账号列表任务异常退出：{error}"))??;
+        .map_err(|error| format!("移除官方账号任务异常退出：{error}"))?
+        .map_err(|error| format!("{error:#}"))?;
+    if let Some(promoted) = promoted {
+        let payload = set_default_official_account(state, promoted).await?;
+        return Ok(merge(payload, json!({ "status": "ok" })));
+    }
+    if removed_default && !accounts_left {
+        // 最后一个官方账号已经删除，配置里由它派生的线路随之失效；先撤掉这些
+        // 线路再重新准备，本地路由不会继续转发到已经不存在的账号。
+        drop_derived_official_routes(state).await?;
+    }
+    let payload = refresh_official_route_after_account_change(state).await?;
     Ok(merge(payload, json!({ "status": "ok" })))
 }
 
+/// Removes every derived official route from the running configuration and
+/// persists the result. Used when the account store is empty, so the local
+/// router stops exposing routes whose accounts no longer exist.
+pub(super) async fn drop_derived_official_routes(state: &Arc<AppState>) -> Result<(), String> {
+    let _config_write_guard = state.config_write_lock.lock().await;
+    let previous = state.config.read().await.clone();
+    if !previous
+        .profiles
+        .iter()
+        .any(|profile| profile.official_account)
+    {
+        return Ok(());
+    }
+    let mut next = previous.clone();
+    next.apply_launch_official_profiles(Vec::new());
+    next = next.normalize();
+    if next.settings_revision == previous.settings_revision {
+        next.settings_revision = previous.settings_revision.saturating_add(1);
+    }
+    save_config_to_store(state, &next).await?;
+    *state.config.write().await = next;
+    Ok(())
+}
+
 /// Saves the route name, short name and upstream proxy of one official
-/// account. The derived official route reads them back from the default
-/// account, so editing the default account also re-derives that route; the
-/// settings of the other accounts take effect once they become the default.
+/// account and re-derives every official route, so the edited account shows
+/// its new name without becoming the default.
 pub(super) async fn save_official_account_route_settings(
     state: &Arc<AppState>,
     account_id: String,
@@ -327,7 +447,7 @@ pub(super) async fn save_official_account_route_settings(
     let saved_name = (!route_name.is_empty()).then_some(route_name);
     let saved_short_name = (!route_short_name.is_empty()).then_some(route_short_name);
     let saved_proxy = (!upstream_proxy.is_empty()).then_some(upstream_proxy);
-    let is_default = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let accounts = store.list()?;
         if !accounts.iter().any(|record| record.id == saved_id) {
             anyhow::bail!("找不到官方账号：{saved_id}");
@@ -341,20 +461,13 @@ pub(super) async fn save_official_account_route_settings(
             anyhow::bail!("短名称「{short_name}」已被官方账号 {label} 使用");
         }
         store.update_route_settings(&saved_id, saved_name, saved_short_name, saved_proxy)?;
-        Ok(store.default_account_id()?.as_deref() == Some(saved_id.as_str()))
+        Ok(())
     })
     .await
     .map_err(|error| format!("保存官方账号线路设置任务异常退出：{error}"))?
     .map_err(|error| format!("{error:#}"))?;
 
-    if is_default {
-        let payload = refresh_official_route_after_account_change(state).await?;
-        return Ok(merge(payload, json!({ "accountId": account_id })));
-    }
-    let store = state.official_accounts();
-    let payload = tokio::task::spawn_blocking(move || accounts_payload(&store))
-        .await
-        .map_err(|error| format!("读取官方账号列表任务异常退出：{error}"))??;
+    let payload = refresh_official_route_after_account_change(state).await?;
     Ok(merge(
         payload,
         json!({ "status": "ok", "accountId": account_id }),
@@ -363,7 +476,7 @@ pub(super) async fn save_official_account_route_settings(
 
 /// Re-runs the launch-time route preparation against the account store and
 /// pushes the resulting routes to a running Codex without a restart.
-async fn refresh_official_route_after_account_change(
+pub(super) async fn refresh_official_route_after_account_change(
     state: &Arc<AppState>,
 ) -> Result<Value, String> {
     let prepare_error = prepare_routes_for_current_launch(state).await.err();
@@ -385,13 +498,34 @@ async fn refresh_official_route_after_account_change(
         "officialAccountStatus": config.official_account_status_this_launch,
         "restartRequired": restart_required,
     }));
+    // 存储账号的线路自带凭据，默认登录缺失时它们仍然可以继续使用。
+    let routes_available = config.usable_official_routes().next().is_some();
     if let Some(error) = prepare_error {
         response = merge(response, json!({ "warning": error }));
-    } else if unauthenticated && !config.official_account_available_this_launch {
+    } else if unauthenticated && !routes_available {
         response = merge(
             response,
             json!({ "warning": "当前没有默认官方账号，官方线路已停用" }),
         );
     }
     Ok(merge(response, accounts))
+}
+
+/// 账号失效后立刻重新派生官方线路，让失效账号的线路从配置里下线。重算失败
+/// 只记日志：额度查询要继续返回账号失效这个结果，不能被线路刷新的错误覆盖。
+pub(super) async fn refresh_official_routes_after_invalid_account(
+    state: &Arc<AppState>,
+    stage: &str,
+    account_id: &str,
+) {
+    // 启动预热可能带着失效标记写入之前的解析结果，先丢弃再重新派生。
+    let _ = state.take_official_account_probe_prewarm().await;
+    if let Err(error) = refresh_official_route_after_account_change(state).await {
+        error_log::record_failure(
+            "official_account_route_refresh_failed",
+            stage,
+            error,
+            json!({ "accountId": account_id }),
+        );
+    }
 }

@@ -336,11 +336,14 @@ pub(crate) fn renderer_route_model_catalog(
 ) -> Vec<RendererRouteModelEntry> {
     let mut entries = Vec::new();
     let mut aliases = HashSet::new();
+    // 多个官方账号并存时，模型 ID 必须带线路前缀，否则渲染进程的模型列表会
+    // 把两个账号的同名模型合并成一条，后端也无法判断该走哪个账号。
+    let qualify_official = config.qualifies_official_model_ids();
     for profile in &config.profiles {
         if !profile.enabled {
             continue;
         }
-        if profile.official_account && !config.official_account_available_this_launch {
+        if profile.official_account && !config.official_route_usable(profile) {
             continue;
         }
         let provider_id = profile.provider_id().trim().to_string();
@@ -425,14 +428,14 @@ pub(crate) fn renderer_route_model_catalog(
         for (model, supported_reasoning_efforts, default_reasoning_effort) in
             official_models.chain(third_party_models)
         {
-            let alias = if profile.official_account {
+            let alias = if profile.official_account && !qualify_official {
                 aliases.insert(model.clone());
                 model.clone()
             } else {
                 route_model_alias(&provider_id, &model, &mut aliases)
             };
-            // ChatGPT validates official model ids before the local router;
-            // only third-party entries may use route-qualified selectors.
+            // 单账号时官方模型沿用原生 ID，多账号时按上面生成的线路前缀为准，
+            // 请求转发仍统一走本地路由。
             let (request_provider_id, request_model) = (
                 config.runtime_gateway_provider_id().to_string(),
                 model.clone(),

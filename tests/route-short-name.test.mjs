@@ -129,3 +129,19 @@ test("official route settings are edited on the route card instead of the accoun
 
   assert.match(app, /"save_official_account_route_settings"/);
 });
+
+test("official accounts derive numbered default route names and short names", async () => {
+  const [modelSection, mock] = await Promise.all([
+    readFile(new URL("../src/ModelSection.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../src/dev/mockApi.ts", import.meta.url), "utf8"),
+  ]);
+
+  // 预览与后端一致：账号没有自定义名称时按添加顺序生成官方账号N / 官N。
+  assert.match(mock, /const previewOfficialRouteName = \(index: number\) => `官方账号\$\{index\}`/);
+  assert.match(mock, /if \(index <= 9\) return `官\$\{index\}`;/);
+  assert.match(mock, /previewEnsureGeneratedRouteSettings\(\);/);
+  assert.doesNotMatch(mock, /previewOfficialDerivedRouteName/);
+
+  assert.match(modelSection, /留空则按账号添加顺序使用默认线路名，例如「官方账号1」/);
+  assert.match(modelSection, /留空则按账号添加顺序使用默认短名称，例如「官1」/);
+});

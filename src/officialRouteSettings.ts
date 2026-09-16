@@ -11,7 +11,7 @@ export type OfficialRouteSettingsDraft = {
 };
 
 /**
- * 官方线路的线路名、短名称和上游代理保存在账号记录里，只有默认账号会覆盖当前线路。
+ * 官方线路的线路名、短名称和上游代理保存在所属账号记录里。
  * 这里只做保存前的本地校验，后端仍会再次校验名称长度和短名称冲突。
  */
 export function validateOfficialRouteSettings(

@@ -12,6 +12,8 @@ type LoginStart = { loginId: string; authUrl: string; browserOpened?: boolean };
 type LoginPoll = OfficialAccountsResult & { status: "wait" | "ok" | "failed" | "expired"; message?: string };
 
 const LOGIN_POLL_INTERVAL_MS = 1500;
+// 账号较多时连续额度查询容易触发官方风控，逐条读取之间留出间隔。
+const USAGE_QUERY_STAGGER_MS = 200;
 
 function formatPlan(plan?: string) {
   if (!plan) return "";
@@ -89,6 +91,15 @@ function windowLabel(minutes: number) {
   return `${minutes} 分钟`;
 }
 
+// 失效账号不再查询额度：卡片直接显示本地失效原因，重新添加账号后才恢复查询。
+function invalidUsageSnapshot(account: OfficialAccount): AccountUsageSnapshot {
+  return {
+    status: "error",
+    reason: "official_account_invalid",
+    message: account.invalidReason || "账号已失效，不再查询额度；重新添加该账号即可恢复",
+  };
+}
+
 function UsageLine({ snapshot }: { snapshot: AccountUsageSnapshot | null }) {
   if (!snapshot) return <small className="official-account-usage">正在读取额度…</small>;
   if (snapshot.status !== "ok") {
@@ -160,7 +171,7 @@ export function OfficialAccountsPanel({
   const [loadError, setLoadError] = useState("");
   const [pending, setPending] = useState<string | null>(null);
   const [confirmAccount, setConfirmAccount] = useState<OfficialAccount | null>(null);
-  const [usage, setUsage] = useState<AccountUsageSnapshot | null>(null);
+  const [usages, setUsages] = useState<Record<string, AccountUsageSnapshot | null>>({});
   const [login, setLogin] = useState<LoginStart | null>(null);
   const [loginError, setLoginError] = useState("");
   const [copied, setCopied] = useState(false);
@@ -189,24 +200,74 @@ export function OfficialAccountsPanel({
     void refresh();
   }, [refresh]);
 
-  const defaultAccount = accounts?.find((account) => account.isDefault) ?? null;
-  const defaultAccountId = defaultAccount?.id ?? null;
-  const refreshUsage = useCallback(async (force: boolean) => {
-    if (!defaultAccountId || !officialAccountAvailable) {
-      setUsage(null);
-      return;
-    }
+  // 官方线路随账号库派生：账号失效后线路从配置里移除，账号恢复后重新出现。
+  // 这里一次取回最新的账号列表、配置和模型状态。
+  const refreshRoutes = useCallback(async () => {
     try {
-      setUsage(await invoke<AccountUsageSnapshot>("query_official_account_usage", { forceRefresh: force }));
+      const result = await invoke<OfficialAccountsResult>("refresh_official_account_routes");
+      applyResult(result);
+      setLoadError("");
     } catch (error) {
-      setUsage({ status: "error", message: errorText(error) });
+      setLoadError(errorText(error));
     }
-  }, [defaultAccountId, officialAccountAvailable]);
+  }, [applyResult]);
 
+  const accountsRef = useRef<OfficialAccount[]>([]);
+  accountsRef.current = accounts ?? [];
+
+  const refreshUsage = useCallback(async (accountId: string, force: boolean) => {
+    setUsages((current) => ({ ...current, [accountId]: current[accountId] ?? null }));
+    try {
+      const snapshot = await invoke<AccountUsageSnapshot>("query_official_account_usage", {
+        accountId,
+        forceRefresh: force,
+      });
+      setUsages((current) => ({ ...current, [accountId]: snapshot }));
+      // 后端确认账号失效后重算线路：卡片随即标红、隐藏切换默认入口，失效
+      // 账号的线路同时从列表里移除。只在状态发生变化时重算一次，已标记失效的
+      // 账号再次返回失效原因不会重复触发。
+      const known = accountsRef.current.find((account) => account.id === accountId);
+      const becameInvalid =
+        snapshot.reason === "official_account_invalid" && !known?.invalid;
+      const recovered = Boolean(known?.invalid) && snapshot.status === "ok";
+      if (becameInvalid || recovered) {
+        void refreshRoutes();
+      }
+    } catch (error) {
+      setUsages((current) => ({ ...current, [accountId]: { status: "error", message: errorText(error) } }));
+    }
+  }, [refreshRoutes]);
+
+  // 额度轮询跟随账号 id 与失效状态：检测到失效后重读列表不会重启整轮查询，
+  // 避免同一批账号反复请求官方接口；账号重新添加恢复可用时轮询重新开始。
+  const accountListKey =
+    accounts?.map((account) => `${account.id}:${account.invalid ? 1 : 0}`).join("\n") ?? "";
   useEffect(() => {
-    setUsage(null);
-    void refreshUsage(false);
-  }, [refreshUsage]);
+    const list = accountsRef.current;
+    if (list.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      // 逐个账号顺序读取额度，并在两次请求之间留出间隔，避免同时向官方接口发起多个请求。
+      let queried = 0;
+      for (const account of list) {
+        if (cancelled) return;
+        if (account.invalid) {
+          // 失效账号不再查询额度，卡片直接显示本地失效原因。
+          setUsages((current) => ({ ...current, [account.id]: invalidUsageSnapshot(account) }));
+          continue;
+        }
+        if (queried > 0) {
+          await new Promise((resolve) => setTimeout(resolve, USAGE_QUERY_STAGGER_MS));
+          if (cancelled) return;
+        }
+        queried += 1;
+        await refreshUsage(account.id, false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [accountListKey, refreshUsage]);
 
   // Poll a pending login until the callback completes or the user closes it.
   useEffect(() => {
@@ -307,6 +368,8 @@ export function OfficialAccountsPanel({
       });
     } catch (error) {
       onNotice({ tone: "error", text: errorText(error) });
+      // 失败原因可能是账号已失效，重读列表即可显示失效标识并收起切换入口。
+      void refresh();
     } finally {
       setPending(null);
     }
@@ -376,7 +439,7 @@ export function OfficialAccountsPanel({
 
       {loadError && <small className="official-accounts-error">{loadError}</small>}
       {accounts && accounts.length === 0 && !loadError && (
-        <small className="official-accounts-empty">尚未添加官方账号。添加后设为默认，Codex 才能使用官方线路。</small>
+        <small className="official-accounts-empty">尚未添加官方账号。添加后每个账号都会成为一条官方线路，设为默认只决定 Codex 的登录身份和页头额度来源。</small>
       )}
 
       {accounts && accounts.length > 0 && (
@@ -385,31 +448,34 @@ export function OfficialAccountsPanel({
             const label = accountLabel(account);
             const plan = formatPlan(account.planType);
             return (
-              <li key={account.id} className={`official-account-item${account.isDefault ? " is-default" : ""}`}>
+              <li
+                key={account.id}
+                className={`official-account-item${account.isDefault ? " is-default" : ""}${account.invalid ? " is-invalid" : ""}`}
+              >
                 <IconBrandOpenai size={18} className="official-account-avatar" aria-hidden="true" />
                 <div className="official-account-main">
                   <div className="official-account-line">
                     <strong title={label}>{label}</strong>
                     {plan && <span className={planTagClass(account.planType)}>{plan}</span>}
-                    {account.isDefault && (
+                    {account.invalid ? (
+                      <Badge variant="destructive" title={account.invalidReason}>
+                        {account.isDefault ? "默认 · 已失效" : "账号已失效"}
+                      </Badge>
+                    ) : account.isDefault ? (
                       <Badge variant={officialAccountAvailable ? "success" : "warning"}>
                         {officialAccountAvailable ? "默认 · 已启用" : "默认 · 待重启"}
                       </Badge>
-                    )}
+                    ) : null}
                   </div>
-                  {account.isDefault ? (
-                    <div className="official-account-line">
-                      <UsageLine snapshot={usage} />
-                      <Button variant="link" color="primary" size="icon-sm" disabled={disabled} onClick={() => void refreshUsage(true)} aria-label="刷新额度" title="刷新额度">
-                        <IconRefresh size={13} aria-hidden="true" />
-                      </Button>
-                    </div>
-                  ) : (
-                    <small className="official-account-usage is-muted">未启用</small>
-                  )}
+                  <div className="official-account-line">
+                    <UsageLine snapshot={usages[account.id] ?? null} />
+                    <Button variant="link" color="primary" size="icon-sm" disabled={disabled} onClick={() => void refreshUsage(account.id, true)} aria-label="刷新额度" title="刷新额度">
+                      <IconRefresh size={13} aria-hidden="true" />
+                    </Button>
+                  </div>
                 </div>
                 <div className="official-account-controls">
-                  {!account.isDefault && (
+                  {!account.isDefault && !account.invalid && (
                     <Button
                       variant="filled"
                       size="xs"
@@ -418,7 +484,7 @@ export function OfficialAccountsPanel({
                       onClick={() => void setDefault(account)}
                     >
                       <IconCheck size={13} aria-hidden="true" />
-                      <span>设为默认并显示额度</span>
+                      <span>设为默认</span>
                     </Button>
                   )}
                   <Button

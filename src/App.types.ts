@@ -21,6 +21,8 @@ export type Profile = {
   upstreamProxy?: string;
   sourceProviderId?: string;
   officialAccount: boolean;
+  /** 该线路来自哪个已保存的官方账号；多条官方线路靠它区分。 */
+  officialAccountId?: string;
   supportsRemoteCompaction?: boolean;
   supportsWebsockets?: boolean;
   supportsNativeWebSearch?: boolean;
@@ -177,6 +179,8 @@ export type OfficialAccount = {
   routeName?: string;
   routeShortName?: string;
   upstreamProxy?: string;
+  invalid?: boolean;
+  invalidReason?: string;
   isDefault: boolean;
 };
 

@@ -60,56 +60,117 @@ pub enum OfficialAccountProfileStatus {
     },
 }
 
-/// Decides whether the official route can be used for this launch. The
-/// decision comes from Codey's own account store: the default account is
-/// copied into the Codex home, and its presence makes the route available.
-/// With no accounts stored, an existing ChatGPT login in the Codex home is
-/// adopted once so earlier installs keep working.
-pub fn current_official_account_profile_status_for_launch(
-    codex_home: &Path,
-    accounts: &OfficialAccountStore,
-) -> Result<OfficialAccountProfileStatus> {
-    let resolution = accounts.resolve_launch_login(codex_home);
-    let snapshot = local_provider_with_auth_policy(codex_home, AuthProbePolicy::Lenient)?;
-    let mut profile = official_profile_from_snapshot(&snapshot);
-    if let Some(record) = accounts.default_account()? {
-        apply_account_route_overrides(&mut profile, &record);
-    }
-    let file_reason = match &snapshot.official_account_auth {
-        OfficialAccountAuthProbe::Available(reason)
-        | OfficialAccountAuthProbe::Unavailable(reason)
-        | OfficialAccountAuthProbe::Unknown(reason) => reason.clone(),
-    };
-    Ok(match resolution {
-        Ok(LaunchLoginResolution::Available { .. }) => {
-            OfficialAccountProfileStatus::Available(profile)
-        }
-        Ok(LaunchLoginResolution::Unavailable { reason }) => {
-            OfficialAccountProfileStatus::Unavailable {
-                reason: format!("{reason}；文件凭据探针：{file_reason}"),
+/// Everything the launch derives from the account store. `status` decides
+/// whether Codex itself can run with the official login, and `profiles` holds
+/// one derived route per usable stored account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OfficialAccountLaunch {
+    pub status: OfficialAccountProfileStatus,
+    pub profiles: Vec<ProviderProfile>,
+    /// 账号库里是否存有账号记录。用来区分从未添加过账号和账号已全部失效：
+    /// 前者保留 Codex 登录派生的兼容线路，后者不再留下任何官方线路。
+    pub has_stored_accounts: bool,
+}
+
+impl OfficialAccountLaunch {
+    pub fn resolve(codex_home: &Path, accounts: &OfficialAccountStore) -> Result<Self> {
+        let resolution = accounts.resolve_launch_login(codex_home);
+        let snapshot = local_provider_with_auth_policy(codex_home, AuthProbePolicy::Lenient)?;
+        let (profiles, has_stored_accounts) = launch_official_profiles(&snapshot, accounts)?;
+        let file_reason = match &snapshot.official_account_auth {
+            OfficialAccountAuthProbe::Available(reason)
+            | OfficialAccountAuthProbe::Unavailable(reason)
+            | OfficialAccountAuthProbe::Unknown(reason) => reason.clone(),
+        };
+        let status = match resolution {
+            Ok(LaunchLoginResolution::Available { .. }) => {
+                let default_profile = profiles
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| official_profile_from_snapshot(&snapshot));
+                OfficialAccountProfileStatus::Available(default_profile)
             }
-        }
-        Err(error) => OfficialAccountProfileStatus::Unknown {
-            profile,
-            reason: format!(
-                "同步默认官方账号到 Codex 失败：{error:#}；文件凭据探针：{file_reason}"
-            ),
-        },
-    })
+            Ok(LaunchLoginResolution::Unavailable { reason }) => {
+                OfficialAccountProfileStatus::Unavailable {
+                    reason: format!("{reason}；文件凭据探针：{file_reason}"),
+                }
+            }
+            Err(error) => OfficialAccountProfileStatus::Unknown {
+                profile: profiles
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| official_profile_from_snapshot(&snapshot)),
+                reason: format!(
+                    "同步默认官方账号到 Codex 失败：{error:#}；文件凭据探针：{file_reason}"
+                ),
+            },
+        };
+        Ok(Self {
+            status,
+            profiles,
+            has_stored_accounts,
+        })
+    }
+}
+
+/// One derived official route per usable stored account, the default account
+/// first. Accounts whose credentials the official endpoint already rejected are
+/// skipped: their route would only produce failing requests. With no stored
+/// account the Codex home login keeps the single legacy route.
+fn launch_official_profiles(
+    snapshot: &LocalProviderSnapshot,
+    accounts: &OfficialAccountStore,
+) -> Result<(Vec<ProviderProfile>, bool)> {
+    // 新账号、以及从 Codex 登录收编的账号，都补上按添加顺序生成的默认线路名
+    // 和短名称，面板和线路列表显示的名称因此保持一致。
+    accounts.ensure_generated_route_settings()?;
+    let mut records = accounts.list()?;
+    if records.is_empty() {
+        return Ok((vec![official_profile_from_snapshot(snapshot)], false));
+    }
+    // 默认名称按添加顺序编号，不随默认账号切换或失效账号离场而改号。
+    let added_order = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| (record.id.clone(), index + 1))
+        .collect::<BTreeMap<_, _>>();
+    records.retain(|record| !record.invalid());
+    let default_id = accounts.default_account_id()?;
+    records.sort_by(|left, right| {
+        let left_default = default_id.as_deref() == Some(left.id.as_str());
+        let right_default = default_id.as_deref() == Some(right.id.as_str());
+        right_default
+            .cmp(&left_default)
+            .then_with(|| left.added_at.cmp(&right.added_at))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let profiles = records
+        .iter()
+        .map(|record| {
+            let mut profile = official_profile_from_snapshot(snapshot);
+            profile.official_account_id = Some(record.id.clone());
+            let index = added_order.get(&record.id).copied().unwrap_or(1);
+            apply_account_route_overrides(&mut profile, record, index);
+            profile
+        })
+        .collect::<Vec<_>>();
+    Ok((profiles, true))
 }
 
 /// The official-account editor stores its route name, short name and proxy per
-/// account; the default account owns the single derived official route.
+/// account; every stored account owns one derived official route.
 fn apply_account_route_overrides(
     profile: &mut ProviderProfile,
     record: &crate::official_accounts::OfficialAccountRecord,
+    index: usize,
 ) {
-    if let Some(name) = trimmed(record.route_name.as_deref()) {
-        profile.name = name.to_string();
-    }
-    if let Some(short_name) = trimmed(record.route_short_name.as_deref()) {
-        profile.short_name = short_name.to_string();
-    }
+    // 账号没有保存过线路名时，用「官方账号1」这类按添加顺序生成的名称兜底。
+    profile.name = trimmed(record.route_name.as_deref())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| crate::config::default_official_route_name(index));
+    profile.short_name = trimmed(record.route_short_name.as_deref())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| crate::config::default_official_route_short_name(index));
     if let Some(proxy) = trimmed(record.upstream_proxy.as_deref()) {
         profile.upstream_proxy = proxy.to_string();
     }
@@ -325,6 +386,7 @@ fn profile_from_provider(
         upstream_proxy: String::new(),
         source_provider_id: None,
         official_account: provider.official,
+        official_account_id: None,
         supports_remote_compaction: provider.supports_remote_compaction,
         supports_websockets: provider.official,
         supports_native_web_search: provider.official,
@@ -800,7 +862,37 @@ experimental_bearer_token = "sk-relay"
 
     fn status_with_empty_store(home: &Path) -> Result<OfficialAccountProfileStatus> {
         let (_dir, store) = empty_store();
-        current_official_account_profile_status_for_launch(home, &store)
+        launch_status(home, &store)
+    }
+
+    fn launch_status(
+        home: &Path,
+        store: &OfficialAccountStore,
+    ) -> Result<OfficialAccountProfileStatus> {
+        Ok(OfficialAccountLaunch::resolve(home, store)?.status)
+    }
+
+    fn stored_account(id: &str, added_at: u64) -> crate::official_accounts::OfficialAccountRecord {
+        crate::official_accounts::OfficialAccountRecord {
+            id: id.to_string(),
+            email: Some(format!("{id}@example.com")),
+            plan_type: Some("plus".to_string()),
+            account_id: Some(format!("chatgpt-{id}")),
+            added_at,
+            route_name: None,
+            route_short_name: None,
+            upstream_proxy: None,
+            invalid_reason: None,
+            invalid_since: None,
+            auth: serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": format!("access-{id}"),
+                    "refresh_token": format!("refresh-{id}"),
+                    "account_id": format!("chatgpt-{id}"),
+                },
+            }),
+        }
     }
 
     #[test]
@@ -853,12 +945,14 @@ experimental_bearer_token = "sk-relay"
         );
         let (_dir, store) = empty_store();
         let OfficialAccountProfileStatus::Available(profile) =
-            current_official_account_profile_status_for_launch(home.path(), &store).unwrap()
+            launch_status(home.path(), &store).unwrap()
         else {
             panic!("the existing ChatGPT login should supply the official route");
         };
+        // 收编为第一个账号后立刻带上按添加顺序生成的默认名称。
         let default_name = profile.name.clone();
-        assert_eq!(profile.short_name, crate::config::OFFICIAL_ROUTE_SHORT_NAME);
+        assert_eq!(default_name, "官方账号1");
+        assert_eq!(profile.short_name, "官1");
         assert!(profile.upstream_proxy.is_empty());
 
         let account_id = store.default_account_id().unwrap().unwrap();
@@ -871,7 +965,7 @@ experimental_bearer_token = "sk-relay"
             )
             .unwrap();
         let OfficialAccountProfileStatus::Available(profile) =
-            current_official_account_profile_status_for_launch(home.path(), &store).unwrap()
+            launch_status(home.path(), &store).unwrap()
         else {
             panic!("the official route should stay available");
         };
@@ -883,13 +977,98 @@ experimental_bearer_token = "sk-relay"
             .update_route_settings(&account_id, None, None, None)
             .unwrap();
         let OfficialAccountProfileStatus::Available(profile) =
-            current_official_account_profile_status_for_launch(home.path(), &store).unwrap()
+            launch_status(home.path(), &store).unwrap()
         else {
             panic!("the official route should stay available");
         };
         assert_eq!(profile.name, default_name);
-        assert_eq!(profile.short_name, crate::config::OFFICIAL_ROUTE_SHORT_NAME);
+        assert_eq!(profile.short_name, "官1");
         assert!(profile.upstream_proxy.is_empty());
+    }
+
+    #[test]
+    fn every_stored_account_derives_its_own_official_route() {
+        let home = TempDir::new().unwrap();
+        write_config(home.path(), "");
+        let (_dir, store) = empty_store();
+        store.upsert(&stored_account("acct-one", 1)).unwrap();
+        store.upsert(&stored_account("acct-two", 2)).unwrap();
+        store.set_default_account_id(Some("acct-two")).unwrap();
+
+        let launch = OfficialAccountLaunch::resolve(home.path(), &store).unwrap();
+
+        assert!(matches!(
+            launch.status,
+            OfficialAccountProfileStatus::Available(_)
+        ));
+        assert_eq!(launch.profiles.len(), 2);
+        // 默认账号排在最前，其余账号按添加时间排序。
+        assert_eq!(
+            launch.profiles[0].official_account_id.as_deref(),
+            Some("acct-two")
+        );
+        assert_eq!(
+            launch.profiles[1].official_account_id.as_deref(),
+            Some("acct-one")
+        );
+        // 默认名称按添加顺序编号，和默认账号排在最前的显示顺序无关。
+        assert_eq!(launch.profiles[0].name, "官方账号2");
+        assert_eq!(launch.profiles[0].short_name, "官2");
+        assert_eq!(launch.profiles[1].name, "官方账号1");
+        assert_eq!(launch.profiles[1].short_name, "官1");
+        // 生成结果写回账号记录，面板编辑时看到的就是线路列表里的名称。
+        let stored = store.list().unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .find(|record| record.id == "acct-one")
+                .and_then(|record| record.route_name.clone())
+                .as_deref(),
+            Some("官方账号1")
+        );
+        assert!(
+            launch
+                .profiles
+                .iter()
+                .all(|profile| profile.official_account)
+        );
+
+        // Codex 客户端登录的仍然是默认账号。
+        let written: Value =
+            serde_json::from_slice(&fs::read(home.path().join("auth.json")).unwrap()).unwrap();
+        assert_eq!(written["tokens"]["access_token"], "access-acct-two");
+    }
+
+    #[test]
+    fn invalid_stored_accounts_do_not_derive_official_routes() {
+        let home = TempDir::new().unwrap();
+        write_config(home.path(), "");
+        let (_dir, store) = empty_store();
+        let mut invalid = stored_account("acct-one", 1);
+        invalid.mark_invalid("官方已撤销该账号的登录凭据，需要重新添加账号");
+        store.upsert(&invalid).unwrap();
+        store.upsert(&stored_account("acct-two", 2)).unwrap();
+        store.set_default_account_id(Some("acct-two")).unwrap();
+
+        let launch = OfficialAccountLaunch::resolve(home.path(), &store).unwrap();
+
+        assert!(launch.has_stored_accounts);
+        assert_eq!(launch.profiles.len(), 1);
+        assert_eq!(
+            launch.profiles[0].official_account_id.as_deref(),
+            Some("acct-two")
+        );
+        // 编号按全部账号的添加顺序计算，失效账号离场不会让剩余线路改号。
+        assert_eq!(launch.profiles[0].name, "官方账号2");
+        assert_eq!(launch.profiles[0].short_name, "官2");
+
+        // 全部账号失效时不再留下任何官方线路。
+        let mut remaining = store.get("acct-two").unwrap().unwrap();
+        remaining.mark_invalid("官方已撤销该账号的登录凭据，需要重新添加账号");
+        store.upsert(&remaining).unwrap();
+        let launch = OfficialAccountLaunch::resolve(home.path(), &store).unwrap();
+        assert!(launch.has_stored_accounts);
+        assert!(launch.profiles.is_empty());
     }
 
     #[test]
@@ -905,7 +1084,7 @@ experimental_bearer_token = "sk-relay"
         );
         let (_dir, store) = empty_store();
         let OfficialAccountProfileStatus::Available(profile) =
-            current_official_account_profile_status_for_launch(home.path(), &store).unwrap()
+            launch_status(home.path(), &store).unwrap()
         else {
             panic!("an existing ChatGPT login should be adopted as the default account");
         };
@@ -919,7 +1098,7 @@ experimental_bearer_token = "sk-relay"
         // The default account is restored into the Codex home on every launch.
         fs::remove_file(home.path().join("auth.json")).unwrap();
         assert!(matches!(
-            current_official_account_profile_status_for_launch(home.path(), &store).unwrap(),
+            launch_status(home.path(), &store).unwrap(),
             OfficialAccountProfileStatus::Available(_)
         ));
         assert!(home.path().join("auth.json").is_file());

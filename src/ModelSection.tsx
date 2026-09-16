@@ -219,7 +219,7 @@ function ModelSectionComponent({
     setRouteApiKeyVisible(false);
   }, [routeConfigReadOnly]);
 
-  // 官方线路的线路名、短名称和代理保存在默认账号记录里，保存入口在线路卡片上。
+  // 官方线路的线路名、短名称和代理保存在所属账号记录里，保存入口在线路卡片上。
   const refreshOfficialAccounts = useCallback(async () => {
     try {
       const result = await invoke<OfficialAccountsResult>("list_official_accounts");
@@ -245,18 +245,31 @@ function ModelSectionComponent({
     () => officialAccounts?.find((account) => account.isDefault) ?? null,
     [officialAccounts],
   );
-  const officialLoginLabel = useMemo(() => {
-    const email = defaultOfficialAccount?.email?.trim();
-    return email ? `官方账号登录 · ${email}` : "官方账号登录";
-  }, [defaultOfficialAccount]);
-  const displayedOfficialEmail = useMemo(() => {
-    const email = defaultOfficialAccount?.email?.trim();
-    if (!email) return "";
-    return maskSensitive ? maskEmail(email) : email;
-  }, [defaultOfficialAccount, maskSensitive]);
-  const displayedOfficialLoginLabel = useMemo(
-    () => (displayedOfficialEmail ? `官方账号登录 · ${displayedOfficialEmail}` : officialLoginLabel),
-    [displayedOfficialEmail, officialLoginLabel],
+  // 每条官方线路对应一个账号记录，线路卡片和编辑弹窗都显示所属账号。
+  const accountForRoute = useCallback(
+    (profile: Profile | null | undefined): OfficialAccount | null => {
+      if (!profile) return null;
+      if (profile.officialAccountId) {
+        return officialAccounts?.find((account) => account.id === profile.officialAccountId) ?? null;
+      }
+      return defaultOfficialAccount;
+    },
+    [defaultOfficialAccount, officialAccounts],
+  );
+  const displayedEmail = useCallback(
+    (account: OfficialAccount | null) => {
+      const email = account?.email?.trim();
+      if (!email) return "";
+      return maskSensitive ? maskEmail(email) : email;
+    },
+    [maskSensitive],
+  );
+  const officialLoginLabelFor = useCallback(
+    (account: OfficialAccount | null) => {
+      const email = displayedEmail(account);
+      return email ? `官方账号登录 · ${email}` : "官方账号登录";
+    },
+    [displayedEmail],
   );
   const hideUrl = useCallback(
     (value: string) => (maskSensitive ? maskUrl(value) : value),
@@ -301,7 +314,11 @@ function ModelSectionComponent({
       if (routeConfigReadOnly) return nativeProfile ? [nativeProfile] : [];
       return config.profiles.filter(
         (profile) =>
-          profile.enabled === false || profile.authMode !== "officialAccount" || officialAccountAvailable,
+          profile.enabled === false ||
+          profile.authMode !== "officialAccount" ||
+          officialAccountAvailable ||
+          // 存储账号的官方线路自带凭据，默认登录缺失时仍由本地路由提供服务。
+          Boolean(profile.officialAccountId),
       );
     },
     [config.profiles, nativeProfile, officialAccountAvailable, routeConfigReadOnly],
@@ -389,10 +406,10 @@ function ModelSectionComponent({
             officialRouteDraft,
             config.profiles,
             officialAccounts,
-            defaultOfficialAccount?.id ?? "",
+            routeDraft?.officialAccountId ?? defaultOfficialAccount?.id ?? "",
           )
         : null,
-    [config.profiles, defaultOfficialAccount, officialAccounts, officialRouteDraft],
+    [config.profiles, defaultOfficialAccount, officialAccounts, officialRouteDraft, routeDraft],
   );
 
   const openNewRouteDialog = () => {
@@ -415,11 +432,12 @@ function ModelSectionComponent({
     setRouteApiKeyVisible(false);
     setRouteHeadersText(headersTextFromMap(profile.modelRequestHeaders));
     setHeaderError("");
+    const routeAccount = official ? accountForRoute(profile) : null;
     setOfficialRouteDraft(
       official && officialScope === "settings"
         ? {
-            routeName: defaultOfficialAccount?.routeName ?? "",
-            routeShortName: defaultOfficialAccount?.routeShortName ?? "",
+            routeName: routeAccount?.routeName ?? "",
+            routeShortName: routeAccount?.routeShortName ?? "",
             upstreamProxy: profile.upstreamProxy ?? "",
           }
         : null,
@@ -498,7 +516,7 @@ function ModelSectionComponent({
       });
       return;
     }
-    const accountId = defaultOfficialAccount?.id ?? "";
+    const accountId = routeDraft.officialAccountId ?? defaultOfficialAccount?.id ?? "";
     const officialProviderId = routeProviderId(routeDraft);
     const configuredOfficialModels = config.selectedModelsByProvider[officialProviderId] || [];
     const currentOfficialModels = configuredOfficialModels.length > 0
@@ -556,6 +574,10 @@ function ModelSectionComponent({
       await onSaveRoute({ ...profile, enabled });
     }
   };
+
+  const draftOfficialAccount = accountForRoute(routeDraft);
+  const draftOfficialAccountLabel =
+    displayedEmail(draftOfficialAccount) || draftOfficialAccount?.id || "";
 
   return (
     <section className="route-section" aria-labelledby="route-title">
@@ -703,6 +725,9 @@ function ModelSectionComponent({
                 const group = modelGroupByProviderId.get(providerId);
                 const isOfficial = profile.authMode === "officialAccount";
                 const disabled = profile.enabled === false;
+                const officialLoginLabel = officialLoginLabelFor(
+                  isOfficial ? accountForRoute(profile) : null,
+                );
                 const syncModels = () => {
                   if (isOfficial && !routeConfigReadOnly) openRouteDialog(profile, "models");
                   else onFetchRouteModels(profile);
@@ -792,14 +817,10 @@ function ModelSectionComponent({
                             </div>
                           </div>
                           <small
-                            title={
-                              isOfficial
-                                ? displayedOfficialLoginLabel
-                                : hideUrl(profile.baseUrl)
-                            }
+                            title={isOfficial ? officialLoginLabel : hideUrl(profile.baseUrl)}
                           >
                             {isOfficial
-                              ? displayedOfficialLoginLabel
+                              ? officialLoginLabel
                               : profile.baseUrl
                                 ? hideUrl(profile.baseUrl)
                                 : "待填写 URL"}
@@ -971,11 +992,11 @@ function ModelSectionComponent({
               <DialogDescription>
                 {routeDraft.authMode === "officialAccount"
                   ? officialDialogScope === "models"
-                    ? defaultOfficialAccount
-                      ? `当前官方账号：${displayedOfficialEmail || defaultOfficialAccount.id}。未勾选的模型不会在模型目录和选择器中显示。`
+                    ? draftOfficialAccount
+                      ? `当前官方账号：${draftOfficialAccountLabel}。未勾选的模型不会在模型目录和选择器中显示。`
                       : "未勾选的模型不会在模型目录和选择器中显示。"
-                    : defaultOfficialAccount
-                      ? `当前官方账号：${displayedOfficialEmail || defaultOfficialAccount.id}。此处只调整线路名、短名称和上游代理，模型列表请使用线路卡片上的同步按钮。`
+                    : draftOfficialAccount
+                      ? `当前官方账号：${draftOfficialAccountLabel}。此处只调整线路名、短名称和上游代理，模型列表请使用线路卡片上的同步按钮。`
                       : "此处只调整线路名、短名称和上游代理，模型列表请使用线路卡片上的同步按钮。"
                   : "配置第三方服务的接入信息。保存后可在模型目录中同步模型。"}
               </DialogDescription>
@@ -1004,7 +1025,7 @@ function ModelSectionComponent({
                               : undefined
                           }
                           value={officialRouteDraft?.routeName ?? ""}
-                          disabled={isBusy || !defaultOfficialAccount}
+                          disabled={isBusy || !draftOfficialAccount}
                           placeholder={routeDraft.name || "OpenAI 官方直登"}
                           onChange={(event) =>
                             updateOfficialRouteDraft({ routeName: event.target.value })}
@@ -1021,9 +1042,9 @@ function ModelSectionComponent({
                           </small>
                         ) : (
                           <small className="route-field-hint">
-                            {defaultOfficialAccount
-                              ? "留空则沿用 Codex 提供的线路名。"
-                              : "添加并设为默认的官方账号后才能编辑。"}
+                            {draftOfficialAccount
+                              ? "留空则按账号添加顺序使用默认线路名，例如「官方账号1」。"
+                              : "未找到该线路对应的官方账号记录。"}
                           </small>
                         )}
                       </label>
@@ -1045,7 +1066,7 @@ function ModelSectionComponent({
                               : undefined
                           }
                           value={officialRouteDraft?.routeShortName ?? ""}
-                          disabled={isBusy || !defaultOfficialAccount}
+                          disabled={isBusy || !draftOfficialAccount}
                           placeholder="官"
                           maxLength={MAX_ROUTE_SHORT_NAME_CHARACTERS}
                           onChange={(event) =>
@@ -1062,7 +1083,9 @@ function ModelSectionComponent({
                             {officialRouteDraftErrors.shortName}
                           </small>
                         ) : (
-                          <small className="route-field-hint">留空使用默认的「官」。</small>
+                          <small className="route-field-hint">
+                            留空则按账号添加顺序使用默认短名称，例如「官1」。
+                          </small>
                         )}
                       </label>
                       <small

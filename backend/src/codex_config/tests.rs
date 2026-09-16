@@ -3186,3 +3186,113 @@ fn pre_isolation_lease_is_released_without_the_removed_restore_path() {
         "user files are left untouched"
     );
 }
+
+#[test]
+fn reserved_provider_ids_are_renamed_with_their_references() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "model_provider = \"openai\"\n\
+         \n\
+         [model_providers.openai]\n\
+         name = \"Relay\"\n\
+         base_url = \"https://relay.example/v1\"\n\
+         wire_api = \"responses\"\n\
+         requires_openai_auth = true\n\
+         \n\
+         [profiles.work]\n\
+         model_provider = \"openai\"\n\
+         model = \"gpt-5\"\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        repair_reserved_provider_ids(&home).unwrap(),
+        vec![ReservedProviderRename {
+            from: "openai".to_string(),
+            to: "openai-custom".to_string(),
+        }]
+    );
+    let document = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert!(document["model_providers"].get("openai").is_none());
+    assert_eq!(document["model_provider"].as_str(), Some("openai-custom"));
+    assert_eq!(
+        document["model_providers"]["openai-custom"]["base_url"].as_str(),
+        Some("https://relay.example/v1")
+    );
+    assert_eq!(
+        document["model_providers"]["openai-custom"]["requires_openai_auth"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        document["profiles"]["work"]["model_provider"].as_str(),
+        Some("openai-custom")
+    );
+    assert_eq!(
+        document["profiles"]["work"]["model"].as_str(),
+        Some("gpt-5")
+    );
+    assert!(repair_reserved_provider_ids(&home).unwrap().is_empty());
+}
+
+#[test]
+fn reserved_provider_rename_keeps_taken_ids_and_inline_tables_working() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "model_provider = \"lmstudio\"\n\
+         model_providers = { lmstudio = { base_url = \"http://127.0.0.1:1234/v1\" }, \
+         lmstudio-custom = { base_url = \"https://existing.example/v1\" } }\n\
+         profiles = { work = { model_provider = \"lmstudio\" } }\n",
+    )
+    .unwrap();
+
+    assert_eq!(
+        repair_reserved_provider_ids(&home).unwrap(),
+        vec![ReservedProviderRename {
+            from: "lmstudio".to_string(),
+            to: "lmstudio-custom-2".to_string(),
+        }]
+    );
+    let document = fs::read_to_string(home.join("config.toml"))
+        .unwrap()
+        .parse::<DocumentMut>()
+        .unwrap();
+    assert_eq!(
+        document["model_provider"].as_str(),
+        Some("lmstudio-custom-2")
+    );
+    assert_eq!(
+        document["model_providers"]["lmstudio-custom"]["base_url"].as_str(),
+        Some("https://existing.example/v1")
+    );
+    assert_eq!(
+        document["profiles"]["work"]["model_provider"].as_str(),
+        Some("lmstudio-custom-2")
+    );
+}
+
+#[test]
+fn unrelated_provider_ids_and_missing_configs_stay_untouched() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    assert!(repair_reserved_provider_ids(&home).unwrap().is_empty());
+
+    let original = b"model_provider = \"my-relay\"\n\
+        \n\
+        [model_providers.my-relay]\n\
+        base_url = \"https://relay.example/v1\"\n\
+        wire_api = \"responses\"\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+
+    assert!(repair_reserved_provider_ids(&home).unwrap().is_empty());
+    assert_eq!(fs::read(home.join("config.toml")).unwrap(), original);
+}

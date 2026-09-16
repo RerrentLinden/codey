@@ -1103,6 +1103,71 @@ fn renderer_catalog_routes_every_model_through_the_codey_router_carrier() {
 }
 
 #[test]
+fn renderer_catalog_qualifies_official_models_for_every_stored_account() {
+    let mut first = ProviderProfile::new("主力账号");
+    first.source_provider_id = Some("openai".into());
+    first.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    first.official_account_id = Some("acct-one".into());
+    first.normalize();
+    let mut second = ProviderProfile::new("备用账号");
+    second.source_provider_id = Some("openai".into());
+    second.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    second.official_account_id = Some("acct-two".into());
+    second.normalize();
+
+    let mut config = CodeyConfig {
+        // 默认登录缺失时，存储账号的线路仍然由本地路由直接转发。
+        official_account_available_this_launch: false,
+        ..CodeyConfig::default()
+    };
+    config.apply_launch_official_profiles(vec![first, second]);
+    let config = config.normalize();
+    let provider_id = config.profiles[0].provider_id().to_string();
+
+    let model_state = model_catalog::ModelSelectionState {
+        official_models: vec![model_catalog::OfficialModelAvailability {
+            slug: "gpt-5.6-sol".into(),
+            display_name: "GPT-5.6 Sol".into(),
+            supported: true,
+            supported_reasoning_efforts: vec!["medium".into()],
+            default_reasoning_effort: "medium".into(),
+        }],
+        official_model_ids: vec!["gpt-5.6-sol".into()],
+        third_party_models: Vec::new(),
+        third_party_model_metadata: Vec::new(),
+        manual_third_party_models: Vec::new(),
+        upstream_models: Vec::new(),
+        default_model: "gpt-5.6-sol".into(),
+    };
+
+    let catalog = renderer_model_catalog_value(&config, &model_state);
+    let model_names = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model.as_str().unwrap())
+        .collect::<Vec<_>>();
+    // 多条官方线路并存时，原生模型名会合并成一条，必须带线路前缀区分账号。
+    let expected_alias = local_router::model_alias(&provider_id, "gpt-5.6-sol");
+    assert!(
+        model_names.contains(&expected_alias.as_str()),
+        "{model_names:?}"
+    );
+    assert!(!model_names.contains(&"gpt-5.6-sol"), "{model_names:?}");
+    let metadata = catalog["model_metadata"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["model"].as_str() == Some(expected_alias.as_str()))
+        .unwrap();
+    assert_eq!(metadata["official_account"], true);
+    assert_eq!(
+        metadata["route_provider_id"].as_str(),
+        Some(provider_id.as_str())
+    );
+}
+
+#[test]
 fn renderer_catalog_keeps_multi_segment_models_from_a_non_current_route() {
     let active = configured_route("active-route", Some("active-model"));
     let mut tokenrouter = configured_route("tokenrouter", Some("z-ai/glm-5.3-free"));

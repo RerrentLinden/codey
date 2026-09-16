@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 
 use crate::config::{RouteRequestLogBackend, RouteRequestLogConfig};
 
-const SCHEMA_VERSION: u8 = 8;
+const SCHEMA_VERSION: u8 = 9;
 const MAX_LOG_STRING_BYTES: usize = 512;
 const MAX_LOG_HEADERS_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_LOG_ERROR_BYTES: usize = 64 * 1024;
@@ -162,6 +162,10 @@ pub(crate) struct RouteRequestLogEntry {
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,
+    /// 官方线路所属的账号记录 id。多条官方线路共用 provider 语义时，只有这
+    /// 个字段能稳定区分账号，额度推算也按它分组。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub official_account_id: Option<String>,
     pub requested_model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -252,6 +256,7 @@ pub(crate) struct RouteRequestLogQuery {
     pub request_id: Option<String>,
     pub request_kind: Option<String>,
     pub session_id: Option<String>,
+    pub official_account_id: Option<String>,
     pub group_by: Option<String>,
 }
 
@@ -272,6 +277,7 @@ impl Default for RouteRequestLogQuery {
             request_id: None,
             request_kind: None,
             session_id: None,
+            official_account_id: None,
             group_by: None,
         }
     }
@@ -293,11 +299,22 @@ impl RouteRequestLogQuery {
         normalize_query_value(&mut self.request_id, MAX_LOG_STRING_BYTES, "请求 ID")?;
         normalize_query_value(&mut self.request_kind, MAX_QUERY_FILTER_BYTES, "请求类型")?;
         normalize_query_value(&mut self.session_id, MAX_LOG_STRING_BYTES, "会话 ID")?;
+        normalize_query_value(
+            &mut self.official_account_id,
+            MAX_LOG_STRING_BYTES,
+            "官方账号",
+        )?;
         normalize_query_value(&mut self.group_by, MAX_QUERY_FILTER_BYTES, "统计维度")?;
         if self.group_by.as_deref().is_some_and(|value| {
             !matches!(
                 value,
-                "model" | "provider" | "status" | "protocol" | "request_kind" | "session"
+                "model"
+                    | "provider"
+                    | "status"
+                    | "protocol"
+                    | "request_kind"
+                    | "session"
+                    | "official_account"
             )
         }) {
             anyhow::bail!("统计维度无效");
@@ -428,6 +445,8 @@ pub(crate) struct RouteRequestLogQueryItem {
     pub timestamp_unix_ms: u64,
     pub provider: Option<String>,
     pub provider_name: Option<String>,
+    /// 非官方请求为 None，官方请求记录该线路所属的账号记录 id。
+    pub official_account_id: Option<String>,
     pub requested_model: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -626,6 +645,7 @@ impl RouteRequestLogProducer {
             timestamp_unix_ms: unix_timestamp_ms_at(start.started_at),
             provider: None,
             provider_name: None,
+            official_account_id: None,
             requested_model: bounded_string(start.requested_model),
             model: None,
             reasoning_effort: start.reasoning_effort.map(bounded_string),
@@ -772,6 +792,7 @@ struct PendingEntry {
     timestamp_unix_ms: u64,
     provider: Option<String>,
     provider_name: Option<String>,
+    official_account_id: Option<String>,
     requested_model: String,
     model: Option<String>,
     reasoning_effort: Option<String>,
@@ -909,6 +930,7 @@ impl RouteRequestLogProbe {
         &self,
         provider: &str,
         provider_name: &str,
+        official_account_id: Option<&str>,
         requested_model: &str,
         model: &str,
         upstream_authority: &str,
@@ -920,6 +942,7 @@ impl RouteRequestLogProbe {
             let mut entry = lock_unpoisoned(&self.shared.entry);
             entry.provider = Some(bounded_string(provider));
             entry.provider_name = Some(bounded_string(provider_name));
+            entry.official_account_id = official_account_id.map(bounded_string);
             entry.requested_model = bounded_string(requested_model);
             entry.model = Some(bounded_string(model));
             entry.upstream_authority = Some(bounded_string(upstream_authority));
@@ -1211,6 +1234,7 @@ impl RouteRequestLogProbe {
             timestamp_unix_ms: pending.timestamp_unix_ms,
             provider: pending.provider.take(),
             provider_name: pending.provider_name.take(),
+            official_account_id: pending.official_account_id.take(),
             requested_model: std::mem::take(&mut pending.requested_model),
             model: pending.model.take(),
             reasoning_effort: pending.reasoning_effort.take(),
@@ -1937,6 +1961,7 @@ impl SqliteSink {
                 timestamp_unix_ms INTEGER NOT NULL,
                 provider TEXT,
                 provider_name TEXT,
+                official_account_id TEXT,
                 requested_model TEXT NOT NULL,
                 model TEXT,
                 reasoning_effort TEXT,
@@ -2000,6 +2025,7 @@ impl SqliteSink {
             "requested_service_tier",
             "service_tier",
             "upstream_request_headers",
+            "official_account_id",
         ] {
             let exists: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('route_request_logs') WHERE name = ?1)",
@@ -2045,13 +2071,14 @@ impl SqliteSink {
                     upstream_request_id, upstream_protocol, protocol_bridge,
                     first_byte_source, client_fingerprint, subagent, schema_version,
                     upstream_error_summary, codex_session_id, codex_session_is_parent,
-                    requested_service_tier, service_tier, upstream_request_headers
+                    requested_service_tier, service_tier, upstream_request_headers,
+                    official_account_id
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
                     ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
-                    ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48
+                    ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49
                 ) ON CONFLICT(request_id) DO NOTHING",
             )?;
             for queued in batch {
@@ -2105,6 +2132,7 @@ impl SqliteSink {
                     entry.requested_service_tier,
                     entry.service_tier,
                     entry.upstream_request_headers,
+                    entry.official_account_id,
                 ])?;
             }
         }
@@ -2169,7 +2197,9 @@ fn query_sqlite_route_request_logs(
 ) -> anyhow::Result<RouteRequestLogQueryPage> {
     let mut connection = open_query_connection(path)?;
     let transaction = connection.transaction()?;
-    let (mut where_clause, mut filter_params) = sqlite_query_filters(query);
+    let optional_columns = sqlite_optional_columns(&transaction, path)?;
+    let (mut where_clause, mut filter_params) =
+        sqlite_query_filters(query, optional_columns.official_account);
     // Legacy page-number callers still receive a precise count. The UI uses cursors.
     let total = if query.cursor_mode {
         0
@@ -2192,11 +2222,15 @@ fn query_sqlite_route_request_logs(
     } else {
         "LIMIT ? OFFSET ?"
     };
-    let has_tiers = sqlite_has_tier_columns(&transaction, path)?;
-    let tier_columns = if has_tiers {
+    let tier_columns = if optional_columns.tiers {
         "requested_service_tier, service_tier"
     } else {
         "NULL, NULL"
+    };
+    let account_column = if optional_columns.official_account {
+        "official_account_id"
+    } else {
+        "NULL"
     };
     let select_sql = format!(
         "SELECT
@@ -2212,7 +2246,8 @@ fn query_sqlite_route_request_logs(
             fallback_reason, upstream_authority,
             upstream_request_id, upstream_protocol, protocol_bridge,
             first_byte_source, subagent, upstream_error_summary,
-            codex_session_id, codex_session_is_parent, {tier_columns}, upstream_request_headers
+            codex_session_id, codex_session_is_parent, {tier_columns},
+            upstream_request_headers, {account_column}
          FROM route_request_logs{where_clause}
          ORDER BY timestamp_unix_ms DESC, request_id DESC
          {pagination}"
@@ -2276,7 +2311,13 @@ fn empty_query_page(page: u64, page_size: u64) -> RouteRequestLogQueryPage {
     }
 }
 
-fn sqlite_query_filters(query: &RouteRequestLogQuery) -> (String, Vec<SqlValue>) {
+/// `has_official_account_column` keeps queries working against a database the
+/// writer has not migrated yet; the account filter and search fall back to the
+/// columns every version ships.
+fn sqlite_query_filters(
+    query: &RouteRequestLogQuery,
+    has_official_account_column: bool,
+) -> (String, Vec<SqlValue>) {
     let mut clauses: Vec<String> = Vec::new();
     let mut values = Vec::new();
     if let (Some(from), Some(to)) = (query.from_unix_ms, query.to_unix_ms) {
@@ -2298,7 +2339,13 @@ fn sqlite_query_filters(query: &RouteRequestLogQuery) -> (String, Vec<SqlValue>)
     }
     if let Some(search) = &query.search {
         let pattern = format!("%{}%", escape_like_pattern(search));
-        let search_clause = String::from(
+        let account_search = if has_official_account_column {
+            "
+              OR COALESCE(official_account_id, '') LIKE ? ESCAPE '\\'"
+        } else {
+            ""
+        };
+        let search_clause = format!(
             "(request_id LIKE ? ESCAPE '\\'
               OR trace_id LIKE ? ESCAPE '\\'
               OR COALESCE(provider, '') LIKE ? ESCAPE '\\'
@@ -2308,9 +2355,12 @@ fn sqlite_query_filters(query: &RouteRequestLogQuery) -> (String, Vec<SqlValue>)
               OR COALESCE(error_code, '') LIKE ? ESCAPE '\\'
               OR COALESCE(upstream_request_id, '') LIKE ? ESCAPE '\\'
               OR COALESCE(upstream_error_summary, '') LIKE ? ESCAPE '\\'
-              OR COALESCE(codex_session_id, '') LIKE ? ESCAPE '\\')",
+              OR COALESCE(codex_session_id, '') LIKE ? ESCAPE '\\'{account_search})",
         );
-        values.extend((0..10).map(|_| SqlValue::Text(pattern.clone())));
+        values.extend(
+            (0..if has_official_account_column { 11 } else { 10 })
+                .map(|_| SqlValue::Text(pattern.clone())),
+        );
         clauses.push(search_clause);
     }
     if let Some(provider) = &query.provider {
@@ -2339,6 +2389,12 @@ fn sqlite_query_filters(query: &RouteRequestLogQuery) -> (String, Vec<SqlValue>)
     if let Some(protocol) = &query.protocol {
         clauses.push("upstream_transport = ?".into());
         values.push(SqlValue::Text(protocol.clone()));
+    }
+    if let Some(account_id) = &query.official_account_id
+        && has_official_account_column
+    {
+        clauses.push("official_account_id = ?".into());
+        values.push(SqlValue::Text(account_id.clone()));
     }
     if clauses.is_empty() {
         (String::new(), values)
@@ -2426,13 +2482,16 @@ pub(crate) fn query_route_request_log_stats(
     }
     let mut connection = open_query_connection(&path)?;
     let transaction = connection.transaction()?;
-    let (where_clause, values) = sqlite_query_filters(&query);
+    let optional_columns = sqlite_optional_columns(&transaction, &path)?;
+    let (where_clause, values) = sqlite_query_filters(&query, optional_columns.official_account);
     result.summary = transaction.query_row(
         &format!("SELECT {SUMMARY_COLUMNS} FROM route_request_logs{where_clause}"),
         params_from_iter(values.iter()),
         summary_from_row,
     )?;
-    if let Some(group_by) = &query.group_by {
+    if let Some(group_by) = &query.group_by
+        && (group_by != "official_account" || optional_columns.official_account)
+    {
         let column = match group_by.as_str() {
             "model" => "COALESCE(model, requested_model)",
             "provider" => "provider",
@@ -2440,6 +2499,7 @@ pub(crate) fn query_route_request_log_stats(
             "protocol" => "upstream_transport",
             "request_kind" => "request_kind",
             "session" => "codex_session_id",
+            "official_account" => "official_account_id",
             _ => unreachable!("validated grouping"),
         };
         let sql = format!(
@@ -2482,23 +2542,53 @@ pub(crate) fn query_route_request_log_stats(
     Ok(result)
 }
 
-/// The tier columns are added by the writer at open time and never dropped, so
-/// a positive probe can be remembered per database path. Negative results keep
+#[derive(Clone, Copy)]
+struct RouteRequestLogOptionalColumns {
+    /// Billing tier columns used by the pricing estimate.
+    tiers: bool,
+    /// The per-route official account id.
+    official_account: bool,
+}
+
+/// These columns are added by the writer at open time and never dropped, so a
+/// positive probe can be remembered per database path. Negative results keep
 /// probing: the writer may add the columns while this process is running.
-fn sqlite_has_tier_columns(connection: &Connection, path: &Path) -> rusqlite::Result<bool> {
+fn sqlite_optional_columns(
+    connection: &Connection,
+    path: &Path,
+) -> rusqlite::Result<RouteRequestLogOptionalColumns> {
     static TIERED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
-    let known = TIERED_PATHS.get_or_init(|| Mutex::new(HashSet::new()));
+    static ACCOUNTED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    Ok(RouteRequestLogOptionalColumns {
+        tiers: sqlite_has_column(connection, path, &TIERED_PATHS, "service_tier")?,
+        official_account: sqlite_has_column(
+            connection,
+            path,
+            &ACCOUNTED_PATHS,
+            "official_account_id",
+        )?,
+    })
+}
+
+fn sqlite_has_column(
+    connection: &Connection,
+    path: &Path,
+    known_paths: &OnceLock<Mutex<HashSet<PathBuf>>>,
+    column: &str,
+) -> rusqlite::Result<bool> {
+    let known = known_paths.get_or_init(|| Mutex::new(HashSet::new()));
     if lock_unpoisoned(known).contains(path) {
         return Ok(true);
     }
-    let has_tiers: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('route_request_logs') WHERE name = 'service_tier')",
-        [], |row| row.get(0),
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('route_request_logs') WHERE name = ?1)",
+        [column],
+        |row| row.get(0),
     )?;
-    if has_tiers {
+    if exists {
         lock_unpoisoned(known).insert(path.to_path_buf());
     }
-    Ok(has_tiers)
+    Ok(exists)
 }
 
 fn open_query_connection(path: &Path) -> rusqlite::Result<Connection> {
@@ -2561,6 +2651,7 @@ fn query_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRequest
         codex_session_id: row.get(41)?,
         codex_session_is_parent: row.get(42)?,
         upstream_request_headers: row.get(45)?,
+        official_account_id: row.get(46)?,
     })
 }
 
@@ -2959,6 +3050,7 @@ mod tests {
             timestamp_unix_ms: 1,
             provider: Some("provider-a".to_string()),
             provider_name: Some("Provider A".to_string()),
+            official_account_id: None,
             requested_model: "alias/model".to_string(),
             model: Some("model".to_string()),
             reasoning_effort: Some("high".to_string()),
@@ -3092,6 +3184,87 @@ mod tests {
             ),
             (Some("flex"), Some("default"))
         );
+    }
+
+    #[test]
+    fn official_account_id_migrates_history_and_filters_one_account() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SQLITE_FILE_NAME);
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut legacy = sample_entry("legacy");
+        legacy.timestamp_unix_ms = unix_timestamp_ms();
+        sink.write_batch(&[queued(legacy)]).unwrap();
+        sink.connection
+            .execute_batch("ALTER TABLE route_request_logs DROP COLUMN official_account_id;")
+            .unwrap();
+        drop(sink);
+
+        // 旧库还没有账号列时查询照常返回，账号筛选被忽略而不是让查询失败。
+        let page = query_route_request_logs(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert!(page.items[0].official_account_id.is_none());
+        let filtered = query_route_request_logs(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery {
+                official_account_id: Some("account-b".into()),
+                ..RouteRequestLogQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.total, 1);
+
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        for (request_id, account_id) in [("first", "account-a"), ("second", "account-b")] {
+            let mut entry = sample_entry(request_id);
+            entry.timestamp_unix_ms = unix_timestamp_ms();
+            entry.official_account_id = Some(account_id.to_string());
+            sink.write_batch(&[queued(entry)]).unwrap();
+        }
+        let json = serde_json::to_value({
+            let mut named = sample_entry("named");
+            named.official_account_id = Some("account-b".into());
+            named
+        })
+        .unwrap();
+        assert_eq!(json["officialAccountId"], "account-b");
+
+        let query_for = |account_id: &str| {
+            query_route_request_logs(
+                directory.path(),
+                RouteRequestLogBackend::Sqlite,
+                RouteRequestLogQuery {
+                    official_account_id: Some(account_id.to_string()),
+                    ..RouteRequestLogQuery::default()
+                },
+            )
+            .unwrap()
+        };
+        let second = query_for("account-b");
+        assert_eq!(second.total, 1);
+        assert_eq!(second.items[0].request_id, "second");
+        assert_eq!(
+            second.items[0].official_account_id.as_deref(),
+            Some("account-b")
+        );
+        assert_eq!(query_for("account-a").items[0].request_id, "first");
+
+        let searched = query_route_request_logs(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery {
+                search: Some("account-a".into()),
+                ..RouteRequestLogQuery::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(searched.total, 1);
+        assert_eq!(searched.items[0].request_id, "first");
     }
 
     #[test]
@@ -3234,7 +3407,7 @@ mod tests {
         }
         .normalize()
         .unwrap();
-        let (filter, params) = sqlite_query_filters(&normalized);
+        let (filter, params) = sqlite_query_filters(&normalized, true);
         let plan = sink
             .connection
             .prepare(&format!(
@@ -3649,6 +3822,7 @@ mod tests {
             timestamp_unix_ms: 1,
             provider: None,
             provider_name: None,
+            official_account_id: None,
             requested_model: "requested".into(),
             model: None,
             reasoning_effort: None,
@@ -4025,6 +4199,7 @@ mod tests {
         probe.resolve_route(
             "provider-a",
             "Provider A",
+            Some("account-a"),
             "alias/model",
             "model",
             "api.example.com",
@@ -4055,6 +4230,10 @@ mod tests {
         assert_eq!(queued.entry.token_usage.total_tokens, Some(15));
         assert_eq!(queued.entry.codex_session_id.as_deref(), Some("thread-one"));
         assert!(!queued.entry.codex_session_is_parent);
+        assert_eq!(
+            queued.entry.official_account_id.as_deref(),
+            Some("account-a")
+        );
         assert_eq!(
             queued.entry.upstream_error_summary.as_deref(),
             Some(

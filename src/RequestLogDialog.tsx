@@ -18,12 +18,13 @@ import {
   IconX,
 } from "@tabler/icons-react";
 
-import type { Config, Profile } from "./App.types";
+import type { Config, OfficialAccount, OfficialAccountsResult, Profile } from "./App.types";
 import requestLogStyles from "./styles.request-log.css?inline";
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
 import { formatTimestamp } from "./formatters";
 import { QuotaEstimateDialog } from "./QuotaEstimateDialog";
+import { maskEmail } from "./sensitiveText";
 import {
   Badge,
   Button,
@@ -44,6 +45,7 @@ type RouteRequestLogItem = {
   timestampUnixMs: number;
   provider?: string | null;
   providerName?: string | null;
+  officialAccountId?: string | null;
   requestedModel: string;
   requestedServiceTier?: string | null;
   serviceTier?: string | null;
@@ -160,7 +162,7 @@ type ActionNotice = {
 
 export type RequestLogCatalog = {
   officialAccountAvailable: boolean;
-  profiles: Array<Pick<Profile, "id" | "name" | "sourceProviderId">>;
+  profiles: Array<Pick<Profile, "id" | "name" | "sourceProviderId" | "officialAccount" | "officialAccountId">>;
   selectedModelsByProvider: Config["selectedModelsByProvider"];
   declaredOfficialModelsByProvider: Config["declaredOfficialModelsByProvider"];
   upstreamModelsByProvider: Config["upstreamModelsByProvider"];
@@ -260,6 +262,7 @@ function RequestLogTable({ columns, rows = [], onRowAction }: {
 const groupByLabels: Record<string, string> = {
   model: "实际模型",
   provider: "供应商",
+  official_account: "官方账号",
   status: "状态",
   protocol: "上游协议",
   request_kind: "请求类型",
@@ -408,6 +411,8 @@ export function RequestLogDialog({
   const [quotaOpen, setQuotaOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [provider, setProvider] = useState("all");
+  const [officialAccount, setOfficialAccount] = useState("all");
+  const [officialAccounts, setOfficialAccounts] = useState<OfficialAccount[]>([]);
   const [model, setModel] = useState("all");
   const [status, setStatus] = useState("all");
   const [protocol, setProtocol] = useState("all");
@@ -509,11 +514,12 @@ export function RequestLogDialog({
     cursorMode: true, fromUnixMs, toUnixMs,
     ...(search ? { [searchMode === "requestId" ? "requestId" : searchMode === "sessionId" ? "sessionId" : "search"]: search } : {}),
     ...(optionalFilter(provider) ? { provider } : {}),
+    ...(optionalFilter(officialAccount) ? { officialAccountId: officialAccount } : {}),
     ...(optionalFilter(model) ? { model } : {}),
     ...(optionalFilter(status) ? { status } : {}),
     ...(optionalFilter(protocol) ? { protocol } : {}),
     ...(optionalFilter(requestKind) ? { requestKind } : {}),
-  }), [fromUnixMs, toUnixMs, search, searchMode, provider, model, status, protocol, requestKind]);
+  }), [fromUnixMs, toUnixMs, search, searchMode, provider, officialAccount, model, status, protocol, requestKind]);
   const cursor = page === 1 ? null : cursors[page - 1] ?? null;
   const health = stats?.recordingHealth;
   const dropped = health ? health.droppedFull + health.droppedClosed + health.writeDropped : 0;
@@ -531,6 +537,44 @@ export function RequestLogDialog({
       ...[...providers].map(([value, label]) => ({ label, value })),
     ];
   }, [catalog.profiles]);
+
+  // 独立托管的日志页只拿到配置本身，启动期能力标志可能缺失；存储账号的官方
+  // 线路自带凭据，只要配置里存在官方线路就读取账号列表，与线路列表口径一致。
+  const officialRoutesPresent = useMemo(
+    () => catalog.officialAccountAvailable === true
+      || catalog.profiles.some((profile) => profile.officialAccount || Boolean(profile.officialAccountId)),
+    [catalog.officialAccountAvailable, catalog.profiles],
+  );
+
+  // 官方账号只用于区分同一供应商下的多条官方线路，标签优先取邮箱。
+  useEffect(() => {
+    if (!opened || !officialRoutesPresent) return;
+    let active = true;
+    void invoke<OfficialAccountsResult>("list_official_accounts").then(
+      (result) => { if (active) setOfficialAccounts(result.accounts ?? []); },
+      () => { if (active) setOfficialAccounts([]); },
+    );
+    return () => { active = false; };
+  }, [opened, officialRoutesPresent]);
+
+  // 请求日志页可能被截图或分享，账号标签只显示脱敏后的邮箱。
+  const officialAccountLabels = useMemo(() => new Map(officialAccounts.map((account) => {
+    const email = account.email?.trim();
+    return [account.id, email ? maskEmail(email) : account.routeName?.trim() || account.id];
+  })), [officialAccounts]);
+
+  const officialAccountOptions = useMemo(() => [
+    { label: "全部官方账号", value: "all" },
+    ...officialAccounts.map((account) => ({
+      label: `${officialAccountLabels.get(account.id) ?? account.id}${account.isDefault ? "（默认）" : ""}`,
+      value: account.id,
+    })),
+  ], [officialAccounts, officialAccountLabels]);
+
+  const officialAccountLabel = useCallback((accountId?: string | null) => {
+    if (!accountId) return "—";
+    return officialAccountLabels.get(accountId) ?? accountId;
+  }, [officialAccountLabels]);
 
   const modelOptions = useMemo(() => {
     const models = new Set<string>(usedModels);
@@ -556,6 +600,7 @@ export function RequestLogDialog({
       toUnixMs,
       groupBy: "model",
       ...(optionalFilter(provider) ? { provider } : {}),
+      ...(optionalFilter(officialAccount) ? { officialAccountId: officialAccount } : {}),
     })
       .then((res) => {
         if (!active) return;
@@ -565,7 +610,7 @@ export function RequestLogDialog({
     return () => {
       active = false;
     };
-  }, [opened, fromUnixMs, toUnixMs, provider, validRange, refreshRevision]);
+  }, [opened, fromUnixMs, toUnixMs, provider, officialAccount, validRange, refreshRevision]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -638,6 +683,7 @@ export function RequestLogDialog({
     setSearchInput("");
     setSearch("");
     setProvider("all");
+    setOfficialAccount("all");
     setModel("all");
     setStatus("all");
     setProtocol("all");
@@ -697,6 +743,7 @@ export function RequestLogDialog({
   const hasFilters = Boolean(
     search ||
       provider !== "all" ||
+      officialAccount !== "all" ||
       model !== "all" ||
       status !== "all" ||
       protocol !== "all" ||
@@ -708,13 +755,14 @@ export function RequestLogDialog({
     let count = 0;
     if (search) count += 1;
     if (provider !== "all") count += 1;
+    if (officialAccount !== "all") count += 1;
     if (model !== "all") count += 1;
     if (status !== "all") count += 1;
     if (protocol !== "all") count += 1;
     if (requestKind !== "all") count += 1;
     if (timeRange !== "24h") count += 1;
     return count;
-  }, [search, provider, model, status, protocol, requestKind, timeRange]);
+  }, [search, provider, officialAccount, model, status, protocol, requestKind, timeRange]);
   const firstVisible = result?.items.length ? (page - 1) * pageSize + 1 : 0;
   const lastVisible = result?.items.length ? firstVisible + result.items.length - 1 : 0;
   const totalCount = stats?.total ?? result?.total ?? 0;
@@ -725,7 +773,7 @@ export function RequestLogDialog({
   return (
     <div className="request-log-workspace relative flex h-full min-h-0 flex-1 flex-col">
       <style>{requestLogStyles}</style>
-      {quotaOpen && catalog.officialAccountAvailable === true && <QuotaEstimateDialog container={standalone ? document.body : container} onClose={() => setQuotaOpen(false)} />}
+      {quotaOpen && officialRoutesPresent && <QuotaEstimateDialog container={standalone ? document.body : container} onClose={() => setQuotaOpen(false)} />}
       <div className="request-log-header">
         <div className="request-log-heading">
           <div><p className="request-log-eyebrow">CODEY / 内置路由</p><h1>请求日志</h1></div>
@@ -763,7 +811,7 @@ export function RequestLogDialog({
         </div>
 
         <div className="request-log-actions">
-          {catalog.officialAccountAvailable === true && (
+          {officialRoutesPresent && (
             <Button variant="link" color="primary" size="sm" onClick={() => setQuotaOpen(true)}>周限额度估算</Button>
           )}
           <Button
@@ -878,6 +926,18 @@ export function RequestLogDialog({
                 resetPagination();
               }}
             />
+
+            {officialAccounts.length > 0 ? <Select
+              aria-label="按官方账号筛选请求日志"
+              className="w-40 shrink-0"
+              filter
+              optionList={officialAccountOptions}
+              value={officialAccount}
+              onChange={(value) => {
+                setOfficialAccount(String(value ?? "all"));
+                resetPagination();
+              }}
+            /> : null}
 
             <Select
               aria-label="按实际模型筛选请求日志"
@@ -1014,6 +1074,9 @@ export function RequestLogDialog({
                     optionList={[
                       { label: "按实际模型统计", value: "model" },
                       { label: "按供应商统计", value: "provider" },
+                      ...(officialAccounts.length > 0
+                        ? [{ label: "按官方账号统计", value: "official_account" }]
+                        : []),
                       { label: "按状态统计", value: "status" },
                       { label: "按协议统计", value: "protocol" },
                       { label: "按请求类型统计", value: "request_kind" },
@@ -1217,7 +1280,9 @@ export function RequestLogDialog({
                                 const rate = group.successRate;
                                 const label = (groupBy === "provider"
                                   ? providerOptions.find((option) => option.value === group.key)?.label
-                                  : undefined) || group.key || "未知";
+                                  : groupBy === "official_account"
+                                    ? officialAccountLabels.get(group.key)
+                                    : undefined) || group.key || "未知";
                                 return (
                                   <tr key={group.key} className="transition-colors hover:bg-blue-50/30">
                                     <td className="py-1 px-2.5 text-[#1d1d1f]" title={label}>
@@ -1402,6 +1467,15 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                             >
                               {item.providerName || item.provider || "—"}
                             </strong>
+                            {item.officialAccountId ? (
+                              <span
+                                className="flex min-w-0 items-center gap-1 text-[10px] text-[#48484a]"
+                                title={`官方账号：${officialAccountLabel(item.officialAccountId)}`}
+                              >
+                                <span className="shrink-0 rounded bg-blue-50 px-1 py-px text-blue-600">官方账号</span>
+                                <span className="truncate">{officialAccountLabel(item.officialAccountId)}</span>
+                              </span>
+                            ) : null}
                             {item.upstreamAuthority ? (
                               <span
                                 className="truncate font-mono text-[10px] text-[#8e8e93]"
@@ -1849,6 +1923,17 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                       {selectedItem.providerName || selectedItem.provider || "—"}
                     </dd>
                   </div>
+                  {selectedItem.officialAccountId ? (
+                    <div>
+                      <dt className="text-[11px] text-[#8e8e93]">官方账号</dt>
+                      <dd
+                        className="m-0 mt-0.5 truncate font-medium text-[#1d1d1f]"
+                        title={officialAccountLabel(selectedItem.officialAccountId)}
+                      >
+                        {officialAccountLabel(selectedItem.officialAccountId)}
+                      </dd>
+                    </div>
+                  ) : null}
                   <div>
                     <dt className="text-[11px] text-[#8e8e93]">请求模型</dt>
                     <dd className="m-0 mt-0.5 font-medium text-[#1d1d1f]">

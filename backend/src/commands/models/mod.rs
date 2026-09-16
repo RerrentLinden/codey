@@ -16,8 +16,7 @@ use crate::cdp;
 use crate::codex_config::codex_home;
 use crate::codex_provider;
 use crate::config::{
-    CodeyConfig, DERIVED_OFFICIAL_PROFILE_ID, OFFICIAL_ROUTE_SHORT_NAME, ProviderProfile,
-    validate_provider_profiles,
+    CodeyConfig, OFFICIAL_ROUTE_SHORT_NAME, ProviderProfile, validate_provider_profiles,
 };
 use crate::error_log;
 use crate::local_router;

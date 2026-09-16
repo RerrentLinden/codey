@@ -716,7 +716,7 @@ export function App({
         ...(upstreamProxy === undefined ? {} : { upstreamProxy }),
       });
       applyRouteResult(modelResult);
-      // 官方线路的线路名、短名称和代理存放在默认账号记录里，重启派生时会重新读回。
+      // 官方线路的线路名、短名称和代理存放在所属账号记录里，重启派生时会重新读回。
       if (routeSettings) {
         const settingsResult = await invoke<import("./App.types").OfficialAccountsResult>(
           "save_official_account_route_settings",

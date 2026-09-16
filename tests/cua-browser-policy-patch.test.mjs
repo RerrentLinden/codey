@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -101,6 +101,73 @@ test("official plugin configuration selects an atomic cached copy and keeps orig
     changed.env.NODE_REPL_NODE_MODULE_DIRS = otherModules;
     await context.__CODEY_PREPARE_CUA_COMPATIBILITY_LAUNCHER__(changed);
     assert.equal(changed.args[0], launcher);
+    assert.equal(warnings.length, 1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("direct runtime configurations redirect the mapped browser service", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "codey-cua-direct-"));
+  const warnings = [];
+  const context = vm.createContext({ process, console: { warn: (message) => warnings.push(message) },
+    recordCodeyPatchFailure() {} });
+  vm.runInContext(compatibility, context);
+  try {
+    const modules = join(directory, "cua_node", "lib", "node_modules");
+    const service = join(modules, "@oai", "browser-desktop", "scripts", "browser-service.mjs");
+    const runtime = join(modules, "@oai", "cua-repl", "bin", "cua-repl.mjs");
+    await mkdir(dirname(service), { recursive: true });
+    await writeFile(service, policy);
+    const config = { enabled: true, env: {
+      CODEX_HOME: directory, NODE_REPL_NODE_MODULE_DIRS: modules,
+      NODE_REPL_TRUSTED_CODE_PATHS: [directory, modules].join(delimiter),
+      CUA_REPL_ENABLED_SURFACES: "browser,computer",
+      NODE_REPL_TRUSTED_SERVICES: JSON.stringify({ browser: "@oai/browser-desktop/service", sky: "@oai/sky/service" }),
+    } };
+    const original = structuredClone(config);
+    // 与新版主包一致：属性名被压缩，launcher 通过成员表达式拼接。
+    const fixture = 'async function configure(e){let c=e;const n={dirs:"NODE_REPL_NODE_MODULE_DIRS"},p={default:{join:(d,x)=>d+"/"+x}};c.env.CUA_REPL_NODE_REPL_PATH="official";e.env!=null&&(c.command="official-node",c.args=[p.default.join(e.env[n.dirs],`@oai/cua-repl/bin/cua-repl.mjs`)]);return c;}';
+    vm.runInContext(context.__CODEY_PATCH_CODEX_CUA_PLUGIN_CONFIG__(fixture), context);
+    const configured = await context.configure(config);
+    assert.equal(configured.args[0], runtime);
+    assert.equal(configured.command, "official-node");
+    const services = JSON.parse(configured.env.NODE_REPL_TRUSTED_SERVICES);
+    assert.equal(services.sky, "@oai/sky/service");
+    assert.equal(dirname(dirname(services.browser)), join(directory, ".tmp", "codey-cua"));
+    const cached = await readFile(services.browser, "utf8");
+    assert.match(cached, /networkTimeoutMs:25e3/);
+    assert.match(cached, /Unable to load browser request-header policy\./);
+    assert.deepEqual(await readdir(dirname(services.browser)), ["browser-service.mjs"]);
+    assert.equal(await readFile(service, "utf8"), policy);
+    const again = structuredClone(original);
+    await context.__CODEY_PREPARE_CUA_COMPATIBILITY_LAUNCHER__(again);
+    assert.equal(JSON.parse(again.env.NODE_REPL_TRUSTED_SERVICES).browser, services.browser);
+    assert.equal(warnings.length, 0);
+    // A build that names the bundled browser implementation by path keeps that
+    // implementation and replaces only the file that is actually loaded.
+    const pluginService = join(directory, "plugins", "browser", "scripts", "browser-service.mjs");
+    await mkdir(dirname(pluginService), { recursive: true });
+    await writeFile(pluginService, ["// browser plugin service", policy].join("\n"));
+    const mapped = { enabled: true, env: { ...structuredClone(original.env),
+      NODE_REPL_TRUSTED_SERVICES: JSON.stringify({ browser: pluginService, sky: "@oai/sky/service" }) } };
+    await context.__CODEY_PREPARE_CUA_COMPATIBILITY_LAUNCHER__(mapped);
+    const mappedServices = JSON.parse(mapped.env.NODE_REPL_TRUSTED_SERVICES);
+    assert.notEqual(mappedServices.browser, pluginService);
+    const mappedCache = await readFile(mappedServices.browser, "utf8");
+    assert.match(mappedCache, /^\/\/ browser plugin service/);
+    assert.match(mappedCache, /networkTimeoutMs:25e3/);
+    assert.equal(await readFile(pluginService, "utf8"), ["// browser plugin service", policy].join("\n"));
+    assert.equal(warnings.length, 0);
+
+    // A build whose browser service no longer matches the policy anchors keeps
+    // the configured specifier and reports the skipped compatibility patch.
+    const otherModules = join(directory, "updated-modules");
+    const otherService = join(otherModules, "@oai", "browser-desktop", "scripts", "browser-service.mjs");
+    await mkdir(dirname(otherService), { recursive: true });
+    await writeFile(otherService, "changed upstream runtime");
+    const changed = structuredClone(original);
+    changed.env.NODE_REPL_NODE_MODULE_DIRS = otherModules;
+    await context.__CODEY_PREPARE_CUA_COMPATIBILITY_LAUNCHER__(changed);
+    assert.equal(changed.env.NODE_REPL_TRUSTED_SERVICES, original.env.NODE_REPL_TRUSTED_SERVICES);
     assert.equal(warnings.length, 1);
   } finally { await rm(directory, { recursive: true, force: true }); }
 });

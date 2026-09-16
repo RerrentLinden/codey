@@ -2,8 +2,24 @@ use super::*;
 
 impl RouterServer {
     pub(crate) async fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
-        if request_looks_like_responses_websocket(&stream).await? {
-            return self.handle_responses_websocket(stream).await;
+        match probe_responses_websocket(&stream).await? {
+            ResponsesWebSocketProbe::Upgrade => {
+                return self.handle_responses_websocket(stream).await;
+            }
+            ResponsesWebSocketProbe::Http => {}
+            ResponsesWebSocketProbe::Silent => {
+                // 空闲或半开连接不会发出请求，和普通 HTTP 路径的读取超时一样
+                // 回一个 408 即可；对端可能已经断开，这里只做尽力回复。
+                let _ = write_error_response(
+                    &mut stream,
+                    408,
+                    "request_timeout",
+                    "读取本地路由请求超时",
+                    None,
+                )
+                .await;
+                return Ok(());
+            }
         }
         let pending =
             match tokio::time::timeout(REQUEST_READ_TIMEOUT, read_http_request_head(&mut stream))
@@ -158,6 +174,7 @@ impl RouterServer {
                 #[serde(rename_all = "camelCase")]
                 struct UsageQuery {
                     force_refresh: Option<bool>,
+                    account_id: Option<String>,
                 }
                 let args = match serde_json::from_slice::<UsageQuery>(&request.body) {
                     Ok(args) => args,
@@ -166,27 +183,86 @@ impl RouterServer {
                         return Ok(());
                     }
                 };
-                let official_proxy = self
-                    .snapshot
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .routes
-                    .values()
-                    .find(|route| route.official_account)
-                    .map(|route| route.upstream_proxy.clone());
-                let value = if official_proxy.is_none() {
-                    json!({"status": "unavailable", "reason": "official_account_missing", "message": "当前线路列表中没有可用的官方账号线路"})
-                } else if let Some(home) = self.official_auth_path.parent() {
-                    let mut cache = self.account_usage_cache.lock().await;
-                    crate::account_usage::query_snapshot(
-                        &mut cache,
-                        home,
-                        args.force_refresh.unwrap_or(false),
-                        official_proxy.flatten().as_deref(),
-                    )
-                    .await
-                } else {
-                    json!({"status": "error", "message": "官方账号目录无效"})
+                let requested_account = args
+                    .account_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|account_id| !account_id.is_empty());
+                let route = {
+                    let snapshot = self
+                        .snapshot
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match requested_account {
+                        Some(account_id) => snapshot
+                            .routes
+                            .values()
+                            .find(|route| {
+                                route.official_account
+                                    && route
+                                        .official_auth
+                                        .as_ref()
+                                        .is_some_and(|auth| auth.account_id == account_id)
+                            })
+                            .cloned(),
+                        // 没有账号参数时读取默认账号，页头额度要跟客户端登录身份一致。
+                        None => snapshot
+                            .default_official_provider
+                            .as_deref()
+                            .and_then(|provider_id| snapshot.routes.get(provider_id))
+                            .filter(|route| route.official_account)
+                            .cloned(),
+                    }
+                };
+                let value = match route {
+                    None => {
+                        json!({"status": "unavailable", "reason": "official_account_missing", "message": "当前线路列表中没有可用的官方账号线路"})
+                    }
+                    Some(route) => {
+                        // 每个账号读取自己的凭据文档，额度查询也走该线路的出口代理。
+                        let auth_path = route
+                            .official_auth
+                            .as_ref()
+                            .map(|auth| auth.path.clone())
+                            .unwrap_or_else(|| self.official_auth_path.clone());
+                        let mut cache = self.account_usage_cache.lock().await;
+                        crate::account_usage::query_snapshot_at(
+                            cache.for_auth_path(&auth_path),
+                            &auth_path,
+                            args.force_refresh.unwrap_or(false),
+                            route.upstream_proxy.as_deref(),
+                        )
+                        .await
+                    }
+                };
+                write_json_response(&mut stream, 200, &value).await?;
+            }
+            // 系统浏览器里的请求日志页只能经由本地路由访问后端；账号筛选、账号名
+            // 显示和按账号推算额度都依赖同一份账号目录。这里只读取账号文档，不再
+            // 同步 Codex 登录，避免浏览器的只读页面改动登录状态。
+            ("POST", "/codey/api/list_official_accounts") => {
+                let store = crate::official_accounts::OfficialAccountStore::for_config_path(
+                    &crate::config::default_config_path(),
+                );
+                let value = match tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
+                    let default_account_id = store.default_account_id()?;
+                    Ok(json!({
+                        "status": "ok",
+                        "accounts": store.summaries()?,
+                        "defaultAccountId": default_account_id,
+                    }))
+                })
+                .await
+                {
+                    Ok(Ok(value)) => value,
+                    Ok(Err(error)) => json!({
+                        "status": "error",
+                        "message": format!("读取官方账号列表失败：{error:#}"),
+                    }),
+                    Err(error) => json!({
+                        "status": "error",
+                        "message": format!("读取官方账号列表任务异常退出：{error}"),
+                    }),
                 };
                 write_json_response(&mut stream, 200, &value).await?;
             }
@@ -398,6 +474,10 @@ impl RouterServer {
             probe.resolve_route(
                 &route.provider_id,
                 &route.route_name,
+                route
+                    .official_auth
+                    .as_ref()
+                    .map(|auth| auth.account_id.as_str()),
                 model,
                 model,
                 &route.upstream_authority,
@@ -657,11 +737,16 @@ impl RouterServer {
         // 请求外发，避免向上游暴露代理痕迹。
         apply_upstream_headers(&mut headers, prepared_headers);
         if route.official_account {
+            let (auth_path, accepts_incoming_authorization) = match &route.official_auth {
+                Some(auth) => (auth.path.as_path(), auth.accepts_incoming_authorization),
+                None => (self.official_auth_path.as_path(), true),
+            };
             let official_auth = resolve_official_upstream_auth(
                 request,
                 &self.bearer_token,
-                &self.official_auth_path,
+                auth_path,
                 &self.official_auth_cache,
+                accepts_incoming_authorization,
             )
             .await
             .ok_or_else(|| {
@@ -1361,6 +1446,11 @@ impl RouterServer {
             probe.resolve_route(
                 &resolved.provider_id,
                 &resolved.route.route_name,
+                resolved
+                    .route
+                    .official_auth
+                    .as_ref()
+                    .map(|auth| auth.account_id.as_str()),
                 &resolved.requested_model,
                 &resolved.upstream_model,
                 &resolved.route.upstream_authority,
@@ -1668,6 +1758,16 @@ impl RouterServer {
                     .await;
             }
         };
+        // 部分第三方 thinking 线路要求把上一轮的 reasoning 明文原样回传，而 Codex
+        // 回放历史时只保留加密字段。首次仍按原样发送，只有上游明确报出
+        // reasoning_text 缺失时才补齐占位明文重发一次。官方线路沿用加密推理语义，
+        // 不参与该回退。
+        let reasoning_text_retry_allowed = bridge == ProtocolBridge::NativeResponses
+            && request_kind == ResponsesRequestKind::Create
+            && !compacting
+            && !resolved.route.official_account;
+        // 重发需要同一份请求头和完整请求体，只有可能重发时才保留。
+        let retry_headers = reasoning_text_retry_allowed.then(|| headers.clone());
         let mut request_builder = upstream_client.post(upstream_url).headers(headers);
         // 压缩请求不设置 reqwest 总期限:该期限从建连算到响应体读完,会把耗时较长的
         // 压缩中途截断。等待响应头由 response_header_timeout 约束,响应体读取由
@@ -1706,7 +1806,8 @@ impl RouterServer {
             drop(encoded_body.take());
             request_builder.json(&upstream_body)
         };
-        drop(upstream_body);
+        // 重发需要完整请求体，只有可能重发时才继续持有它。
+        let mut retryable_body = retry_headers.is_some().then_some(upstream_body);
         let response_header_timeout = if compacting {
             // 流式压缩在生成期间持续返回事件，非流式压缩要到生成结束后才返回
             // 响应头，两者的等待期限不同，都只约束响应头。
@@ -1741,130 +1842,119 @@ impl RouterServer {
             drop(std::mem::take(&mut request.body));
             drop(request._body_budget_permit.take());
         }
-        let response = match response_result {
-            Ok(Ok(response)) => response,
-            Ok(Err(error)) if compacting && error.is_timeout() => {
-                return downstream
-                    .write_error(
-                        504,
-                        "compaction_timeout",
-                        "远程压缩超过总时限，原始会话历史未被 Codey 修改，请稍后重试".into(),
-                        Some(&resolved.route),
-                    )
-                    .await;
-            }
-            Ok(Err(error)) => {
-                let timeout = error.is_timeout();
-                let connect = error.is_connect();
-                let sanitized_error = error.without_url().to_string();
-                record_router_failure_nonblocking(
-                    "local_router_upstream_failed",
-                    "proxy_local_router_request",
-                    sanitized_error,
-                    serde_json::json!({
-                        "routeId": resolved.provider_id.as_str(),
-                        "routeName": resolved.route.route_name.as_str(),
-                        "requestedModel": resolved.requested_model.as_str(),
-                        "model": resolved.upstream_model.as_str(),
-                        "timeout": timeout,
-                        "connect": connect,
-                        "upstream": resolved.route.upstream_authority.as_str(),
-                        "upstreamProtocol": bridge.upstream_protocol().label(),
-                        "protocolBridge": bridge.label(),
-                        "requestKind": request_kind.label(),
-                        "upstreamStream": upstream_stream_requested,
-                        "responseHeaderTimeoutSeconds": response_header_timeout.as_secs(),
-                        "requestId": current_router_request_id(),
-                    }),
-                );
-                let route_name = route_display_name(&resolved.route);
-                let upstream = resolved.route.upstream_authority.as_str();
-                let (status, code, message) = if timeout {
-                    (
-                        504,
-                        "upstream_timeout",
-                        format!(
-                            "Codey 线路「{route_name}」请求上游 {upstream} 超时；请检查上游服务状态或网络连接"
-                        ),
-                    )
-                } else {
-                    (
-                        424,
-                        "upstream_unreachable",
-                        format!(
-                            "Codey 线路「{route_name}」无法连接上游 {upstream}；请确认上游服务已启动，并检查线路 URL、证书和网络设置"
-                        ),
-                    )
-                };
-                // Codex currently reduces JSON bodies from locally generated
-                // gateway failures to "Unknown error". A concise text body is
-                // preserved in its surfaced `unexpected status` message. A
-                // transport setup failure uses non-retryable 424 so Codex does
-                // not repeat the same deterministic failure four more times.
-                downstream.write_text_error(status, code, message).await?;
-                return Ok(());
-            }
-            Err(_) => {
-                record_router_failure_nonblocking(
-                    "local_router_upstream_failed",
-                    "wait_for_local_router_upstream_headers",
-                    "等待上游响应头超时",
-                    serde_json::json!({
-                        "routeId": resolved.provider_id.as_str(),
-                        "routeName": resolved.route.route_name.as_str(),
-                        "requestedModel": resolved.requested_model.as_str(),
-                        "model": resolved.upstream_model.as_str(),
-                        "timeout": true,
-                        "stage": "response_headers",
-                        "upstream": resolved.route.upstream_authority.as_str(),
-                        "upstreamProtocol": bridge.upstream_protocol().label(),
-                        "protocolBridge": bridge.label(),
-                        "requestKind": request_kind.label(),
-                        "upstreamStream": upstream_stream_requested,
-                        "responseHeaderTimeoutSeconds": response_header_timeout.as_secs(),
-                        "requestId": current_router_request_id(),
-                    }),
-                );
-                if compacting {
-                    // 压缩的等待期限与普通请求不同，失败保持压缩专用的结构化
-                    // 错误码，客户端据此显示可重试的压缩超时提示。
-                    downstream
-                        .write_error(
-                            504,
-                            "compaction_timeout",
-                            format!(
-                                "远程压缩等待上游 {} 返回响应头超时，原始会话历史未被 Codey 修改，请稍后重试",
-                                resolved.route.upstream_authority
-                            ),
-                            Some(&resolved.route),
-                        )
-                        .await?;
-                } else {
-                    downstream
-                        .write_text_error(
-                            504,
-                            "upstream_header_timeout",
-                            format!(
-                                "Codey 线路「{}」等待上游 {} 返回响应头超时",
-                                route_display_name(&resolved.route),
-                                resolved.route.upstream_authority
-                            ),
-                        )
-                        .await?;
-                }
-                return Ok(());
-            }
+        let Some(response) = Self::finish_upstream_http_send(
+            downstream,
+            response_result,
+            response_header_timeout,
+            &resolved,
+            bridge,
+            request_kind,
+            upstream_stream_requested,
+            compacting,
+        )
+        .await?
+        else {
+            return Ok(());
         };
-        if let Some(probe) = downstream.request_log_probe() {
-            let upstream_request_id = upstream_request_id_from_headers(response.headers());
-            probe.mark_upstream_headers(response.status().as_u16(), upstream_request_id.as_deref());
+        let mut upstream_status = response.status().as_u16();
+        let mut upstream_request_id = upstream_request_id_from_headers(response.headers());
+        let mut upstream_response = Some(response);
+        let mut preloaded_error_body = None;
+        if upstream_status == 400
+            && let Some(retry_headers) = retry_headers
+        {
+            let response = upstream_response
+                .take()
+                .expect("first upstream response is still held here");
+            let probe = downstream.request_log_probe().cloned();
+            let body = await_upstream(
+                downstream,
+                read_bounded_upstream_error_body(response, probe.as_ref()),
+            )
+            .await??;
+            if requires_reasoning_text_fallback(&body)
+                && let Some(retryable_body) = retryable_body.as_mut()
+                && fill_missing_reasoning_text(retryable_body)
+            {
+                let encoded = serde_json::to_vec(retryable_body)
+                    .context("序列化补齐 reasoning 明文的 Responses 请求失败")?;
+                if let Some(probe) = downstream.request_log_probe() {
+                    probe.mark_fallback("reasoning_text_placeholder_retry");
+                    probe.mark_upstream_send(if upstream_stream_requested {
+                        UpstreamTransport::HttpSse
+                    } else {
+                        UpstreamTransport::Http
+                    });
+                }
+                let retry_result = await_upstream(
+                    downstream,
+                    tokio::time::timeout(
+                        response_header_timeout,
+                        upstream_client
+                            .post(upstream_url)
+                            .headers(retry_headers)
+                            .body(encoded)
+                            .send(),
+                    ),
+                )
+                .await?;
+                let Some(retried) = Self::finish_upstream_http_send(
+                    downstream,
+                    retry_result,
+                    response_header_timeout,
+                    &resolved,
+                    bridge,
+                    request_kind,
+                    upstream_stream_requested,
+                    compacting,
+                )
+                .await?
+                else {
+                    return Ok(());
+                };
+                upstream_status = retried.status().as_u16();
+                upstream_request_id = upstream_request_id_from_headers(retried.headers());
+                upstream_response = Some(retried);
+            } else {
+                preloaded_error_body = Some(body);
+            }
         }
+        if let Some(probe) = downstream.request_log_probe() {
+            probe.mark_upstream_headers(upstream_status, upstream_request_id.as_deref());
+        }
+        // 首次错误正文已经读完且没有重发时，直接把它写回下游。
+        let Some(response) = upstream_response else {
+            return write_upstream_http_error(
+                downstream,
+                upstream_status,
+                upstream_request_id.as_deref(),
+                preloaded_error_body.as_deref().unwrap_or_default(),
+                &resolved,
+                bridge,
+                request_kind,
+            )
+            .await;
+        };
         let result = match bridge {
             // Every upstream protocol surfaces its real HTTP status. Mapping
             // Anthropic 4xx to 502 made Codex retry non-retryable failures.
             _ if !response.status().is_success() => {
-                write_upstream_http_error(downstream, response, &resolved, bridge, request_kind)
-                    .await
+                let probe = downstream.request_log_probe().cloned();
+                let body = await_upstream(
+                    downstream,
+                    read_bounded_upstream_error_body(response, probe.as_ref()),
+                )
+                .await??;
+                write_upstream_http_error(
+                    downstream,
+                    upstream_status,
+                    upstream_request_id.as_deref(),
+                    &body,
+                    &resolved,
+                    bridge,
+                    request_kind,
+                )
+                .await
             }
             _ if compacting => {
                 write_validated_compaction(
@@ -1919,6 +2009,151 @@ impl RouterServer {
                 .await;
         }
         result
+    }
+
+    /// 把上游 HTTP 发送结果转换成可用的响应；传输层失败会记录并写回下游，
+    /// 返回 None 表示调用方直接结束请求。
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_upstream_http_send<D>(
+        downstream: &mut D,
+        response_result: std::result::Result<
+            std::result::Result<reqwest::Response, reqwest::Error>,
+            tokio::time::error::Elapsed,
+        >,
+        response_header_timeout: Duration,
+        resolved: &RouteSelection,
+        bridge: ProtocolBridge,
+        request_kind: ResponsesRequestKind,
+        upstream_stream_requested: bool,
+        compacting: bool,
+    ) -> Result<Option<reqwest::Response>>
+    where
+        D: ResponsesDownstream + ?Sized,
+    {
+        let response = match response_result {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) if compacting && error.is_timeout() => {
+                let detail = sanitize_upstream_error_text(
+                    &error.without_url().to_string(),
+                    &resolved.route,
+                    256,
+                )
+                .unwrap_or_else(|| "上游未在期限内返回响应头".to_string());
+                downstream
+                    .write_error(
+                        504,
+                        "compaction_timeout",
+                        format!(
+                            "远程压缩等待上游响应超时（{detail}），原始会话历史未被 Codey 修改，请稍后重试"
+                        ),
+                        Some(&resolved.route),
+                    )
+                    .await?;
+                return Ok(None);
+            }
+            Ok(Err(error)) => {
+                let timeout = error.is_timeout();
+                let connect = error.is_connect();
+                let sanitized_error = error.without_url().to_string();
+                record_router_failure_nonblocking(
+                    "local_router_upstream_failed",
+                    "proxy_local_router_request",
+                    sanitized_error,
+                    serde_json::json!({
+                        "routeId": resolved.provider_id.as_str(),
+                        "routeName": resolved.route.route_name.as_str(),
+                        "requestedModel": resolved.requested_model.as_str(),
+                        "model": resolved.upstream_model.as_str(),
+                        "timeout": timeout,
+                        "connect": connect,
+                        "upstream": resolved.route.upstream_authority.as_str(),
+                        "upstreamProtocol": bridge.upstream_protocol().label(),
+                        "protocolBridge": bridge.label(),
+                        "requestKind": request_kind.label(),
+                        "upstreamStream": upstream_stream_requested,
+                        "responseHeaderTimeoutSeconds": response_header_timeout.as_secs(),
+                        "requestId": current_router_request_id(),
+                    }),
+                );
+                let route_name = route_display_name(&resolved.route);
+                let upstream = resolved.route.upstream_authority.as_str();
+                let (status, code, message) = if timeout {
+                    (
+                        504,
+                        "upstream_timeout",
+                        format!(
+                            "Codey 线路「{route_name}」请求上游 {upstream} 超时；请检查上游服务状态或网络连接"
+                        ),
+                    )
+                } else {
+                    (
+                        424,
+                        "upstream_unreachable",
+                        format!(
+                            "Codey 线路「{route_name}」无法连接上游 {upstream}；请确认上游服务已启动，并检查线路 URL、证书和网络设置"
+                        ),
+                    )
+                };
+                // Codex currently reduces JSON bodies from locally generated
+                // gateway failures to "Unknown error". A concise text body is
+                // preserved in its surfaced `unexpected status` message. A
+                // transport setup failure uses non-retryable 424 so Codex does
+                // not repeat the same deterministic failure four more times.
+                downstream.write_text_error(status, code, message).await?;
+                return Ok(None);
+            }
+            Err(_) => {
+                record_router_failure_nonblocking(
+                    "local_router_upstream_failed",
+                    "wait_for_local_router_upstream_headers",
+                    "等待上游响应头超时",
+                    serde_json::json!({
+                        "routeId": resolved.provider_id.as_str(),
+                        "routeName": resolved.route.route_name.as_str(),
+                        "requestedModel": resolved.requested_model.as_str(),
+                        "model": resolved.upstream_model.as_str(),
+                        "timeout": true,
+                        "stage": "response_headers",
+                        "upstream": resolved.route.upstream_authority.as_str(),
+                        "upstreamProtocol": bridge.upstream_protocol().label(),
+                        "protocolBridge": bridge.label(),
+                        "requestKind": request_kind.label(),
+                        "upstreamStream": upstream_stream_requested,
+                        "responseHeaderTimeoutSeconds": response_header_timeout.as_secs(),
+                        "requestId": current_router_request_id(),
+                    }),
+                );
+                if compacting {
+                    // 压缩的等待期限与普通请求不同，失败保持压缩专用的结构化
+                    // 错误码，客户端据此显示可重试的压缩超时提示。
+                    downstream
+                        .write_error(
+                            504,
+                            "compaction_timeout",
+                            format!(
+                                "远程压缩等待上游 {} 返回响应头超时，原始会话历史未被 Codey 修改，请稍后重试",
+                                resolved.route.upstream_authority
+                            ),
+                            Some(&resolved.route),
+                        )
+                        .await?;
+                } else {
+                    downstream
+                        .write_text_error(
+                            504,
+                            "upstream_header_timeout",
+                            format!(
+                                "Codey 线路「{}」等待上游 {} 返回响应头超时",
+                                route_display_name(&resolved.route),
+                                resolved.route.upstream_authority
+                            ),
+                        )
+                        .await?;
+                }
+                return Ok(None);
+            }
+        };
+        Ok(Some(response))
     }
 }
 

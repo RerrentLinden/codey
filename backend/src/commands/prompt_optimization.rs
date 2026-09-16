@@ -90,7 +90,7 @@ fn codey_route_model_uses_official_account(
 
     let mut raw_match = None;
     for profile in &config.profiles {
-        if profile.official_account && !config.official_account_available_this_launch {
+        if profile.official_account && !config.official_route_usable(profile) {
             continue;
         }
         let provider_id = profile.provider_id();

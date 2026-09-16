@@ -16,12 +16,18 @@ pub(crate) async fn resolve_official_upstream_auth(
     request: &HttpRequest,
     router_bearer_token: &str,
     auth_path: &Path,
-    auth_cache: &Mutex<crate::account_usage::OfficialAuthCache>,
+    auth_caches: &Mutex<crate::account_usage::OfficialAuthCaches>,
+    // Only the account Codex itself is logged in as may reuse the token the
+    // downstream request carries. Every other account reads its own document,
+    // so one conversation never spends another account's login.
+    accepts_incoming_authorization: bool,
 ) -> Option<OfficialUpstreamAuth> {
-    if let Some(authorization) = incoming_openai_authorization(request, router_bearer_token) {
+    if accepts_incoming_authorization
+        && let Some(authorization) = incoming_openai_authorization(request, router_bearer_token)
+    {
         let account_id = match incoming_chatgpt_account_id(request) {
             Some(account_id) => Some(account_id),
-            None => read_cached_official_auth(auth_path, auth_cache)
+            None => read_cached_official_auth(auth_path, auth_caches)
                 .await
                 .and_then(|auth| auth.account_id),
         };
@@ -31,7 +37,7 @@ pub(crate) async fn resolve_official_upstream_auth(
         });
     }
 
-    let auth = read_cached_official_auth(auth_path, auth_cache).await?;
+    let auth = read_cached_official_auth(auth_path, auth_caches).await?;
     Some(OfficialUpstreamAuth {
         authorization: format!("Bearer {}", auth.access_token),
         // The account ID stored with the selected OAuth token is authoritative.
@@ -45,26 +51,28 @@ pub(crate) async fn resolve_official_upstream_auth(
 
 pub(crate) async fn read_cached_official_auth(
     auth_path: &Path,
-    auth_cache: &Mutex<crate::account_usage::OfficialAuthCache>,
+    auth_caches: &Mutex<crate::account_usage::OfficialAuthCaches>,
 ) -> Option<crate::account_usage::OfficialAuth> {
     let now = Instant::now();
-    if let Some(cached) = auth_cache
+    if let Some(cached) = auth_caches
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .for_path(auth_path)
         .get(now)
     {
         return cached.ok();
     }
 
-    let auth_path = auth_path.to_path_buf();
+    let read_path = auth_path.to_path_buf();
     let result =
-        tokio::task::spawn_blocking(move || crate::account_usage::read_official_auth(&auth_path))
+        tokio::task::spawn_blocking(move || crate::account_usage::read_official_auth(&read_path))
             .await
             .ok()?;
     let now = Instant::now();
-    let mut cache = auth_cache
+    let mut caches = auth_caches
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let cache = caches.for_path(auth_path);
     if let Some(cached) = cache.get(now) {
         return cached.ok();
     }

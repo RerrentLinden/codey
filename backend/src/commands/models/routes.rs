@@ -34,8 +34,14 @@ pub(crate) fn config_after_route_deletion(
     previous: &CodeyConfig,
     route_id: &str,
 ) -> Result<CodeyConfig, String> {
-    if route_id == DERIVED_OFFICIAL_PROFILE_ID {
-        return Err("官方账号线路由当前 Codex 登录状态管理，不能手动删除".to_string());
+    // 每条官方线路都由官方账号列表派生，删除后仍会在下次派生时回来，因此统一
+    // 引导用户去账号列表移除账号。
+    if previous
+        .profiles
+        .iter()
+        .any(|profile| profile.id == route_id && profile.official_account)
+    {
+        return Err("官方账号线路跟随账号列表自动生成，请在官方账号列表里移除该账号".to_string());
     }
     if previous.profiles.len() <= 1 {
         return Err("至少需要保留一条线路".to_string());

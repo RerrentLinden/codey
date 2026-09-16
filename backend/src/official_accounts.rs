@@ -6,7 +6,7 @@
 //! default copies its credentials into the Codex home so Codex itself (and the
 //! local router, which reads the same file) run as that account.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+use crate::config::{default_official_route_name, default_official_route_short_name};
 
 pub const ACCOUNTS_DIR_NAME: &str = "official-accounts";
 const DEFAULT_FILE_NAME: &str = "default.json";
@@ -37,6 +39,9 @@ const MAX_JWT_PAYLOAD_BYTES: usize = 64 * 1024;
 /// Stored credentials older than this are refreshed before being handed to
 /// Codex, so switching back to an account that idled for days still works.
 const REFRESH_BEFORE_ACTIVATE_AGE: Duration = Duration::from_secs(6 * 60 * 60);
+/// Access tokens that expire within this margin are refreshed before use, so a
+/// request never starts on a token that is about to lapse.
+const TOKEN_REFRESH_MARGIN_SECONDS: u64 = 5 * 60;
 
 // ---------------------------------------------------------------------------
 // Records
@@ -62,6 +67,12 @@ pub struct OfficialAccountRecord {
     pub route_short_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<String>,
+    /// 官方明确拒绝该账号凭据时写入的原因与检测时间。网络故障、超时和
+    /// 服务端 5xx 不会写入，刷新成功后清空。老记录没有这两个字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalid_since: Option<u64>,
     /// Complete Codex `auth.json` document for this account.
     pub auth: Value,
 }
@@ -86,6 +97,10 @@ pub struct OfficialAccountSummary {
     pub route_short_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_proxy: Option<String>,
+    /// 卡片据此把失效账号标红，并隐藏切换到该账号的入口。
+    pub invalid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalid_reason: Option<String>,
     pub is_default: bool,
 }
 
@@ -168,6 +183,8 @@ impl OfficialAccountRecord {
             route_name: None,
             route_short_name: None,
             upstream_proxy: None,
+            invalid_reason: None,
+            invalid_since: None,
             auth,
         })
     }
@@ -207,8 +224,39 @@ impl OfficialAccountRecord {
             route_name: self.route_name.clone(),
             route_short_name: self.route_short_name.clone(),
             upstream_proxy: self.upstream_proxy.clone(),
+            invalid: self.invalid(),
+            invalid_reason: self.invalid_reason.clone(),
             is_default: default_id == Some(self.id.as_str()),
         }
+    }
+
+    /// 官方是否明确拒绝过该账号的凭据。额度查询和切换默认都会先看这个标记。
+    pub fn invalid(&self) -> bool {
+        self.invalid_reason.is_some()
+    }
+
+    pub fn invalid_reason(&self) -> Option<&str> {
+        self.invalid_reason.as_deref()
+    }
+
+    /// 记录失效。已有原因时保留首次检测时间，只更新原因文本。
+    pub fn mark_invalid(&mut self, reason: &str) {
+        if self.invalid_reason.is_none() {
+            self.invalid_since = Some(unix_timestamp());
+        }
+        self.invalid_reason = Some(reason.to_string());
+    }
+
+    pub fn clear_invalid(&mut self) {
+        self.invalid_reason = None;
+        self.invalid_since = None;
+    }
+
+    /// 本地保存的 access token 是否仍在使用期限内。默认账号的凭据由 Codex
+    /// 维护，判断额度接口 401 是否可信时用它排除尚未刷新的过期令牌。
+    pub fn has_live_access_token(&self) -> bool {
+        access_token_expires_at(self)
+            .is_some_and(|expires_at| expires_at > unix_timestamp() + TOKEN_REFRESH_MARGIN_SECONDS)
     }
 
     /// Whether a Codex `auth.json` document belongs to this account.
@@ -328,6 +376,47 @@ fn route_setting(value: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// 去掉首尾空白后仍非空的设置值。
+fn trimmed_setting(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// 从「官方账号1」或「官1」这类默认名称里取出编号，自定义名称返回 `None`。
+fn route_index(value: Option<&str>) -> Option<usize> {
+    let value = trimmed_setting(value)?;
+    let digits = value
+        .strip_prefix(crate::config::OFFICIAL_ROUTE_NAME_PREFIX)
+        .or_else(|| value.strip_prefix(crate::config::OFFICIAL_ROUTE_SHORT_NAME))?;
+    if let Ok(index) = digits.parse::<usize>() {
+        return (index > 0).then_some(index);
+    }
+    // 第 10 个账号起短名称改用字母编号，这里换回同一个编号。
+    let mut letters = digits.chars();
+    let letter = letters.next()?;
+    if letters.next().is_some() {
+        return None;
+    }
+    crate::config::OFFICIAL_ROUTE_SHORT_NAME_LETTERS
+        .chars()
+        .position(|candidate| candidate == letter)
+        .map(|position| position + 10)
+}
+
+/// 当前可用的最小编号；需要补短名称时跳过短名称已被占用的编号。
+fn smallest_free_official_index(
+    used_indices: &BTreeSet<usize>,
+    used_short_names: &BTreeSet<String>,
+    needs_short_name: bool,
+) -> usize {
+    (1..)
+        .find(|index| {
+            !used_indices.contains(index)
+                && (!needs_short_name
+                    || !used_short_names.contains(&default_official_route_short_name(*index)))
+        })
+        .unwrap_or(1)
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -366,7 +455,7 @@ impl OfficialAccountStore {
         Self::new(parent.join(ACCOUNTS_DIR_NAME))
     }
 
-    fn account_path(&self, id: &str) -> PathBuf {
+    pub(crate) fn account_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{}.json", sanitize_id(id)))
     }
 
@@ -472,6 +561,55 @@ impl OfficialAccountStore {
         self.write(&record)
     }
 
+    /// 给还没有线路设置的账号补上按添加顺序生成的默认名称，例如「官方账号1」
+    /// 和「官1」。编号取当前未被占用的最小编号，所以移除账号后新增的账号不会
+    /// 和已有名称重复；已经保存过设置的账号原样保留。
+    pub fn ensure_generated_route_settings(&self) -> Result<()> {
+        let records = self.list()?;
+        let missing = |value: Option<&str>| trimmed_setting(value).is_none();
+        let mut used_indices = BTreeSet::new();
+        let mut used_short_names = BTreeSet::new();
+        for record in &records {
+            for value in [&record.route_name, &record.route_short_name] {
+                if let Some(index) = route_index(value.as_deref()) {
+                    used_indices.insert(index);
+                }
+            }
+            if let Some(short_name) = trimmed_setting(record.route_short_name.as_deref()) {
+                used_short_names.insert(short_name.to_string());
+            }
+        }
+        for record in &records {
+            let needs_name = missing(record.route_name.as_deref());
+            let needs_short_name = missing(record.route_short_name.as_deref());
+            if !needs_name && !needs_short_name {
+                continue;
+            }
+            // 只缺其中一项时沿用已保存另一半的编号，名称和短名称保持同号。
+            let index = route_index(record.route_name.as_deref())
+                .or_else(|| route_index(record.route_short_name.as_deref()))
+                .filter(|index| {
+                    !needs_short_name
+                        || !used_short_names.contains(&default_official_route_short_name(*index))
+                })
+                .unwrap_or_else(|| {
+                    smallest_free_official_index(&used_indices, &used_short_names, needs_short_name)
+                });
+            used_indices.insert(index);
+            let mut updated = record.clone();
+            if needs_name {
+                updated.route_name = Some(default_official_route_name(index));
+            }
+            if needs_short_name {
+                let short_name = default_official_route_short_name(index);
+                used_short_names.insert(short_name.clone());
+                updated.route_short_name = Some(short_name);
+            }
+            self.write(&updated)?;
+        }
+        Ok(())
+    }
+
     fn write(&self, record: &OfficialAccountRecord) -> Result<()> {
         let bytes = serde_json::to_vec_pretty(record)?;
         crate::fs_util::atomic_write_private_with_parent(&self.account_path(&record.id), &bytes)
@@ -494,6 +632,22 @@ impl OfficialAccountStore {
             .into_iter()
             .map(|record| record.summary(default_id.as_deref()))
             .collect())
+    }
+
+    /// Credential document the runtime reads for one account. Codex refreshes
+    /// the default account's copy in place, so it keeps using the Codex home
+    /// `auth.json`; every other account reads the document Codey stored.
+    pub fn credential_path(&self, codex_home: &Path, account_id: &str) -> PathBuf {
+        let is_default = self
+            .default_account_id()
+            .ok()
+            .flatten()
+            .is_some_and(|id| id == account_id);
+        if is_default {
+            codex_home.join(CODEX_AUTH_FILE_NAME)
+        } else {
+            self.account_path(account_id)
+        }
     }
 
     /// Reads the Codex home `auth.json` as an account record when it is a
@@ -555,6 +709,8 @@ impl OfficialAccountStore {
             return Ok(());
         }
         record.auth = auth;
+        // Codex 自己刷新成功说明凭据仍然有效，之前的失效标记不再成立。
+        record.clear_invalid();
         self.upsert(&record)
     }
 
@@ -609,14 +765,91 @@ impl OfficialAccountStore {
 // Token refresh
 // ---------------------------------------------------------------------------
 
-/// Refreshes the account's tokens when they are old enough to matter. Errors
-/// are returned so callers can decide whether to fall back to the stored copy.
+/// 官方令牌端点返回 invalid_grant：refresh token 已被撤销，账号必须重新
+/// 登录。调用方据此把账号标记为失效；网络故障、超时、5xx 和限流都会走
+/// 普通错误，不会误标账号。
+#[derive(Debug)]
+pub struct OfficialAccountInvalid {
+    reason: String,
+    detail: Option<String>,
+}
+
+impl OfficialAccountInvalid {
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// 官方返回的原始错误描述，只用于请求日志，不进入界面文案。
+    pub fn detail(&self) -> Option<&str> {
+        self.detail.as_deref()
+    }
+}
+
+impl std::fmt::Display for OfficialAccountInvalid {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.detail.as_deref() {
+            Some(detail) => write!(formatter, "{}：{detail}", self.reason),
+            None => write!(formatter, "{}", self.reason),
+        }
+    }
+}
+
+impl std::error::Error for OfficialAccountInvalid {}
+
+/// OAuth 标准错误响应里 `invalid_grant` 表示刷新令牌已被拒绝。其他 OAuth
+/// 错误（例如 `invalid_request`）说明请求本身有问题，不代表账号失效。
+fn official_account_invalid_from_body(body: &[u8]) -> Option<OfficialAccountInvalid> {
+    let payload = serde_json::from_slice::<Value>(body).ok()?;
+    if payload.get("error").and_then(Value::as_str) != Some("invalid_grant") {
+        return None;
+    }
+    Some(OfficialAccountInvalid {
+        reason: "官方已撤销该账号的登录凭据，需要重新添加账号".to_string(),
+        detail: payload
+            .get("error_description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+            .map(ToString::to_string),
+    })
+}
+
+/// Expiry time of the stored access token, when the token carries one.
+pub(crate) fn access_token_expires_at(record: &OfficialAccountRecord) -> Option<u64> {
+    record
+        .auth
+        .get("tokens")
+        .and_then(|tokens| tokens.get("access_token"))
+        .and_then(Value::as_str)
+        .and_then(jwt_claims)?
+        .get("exp")
+        .and_then(Value::as_u64)
+}
+
+fn needs_token_refresh(record: &OfficialAccountRecord) -> bool {
+    if access_token_expires_at(record)
+        .is_some_and(|expires_at| expires_at <= unix_timestamp() + TOKEN_REFRESH_MARGIN_SECONDS)
+    {
+        return true;
+    }
+    record
+        .last_refresh_age(SystemTime::now())
+        .is_none_or(|age| age >= REFRESH_BEFORE_ACTIVATE_AGE)
+}
+
+/// Refreshes the account's tokens when the stored access token is expired,
+/// close to expiry, or old enough to matter. Errors are returned so callers can
+/// decide whether to fall back to the stored copy.
 pub async fn refresh_if_stale(
     client: &reqwest::Client,
     record: &mut OfficialAccountRecord,
 ) -> Result<bool> {
-    let age = record.last_refresh_age(SystemTime::now());
-    if age.is_some_and(|age| age < REFRESH_BEFORE_ACTIVATE_AGE) {
+    // 已确认失效的账号不再尝试刷新：官方每次都会拒绝，重复请求只会抬高
+    // 风控概率；重新添加账号会写入新凭据并清除失效标记。
+    if record.invalid() {
+        return Ok(false);
+    }
+    if !needs_token_refresh(record) {
         return Ok(false);
     }
     let Some(refresh_token) = record.refresh_token().map(ToString::to_string) else {
@@ -638,10 +871,15 @@ pub async fn refresh_if_stale(
     let body =
         crate::http_response::read_bounded_body(response, 256 * 1024, "刷新令牌响应").await?;
     if !status.is_success() {
+        if let Some(invalid) = official_account_invalid_from_body(&body) {
+            return Err(anyhow::Error::new(invalid));
+        }
         bail!("刷新官方账号令牌失败：{status}");
     }
     let payload: Value = serde_json::from_slice(&body).context("刷新令牌响应格式无效")?;
     apply_token_response(record, &payload)?;
+    // 刷新成功说明凭据重新可用，之前记录的失效状态随之清除。
+    record.clear_invalid();
     Ok(true)
 }
 
@@ -1163,6 +1401,135 @@ mod tests {
     }
 
     #[test]
+    fn generated_route_settings_number_accounts_and_keep_custom_names() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join(ACCOUNTS_DIR_NAME));
+        for (index, id) in ["acct_1", "acct_2", "acct_3"].into_iter().enumerate() {
+            let record = OfficialAccountRecord::from_auth(
+                chatgpt_auth(id, &format!("{id}@example.com"), "2026-01-01T00:00:00Z"),
+                index as u64 + 1,
+            )
+            .unwrap();
+            store.upsert(&record).unwrap();
+        }
+
+        store.ensure_generated_route_settings().unwrap();
+        let generated = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|record| {
+                (
+                    record.id,
+                    record.route_name.unwrap_or_default(),
+                    record.route_short_name.unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            generated,
+            vec![
+                (
+                    "acct_1".to_string(),
+                    "官方账号1".to_string(),
+                    "官1".to_string()
+                ),
+                (
+                    "acct_2".to_string(),
+                    "官方账号2".to_string(),
+                    "官2".to_string()
+                ),
+                (
+                    "acct_3".to_string(),
+                    "官方账号3".to_string(),
+                    "官3".to_string()
+                ),
+            ]
+        );
+
+        // 重复执行不会改写已经生成的名称，手动设置的名称也不会被覆盖。
+        store.ensure_generated_route_settings().unwrap();
+        store
+            .update_route_settings("acct_2", Some("主力官方号".into()), Some("主".into()), None)
+            .unwrap();
+        store.ensure_generated_route_settings().unwrap();
+        let custom = store.get("acct_2").unwrap().unwrap();
+        assert_eq!(custom.route_name.as_deref(), Some("主力官方号"));
+        assert_eq!(custom.route_short_name.as_deref(), Some("主"));
+
+        // 移除账号 1 后新增的账号取当前最小编号，不会和账号 3 的「官方账号3」重复。
+        store.remove("acct_1").unwrap();
+        let added_later = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_4", "acct_4@example.com", "2026-01-01T00:00:00Z"),
+            4,
+        )
+        .unwrap();
+        store.upsert(&added_later).unwrap();
+        store.ensure_generated_route_settings().unwrap();
+        let renumbered = store.get("acct_4").unwrap().unwrap();
+        assert_eq!(renumbered.route_name.as_deref(), Some("官方账号1"));
+        assert_eq!(renumbered.route_short_name.as_deref(), Some("官1"));
+        let untouched = store.get("acct_3").unwrap().unwrap();
+        assert_eq!(untouched.route_name.as_deref(), Some("官方账号3"));
+        assert_eq!(untouched.route_short_name.as_deref(), Some("官3"));
+
+        // 只缺一半设置时，补上的名称沿用另一半的编号。
+        store
+            .update_route_settings("acct_3", Some("官方账号7".into()), None, None)
+            .unwrap();
+        store.ensure_generated_route_settings().unwrap();
+        let paired = store.get("acct_3").unwrap().unwrap();
+        assert_eq!(paired.route_name.as_deref(), Some("官方账号7"));
+        assert_eq!(paired.route_short_name.as_deref(), Some("官7"));
+    }
+
+    #[test]
+    fn generated_short_names_keep_numbering_after_the_ninth_account() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join(ACCOUNTS_DIR_NAME));
+        for index in 1..=11u64 {
+            let id = format!("acct_{index}");
+            let record = OfficialAccountRecord::from_auth(
+                chatgpt_auth(&id, &format!("{id}@example.com"), "2026-01-01T00:00:00Z"),
+                index,
+            )
+            .unwrap();
+            store.upsert(&record).unwrap();
+        }
+
+        store.ensure_generated_route_settings().unwrap();
+        // 短名称只有两个字符，第 10 个账号起改用字母编号。
+        assert_eq!(
+            store
+                .get("acct_10")
+                .unwrap()
+                .unwrap()
+                .route_short_name
+                .as_deref(),
+            Some("官A")
+        );
+        assert_eq!(
+            store
+                .get("acct_11")
+                .unwrap()
+                .unwrap()
+                .route_short_name
+                .as_deref(),
+            Some("官B")
+        );
+
+        // 字母编号对应同一个编号，重复补齐不会重新分配已用值。
+        store.ensure_generated_route_settings().unwrap();
+        let names = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .filter_map(|record| record.route_short_name)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(names.len(), 11);
+    }
+
+    #[test]
     fn launch_resolution_writes_default_into_codex_home() {
         let dir = TempDir::new().unwrap();
         let home = TempDir::new().unwrap();
@@ -1342,5 +1709,165 @@ mod tests {
         assert_eq!(record.auth["tokens"]["access_token"], json!("access-2"));
         assert_eq!(record.auth["tokens"]["refresh_token"], json!("refresh-2"));
         assert_ne!(record.auth["last_refresh"], json!("2026-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn only_invalid_grant_marks_the_account_invalid() {
+        let invalid = official_account_invalid_from_body(
+            br#"{"error":"invalid_grant","error_description":"refresh token revoked"}"#,
+        )
+        .expect("invalid_grant 表示刷新令牌已被撤销");
+        assert!(invalid.reason().contains("已撤销"));
+        assert_eq!(invalid.detail(), Some("refresh token revoked"));
+
+        // 请求错误、限流、服务端故障和网络错误都不代表账号失效。
+        for body in [
+            br#"{"error":"invalid_request","error_description":"missing scope"}"#.as_slice(),
+            br#"{"error":"temporarily_unavailable"}"#.as_slice(),
+            br#"{"status":500}"#.as_slice(),
+            b"<html>bad gateway</html>".as_slice(),
+        ] {
+            assert!(
+                official_account_invalid_from_body(body).is_none(),
+                "非 invalid_grant 响应不得标记账号失效：{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_state_round_trips_through_the_store_and_clears_on_refresh() {
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join(ACCOUNTS_DIR_NAME));
+        let mut record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_1", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        assert!(!record.summary(None).invalid);
+
+        record.mark_invalid("官方已撤销该账号的登录凭据，需要重新添加账号");
+        store.upsert(&record).unwrap();
+        let summary = store.summaries().unwrap().remove(0);
+        assert!(summary.invalid);
+        assert_eq!(
+            summary.invalid_reason.as_deref(),
+            Some("官方已撤销该账号的登录凭据，需要重新添加账号")
+        );
+
+        // Codex 用同一个账号成功刷新后，失效标记随之清除。
+        let mut refreshed = chatgpt_auth("acct_1", "a@example.com", "2026-02-01T00:00:00Z");
+        refreshed["tokens"]["access_token"] = json!("access-new");
+        fs::write(
+            home.path().join("auth.json"),
+            serde_json::to_vec(&refreshed).unwrap(),
+        )
+        .unwrap();
+        store.set_default_account_id(Some("acct_1")).unwrap();
+        store.sync_default_from_codex_home(home.path()).unwrap();
+        let stored = store.get("acct_1").unwrap().unwrap();
+        assert!(!stored.invalid());
+        assert!(stored.invalid_since.is_none());
+    }
+
+    #[test]
+    fn live_access_token_check_excludes_expired_and_opaque_tokens() {
+        let mut record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_1", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        record.auth["tokens"]["access_token"] = json!("opaque-token");
+        assert!(!record.has_live_access_token());
+
+        record.auth["tokens"]["access_token"] = json!(unsigned_jwt(json!({
+            "exp": unix_timestamp() + 3600
+        })));
+        assert!(record.has_live_access_token());
+
+        record.auth["tokens"]["access_token"] = json!(unsigned_jwt(json!({
+            "exp": unix_timestamp().saturating_sub(3600)
+        })));
+        assert!(!record.has_live_access_token());
+    }
+
+    #[test]
+    fn only_the_default_account_reads_the_codex_home_credential() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join(ACCOUNTS_DIR_NAME));
+        let home = dir.path().join("codex-home");
+        for id in ["acct_1", "acct_2"] {
+            store
+                .upsert(
+                    &OfficialAccountRecord::from_auth(
+                        chatgpt_auth(id, "a@example.com", "2026-01-01T00:00:00Z"),
+                        1,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        store.set_default_account_id(Some("acct_2")).unwrap();
+
+        assert_eq!(
+            store.credential_path(&home, "acct_2"),
+            home.join(CODEX_AUTH_FILE_NAME),
+            "Codex refreshes the default account copy in place"
+        );
+        assert_eq!(
+            store.credential_path(&home, "acct_1"),
+            store.account_path("acct_1"),
+            "idle accounts read the document Codey stored"
+        );
+    }
+
+    #[test]
+    fn stored_account_credentials_read_back_from_the_account_record() {
+        let dir = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path().join(ACCOUNTS_DIR_NAME));
+        let home = dir.path().join("codex-home");
+        let first = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_1", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        let second = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_2", "b@example.com", "2026-01-01T00:00:00Z"),
+            2,
+        )
+        .unwrap();
+        store.upsert(&first).unwrap();
+        store.upsert(&second).unwrap();
+        store.set_default_account_id(Some("acct_1")).unwrap();
+
+        let auth =
+            crate::account_usage::read_official_auth(&store.credential_path(&home, "acct_2"))
+                .expect("非默认账号的线路与额度都从自己的账号记录读取凭据");
+        assert_eq!(auth.access_token, "access-acct_2");
+        assert_eq!(auth.account_id.as_deref(), Some("acct_2"));
+    }
+
+    #[test]
+    fn tokens_inside_the_expiry_margin_are_refreshed() {
+        let mut record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_1", "a@example.com", &rfc3339_now()),
+            1,
+        )
+        .unwrap();
+        record.auth["tokens"]["access_token"] =
+            json!(unsigned_jwt(json!({ "exp": unix_timestamp() + 60 })));
+        assert!(
+            needs_token_refresh(&record),
+            "a token that lapses inside the margin is refreshed"
+        );
+
+        record.auth["tokens"]["access_token"] = json!(unsigned_jwt(
+            json!({ "exp": unix_timestamp() + 12 * 60 * 60 })
+        ));
+        assert!(
+            !needs_token_refresh(&record),
+            "a freshly stored long-lived token is left alone"
+        );
     }
 }

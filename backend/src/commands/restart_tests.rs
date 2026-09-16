@@ -47,6 +47,46 @@ fn api_key_launch_rejects_new_or_active_official_account_routes() {
 }
 
 #[test]
+fn api_key_launch_allows_stored_account_routes() {
+    let mut api_route = crate::config::ProviderProfile::new("Relay");
+    api_route.id = "relay".into();
+    api_route.base_url = "https://relay.example/v1".into();
+    api_route.api_key = "secret".into();
+    api_route.normalize();
+    let previous = CodeyConfig {
+        active_profile_id: api_route.id.clone(),
+        profiles: vec![api_route.clone()],
+        official_account_available_this_launch: false,
+        ..CodeyConfig::default()
+    };
+
+    let mut stored = crate::config::ProviderProfile::new("主力账号");
+    stored.id = crate::config::official_profile_id("acct-one");
+    stored.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    stored.official_account_id = Some("acct-one".into());
+    stored.normalize();
+
+    // 存储账号自带凭据，本地路由可以直接使用，因此 API Key 启动时也允许
+    // 出现并启用这类线路。
+    let mut with_stored = previous.clone();
+    with_stored.profiles.push(stored.clone());
+    assert!(validate_official_account_config_change(&previous, &with_stored).is_ok());
+
+    let mut activated = with_stored.clone();
+    activated.active_profile_id = stored.id.clone();
+    assert!(validate_official_account_config_change(&with_stored, &activated).is_ok());
+
+    // 本地路由关闭后存储账号的凭据没有出口，仍然按原来的限制处理。
+    let mut router_disabled = with_stored;
+    router_disabled.local_router_enabled = false;
+    assert!(
+        validate_official_account_config_change(&previous, &router_disabled)
+            .unwrap_err()
+            .contains("不能新增")
+    );
+}
+
+#[test]
 fn official_account_launch_allows_official_routes() {
     let previous = CodeyConfig {
         official_account_available_this_launch: true,
@@ -80,16 +120,20 @@ fn unknown_official_auth_from_auto_store_allows_official_only_launch_to_reach_ru
 
     let next = route_config_for_official_probe(
         &previous,
-        crate::codex_provider::OfficialAccountProfileStatus::Unknown {
-            profile: official.clone(),
-            reason: concat!(
-                "无法运行 codex login status：拒绝访问。 (os error 5)；",
-                "Codex auth.json 未包含 ChatGPT token（authMode=missing, ",
-                "chatgptTokenFields=[\"access_token\", \"id_token\", \"refresh_token\"], ",
-                "openaiApiKeyPresent=false），当前凭据存储为 auto，",
-                "可能由系统凭据存储接管"
-            )
-            .into(),
+        crate::codex_provider::OfficialAccountLaunch {
+            status: crate::codex_provider::OfficialAccountProfileStatus::Unknown {
+                profile: official.clone(),
+                reason: concat!(
+                    "无法运行 codex login status：拒绝访问。 (os error 5)；",
+                    "Codex auth.json 未包含 ChatGPT token（authMode=missing, ",
+                    "chatgptTokenFields=[\"access_token\", \"id_token\", \"refresh_token\"], ",
+                    "openaiApiKeyPresent=false），当前凭据存储为 auto，",
+                    "可能由系统凭据存储接管"
+                )
+                .into(),
+            },
+            profiles: vec![official.clone()],
+            has_stored_accounts: false,
         },
     )
     .unwrap();
@@ -130,9 +174,13 @@ fn unknown_official_auth_does_not_force_openai_auth_for_third_party_launches() {
 
     let next = route_config_for_official_probe(
         &previous,
-        crate::codex_provider::OfficialAccountProfileStatus::Unknown {
-            profile: official.clone(),
-            reason: "auth.json not found under auto store".into(),
+        crate::codex_provider::OfficialAccountLaunch {
+            status: crate::codex_provider::OfficialAccountProfileStatus::Unknown {
+                profile: official.clone(),
+                reason: "auth.json not found under auto store".into(),
+            },
+            profiles: vec![official.clone()],
+            has_stored_accounts: false,
         },
     )
     .unwrap();
@@ -164,9 +212,14 @@ fn unavailable_official_auth_error_keeps_safe_probe_diagnostics() {
 
     let error = route_config_for_official_probe(
         &previous,
-        crate::codex_provider::OfficialAccountProfileStatus::Unavailable {
-            reason: "nativeStatus=not_logged_in; executable=codex.exe; credentialsIncluded=false"
-                .into(),
+        crate::codex_provider::OfficialAccountLaunch {
+            status: crate::codex_provider::OfficialAccountProfileStatus::Unavailable {
+                reason:
+                    "nativeStatus=not_logged_in; executable=codex.exe; credentialsIncluded=false"
+                        .into(),
+            },
+            profiles: Vec::new(),
+            has_stored_accounts: false,
         },
     )
     .unwrap_err();
@@ -1139,7 +1192,7 @@ fn manual_model_selection_separates_official_and_other_models() {
 
     let (supported_official, selected_third_party) = validate_manual_model_selection(
         &official,
-        &["gpt-5.6-luna".into(), "gpt-5.4".into()],
+        &["gpt-5.6-luna".into(), "gpt-5.5".into()],
         &[
             " provider-manual-model ".into(),
             "provider-manual-model".into(),
@@ -1147,7 +1200,7 @@ fn manual_model_selection_separates_official_and_other_models() {
     )
     .unwrap();
 
-    assert_eq!(supported_official, ["gpt-5.6-luna", "gpt-5.4"]);
+    assert_eq!(supported_official, ["gpt-5.6-luna", "gpt-5.5"]);
     assert_eq!(selected_third_party, ["provider-manual-model"]);
 }
 

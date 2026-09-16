@@ -93,6 +93,87 @@ pub(crate) fn normalize_native_responses_context(
     changed
 }
 
+// 第三方 thinking 模式只校验 reasoning 明文是否存在，占位文本不影响后续回答。
+pub(crate) const MISSING_REASONING_TEXT_PLACEHOLDER: &str = "(thinking unavailable)";
+
+/// 部分第三方 thinking 模式（DeepSeek 等）要求把上一轮的 reasoning 明文原样
+/// 回传，而 Codex 回放历史时会省略 reasoning 项的明文 content，只保留
+/// encrypted_content，上游因此拒绝整条请求。这里给缺少明文的 reasoning 项补一段
+/// 占位文本；已有明文的项保持原始字节不变。
+pub(crate) fn fill_missing_reasoning_text(body: &mut Value) -> bool {
+    match body.get_mut("input") {
+        Some(Value::Array(items)) => {
+            let mut changed = false;
+            for item in items {
+                changed |= fill_reasoning_item_text(item);
+            }
+            changed
+        }
+        Some(item @ Value::Object(_)) => fill_reasoning_item_text(item),
+        _ => false,
+    }
+}
+
+fn fill_reasoning_item_text(item: &mut Value) -> bool {
+    if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return false;
+    }
+    let Some(object) = item.as_object_mut() else {
+        return false;
+    };
+    if object.get("content").is_none() {
+        object.insert(
+            "content".to_string(),
+            Value::Array(vec![reasoning_text_placeholder()]),
+        );
+        return true;
+    }
+    let Some(content) = object.get_mut("content") else {
+        return false;
+    };
+    match content {
+        Value::Array(parts) => {
+            if parts.iter().any(reasoning_part_has_text) {
+                return false;
+            }
+            // 空白片段一并清理，只留下占位明文。
+            parts.retain(|part| !is_reasoning_text_part(part));
+            parts.push(reasoning_text_placeholder());
+            true
+        }
+        Value::Object(_) => {
+            if reasoning_part_has_text(content) {
+                return false;
+            }
+            *content = reasoning_text_placeholder();
+            true
+        }
+        _ => {
+            *content = Value::Array(vec![reasoning_text_placeholder()]);
+            true
+        }
+    }
+}
+
+fn reasoning_text_placeholder() -> Value {
+    json!({"type":"reasoning_text","text":MISSING_REASONING_TEXT_PLACEHOLDER})
+}
+
+fn reasoning_part_has_text(part: &Value) -> bool {
+    is_reasoning_text_part(part)
+        && part
+            .get("text")
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.trim().is_empty())
+}
+
+fn is_reasoning_text_part(part: &Value) -> bool {
+    matches!(
+        part.get("type").and_then(Value::as_str),
+        Some("reasoning_text" | "text")
+    )
+}
+
 fn normalize_encrypted_agent_payloads(body: &mut Value) -> bool {
     match body.get_mut("input") {
         Some(Value::Array(items)) => {
@@ -355,6 +436,62 @@ mod tests {
                 assert!(!normalize_native_responses_context(&mut body, true));
             }
         }
+    }
+
+    #[test]
+    fn missing_reasoning_text_gets_placeholder() {
+        let mut body = json!({
+            "input":[
+                {"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"opaque"},
+                {"type":"reasoning","id":"rs_2","summary":[],"encrypted_content":"opaque",
+                 "content":[{"type":"reasoning_text","text":"真实明文"}]},
+                {"type":"reasoning","id":"rs_3","summary":[],"encrypted_content":"opaque","content":[]},
+                {"role":"user","content":[{"type":"input_text","text":"继续"}]}
+            ]
+        });
+        assert!(fill_missing_reasoning_text(&mut body));
+        assert_eq!(
+            body["input"][0]["content"],
+            json!([{"type":"reasoning_text","text":MISSING_REASONING_TEXT_PLACEHOLDER}])
+        );
+        assert_eq!(
+            body["input"][1]["content"],
+            json!([{"type":"reasoning_text","text":"真实明文"}])
+        );
+        assert_eq!(
+            body["input"][2]["content"],
+            json!([{"type":"reasoning_text","text":MISSING_REASONING_TEXT_PLACEHOLDER}])
+        );
+        assert_eq!(
+            body["input"][3],
+            json!({"role":"user","content":[{"type":"input_text","text":"继续"}]})
+        );
+        // 补齐后的请求再次经过时保持字节不变。
+        assert!(!fill_missing_reasoning_text(&mut body));
+    }
+
+    #[test]
+    fn blank_reasoning_text_is_replaced_and_other_inputs_are_kept() {
+        let mut single = json!({
+            "input":{"type":"reasoning","id":"rs_1","summary":[],
+                     "content":[{"type":"reasoning_text","text":"   "}]}
+        });
+        assert!(fill_missing_reasoning_text(&mut single));
+        assert_eq!(
+            single["input"]["content"],
+            json!([{"type":"reasoning_text","text":MISSING_REASONING_TEXT_PLACEHOLDER}])
+        );
+
+        let mut text_plaintext = json!({
+            "input":[{"type":"reasoning","id":"rs_2","summary":[],
+                      "content":[{"type":"text","text":"第三方明文"}]}]
+        });
+        assert!(!fill_missing_reasoning_text(&mut text_plaintext));
+
+        let mut plain = json!({"input":"没有 reasoning 项"});
+        let original = plain.clone();
+        assert!(!fill_missing_reasoning_text(&mut plain));
+        assert_eq!(plain, original);
     }
 
     #[test]

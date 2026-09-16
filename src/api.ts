@@ -14,6 +14,7 @@ export const CODEY_API_COMMANDS = [
   "query_official_account_usage",
   "store_official_account_usage",
   "list_official_accounts",
+  "refresh_official_account_routes",
   "start_official_account_login",
   "poll_official_account_login",
   "cancel_official_account_login",

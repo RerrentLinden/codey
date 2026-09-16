@@ -33,8 +33,40 @@ if (import.meta.env.DEV) {
       feishu: "https://webhook.example.invalid/feishu/preview-only",
       wecom: "https://webhook.example.invalid/wecom/preview-only?key=preview",
     } as const;
-    // 官方线路由启动时的默认账号派生，账号没有自定义线路名时使用该名称。
-    const previewOfficialDerivedRouteName = "OpenAI 官方直登";
+    // 官方线路按存储账号逐条派生；账号没有自定义名称时，使用按添加顺序生成的
+    // 默认线路名和短名称，例如第一个账号是「官方账号1」和「官1」。
+    const previewOfficialRouteName = (index: number) => `官方账号${index}`;
+    const previewOfficialRouteShortName = (index: number) => {
+      if (index <= 9) return `官${index}`;
+      const letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+      return `官${letters[Math.min(index - 10, letters.length - 1)] ?? "Z"}`;
+    };
+    const previewAccountRouteIndex = (account: OfficialAccount) => {
+      const value = (account.routeName ?? account.routeShortName ?? "").trim();
+      const digits = value.startsWith("官方账号")
+        ? value.slice("官方账号".length)
+        : value.startsWith("官")
+          ? value.slice(1)
+          : "";
+      const index = Number.parseInt(digits, 10);
+      return Number.isInteger(index) && index > 0 ? index : null;
+    };
+    // 与后端保持一致：还没有名称的账号补上当前最小编号，已有名称保持不动。
+    const previewEnsureGeneratedRouteSettings = () => {
+      const used = new Set<number>();
+      for (const account of previewOfficialAccounts) {
+        const index = previewAccountRouteIndex(account);
+        if (index !== null) used.add(index);
+      }
+      for (const account of [...previewOfficialAccounts].sort((left, right) => left.addedAt - right.addedAt)) {
+        if (account.routeName && account.routeShortName) continue;
+        let index = 1;
+        while (used.has(index)) index += 1;
+        used.add(index);
+        account.routeName ??= previewOfficialRouteName(index);
+        account.routeShortName ??= previewOfficialRouteShortName(index);
+      }
+    };
     let previewConfig: Config = {
       settingsRevision: 0,
       localRouterEnabled: true,
@@ -54,25 +86,6 @@ if (import.meta.env.DEV) {
       activeProfileId: "primary",
       initialRouteImportCompleted: true,
       profiles: [
-        {
-          id: "codey-official-account",
-          enabled: true,
-          name: previewOfficialDerivedRouteName,
-          shortName: "官",
-          baseUrl: "",
-          apiKey: "",
-          upstreamProtocol: "official",
-          authMode: "officialAccount",
-          apiKeyConfigured: false,
-          clearApiKey: false,
-          sourceProviderId: "openai",
-          officialAccount: true,
-          supportsRemoteCompaction: false,
-          supportsWebsockets: true,
-          supportsNativeWebSearch: true,
-          supportsAutoReview: true,
-          upstreamProxy: "",
-        },
         {
           id: "primary",
           enabled: true,
@@ -212,9 +225,69 @@ if (import.meta.env.DEV) {
     let previewOfficialAccounts: OfficialAccount[] = [
       { id: "acct_preview_1", email: "preview@example.com", planType: "pro", accountId: "acct_preview_1", addedAt: 1_757_000_000, isDefault: true },
       { id: "acct_preview_2", email: "backup@example.com", planType: "plus", accountId: "acct_preview_2", addedAt: 1_757_100_000, isDefault: false, routeName: "备用官方线路", routeShortName: "备2" },
+      // 预览失效账号：卡片标红、隐藏切换默认入口，额度显示失效原因。
+      { id: "acct_preview_3", email: "blocked@example.com", planType: "plus", accountId: "acct_preview_3", addedAt: 1_757_200_000, isDefault: false, invalid: true, invalidReason: "官方已撤销该账号的登录凭据，需要重新添加账号" },
     ];
     let previewOfficialLoginPolls = 0;
     const previewDefaultOfficialAccountId = () => previewOfficialAccounts.find((account) => account.isDefault)?.id ?? null;
+    const previewOfficialProviderId = (account: { id: string }) =>
+      `codey-official-account-${account.id.replace(/[^A-Za-z0-9_-]/g, "-")}`;
+    // 预览配置与启动派生保持一致：每个账号一条官方线路，默认账号排在最前。
+    const previewDeriveOfficialProfiles = () => {
+      previewEnsureGeneratedRouteSettings();
+      // 编号按全部账号的添加顺序计算；失效账号不生成线路，也不会让其余线路改号。
+      const addedOrder = [...previewOfficialAccounts].sort((left, right) => left.addedAt - right.addedAt);
+      const defaultId = previewDefaultOfficialAccountId();
+      const ordered = previewOfficialAccounts
+        .filter((account) => !account.invalid)
+        .sort((left, right) => {
+          const leftDefault = left.id === defaultId ? 1 : 0;
+          const rightDefault = right.id === defaultId ? 1 : 0;
+          return rightDefault - leftDefault || left.addedAt - right.addedAt;
+        });
+      const officialProfiles: Profile[] = ordered.map((account) => {
+        // 默认名称按添加顺序编号，和默认账号排在最前的显示顺序无关。
+        const index = addedOrder.findIndex((item) => item.id === account.id) + 1;
+        return {
+          id: previewOfficialProviderId(account),
+          enabled: true,
+          name: account.routeName ?? previewOfficialRouteName(index),
+          shortName: account.routeShortName ?? previewOfficialRouteShortName(index),
+          baseUrl: "",
+          apiKey: "",
+          upstreamProtocol: "official",
+          authMode: "officialAccount",
+          apiKeyConfigured: false,
+          clearApiKey: false,
+          officialAccount: true,
+          officialAccountId: account.id,
+          supportsRemoteCompaction: false,
+          supportsWebsockets: true,
+          supportsNativeWebSearch: true,
+          supportsAutoReview: true,
+          upstreamProxy: account.upstreamProxy ?? "",
+        };
+      });
+      previewConfig = {
+        ...previewConfig,
+        profiles: [
+          ...officialProfiles,
+          ...previewConfig.profiles.filter(
+            (profile) => profile.authMode !== "officialAccount",
+          ),
+        ],
+        selectedModelsByProvider: {
+          ...previewConfig.selectedModelsByProvider,
+          ...Object.fromEntries(
+            officialProfiles.map((profile) => [
+              profile.id,
+              previewOfficialModels.map((model) => model.slug),
+            ]),
+          ),
+        },
+      };
+    };
+    previewDeriveOfficialProfiles();
     let previewModelState: ModelState = {
       officialModels: previewOfficialModels.map((model) => ({
         ...model,
@@ -325,7 +398,12 @@ if (import.meta.env.DEV) {
       | typeof previewCrashpadPendingStats
       | undefined = previewCrashpadPendingStats;
     const previewRouteRequestLogs = Array.from({ length: 47 }, (_, index) => {
-      const primary = index % 3 !== 1;
+      // 预览里按线路区分官方与第三方请求，官方请求额外带上账号，方便核对
+      // 请求日志的账号筛选和周限估算的分账号统计。
+      const account = index % 3 === 2
+        ? previewOfficialAccounts[index % previewOfficialAccounts.length]
+        : null;
+      const primary = account == null && index % 3 !== 1;
       const failed = index % 9 === 4;
       const protocol = (["sse", "ws", "http"] as const)[index % 3];
       const inputTokens = 1_200 + index * 137;
@@ -340,10 +418,11 @@ if (import.meta.env.DEV) {
           : `preview-${codexSessionIsParent ? "parent-" : ""}session-${String(index + 1).padStart(4, "0")}`,
         codexSessionIsParent,
         timestampUnixMs: Date.now() - index * 83_000,
-        provider: primary ? "primary" : "backup",
-        providerName: primary ? "主力代理 (ChatGPT)" : "备用中转 (Claude)",
-        requestedModel: primary ? "provider-fast-coder" : "claude-sonnet-4-5",
-        model: primary ? "provider-fast-coder" : "claude-sonnet-4-5",
+        provider: account ? previewOfficialProviderId(account) : primary ? "primary" : "backup",
+        providerName: account ? account.routeName ?? "官方线路" : primary ? "主力代理 (ChatGPT)" : "备用中转 (Claude)",
+        officialAccountId: account?.id,
+        requestedModel: account ? "gpt-5.6-sol" : primary ? "provider-fast-coder" : "claude-sonnet-4-5",
+        model: account ? "gpt-5.6-sol" : primary ? "provider-fast-coder" : "claude-sonnet-4-5",
         reasoningEffort: (["low", "medium", "high"] as const)[index % 3],
         thinkingBudgetTokens: undefined,
         ttftMs: failed ? undefined : 190 + index * 13,
@@ -515,6 +594,10 @@ if (import.meta.env.DEV) {
       if (command === "list_official_accounts") {
         return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: true };
       }
+      if (command === "refresh_official_account_routes") {
+        previewDeriveOfficialProfiles();
+        return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: true, config: previewConfig, modelState: previewModelState, restartRequired: false };
+      }
       if (command === "start_official_account_login") {
         return { status: "wait", loginId: "preview-official-login", authUrl: "https://auth.openai.com/oauth/authorize?client_id=preview&state=preview", browserOpened: true };
       }
@@ -524,7 +607,8 @@ if (import.meta.env.DEV) {
         previewOfficialLoginPolls = 0;
         const id = `acct_preview_${previewOfficialAccounts.length + 1}`;
         previewOfficialAccounts.push({ id, email: `user${previewOfficialAccounts.length + 1}@example.com`, planType: "plus", accountId: id, addedAt: Math.floor(Date.now() / 1000), isDefault: previewOfficialAccounts.length === 0 });
-        return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: true };
+        previewDeriveOfficialProfiles();
+        return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: true, config: previewConfig, modelState: previewModelState, restartRequired: false };
       }
       if (command === "cancel_official_account_login") {
         previewOfficialLoginPolls = 0;
@@ -534,15 +618,23 @@ if (import.meta.env.DEV) {
         return { status: "failed", message: "当前 Codex 没有 ChatGPT 官方账号登录，无法导入" };
       }
       if (command === "set_default_official_account") {
+        const target = previewOfficialAccounts.find((account) => account.id === args.accountId);
+        if (target?.invalid) {
+          return { status: "failed", message: "该账号已失效，无法设为默认；请重新添加账号" };
+        }
         for (const account of previewOfficialAccounts) account.isDefault = account.id === args.accountId;
-        previewConfig = { ...previewConfig, showAccountUsageInHeader: true };
+        previewDeriveOfficialProfiles();
         return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: true, config: previewConfig, modelState: previewModelState, restartRequired: false };
       }
       if (command === "remove_official_account") {
         const removed = previewOfficialAccounts.find((account) => account.id === args.accountId);
         previewOfficialAccounts = previewOfficialAccounts.filter((account) => account.id !== args.accountId);
+        if (removed?.isDefault && previewOfficialAccounts.length > 0) {
+          previewOfficialAccounts[0].isDefault = true;
+        }
+        previewDeriveOfficialProfiles();
         const available = previewOfficialAccounts.some((account) => account.isDefault);
-        return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: available, config: previewConfig, modelState: previewModelState, restartRequired: false, ...(removed?.isDefault ? { warning: "当前没有默认官方账号，官方线路已停用" } : {}) };
+        return { status: "ok", accounts: previewOfficialAccounts, defaultAccountId: previewDefaultOfficialAccountId(), officialAccountAvailable: available, config: previewConfig, modelState: previewModelState, restartRequired: false, ...(removed?.isDefault && !available ? { warning: "当前没有默认官方账号，官方线路已停用" } : {}) };
       }
       if (command === "save_official_account_route_settings") {
         const account = previewOfficialAccounts.find((item) => item.id === args.accountId);
@@ -554,36 +646,32 @@ if (import.meta.env.DEV) {
         account.routeName = routeOverride(args.routeName);
         account.routeShortName = routeOverride(args.routeShortName);
         account.upstreamProxy = routeOverride(args.upstreamProxy);
-        if (account.isDefault) {
-          previewConfig = {
-            ...previewConfig,
-            profiles: previewConfig.profiles.map((profile) =>
-              profile.authMode === "officialAccount"
-                ? {
-                    ...profile,
-                    name: account.routeName ?? previewOfficialDerivedRouteName,
-                    shortName: account.routeShortName ?? "官",
-                    upstreamProxy: account.upstreamProxy ?? "",
-                  }
-                : profile,
-            ),
-          };
-        }
+        // 清空设置后后端会立刻补回生成的默认名称，预览保持一致。
+        previewDeriveOfficialProfiles();
         return {
           status: "ok",
           accounts: previewOfficialAccounts,
           defaultAccountId: previewDefaultOfficialAccountId(),
           officialAccountAvailable: true,
           accountId: account.id,
-          ...(account.isDefault
-            ? { config: previewConfig, modelState: previewModelState, restartRequired: false }
-            : {}),
+          config: previewConfig,
+          modelState: previewModelState,
+          restartRequired: false,
         };
       }
       if (command === "query_official_account_usage") {
         const fetchedAt = Math.floor(Date.now() / 1000);
+        const accountId = String(args.accountId || "default");
+        // 失效账号不再请求官方接口，直接返回失效原因，供卡片显示。
+        const account = previewOfficialAccounts.find((item) => item.id === accountId);
+        if (account?.invalid) {
+          return { status: "error", reason: "official_account_invalid", message: account.invalidReason || "账号已失效" };
+        }
+        // 预览模式按账号返回不同的额度，避免所有线路显示同一份数据。
+        let seed = 0;
+        for (const character of accountId) seed = (seed * 31 + character.charCodeAt(0)) % 60;
         return { status: "ok", fetchedAt, secondary: {
-          usedPercent: 40, windowMinutes: 10080, resetsAt: fetchedAt + 3 * 86400,
+          usedPercent: 20 + seed, windowMinutes: 10080, resetsAt: fetchedAt + 3 * 86400,
         } };
       }
       if (command === "query_route_request_logs" || command === "query_route_request_log_stats") {
@@ -591,6 +679,7 @@ if (import.meta.env.DEV) {
         const pageSize = Math.min(100, Math.max(1, Number(args.pageSize) || 20));
         const search = String(args.search || "").trim().toLocaleLowerCase();
         const provider = String(args.provider || "");
+        const officialAccountId = String(args.officialAccountId || "");
         const model = String(args.model || "");
         const status = String(args.status || "");
         const protocol = String(args.protocol || "");
@@ -602,6 +691,7 @@ if (import.meta.env.DEV) {
           if (args.sessionId && item.codexSessionId !== args.sessionId) return false;
           if (args.requestKind && item.requestKind !== args.requestKind) return false;
           if (provider && item.provider !== provider && item.providerName !== provider) return false;
+          if (officialAccountId && item.officialAccountId !== officialAccountId) return false;
           if (model && item.model !== model && item.requestedModel !== model) return false;
           if (status && item.status !== status) return false;
           if (protocol && item.upstreamTransport !== protocol) return false;
@@ -612,6 +702,7 @@ if (import.meta.env.DEV) {
             item.codexSessionId,
             item.provider,
             item.providerName,
+            item.officialAccountId,
             item.model,
             item.upstreamAuthority,
             item.upstreamErrorSummary,
@@ -647,7 +738,9 @@ if (import.meta.env.DEV) {
           for (const item of filtered) {
             const key = args.groupBy === "provider" ? item.provider : args.groupBy === "status" ? item.status
               : args.groupBy === "protocol" ? item.upstreamTransport : args.groupBy === "request_kind" ? item.requestKind
-              : args.groupBy === "session" ? item.codexSessionId ?? "" : item.model ?? item.requestedModel;
+              : args.groupBy === "session" ? item.codexSessionId ?? ""
+              : args.groupBy === "official_account" ? item.officialAccountId ?? ""
+              : item.model ?? item.requestedModel;
             const bucket = Math.floor(item.timestampUnixMs / bucketMs) * bucketMs;
             grouped.set(key, [...(grouped.get(key) ?? []), item]);
             buckets.set(bucket, [...(buckets.get(bucket) ?? []), item]);

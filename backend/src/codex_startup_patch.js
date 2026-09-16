@@ -1543,61 +1543,109 @@
     return source.replace(budget, "var $1=25e3,$2;")
       .replace(network, "networkConfig:{networkTimeoutMs:25e3,api:$1,sdkExceptionUrl:");
   };
+  const cuaBrowserServiceSpecifier = "@oai/browser-desktop/service";
+  const findCuaTrustedServices = (env, path) => {
+    // Plugin configurations expose the browser service to the Computer Use
+    // runtime through a JSON environment mapping. Older builds keep the same
+    // mapping inside the plugin launcher, which is patched separately.
+    for (const [key, value] of Object.entries(env ?? {})) {
+      if (typeof value !== "string" || value.length > 4096) continue;
+      let services;
+      try { services = JSON.parse(value); } catch { continue; }
+      if (services == null || typeof services !== "object" || Array.isArray(services)) continue;
+      const browser = services.browser;
+      if (typeof browser !== "string") continue;
+      if (browser === cuaBrowserServiceSpecifier ||
+          (path.isAbsolute(browser) && /[\\/]browser-service\.mjs$/.test(browser))) {
+        return { key, services };
+      }
+    }
+    return null;
+  };
   const prepareCuaCompatibilityLauncher = async (config) => {
     if (!config?.enabled || !config.env?.CUA_REPL_ENABLED_SURFACES?.split(",").includes("browser")) return;
     const path = process.getBuiltinModule("path");
     const launcherPath = config.args?.[0];
+    const usesOfficialLauncher = typeof launcherPath === "string" &&
+      /[\\/]unified-computer-use[\\/][^\\/]+[\\/]scripts[\\/]launch\.mjs$/.test(launcherPath);
+    const trustedServices = findCuaTrustedServices(config.env, path);
     const codexHome = config.env.CODEX_HOME;
     const moduleDirs = config.env.NODE_REPL_NODE_MODULE_DIRS?.split(path.delimiter) ?? [];
-    if (typeof launcherPath !== "string" ||
-        !/[\\/]unified-computer-use[\\/][^\\/]+[\\/]scripts[\\/]launch\.mjs$/.test(launcherPath) ||
+    if ((!usesOfficialLauncher && trustedServices == null) ||
         !path.isAbsolute(codexHome ?? "") ||
         !config.env.NODE_REPL_TRUSTED_CODE_PATHS?.split(path.delimiter)
           .some((entry) => path.resolve(entry) === path.resolve(codexHome))) return;
-    const key = JSON.stringify([launcherPath, codexHome, moduleDirs]);
+    const key = JSON.stringify([
+      usesOfficialLauncher ? launcherPath : trustedServices.services.browser,
+      codexHome,
+      moduleDirs,
+    ]);
     let prepared = cuaCompatibilityLaunchers.get(key);
     if (!prepared) {
       prepared = (async () => {
         const fs = process.getBuiltinModule("fs/promises");
         const { pathToFileURL } = process.getBuiltinModule("url");
         const { createHash, randomUUID } = process.getBuiltinModule("crypto");
-        let servicePath;
-        for (const directory of moduleDirs.filter((entry) => path.isAbsolute(entry))) {
-          const candidate = path.join(directory, "@oai/browser-desktop/scripts/browser-service.mjs");
-          try { await fs.access(candidate); servicePath = candidate; break; }
-          catch (error) { if (error.code !== "ENOENT") throw error; }
+        // The runtime names the browser service either as a module specifier or
+        // as an absolute path to a bundled implementation; only the specifier
+        // has to be resolved through the configured module directories.
+        const mappedBrowser = usesOfficialLauncher ? null : trustedServices.services.browser;
+        let servicePath = mappedBrowser === cuaBrowserServiceSpecifier ? null : mappedBrowser;
+        if (servicePath == null) {
+          for (const directory of moduleDirs.filter((entry) => path.isAbsolute(entry))) {
+            const candidate = path.join(directory, "@oai/browser-desktop/scripts/browser-service.mjs");
+            try { await fs.access(candidate); servicePath = candidate; break; }
+            catch (error) { if (error.code !== "ENOENT") throw error; }
+          }
         }
         if (!servicePath) throw new Error("Computer Use browser runtime is unavailable");
-        const [launcher, service] = await Promise.all([
-          fs.readFile(launcherPath, "utf8"), fs.readFile(servicePath, "utf8"),
-        ]);
-        const serviceAnchor = /browser: ["']@oai\/browser-desktop\/service["']/g;
-        if ([...launcher.matchAll(serviceAnchor)].length !== 1) {
-          throw new Error("Unsupported Computer Use launcher");
-        }
+        const service = await fs.readFile(servicePath, "utf8");
         const patchedService = patchCuaBrowserPolicyTimeout(service)
           .replaceAll("import.meta.url", () => JSON.stringify(pathToFileURL(servicePath).href));
+        // Earlier releases start the runtime through the bundled plugin launcher
+        // and are redirected by patching that launcher. Newer releases start the
+        // runtime directly and carry the service mapping in the plugin
+        // environment, so the mapped browser service is redirected there.
+        const launcher = usesOfficialLauncher ? await fs.readFile(launcherPath, "utf8") : null;
         const fingerprint = createHash("sha256").update(patchedService)
-          .update(launcher).update(launcherPath).digest("hex");
+          .update(launcher ?? trustedServices.services.browser)
+          .update(launcherPath ?? servicePath).digest("hex");
         // Stay within the official runtime's existing trusted Codex directory.
         const directory = path.join(codexHome, ".tmp", "codey-cua", fingerprint);
         const browserPath = path.join(directory, "browser-service.mjs");
-        const preparedLauncher = path.join(directory, "launch.mjs");
-        const patchedLauncher = launcher
-          .replace(serviceAnchor, () => `browser: ${JSON.stringify(browserPath)}`)
-          .replaceAll("import.meta.url", () => JSON.stringify(pathToFileURL(launcherPath).href));
+        let patchedLauncher = null;
+        if (launcher != null) {
+          const serviceAnchor = /browser: ["']@oai\/browser-desktop\/service["']/g;
+          if ([...launcher.matchAll(serviceAnchor)].length !== 1) {
+            throw new Error("Unsupported Computer Use launcher");
+          }
+          patchedLauncher = launcher
+            .replace(serviceAnchor, () => `browser: ${JSON.stringify(browserPath)}`)
+            .replaceAll("import.meta.url", () => JSON.stringify(pathToFileURL(launcherPath).href));
+        }
+        const preparedLauncher = patchedLauncher == null ? null : path.join(directory, "launch.mjs");
         await fs.mkdir(directory, { recursive: true });
-        for (const [filename, contents] of [[browserPath, patchedService], [preparedLauncher, patchedLauncher]]) {
+        const outputs = [[browserPath, patchedService]];
+        if (preparedLauncher != null) outputs.push([preparedLauncher, patchedLauncher]);
+        for (const [filename, contents] of outputs) {
           const temporary = `${filename}.${randomUUID()}.tmp`;
           try { await fs.writeFile(temporary, contents); await fs.rename(temporary, filename); }
           finally { await fs.rm(temporary, { force: true }); }
         }
-        return preparedLauncher;
+        return { browserPath, preparedLauncher };
       })();
       cuaCompatibilityLaunchers.set(key, prepared);
     }
     try {
-      config.args = [await prepared, ...config.args.slice(1)];
+      const preparedRuntime = await prepared;
+      if (preparedRuntime.preparedLauncher != null) {
+        config.args = [preparedRuntime.preparedLauncher, ...config.args.slice(1)];
+      } else if (trustedServices != null) {
+        config.env[trustedServices.key] = JSON.stringify({
+          ...trustedServices.services,
+          browser: preparedRuntime.browserPath,
+        });
+      }
     } catch (error) {
       cuaCompatibilityLaunchers.delete(key);
       recordCodeyPatchFailure("optional_main_bundle_patch:cuaBrowserPolicyRuntime", error);
@@ -1605,7 +1653,7 @@
     }
   };
   const patchCodexCuaPluginConfig = (source) => {
-    const anchor = /([$\w]+)\.args=\[([$\w.]+)\.join\(([$\w]+),([`"'])scripts\/launch\.mjs\4\)\]\);/g;
+    const anchor = /([$\w.]+)\s*\.args\s*=\s*\[([^;]{0,300}?\.join\([^;]{0,200}?,\s*([`"'])(?:\.\/)?(?:scripts[\\/]launch\.mjs|@oai[\\/]cua-repl[\\/]bin[\\/]cua-repl\.mjs)\3\s*\)[^;]{0,300}?)\]\s*\)\s*;/g;
     if (!source.includes("CUA_REPL_NODE_REPL_PATH") || [...source.matchAll(anchor)].length !== 1) {
       throw new Error("Computer Use plugin configuration anchor is unavailable");
     }

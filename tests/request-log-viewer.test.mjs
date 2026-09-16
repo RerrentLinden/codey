@@ -79,6 +79,13 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /按实际模型筛选请求日志/);
   assert.match(viewer, /按状态筛选请求日志/);
   assert.match(viewer, /按上游协议筛选请求日志/);
+  assert.match(viewer, /按官方账号筛选请求日志/);
+  assert.match(viewer, /officialAccountId: officialAccount/);
+  assert.match(viewer, /\{ label: "按官方账号统计", value: "official_account" \}/);
+  assert.match(viewer, /official_account: "官方账号"/);
+  assert.match(viewer, /官方账号：\$\{officialAccountLabel\(item\.officialAccountId\)\}/);
+  // 独立页面拿不到启动期能力标志，存在官方线路时仍要读取账号列表。
+  assert.match(viewer, /profile\.officialAccount \|\| Boolean\(profile\.officialAccountId\)/);
   assert.match(viewer, /label: "SSE", value: "http_sse"/);
   assert.match(viewer, /item\.upstreamTransport === "http_sse" \? "SSE" : \(item\.upstreamTransport \|\| "—"\)\.toUpperCase\(\)/);
   assert.match(viewer, /protocolTagClass\(item\.upstreamTransport\)/);

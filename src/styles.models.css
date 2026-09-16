@@ -781,6 +781,17 @@
   color: #10a37f;
 }
 
+/* 官方明确拒绝凭据的账号：红色底标识失效，同时隐藏切换默认入口。 */
+.official-account-item.is-invalid {
+  border-color: rgba(255, 59, 48, 0.35);
+  background: rgba(255, 59, 48, 0.1);
+}
+
+.official-account-item.is-invalid .official-account-avatar,
+.official-account-item.is-invalid .official-account-line strong {
+  color: #d70015;
+}
+
 .official-account-plan-badge {
   display: inline-flex;
   align-items: center;

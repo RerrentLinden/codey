@@ -194,9 +194,17 @@ pub(crate) fn upstream_request_id_from_headers(headers: &HeaderMap) -> Option<St
         .and_then(bounded_upstream_request_id)
 }
 
+/// 部分第三方 thinking 模式要求把上一轮的 reasoning 明文原样回传，请求缺少
+/// 明文字段时上游拒绝整条请求。识别该错误后由调用方补齐占位明文再重发一次。
+pub(crate) fn requires_reasoning_text_fallback(body: &[u8]) -> bool {
+    String::from_utf8_lossy(body).contains("reasoning_text")
+}
+
 pub(crate) async fn write_upstream_http_error<D>(
     downstream: &mut D,
-    response: reqwest::Response,
+    status: u16,
+    upstream_request_id: Option<&str>,
+    body: &[u8],
     resolved: &RouteSelection,
     bridge: ProtocolBridge,
     request_kind: ResponsesRequestKind,
@@ -204,15 +212,9 @@ pub(crate) async fn write_upstream_http_error<D>(
 where
     D: ResponsesDownstream + ?Sized,
 {
-    let status = response.status().as_u16();
-    let upstream_request_id = upstream_request_id_from_headers(response.headers());
+    let upstream_request_id = upstream_request_id.map(str::to_string);
     let probe = downstream.request_log_probe().cloned();
-    let body = await_upstream(
-        downstream,
-        read_bounded_upstream_error_body(response, probe.as_ref()),
-    )
-    .await??;
-    let parsed = serde_json::from_slice::<Value>(&body).ok();
+    let parsed = serde_json::from_slice::<Value>(body).ok();
     let context_exceeded = parsed.as_ref().is_some_and(is_context_length_error);
     let summary = parsed
         .as_ref()
@@ -221,7 +223,7 @@ where
     let detail = upstream_error_detail(&summary);
     if let Some(probe) = probe.as_ref() {
         let mut original =
-            redact_upstream_error_text(&String::from_utf8_lossy(&body), &resolved.route);
+            redact_upstream_error_text(&String::from_utf8_lossy(body), &resolved.route);
         if body.len() == MAX_UPSTREAM_ERROR_BYTES {
             original.push_str("\n[上游错误正文达到读取上限，内容可能不完整]");
         }

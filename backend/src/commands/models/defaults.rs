@@ -23,7 +23,7 @@ pub async fn save_default_model(
         .find(|profile| profile.id == target_route_id)
         .cloned()
         .ok_or_else(|| "找不到要设置默认模型的线路".to_string())?;
-    if target_profile.official_account && !config.official_account_available_this_launch {
+    if target_profile.official_account && !config.official_route_usable(&target_profile) {
         return Err("本次 Codex 没有可用的官方账号登录态，不能选择官方模型".to_string());
     }
     let target = config
@@ -71,7 +71,7 @@ pub async fn save_official_route_models(
         .position(|profile| profile.id == route_id)
         .ok_or_else(|| "找不到要更新模型的官方账号线路".to_string())?;
     let profile = &config.profiles[profile_index];
-    if !profile.official_account || !config.official_account_available_this_launch {
+    if !profile.official_account || !config.official_route_usable(profile) {
         return Err("当前线路不是本次登录可用的官方账号线路".to_string());
     }
     let provider_id = profile.provider_id().to_string();
@@ -132,11 +132,18 @@ pub async fn save_official_route_models(
     if let Err(error) = save_config_to_store(state, &config).await {
         return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
     }
-    // 官方线路在每次启动准备时按默认账号重新派生，因此代理还要写回账号记录，
-    // 否则重启后会被派生结果覆盖。失败只降级为提示，不影响已经生效的配置。
+    // 官方线路在每次启动准备时按账号记录重新派生，因此代理还要写回该线路自己
+    // 的账号记录，否则重启后会被派生结果覆盖。失败只降级为提示，不影响已经
+    // 生效的配置。
     let mut account_override_warning: Option<String> = None;
+    let route_account_id = config
+        .profiles
+        .iter()
+        .find(|profile| profile.id == route_id)
+        .and_then(|profile| profile.official_account_id.clone());
     if let Some(upstream_proxy) = mirrored_proxy
-        && let Err(error) = persist_official_account_proxy(state, upstream_proxy).await
+        && let Some(account_id) = route_account_id
+        && let Err(error) = persist_official_account_proxy(state, account_id, upstream_proxy).await
     {
         account_override_warning = Some(format!("线路代理未能写入官方账号记录：{error}"));
     }
@@ -168,11 +175,12 @@ pub async fn save_official_route_models(
 /// official route card.
 async fn persist_official_account_proxy(
     state: &Arc<AppState>,
+    account_id: String,
     upstream_proxy: String,
 ) -> Result<(), String> {
     let store = state.official_accounts();
     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let Some(record) = store.default_account()? else {
+        let Some(record) = store.get(&account_id)? else {
             return Ok(());
         };
         let upstream_proxy = upstream_proxy.trim();
@@ -278,7 +286,7 @@ pub(crate) fn current_model_state_at(
         return Ok(model_catalog::ModelSelectionState::default());
     };
     let provider_id = active_profile.provider_id();
-    let official = active_profile.official_account && config.official_account_available_this_launch;
+    let official = active_profile.official_account && config.official_route_usable(active_profile);
     let selected_models = if official {
         config
             .selected_models_by_provider

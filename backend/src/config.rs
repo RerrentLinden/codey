@@ -42,6 +42,10 @@ pub struct ProviderProfile {
     pub source_provider_id: Option<String>,
     #[serde(default)]
     pub official_account: bool,
+    /// Codey account id when this route is derived from one stored official
+    /// account. Every stored account owns exactly one derived official route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub official_account_id: Option<String>,
     /// Preserve the exact Codex provider identity required for remote
     /// compaction when it was explicitly enabled by the source configuration.
     #[serde(default)]
@@ -65,13 +69,106 @@ pub struct ProviderProfile {
 
 pub const DERIVED_OFFICIAL_PROFILE_ID: &str = "codey-official-account";
 pub const OFFICIAL_ROUTE_SHORT_NAME: &str = "官";
+/// 官方账号默认线路名的前缀，完整形式是「官方账号1」这类编号。
+pub const OFFICIAL_ROUTE_NAME_PREFIX: &str = "官方账号";
+/// 短名称在第 10 个账号之后使用的字母编号表，顺序对应编号 10 起的取值。
+pub const OFFICIAL_ROUTE_SHORT_NAME_LETTERS: &str =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 pub const MAX_ROUTE_SHORT_NAME_CHARS: usize = 2;
+
+/// 官方账号默认线路名按添加顺序编号，第一个账号是「官方账号1」。
+pub fn default_official_route_name(index: usize) -> String {
+    format!("{OFFICIAL_ROUTE_NAME_PREFIX}{index}")
+}
+
+/// 官方账号默认短名称与线路名同号，例如「官1」。短名称最长两个字符，
+/// 编号越过 9 之后依次使用「官A」这类字母编号。
+pub fn default_official_route_short_name(index: usize) -> String {
+    let prefix = OFFICIAL_ROUTE_SHORT_NAME;
+    if index <= 9 {
+        return format!("{prefix}{index}");
+    }
+    let letter = OFFICIAL_ROUTE_SHORT_NAME_LETTERS
+        .chars()
+        .nth(index - 10)
+        .or_else(|| OFFICIAL_ROUTE_SHORT_NAME_LETTERS.chars().last())
+        .unwrap_or('Z');
+    format!("{prefix}{letter}")
+}
+
+/// Stable profile id of the derived official route that belongs to one stored
+/// account. The id doubles as the route-scoped provider id, so several
+/// accounts can be selected side by side in one conversation.
+pub fn official_profile_id(account_id: &str) -> String {
+    let cleaned = account_id
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    format!("{DERIVED_OFFICIAL_PROFILE_ID}-{cleaned}")
+}
+
+/// Whether one route-scoped provider id belongs to a derived official account
+/// route.
+pub fn is_official_profile_id(provider_id: &str) -> bool {
+    let provider_id = provider_id.trim();
+    provider_id == DERIVED_OFFICIAL_PROFILE_ID
+        || provider_id
+            .strip_prefix(DERIVED_OFFICIAL_PROFILE_ID)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+}
 
 fn default_route_short_name(name: &str) -> String {
     name.trim()
         .chars()
         .take(MAX_ROUTE_SHORT_NAME_CHARS)
         .collect()
+}
+
+/// Keeps one official account's preferred short name when it is still free and
+/// otherwise numbers the following accounts so route-scoped model ids stay
+/// readable.
+fn unique_official_route_short_name(preferred: &str, used: &BTreeSet<String>) -> String {
+    let preferred = preferred.trim();
+    if !preferred.is_empty() && !used.contains(preferred) {
+        return preferred.to_string();
+    }
+    let official_prefix = OFFICIAL_ROUTE_SHORT_NAME.chars().next().unwrap_or('官');
+    let stem = preferred
+        .chars()
+        .next()
+        .filter(|character| *character != official_prefix)
+        .unwrap_or(official_prefix);
+    for suffix in 1..=9 {
+        let candidate = format!("{stem}{suffix}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        let official = format!("{official_prefix}{suffix}");
+        if official != candidate && !used.contains(&official) {
+            return official;
+        }
+    }
+    let fallback = unique_default_route_short_name(preferred, used);
+    if !used.contains(&fallback) {
+        return fallback;
+    }
+    for codepoint in 0x4E00..=0x9FFF {
+        let Some(character) = char::from_u32(codepoint) else {
+            continue;
+        };
+        let candidate = character.to_string();
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    fallback
 }
 
 fn unique_default_route_short_name(name: &str, used: &BTreeSet<String>) -> String {
@@ -128,6 +225,7 @@ impl ProviderProfile {
             upstream_proxy: String::new(),
             source_provider_id: None,
             official_account: false,
+            official_account_id: None,
             supports_remote_compaction: false,
             supports_websockets: false,
             supports_native_web_search: false,
@@ -195,6 +293,11 @@ impl ProviderProfile {
             .take()
             .map(|provider_id| provider_id.trim().to_string())
             .filter(|provider_id| !provider_id.is_empty());
+        self.official_account_id = self
+            .official_account_id
+            .take()
+            .map(|account_id| account_id.trim().to_string())
+            .filter(|account_id| !account_id.is_empty());
         self.upstream_protocol = normalize_upstream_protocol(&self.upstream_protocol);
         if self.resolves_to_official_account_route() {
             self.official_account = true;
@@ -895,6 +998,7 @@ impl CodeyConfig {
                 .clone();
         }
         normalize_model_lists(&mut self.selected_models_by_provider);
+        self.prune_retired_official_selections();
         normalize_model_reasoning_effort_lists(&mut self.model_reasoning_efforts_by_provider);
         normalize_model_lists(&mut self.manual_third_party_models_by_provider);
         normalize_model_lists(&mut self.declared_official_models_by_provider);
@@ -919,23 +1023,26 @@ impl CodeyConfig {
         self
     }
 
-    pub(crate) fn apply_launch_official_profile(
+    /// Replaces every derived official route with one route per stored
+    /// account. Route names, short names and proxies come from the account
+    /// record, so the same account keeps its settings across launches.
+    pub(crate) fn apply_launch_official_profiles(
         &mut self,
-        official_profile: Option<ProviderProfile>,
+        official_profiles: Vec<ProviderProfile>,
     ) {
         let previous_active_id = self.active_profile_id.clone();
-        let official_enabled = self
-            .profiles
-            .iter()
-            .find(|profile| profile.official_account)
-            .map(|profile| profile.enabled)
-            .unwrap_or(true);
-        let previous_official_provider_ids = self
+        let previous_official_profiles = self
             .profiles
             .iter()
             .filter(|profile| profile.official_account)
-            .map(|profile| profile.provider_id().to_string())
-            .collect::<BTreeSet<_>>();
+            .map(|profile| {
+                (
+                    profile.provider_id().to_string(),
+                    profile.official_account_id.clone(),
+                    profile.enabled,
+                )
+            })
+            .collect::<Vec<_>>();
         let placeholder_provider_id = self
             .looks_like_empty_default_route()
             .then(|| self.profiles[0].provider_id().to_string());
@@ -958,26 +1065,79 @@ impl CodeyConfig {
                 .remove(&provider_id);
             self.upstream_models_by_provider.remove(&provider_id);
         }
-        if let Some(mut official_profile) = official_profile {
-            official_profile.id = DERIVED_OFFICIAL_PROFILE_ID.to_string();
-            official_profile.enabled = official_enabled;
-            official_profile.normalize();
-            let official_provider_id = official_profile.provider_id().to_string();
-            for previous_provider_id in previous_official_provider_ids {
-                self.migrate_official_provider_state(&previous_provider_id, &official_provider_id);
-            }
-            if let Some(existing) = self
+        if !official_profiles.is_empty() {
+            // Official and third-party routes share the short-name namespace,
+            // so third-party names are reserved before the official ones.
+            let mut used_short_names = self
                 .profiles
-                .iter_mut()
-                .find(|profile| profile.id == DERIVED_OFFICIAL_PROFILE_ID)
-            {
-                *existing = official_profile;
-            } else {
-                self.profiles.insert(0, official_profile);
+                .iter()
+                .map(|profile| profile.short_name.trim().to_string())
+                .filter(|short_name| !short_name.is_empty())
+                .collect::<BTreeSet<_>>();
+            let mut derived = Vec::with_capacity(official_profiles.len());
+            for (index, mut official_profile) in official_profiles.into_iter().enumerate() {
+                let account_id = official_profile.official_account_id.clone();
+                match account_id.as_deref() {
+                    // 每个账号拥有独立的 Provider ID，同一段对话里可以并存多条
+                    // 官方线路，同名模型也能区分。
+                    Some(account_id) => {
+                        official_profile.id = official_profile_id(account_id);
+                        official_profile.source_provider_id = None;
+                    }
+                    // 升级前没有账号记录时保留原有 Provider ID，Codex 仍按官方
+                    // 登录直接访问。
+                    None => official_profile.id = DERIVED_OFFICIAL_PROFILE_ID.to_string(),
+                }
+                let account_key = account_id.unwrap_or_default();
+                official_profile.enabled = previous_official_profiles
+                    .iter()
+                    .find(|(_, previous_account_id, _)| {
+                        previous_account_id.as_deref() == Some(account_key.as_str())
+                    })
+                    .map(|(_, _, enabled)| *enabled)
+                    .or_else(|| {
+                        // 升级前只有一条官方线路，它的启用状态留给默认账号。
+                        (index == 0)
+                            .then(|| {
+                                previous_official_profiles
+                                    .iter()
+                                    .find(|(_, previous_account_id, _)| {
+                                        previous_account_id.is_none()
+                                    })
+                                    .map(|(_, _, enabled)| *enabled)
+                            })
+                            .flatten()
+                    })
+                    .unwrap_or(true);
+                official_profile.normalize();
+                official_profile.short_name = unique_official_route_short_name(
+                    &official_profile.short_name,
+                    &used_short_names,
+                );
+                used_short_names.insert(official_profile.short_name.clone());
+                derived.push(official_profile);
             }
-            self.selected_models_by_provider
-                .entry(official_provider_id)
-                .or_insert_with(model_catalog::default_official_model_slugs);
+            // 旧版本只保留一条官方线路，把它的模型选择等状态交给默认账号。
+            if let Some(default_provider_id) = derived.first().map(|profile| profile.provider_id())
+            {
+                let default_provider_id = default_provider_id.to_string();
+                for (previous_provider_id, previous_account_id, _) in &previous_official_profiles {
+                    if previous_account_id.is_some() {
+                        continue;
+                    }
+                    self.migrate_official_provider_state(
+                        previous_provider_id,
+                        &default_provider_id,
+                    );
+                }
+            }
+            for (index, official_profile) in derived.into_iter().enumerate() {
+                let official_provider_id = official_profile.provider_id().to_string();
+                self.selected_models_by_provider
+                    .entry(official_provider_id)
+                    .or_insert_with(model_catalog::default_official_model_slugs);
+                self.profiles.insert(index, official_profile);
+            }
         }
         if self
             .profiles
@@ -1093,19 +1253,21 @@ impl CodeyConfig {
     }
 
     pub(crate) fn runtime_model_contexts(&self) -> BTreeMap<String, ModelContextConfig> {
+        let qualify_official = self.qualifies_official_model_ids();
         self.profiles
             .iter()
             .filter(|profile| profile.enabled)
-            .filter(|profile| {
-                !profile.official_account || self.official_account_available_this_launch
-            })
+            .filter(|profile| !profile.official_account || self.official_route_usable(profile))
             .flat_map(|profile| {
                 self.model_context_by_provider
                     .get(profile.provider_id())
                     .into_iter()
                     .flat_map(move |models| {
                         models.iter().map(move |(model, policy)| {
-                            (runtime_catalog_model_id(profile, model), policy.clone())
+                            (
+                                runtime_catalog_model_id(profile, model, qualify_official),
+                                policy.clone(),
+                            )
                         })
                     })
             })
@@ -1116,19 +1278,21 @@ impl CodeyConfig {
     pub(crate) fn runtime_model_reasoning_efforts(
         &self,
     ) -> BTreeMap<String, Vec<ModelReasoningEffort>> {
+        let qualify_official = self.qualifies_official_model_ids();
         self.profiles
             .iter()
             .filter(|profile| profile.enabled)
-            .filter(|profile| {
-                !profile.official_account || self.official_account_available_this_launch
-            })
+            .filter(|profile| !profile.official_account || self.official_route_usable(profile))
             .flat_map(|profile| {
                 self.model_reasoning_efforts_by_provider
                     .get(profile.provider_id())
                     .into_iter()
                     .flat_map(move |models| {
                         models.iter().map(move |(model, efforts)| {
-                            (runtime_catalog_model_id(profile, model), efforts.clone())
+                            (
+                                runtime_catalog_model_id(profile, model, qualify_official),
+                                efforts.clone(),
+                            )
                         })
                     })
             })
@@ -1193,6 +1357,29 @@ impl CodeyConfig {
             .unwrap_or_else(model_catalog::default_official_model_slugs)
     }
 
+    /// 官方线路只能选择内置官方模型清单里的模型。上游下线某个模型后，旧配置里
+    /// 遗留的选择会在这里清掉，避免模型界面和生成的目录继续出现它。
+    fn prune_retired_official_selections(&mut self) {
+        let official_provider_ids = self
+            .profiles
+            .iter()
+            .filter(|profile| profile.resolves_to_official_account_route())
+            .map(|profile| profile.provider_id().to_string())
+            .collect::<BTreeSet<_>>();
+        if official_provider_ids.is_empty() {
+            return;
+        }
+        let supported_models = official_models_by_key();
+        self.selected_models_by_provider
+            .retain(|provider_id, models| {
+                if !official_provider_ids.contains(provider_id) {
+                    return true;
+                }
+                models.retain(|model| supported_models.contains_key(&model_id::key(model)));
+                !models.is_empty()
+            });
+    }
+
     /// Whether official ChatGPT routes can be served this launch.
     ///
     /// The loopback provider keeps Codex's native OpenAI authentication when
@@ -1205,6 +1392,27 @@ impl CodeyConfig {
                 .profiles
                 .iter()
                 .any(|profile| profile.enabled && profile.official_account)
+    }
+
+    /// Whether one derived official route can be used this launch. Routes
+    /// owned by a stored account carry that account's own credentials, so they
+    /// no longer depend on the Codex login of the default account.
+    pub(crate) fn official_route_usable(&self, profile: &ProviderProfile) -> bool {
+        profile.official_account
+            && (self.official_account_available_this_launch
+                || (self.local_router_enabled && profile.official_account_id.is_some()))
+    }
+
+    /// Derived official routes of the accounts that are live this launch.
+    pub(crate) fn usable_official_routes(&self) -> impl Iterator<Item = &ProviderProfile> {
+        self.profiles
+            .iter()
+            .filter(|profile| profile.enabled && self.official_route_usable(profile))
+    }
+
+    /// 官方模型只在多条官方线路并存时才带上线路前缀，单个账号的展示保持原样。
+    pub(crate) fn qualifies_official_model_ids(&self) -> bool {
+        self.local_router_enabled && self.usable_official_routes().count() > 1
     }
 
     pub(crate) fn runtime_gateway_provider_id(&self) -> &'static str {
@@ -1230,7 +1438,7 @@ impl CodeyConfig {
             return false;
         }
         if profile.official_account {
-            return self.official_account_available_this_launch;
+            return self.official_route_usable(profile);
         }
         profile.supports_websockets
             && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
@@ -1241,6 +1449,7 @@ impl CodeyConfig {
         if !self.runtime_supports_websockets() {
             return Vec::new();
         }
+        let qualify_official = self.qualifies_official_model_ids();
         self.profiles
             .iter()
             .filter(|profile| self.route_supports_websockets_this_launch(profile))
@@ -1253,7 +1462,7 @@ impl CodeyConfig {
                 };
                 models
                     .into_iter()
-                    .map(move |model| runtime_catalog_model_id(profile, &model))
+                    .map(move |model| runtime_catalog_model_id(profile, &model, qualify_official))
             })
             .collect()
     }
@@ -1279,7 +1488,7 @@ impl CodeyConfig {
             return false;
         }
         if profile.official_account {
-            return self.official_account_available_this_launch;
+            return self.official_route_usable(profile);
         }
         profile.supports_native_web_search
             && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
@@ -1290,6 +1499,7 @@ impl CodeyConfig {
     /// only preserves the capability when the source model metadata declares
     /// support as well.
     pub(crate) fn runtime_native_web_search_model_aliases(&self) -> Vec<String> {
+        let qualify_official = self.qualifies_official_model_ids();
         self.profiles
             .iter()
             .filter(|profile| self.route_supports_native_web_search_this_launch(profile))
@@ -1302,7 +1512,7 @@ impl CodeyConfig {
                 };
                 models
                     .into_iter()
-                    .map(move |model| runtime_catalog_model_id(profile, &model))
+                    .map(move |model| runtime_catalog_model_id(profile, &model, qualify_official))
             })
             .collect()
     }
@@ -1318,7 +1528,7 @@ impl CodeyConfig {
             return false;
         }
         if profile.official_account {
-            return self.official_account_available_this_launch;
+            return self.official_route_usable(profile);
         }
         profile.supports_remote_compaction
             && profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
@@ -1335,7 +1545,7 @@ impl CodeyConfig {
                 continue;
             }
             if profile.official_account {
-                if !self.official_account_available_this_launch {
+                if !self.official_route_usable(profile) {
                     continue;
                 }
             } else if profile.normalized_base_url().is_empty() {
@@ -1415,9 +1625,13 @@ impl CodeyConfig {
     }
 
     pub(crate) fn runtime_model_targets(&self) -> Vec<RuntimeModelTarget> {
+        let usable_official_routes = self
+            .usable_official_routes()
+            .map(|profile| profile.id.clone())
+            .collect::<BTreeSet<_>>();
         self.configured_model_targets()
             .into_iter()
-            .filter(|target| !target.official || self.official_account_available_this_launch)
+            .filter(|target| !target.official || usable_official_routes.contains(&target.route_id))
             .collect()
     }
 
@@ -1429,6 +1643,8 @@ impl CodeyConfig {
 
     pub(crate) fn uses_builtin_official_model_catalog(&self) -> bool {
         !self.has_third_party_route()
+            // 多账号并存时官方模型名必须带线路前缀，内置目录无法表达。
+            && !self.qualifies_official_model_ids()
             && self
                 .profiles
                 .iter()
@@ -1545,8 +1761,7 @@ impl CodeyConfig {
     /// process. Third-party entries use local-router aliases so Codex can send
     /// requests through one stable provider while Codey restores upstream ids.
     pub fn runtime_catalog_models(&self) -> (Vec<String>, Vec<String>) {
-        let include_all_official = self.official_account_available_this_launch
-            && self.profiles.iter().any(|profile| profile.official_account);
+        let qualify_official = self.qualifies_official_model_ids();
         let mut upstream = Vec::new();
         let mut selected = Vec::new();
         for profile in &self.profiles {
@@ -1554,12 +1769,12 @@ impl CodeyConfig {
                 continue;
             }
             if profile.official_account {
-                if include_all_official {
+                if self.official_route_usable(profile) {
                     let provider_id = profile.provider_id();
                     let enabled = self.enabled_official_route_models(provider_id);
                     let aliases = enabled
                         .iter()
-                        .map(|model| runtime_catalog_model_id(profile, model))
+                        .map(|model| runtime_catalog_model_id(profile, model, qualify_official))
                         .collect::<Vec<_>>();
                     upstream.extend(aliases.iter().cloned());
                     selected.extend(aliases);
@@ -1588,6 +1803,17 @@ impl CodeyConfig {
             model_id::dedupe_preserving_first(upstream.iter().map(String::as_str)),
             model_id::dedupe_preserving_first(selected.iter().map(String::as_str)),
         )
+    }
+
+    /// Catalog id of one runtime model target. It matches the ids produced by
+    /// `runtime_catalog_models` so the default model always names a model that
+    /// Codex can find in the generated catalog.
+    pub(crate) fn runtime_catalog_id_for_target(&self, target: &RuntimeModelTarget) -> String {
+        if target.official && !self.qualifies_official_model_ids() {
+            target.upstream_model.clone()
+        } else {
+            target.alias.clone()
+        }
     }
 
     pub(crate) fn remember_current_provider_official_model_support(
@@ -1735,8 +1961,15 @@ impl CodeyConfig {
     }
 }
 
-fn runtime_catalog_model_id(profile: &ProviderProfile, model: &str) -> String {
-    if profile.official_account {
+/// Catalog id Codex sees for one route model. Official models keep their native
+/// OpenAI ids while a single account is in use and gain the route prefix once
+/// several official accounts are served side by side.
+fn runtime_catalog_model_id(
+    profile: &ProviderProfile,
+    model: &str,
+    qualify_official: bool,
+) -> String {
+    if profile.official_account && !qualify_official {
         model.trim().to_string()
     } else {
         local_router::model_alias(profile.provider_id(), model)
@@ -2742,6 +2975,28 @@ mod tests {
     }
 
     #[test]
+    fn generated_official_account_names_follow_the_add_order() {
+        assert_eq!(default_official_route_name(1), "官方账号1");
+        assert_eq!(default_official_route_short_name(1), "官1");
+        assert_eq!(default_official_route_short_name(2), "官2");
+        assert_eq!(default_official_route_short_name(9), "官9");
+        // 短名称受两个字符限制，编号超过 9 之后改用字母，仍然是两个字符。
+        assert_eq!(default_official_route_short_name(10), "官A");
+        for index in 1..=300 {
+            let short_name = default_official_route_short_name(index);
+            assert!(short_name.chars().count() <= MAX_ROUTE_SHORT_NAME_CHARS);
+        }
+
+        let mut route = ProviderProfile::new(default_official_route_name(1));
+        route.short_name = default_official_route_short_name(1);
+        route.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        route.normalize();
+        assert_eq!(route.name, "官方账号1");
+        assert_eq!(route.short_name, "官1");
+        assert!(route.validate().is_ok());
+    }
+
+    #[test]
     fn official_short_names_are_unique_against_third_party_routes() {
         let mut official = ProviderProfile::new("OpenAI 官方直登");
         official.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
@@ -2829,13 +3084,66 @@ mod tests {
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
                 "gpt-5.5",
-                "gpt-5.4",
-                "gpt-5.4-mini",
                 "gpt-5.3-codex-spark",
                 "relay/shared-model",
                 "relay/manual-model",
             ]
         );
+    }
+
+    #[test]
+    fn normalize_drops_retired_official_models_from_saved_selections() {
+        let mut official = ProviderProfile::new("Official");
+        official.id = "official-profile".into();
+        official.source_provider_id = Some("openai".into());
+        official.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        official.normalize();
+
+        let mut retired_only = ProviderProfile::new("Official Second");
+        retired_only.id = "official-profile-two".into();
+        retired_only.source_provider_id = Some("openai-two".into());
+        retired_only.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        retired_only.normalize();
+
+        let mut relay = ProviderProfile::new("Relay");
+        relay.id = "relay".into();
+        relay.base_url = "https://relay.example/v1".into();
+        relay.api_key = "relay-key".into();
+        relay.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: official.id.clone(),
+            profiles: vec![official, retired_only, relay],
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        };
+        config.selected_models_by_provider.insert(
+            "openai".into(),
+            vec![
+                "gpt-5.6-sol".into(),
+                "gpt-5.4".into(),
+                "GPT-5.4-Mini".into(),
+            ],
+        );
+        config
+            .selected_models_by_provider
+            .insert("openai-two".into(), vec!["gpt-5.4-mini".into()]);
+        config
+            .selected_models_by_provider
+            .insert("relay".into(), vec!["gpt-5.4".into()]);
+
+        let config = config.normalize();
+
+        assert_eq!(
+            config.selected_models_by_provider["openai"],
+            ["gpt-5.6-sol"]
+        );
+        assert!(
+            !config
+                .selected_models_by_provider
+                .contains_key("openai-two")
+        );
+        assert_eq!(config.selected_models_by_provider["relay"], ["gpt-5.4"]);
     }
 
     #[test]
@@ -3145,7 +3453,7 @@ mod tests {
         };
         config.default_model = "openai/gpt-5.6-sol".into();
 
-        config.apply_launch_official_profile(Some(official));
+        config.apply_launch_official_profiles(vec![official]);
         config = config.normalize();
 
         assert_eq!(config.profiles[0].id, DERIVED_OFFICIAL_PROFILE_ID);
@@ -3205,7 +3513,7 @@ mod tests {
             .insert("local-official".into(), vec!["gpt-5.6-terra".into()]);
         config.default_model = "local-official/gpt-5.6-terra".into();
 
-        config.apply_launch_official_profile(Some(launched));
+        config.apply_launch_official_profiles(vec![launched]);
 
         assert_eq!(config.profiles.len(), 1);
         assert_eq!(config.profiles[0].id, DERIVED_OFFICIAL_PROFILE_ID);
@@ -3258,6 +3566,90 @@ mod tests {
     }
 
     #[test]
+    fn launch_official_profiles_give_every_stored_account_its_own_route() {
+        let mut first = ProviderProfile::new("主力账号");
+        first.source_provider_id = Some("openai".into());
+        first.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        first.official_account_id = Some("acct-one".into());
+        first.normalize();
+        let mut second = ProviderProfile::new("备用账号");
+        second.source_provider_id = Some("openai".into());
+        second.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        second.official_account_id = Some("acct-two".into());
+        second.normalize();
+
+        let mut config = CodeyConfig {
+            initial_route_import_completed: true,
+            official_account_available_this_launch: true,
+            ..CodeyConfig::default()
+        };
+
+        config.apply_launch_official_profiles(vec![first, second]);
+        let config = config.normalize();
+
+        assert_eq!(config.profiles.len(), 2);
+        assert_eq!(config.profiles[0].id, official_profile_id("acct-one"));
+        assert_eq!(config.profiles[1].id, official_profile_id("acct-two"));
+        assert_eq!(
+            config.profiles[0].official_account_id.as_deref(),
+            Some("acct-one")
+        );
+        assert_eq!(
+            config.profiles[1].official_account_id.as_deref(),
+            Some("acct-two")
+        );
+        assert_ne!(config.profiles[0].short_name, config.profiles[1].short_name);
+        assert!(config.qualifies_official_model_ids());
+
+        // 同一段对话里两条官方线路的模型必须能区分，模型名带上线路前缀。
+        let (_, selected) = config.runtime_catalog_models();
+        let first_alias =
+            local_router::model_alias(config.profiles[0].provider_id(), "gpt-5.6-sol");
+        let second_alias =
+            local_router::model_alias(config.profiles[1].provider_id(), "gpt-5.6-sol");
+        assert!(selected.contains(&first_alias), "{selected:?}");
+        assert!(selected.contains(&second_alias), "{selected:?}");
+        assert!(
+            !selected.contains(&"gpt-5.6-sol".to_string()),
+            "{selected:?}"
+        );
+
+        let targets = config.runtime_model_targets();
+        assert_eq!(
+            targets
+                .iter()
+                .filter(|target| target.official && target.upstream_model == "gpt-5.6-sol")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_single_stored_account_keeps_native_official_model_ids() {
+        let mut only = ProviderProfile::new("主力账号");
+        only.source_provider_id = Some("openai".into());
+        only.auth_mode = AUTH_MODE_OFFICIAL_ACCOUNT.into();
+        only.official_account_id = Some("acct-one".into());
+        only.normalize();
+
+        let mut config = CodeyConfig {
+            initial_route_import_completed: true,
+            ..CodeyConfig::default()
+        };
+        // 默认登录缺失时，存储账号仍然可以经本地路由直接使用。
+        config.official_account_available_this_launch = false;
+        config.apply_launch_official_profiles(vec![only]);
+        let config = config.normalize();
+
+        assert!(!config.qualifies_official_model_ids());
+        let (_, selected) = config.runtime_catalog_models();
+        assert!(
+            selected.contains(&"gpt-5.6-sol".to_string()),
+            "{selected:?}"
+        );
+    }
+
+    #[test]
     fn api_key_launch_removes_derived_official_route_and_falls_back_to_saved_route() {
         let mut official = ProviderProfile::new("OpenAI 官方直登");
         official.id = DERIVED_OFFICIAL_PROFILE_ID.into();
@@ -3277,7 +3669,7 @@ mod tests {
         };
         config.default_model = "gpt-5.6-sol".into();
 
-        config.apply_launch_official_profile(None);
+        config.apply_launch_official_profiles(Vec::new());
         config = config.normalize();
 
         assert_eq!(config.profiles.len(), 1);

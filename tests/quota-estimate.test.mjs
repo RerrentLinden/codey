@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 
@@ -123,6 +124,62 @@ test("weekly limit uses actual consumed percentage rather than projected weekly 
   assert.equal(quota.projectQuota(100, quota.WEEK_MS / 2, 100).remaining, 0);
   for (const value of [-1, 100.01, NaN, Infinity, "80", null]) assert.throws(() => quota.projectQuota(80, quota.WEEK_MS, value));
   assert.throws(() => quota.projectQuota(80, 0, 80));
+});
+
+test("every official account is projected from its own usage and its own used percentage", () => {
+  const now = 1788969600000;
+  const resetsAt = now / 1000 + 86_400;
+  const fetchedAt = now / 1000 - 30;
+  const snapshot = (usedPercent) => ({
+    status: "ok", fetchedAt,
+    secondary: { windowMinutes: 10080, usedPercent, resetsAt },
+  });
+  const at = quota.quotaPeriod(snapshot(40), now).fromUnixMs + 86_400_000;
+  const accountA = [{ model: "gpt-5.6-sol", inputTokens: 100_000, timestampUnixMs: at }];
+  const accountB = [{ model: "gpt-5.6-sol", inputTokens: 200_000, timestampUnixMs: at }];
+  const a = quota.estimateQuota(snapshot(40), accountA, now);
+  const b = quota.estimateQuota(snapshot(20), accountB, now);
+  near(a.total.cost, .4); near(a.result.limit, 1); near(a.result.remaining, .6);
+  near(b.total.cost, .8); near(b.result.limit, 4); near(b.result.remaining, 3.2);
+  // 把两个账号的消耗相加、再除以其中一个账号的比例，得到的是第三个错误数字。
+  const merged = quota.estimateQuota(snapshot(40), [...accountA, ...accountB], now);
+  near(merged.total.cost, 1.2); near(merged.result.limit, 3);
+  assert.notEqual(merged.result.limit, a.result.limit);
+  assert.notEqual(merged.result.limit, b.result.limit);
+});
+
+test("records outside the account period never reach the weekly limit projection", () => {
+  const now = 1788969600000;
+  const resetsAt = now / 1000 + 86_400;
+  const snapshot = {
+    status: "ok", fetchedAt: now / 1000 - 30,
+    secondary: { windowMinutes: 10080, usedPercent: 50, resetsAt },
+  };
+  const period = quota.quotaPeriod(snapshot, now);
+  const record = (timestampUnixMs) => ({ model: "gpt-5.6-sol", inputTokens: 100_000, timestampUnixMs });
+  const kept = quota.periodRows([
+    record(period.fromUnixMs - 1), record(period.fromUnixMs),
+    record(period.toUnixMs - 1), record(period.toUnixMs),
+  ], period.fromUnixMs, period.toUnixMs);
+  assert.deepEqual(kept.map((item) => item.timestampUnixMs), [period.fromUnixMs, period.toUnixMs - 1]);
+  // 旧记录没有时间戳时保留，避免已有数据被整体丢弃。
+  assert.equal(quota.periodRows([{ model: "gpt-5.6-sol" }], period.fromUnixMs, period.toUnixMs).length, 1);
+  assert.equal(quota.estimateQuota(snapshot, [record(period.fromUnixMs - 1)], now).result, null);
+  near(quota.estimateQuota(snapshot, [record(period.fromUnixMs)], now).result.limit, .8);
+});
+
+test("the quota dialog estimates one group per account and keeps untagged records apart", async () => {
+  const dialog = await readFile(new URL("../src/QuotaEstimateDialog.tsx", import.meta.url), "utf8");
+  // 每个账号用自己的过滤条件读日志、用自己的快照推算。
+  assert.match(dialog, /filter: \{ officialAccountId: account\.id \}/);
+  assert.match(dialog, /filter: \{ provider: "openai" \}/);
+  assert.match(dialog, /const estimate = estimateQuota\(snapshot, items\)/);
+  // 按供应商查询会命中已记录账号的请求，未区分账号的分组必须再过滤一次。
+  assert.match(dialog, /: loaded\.filter\(\(item\) => !item\.officialAccountId\)/);
+  assert.match(dialog, /query_official_account_usage"[\s\S]*accountId/);
+  // 逐个账号读取官方额度，两次请求之间留出间隔。
+  assert.match(dialog, /USAGE_QUERY_STAGGER_MS = \d+/);
+  assert.match(dialog, /await new Promise\(\(resolve\) => setTimeout\(resolve, USAGE_QUERY_STAGGER_MS\)\)/);
 });
 
 test("read all cursor pages, retain every model, reject unavailable/failed/stuck pagination and cancel", async () => {

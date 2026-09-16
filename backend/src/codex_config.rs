@@ -47,6 +47,15 @@ use runtime_role_transaction::refresh_runtime_subagent_roles_at;
 
 pub const CHATGPT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
 pub(crate) const BUILTIN_OPENAI_PROVIDER_ID: &str = "openai";
+/// Codex 自带这些 Provider，`model_providers` 里出现同名表会让 Codex 在加载
+/// 配置阶段直接退出；启动前需要先改名再放行。
+pub(crate) const RESERVED_BUILTIN_PROVIDER_IDS: &[&str] = &[
+    BUILTIN_OPENAI_PROVIDER_ID,
+    "ollama",
+    "lmstudio",
+    "amazon-bedrock",
+];
+const RESERVED_PROVIDER_RENAME_SUFFIX: &str = "-custom";
 const LOCAL_ROUTER_PROVIDER_NAME: &str = "Codey Local Router";
 const OPENAI_PROVIDER_NAME: &str = "OpenAI";
 const CODEY_FASTCTX_SERVER_ID: &str = "codey_fastctx";
@@ -1223,6 +1232,175 @@ fn repair_persistent_codey_runtime_config(home: &Path) -> Result<bool> {
         "codex_config.repair_persistent_codey_runtime_config",
     )?;
     Ok(true)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReservedProviderRename {
+    pub(crate) from: String,
+    pub(crate) to: String,
+}
+
+/// Renames custom providers that reuse a Codex built-in Provider ID. Codex
+/// refuses to load such a config, so the process exits before Codey can patch
+/// anything; renaming keeps the user's endpoint reachable and is the same
+/// remedy Codex suggests in its own error message.
+pub(crate) fn repair_reserved_provider_ids(home: &Path) -> Result<Vec<ReservedProviderRename>> {
+    let config_path = home.join("config.toml");
+    let manager = ConfigManager::new(&config_path);
+    let snapshot = manager.load()?;
+    if !snapshot.exists() {
+        return Ok(Vec::new());
+    }
+    let mut document = snapshot.document().clone();
+    let renames = rename_reserved_provider_tables(&mut document);
+    if renames.is_empty() {
+        return Ok(renames);
+    }
+    manager.replace_document(
+        Some(snapshot.revision()),
+        document,
+        "rename reserved built-in provider ids",
+        "codex_config.repair_reserved_provider_ids",
+    )?;
+    Ok(renames)
+}
+
+fn rename_reserved_provider_tables(document: &mut DocumentMut) -> Vec<ReservedProviderRename> {
+    let mut renames = Vec::new();
+    for reserved in RESERVED_BUILTIN_PROVIDER_IDS {
+        let Some(container) = document.get_mut("model_providers") else {
+            return renames;
+        };
+        if !provider_entry_is_custom(container, reserved) {
+            continue;
+        }
+        let taken = provider_keys(container);
+        let Some(target) = available_provider_id(reserved, &taken) else {
+            continue;
+        };
+        if !rename_provider_entry(container, reserved, &target) {
+            continue;
+        }
+        renames.push(ReservedProviderRename {
+            from: (*reserved).to_string(),
+            to: target,
+        });
+    }
+    if !renames.is_empty() {
+        reassign_provider_references(document, &renames);
+    }
+    renames
+}
+
+fn provider_entry_is_custom(container: &Item, id: &str) -> bool {
+    container
+        .get(id)
+        .is_some_and(|provider| provider.as_table_like().is_some())
+}
+
+fn provider_keys(container: &Item) -> Vec<String> {
+    match container {
+        Item::Table(providers) => providers.iter().map(|(key, _)| key.to_string()).collect(),
+        Item::Value(Value::InlineTable(providers)) => {
+            providers.iter().map(|(key, _)| key.to_string()).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn available_provider_id(reserved: &str, taken: &[String]) -> Option<String> {
+    let base = format!("{reserved}{RESERVED_PROVIDER_RENAME_SUFFIX}");
+    if !taken.iter().any(|key| key == &base) {
+        return Some(base);
+    }
+    (2..)
+        .map(|index| format!("{base}-{index}"))
+        .find(|candidate| !taken.iter().any(|key| key == candidate))
+}
+
+fn rename_provider_entry(container: &mut Item, from: &str, to: &str) -> bool {
+    match container {
+        Item::Table(providers) => match providers.remove(from) {
+            Some(provider) => {
+                providers.insert(to, provider);
+                true
+            }
+            None => false,
+        },
+        Item::Value(Value::InlineTable(providers)) => match providers.remove(from) {
+            Some(provider) => {
+                providers.insert(to, provider);
+                true
+            }
+            None => false,
+        },
+        _ => false,
+    }
+}
+
+fn reassign_provider_references(document: &mut DocumentMut, renames: &[ReservedProviderRename]) {
+    for rename in renames {
+        if document_model_provider(document).as_deref() == Some(rename.from.as_str()) {
+            document["model_provider"] = value(rename.to.as_str());
+        }
+        let Some(profiles) = document.get_mut("profiles") else {
+            continue;
+        };
+        match profiles {
+            Item::Table(profiles) => {
+                for (_, profile) in profiles.iter_mut() {
+                    replace_model_provider_reference(profile, &rename.from, &rename.to);
+                }
+            }
+            Item::Value(Value::InlineTable(profiles)) => {
+                for (_, profile) in profiles.iter_mut() {
+                    replace_inline_model_provider_reference(profile, &rename.from, &rename.to);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn document_model_provider(document: &DocumentMut) -> Option<String> {
+    document
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(ToString::to_string)
+}
+
+fn replace_model_provider_reference(profile: &mut Item, from: &str, to: &str) -> bool {
+    let Some(table) = profile.as_table_mut() else {
+        return false;
+    };
+    if table
+        .get("model_provider")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        != Some(from)
+    {
+        return false;
+    }
+    table["model_provider"] = value(to);
+    true
+}
+
+fn replace_inline_model_provider_reference(profile: &mut Value, from: &str, to: &str) -> bool {
+    let Some(table) = profile.as_inline_table_mut() else {
+        return false;
+    };
+    if table
+        .get("model_provider")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        != Some(from)
+    {
+        return false;
+    }
+    table.insert("model_provider", Value::from(to));
+    true
 }
 
 /// Idle/restore disk table for `codey_router`. Codex Desktop looks up a

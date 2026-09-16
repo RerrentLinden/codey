@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
@@ -14,6 +15,7 @@ use serde_json::Value;
 static LAST_GOOD_USAGE_ENDPOINT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+const CODEX_AUTH_FILE_NAME: &str = "auth.json";
 const USAGE_ENDPOINTS: [&str; 2] = [
     "https://chatgpt.com/backend-api/wham/usage",
     "https://chatgpt.com/backend-api/api/codex/usage",
@@ -28,12 +30,35 @@ const MAX_JWT_PAYLOAD_ENCODED_BYTES: usize = 96 * 1024;
 // Local-router requests only need eventual auth-file invalidation. Rechecking once per
 // second avoids filesystem work on every request while keeping account switches prompt.
 const OFFICIAL_AUTH_REVALIDATE_TTL: Duration = Duration::from_secs(1);
+/// Upper bound for the per-account usage caches. The account store is far
+/// smaller than this; the limit only stops an unexpected caller from growing
+/// the map without bound.
+const MAX_ACCOUNT_USAGE_CACHES: usize = 24;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OfficialAuth {
     pub(crate) access_token: String,
     pub(crate) account_id: Option<String>,
 }
+
+/// 额度查询结果里表示凭据被官方拒绝的 reason 值，调用方据此标记账号失效。
+pub(crate) const USAGE_REASON_CREDENTIAL_REJECTED: &str = "official_account_credential_rejected";
+
+/// 官方额度接口以 401 拒绝当前凭据。请求方会结合本地令牌是否仍在有效期
+/// 内判断账号是否失效，避免把尚未刷新的过期令牌误判成账号被撤销。
+#[derive(Debug)]
+pub(crate) struct AccountUsageUnauthorized;
+
+impl std::fmt::Display for AccountUsageUnauthorized {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "官方额度接口拒绝当前账号的凭据，登录状态可能已失效"
+        )
+    }
+}
+
+impl std::error::Error for AccountUsageUnauthorized {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OfficialAuthFingerprint {
@@ -86,6 +111,24 @@ impl OfficialAuthCache {
     }
 }
 
+/// Credential reads of several official accounts at once. Every account reads
+/// its own document, so one account never answers with another account's
+/// token.
+#[derive(Debug, Default)]
+pub(crate) struct OfficialAuthCaches {
+    caches: HashMap<String, OfficialAuthCache>,
+}
+
+impl OfficialAuthCaches {
+    pub(crate) fn for_path(&mut self, auth_path: &Path) -> &mut OfficialAuthCache {
+        let key = auth_path.to_string_lossy().into_owned();
+        if !self.caches.contains_key(&key) && self.caches.len() >= MAX_ACCOUNT_USAGE_CACHES {
+            self.caches.clear();
+        }
+        self.caches.entry(key).or_default()
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountUsageSnapshot {
@@ -129,14 +172,42 @@ pub struct AccountUsageCache {
     auth_generation: u64,
 }
 
+/// Usage snapshots for several official accounts at once. Each credential file
+/// keeps its own snapshot, TTL, failure backoff and auth fingerprint, so one
+/// account being unavailable never hides another account's usage.
+#[derive(Debug, Default)]
+pub struct AccountUsageCaches {
+    caches: HashMap<String, AccountUsageCache>,
+}
+
+impl AccountUsageCaches {
+    pub(crate) fn for_auth_path(&mut self, auth_path: &Path) -> &mut AccountUsageCache {
+        let key = auth_path.to_string_lossy().into_owned();
+        if !self.caches.contains_key(&key) && self.caches.len() >= MAX_ACCOUNT_USAGE_CACHES {
+            self.caches.clear();
+        }
+        self.caches.entry(key).or_default()
+    }
+
+    pub(crate) fn for_codex_home(&mut self, codex_home: &Path) -> &mut AccountUsageCache {
+        let auth_path = codex_home.join(CODEX_AUTH_FILE_NAME);
+        self.for_auth_path(&auth_path)
+    }
+}
+
+/// Credential document of the account Codex itself is logged in as.
+pub(crate) fn codex_auth_path(codex_home: &Path) -> std::path::PathBuf {
+    codex_home.join(CODEX_AUTH_FILE_NAME)
+}
+
 impl AccountUsageCache {
     pub(crate) fn store_displayed_snapshot(
         &mut self,
-        home: &Path,
+        auth_path: &Path,
         auth_generation: u64,
         snapshot: AccountUsageSnapshot,
     ) -> Result<()> {
-        self.observe_auth_fingerprint(official_auth_fingerprint(&home.join("auth.json")));
+        self.observe_auth_fingerprint(official_auth_fingerprint(auth_path));
         if self.auth_generation != auth_generation {
             bail!("官方登录状态已变化，请重新读取额度");
         }
@@ -185,22 +256,16 @@ impl AccountUsageCache {
         Some(snapshot.clone())
     }
 
-    pub async fn fetch(
+    /// Refreshes the snapshot that belongs to one credential document. Callers
+    /// that serve several official accounts pass the matching file so every
+    /// account keeps an independent cache entry.
+    pub(crate) async fn fetch_at(
         &mut self,
-        codex_home: &Path,
-        upstream_proxy: Option<&str>,
-    ) -> Result<AccountUsageSnapshot> {
-        self.fetch_with_refresh(codex_home, false, upstream_proxy)
-            .await
-    }
-
-    pub async fn fetch_with_refresh(
-        &mut self,
-        codex_home: &Path,
+        auth_path: &Path,
         force_refresh: bool,
         upstream_proxy: Option<&str>,
     ) -> Result<AccountUsageSnapshot> {
-        self.observe_auth_fingerprint(official_auth_fingerprint(&codex_home.join("auth.json")));
+        self.observe_auth_fingerprint(official_auth_fingerprint(auth_path));
         let generation = self.auth_generation;
         if force_refresh {
             self.expires_at = None;
@@ -215,11 +280,11 @@ impl AccountUsageCache {
         // 官方线路配置了上游代理时，额度查询走同一出口，避免同一账号同时从
         // 两个地区访问。
         let result = match account_usage_http_client(upstream_proxy) {
-            Ok(client) => fetch_official_account_usage(&client, codex_home).await,
+            Ok(client) => fetch_official_account_usage(&client, auth_path).await,
             Err(error) => Err(error),
         };
 
-        self.observe_auth_fingerprint(official_auth_fingerprint(&codex_home.join("auth.json")));
+        self.observe_auth_fingerprint(official_auth_fingerprint(auth_path));
         if generation != self.auth_generation {
             bail!("官方登录状态已变化，请重新读取额度");
         }
@@ -290,10 +355,22 @@ pub(crate) async fn query_snapshot(
     force_refresh: bool,
     upstream_proxy: Option<&str>,
 ) -> Value {
+    let auth_path = home.join(CODEX_AUTH_FILE_NAME);
+    query_snapshot_at(cache, &auth_path, force_refresh, upstream_proxy).await
+}
+
+/// Reads one credential document's usage, keeping the snapshot, TTL and
+/// failure backoff of that account only.
+pub(crate) async fn query_snapshot_at(
+    cache: &mut AccountUsageCache,
+    auth_path: &Path,
+    force_refresh: bool,
+    upstream_proxy: Option<&str>,
+) -> Value {
     let result = if force_refresh {
-        cache.fetch_with_refresh(home, true, upstream_proxy).await
+        cache.fetch_at(auth_path, true, upstream_proxy).await
     } else {
-        cache.fetch(home, upstream_proxy).await
+        cache.fetch_at(auth_path, false, upstream_proxy).await
     };
     let mut value = match result {
         Ok(snapshot) => {
@@ -313,7 +390,14 @@ pub(crate) async fn query_snapshot(
                 );
                 value
             }
-            None => serde_json::json!({"status": "error", "message": error.to_string()}),
+            None => {
+                let mut value =
+                    serde_json::json!({"status": "error", "message": error.to_string()});
+                if error.downcast_ref::<AccountUsageUnauthorized>().is_some() {
+                    value["reason"] = Value::String(USAGE_REASON_CREDENTIAL_REJECTED.to_string());
+                }
+                value
+            }
         },
     };
     value["authGeneration"] = cache.auth_generation.into();
@@ -344,9 +428,9 @@ fn account_usage_failure_backoff(consecutive_failures: u32) -> Duration {
 
 pub async fn fetch_official_account_usage(
     client: &Client,
-    codex_home: &Path,
+    auth_path: &Path,
 ) -> Result<AccountUsageSnapshot> {
-    let auth_path = codex_home.join("auth.json");
+    let auth_path = auth_path.to_path_buf();
     let auth = tokio::task::spawn_blocking(move || read_official_auth(&auth_path))
         .await
         .context("读取 Codex 官方登录信息任务异常退出")??;
@@ -378,6 +462,9 @@ pub async fn fetch_official_account_usage(
             continue;
         }
         if !status.is_success() {
+            if status == StatusCode::UNAUTHORIZED {
+                return Err(anyhow::Error::new(AccountUsageUnauthorized));
+            }
             bail!("官方额度接口返回 {status}");
         }
 
@@ -402,15 +489,13 @@ pub async fn fetch_official_account_usage(
 pub(crate) fn read_official_auth(path: &Path) -> Result<OfficialAuth> {
     let bytes = fs::read(path).with_context(|| "未找到 Codex 官方登录信息")?;
     let value: Value = serde_json::from_slice(&bytes).with_context(|| "Codex 登录信息格式无效")?;
-    let is_chatgpt = value
-        .get("auth_mode")
-        .and_then(Value::as_str)
-        .is_some_and(|mode| mode.eq_ignore_ascii_case("chatgpt"));
-    if !is_chatgpt {
+    // 非默认账号的凭据保存在 Codey 的账号记录里，auth.json 原文位于 auth
+    // 字段；两种文档都在这里解析，账号线路和额度查询共用同一条读取路径。
+    let Some(auth) = chatgpt_auth_document(&value) else {
         bail!("当前不是 ChatGPT 官方账号登录");
-    }
+    };
 
-    let tokens = value
+    let tokens = auth
         .get("tokens")
         .and_then(Value::as_object)
         .context("Codex 官方登录令牌缺失")?;
@@ -440,6 +525,21 @@ pub(crate) fn read_official_auth(path: &Path) -> Result<OfficialAuth> {
         access_token,
         account_id,
     })
+}
+
+/// 官方登录文档在磁盘上有两种形态：Codex 直接维护的 auth.json，以及 Codey
+/// 保存的账号记录（登录文档嵌套在 auth 字段里）。只有 ChatGPT 登录才返回。
+fn chatgpt_auth_document(value: &Value) -> Option<&Value> {
+    fn is_chatgpt_login(value: &Value) -> bool {
+        value
+            .get("auth_mode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("chatgpt"))
+    }
+    if is_chatgpt_login(value) {
+        return Some(value);
+    }
+    value.get("auth").filter(|nested| is_chatgpt_login(nested))
 }
 
 fn account_id_from_jwt(token: &str) -> Option<String> {
@@ -677,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn displayed_usage_is_shared_with_log_window_and_survives_refresh_failure() {
         let home = crate::codex_config::codex_home();
-        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(AccountUsageCache::default()));
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(AccountUsageCaches::default()));
         let mut snapshot = sample_snapshot();
         snapshot.fetched_at = unix_timestamp();
         snapshot.primary = Some(AccountUsageWindow {
@@ -689,7 +789,8 @@ mod tests {
         shared
             .lock()
             .await
-            .store_displayed_snapshot(home, 1, snapshot.clone())
+            .for_codex_home(home)
+            .store_displayed_snapshot(&home.join(CODEX_AUTH_FILE_NAME), 1, snapshot.clone())
             .unwrap();
         let mut profile = crate::config::ProviderProfile::new("Official");
         profile.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
@@ -709,6 +810,7 @@ mod tests {
             shared
                 .lock()
                 .await
+                .for_codex_home(home)
                 .record_failure("offline".into(), Instant::now());
             let value: Value = client
                 .post(format!(
@@ -744,20 +846,20 @@ mod tests {
         });
         snapshot.secondary = None;
         cache
-            .store_displayed_snapshot(directory.path(), 1, snapshot.clone())
+            .store_displayed_snapshot(&directory.path().join("auth.json"), 1, snapshot.clone())
             .unwrap();
         assert!(cache.valid_weekly_snapshot().is_some());
         let mut invalid = snapshot.clone();
         invalid.primary.as_mut().unwrap().used_percent = 101.0;
         assert!(
             cache
-                .store_displayed_snapshot(directory.path(), 1, invalid)
+                .store_displayed_snapshot(&directory.path().join("auth.json"), 1, invalid)
                 .is_err()
         );
         std::fs::write(directory.path().join("auth.json"), "changed account").unwrap();
         assert!(
             cache
-                .store_displayed_snapshot(directory.path(), 1, snapshot.clone())
+                .store_displayed_snapshot(&directory.path().join("auth.json"), 1, snapshot.clone())
                 .is_err()
         );
         assert!(cache.valid_weekly_snapshot().is_none());
@@ -827,6 +929,66 @@ mod tests {
                 access_token: "token-value".into(),
                 account_id: Some("account-value".into()),
             }
+        );
+    }
+
+    #[test]
+    fn reads_chatgpt_auth_from_a_stored_account_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("account.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": "account-value",
+                "email": "a@example.com",
+                "planType": "plus",
+                "accountId": "account-value",
+                "addedAt": 1,
+                "auth": {
+                    "auth_mode": "chatgpt",
+                    "tokens": {
+                        "access_token": "token-value",
+                        "account_id": "account-value"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_official_auth(&path).unwrap(),
+            OfficialAuth {
+                access_token: "token-value".into(),
+                account_id: Some("account-value".into()),
+            },
+            "非默认账号的凭据保存在账号记录的 auth 字段里"
+        );
+    }
+
+    #[test]
+    fn rejects_stored_account_records_without_a_chatgpt_login() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("account.json");
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "id": "account-value",
+                "addedAt": 1,
+                "auth": {
+                    "auth_mode": "apikey",
+                    "OPENAI_API_KEY": "sk"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            read_official_auth(&path)
+                .unwrap_err()
+                .to_string()
+                .contains("不是 ChatGPT 官方账号登录")
         );
     }
 
@@ -1058,5 +1220,33 @@ mod tests {
         assert_eq!(snapshot.plan_type.as_deref(), Some("plus"));
         assert_eq!(snapshot.primary.unwrap().window_minutes, 300);
         assert_eq!(snapshot.secondary.unwrap().window_minutes, 10_080);
+    }
+
+    #[test]
+    fn every_credential_file_keeps_its_own_usage_cache() {
+        let mut caches = AccountUsageCaches::default();
+        let first = std::path::PathBuf::from("/tmp/codey-usage/acct_1.json");
+        let second = std::path::PathBuf::from("/tmp/codey-usage/acct_2.json");
+
+        let first_cache = caches.for_auth_path(&first) as *const AccountUsageCache;
+        assert!(
+            std::ptr::eq(first_cache, caches.for_auth_path(&first)),
+            "the same credential document reuses one cache entry"
+        );
+        assert!(
+            !std::ptr::eq(first_cache, caches.for_auth_path(&second)),
+            "a second account never reuses the first account cache entry"
+        );
+
+        for index in 0..MAX_ACCOUNT_USAGE_CACHES + 4 {
+            let path = std::path::PathBuf::from(format!("/tmp/codey-usage/acct_{index}.json"));
+            caches
+                .for_auth_path(&path)
+                .record_failure("offline".into(), Instant::now());
+        }
+        assert!(
+            caches.caches.len() <= MAX_ACCOUNT_USAGE_CACHES,
+            "the cache map stays bounded"
+        );
     }
 }

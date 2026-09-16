@@ -34,14 +34,16 @@ const REASONING_LEVEL_DESCRIPTIONS: [(&str, &str); 6] = [
 const FAST_SERVICE_TIER_ID: &str = "priority";
 const FAST_SPEED_TIER_ID: &str = "fast";
 const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
-const OFFICIAL_MODELS: [(&str, &str); 8] = [
+/// Official account models Codey exposes. Upstream retires a model by dropping
+/// it from the Codex model cache, so a retired slug has to leave this list in
+/// the same change; otherwise the picker keeps offering a model the account can
+/// no longer call.
+const OFFICIAL_MODELS: [(&str, &str); 6] = [
     ("gpt-6-astra", "GPT-6-Astra"),
     ("gpt-5.6-sol", "GPT-5.6-Sol"),
     ("gpt-5.6-terra", "GPT-5.6-Terra"),
     ("gpt-5.6-luna", "GPT-5.6-Luna"),
     ("gpt-5.5", "GPT-5.5"),
-    ("gpt-5.4", "GPT-5.4"),
-    ("gpt-5.4-mini", "GPT-5.4-Mini"),
     ("gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark"),
 ];
 
@@ -487,7 +489,8 @@ fn refresh_for_provider_with_transport_preferences(
         // Mixed catalogs must keep compatible official raw slugs for spawn_agent,
         // but a newly bundled official model without a local runtime template
         // cannot fail the whole refresh. Official-only generation still
-        // fail-closes on that slug.
+        // fail-closes on that slug, and so does a user-declared third-party
+        // route that reuses an official model id.
         catalog_models.retain(model_is_runtime_source_compatible);
         let template = official_models
             .iter()
@@ -513,6 +516,17 @@ fn refresh_for_provider_with_transport_preferences(
             }
             let source_template =
                 official_template_for_route_alias(official_models.as_slice(), model_id);
+            // A derived official route only mirrors the model list of its own
+            // account. A model the local Codex cache no longer carries is
+            // dropped like the raw official entry above instead of falling back
+            // to the generic template or blocking every route, while a
+            // third-party alias still fails closed on the final check.
+            if is_official_route_alias(model_id)
+                && source_template
+                    .is_none_or(|template| model_instruction_source(template).is_none())
+            {
+                continue;
+            }
             let (source_template, preserve_source_runtime_metadata) = source_template
                 .map(|source_template| (source_template, true))
                 .unwrap_or((&template, false));
@@ -548,7 +562,7 @@ fn refresh_for_provider_with_transport_preferences(
     for model in &mut catalog_models {
         prepare_cached_context_window(model);
     }
-    // Synthetic routes still fail closed when their template lacks runtime
+    // Third-party routes still fail closed when their template lacks runtime
     // fields. Official-only catalogs never drop incompatible slugs above, so
     // this remains all-or-nothing for that path.
     if !catalog_models.is_empty() {
@@ -1394,6 +1408,13 @@ fn official_template_for_route_alias<'a>(
     official_entry_for_route_model(official_models, route_model_id)
 }
 
+/// Whether one runtime catalog id is a route alias of a derived official
+/// account route rather than a model the user declared on a third-party route.
+fn is_official_route_alias(model_id: &str) -> bool {
+    crate::model_id::parse_alias(model_id)
+        .is_some_and(|alias| crate::config::is_official_profile_id(alias.provider_key))
+}
+
 fn third_party_reasoning_levels(template: &Value, use_template_metadata: bool) -> Value {
     let efforts = if use_template_metadata {
         third_party_reasoning_efforts_from_value(template)
@@ -1730,8 +1751,11 @@ mod tests {
                     "experimental_supported_tools": [],
                     "node_repl_auto_review_required": false,
                     "node_repl_disabled": false,
-                    "additional_speed_tiers": ["fast"]
+                    "additional_speed_tiers": ["fast"],
+                    "upgrade": {"model": "gpt-5.6-sol"}
                 },
+                // An older cache can still carry a model the official list has
+                // retired; the generated catalog must not expose it again.
                 {
                     "slug": "gpt-5.4",
                     "display_name": "GPT-5.4",
@@ -1743,8 +1767,7 @@ mod tests {
                         {"effort": "xhigh"}, {"effort": "max"}
                     ],
                     "service_tiers": [{"id": "priority"}],
-                    "additional_speed_tiers": ["fast"],
-                    "upgrade": {"model": "gpt-5.6-sol"}
+                    "additional_speed_tiers": ["fast"]
                 },
                 {
                     "slug": "gpt-5.3-codex-spark",
@@ -1791,7 +1814,7 @@ mod tests {
                 "gpt-5.6-luna" => {
                     model["multi_agent_version"] = json!("v1");
                 }
-                "gpt-5.4" => {
+                "gpt-5.3-codex-spark" => {
                     model["multi_agent_version"] = json!("disabled");
                 }
                 _ => {
@@ -1992,11 +2015,6 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.6-luna")
             .unwrap();
         assert_eq!(luna["multi_agent_version"], "v1");
-        let gpt_54 = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.4")
-            .unwrap();
-        assert_eq!(gpt_54["multi_agent_version"], "disabled");
         let spark = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.3-codex-spark")
@@ -2004,11 +2022,6 @@ mod tests {
         assert_eq!(spark["supported_in_api"], true);
         assert_eq!(spark["supports_reasoning_summaries"], true);
         assert_no_native_fast(spark);
-        let mini = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.4-mini")
-            .unwrap();
-        assert_no_native_fast(mini);
         assert_eq!(
             models
                 .iter()
@@ -2021,7 +2034,6 @@ mod tests {
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
                 "gpt-5.5",
-                "gpt-5.4",
             ]
         );
     }
@@ -2050,7 +2062,7 @@ mod tests {
         assert_eq!(marker("gpt-5.6-sol"), Some("v2"));
         assert_eq!(marker("gpt-5.6-terra"), Some("v2"));
         assert_eq!(marker("gpt-5.6-luna"), Some("v1"));
-        assert_eq!(marker("gpt-5.4"), Some("disabled"));
+        assert_eq!(marker("gpt-5.3-codex-spark"), Some("disabled"));
         assert_eq!(marker("gpt-5.5"), None);
     }
 
@@ -2060,7 +2072,7 @@ mod tests {
         write_cache(home.path());
         let upstream = vec![
             "gpt-5.6-luna".into(),
-            "gpt-5.4".into(),
+            "gpt-5.3-codex-spark".into(),
             "provider-custom-model".into(),
         ];
 
@@ -2076,11 +2088,11 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.6-luna")
             .unwrap();
         assert_eq!(luna["multi_agent_version"], "v1");
-        let gpt_54 = models
+        let spark = models
             .iter()
-            .find(|model| model["slug"] == "gpt-5.4")
+            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
             .unwrap();
-        assert_eq!(gpt_54["multi_agent_version"], "disabled");
+        assert_eq!(spark["multi_agent_version"], "disabled");
         let custom = models
             .iter()
             .find(|model| model["slug"] == "provider-custom-model")
@@ -2163,7 +2175,7 @@ mod tests {
             .remove("description");
         models
             .iter_mut()
-            .find(|model| model["slug"] == "gpt-5.4")
+            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
             .unwrap()["description"] = json!("   ");
         fs::write(
             home.path().join("models_cache.json"),
@@ -2190,7 +2202,7 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.6-sol")
             .unwrap();
         assert_eq!(sol["description"], "Local Sol description");
-        for slug in ["gpt-5.5", "gpt-5.4"] {
+        for slug in ["gpt-5.5", "gpt-5.3-codex-spark"] {
             let model = models.iter().find(|model| model["slug"] == slug).unwrap();
             assert_eq!(model["description"], model["display_name"]);
         }
@@ -2319,13 +2331,13 @@ mod tests {
                 "gpt-5.6-terra",
                 "gpt-5.6-luna",
                 "gpt-5.5",
-                "gpt-5.4",
             ]
         );
-        for slug in ["gpt-5.4-mini", "gpt-5.3-codex-spark"] {
-            let model = models.iter().find(|model| model["slug"] == slug).unwrap();
-            assert_no_native_fast(model);
-        }
+        let spark = models
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
+            .unwrap();
+        assert_no_native_fast(spark);
     }
 
     #[test]
@@ -2334,7 +2346,7 @@ mod tests {
         write_cache_with_template_only(home.path());
         let upstream = vec![
             "gpt-5.6-sol".into(),
-            "gpt-5.4".into(),
+            "gpt-5.5".into(),
             "gpt-5.3-codex-spark".into(),
             "claude-sonnet".into(),
         ];
@@ -2356,7 +2368,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "gpt-5.6-sol",
-                "gpt-5.4",
+                "gpt-5.5",
                 "gpt-5.3-codex-spark",
                 "claude-sonnet",
             ]
@@ -2370,12 +2382,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["low", "medium", "high", "xhigh", "max", "ultra"]
         );
-        let gpt_54 = models
+        let gpt_55 = models
             .iter()
-            .find(|model| model["slug"] == "gpt-5.4")
+            .find(|model| model["slug"] == "gpt-5.5")
             .unwrap();
-        assert_eq!(gpt_54["visibility"], "list");
-        assert!(gpt_54.get("upgrade").is_none());
+        assert_eq!(gpt_55["visibility"], "list");
+        assert!(gpt_55.get("upgrade").is_none());
         let spark = models
             .iter()
             .find(|model| model["slug"] == "gpt-5.3-codex-spark")
@@ -2417,7 +2429,7 @@ mod tests {
         assert_native_fast(
             models
                 .iter()
-                .find(|model| model["slug"] == "gpt-5.4")
+                .find(|model| model["slug"] == "gpt-5.5")
                 .unwrap(),
         );
     }
@@ -2426,10 +2438,16 @@ mod tests {
     fn mixed_catalog_drops_prompt_free_official_stubs_without_blocking_supported_models() {
         let home = tempfile::tempdir().unwrap();
         let mut cache = official_cache();
-        cache["models"]
+        let stub = cache["models"]
             .as_array_mut()
             .unwrap()
-            .retain(|model| model["slug"] != "gpt-5.4-mini");
+            .iter_mut()
+            .find(|model| model["slug"] == "gpt-5.5")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        stub.remove("base_instructions");
+        stub.remove("model_messages");
         fs::write(
             home.path().join("models_cache.json"),
             serde_json::to_vec(&cache).unwrap(),
@@ -2439,7 +2457,7 @@ mod tests {
             "gpt-5.6-sol".into(),
             "gpt-5.6-luna".into(),
             "gpt-6-astra".into(),
-            "gpt-5.4-mini".into(),
+            "gpt-5.5".into(),
             "route-oc/deepseek-flash".into(),
         ];
 
@@ -3054,6 +3072,59 @@ mod tests {
     }
 
     #[test]
+    fn official_route_aliases_without_a_local_runtime_template_are_dropped() {
+        let home = tempfile::tempdir().unwrap();
+        // One official model has no runtime instructions in this machine's
+        // sources, and an older config still selects a slug upstream retired.
+        let mut cache = official_cache();
+        let prompt_free = cache["models"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|model| model["slug"] == "gpt-5.5")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        prompt_free.remove("base_instructions");
+        prompt_free.remove("model_messages");
+        fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+
+        let first = crate::config::official_profile_id("acct-one");
+        let second = crate::config::official_profile_id("acct-two");
+        let selected = vec![
+            format!("{first}/gpt-5.5"),
+            format!("{first}/gpt-5.4"),
+            format!("{second}/gpt-5.6-sol"),
+        ];
+
+        assert_eq!(
+            refresh_for_provider(home.path(), false, Some(&selected), &selected).unwrap(),
+            1
+        );
+        let catalog = read_catalog_value(&home.path().join(relative_path())).unwrap();
+        assert_eq!(catalog["models"].as_array().unwrap().len(), 1);
+        assert_eq!(catalog["models"][0]["slug"], selected[2].as_str());
+        assert!(is_available(home.path()));
+
+        // The same upstream name on a user-declared third-party route is not
+        // affected by the retirement, so it keeps the generic template.
+        let third_party = vec!["relay/gpt-5.4".to_string()];
+        assert_eq!(
+            refresh_for_provider(home.path(), false, Some(&third_party), &third_party).unwrap(),
+            1
+        );
+        let catalog = read_catalog_value(&home.path().join(relative_path())).unwrap();
+        assert_eq!(catalog["models"][0]["slug"], "relay/gpt-5.4");
+        assert!(model_instruction_source(&catalog["models"][0]).is_some());
+        assert!(model_has_runtime_description(&catalog["models"][0]));
+        assert!(is_available(home.path()));
+    }
+
+    #[test]
     fn prompt_free_existing_catalog_is_not_reused_as_a_runtime_fallback() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
@@ -3100,15 +3171,13 @@ mod tests {
         refresh_for_provider(home.path(), true, None, &[]).unwrap();
 
         let catalog: Value = serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
-        for slug in ["gpt-5.4-mini", "gpt-5.3-codex-spark"] {
-            let model = catalog["models"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|model| model["slug"] == slug)
-                .unwrap();
-            assert_no_native_fast(model);
-        }
+        let spark = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
+            .unwrap();
+        assert_no_native_fast(spark);
     }
 
     #[test]

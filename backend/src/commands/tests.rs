@@ -564,7 +564,12 @@ fn official_probe_migrates_legacy_account_route_to_current_provider() {
                 reason: "WindowsApps access denied".into(),
             }
         };
-        let next = route_config_for_official_probe(&previous, status).unwrap();
+        let launch = crate::codex_provider::OfficialAccountLaunch {
+            status,
+            profiles: vec![official.clone()],
+            has_stored_accounts: false,
+        };
+        let next = route_config_for_official_probe(&previous, launch).unwrap();
         assert_eq!(next.profiles.len(), 1);
         assert!(next.profiles[0].official_account);
         assert_eq!(next.profiles[0].provider_id(), "openai");
@@ -577,8 +582,12 @@ fn official_probe_migrates_legacy_account_route_to_current_provider() {
     assert!(
         route_config_for_official_probe(
             &previous,
-            OfficialAccountProfileStatus::Unavailable {
-                reason: "not logged in".into()
+            crate::codex_provider::OfficialAccountLaunch {
+                status: OfficialAccountProfileStatus::Unavailable {
+                    reason: "not logged in".into()
+                },
+                profiles: Vec::new(),
+                has_stored_accounts: false,
             },
         )
         .unwrap_err()
@@ -608,9 +617,13 @@ fn inconclusive_official_auth_probe_keeps_active_third_party_route() {
 
     let next = route_config_for_official_probe(
         &previous,
-        OfficialAccountProfileStatus::Unknown {
-            profile: official,
-            reason: "probe unavailable".to_string(),
+        crate::codex_provider::OfficialAccountLaunch {
+            status: OfficialAccountProfileStatus::Unknown {
+                profile: official,
+                reason: "probe unavailable".to_string(),
+            },
+            profiles: Vec::new(),
+            has_stored_accounts: false,
         },
     )
     .unwrap();
@@ -642,7 +655,8 @@ fn unavailable_official_auth_ignores_disabled_official_routes() {
         ..CodeyConfig::default()
     };
 
-    let next = apply_unavailable_official_probe(config, "not logged in".into()).unwrap();
+    let next = apply_unavailable_official_probe(config, "not logged in".into(), Vec::new(), false)
+        .unwrap();
 
     assert!(!next.official_account_available_this_launch);
     assert_eq!(
@@ -651,6 +665,230 @@ fn unavailable_official_auth_ignores_disabled_official_routes() {
     );
     assert_eq!(next.profiles.len(), 1);
     assert!(!next.profiles[0].enabled);
+}
+
+#[test]
+fn unavailable_official_auth_keeps_stored_account_routes() {
+    let mut account = ProviderProfile::new("主力账号");
+    account.source_provider_id = Some("openai".to_string());
+    account.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    account.official_account_id = Some("acct-one".to_string());
+    account.normalize();
+    let mut config = CodeyConfig {
+        local_router_enabled: true,
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    };
+    config.apply_launch_official_profiles(vec![account.clone()]);
+    let config = config.normalize();
+    let provider_id = config.profiles[0].provider_id().to_string();
+
+    let next =
+        apply_unavailable_official_probe(config, "not logged in".into(), vec![account], true)
+            .unwrap();
+
+    assert!(!next.official_account_available_this_launch);
+    assert_eq!(
+        next.official_account_status_this_launch,
+        LaunchOfficialAccountStatus::Unauthenticated
+    );
+    // 存储账号的线路自带凭据，默认登录缺失时仍然保留。
+    let routes = next
+        .usable_official_routes()
+        .map(|profile| profile.provider_id().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(routes, vec![provider_id]);
+}
+
+#[test]
+fn unavailable_official_auth_drops_routes_of_missing_accounts() {
+    // 配置里留着已删除账号的线路，而账号列表已经没有这个账号。
+    let mut stale = ProviderProfile::new("已删除的账号");
+    stale.id = crate::config::official_profile_id("acct-gone");
+    stale.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    stale.official_account_id = Some("acct-gone".to_string());
+    stale.normalize();
+    let mut relay = ProviderProfile::new("中转线路");
+    relay.base_url = "https://relay.example/v1".to_string();
+    relay.api_key = "relay-key".to_string();
+    relay.normalize();
+    let stale_id = stale.provider_id().to_string();
+    let config = CodeyConfig {
+        active_profile_id: stale_id,
+        profiles: vec![stale, relay],
+        local_router_enabled: true,
+        official_account_available_this_launch: false,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    // 没有账号记录时派生出来的是 Codex 登录自己的兼容线路。
+    let mut legacy = ProviderProfile::new("OpenAI 官方直登");
+    legacy.source_provider_id = Some("openai".to_string());
+    legacy.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    legacy.normalize();
+
+    let next =
+        apply_unavailable_official_probe(config, "not logged in".into(), vec![legacy], false)
+            .unwrap();
+
+    assert!(
+        next.profiles
+            .iter()
+            .all(|profile| !profile.official_account)
+    );
+    assert!(
+        next.profiles
+            .iter()
+            .any(|profile| profile.name == "中转线路")
+    );
+}
+
+#[test]
+fn unavailable_official_auth_drops_routes_of_invalid_accounts() {
+    // 账号都还在，但凭据已经被官方拒绝：线路要移除，且不能报成需要重新登录。
+    let mut invalid = ProviderProfile::new("已失效的账号");
+    invalid.id = crate::config::official_profile_id("acct-invalid");
+    invalid.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    invalid.official_account_id = Some("acct-invalid".to_string());
+    invalid.normalize();
+    let invalid_id = invalid.provider_id().to_string();
+    let config = CodeyConfig {
+        active_profile_id: invalid_id,
+        profiles: vec![invalid],
+        local_router_enabled: true,
+        official_account_available_this_launch: true,
+        ..CodeyConfig::default()
+    }
+    .normalize();
+
+    let next =
+        apply_unavailable_official_probe(config, "not logged in".into(), Vec::new(), true).unwrap();
+
+    assert!(
+        next.profiles
+            .iter()
+            .all(|profile| !profile.official_account)
+    );
+    assert!(!next.official_account_available_this_launch);
+    assert_eq!(
+        next.official_account_status_this_launch,
+        LaunchOfficialAccountStatus::Unauthenticated
+    );
+}
+
+#[tokio::test]
+async fn dropping_derived_official_routes_persists_the_route_removal() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut account = ProviderProfile::new("主力账号");
+    account.source_provider_id = Some("openai".to_string());
+    account.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    account.official_account_id = Some("acct-one".to_string());
+    account.normalize();
+    let mut relay = ProviderProfile::new("中转线路");
+    relay.base_url = "https://relay.example/v1".to_string();
+    relay.api_key = "relay-key".to_string();
+    relay.normalize();
+    let mut config = CodeyConfig {
+        local_router_enabled: true,
+        ..CodeyConfig::default()
+    };
+    config.apply_launch_official_profiles(vec![account]);
+    config.profiles.push(relay);
+    let config = config.normalize();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(config.clone()),
+        ..AppState::default()
+    });
+    state.store.save(&config).unwrap();
+
+    crate::commands::official_accounts::drop_derived_official_routes(&state)
+        .await
+        .unwrap();
+
+    let next = state.config.read().await.clone();
+    assert!(
+        next.profiles
+            .iter()
+            .all(|profile| !profile.official_account)
+    );
+    assert!(
+        next.profiles
+            .iter()
+            .any(|profile| profile.name == "中转线路")
+    );
+    assert!(next.settings_revision > config.settings_revision);
+    let saved: CodeyConfig =
+        serde_json::from_slice(&std::fs::read(state.store.path()).unwrap()).unwrap();
+    assert!(
+        saved
+            .profiles
+            .iter()
+            .all(|profile| !profile.official_account)
+    );
+
+    // 没有官方线路时重复调用不再改写配置。
+    let revision = next.settings_revision;
+    crate::commands::official_accounts::drop_derived_official_routes(&state)
+        .await
+        .unwrap();
+    assert_eq!(state.config.read().await.settings_revision, revision);
+}
+
+fn stored_official_account(
+    id: &str,
+    added_at: u64,
+) -> crate::official_accounts::OfficialAccountRecord {
+    serde_json::from_value(json!({
+        "id": id,
+        "email": format!("{id}@example.com"),
+        "planType": "plus",
+        "accountId": id,
+        "addedAt": added_at,
+        "auth": {
+            "OPENAI_API_KEY": null,
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": format!("access-{id}"),
+                "account_id": id,
+            },
+            "last_refresh": "2026-01-01T00:00:00Z",
+        }
+    }))
+    .expect("可反序列化的官方账号记录")
+}
+
+#[tokio::test]
+async fn header_usage_follows_the_default_account_and_falls_back_without_one() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        ..AppState::default()
+    });
+    // 账号列表为空时保留读取 Codex 登录本身的旧路径。
+    assert_eq!(header_official_account_id(&state).await, None);
+
+    let store = state.official_accounts();
+    store.upsert(&stored_official_account("acct_2", 2)).unwrap();
+    store.upsert(&stored_official_account("acct_1", 1)).unwrap();
+    assert_eq!(
+        header_official_account_id(&state).await.as_deref(),
+        Some("acct_1"),
+        "没有默认账号时页头额度回落到最早的账号"
+    );
+
+    store.set_default_account_id(Some("acct_2")).unwrap();
+    assert_eq!(
+        header_official_account_id(&state).await.as_deref(),
+        Some("acct_2")
+    );
+
+    // 默认账号已经从列表里删除时，同样回落到现存最早的账号。
+    store.set_default_account_id(Some("acct_gone")).unwrap();
+    assert_eq!(
+        header_official_account_id(&state).await.as_deref(),
+        Some("acct_1")
+    );
 }
 
 #[tokio::test]

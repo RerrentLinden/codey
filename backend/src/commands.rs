@@ -52,8 +52,9 @@ pub use models::{
 };
 use official_accounts::{
     cancel_official_account_login, import_current_codex_login, list_official_accounts,
-    poll_official_account_login, remove_official_account, save_official_account_route_settings,
-    set_default_official_account, start_official_account_login,
+    poll_official_account_login, refresh_official_route_after_account_change,
+    remove_official_account, save_official_account_route_settings, set_default_official_account,
+    start_official_account_login,
 };
 use plugins::{plugin_marketplace_status, repair_plugin_marketplace};
 use prompt_optimization::{
@@ -98,7 +99,8 @@ use crate::codex_provider;
 use crate::codex_provider::OfficialAccountProfileStatus;
 use crate::config::{
     CodeyConfig, ConfigStore, LaunchOfficialAccountStatus, PromptOptimizationConfig,
-    SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SubagentRoleConfig, validate_provider_profiles,
+    ProviderProfile, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SubagentRoleConfig,
+    validate_provider_profiles,
 };
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
@@ -140,7 +142,10 @@ pub struct AppState {
     /// startup waits overlap.
     official_account_probe_prewarm: Mutex<Option<OfficialAccountProbePrewarm>>,
     official_account_logins: Mutex<crate::official_accounts::LoginSessions>,
-    account_usage_cache: Arc<Mutex<account_usage::AccountUsageCache>>,
+    /// 令牌刷新按账号串行执行。多个请求同时轮换同一个 refresh token 会让
+    /// 先写回的凭据立刻失效。
+    official_account_refresh_lock: Mutex<()>,
+    account_usage_cache: Arc<Mutex<account_usage::AccountUsageCaches>>,
     pub runtime: Mutex<Option<Arc<CodeyRuntime>>>,
     runtime_operation: Mutex<()>,
     diagnostic_storage_operation: Mutex<()>,
@@ -176,7 +181,7 @@ pub struct AppState {
 }
 
 struct OfficialAccountProbePrewarm {
-    task: tokio::task::JoinHandle<anyhow::Result<OfficialAccountProfileStatus>>,
+    task: tokio::task::JoinHandle<anyhow::Result<crate::codex_provider::OfficialAccountLaunch>>,
 }
 
 struct ScheduledRestart {
@@ -233,7 +238,8 @@ impl Default for AppState {
             wechat_claw_login_http_client: std::sync::OnceLock::new(),
             official_account_probe_prewarm: Mutex::new(None),
             official_account_logins: Mutex::new(crate::official_accounts::LoginSessions::default()),
-            account_usage_cache: Arc::new(Mutex::new(account_usage::AccountUsageCache::default())),
+            official_account_refresh_lock: Mutex::new(()),
+            account_usage_cache: Arc::new(Mutex::new(account_usage::AccountUsageCaches::default())),
             runtime: Mutex::new(None),
             runtime_operation: Mutex::new(()),
             diagnostic_storage_operation: Mutex::new(()),
@@ -314,9 +320,7 @@ impl AppState {
         let home = codex_home().to_path_buf();
         let accounts = self.official_accounts();
         let task = tokio::task::spawn_blocking(move || {
-            crate::codex_provider::current_official_account_profile_status_for_launch(
-                &home, &accounts,
-            )
+            crate::codex_provider::OfficialAccountLaunch::resolve(&home, &accounts)
         });
         *self.official_account_probe_prewarm.lock().await =
             Some(OfficialAccountProbePrewarm { task });
@@ -324,7 +328,8 @@ impl AppState {
 
     async fn take_official_account_probe_prewarm(
         &self,
-    ) -> Option<tokio::task::JoinHandle<anyhow::Result<OfficialAccountProfileStatus>>> {
+    ) -> Option<tokio::task::JoinHandle<anyhow::Result<crate::codex_provider::OfficialAccountLaunch>>>
+    {
         let prewarm = self.official_account_probe_prewarm.lock().await.take()?;
         Some(prewarm.task)
     }
@@ -711,10 +716,14 @@ pub(super) fn validate_official_account_config_change(
     if previous.official_account_available_this_launch {
         return Ok(());
     }
-    if next
-        .active_profile()
-        .is_some_and(|profile| profile.enabled && profile.official_account)
-    {
+    // 存储账号各自带着自己的凭据，本地路由可以不依赖本次启动的默认登录
+    // 直接转发，因此这类线路允许出现并被启用。
+    let runs_without_codex_login = |profile: &ProviderProfile| {
+        next.local_router_enabled && profile.official_account_id.is_some()
+    };
+    if next.active_profile().is_some_and(|profile| {
+        profile.enabled && profile.official_account && !runs_without_codex_login(&profile)
+    }) {
         return Err(
             "本次 Codex 由 API Key 线路启动，不能启用官方账号线路；请先在线路设置中添加官方账号并设为默认，再重新启动 Codey"
                 .to_string(),
@@ -722,6 +731,7 @@ pub(super) fn validate_official_account_config_change(
     }
     if next.profiles.iter().any(|profile| {
         profile.official_account
+            && !runs_without_codex_login(profile)
             && !previous.profiles.iter().any(|previous_profile| {
                 previous_profile.id == profile.id && previous_profile.official_account
             })
@@ -740,12 +750,10 @@ pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> 
     let probe = match state.take_official_account_probe_prewarm().await {
         Some(task) => task,
         None => tokio::task::spawn_blocking(move || {
-            crate::codex_provider::current_official_account_profile_status_for_launch(
-                &home, &accounts,
-            )
+            crate::codex_provider::OfficialAccountLaunch::resolve(&home, &accounts)
         }),
     };
-    let official_status = probe
+    let official_launch = probe
         .await
         .map_err(|error| format!("解析默认官方账号的任务异常退出：{error}"))?
         .map_err(|error| format!("解析默认官方账号失败：{error:#}"))?;
@@ -753,11 +761,11 @@ pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> 
     let _config_write_guard = state.config_write_lock.lock().await;
     let previous = state.config.read().await.clone();
     if !previous.local_router_enabled {
-        let next = read_only_config_for_official_probe(previous, official_status);
+        let next = read_only_config_for_official_probe(previous, official_launch.status);
         *state.config.write().await = next;
         return Ok(());
     }
-    let mut next = route_config_for_official_probe(&previous, official_status)?;
+    let mut next = route_config_for_official_probe(&previous, official_launch)?;
 
     if persisted_config_changed(&previous, &next) {
         if next.settings_revision == previous.settings_revision {
@@ -795,23 +803,33 @@ fn read_only_config_for_official_probe(
 
 fn route_config_for_official_probe(
     previous: &CodeyConfig,
-    official_status: OfficialAccountProfileStatus,
+    launch: crate::codex_provider::OfficialAccountLaunch,
 ) -> Result<CodeyConfig, String> {
+    let crate::codex_provider::OfficialAccountLaunch {
+        status: official_status,
+        profiles: official_profiles,
+        has_stored_accounts,
+    } = launch;
     let mut next = previous.clone();
     match official_status {
-        OfficialAccountProfileStatus::Available(official_profile) => {
-            next.apply_launch_official_profile(Some(official_profile));
+        OfficialAccountProfileStatus::Available(_) => {
+            next.apply_launch_official_profiles(official_profiles);
             next.initial_route_import_completed = true;
             next = next.normalize();
             next.official_account_available_this_launch = true;
             next.official_account_status_this_launch = LaunchOfficialAccountStatus::Authenticated;
         }
         OfficialAccountProfileStatus::Unavailable { reason } => {
-            next = apply_unavailable_official_probe(next, reason)?;
+            next = apply_unavailable_official_probe(
+                next,
+                reason,
+                official_profiles,
+                has_stored_accounts,
+            )?;
         }
-        OfficialAccountProfileStatus::Unknown { profile, reason } => {
+        OfficialAccountProfileStatus::Unknown { reason, .. } => {
             if should_attempt_official_launch_when_auth_unknown(previous) {
-                next.apply_launch_official_profile(Some(profile));
+                next.apply_launch_official_profiles(official_profiles);
                 next.initial_route_import_completed = true;
                 next = next.normalize();
                 next.official_account_available_this_launch = true;
@@ -852,21 +870,35 @@ fn route_config_for_official_probe(
 fn apply_unavailable_official_probe(
     mut next: CodeyConfig,
     reason: String,
+    official_profiles: Vec<ProviderProfile>,
+    has_stored_accounts: bool,
 ) -> Result<CodeyConfig, String> {
     let has_official_route = next
         .profiles
         .iter()
         .any(|profile| profile.enabled && profile.official_account);
+    // Stored accounts keep their own credentials, so their routes stay usable
+    // through the local router even when the default login is unavailable.
+    // 没有账号记录时派生出来的是 Codex 登录自己的兼容线路，本次登录不可用时
+    // 不能把它留在配置里。
+    let keeps_account_routes = official_profiles
+        .iter()
+        .any(|profile| profile.official_account_id.is_some());
     let fallback = if next.has_third_party_route() {
         "third_party_route"
+    } else if keeps_account_routes {
+        "stored_account_routes"
+    } else if has_stored_accounts {
+        // 账号都还在，只是凭据已失效：清掉线路，等用户重新添加账号。
+        "stored_accounts_invalid"
     } else if has_official_route {
         "startup_blocked"
     } else {
         "no_official_route_configured"
     };
     let diagnostics = official_auth_route_diagnostics(&next, "unauthenticated", fallback);
-    if has_official_route {
-        if !next.has_third_party_route() {
+    if has_official_route || keeps_account_routes {
+        if !next.has_third_party_route() && !keeps_account_routes && !has_stored_accounts {
             let error = format!(
                 "Codey 中没有设为默认的官方账号，也没有已保存的 API Key 线路；请先添加官方账号并设为默认，或添加第三方 API 线路。认证诊断：{reason}"
             );
@@ -882,7 +914,13 @@ fn apply_unavailable_official_probe(
             );
             return Err(error);
         }
-        next.apply_launch_official_profile(None);
+        // 登录不可用时只保留存储账号的线路，其余派生线路（含已删除账号留下的
+        // 记录）一并清空，避免本地路由继续暴露不可用的官方线路。
+        next.apply_launch_official_profiles(if keeps_account_routes {
+            official_profiles
+        } else {
+            Vec::new()
+        });
         next = next.normalize();
     }
     error_log::record_failure_with_metadata(
@@ -993,9 +1031,14 @@ async fn resolve_session_name_cached(
 pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Value {
     let result = match command {
         "load_codey_config" => load_codey_config(state).await,
-        "query_official_account_usage" => match optional_argument::<bool>(&args, "forceRefresh") {
-            Ok(force) => Ok(query_official_account_usage(state, force.unwrap_or(false)).await),
-            Err(error) => Err(error),
+        "query_official_account_usage" => match (
+            optional_argument::<bool>(&args, "forceRefresh"),
+            optional_argument::<String>(&args, "accountId"),
+        ) {
+            (Ok(force), Ok(account_id)) => {
+                Ok(query_official_account_usage(state, force.unwrap_or(false), account_id).await)
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
         },
         "store_official_account_usage" => match (
             argument::<u64>(&args, "authGeneration"),
@@ -1009,7 +1052,12 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                         .account_usage_cache
                         .lock()
                         .await
-                        .store_displayed_snapshot(codex_home(), generation, snapshot)
+                        .for_codex_home(codex_home())
+                        .store_displayed_snapshot(
+                            &account_usage::codex_auth_path(codex_home()),
+                            generation,
+                            snapshot,
+                        )
                         .map(|()| json!({"status": "ok"}))
                         .map_err(|error| error.to_string())
                 }
@@ -1170,6 +1218,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             }
         }
         "list_official_accounts" => list_official_accounts(state).await,
+        "refresh_official_account_routes" => {
+            refresh_official_route_after_account_change(state).await
+        }
         "start_official_account_login" => start_official_account_login(state).await,
         "poll_official_account_login" => match string_argument(&args, "loginId") {
             Ok(login_id) => poll_official_account_login(state, login_id).await,
@@ -2490,10 +2541,26 @@ async fn account_usage_snapshot(state: &Arc<AppState>) -> Value {
     if !state.config.read().await.show_account_usage_in_header {
         return json!({"status": "disabled"});
     }
-    query_official_account_usage(state, false).await
+    query_official_account_usage(state, false, None).await
 }
 
-async fn query_official_account_usage(state: &Arc<AppState>, force_refresh: bool) -> Value {
+/// Reads official usage. Without an account id the header reads the default
+/// account; the account list always passes an id so every stored account
+/// reports its own quota.
+async fn query_official_account_usage(
+    state: &Arc<AppState>,
+    force_refresh: bool,
+    account_id: Option<String>,
+) -> Value {
+    if let Some(account_id) = account_id
+        .map(|account_id| account_id.trim().to_string())
+        .filter(|account_id| !account_id.is_empty())
+    {
+        return query_stored_official_account_usage(state, force_refresh, account_id).await;
+    }
+    if let Some(account_id) = header_official_account_id(state).await {
+        return query_stored_official_account_usage(state, force_refresh, account_id).await;
+    }
     let official_proxy;
     {
         let config = state.config.read().await;
@@ -2504,6 +2571,8 @@ async fn query_official_account_usage(state: &Arc<AppState>, force_refresh: bool
                 "message": "当前线路列表中没有可用的官方账号线路",
             });
         }
+        // 账号列表为空时额度只能来自 Codex 登录本身，出口代理取第一条官方
+        // 线路，避免用另一个账号的地区查询额度。
         official_proxy = config
             .profiles
             .iter()
@@ -2514,7 +2583,193 @@ async fn query_official_account_usage(state: &Arc<AppState>, force_refresh: bool
 
     let home = codex_home();
     let mut cache = state.account_usage_cache.lock().await;
-    account_usage::query_snapshot(&mut cache, home, force_refresh, official_proxy.as_deref()).await
+    account_usage::query_snapshot(
+        cache.for_codex_home(home),
+        home,
+        force_refresh,
+        official_proxy.as_deref(),
+    )
+    .await
+}
+
+/// 页头额度跟随设为默认的账号。没有默认账号时回落到账号列表里最早的一条，
+/// 优先跳过失效账号，与失效账号不再派生线路的规则保持一致；账号全部失效时
+/// 仍返回其中最早的一条，页头据此显示失效原因。
+async fn header_official_account_id(state: &Arc<AppState>) -> Option<String> {
+    let store = state.official_accounts();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Option<String>> {
+        let records = store.list()?;
+        if let Some(default_id) = store.default_account_id()?
+            && records.iter().any(|record| record.id == default_id)
+        {
+            return Ok(Some(default_id));
+        }
+        let fallback = records
+            .iter()
+            .find(|record| !record.invalid())
+            .or_else(|| records.first())
+            .map(|record| record.id.clone());
+        Ok(fallback)
+    })
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten()
+}
+
+/// Reads one stored account's usage from its own credential document. Tokens
+/// that expired while the account was idle are refreshed first, and the egress
+/// proxy of that account's route is reused so one account never queries usage
+/// from two regions.
+async fn query_stored_official_account_usage(
+    state: &Arc<AppState>,
+    force_refresh: bool,
+    account_id: String,
+) -> Value {
+    let store = state.official_accounts();
+    let home = codex_home().to_path_buf();
+    let lookup_store = store.clone();
+    let lookup_id = account_id.clone();
+    let lookup_home = home.clone();
+    let auth_path = match tokio::task::spawn_blocking(move || -> anyhow::Result<PathBuf> {
+        if lookup_store.get(&lookup_id)?.is_none() {
+            anyhow::bail!("找不到官方账号：{lookup_id}");
+        }
+        Ok(lookup_store.credential_path(&lookup_home, &lookup_id))
+    })
+    .await
+    {
+        Ok(Ok(auth_path)) => auth_path,
+        Ok(Err(error)) => {
+            return json!({"status": "unavailable", "reason": "official_account_missing", "message": format!("{error:#}")});
+        }
+        Err(error) => {
+            return json!({"status": "error", "message": format!("读取官方账号任务异常退出：{error}")});
+        }
+    };
+    let record = match official_accounts::refresh_official_account_tokens(state, &account_id).await
+    {
+        Ok(record) => record,
+        Err(error) => {
+            // 刷新令牌被官方拒绝时账号记录已经带上失效标记，这里改写成界面
+            // 可识别的失效状态，卡片随即标红并触发线路重算。
+            if let Some(reason) = official_account_invalid_reason(state, &account_id).await {
+                return json!({
+                    "status": "error",
+                    "reason": "official_account_invalid",
+                    "message": reason,
+                });
+            }
+            return json!({"status": "error", "message": error});
+        }
+    };
+    // 已确认失效的账号不再请求官方接口：既减少触发风控的无效请求，卡片也
+    // 直接显示失效原因。
+    if let Some(reason) = record.invalid_reason() {
+        return json!({
+            "status": "error",
+            "reason": "official_account_invalid",
+            "message": reason,
+        });
+    }
+    let upstream_proxy = official_account_usage_proxy(state, &account_id).await;
+    let snapshot = {
+        let mut cache = state.account_usage_cache.lock().await;
+        account_usage::query_snapshot_at(
+            cache.for_auth_path(&auth_path),
+            &auth_path,
+            force_refresh,
+            upstream_proxy.as_deref(),
+        )
+        .await
+    };
+    // 令牌刚刷新过、本地仍判定有效，官方却以 401 拒绝，说明凭据已被撤销。
+    // 默认账号尚未刷新的过期令牌会落在此判断之外，不会被误标。
+    let credential_rejected = snapshot.get("reason").and_then(Value::as_str)
+        == Some(account_usage::USAGE_REASON_CREDENTIAL_REJECTED);
+    if credential_rejected && record.has_live_access_token() {
+        let reason = "官方已拒绝该账号的凭据，账号可能已被停用，需要重新添加";
+        mark_official_account_invalid(state, &account_id, reason).await;
+        return json!({
+            "status": "error",
+            "reason": "official_account_invalid",
+            "message": reason,
+        });
+    }
+    snapshot
+}
+
+/// 读取账号当前的失效原因，供额度查询把错误改写成失效状态。
+async fn official_account_invalid_reason(
+    state: &Arc<AppState>,
+    account_id: &str,
+) -> Option<String> {
+    let store = state.official_accounts();
+    let id = account_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        store
+            .get(&id)
+            .ok()
+            .flatten()
+            .and_then(|record| record.invalid_reason().map(ToString::to_string))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// 把官方明确的凭据拒绝写回账号记录，让账号列表在下次读取时标识失效。
+async fn mark_official_account_invalid(state: &Arc<AppState>, account_id: &str, reason: &str) {
+    let store = state.official_accounts();
+    let id = account_id.to_string();
+    let reason = reason.to_string();
+    let marked = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let Some(mut record) = store.get(&id)? else {
+            return Ok(());
+        };
+        record.mark_invalid(&reason);
+        store.upsert(&record)
+    })
+    .await;
+    let error = match marked {
+        Ok(Ok(())) => {
+            // 失效账号的线路立刻下线，重新添加账号后由刷新流程恢复。
+            official_accounts::refresh_official_routes_after_invalid_account(
+                state,
+                "mark_official_account_invalid",
+                account_id,
+            )
+            .await;
+            return;
+        }
+        Ok(Err(error)) => format!("{error:#}"),
+        Err(error) => format!("保存官方账号失效标记任务异常退出：{error}"),
+    };
+    error_log::record_failure(
+        "official_account_invalid_save_failed",
+        "mark_official_account_invalid",
+        error,
+        json!({ "accountId": account_id }),
+    );
+}
+
+/// Egress proxy that belongs to one account's route. When the account has no
+/// route yet the query falls back to a direct connection instead of borrowing
+/// another account's proxy, so two accounts never share one exit by accident.
+async fn official_account_usage_proxy(state: &Arc<AppState>, account_id: &str) -> Option<String> {
+    let configured = |config: &CodeyConfig| -> Option<String> {
+        config
+            .profiles
+            .iter()
+            .find(|profile| {
+                profile.official_account
+                    && profile.official_account_id.as_deref() == Some(account_id)
+            })
+            .map(|profile| profile.upstream_proxy.trim().to_string())
+            .filter(|proxy| !proxy.is_empty())
+    };
+    let config = state.config.read().await;
+    configured(&config)
 }
 
 #[cfg(test)]

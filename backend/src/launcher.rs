@@ -21,6 +21,7 @@ use crate::cdp;
 use crate::codex_config::{
     RuntimeRouterConfigOptions, apply_runtime_router_config, codex_home,
     prepare_persistent_router_resume_shim as prepare_codex_router_resume_shim,
+    repair_reserved_provider_ids,
     restore_runtime_config_for_router_mode as restore_codex_runtime_config_for_router_mode,
     user_owned_router_provider_occupies_id,
 };
@@ -261,6 +262,73 @@ async fn validate_startup_router_provider(home: &std::path::Path) -> Result<()> 
         })
 }
 
+/// Codex 内置 `openai` 等 Provider，同名的自定义表会让它直接拒绝加载配置并
+/// 退出。第三方中转教程常把自定义端点写成 `[model_providers.openai]`，所以
+/// 启动前先改名；修复本身失败只记录诊断信息，不影响启动流程。
+async fn repair_startup_reserved_providers(home: &std::path::Path) {
+    let provider_home = home.to_path_buf();
+    let result =
+        tokio::task::spawn_blocking(move || repair_reserved_provider_ids(&provider_home)).await;
+    let renames = match result {
+        Ok(Ok(renames)) => renames,
+        Ok(Err(error)) => {
+            record_reserved_provider_repair_failure(home, format!("{error:#}"), false);
+            return;
+        }
+        Err(error) => {
+            record_reserved_provider_repair_failure(home, format!("{error}"), true);
+            return;
+        }
+    };
+    if renames.is_empty() {
+        return;
+    }
+    let summary = renames
+        .iter()
+        .map(|rename| format!("{} -> {}", rename.from, rename.to))
+        .collect::<Vec<_>>()
+        .join("; ");
+    error_log::record_failure_with_metadata(
+        "config_repaired",
+        "repair_reserved_provider_ids",
+        format!("已将占用内置 Provider ID 的自定义配置改名：{summary}"),
+        error_log::FailureMetadata {
+            stage: Some("startup.config_repair".to_string()),
+            recoverable: Some(true),
+        },
+        serde_json::json!({
+            "codexHome": home,
+            "renames": renames
+                .iter()
+                .map(|rename| serde_json::json!({
+                    "from": rename.from,
+                    "to": rename.to,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+    );
+}
+
+fn record_reserved_provider_repair_failure(
+    home: &std::path::Path,
+    error: String,
+    task_join_failed: bool,
+) {
+    error_log::record_failure_with_metadata(
+        "patch_failed",
+        "repair_reserved_provider_ids",
+        error,
+        error_log::FailureMetadata {
+            stage: Some("startup.config_repair".to_string()),
+            recoverable: Some(true),
+        },
+        serde_json::json!({
+            "codexHome": home,
+            "taskJoinFailed": task_join_failed,
+        }),
+    );
+}
+
 async fn run_startup_session_maintenance(
     home: &std::path::Path,
 ) -> Result<SessionMaintenanceSummary> {
@@ -494,13 +562,7 @@ fn runtime_default_model(
     let model = if codey_catalog_installed {
         config
             .effective_runtime_default_target()
-            .map(|target| {
-                if target.official {
-                    target.upstream_model
-                } else {
-                    target.alias
-                }
-            })
+            .map(|target| config.runtime_catalog_id_for_target(&target))
             .or_else(|| {
                 config
                     .profiles
@@ -1339,7 +1401,7 @@ fn resolve_startup_profile(config: &CodeyConfig) -> Result<ProviderProfile> {
         .or_else(|| config.active_profile())
         .ok_or_else(|| anyhow::anyhow!("找不到全局默认模型所属的 Codex 线路"))?;
     if current_profile.enabled {
-        if current_profile.official_account && !config.official_account_available_this_launch {
+        if current_profile.official_account && !config.official_route_usable(&current_profile) {
             anyhow::bail!("当前线路需要官方账号登录，但本次 Codex 启动未检测到可用的官方登录态");
         }
         current_profile.validate().map_err(anyhow::Error::msg)?;
@@ -1846,9 +1908,10 @@ impl CodeyRuntime {
         handler: codey_runtime_core::bridge::BridgeHandler,
         trace_log_write_protection_active: &AtomicBool,
         crashpad_pending_stats: CrashpadPendingStatsHandle,
-        account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCache>>,
+        account_usage_cache: Arc<tokio::sync::Mutex<crate::account_usage::AccountUsageCaches>>,
     ) -> Result<(Self, oneshot::Receiver<()>)> {
         let home = codex_home();
+        repair_startup_reserved_providers(home).await;
         trace_log_write_protection_active.store(false, Ordering::Release);
         let injection_scripts = cdp::prepare_injection_scripts(
             config.local_router_enabled,

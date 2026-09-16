@@ -181,7 +181,8 @@ export function buildSubagentModelOptions(
   for (const profile of config.profiles) {
     if (profile.enabled === false) continue;
     const official = profile.authMode === "officialAccount";
-    if (official && !officialAccountAvailable) continue;
+    // 存储账号的官方线路自带凭据，默认登录缺失时仍能由本地路由提供模型。
+    if (official && !officialAccountAvailable && !profile.officialAccountId) continue;
 
     const providerId = routeProviderId(profile);
     for (const modelId of enabledModelsForRoute(config, modelState, profile)) {
