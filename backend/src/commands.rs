@@ -935,6 +935,11 @@ fn apply_unavailable_official_probe(
             Vec::new()
         });
         next = next.normalize();
+        if next.profiles.len() == 1 && next.profiles[0].is_unconfigured_default() {
+            // Let the next launch import the current Codex provider instead of
+            // validating the blank placeholder and exiting.
+            next.initial_route_import_completed = false;
+        }
     }
     error_log::record_failure_with_metadata(
         "official_auth_unavailable",

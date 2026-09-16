@@ -804,6 +804,34 @@ fn unavailable_official_auth_drops_routes_of_invalid_accounts() {
     );
 }
 
+#[test]
+fn unavailable_official_auth_returns_the_placeholder_to_initial_import() {
+    let mut official = ProviderProfile::new("OpenAI 官方直登");
+    official.id = crate::config::DERIVED_OFFICIAL_PROFILE_ID.to_string();
+    official.source_provider_id = Some("openai".to_string());
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.normalize();
+
+    let mut config = CodeyConfig {
+        local_router_enabled: true,
+        initial_route_import_completed: true,
+        ..CodeyConfig::default()
+    };
+    config.active_profile_id = official.id.clone();
+    config.profiles.push(official.clone());
+    config
+        .selected_models_by_provider
+        .insert("openai".to_string(), vec!["gpt-5.6-sol".to_string()]);
+
+    let next =
+        apply_unavailable_official_probe(config, "not logged in".into(), vec![official], false)
+            .unwrap();
+
+    assert!(next.profiles[0].is_unconfigured_default());
+    assert!(!next.initial_route_import_completed);
+    assert!(next.needs_initial_route_import());
+}
+
 #[tokio::test]
 async fn dropping_derived_official_routes_persists_the_route_removal() {
     let directory = tempfile::tempdir().unwrap();

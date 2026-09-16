@@ -1757,7 +1757,11 @@ impl CodeyConfig {
     }
 
     pub(crate) fn needs_initial_route_import(&self) -> bool {
-        !self.initial_route_import_completed && self.looks_like_empty_default_route()
+        // A launch-derived official route can disappear when the auth probe
+        // falls back to an API-key launch. The resulting empty placeholder must
+        // still be able to import the current Codex provider again, even if a
+        // previous launch already marked the initial import as completed.
+        self.profiles.len() == 1 && self.profiles[0].is_unconfigured_default()
     }
 
     /// Build one model catalog for all routes registered in the current Codex
