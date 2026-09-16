@@ -459,7 +459,7 @@ fn route_subagent_model(
     route_provider: &str,
     model: &str,
     targets: &[RuntimeModelTarget],
-    builtin_official_catalog: bool,
+    config: &CodeyConfig,
 ) -> String {
     let requested = model.trim();
     let target = targets
@@ -479,18 +479,12 @@ fn route_subagent_model(
             })
         });
     if let Some(target) = target {
-        // ChatGPT validates official slugs before the loopback router. Only
-        // third-party targets may use route-qualified runtime ids.
-        return if target.official {
-            target.upstream_model.clone()
-        } else {
-            target.alias.clone()
-        };
+        return config.runtime_catalog_id_for_target(target);
     }
     let official_route = targets
         .iter()
         .any(|target| target.official && target.provider_id == route_provider);
-    if builtin_official_catalog || official_route {
+    if config.uses_builtin_official_model_catalog() || official_route {
         requested.to_string()
     } else {
         local_router::model_alias(route_provider, requested)
@@ -519,7 +513,7 @@ fn router_subagent_runtime_config(
         if !selection.enabled {
             continue;
         }
-        let routed = route_subagent_model(provider, &selection.model, &targets, false);
+        let routed = route_subagent_model(provider, &selection.model, &targets, config);
         selection.model = if route_catalog_installed {
             routed
         } else {

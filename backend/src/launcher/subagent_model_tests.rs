@@ -1,5 +1,72 @@
 use super::*;
 
+fn official_subagent_config(account_count: usize) -> CodeyConfig {
+    let profiles = (0..account_count)
+        .map(|index| {
+            let mut profile = ProviderProfile::new(&format!("Account {index}"));
+            profile.source_provider_id = Some("openai".into());
+            profile.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+            profile.official_account_id = Some(format!("account-{index}"));
+            profile.normalize();
+            profile
+        })
+        .collect();
+    let mut config = CodeyConfig {
+        initial_route_import_completed: true,
+        local_router_enabled: true,
+        subagent_optimization: true,
+        ..CodeyConfig::default()
+    };
+    config.apply_launch_official_profiles(profiles);
+    let model = local_router::model_alias(config.profiles[0].provider_id(), "gpt-6-astra");
+    config.subagent_model = model.clone();
+    config.subagent_roles = crate::config::uniform_subagent_roles(&model, "high");
+    config.normalize()
+}
+
+#[test]
+fn official_subagent_models_match_catalog_and_preserve_account_selection() {
+    for account_count in [1, 2] {
+        let mut config = official_subagent_config(account_count);
+        let last_provider = config.profiles.last().unwrap().provider_id();
+        let worker_alias = local_router::model_alias(last_provider, "gpt-6-astra");
+        config.subagent_roles.get_mut("codey_worker").unwrap().model = worker_alias.clone();
+        let saved = config.clone();
+        let runtime = router_subagent_runtime_config(&config, true).unwrap();
+        let (_, catalog) = config.runtime_catalog_models();
+        for selection in runtime.subagent_roles.values() {
+            assert!(
+                catalog.contains(&selection.model),
+                "{}: {catalog:?}",
+                selection.model
+            );
+        }
+        let expected_default = if account_count == 1 {
+            "gpt-6-astra"
+        } else {
+            &config.subagent_model
+        };
+        let expected_worker = if account_count == 1 {
+            "gpt-6-astra"
+        } else {
+            &worker_alias
+        };
+        assert_eq!(runtime.subagent_model, expected_default);
+        assert_eq!(runtime.subagent_roles["codey_worker"].model, expected_worker);
+        assert_eq!(config, saved);
+    }
+}
+
+#[test]
+fn official_subagent_models_reject_ambiguous_builtin_catalog_fallback() {
+    let single = official_subagent_config(1);
+    let runtime = router_subagent_runtime_config(&single, false).unwrap();
+    assert_eq!(runtime.subagent_model, "gpt-6-astra");
+    let multiple = official_subagent_config(2);
+    let error = router_subagent_runtime_config(&multiple, false).unwrap_err();
+    assert!(error.to_string().contains("同名线路"), "{error}");
+}
+
 fn subagent_catalog_fallback_config() -> CodeyConfig {
     let mut route = ProviderProfile::new("Relay");
     route.id = "route-a".into();
