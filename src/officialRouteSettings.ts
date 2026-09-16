@@ -2,7 +2,8 @@ import type { OfficialAccount, Profile } from "./App.types";
 import { validateOfficialRouteShortName } from "./routeShortNames";
 import { validateOutboundProxyUrl } from "./urlValidation";
 
-export const MAX_OFFICIAL_ROUTE_NAME_CHARACTERS = 60;
+export const MAX_ROUTE_NAME_CHARACTERS = 10;
+export const MAX_OFFICIAL_ROUTE_NAME_CHARACTERS = MAX_ROUTE_NAME_CHARACTERS;
 
 export type OfficialRouteSettingsDraft = {
   routeName: string;

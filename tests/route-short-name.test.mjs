@@ -56,15 +56,17 @@ test("model labels use the default official prefix or a custom route short name"
   assert.equal(shortNames.fallbackRouteShortName(" 备用中转 "), "备用");
 });
 
-test("the third-party route editor exposes the short-name field and validation hint", async () => {
+test("the third-party route editor exposes the route-name and short-name fields with maxLength", async () => {
   const source = await readFile(
     new URL("../src/ModelSection.tsx", import.meta.url),
     "utf8",
   );
 
+  assert.match(source, /id="route-name-input"/);
   assert.match(source, /id="route-short-name-input"/);
+  assert.match(source, /maxLength=\{MAX_ROUTE_NAME_CHARACTERS\}/);
   assert.match(source, /maxLength=\{MAX_ROUTE_SHORT_NAME_CHARACTERS\}/);
-  assert.match(source, /最多 2 个字符且不可重复，模型名称前会显示为 \[短名称\]/);
+  assert.doesNotMatch(source, /最多 2 个字符且不可重复，模型名称前会显示为 \[短名称\]/);
   assert.match(
     source,
     /validateThirdPartyRouteShortName\(route\.shortName, profiles, route\.id\)/,
@@ -111,6 +113,7 @@ test("official route settings are edited on the route card instead of the accoun
 
   assert.match(modelSection, /id="official-route-name-input"/);
   assert.match(modelSection, /id="official-route-short-name-input"/);
+  assert.match(modelSection, /maxLength=\{MAX_ROUTE_NAME_CHARACTERS\}/);
   assert.match(modelSection, /maxLength=\{MAX_ROUTE_SHORT_NAME_CHARACTERS\}/);
   assert.match(modelSection, /validateOfficialRouteSettings\(/);
   assert.match(modelSection, /官方账号登录 · \$\{email\}/);
@@ -142,6 +145,7 @@ test("official accounts derive numbered default route names and short names", as
   assert.match(mock, /previewEnsureGeneratedRouteSettings\(\);/);
   assert.doesNotMatch(mock, /previewOfficialDerivedRouteName/);
 
-  assert.match(modelSection, /留空则按账号添加顺序使用默认线路名，例如「官方账号1」/);
-  assert.match(modelSection, /留空则按账号添加顺序使用默认短名称，例如「官1」/);
+  assert.doesNotMatch(modelSection, /留空则按账号添加顺序使用默认线路名，例如「官方账号1」/);
+  assert.doesNotMatch(modelSection, /留空则按账号添加顺序使用默认短名称，例如「官1」/);
+  assert.doesNotMatch(modelSection, /最多 2 个字符且不可重复，模型名称前会显示为 \[短名称\]/);
 });

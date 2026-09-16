@@ -6,6 +6,7 @@ import {
   IconEye,
   IconEyeOff,
   IconGripVertical,
+  IconHelpCircle,
   IconInfoCircle,
   IconListDetails,
   IconPlus as Plus,
@@ -37,6 +38,7 @@ import {
 } from "./components/ui";
 import { modelIdsEqual, modelKey, uniqueModelIds } from "./modelIds";
 import {
+  MAX_ROUTE_NAME_CHARACTERS,
   validateOfficialRouteSettings,
   type OfficialRouteSettingsDraft,
 } from "./officialRouteSettings";
@@ -136,6 +138,31 @@ type RouteDraftErrors = {
 // 官方线路的编辑入口只改线路名、短名称和代理，模型列举交给同步入口。
 type OfficialRouteDialogScope = "settings" | "models";
 
+export { MAX_ROUTE_NAME_CHARACTERS };
+
+const UPSTREAM_PROXY_TOOLTIP_CONTENT = (
+  <div className="space-y-1.5 text-xs text-left leading-relaxed">
+    <div className="font-semibold">上游代理格式与提示</div>
+    <div>
+      支持协议：<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">http://</code>、<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">https://</code>、<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">socks5://</code>、<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">socks5h://</code>
+    </div>
+    <div>
+      支持代理认证：允许携带用户名与密码（如 <code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">user:pass@host:port</code>）。
+    </div>
+    <div className="pt-0.5">
+      <div className="font-semibold text-[11px] opacity-80">常见示例：</div>
+      <div className="mt-0.5 space-y-0.5 font-mono text-[11px] opacity-90">
+        <div>http://127.0.0.1:7890</div>
+        <div>socks5://127.0.0.1:7890</div>
+        <div>http://user:pass@192.168.1.100:8080</div>
+      </div>
+    </div>
+    <div className="border-t border-current/15 pt-1 text-[11px] opacity-80">
+      留空使用系统代理；设置后该线路改用流式 HTTP 传输。
+    </div>
+  </div>
+);
+
 function validateRouteDraft(route: Profile, profiles: readonly Profile[]): RouteDraftErrors {
   if (route.authMode === "officialAccount") {
     return {
@@ -147,7 +174,11 @@ function validateRouteDraft(route: Profile, profiles: readonly Profile[]): Route
     };
   }
   const errors: RouteDraftErrors = {
-    name: route.name.trim() ? "" : "请输入线路名称",
+    name: !route.name.trim()
+      ? "请输入线路名称"
+      : Array.from(route.name.trim()).length > MAX_ROUTE_NAME_CHARACTERS
+        ? `线路名最多 ${MAX_ROUTE_NAME_CHARACTERS} 个字符`
+        : "",
     shortName: validateThirdPartyRouteShortName(route.shortName, profiles, route.id),
     baseUrl: "",
     apiKey: "",
@@ -1012,6 +1043,7 @@ function ModelSectionComponent({
                         <Input
                           id="official-route-name-input"
                           aria-label="线路名"
+                          maxLength={MAX_ROUTE_NAME_CHARACTERS}
                           aria-invalid={Boolean(
                             officialRouteDraftErrors?.routeName &&
                             (routeValidationAttempted ||
@@ -1040,13 +1072,11 @@ function ModelSectionComponent({
                           >
                             {officialRouteDraftErrors.routeName}
                           </small>
-                        ) : (
+                        ) : !draftOfficialAccount ? (
                           <small className="route-field-hint">
-                            {draftOfficialAccount
-                              ? "留空则按账号添加顺序使用默认线路名，例如「官方账号1」。"
-                              : "未找到该线路对应的官方账号记录。"}
+                            未找到该线路对应的官方账号记录。
                           </small>
-                        )}
+                        ) : null}
                       </label>
                       <label className="route-field">
                         <span>短名称</span>
@@ -1082,22 +1112,26 @@ function ModelSectionComponent({
                           >
                             {officialRouteDraftErrors.shortName}
                           </small>
-                        ) : (
-                          <small className="route-field-hint">
-                            留空则按账号添加顺序使用默认短名称，例如「官1」。
-                          </small>
-                        )}
+                        ) : null}
                       </label>
-                      <small
-                        id="official-route-short-name-hint"
-                        className="route-field-hint route-editor-span-all"
-                      >
-                        最多 2 个字符且不可重复，模型名称前会显示为 [短名称]
-                      </small>
                     </div>
 
                     <label className="route-field">
-                      <span>上游代理（可选）</span>
+                      <span className="route-option-title-group">
+                        <span>上游代理（可选）</span>
+                        <Tooltip content={UPSTREAM_PROXY_TOOLTIP_CONTENT}>
+                          <span
+                            className="route-option-info-trigger"
+                            aria-label="上游代理格式与提示"
+                            onClick={(e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                            }}
+                          >
+                            <IconHelpCircle size={13} />
+                          </span>
+                        </Tooltip>
+                      </span>
                       <Input
                         id="official-route-proxy-input"
                         aria-label="上游代理（可选）"
@@ -1109,7 +1143,7 @@ function ModelSectionComponent({
                         }
                         value={officialRouteDraft?.upstreamProxy ?? routeDraft.upstreamProxy ?? ""}
                         disabled={isBusy}
-                        placeholder="http://127.0.0.1:7890 或 socks5://…，留空使用系统代理"
+                        placeholder="留空使用系统代理"
                         onChange={(event) =>
                           updateOfficialRouteDraft({ upstreamProxy: event.target.value })}
                       />
@@ -1117,11 +1151,7 @@ function ModelSectionComponent({
                         <small id="official-route-proxy-error" className="text-[#d70015]" role="alert">
                           {officialRouteDraftErrors.upstreamProxy}
                         </small>
-                      ) : (
-                        <small className="route-field-hint">
-                          本线路的上游流量（含额度查询）改走此代理，可用于指定出口地区；设置后该线路改用流式 HTTP 传输。
-                        </small>
-                      )}
+                      ) : null}
                     </label>
                   </>
                 )}
@@ -1180,6 +1210,7 @@ function ModelSectionComponent({
                     <Input
                       id="route-name-input"
                       aria-label="线路名"
+                      maxLength={MAX_ROUTE_NAME_CHARACTERS}
                       aria-invalid={Boolean(
                         routeDraftErrors?.name &&
                         (routeValidationAttempted || routeDraft.name.length > 0),
@@ -1235,9 +1266,6 @@ function ModelSectionComponent({
                       </small>
                     ) : null}
                   </label>
-                  <small id="route-short-name-hint" className="route-field-hint route-editor-span-all">
-                    最多 2 个字符且不可重复，模型名称前会显示为 [短名称]
-                  </small>
                 </div>
 
                 <div className="route-field">
@@ -1264,9 +1292,6 @@ function ModelSectionComponent({
                     }}
                     optionList={routeProtocolOptions}
                   />
-                  <small className="route-field-hint">
-                    请选择上游实际支持的接口协议；Chat Completions 与 Anthropic Messages 会由本地路由适配为 Codex 可用格式。
-                  </small>
                 </div>
 
                 {routeDraft.upstreamProtocol === "openaiResponses" && (
@@ -1389,7 +1414,21 @@ function ModelSectionComponent({
                 </label>
 
                 <label className="route-field">
-                  <span>上游代理（可选）</span>
+                  <span className="route-option-title-group">
+                    <span>上游代理（可选）</span>
+                    <Tooltip content={UPSTREAM_PROXY_TOOLTIP_CONTENT}>
+                      <span
+                        className="route-option-info-trigger"
+                        aria-label="上游代理格式与提示"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
+                      >
+                        <IconHelpCircle size={13} />
+                      </span>
+                    </Tooltip>
+                  </span>
                   <Input
                     id="route-proxy-input"
                     aria-label="上游代理（可选）"
@@ -1405,7 +1444,7 @@ function ModelSectionComponent({
                     }
                     value={routeDraft.upstreamProxy || ""}
                     disabled={isBusy}
-                    placeholder="http://127.0.0.1:7890 或 socks5://…，留空使用系统代理"
+                    placeholder="留空使用系统代理"
                     onChange={(event) =>
                       updateRouteDraft({ upstreamProxy: event.target.value })}
                   />
@@ -1414,11 +1453,7 @@ function ModelSectionComponent({
                     <small id="route-proxy-error" className="text-[#d70015]" role="alert">
                       {routeDraftErrors.upstreamProxy}
                     </small>
-                  ) : (
-                    <small className="route-field-hint">
-                      本线路的上游流量改走此代理，可用于指定出口地区；设置后该线路改用流式 HTTP 传输。
-                    </small>
-                  )}
+                  ) : null}
                 </label>
               </div>
             )}
