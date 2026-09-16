@@ -2345,21 +2345,28 @@ fn build_isolated_runtime_overrides(
                 .and_then(Item::as_str)
         })
         .unwrap_or("openai");
-    let provider_segment =
-        codex_config_override_bare_segment(retry_provider_id, "Codex Provider ID")?;
-    push_runtime_override_value(
-        &mut overrides,
-        &format!("model_providers.{provider_segment}.stream_max_retries"),
-        &Value::from(stream_max_retries as i64),
-    );
-    if provider_id.is_some() {
-        // 压缩期间 Codey 要等上游完整生成并通过校验才写回下游，客户端默认
-        // 的 5 分钟流空闲期限会先判定连接失效；这里按 Codey 的上游预算放宽。
+    // 选中内置 Provider 时不能下发 `model_providers.<id>.*`：Codex 在加载配置
+    // 阶段就会以「reserved built-in provider IDs」为由退出，app-server 随之
+    // 启动失败，因此这类覆盖必须整条跳过，由 Codex 自身默认值接管。
+    if !RESERVED_BUILTIN_PROVIDER_IDS.contains(&retry_provider_id) {
+        let provider_segment =
+            codex_config_override_bare_segment(retry_provider_id, "Codex Provider ID")?;
         push_runtime_override_value(
             &mut overrides,
-            &format!("model_providers.{provider_segment}.stream_idle_timeout_ms"),
-            &Value::from(local_router::COMPACTION_CLIENT_STREAM_IDLE_TIMEOUT.as_millis() as i64),
+            &format!("model_providers.{provider_segment}.stream_max_retries"),
+            &Value::from(stream_max_retries as i64),
         );
+        if provider_id.is_some() {
+            // 压缩期间 Codey 要等上游完整生成并通过校验才写回下游，客户端默认
+            // 的 5 分钟流空闲期限会先判定连接失效；这里按 Codey 的上游预算放宽。
+            push_runtime_override_value(
+                &mut overrides,
+                &format!("model_providers.{provider_segment}.stream_idle_timeout_ms"),
+                &Value::from(
+                    local_router::COMPACTION_CLIENT_STREAM_IDLE_TIMEOUT.as_millis() as i64,
+                ),
+            );
+        }
     }
     push_required_document_override(
         &mut overrides,

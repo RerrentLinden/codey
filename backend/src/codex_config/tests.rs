@@ -1137,11 +1137,102 @@ fn native_isolated_runtime_does_not_create_a_missing_codex_config() {
     assert!(applied.runtime_config_overrides.iter().all(|entry| {
         !entry.starts_with("model_provider=")
             && !entry.starts_with("model_catalog_json=")
-            && (!entry.starts_with("model_providers.")
-                || entry.starts_with("model_providers.openai.stream_max_retries="))
+            && !entry.starts_with("model_providers.")
     }));
     assert!(restore_runtime_config_at(&home, &marker, false).unwrap());
     assert!(!home.join("config.toml").exists());
+}
+
+#[test]
+fn isolated_runtime_skips_retry_overrides_for_builtin_providers() {
+    // Codex 禁止在 `model_providers` 下覆盖内置 Provider，路由关闭时必须跳过
+    // 这条覆盖，否则 app-server 在加载配置阶段就会退出。
+    for existing in [
+        None,
+        Some("model = \"gpt-5\"\n"),
+        Some("model_provider = \"openai\"\n"),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("codex-home");
+        let marker = temp.path().join("codey-state/codex-lease.json");
+        let backup_root = temp.path().join("codey-state/codex-backups");
+        fs::create_dir_all(&home).unwrap();
+        if let Some(existing) = existing {
+            fs::write(home.join("config.toml"), existing).unwrap();
+        }
+
+        let applied = apply_isolated_runtime_router_config(
+            &home,
+            RouterApplyOptions {
+                stream_max_retries: 7,
+                local_router: None,
+                use_official_catalog: false,
+                default_model: None,
+                fastctx_command: None,
+                subagent_optimization: false,
+                subagent_model: DEFAULT_SUBAGENT_MODEL,
+                subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+                subagent_roles: None,
+                marker: &marker,
+                backup_root: &backup_root,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            applied.runtime_config_overrides.iter().all(|entry| {
+                !RESERVED_BUILTIN_PROVIDER_IDS
+                    .iter()
+                    .any(|id| entry.starts_with(&format!("model_providers.{id}.")))
+            }),
+            "覆盖内置 Provider 会让 Codex 启动失败：{:?}",
+            applied.runtime_config_overrides
+        );
+        assert!(restore_runtime_config_at(&home, &marker, false).unwrap());
+    }
+}
+
+#[test]
+fn isolated_runtime_keeps_retry_overrides_for_custom_providers() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    let marker = temp.path().join("codey-state/codex-lease.json");
+    let backup_root = temp.path().join("codey-state/codex-backups");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        home.join("config.toml"),
+        "model_provider = \"relay\"\n\n[model_providers.relay]\nname = \"Relay\"\n\
+         base_url = \"https://relay.example/v1\"\nwire_api = \"responses\"\n",
+    )
+    .unwrap();
+
+    let applied = apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            stream_max_retries: 7,
+            local_router: None,
+            use_official_catalog: false,
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backup_root,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        applied
+            .runtime_config_overrides
+            .iter()
+            .any(|entry| entry == "model_providers.relay.stream_max_retries=7"),
+        "自定义 Provider 仍需按设置调整重试次数：{:?}",
+        applied.runtime_config_overrides
+    );
+    assert!(restore_runtime_config_at(&home, &marker, false).unwrap());
 }
 
 #[test]
