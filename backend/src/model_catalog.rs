@@ -12,6 +12,10 @@ use crate::fs_util::atomic_write_private_with_parent as atomic_write;
 use crate::model_id;
 
 const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
+/// Raw `codex debug models` output Codey captured itself. Recent Codex builds
+/// no longer maintain `models_cache.json` on disk, so this snapshot is the
+/// durable source for models that need instruction-bearing entries.
+const DEBUG_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-runtime-catalog.json";
 /// Context window an older Codey version wrote for models flagged as 1M capable.
 const LEGACY_1M_CONTEXT_WINDOW: u64 = 1_000_000;
 const DEFAULT_CONTEXT_WINDOW: u64 = 272_000;
@@ -435,7 +439,16 @@ fn refresh_for_provider_with_transport_preferences(
     {
         return write_verified_catalog(home, &[]);
     }
-    let official_models = read_official_entries(home)?;
+    let mut official_models = read_official_entries(home)?;
+    if official_models
+        .iter()
+        .all(|model| model_instruction_source(model).is_none())
+        // Codex 26.908+ may never write `models_cache.json`; capture the CLI's
+        // own catalog before declaring the runtime cache unusable.
+        && sync_runtime_catalog_snapshot(home).unwrap_or(false)
+    {
+        official_models = read_official_entries(home)?;
+    }
     if official_models
         .iter()
         .all(|model| model_instruction_source(model).is_none())
@@ -814,7 +827,11 @@ fn catalog_signature(paths: &[PathBuf]) -> CatalogSignature {
 }
 
 fn read_official_entries(home: &Path) -> Result<std::sync::Arc<Vec<Value>>> {
-    let paths = vec![home.join("models_cache.json"), home.join(relative_path())];
+    let paths = vec![
+        home.join("models_cache.json"),
+        home.join(DEBUG_CATALOG_RELATIVE_PATH),
+        home.join(relative_path()),
+    ];
     let signature = catalog_signature(&paths);
     let cache = OFFICIAL_ENTRIES_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     if let Ok(guard) = cache.lock()
@@ -880,15 +897,22 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
         .iter()
         .enumerate()
         .map(|(priority, (slug, display_name))| {
-            let mut matching_models = catalogs
+            let matching_models = catalogs
                 .iter()
                 .flat_map(|models| models.iter())
-                .filter(|model| model.get("slug").and_then(Value::as_str) == Some(*slug));
+                .filter(|model| model.get("slug").and_then(Value::as_str) == Some(*slug))
+                .collect::<Vec<_>>();
+            // A source may hold the slug without runtime fields (for example an
+            // incomplete `models_cache.json` written before a Codex update).
+            // Prefer the first instruction-bearing entry so a fresher Codey
+            // snapshot can repair it instead of failing the whole catalog.
             let mut model = matching_models
-                .next()
-                .cloned()
+                .iter()
+                .find(|model| model_instruction_source(model).is_some())
+                .or_else(|| matching_models.first())
+                .map(|model| (*model).clone())
                 .ok_or_else(|| anyhow::anyhow!("Codex 模型模板缺少固定官方模型 {slug}"))?;
-            let fallbacks = matching_models.collect::<Vec<_>>();
+            let fallbacks = matching_models;
             complete_reasoning_metadata(&mut model, &fallbacks);
             normalize_official_model(&mut model, slug, display_name, priority);
             if bundled_fast_model_slugs.contains(*slug) {
@@ -899,6 +923,172 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
             Ok(model)
         })
         .collect()
+}
+
+/// Codex 26.908.x stopped maintaining `models_cache.json` on disk. When no
+/// file source carries instruction-bearing entries, ask the bundled Codex CLI
+/// to render its catalog and keep the output as a Codey-owned snapshot that
+/// `read_official_entries` picks up like any other source.
+#[cfg(not(test))]
+fn sync_runtime_catalog_snapshot(home: &Path) -> Result<bool> {
+    let Some(models) = debug_model_entries(home) else {
+        return Ok(false);
+    };
+    let catalog = serde_json::to_vec_pretty(&json!({ "models": models }))
+        .context("序列化 Codex 内置模型目录快照失败")?;
+    atomic_write(&home.join(DEBUG_CATALOG_RELATIVE_PATH), &catalog)
+        .context("写入 Codex 内置模型目录快照失败")?;
+    Ok(true)
+}
+
+/// Renders the runtime catalog through the Codex CLI. Prefers the full output
+/// (which merges remote models for signed-in accounts) and falls back to the
+/// bundled copy when the live render fails.
+#[cfg(not(test))]
+fn debug_model_entries(home: &Path) -> Option<Vec<Value>> {
+    for cli in codex_cli_candidates() {
+        for bundled in [false, true] {
+            let Some(output) = run_codex_debug_models(&cli, home, bundled) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_slice::<Value>(&output) else {
+                continue;
+            };
+            let models = official_models_from_value(&value);
+            if models.iter().any(model_is_runtime_source_compatible) {
+                return Some(models);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(test))]
+fn codex_cli_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut push = |path: PathBuf| {
+        if path.is_file() && !candidates.contains(&path) {
+            candidates.push(path);
+        }
+    };
+    // The staged copy is verified runnable (the WindowsApps package location
+    // needs special execution rights), so it comes before the app resources.
+    for path in hashed_cli_dirs("Codey", "codex-runtime") {
+        push(path.join("codex.exe"));
+    }
+    if let Some(app_dir) = codey_runtime_core::app_paths::resolve_codex_app_dir(None)
+        && let Some(executable) = codey_runtime_core::app_paths::codex_runtime_executable(&app_dir)
+    {
+        push(executable);
+    }
+    for path in hashed_cli_dirs("OpenAI", "Codex") {
+        push(path.join("codex.exe"));
+    }
+    if let Some(path) = cli_on_path() {
+        push(path);
+    }
+    candidates
+}
+
+/// `%LOCALAPPDATA%\<vendor>\<dir>\<hash>` hosts the standalone Codex CLI and
+/// Codey's staged copies; newest first so an updated install wins.
+#[cfg(all(windows, not(test)))]
+fn hashed_cli_dirs(vendor: &str, dir: &str) -> Vec<PathBuf> {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return Vec::new();
+    };
+    let mut root = PathBuf::from(local_app_data).join(vendor).join(dir);
+    // The standalone installer nests the hash directories under `bin`.
+    if vendor == "OpenAI" {
+        root = root.join("bin");
+    }
+    let mut entries = std::fs::read_dir(&root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|path| {
+        std::cmp::Reverse(
+            path.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+        )
+    });
+    entries
+}
+
+#[cfg(all(not(windows), not(test)))]
+fn hashed_cli_dirs(_vendor: &str, _dir: &str) -> Vec<PathBuf> {
+    Vec::new()
+}
+
+#[cfg(not(test))]
+fn cli_on_path() -> Option<PathBuf> {
+    let name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+#[cfg(test)]
+fn sync_runtime_catalog_snapshot(_home: &Path) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(not(test))]
+const DEBUG_MODELS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(not(test))]
+fn run_codex_debug_models(cli: &Path, home: &Path, bundled: bool) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new(cli);
+    command.args(["debug", "models"]);
+    if bundled {
+        command.arg("--bundled");
+    }
+    command
+        .env("CODEX_HOME", home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(codey_runtime_core::windows_create_no_window());
+    }
+    let mut child = command.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    // The catalog is larger than the pipe buffer, so it must be drained while
+    // the deadline is being polled.
+    let reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        stdout.read_to_end(&mut buffer).ok().map(|_| buffer)
+    });
+    let deadline = std::time::Instant::now() + DEBUG_MODELS_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let output = reader.join().ok().flatten();
+                return status.success().then_some(()).and(output);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return None;
+            }
+        }
+    }
 }
 
 fn complete_reasoning_metadata(model: &mut Value, fallbacks: &[&Value]) {
@@ -2206,6 +2396,51 @@ mod tests {
             let model = models.iter().find(|model| model["slug"] == slug).unwrap();
             assert_eq!(model["description"], model["display_name"]);
         }
+    }
+
+    #[test]
+    fn instruction_bearing_snapshot_entry_repairs_an_incomplete_cache_entry() {
+        let home = tempfile::tempdir().unwrap();
+        // Codex 26.908+ may keep a cache file that lacks runtime fields while a
+        // `codex debug models` snapshot captured by Codey carries them. The
+        // merge must prefer the instruction-bearing entry per slug.
+        let mut incomplete = official_cache();
+        for model in incomplete["models"].as_array_mut().unwrap() {
+            let object = model.as_object_mut().unwrap();
+            object.remove("base_instructions");
+            object.remove("model_messages");
+        }
+        fs::write(
+            home.path().join("models_cache.json"),
+            serde_json::to_vec(&incomplete).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&official_cache()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            refresh_for_provider(home.path(), true, None, &[]).unwrap(),
+            OFFICIAL_MODELS.len()
+        );
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let sol = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        assert!(
+            sol["base_instructions"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
     }
 
     #[test]
