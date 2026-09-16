@@ -446,8 +446,17 @@ fn restart_codey(invocation: &UpdateHelperInvocation, log_path: &Path) -> Result
         }
         let current_dir = target.parent().unwrap_or_else(|| Path::new("."));
         let deadline = std::time::Instant::now() + RESTART_RETRY_WINDOW;
+        let mut attempt = 0_u32;
         loop {
-            append_update_log(log_path, &format!("Restarting Codey: {}", target.display()));
+            attempt += 1;
+            // 每次重试都写日志会把锁等待刷成上百行重复记录；记首次与之后的每
+            // 十次的进度即可。
+            if attempt == 1 || attempt.is_multiple_of(10) {
+                append_update_log(
+                    log_path,
+                    &format!("Restarting Codey: {} (attempt {attempt})", target.display()),
+                );
+            }
             match std::process::Command::new(&target)
                 .current_dir(current_dir)
                 .creation_flags(
