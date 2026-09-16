@@ -16,6 +16,10 @@ const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 /// no longer maintain `models_cache.json` on disk, so this snapshot is the
 /// durable source for models that need instruction-bearing entries.
 const DEBUG_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-runtime-catalog.json";
+/// The CLI render takes seconds; an opportunistic refresh of a stale snapshot
+/// is attempted at most once per launch.
+static RUNTIME_SNAPSHOT_SYNC_ATTEMPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Context window an older Codey version wrote for models flagged as 1M capable.
 const LEGACY_1M_CONTEXT_WINDOW: u64 = 1_000_000;
 const DEFAULT_CONTEXT_WINDOW: u64 = 272_000;
@@ -440,12 +444,17 @@ fn refresh_for_provider_with_transport_preferences(
         return write_verified_catalog(home, &[]);
     }
     let mut official_models = read_official_entries(home)?;
-    // Codex 26.908+ may never write `models_cache.json`; capture the CLI's
-    // own catalog before declaring the runtime cache unusable.
-    if official_models
+    // Codex 26.908+ may never write `models_cache.json`; capture the CLI's own
+    // catalog before declaring the runtime cache unusable. A snapshot older
+    // than the newest local Codex binary is refreshed once per launch so a
+    // Codex upgrade does not keep serving stale instructions.
+    let sources_unusable = official_models
         .iter()
-        .all(|model| model_instruction_source(model).is_none())
-    {
+        .all(|model| model_instruction_source(model).is_none());
+    let stale_snapshot = !sources_unusable
+        && runtime_snapshot_is_stale(home)
+        && !RUNTIME_SNAPSHOT_SYNC_ATTEMPTED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    if sources_unusable || stale_snapshot {
         let snapshot_synced = sync_runtime_catalog_snapshot(home).unwrap_or_else(|error| {
             eprintln!("读取 Codex 命令行模型清单失败：{error:#}");
             false
@@ -928,6 +937,32 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
             Ok(model)
         })
         .collect()
+}
+
+/// The snapshot predates the newest local Codex CLI: the install was upgraded
+/// since the capture, so the stored instructions may be stale. Absence of the
+/// snapshot is not staleness — the unusable-sources path captures it anyway.
+#[cfg(not(test))]
+fn runtime_snapshot_is_stale(home: &Path) -> bool {
+    let Some(snapshot_mtime) = fs::metadata(home.join(DEBUG_CATALOG_RELATIVE_PATH))
+        .and_then(|metadata| metadata.modified())
+        .ok()
+    else {
+        return false;
+    };
+    codex_cli_candidates()
+        .iter()
+        .filter_map(|path| {
+            path.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+        })
+        .any(|mtime| mtime > snapshot_mtime)
+}
+
+#[cfg(test)]
+fn runtime_snapshot_is_stale(_home: &Path) -> bool {
+    false
 }
 
 /// Codex 26.908.x stopped maintaining `models_cache.json` on disk. When no
