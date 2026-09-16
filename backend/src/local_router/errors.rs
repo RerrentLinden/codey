@@ -200,6 +200,53 @@ pub(crate) fn requires_reasoning_text_fallback(body: &[u8]) -> bool {
     String::from_utf8_lossy(body).contains("reasoning_text")
 }
 
+/// 上游非 2xx 错误正文读取超时：与压缩路径一致返回结构化 504，而不是让
+/// 下游连接在没有响应的情况下断开。
+pub(crate) async fn write_upstream_error_body_timeout<D>(
+    downstream: &mut D,
+    resolved: &RouteSelection,
+    compacting: bool,
+    error: &anyhow::Error,
+) -> Result<()>
+where
+    D: ResponsesDownstream + ?Sized,
+{
+    let detail = sanitize_upstream_error_text(&format!("{error:#}"), &resolved.route, 256)
+        .unwrap_or_else(|| "上游错误响应正文未在期限内读完".to_string());
+    let (code, message) = if compacting {
+        (
+            "compaction_timeout",
+            format!(
+                "远程压缩读取上游错误响应超时（{detail}），原始会话历史未被 Codey 修改，请稍后重试"
+            ),
+        )
+    } else {
+        (
+            "upstream_timeout",
+            format!(
+                "Codey 线路「{}」读取上游错误响应超时：{detail}",
+                route_display_name(&resolved.route)
+            ),
+        )
+    };
+    record_router_failure_nonblocking(
+        "local_router_upstream_error_body_timeout",
+        "proxy_local_router_request",
+        format!("读取上游错误响应正文超时；{detail}"),
+        serde_json::json!({
+            "routeId": resolved.provider_id.as_str(),
+            "routeName": resolved.route.route_name.as_str(),
+            "requestedModel": resolved.requested_model.as_str(),
+            "model": resolved.upstream_model.as_str(),
+            "upstream": resolved.route.upstream_authority.as_str(),
+            "requestId": current_router_request_id(),
+        }),
+    );
+    downstream
+        .write_error(504, code, message, Some(&resolved.route))
+        .await
+}
+
 pub(crate) async fn write_upstream_http_error<D>(
     downstream: &mut D,
     status: u16,

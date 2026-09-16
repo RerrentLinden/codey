@@ -1884,11 +1884,20 @@ impl RouterServer {
             // 错误正文与成功正文共用同一个总期限：只有每次读取的空闲期限时，
             // 上游每隔不到期限发送少量数据就能永久占用请求与压缩会话锁。
             let deadline = upstream_response_body_deadline();
-            let body = await_upstream(
+            let body = match await_upstream(
                 downstream,
                 read_bounded_upstream_error_body(response, probe.as_ref(), deadline),
             )
-            .await??;
+            .await
+            {
+                Ok(Ok(body)) => body,
+                Ok(Err(error)) | Err(error) if is_upstream_timeout_error(&error) => {
+                    write_upstream_error_body_timeout(downstream, &resolved, compacting, &error)
+                        .await?;
+                    return Ok(());
+                }
+                Ok(Err(error)) | Err(error) => return Err(error),
+            };
             if requires_reasoning_text_fallback(&body)
                 && let Some(retryable_body) = retryable_body.as_mut()
                 && fill_missing_reasoning_text(retryable_body)
@@ -1962,21 +1971,32 @@ impl RouterServer {
             _ if !response.status().is_success() => {
                 let probe = downstream.request_log_probe().cloned();
                 let deadline = upstream_response_body_deadline();
-                let body = await_upstream(
+                // 错误正文和成功正文共用同一个总期限；读取超时时返回结构化
+                // 504，语义与压缩路径一致，下游不会只看到连接断开。
+                match await_upstream(
                     downstream,
                     read_bounded_upstream_error_body(response, probe.as_ref(), deadline),
                 )
-                .await??;
-                write_upstream_http_error(
-                    downstream,
-                    upstream_status,
-                    upstream_request_id.as_deref(),
-                    &body,
-                    &resolved,
-                    bridge,
-                    request_kind,
-                )
                 .await
+                {
+                    Ok(Ok(body)) => {
+                        write_upstream_http_error(
+                            downstream,
+                            upstream_status,
+                            upstream_request_id.as_deref(),
+                            &body,
+                            &resolved,
+                            bridge,
+                            request_kind,
+                        )
+                        .await
+                    }
+                    Ok(Err(error)) | Err(error) if is_upstream_timeout_error(&error) => {
+                        write_upstream_error_body_timeout(downstream, &resolved, compacting, &error)
+                            .await
+                    }
+                    Ok(Err(error)) | Err(error) => Err(error),
+                }
             }
             _ if compacting => {
                 write_validated_compaction(

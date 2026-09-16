@@ -78,6 +78,7 @@ fn official_auth_fingerprint(path: &Path) -> Option<OfficialAuthFingerprint> {
 pub(crate) struct OfficialAuthCache {
     cached: Option<std::result::Result<OfficialAuth, String>>,
     expires_at: Option<Instant>,
+    last_used: u64,
 }
 
 impl OfficialAuthCache {
@@ -117,16 +118,33 @@ impl OfficialAuthCache {
 #[derive(Debug, Default)]
 pub(crate) struct OfficialAuthCaches {
     caches: HashMap<String, OfficialAuthCache>,
+    usage_clock: u64,
 }
 
 impl OfficialAuthCaches {
     pub(crate) fn for_path(&mut self, auth_path: &Path) -> &mut OfficialAuthCache {
         let key = auth_path.to_string_lossy().into_owned();
         if !self.caches.contains_key(&key) && self.caches.len() >= MAX_ACCOUNT_USAGE_CACHES {
-            self.caches.clear();
+            evict_least_recently_used(&mut self.caches, |cache| cache.last_used);
         }
-        self.caches.entry(key).or_default()
+        self.usage_clock = self.usage_clock.saturating_add(1);
+        let last_used = self.usage_clock;
+        let cache = self.caches.entry(key).or_default();
+        cache.last_used = last_used;
+        cache
     }
+}
+
+/// 缓存达到上限时只淘汰最久未使用的条目，其他账号的额度结果继续命中。
+fn evict_least_recently_used<T>(caches: &mut HashMap<String, T>, last_used: impl Fn(&T) -> u64) {
+    let Some(key) = caches
+        .iter()
+        .min_by_key(|(_, value)| last_used(value))
+        .map(|(key, _)| key.clone())
+    else {
+        return;
+    };
+    caches.remove(&key);
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -170,6 +188,7 @@ pub struct AccountUsageCache {
     auth_fingerprint_initialized: bool,
     auth_fingerprint: Option<OfficialAuthFingerprint>,
     auth_generation: u64,
+    last_used: u64,
 }
 
 /// Usage snapshots for several official accounts at once. Each credential file
@@ -178,15 +197,20 @@ pub struct AccountUsageCache {
 #[derive(Debug, Default)]
 pub struct AccountUsageCaches {
     caches: HashMap<String, AccountUsageCache>,
+    usage_clock: u64,
 }
 
 impl AccountUsageCaches {
     pub(crate) fn for_auth_path(&mut self, auth_path: &Path) -> &mut AccountUsageCache {
         let key = auth_path.to_string_lossy().into_owned();
         if !self.caches.contains_key(&key) && self.caches.len() >= MAX_ACCOUNT_USAGE_CACHES {
-            self.caches.clear();
+            evict_least_recently_used(&mut self.caches, |cache| cache.last_used);
         }
-        self.caches.entry(key).or_default()
+        self.usage_clock = self.usage_clock.saturating_add(1);
+        let last_used = self.usage_clock;
+        let cache = self.caches.entry(key).or_default();
+        cache.last_used = last_used;
+        cache
     }
 
     pub(crate) fn for_codex_home(&mut self, codex_home: &Path) -> &mut AccountUsageCache {
@@ -1248,5 +1272,57 @@ mod tests {
             caches.caches.len() <= MAX_ACCOUNT_USAGE_CACHES,
             "the cache map stays bounded"
         );
+    }
+
+    #[test]
+    fn usage_caches_evict_only_the_least_recently_used_credential_file() {
+        let mut caches = AccountUsageCaches::default();
+        let oldest = "/tmp/codey-usage/oldest.json";
+        let recent = "/tmp/codey-usage/recent.json";
+        caches
+            .for_auth_path(Path::new(oldest))
+            .record_failure("offline".into(), Instant::now());
+        caches
+            .for_auth_path(Path::new(recent))
+            .record_failure("offline".into(), Instant::now());
+        for index in 0..MAX_ACCOUNT_USAGE_CACHES - 2 {
+            let path = format!("/tmp/codey-usage/fill_{index}.json");
+            caches.for_auth_path(Path::new(&path));
+        }
+        assert_eq!(caches.caches.len(), MAX_ACCOUNT_USAGE_CACHES);
+        // 再次读取 recent，让最早建立的 oldest 成为唯一的淘汰候选。
+        caches.for_auth_path(Path::new(recent));
+        caches.for_auth_path(Path::new("/tmp/codey-usage/overflow.json"));
+
+        assert_eq!(caches.caches.len(), MAX_ACCOUNT_USAGE_CACHES);
+        assert!(
+            !caches.caches.contains_key(oldest),
+            "超过上限时只淘汰最久未使用的凭据缓存"
+        );
+        assert!(caches.caches.contains_key(recent));
+        assert!(caches.caches.contains_key("/tmp/codey-usage/overflow.json"));
+    }
+
+    #[test]
+    fn auth_caches_evict_only_the_least_recently_used_credential_file() {
+        let mut caches = OfficialAuthCaches::default();
+        let oldest = "/tmp/codey-auth/oldest.json";
+        let recent = "/tmp/codey-auth/recent.json";
+        caches.for_path(Path::new(oldest));
+        caches.for_path(Path::new(recent));
+        for index in 0..MAX_ACCOUNT_USAGE_CACHES - 2 {
+            let path = format!("/tmp/codey-auth/fill_{index}.json");
+            caches.for_path(Path::new(&path));
+        }
+        caches.for_path(Path::new(recent));
+        caches.for_path(Path::new("/tmp/codey-auth/overflow.json"));
+
+        assert_eq!(caches.caches.len(), MAX_ACCOUNT_USAGE_CACHES);
+        assert!(
+            !caches.caches.contains_key(oldest),
+            "超过上限时不清空整表，只淘汰最久未使用的凭据缓存"
+        );
+        assert!(caches.caches.contains_key(recent));
+        assert!(caches.caches.contains_key("/tmp/codey-auth/overflow.json"));
     }
 }

@@ -458,6 +458,34 @@ fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
 }
 
 #[test]
+fn route_name_limit_matches_the_renderer_and_legacy_names_stay_saveable() {
+    let mut legacy = ProviderProfile::new("一条超过十个字符的旧线路名称");
+    legacy.id = "legacy-route".to_string();
+    legacy.base_url = "https://relay.example/v1".to_string();
+    legacy.api_key = "sk-relay".to_string();
+    legacy.normalize();
+    assert!(legacy.name.chars().count() > crate::config::MAX_ROUTE_NAME_CHARS);
+    let previous = CodeyConfig {
+        active_profile_id: legacy.id.clone(),
+        profiles: vec![legacy.clone()],
+        ..CodeyConfig::default()
+    };
+
+    // 旧配置里的超限名称只要这次没有改动,保存其他设置仍然成功。
+    let mut updated = legacy.clone();
+    updated.api_key = "sk-relay-updated".to_string();
+    let merged = merge_profile_secrets(vec![updated], &previous).unwrap();
+    assert_eq!(merged[0].name, legacy.name);
+    assert_eq!(merged[0].api_key, "sk-relay-updated");
+
+    // 改名以后超过上限会被拒绝,直接调用后端接口也无法写进界面存不下的名称。
+    let mut renamed = legacy.clone();
+    renamed.name = "改名后依然超过十个字符".to_string();
+    let error = merge_profile_secrets(vec![renamed], &previous).unwrap_err();
+    assert!(error.contains("最多 10 个字符"), "{error}");
+}
+
+#[test]
 fn account_usage_stays_enabled_when_an_official_route_exists_but_a_third_party_route_is_active() {
     let mut official = ProviderProfile::new("OpenAI 官方直登");
     official.id = "official-route".to_string();
@@ -856,6 +884,66 @@ fn stored_official_account(
         }
     }))
     .expect("可反序列化的官方账号记录")
+}
+
+#[tokio::test]
+async fn official_account_short_names_follow_the_derived_route_namespace() {
+    let directory = tempfile::tempdir().unwrap();
+    let store =
+        crate::official_accounts::OfficialAccountStore::new(directory.path().join("accounts"));
+    let mut record = stored_official_account("acct-one", 1);
+    record.route_name = Some("官方账号1".to_string());
+    record.route_short_name = Some("中转".to_string());
+    store.upsert(&record).unwrap();
+
+    // 账号先保存了「中转」,之后又有第三方线路占用同名短名称,派生时官方线路
+    // 只能改用「中1」。
+    let mut relay = ProviderProfile::new("第三方线路");
+    relay.id = "third-party-route".to_string();
+    relay.base_url = "https://relay.example/v1".to_string();
+    relay.api_key = "sk-relay".to_string();
+    relay.short_name = "中转".to_string();
+    relay.normalize();
+    let mut official = ProviderProfile::new("官方账号1");
+    official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+    official.official_account_id = Some("acct-one".to_string());
+    official.short_name = "中转".to_string();
+    official.normalize();
+    let mut config = CodeyConfig {
+        local_router_enabled: true,
+        profiles: vec![relay],
+        ..CodeyConfig::default()
+    };
+    config.apply_launch_official_profiles(vec![official]);
+
+    let derived = config
+        .profiles
+        .iter()
+        .find(|profile| profile.official_account_id.as_deref() == Some("acct-one"))
+        .expect("官方线路应该已经派生")
+        .short_name
+        .clone();
+    assert_eq!(derived, "中1");
+    assert_ne!(
+        record.route_short_name.as_deref(),
+        Some(derived.as_str()),
+        "用例需要账号记录与派生结果不一致"
+    );
+
+    crate::commands::official_accounts::reconcile_official_account_short_names(&store, &config)
+        .await
+        .unwrap();
+
+    // 回写以后面板显示和编辑的短名称与线路列表、模型前缀一致。
+    assert_eq!(
+        store
+            .get("acct-one")
+            .unwrap()
+            .unwrap()
+            .route_short_name
+            .as_deref(),
+        Some("中1")
+    );
 }
 
 #[tokio::test]

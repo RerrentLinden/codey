@@ -98,9 +98,9 @@ use crate::codex_config::{
 use crate::codex_provider;
 use crate::codex_provider::OfficialAccountProfileStatus;
 use crate::config::{
-    CodeyConfig, ConfigStore, LaunchOfficialAccountStatus, PromptOptimizationConfig,
-    ProviderProfile, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS, SubagentRoleConfig,
-    validate_provider_profiles,
+    CodeyConfig, ConfigStore, LaunchOfficialAccountStatus, MAX_ROUTE_NAME_CHARS,
+    PromptOptimizationConfig, ProviderProfile, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
+    SubagentRoleConfig, validate_provider_profiles,
 };
 use crate::crashpad_pending_guard::{
     self, CrashpadPendingStatsHandle, CrashpadPendingStatsSnapshot,
@@ -766,6 +766,19 @@ pub(super) async fn prepare_routes_for_current_launch(state: &Arc<AppState>) -> 
         return Ok(());
     }
     let mut next = route_config_for_official_probe(&previous, official_launch)?;
+    // 派生时会按第三方线路占用的短名称挤开官方线路的短名称，把结果写回
+    // 账号记录，账号面板显示的短名称才和线路列表、模型前缀保持一致。
+    if let Err(error) =
+        official_accounts::reconcile_official_account_short_names(&state.official_accounts(), &next)
+            .await
+    {
+        error_log::record_failure(
+            "official_account_short_name_reconcile_failed",
+            "prepare_routes_for_current_launch",
+            error,
+            json!({}),
+        );
+    }
 
     if persisted_config_changed(&previous, &next) {
         if next.settings_revision == previous.settings_revision {
@@ -1982,6 +1995,16 @@ fn merge_profile_secrets(
             }
         }
         profile.normalize();
+        // 线路名上限与渲染层一致。旧配置里已经超限的名称只要这次没有改动就
+        // 放行，用户仍能保存其他设置或删除这条线路，不会被历史数据卡住。
+        let kept_legacy_name =
+            previous_profile.is_some_and(|saved| saved.name.trim() == profile.name);
+        if !kept_legacy_name && profile.name.chars().count() > MAX_ROUTE_NAME_CHARS {
+            return Err(format!(
+                "线路「{}」的线路名最多 {MAX_ROUTE_NAME_CHARS} 个字符",
+                profile.name
+            ));
+        }
     }
     validate_provider_profiles(&profiles)?;
     Ok(profiles)

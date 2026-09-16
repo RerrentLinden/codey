@@ -561,6 +561,16 @@ impl OfficialAccountStore {
         self.write(&record)
     }
 
+    /// 只回写运行时派生后的短名称：官方与第三方线路共用短名称命名空间，
+    /// 派生时可能被占用的名字挤开，账号记录跟随调整后才与线路列表一致。
+    pub fn update_route_short_name(&self, id: &str, short_name: &str) -> Result<()> {
+        let mut record = self
+            .get(id)?
+            .ok_or_else(|| anyhow!("找不到官方账号：{id}"))?;
+        record.route_short_name = route_setting(Some(short_name.to_string()));
+        self.write(&record)
+    }
+
     /// 给还没有线路设置的账号补上按添加顺序生成的默认名称，例如「官方账号1」
     /// 和「官1」。编号取当前未被占用的最小编号，所以移除账号后新增的账号不会
     /// 和已有名称重复；已经保存过设置的账号原样保留。

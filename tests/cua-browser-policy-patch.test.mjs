@@ -124,8 +124,9 @@ test("direct runtime configurations redirect the mapped browser service", async 
       NODE_REPL_TRUSTED_SERVICES: JSON.stringify({ browser: "@oai/browser-desktop/service", sky: "@oai/sky/service" }),
     } };
     const original = structuredClone(config);
-    // 与新版主包一致：属性名被压缩，launcher 通过成员表达式拼接。
-    const fixture = 'async function configure(e){let c=e;const n={dirs:"NODE_REPL_NODE_MODULE_DIRS"},p={default:{join:(d,x)=>d+"/"+x}};c.env.CUA_REPL_NODE_REPL_PATH="official";e.env!=null&&(c.command="official-node",c.args=[p.default.join(e.env[n.dirs],`@oai/cua-repl/bin/cua-repl.mjs`)]);return c;}';
+    // 与新版主包一致：属性名被压缩，运行时入口由平台的 path.join 拼接，
+    // 因此 Windows 上同样得到反斜杠路径。
+    const fixture = 'async function configure(e){let c=e;const n={dirs:"NODE_REPL_NODE_MODULE_DIRS"},p={default:process.getBuiltinModule("path")};c.env.CUA_REPL_NODE_REPL_PATH="official";e.env!=null&&(c.command="official-node",c.args=[p.default.join(e.env[n.dirs],`@oai/cua-repl/bin/cua-repl.mjs`)]);return c;}';
     vm.runInContext(context.__CODEY_PATCH_CODEX_CUA_PLUGIN_CONFIG__(fixture), context);
     const configured = await context.configure(config);
     assert.equal(configured.args[0], runtime);

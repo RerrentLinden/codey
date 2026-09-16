@@ -914,11 +914,7 @@ pub(crate) async fn write_validated_compaction<D: ResponsesDownstream + ?Sized>(
         Ok(value) if stream => write_responses_response_as_events(downstream, &value).await,
         Ok(value) => downstream.write_json(200, &value).await,
         Err(error) => {
-            let timeout = error
-                .downcast_ref::<reqwest::Error>()
-                .is_some_and(reqwest::Error::is_timeout)
-                || error.is::<UpstreamResponseDeadline>()
-                || error.is::<UpstreamReadIdleTimeout>();
+            let timeout = is_upstream_timeout_error(&error);
             let (status, code) = if timeout {
                 (504, "compaction_timeout")
             } else if error.is::<ContextLengthExceeded>() {

@@ -6192,6 +6192,66 @@ async fn upstream_error_body_read_stops_at_the_total_deadline() {
 }
 
 #[tokio::test]
+async fn non_2xx_error_body_deadline_returns_a_structured_timeout() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (config, provider_id, model) = router_config(format!(
+        "http://{}/v1/responses",
+        upstream.local_addr().unwrap()
+    ));
+    let (headers_sent, upstream_headers_sent) = oneshot::channel();
+    let (stop_drip, drip_stopped) = oneshot::channel::<()>();
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut socket).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        headers_sent.send(()).unwrap();
+        // 每 50 秒写 4 字节:每次读取都远在 90 秒读取空闲期限之内,只有总期限
+        // 能结束这次读取。
+        tokio::select! {
+            _ = drip_stopped => {}
+            _ = async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(50)).await;
+                    if socket.write_all(b"4\r\n{\"a\"\r\n").await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+        }
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let request = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({"model":model_alias(&provider_id, &model),"input":"hello"}));
+    let mut pending = tokio::spawn(async move { request.send().await.unwrap() });
+    upstream_headers_sent.await.unwrap();
+    tokio::time::pause();
+    let settled = tokio::time::timeout(
+        UPSTREAM_RESPONSE_TIMEOUT + Duration::from_secs(60),
+        &mut pending,
+    )
+    .await
+    .expect("非 2xx 错误正文读取必须由总期限结束");
+    tokio::time::resume();
+    let _ = stop_drip.send(());
+    let response = settled.expect("请求任务异常退出");
+    // 普通请求的错误正文超时和压缩路径一致,给出结构化 504,下游不会只看到
+    // 连接断开。
+    assert_eq!(response.status().as_u16(), 504);
+    let value = response.json::<Value>().await.unwrap();
+    assert_eq!(value["error"]["code"], "upstream_timeout");
+    upstream_task.await.unwrap();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn compaction_upstream_http_error_releases_the_session_lock() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let (mut config, provider_id, model) = router_config(format!(

@@ -24,6 +24,16 @@ impl std::fmt::Display for UpstreamResponseDeadline {
 
 impl std::error::Error for UpstreamResponseDeadline {}
 
+/// 上游响应读取超时的统一判定：请求发送失败的超时、响应体总期限和每次读取
+/// 的空闲期限都算同一种超时，调用方据此返回结构化 504。
+pub(crate) fn is_upstream_timeout_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_timeout)
+        || error.is::<UpstreamResponseDeadline>()
+        || error.is::<UpstreamReadIdleTimeout>()
+}
+
 /// Deadline for reading one upstream response body. Success bodies are bounded
 /// by this budget already; error bodies share it so an upstream that keeps
 /// dribbling a few bytes cannot outlive the successful path.

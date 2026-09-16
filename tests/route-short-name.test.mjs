@@ -149,3 +149,23 @@ test("official accounts derive numbered default route names and short names", as
   assert.doesNotMatch(modelSection, /留空则按账号添加顺序使用默认短名称，例如「官1」/);
   assert.doesNotMatch(modelSection, /最多 2 个字符且不可重复，模型名称前会显示为 \[短名称\]/);
 });
+
+test("the route-name limit is shared by the renderer and the official account command", async () => {
+  const [settings, backendConfig, officialAccounts] = await Promise.all([
+    readFile(new URL("../src/officialRouteSettings.ts", import.meta.url), "utf8"),
+    readFile(new URL("../backend/src/config.rs", import.meta.url), "utf8"),
+    readFile(
+      new URL("../backend/src/commands/official_accounts.rs", import.meta.url),
+      "utf8",
+    ),
+  ]);
+
+  assert.match(settings, /export const MAX_ROUTE_NAME_CHARACTERS = 10;/);
+  assert.match(backendConfig, /pub const MAX_ROUTE_NAME_CHARS: usize = 10;/);
+  // 后端保存线路时使用同一个上限，直接调用接口也写不进界面存不下的名称。
+  assert.match(
+    officialAccounts,
+    /if route_name\.chars\(\)\.count\(\) > MAX_ROUTE_NAME_CHARS \{/,
+  );
+  assert.doesNotMatch(officialAccounts, /MAX_OFFICIAL_ROUTE_NAME_CHARS/);
+});
