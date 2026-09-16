@@ -127,24 +127,35 @@ pub(crate) async fn read_chat_completions_as_responses(
     chat_completion_to_responses_body_with_tool_bridge(chat, model, tool_bridge)
 }
 
+/// Reads a bounded error body inside one fixed deadline. Success bodies use the
+/// same total budget, so an error stream that dribbles a few bytes before every
+/// idle timeout must not hold the connection, the request log and any session
+/// compaction lock past the limit the success path already has.
 pub(crate) async fn read_bounded_upstream_error_body(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     probe: Option<&RouteRequestLogProbe>,
+    deadline: tokio::time::Instant,
 ) -> Result<Vec<u8>> {
-    let mut body = Vec::new();
-    while let Some(chunk) =
-        read_upstream_chunk(&mut response, "读取上游错误响应失败", probe).await?
-    {
-        let remaining = MAX_UPSTREAM_ERROR_BYTES.saturating_sub(body.len());
-        if remaining == 0 {
-            break;
+    let mut response = response;
+    let read_body = async {
+        let mut body = Vec::new();
+        while let Some(chunk) =
+            read_upstream_chunk(&mut response, "读取上游错误响应失败", probe).await?
+        {
+            let remaining = MAX_UPSTREAM_ERROR_BYTES.saturating_sub(body.len());
+            if remaining == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+            if body.len() == MAX_UPSTREAM_ERROR_BYTES {
+                break;
+            }
         }
-        body.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-        if body.len() == MAX_UPSTREAM_ERROR_BYTES {
-            break;
-        }
-    }
-    Ok(body)
+        Ok(body)
+    };
+    tokio::time::timeout_at(deadline, read_body)
+        .await
+        .map_err(|_| anyhow::Error::new(UpstreamResponseDeadline))?
 }
 
 pub(crate) async fn read_anthropic_messages_as_responses(

@@ -5624,6 +5624,21 @@ fn responses_request_converts_messages_images_tools_and_results_to_anthropic() {
 }
 
 #[test]
+fn removed_minimal_effort_still_maps_to_low_for_anthropic() {
+    // `minimal` 已不再是界面档位，但旧会话和自定义档位的 value 仍可能带上它；
+    // 它必须继续按最低推理强度处理，而不是落到默认的高强度。
+    for effort in ["minimal", "MINIMAL", " minimal "] {
+        let anthropic = responses_to_anthropic_messages_body(&json!({
+            "model":"claude-sonnet-test",
+            "input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "reasoning":{"effort":effort}
+        }))
+        .unwrap();
+        assert_eq!(anthropic["output_config"]["effort"], "low", "{effort}");
+    }
+}
+
+#[test]
 fn anthropic_response_converts_text_tools_and_cache_usage_to_responses() {
     let responses = anthropic_message_to_responses_body(
         &json!({
@@ -6130,6 +6145,198 @@ async fn compaction_timeout_releases_session_and_model_switch_keeps_request_snap
         .unwrap();
     assert_ne!(retry.status().as_u16(), 409);
     upstream_task.abort();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn upstream_error_body_read_stops_at_the_total_deadline() {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mock = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_http_request(&mut socket).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        // 每 50 毫秒写 4 字节:任何一次读取都远在 90 秒空闲期限之内,只有总期限
+        // 能结束这次读取。连接被关闭后写入失败,循环随之退出。
+        loop {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if socket.write_all(b"4\r\n{\"a\"\r\n").await.is_err() {
+                break;
+            }
+        }
+    });
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{address}/responses"))
+        .send()
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        read_bounded_upstream_error_body(response, None, deadline),
+    )
+    .await
+    .expect("非 2xx 响应正文读取必须有总期限")
+    .unwrap_err();
+    assert!(error.is::<UpstreamResponseDeadline>(), "{error:#}");
+    mock.abort();
+    let _ = mock.await;
+}
+
+#[tokio::test]
+async fn compaction_upstream_http_error_releases_the_session_lock() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (mut config, provider_id, model) = router_config(format!(
+        "http://{}/v1/responses",
+        upstream.local_addr().unwrap()
+    ));
+    config.profiles[0].supports_remote_compaction = true;
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut socket).await.unwrap();
+        write_json_response(
+            &mut socket,
+            500,
+            &json!({"error":{"message":"upstream failed"}}),
+        )
+        .await
+        .unwrap();
+        let (mut retry, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut retry).await.unwrap();
+        write_json_response(
+            &mut retry,
+            200,
+            &json!({"status":"completed","output":[{"type":"compaction","encrypted_content":"opaque"}]}),
+        )
+        .await
+        .unwrap();
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = format!("{}/responses/compact", endpoint.base_url);
+    let request_body = json!({"model":model_alias(&provider_id, &model),"input":"full context"});
+    let first = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&endpoint.token)
+        .header("thread-id", "compaction-error-body")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    // 上游状态原样回传;错误正文读取结束后同会话的压缩必须可以立即重试。
+    assert_eq!(first.status().as_u16(), 500);
+    let detail = first.text().await.unwrap();
+    assert!(detail.contains("HTTP 500"), "{detail}");
+    let retry = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&endpoint.token)
+        .header("thread-id", "compaction-error-body")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(retry.status().as_u16(), 200);
+    assert!(retry.text().await.unwrap().contains("opaque"));
+    upstream_task.await.unwrap();
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn compaction_error_body_drip_ends_at_the_total_deadline_and_releases_the_session() {
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let (mut config, provider_id, model) = router_config(format!(
+        "http://{}/v1/responses",
+        upstream.local_addr().unwrap()
+    ));
+    config.profiles[0].supports_remote_compaction = true;
+    let (headers_sent, upstream_headers_sent) = oneshot::channel();
+    let (stop_drip, drip_stopped) = oneshot::channel::<()>();
+    let upstream_task = tokio::spawn(async move {
+        let (mut socket, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut socket).await.unwrap();
+        socket
+            .write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        headers_sent.send(()).unwrap();
+        // 每 50 秒写 4 字节:每次读取都远在 90 秒读取空闲期限之内,只有总期限
+        // 能结束这次读取。
+        tokio::select! {
+            _ = drip_stopped => {}
+            _ = async {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(50)).await;
+                    if socket.write_all(b"4\r\n{\"a\"\r\n").await.is_err() {
+                        break;
+                    }
+                }
+            } => {}
+        }
+        drop(socket);
+        let (mut retry, _) = upstream.accept().await.unwrap();
+        read_http_request(&mut retry).await.unwrap();
+        write_json_response(
+            &mut retry,
+            200,
+            &json!({"status":"completed","output":[{"type":"compaction","encrypted_content":"opaque"}]}),
+        )
+        .await
+        .unwrap();
+    });
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+    let url = format!("{}/responses/compact", endpoint.base_url);
+    let request_body = json!({"model":model_alias(&provider_id, &model),"input":"full context"});
+    let request = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&endpoint.token)
+        .header("thread-id", "compaction-error-drip")
+        .json(&request_body);
+    let mut pending = tokio::spawn(async move { request.send().await });
+    upstream_headers_sent.await.unwrap();
+    let started = tokio::time::Instant::now();
+    tokio::time::pause();
+    // 没有总期限时滴流会一直继续,这个等待会先在虚拟时间上到期。
+    let settled = tokio::time::timeout(
+        UPSTREAM_RESPONSE_TIMEOUT + Duration::from_secs(60),
+        &mut pending,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    tokio::time::resume();
+    let settled = settled.expect("非 2xx 压缩错误响应正文必须由总期限结束");
+    // 请求以连接关闭收尾,这里只要求它确实结束,不限定收尾形式。
+    let _ended = settled.expect("压缩请求任务异常退出");
+    assert!(
+        elapsed >= UPSTREAM_RESPONSE_TIMEOUT - Duration::from_secs(60),
+        "错误正文读取提前结束:{elapsed:?}"
+    );
+    let _ = stop_drip.send(());
+    let retry = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(&endpoint.token)
+        .header("thread-id", "compaction-error-drip")
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        retry.status().as_u16(),
+        200,
+        "总期限结束后压缩会话锁必须释放"
+    );
+    assert!(retry.text().await.unwrap().contains("opaque"));
+    upstream_task.await.unwrap();
     router.stop().await.unwrap();
 }
 

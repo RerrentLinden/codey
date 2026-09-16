@@ -28,6 +28,10 @@ const MAX_ERROR_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_TOKENS: u32 = 2048;
 const MAX_MODELS: usize = 2000;
 const MAX_MODEL_ID_CHARS: usize = 512;
+/// Some relays prefix a JSON body with a UTF-8 byte order mark. Classification
+/// and parsing must see the same bytes, so the mark is stripped once at the
+/// entry instead of only where the body is classified.
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 #[derive(Debug)]
 enum ModelListBodyError {
@@ -720,11 +724,12 @@ async fn parse_optimized_response(
     )
     .await
     .map_err(OptimizedResponseError::fatal)?;
+    let body = strip_utf8_bom(&body);
     if protocol == OptimizationUpstreamProtocol::OpenAiResponses
         && config.response_stream == Some(true)
-        && !responses_stream_body_is_json(&body)
+        && !responses_stream_body_is_json(body)
     {
-        let optimized = extract_responses_stream_optimized_text(&body).map_err(|error| {
+        let optimized = extract_responses_stream_optimized_text(body).map_err(|error| {
             let preview = sanitize_resolved_error(&error, config);
             OptimizedResponseError::fatal(format!(
                 "优化 API 流式响应无法解析（{endpoint}）：{preview}"
@@ -739,7 +744,13 @@ async fn parse_optimized_response(
         return Ok(optimized.chars().take(MAX_OUTPUT_CHARS).collect());
     }
 
-    optimized_text_from_json_body(&body, endpoint, config, protocol)
+    optimized_text_from_json_body(body, endpoint, config, protocol)
+}
+
+/// 分类与解析共用的正文切片：带 BOM 的 JSON 会在分类阶段被识别为 JSON，若只在
+/// 分类处去掉 BOM，解析阶段仍会因为 BOM 不是合法 JSON 前缀而失败。
+fn strip_utf8_bom(body: &[u8]) -> &[u8] {
+    body.strip_prefix(UTF8_BOM).unwrap_or(body)
 }
 
 /// Streaming requests normally answer with SSE frames, but some relays ignore
@@ -747,7 +758,6 @@ async fn parse_optimized_response(
 /// output contract, so a JSON body is handed to the JSON parser instead of
 /// being reported as an unreadable stream.
 fn responses_stream_body_is_json(body: &[u8]) -> bool {
-    let body = body.strip_prefix(b"\xef\xbb\xbf").unwrap_or(body);
     body.iter()
         .find(|byte| !byte.is_ascii_whitespace())
         .is_some_and(|byte| *byte == b'{')
@@ -771,6 +781,15 @@ fn optimized_text_from_json_body(
             "优化 API 返回的不是有效 JSON（{endpoint}）。响应摘要：{preview}"
         ))
     })?;
+    if protocol == OptimizationUpstreamProtocol::OpenAiResponses
+        && let Some(failure) = responses_terminal_error_message(&value)
+    {
+        let failure = sanitize_resolved_error(&failure, config);
+        let failure: String = failure.chars().take(200).collect();
+        return Err(OptimizedResponseError::fatal(format!(
+            "优化 API 返回了未成功完成的响应（{endpoint}）：{failure}"
+        )));
+    }
     let optimized = extract_optimized_text(&value, protocol)
         .ok_or_else(|| missing_optimized_text_error(&value, endpoint, protocol, config))?;
     let optimized = optimized.trim();
@@ -844,7 +863,7 @@ fn missing_text_detail(value: &Value, protocol: OptimizationUpstreamProtocol) ->
 }
 
 fn extract_responses_stream_optimized_text(body: &[u8]) -> Result<String, String> {
-    let body = body.strip_prefix(b"\xef\xbb\xbf").unwrap_or(body);
+    let body = strip_utf8_bom(body);
     let mut cursor = 0;
     let mut text = String::new();
     let mut final_text = None;
@@ -908,6 +927,30 @@ fn extract_responses_stream_optimized_text(body: &[u8]) -> Result<String, String
     }
 }
 
+/// 终态失败信息，JSON 正文与 SSE 事件共用同一判断：两种响应形式承载同一份
+/// `status`、`error` 与 `incomplete_details` 契约，同一种结果不应被一种形式
+/// 接受、被另一种形式拒绝。缺少 `status` 的旧响应不视为失败。
+fn responses_terminal_error_message(response: &Value) -> Option<String> {
+    let status = response.get("status").and_then(Value::as_str);
+    let error = response
+        .get("error")
+        .filter(|error| !error.is_null())
+        .filter(|error| error.is_object() || error.is_string());
+    if error.is_none() && !matches!(status, Some("failed" | "incomplete")) {
+        return None;
+    }
+    [
+        response.pointer("/error/message"),
+        response.pointer("/incomplete_details/reason"),
+        response.get("message"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_str)
+    .map(str::to_string)
+    .or_else(|| Some(response.to_string()))
+}
+
 fn responses_stream_error_message(event: &Value) -> Option<String> {
     if !matches!(
         event.get("type").and_then(Value::as_str),
@@ -915,17 +958,19 @@ fn responses_stream_error_message(event: &Value) -> Option<String> {
     ) {
         return None;
     }
-    [
-        event.pointer("/error/message"),
-        event.pointer("/response/error/message"),
-        event.pointer("/response/incomplete_details/reason"),
-        event.get("message"),
-    ]
-    .into_iter()
-    .flatten()
-    .find_map(Value::as_str)
-    .map(str::to_string)
-    .or_else(|| Some(event.to_string()))
+    // `error` 事件把失败放在顶层，`response.*` 事件把它包在 `response` 里。
+    let response = event
+        .get("response")
+        .filter(|response| response.is_object())
+        .unwrap_or(event);
+    responses_terminal_error_message(response)
+        .or_else(|| {
+            event
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| Some(event.to_string()))
 }
 
 fn take_next_sse_frame<'a>(buffer: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
@@ -1908,6 +1953,81 @@ mod tests {
     }
 
     #[test]
+    fn responses_json_and_sse_reject_the_same_terminal_failures() {
+        let endpoint = "https://relay.test/v1/responses";
+        let config = ResolvedPromptOptimizationConfig::from_custom(&configured());
+        // 同一份失败结果:普通 JSON 正文与流式事件必须给出相同的判断。
+        for (failure, event_type, detail) in [
+            (
+                json!({
+                    "status":"incomplete",
+                    "incomplete_details":{"reason":"max_output_tokens"},
+                    "output_text":"截断的优化指令"
+                }),
+                "response.incomplete",
+                "max_output_tokens",
+            ),
+            (
+                json!({
+                    "status":"failed",
+                    "error":{"message":"upstream rejected"},
+                    "output_text":"部分优化指令"
+                }),
+                "response.failed",
+                "upstream rejected",
+            ),
+            (
+                json!({"error":{"message":"rate limited"},"output_text":"部分优化指令"}),
+                "error",
+                "rate limited",
+            ),
+        ] {
+            let json_error = optimized_text_from_json_body(
+                &serde_json::to_vec(&failure).unwrap(),
+                endpoint,
+                &config,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap_err();
+            assert!(
+                json_error.message.contains(detail),
+                "{}",
+                json_error.message
+            );
+            let sse = format!(
+                "data: {}\n\n",
+                json!({"type":event_type,"response":failure})
+            );
+            assert_eq!(
+                extract_responses_stream_optimized_text(sse.as_bytes()).unwrap_err(),
+                detail
+            );
+        }
+
+        // 缺少 status 的旧响应与明确完成的响应仍然可用。
+        assert_eq!(
+            optimized_text_from_json_body(
+                r#"{"output_text":"旧响应结果"}"#.as_bytes(),
+                endpoint,
+                &config,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap(),
+            "旧响应结果"
+        );
+        assert_eq!(
+            optimized_text_from_json_body(
+                r#"{"status":"completed","output_text":"完成结果"}"#.as_bytes(),
+                endpoint,
+                &config,
+                OptimizationUpstreamProtocol::OpenAiResponses,
+            )
+            .unwrap(),
+            "完成结果"
+        );
+    }
+
+    #[test]
     fn sanitize_error_hides_the_api_key() {
         assert_eq!(
             sanitize_error("401 unauthorized for sk-test-key", "sk-test-key"),
@@ -2230,7 +2350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streamed_responses_request_accepts_a_plain_json_body() {
+    async fn streamed_responses_request_accepts_a_bom_prefixed_plain_json_body() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -2266,7 +2386,7 @@ mod tests {
             }
             let request = String::from_utf8_lossy(&request);
             assert!(request.contains(r#""stream":true"#), "{request}");
-            let body = r#"{"output_text":"忽略流式的正文"}"#;
+            let body = "\u{feff}{\"output_text\":\"忽略流式的正文\"}";
             let response = format!(
                 "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
                 body.len(),

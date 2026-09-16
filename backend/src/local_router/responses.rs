@@ -1867,9 +1867,12 @@ impl RouterServer {
                 .take()
                 .expect("first upstream response is still held here");
             let probe = downstream.request_log_probe().cloned();
+            // 错误正文与成功正文共用同一个总期限：只有每次读取的空闲期限时，
+            // 上游每隔不到期限发送少量数据就能永久占用请求与压缩会话锁。
+            let deadline = upstream_response_body_deadline();
             let body = await_upstream(
                 downstream,
-                read_bounded_upstream_error_body(response, probe.as_ref()),
+                read_bounded_upstream_error_body(response, probe.as_ref(), deadline),
             )
             .await??;
             if requires_reasoning_text_fallback(&body)
@@ -1940,9 +1943,10 @@ impl RouterServer {
             // Anthropic 4xx to 502 made Codex retry non-retryable failures.
             _ if !response.status().is_success() => {
                 let probe = downstream.request_log_probe().cloned();
+                let deadline = upstream_response_body_deadline();
                 let body = await_upstream(
                     downstream,
-                    read_bounded_upstream_error_body(response, probe.as_ref()),
+                    read_bounded_upstream_error_body(response, probe.as_ref(), deadline),
                 )
                 .await??;
                 write_upstream_http_error(

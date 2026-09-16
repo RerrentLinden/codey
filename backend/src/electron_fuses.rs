@@ -290,6 +290,48 @@ struct FuseCacheEntry {
     states: Option<String>,
 }
 
+/// Bounded cache with one entry per candidate runtime. A split runtime probes
+/// `chrome.dll` and then the main executable, so a single shared entry would let
+/// the two candidates evict each other and force a full scan on every probe.
+#[cfg(any(windows, target_os = "macos", test))]
+const MAX_CACHE_ENTRIES: usize = 8;
+
+#[cfg(any(windows, target_os = "macos", test))]
+#[derive(Default, Serialize, Deserialize)]
+struct FuseCache {
+    #[serde(default)]
+    entries: Vec<FuseCacheEntry>,
+}
+
+#[cfg(any(windows, target_os = "macos", test))]
+impl FuseCache {
+    /// An unreadable cache is not an error: it only costs one rescan. Entries in
+    /// the previous single-entry format are discarded the same way.
+    fn read(cache: &Path) -> Self {
+        crate::fs_util::read_bounded(cache, MAX_CACHE_BYTES)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+
+    /// Only the size and modification time guard a hit, so a same-size in-place
+    /// runtime update still invalidates its own entry once the timestamp moves.
+    fn entry_for(&self, binary: &Path, signature: (u64, Option<u64>)) -> Option<&FuseCacheEntry> {
+        let path = binary.to_string_lossy();
+        self.entries.iter().find(|entry| {
+            entry.path == path && entry.len == signature.0 && entry.modified_ms == signature.1
+        })
+    }
+
+    fn insert(&mut self, entry: FuseCacheEntry) {
+        self.entries.retain(|saved| saved.path != entry.path);
+        if self.entries.len() >= MAX_CACHE_ENTRIES {
+            self.entries.remove(0);
+        }
+        self.entries.push(entry);
+    }
+}
+
 #[cfg(any(windows, target_os = "macos"))]
 fn cache_path() -> PathBuf {
     codey_runtime_core::paths::default_app_state_dir().join(CACHE_FILE)
@@ -312,15 +354,9 @@ fn load_cached_wire(
     binary: &Path,
     signature: (u64, Option<u64>),
 ) -> Option<Option<FuseWire>> {
-    let bytes = crate::fs_util::read_bounded(cache, MAX_CACHE_BYTES).ok()?;
-    let entry: FuseCacheEntry = serde_json::from_slice(&bytes).ok()?;
-    if entry.path != binary.to_string_lossy()
-        || entry.len != signature.0
-        || entry.modified_ms != signature.1
-    {
-        return None;
-    }
-    Some(match (entry.version, entry.states) {
+    let store = FuseCache::read(cache);
+    let entry = store.entry_for(binary, signature)?;
+    Some(match (entry.version, entry.states.clone()) {
         (Some(version), Some(states)) => Some(FuseWire { version, states }),
         _ => None,
     })
@@ -333,14 +369,15 @@ fn store_cached_wire(
     signature: (u64, Option<u64>),
     wire: Option<&FuseWire>,
 ) -> Result<()> {
-    let entry = FuseCacheEntry {
+    let mut store = FuseCache::read(cache);
+    store.insert(FuseCacheEntry {
         path: binary.to_string_lossy().into_owned(),
         len: signature.0,
         modified_ms: signature.1,
         version: wire.map(|wire| wire.version),
         states: wire.map(|wire| wire.states.clone()),
-    };
-    crate::fs_util::atomic_write_private_with_parent(cache, &serde_json::to_vec(&entry)?)
+    });
+    crate::fs_util::atomic_write_private_with_parent(cache, &serde_json::to_vec(&store)?)
 }
 
 /// Reads the wire for `binary`, reusing a cached result while the binary's
@@ -1268,6 +1305,48 @@ mod tests {
         assert_eq!(binary, dll);
         assert!(wire.is_none());
         assert!(electron_runtime_with_wire(&temp.path().join("missing"), None).is_err());
+    }
+
+    #[test]
+    fn split_runtime_keeps_a_cache_entry_for_every_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        let dll = app.join("chrome.dll");
+        std::fs::write(&dll, b"no fuse wire here").unwrap();
+        let executable = app.join("Codex.exe");
+        std::fs::write(&executable, wire_bytes("010011001")).unwrap();
+        let cache = temp.path().join(CACHE_FILE);
+
+        let (binary, wire, cached) = electron_runtime_with_wire(&app, Some(&cache)).unwrap();
+        assert_eq!(binary, executable);
+        assert_eq!(wire.unwrap().states, "010011001");
+        assert!(!cached);
+        // 无 wire 的候选也要留下自己的条目:单条目缓存会被两个候选互相覆盖,
+        // 于是每次探测都要重新扫描整个无 wire 的运行时。
+        let store = FuseCache::read(&cache);
+        for candidate in [&dll, &executable] {
+            assert!(
+                store
+                    .entries
+                    .iter()
+                    .any(|entry| entry.path == candidate.to_string_lossy()),
+                "缺少 {} 的缓存条目",
+                candidate.display()
+            );
+        }
+
+        let (binary, wire, cached) = electron_runtime_with_wire(&app, Some(&cache)).unwrap();
+        assert_eq!(binary, executable);
+        assert_eq!(wire.unwrap().states, "010011001");
+        assert!(cached);
+        // 缓存命中必须逐候选判定:第二次探测时无 wire 的 DLL 也要直接命中,
+        // 否则它仍会在每次探测时被重新扫描。
+        let dll_signature = binary_signature(&dll).unwrap();
+        assert!(
+            matches!(load_cached_wire(&cache, &dll, dll_signature), Some(None)),
+            "无 wire 的候选在第二次探测时仍被重新扫描"
+        );
     }
 
     #[test]

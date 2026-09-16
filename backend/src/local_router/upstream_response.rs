@@ -24,6 +24,13 @@ impl std::fmt::Display for UpstreamResponseDeadline {
 
 impl std::error::Error for UpstreamResponseDeadline {}
 
+/// Deadline for reading one upstream response body. Success bodies are bounded
+/// by this budget already; error bodies share it so an upstream that keeps
+/// dribbling a few bytes cannot outlive the successful path.
+pub(crate) fn upstream_response_body_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + UPSTREAM_RESPONSE_TIMEOUT
+}
+
 pub(crate) struct PreparedUpstreamResponse {
     pub(crate) response: reqwest::Response,
     pub(crate) prefix: VecDeque<Bytes>,
@@ -38,7 +45,7 @@ pub(crate) async fn prepare_upstream_response(
     operation: &'static str,
     probe: Option<&RouteRequestLogProbe>,
 ) -> Result<PreparedUpstreamResponse> {
-    let deadline = tokio::time::Instant::now() + UPSTREAM_RESPONSE_TIMEOUT;
+    let deadline = upstream_response_body_deadline();
     if response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)

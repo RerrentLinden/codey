@@ -463,7 +463,9 @@ pub(crate) fn anthropic_stop_sequences(stop: &Value) -> Result<Value> {
 
 pub(crate) fn normalize_anthropic_effort(effort: &str) -> &'static str {
     let effort = effort.trim();
-    if effort.eq_ignore_ascii_case("low") {
+    // `minimal` 已不再作为界面档位提供，但旧会话和自定义档位的 value 仍可能带上
+    // 它；它按最低推理强度处理，落入默认分支会被静默提升为高强度。
+    if effort.eq_ignore_ascii_case("low") || effort.eq_ignore_ascii_case("minimal") {
         "low"
     } else if effort.eq_ignore_ascii_case("medium") {
         "medium"
