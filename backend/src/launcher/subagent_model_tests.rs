@@ -3,7 +3,7 @@ use super::*;
 fn official_subagent_config(account_count: usize) -> CodeyConfig {
     let profiles = (0..account_count)
         .map(|index| {
-            let mut profile = ProviderProfile::new(&format!("Account {index}"));
+            let mut profile = ProviderProfile::new(format!("Account {index}"));
             profile.source_provider_id = Some("openai".into());
             profile.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
             profile.official_account_id = Some(format!("account-{index}"));
@@ -52,7 +52,10 @@ fn official_subagent_models_match_catalog_and_preserve_account_selection() {
             &worker_alias
         };
         assert_eq!(runtime.subagent_model, expected_default);
-        assert_eq!(runtime.subagent_roles["codey_worker"].model, expected_worker);
+        assert_eq!(
+            runtime.subagent_roles["codey_worker"].model,
+            expected_worker
+        );
         assert_eq!(config, saved);
     }
 }
