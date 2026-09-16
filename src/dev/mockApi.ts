@@ -457,6 +457,15 @@ if (import.meta.env.DEV) {
         upstreamRequestId: `upstream-preview-${index + 1}`,
         upstreamProtocol: primary ? "openaiResponses" : "openaiChatCompletions",
         protocolBridge: primary ? undefined : "chat_completions_to_responses",
+        // 预览同时覆盖正常输入和上游空数组两种形态，便于核对诊断展示。
+        requestInputState: "array",
+        requestInputItems: 12 + index,
+        requestHasPreviousResponseId: index % 3 === 0,
+        requestBytes: 4_096 + index * 137,
+        upstreamInputState: "array",
+        upstreamInputItems: failed ? 0 : 12 + index,
+        upstreamHasPreviousResponseId: index % 3 === 0,
+        upstreamBytes: 4_096 + index * 137,
         firstByteSource: protocol === "http" ? "headers" : "stream",
         subagent: index % 6 === 0,
       };

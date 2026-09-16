@@ -22,7 +22,7 @@ import type { Config, OfficialAccount, OfficialAccountsResult, Profile } from ".
 import requestLogStyles from "./styles.request-log.css?inline";
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
-import { formatTimestamp } from "./formatters";
+import { formatBytes, formatTimestamp } from "./formatters";
 import { QuotaEstimateDialog } from "./QuotaEstimateDialog";
 import { maskEmail } from "./sensitiveText";
 import {
@@ -83,6 +83,14 @@ type RouteRequestLogItem = {
   upstreamRequestId?: string | null;
   upstreamProtocol?: string | null;
   protocolBridge?: string | null;
+  requestInputState?: string | null;
+  requestInputItems?: number | null;
+  requestHasPreviousResponseId?: boolean | null;
+  requestBytes?: number | null;
+  upstreamInputState?: string | null;
+  upstreamInputItems?: number | null;
+  upstreamHasPreviousResponseId?: boolean | null;
+  upstreamBytes?: number | null;
   firstByteSource?: string | null;
   codexSessionId?: string | null;
   codexSessionIsParent?: boolean | null;
@@ -340,6 +348,43 @@ function formatTokens(value?: number | null) {
 function formatCacheHitRate(input?: number | null, cached?: number | null) {
   if (input == null || cached == null || !Number.isFinite(input) || !Number.isFinite(cached) || input <= 0 || cached < 0 || cached > input) return "—";
   return `${(cached / input * 100).toFixed(1)}%`;
+}
+
+// 日志只保留请求体的形态摘要，这里把形态和项数还原成可读文字。
+function requestShapeText(state?: string | null, items?: number | null, hasPreviousResponseId?: boolean | null) {
+  if (!state) return null;
+  if (state === "array" && (items ?? 0) === 0) return "空数组（0 项）";
+  const parts: string[] = [];
+  switch (state) {
+    case "absent":
+      parts.push("无 input 字段");
+      break;
+    case "null":
+      parts.push("input 为 null");
+      break;
+    case "array":
+      parts.push(`数组 ${(items ?? 0).toLocaleString()} 项`);
+      break;
+    case "string":
+      parts.push("字符串");
+      break;
+    case "object":
+      parts.push("对象");
+      break;
+    case "other":
+      parts.push("其他类型");
+      break;
+    default:
+      parts.push(state);
+      break;
+  }
+  if (hasPreviousResponseId) parts.push("带 previous_response_id");
+  return parts.join(" · ");
+}
+
+// input 为空数组时会触发上游的 input items 校验错误，单独标红提示。
+function isEmptyInputArray(state?: string | null, items?: number | null) {
+  return state === "array" && (items ?? 0) === 0;
 }
 
 const usageUnavailablePresentations: Record<string, { label: string; message: string }> = {
@@ -1459,24 +1504,33 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                             <span className="text-[#8e8e93]">—</span>
                           )}
                         </div>,
-<div>
+                        <div>
                           <div className="grid min-w-32 max-w-56 gap-0.5">
-                            <strong
-                              className="truncate font-semibold text-[#1d1d1f]"
-                              title={item.providerName || item.provider || undefined}
-                            >
-                              {item.providerName || item.provider || "—"}
-                            </strong>
+                            <div className="flex min-w-0 items-center gap-1">
+                              {item.officialAccountId ? (
+                                <span
+                                  className="shrink-0 rounded bg-blue-50 px-1 py-px text-[10px] font-medium text-blue-600"
+                                  title="官方账号"
+                                >
+                                  官
+                                </span>
+                              ) : null}
+                              <strong
+                                className="truncate font-semibold text-[#1d1d1f]"
+                                title={item.providerName || item.provider || undefined}
+                              >
+                                {item.providerName || item.provider || "—"}
+                              </strong>
+                            </div>
                             {item.officialAccountId ? (
                               <span
-                                className="flex min-w-0 items-center gap-1 text-[10px] text-[#48484a]"
+                                className="truncate text-[10px] text-[#48484a]"
                                 title={`官方账号：${officialAccountLabel(item.officialAccountId)}`}
                               >
-                                <span className="shrink-0 rounded bg-blue-50 px-1 py-px text-blue-600">官方账号</span>
-                                <span className="truncate">{officialAccountLabel(item.officialAccountId)}</span>
+                                {officialAccountLabel(item.officialAccountId)}
                               </span>
                             ) : null}
-                            {item.upstreamAuthority ? (
+                            {!item.officialAccountId && item.upstreamAuthority ? (
                               <span
                                 className="truncate font-mono text-[10px] text-[#8e8e93]"
                                 title={`上游: ${item.upstreamAuthority}`}
@@ -2033,6 +2087,35 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                       <dt className="text-[11px] text-[#8e8e93]">协议桥接</dt>
                       <dd className="m-0 mt-0.5 font-mono text-[11px] text-[#48484a]">
                         {selectedItem.protocolBridge}
+                      </dd>
+                    </div>
+                  ) : null}
+                  {selectedItem.requestInputState || selectedItem.upstreamInputState ? (
+                    <div className="col-span-2">
+                      <dt className="text-[11px] text-[#8e8e93]">请求体 input 形态（客户端 / 发往上游）</dt>
+                      <dd className="m-0 mt-0.5 grid gap-0.5">
+                        <span
+                          className={`font-medium ${isEmptyInputArray(selectedItem.requestInputState, selectedItem.requestInputItems) ? "text-red-600" : "text-[#1d1d1f]"}`}
+                        >
+                          客户端：
+                          {requestShapeText(
+                            selectedItem.requestInputState,
+                            selectedItem.requestInputItems,
+                            selectedItem.requestHasPreviousResponseId,
+                          ) ?? "未记录"}
+                          {selectedItem.requestBytes != null ? ` · ${formatBytes(selectedItem.requestBytes)}` : ""}
+                        </span>
+                        <span
+                          className={`font-medium ${isEmptyInputArray(selectedItem.upstreamInputState, selectedItem.upstreamInputItems) ? "text-red-600" : "text-[#1d1d1f]"}`}
+                        >
+                          上游：
+                          {requestShapeText(
+                            selectedItem.upstreamInputState,
+                            selectedItem.upstreamInputItems,
+                            selectedItem.upstreamHasPreviousResponseId,
+                          ) ?? "未记录"}
+                          {selectedItem.upstreamBytes != null ? ` · ${formatBytes(selectedItem.upstreamBytes)}` : ""}
+                        </span>
                       </dd>
                     </div>
                   ) : null}

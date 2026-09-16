@@ -180,6 +180,9 @@ test("the quota dialog estimates one group per account and keeps untagged record
   // 逐个账号读取官方额度，两次请求之间留出间隔。
   assert.match(dialog, /USAGE_QUERY_STAGGER_MS = \d+/);
   assert.match(dialog, /await new Promise\(\(resolve\) => setTimeout\(resolve, USAGE_QUERY_STAGGER_MS\)\)/);
+  // 仅供选择有明确账号且有请求记录的官方账号，并通过下拉框按账号切换展示
+  assert.match(dialog, /groups\.filter\(\(group\) => group\.projectable && group\.rows\.length > 0\)/);
+  assert.match(dialog, /<Select[\s\S]*aria-label="选择官方账号"/);
 });
 
 test("read all cursor pages, retain every model, reject unavailable/failed/stuck pagination and cancel", async () => {

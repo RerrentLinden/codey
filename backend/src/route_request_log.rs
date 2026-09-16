@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 
 use crate::config::{RouteRequestLogBackend, RouteRequestLogConfig};
 
-const SCHEMA_VERSION: u8 = 9;
+const SCHEMA_VERSION: u8 = 10;
 const MAX_LOG_STRING_BYTES: usize = 512;
 const MAX_LOG_HEADERS_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_LOG_ERROR_BYTES: usize = 64 * 1024;
@@ -97,6 +97,65 @@ impl FirstByteSource {
         match self {
             Self::UpstreamHttpBody => "upstream_http_body",
             Self::UpstreamWebSocketEvent => "upstream_ws_event",
+        }
+    }
+}
+
+/// Responses 请求体里 input 字段的形态。日志不保存正文，只保留这个摘要，
+/// 用于区分缺失、null、空数组和正常输入。
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RequestInputState {
+    Absent,
+    Null,
+    String,
+    Object,
+    Array,
+    Other,
+}
+
+impl RequestInputState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Absent => "absent",
+            Self::Null => "null",
+            Self::String => "string",
+            Self::Object => "object",
+            Self::Array => "array",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// 请求体形态摘要。正文、提示词和输出都不落盘，只记录形状与体积。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RequestBodySummary {
+    pub input_state: RequestInputState,
+    pub input_items: u64,
+    pub has_previous_response_id: bool,
+    pub bytes: Option<u64>,
+}
+
+impl RequestBodySummary {
+    /// 只有 Responses 形态的请求体才有 input 语义；其他协议的上游请求体
+    /// 不应套用该摘要。
+    pub(crate) fn from_responses_body(body: &Value, bytes: Option<u64>) -> Self {
+        let (input_state, input_items) = match body.get("input") {
+            None => (RequestInputState::Absent, 0),
+            Some(Value::Null) => (RequestInputState::Null, 0),
+            Some(Value::Array(items)) => (RequestInputState::Array, items.len() as u64),
+            Some(Value::String(_)) => (RequestInputState::String, 1),
+            Some(Value::Object(_)) => (RequestInputState::Object, 1),
+            Some(_) => (RequestInputState::Other, 0),
+        };
+        let has_previous_response_id = body
+            .get("previous_response_id")
+            .is_some_and(|value| !value.is_null());
+        Self {
+            input_state,
+            input_items,
+            has_previous_response_id,
+            bytes,
         }
     }
 }
@@ -217,6 +276,22 @@ pub(crate) struct RouteRequestLogEntry {
     pub upstream_protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_bridge: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_input_state: Option<RequestInputState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_input_items: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_has_previous_response_id: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_input_state: Option<RequestInputState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_input_items: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_has_previous_response_id: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_byte_source: Option<FirstByteSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -482,6 +557,16 @@ pub(crate) struct RouteRequestLogQueryItem {
     pub upstream_request_id: Option<String>,
     pub upstream_protocol: Option<String>,
     pub protocol_bridge: Option<String>,
+    /// 请求体形态摘要：日志只保留 input 的形态、项数、是否带
+    /// previous_response_id 与字节数，不保存正文。
+    pub request_input_state: Option<String>,
+    pub request_input_items: Option<u64>,
+    pub request_has_previous_response_id: Option<bool>,
+    pub request_bytes: Option<u64>,
+    pub upstream_input_state: Option<String>,
+    pub upstream_input_items: Option<u64>,
+    pub upstream_has_previous_response_id: Option<bool>,
+    pub upstream_bytes: Option<u64>,
     pub first_byte_source: Option<String>,
     pub subagent: bool,
     pub codex_session_id: Option<String>,
@@ -640,6 +725,8 @@ impl RouteRequestLogProducer {
         let entry = PendingEntry {
             requested_service_tier: None,
             service_tier: None,
+            request_body: None,
+            upstream_body: None,
             request_id: request_id.clone(),
             trace_id: request_id,
             timestamp_unix_ms: unix_timestamp_ms_at(start.started_at),
@@ -787,6 +874,8 @@ impl Drop for RouteRequestLogFinishGuard {
 struct PendingEntry {
     requested_service_tier: Option<String>,
     service_tier: Option<String>,
+    request_body: Option<RequestBodySummary>,
+    upstream_body: Option<RequestBodySummary>,
     request_id: String,
     trace_id: String,
     timestamp_unix_ms: u64,
@@ -834,6 +923,22 @@ impl RouteRequestLogProbe {
             lock_unpoisoned(&self.shared.entry).service_tier = Some(bounded_string(tier));
         });
     }
+
+    /// 记录客户端请求体的形态摘要，不保存正文。
+    pub(crate) fn record_request_body(&self, summary: RequestBodySummary) {
+        self.shield(|| {
+            lock_unpoisoned(&self.shared.entry).request_body = Some(summary);
+        });
+    }
+
+    /// 记录最终发往上游的请求体形态摘要。适配线路重写编码体时会再次调用，
+    /// 保留最后一次发送的实际形态。
+    pub(crate) fn record_upstream_body(&self, summary: RequestBodySummary) {
+        self.shield(|| {
+            lock_unpoisoned(&self.shared.entry).upstream_body = Some(summary);
+        });
+    }
+
     /// Defers final submission while a best-effort response observer drains.
     /// The request path never waits for the observer; dropping the guard
     /// releases the deferred exactly-once finish.
@@ -1267,6 +1372,18 @@ impl RouteRequestLogProbe {
             upstream_request_id: pending.upstream_request_id.take(),
             upstream_protocol: pending.upstream_protocol.take(),
             protocol_bridge: pending.protocol_bridge.take(),
+            request_input_state: pending.request_body.map(|summary| summary.input_state),
+            request_input_items: pending.request_body.map(|summary| summary.input_items),
+            request_has_previous_response_id: pending
+                .request_body
+                .map(|summary| summary.has_previous_response_id),
+            request_bytes: pending.request_body.and_then(|summary| summary.bytes),
+            upstream_input_state: pending.upstream_body.map(|summary| summary.input_state),
+            upstream_input_items: pending.upstream_body.map(|summary| summary.input_items),
+            upstream_has_previous_response_id: pending
+                .upstream_body
+                .map(|summary| summary.has_previous_response_id),
+            upstream_bytes: pending.upstream_body.and_then(|summary| summary.bytes),
             first_byte_source: pending.first_byte_source,
             client_fingerprint: pending.client_fingerprint.take(),
             subagent: pending.subagent,
@@ -2004,7 +2121,15 @@ impl SqliteSink {
                 codex_session_is_parent INTEGER NOT NULL,
                 requested_service_tier TEXT,
                 service_tier TEXT,
-                upstream_request_headers TEXT
+                upstream_request_headers TEXT,
+                request_input_state TEXT,
+                request_input_items INTEGER,
+                request_has_previous_response_id INTEGER,
+                request_bytes INTEGER,
+                upstream_input_state TEXT,
+                upstream_input_items INTEGER,
+                upstream_has_previous_response_id INTEGER,
+                upstream_bytes INTEGER
              );
              CREATE INDEX IF NOT EXISTS idx_route_request_logs_time_id
                 ON route_request_logs(timestamp_unix_ms DESC, request_id DESC);
@@ -2021,11 +2146,19 @@ impl SqliteSink {
              CREATE INDEX IF NOT EXISTS idx_route_request_logs_status_time_id
                 ON route_request_logs(status, timestamp_unix_ms DESC, request_id DESC);",
         )?;
-        for column in [
-            "requested_service_tier",
-            "service_tier",
-            "upstream_request_headers",
-            "official_account_id",
+        for (column, column_type) in [
+            ("requested_service_tier", "TEXT"),
+            ("service_tier", "TEXT"),
+            ("upstream_request_headers", "TEXT"),
+            ("official_account_id", "TEXT"),
+            ("request_input_state", "TEXT"),
+            ("request_input_items", "INTEGER"),
+            ("request_has_previous_response_id", "INTEGER"),
+            ("request_bytes", "INTEGER"),
+            ("upstream_input_state", "TEXT"),
+            ("upstream_input_items", "INTEGER"),
+            ("upstream_has_previous_response_id", "INTEGER"),
+            ("upstream_bytes", "INTEGER"),
         ] {
             let exists: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('route_request_logs') WHERE name = ?1)",
@@ -2033,7 +2166,7 @@ impl SqliteSink {
             )?;
             if !exists {
                 connection.execute_batch(&format!(
-                    "ALTER TABLE route_request_logs ADD COLUMN {column} TEXT"
+                    "ALTER TABLE route_request_logs ADD COLUMN {column} {column_type}"
                 ))?;
             }
         }
@@ -2072,13 +2205,17 @@ impl SqliteSink {
                     first_byte_source, client_fingerprint, subagent, schema_version,
                     upstream_error_summary, codex_session_id, codex_session_is_parent,
                     requested_service_tier, service_tier, upstream_request_headers,
-                    official_account_id
+                    official_account_id, request_input_state, request_input_items,
+                    request_has_previous_response_id, request_bytes,
+                    upstream_input_state, upstream_input_items,
+                    upstream_has_previous_response_id, upstream_bytes
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
                     ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
-                    ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49
+                    ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
+                    ?51, ?52, ?53, ?54, ?55, ?56, ?57
                 ) ON CONFLICT(request_id) DO NOTHING",
             )?;
             for queued in batch {
@@ -2133,6 +2270,14 @@ impl SqliteSink {
                     entry.service_tier,
                     entry.upstream_request_headers,
                     entry.official_account_id,
+                    entry.request_input_state.map(RequestInputState::as_str),
+                    entry.request_input_items.map(to_i64),
+                    entry.request_has_previous_response_id,
+                    entry.request_bytes.map(to_i64),
+                    entry.upstream_input_state.map(RequestInputState::as_str),
+                    entry.upstream_input_items.map(to_i64),
+                    entry.upstream_has_previous_response_id,
+                    entry.upstream_bytes.map(to_i64),
                 ])?;
             }
         }
@@ -2232,6 +2377,13 @@ fn query_sqlite_route_request_logs(
     } else {
         "NULL"
     };
+    let request_shape_columns = if optional_columns.request_shape {
+        "request_input_state, request_input_items, request_has_previous_response_id,
+            request_bytes, upstream_input_state, upstream_input_items,
+            upstream_has_previous_response_id, upstream_bytes"
+    } else {
+        "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL"
+    };
     let select_sql = format!(
         "SELECT
             request_id, trace_id, timestamp_unix_ms, provider, provider_name,
@@ -2247,7 +2399,7 @@ fn query_sqlite_route_request_logs(
             upstream_request_id, upstream_protocol, protocol_bridge,
             first_byte_source, subagent, upstream_error_summary,
             codex_session_id, codex_session_is_parent, {tier_columns},
-            upstream_request_headers, {account_column}
+            upstream_request_headers, {account_column}, {request_shape_columns}
          FROM route_request_logs{where_clause}
          ORDER BY timestamp_unix_ms DESC, request_id DESC
          {pagination}"
@@ -2548,6 +2700,8 @@ struct RouteRequestLogOptionalColumns {
     tiers: bool,
     /// The per-route official account id.
     official_account: bool,
+    /// Request body shape summary columns written for every request.
+    request_shape: bool,
 }
 
 /// These columns are added by the writer at open time and never dropped, so a
@@ -2559,6 +2713,7 @@ fn sqlite_optional_columns(
 ) -> rusqlite::Result<RouteRequestLogOptionalColumns> {
     static TIERED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     static ACCOUNTED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    static SHAPED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     Ok(RouteRequestLogOptionalColumns {
         tiers: sqlite_has_column(connection, path, &TIERED_PATHS, "service_tier")?,
         official_account: sqlite_has_column(
@@ -2567,6 +2722,7 @@ fn sqlite_optional_columns(
             &ACCOUNTED_PATHS,
             "official_account_id",
         )?,
+        request_shape: sqlite_has_column(connection, path, &SHAPED_PATHS, "request_bytes")?,
     })
 }
 
@@ -2652,6 +2808,14 @@ fn query_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRequest
         codex_session_is_parent: row.get(42)?,
         upstream_request_headers: row.get(45)?,
         official_account_id: row.get(46)?,
+        request_input_state: row.get(47)?,
+        request_input_items: row_optional_u64(row, 48)?,
+        request_has_previous_response_id: row.get(49)?,
+        request_bytes: row_optional_u64(row, 50)?,
+        upstream_input_state: row.get(51)?,
+        upstream_input_items: row_optional_u64(row, 52)?,
+        upstream_has_previous_response_id: row.get(53)?,
+        upstream_bytes: row_optional_u64(row, 54)?,
     })
 }
 
@@ -3088,6 +3252,14 @@ mod tests {
             upstream_request_id: Some("upstream-id".to_string()),
             upstream_protocol: Some("OpenAI Responses".to_string()),
             protocol_bridge: Some("Responses passthrough".to_string()),
+            request_input_state: Some(RequestInputState::Array),
+            request_input_items: Some(4),
+            request_has_previous_response_id: Some(false),
+            request_bytes: Some(1_024),
+            upstream_input_state: Some(RequestInputState::Array),
+            upstream_input_items: Some(4),
+            upstream_has_previous_response_id: Some(false),
+            upstream_bytes: Some(1_130),
             first_byte_source: Some(FirstByteSource::UpstreamHttpBody),
             client_fingerprint: None,
             subagent: false,
@@ -3126,6 +3298,36 @@ mod tests {
         assert_eq!(entry.requested_service_tier.as_deref(), Some("priority"));
         assert_eq!(entry.service_tier.as_deref(), Some("default"));
         assert_eq!(entry.token_usage.cache_creation_input_tokens, Some(1500));
+    }
+
+    #[test]
+    fn request_body_summary_classifies_input_shape() {
+        let absent =
+            RequestBodySummary::from_responses_body(&serde_json::json!({"model": "m"}), Some(64));
+        assert_eq!(absent.input_state, RequestInputState::Absent);
+        assert_eq!(absent.input_items, 0);
+        assert!(!absent.has_previous_response_id);
+        let null =
+            RequestBodySummary::from_responses_body(&serde_json::json!({"input": null}), None);
+        assert_eq!(null.input_state, RequestInputState::Null);
+        assert_eq!(null.bytes, None);
+        // 空数组正是上游报错 Input items array must not be empty 的形态，
+        // 必须能和正常输入区分开。
+        let empty =
+            RequestBodySummary::from_responses_body(&serde_json::json!({"input": []}), Some(128));
+        assert_eq!(empty.input_state, RequestInputState::Array);
+        assert_eq!(empty.input_items, 0);
+        let items = RequestBodySummary::from_responses_body(
+            &serde_json::json!({
+                "input": [{"role": "user"}, {"role": "user"}],
+                "previous_response_id": "resp_1"
+            }),
+            Some(256),
+        );
+        assert_eq!(items.input_state, RequestInputState::Array);
+        assert_eq!(items.input_items, 2);
+        assert!(items.has_previous_response_id);
+        assert_eq!(items.bytes, Some(256));
     }
 
     #[test]
@@ -3184,6 +3386,74 @@ mod tests {
             ),
             (Some("flex"), Some("default"))
         );
+    }
+
+    #[test]
+    fn request_shape_columns_migrate_history_and_roundtrip() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SQLITE_FILE_NAME);
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut legacy = sample_entry("legacy");
+        legacy.timestamp_unix_ms = unix_timestamp_ms();
+        sink.write_batch(&[queued(legacy)]).unwrap();
+        sink.connection
+            .execute_batch(
+                "ALTER TABLE route_request_logs DROP COLUMN request_input_state;
+                 ALTER TABLE route_request_logs DROP COLUMN request_input_items;
+                 ALTER TABLE route_request_logs DROP COLUMN request_has_previous_response_id;
+                 ALTER TABLE route_request_logs DROP COLUMN request_bytes;
+                 ALTER TABLE route_request_logs DROP COLUMN upstream_input_state;
+                 ALTER TABLE route_request_logs DROP COLUMN upstream_input_items;
+                 ALTER TABLE route_request_logs DROP COLUMN upstream_has_previous_response_id;
+                 ALTER TABLE route_request_logs DROP COLUMN upstream_bytes;",
+            )
+            .unwrap();
+        drop(sink);
+        let page = query_route_request_logs(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(page.items[0].request_input_state, None);
+        assert_eq!(page.items[0].upstream_input_items, None);
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut entry = sample_entry("shape");
+        entry.timestamp_unix_ms = unix_timestamp_ms();
+        entry.request_input_state = Some(RequestInputState::Array);
+        entry.request_input_items = Some(0);
+        entry.request_bytes = Some(512);
+        entry.upstream_input_state = Some(RequestInputState::Absent);
+        entry.upstream_input_items = Some(0);
+        entry.upstream_bytes = Some(1024);
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["requestInputState"], "array");
+        assert_eq!(json["requestInputItems"], 0);
+        assert_eq!(json["upstreamInputState"], "absent");
+        sink.write_batch(&[queued(entry)]).unwrap();
+        let page = query_route_request_logs(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery::default(),
+        )
+        .unwrap();
+        let legacy = page
+            .items
+            .iter()
+            .find(|item| item.request_id == "legacy")
+            .unwrap();
+        assert_eq!(legacy.request_input_state, None);
+        assert_eq!(legacy.request_bytes, None);
+        let shape = page
+            .items
+            .iter()
+            .find(|item| item.request_id == "shape")
+            .unwrap();
+        assert_eq!(shape.request_input_state.as_deref(), Some("array"));
+        assert_eq!(shape.request_input_items, Some(0));
+        assert_eq!(shape.request_bytes, Some(512));
+        assert_eq!(shape.upstream_input_state.as_deref(), Some("absent"));
+        assert_eq!(shape.upstream_bytes, Some(1024));
     }
 
     #[test]
@@ -3858,6 +4128,14 @@ mod tests {
             upstream_request_id: None,
             upstream_protocol: None,
             protocol_bridge: None,
+            request_input_state: Some("array".into()),
+            request_input_items: Some(3),
+            request_has_previous_response_id: Some(false),
+            request_bytes: Some(2_048),
+            upstream_input_state: Some("array".into()),
+            upstream_input_items: Some(3),
+            upstream_has_previous_response_id: None,
+            upstream_bytes: None,
             first_byte_source: None,
             subagent: false,
             codex_session_id: Some("parent-thread".into()),
@@ -3869,6 +4147,16 @@ mod tests {
         assert_eq!(value["upstreamErrorSummary"], "rate limit reached");
         assert_eq!(value["codexSessionId"], "parent-thread");
         assert_eq!(value["codexSessionIsParent"], true);
+        assert_eq!(value["requestInputState"], "array");
+        assert_eq!(value["requestInputItems"], 3);
+        assert_eq!(value["requestBytes"], 2_048);
+        assert!(
+            value
+                .get("upstreamHasPreviousResponseId")
+                .unwrap()
+                .is_null()
+        );
+        assert!(value.get("upstreamBytes").unwrap().is_null());
         assert!(value.get("routerPreUpstreamMs").unwrap().is_null());
         assert!(value.get("upstreamFirstByteMs").unwrap().is_null());
         assert!(value.get("downstreamFirstContentMs").unwrap().is_null());

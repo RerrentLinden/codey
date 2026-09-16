@@ -4,7 +4,7 @@ import { IconRefresh } from "@tabler/icons-react";
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
 import { formatTimestamp } from "./formatters";
-import { Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "./components/ui";
+import { Button, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Select } from "./components/ui";
 import { estimateQuota, loadQuotaUsage, periodRows, PRICING_CHECKED, PRICING_SOURCE, quotaRows, sumQuotaRows, WEEK_MS } from "./quotaEstimate";
 import type { AccountUsageSnapshot, QuotaEstimate, QuotaPage, QuotaRow } from "./quotaEstimate";
 import type { OfficialAccount, OfficialAccountsResult } from "./App.types";
@@ -80,7 +80,7 @@ function estimateTargets(accounts: OfficialAccount[]): EstimateTarget[] {
       projectable: true,
     }];
   }
-  return [...stored, unattributed];
+  return stored;
 }
 
 const integer = (value: number) => value.toLocaleString("en-US", { maximumFractionDigits: 0 });
@@ -94,6 +94,7 @@ export function QuotaEstimateDialog({ container, onClose }: {
   container: HTMLElement | null; onClose: () => void;
 }) {
   const [groups, setGroups] = useState<EstimateGroup[]>([]);
+  const [selectedKey, setSelectedKey] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [loaded, setLoaded] = useState(0);
   const [error, setError] = useState("");
@@ -174,16 +175,22 @@ export function QuotaEstimateDialog({ container, onClose }: {
     return () => { active = false; };
   }, [revision]);
 
-  const totals = sumQuotaRows(groups.map((group) => group.total));
-  const usageWarnings = groups.map((group) => group.usageWarning).filter(Boolean);
-  const groupErrors = groups.filter((group) => group.error);
-  const warnings = [
+  // 只能选到有明确账号记录的，没记录账号的不放在里面展示
+  const selectableGroups = groups.filter((group) => group.projectable && group.rows.length > 0);
+  const activeGroup = selectableGroups.find((group) => group.key === selectedKey)
+    ?? selectableGroups.find((group) => group.isDefault)
+    ?? selectableGroups[0]
+    ?? null;
+  const activeKey = activeGroup?.key ?? "";
+
+  const activeTotal = activeGroup ? activeGroup.total : sumQuotaRows([]);
+  const warnings = activeGroup ? [
     healthWarning && "日志记录未完整开启或存在采样、丢弃及写入异常，估算仅覆盖已记录的请求。",
-    totals.unpriced > 0 && `${integer(totals.unpriced)} 次请求因档位或费率缺失未计价。`,
-    totals.missing > 0 && `${integer(totals.missing)} 次请求缺少 Token 数据，缺失值按 0，结果可能偏低。`,
-    totals.assumed > 0 && `${integer(totals.assumed)} 次请求未经响应确认档位，按请求档位或默认 Standard 估算，并与已确认用量分开。`,
-    totals.missingWrites > 0 && `${integer(totals.missingWrites)} 次请求未记录缓存写入量，按 0 展示；对应输入仍按普通输入价计费，额外写入费用可能未计入。`,
-  ].filter(Boolean);
+    activeTotal.unpriced > 0 && `${integer(activeTotal.unpriced)} 次请求因档位或费率缺失未计价。`,
+    activeTotal.missing > 0 && `${integer(activeTotal.missing)} 次请求缺少 Token 数据，缺失值按 0，结果可能偏低。`,
+    activeTotal.assumed > 0 && `${integer(activeTotal.assumed)} 次请求未经响应确认档位，按请求档位或默认 Standard 估算，并与已确认用量分开。`,
+    activeTotal.missingWrites > 0 && `${integer(activeTotal.missingWrites)} 次请求未记录缓存写入量，按 0 展示；对应输入仍按普通输入价计费，额外写入费用可能未计入。`,
+  ].filter(Boolean) : (healthWarning ? ["日志记录未完整开启或存在采样、丢弃及写入异常，估算仅覆盖已记录的请求。"] : []);
   const metrics = (items: ReadonlyArray<readonly [string, string, string?]>) => <dl className="m-0 grid gap-0.5 text-xs tabular-nums">
     {items.map(([label, value, colorClass]) => <div key={label} className="flex items-center justify-between gap-2">
       <dt className="font-normal text-gray-500">{label}</dt>
@@ -243,31 +250,50 @@ export function QuotaEstimateDialog({ container, onClose }: {
         <div className="flex flex-wrap items-center justify-between gap-3 py-1 text-xs">
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-gray-600">
             <span>读取区间：<span className="font-medium text-gray-800">{formatTimestamp(rangeEnd - WEEK_MS)}</span> 至 <span className="font-medium text-gray-800">{formatTimestamp(rangeEnd)}</span>（不含结束时间）</span>
-            {groups.length > 0 && <>
+            {selectableGroups.length > 0 && <>
               <span className="text-gray-300">·</span>
-              <span>账号：<span className="font-medium text-gray-800">{integer(groups.length)} 个</span></span>
+              <span>有记录账号：<span className="font-medium text-gray-800">{integer(selectableGroups.length)} 个</span></span>
             </>}
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            className="h-7 shrink-0 gap-1.5 px-3 text-xs font-medium text-blue-600 border-blue-200 hover:bg-blue-50/80 transition-colors"
-            disabled={loading}
-            onClick={() => setRevision(value => value + 1)}
-          >
-            <IconRefresh size={13} className={loading ? "animate-spin" : ""} aria-hidden="true" />
-            刷新数据
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-1.5 text-xs text-gray-600">
+              <span className="shrink-0 font-medium text-gray-700">账号：</span>
+              <Select
+                aria-label="选择官方账号"
+                className="w-60 shrink-0"
+                disabled={loading || selectableGroups.length === 0}
+                placeholder={loading ? "正在加载账号…" : selectableGroups.length === 0 ? "暂无账号记录" : "选择账号"}
+                value={activeKey}
+                onChange={(value) => {
+                  if (value != null) setSelectedKey(String(value));
+                }}
+                optionList={selectableGroups.map((group) => ({
+                  label: `${group.label}${group.isDefault ? "（默认）" : ""}${group.error ? "（额度读取失败）" : ""}`,
+                  value: group.key,
+                }))}
+              />
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 shrink-0 gap-1.5 px-3 text-xs font-medium text-blue-600 border-blue-200 hover:bg-blue-50/80 transition-colors"
+              disabled={loading}
+              onClick={() => setRevision(value => value + 1)}
+            >
+              <IconRefresh size={13} className={loading ? "animate-spin" : ""} aria-hidden="true" />
+              刷新数据
+            </Button>
+          </div>
         </div>
-        <Alert className="px-3.5 py-2.5" status={error || groupErrors.length > 0 ? "danger" : warnings.length || usageWarnings.length ? "warning" : "accent"}>
+        <Alert className="px-3.5 py-2.5" status={error || activeGroup?.error ? "danger" : warnings.length || activeGroup?.usageWarning ? "warning" : "accent"}>
           <Alert.Indicator />
           <Alert.Content>
           <Alert.Title><span className="text-xs font-medium text-amber-900">按 OpenAI 各档位 API 单价估算等值金额（USD），不代表订阅实际扣费或官方周限。</span></Alert.Title>
           <Alert.Description><div className="text-xs leading-relaxed text-amber-800">
             {error && <p className="m-0 font-medium text-red-600">{error}</p>}
-            {groupErrors.map((group) => <p key={group.key} className="m-0 font-medium text-red-600">账号「{group.label}」额度读取失败：{group.error}</p>)}
-            {usageWarnings.length > 0 && <p className="m-0">{usageWarnings.join(" ")}</p>}
-            {groups.some((group) => group.estimate?.period.usedPercent === 0) && <p className="m-0">部分账号官方周额度已用比例为 0%，暂时无法反推该账号的周限及剩余额度；产生用量后可刷新重算。</p>}
+            {activeGroup?.error && <p className="m-0 font-medium text-red-600">账号「{activeGroup.label}」额度读取失败：{activeGroup.error}</p>}
+            {activeGroup?.usageWarning && <p className="m-0">{activeGroup.usageWarning}</p>}
+            {activeGroup?.estimate?.period.usedPercent === 0 && <p className="m-0">该账号官方周额度已用比例为 0%，暂时无法反推该账号的周限及剩余额度；产生用量后可刷新重算。</p>}
             {warnings.length > 0 && <p className="m-0">{warnings.join(" ")}</p>}
             <details className="mt-1">
               <summary className="cursor-pointer select-none font-medium text-amber-900 hover:text-amber-950 transition-colors">计算说明与价格来源</summary>
@@ -278,42 +304,41 @@ export function QuotaEstimateDialog({ container, onClose }: {
                   <p className="m-0">每个账号只使用自己的请求记录和自己的已用比例，多个账号的消耗不会相加后反推周限。账号的已用比例可能包含该账号在其他设备的用量。</p>
                   <p className="m-0">Standard、Fast（含 priority）、Flex、Batch 各用独立价表，响应档位优先于请求档位；请求 Fast 而响应 default 按 Standard 计价。只有请求档位时单独列为推定；未记录计费档位或仅记录 auto 时按默认 Standard 档位计价，并标明默认依据。</p>
                   <p className="m-0">适用模型单次输入超过 272K 时，整次请求使用该档位的长上下文价，表格与短上下文分开。未公布价格的组合不借用其他档位价格。</p>
-                  <p className="m-0">估算仅覆盖已记录的 Token，不按采样率补推。升级前未记录账号的历史记录只展示消耗，不参与周限反推。工具调用、搜索内容特殊计价、容器和存储等缺少完整计费数据，尚未计入。合计中的未计价请求不代表实际免费。</p>
+                  <p className="m-0">估算仅覆盖已记录的 Token，不按采样率补推。工具调用、搜索内容特殊计价、容器和存储等缺少完整计费数据，尚未计入。合计中的未计价请求不代表实际免费。</p>
                   <p className="m-0">价格核对：{PRICING_CHECKED} · <a className="text-blue-600 hover:underline font-medium" href={PRICING_SOURCE} target="_blank" rel="noreferrer">OpenAI 官方价格</a>；Codex 历史模型价格见对应官方模型页。GPT-5.6 Sol 使用当前公开促销价。</p>
                 </div>
             </details>
           </div></Alert.Description>
           </Alert.Content>
         </Alert>
-        {groups.map((group) => <section key={group.key} className="flex min-w-0 flex-col gap-2 rounded-xl border border-gray-200/90 bg-white p-3.5 shadow-xs">
+        {activeGroup ? <section key={activeGroup.key} className="flex min-w-0 flex-col gap-2 rounded-xl border border-gray-200/90 bg-white p-3.5 shadow-xs">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex flex-wrap items-center gap-2 text-xs">
-              <span className="font-semibold text-gray-900">{group.label}</span>
-              {group.isDefault && <span className="rounded bg-blue-50 px-1.5 py-0.5 font-normal text-blue-600 border border-blue-200/60">默认</span>}
-              {!group.projectable && <span className="rounded bg-gray-100 px-1.5 py-0.5 font-normal text-gray-600">未记录账号，仅展示消耗</span>}
+              <span className="font-semibold text-gray-900">{activeGroup.label}</span>
+              {activeGroup.isDefault && <span className="rounded bg-blue-50 px-1.5 py-0.5 font-normal text-blue-600 border border-blue-200/60">默认</span>}
               <span className="text-gray-300">·</span>
               <span className="text-gray-500">官方周额度已使用：</span>
               <span className="inline-flex items-center px-2 py-0.5 rounded-md font-semibold bg-blue-50 text-blue-600 border border-blue-200/60 tabular-nums">
-                {group.estimate ? `${group.estimate.period.usedPercent.toFixed(2)}%` : loading ? "正在读取…" : "暂不可用"}
+                {activeGroup.estimate ? `${activeGroup.estimate.period.usedPercent.toFixed(2)}%` : loading ? "正在读取…" : "暂不可用"}
               </span>
             </div>
-            {group.estimate && <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-600">
-              <span>上次重置（推算）：<span className="text-gray-800 font-medium">{formatTimestamp(group.estimate.period.fromUnixMs)}</span></span>
+            {activeGroup.estimate && <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-600">
+              <span>上次重置（推算）：<span className="text-gray-800 font-medium">{formatTimestamp(activeGroup.estimate.period.fromUnixMs)}</span></span>
               <span className="text-gray-300">·</span>
-              <span>下次重置：<span className="text-gray-800 font-medium">{formatTimestamp(group.estimate.period.resetsAt)}</span></span>
+              <span>下次重置：<span className="text-gray-800 font-medium">{formatTimestamp(activeGroup.estimate.period.resetsAt)}</span></span>
               <span className="text-gray-300">·</span>
-              <span>更新时间：<span className="text-gray-800 font-medium">{formatTimestamp(group.estimate.period.toUnixMs)}</span></span>
+              <span>更新时间：<span className="text-gray-800 font-medium">{formatTimestamp(activeGroup.estimate.period.toUnixMs)}</span></span>
             </div>}
           </div>
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-3" aria-live="polite">
             {([
-              ["当前预计周额度消耗", group.estimate?.result?.weekly],
-              ["预估周限", group.estimate?.result?.limit],
-              ["当前预估剩余额度", group.estimate?.result?.remaining],
+              ["当前预计周额度消耗", activeGroup.estimate?.result?.weekly],
+              ["预估周限", activeGroup.estimate?.result?.limit],
+              ["当前预估剩余额度", activeGroup.estimate?.result?.remaining],
             ] as const).map(([label, value]) => <div key={label} className="flex flex-col justify-between rounded-xl border border-gray-200/90 bg-white p-3 shadow-xs">
               <div className="flex items-center justify-between text-xs text-gray-500">
                 <span className="font-medium">{label}</span>
-                {group.total.unpriced > 0 && <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-normal text-amber-700 border border-amber-200/60">仅含可计价用量</span>}
+                {activeGroup.total.unpriced > 0 && <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[11px] font-normal text-amber-700 border border-amber-200/60">仅含可计价用量</span>}
               </div>
               <div className="mt-1.5 flex items-baseline gap-1">
                 <span className="text-xl font-bold tracking-tight text-blue-600 tabular-nums">{money(value ?? null)}</span>
@@ -321,37 +346,40 @@ export function QuotaEstimateDialog({ container, onClose }: {
               </div>
             </div>)}
           </div>
-          {group.error ? <p className="m-0 text-xs font-medium text-red-600">该账号额度暂不可用，未生成周限推算。</p>
-            : group.estimate === null ? <p className="m-0 text-xs text-gray-500">{group.projectable
-              ? "该账号本周期没有请求记录，未读取官方额度，无法推算周限。"
-              : "这些记录没有账号字段，只统计最近 7 天的消耗，不参与周限反推。"}</p>
+          {activeGroup.error ? <p className="m-0 text-xs font-medium text-red-600">该账号额度暂不可用，未生成周限推算。</p>
+            : activeGroup.estimate === null ? <p className="m-0 text-xs text-gray-500">该账号本周期没有请求记录，未读取官方额度，无法推算周限。</p>
             : null}
-          {group.rows.length > 0 && <Table className="quota-estimate-table relative" variant="secondary" aria-busy={loading}>
+          {activeGroup.rows.length > 0 && <Table className="quota-estimate-table relative" variant="secondary" aria-busy={loading}>
             <Table.ScrollContainer className="max-h-[420px] overflow-auto rounded-xl border border-gray-200 bg-white shadow-2xs">
-              <Table.Content aria-label={`${group.label} 模型额度明细`} className={`min-w-[1180px] ${loading ? "opacity-60" : ""}`}>
+              <Table.Content aria-label={`${activeGroup.label} 模型额度明细`} className={`min-w-[1180px] ${loading ? "opacity-60" : ""}`}>
                 <Table.Header>
-                  {columnsFor(group).map((column, index) => <Table.Column key={column.key} isRowHeader={index === 0}
+                  {columnsFor(activeGroup).map((column, index) => <Table.Column key={column.key} isRowHeader={index === 0}
                     className={`sticky top-0 z-[1] bg-gray-50/95 text-xs font-semibold text-gray-700 backdrop-blur-xs border-b border-gray-200 ${column.align === "right" ? "text-right" : ""}`}
                     style={{ width: column.width, minWidth: column.width }}>{column.title}</Table.Column>)}
                 </Table.Header>
                 <Table.Body renderEmptyState={() => <div className="p-8 text-center text-xs text-gray-500">
-                  {group.error ? "数据读取失败，请刷新重试" : "当前周期内没有请求记录"}
+                  {activeGroup.error ? "数据读取失败，请刷新重试" : "当前周期内没有请求记录"}
                 </div>}>
-                  {group.rows.map((row) => <Table.Row key={row.key} id={row.key} className="hover:bg-blue-50/20 transition-colors border-b border-gray-100">
-                    {columnsFor(group).map((column) => <Table.Cell key={column.key} className={`align-top text-xs ${column.align === "right" ? "text-right" : ""}`}>
+                  {activeGroup.rows.map((row) => <Table.Row key={row.key} id={row.key} className="hover:bg-blue-50/20 transition-colors border-b border-gray-100">
+                    {columnsFor(activeGroup).map((column) => <Table.Cell key={column.key} className={`align-top text-xs ${column.align === "right" ? "text-right" : ""}`}>
                       {column.render(undefined, row)}
                     </Table.Cell>)}
                   </Table.Row>)}
                   <Table.Row id="__total" className="border-t-2 border-blue-200 bg-blue-50/30 font-semibold">
-                    {columnsFor(group).map((column, index) => <Table.Cell key={column.key} className={`align-top text-xs ${column.align === "right" ? "text-right" : ""}`}>
-                      {index === 0 ? <strong className="text-blue-900 font-bold">本账号小计</strong> : column.render(undefined, group.total)}
+                    {columnsFor(activeGroup).map((column, index) => <Table.Cell key={column.key} className={`align-top text-xs ${column.align === "right" ? "text-right" : ""}`}>
+                      {index === 0 ? <strong className="text-blue-900 font-bold">本账号小计</strong> : column.render(undefined, activeGroup.total)}
                     </Table.Cell>)}
                   </Table.Row>
                 </Table.Body>
               </Table.Content>
             </Table.ScrollContainer>
           </Table>}
-        </section>)}
+        </section> : !loading ? (
+          <section className="flex min-w-0 flex-col items-center justify-center rounded-xl border border-dashed border-gray-200 bg-white p-12 text-center text-xs text-gray-500">
+            <p className="m-0 font-medium text-gray-700 text-sm">暂无可估算的官方账号</p>
+            <p className="mt-1.5 m-0 text-gray-400">仅展示有明确账号请求记录的官方账号；当前周期内未查询到符合条件的请求记录。</p>
+          </section>
+        ) : null}
         {loading && <div role="status" className="flex items-center gap-2 text-xs text-gray-500">
           <Spinner size="sm" />
           <span>{groups.length > 0 ? `正在读取账号额度，已加载 ${integer(loaded)} 次请求…` : "正在读取官方账号与日志…"}</span>

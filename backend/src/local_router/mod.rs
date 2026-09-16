@@ -45,9 +45,9 @@ use crate::config::{
 };
 use crate::model_id;
 use crate::route_request_log::{
-    FirstByteSource, RequestProtocol, RouteRequestLogClearResult, RouteRequestLogController,
-    RouteRequestLogGuard, RouteRequestLogProbe, RouteRequestLogQuery, RouteRequestLogReconfigure,
-    RouteRequestLogStart, UpstreamTransport,
+    FirstByteSource, RequestBodySummary, RequestProtocol, RouteRequestLogClearResult,
+    RouteRequestLogController, RouteRequestLogGuard, RouteRequestLogProbe, RouteRequestLogQuery,
+    RouteRequestLogReconfigure, RouteRequestLogStart, UpstreamTransport,
 };
 
 pub(crate) const ROUTER_PROVIDER_ID: &str = "codey_router";

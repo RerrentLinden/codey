@@ -19,6 +19,22 @@ test("request log cache hit rate uses input tokens and preserves unknown usage",
   }
 });
 
+test("request log detail labels request body shape and flags empty input arrays", async () => {
+  const viewer = await readFile(new URL("src/RequestLogDialog.tsx", root), "utf8");
+  const source = viewer.match(/function requestShapeText\([\s\S]*?\n\}/)?.[0];
+  assert.ok(source);
+  const compiled = ts.transpileModule(source, {}).outputText;
+  const shape = new Function(`${compiled}; return requestShapeText;`)();
+  assert.equal(shape("array", 2, false), "数组 2 项");
+  assert.equal(shape("array", 0, true), "空数组（0 项）");
+  assert.equal(shape("absent", 0, false), "无 input 字段");
+  assert.equal(shape("null", 0, false), "input 为 null");
+  assert.equal(shape("array", 3, true), "数组 3 项 · 带 previous_response_id");
+  assert.equal(shape(null, 0, true), null);
+  assert.match(viewer, /请求体 input 形态（客户端 \/ 发往上游）/);
+  assert.match(viewer, /isEmptyInputArray\(selectedItem\.upstreamInputState, selectedItem\.upstreamInputItems\)/);
+});
+
 test("request log controls are scoped to built-in routing and preserve logger settings", async () => {
   const [app, modelSection, types, preview] = await Promise.all([
     readFile(new URL("src/App.tsx", root), "utf8"),
@@ -46,6 +62,8 @@ test("request log controls are scoped to built-in routing and preserve logger se
   assert.match(preview, /item\.codexSessionId,/);
   assert.doesNotMatch(preview, /retryCount/);
   assert.match(preview, /upstreamTransport: protocol === "sse" \? "http_sse" : protocol/);
+  assert.match(preview, /requestInputState: "array",/);
+  assert.match(preview, /upstreamInputItems: failed \? 0 : 12 \+ index,/);
   assert.match(preview, /protocol && item\.upstreamTransport !== protocol/);
   assert.doesNotMatch(preview, /protocol && item\.requestProtocol/);
 });
@@ -84,6 +102,8 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /\{ label: "按官方账号统计", value: "official_account" \}/);
   assert.match(viewer, /official_account: "官方账号"/);
   assert.match(viewer, /官方账号：\$\{officialAccountLabel\(item\.officialAccountId\)\}/);
+  assert.match(viewer, />\s*官\s*<\/span>/);
+  assert.doesNotMatch(viewer, />官方账号<\/span>/);
   // 独立页面拿不到启动期能力标志，存在官方线路时仍要读取账号列表。
   assert.match(viewer, /profile\.officialAccount \|\| Boolean\(profile\.officialAccountId\)/);
   assert.match(viewer, /label: "SSE", value: "http_sse"/);

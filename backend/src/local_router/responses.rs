@@ -903,6 +903,7 @@ impl RouterServer {
                             continue;
                         }
                     };
+                    let request_body_bytes = Some(text.len() as u64);
                     drop(text);
                     let message_type = body
                         .as_object_mut()
@@ -986,6 +987,7 @@ impl RouterServer {
                                     request,
                                     body,
                                     None,
+                                    request_body_bytes,
                                     ResponsesRequestKind::Create,
                                     &mut downstream,
                                 ),
@@ -1202,6 +1204,7 @@ impl RouterServer {
             request,
             body,
             Some(encoded_body),
+            None,
             request_kind,
             &mut downstream,
         )
@@ -1213,6 +1216,7 @@ impl RouterServer {
         request: HttpRequest,
         body: Value,
         encoded_body: Option<Vec<u8>>,
+        request_body_bytes: Option<u64>,
         request_kind: ResponsesRequestKind,
         downstream: &mut D,
     ) -> Result<()>
@@ -1272,6 +1276,10 @@ impl RouterServer {
         }
         if let Some(probe) = &probe {
             probe.set_requested_service_tier(body.get("service_tier").and_then(Value::as_str));
+            probe.record_request_body(RequestBodySummary::from_responses_body(
+                &body,
+                request_body_bytes.or_else(|| encoded_body.as_ref().map(|body| body.len() as u64)),
+            ));
         }
         let _request_log_guard = RouteRequestLogGuard::new(probe.clone());
         let mut observed = ObservedResponsesDownstream::new(downstream, probe);
@@ -1801,6 +1809,12 @@ impl RouterServer {
                 None => serde_json::to_vec(&upstream_body)
                     .context("序列化 Responses WebSocket 上游请求失败")?,
             };
+            if let Some(probe) = downstream.request_log_probe() {
+                probe.record_upstream_body(RequestBodySummary::from_responses_body(
+                    &upstream_body,
+                    Some(passthrough_body.len() as u64),
+                ));
+            }
             request_builder.body(passthrough_body)
         } else {
             drop(encoded_body.take());
@@ -1888,6 +1902,10 @@ impl RouterServer {
                     } else {
                         UpstreamTransport::Http
                     });
+                    probe.record_upstream_body(RequestBodySummary::from_responses_body(
+                        retryable_body,
+                        Some(encoded.len() as u64),
+                    ));
                 }
                 let retry_result = await_upstream(
                     downstream,

@@ -407,6 +407,10 @@ impl WebSocketResponsesDownstream {
         // over HTTP, avoiding duplicate tool calls and other side effects.
         if let Some(probe) = probe {
             probe.mark_upstream_send(UpstreamTransport::WebSocket);
+            probe.record_upstream_body(RequestBodySummary::from_responses_body(
+                body,
+                Some(message.len() as u64),
+            ));
         }
         match self
             .wait_for_upstream(tokio::time::timeout(
