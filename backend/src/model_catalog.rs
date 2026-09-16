@@ -440,14 +440,19 @@ fn refresh_for_provider_with_transport_preferences(
         return write_verified_catalog(home, &[]);
     }
     let mut official_models = read_official_entries(home)?;
+    // Codex 26.908+ may never write `models_cache.json`; capture the CLI's
+    // own catalog before declaring the runtime cache unusable.
     if official_models
         .iter()
         .all(|model| model_instruction_source(model).is_none())
-        // Codex 26.908+ may never write `models_cache.json`; capture the CLI's
-        // own catalog before declaring the runtime cache unusable.
-        && sync_runtime_catalog_snapshot(home).unwrap_or(false)
     {
-        official_models = read_official_entries(home)?;
+        let snapshot_synced = sync_runtime_catalog_snapshot(home).unwrap_or_else(|error| {
+            eprintln!("读取 Codex 命令行模型清单失败：{error:#}");
+            false
+        });
+        if snapshot_synced {
+            official_models = read_official_entries(home)?;
+        }
     }
     if official_models
         .iter()
@@ -932,6 +937,7 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
 #[cfg(not(test))]
 fn sync_runtime_catalog_snapshot(home: &Path) -> Result<bool> {
     let Some(models) = debug_model_entries(home) else {
+        eprintln!("本机 Codex 命令行未产出可用的模型清单快照");
         return Ok(false);
     };
     let catalog = serde_json::to_vec_pretty(&json!({ "models": models }))
