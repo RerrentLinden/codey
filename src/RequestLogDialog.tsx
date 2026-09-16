@@ -80,6 +80,7 @@ type RouteRequestLogItem = {
   fallbackReason?: string | null;
   upstreamAuthority?: string | null;
   upstreamRequestHeaders?: string | null;
+  upstreamResponseHeaders?: string | null;
   upstreamRequestId?: string | null;
   upstreamProtocol?: string | null;
   protocolBridge?: string | null;
@@ -2037,27 +2038,6 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                       </dd>
                     </div>
                   ) : null}
-                  {selectedItem.upstreamRequestHeaders ? (
-                    <div className="col-span-2">
-                      <dt className="flex items-center gap-1 text-[11px] text-[#8e8e93]">
-                        <span>上游请求头（敏感值已脱敏）</span>
-                        <button
-                          type="button"
-                          className="inline-flex items-center rounded p-0.5 text-[#8e8e93] transition-colors hover:bg-black/8 hover:text-[#1d1d1f] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
-                          onClick={() => handleCopyId(selectedItem.upstreamRequestHeaders!, "上游请求头", "请求头内容")}
-                          aria-label="复制上游请求头"
-                          title="复制上游请求头"
-                        >
-                          <IconCopy size={12} aria-hidden="true" />
-                        </button>
-                      </dt>
-                      <dd className="m-0 mt-1">
-                        <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-black/5 p-2 font-mono text-[10px] leading-relaxed text-[#48484a] break-words">
-                          {selectedItem.upstreamRequestHeaders}
-                        </pre>
-                      </dd>
-                    </div>
-                  ) : null}
                   {selectedItem.codexSessionId ? (
                     <div className="col-span-2">
                       <dt className="text-[11px] text-[#8e8e93]">Codex 会话 ID</dt>
@@ -2122,14 +2102,67 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                 </dl>
               </div>
 
-              {/* 原始记录 JSON */}
+              {/* 请求头与响应头 */}
               <div className="rounded-xl border border-black/8 bg-[#fafafa] p-3.5 text-xs">
                 <span className="block font-semibold text-[#1d1d1f] pb-2 border-b border-black/6">
-                  原始记录 JSON
+                  请求头与响应头
                 </span>
-                <pre className="mt-3 max-h-60 overflow-auto rounded-lg bg-black/5 p-2.5 font-mono text-[10px] text-[#1d1d1f]">
-                  {JSON.stringify(selectedItem, null, 2)}
-                </pre>
+                <div className="mt-3 grid gap-3">
+                  <div>
+                    <div className="flex items-center gap-1">
+                      <span className="text-[11px] font-medium text-[#48484a]">
+                        请求头（Codey 发往上游，敏感值已脱敏）
+                      </span>
+                      {selectedItem.upstreamRequestHeaders ? (
+                        <button
+                          type="button"
+                          className="inline-flex items-center rounded p-0.5 text-[#8e8e93] transition-colors hover:bg-black/8 hover:text-[#1d1d1f] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                          onClick={() => handleCopyId(selectedItem.upstreamRequestHeaders!, "上游请求头", "请求头内容")}
+                          aria-label="复制上游请求头"
+                          title="复制上游请求头"
+                        >
+                          <IconCopy size={12} aria-hidden="true" />
+                        </button>
+                      ) : null}
+                    </div>
+                    {selectedItem.upstreamRequestHeaders ? (
+                      <pre className="m-0 mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-black/5 p-2 font-mono text-[10px] leading-relaxed text-[#48484a] break-words">
+                        {selectedItem.upstreamRequestHeaders}
+                      </pre>
+                    ) : (
+                      <p className="m-0 mt-1 rounded-lg bg-black/5 p-2 text-[11px] text-[#8e8e93]">
+                        未记录
+                      </p>
+                    )}
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-1">
+                      <span className="text-[11px] font-medium text-[#48484a]">
+                        响应头（上游返回，敏感值已脱敏）
+                      </span>
+                      {selectedItem.upstreamResponseHeaders ? (
+                        <button
+                          type="button"
+                          className="inline-flex items-center rounded p-0.5 text-[#8e8e93] transition-colors hover:bg-black/8 hover:text-[#1d1d1f] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                          onClick={() => handleCopyId(selectedItem.upstreamResponseHeaders!, "上游响应头", "响应头内容")}
+                          aria-label="复制上游响应头"
+                          title="复制上游响应头"
+                        >
+                          <IconCopy size={12} aria-hidden="true" />
+                        </button>
+                      ) : null}
+                    </div>
+                    {selectedItem.upstreamResponseHeaders ? (
+                      <pre className="m-0 mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-black/5 p-2 font-mono text-[10px] leading-relaxed text-[#48484a] break-words">
+                        {selectedItem.upstreamResponseHeaders}
+                      </pre>
+                    ) : (
+                      <p className="m-0 mt-1 rounded-lg bg-black/5 p-2 text-[11px] text-[#8e8e93]">
+                        未记录
+                      </p>
+                    )}
+                  </div>
+                </div>
               </div>
 
               {/* 异常与降级诊断 */}

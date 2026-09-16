@@ -8684,7 +8684,7 @@ async fn router_proxies_image_generation_to_the_default_openai_route() {
         stream
             .write_all(
                 format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-codex-turn-state: sticky-token\r\nset-cookie: session=private-value\r\nconnection: close\r\n\r\n{response}",
                     response.len()
                 )
                 .as_bytes(),
@@ -8768,6 +8768,16 @@ async fn router_proxies_image_generation_to_the_default_openai_route() {
     assert_eq!(image.status, "succeeded");
     assert_eq!(image.model.as_deref(), Some("gpt-image-2"));
     assert_eq!(image.total_tokens, None);
+    // HTTP 上游路径要同时记录请求头与响应头；凭据脱敏，粘性路由令牌保留。
+    let request_headers = image.upstream_request_headers.as_deref().unwrap();
+    assert!(request_headers.contains("authorization: [REDACTED]"));
+    assert!(request_headers.contains("content-type: application/json"));
+    let response_headers = image.upstream_response_headers.as_deref().unwrap();
+    assert!(
+        response_headers.contains("x-codex-turn-state: sticky-token"),
+        "recorded response headers: {response_headers}"
+    );
+    assert!(response_headers.contains("set-cookie: [REDACTED]"));
     let rejected = page
         .items
         .iter()

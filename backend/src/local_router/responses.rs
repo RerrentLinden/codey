@@ -561,6 +561,9 @@ impl RouterServer {
         let mut headers = headers;
         // insert 保证只有一个 content-type；在 .headers() 之后用 .header() 会追加重复值。
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        if let Some(probe) = &probe {
+            probe.set_upstream_request_headers(&format_upstream_headers(&headers));
+        }
         let upstream_client = match self.upstream_client(&route) {
             Ok(client) => client,
             Err(message) => {
@@ -1776,6 +1779,9 @@ impl RouterServer {
             && !resolved.route.official_account;
         // 重发需要同一份请求头和完整请求体，只有可能重发时才保留。
         let retry_headers = reasoning_text_retry_allowed.then(|| headers.clone());
+        if let Some(probe) = downstream.request_log_probe() {
+            probe.set_upstream_request_headers(&format_upstream_headers(&headers));
+        }
         let mut request_builder = upstream_client.post(upstream_url).headers(headers);
         // 压缩请求不设置 reqwest 总期限:该期限从建连算到响应体读完,会把耗时较长的
         // 压缩中途截断。等待响应头由 response_header_timeout 约束,响应体读取由
@@ -1872,6 +1878,11 @@ impl RouterServer {
         };
         let mut upstream_status = response.status().as_u16();
         let mut upstream_request_id = upstream_request_id_from_headers(response.headers());
+        if let Some(probe) = downstream.request_log_probe() {
+            probe.set_upstream_response_headers(&format_upstream_response_headers(
+                response.headers(),
+            ));
+        }
         let mut upstream_response = Some(response);
         let mut preloaded_error_body = None;
         if upstream_status == 400
@@ -1944,6 +1955,11 @@ impl RouterServer {
                 };
                 upstream_status = retried.status().as_u16();
                 upstream_request_id = upstream_request_id_from_headers(retried.headers());
+                if let Some(probe) = downstream.request_log_probe() {
+                    probe.set_upstream_response_headers(&format_upstream_response_headers(
+                        retried.headers(),
+                    ));
+                }
                 upstream_response = Some(retried);
             } else {
                 preloaded_error_body = Some(body);
@@ -2215,4 +2231,30 @@ pub(crate) fn format_upstream_headers(headers: &reqwest::header::HeaderMap) -> S
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 上游响应头的日志文本。沿用请求头的脱敏规则，并额外隐藏响应侧的
+/// 会话 Cookie。
+pub(crate) fn format_upstream_response_headers(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            let sensitive = value.is_sensitive()
+                || is_sensitive_upstream_header(name.as_str())
+                || is_sensitive_upstream_response_header(name.as_str());
+            format!(
+                "{name}: {}",
+                if sensitive {
+                    "[REDACTED]"
+                } else {
+                    value.to_str().unwrap_or("<binary>")
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_sensitive_upstream_response_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("set-cookie") || name.eq_ignore_ascii_case("set-cookie2")
 }
