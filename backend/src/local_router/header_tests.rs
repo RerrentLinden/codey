@@ -150,3 +150,33 @@ fn header_logs_hide_credentials_but_keep_other_values() {
     assert!(log.contains(RESPONSES_WEBSOCKET_BETA));
     assert!(log.contains("sec-websocket-key: [REDACTED]"));
 }
+
+#[test]
+fn response_header_logs_hide_credentials_but_keep_route_tokens() {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        HeaderName::from_static("set-cookie"),
+        HeaderValue::from_static("session=private-value"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-codex-turn-state"),
+        HeaderValue::from_static("sticky-token"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-models-etag"),
+        HeaderValue::from_static("etag-1"),
+    );
+    headers.insert(
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_static("Bearer private-value"),
+    );
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let text = super::responses::format_upstream_response_headers(&headers);
+    assert!(!text.contains("private-value"));
+    // 粘性路由令牌是 Codex 依赖的端到端响应头，必须保留明文。
+    assert!(text.contains("x-codex-turn-state: sticky-token"));
+    assert!(text.contains("x-models-etag: etag-1"));
+    assert!(text.contains("content-type: application/json"));
+    assert!(text.contains("set-cookie: [REDACTED]"));
+    assert!(text.contains("authorization: [REDACTED]"));
+}

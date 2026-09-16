@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 
 use crate::config::{RouteRequestLogBackend, RouteRequestLogConfig};
 
-const SCHEMA_VERSION: u8 = 10;
+const SCHEMA_VERSION: u8 = 11;
 const MAX_LOG_STRING_BYTES: usize = 512;
 const MAX_LOG_HEADERS_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_LOG_ERROR_BYTES: usize = 64 * 1024;
@@ -270,6 +270,9 @@ pub(crate) struct RouteRequestLogEntry {
     pub upstream_authority: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_request_headers: Option<String>,
+    /// 上游返回的响应头，敏感值同样只保留脱敏占位。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_response_headers: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream_request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -554,6 +557,7 @@ pub(crate) struct RouteRequestLogQueryItem {
     pub fallback_reason: Option<String>,
     pub upstream_authority: Option<String>,
     pub upstream_request_headers: Option<String>,
+    pub upstream_response_headers: Option<String>,
     pub upstream_request_id: Option<String>,
     pub upstream_protocol: Option<String>,
     pub protocol_bridge: Option<String>,
@@ -752,6 +756,7 @@ impl RouteRequestLogProducer {
             fallback_reason: None,
             upstream_authority: None,
             upstream_request_headers: None,
+            upstream_response_headers: None,
             upstream_request_id: None,
             upstream_protocol: None,
             protocol_bridge: None,
@@ -901,6 +906,7 @@ struct PendingEntry {
     fallback_reason: Option<String>,
     upstream_authority: Option<String>,
     upstream_request_headers: Option<String>,
+    upstream_response_headers: Option<String>,
     upstream_request_id: Option<String>,
     upstream_protocol: Option<String>,
     protocol_bridge: Option<String>,
@@ -1060,6 +1066,15 @@ impl RouteRequestLogProbe {
     pub(crate) fn set_upstream_request_headers(&self, headers: &str) {
         self.shield(|| {
             lock_unpoisoned(&self.shared.entry).upstream_request_headers =
+                Some(bounded_string_to(headers, MAX_LOG_HEADERS_BYTES));
+        });
+    }
+
+    /// 记录上游返回的响应头。适配线路与 WebSocket 握手各自写入一次，
+    /// 保留最后一次看到的值。
+    pub(crate) fn set_upstream_response_headers(&self, headers: &str) {
+        self.shield(|| {
+            lock_unpoisoned(&self.shared.entry).upstream_response_headers =
                 Some(bounded_string_to(headers, MAX_LOG_HEADERS_BYTES));
         });
     }
@@ -1369,6 +1384,7 @@ impl RouteRequestLogProbe {
             fallback_reason: pending.fallback_reason.take(),
             upstream_authority: pending.upstream_authority.take(),
             upstream_request_headers: pending.upstream_request_headers.take(),
+            upstream_response_headers: pending.upstream_response_headers.take(),
             upstream_request_id: pending.upstream_request_id.take(),
             upstream_protocol: pending.upstream_protocol.take(),
             protocol_bridge: pending.protocol_bridge.take(),
@@ -2122,6 +2138,7 @@ impl SqliteSink {
                 requested_service_tier TEXT,
                 service_tier TEXT,
                 upstream_request_headers TEXT,
+                upstream_response_headers TEXT,
                 request_input_state TEXT,
                 request_input_items INTEGER,
                 request_has_previous_response_id INTEGER,
@@ -2150,6 +2167,7 @@ impl SqliteSink {
             ("requested_service_tier", "TEXT"),
             ("service_tier", "TEXT"),
             ("upstream_request_headers", "TEXT"),
+            ("upstream_response_headers", "TEXT"),
             ("official_account_id", "TEXT"),
             ("request_input_state", "TEXT"),
             ("request_input_items", "INTEGER"),
@@ -2205,6 +2223,7 @@ impl SqliteSink {
                     first_byte_source, client_fingerprint, subagent, schema_version,
                     upstream_error_summary, codex_session_id, codex_session_is_parent,
                     requested_service_tier, service_tier, upstream_request_headers,
+                    upstream_response_headers,
                     official_account_id, request_input_state, request_input_items,
                     request_has_previous_response_id, request_bytes,
                     upstream_input_state, upstream_input_items,
@@ -2215,7 +2234,7 @@ impl SqliteSink {
                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
                     ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
                     ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
-                    ?51, ?52, ?53, ?54, ?55, ?56, ?57
+                    ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58
                 ) ON CONFLICT(request_id) DO NOTHING",
             )?;
             for queued in batch {
@@ -2269,6 +2288,7 @@ impl SqliteSink {
                     entry.requested_service_tier,
                     entry.service_tier,
                     entry.upstream_request_headers,
+                    entry.upstream_response_headers,
                     entry.official_account_id,
                     entry.request_input_state.map(RequestInputState::as_str),
                     entry.request_input_items.map(to_i64),
@@ -2384,6 +2404,11 @@ fn query_sqlite_route_request_logs(
     } else {
         "NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL"
     };
+    let response_header_column = if optional_columns.response_headers {
+        "upstream_response_headers"
+    } else {
+        "NULL"
+    };
     let select_sql = format!(
         "SELECT
             request_id, trace_id, timestamp_unix_ms, provider, provider_name,
@@ -2399,7 +2424,8 @@ fn query_sqlite_route_request_logs(
             upstream_request_id, upstream_protocol, protocol_bridge,
             first_byte_source, subagent, upstream_error_summary,
             codex_session_id, codex_session_is_parent, {tier_columns},
-            upstream_request_headers, {account_column}, {request_shape_columns}
+            upstream_request_headers, {account_column}, {request_shape_columns},
+            {response_header_column}
          FROM route_request_logs{where_clause}
          ORDER BY timestamp_unix_ms DESC, request_id DESC
          {pagination}"
@@ -2702,6 +2728,8 @@ struct RouteRequestLogOptionalColumns {
     official_account: bool,
     /// Request body shape summary columns written for every request.
     request_shape: bool,
+    /// 上游响应头列随 schema 版本 11 加入，旧库尚未迁移时按缺失处理。
+    response_headers: bool,
 }
 
 /// These columns are added by the writer at open time and never dropped, so a
@@ -2714,6 +2742,7 @@ fn sqlite_optional_columns(
     static TIERED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     static ACCOUNTED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     static SHAPED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    static RESPONSE_HEADER_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     Ok(RouteRequestLogOptionalColumns {
         tiers: sqlite_has_column(connection, path, &TIERED_PATHS, "service_tier")?,
         official_account: sqlite_has_column(
@@ -2723,6 +2752,12 @@ fn sqlite_optional_columns(
             "official_account_id",
         )?,
         request_shape: sqlite_has_column(connection, path, &SHAPED_PATHS, "request_bytes")?,
+        response_headers: sqlite_has_column(
+            connection,
+            path,
+            &RESPONSE_HEADER_PATHS,
+            "upstream_response_headers",
+        )?,
     })
 }
 
@@ -2816,6 +2851,7 @@ fn query_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRequest
         upstream_input_items: row_optional_u64(row, 52)?,
         upstream_has_previous_response_id: row.get(53)?,
         upstream_bytes: row_optional_u64(row, 54)?,
+        upstream_response_headers: row.get(55)?,
     })
 }
 
@@ -3249,6 +3285,9 @@ mod tests {
             fallback_reason: None,
             upstream_authority: Some("api.example.com".to_string()),
             upstream_request_headers: Some("authorization: [REDACTED]\nx-test: value".to_string()),
+            upstream_response_headers: Some(
+                "x-codex-turn-state: routed\nset-cookie: [REDACTED]".to_string(),
+            ),
             upstream_request_id: Some("upstream-id".to_string()),
             upstream_protocol: Some("OpenAI Responses".to_string()),
             protocol_bridge: Some("Responses passthrough".to_string()),
@@ -3385,6 +3424,47 @@ mod tests {
                 new.service_tier.as_deref()
             ),
             (Some("flex"), Some("default"))
+        );
+    }
+
+    #[test]
+    fn response_headers_column_migrates_history_and_roundtrips() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SQLITE_FILE_NAME);
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut legacy = sample_entry("legacy");
+        legacy.timestamp_unix_ms = unix_timestamp_ms();
+        sink.write_batch(&[queued(legacy)]).unwrap();
+        sink.connection
+            .execute_batch("ALTER TABLE route_request_logs DROP COLUMN upstream_response_headers;")
+            .unwrap();
+        drop(sink);
+        let page = query_route_request_logs(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery::default(),
+        )
+        .unwrap();
+        // 旧库缺少响应头列时查询照常返回，该字段按未记录处理。
+        assert_eq!(page.items[0].upstream_response_headers, None);
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut entry = sample_entry("response-headers");
+        entry.timestamp_unix_ms = unix_timestamp_ms();
+        sink.write_batch(&[queued(entry)]).unwrap();
+        let page = query_route_request_logs(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery::default(),
+        )
+        .unwrap();
+        let item = page
+            .items
+            .iter()
+            .find(|item| item.request_id == "response-headers")
+            .unwrap();
+        assert_eq!(
+            item.upstream_response_headers.as_deref(),
+            Some("x-codex-turn-state: routed\nset-cookie: [REDACTED]")
         );
     }
 
@@ -3856,6 +3936,10 @@ mod tests {
             page.items[0].upstream_request_headers.as_deref(),
             Some("authorization: [REDACTED]\nx-test: value")
         );
+        assert_eq!(
+            page.items[0].upstream_response_headers.as_deref(),
+            Some("x-codex-turn-state: routed\nset-cookie: [REDACTED]")
+        );
     }
 
     #[test]
@@ -4125,6 +4209,7 @@ mod tests {
             fallback_reason: None,
             upstream_authority: None,
             upstream_request_headers: None,
+            upstream_response_headers: None,
             upstream_request_id: None,
             upstream_protocol: None,
             protocol_bridge: None,

@@ -56,6 +56,11 @@ pub(crate) async fn prepare_upstream_response(
     probe: Option<&RouteRequestLogProbe>,
 ) -> Result<PreparedUpstreamResponse> {
     let deadline = upstream_response_body_deadline();
+    if let Some(probe) = probe {
+        probe.set_upstream_response_headers(&super::responses::format_upstream_response_headers(
+            response.headers(),
+        ));
+    }
     if response
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
