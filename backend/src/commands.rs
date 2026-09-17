@@ -2549,6 +2549,7 @@ fn redacted_config(config: &CodeyConfig) -> CodeyConfig {
             channel.kind,
             crate::notifications::NotificationChannelKind::Feishu
                 | crate::notifications::NotificationChannelKind::Wecom
+                | crate::notifications::NotificationChannelKind::Ntfy
         ) {
             channel.url.clear();
         }
