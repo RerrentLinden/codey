@@ -17,8 +17,6 @@ static OPTIMIZER_CLIENT: OnceLock<Client> = OnceLock::new();
 static LOOPBACK_OPTIMIZER_CLIENT: OnceLock<Client> = OnceLock::new();
 const CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
 const CODEX_INSTALLATION_ID_FILE: &str = "installation_id";
-const AUTHORIZATION_HEADER: &str = "authorization";
-const CHATGPT_ACCOUNT_ID_HEADER: &str = "chatgpt-account-id";
 
 fn optimizer_client(uses_codey_route: bool) -> Result<&'static Client, String> {
     let slot = if uses_codey_route {
@@ -54,29 +52,38 @@ async fn resolve_request_config(
         let endpoint = runtime.local_router_endpoint().ok_or_else(|| {
             "本地路由已关闭；请启用本地路由并重启 Codex，或改用手动配置".to_string()
         })?;
-        let mut request_headers = std::collections::BTreeMap::new();
-        request_headers.insert(local_router::ROUTER_AUTH_HEADER.to_string(), endpoint.token);
-        let uses_official_account = endpoint.requires_openai_auth
-            && codey_route_model_uses_official_account(&config, &optimization.model);
-        if uses_official_account {
-            request_headers.extend(read_official_auth_headers(codex_home())?);
-        }
-        return Ok(prompt_optimization::ResolvedPromptOptimizationConfig {
-            base_url: endpoint.base_url,
-            api_key: String::new(),
-            request_headers,
-            response_store: uses_official_account.then_some(false),
-            // Codey routes always ask for a streamed Responses body: some
-            // third-party relays only fill `output` for streamed requests and
-            // answer non-streamed ones with a billed but empty result.
-            response_stream: Some(true),
-            response_omit_max_output_tokens: uses_official_account,
-            model: optimization.model.clone(),
-            upstream_protocol: crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
-            instruction: optimization.instruction.clone(),
-        });
+        return Ok(resolve_codey_request_config(
+            &config,
+            optimization,
+            endpoint,
+        ));
     }
     resolve_manual_request_config_at(optimization, codex_home())
+}
+
+fn resolve_codey_request_config(
+    config: &crate::config::CodeyConfig,
+    optimization: &PromptOptimizationConfig,
+    endpoint: local_router::RuntimeRouterEndpoint,
+) -> prompt_optimization::ResolvedPromptOptimizationConfig {
+    let mut request_headers = BTreeMap::new();
+    request_headers.insert(local_router::ROUTER_AUTH_HEADER.to_string(), endpoint.token);
+    let uses_official_account =
+        codey_route_model_uses_official_account(config, &optimization.model);
+    prompt_optimization::ResolvedPromptOptimizationConfig {
+        base_url: endpoint.base_url,
+        api_key: String::new(),
+        request_headers,
+        response_store: uses_official_account.then_some(false),
+        // Codey routes always ask for a streamed Responses body: some
+        // third-party relays only fill `output` for streamed requests and
+        // answer non-streamed ones with a billed but empty result.
+        response_stream: Some(true),
+        response_omit_max_output_tokens: uses_official_account,
+        model: optimization.model.clone(),
+        upstream_protocol: crate::config::UPSTREAM_PROTOCOL_OPENAI_RESPONSES.to_string(),
+        instruction: optimization.instruction.clone(),
+    }
 }
 
 fn codey_route_model_uses_official_account(
@@ -90,7 +97,8 @@ fn codey_route_model_uses_official_account(
 
     let mut raw_match = None;
     for profile in &config.profiles {
-        if profile.official_account && !config.official_route_usable(profile) {
+        if !profile.enabled || (profile.official_account && !config.official_route_usable(profile))
+        {
             continue;
         }
         let provider_id = profile.provider_id();
@@ -114,20 +122,6 @@ fn codey_route_model_uses_official_account(
         }
     }
     raw_match.unwrap_or(false)
-}
-
-fn read_official_auth_headers(codex_home: &Path) -> Result<BTreeMap<String, String>, String> {
-    let auth = crate::account_usage::read_official_auth(&codex_home.join("auth.json"))
-        .map_err(|error| format!("读取 Codex 官方账号登录态失败：{error}"))?;
-    let mut headers = BTreeMap::new();
-    headers.insert(
-        AUTHORIZATION_HEADER.to_string(),
-        format!("Bearer {}", auth.access_token),
-    );
-    if let Some(account_id) = auth.account_id {
-        headers.insert(CHATGPT_ACCOUNT_ID_HEADER.to_string(), account_id);
-    }
-    Ok(headers)
 }
 
 fn resolve_manual_request_config_at(
@@ -305,31 +299,85 @@ mod tests {
     }
 
     #[test]
-    fn official_auth_headers_are_loaded_from_codex_auth_json() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(
-            directory.path().join("auth.json"),
-            serde_json::to_vec_pretty(&json!({
-                "auth_mode": "chatgpt",
-                "tokens": {
-                    "access_token": "access-token",
-                    "account_id": "account-123"
+    fn codey_route_parameters_follow_selected_route_independently_of_default_auth() {
+        let mut official = crate::config::ProviderProfile::new("官方账号2");
+        official.id = "official-two".to_string();
+        official.source_provider_id = Some("official-two".to_string());
+        official.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.to_string();
+        official.official_account_id = Some("account-two".to_string());
+        official.normalize();
+        let mut relay = crate::config::ProviderProfile::new("Relay");
+        relay.id = "relay-route".to_string();
+        relay.base_url = "https://relay.example/v1".to_string();
+        relay.normalize();
+        let mut config = crate::config::CodeyConfig {
+            profiles: vec![official, relay],
+            local_router_enabled: true,
+            official_account_available_this_launch: false,
+            ..crate::config::CodeyConfig::default()
+        };
+        config
+            .declared_official_models_by_provider
+            .insert("official-two".to_string(), vec!["gpt-5.6-luna".to_string()]);
+        config
+            .selected_models_by_provider
+            .insert("relay-route".to_string(), vec!["gpt-5.6-luna".to_string()]);
+
+        for default_auth_available in [false, true] {
+            config.official_account_available_this_launch = default_auth_available;
+            for requires_openai_auth in [false, true] {
+                for (model, official) in [
+                    ("official-two/gpt-5.6-luna", true),
+                    ("relay-route/gpt-5.6-luna", false),
+                    ("gpt-5.6-luna", false),
+                    ("missing/model", false),
+                    ("", false),
+                ] {
+                    let resolved = resolve_codey_request_config(
+                        &config,
+                        &PromptOptimizationConfig {
+                            model: model.to_string(),
+                            ..PromptOptimizationConfig::default()
+                        },
+                        local_router::RuntimeRouterEndpoint {
+                            base_url: "http://127.0.0.1:12345/v1".to_string(),
+                            token: "test-router-token".to_string(),
+                            supports_websockets: false,
+                            supports_remote_compaction: false,
+                            requires_openai_auth,
+                        },
+                    );
+                    assert_eq!(
+                        resolved.response_store,
+                        official.then_some(false),
+                        "{model}"
+                    );
+                    assert_eq!(
+                        resolved.response_omit_max_output_tokens, official,
+                        "{model}"
+                    );
+                    assert_eq!(resolved.response_stream, Some(true));
+                    assert_eq!(
+                        resolved.request_headers,
+                        BTreeMap::from([(
+                            local_router::ROUTER_AUTH_HEADER.to_string(),
+                            "test-router-token".to_string()
+                        ),])
+                    );
                 }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+            }
+        }
 
-        let headers = read_official_auth_headers(directory.path()).unwrap();
-
-        assert_eq!(
-            headers.get(AUTHORIZATION_HEADER).map(String::as_str),
-            Some("Bearer access-token")
-        );
-        assert_eq!(
-            headers.get(CHATGPT_ACCOUNT_ID_HEADER).map(String::as_str),
-            Some("account-123")
-        );
+        config.profiles[1].enabled = false;
+        assert!(codey_route_model_uses_official_account(
+            &config,
+            "gpt-5.6-luna"
+        ));
+        config.profiles[0].enabled = false;
+        assert!(!codey_route_model_uses_official_account(
+            &config,
+            "official-two/gpt-5.6-luna"
+        ));
     }
 
     #[test]
