@@ -1491,6 +1491,91 @@ test("thread settings model changes replace the old route before the next turn",
   runtime.patch.dispose();
 });
 
+test("qualified official selectors survive composer state requests", async () => {
+  const alias = "route-b/gpt-5.6-sol";
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["route-a/gpt-5.6-sol", alias],
+    default_model: alias,
+    model_metadata: ["route-a", "route-b"].map((routeProviderId) => ({
+      model: `${routeProviderId}/gpt-5.6-sol`,
+      display_name: `[官] gpt-5.6-sol`,
+      route_name: `官方线路 ${routeProviderId}`,
+      provider_id: "codey_router",
+      source_model: "gpt-5.6-sol",
+      route_provider_id: routeProviderId,
+      official_account: true,
+    })),
+  }, [statsigClient()]);
+  runtime.dispatchWindowEvent("message", {
+    data: {
+      type: "mcp-response",
+      message: {
+        id: "qualified-official-thread-list",
+        result: {
+          data: [{ id: "qualified-official-thread", modelProvider: "codey_router" }],
+        },
+      },
+    },
+  });
+
+  const start = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "qualified-official-start",
+      method: "thread/start",
+      params: { model: alias, modelProvider: "codey_router" },
+    },
+  });
+  assert.deepEqual(start.request.params, {
+    model: alias,
+    modelProvider: "codey_router",
+  });
+
+  const resumed = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "qualified-official-resume",
+      method: "thread/resume",
+      params: { threadId: "qualified-official-thread", model: alias },
+    },
+  });
+  assert.deepEqual(resumed.request.params, {
+    threadId: "qualified-official-thread",
+    model: alias,
+    modelProvider: "codey_router",
+  });
+
+  const selected = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "qualified-official-settings",
+      method: "thread/settings/update",
+      params: { threadId: "qualified-official-thread", model: alias },
+    },
+  });
+  assert.deepEqual(selected.request.params, {
+    threadId: "qualified-official-thread",
+    model: alias,
+  });
+  assert.equal(runtime.patch.isBlockedOutgoingMessage(selected), false);
+
+  const nextTurn = runtime.patch.rewriteOutgoingMessage({
+    type: "mcp-request",
+    request: {
+      id: "qualified-official-turn",
+      method: "turn/start",
+      params: { threadId: "qualified-official-thread" },
+    },
+  });
+  assert.deepEqual(nextTurn.request.params, {
+    threadId: "qualified-official-thread",
+    model: "gpt-5.6-sol",
+    responsesapiClientMetadata: { codey_route: "route-b" },
+  });
+  runtime.patch.dispose();
+});
+
 test("an explicit official settings choice beats an old same-id relay route", async () => {
   const runtime = await loadPatch({
     status: "ok",

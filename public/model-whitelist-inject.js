@@ -316,12 +316,16 @@
       ? (threadId ? knownThreadProvider(source) : paramsProviderId(source))
       : "";
     const routedProviderId = localRouterProviderId;
-    // Turns carry the route in metadata and send the upstream model id.
-    // Keep third-party selectors on thread requests without route metadata.
-    const routedModel = isOfficialRoute(route)
-      || (method === "turn/start" && routeProviderId)
-      ? cleanText(route?.sourceModel) || model
-      : model;
+    const turnSendsUpstreamModel = method === "turn/start" && Boolean(routeProviderId);
+    const officialRoute = isOfficialRoute(route);
+    let routedModel = model;
+    if (officialRoute) {
+      routedModel = turnSendsUpstreamModel
+        ? cleanText(route?.sourceModel) || model
+        : cleanText(route?.selectorModel) || cleanText(route?.sourceModel) || model;
+    } else if (turnSendsUpstreamModel) {
+      routedModel = cleanText(route?.sourceModel) || model;
+    }
     const next = { ...source };
     if (routedModel || Object.hasOwn(source, "model")) next.model = routedModel;
     delete next.model_provider;
