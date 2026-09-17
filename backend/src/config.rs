@@ -1528,6 +1528,43 @@ impl CodeyConfig {
             .collect()
     }
 
+    /// Whether one route can carry the Responses `input_image.detail=original`
+    /// hint end to end. Only the native Responses protocol preserves it;
+    /// adapted Chat Completions and Anthropic routes would have to drop or
+    /// rewrite the value, so their catalog entries must not advertise it.
+    pub(crate) fn route_supports_image_detail_original_this_launch(
+        &self,
+        profile: &ProviderProfile,
+    ) -> bool {
+        if !profile.enabled {
+            return false;
+        }
+        if profile.official_account {
+            return self.official_route_usable(profile);
+        }
+        profile.upstream_protocol == UPSTREAM_PROTOCOL_OPENAI_RESPONSES
+    }
+
+    /// Runtime catalog model IDs that may keep `supports_image_detail_original`.
+    pub(crate) fn runtime_image_detail_original_model_aliases(&self) -> Vec<String> {
+        let qualify_official = self.qualifies_official_model_ids();
+        self.profiles
+            .iter()
+            .filter(|profile| self.route_supports_image_detail_original_this_launch(profile))
+            .flat_map(|profile| {
+                let provider_id = profile.provider_id();
+                let models = if profile.official_account {
+                    self.enabled_official_route_models(provider_id)
+                } else {
+                    self.enabled_route_models(provider_id)
+                };
+                models
+                    .into_iter()
+                    .map(move |model| runtime_catalog_model_id(profile, &model, qualify_official))
+            })
+            .collect()
+    }
+
     /// Whether one route natively supports the Responses compaction contract
     /// this launch, including the current `/responses` trigger flow and the
     /// legacy standalone compact endpoint.
@@ -3311,6 +3348,53 @@ mod tests {
         assert_eq!(
             config.runtime_native_web_search_model_aliases(),
             vec![local_router::model_alias("route-search", "gpt-5.6-sol")]
+        );
+    }
+
+    #[test]
+    fn image_detail_original_requires_a_native_responses_route() {
+        let mut responses_route = ProviderProfile::new("原生线路");
+        responses_route.id = "route-native".into();
+        responses_route.base_url = "https://native.example/v1".into();
+        responses_route.api_key = "native-key".into();
+        responses_route.normalize();
+
+        let mut chat_route = ProviderProfile::new("兼容线路");
+        chat_route.id = "route-chat".into();
+        chat_route.base_url = "https://chat.example/v1".into();
+        chat_route.api_key = "chat-key".into();
+        chat_route.upstream_protocol = UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        chat_route.normalize();
+
+        let mut anthropic_route = ProviderProfile::new("anthropic 线路");
+        anthropic_route.id = "route-anthropic".into();
+        anthropic_route.base_url = "https://anthropic.example/v1".into();
+        anthropic_route.api_key = "anthropic-key".into();
+        anthropic_route.upstream_protocol = UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES.into();
+        anthropic_route.normalize();
+
+        let mut disabled_route = ProviderProfile::new("停用线路");
+        disabled_route.id = "route-off".into();
+        disabled_route.base_url = "https://off.example/v1".into();
+        disabled_route.api_key = "off-key".into();
+        disabled_route.enabled = false;
+        disabled_route.normalize();
+
+        let mut config = CodeyConfig {
+            active_profile_id: responses_route.id.clone(),
+            profiles: vec![responses_route, chat_route, anthropic_route, disabled_route],
+            ..CodeyConfig::default()
+        }
+        .normalize();
+        for provider_id in ["route-native", "route-chat", "route-anthropic", "route-off"] {
+            config
+                .selected_models_by_provider
+                .insert(provider_id.into(), vec!["shared-model".into()]);
+        }
+
+        assert_eq!(
+            config.runtime_image_detail_original_model_aliases(),
+            vec![local_router::model_alias("route-native", "shared-model")]
         );
     }
 

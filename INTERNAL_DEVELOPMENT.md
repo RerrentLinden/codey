@@ -56,7 +56,7 @@
 
 ## 协议转发与连接恢复
 
-原生 Responses 保留同一线路的完整 reasoning 内容及加密状态，跨线路切换清理上一供应商的 reasoning 状态。HTTP 转发把上游端到端响应头（含 `x-codex-turn-state` 粘性路由令牌）原样透传给下游，仅重写传输层头；Chat Completions、Anthropic Messages 转换消息、工具、图片、用量及流式事件。协议无法表达的必要内容在发送前拒绝，不静默裁剪历史。
+原生 Responses 保留同一线路的完整 reasoning 内容及加密状态，跨线路切换清理上一供应商的 reasoning 状态。HTTP 转发把上游端到端响应头（含 `x-codex-turn-state` 粘性路由令牌）原样透传给下游，仅重写传输层头；Chat Completions、Anthropic Messages 转换消息、工具、图片、用量及流式事件，并行工具调用产生的图片在该轮全部工具结果之后送出，保持调用与结果连续配对。目录只为原生 Responses 线路保留 `input_image.detail=original` 能力声明，兼容线路上的历史原图请求在转换时降级为 high。协议无法表达的必要内容在发送前拒绝，不静默裁剪历史。
 
 - 线路可配置独立上游代理（http/https/socks5）：该线路的转发、模型同步及官方额度查询改走专用客户端，并禁用上游 WebSocket；其余线路仍遵循系统代理。
 - HTTP 入口使用 HTTP 上游；WebSocket 入口按线路能力、系统代理和退避状态选择传输，连接按线路、配置和认证身份隔离复用。上游 HTTP 客户端统一配置保活与连接池，HTTP/2 使用固定流量窗口而不启用自适应窗口：自适应窗口会把初始连接窗口压回 65535，使新版 h2 对小 DATA 帧的洪泛保护过早在逐 token 的 SSE 上触发。WSS 共享 TLS 配置与按服务端域名隔离的会话缓存，保留证书校验并禁用 0-RTT；服务端不接受会话恢复时执行完整握手。

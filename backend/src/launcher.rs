@@ -598,6 +598,7 @@ async fn prepare_startup_model_catalog(
     let (runtime_upstream_models, runtime_selected_models) = config.runtime_catalog_models();
     let runtime_websocket_models = config.runtime_websocket_model_aliases();
     let runtime_native_web_search_models = config.runtime_native_web_search_model_aliases();
+    let runtime_image_detail_original_models = config.runtime_image_detail_original_model_aliases();
     let runtime_model_reasoning_efforts = config.runtime_model_reasoning_efforts();
     let runtime_model_contexts = config.runtime_model_contexts();
     let custom_context = !runtime_model_contexts.is_empty();
@@ -649,6 +650,7 @@ async fn prepare_startup_model_catalog(
                 &runtime_selected_models,
                 &runtime_websocket_models,
                 &runtime_native_web_search_models,
+                &runtime_image_detail_original_models,
                 &runtime_model_contexts,
                 &runtime_model_reasoning_efforts,
                 &catalog_codex_app_path,
@@ -657,6 +659,7 @@ async fn prepare_startup_model_catalog(
                 model_catalog::prepare_cached_catalog_for_current_capabilities(
                     &catalog_home,
                     &runtime_native_web_search_models,
+                    &runtime_image_detail_original_models,
                 )
                 .and_then(|available| {
                     if available {

@@ -194,6 +194,7 @@ pub fn refresh_for_provider(
         selected_models,
         None,
         None,
+        None,
         "",
     )
 }
@@ -213,6 +214,7 @@ pub(crate) fn refresh_for_provider_with_websocket_models(
         selected_models,
         Some(websocket_models),
         None,
+        None,
         "",
     )
 }
@@ -224,6 +226,7 @@ pub(crate) fn refresh_for_provider_with_capabilities(
     selected_models: &[String],
     websocket_models: &[String],
     native_web_search_models: &[String],
+    image_detail_original_models: &[String],
     codex_app_path: &str,
 ) -> Result<usize> {
     refresh_for_provider_with_transport_preferences(
@@ -233,6 +236,7 @@ pub(crate) fn refresh_for_provider_with_capabilities(
         selected_models,
         Some(websocket_models),
         Some(native_web_search_models),
+        Some(image_detail_original_models),
         codex_app_path,
     )
 }
@@ -246,6 +250,7 @@ pub(crate) fn refresh_for_provider_with_contexts(
     selected_models: &[String],
     websocket_models: &[String],
     native_web_search_models: &[String],
+    image_detail_original_models: &[String],
     contexts: &std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
     reasoning_efforts: &std::collections::BTreeMap<
         String,
@@ -260,6 +265,7 @@ pub(crate) fn refresh_for_provider_with_contexts(
         selected_models,
         websocket_models,
         native_web_search_models,
+        image_detail_original_models,
         codex_app_path,
     )?;
     apply_catalog_contexts(home, contexts)?;
@@ -444,6 +450,7 @@ fn refresh_for_provider_with_transport_preferences(
     selected_models: &[String],
     websocket_models: Option<&[String]>,
     native_web_search_models: Option<&[String]>,
+    image_detail_original_models: Option<&[String]>,
     codex_app_path: &str,
 ) -> Result<usize> {
     if !official_provider
@@ -593,6 +600,15 @@ fn refresh_for_provider_with_transport_preferences(
         .collect::<HashSet<_>>();
     for model in &mut catalog_models {
         gate_synthetic_native_web_search(model, &native_web_search_model_keys);
+    }
+    if let Some(image_detail_original_models) = image_detail_original_models {
+        let image_detail_original_model_keys = image_detail_original_models
+            .iter()
+            .map(|model| model_id::key(model))
+            .collect::<HashSet<_>>();
+        for model in &mut catalog_models {
+            gate_cached_image_detail_original(model, &image_detail_original_model_keys);
+        }
     }
     for model in &mut catalog_models {
         prepare_cached_context_window(model);
@@ -787,6 +803,7 @@ pub fn is_available(home: &Path) -> bool {
 pub(crate) fn prepare_cached_catalog_for_current_capabilities(
     home: &Path,
     native_web_search_models: &[String],
+    image_detail_original_models: &[String],
 ) -> Result<bool> {
     if !is_available(home) {
         return Ok(false);
@@ -797,10 +814,15 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
         .iter()
         .map(|model| model_id::key(model))
         .collect::<HashSet<_>>();
+    let image_detail_original_model_keys = image_detail_original_models
+        .iter()
+        .map(|model| model_id::key(model))
+        .collect::<HashSet<_>>();
     let mut changed = false;
     for model in &mut models {
         let previous = model.clone();
         gate_cached_native_web_search(model, &allowed_model_keys);
+        gate_cached_image_detail_original(model, &image_detail_original_model_keys);
         prepare_cached_context_window(model);
         changed |= *model != previous;
     }
@@ -812,6 +834,7 @@ pub(crate) fn prepare_cached_catalog_for_current_capabilities(
     let mut safely_gated_models = written_models.clone();
     for model in &mut safely_gated_models {
         gate_cached_native_web_search(model, &allowed_model_keys);
+        gate_cached_image_detail_original(model, &image_detail_original_model_keys);
         prepare_cached_context_window(model);
     }
     if safely_gated_models != written_models {
@@ -1861,6 +1884,22 @@ fn gate_cached_native_web_search(model: &mut Value, allowed_model_keys: &HashSet
     }
 }
 
+/// Chat Completions 与 Anthropic Messages 都没有 `input_image.detail=original`
+/// 的对应字段，Codex 只会按运行时目录里声明的能力决定是否发出这个值。适配
+/// 线路上必须清掉该声明，否则历史里已经存在的原图请求会被本地路由拒绝。
+fn gate_cached_image_detail_original(model: &mut Value, allowed_model_keys: &HashSet<String>) {
+    let allowed = model
+        .get("slug")
+        .and_then(Value::as_str)
+        .is_some_and(|slug| allowed_model_keys.contains(&model_id::key(slug)));
+    if allowed {
+        return;
+    }
+    if let Some(object) = model.as_object_mut() {
+        object.remove("supports_image_detail_original");
+    }
+}
+
 /// Restores the context fields of a reused catalog to their declared values and
 /// migrates the larger window an older Codey version wrote for selected models.
 fn prepare_cached_context_window(model: &mut Value) {
@@ -2195,6 +2234,22 @@ mod tests {
             .unwrap();
         sol["supports_search_tool"] = json!(true);
         sol["web_search_tool_type"] = json!("text_and_image");
+        fs::write(
+            home.join("models_cache.json"),
+            serde_json::to_vec(&cache).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_cache_with_image_detail_original(home: &Path) {
+        let mut cache = official_cache();
+        let sol = cache["models"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        sol["supports_image_detail_original"] = json!(true);
         fs::write(
             home.join("models_cache.json"),
             serde_json::to_vec(&cache).unwrap(),
@@ -3043,6 +3098,7 @@ mod tests {
             &selected,
             &[],
             &[],
+            &[],
             "",
         )
         .unwrap();
@@ -3059,7 +3115,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&catalog).unwrap()).unwrap();
 
         assert!(
-            prepare_cached_catalog_for_current_capabilities(home.path(), &[]).unwrap(),
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap(),
             "the legacy window must be rewritten"
         );
         let catalog: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -3075,6 +3131,80 @@ mod tests {
     }
 
     #[test]
+    fn image_detail_original_is_gated_by_route_protocol() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache_with_image_detail_original(home.path());
+        let selected = vec![
+            "route-native/gpt-5.6-sol".to_string(),
+            "route-chat/gpt-5.6-sol".to_string(),
+            "route-anthropic/gpt-5.6-sol".to_string(),
+        ];
+        let image_detail_original_models = vec!["route-native/gpt-5.6-sol".to_string()];
+
+        assert_eq!(
+            refresh_for_provider_with_capabilities(
+                home.path(),
+                false,
+                Some(&selected),
+                &selected,
+                &[],
+                &[],
+                &image_detail_original_models,
+                "",
+            )
+            .unwrap(),
+            selected.len()
+        );
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        let native = models
+            .iter()
+            .find(|model| model["slug"] == "route-native/gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(native["supports_image_detail_original"], true);
+        for slug in ["route-chat/gpt-5.6-sol", "route-anthropic/gpt-5.6-sol"] {
+            let adapted = models.iter().find(|model| model["slug"] == slug).unwrap();
+            assert!(
+                adapted.get("supports_image_detail_original").is_none(),
+                "{slug} 声明的能力必须随线路协议移除"
+            );
+        }
+    }
+
+    #[test]
+    fn cached_catalog_fallback_removes_stale_image_detail_original_metadata() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache_with_image_detail_original(home.path());
+        let selected = vec!["route-chat/gpt-5.6-sol".to_string()];
+
+        refresh_for_provider_with_capabilities(
+            home.path(),
+            false,
+            Some(&selected),
+            &selected,
+            &[],
+            &[],
+            &selected,
+            "",
+        )
+        .unwrap();
+        let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
+        let stale: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(stale["models"][0]["supports_image_detail_original"], true);
+
+        assert!(prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap());
+        let sanitized: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            sanitized["models"][0]
+                .get("supports_image_detail_original")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn model_reasoning_effort_override_applies_and_restores_the_template() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
@@ -3084,6 +3214,7 @@ mod tests {
             false,
             Some(&selected),
             &selected,
+            &[],
             &[],
             &[],
             "",
@@ -3194,6 +3325,7 @@ mod tests {
             &selected,
             &[],
             &native_web_search_models,
+            &[],
             "",
         )
         .unwrap();
@@ -3236,6 +3368,7 @@ mod tests {
             &selected,
             &[],
             &selected,
+            &[],
             "",
         )
         .unwrap();
@@ -3259,7 +3392,7 @@ mod tests {
         fs::write(&path, serde_json::to_vec_pretty(&stale).unwrap()).unwrap();
 
         assert!(
-            prepare_cached_catalog_for_current_capabilities(home.path(), &[]).unwrap(),
+            prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap(),
             "a valid cached catalog should remain usable after stale capabilities are removed"
         );
         let sanitized: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -3271,7 +3404,7 @@ mod tests {
         );
         let sanitized_bytes = fs::read(&path).unwrap();
 
-        assert!(prepare_cached_catalog_for_current_capabilities(home.path(), &[]).unwrap());
+        assert!(prepare_cached_catalog_for_current_capabilities(home.path(), &[], &[]).unwrap());
         assert_eq!(fs::read(&path).unwrap(), sanitized_bytes);
     }
 

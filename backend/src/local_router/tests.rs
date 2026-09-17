@@ -4044,6 +4044,139 @@ fn responses_tool_output_images_remain_visible_in_fallback_protocols() {
 }
 
 #[test]
+fn responses_image_detail_original_is_downgraded_for_adapted_protocols() {
+    let body = json!({
+        "model":"provider-model",
+        "input":[
+            {
+                "type":"message",
+                "role":"user",
+                "content":[
+                    {"type":"input_text","text":"inspect"},
+                    {
+                        "type":"input_image",
+                        "image_url":"https://example.invalid/a.png",
+                        "detail":"original"
+                    }
+                ]
+            }
+        ]
+    });
+
+    let chat = responses_to_chat_completions_body(&body).unwrap();
+    assert_eq!(
+        chat["messages"][0]["content"][1]["image_url"]["detail"],
+        "high"
+    );
+    assert_eq!(
+        chat["messages"][0]["content"][1]["image_url"]["url"],
+        "https://example.invalid/a.png"
+    );
+
+    // Anthropic Messages 复用同一套归一化，同样不会把原图请求整条拒绝。
+    assert!(responses_to_anthropic_messages_body(&body).is_ok());
+
+    let unknown = json!({
+        "type":"input_image",
+        "image_url":"https://example.invalid/a.png",
+        "detail":"ultra"
+    });
+    assert!(responses_image_url_to_chat_image_url(unknown.as_object().unwrap()).is_err());
+
+    // 内层 image_url 对象自带 original 时也必须归一，否则会原样透传给上游。
+    let nested = json!({
+        "type":"input_image",
+        "image_url":{"url":"https://example.invalid/b.png","detail":"original"}
+    });
+    assert_eq!(
+        responses_image_url_to_chat_image_url(nested.as_object().unwrap()).unwrap()["detail"],
+        "high"
+    );
+    let nested_invalid = json!({
+        "type":"input_image",
+        "image_url":{"url":"https://example.invalid/b.png","detail":"ultra"}
+    });
+    assert!(responses_image_url_to_chat_image_url(nested_invalid.as_object().unwrap()).is_err());
+
+    // 内层已声明 detail 时保持它，外层只作为缺省补充，与转换前的行为一致。
+    let conflict = json!({
+        "type":"input_image",
+        "image_url":{"url":"https://example.invalid/c.png","detail":"low"},
+        "detail":"original"
+    });
+    let converted = responses_image_url_to_chat_image_url(conflict.as_object().unwrap()).unwrap();
+    assert_eq!(converted["detail"], "low");
+    assert_eq!(converted["url"], "https://example.invalid/c.png");
+}
+
+#[test]
+fn parallel_tool_output_images_do_not_split_tool_result_groups() {
+    let body = json!({
+        "model":"provider-model",
+        "input":[
+            {"type":"function_call","call_id":"call-1","name":"inspect","arguments":"{}"},
+            {"type":"function_call","call_id":"call-2","name":"inspect","arguments":"{}"},
+            {"type":"function_call_output","call_id":"call-1","output":[
+                {"type":"input_text","text":"first"},
+                {"type":"input_image","image_url":"data:image/png;base64,aGVsbG8="}
+            ]},
+            {"type":"function_call_output","call_id":"call-2","output":[
+                {"type":"input_text","text":"second"},
+                {"type":"input_image","image_url":"data:image/png;base64,d29ybGQ="}
+            ]},
+            {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+        ],
+        "tools":[{
+            "type":"function",
+            "name":"inspect",
+            "parameters":{"type":"object"}
+        }]
+    });
+
+    let chat = responses_to_chat_completions_body(&body).unwrap();
+    let messages = chat["messages"].as_array().unwrap();
+    // 并行工具调用的结果必须连续出现，图片放在本轮工具结果之后。
+    assert_eq!(messages[0]["role"], "assistant");
+    assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 2);
+    assert_eq!(messages[1]["role"], "tool");
+    assert_eq!(messages[1]["tool_call_id"], "call-1");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[2]["tool_call_id"], "call-2");
+    let image_messages = messages[3..5]
+        .iter()
+        .map(|message| {
+            assert_eq!(message["role"], "user");
+            message["content"][0]["image_url"]["url"].as_str().unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        image_messages,
+        vec![
+            "data:image/png;base64,aGVsbG8=",
+            "data:image/png;base64,d29ybGQ="
+        ]
+    );
+    // 后续真实用户消息仍排在图片之后。
+    assert_eq!(messages[5]["role"], "user");
+    assert_eq!(messages[5]["content"][0]["text"], "continue");
+    assert_eq!(messages.len(), 6);
+
+    let anthropic = responses_to_anthropic_messages_body(&body).unwrap();
+    let messages = anthropic["messages"].as_array().unwrap();
+    assert_eq!(messages[0]["content"][0]["type"], "tool_use");
+    let result = messages[1]["content"].as_array().unwrap();
+    assert_eq!(result[0]["type"], "tool_result");
+    assert_eq!(result[0]["tool_use_id"], "call-1");
+    assert_eq!(result[1]["type"], "tool_result");
+    assert_eq!(result[1]["tool_use_id"], "call-2");
+    assert_eq!(result[2]["type"], "image");
+    assert_eq!(result[3]["type"], "image");
+    assert_eq!(result[4]["type"], "text");
+    assert_eq!(result[4]["text"], "continue");
+    assert_eq!(messages.len(), 2);
+}
+
+#[test]
 fn configured_duplicate_function_tools_are_deduplicated_without_merging_conflicts() {
     let string_lookup = json!({
         "type":"function",

@@ -14,11 +14,59 @@ pub(crate) fn append_chat_messages_from_responses_input(
             for item in items {
                 append_chat_message_item(item, messages, tool_bridge)?;
             }
+            move_tool_images_after_tool_results(messages);
             Ok(())
         }
         Value::Object(_) => append_chat_message_item(input, messages, tool_bridge),
         _ => anyhow::bail!("input 必须是字符串、对象或数组"),
     }
+}
+
+/// Chat Completions 要求 assistant 的 tool_calls 后紧跟对应的 tool 消息。
+/// 工具输出中的图片会额外生成 user 消息，多个并行调用时这些消息会插在
+/// tool 消息之间，部分上游据此判定工具结果不完整并拒绝整条请求。这里把
+/// 夹在 tool 消息序列中的图片消息移到本轮全部 tool 消息之后，既保留图片
+/// 内容，也保持调用与结果的配对完整。
+pub(crate) fn move_tool_images_after_tool_results(messages: &mut Vec<Value>) {
+    let mut ordered = Vec::with_capacity(messages.len());
+    let mut pending_images = Vec::new();
+    let mut in_tool_run = false;
+    for message in messages.drain(..) {
+        if message.get("role").and_then(Value::as_str) == Some("tool") {
+            in_tool_run = true;
+            ordered.push(message);
+            continue;
+        }
+        if in_tool_run && is_tool_image_message(&message) {
+            pending_images.push(message);
+            continue;
+        }
+        if !pending_images.is_empty() {
+            ordered.append(&mut pending_images);
+        }
+        in_tool_run = false;
+        ordered.push(message);
+    }
+    if !pending_images.is_empty() {
+        ordered.append(&mut pending_images);
+    }
+    *messages = ordered;
+}
+
+pub(crate) fn is_tool_image_message(message: &Value) -> bool {
+    let Some(object) = message.as_object() else {
+        return false;
+    };
+    if object.get("role").and_then(Value::as_str) != Some("user") {
+        return false;
+    }
+    let Some(parts) = object.get("content").and_then(Value::as_array) else {
+        return false;
+    };
+    !parts.is_empty()
+        && parts
+            .iter()
+            .all(|part| part.get("type").and_then(Value::as_str) == Some("image_url"))
 }
 
 pub(crate) fn append_chat_message_item(
@@ -316,22 +364,46 @@ pub(crate) fn responses_image_url_to_chat_image_url(
         Some(_) => anyhow::bail!("input_image.image_url 必须是字符串或对象"),
         None => anyhow::bail!("input_image 缺少 image_url"),
     };
-    if let Some(detail) = object.get("detail") {
-        let detail = detail
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("input_image.detail 必须是字符串"))?;
-        if !matches!(detail, "auto" | "low" | "high") {
-            anyhow::bail!(
-                "input_image.detail={detail} 不能无损转换为 Chat Completions image_url.detail"
-            );
-        }
-        if let Some(image_url) = image_url.as_object_mut() {
-            image_url
-                .entry("detail".to_string())
-                .or_insert_with(|| Value::String(detail.to_string()));
+    // Chat Completions 只有 auto、low、high 三档，Responses 的 original 只表示
+    // 希望保留原始图像细节，降级为 high 仍然把图片本身完整送达上游。目录门控负责
+    // 让兼容线路不再声明该能力，这里兜住尚未刷新的目录、历史会话和直接调用方，
+    // 使这类请求不再整条失败。外层 input_image 和内层 image_url 对象都允许携带
+    // detail，两处都要归一，否则无效取值会原样透传给上游。
+    let outer_detail = match object.get("detail") {
+        Some(detail) => Some(
+            detail
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("input_image.detail 必须是字符串"))
+                .and_then(normalize_chat_image_detail)?,
+        ),
+        None => None,
+    };
+    if let Some(image_url) = image_url.as_object_mut() {
+        let inner_detail = match image_url.get("detail") {
+            Some(detail) => Some(
+                detail
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("input_image.image_url.detail 必须是字符串"))
+                    .and_then(normalize_chat_image_detail)?,
+            ),
+            None => None,
+        };
+        // 内层取值优先，外层只作为缺省补充，与转换前的行为一致。
+        if let Some(detail) = inner_detail.or(outer_detail) {
+            image_url.insert("detail".to_string(), Value::String(detail.to_string()));
         }
     }
     Ok(image_url)
+}
+
+fn normalize_chat_image_detail(detail: &str) -> Result<&str> {
+    match detail {
+        "original" => Ok("high"),
+        detail @ ("auto" | "low" | "high") => Ok(detail),
+        detail => anyhow::bail!(
+            "input_image.detail={detail} 不能无损转换为 Chat Completions image_url.detail"
+        ),
+    }
 }
 
 pub(crate) fn append_single_content_part_as_user_message(
