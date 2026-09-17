@@ -26,29 +26,33 @@ fn refresh_model_catalog_or_fallback_at(
     let native_web_search_models = config.runtime_native_web_search_model_aliases();
     let image_detail_original_models = config.runtime_image_detail_original_model_aliases();
     let runtime_model_reasoning_efforts = config.runtime_model_reasoning_efforts();
+    let runtime_model_contexts = config.runtime_model_contexts();
+    let refresh = try_refresh_model_catalog(config, home);
+    let reused_cached_catalog = refresh.is_err();
     let result = model_catalog_fallback(
-        try_refresh_model_catalog(config, home),
+        refresh,
         home,
         &native_web_search_models,
         &image_detail_original_models,
     );
     match result {
         Ok(fallback) => {
-            if !config.runtime_model_contexts().is_empty() && !model_catalog::is_available(home) {
+            let available = model_catalog::is_available(home);
+            if !runtime_model_contexts.is_empty() && !available {
                 return Err(rollback_model_catalog_snapshot(
                     snapshot,
                     model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE.to_string(),
                 ));
             }
-            if model_catalog::is_available(home) {
-                if let Err(error) =
-                    model_catalog::apply_catalog_contexts(home, &config.runtime_model_contexts())
-                {
-                    return Err(rollback_model_catalog_snapshot(snapshot, error.to_string()));
-                }
-                if let Err(error) = model_catalog::apply_catalog_reasoning_efforts(
+            // Freshly generated catalogs already include both overrides. Only
+            // a reused catalog needs a separate, single read/write pass.
+            if reused_cached_catalog && available {
+                if let Err(error) = model_catalog::apply_catalog_overrides(
                     home,
-                    &runtime_model_reasoning_efforts,
+                    model_catalog::CatalogOverrides {
+                        contexts: &runtime_model_contexts,
+                        reasoning_efforts: &runtime_model_reasoning_efforts,
+                    },
                 ) {
                     return Err(rollback_model_catalog_snapshot(snapshot, error.to_string()));
                 }
@@ -86,14 +90,13 @@ async fn refreshed_model_state_at_async(
     let config = config.clone();
     let home = home.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let should_refresh = if refresh_only_when_populated {
-            should_refresh_model_catalog(&current_model_state_at(&config, &home)?)
-        } else {
-            true
-        };
-        let refresh = should_refresh
-            .then(|| refresh_model_catalog_or_fallback_at(&config, &home))
-            .transpose()?;
+        if refresh_only_when_populated {
+            let model_state = current_model_state_at(&config, &home)?;
+            if !should_refresh_model_catalog(&model_state) {
+                return Ok((None, model_state));
+            }
+        }
+        let refresh = Some(refresh_model_catalog_or_fallback_at(&config, &home)?);
         match current_model_state_at(&config, &home) {
             Ok(model_state) => Ok((refresh, model_state)),
             Err(error) => Err(rollback_model_catalog_after_config_save(refresh, error)),
@@ -276,7 +279,7 @@ fn try_refresh_model_catalog(config: &CodeyConfig, home: &std::path::Path) -> an
     let websocket_models = config.runtime_websocket_model_aliases();
     let native_web_search_models = config.runtime_native_web_search_model_aliases();
     let image_detail_original_models = config.runtime_image_detail_original_model_aliases();
-    model_catalog::refresh_for_provider_with_capabilities(
+    model_catalog::refresh_for_provider_with_contexts(
         home,
         config.official_account_available_this_launch && use_builtin_official_catalog,
         (!use_builtin_official_catalog)
@@ -287,6 +290,10 @@ fn try_refresh_model_catalog(config: &CodeyConfig, home: &std::path::Path) -> an
             websocket_models: Some(&websocket_models),
             native_web_search_models: Some(&native_web_search_models),
             image_detail_original_models: Some(&image_detail_original_models),
+        },
+        model_catalog::CatalogOverrides {
+            contexts: &config.runtime_model_contexts(),
+            reasoning_efforts: &config.runtime_model_reasoning_efforts(),
         },
         &config.codex_app_path,
     )

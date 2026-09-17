@@ -188,7 +188,7 @@ pub(crate) struct CapabilityLists<'a> {
     pub(crate) image_detail_original_models: Option<&'a [String]>,
 }
 
-/// 刷新完成后按模型写入的上下文与思考等级覆盖。
+/// 生成目录时一并应用的上下文与思考等级覆盖。
 #[derive(Clone, Copy)]
 pub(crate) struct CatalogOverrides<'a> {
     pub(crate) contexts: &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
@@ -203,7 +203,7 @@ pub fn refresh_for_provider(
     upstream_models: Option<&[String]>,
     selected_models: &[String],
 ) -> Result<usize> {
-    refresh_for_provider_with_transport_preferences(
+    refresh_for_provider_with_capabilities(
         home,
         official_provider,
         upstream_models,
@@ -221,7 +221,7 @@ pub(crate) fn refresh_for_provider_with_websocket_models(
     selected_models: &[String],
     websocket_models: &[String],
 ) -> Result<usize> {
-    refresh_for_provider_with_transport_preferences(
+    refresh_for_provider_with_capabilities(
         home,
         official_provider,
         upstream_models,
@@ -234,6 +234,7 @@ pub(crate) fn refresh_for_provider_with_websocket_models(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn refresh_for_provider_with_capabilities(
     home: &Path,
     official_provider: bool,
@@ -242,14 +243,15 @@ pub(crate) fn refresh_for_provider_with_capabilities(
     capabilities: CapabilityLists<'_>,
     codex_app_path: &str,
 ) -> Result<usize> {
-    refresh_for_provider_with_transport_preferences(
+    let models = render_catalog_for_provider(
         home,
         official_provider,
         upstream_models,
         selected_models,
         capabilities,
         codex_app_path,
-    )
+    )?;
+    write_verified_catalog(home, &models)
 }
 
 pub(crate) fn refresh_for_provider_with_contexts(
@@ -261,7 +263,7 @@ pub(crate) fn refresh_for_provider_with_contexts(
     overrides: CatalogOverrides<'_>,
     codex_app_path: &str,
 ) -> Result<usize> {
-    let count = refresh_for_provider_with_capabilities(
+    let mut models = render_catalog_for_provider(
         home,
         official_provider,
         upstream_models,
@@ -269,26 +271,36 @@ pub(crate) fn refresh_for_provider_with_contexts(
         capabilities,
         codex_app_path,
     )?;
-    apply_catalog_contexts(home, overrides.contexts)?;
-    apply_catalog_reasoning_efforts(home, overrides.reasoning_efforts)?;
-    Ok(count)
+    apply_overrides_to_models(&mut models, overrides)?;
+    write_verified_catalog(home, &models)
 }
 
-pub(crate) fn apply_catalog_contexts(
-    home: &Path,
-    contexts: &std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
-) -> Result<()> {
+pub(crate) fn apply_catalog_overrides(home: &Path, overrides: CatalogOverrides<'_>) -> Result<()> {
     let mut models = read_runtime_catalog_models(home)?;
-    for model in &mut models {
+    apply_overrides_to_models(&mut models, overrides)?;
+    write_verified_catalog(home, &models)?;
+    Ok(())
+}
+
+fn apply_overrides_to_models(models: &mut [Value], overrides: CatalogOverrides<'_>) -> Result<()> {
+    for model in models {
         let policy = model.get("slug").and_then(Value::as_str).and_then(|slug| {
-            contexts
+            overrides
+                .contexts
                 .iter()
                 .find(|(key, _)| model_id::equal(key, slug))
                 .map(|(_, policy)| policy)
         });
         apply_model_context(model, policy)?;
+        let declaration = model.get("slug").and_then(Value::as_str).and_then(|slug| {
+            overrides
+                .reasoning_efforts
+                .iter()
+                .find(|(key, _)| model_id::equal(key, slug))
+                .map(|(_, efforts)| efforts.as_slice())
+        });
+        apply_model_reasoning_efforts(model, declaration);
     }
-    write_verified_catalog(home, &models)?;
     Ok(())
 }
 
@@ -349,7 +361,8 @@ const REASONING_DECLARATION_FIELDS: [&str; 3] = [
     "supports_reasoning_summaries",
 ];
 
-pub(crate) fn apply_catalog_reasoning_efforts(
+#[cfg(test)]
+fn apply_catalog_reasoning_efforts(
     home: &Path,
     overrides: &std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
 ) -> Result<()> {
@@ -444,14 +457,14 @@ pub(crate) fn apply_model_reasoning_efforts(
     model["supports_reasoning_summaries"] = json!(!declaration.is_empty());
 }
 
-fn refresh_for_provider_with_transport_preferences(
+fn render_catalog_for_provider(
     home: &Path,
     official_provider: bool,
     upstream_models: Option<&[String]>,
     selected_models: &[String],
     capabilities: CapabilityLists<'_>,
     codex_app_path: &str,
-) -> Result<usize> {
+) -> Result<Vec<Value>> {
     let CapabilityLists {
         websocket_models,
         native_web_search_models,
@@ -461,7 +474,7 @@ fn refresh_for_provider_with_transport_preferences(
         && upstream_models.is_some_and(|models| models.is_empty())
         && selected_models.is_empty()
     {
-        return write_verified_catalog(home, &[]);
+        return Ok(Vec::new());
     }
     let mut official_models = read_official_entries(home)?;
     // Codex 26.908+ may never write `models_cache.json`; capture the CLI's own
@@ -623,7 +636,7 @@ fn refresh_for_provider_with_transport_preferences(
     if !catalog_models.is_empty() {
         ensure_runtime_compatible_models(&catalog_models)?;
     }
-    write_verified_catalog(home, &catalog_models)
+    Ok(catalog_models)
 }
 
 #[cfg(test)]
@@ -2226,6 +2239,209 @@ mod tests {
             serde_json::to_vec(&official_cache()).unwrap(),
         )
         .unwrap();
+    }
+
+    fn staged_catalog_refresh(home: &Path, selected: &[String], overrides: CatalogOverrides<'_>) {
+        refresh_for_provider_with_capabilities(
+            home,
+            false,
+            Some(selected),
+            selected,
+            CapabilityLists::default(),
+            "",
+        )
+        .unwrap();
+        let mut models = read_runtime_catalog_models(home).unwrap();
+        for model in &mut models {
+            let policy = model["slug"].as_str().and_then(|slug| {
+                overrides
+                    .contexts
+                    .iter()
+                    .find(|(key, _)| model_id::equal(key, slug))
+                    .map(|(_, policy)| policy)
+            });
+            apply_model_context(model, policy).unwrap();
+        }
+        write_verified_catalog(home, &models).unwrap();
+        apply_catalog_reasoning_efforts(home, overrides.reasoning_efforts).unwrap();
+    }
+
+    #[test]
+    fn combined_catalog_refresh_preserves_staged_context_and_reasoning_results() {
+        let staged = tempfile::tempdir().unwrap();
+        let combined = tempfile::tempdir().unwrap();
+        for home in [staged.path(), combined.path()] {
+            write_cache(home);
+        }
+        let selected = vec![
+            "route/gpt-5.6-sol".to_string(),
+            "route/custom-model".to_string(),
+        ];
+        let contexts = std::collections::BTreeMap::from([(
+            "ROUTE/GPT-5.6-SOL".to_string(),
+            crate::config::ModelContextConfig {
+                context_window_tokens: 256_000,
+                auto_compact_token_limit: Some(200_000),
+                reserve_output_tokens: Some(32_000),
+            },
+        )]);
+        let efforts = std::collections::BTreeMap::from([(
+            "route/gpt-5.6-sol".to_string(),
+            vec![crate::config::ModelReasoningEffort {
+                level: "high".into(),
+                value: "high".into(),
+            }],
+        )]);
+        let overrides = CatalogOverrides {
+            contexts: &contexts,
+            reasoning_efforts: &efforts,
+        };
+        staged_catalog_refresh(staged.path(), &selected, overrides);
+        refresh_for_provider_with_contexts(
+            combined.path(),
+            false,
+            Some(&selected),
+            &selected,
+            CapabilityLists::default(),
+            overrides,
+            "",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(staged.path().join(relative_path())).unwrap(),
+            fs::read(combined.path().join(relative_path())).unwrap()
+        );
+
+        // Removing a declaration from a cached catalog must restore its template.
+        let no_efforts = std::collections::BTreeMap::new();
+        apply_catalog_reasoning_efforts(staged.path(), &no_efforts).unwrap();
+        apply_catalog_overrides(
+            combined.path(),
+            CatalogOverrides {
+                contexts: &contexts,
+                reasoning_efforts: &no_efforts,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(staged.path().join(relative_path())).unwrap(),
+            fs::read(combined.path().join(relative_path())).unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_override_keeps_previous_catalog_for_generation_and_cached_updates() {
+        let home = tempfile::tempdir().unwrap();
+        write_cache(home.path());
+        let selected = vec!["route/gpt-5.6-sol".to_string()];
+        refresh_for_provider_with_capabilities(
+            home.path(),
+            false,
+            Some(&selected),
+            &selected,
+            CapabilityLists::default(),
+            "",
+        )
+        .unwrap();
+        let path = home.path().join(relative_path());
+        let original = fs::read(&path).unwrap();
+        let contexts = std::collections::BTreeMap::from([(
+            selected[0].clone(),
+            crate::config::ModelContextConfig {
+                context_window_tokens: 0,
+                auto_compact_token_limit: None,
+                reserve_output_tokens: None,
+            },
+        )]);
+        let efforts = std::collections::BTreeMap::new();
+        let overrides = CatalogOverrides {
+            contexts: &contexts,
+            reasoning_efforts: &efforts,
+        };
+        assert!(
+            refresh_for_provider_with_contexts(
+                home.path(),
+                false,
+                Some(&selected),
+                &selected,
+                CapabilityLists::default(),
+                overrides,
+                ""
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(apply_catalog_overrides(home.path(), overrides).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    #[ignore = "使用合成模型目录测量保存耗时，按需运行"]
+    fn benchmark_combined_catalog_refresh() {
+        let staged = tempfile::tempdir().unwrap();
+        let combined = tempfile::tempdir().unwrap();
+        let mut cache = official_cache();
+        for model in cache["models"].as_array_mut().unwrap() {
+            model["base_instructions"] =
+                json!("synthetic instructions for catalog benchmark\n".repeat(1_000));
+        }
+        let cache = serde_json::to_vec(&cache).unwrap();
+        for home in [staged.path(), combined.path()] {
+            fs::write(home.join("models_cache.json"), &cache).unwrap();
+        }
+        let selected = (0..24)
+            .map(|i| format!("route-{i}/gpt-5.6-sol"))
+            .collect::<Vec<_>>();
+        let contexts = selected
+            .iter()
+            .map(|slug| {
+                (
+                    slug.clone(),
+                    crate::config::ModelContextConfig {
+                        context_window_tokens: 256_000,
+                        auto_compact_token_limit: None,
+                        reserve_output_tokens: None,
+                    },
+                )
+            })
+            .collect();
+        let efforts = std::collections::BTreeMap::new();
+        let overrides = CatalogOverrides {
+            contexts: &contexts,
+            reasoning_efforts: &efforts,
+        };
+        let mut staged_us = Vec::new();
+        let mut combined_us = Vec::new();
+        for _ in 0..7 {
+            let started = std::time::Instant::now();
+            staged_catalog_refresh(staged.path(), &selected, overrides);
+            staged_us.push(started.elapsed().as_micros());
+            let started = std::time::Instant::now();
+            refresh_for_provider_with_contexts(
+                combined.path(),
+                false,
+                Some(&selected),
+                &selected,
+                CapabilityLists::default(),
+                overrides,
+                "",
+            )
+            .unwrap();
+            combined_us.push(started.elapsed().as_micros());
+        }
+        let bytes = fs::read(staged.path().join(relative_path())).unwrap();
+        assert_eq!(
+            bytes,
+            fs::read(combined.path().join(relative_path())).unwrap()
+        );
+        staged_us.sort_unstable();
+        combined_us.sort_unstable();
+        eprintln!(
+            "catalogBytes={} stagedMedianUs={} combinedMedianUs={}",
+            bytes.len(),
+            staged_us[3],
+            combined_us[3]
+        );
     }
 
     fn write_cache_with_native_web_search(home: &Path) {

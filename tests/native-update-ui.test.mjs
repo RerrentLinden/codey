@@ -4,27 +4,25 @@ import test from "node:test";
 
 const root = new URL("../", import.meta.url);
 
-test("startup update preflight completes before the first Codex launch", async () => {
+test("automatic update checks start after Codex launches and share runtime shutdown", async () => {
   const library = await readFile(
     new URL("backend/src/lib.rs", root),
     "utf8",
   );
-  const preflight = library.indexOf("startup_update::run(&state, &ui)");
-  const installExit = library.indexOf(
-    "StartupUpdateOutcome::InstallScheduled",
-    preflight,
-  );
+  const update = library.indexOf("startup_update::run(&state, &ui)");
   const launch = library.indexOf(
     "commands::launch_codey_runtime(&state).await",
-    preflight,
   );
 
-  assert.notEqual(preflight, -1);
-  assert.ok(preflight < installExit);
-  assert.ok(installExit < launch);
+  assert.notEqual(launch, -1);
+  assert.ok(launch < update);
   assert.match(
-    library.slice(installExit, launch),
-    /InstallScheduled \{\s*return Ok\(\(\)\);/,
+    library.slice(launch, update),
+    /Ok\(_\) => \{\s*break wait_for_runtime_shutdown\(/,
+  );
+  assert.match(
+    library,
+    /StartupUpdateOutcome::InstallScheduled \{[\s\S]*?return ShutdownReason::InstallUpdate;/,
   );
 });
 

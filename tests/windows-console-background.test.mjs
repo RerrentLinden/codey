@@ -36,8 +36,12 @@ test("Windows source contract: fatal startup failures remain visible", async () 
   const failureBranch = library.slice(failureStart, shutdownCleanup);
   assert.match(failureBranch, /commands::launch_codey_runtime\(&state\)\.await/);
   assert.match(failureBranch, /stop_runtime_with_retry\(&state\)\.await/);
-  assert.match(failureBranch, /show_initial_startup_failure\(&error\)\.await/);
-  assert.match(failureBranch, /return Err\(/);
+  assert.match(failureBranch, /finish_failed_startup\(/);
+  assert.match(
+    failureBranch,
+    /if let Err\(error\) = &result \{\s*show_initial_startup_failure\(error\)\.await;/,
+  );
+  assert.match(failureBranch, /return result\.map_err\(anyhow::Error::msg\)/);
 
   const cleanupHelper = library.slice(
     library.indexOf("async fn stop_runtime_with_retry"),

@@ -394,7 +394,8 @@ export function App({
       }));
     }
     setDirty(false);
-    await refreshStatus().catch(() => undefined);
+    // 保存结果已包含配置、模型和重启状态；其余运行状态在后台补充。
+    void refreshStatus().catch(() => undefined);
     return result;
   }
 

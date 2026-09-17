@@ -42,7 +42,7 @@ impl NativeUpdateUi {
         show_dialog(
             format!("发现 Codey v{latest_version} 更新"),
             format!(
-                "当前版本为 v{current_version}。是否现在下载、校验并安装更新？安装时 Codey 会退出，并尝试启动新版。"
+                "当前版本为 v{current_version}。是否现在下载、校验并安装更新？安装时会退出 Codex 和 Codey，并尝试启动新版。"
             ),
             DialogKind::Confirm,
             "更新并重启".to_string(),

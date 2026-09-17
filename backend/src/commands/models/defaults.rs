@@ -60,8 +60,10 @@ pub async fn save_official_route_models(
     requested_show_account_usage: Option<bool>,
     requested_upstream_proxy: Option<String>,
 ) -> Result<Value, String> {
+    let mut timings = ModelOperationTimings::new("save_official_route_models");
     validate_requested_model_list_bounds("官方模型", &requested_models)?;
     let _config_write_guard = state.config_write_lock.lock().await;
+    timings.mark("validationAndLockMs");
     let mut config = state.config.read().await.clone();
     ensure_local_route_config_writable(&config)?;
     let route_id = route_id.trim();
@@ -126,6 +128,7 @@ pub async fn save_official_route_models(
         crate::native_update_ui::confirm_context_recovery,
     )
     .await?;
+    timings.mark("prepareModelsMs");
     subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     config = config.normalize();
     config.settings_revision = config.settings_revision.saturating_add(1);
@@ -150,8 +153,11 @@ pub async fn save_official_route_models(
     *state.config.write().await = config.clone();
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
+    timings.mark("saveConfigMs");
     let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    timings.mark("modelDeliveryMs");
     let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+    timings.mark("subagentReloadMs");
     let restart_required = runtime_config_requires_restart(state, &config).await;
     let mut response = hot_reload.add_to_response(json!({
         "status":"ok",

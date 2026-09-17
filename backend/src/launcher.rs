@@ -661,13 +661,12 @@ async fn prepare_startup_model_catalog(
                 )
                 .and_then(|available| {
                     if available {
-                        model_catalog::apply_catalog_contexts(
+                        model_catalog::apply_catalog_overrides(
                             &catalog_home,
-                            &runtime_model_contexts,
-                        )?;
-                        model_catalog::apply_catalog_reasoning_efforts(
-                            &catalog_home,
-                            &runtime_model_reasoning_efforts,
+                            model_catalog::CatalogOverrides {
+                                contexts: &runtime_model_contexts,
+                                reasoning_efforts: &runtime_model_reasoning_efforts,
+                            },
                         )?;
                     }
                     Ok(available)

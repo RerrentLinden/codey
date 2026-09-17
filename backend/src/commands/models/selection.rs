@@ -17,6 +17,7 @@ pub async fn save_selected_models(
     >,
     requested_model_contexts: Option<BTreeMap<String, crate::config::ModelContextConfig>>,
 ) -> Result<Value, String> {
+    let mut timings = ModelOperationTimings::new("save_selected_models");
     validate_requested_model_list_bounds("官方模型", &requested_official_models)?;
     validate_requested_model_list_bounds("其他模型", &requested_third_party_models)?;
     validate_requested_model_list_bounds(
@@ -45,6 +46,7 @@ pub async fn save_selected_models(
         .await;
     }
     let _config_write_guard = state.config_write_lock.lock().await;
+    timings.mark("validationAndLockMs");
     let mut config = state.config.read().await.clone();
     ensure_local_route_config_writable(&config)?;
     let target_route_id = requested_route_id
@@ -165,6 +167,7 @@ pub async fn save_selected_models(
         crate::native_update_ui::confirm_context_recovery,
     )
     .await?;
+    timings.mark("prepareModelsMs");
     subagent_policy::reconcile_with_model_state(&mut config, Some(&model_state));
     config = config.normalize();
     config.settings_revision = config.settings_revision.saturating_add(1);
@@ -177,8 +180,11 @@ pub async fn save_selected_models(
     *state.config.write().await = config.clone();
     let public_config = redacted_config(&config);
     drop(_config_write_guard);
+    timings.mark("saveConfigMs");
     let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    timings.mark("modelDeliveryMs");
     let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+    timings.mark("subagentReloadMs");
     let restart_required = runtime_config_requires_restart(state, &config).await;
     Ok(add_subagent_hot_reload_to_response(
         hot_reload.add_to_response(json!({

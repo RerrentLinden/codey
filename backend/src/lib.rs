@@ -197,38 +197,27 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
         );
         eprintln!("Codey 启动前写入 codey_router 恢复兼容桩失败：{error:#}");
     }
-    // Resolving the default official account touches the account store and the
-    // Codex home, and the update check is a network round trip (up to 10 s).
-    // Neither depends on the other, so start the probe now and let the launch
-    // path collect it.
+    // Resolve the default official account while the launch path prepares its
+    // remaining state. Update checks start only after the runtime is ready.
     state.prewarm_official_account_probe().await;
-    let mut shutdown = Box::pin(shutdown_signal());
-    let startup_update = startup_update::run(&state, &ui);
-    tokio::pin!(startup_update);
-    let update_check_started = std::time::Instant::now();
-    let startup_update_outcome = tokio::select! {
-        outcome = &mut startup_update => outcome,
-        _ = &mut shutdown => return Ok(()),
+    // Register signal listeners during launch even though the update workflow
+    // no longer polls them before launching Codex.
+    let shutdown_task = tokio::spawn(shutdown_signal());
+    let shutdown = async {
+        let _ = shutdown_task.await;
     };
-    let _ = codey_runtime_core::diagnostic_log::append_diagnostic_log(
-        "launcher.update_check_timing",
-        serde_json::json!({ "updateCheckMs": update_check_started.elapsed().as_millis() as u64 }),
-    );
-    if startup_update_outcome == startup_update::StartupUpdateOutcome::InstallScheduled {
-        return Ok(());
-    }
+    tokio::pin!(shutdown);
     let shutdown_reason = loop {
         match commands::launch_codey_runtime(&state).await {
             Ok(_) => {
-                break tokio::select! {
-                    reason = state.wait_for_shutdown() => match reason {
-                        AppShutdownReason::CodexExited => ShutdownReason::CodexExited,
-                        AppShutdownReason::InstallUpdate => ShutdownReason::InstallUpdate,
-                    },
-                    _ = &mut shutdown => ShutdownReason::Signal,
-                };
+                break wait_for_runtime_shutdown(
+                    startup_update::run(&state, &ui),
+                    state.wait_for_shutdown(),
+                    &mut shutdown,
+                )
+                .await;
             }
-            Err(error) => {
+            Err(mut error) => {
                 eprintln!("Codey 自动启动 Codex 失败：{error:#}");
                 let context_recovery = error == model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE;
                 let cleanup = if context_recovery {
@@ -247,21 +236,26 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
                     );
                 }
                 if cleanup.is_ok() && context_recovery {
-                    let restored = commands::recover_default_context_budgets_for_launch(&state)
-                        .await
-                        .map_err(anyhow::Error::msg)?;
-                    if restored {
-                        continue;
+                    match commands::recover_default_context_budgets_for_launch(&state).await {
+                        Ok(true) => continue,
+                        Ok(false) => {}
+                        Err(recovery_error) => {
+                            error = format!("{error}；恢复默认上下文预算失败：{recovery_error}");
+                        }
                     }
-                    return Err(anyhow::Error::msg(error));
                 }
-                let error = initial_startup_failure_error(
+                let result = finish_failed_startup(
                     &error,
-                    cleanup.as_ref().err().map(String::as_str),
-                );
+                    cleanup,
+                    startup_update::run_after_launch_failure(&state, &ui),
+                    &mut shutdown,
+                )
+                .await;
                 #[cfg(windows)]
-                show_initial_startup_failure(&error).await;
-                return Err(anyhow::Error::msg(error));
+                if let Err(error) = &result {
+                    show_initial_startup_failure(error).await;
+                }
+                return result.map_err(anyhow::Error::msg);
             }
         }
     };
@@ -296,6 +290,58 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
         }
     }
     cleanup.map_err(anyhow::Error::msg)
+}
+
+async fn finish_failed_startup(
+    startup_error: &str,
+    cleanup: Result<(), String>,
+    update: impl std::future::Future<Output = startup_update::StartupUpdateOutcome>,
+    signal: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    // Only offer replacement after Codex has stopped and its temporary state
+    // has been restored. A failed cleanup must preserve its original error.
+    if cleanup.is_ok() {
+        tokio::select! {
+            biased;
+            _ = signal => return Ok(()),
+            outcome = update => {
+                if outcome == startup_update::StartupUpdateOutcome::InstallScheduled {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Err(initial_startup_failure_error(
+        startup_error,
+        cleanup.as_ref().err().map(String::as_str),
+    ))
+}
+
+async fn wait_for_runtime_shutdown(
+    update: impl std::future::Future<Output = startup_update::StartupUpdateOutcome>,
+    app_shutdown: impl std::future::Future<Output = AppShutdownReason>,
+    signal: impl std::future::Future<Output = ()>,
+) -> ShutdownReason {
+    tokio::pin!(update, app_shutdown, signal);
+    let mut update_pending = true;
+    loop {
+        tokio::select! {
+            biased;
+            reason = &mut app_shutdown => return match reason {
+                AppShutdownReason::CodexExited => ShutdownReason::CodexExited,
+                AppShutdownReason::InstallUpdate => ShutdownReason::InstallUpdate,
+            },
+            _ = &mut signal => return ShutdownReason::Signal,
+            outcome = &mut update, if update_pending => {
+                update_pending = false;
+                if outcome == startup_update::StartupUpdateOutcome::InstallScheduled {
+                    // The runtime is already running; installing must use the
+                    // same cleanup path as an update from the console.
+                    return ShutdownReason::InstallUpdate;
+                }
+            }
+        }
+    }
 }
 
 async fn stop_runtime_with_retry(state: &Arc<AppState>) -> Result<(), String> {
@@ -371,7 +417,128 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::initial_startup_failure_error;
+    use std::{future::pending, time::Duration};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_startup_keeps_error_when_no_update_is_installed() {
+        assert_eq!(
+            finish_failed_startup(
+                "Codex 启动失败",
+                Ok(()),
+                async { startup_update::StartupUpdateOutcome::Continue },
+                pending(),
+            )
+            .await,
+            Err("Codex 启动失败".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_startup_can_install_update_after_cleanup() {
+        assert_eq!(
+            finish_failed_startup(
+                "Codex 启动失败",
+                Ok(()),
+                async { startup_update::StartupUpdateOutcome::InstallScheduled },
+                pending(),
+            )
+            .await,
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_startup_does_not_poll_update_when_cleanup_failed() {
+        assert_eq!(
+            finish_failed_startup(
+                "Codex 启动失败",
+                Err("配置恢复失败".to_string()),
+                async { panic!("清理失败后不应检查或安装更新") },
+                pending(),
+            )
+            .await,
+            Err("Codex 启动失败；启动失败后的清理也失败：配置恢复失败".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_startup_update_can_be_cancelled_by_shutdown() {
+        assert_eq!(
+            finish_failed_startup("Codex 启动失败", Ok(()), pending(), async {}).await,
+            Ok(())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_update_check_does_not_delay_codex_exit() {
+        let started = tokio::time::Instant::now();
+        let reason = wait_for_runtime_shutdown(
+            async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                panic!("更新检查应随 Codex 退出而取消");
+            },
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                AppShutdownReason::CodexExited
+            },
+            pending(),
+        )
+        .await;
+        assert_eq!(reason, ShutdownReason::CodexExited);
+        assert_eq!(started.elapsed(), Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn shutdown_signal_cancels_pending_update() {
+        assert_eq!(
+            wait_for_runtime_shutdown(pending(), pending(), async {}).await,
+            ShutdownReason::Signal
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_update_check_keeps_runtime_alive_until_shutdown() {
+        let started = tokio::time::Instant::now();
+        let reason = wait_for_runtime_shutdown(
+            async { startup_update::StartupUpdateOutcome::Continue },
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                AppShutdownReason::InstallUpdate
+            },
+            pending(),
+        )
+        .await;
+        assert_eq!(reason, ShutdownReason::InstallUpdate);
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn confirmed_background_update_uses_runtime_shutdown() {
+        assert_eq!(
+            wait_for_runtime_shutdown(
+                async { startup_update::StartupUpdateOutcome::InstallScheduled },
+                pending(),
+                pending(),
+            )
+            .await,
+            ShutdownReason::InstallUpdate
+        );
+    }
+
+    #[tokio::test]
+    async fn ready_shutdown_prevents_starting_an_update() {
+        assert_eq!(
+            wait_for_runtime_shutdown(
+                async { panic!("退出时不应继续检查或安装更新") },
+                async { AppShutdownReason::CodexExited },
+                pending(),
+            )
+            .await,
+            ShutdownReason::CodexExited
+        );
+    }
 
     #[test]
     fn startup_failure_keeps_the_cleanup_error() {

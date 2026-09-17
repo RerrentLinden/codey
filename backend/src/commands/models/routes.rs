@@ -91,7 +91,9 @@ pub async fn fetch_route_models(
     route_id: String,
     expected_revision: u64,
 ) -> Result<Value, String> {
+    let mut timings = ModelOperationTimings::new("fetch_route_models");
     let _provider_model_sync_guard = state.provider_model_sync_lock.lock().await;
+    timings.mark("syncLockMs");
     let config = state.config.read().await.clone();
     if !config.local_router_enabled {
         return sync_native_current_provider_models(state, Some((route_id, expected_revision)))
@@ -118,7 +120,9 @@ pub async fn fetch_route_models(
         .await
         .map_err(|error| error.to_string())?;
     let visible_fetched_models = regular_route_models(fetched_models.clone());
+    timings.mark("fetchModelsMs");
     let _config_write_guard = state.config_write_lock.lock().await;
+    timings.mark("configLockMs");
     let mut latest = state.config.read().await.clone();
     ensure_local_route_config_writable(&latest)?;
     ensure_route_revision(&latest, expected_revision)?;
@@ -137,7 +141,6 @@ pub async fn fetch_route_models(
         codex_home(),
     );
     latest.settings_revision = latest.settings_revision.saturating_add(1);
-    let route_model_state = model_state_for_route_async(&latest, route_id).await?;
     let RefreshedModelState {
         refresh: catalog_refresh,
         model_state,
@@ -148,13 +151,29 @@ pub async fn fetch_route_models(
         crate::native_update_ui::confirm_context_recovery,
     )
     .await?;
+    let route_model_state = if latest.active_profile_id == route_id {
+        model_state.clone()
+    } else {
+        match model_state_for_route_async(&latest, route_id).await {
+            Ok(route_state) => route_state,
+            Err(error) => {
+                return Err(
+                    rollback_model_catalog_after_config_save_async(catalog_refresh, error).await,
+                );
+            }
+        }
+    };
+    timings.mark("prepareModelsMs");
     if let Err(error) = save_config_to_store(state, &latest).await {
         return Err(rollback_model_catalog_after_config_save_async(catalog_refresh, error).await);
     }
     *state.config.write().await = latest.clone();
     drop(_config_write_guard);
+    timings.mark("saveConfigMs");
     let hot_reload = hot_reload_runtime_models(state, &latest, &model_state).await;
+    timings.mark("modelDeliveryMs");
     let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &latest).await;
+    timings.mark("subagentReloadMs");
     let restart_required = runtime_config_requires_restart(state, &latest).await;
     Ok(add_subagent_hot_reload_to_response(
         hot_reload.add_to_response(json!({
