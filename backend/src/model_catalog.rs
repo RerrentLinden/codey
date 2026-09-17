@@ -16,10 +16,13 @@ const MODEL_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-official.json";
 /// no longer maintain `models_cache.json` on disk, so this snapshot is the
 /// durable source for models that need instruction-bearing entries.
 const DEBUG_CATALOG_RELATIVE_PATH: &str = "model-catalogs/codey-runtime-catalog.json";
-/// The CLI render takes seconds; an opportunistic refresh of a stale snapshot
-/// is attempted at most once per launch.
-static RUNTIME_SNAPSHOT_SYNC_ATTEMPTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Newest Codex CLI build whose catalog Codey already rendered in this process.
+/// The render takes seconds, so the same build is not consulted twice, while a
+/// Codex upgrade replaces the binary and its modification time and therefore
+/// lets a restart inside the same Codey process capture the new catalog.
+#[cfg(not(test))]
+static RUNTIME_SNAPSHOT_SYNC_ATTEMPTED: std::sync::Mutex<Option<std::time::SystemTime>> =
+    std::sync::Mutex::new(None);
 /// Context window an older Codey version wrote for models flagged as 1M capable.
 const LEGACY_1M_CONTEXT_WINDOW: u64 = 1_000_000;
 const DEFAULT_CONTEXT_WINDOW: u64 = 272_000;
@@ -46,13 +49,12 @@ const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
 /// it from the Codex model cache, so a retired slug has to leave this list in
 /// the same change; otherwise the picker keeps offering a model the account can
 /// no longer call.
-const OFFICIAL_MODELS: [(&str, &str); 6] = [
+const OFFICIAL_MODELS: [(&str, &str); 5] = [
     ("gpt-6-astra", "GPT-6-Astra"),
     ("gpt-5.6-sol", "GPT-5.6-Sol"),
     ("gpt-5.6-terra", "GPT-5.6-Terra"),
     ("gpt-5.6-luna", "GPT-5.6-Luna"),
     ("gpt-5.5", "GPT-5.5"),
-    ("gpt-5.3-codex-spark", "GPT-5.3-Codex-Spark"),
 ];
 
 #[derive(Debug)]
@@ -192,6 +194,7 @@ pub fn refresh_for_provider(
         selected_models,
         None,
         None,
+        "",
     )
 }
 
@@ -210,6 +213,7 @@ pub(crate) fn refresh_for_provider_with_websocket_models(
         selected_models,
         Some(websocket_models),
         None,
+        "",
     )
 }
 
@@ -220,6 +224,7 @@ pub(crate) fn refresh_for_provider_with_capabilities(
     selected_models: &[String],
     websocket_models: &[String],
     native_web_search_models: &[String],
+    codex_app_path: &str,
 ) -> Result<usize> {
     refresh_for_provider_with_transport_preferences(
         home,
@@ -228,6 +233,7 @@ pub(crate) fn refresh_for_provider_with_capabilities(
         selected_models,
         Some(websocket_models),
         Some(native_web_search_models),
+        codex_app_path,
     )
 }
 
@@ -245,6 +251,7 @@ pub(crate) fn refresh_for_provider_with_contexts(
         String,
         Vec<crate::config::ModelReasoningEffort>,
     >,
+    codex_app_path: &str,
 ) -> Result<usize> {
     let count = refresh_for_provider_with_capabilities(
         home,
@@ -253,6 +260,7 @@ pub(crate) fn refresh_for_provider_with_contexts(
         selected_models,
         websocket_models,
         native_web_search_models,
+        codex_app_path,
     )?;
     apply_catalog_contexts(home, contexts)?;
     apply_catalog_reasoning_efforts(home, reasoning_efforts)?;
@@ -436,6 +444,7 @@ fn refresh_for_provider_with_transport_preferences(
     selected_models: &[String],
     websocket_models: Option<&[String]>,
     native_web_search_models: Option<&[String]>,
+    codex_app_path: &str,
 ) -> Result<usize> {
     if !official_provider
         && upstream_models.is_some_and(|models| models.is_empty())
@@ -446,19 +455,18 @@ fn refresh_for_provider_with_transport_preferences(
     let mut official_models = read_official_entries(home)?;
     // Codex 26.908+ may never write `models_cache.json`; capture the CLI's own
     // catalog before declaring the runtime cache unusable. A snapshot older
-    // than the newest local Codex binary is refreshed once per launch so a
+    // than the local Codex binary is refreshed again so a
     // Codex upgrade does not keep serving stale instructions.
     let sources_unusable = official_models
         .iter()
         .all(|model| model_instruction_source(model).is_none());
-    let stale_snapshot = !sources_unusable
-        && runtime_snapshot_is_stale(home)
-        && !RUNTIME_SNAPSHOT_SYNC_ATTEMPTED.swap(true, std::sync::atomic::Ordering::Relaxed);
+    let stale_snapshot = !sources_unusable && runtime_snapshot_is_stale(home, codex_app_path);
     if sources_unusable || stale_snapshot {
-        let snapshot_synced = sync_runtime_catalog_snapshot(home).unwrap_or_else(|error| {
-            eprintln!("读取 Codex 命令行模型清单失败：{error:#}");
-            false
-        });
+        let snapshot_synced =
+            sync_runtime_catalog_snapshot(home, codex_app_path).unwrap_or_else(|error| {
+                eprintln!("读取 Codex 命令行模型清单失败：{error:#}");
+                false
+            });
         if snapshot_synced {
             official_models = read_official_entries(home)?;
         }
@@ -841,11 +849,7 @@ fn catalog_signature(paths: &[PathBuf]) -> CatalogSignature {
 }
 
 fn read_official_entries(home: &Path) -> Result<std::sync::Arc<Vec<Value>>> {
-    let paths = vec![
-        home.join("models_cache.json"),
-        home.join(DEBUG_CATALOG_RELATIVE_PATH),
-        home.join(relative_path()),
-    ];
+    let paths = ordered_catalog_sources(home);
     let signature = catalog_signature(&paths);
     let cache = OFFICIAL_ENTRIES_CACHE.get_or_init(|| std::sync::Mutex::new(None));
     if let Ok(guard) = cache.lock()
@@ -861,6 +865,29 @@ fn read_official_entries(home: &Path) -> Result<std::sync::Arc<Vec<Value>>> {
         *guard = Some((signature, std::sync::Arc::clone(&entries)));
     }
     Ok(entries)
+}
+
+/// Raw catalog sources, newest first. A snapshot is captured only when it is
+/// missing or older than the installed Codex, so whenever it is newer than
+/// `models_cache.json` it carries instructions the cache cannot: without this
+/// ordering a Codex upgrade that stops maintaining the cache would keep the
+/// pre-upgrade instructions forever, and the refresh would be wasted work.
+/// Missing files sort last; they contribute nothing either way.
+fn ordered_catalog_sources(home: &Path) -> Vec<PathBuf> {
+    let mut raw = [
+        home.join("models_cache.json"),
+        home.join(DEBUG_CATALOG_RELATIVE_PATH),
+    ];
+    raw.sort_by_key(|path| {
+        std::cmp::Reverse(
+            fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+        )
+    });
+    raw.into_iter()
+        .chain([home.join(relative_path())])
+        .collect()
 }
 
 fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
@@ -939,30 +966,82 @@ fn read_official_entries_uncached(paths: &[PathBuf]) -> Result<Vec<Value>> {
         .collect()
 }
 
-/// The snapshot predates the newest local Codex CLI: the install was upgraded
-/// since the capture, so the stored instructions may be stale. Absence of the
-/// snapshot is not staleness — the unusable-sources path captures it anyway.
-#[cfg(not(test))]
-fn runtime_snapshot_is_stale(home: &Path) -> bool {
-    let Some(snapshot_mtime) = fs::metadata(home.join(DEBUG_CATALOG_RELATIVE_PATH))
-        .and_then(|metadata| metadata.modified())
-        .ok()
-    else {
-        return false;
-    };
-    codex_cli_candidates()
+/// The same install keeps different Codex builds in its staged and app
+/// directories, so the stamp covers every candidate: a newer build anywhere is
+/// enough to justify re-rendering the catalog once.
+fn codex_cli_stamp_for(candidates: &[PathBuf]) -> Option<std::time::SystemTime> {
+    candidates
         .iter()
         .filter_map(|path| {
             path.metadata()
                 .and_then(|metadata| metadata.modified())
                 .ok()
         })
-        .any(|mtime| mtime > snapshot_mtime)
+        .max()
 }
 
+/// The snapshot is missing or predates the local Codex CLI. A missing snapshot
+/// counts as stale because a Codex upgrade that arrives without a
+/// `models_cache.json` has no other way to produce one, while an existing
+/// instruction-bearing source would otherwise suppress the capture.
+#[cfg(not(test))]
+fn runtime_snapshot_is_stale(home: &Path, codex_app_path: &str) -> bool {
+    let snapshot_mtime = fs::metadata(home.join(DEBUG_CATALOG_RELATIVE_PATH))
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    runtime_snapshot_is_stale_at(
+        snapshot_mtime,
+        codex_cli_stamp_for(&codex_cli_candidates_for(codex_app_path)),
+    )
+}
+
+fn runtime_snapshot_is_stale_at(
+    snapshot_mtime: Option<std::time::SystemTime>,
+    cli_stamp: Option<std::time::SystemTime>,
+) -> bool {
+    let Some(cli_stamp) = cli_stamp else {
+        return false;
+    };
+    snapshot_mtime.is_none_or(|snapshot_mtime| cli_stamp > snapshot_mtime)
+}
+
+/// Unit tests never run the Codex CLI installed on the build machine, and the
+/// snapshot capture itself is stubbed there. Staleness stays reachable through
+/// `runtime_snapshot_is_stale_at` so the decision logic can still be tested.
 #[cfg(test)]
-fn runtime_snapshot_is_stale(_home: &Path) -> bool {
+fn runtime_snapshot_is_stale(_home: &Path, _codex_app_path: &str) -> bool {
     false
+}
+
+/// Claims the right to render the catalog for the current local Codex build.
+/// The claim is released again when the render fails so a later launch in the
+/// same process can retry.
+fn claim_snapshot_sync_slot(
+    attempted: &std::sync::Mutex<Option<std::time::SystemTime>>,
+    stamp: Option<std::time::SystemTime>,
+) -> bool {
+    let Ok(mut attempted) = attempted.lock() else {
+        return true;
+    };
+    if stamp.is_some() && *attempted == stamp {
+        return false;
+    }
+    *attempted = stamp;
+    true
+}
+
+fn release_snapshot_sync_slot(
+    attempted: &std::sync::Mutex<Option<std::time::SystemTime>>,
+    stamp: Option<std::time::SystemTime>,
+) {
+    if stamp.is_none() {
+        return;
+    }
+    if let Ok(mut attempted) = attempted.lock()
+        && *attempted == stamp
+    {
+        *attempted = None;
+    }
 }
 
 /// Codex 26.908.x stopped maintaining `models_cache.json` on disk. When no
@@ -970,9 +1049,16 @@ fn runtime_snapshot_is_stale(_home: &Path) -> bool {
 /// to render its catalog and keep the output as a Codey-owned snapshot that
 /// `read_official_entries` picks up like any other source.
 #[cfg(not(test))]
-fn sync_runtime_catalog_snapshot(home: &Path) -> Result<bool> {
-    let Some(models) = debug_model_entries(home) else {
+fn sync_runtime_catalog_snapshot(home: &Path, codex_app_path: &str) -> Result<bool> {
+    let candidates = codex_cli_candidates_for(codex_app_path);
+    let stamp = codex_cli_stamp_for(&candidates);
+    if !claim_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, stamp) {
+        return Ok(false);
+    }
+    let Some(models) = debug_model_entries(home, &candidates) else {
         eprintln!("本机 Codex 命令行未产出可用的模型清单快照");
+        // Nothing was captured, so a later launch in this process may retry.
+        release_snapshot_sync_slot(&RUNTIME_SNAPSHOT_SYNC_ATTEMPTED, stamp);
         return Ok(false);
     };
     let catalog = serde_json::to_vec_pretty(&json!({ "models": models }))
@@ -982,21 +1068,26 @@ fn sync_runtime_catalog_snapshot(home: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Renders the runtime catalog through the Codex CLI. Prefers the full output
-/// (which merges remote models for signed-in accounts) and falls back to the
-/// bundled copy when the live render fails.
+/// Unit tests must never invoke the Codex CLI installed on the machine running
+/// them: the render is slow, needs account state, and would write a real
+/// snapshot. The surrounding logic is covered through the pure helpers below.
+#[cfg(test)]
+fn sync_runtime_catalog_snapshot(_home: &Path, _codex_app_path: &str) -> Result<bool> {
+    Ok(false)
+}
+
 #[cfg(not(test))]
-fn debug_model_entries(home: &Path) -> Option<Vec<Value>> {
-    for cli in codex_cli_candidates() {
+fn debug_model_entries(home: &Path, candidates: &[PathBuf]) -> Option<Vec<Value>> {
+    for cli in candidates {
         for bundled in [false, true] {
-            let Some(output) = run_codex_debug_models(&cli, home, bundled) else {
+            let Some(output) = run_codex_debug_models(cli, home, bundled) else {
                 continue;
             };
             let Ok(value) = serde_json::from_slice::<Value>(&output) else {
                 continue;
             };
             let models = official_models_from_value(&value);
-            if models.iter().any(model_is_runtime_source_compatible) {
+            if snapshot_covers_official_models(&models) {
                 return Some(models);
             }
         }
@@ -1004,14 +1095,42 @@ fn debug_model_entries(home: &Path) -> Option<Vec<Value>> {
     None
 }
 
+/// A snapshot is only worth persisting when it can serve every fixed official
+/// model. A partial render (for example one that lost a model to an upstream
+/// retirement, or a signed-out render missing account models) would otherwise
+/// be frozen on disk and quietly suppress later capture attempts.
+///
+/// Only the instruction source is checked: `normalize_official_model` fills a
+/// missing description from the display name, while nothing can invent the
+/// instructions a model needs to run.
+fn snapshot_covers_official_models(models: &[Value]) -> bool {
+    OFFICIAL_MODELS.iter().all(|(slug, _)| {
+        models.iter().any(|model| {
+            model.get("slug").and_then(Value::as_str) == Some(*slug)
+                && model_instruction_source(model).is_some()
+        })
+    })
+}
+
+/// Candidates are ordered the way the launch resolves its own runtime: the
+/// configured app directory first, then the staged copy Codey keeps for
+/// packages that cannot be executed in place, then any other installed copy.
 #[cfg(not(test))]
-fn codex_cli_candidates() -> Vec<PathBuf> {
+fn codex_cli_candidates_for(codex_app_path: &str) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut push = |path: PathBuf| {
         if path.is_file() && !candidates.contains(&path) {
             candidates.push(path);
         }
     };
+    let configured = codex_app_path.trim();
+    if !configured.is_empty()
+        && let Some(app_dir) =
+            codey_runtime_core::app_paths::resolve_codex_app_dir(Some(Path::new(configured)))
+        && let Some(executable) = codey_runtime_core::app_paths::codex_runtime_executable(&app_dir)
+    {
+        push(executable);
+    }
     // The staged copy is verified runnable (the WindowsApps package location
     // needs special execution rights), so it comes before the app resources.
     for path in hashed_cli_dirs("Codey", "codex-runtime") {
@@ -1074,11 +1193,6 @@ fn cli_on_path() -> Option<PathBuf> {
             .map(|dir| dir.join(name))
             .find(|candidate| candidate.is_file())
     })
-}
-
-#[cfg(test)]
-fn sync_runtime_catalog_snapshot(_home: &Path) -> Result<bool> {
-    Ok(false)
 }
 
 #[cfg(not(test))]
@@ -2000,12 +2114,15 @@ mod tests {
                     "service_tiers": [{"id": "priority"}],
                     "additional_speed_tiers": ["fast"]
                 },
+                // Upstream retired this slug and the fixed official list no
+                // longer carries it; an old cache that still holds it must not
+                // bring it back into the generated catalog.
                 {
                     "slug": "gpt-5.3-codex-spark",
                     "display_name": "GPT-5.3-Codex-Spark",
                     "visibility": "list",
                     "priority": 30,
-                    "supported_in_api": false,
+                    "supported_in_api": true,
                     "default_reasoning_level": "high",
                     "supported_reasoning_levels": [
                         {"effort": "low"}, {"effort": "medium"},
@@ -2192,10 +2309,6 @@ mod tests {
         );
     }
 
-    fn assert_no_native_fast(model: &Value) {
-        assert!(!declares_fast_speed_support(model));
-    }
-
     #[test]
     fn official_catalog_keeps_the_fixed_order_and_native_fast_metadata() {
         let home = tempfile::tempdir().unwrap();
@@ -2246,13 +2359,13 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.6-luna")
             .unwrap();
         assert_eq!(luna["multi_agent_version"], "v1");
-        let spark = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
-            .unwrap();
-        assert_eq!(spark["supported_in_api"], true);
-        assert_eq!(spark["supports_reasoning_summaries"], true);
-        assert_no_native_fast(spark);
+        // Upstream retired this slug, so a cache that still carries it must not
+        // put it back into the generated catalog.
+        assert!(
+            !models
+                .iter()
+                .any(|model| model["slug"] == "gpt-5.3-codex-spark")
+        );
         assert_eq!(
             models
                 .iter()
@@ -2293,7 +2406,7 @@ mod tests {
         assert_eq!(marker("gpt-5.6-sol"), Some("v2"));
         assert_eq!(marker("gpt-5.6-terra"), Some("v2"));
         assert_eq!(marker("gpt-5.6-luna"), Some("v1"));
-        assert_eq!(marker("gpt-5.3-codex-spark"), Some("disabled"));
+        assert_eq!(marker("gpt-5.3-codex-spark"), None);
         assert_eq!(marker("gpt-5.5"), None);
     }
 
@@ -2301,11 +2414,7 @@ mod tests {
     fn generated_catalog_keeps_leaf_models_without_v2_coordinator_markers() {
         let home = tempfile::tempdir().unwrap();
         write_cache(home.path());
-        let upstream = vec![
-            "gpt-5.6-luna".into(),
-            "gpt-5.3-codex-spark".into(),
-            "provider-custom-model".into(),
-        ];
+        let upstream = vec!["gpt-5.6-luna".into(), "provider-custom-model".into()];
 
         refresh_for_provider(home.path(), false, Some(&upstream), &upstream).unwrap();
 
@@ -2319,11 +2428,13 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.6-luna")
             .unwrap();
         assert_eq!(luna["multi_agent_version"], "v1");
-        let spark = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
-            .unwrap();
-        assert_eq!(spark["multi_agent_version"], "disabled");
+        // A retired upstream slug is no longer part of the fixed official list,
+        // so a route that still advertises it must not resurrect the entry.
+        assert!(
+            !models
+                .iter()
+                .any(|model| model["slug"] == "gpt-5.3-codex-spark")
+        );
         let custom = models
             .iter()
             .find(|model| model["slug"] == "provider-custom-model")
@@ -2406,7 +2517,7 @@ mod tests {
             .remove("description");
         models
             .iter_mut()
-            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
+            .find(|model| model["slug"] == "gpt-5.6-luna")
             .unwrap()["description"] = json!("   ");
         fs::write(
             home.path().join("models_cache.json"),
@@ -2433,7 +2544,7 @@ mod tests {
             .find(|model| model["slug"] == "gpt-5.6-sol")
             .unwrap();
         assert_eq!(sol["description"], "Local Sol description");
-        for slug in ["gpt-5.5", "gpt-5.3-codex-spark"] {
+        for slug in ["gpt-5.5", "gpt-5.6-luna"] {
             let model = models.iter().find(|model| model["slug"] == slug).unwrap();
             assert_eq!(model["description"], model["display_name"]);
         }
@@ -2609,11 +2720,13 @@ mod tests {
                 "gpt-5.5",
             ]
         );
-        let spark = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
-            .unwrap();
-        assert_no_native_fast(spark);
+        // The retired slug must not reappear just because an old cache carried
+        // native fast metadata for it.
+        assert!(
+            !models
+                .iter()
+                .any(|model| model["slug"] == "gpt-5.3-codex-spark")
+        );
     }
 
     #[test]
@@ -2623,14 +2736,13 @@ mod tests {
         let upstream = vec![
             "gpt-5.6-sol".into(),
             "gpt-5.5".into(),
-            "gpt-5.3-codex-spark".into(),
             "claude-sonnet".into(),
         ];
         let selected = upstream.clone();
 
         assert_eq!(
             refresh_for_provider(home.path(), false, Some(&upstream), &selected,).unwrap(),
-            4
+            3
         );
         let catalog: Value = serde_json::from_slice(
             &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
@@ -2642,12 +2754,7 @@ mod tests {
                 .iter()
                 .map(|model| model["slug"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            [
-                "gpt-5.6-sol",
-                "gpt-5.5",
-                "gpt-5.3-codex-spark",
-                "claude-sonnet",
-            ]
+            ["gpt-5.6-sol", "gpt-5.5", "claude-sonnet",]
         );
         assert_eq!(
             models[0]["supported_reasoning_levels"]
@@ -2664,12 +2771,6 @@ mod tests {
             .unwrap();
         assert_eq!(gpt_55["visibility"], "list");
         assert!(gpt_55.get("upgrade").is_none());
-        let spark = models
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
-            .unwrap();
-        assert_eq!(spark["supported_in_api"], true);
-        assert_no_native_fast(spark);
         let custom = models.last().unwrap();
         assert_eq!(custom["slug"], "claude-sonnet");
         assert_eq!(custom["codey_source"], "third_party");
@@ -2942,6 +3043,7 @@ mod tests {
             &selected,
             &[],
             &[],
+            "",
         )
         .unwrap();
         let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
@@ -2984,6 +3086,7 @@ mod tests {
             &selected,
             &[],
             &[],
+            "",
         )
         .unwrap();
         let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
@@ -3091,6 +3194,7 @@ mod tests {
             &selected,
             &[],
             &native_web_search_models,
+            "",
         )
         .unwrap();
         let catalog: Value = serde_json::from_slice(
@@ -3132,6 +3236,7 @@ mod tests {
             &selected,
             &[],
             &selected,
+            "",
         )
         .unwrap();
         let path = home.path().join(MODEL_CATALOG_RELATIVE_PATH);
@@ -3447,13 +3552,29 @@ mod tests {
         refresh_for_provider(home.path(), true, None, &[]).unwrap();
 
         let catalog: Value = serde_json::from_slice(&fs::read(catalog_path).unwrap()).unwrap();
-        let spark = catalog["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|model| model["slug"] == "gpt-5.3-codex-spark")
-            .unwrap();
-        assert_no_native_fast(spark);
+        let models = catalog["models"].as_array().unwrap();
+        // The stale catalog claimed native fast support for every slug; the
+        // regenerated one must rebuild that metadata from the bundled catalog
+        // and drop the retired slug entirely.
+        assert_eq!(
+            models
+                .iter()
+                .filter(|model| declares_fast_speed_support(model))
+                .map(|model| model["slug"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "gpt-6-astra",
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+            ]
+        );
+        assert!(
+            !models
+                .iter()
+                .any(|model| model["slug"] == "gpt-5.3-codex-spark")
+        );
     }
 
     #[test]
@@ -3761,5 +3882,291 @@ mod tests {
         restore_snapshot(new_snapshot).unwrap();
 
         assert!(!new_path.exists());
+    }
+
+    #[test]
+    fn runtime_snapshot_is_stale_without_a_snapshot_or_after_a_codex_upgrade() {
+        let stale = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let fresh = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(200);
+
+        // No local Codex CLI means Codey cannot capture anything, so it must not
+        // treat a missing snapshot as work it can do.
+        assert!(!runtime_snapshot_is_stale_at(None, None));
+        assert!(!runtime_snapshot_is_stale_at(Some(stale), None));
+        // A missing snapshot is stale whenever a CLI is available: Codex
+        // 26.908+ leaves no `models_cache.json`, so this is the only path that
+        // ever creates the first capture.
+        assert!(runtime_snapshot_is_stale_at(None, Some(fresh)));
+        // A snapshot older than the newest local build is stale; one newer than
+        // every candidate is not.
+        assert!(runtime_snapshot_is_stale_at(Some(stale), Some(fresh)));
+        assert!(!runtime_snapshot_is_stale_at(Some(fresh), Some(stale)));
+        assert!(!runtime_snapshot_is_stale_at(Some(fresh), Some(fresh)));
+    }
+
+    #[test]
+    fn snapshot_sync_slot_is_claimed_once_per_codex_build() {
+        let attempted = std::sync::Mutex::new(None);
+        let first = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10);
+        let second = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(20);
+
+        assert!(claim_snapshot_sync_slot(&attempted, Some(first)));
+        // The same build is not rendered twice in one process.
+        assert!(!claim_snapshot_sync_slot(&attempted, Some(first)));
+        // A failed render releases the claim, so a restart can retry.
+        release_snapshot_sync_slot(&attempted, Some(first));
+        assert!(claim_snapshot_sync_slot(&attempted, Some(first)));
+        // A Codex upgrade changes the stamp and is rendered again.
+        assert!(claim_snapshot_sync_slot(&attempted, Some(second)));
+        // A release that does not own the current claim leaves it in place.
+        release_snapshot_sync_slot(&attempted, Some(first));
+        assert!(!claim_snapshot_sync_slot(&attempted, Some(second)));
+    }
+
+    #[test]
+    fn codex_cli_stamp_uses_the_newest_candidate_and_ignores_missing_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let older = home.path().join("older-codex");
+        let newer = home.path().join("newer-codex");
+        fs::write(&older, b"old").unwrap();
+        fs::write(&newer, b"new").unwrap();
+        let older_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let newer_mtime = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(200);
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(older_mtime)
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&newer)
+            .unwrap()
+            .set_modified(newer_mtime)
+            .unwrap();
+
+        // The newest build decides, whichever order the candidates arrive in,
+        // and a path that does not exist never contributes a stamp.
+        for candidates in [
+            vec![older.clone(), newer.clone()],
+            vec![newer.clone(), older.clone()],
+        ] {
+            assert_eq!(codex_cli_stamp_for(&candidates), Some(newer_mtime));
+        }
+        assert_eq!(codex_cli_stamp_for(&[]), None);
+        assert_eq!(codex_cli_stamp_for(&[home.path().join("absent")]), None);
+        assert_eq!(
+            codex_cli_stamp_for(&[home.path().join("absent"), newer.clone()]),
+            Some(newer_mtime)
+        );
+    }
+
+    #[test]
+    fn snapshot_requires_every_fixed_official_model() {
+        let mut cache = official_cache();
+        let models = official_models_from_value(&cache);
+        assert!(snapshot_covers_official_models(&models));
+
+        // A render missing one fixed slug, or carrying it without runtime
+        // fields, must not be persisted as a durable source.
+        for slug in OFFICIAL_MODELS.iter().map(|(slug, _)| *slug) {
+            let mut partial = models.clone();
+            partial.retain(|model| model["slug"] != slug);
+            assert!(
+                !snapshot_covers_official_models(&partial),
+                "{slug} should be required"
+            );
+
+            let mut stripped = models.clone();
+            let entry = stripped
+                .iter_mut()
+                .find(|model| model["slug"] == slug)
+                .unwrap()
+                .as_object_mut()
+                .unwrap();
+            entry.remove("base_instructions");
+            entry.remove("model_messages");
+            assert!(
+                !snapshot_covers_official_models(&stripped),
+                "{slug} needs runtime fields"
+            );
+        }
+
+        cache["models"] = json!([]);
+        assert!(!snapshot_covers_official_models(
+            &official_models_from_value(&cache)
+        ));
+    }
+
+    #[test]
+    fn snapshot_accepts_the_real_codex_26_908_render() {
+        // The 26.908 CLI renders these eleven slugs on a clean CODEX_HOME. The
+        // render must be accepted, so no fixed entry may name a slug the
+        // installed Codex no longer publishes: a single retired slug in
+        // `OFFICIAL_MODELS` would reject every real render and silently leave
+        // the missing cache unrepaired.
+        let rendered = [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+        ]
+        .into_iter()
+        .chain([
+            "gpt-daybreak-blue-latest",
+            "gpt-daybreak-red-latest",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.2",
+            "codex-auto-review",
+        ])
+        .map(|slug| {
+            json!({
+                "slug": slug,
+                "display_name": slug,
+                "description": format!("{slug} description"),
+                "base_instructions": format!("{slug} instructions"),
+            })
+        })
+        .collect::<Vec<_>>();
+
+        assert!(snapshot_covers_official_models(&rendered));
+        assert!(
+            !rendered
+                .iter()
+                .any(|model| model["slug"] == "gpt-5.3-codex-spark")
+        );
+    }
+
+    #[test]
+    fn codex_26_908_snapshot_alone_generates_the_catalog() {
+        // End-to-end for the bug this change set targets: Codex 26.908 writes
+        // no `models_cache.json`, so the captured snapshot is the only
+        // instruction-bearing source. A retired slug left in `OFFICIAL_MODELS`
+        // would reject the render and force the custom-context recovery dialog
+        // on every launch.
+        let home = tempfile::tempdir().unwrap();
+        let models = [
+            "gpt-6-astra",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-daybreak-blue-latest",
+            "gpt-daybreak-red-latest",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.2",
+            "codex-auto-review",
+        ]
+        .into_iter()
+        .map(|slug| {
+            json!({
+                "slug": slug,
+                "display_name": slug,
+                "description": format!("{slug} description"),
+                "base_instructions": format!("{slug} instructions"),
+                "supported_reasoning_levels": [{"effort": "low"}],
+            })
+        })
+        .collect::<Vec<_>>();
+        let snapshot = json!({ "models": models });
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(
+            home.path().join(DEBUG_CATALOG_RELATIVE_PATH),
+            serde_json::to_vec(&snapshot).unwrap(),
+        )
+        .unwrap();
+        assert!(!home.path().join("models_cache.json").exists());
+
+        assert_eq!(
+            refresh_for_provider(home.path(), true, None, &[]).unwrap(),
+            OFFICIAL_MODELS.len()
+        );
+        let catalog: Value = serde_json::from_slice(
+            &fs::read(home.path().join(MODEL_CATALOG_RELATIVE_PATH)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|model| model["slug"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            OFFICIAL_MODELS
+                .iter()
+                .map(|(slug, _)| *slug)
+                .collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn newer_snapshot_supersedes_a_stale_cache_entry() {
+        // A capture happens when the snapshot is missing or older than the
+        // installed Codex, so a snapshot that outdates `models_cache.json`
+        // carries the instructions the cache cannot. Reading sources in a
+        // fixed order would let the stale cache win and silently waste the
+        // capture, leaving upgraded installs on pre-upgrade instructions.
+        let home = tempfile::tempdir().unwrap();
+        let source = |label: &str| {
+            json!({
+                "models": OFFICIAL_MODELS
+                    .iter()
+                    .map(|(slug, _)| {
+                        json!({
+                            "slug": slug,
+                            "display_name": slug,
+                            "description": format!("{label} description"),
+                            "base_instructions": format!("{label} instructions for {slug}"),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let cache = home.path().join("models_cache.json");
+        let snapshot = home.path().join(DEBUG_CATALOG_RELATIVE_PATH);
+        fs::write(&cache, serde_json::to_vec(&source("CACHED")).unwrap()).unwrap();
+        fs::create_dir_all(home.path().join("model-catalogs")).unwrap();
+        fs::write(&snapshot, serde_json::to_vec(&source("SNAPSHOT")).unwrap()).unwrap();
+
+        let older = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100);
+        let newer = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(200);
+        for (path, stamp) in [(cache, older), (snapshot, newer)] {
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(stamp)
+                .unwrap();
+        }
+
+        let entries = read_official_entries(home.path()).unwrap();
+        let sol = entries
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(
+            sol["base_instructions"],
+            "SNAPSHOT instructions for gpt-5.6-sol"
+        );
+
+        // The reverse order still prefers the cache, so an install whose Codex
+        // keeps writing its own cache does not inherit Codey snapshot text.
+        std::fs::File::options()
+            .write(true)
+            .open(home.path().join("models_cache.json"))
+            .unwrap()
+            .set_modified(newer + std::time::Duration::from_secs(100))
+            .unwrap();
+        let entries = read_official_entries(home.path()).unwrap();
+        let sol = entries
+            .iter()
+            .find(|model| model["slug"] == "gpt-5.6-sol")
+            .unwrap();
+        assert_eq!(
+            sol["base_instructions"],
+            "CACHED instructions for gpt-5.6-sol"
+        );
     }
 }

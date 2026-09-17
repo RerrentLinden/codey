@@ -280,6 +280,7 @@ fn try_refresh_model_catalog(config: &CodeyConfig, home: &std::path::Path) -> an
         &selected_models,
         &websocket_models,
         &native_web_search_models,
+        &config.codex_app_path,
     )
     .map(|_| ())
 }
