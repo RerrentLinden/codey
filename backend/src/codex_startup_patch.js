@@ -1153,17 +1153,97 @@
     value: routeLocalAppServerMessage,
   });
   let localRouterMessageSourcePatched = false;
+  // The shared transport wraps the outgoing payload in the connection call as
+  // `this.options.transformOutgoingMessage==null?payload:this.options.transformOutgoingMessage(payload)`.
+  // Only the payload and the message argument are captured, so the routing
+  // wrapper keeps the transport's own null guard and call form: a transport
+  // without a transform still sends the untouched message, and a build that
+  // minifies the guard as `===null`, `===void 0` or an optional call keeps
+  // working without another release.
+  const appServerMessageTransportRewrites = [
+    // `this.options.transformOutgoingMessage==null?e:this.options.transformOutgoingMessage(t)`
+    {
+      form: "ternary",
+      pattern:
+        /(this\.options\.transformOutgoingMessage[!=]==?(?:null|void 0|undefined)\?([$A-Z_a-z][$\w]*):)this\.options\.transformOutgoingMessage\(([$A-Z_a-z][$\w]*)\)/g,
+      wrap: (match) => `(${match[1]}this.options.transformOutgoingMessage(${match[3]}))`,
+    },
+    // `this.options.transformOutgoingMessage==null?e:this.options.transformOutgoingMessage?.(t)`
+    {
+      form: "ternary-optional-call",
+      pattern:
+        /(this\.options\.transformOutgoingMessage[!=]==?(?:null|void 0|undefined)\?([$A-Z_a-z][$\w]*):)this\.options\.transformOutgoingMessage\?\.\(([$A-Z_a-z][$\w]*)\)/g,
+      wrap: (match) => `(${match[1]}this.options.transformOutgoingMessage?.(${match[3]}))`,
+    },
+    // `this.options.transformOutgoingMessage?.(t)??e`
+    {
+      form: "optional-call",
+      pattern:
+        /this\.options\.transformOutgoingMessage\?\.\(([$A-Z_a-z][$\w]*)\)(\?\?|\|\|)([$A-Z_a-z][$\w]*)/g,
+      wrap: (match) =>
+        `(this.options.transformOutgoingMessage?.(${match[1]})${match[2]}${match[3]})`,
+    },
+  ];
+  // The transport method reads the connection through this accessor before it
+  // sends. Background chunks own it; shared chunks reach it as a global.
+  const appServerConnectionAccessors = [
+    "this.options.getConnection",
+    "globalThis.getConnection",
+    "globalThis.__CODEY_GET_CONNECTION__",
+  ];
+  const appServerAnchorWindow = 320;
+  const appServerAnchorNames = [
+    "this.options.transformOutgoingMessage",
+    "transformOutgoingMessage",
+  ];
+  const appServerAnchorSnippet = (source) => {
+    // A drifted build keeps the property somewhere else; locating it by name
+    // alone is what makes the recorded drift actionable without the bundle.
+    const anchorIndex = appServerAnchorNames
+      .map((name) => source.indexOf(name))
+      .find((index) => index >= 0);
+    if (anchorIndex == null) return "";
+    const halfWindow = Math.floor(appServerAnchorWindow / 2);
+    const start = Math.max(0, anchorIndex - halfWindow);
+    const end = Math.min(source.length, start + appServerAnchorWindow);
+    const snippet = source.slice(start, end).replace(/\s+/g, " ");
+    return start > 0 ? `…${snippet}` : snippet;
+  };
   const patchCodexAppServerMessages = (source) => {
+    let patched = "";
     let count = 0;
-    const patched = source.replace(
-      /this\.options\.transformOutgoingMessage==null\?([$A-Z_a-z][$\w]*):this\.options\.transformOutgoingMessage\(\1\)/g,
-      (expression) => {
-        count += 1;
-        return `globalThis.__CODEY_ROUTE_LOCAL_APP_SERVER_MESSAGE__((${expression}),this.options.hostKind)`;
-      },
+    let matchedForm = "";
+    for (const { pattern, form, wrap } of appServerMessageTransportRewrites) {
+      let patternCount = 0;
+      let patternPatched = "";
+      let patternCursor = 0;
+      for (const match of source.matchAll(pattern)) {
+        patternCount += 1;
+        patternPatched +=
+          source.slice(patternCursor, match.index) +
+          "globalThis.__CODEY_ROUTE_LOCAL_APP_SERVER_MESSAGE__(" +
+          `${wrap(match)},this.options.hostKind)`;
+        patternCursor = match.index + match[0].length;
+      }
+      if (patternCount > 0) {
+        patched = patternPatched + source.slice(patternCursor);
+        count = patternCount;
+        matchedForm = form;
+        break;
+      }
+    }
+    const connectionAccessor = appServerConnectionAccessors.find((candidate) =>
+      source.includes(candidate),
     );
-    if (count !== 1 || !source.includes("this.options.getConnection")) {
-      throw new Error(`Codey app-server message transport matched ${count} times`);
+    if (count !== 1 || connectionAccessor == null) {
+      const reason = count !== 1
+        ? `matched ${count} times`
+        : "found no connection accessor";
+      throw new Error(
+        "Codey app-server message transport " +
+        `${reason}; form=${matchedForm || "unknown"}; ` +
+        `anchor=${appServerAnchorSnippet(source)}`,
+      );
     }
     localRouterMessageSourcePatched = true;
     return patched;
@@ -2433,10 +2513,11 @@
         try {
           source = patchCodexAppServerMessages(source);
         } catch (error) {
-          // Fail closed (router mode cannot run without this hook), but leave
-          // the diagnostic behind so a drifted anchor is visible in the log.
+          // Router mode cannot route without this hook, so the app-server spawn
+          // below still fails closed. Letting the error escape this compile hook
+          // would instead kill the desktop app before its first window exists,
+          // which the launcher can only report as a renderer injection failure.
           recordCodeyPatchFailure("patch_codex_app_server_messages", error, { filename });
-          throw error;
         }
       }
       const hasMainBundleName =

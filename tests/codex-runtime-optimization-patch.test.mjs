@@ -140,6 +140,78 @@ test("shared app-server chunk routes native thread requests after Desktop's tran
   } finally { native.restore(); }
 });
 
+test("app-server transport drift reports the anchor shape before failing closed", async () => {
+  const runtime = await loadPatchInIsolatedContext(['model_provider="codey_router"'], {}, false);
+  try {
+    const patch = runtime.context.__CODEY_PATCH_CODEX_APP_SERVER_MESSAGES__;
+    const drifted = appServerTransportFixture.replace(
+      "this.options.transformOutgoingMessage(e)",
+      "this.options.transformOutgoingMessage.call(null,e)",
+    );
+    assert.throws(() => patch(drifted), /matched 0 times/);
+    assert.throws(() => patch(drifted), /transformOutgoingMessage\.call\(null,e\)/);
+    assert.throws(() => patch(drifted), /form=unknown/);
+    const relabelled = appServerTransportFixture.replace(
+      "this.options.getConnection()",
+      "this.options.connection()",
+    );
+    assert.throws(() => patch(relabelled), /found no connection accessor/);
+    assert.equal(
+      runtime.context.__CODEY_CODEX_STARTUP_PATCH__.localRouterMessageSourcePatched,
+      false,
+    );
+  } finally {
+    runtime.restore();
+  }
+});
+
+test("app-server transport minifier variants still route", async () => {
+  const runtime = await loadPatchInIsolatedContext(['model_provider="codey_router"'], {}, false);
+  try {
+    const patch = runtime.context.__CODEY_PATCH_CODEX_APP_SERVER_MESSAGES__;
+    const variants = {
+      "strict-null": [appServerTransportFixture
+        .replace("transformOutgoingMessage==null?", "transformOutgoingMessage===null?")
+        .replace("globalThis.Transport", "globalThis.StrictNullTransport"), "StrictNullTransport", null],
+      "void-0": [appServerTransportFixture
+        .replace("transformOutgoingMessage==null?", "transformOutgoingMessage===void 0?")
+        .replace("globalThis.Transport", "globalThis.VoidZeroTransport"), "VoidZeroTransport", undefined],
+      "ternary-optional-call": [appServerTransportFixture
+        .replace("transformOutgoingMessage(e);n.send", "transformOutgoingMessage?.(e);n.send")
+        .replace("globalThis.Transport", "globalThis.TernaryOptionalTransport"), "TernaryOptionalTransport", undefined],
+      "plain-optional-call": [`globalThis.PlainOptionalTransport=class {
+  constructor(options){this.options=options}
+  sendMessage(e){let n=this.options.getConnection(),a=this.options.transformOutgoingMessage?.(e)||e;n.send(JSON.stringify(a))}
+};`, "PlainOptionalTransport", undefined],
+    };
+    for (const [form, [fixture, constructorName, missingTransform]] of Object.entries(variants)) {
+      const patched = patch(fixture);
+      const messages = [];
+      const options = {
+        hostKind: "local",
+        getConnection: () => ({ send: (message) => messages.push(JSON.parse(message)) }),
+        transformOutgoingMessage: (message) => ({ ...message, params: {
+          ...message.params, modelProvider: "first",
+        } }),
+      };
+      vm.runInContext(patched, runtime.context);
+      assert.equal(typeof runtime.context[constructorName], "function", form);
+      const transport = new runtime.context[constructorName](options);
+      transport.sendMessage({ id: 31, method: "thread/fork", params: { modelProvider: null } });
+      assert.deepEqual(messages.at(-1), { id: 31, method: "thread/fork", params: {
+        modelProvider: "codey_router",
+      } }, form);
+      // Each guard skips its own "no transform" value and sends untouched.
+      options.transformOutgoingMessage = missingTransform;
+      const untouched = { id: 32, method: "turn/start", params: {} };
+      transport.sendMessage(untouched);
+      assert.deepEqual(messages.at(-1), untouched, form);
+    }
+  } finally {
+    runtime.restore();
+  }
+});
+
 test("build chunks use one native source read and retain CommonJS loading semantics", async () => {
   const directory = await realpath(await mkdtemp(join(tmpdir(), "codey-build-loading-")));
   const build = join(directory, ".vite", "build");
