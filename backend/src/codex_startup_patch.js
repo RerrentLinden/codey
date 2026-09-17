@@ -1158,21 +1158,21 @@
   // Only the payload and the message argument are captured, so the routing
   // wrapper keeps the transport's own null guard and call form: a transport
   // without a transform still sends the untouched message, and a build that
-  // minifies the guard as `===null`, `===void 0` or an optional call keeps
-  // working without another release.
+  // minifies the guard as `===null`, `===void 0`, an optional call or an extra
+  // `||`/`&&` term next to the null test keeps working without another release.
   const appServerMessageTransportRewrites = [
     // `this.options.transformOutgoingMessage==null?e:this.options.transformOutgoingMessage(t)`
     {
       form: "ternary",
       pattern:
-        /(this\.options\.transformOutgoingMessage[!=]==?(?:null|void 0|undefined)\?([$A-Z_a-z][$\w]*):)this\.options\.transformOutgoingMessage\(([$A-Z_a-z][$\w]*)\)/g,
+        /(this\.options\.transformOutgoingMessage[!=]==?(?:null|void 0|undefined)(?:(?:\|\||&&)[^;]{0,160}?)?\?([$A-Z_a-z][$\w]*):)this\.options\.transformOutgoingMessage\(([$A-Z_a-z][$\w]*)\)/g,
       wrap: (match) => `(${match[1]}this.options.transformOutgoingMessage(${match[3]}))`,
     },
     // `this.options.transformOutgoingMessage==null?e:this.options.transformOutgoingMessage?.(t)`
     {
       form: "ternary-optional-call",
       pattern:
-        /(this\.options\.transformOutgoingMessage[!=]==?(?:null|void 0|undefined)\?([$A-Z_a-z][$\w]*):)this\.options\.transformOutgoingMessage\?\.\(([$A-Z_a-z][$\w]*)\)/g,
+        /(this\.options\.transformOutgoingMessage[!=]==?(?:null|void 0|undefined)(?:(?:\|\||&&)[^;]{0,160}?)?\?([$A-Z_a-z][$\w]*):)this\.options\.transformOutgoingMessage\?\.\(([$A-Z_a-z][$\w]*)\)/g,
       wrap: (match) => `(${match[1]}this.options.transformOutgoingMessage?.(${match[3]}))`,
     },
     // `this.options.transformOutgoingMessage?.(t)??e`
@@ -1191,6 +1191,9 @@
     "globalThis.getConnection",
     "globalThis.__CODEY_GET_CONNECTION__",
   ];
+  // A renamed receiver keeps the accessor name, so the same transport is still
+  // recognised; a renamed accessor counts as drift and fails closed.
+  const appServerConnectionAccessorPattern = /\bgetConnection\b/;
   const appServerAnchorWindow = 320;
   const appServerAnchorNames = [
     "this.options.transformOutgoingMessage",
@@ -1232,9 +1235,9 @@
         break;
       }
     }
-    const connectionAccessor = appServerConnectionAccessors.find((candidate) =>
-      source.includes(candidate),
-    );
+    const connectionAccessor =
+      appServerConnectionAccessors.find((candidate) => source.includes(candidate)) ??
+      (appServerConnectionAccessorPattern.test(source) ? "getConnection" : null);
     if (count !== 1 || connectionAccessor == null) {
       const reason = count !== 1
         ? `matched ${count} times`

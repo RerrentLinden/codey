@@ -14,6 +14,9 @@ const appServerTransportFixture = `globalThis.Transport=class {
   constructor(options){this.options=options}
   sendMessage(e){let n=this.options.getConnection(),a=this.options.transformOutgoingMessage==null?e:this.options.transformOutgoingMessage(e);n.send(JSON.stringify(a))}
 };`;
+// Codex 26.911 keeps the same site but adds a term next to the null test, the
+// way the real `src-BiETdQsO.js` chunk minifies it.
+const appServerGuardedTransportFixture = `globalThis.GuardedTransport=class{constructor(e){this.options=e}sendMessage(e,t){let n=this.options.getConnection();if(n==null)throw new Error("Codex app-server is not available");let r=t?.savedEnvironmentConfig;if(r!=null&&(this.options.hostId!==\`durable\`||!(\`method\`in e)||e.method!==\`thread/start\`||n.authenticatedPrincipal?.accountId!==r.accountId))throw new Error("The saved environment account changed. Select an environment again.");let i=IJ(e),a=this.options.transformOutgoingMessage==null||cJ(e)?e:this.options.transformOutgoingMessage(e),o=this.options.hostId===\`durable\`?P_(a,t?.prewarmThread,r?.environmentConfigId):JSON.stringify(a);n.send(o)}};`;
 
 
 async function loadPatchInIsolatedContext(
@@ -207,6 +210,88 @@ test("app-server transport minifier variants still route", async () => {
       transport.sendMessage(untouched);
       assert.deepEqual(messages.at(-1), untouched, form);
     }
+  } finally {
+    runtime.restore();
+  }
+});
+
+test("app-server transport tolerates an extra guard term next to the null test", async () => {
+  const runtime = await loadPatchInIsolatedContext(
+    ['model_provider="codey_router"'],
+    { cJ: () => false, IJ: () => ({}), P_: (message) => JSON.stringify(message) },
+    false,
+  );
+  try {
+    const patch = runtime.context.__CODEY_PATCH_CODEX_APP_SERVER_MESSAGES__;
+    const messages = [];
+    const routeTransform = (message) => ({ ...message, params: {
+      ...message.params, modelProvider: "first",
+    } });
+    const options = {
+      hostKind: "local",
+      hostId: "local",
+      getConnection: () => ({ send: (message) => messages.push(JSON.parse(message)) }),
+      transformOutgoingMessage: routeTransform,
+    };
+    vm.runInContext(patch(appServerGuardedTransportFixture), runtime.context);
+    const transport = new runtime.context.GuardedTransport(options);
+    transport.sendMessage({ id: 51, method: "thread/start", params: { modelProvider: null } });
+    assert.deepEqual(messages.at(-1), { id: 51, method: "thread/start", params: {
+      modelProvider: "codey_router",
+    } });
+    // 打包代码自己的旁路条件命中时，仍然交给本地路由处理。
+    runtime.context.cJ = () => true;
+    options.transformOutgoingMessage = null;
+    transport.sendMessage({ id: 52, method: "thread/resume", params: { modelProvider: null } });
+    assert.deepEqual(messages.at(-1), { id: 52, method: "thread/resume", params: {
+      modelProvider: "codey_router",
+    } });
+    const untouched = { id: 53, method: "turn/start", params: {} };
+    transport.sendMessage(untouched);
+    assert.deepEqual(messages.at(-1), untouched);
+    // 同一条件写法下的可选调用形式。
+    runtime.context.cJ = () => false;
+    vm.runInContext(
+      patch(appServerGuardedTransportFixture
+        .replace("transformOutgoingMessage(e),o=", "transformOutgoingMessage?.(e),o=")
+        .replace("globalThis.GuardedTransport", "globalThis.GuardedOptionalTransport")),
+      runtime.context,
+    );
+    const optional = new runtime.context.GuardedOptionalTransport({
+      ...options,
+      transformOutgoingMessage: routeTransform,
+    });
+    optional.sendMessage({ id: 54, method: "thread/fork", params: { modelProvider: null } });
+    assert.deepEqual(messages.at(-1), { id: 54, method: "thread/fork", params: {
+      modelProvider: "codey_router",
+    } });
+    // 同一条件写法下的其它空值比较。
+    vm.runInContext(
+      patch(appServerGuardedTransportFixture
+        .replace("transformOutgoingMessage==null||cJ(e)?", "transformOutgoingMessage===void 0||cJ(e)?")
+        .replace("globalThis.GuardedTransport", "globalThis.GuardedVoidZeroTransport")),
+      runtime.context,
+    );
+    const voidZero = new runtime.context.GuardedVoidZeroTransport({
+      ...options,
+      transformOutgoingMessage: routeTransform,
+    });
+    voidZero.sendMessage({ id: 55, method: "thread/resume", params: { modelProvider: null } });
+    assert.deepEqual(messages.at(-1), { id: 55, method: "thread/resume", params: {
+      modelProvider: "codey_router",
+    } });
+    // 接收者改名后访问器名称仍在，访问器本身改名按漂移失败关闭。
+    assert.doesNotThrow(() => patch(appServerGuardedTransportFixture.replace(
+      "this.options.getConnection()",
+      "this.options.getConnectionIfReady()",
+    )));
+    assert.throws(
+      () => patch(appServerGuardedTransportFixture.replace(
+        "this.options.getConnection()",
+        "this.options.connection()",
+      )),
+      /found no connection accessor/,
+    );
   } finally {
     runtime.restore();
   }
