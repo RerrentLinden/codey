@@ -658,13 +658,17 @@ export function RequestLogDialog({
     };
   }, [opened, fromUnixMs, toUnixMs, provider, officialAccount, validRange, refreshRevision]);
 
+  // 挂载时这个 effect 也会跑一次，若无条件重置分页，会把首页查询刚写入的
+  // 下一页游标清空，导致除第 1 页外的页码都判为不可用。
   useEffect(() => {
+    const nextSearch = searchInput.trim();
+    if (nextSearch === search) return;
     const timer = window.setTimeout(() => {
-      setSearch(searchInput.trim());
+      setSearch(nextSearch);
       resetPagination();
     }, 300);
     return () => window.clearTimeout(timer);
-  }, [searchInput]);
+  }, [searchInput, search]);
 
   useEffect(() => {
     if (!opened) return;

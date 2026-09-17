@@ -219,3 +219,19 @@ test("request log preview supports clearing all history", async () => {
   assert.match(preview, /removedFileCount: hadLogs \? 1 : 0/);
   assert.match(preview, /recordingRestarted: true/);
 });
+
+// 搜索防抖的首次执行发生在挂载时，若此时重置分页，首页查询刚拿到的游标会被清空，
+// 第 2 页及之后的页码都会保持禁用。
+test("request log search debounce keeps the first page cursors when the query text is unchanged", async () => {
+  const viewer = await readFile(new URL("src/RequestLogDialog.tsx", root), "utf8");
+  const source = viewer.match(
+    /useEffect\(\(\) => \{\n\s+const nextSearch = searchInput\.trim\(\);[\s\S]*?\}, \[searchInput, search\]\);/,
+  )?.[0];
+
+  assert.ok(source);
+  assert.match(source, /if \(nextSearch === search\) return;/);
+  assert.match(source, /window\.setTimeout\([\s\S]*?300/);
+  assert.match(source, /setSearch\(nextSearch\)/);
+  assert.match(source, /resetPagination\(\)/);
+  assert.match(source, /window\.clearTimeout\(timer\)/);
+});
