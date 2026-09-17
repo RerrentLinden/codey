@@ -983,6 +983,34 @@ test("startup patch disables Codex analytics and trims diagnostic polling", asyn
       /analytics\?\.enabled!==!1/,
     );
 
+    // 26.911 hoists the readiness promise into local bindings, so the
+    // transport reads `analyticsEnabled:read` instead of an inline chain.
+    const hoistedDesktopAnalyticsFixture = [
+      "let s={get(){return Promise.resolve({})}},",
+      "ready=e=>e.analytics?.enabled!==!1,",
+      "read=s.get().then(ready);",
+      "T=new Transport({analyticsEnabled:read,waitUntilReady:()=>read}),",
+      "E=new Reporter({source:`codex-desktop`,transport:T});",
+    ].join("");
+    const patchedHoistedDesktopAnalytics =
+      globalThis.__CODEY_PATCH_CODEX_MAIN_DESKTOP_ANALYTICS__(
+        hoistedDesktopAnalyticsFixture,
+        { worker: false, transport: true },
+      );
+    assert.match(
+      patchedHoistedDesktopAnalytics,
+      /\{analyticsEnabled:!1,waitUntilReady/,
+    );
+    assert.match(patchedHoistedDesktopAnalytics, /read=s\.get\(\)\.then\(ready\)/);
+    // A same-named binding without the readiness predicate is still drift.
+    assert.throws(
+      () => globalThis.__CODEY_PATCH_CODEX_MAIN_DESKTOP_ANALYTICS__(
+        "u=other();T=new Transport({analyticsEnabled:u,});",
+        { worker: false, transport: true },
+      ),
+      /matches 0\/0\/0/,
+    );
+
     const desktopAnalyticsWithoutReporterFixture =
       desktopAnalyticsFixture.replace(
         "E=new Reporter({source:`codex-desktop`,transport:T});",

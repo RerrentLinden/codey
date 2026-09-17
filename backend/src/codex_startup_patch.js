@@ -1919,6 +1919,40 @@
         return "analyticsEnabled:!1";
       },
     );
+    if (mainTransportCount === 0) {
+      // 26.911 hoists the readiness promise and its predicate before the
+      // transport is constructed:
+      // `ready=(snapshot)=>snapshot.analytics?.enabled!==!1` then
+      // `read=state.get().then(ready)` and
+      // `new Transport({analyticsEnabled:read, ...})`. Track the minified
+      // binding names instead of one exact spelling of the same expression.
+      const analyticsReadyPredicates = new Set();
+      for (const match of source.matchAll(
+        /([$A-Z_a-z][$\w]*)=([$A-Z_a-z][$\w]*)=>\2\.analytics\?\.enabled!==!1/g,
+      )) {
+        analyticsReadyPredicates.add(match[1]);
+      }
+      const analyticsReadyValues = new Set();
+      if (analyticsReadyPredicates.size > 0) {
+        for (const match of source.matchAll(
+          /([$A-Z_a-z][$\w]*)=([$A-Z_a-z][$\w]*)\.get\(\)\.then\(([$A-Z_a-z][$\w]*)\)/g,
+        )) {
+          if (analyticsReadyPredicates.has(match[3])) {
+            analyticsReadyValues.add(match[1]);
+          }
+        }
+      }
+      if (analyticsReadyValues.size > 0) {
+        patched = patched.replace(
+          /analyticsEnabled:([$A-Z_a-z][$\w]*)(?=[,})])/g,
+          (match, name) => {
+            if (!analyticsReadyValues.has(name)) return match;
+            mainTransportCount += 1;
+            return "analyticsEnabled:!1";
+          },
+        );
+      }
+    }
     if (
       workerBootstrapCount !== Number(worker) ||
       workerUpdateCount !== Number(worker) ||
