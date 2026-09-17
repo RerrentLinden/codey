@@ -438,8 +438,17 @@ if (import.meta.env.DEV) {
         provider: account ? previewOfficialProviderId(account) : primary ? "primary" : "backup",
         providerName: account ? account.routeName ?? "官方线路" : primary ? "主力代理 (ChatGPT)" : "备用中转 (Claude)",
         officialAccountId: account?.id,
-        requestedModel: account ? "gpt-5.6-sol" : primary ? "provider-fast-coder" : "claude-sonnet-4-5",
+        // 预览同时覆盖请求模型带线路前缀与不带前缀两种形态。
+        requestedModel: account ? "gpt-5.6-sol" : primary ? "primary/provider-fast-coder" : "claude-sonnet-4-5",
         model: account ? "gpt-5.6-sol" : primary ? "provider-fast-coder" : "claude-sonnet-4-5",
+        // 上游回报实际模型时可能一致、可能不同，失败请求则没有该字段。
+        upstreamResponseModel: failed
+          ? undefined
+          : account
+            ? "gpt-5.6-sol"
+            : primary
+              ? "deepseek/deepseek-v4.1-flash"
+              : "claude-sonnet-4-5-20250929",
         reasoningEffort: (["low", "medium", "high"] as const)[index % 3],
         thinkingBudgetTokens: undefined,
         ttftMs: failed ? undefined : 190 + index * 13,
@@ -731,6 +740,7 @@ if (import.meta.env.DEV) {
             item.provider,
             item.providerName,
             item.officialAccountId,
+            item.requestedModel,
             item.model,
             item.upstreamAuthority,
             item.upstreamErrorSummary,

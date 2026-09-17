@@ -357,5 +357,7 @@ pub(crate) async fn write_proxy_response(
 pub(crate) const REQUEST_LOG_TAP_CHUNK_BYTES: usize = 8 * 1024;
 pub(crate) const REQUEST_LOG_TAP_QUEUE_CHUNKS: usize = 64;
 pub(crate) const REQUEST_LOG_USAGE_KEY_BYTES: usize = 64;
+/// 完整投影的字符串上限。键都很短，模型名可能较长，因此比键上限宽松。
+pub(crate) const REQUEST_LOG_METADATA_STRING_BYTES: usize = 256;
 pub(crate) const REQUEST_LOG_USAGE_SCALAR_BYTES: usize = 64;
 pub(crate) const REQUEST_LOG_USAGE_NESTING_DEPTH: usize = 64;

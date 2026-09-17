@@ -23,6 +23,7 @@ import requestLogStyles from "./styles.request-log.css?inline";
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
 import { formatBytes, formatTimestamp } from "./formatters";
+import { modelIdsEqual } from "./modelIds";
 import { QuotaEstimateDialog } from "./QuotaEstimateDialog";
 import { maskEmail } from "./sensitiveText";
 import {
@@ -50,6 +51,8 @@ type RouteRequestLogItem = {
   requestedServiceTier?: string | null;
   serviceTier?: string | null;
   model?: string | null;
+  /// 上游响应里回报的实际使用模型，上游没有回报时为空。
+  upstreamResponseModel?: string | null;
   reasoningEffort?: string | null;
   thinkingBudgetTokens?: number | null;
   ttftMs?: number | null;
@@ -269,7 +272,7 @@ function RequestLogTable({ columns, rows = [], onRowAction }: {
 }
 
 const groupByLabels: Record<string, string> = {
-  model: "实际模型",
+  model: "请求模型",
   provider: "供应商",
   official_account: "官方账号",
   status: "状态",
@@ -990,7 +993,7 @@ export function RequestLogDialog({
             /> : null}
 
             <Select
-              aria-label="按实际模型筛选请求日志"
+              aria-label="按请求模型筛选请求日志"
               className="w-36 shrink-0"
               filter
               optionList={modelOptions}
@@ -1122,7 +1125,7 @@ export function RequestLogDialog({
                     aria-label="统计分组"
                     className="w-44"
                     optionList={[
-                      { label: "按实际模型统计", value: "model" },
+                      { label: "按请求模型统计", value: "model" },
                       { label: "按供应商统计", value: "provider" },
                       ...(officialAccounts.length > 0
                         ? [{ label: "按官方账号统计", value: "official_account" }]
@@ -1430,7 +1433,7 @@ export function RequestLogDialog({
                   { title: "时间 / 请求 ID", width: 180, render: (record) => record.cells[0] },
                   { title: "会话 ID", width: 190, render: (record) => record.cells[1] },
                   { title: "供应商 / 上游", width: 180, render: (record) => record.cells[2] },
-                  { title: "模型", width: 180, render: (record) => record.cells[3] },
+                  { title: "模型", width: 232, render: (record) => record.cells[3] },
                   { title: "思考强度", width: 100, render: (record) => record.cells[4] },
                   { title: "上游协议", width: 100, render: (record) => record.cells[5] },
                   { title: "状态", width: 120, render: (record) => record.cells[6] },
@@ -1452,6 +1455,10 @@ export function RequestLogDialog({
    const timingTitle = item.downstreamFirstContentMs == null
      ? `首字耗时 (旧指标，上游首包): ${formatDuration(item.ttftMs)}`
      : `端到端首内容: ${formatDuration(item.downstreamFirstContentMs)} · 路由前置: ${formatDuration(item.routerPreUpstreamMs)} · 上游首包: ${formatDuration(item.upstreamFirstByteMs)}`;
+   // 请求模型是 Codey 发往上游的模型；实际模型是上游响应里回报的模型。
+   const sentModel = (item.model ?? "").trim() || item.requestedModel.trim();
+   const upstreamModel = (item.upstreamResponseModel ?? "").trim();
+   const upstreamModelDiffers = Boolean(upstreamModel) && !modelIdsEqual(upstreamModel, sentModel);
 return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                           <div className="grid min-w-36 max-w-44 gap-0.5 font-mono">
                             <span className="whitespace-nowrap text-[11px] text-[#1d1d1f]">
@@ -1545,10 +1552,22 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                             ) : null}
                           </div>
                         </div>,
-<div className="max-w-56 truncate" title={item.model || item.requestedModel}>
-                          <span className="font-medium text-[#1d1d1f]">
-                            {item.model || item.requestedModel || "—"}
+<div className="grid min-w-32 max-w-56 gap-0.5">
+                          <span
+                            className="truncate font-medium text-[#1d1d1f]"
+                            title={sentModel ? `请求模型（发往上游）：${sentModel}` : undefined}
+                          >
+                            {sentModel || "—"}
                           </span>
+                          {upstreamModelDiffers ? (
+                            <span
+                              className="flex min-w-0 items-center gap-1 text-[10px] text-[#8e8e93]"
+                              title={`上游实际使用模型：${upstreamModel}`}
+                            >
+                              <span className="shrink-0">实际</span>
+                              <span className="truncate">{upstreamModel}</span>
+                            </span>
+                          ) : null}
                         </div>,
 <div className="whitespace-nowrap text-[#48484a]">{reasoningLabel(item)}</div>,
 <div>
@@ -1996,15 +2015,27 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                   <div>
                     <dt className="text-[11px] text-[#8e8e93]">请求模型</dt>
                     <dd className="m-0 mt-0.5 font-medium text-[#1d1d1f]">
-                      {selectedItem.requestedModel}
+                      {selectedItem.model || selectedItem.requestedModel || "—"}
                     </dd>
                   </div>
                   <div>
                     <dt className="text-[11px] text-[#8e8e93]">实际使用模型</dt>
-                    <dd className="m-0 mt-0.5 font-medium text-[#1d1d1f]">
-                      {selectedItem.model || selectedItem.requestedModel}
+                    <dd className="m-0 mt-0.5 break-all font-medium text-[#1d1d1f]">
+                      {selectedItem.upstreamResponseModel?.trim() || "上游未回报"}
                     </dd>
                   </div>
+                  {selectedItem.requestedModel.trim()
+                  && !modelIdsEqual(selectedItem.requestedModel, selectedItem.model || selectedItem.requestedModel) ? (
+                    <div>
+                      <dt className="text-[11px] text-[#8e8e93]">Codex 选择器</dt>
+                      <dd
+                        className="m-0 mt-0.5 break-all font-mono text-[11px] text-[#48484a]"
+                        title="Codex 请求 Codey 时选择的模型 ID，带线路前缀"
+                      >
+                        {selectedItem.requestedModel}
+                      </dd>
+                    </div>
+                  ) : null}
                   <div>
                     <dt className="text-[11px] text-[#8e8e93]">计费档位（请求 / 实际）</dt>
                     <dd className="m-0 mt-0.5 font-medium text-[#1d1d1f]">

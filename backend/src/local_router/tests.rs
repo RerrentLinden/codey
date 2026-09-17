@@ -7157,6 +7157,160 @@ async fn chat_completions_route_uses_its_path_key_and_returns_responses_sse() {
 }
 
 #[tokio::test]
+async fn request_log_keeps_the_upstream_model_apart_from_the_codex_selector() {
+    let logs = tempfile::tempdir().unwrap();
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+        let sse = concat!(
+            "data: {\"id\":\"chatcmpl-log\",\"created\":1,\"model\":\"provider-actual\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-log\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        body
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    config.route_request_log.enabled = true;
+    config.route_request_log.backend = RouteRequestLogBackend::Sqlite;
+    config.route_request_log.batch_size = 1;
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let endpoint = router.endpoint();
+    // Codex 选择器带线路前缀，发往上游的是线路配置里的模型名。
+    let selector = model_alias(&provider_id, &model);
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": selector.clone(),
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let _ = response.text().await.unwrap();
+    let body = upstream_task.await.unwrap();
+    assert_eq!(body["model"], model);
+    router.stop().await.unwrap();
+
+    let page = crate::route_request_log::query_route_request_logs(
+        logs.path(),
+        RouteRequestLogBackend::Sqlite,
+        crate::route_request_log::RouteRequestLogQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(page.total, 1);
+    let item = &page.items[0];
+    assert_eq!(item.requested_model, selector);
+    assert_eq!(item.model.as_deref(), Some(model.as_str()));
+    // 桥接线路从上游响应里取回报的实际模型，与发往上游的模型区分开。
+    assert_eq!(
+        item.upstream_response_model.as_deref(),
+        Some("provider-actual")
+    );
+}
+
+#[tokio::test]
+async fn request_log_projects_the_model_a_native_responses_upstream_reports() {
+    let logs = tempfile::tempdir().unwrap();
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-log\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"provider-actual\",\"output\":[]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-log\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"provider-actual\",\"output\":[],\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n"
+        );
+        stream
+            .write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        body
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.route_request_log.enabled = true;
+    config.route_request_log.backend = RouteRequestLogBackend::Sqlite;
+    config.route_request_log.batch_size = 1;
+    let router = LocalRouter::start_with_logger(
+        &config,
+        Arc::new(RouteRequestLogController::with_root(
+            logs.path().to_path_buf(),
+        )),
+    )
+    .await
+    .unwrap();
+    let endpoint = router.endpoint();
+    let selector = model_alias(&provider_id, &model);
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model": selector,
+            "input": "hello",
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let events = response.text().await.unwrap();
+    assert!(events.contains("\"model\":\"provider-actual\""));
+    let body = upstream_task.await.unwrap();
+    assert_eq!(body["model"], model);
+    router.stop().await.unwrap();
+
+    let page = crate::route_request_log::query_route_request_logs(
+        logs.path(),
+        RouteRequestLogBackend::Sqlite,
+        crate::route_request_log::RouteRequestLogQuery::default(),
+    )
+    .unwrap();
+    assert_eq!(page.total, 1);
+    let item = &page.items[0];
+    assert_eq!(item.upstream_transport.as_deref(), Some("http_sse"));
+    assert_eq!(item.model.as_deref(), Some(model.as_str()));
+    // 原生转发线路由原始响应字节里投影出上游回报的模型。
+    assert_eq!(
+        item.upstream_response_model.as_deref(),
+        Some("provider-actual")
+    );
+}
+
+#[tokio::test]
 async fn chat_route_maps_web_search_for_provider_scoped_model_without_model_name_gate() {
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     let upstream_address = upstream.local_addr().unwrap();

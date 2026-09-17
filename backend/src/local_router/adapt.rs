@@ -124,6 +124,7 @@ pub(crate) async fn read_chat_completions_as_responses(
             Err(error) => return Err(error).context("Chat Completions 上游响应不是有效 JSON"),
         }
     };
+    observe_upstream_response_model(probe, &chat);
     chat_completion_to_responses_body_with_tool_bridge(chat, model, tool_bridge)
 }
 
@@ -193,5 +194,6 @@ pub(crate) async fn read_anthropic_messages_as_responses(
             }
         }
     };
+    observe_upstream_response_model(probe, &message);
     anthropic_message_to_responses_body_with_tool_bridge(&message, model, tool_bridge)
 }

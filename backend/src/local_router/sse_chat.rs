@@ -566,6 +566,7 @@ where
             }
         }
         let chat = accumulator.into_chat_completion(done)?;
+        observe_upstream_response_model(request_log_probe.as_ref(), &chat);
         let completed =
             chat_completion_to_responses_body_with_tool_bridge(chat, model, tool_bridge)?;
         if output.output_order.is_empty() {

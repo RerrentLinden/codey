@@ -78,7 +78,9 @@ impl RequestLogResponseTap {
 #[derive(Default)]
 pub(crate) struct RequestLogMetadataProjector {
     response_depth: Option<usize>,
+    message_depth: Option<usize>,
     awaiting_response: bool,
+    awaiting_message: bool,
     pub(crate) depth: usize,
     pub(crate) in_string: bool,
     pub(crate) escaped: bool,
@@ -96,10 +98,12 @@ pub(crate) struct RequestLogMetadataProjector {
 #[derive(Clone, Copy)]
 pub(crate) enum ProjectedMetadataKey {
     Response,
+    Message,
     ServiceTier,
     Usage,
     Type,
     Delta,
+    Model,
     Status,
     Code,
 }
@@ -109,6 +113,7 @@ pub(crate) enum ProjectedMetadataScalar {
     ServiceTier,
     EventType,
     Delta,
+    ResponseModel,
     ResponseStatus,
     ErrorCode,
 }
@@ -536,6 +541,11 @@ impl RequestLogMetadataProjector {
                             ProjectedMetadataScalar::ServiceTier if !self.string_overflow => {
                                 probe.observe_service_tier(&String::from_utf8_lossy(&self.string));
                             }
+                            ProjectedMetadataScalar::ResponseModel if !self.string_overflow => {
+                                probe.observe_upstream_response_model(
+                                    &String::from_utf8_lossy(&self.string),
+                                );
+                            }
                             ProjectedMetadataScalar::Delta => {
                                 self.event_delta_has_content =
                                     self.string_overflow || !self.string.is_empty();
@@ -564,6 +574,7 @@ impl RequestLogMetadataProjector {
                             }
                             ProjectedMetadataScalar::EventType
                             | ProjectedMetadataScalar::ServiceTier
+                            | ProjectedMetadataScalar::ResponseModel
                             | ProjectedMetadataScalar::ResponseStatus
                             | ProjectedMetadataScalar::ErrorCode => {}
                         }
@@ -573,7 +584,7 @@ impl RequestLogMetadataProjector {
                             .then(|| projected_metadata_key(&self.string))
                             .flatten();
                     }
-                } else if self.string.len() < 64 {
+                } else if self.string.len() < REQUEST_LOG_METADATA_STRING_BYTES {
                     self.string.push(byte);
                 } else {
                     self.string_overflow = true;
@@ -588,12 +599,15 @@ impl RequestLogMetadataProjector {
                     self.string.clear();
                     self.string_overflow = false;
                     self.capturing_scalar = self.awaiting_scalar.take();
+                    self.awaiting_message = false;
                     self.awaiting_usage = false;
                 }
                 b':' => {
                     let key = self.last_key.take();
                     self.awaiting_response =
                         self.depth == 1 && matches!(key, Some(ProjectedMetadataKey::Response));
+                    self.awaiting_message =
+                        self.depth == 1 && matches!(key, Some(ProjectedMetadataKey::Message));
                     self.awaiting_usage =
                         self.depth <= 2 && matches!(key, Some(ProjectedMetadataKey::Usage));
                     self.awaiting_scalar = match (self.depth, key) {
@@ -601,6 +615,13 @@ impl RequestLogMetadataProjector {
                             if depth == 1 || self.response_depth == Some(depth) =>
                         {
                             Some(ProjectedMetadataScalar::ServiceTier)
+                        }
+                        (depth, Some(ProjectedMetadataKey::Model))
+                            if depth == 1
+                                || self.response_depth == Some(depth)
+                                || self.message_depth == Some(depth) =>
+                        {
+                            Some(ProjectedMetadataScalar::ResponseModel)
                         }
                         (1, Some(ProjectedMetadataKey::Type)) => {
                             Some(ProjectedMetadataScalar::EventType)
@@ -619,6 +640,7 @@ impl RequestLogMetadataProjector {
                 }
                 b'{' if self.awaiting_usage => {
                     self.awaiting_usage = false;
+                    self.awaiting_message = false;
                     self.awaiting_scalar = None;
                     self.usage = Some(UsageCapture::new());
                 }
@@ -631,13 +653,18 @@ impl RequestLogMetadataProjector {
                     if self.awaiting_response {
                         self.response_depth = Some(self.depth);
                     }
+                    if self.awaiting_message {
+                        self.message_depth = Some(self.depth);
+                    }
                     self.awaiting_response = false;
+                    self.awaiting_message = false;
                     self.awaiting_usage = false;
                     self.awaiting_scalar = None;
                     self.last_key = None;
                 }
                 b'[' => {
                     self.awaiting_response = false;
+                    self.awaiting_message = false;
                     self.depth += 1;
                     self.awaiting_usage = false;
                     self.awaiting_scalar = None;
@@ -647,6 +674,9 @@ impl RequestLogMetadataProjector {
                     if self.response_depth == Some(self.depth) {
                         self.response_depth = None;
                     }
+                    if self.message_depth == Some(self.depth) {
+                        self.message_depth = None;
+                    }
                     self.depth = self.depth.saturating_sub(1);
                     self.awaiting_usage = false;
                     self.awaiting_scalar = None;
@@ -655,6 +685,7 @@ impl RequestLogMetadataProjector {
                 byte if byte.is_ascii_whitespace() => {}
                 _ => {
                     self.awaiting_response = false;
+                    self.awaiting_message = false;
                     self.awaiting_usage = false;
                     self.awaiting_scalar = None;
                     self.last_key = None;
@@ -668,10 +699,12 @@ impl RequestLogMetadataProjector {
 pub(crate) fn projected_metadata_key(value: &[u8]) -> Option<ProjectedMetadataKey> {
     match value {
         b"response" => Some(ProjectedMetadataKey::Response),
+        b"message" => Some(ProjectedMetadataKey::Message),
         b"service_tier" => Some(ProjectedMetadataKey::ServiceTier),
         b"usage" => Some(ProjectedMetadataKey::Usage),
         b"type" => Some(ProjectedMetadataKey::Type),
         b"delta" => Some(ProjectedMetadataKey::Delta),
+        b"model" => Some(ProjectedMetadataKey::Model),
         b"status" => Some(ProjectedMetadataKey::Status),
         b"code" => Some(ProjectedMetadataKey::Code),
         _ => None,
@@ -681,6 +714,58 @@ pub(crate) fn projected_metadata_key(value: &[u8]) -> Option<ProjectedMetadataKe
 #[cfg(test)]
 mod billing_tests {
     use super::*;
+
+    #[test]
+    fn upstream_reported_model_projects_from_chunked_sse() {
+        const CASES: [(&[u8], &str); 3] = [
+            (
+                br#"data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.1-codex"}}"#,
+                "gpt-5.1-codex",
+            ),
+            (
+                br#"data: {"id":"chatcmpl_1","model":"deepseek/deepseek-v4.1-flash","choices":[]}"#,
+                "deepseek/deepseek-v4.1-flash",
+            ),
+            (
+                br#"data: {"type":"message_start","message":{"id":"msg_1","model":"claude-sonnet-4-5"}}"#,
+                "claude-sonnet-4-5",
+            ),
+        ];
+        for (bytes, expected) in CASES {
+            let probe = RouteRequestLogProbe::detached_test_probe();
+            let mut projector = RequestLogMetadataProjector::default();
+            for chunk in bytes.chunks(5) {
+                projector.observe(chunk, &probe, Instant::now()).unwrap();
+            }
+            assert_eq!(
+                probe.upstream_response_model_for_test().as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_reported_model_ignores_nested_and_repeated_values() {
+        let probe = RouteRequestLogProbe::detached_test_probe();
+        let mut projector = RequestLogMetadataProjector::default();
+        for chunk in
+            br#"data: {"type":"response.created","response":{"model":"gpt-5.1-codex","output":[{"model":"nested"}]}}"#
+                .chunks(7)
+        {
+            projector.observe(chunk, &probe, Instant::now()).unwrap();
+        }
+        projector
+            .observe(
+                b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"other\"}}\n\n",
+                &probe,
+                Instant::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            probe.upstream_response_model_for_test().as_deref(),
+            Some("gpt-5.1-codex")
+        );
+    }
 
     #[test]
     fn service_tier_projects_chunked_long_sse_without_reading_nested_content() {
@@ -709,6 +794,6 @@ mod billing_tests {
             probe.token_usage_for_test().cache_creation_input_tokens,
             Some(1500)
         );
-        assert!(projector.string.len() <= 64);
+        assert!(projector.string.len() <= REQUEST_LOG_METADATA_STRING_BYTES);
     }
 }

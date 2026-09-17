@@ -531,6 +531,7 @@ where
             )
         });
         let message = accumulator.into_message()?;
+        observe_upstream_response_model(request_log_probe.as_ref(), &message);
         let completed =
             anthropic_message_to_responses_body_with_tool_bridge(&message, model, tool_bridge)?;
         drop(message);

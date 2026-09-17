@@ -22,7 +22,7 @@ use tokio::sync::oneshot;
 
 use crate::config::{RouteRequestLogBackend, RouteRequestLogConfig};
 
-const SCHEMA_VERSION: u8 = 11;
+const SCHEMA_VERSION: u8 = 12;
 const MAX_LOG_STRING_BYTES: usize = 512;
 const MAX_LOG_HEADERS_BYTES: usize = 16 * 1024;
 pub(crate) const MAX_LOG_ERROR_BYTES: usize = 64 * 1024;
@@ -228,6 +228,9 @@ pub(crate) struct RouteRequestLogEntry {
     pub requested_model: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// 上游响应里返回的实际使用模型，上游未回报时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_response_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -527,6 +530,8 @@ pub(crate) struct RouteRequestLogQueryItem {
     pub official_account_id: Option<String>,
     pub requested_model: String,
     pub model: Option<String>,
+    /// 上游响应里返回的实际使用模型，上游未回报时为 None。
+    pub upstream_response_model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub thinking_budget_tokens: Option<u64>,
     pub ttft_ms: Option<u64>,
@@ -739,6 +744,8 @@ impl RouteRequestLogProducer {
             official_account_id: None,
             requested_model: bounded_string(start.requested_model),
             model: None,
+            upstream_response_model: None,
+            downstream_response_model: None,
             reasoning_effort: start.reasoning_effort.map(bounded_string),
             thinking_budget_tokens: start.thinking_budget_tokens,
             token_usage: RequestTokenUsage::default(),
@@ -889,6 +896,11 @@ struct PendingEntry {
     official_account_id: Option<String>,
     requested_model: String,
     model: Option<String>,
+    /// 上游响应里返回的实际使用模型，只在原始上游响应里取值。
+    upstream_response_model: Option<String>,
+    /// 下游 JSON 中出现的模型值。适配线路会在发给 Codex 的响应里带上
+    /// 本地发送的模型名，所以这一来源只在上游没有回报时兜底。
+    downstream_response_model: Option<String>,
     reasoning_effort: Option<String>,
     thinking_budget_tokens: Option<u64>,
     token_usage: RequestTokenUsage,
@@ -927,6 +939,21 @@ impl RouteRequestLogProbe {
     pub(crate) fn observe_service_tier(&self, tier: &str) {
         self.shield(|| {
             lock_unpoisoned(&self.shared.entry).service_tier = Some(bounded_string(tier));
+        });
+    }
+
+    /// 记录原始上游响应里返回的实际使用模型。上游通常在每个事件里重复
+    /// 返回同一个值，只保留最先出现的非空值。
+    pub(crate) fn observe_upstream_response_model(&self, model: &str) {
+        self.shield(|| {
+            let mut entry = lock_unpoisoned(&self.shared.entry);
+            if entry.upstream_response_model.is_some() {
+                return;
+            }
+            let model = bounded_string(model);
+            if !model.is_empty() {
+                entry.upstream_response_model = Some(model);
+            }
         });
     }
 
@@ -1004,6 +1031,15 @@ impl RouteRequestLogProbe {
     #[cfg(test)]
     pub(crate) fn token_usage_for_test(&self) -> RequestTokenUsage {
         lock_unpoisoned(&self.shared.entry).token_usage.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upstream_response_model_for_test(&self) -> Option<String> {
+        let entry = lock_unpoisoned(&self.shared.entry);
+        entry
+            .upstream_response_model
+            .clone()
+            .or_else(|| entry.downstream_response_model.clone())
     }
 
     #[cfg(test)]
@@ -1251,6 +1287,7 @@ impl RouteRequestLogProbe {
             let contains_usage = usage_value(event).is_some();
             if !contains_usage
                 && response_service_tier(event).is_none()
+                && upstream_response_model(event).is_none()
                 && !matches!(
                     event_type,
                     Some(
@@ -1357,6 +1394,10 @@ impl RouteRequestLogProbe {
             official_account_id: pending.official_account_id.take(),
             requested_model: std::mem::take(&mut pending.requested_model),
             model: pending.model.take(),
+            upstream_response_model: pending
+                .upstream_response_model
+                .take()
+                .or_else(|| pending.downstream_response_model.take()),
             reasoning_effort: pending.reasoning_effort.take(),
             thinking_budget_tokens: pending.thinking_budget_tokens,
             ttft_ms: load_duration_ms(&self.shared.first_byte_micros),
@@ -2146,7 +2187,8 @@ impl SqliteSink {
                 upstream_input_state TEXT,
                 upstream_input_items INTEGER,
                 upstream_has_previous_response_id INTEGER,
-                upstream_bytes INTEGER
+                upstream_bytes INTEGER,
+                upstream_response_model TEXT
              );
              CREATE INDEX IF NOT EXISTS idx_route_request_logs_time_id
                 ON route_request_logs(timestamp_unix_ms DESC, request_id DESC);
@@ -2177,6 +2219,7 @@ impl SqliteSink {
             ("upstream_input_items", "INTEGER"),
             ("upstream_has_previous_response_id", "INTEGER"),
             ("upstream_bytes", "INTEGER"),
+            ("upstream_response_model", "TEXT"),
         ] {
             let exists: bool = connection.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pragma_table_info('route_request_logs') WHERE name = ?1)",
@@ -2227,14 +2270,15 @@ impl SqliteSink {
                     official_account_id, request_input_state, request_input_items,
                     request_has_previous_response_id, request_bytes,
                     upstream_input_state, upstream_input_items,
-                    upstream_has_previous_response_id, upstream_bytes
+                    upstream_has_previous_response_id, upstream_bytes,
+                    upstream_response_model
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
                     ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30,
                     ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40,
                     ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50,
-                    ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58
+                    ?51, ?52, ?53, ?54, ?55, ?56, ?57, ?58, ?59
                 ) ON CONFLICT(request_id) DO NOTHING",
             )?;
             for queued in batch {
@@ -2298,6 +2342,7 @@ impl SqliteSink {
                     entry.upstream_input_items.map(to_i64),
                     entry.upstream_has_previous_response_id,
                     entry.upstream_bytes.map(to_i64),
+                    entry.upstream_response_model,
                 ])?;
             }
         }
@@ -2409,6 +2454,11 @@ fn query_sqlite_route_request_logs(
     } else {
         "NULL"
     };
+    let response_model_column = if optional_columns.response_model {
+        "upstream_response_model"
+    } else {
+        "NULL"
+    };
     let select_sql = format!(
         "SELECT
             request_id, trace_id, timestamp_unix_ms, provider, provider_name,
@@ -2425,7 +2475,7 @@ fn query_sqlite_route_request_logs(
             first_byte_source, subagent, upstream_error_summary,
             codex_session_id, codex_session_is_parent, {tier_columns},
             upstream_request_headers, {account_column}, {request_shape_columns},
-            {response_header_column}
+            {response_header_column}, {response_model_column}
          FROM route_request_logs{where_clause}
          ORDER BY timestamp_unix_ms DESC, request_id DESC
          {pagination}"
@@ -2730,6 +2780,8 @@ struct RouteRequestLogOptionalColumns {
     request_shape: bool,
     /// 上游响应头列随 schema 版本 11 加入，旧库尚未迁移时按缺失处理。
     response_headers: bool,
+    /// 上游回报的实际使用模型列随 schema 版本 12 加入。
+    response_model: bool,
 }
 
 /// These columns are added by the writer at open time and never dropped, so a
@@ -2743,6 +2795,7 @@ fn sqlite_optional_columns(
     static ACCOUNTED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     static SHAPED_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     static RESPONSE_HEADER_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    static RESPONSE_MODEL_PATHS: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
     Ok(RouteRequestLogOptionalColumns {
         tiers: sqlite_has_column(connection, path, &TIERED_PATHS, "service_tier")?,
         official_account: sqlite_has_column(
@@ -2757,6 +2810,12 @@ fn sqlite_optional_columns(
             path,
             &RESPONSE_HEADER_PATHS,
             "upstream_response_headers",
+        )?,
+        response_model: sqlite_has_column(
+            connection,
+            path,
+            &RESPONSE_MODEL_PATHS,
+            "upstream_response_model",
         )?,
     })
 }
@@ -2852,6 +2911,7 @@ fn query_item_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRequest
         upstream_has_previous_response_id: row.get(53)?,
         upstream_bytes: row_optional_u64(row, 54)?,
         upstream_response_headers: row.get(55)?,
+        upstream_response_model: row.get(56)?,
     })
 }
 
@@ -2912,9 +2972,40 @@ fn response_service_tier(value: &Value) -> Option<&str> {
         .and_then(Value::as_str)
 }
 
+/// 上游响应里报告的实际使用模型。Responses 事件放在 response 对象里，
+/// Chat Completions 放在根级，Anthropic Messages 放在 message 对象里。
+pub(crate) fn upstream_response_model(value: &Value) -> Option<&str> {
+    value
+        .pointer("/response/model")
+        .or_else(|| value.pointer("/message/model"))
+        .or_else(|| value.get("model"))
+        .and_then(Value::as_str)
+}
+
+/// 记录上游原始响应里出现的实际使用模型。桥接线路不经过原始字节投影，
+/// 由各适配器在解析上游响应时直接调用。
+pub(crate) fn observe_upstream_response_model(
+    probe: Option<&RouteRequestLogProbe>,
+    value: &Value,
+) {
+    if let Some(probe) = probe
+        && let Some(model) = upstream_response_model(value)
+    {
+        probe.observe_upstream_response_model(model);
+    }
+}
+
 fn observe_terminal_value(entry: &mut PendingEntry, value: &Value) {
     if let Some(tier) = response_service_tier(value) {
         entry.service_tier = Some(bounded_string(tier));
+    }
+    if entry.downstream_response_model.is_none()
+        && let Some(model) = upstream_response_model(value)
+    {
+        let model = bounded_string(model);
+        if !model.is_empty() {
+            entry.downstream_response_model = Some(model);
+        }
     }
     let event_type = value.get("type").and_then(Value::as_str);
     let response_status = value
@@ -3253,6 +3344,7 @@ mod tests {
             official_account_id: None,
             requested_model: "alias/model".to_string(),
             model: Some("model".to_string()),
+            upstream_response_model: None,
             reasoning_effort: Some("high".to_string()),
             thinking_budget_tokens: None,
             ttft_ms: Some(12),
@@ -3465,6 +3557,71 @@ mod tests {
         assert_eq!(
             item.upstream_response_headers.as_deref(),
             Some("x-codex-turn-state: routed\nset-cookie: [REDACTED]")
+        );
+    }
+
+    #[test]
+    fn upstream_response_model_column_migrates_history_and_roundtrips() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SQLITE_FILE_NAME);
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut legacy = sample_entry("legacy");
+        legacy.timestamp_unix_ms = unix_timestamp_ms();
+        sink.write_batch(&[queued(legacy)]).unwrap();
+        sink.connection
+            .execute_batch("ALTER TABLE route_request_logs DROP COLUMN upstream_response_model;")
+            .unwrap();
+        drop(sink);
+        let page = query_route_request_logs(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery::default(),
+        )
+        .unwrap();
+        // 旧库缺少该列时查询照常返回，字段按上游未回报处理。
+        assert_eq!(page.items[0].upstream_response_model, None);
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut entry = sample_entry("upstream-model");
+        entry.timestamp_unix_ms = unix_timestamp_ms();
+        entry.upstream_response_model = Some("deepseek/deepseek-v4.1-flash".into());
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            json["upstreamResponseModel"],
+            "deepseek/deepseek-v4.1-flash"
+        );
+        sink.write_batch(&[queued(entry)]).unwrap();
+        let page = query_route_request_logs(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogQuery::default(),
+        )
+        .unwrap();
+        let item = page
+            .items
+            .iter()
+            .find(|item| item.request_id == "upstream-model")
+            .unwrap();
+        assert_eq!(
+            item.upstream_response_model.as_deref(),
+            Some("deepseek/deepseek-v4.1-flash")
+        );
+    }
+
+    #[test]
+    fn raw_upstream_model_outranks_the_relayed_downstream_model() {
+        let probe = RouteRequestLogProbe::detached_test_probe();
+        probe.observe_event(&serde_json::json!({
+            "type": "response.completed",
+            "response": {"model": "provider-model", "status": "completed"},
+        }));
+        assert_eq!(
+            probe.upstream_response_model_for_test().as_deref(),
+            Some("provider-model")
+        );
+        probe.observe_upstream_response_model("deepseek/deepseek-v4.1-flash");
+        assert_eq!(
+            probe.upstream_response_model_for_test().as_deref(),
+            Some("deepseek/deepseek-v4.1-flash")
         );
     }
 
@@ -4179,6 +4336,7 @@ mod tests {
             official_account_id: None,
             requested_model: "requested".into(),
             model: None,
+            upstream_response_model: None,
             reasoning_effort: None,
             thinking_budget_tokens: None,
             ttft_ms: None,
@@ -4245,6 +4403,8 @@ mod tests {
         assert!(value.get("routerPreUpstreamMs").unwrap().is_null());
         assert!(value.get("upstreamFirstByteMs").unwrap().is_null());
         assert!(value.get("downstreamFirstContentMs").unwrap().is_null());
+        // 上游未回报实际使用模型时该字段为空。
+        assert!(value.get("upstreamResponseModel").unwrap().is_null());
         assert!(value.get("request_id").is_none());
         assert!(value.get("retryCount").is_none());
     }

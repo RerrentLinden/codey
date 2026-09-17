@@ -19,6 +19,35 @@ test("request log cache hit rate uses input tokens and preserves unknown usage",
   }
 });
 
+test("request log model cell shows the model sent upstream and the upstream model when it differs", async () => {
+  const [viewer, preview] = await Promise.all([
+    readFile(new URL("src/RequestLogDialog.tsx", root), "utf8"),
+    readFile(new URL("src/dev/mockApi.ts", root), "utf8"),
+  ]);
+
+  assert.ok(viewer.includes('import { modelIdsEqual } from "./modelIds";'));
+  assert.ok(viewer.includes('const sentModel = (item.model ?? "").trim() || item.requestedModel.trim();'));
+  assert.ok(viewer.includes('const upstreamModel = (item.upstreamResponseModel ?? "").trim();'));
+  assert.ok(viewer.includes("const upstreamModelDiffers = Boolean(upstreamModel) && !modelIdsEqual(upstreamModel, sentModel);"));
+  assert.ok(viewer.includes('{sentModel || "—"}'));
+  assert.ok(viewer.includes("{upstreamModelDiffers ? ("));
+  assert.ok(viewer.includes("请求模型（发往上游）：${sentModel}"));
+  assert.ok(viewer.includes("上游实际使用模型：${upstreamModel}"));
+  assert.ok(viewer.includes("upstreamResponseModel?: string | null;"));
+  assert.ok(viewer.includes("Codex 请求 Codey 时选择的模型 ID，带线路前缀"));
+  // 请求模型取发往上游的模型，实际模型取上游响应回报的模型。
+  assert.match(viewer, /请求模型<\/dt>[\s\S]*?selectedItem\.model \|\| selectedItem\.requestedModel/);
+  assert.match(viewer, /实际使用模型<\/dt>[\s\S]*?selectedItem\.upstreamResponseModel/);
+  // 请求模型不展示带线路前缀的 Codex 选择器，只在详情里单列一行。
+  assert.ok(viewer.includes("{selectedItem.requestedModel}"));
+  // 预览覆盖实际模型与请求模型一致、不一致以及上游未回报三种形态。
+  assert.ok(preview.includes('primary ? "primary/provider-fast-coder" : "claude-sonnet-4-5"'));
+  assert.ok(preview.includes('model: account ? "gpt-5.6-sol" : primary ? "provider-fast-coder" : "claude-sonnet-4-5"'));
+  assert.ok(preview.includes("upstreamResponseModel: failed"));
+  assert.ok(preview.includes('"deepseek/deepseek-v4.1-flash"'));
+  assert.ok(preview.includes('"claude-sonnet-4-5-20250929"'));
+});
+
 test("request log detail labels request body shape and flags empty input arrays", async () => {
   const viewer = await readFile(new URL("src/RequestLogDialog.tsx", root), "utf8");
   const source = viewer.match(/function requestShapeText\([\s\S]*?\n\}/)?.[0];
@@ -94,7 +123,7 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /pageSize/);
   assert.match(viewer, /window\.setTimeout\([\s\S]*300/);
   assert.match(viewer, /按供应商筛选请求日志/);
-  assert.match(viewer, /按实际模型筛选请求日志/);
+  assert.match(viewer, /按请求模型筛选请求日志/);
   assert.match(viewer, /按状态筛选请求日志/);
   assert.match(viewer, /按上游协议筛选请求日志/);
   assert.match(viewer, /按官方账号筛选请求日志/);
