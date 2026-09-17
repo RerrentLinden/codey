@@ -648,11 +648,15 @@ async fn prepare_startup_model_catalog(
                 refresh_official_provider,
                 refresh_upstream_models.as_deref(),
                 &runtime_selected_models,
-                &runtime_websocket_models,
-                &runtime_native_web_search_models,
-                &runtime_image_detail_original_models,
-                &runtime_model_contexts,
-                &runtime_model_reasoning_efforts,
+                model_catalog::CapabilityLists {
+                    websocket_models: Some(&runtime_websocket_models),
+                    native_web_search_models: Some(&runtime_native_web_search_models),
+                    image_detail_original_models: Some(&runtime_image_detail_original_models),
+                },
+                model_catalog::CatalogOverrides {
+                    contexts: &runtime_model_contexts,
+                    reasoning_efforts: &runtime_model_reasoning_efforts,
+                },
                 &catalog_codex_app_path,
             );
             let cached_catalog = if refresh.is_err() {

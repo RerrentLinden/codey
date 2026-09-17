@@ -283,9 +283,11 @@ fn try_refresh_model_catalog(config: &CodeyConfig, home: &std::path::Path) -> an
             .then_some(upstream_models)
             .as_deref(),
         &selected_models,
-        &websocket_models,
-        &native_web_search_models,
-        &image_detail_original_models,
+        model_catalog::CapabilityLists {
+            websocket_models: Some(&websocket_models),
+            native_web_search_models: Some(&native_web_search_models),
+            image_detail_original_models: Some(&image_detail_original_models),
+        },
         &config.codex_app_path,
     )
     .map(|_| ())

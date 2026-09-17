@@ -281,7 +281,7 @@ pub(super) async fn spawn_codex(
                 fuses.node_options.node_options_possible() && !retry_without_require;
             let require_patch = prepare_startup_require_launch(
                 require_wanted,
-                patch_options,
+                patch_options.clone(),
                 runtime_config_overrides,
                 "windows",
             )
@@ -441,7 +441,7 @@ pub(super) async fn spawn_codex(
             }
             let startup_result = install_startup_patch_with_cli_fallback(
                 inspector_port,
-                patch_options,
+                patch_options.clone(),
                 runtime_config_overrides,
                 wrapper_handshake,
                 StartupWaitContext {

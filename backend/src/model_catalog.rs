@@ -180,6 +180,22 @@ pub fn default_official_model_slugs() -> Vec<String> {
         .collect()
 }
 
+/// 本次刷新声明的模型能力清单；为 `None` 表示不声明该类能力。
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CapabilityLists<'a> {
+    pub(crate) websocket_models: Option<&'a [String]>,
+    pub(crate) native_web_search_models: Option<&'a [String]>,
+    pub(crate) image_detail_original_models: Option<&'a [String]>,
+}
+
+/// 刷新完成后按模型写入的上下文与思考等级覆盖。
+#[derive(Clone, Copy)]
+pub(crate) struct CatalogOverrides<'a> {
+    pub(crate) contexts: &'a std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
+    pub(crate) reasoning_efforts:
+        &'a std::collections::BTreeMap<String, Vec<crate::config::ModelReasoningEffort>>,
+}
+
 #[cfg(test)]
 pub fn refresh_for_provider(
     home: &Path,
@@ -192,9 +208,7 @@ pub fn refresh_for_provider(
         official_provider,
         upstream_models,
         selected_models,
-        None,
-        None,
-        None,
+        CapabilityLists::default(),
         "",
     )
 }
@@ -212,9 +226,10 @@ pub(crate) fn refresh_for_provider_with_websocket_models(
         official_provider,
         upstream_models,
         selected_models,
-        Some(websocket_models),
-        None,
-        None,
+        CapabilityLists {
+            websocket_models: Some(websocket_models),
+            ..CapabilityLists::default()
+        },
         "",
     )
 }
@@ -224,9 +239,7 @@ pub(crate) fn refresh_for_provider_with_capabilities(
     official_provider: bool,
     upstream_models: Option<&[String]>,
     selected_models: &[String],
-    websocket_models: &[String],
-    native_web_search_models: &[String],
-    image_detail_original_models: &[String],
+    capabilities: CapabilityLists<'_>,
     codex_app_path: &str,
 ) -> Result<usize> {
     refresh_for_provider_with_transport_preferences(
@@ -234,28 +247,18 @@ pub(crate) fn refresh_for_provider_with_capabilities(
         official_provider,
         upstream_models,
         selected_models,
-        Some(websocket_models),
-        Some(native_web_search_models),
-        Some(image_detail_original_models),
+        capabilities,
         codex_app_path,
     )
 }
 
-// Extends the existing capability entry point without changing its callers' API.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh_for_provider_with_contexts(
     home: &Path,
     official_provider: bool,
     upstream_models: Option<&[String]>,
     selected_models: &[String],
-    websocket_models: &[String],
-    native_web_search_models: &[String],
-    image_detail_original_models: &[String],
-    contexts: &std::collections::BTreeMap<String, crate::config::ModelContextConfig>,
-    reasoning_efforts: &std::collections::BTreeMap<
-        String,
-        Vec<crate::config::ModelReasoningEffort>,
-    >,
+    capabilities: CapabilityLists<'_>,
+    overrides: CatalogOverrides<'_>,
     codex_app_path: &str,
 ) -> Result<usize> {
     let count = refresh_for_provider_with_capabilities(
@@ -263,13 +266,11 @@ pub(crate) fn refresh_for_provider_with_contexts(
         official_provider,
         upstream_models,
         selected_models,
-        websocket_models,
-        native_web_search_models,
-        image_detail_original_models,
+        capabilities,
         codex_app_path,
     )?;
-    apply_catalog_contexts(home, contexts)?;
-    apply_catalog_reasoning_efforts(home, reasoning_efforts)?;
+    apply_catalog_contexts(home, overrides.contexts)?;
+    apply_catalog_reasoning_efforts(home, overrides.reasoning_efforts)?;
     Ok(count)
 }
 
@@ -448,11 +449,14 @@ fn refresh_for_provider_with_transport_preferences(
     official_provider: bool,
     upstream_models: Option<&[String]>,
     selected_models: &[String],
-    websocket_models: Option<&[String]>,
-    native_web_search_models: Option<&[String]>,
-    image_detail_original_models: Option<&[String]>,
+    capabilities: CapabilityLists<'_>,
     codex_app_path: &str,
 ) -> Result<usize> {
+    let CapabilityLists {
+        websocket_models,
+        native_web_search_models,
+        image_detail_original_models,
+    } = capabilities;
     if !official_provider
         && upstream_models.is_some_and(|models| models.is_empty())
         && selected_models.is_empty()
@@ -3096,9 +3100,7 @@ mod tests {
             false,
             Some(&selected),
             &selected,
-            &[],
-            &[],
-            &[],
+            CapabilityLists::default(),
             "",
         )
         .unwrap();
@@ -3147,9 +3149,10 @@ mod tests {
                 false,
                 Some(&selected),
                 &selected,
-                &[],
-                &[],
-                &image_detail_original_models,
+                CapabilityLists {
+                    image_detail_original_models: Some(&image_detail_original_models),
+                    ..CapabilityLists::default()
+                },
                 "",
             )
             .unwrap(),
@@ -3185,9 +3188,10 @@ mod tests {
             false,
             Some(&selected),
             &selected,
-            &[],
-            &[],
-            &selected,
+            CapabilityLists {
+                image_detail_original_models: Some(&selected),
+                ..CapabilityLists::default()
+            },
             "",
         )
         .unwrap();
@@ -3214,9 +3218,7 @@ mod tests {
             false,
             Some(&selected),
             &selected,
-            &[],
-            &[],
-            &[],
+            CapabilityLists::default(),
             "",
         )
         .unwrap();
@@ -3323,9 +3325,10 @@ mod tests {
             false,
             Some(&selected),
             &selected,
-            &[],
-            &native_web_search_models,
-            &[],
+            CapabilityLists {
+                native_web_search_models: Some(&native_web_search_models),
+                ..CapabilityLists::default()
+            },
             "",
         )
         .unwrap();
@@ -3366,9 +3369,10 @@ mod tests {
             false,
             Some(&selected),
             &selected,
-            &[],
-            &selected,
-            &[],
+            CapabilityLists {
+                native_web_search_models: Some(&selected),
+                ..CapabilityLists::default()
+            },
             "",
         )
         .unwrap();
