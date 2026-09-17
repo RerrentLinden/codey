@@ -13,6 +13,7 @@ pub enum NotificationChannelKind {
     Wecom,
     Telegram,
     WechatClaw,
+    Ntfy,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -109,6 +110,9 @@ impl NotificationChannelConfig {
                     && !self.chat_id.trim().is_empty()
                     && self.wechat_claw_base_url().is_ok()
             }
+            NotificationChannelKind::Ntfy => {
+                self.ntfy_base_url().is_ok() && self.ntfy_topic().is_ok()
+            }
         }
     }
 
@@ -194,6 +198,48 @@ impl NotificationChannelConfig {
             return Err(INVALID_URL);
         }
         Ok(url)
+    }
+
+    /// ntfy 服务器地址，请求发往根路径，主题放在 JSON 请求体中；允许自建服务，
+    /// 因此只约束协议、主机和路径，不限定域名与端口。
+    pub(crate) fn ntfy_base_url(&self) -> Result<reqwest::Url, &'static str> {
+        const INVALID_URL: &str = "ntfy 服务器地址必须是 HTTPS 根地址，例如 https://ntfy.sh";
+        let value = self.url.trim();
+        if value.is_empty() {
+            return Err("请先填写 ntfy 服务器地址");
+        }
+        let url = reqwest::Url::parse(value).map_err(|_| INVALID_URL)?;
+        #[cfg(test)]
+        if self.allow_insecure_test_url {
+            return Ok(url);
+        }
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || !matches!(url.path(), "" | "/")
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(INVALID_URL);
+        }
+        Ok(url)
+    }
+
+    /// ntfy 主题沿用聊天渠道的接收方字段，取值限制与 ntfy 服务端一致。
+    pub(crate) fn ntfy_topic(&self) -> Result<&str, &'static str> {
+        let topic = self.chat_id.trim();
+        if topic.is_empty() {
+            return Err("请先填写 ntfy 主题");
+        }
+        if topic.len() > 64
+            || !topic.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+            })
+        {
+            return Err("ntfy 主题只能包含字母、数字、下划线和连字符，长度不超过 64 个字符");
+        }
+        Ok(topic)
     }
 }
 
@@ -288,6 +334,12 @@ impl WebhookConfig {
                             .map_err(ToString::to_string)?;
                     }
                 }
+                NotificationChannelKind::Ntfy => {
+                    channel.ntfy_base_url().map_err(ToString::to_string)?;
+                    if !channel.chat_id.trim().is_empty() {
+                        channel.ntfy_topic().map_err(ToString::to_string)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -295,26 +347,16 @@ impl WebhookConfig {
 
     pub fn merge_redacted_secrets(&mut self, previous: &Self) {
         for channel in &mut self.channels {
+            if matches!(
+                channel.kind,
+                NotificationChannelKind::Feishu
+                    | NotificationChannelKind::Wecom
+                    | NotificationChannelKind::Ntfy
+            ) {
+                restore_redacted_url(channel, previous);
+            }
             match channel.kind {
-                NotificationChannelKind::Feishu | NotificationChannelKind::Wecom => {
-                    let kind = channel.kind;
-                    if channel.clear_url {
-                        channel.url.clear();
-                        channel.url_configured = false;
-                        continue;
-                    }
-                    if !channel.url.trim().is_empty() || !channel.url_configured {
-                        continue;
-                    }
-                    if let Some(existing) = previous
-                        .channels
-                        .iter()
-                        .find(|existing| existing.id == channel.id && existing.kind == kind)
-                    {
-                        channel.url = existing.url.clone();
-                    }
-                }
-                NotificationChannelKind::Telegram => {
+                NotificationChannelKind::Telegram | NotificationChannelKind::Ntfy => {
                     let kind = channel.kind;
                     if channel.clear_bot_token {
                         channel.bot_token.clear();
@@ -397,8 +439,28 @@ impl WebhookConfig {
                         channel.session_status = NotificationChannelSessionStatus::Active;
                     }
                 }
+                NotificationChannelKind::Feishu | NotificationChannelKind::Wecom => {}
             }
         }
+    }
+}
+
+fn restore_redacted_url(channel: &mut NotificationChannelConfig, previous: &WebhookConfig) {
+    if channel.clear_url {
+        channel.url.clear();
+        channel.url_configured = false;
+        return;
+    }
+    if !channel.url.trim().is_empty() || !channel.url_configured {
+        return;
+    }
+    let kind = channel.kind;
+    if let Some(existing) = previous
+        .channels
+        .iter()
+        .find(|existing| existing.id == channel.id && existing.kind == kind)
+    {
+        channel.url = existing.url.clone();
     }
 }
 
@@ -672,6 +734,132 @@ mod tests {
             };
             assert!(config.wechat_claw_base_url().is_err(), "{rejected}");
         }
+    }
+
+    #[test]
+    fn ntfy_requires_an_https_root_url_and_a_valid_topic() {
+        for accepted in [
+            "https://ntfy.sh",
+            "https://ntfy.example.com/",
+            "https://ntfy.example.com:8443",
+        ] {
+            let config = NotificationChannelConfig {
+                kind: NotificationChannelKind::Ntfy,
+                url: accepted.to_string(),
+                chat_id: "codey_topic-1".to_string(),
+                ..NotificationChannelConfig::default()
+            };
+            assert!(config.ntfy_base_url().is_ok(), "{accepted}");
+            assert!(config.is_configured(), "{accepted}");
+        }
+
+        for rejected in [
+            "http://ntfy.sh",
+            "https://ntfy.sh/publish",
+            "https://ntfy.sh?x=1",
+            "https://ntfy.sh#fragment",
+            "https://user@ntfy.sh",
+        ] {
+            let config = NotificationChannelConfig {
+                kind: NotificationChannelKind::Ntfy,
+                url: rejected.to_string(),
+                chat_id: "codey_topic".to_string(),
+                ..NotificationChannelConfig::default()
+            };
+            assert!(config.ntfy_base_url().is_err(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn ntfy_topic_matches_the_publish_contract() {
+        for accepted in ["a", "codey_topic", "Codey-Topic-1", "_"] {
+            let config = NotificationChannelConfig {
+                kind: NotificationChannelKind::Ntfy,
+                url: "https://ntfy.sh".to_string(),
+                chat_id: accepted.to_string(),
+                ..NotificationChannelConfig::default()
+            };
+            assert!(config.ntfy_topic().is_ok(), "{accepted}");
+        }
+
+        for rejected in ["", "has space", "topic.dot", "主题", &"a".repeat(65)] {
+            let config = NotificationChannelConfig {
+                kind: NotificationChannelKind::Ntfy,
+                url: "https://ntfy.sh".to_string(),
+                chat_id: rejected.to_string(),
+                ..NotificationChannelConfig::default()
+            };
+            assert!(config.ntfy_topic().is_err(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn ntfy_channel_without_a_topic_is_not_configured() {
+        let channel = NotificationChannelConfig {
+            kind: NotificationChannelKind::Ntfy,
+            enabled: true,
+            url: "https://ntfy.sh".to_string(),
+            ..NotificationChannelConfig::default()
+        };
+
+        assert!(!channel.is_configured());
+    }
+
+    #[test]
+    fn redacted_ntfy_server_url_and_access_token_are_restored_on_save() {
+        let previous = WebhookConfig {
+            channels: vec![NotificationChannelConfig {
+                id: "ntfy-1".to_string(),
+                kind: NotificationChannelKind::Ntfy,
+                enabled: true,
+                url: "https://ntfy.example.com".to_string(),
+                url_configured: true,
+                bot_token: "tk_secret".to_string(),
+                bot_token_configured: true,
+                chat_id: "codey-topic".to_string(),
+                ..NotificationChannelConfig::default()
+            }],
+            ..WebhookConfig::default()
+        };
+        let mut incoming = previous.clone();
+        incoming.channels[0].url.clear();
+        incoming.channels[0].bot_token.clear();
+        incoming.merge_redacted_secrets(&previous);
+
+        assert_eq!(incoming.channels[0].url, "https://ntfy.example.com");
+        assert_eq!(incoming.channels[0].bot_token, "tk_secret");
+        assert!(incoming.channels[0].is_configured());
+    }
+
+    #[test]
+    fn explicit_ntfy_clear_does_not_restore_the_previous_credentials() {
+        let previous = WebhookConfig {
+            channels: vec![NotificationChannelConfig {
+                id: "ntfy-1".to_string(),
+                kind: NotificationChannelKind::Ntfy,
+                url: "https://ntfy.example.com".to_string(),
+                url_configured: true,
+                bot_token: "tk_secret".to_string(),
+                bot_token_configured: true,
+                chat_id: "codey-topic".to_string(),
+                ..NotificationChannelConfig::default()
+            }],
+            ..WebhookConfig::default()
+        };
+        let mut incoming = previous.clone();
+        incoming.channels[0].bot_token.clear();
+        incoming.channels[0].clear_bot_token = true;
+        incoming.channels[0].url.clear();
+        incoming.channels[0].clear_url = true;
+        incoming.merge_redacted_secrets(&previous);
+
+        assert!(incoming.channels[0].url.is_empty());
+        assert!(incoming.channels[0].bot_token.is_empty());
+        assert!(!incoming.channels[0].bot_token_configured);
+        assert!(!incoming.channels[0].is_configured());
+        let serialized = serde_json::to_value(&incoming).unwrap();
+        assert!(serialized["channels"][0].get("clearUrl").is_none());
+        assert!(serialized["channels"][0].get("clearBotToken").is_none());
     }
 
     #[test]

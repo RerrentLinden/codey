@@ -374,6 +374,14 @@ fn renderer_settings_keep_editable_credentials_but_clear_clawbot_tokens() {
         chat_id: "user@im.wechat".to_string(),
         ..NotificationChannelConfig::default()
     });
+    config.webhook.channels.push(NotificationChannelConfig {
+        id: "ntfy-1".to_string(),
+        kind: crate::notifications::NotificationChannelKind::Ntfy,
+        url: "https://ntfy.example.com".to_string(),
+        bot_token: "ntfy-access-secret".to_string(),
+        chat_id: "codey-topic".to_string(),
+        ..NotificationChannelConfig::default()
+    });
 
     let public = serde_json::to_value(redacted_config(&config)).unwrap();
 
@@ -408,11 +416,20 @@ fn renderer_settings_keep_editable_credentials_but_clear_clawbot_tokens() {
         public["webhook"]["channels"][3]["contextTokenConfigured"],
         true
     );
+    assert_eq!(
+        public["webhook"]["channels"][4]["url"],
+        "https://ntfy.example.com"
+    );
+    assert_eq!(public["webhook"]["channels"][4]["urlConfigured"], true);
+    assert_eq!(public["webhook"]["channels"][4]["botToken"], "");
+    assert_eq!(public["webhook"]["channels"][4]["botTokenConfigured"], true);
+    assert_eq!(public["webhook"]["channels"][4]["chatId"], "codey-topic");
     assert!(public.to_string().contains("renderer-secret"));
     assert!(public.to_string().contains("optimizer-secret"));
     assert!(public.to_string().contains("feishu-secret"));
     assert!(public.to_string().contains("telegram-secret"));
     assert!(public.to_string().contains("wecom-secret"));
+    assert!(!public.to_string().contains("ntfy-access-secret"));
     assert!(!public.to_string().contains("wechat-claw-secret"));
     assert!(!public.to_string().contains("wechat-context-secret"));
     assert!(!public.to_string().contains("legacy-secret"));

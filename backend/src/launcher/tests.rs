@@ -147,18 +147,20 @@ async fn custom_context_cold_start_can_retry_after_restoring_defaults() {
             },
         )]),
     );
-    let error = prepare_startup_model_catalog(&config, &config.profiles[0], home.path())
-        .await
-        .err()
-        .unwrap();
+    let error =
+        prepare_startup_model_catalog(&config, &config.profiles[0], home.path(), home.path())
+            .await
+            .err()
+            .unwrap();
     assert_eq!(
         error.to_string(),
         model_catalog::CUSTOM_CONTEXT_CATALOG_UNAVAILABLE
     );
     config.model_context_by_provider.clear();
-    let startup = prepare_startup_model_catalog(&config, &config.profiles[0], home.path())
-        .await
-        .unwrap();
+    let startup =
+        prepare_startup_model_catalog(&config, &config.profiles[0], home.path(), home.path())
+            .await
+            .unwrap();
     assert!(!startup.use_official_catalog);
 }
 
@@ -187,9 +189,10 @@ async fn disabled_official_route_does_not_install_an_empty_model_catalog() {
     }
     .normalize();
 
-    let startup = prepare_startup_model_catalog(&config, &config.profiles[0], home.path())
-        .await
-        .unwrap();
+    let startup =
+        prepare_startup_model_catalog(&config, &config.profiles[0], home.path(), home.path())
+            .await
+            .unwrap();
 
     assert!(!startup.use_official_catalog);
     assert!(startup.model_state.official_models.is_empty());
@@ -218,10 +221,14 @@ async fn disabled_official_route_does_not_install_an_empty_model_catalog() {
 
     // Repeat with the previous empty file still present, as on the affected host.
     for _ in 0..2 {
-        let startup =
-            prepare_startup_model_catalog(&unavailable, &unavailable.profiles[1], home.path())
-                .await
-                .unwrap();
+        let startup = prepare_startup_model_catalog(
+            &unavailable,
+            &unavailable.profiles[1],
+            home.path(),
+            home.path(),
+        )
+        .await
+        .unwrap();
         assert!(!startup.use_official_catalog);
         assert!(startup.model_state.third_party_models.is_empty());
     }
@@ -270,9 +277,10 @@ async fn startup_fallback_removes_search_from_a_stale_chat_route_catalog() {
         .insert("route-chat".into(), vec!["gpt-5.6-sol".into()]);
     config = config.normalize();
 
-    let startup = prepare_startup_model_catalog(&config, &config.profiles[0], home.path())
-        .await
-        .unwrap();
+    let startup =
+        prepare_startup_model_catalog(&config, &config.profiles[0], home.path(), home.path())
+            .await
+            .unwrap();
 
     assert!(startup.use_official_catalog);
     let catalog: serde_json::Value =

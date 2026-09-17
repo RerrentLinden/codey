@@ -12,6 +12,39 @@ pub(crate) fn incoming_chatgpt_account_id(request: &HttpRequest) -> Option<Strin
         .map(ToString::to_string)
 }
 
+/// 取出 Bearer 方案携带的令牌，其他方案或空值返回 None。
+fn bearer_token(authorization: &str) -> Option<&str> {
+    let (scheme, token) = authorization.trim().split_once(' ')?;
+    let token = token.trim();
+    (scheme.eq_ignore_ascii_case("bearer") && !token.is_empty()).then_some(token)
+}
+
+/// 访问令牌的签发时间，用来比较两份凭据的新旧。
+fn access_token_issued_at(token: &str) -> Option<u64> {
+    crate::official_accounts::jwt_claims(token)?
+        .get("iat")
+        .and_then(Value::as_u64)
+}
+
+/// 已启动的 Codex 进程会把登录时拿到的令牌留在内存里；用户在 Codey 里重新
+/// 登录后账号文件已经换成新令牌，请求头仍会带着旧令牌。两份令牌都能读出签发
+/// 时间时取较新的一份；请求头不是可解读的 JWT 而账号文件有令牌时也以账号
+/// 文件为准，官方端点只接受这种登录令牌，避免把已经失效的旧令牌继续转发。
+pub(crate) fn stored_token_supersedes_incoming(
+    incoming_authorization: &str,
+    stored_access_token: &str,
+) -> bool {
+    let incoming_issued_at = bearer_token(incoming_authorization).and_then(access_token_issued_at);
+    match (
+        incoming_issued_at,
+        access_token_issued_at(stored_access_token),
+    ) {
+        (Some(incoming), Some(stored)) => stored > incoming,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
 pub(crate) async fn resolve_official_upstream_auth(
     request: &HttpRequest,
     router_bearer_token: &str,
@@ -25,11 +58,23 @@ pub(crate) async fn resolve_official_upstream_auth(
     if accepts_incoming_authorization
         && let Some(authorization) = incoming_openai_authorization(request, router_bearer_token)
     {
+        // 重新登录只替换账号文件，已经启动的 Codex 仍会发送登录时缓存的旧
+        // 令牌；账号文件里的令牌更新时以它为准，新登录才能立即生效。
+        let stored = read_cached_official_auth(auth_path, auth_caches).await;
+        if let Some(stored_auth) = stored.as_ref()
+            && stored_token_supersedes_incoming(authorization, &stored_auth.access_token)
+        {
+            return Some(OfficialUpstreamAuth {
+                authorization: format!("Bearer {}", stored_auth.access_token),
+                account_id: stored_auth
+                    .account_id
+                    .clone()
+                    .or_else(|| incoming_chatgpt_account_id(request)),
+            });
+        }
         let account_id = match incoming_chatgpt_account_id(request) {
             Some(account_id) => Some(account_id),
-            None => read_cached_official_auth(auth_path, auth_caches)
-                .await
-                .and_then(|auth| auth.account_id),
+            None => stored.and_then(|auth| auth.account_id),
         };
         return Some(OfficialUpstreamAuth {
             authorization: authorization.to_string(),

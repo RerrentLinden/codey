@@ -1,4 +1,5 @@
 mod feishu;
+mod ntfy;
 mod telegram;
 mod wechat_claw;
 mod wecom;
@@ -45,5 +46,6 @@ pub(super) fn adapter_for(
         NotificationChannelKind::WechatClaw => {
             Box::new(wechat_claw::WechatClawChannel::new(config))
         }
+        NotificationChannelKind::Ntfy => Box::new(ntfy::NtfyChannel::new(config)),
     }
 }

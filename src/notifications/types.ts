@@ -1,4 +1,5 @@
-export type NotificationChannelKind = "feishu" | "wecom" | "telegram" | "wechatClaw";
+export type NotificationChannelKind =
+  "feishu" | "wecom" | "telegram" | "wechatClaw" | "ntfy";
 export type NotificationChannelSessionStatus = "active" | "expired";
 
 export const MAX_NOTIFICATION_CHANNELS = 32;

@@ -3101,6 +3101,147 @@ async fn official_upstream_auth_prefers_incoming_oauth_over_auth_json() {
     assert_eq!(auth.account_id.as_deref(), Some("acct-incoming"));
 }
 
+/// 测试用无签名 JWT：只填充本地路由需要读取的签发时间。
+fn unsigned_access_token(issued_at: u64) -> String {
+    use base64::Engine as _;
+    let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+        serde_json::to_vec(&json!({ "iat": issued_at, "exp": issued_at + 100_000 })).unwrap(),
+    );
+    format!("{header}.{payload}.sig")
+}
+
+#[test]
+fn newer_stored_token_supersedes_a_stale_incoming_bearer_token() {
+    let stale = unsigned_access_token(1_000);
+    let fresh = unsigned_access_token(2_000);
+    assert!(stored_token_supersedes_incoming(
+        &format!("Bearer {stale}"),
+        &fresh
+    ));
+    // 客户端手里的令牌更新时继续沿用请求头里的那一份。
+    assert!(!stored_token_supersedes_incoming(
+        &format!("Bearer {fresh}"),
+        &stale
+    ));
+    // 令牌相同时不必改写请求头。
+    assert!(!stored_token_supersedes_incoming(
+        &format!("Bearer {fresh}"),
+        &fresh
+    ));
+    // 账号文件不是可比较的新式令牌时保持原有行为。
+    assert!(!stored_token_supersedes_incoming(
+        &format!("Bearer {fresh}"),
+        "opaque-access-token"
+    ));
+    // 请求头不是可解读的 JWT 而账号文件里是完整登录令牌时，以账号文件为准。
+    assert!(stored_token_supersedes_incoming(
+        "Bearer opaque-downstream-token",
+        &stale
+    ));
+    assert!(stored_token_supersedes_incoming(
+        "Bearer codey-router-token",
+        &fresh
+    ));
+    // 两份凭据都不是可解读的登录令牌时保持原有行为。
+    assert!(!stored_token_supersedes_incoming(
+        "Bearer opaque-downstream-token",
+        "opaque-access-token"
+    ));
+}
+
+#[tokio::test]
+async fn official_upstream_auth_replaces_a_stale_incoming_token_after_relogin() {
+    let directory = tempfile::tempdir().unwrap();
+    let auth_path = directory.path().join("auth.json");
+    let stale = unsigned_access_token(1_000);
+    let fresh = unsigned_access_token(2_000);
+    std::fs::write(
+        &auth_path,
+        serde_json::to_vec(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": fresh,
+                "account_id": "acct-fresh"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        path: "/v1/responses".to_string(),
+        headers: vec![
+            ("authorization".to_string(), format!("Bearer {stale}")),
+            (
+                CHATGPT_ACCOUNT_ID_HEADER.to_string(),
+                "acct-fresh".to_string(),
+            ),
+        ],
+        body: Vec::new(),
+        _body_budget_permit: None,
+    };
+
+    let auth_cache = Mutex::new(crate::account_usage::OfficialAuthCaches::default());
+    let auth = resolve_official_upstream_auth(
+        &request,
+        "Bearer codey-router-token",
+        &auth_path,
+        &auth_cache,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(auth.authorization, format!("Bearer {fresh}"));
+    assert_eq!(auth.account_id.as_deref(), Some("acct-fresh"));
+}
+
+#[tokio::test]
+async fn official_upstream_auth_keeps_a_newer_incoming_token() {
+    let directory = tempfile::tempdir().unwrap();
+    let auth_path = directory.path().join("auth.json");
+    let stale = unsigned_access_token(1_000);
+    let fresh = unsigned_access_token(2_000);
+    std::fs::write(
+        &auth_path,
+        serde_json::to_vec(&json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": stale,
+                "account_id": "acct-stored"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let request = HttpRequest {
+        method: "POST".to_string(),
+        path: "/v1/responses".to_string(),
+        headers: vec![
+            ("authorization".to_string(), format!("Bearer {fresh}")),
+            (
+                CHATGPT_ACCOUNT_ID_HEADER.to_string(),
+                "acct-incoming".to_string(),
+            ),
+        ],
+        body: Vec::new(),
+        _body_budget_permit: None,
+    };
+
+    let auth_cache = Mutex::new(crate::account_usage::OfficialAuthCaches::default());
+    let auth = resolve_official_upstream_auth(
+        &request,
+        "Bearer codey-router-token",
+        &auth_path,
+        &auth_cache,
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(auth.authorization, format!("Bearer {fresh}"));
+    assert_eq!(auth.account_id.as_deref(), Some("acct-incoming"));
+}
+
 #[tokio::test]
 async fn idle_official_account_reads_its_own_credential_instead_of_the_codex_login() {
     let directory = tempfile::tempdir().unwrap();

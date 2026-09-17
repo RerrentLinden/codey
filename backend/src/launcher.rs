@@ -578,8 +578,12 @@ async fn prepare_startup_model_catalog(
     config: &CodeyConfig,
     current_profile: &ProviderProfile,
     home: &std::path::Path,
+    codex_app_dir: &std::path::Path,
 ) -> Result<StartupModelCatalog> {
     let catalog_home = home.to_path_buf();
+    // The snapshot has to come from the install this launch uses, so the
+    // resolved app directory is forwarded instead of re-probing the default.
+    let catalog_codex_app_path = codex_app_dir.to_string_lossy().into_owned();
     let use_builtin_official_catalog =
         current_profile.enabled && config.uses_builtin_official_model_catalog();
     let official_provider = use_builtin_official_catalog
@@ -641,6 +645,7 @@ async fn prepare_startup_model_catalog(
                 &runtime_native_web_search_models,
                 &runtime_model_contexts,
                 &runtime_model_reasoning_efforts,
+                &catalog_codex_app_path,
             );
             let cached_catalog = if refresh.is_err() {
                 model_catalog::prepare_cached_catalog_for_current_capabilities(
@@ -1423,7 +1428,7 @@ async fn prepare_startup_storage(
         let (session_maintenance, startup_catalog) =
             tokio::join!(run_startup_session_maintenance(home), async {
                 match current_profile {
-                    Some(profile) => prepare_startup_model_catalog(config, profile, home)
+                    Some(profile) => prepare_startup_model_catalog(config, profile, home, &app_dir)
                         .await
                         .map(Some),
                     None => Ok(None),

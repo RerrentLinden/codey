@@ -182,6 +182,14 @@ pub(crate) async fn sync_native_current_provider_models(
         {
             cached_models = preserve_selected_third_party_models(cached_models, manual_models);
         }
+        // A single sync response can be incomplete (truncated upstream list,
+        // provider-side flakiness). Models the user still has enabled keep
+        // their saved context/reasoning settings until they are unchecked;
+        // only an authoritative removal by the user may drop them.
+        cached_models = preserve_selected_third_party_models(
+            cached_models,
+            &next.enabled_route_models(&context.provider.id),
+        );
         next.upstream_models_by_provider
             .insert(context.provider.id.clone(), cached_models.clone());
         next.retain_model_contexts(&context.provider.id, &cached_models);
