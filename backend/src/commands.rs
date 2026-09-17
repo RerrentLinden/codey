@@ -1607,6 +1607,7 @@ struct CodeyConfigSaveInput {
     subagent_roles_present: bool,
     subagent_model_present: bool,
     subagent_reasoning_effort_present: bool,
+    misc_model_present: bool,
 }
 
 #[cfg(test)]
@@ -1622,6 +1623,7 @@ impl CodeyConfigSaveInput {
             subagent_roles_present: true,
             subagent_model_present: true,
             subagent_reasoning_effort_present: true,
+            misc_model_present: true,
         }
     }
 }
@@ -1642,6 +1644,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
     let subagent_roles_present = fields.contains_key("subagentRoles");
     let subagent_model_present = fields.contains_key("subagentModel");
     let subagent_reasoning_effort_present = fields.contains_key("subagentReasoningEffort");
+    let misc_model_present = fields.contains_key("miscModel");
     let config = serde_json::from_value(config_value)
         .map_err(|error| format!("参数 config 无效：{error}"))?;
     Ok(CodeyConfigSaveInput {
@@ -1654,6 +1657,7 @@ fn codey_config_save_input(args: &Value) -> Result<CodeyConfigSaveInput, String>
         subagent_roles_present,
         subagent_model_present,
         subagent_reasoning_effort_present,
+        misc_model_present,
     })
 }
 
@@ -1688,6 +1692,7 @@ async fn save_codey_config_locked(
         subagent_roles_present,
         subagent_model_present,
         subagent_reasoning_effort_present,
+        misc_model_present,
     } = input;
     let previous = state.config.read().await.clone();
     if config_input.settings_revision != previous.settings_revision {
@@ -1872,6 +1877,9 @@ async fn save_codey_config_locked(
         if default_changed {
             explicitly_configured_subagent_models.push(default_role.model.clone());
         }
+    }
+    if misc_model_present {
+        config.misc_model = config_input.misc_model;
     }
     config.hide_full_access_warning = config_input.hide_full_access_warning;
     config.show_account_usage_in_header = config_input.show_account_usage_in_header;
@@ -2847,6 +2855,10 @@ pub(super) fn config_requires_restart_with_route_status(
         || applied.gpu_launch_mode != current.gpu_launch_mode
         || applied.fast_context_tools != current.fast_context_tools
         || applied.subagent_optimization != current.subagent_optimization
+        || !applied
+            .misc_model
+            .trim()
+            .eq_ignore_ascii_case(current.misc_model.trim())
         || !applied_models.matches(current)
         || ((applied.subagent_optimization || current.subagent_optimization)
             && !applied_subagent.matches(current))

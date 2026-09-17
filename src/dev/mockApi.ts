@@ -235,6 +235,7 @@ if (import.meta.env.DEV) {
         codey_visual_worker: { enabled: true, model: "gpt-5.6-sol", reasoningEffort: "high" },
         default: { enabled: true, model: "gpt-5.6-sol", reasoningEffort: "medium" },
       },
+      miscModel: "",
       hideFullAccessWarning: false,
       showAccountUsageInHeader: true,
     };

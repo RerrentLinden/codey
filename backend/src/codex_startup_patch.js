@@ -3,6 +3,11 @@
   const requireAppServerRuntimeOverrideValidation =
     __REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__;
   const codeyErrorLoggerExecutable = "__CODEY_ERROR_LOGGER_EXECUTABLE__";
+  // 杂事模型在 Codex 模型目录里的 id。空值表示保持 Codex 原生行为：会话
+  // 命名和 Git 消息生成沿用内置 Luna，环境建议与安全过滤也不改写。
+  const rawMiscModelId = "__CODEY_MISC_MODEL_ID__";
+  const miscModelId =
+    typeof rawMiscModelId === "string" ? rawMiscModelId.trim() : "";
   const maxOptionalPatchFailureBatchSize = 64;
   const optionalPatchFailureQueue = [];
   let optionalPatchFailureFlushScheduled = false;
@@ -1171,6 +1176,8 @@
     configs = nativeRuntimeConfigOverrides,
     suppliedCatalogModels = null,
   ) => {
+    // 用户指定杂事模型时，会话命名统一走这一项，不再按线路寻找 Luna。
+    if (miscModelId) return miscModelId;
     const providerId = String(runtimeConfigValue(configs, "model_provider") ?? "").trim();
     const defaultModel = String(runtimeConfigValue(configs, "model") ?? "").trim();
     const officialAccountAvailable =
@@ -1214,6 +1221,20 @@
   Object.defineProperty(globalThis, "__CODEY_SELECT_THREAD_TITLE_MODEL__", {
     configurable: false,
     value: selectThreadTitleModel,
+    writable: false,
+  });
+  // 会话命名、Git 提交消息生成和环境建议共用同一段 Luna 常量声明。
+  // 这里注入一次运行期覆盖函数，供可选的主进程补丁把常量声明改写成
+  // `miscModelId || 原值`，从而不依赖具体的小写变量名。
+  Object.defineProperty(globalThis, "__CODEY_MISC_MODEL__", {
+    configurable: false,
+    value: miscModelId,
+    writable: false,
+  });
+  Object.defineProperty(globalThis, "__CODEY_SELECT_MISC_MODEL__", {
+    configurable: false,
+    value: (nativeModel) =>
+      miscModelId || String(nativeModel ?? "").trim(),
     writable: false,
   });
   const appServerRuntimeConfigs = uniqueRuntimeConfigsByKey([
@@ -1928,6 +1949,43 @@
     },
   );
 
+  // 会话命名、Git 提交消息生成和环境建议都从 Luna 常量取值，但常量名由
+  // 打包结果决定。把每一处 Luna 常量声明改写成运行期覆盖，既不依赖具体
+  // 变量名，也不影响同一 chunk 里其它同名导出。
+  const patchCodexMiscModelConstants = (source) => {
+    if (!miscModelId) return source;
+    // 打包后的 Luna 常量是一个普通标识符赋值，且同一标识符在同一 chunk 里
+    // 只声明一次。按匹配位置精确切片，避免变量名尾部重合造成误替换。
+    const declarationPattern =
+      /(?<![$\w.])([$A-Z_a-z][$\w]*)=(`gpt-5\.6-luna`)/g;
+    const declarations = [...source.matchAll(declarationPattern)];
+    if (declarations.length === 0) {
+      throw new Error("Codey misc model Luna constants not found");
+    }
+    const names = new Set(declarations.map((declaration) => declaration[1]));
+    if (names.size !== declarations.length) {
+      throw new Error("Codey misc model Luna constants are not unique");
+    }
+    let patched = "";
+    let lastIndex = 0;
+    for (const declaration of declarations) {
+      patched +=
+        source.slice(lastIndex, declaration.index) +
+        `${declaration[1]}=globalThis.__CODEY_SELECT_MISC_MODEL__(\`gpt-5.6-luna\`)`;
+      lastIndex = declaration.index + declaration[0].length;
+    }
+    return patched + source.slice(lastIndex);
+  };
+  Object.defineProperty(
+    globalThis,
+    "__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__",
+    {
+      configurable: false,
+      value: patchCodexMiscModelConstants,
+      writable: false,
+    },
+  );
+
   // Codex prewarms the shared avatar/voice overlay at startup by creating a
   // hidden BrowserWindow. In slim-pet mode the pet entry points are already
   // unavailable, so keep the manager and voice path intact but make prewarm a
@@ -2416,6 +2474,15 @@
           desktopAnalyticsWorkerSourcePatched && desktopAnalyticsTransportSourcePatched;
       }
       if (hasThreadTitleModel) {
+        if (miscModelId) {
+          source = applyOptionalMainBundlePatch(
+            "miscModelConstants",
+            patchCodexMiscModelConstants,
+            source,
+          );
+          globalThis.__CODEY_MISC_MODEL_CONSTANTS_SOURCE_PATCHED__ =
+            !hasOptionalMainBundlePatchFailure("miscModelConstants");
+        }
         source = applyOptionalMainBundlePatch(
           "threadTitleModel",
           patchCodexMainThreadTitleModel,
@@ -2649,6 +2716,12 @@
     },
     get routeThreadTitleModel() {
       return !hasOptionalMainBundlePatchFailure("threadTitleModel");
+    },
+    get routeMiscModel() {
+      return (
+        miscModelId !== "" &&
+        !hasOptionalMainBundlePatchFailure("miscModelConstants")
+      );
     },
     get optionalMainBundlePatchFailures() {
       return optionalMainBundlePatchFailures.map((failure) => ({ ...failure }));

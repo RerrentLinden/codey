@@ -65,10 +65,12 @@ const CLI_WRAPPER_HANDSHAKE_RETRY_DELAY: std::time::Duration =
 #[cfg(any(windows, test))]
 pub(crate) const WINDOWS_PACKAGE_RESUME_ARGUMENT: &str = "--codey-resume-packaged-app";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchOptions {
     pub disable_pet: bool,
     pub subagent_gate_active: bool,
+    /// 杂事模型在 Codex 模型目录里的 id。`None` 表示保持 Codex 原生行为。
+    pub misc_model: Option<String>,
 }
 
 pub fn inspector_argument(port: u16) -> String {
@@ -137,6 +139,10 @@ fn patch_expression_with_runtime_overrides_and_validation(
             } else {
                 "false"
             },
+        )
+        .replace(
+            "\"__CODEY_MISC_MODEL_ID__\"",
+            &serde_json::to_string(&options.misc_model).expect("misc model should serialize"),
         )
 }
 
@@ -1663,6 +1669,7 @@ mod tests {
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
             subagent_gate_active: true,
+            misc_model: None,
         });
 
         assert!(expression.contains("const disablePet = true"));
@@ -1723,6 +1730,7 @@ mod tests {
             PatchOptions {
                 disable_pet: false,
                 subagent_gate_active: true,
+                misc_model: None,
             },
             &overrides,
         );
@@ -1731,6 +1739,26 @@ mod tests {
         assert!(expression.contains("features.hooks=true"));
         assert!(expression.contains("developer_instructions="));
         assert!(!expression.contains("__CODEY_RUNTIME_CONFIG_OVERRIDES__"));
+    }
+
+    #[test]
+    fn patch_expression_injects_the_misc_model_without_renaming_its_global() {
+        let unset = patch_expression(PatchOptions {
+            disable_pet: false,
+            subagent_gate_active: true,
+            misc_model: None,
+        });
+        assert!(!unset.contains("__CODEY_MISC_MODEL_ID__"));
+        assert!(unset.contains("const rawMiscModelId = null"));
+        assert!(unset.contains("globalThis, \"__CODEY_MISC_MODEL__\""));
+
+        let selected = patch_expression(PatchOptions {
+            disable_pet: false,
+            subagent_gate_active: true,
+            misc_model: Some("relay/housekeeping".to_string()),
+        });
+        assert!(selected.contains("const rawMiscModelId = \"relay/housekeeping\""));
+        assert!(selected.contains("globalThis, \"__CODEY_MISC_MODEL__\""));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1867,6 +1895,7 @@ mod tests {
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
             subagent_gate_active: true,
+            misc_model: None,
         });
         install_over_websocket(&format!("ws://{address}"), &expression, false)
             .await
@@ -2008,6 +2037,7 @@ mod tests {
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
             subagent_gate_active: true,
+            misc_model: None,
         });
         install_over_websocket(&format!("ws://{address}"), &expression, true)
             .await
@@ -2068,6 +2098,7 @@ mod tests {
         let expression = patch_expression(PatchOptions {
             disable_pet: true,
             subagent_gate_active: true,
+            misc_model: None,
         });
         let error = tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -2238,6 +2269,7 @@ mod tests {
             PatchOptions {
                 disable_pet: false,
                 subagent_gate_active: true,
+                misc_model: None,
             },
             &["analytics.enabled=false".to_string()],
         )

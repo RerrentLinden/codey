@@ -2834,6 +2834,54 @@ fn auto_review_is_not_invented_for_an_unsupported_third_party_route() {
 }
 
 #[test]
+fn auto_review_falls_back_to_the_misc_model_only_without_a_capable_route() {
+    let (mut config, provider_id, model) = router_config("https://relay.example/v1".to_string());
+    config.misc_model = format!("{provider_id}/{model}");
+    let snapshot = RouterSnapshot::from_config(&config);
+
+    // 没有线路支持专用复核模型时，请求落到杂事模型，并保留原始请求名。
+    let fallback = snapshot
+        .target_for_model(CODEX_AUTO_REVIEW_MODEL)
+        .expect("misc model should serve the review request");
+    assert_eq!(fallback.provider_id, provider_id);
+    assert_eq!(fallback.upstream_model, model);
+    assert_eq!(fallback.requested_model, CODEX_AUTO_REVIEW_MODEL);
+    assert_eq!(
+        fallback.fallback_reason.as_deref(),
+        Some("auto_review_misc_model")
+    );
+
+    // 有线路声明支持专用复核模型后仍优先使用专用模型。
+    config.upstream_models_by_provider.insert(
+        provider_id.clone(),
+        vec![CODEX_AUTO_REVIEW_MODEL.to_string()],
+    );
+    config.profiles[0].supports_auto_review = true;
+    let snapshot = RouterSnapshot::from_config(&config);
+    let dedicated = snapshot.target_for_model(CODEX_AUTO_REVIEW_MODEL).unwrap();
+    assert_eq!(dedicated.upstream_model, CODEX_AUTO_REVIEW_MODEL);
+    assert!(dedicated.fallback_reason.is_none());
+}
+
+#[test]
+fn auto_review_keeps_failing_without_a_usable_misc_model() {
+    let (mut config, provider_id, _) = router_config("https://relay.example/v1".to_string());
+    config.misc_model = format!("{provider_id}/missing-model");
+    assert!(
+        RouterSnapshot::from_config(&config)
+            .target_for_model(CODEX_AUTO_REVIEW_MODEL)
+            .is_err()
+    );
+
+    config.misc_model = CODEX_AUTO_REVIEW_MODEL.to_string();
+    assert!(
+        RouterSnapshot::from_config(&config)
+            .target_for_model(CODEX_AUTO_REVIEW_MODEL)
+            .is_err()
+    );
+}
+
+#[test]
 fn third_party_routes_forward_codex_identity_without_chatgpt_account_headers() {
     assert!(should_forward_incoming_header("chatgpt-account-id", true));
     assert!(should_forward_incoming_header("x-openai-originator", true));

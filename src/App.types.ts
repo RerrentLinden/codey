@@ -113,6 +113,7 @@ export type Config = {
   subagentModel: string;
   subagentReasoningEffort: string;
   subagentRoles: Record<SubagentRoleId, SubagentRoleConfig>;
+  miscModel: string;
   hideFullAccessWarning: boolean;
   showAccountUsageInHeader: boolean;
 };

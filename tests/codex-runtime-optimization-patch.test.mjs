@@ -15,7 +15,13 @@ const appServerTransportFixture = `globalThis.Transport=class {
   sendMessage(e){let n=this.options.getConnection(),a=this.options.transformOutgoingMessage==null?e:this.options.transformOutgoingMessage(e);n.send(JSON.stringify(a))}
 };`;
 
-async function loadPatchInIsolatedContext(runtimeConfigOverrides, contextOverrides = {}, installMessagePatch = true) {
+
+async function loadPatchInIsolatedContext(
+  runtimeConfigOverrides,
+  contextOverrides = {},
+  installMessagePatch = true,
+  miscModel = null,
+) {
   const Module = process.getBuiltinModule("module");
   const originalLoad = Module._load;
   const originalJsExtension = Module._extensions[".js"];
@@ -51,6 +57,7 @@ async function loadPatchInIsolatedContext(runtimeConfigOverrides, contextOverrid
   try {
     const result = vm.runInNewContext(
       await loadStartupPatchTemplate({
+        miscModel,
         runtimeConfigOverrides,
         requireAppServerRuntimeOverrides: true,
       }),
@@ -512,6 +519,60 @@ test("thread title routing prefers official Luna, route Luna, then the default m
     assert.match(patched, /const unrelated=\{model:tj\}/);
   } finally {
     runtime.restore();
+  }
+});
+
+test("misc model routes naming, commit messages, and suggests a review fallback", async () => {
+  const fixture = [
+    "var ij=`gpt-5.6-luna`,aj=`low`;",
+    "var dj=`gpt-5.6-luna`,sae=`ambient-suggestions`;",
+    "export{dj as mi,ij as Xr};",
+  ].join("");
+
+  const selected = await loadPatchInIsolatedContext([], {}, false, "relay/housekeeping");
+  try {
+    const misc = selected.context.__CODEY_MISC_MODEL__;
+    assert.equal(misc, "relay/housekeeping");
+    const selectMisc = selected.context.__CODEY_SELECT_MISC_MODEL__;
+    assert.equal(selectMisc("gpt-5.6-luna"), "relay/housekeeping");
+    assert.equal(
+      selected.context.__CODEY_SELECT_THREAD_TITLE_MODEL__([], []),
+      "relay/housekeeping",
+    );
+
+    const patched =
+      selected.context.__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__(fixture);
+    assert.equal(
+      patched.match(/globalThis\.__CODEY_SELECT_MISC_MODEL__/g)?.length,
+      2,
+    );
+    assert.match(patched, /var ij=globalThis\.__CODEY_SELECT_MISC_MODEL__\(`gpt-5\.6-luna`\)/);
+    assert.match(patched, /var dj=globalThis\.__CODEY_SELECT_MISC_MODEL__\(`gpt-5\.6-luna`\)/);
+    assert.match(patched, /export\{dj as mi,ij as Xr\}/);
+  } finally {
+    selected.restore();
+  }
+
+  const unset = await loadPatchInIsolatedContext([], {}, false);
+  try {
+    assert.equal(unset.context.__CODEY_MISC_MODEL__, "");
+    assert.equal(
+      unset.context.__CODEY_PATCH_CODEX_MISC_MODEL_CONSTANTS__(fixture),
+      fixture,
+    );
+    assert.equal(
+      unset.context.__CODEY_SELECT_THREAD_TITLE_MODEL__(
+        [
+          'model_provider="codey_router"',
+          'model="relay/gpt-5.6-sol"',
+          "model_providers.codey_router.requires_openai_auth=true",
+        ],
+        [],
+      ),
+      "gpt-5.6-luna",
+    );
+  } finally {
+    unset.restore();
   }
 });
 

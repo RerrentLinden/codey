@@ -815,6 +815,12 @@ pub struct CodeyConfig {
     /// `default` role so older Codey stores and Codex builds remain readable.
     #[serde(default)]
     pub subagent_roles: BTreeMap<String, SubagentRoleConfig>,
+    /// One route-aware model for Codex housekeeping calls: conversation
+    /// naming, Git commit and pull-request message generation, and the
+    /// automatic review fallback when no route serves `codex-auto-review`.
+    /// Empty keeps the native Codex behavior untouched.
+    #[serde(default)]
+    pub misc_model: String,
     /// Tracks whether Codey has already consumed the one-time default route
     /// import window. Existing non-empty configs are treated as already
     /// initialized so later launches never overwrite saved third-party routes
@@ -946,6 +952,7 @@ impl Default for CodeyConfig {
             subagent_model: default_subagent_model(),
             subagent_reasoning_effort: default_subagent_reasoning_effort(),
             subagent_roles: default_subagent_roles(),
+            misc_model: String::new(),
             initial_route_import_completed: false,
             hide_full_access_warning: false,
             show_account_usage_in_header: true,
@@ -1018,6 +1025,7 @@ impl CodeyConfig {
             &mut self.subagent_roles,
         );
         self.normalize_subagent_model_references();
+        self.normalize_misc_model();
         if !self.initial_route_import_completed && !self.looks_like_empty_default_route() {
             self.initial_route_import_completed = true;
         }
@@ -1940,9 +1948,71 @@ impl CodeyConfig {
         }
     }
 
+    /// 杂事模型只有一个可选项：留着空值表示沿用 Codex 原生行为，写入值
+    /// 时尽量把它归一成带线路的稳定选择器。无法定位到线路时保留用户输入，
+    /// 交给运行期按目录查找。这里只认当前线路，不借助别名历史把已删线路
+    /// 的选择迁移到另一条同名模型的线路，避免静默改换上游。
+    fn normalize_misc_model(&mut self) {
+        self.misc_model = self.misc_model.trim().to_string();
+        if self.misc_model.is_empty() {
+            return;
+        }
+        let targets = self.configured_model_targets();
+        if targets.is_empty() {
+            return;
+        }
+        if let Some(canonical) = targets
+            .iter()
+            .find(|target| model_id::equal(&target.alias, &self.misc_model))
+            .map(|target| target.alias.clone())
+            .or_else(|| {
+                if !self.local_router_enabled {
+                    return None;
+                }
+                let mut matches = targets
+                    .iter()
+                    .filter(|target| model_id::equal(&target.upstream_model, &self.misc_model));
+                let target = matches.next()?;
+                matches.next().is_none().then(|| target.alias.clone())
+            })
+        {
+            self.misc_model = canonical;
+        }
+    }
+
+    /// 杂事模型对应的运行期模型。空值、线路已移除或线路未启用该模型时返回
+    /// `None`，调用方据此保持 Codex 原生行为。
+    pub(crate) fn misc_model_target(&self) -> Option<RuntimeModelTarget> {
+        let requested = self.misc_model.trim();
+        if requested.is_empty() {
+            return None;
+        }
+        self.runtime_model_targets()
+            .into_iter()
+            .find(|target| model_id::equal(&target.alias, requested))
+    }
+
+    /// 杂事模型在 Codex 目录里实际使用的 id。官方模型在单一官方线路下沿用
+    /// 原生 OpenAI id，其余情况使用带线路的稳定选择器。未启用本地路由时
+    /// Codex 直接面向当前线路，沿用用户填写或界面选择的原始模型名。
+    pub(crate) fn misc_model_catalog_id(&self) -> Option<String> {
+        if !self.local_router_enabled {
+            let requested = self.misc_model.trim();
+            return (!requested.is_empty()).then(|| requested.to_string());
+        }
+        let target = self.misc_model_target()?;
+        Some(self.runtime_catalog_id_for_target(&target))
+    }
+
     pub(crate) fn reconcile_after_route_removal(&mut self, removed_provider_id: &str) {
         self.normalize_global_default_model();
         self.normalize_subagent_model_references();
+        // 杂事模型没有隐式默认值，线路消失后回到原生行为。必须在归一之前
+        // 判断，否则别名历史会把它改写成另一条同名模型的线路。
+        if model_references_provider(&self.misc_model, removed_provider_id) {
+            self.misc_model.clear();
+        }
+        self.normalize_misc_model();
         let targets = self.configured_model_targets();
         let fallback_alias = targets
             .iter()
@@ -4199,6 +4269,109 @@ mod tests {
             .normalize();
 
         assert!(!config.hide_full_access_warning);
+    }
+
+    #[test]
+    fn misc_model_defaults_to_empty_and_normalizes_to_a_unique_route_alias() {
+        let empty = serde_json::from_str::<CodeyConfig>(r#"{"activeProfileId":"","profiles":[]}"#)
+            .unwrap()
+            .normalize();
+        assert!(empty.misc_model.is_empty());
+        assert!(empty.misc_model_catalog_id().is_none());
+
+        for (router_enabled, duplicate, requested, expected) in [
+            (true, false, " worker-model ", "route-a/worker-model"),
+            (true, false, "WORKER-MODEL", "route-a/worker-model"),
+            (true, false, "route-a/worker-model", "route-a/worker-model"),
+            (true, true, "worker-model", "worker-model"),
+            (false, false, "worker-model", "worker-model"),
+            (true, false, "unknown-model", "unknown-model"),
+        ] {
+            let mut route_a = ProviderProfile::new("Route A");
+            route_a.id = "route-a".into();
+            let mut route_b = ProviderProfile::new("Route B");
+            route_b.id = "route-b".into();
+            let config = CodeyConfig {
+                local_router_enabled: router_enabled,
+                active_profile_id: route_a.id.clone(),
+                profiles: vec![route_a, route_b],
+                selected_models_by_provider: BTreeMap::from([
+                    ("route-a".into(), vec!["worker-model".into()]),
+                    (
+                        "route-b".into(),
+                        vec![
+                            if duplicate {
+                                "worker-model"
+                            } else {
+                                "other-model"
+                            }
+                            .into(),
+                        ],
+                    ),
+                ]),
+                misc_model: requested.into(),
+                ..CodeyConfig::default()
+            }
+            .normalize();
+
+            assert_eq!(config.misc_model, expected, "requested: {requested}");
+            assert_eq!(config.clone().normalize(), config);
+        }
+    }
+
+    #[test]
+    fn misc_model_clears_when_its_route_is_removed() {
+        let mut route = ProviderProfile::new("Route A");
+        route.id = "route-a".into();
+        let mut config = CodeyConfig {
+            active_profile_id: route.id.clone(),
+            profiles: vec![route],
+            selected_models_by_provider: BTreeMap::from([(
+                "route-a".into(),
+                vec!["worker-model".into()],
+            )]),
+            misc_model: "route-a/worker-model".into(),
+            ..CodeyConfig::default()
+        }
+        .normalize();
+        assert_eq!(config.misc_model, "route-a/worker-model");
+        assert_eq!(
+            config.misc_model_catalog_id().as_deref(),
+            Some("route-a/worker-model")
+        );
+
+        config.profiles.clear();
+        config.selected_models_by_provider.clear();
+        config.reconcile_after_route_removal("route-a");
+        assert!(config.misc_model.is_empty());
+        assert!(config.misc_model_catalog_id().is_none());
+    }
+
+    #[test]
+    fn misc_model_is_cleared_instead_of_migrating_to_an_equal_model_on_another_route() {
+        let mut route_a = ProviderProfile::new("Route A");
+        route_a.id = "route-a".into();
+        let mut route_b = ProviderProfile::new("Route B");
+        route_b.id = "route-b".into();
+        let mut config = CodeyConfig {
+            active_profile_id: route_a.id.clone(),
+            profiles: vec![route_a, route_b],
+            selected_models_by_provider: BTreeMap::from([
+                ("route-a".into(), vec!["worker-model".into()]),
+                ("route-b".into(), vec!["worker-model".into()]),
+            ]),
+            misc_model: "route-a/worker-model".into(),
+            ..CodeyConfig::default()
+        }
+        .normalize();
+        config.remember_model_aliases();
+
+        config.profiles.retain(|profile| profile.id != "route-a");
+        config.selected_models_by_provider.remove("route-a");
+        config = config.normalize();
+        config.reconcile_after_route_removal("route-a");
+
+        assert!(config.misc_model.is_empty());
     }
 
     #[test]

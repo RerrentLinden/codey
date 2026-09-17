@@ -1419,6 +1419,9 @@ impl RouterServer {
             } else {
                 RequestProtocol::Http
             });
+            if let Some(reason) = resolved.fallback_reason.as_deref() {
+                probe.mark_fallback(reason);
+            }
         }
         let bridge = ProtocolBridge::from_upstream_protocol(resolved.protocol);
         if compacting && !resolved.route.supports_remote_compaction {

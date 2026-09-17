@@ -230,6 +230,7 @@ pub(super) async fn spawn_codex(
     debug_port: u16,
     disable_codex_pet: bool,
     subagent_gate_active: bool,
+    misc_model: Option<String>,
     gpu_launch_mode: GpuLaunchMode,
     runtime_config_overrides: &[String],
 ) -> Result<SpawnedCodex> {
@@ -237,11 +238,13 @@ pub(super) async fn spawn_codex(
     let patch_options = crate::codex_startup_patch::PatchOptions {
         disable_pet: disable_codex_pet,
         subagent_gate_active,
+        misc_model,
     };
     #[cfg(not(any(windows, target_os = "macos")))]
     let _ = (
         disable_codex_pet,
         subagent_gate_active,
+        misc_model,
         runtime_config_overrides,
     );
     let runtime_arguments =
@@ -598,7 +601,7 @@ pub(super) async fn spawn_codex(
         let require_wanted = is_app_bundle && fuses.node_options.node_options_possible();
         let require_patch = prepare_startup_require_launch(
             require_wanted,
-            patch_options,
+            patch_options.clone(),
             runtime_config_overrides,
             "macos",
         )
@@ -655,7 +658,7 @@ pub(super) async fn spawn_codex(
         let wait_inspector_port = if use_inspector { inspector_port } else { None };
         let startup_result = install_startup_patch_with_cli_fallback(
             wait_inspector_port,
-            patch_options,
+            patch_options.clone(),
             runtime_config_overrides,
             wrapper.map(CliWrapperLaunch::into_handshake),
             StartupWaitContext {
@@ -2244,11 +2247,13 @@ mod cli_wrapper_tests {
     }
 
     #[cfg(any(windows, target_os = "macos"))]
-    const TEST_PATCH_OPTIONS: crate::codex_startup_patch::PatchOptions =
+    fn test_patch_options() -> crate::codex_startup_patch::PatchOptions {
         crate::codex_startup_patch::PatchOptions {
             disable_pet: false,
             subagent_gate_active: true,
-        };
+            misc_model: None,
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn startup_retry_requires_a_transient_error_and_is_limited_to_two_attempts() {
@@ -2325,7 +2330,7 @@ mod cli_wrapper_tests {
             Duration::from_millis(500),
             install_startup_patch_with_cli_fallback(
                 Some(port),
-                TEST_PATCH_OPTIONS,
+                test_patch_options(),
                 &["analytics.enabled=false".to_string()],
                 Some(handshake),
                 test_context(deadline),
@@ -2354,7 +2359,7 @@ mod cli_wrapper_tests {
         let overrides = ["model_provider=\"codey_router\"".to_string()];
         let error = install_startup_patch_with_cli_fallback(
             Some(port),
-            TEST_PATCH_OPTIONS,
+            test_patch_options(),
             &overrides,
             Some(first_handshake),
             test_context(tokio::time::Instant::now() + Duration::from_millis(40)),
@@ -2380,7 +2385,7 @@ mod cli_wrapper_tests {
         });
         install_startup_patch_with_cli_fallback(
             None,
-            TEST_PATCH_OPTIONS,
+            test_patch_options(),
             &overrides,
             Some(handshake),
             test_context(
@@ -2392,7 +2397,7 @@ mod cli_wrapper_tests {
         sender.await.unwrap();
         let error = install_startup_patch_with_cli_fallback(
             None,
-            TEST_PATCH_OPTIONS,
+            test_patch_options(),
             &overrides,
             None,
             test_context(tokio::time::Instant::now() + Duration::from_secs(1)),
@@ -2433,7 +2438,7 @@ mod cli_wrapper_tests {
                 Duration::from_secs(5),
                 install_startup_patch_with_cli_fallback(
                     Some(port),
-                    TEST_PATCH_OPTIONS,
+                    test_patch_options(),
                     &[],
                     Some(handshake),
                     test_context(
@@ -2555,7 +2560,7 @@ mod cli_wrapper_tests {
         });
         let mode = install_startup_patch_with_cli_fallback(
             None,
-            TEST_PATCH_OPTIONS,
+            test_patch_options(),
             &[],
             None,
             StartupWaitContext {
@@ -2589,7 +2594,7 @@ mod cli_wrapper_tests {
         ));
         let error = install_startup_patch_with_cli_fallback(
             None,
-            TEST_PATCH_OPTIONS,
+            test_patch_options(),
             &[],
             None,
             StartupWaitContext {
@@ -2628,7 +2633,7 @@ mod cli_wrapper_tests {
         });
         let mode = install_startup_patch_with_cli_fallback(
             None,
-            TEST_PATCH_OPTIONS,
+            test_patch_options(),
             &[],
             Some(handshake),
             StartupWaitContext {
@@ -2686,7 +2691,7 @@ mod cli_wrapper_tests {
         let started = std::time::Instant::now();
         let error = install_startup_patch_with_cli_fallback(
             None,
-            TEST_PATCH_OPTIONS,
+            test_patch_options(),
             &[],
             Some(handshake),
             StartupWaitContext {
@@ -2774,7 +2779,7 @@ mod cli_wrapper_tests {
         });
         install_startup_patch_with_cli_fallback(
             Some(inspector_port),
-            TEST_PATCH_OPTIONS,
+            test_patch_options(),
             &["analytics.enabled=false".to_string()],
             Some(handshake),
             test_context(

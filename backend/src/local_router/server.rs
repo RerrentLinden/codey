@@ -608,6 +608,9 @@ pub(crate) struct RouterSnapshot {
     /// Codex 登录本身，用户调整线路顺序不会改变这里的选择。
     pub(crate) default_official_provider: Option<String>,
     pub(crate) default_model: String,
+    /// 杂事模型。仅在没有任何线路支持 `codex-auto-review` 时用于自动复核
+    /// 请求，解析失败时保持原有报错。
+    pub(crate) misc_model: String,
     pub(crate) request_log_backend: RouteRequestLogBackend,
     pub(crate) request_log_catalog: RequestLogCatalog,
 }
@@ -708,6 +711,7 @@ impl RouterSnapshot {
             model_ids,
             default_official_provider,
             default_model: config.default_model().unwrap_or_default().to_string(),
+            misc_model: config.misc_model.trim().to_string(),
             request_log_backend: config.route_request_log.backend,
             request_log_catalog: RequestLogCatalog::from_config(config),
         }
@@ -887,6 +891,17 @@ impl RouterSnapshot {
         if candidates.len() > 1 {
             anyhow::bail!("模型 {requested_model} 同时存在于多条线路，缺少明确的 Codey 线路元数据");
         }
+        // 没有任何线路支持自动复核时，用杂事模型承接这一请求。这里保留
+        // 请求里的原始模型名，让下游的日志与提示头仍能看出这是一次回退。
+        if model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
+            && !self.misc_model.is_empty()
+            && !model_id::equal(&self.misc_model, CODEX_AUTO_REVIEW_MODEL)
+            && let Ok(mut selection) = self.target_for_request(&self.misc_model, None, None)
+        {
+            selection.requested_model = requested_model.to_string();
+            selection.fallback_reason = Some("auto_review_misc_model".to_string());
+            return Ok(selection);
+        }
         anyhow::bail!("模型未在线路路由表中启用：{requested_model}")
     }
 
@@ -914,6 +929,7 @@ impl RouterSnapshot {
             requested_model: requested_model.to_string(),
             route: Arc::clone(target),
             upstream_model: model.to_string(),
+            fallback_reason: None,
         })
     }
 
@@ -1042,6 +1058,8 @@ pub(crate) struct RouteSelection {
     pub(crate) requested_model: String,
     pub(crate) route: Arc<RouteTarget>,
     pub(crate) upstream_model: String,
+    /// 本次选择相对请求模型做过的降级说明，写入请求日志。
+    pub(crate) fallback_reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]

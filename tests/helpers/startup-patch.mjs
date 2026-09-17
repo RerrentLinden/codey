@@ -7,6 +7,7 @@ import { readSource } from "./read-source.mjs";
 // remaining ones stay visible to source assertions.
 export async function loadStartupPatchTemplate({
   disablePet = false,
+  miscModel = null,
   requireAppServerRuntimeOverrides = false,
   runtimeConfigOverrides = null,
   subagentGateActive = null,
@@ -16,6 +17,10 @@ export async function loadStartupPatchTemplate({
   assert.ok(template, "startup patch template should be readable");
   let expression = template
     .replaceAll("__DISABLE_PET__", disablePet ? "true" : "false")
+    .replaceAll(
+      '"__CODEY_MISC_MODEL_ID__"',
+      JSON.stringify(miscModel),
+    )
     .replaceAll(
       "__REQUIRE_APP_SERVER_RUNTIME_OVERRIDES__",
       requireAppServerRuntimeOverrides ? "true" : "false",
