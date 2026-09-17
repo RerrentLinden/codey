@@ -119,19 +119,30 @@ pub async fn wait_for_windows_process_id(process_id: u32) -> anyhow::Result<()> 
 
 #[cfg(windows)]
 fn wait_for_windows_process_id_blocking(process_id: u32) -> anyhow::Result<()> {
-    use windows::Win32::Foundation::{CloseHandle, WAIT_FAILED};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_FAILED};
     use windows::Win32::System::Threading::{
         INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
         WaitForSingleObject,
     };
 
     unsafe {
-        let handle = OpenProcess(
+        // The process may already be gone when we get here; opening a dead PID
+        // fails with ERROR_INVALID_PARAMETER, which is exactly the exit we are
+        // waiting for — the same rule `process_is_running` applies.
+        let handle = match OpenProcess(
             PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
             false,
             process_id,
-        )
-        .with_context(|| format!("failed to open Windows process id {process_id}"))?;
+        ) {
+            Ok(handle) => handle,
+            Err(error) if error.code() == ERROR_INVALID_PARAMETER.to_hresult() => {
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to open Windows process id {process_id}"));
+            }
+        };
         let wait_result = WaitForSingleObject(handle, INFINITE);
         let _ = CloseHandle(handle);
         if wait_result == WAIT_FAILED {

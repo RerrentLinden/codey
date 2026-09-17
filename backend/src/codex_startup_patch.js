@@ -1653,11 +1653,21 @@
     }
   };
   const patchCodexCuaPluginConfig = (source) => {
-    const anchor = /([$\w.]+)\s*\.args\s*=\s*\[([^;]{0,300}?\.join\([^;]{0,200}?,\s*([`"'])(?:\.\/)?(?:scripts[\\/]launch\.mjs|@oai[\\/]cua-repl[\\/]bin[\\/]cua-repl\.mjs)\3\s*\)[^;]{0,300}?)\]\s*\)\s*;/g;
-    if (!source.includes("CUA_REPL_NODE_REPL_PATH") || [...source.matchAll(anchor)].length !== 1) {
+    // Older builds wrap the launcher path in a grouped expression ending `])`,
+    // while 26.908+ assigns `cua-repl.mjs` directly to the MCP server entry as
+    // `args = [join(dir, "@oai/cua-repl/bin/cua-repl.mjs")];`. Both assign the
+    // plugin config object whose `env` carries CUA_REPL_ENABLED_SURFACES.
+    const anchors = [
+      /([$\w.]+)\s*\.args\s*=\s*\[([^;]{0,300}?\.join\([^;]{0,200}?,\s*([`"'])(?:\.\/)?(?:scripts[\\/]launch\.mjs|@oai[\\/]cua-repl[\\/]bin[\\/]cua-repl\.mjs)\3\s*\)[^;]{0,300}?)\]\s*\)\s*;/g,
+      /([$\w.]+)\s*\.args\s*=\s*\[([^;]{0,400}?\.join\([^;]{0,300}?,\s*([`"'])@oai[\\/]cua-repl[\\/]bin[\\/]cua-repl\.mjs\3\s*\)[^;]{0,200}?)\]\s*;/g,
+    ];
+    const matched = anchors.filter(
+      (anchor) => [...source.matchAll(anchor)].length === 1,
+    );
+    if (!source.includes("CUA_REPL_NODE_REPL_PATH") || matched.length !== 1) {
       throw new Error("Computer Use plugin configuration anchor is unavailable");
     }
-    return source.replace(anchor, (match, config) =>
+    return source.replace(matched[0], (match, config) =>
       `${match}await globalThis.__CODEY_PREPARE_CUA_COMPATIBILITY_LAUNCHER__(${config});`);
   };
   Object.defineProperties(globalThis, {

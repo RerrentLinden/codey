@@ -25,16 +25,29 @@ const RESPONSES_WEBSOCKET_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 pub(crate) async fn probe_responses_websocket(
     stream: &TcpStream,
 ) -> Result<ResponsesWebSocketProbe> {
+    // None 表示对端在发出任何请求前就已断开（优雅关闭或 RST）。这种连接在
+    // Codex 重启、更新期间很常见，按静默连接处理，不记录为请求失败。
     let detected = tokio::time::timeout(RESPONSES_WEBSOCKET_PROBE_TIMEOUT, async {
         let mut peek = vec![0_u8; 4096];
         loop {
-            let read = stream
-                .peek(&mut peek)
-                .await
-                .context("探测 Codey Responses WebSocket 请求失败")?;
-            if read == 0 {
-                return Ok(false);
-            }
+            let read = match stream.peek(&mut peek).await {
+                Ok(0) => return Ok(None),
+                Ok(read) => read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => {
+                    return Err(error).context("探测 Codey Responses WebSocket 请求失败");
+                }
+            };
             let bytes = &peek[..read];
             let Some(request_line_end) = bytes.windows(2).position(|window| window == b"\r\n")
             else {
@@ -48,7 +61,7 @@ pub(crate) async fn probe_responses_websocket(
             let raw_path = parts.next().unwrap_or_default();
             let path = raw_path.split('?').next().unwrap_or(raw_path);
             if method != "GET" || !RESPONSES_WEBSOCKET_PATHS.contains(&path) {
-                return Ok(false);
+                return Ok(Some(false));
             }
             if let Some(header_end) = find_header_end(bytes) {
                 let headers = String::from_utf8_lossy(&bytes[request_line_end + 2..header_end]);
@@ -66,11 +79,11 @@ pub(crate) async fn probe_responses_websocket(
                         websocket_upgrade = value.trim().eq_ignore_ascii_case("websocket");
                     }
                 }
-                return Ok(connection_upgrade && websocket_upgrade);
+                return Ok(Some(connection_upgrade && websocket_upgrade));
             }
             if read == peek.len() {
                 if peek.len() >= MAX_HEADER_BYTES.saturating_add(4) {
-                    return Ok(false);
+                    return Ok(Some(false));
                 }
                 peek.resize(
                     peek.len()
@@ -87,8 +100,9 @@ pub(crate) async fn probe_responses_websocket(
     })
     .await;
     match detected {
-        Ok(Ok(true)) => Ok(ResponsesWebSocketProbe::Upgrade),
-        Ok(Ok(false)) => Ok(ResponsesWebSocketProbe::Http),
+        Ok(Ok(Some(true))) => Ok(ResponsesWebSocketProbe::Upgrade),
+        Ok(Ok(Some(false))) => Ok(ResponsesWebSocketProbe::Http),
+        Ok(Ok(None)) => Ok(ResponsesWebSocketProbe::Silent),
         Ok(Err(error)) => Err(error),
         Err(_) => Ok(ResponsesWebSocketProbe::Silent),
     }

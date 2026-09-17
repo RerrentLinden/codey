@@ -434,28 +434,52 @@ fn restart_codey(invocation: &UpdateHelperInvocation, log_path: &Path) -> Result
 
     const DETACHED_PROCESS: u32 = 0x00000008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    // NSIS 替换完文件后，安装器残留的清理进程（或杀毒软件扫描）会短暂持有
+    // 新写入的 Codey.exe；此时启动会报 os error 32/33。给每个候选路径一段
+    // 有界的重试窗口，等文件锁真正释放。
+    const RESTART_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
     let mut failures = Vec::new();
     for target in candidates {
         if !target.is_file() {
             failures.push(format!("{} 不存在", target.display()));
             continue;
         }
-        append_update_log(log_path, &format!("Restarting Codey: {}", target.display()));
         let current_dir = target.parent().unwrap_or_else(|| Path::new("."));
-        match std::process::Command::new(&target)
-            .current_dir(current_dir)
-            .creation_flags(
-                codey_runtime_core::windows_create_no_window()
-                    | DETACHED_PROCESS
-                    | CREATE_NEW_PROCESS_GROUP,
-            )
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(_) => return Ok(()),
-            Err(error) => failures.push(format!("{}：{error}", target.display())),
+        let deadline = std::time::Instant::now() + RESTART_RETRY_WINDOW;
+        let mut attempt = 0_u32;
+        loop {
+            attempt += 1;
+            // 每次重试都写日志会把锁等待刷成上百行重复记录；记首次与之后的每
+            // 十次的进度即可。
+            if attempt == 1 || attempt.is_multiple_of(10) {
+                append_update_log(
+                    log_path,
+                    &format!("Restarting Codey: {} (attempt {attempt})", target.display()),
+                );
+            }
+            match std::process::Command::new(&target)
+                .current_dir(current_dir)
+                .creation_flags(
+                    codey_runtime_core::windows_create_no_window()
+                        | DETACHED_PROCESS
+                        | CREATE_NEW_PROCESS_GROUP,
+                )
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    let retryable = matches!(error.raw_os_error(), Some(32) | Some(33))
+                        && std::time::Instant::now() < deadline;
+                    if !retryable {
+                        failures.push(format!("{}：{error}", target.display()));
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
         }
     }
     Err(failures.join("；"))

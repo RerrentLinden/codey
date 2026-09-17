@@ -29,12 +29,6 @@ export const previewOfficialModels = [
     supportedReasoningEfforts: ["low", "medium", "high", "xhigh"],
     defaultReasoningEffort: "medium",
   },
-  {
-    slug: "gpt-5.3-codex-spark",
-    displayName: "GPT-5.3-Codex-Spark",
-    supportedReasoningEfforts: ["low", "medium", "high"],
-    defaultReasoningEffort: "medium",
-  },
 ];
 
 export const previewUpstreamModels = [
