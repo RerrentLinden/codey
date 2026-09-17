@@ -331,6 +331,7 @@ fn generated_catalog_uses_the_route_aware_default_selector() {
 
 #[test]
 fn subagent_runtime_models_use_route_aware_aliases() {
+    let config = CodeyConfig::default();
     let target = |provider: &str, model: &str, official: bool| RuntimeModelTarget {
         route_id: provider.into(),
         provider_id: provider.into(),
@@ -354,7 +355,7 @@ fn subagent_runtime_models_use_route_aware_aliases() {
         ("unknown-model", "route-a/unknown-model"),
     ] {
         assert_eq!(
-            route_subagent_model("route-a", requested, &targets, false),
+            route_subagent_model("route-a", requested, &targets, &config),
             expected,
             "requested: {requested}"
         );
@@ -363,23 +364,23 @@ fn subagent_runtime_models_use_route_aware_aliases() {
     let mut ambiguous = targets.clone();
     ambiguous.push(target("route-a", "shared-model", false));
     assert_eq!(
-        route_subagent_model("route-a", "shared-model", &ambiguous, false),
+        route_subagent_model("route-a", "shared-model", &ambiguous, &config),
         "route-a/shared-model"
     );
     assert_eq!(
-        route_subagent_model("route-a", "route-b/shared-model", &ambiguous, false),
+        route_subagent_model("route-a", "route-b/shared-model", &ambiguous, &config),
         "route-b/shared-model"
     );
 
     let official_targets = vec![target("openai", "gpt-5.6-sol", true)];
     for requested in ["gpt-5.6-sol", "openai/gpt-5.6-sol"] {
         assert_eq!(
-            route_subagent_model("openai", requested, &official_targets, true),
+            route_subagent_model("openai", requested, &official_targets, &config),
             "gpt-5.6-sol"
         );
     }
     assert_eq!(
-        route_subagent_model("openai", "unknown-model", &official_targets, true),
+        route_subagent_model("openai", "unknown-model", &official_targets, &config),
         "unknown-model"
     );
 }

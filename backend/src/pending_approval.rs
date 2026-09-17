@@ -290,10 +290,8 @@ impl RolloutParseState {
                     return;
                 };
                 match payload.get("type").and_then(Value::as_str) {
-                    Some("task_started") => {
-                        if self.active_turns.insert(turn_id.to_string()) {
-                            self.events.started_turns.push(turn_id.to_string());
-                        }
+                    Some("task_started") if self.active_turns.insert(turn_id.to_string()) => {
+                        self.events.started_turns.push(turn_id.to_string());
                     }
                     Some("task_complete") => {
                         let error = task_completion_error(payload);
@@ -1247,6 +1245,7 @@ mod tests {
     #[test]
     fn finds_authoritative_task_lifecycle_events() {
         let rollout = r#"
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
 {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}
 {"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","duration_ms":1234,"completed_at":200}}
 {"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-error"}}
