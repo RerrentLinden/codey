@@ -8467,6 +8467,85 @@ async fn native_passthrough_rewrites_plaintext_agent_payload_before_send() {
 }
 
 #[tokio::test]
+async fn chat_completions_route_rewrites_plaintext_agent_payload_before_conversion() {
+    let task = "只读核对任务（第 3 轮）。禁止写入任何文件，完成后给出结论。";
+    let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let upstream_address = upstream.local_addr().unwrap();
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _) = upstream.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await.unwrap();
+        let body = serde_json::from_slice::<Value>(&request.body).unwrap();
+        write_json_response(
+            &mut stream,
+            200,
+            &json!({
+                "id":"chatcmpl-agent-payload",
+                "created":123,
+                "model":body["model"],
+                "choices":[{
+                    "message":{"role":"assistant","content":"received"},
+                    "finish_reason":"stop"
+                }],
+                "usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}
+            }),
+        )
+        .await
+        .unwrap();
+        (request.path, body)
+    });
+    let (mut config, provider_id, model) = router_config(format!("http://{upstream_address}/v1"));
+    config.profiles[0].upstream_protocol =
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+    config.profiles[0].normalize();
+    let router = LocalRouter::start(&config).await.unwrap();
+    let endpoint = router.endpoint();
+
+    let response = reqwest::Client::new()
+        .post(format!("{}/responses", endpoint.base_url))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({
+            "model":model_alias(&provider_id, &model),
+            "input":[
+                {"role":"user","content":"continue"},
+                {
+                    "type":"agent_message",
+                    "id":"amsg_3",
+                    "author":"/root",
+                    "recipient":"/root/child",
+                    "content":[
+                        {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                        {"type":"encrypted_content","encrypted_content":task}
+                    ]
+                }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["output_text"],
+        "received"
+    );
+
+    let (path, body) = upstream_task.await.unwrap();
+    assert_eq!(path, "/v1/chat/completions");
+    let sent_messages = body["messages"].as_array().unwrap();
+    // agent_message 会转换成 assistant 消息，任务正文必须作为可见文本出现在
+    // 该消息里；协议转换不能把 encrypted_content 直接丢弃。
+    let agent_content = sent_messages
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .find(|content| content.contains("Message Type: NEW_TASK"))
+        .expect("上游必须收到包含任务头部的协作消息");
+    assert!(
+        agent_content.contains(task),
+        "协作消息必须包含完整任务正文，实际收到：{agent_content}"
+    );
+    router.stop().await.unwrap();
+}
+
+#[tokio::test]
 async fn upstream_websocket_requests_rewrite_plaintext_agent_payloads() {
     let task = "只读研究任务（第 2 轮）。禁止派生任何子代理。";
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

@@ -77,10 +77,7 @@ pub(crate) fn validate_cross_route_context(body: &Value) -> Result<()> {
     Ok(())
 }
 
-/// 协作任务正文由 Codex 运行时刻写成密文并交给持有密钥的上游解密，线路本身
-/// 不判断内容。第三方线路可能把这个字段直接写成明文，接收方解密失败会拒绝
-/// 整条请求，因此发送前按结构识别：令牌形态原样保留，其余形态改写为可见
-/// 文本，避免历史内容丢失。
+/// 原生 Responses 线路在发送前统一处理协作任务载荷和跨线路 reasoning 状态。
 pub(crate) fn normalize_native_responses_context(
     body: &mut Value,
     discard_opaque_reasoning: bool,
@@ -174,7 +171,13 @@ fn is_reasoning_text_part(part: &Value) -> bool {
     )
 }
 
-fn normalize_encrypted_agent_payloads(body: &mut Value) -> bool {
+/// 协作任务正文由 Codex 运行时刻写入 `agent_message` 的 `encrypted_content`
+/// 字段，交给持有密钥的上游解密；线路本身不判断内容。第三方线路经常把该
+/// 字段直接写成明文，接收方解密失败会拒绝整条请求。Chat Completions 和
+/// Anthropic Messages 都表达不了这个字段，转换时只能丢弃，任务正文会随之
+/// 消失，因此所有线路都在协议转换前按结构识别：令牌形态原样保留，其余形态
+/// 改写为可见文本。
+pub(crate) fn normalize_encrypted_agent_payloads(body: &mut Value) -> bool {
     match body.get_mut("input") {
         Some(Value::Array(items)) => {
             let mut changed = false;

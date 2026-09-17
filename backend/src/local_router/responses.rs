@@ -1522,11 +1522,20 @@ impl RouterServer {
                 .await;
         }
         let discard_opaque_reasoning = route_changed || restoring_adapted_history;
-        if bridge == ProtocolBridge::NativeResponses
-            && normalize_native_responses_context(&mut body, discard_opaque_reasoning)
-        {
-            body_mutated = true;
-            encoded_body = None;
+        if bridge == ProtocolBridge::NativeResponses {
+            if normalize_native_responses_context(&mut body, discard_opaque_reasoning) {
+                body_mutated = true;
+                encoded_body = None;
+            }
+        } else {
+            // Chat Completions 与 Anthropic Messages 都表达不了 encrypted_content，
+            // 协议转换只能丢弃该字段。第三方线路常把协作任务正文写在这个字段里，
+            // 转换前必须先改写为可见文本，否则子代理收到的任务载荷为空。
+            // encoded_body 在非原生线路上只作为大请求异步转换的体积标记，正文本身
+            // 以转换结果为准，保留它可以让超大请求继续走异步转换。
+            if normalize_encrypted_agent_payloads(&mut body) {
+                body_mutated = true;
+            }
         }
         let force_upstream_stream = should_force_upstream_streaming(
             bridge,
