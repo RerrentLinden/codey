@@ -1535,7 +1535,7 @@ fn validate_codex_app_path(path: &str) -> Result<PathBuf, String> {
     }
 
     let app_dir = normalize_codex_app_path(Path::new(selected)).ok_or_else(|| {
-        "所选目录不是可启动的 Codex 桌面应用。请选择包含 ChatGPT.exe 或 Codex.exe 的目录，不要选择 codex.exe 命令行程序".to_string()
+        "所选目录不是可启动的 Codex 桌面应用。请选择包含 ChatGPT.exe 或 Codex.exe 的目录，不要选择 codex.exe 命令行程序或第三方 Codex 启动器".to_string()
     })?;
     let executable = build_codex_executable(&app_dir);
     if !executable.is_file() {
@@ -1553,7 +1553,11 @@ async fn ensure_windows_codex_app_path(state: &Arc<AppState>) -> Result<(), Stri
     let configured_path =
         (!configured_app_path.is_empty()).then(|| PathBuf::from(configured_app_path.as_str()));
     let resolved = tokio::task::spawn_blocking(move || {
+        // The launcher needs a startable executable, not merely a normalizable
+        // path: a stale or third-party directory must be reselected here instead
+        // of surfacing later as a bare spawn failure.
         resolve_codex_app_dir_with_saved(configured_path.as_deref(), None)
+            .filter(|app_dir| build_codex_executable(app_dir).is_file())
     })
     .await
     .map_err(|error| format!("检测 Codex 桌面应用目录的任务异常退出：{error}"))?;

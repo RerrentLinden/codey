@@ -19,6 +19,14 @@ struct AppPackageSpec {
 const CODEX_PACKAGE_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
 const STANDALONE_CODEX_EXECUTABLES: &[&str] = &["ChatGPT.exe", "Codex.exe"];
 
+/// Windows resolves program names case-insensitively, so an install whose main
+/// binary is spelled `codex.exe` must not be skipped.
+const EXECUTABLE_NAMES_ARE_CASE_INSENSITIVE: bool = cfg!(windows);
+
+/// Windows refuses a selected file that no Codex launcher sits beside, so a
+/// third-party tool's binary cannot name its own directory as the Codex app.
+const SELECTED_FILE_REQUIRES_SIBLING_EXECUTABLE: bool = cfg!(windows);
+
 const APP_PACKAGE_SPECS: &[AppPackageSpec] = &[
     AppPackageSpec {
         identity: "OpenAI.Codex",
@@ -215,7 +223,7 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
     }
 
     if path.is_file() {
-        return path.parent().map(Path::to_path_buf);
+        return install_dir_from_selected_file(path, SELECTED_FILE_REQUIRES_SIBLING_EXECUTABLE);
     }
 
     if executable_in_dir(path).is_some() {
@@ -239,6 +247,23 @@ pub fn normalize_codex_app_path(path: &Path) -> Option<PathBuf> {
         return Some(path.to_path_buf());
     }
 
+    None
+}
+
+/// Names the install directory a user-selected file belongs to.
+///
+/// A file only names a Codex install when a launchable launcher sits beside it.
+/// Guessing the parent of an unrelated binary (a CLI build or a third-party
+/// Codex launcher such as `codex-x.exe`) would hand the launcher a path it can
+/// never start, and the failure would only surface as a spawn error.
+fn install_dir_from_selected_file(
+    path: &Path,
+    require_sibling_executable: bool,
+) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    if !require_sibling_executable || executable_in_dir(parent).is_some() {
+        return Some(parent.to_path_buf());
+    }
     None
 }
 
@@ -662,12 +687,26 @@ fn executable_in_dir(dir: &Path) -> Option<PathBuf> {
         let entry = std::fs::read_dir(dir)
             .ok()?
             .filter_map(Result::ok)
-            .find(|entry| entry.file_name() == OsStr::new(name) && entry.path().is_file());
+            .find(|entry| {
+                executable_name_matches(&entry.file_name(), name) && entry.path().is_file()
+            });
         if let Some(entry) = entry {
             return Some(entry.path());
         }
     }
     None
+}
+
+fn executable_name_matches(candidate: &OsStr, expected: &str) -> bool {
+    executable_name_matches_with(candidate, expected, EXECUTABLE_NAMES_ARE_CASE_INSENSITIVE)
+}
+
+fn executable_name_matches_with(candidate: &OsStr, expected: &str, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        candidate.to_string_lossy().eq_ignore_ascii_case(expected)
+    } else {
+        candidate == OsStr::new(expected)
+    }
 }
 
 fn codex_package_parts(package_name: &str) -> Option<(AppPackageSpec, &str, &str)> {
@@ -721,5 +760,86 @@ mod tests {
             Some("26.803.81509")
         );
         assert_eq!(normalize_version_value("Codex 26.803.81509"), None);
+    }
+
+    #[test]
+    fn selected_executable_requires_a_sibling_codex_launcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("Codex-X");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let third_party = app_dir.join("codex-x.exe");
+        std::fs::write(&third_party, []).unwrap();
+
+        // A third-party launcher must not turn its own directory into the Codex app.
+        assert_eq!(install_dir_from_selected_file(&third_party, true), None);
+        assert_eq!(
+            install_dir_from_selected_file(&third_party, false).as_deref(),
+            Some(app_dir.as_path())
+        );
+
+        std::fs::write(app_dir.join("Codex.exe"), []).unwrap();
+        assert_eq!(
+            install_dir_from_selected_file(&third_party, true).as_deref(),
+            Some(app_dir.as_path())
+        );
+    }
+
+    #[test]
+    fn windows_executable_lookup_ignores_letter_case() {
+        assert!(executable_name_matches_with(
+            OsStr::new("codex.exe"),
+            "Codex.exe",
+            true
+        ));
+        assert!(executable_name_matches_with(
+            OsStr::new("CHATGPT.EXE"),
+            "ChatGPT.exe",
+            true
+        ));
+        assert!(!executable_name_matches_with(
+            OsStr::new("codex.exe"),
+            "Codex.exe",
+            false
+        ));
+        assert!(!executable_name_matches_with(
+            OsStr::new("codex-x.exe"),
+            "Codex.exe",
+            true
+        ));
+    }
+
+    /// A third-party Codex launcher installs its own binary beside no Codex
+    /// desktop app, so its directory must not resolve to a launchable app.
+    #[cfg(windows)]
+    #[test]
+    fn third_party_launcher_does_not_name_a_codex_install_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_dir = temp.path().join("Codex-X");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let third_party = app_dir.join("codex-x.exe");
+        std::fs::write(&third_party, []).unwrap();
+
+        assert_eq!(normalize_codex_app_path(&third_party), None);
+        assert_eq!(normalize_codex_app_path(&app_dir), None);
+
+        std::fs::write(app_dir.join("Codex.exe"), []).unwrap();
+        assert_eq!(
+            normalize_codex_app_path(&third_party).as_deref(),
+            Some(app_dir.as_path())
+        );
+    }
+
+    /// Windows installs may spell the launcher in lower case; the discovery
+    /// must still find it.
+    #[cfg(windows)]
+    #[test]
+    fn lowercase_launcher_name_still_names_its_install_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("codex.exe"), []).unwrap();
+
+        assert_eq!(
+            normalize_codex_app_path(temp.path()).as_deref(),
+            Some(temp.path())
+        );
     }
 }

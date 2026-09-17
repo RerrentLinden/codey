@@ -65,7 +65,7 @@ enum InjectionHealth {
     TargetUnavailable,
 }
 pub const CODEX_APP_NOT_FOUND_ERROR: &str = "找不到 Codex 桌面应用";
-pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效或指向了 Codex CLI；请选择 Codex 桌面 App，不要选择 codex.exe 命令行程序";
+pub const CODEX_APP_PATH_INVALID_ERROR: &str = "配置的 Codex App 路径无效或指向了 Codex CLI；请选择 Codex 桌面 App 的安装目录，不要选择 codex.exe 命令行程序或第三方 Codex 启动器";
 const DISABLE_GPU_ARGUMENT: &str = "--disable-gpu";
 const DISABLE_GPU_RASTERIZATION_ARGUMENT: &str = "--disable-gpu-rasterization";
 const DISABLE_BACKGROUND_ECOQOS_ARGUMENT: &str = "--disable-features=UseEcoQoSForBackgroundProcess";
