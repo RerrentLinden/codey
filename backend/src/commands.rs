@@ -118,7 +118,6 @@ use crate::pending_approval;
 use crate::plugin_marketplace;
 use crate::route_request_log::RouteRequestLogQuery;
 use crate::route_request_log::RouteRequestLogReconfigure;
-use crate::session_delete;
 use crate::session_metadata;
 use crate::session_transfer;
 use crate::trace_log_guard;
@@ -438,13 +437,6 @@ impl AppState {
                     Ok(timestamps) => json!({"status":"ok", "timestamps": timestamps}),
                     Err(error) => api_error_message(error),
                 }
-            }
-            "/session/delete" => {
-                let session_id = bridge_string(&payload, "sessionId");
-                let title = bridge_string(&payload, "title");
-                delete_session_record(self, session_id, title)
-                    .await
-                    .unwrap_or_else(api_error_message)
             }
             "/session/export/start" => {
                 let session_id = bridge_string(&payload, "sessionId");
@@ -2947,32 +2939,6 @@ pub async fn delete_selected_messages(
     .map_err(|error| format!("消息删除任务异常退出：{error}"))?
     .map_err(|error| error.to_string())?;
     serde_json::to_value(result).map_err(|error| error.to_string())
-}
-
-pub async fn delete_session_record(
-    state: &Arc<AppState>,
-    session_id: String,
-    title: String,
-) -> Result<Value, String> {
-    let home = codex_home();
-    let result = tokio::task::spawn_blocking(move || {
-        session_delete::delete_session(home, &session_id, &title)
-    })
-    .await
-    .map_err(|error| format!("会话删除任务异常退出：{error}"))?
-    .map_err(|error| error.to_string())?;
-    let normalized_session_id = result.session_id.trim_start_matches("local:").to_string();
-    state
-        .session_titles
-        .write()
-        .await
-        .remove(&normalized_session_id);
-    Ok(json!({
-        "status": "ok",
-        "deleted": true,
-        "sessionId": normalized_session_id,
-        "message": result.message,
-    }))
 }
 
 fn argument<T: DeserializeOwned>(args: &Value, name: &str) -> Result<T, String> {

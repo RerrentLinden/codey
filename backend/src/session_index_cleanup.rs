@@ -149,8 +149,7 @@ pub fn cleanup(home: &Path) -> Result<SessionIndexCleanupReport> {
     let live_thread_scan = collect_live_thread_ids(home, &candidate_ids)?;
     // A discoverable schema (including an old empty catalog) is not evidence
     // that every indexed thread was deleted. If no candidate can be confirmed
-    // live, keep the whole index and retry discovery on a later startup. Exact
-    // user-requested deletions use remove_thread and do not need this inference.
+    // live, keep the whole index and retry discovery on a later startup.
     if live_thread_scan.authoritative_sources == 0 || live_thread_scan.ids.is_empty() {
         return Ok(SessionIndexCleanupReport {
             scanned_entries: plan.scanned_entries,
@@ -177,24 +176,6 @@ pub fn cleanup(home: &Path) -> Result<SessionIndexCleanupReport> {
     let report = apply_cleanup_plan(home, plan, live_thread_ids.len(), true)?;
     record_cleanup_marker(home, &index_path);
     Ok(report)
-}
-
-/// Removes one known thread from the legacy index as part of an explicit
-/// deletion, regardless of stale catalog references that are being deleted in
-/// the same operation.
-pub fn remove_thread(home: &Path, thread_id: &str) -> Result<SessionIndexCleanupReport> {
-    let thread_id = crate::session_metadata::normalize_session_id(thread_id);
-    if !home.exists() || thread_id.is_empty() {
-        return Ok(SessionIndexCleanupReport::default());
-    }
-    let _lock = CleanupLock::acquire(home)?;
-    let Some(plan) = plan_cleanup_matching(&home.join("session_index.jsonl"), |candidate| {
-        candidate.id == thread_id
-    })?
-    else {
-        return Ok(SessionIndexCleanupReport::default());
-    };
-    apply_cleanup_plan(home, plan, 0, false)
 }
 
 fn apply_cleanup_plan(
@@ -699,31 +680,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_delete_removes_the_selected_index_entry_despite_catalog_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path();
-        fs::write(
-            home.join("session_index.jsonl"),
-            [
-                index_line("deleted-thread", "deleted"),
-                index_line("kept-thread", "kept"),
-            ]
-            .join("\n")
-                + "\n",
-        )
-        .unwrap();
-
-        let report = remove_thread(home, "local:deleted-thread").unwrap();
-
-        assert_eq!(report.pruned_entries, 1);
-        let updated = fs::read_to_string(home.join("session_index.jsonl")).unwrap();
-        assert!(!updated.contains("\"id\":\"deleted-thread\""));
-        assert!(updated.contains("\"id\":\"kept-thread\""));
-        assert!(report.backup_dir.is_none());
-        assert!(!home.join("backups_state").exists());
-    }
-
-    #[test]
     fn filtering_uses_planned_line_identity_and_preserves_original_endings() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("session_index.jsonl");
@@ -751,36 +707,6 @@ mod tests {
 
         assert_eq!(removed, 1);
         assert_eq!(filtered, format!("{retained}\n{unknown_shape}\nnot-json"));
-    }
-
-    #[test]
-    fn explicit_delete_removes_all_exact_duplicate_entries() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path();
-        let sqlite = home.join("sqlite");
-        fs::create_dir_all(&sqlite).unwrap();
-        Connection::open(sqlite.join("codex.db"))
-            .unwrap()
-            .execute("CREATE TABLE local_thread_catalog (thread_id TEXT)", [])
-            .unwrap();
-        fs::write(
-            home.join("session_index.jsonl"),
-            format!(
-                "{}\n{}\n",
-                index_line("duplicate-orphan", "first"),
-                index_line("duplicate-orphan", "second")
-            ),
-        )
-        .unwrap();
-
-        let report = remove_thread(home, "duplicate-orphan").unwrap();
-
-        assert_eq!(report.pruned_entries, 2);
-        assert!(
-            fs::read_to_string(home.join("session_index.jsonl"))
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]

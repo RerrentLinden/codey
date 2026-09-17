@@ -481,23 +481,10 @@ fn queue_bridge_dispatch(
         Some(ParsedBridgeDispatch::Call(call)) if bridge_path_can_run_concurrently(&call.path) => {
             pending_concurrent.push_back(call);
         }
-        Some(ParsedBridgeDispatch::Call(call))
-            if bridge_path_is_high_priority_serial(&call.path) =>
-        {
-            let insertion_index = pending_serial
-                .iter()
-                .position(|queued| !bridge_path_is_high_priority_serial(&queued.path))
-                .unwrap_or(pending_serial.len());
-            pending_serial.insert(insertion_index, call);
-        }
         Some(ParsedBridgeDispatch::Call(call)) => pending_serial.push_back(call),
         Some(ParsedBridgeDispatch::Completion(completion)) => ready.push_back(completion),
         None => {}
     }
-}
-
-fn bridge_path_is_high_priority_serial(path: &str) -> bool {
-    matches!(path, "/session/delete")
 }
 
 fn bridge_path_can_run_concurrently(path: &str) -> bool {
@@ -751,36 +738,6 @@ mod tests {
             path: path.to_string(),
             payload: json!({}),
         })
-    }
-
-    #[test]
-    fn session_deletes_jump_ahead_of_pending_serial_reads_without_reordering_each_other() {
-        let mut pending_concurrent = VecDeque::new();
-        let mut pending_serial = VecDeque::new();
-        let mut ready = VecDeque::new();
-        for (request_id, path) in [
-            ("usage", "/thread-usage-history"),
-            ("delete-1", "/session/delete"),
-            ("settings", "/settings/set"),
-            ("delete-2", "/session/delete"),
-        ] {
-            queue_bridge_dispatch(
-                Some(bridge_call(request_id, path)),
-                &mut pending_concurrent,
-                &mut pending_serial,
-                &mut ready,
-            );
-        }
-
-        assert!(pending_concurrent.is_empty());
-        assert!(ready.is_empty());
-        assert_eq!(
-            pending_serial
-                .iter()
-                .map(|call| call.request_id.as_str())
-                .collect::<Vec<_>>(),
-            ["delete-1", "delete-2", "usage", "settings"]
-        );
     }
 
     #[test]
