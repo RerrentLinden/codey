@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
 import test from "node:test";
 import ts from "typescript";
 
-const root = new URL("../", import.meta.url);
+import { readSource } from "./helpers/read-source.mjs";
 
 test("request log cache hit rate uses input tokens and preserves unknown usage", async () => {
-  const viewer = await readFile(new URL("src/RequestLogDialog.tsx", root), "utf8");
+  const viewer = await readSource("src/RequestLogDialog.tsx");
   const source = viewer.match(/function formatCacheHitRate\([\s\S]*?\n\}/)?.[0];
   assert.ok(source);
   const compiled = ts.transpileModule(source, {}).outputText;
@@ -21,8 +20,8 @@ test("request log cache hit rate uses input tokens and preserves unknown usage",
 
 test("request log model cell shows the model sent upstream and the upstream model when it differs", async () => {
   const [viewer, preview] = await Promise.all([
-    readFile(new URL("src/RequestLogDialog.tsx", root), "utf8"),
-    readFile(new URL("src/dev/mockApi.ts", root), "utf8"),
+    readSource("src/RequestLogDialog.tsx"),
+    readSource("src/dev/mockApi.ts"),
   ]);
 
   assert.ok(viewer.includes('import { modelIdsEqual } from "./modelIds";'));
@@ -49,7 +48,7 @@ test("request log model cell shows the model sent upstream and the upstream mode
 });
 
 test("request log detail labels request body shape and flags empty input arrays", async () => {
-  const viewer = await readFile(new URL("src/RequestLogDialog.tsx", root), "utf8");
+  const viewer = await readSource("src/RequestLogDialog.tsx");
   const source = viewer.match(/function requestShapeText\([\s\S]*?\n\}/)?.[0];
   assert.ok(source);
   const compiled = ts.transpileModule(source, {}).outputText;
@@ -66,10 +65,10 @@ test("request log detail labels request body shape and flags empty input arrays"
 
 test("request log controls are scoped to built-in routing and preserve logger settings", async () => {
   const [app, modelSection, types, preview] = await Promise.all([
-    readFile(new URL("src/App.tsx", root), "utf8"),
-    readFile(new URL("src/ModelSection.tsx", root), "utf8"),
-    readFile(new URL("src/App.types.ts", root), "utf8"),
-    readFile(new URL("src/dev/mockApi.ts", root), "utf8"),
+    readSource("src/App.tsx"),
+    readSource("src/ModelSection.tsx"),
+    readSource("src/App.types.ts"),
+    readSource("src/dev/mockApi.ts"),
   ]);
 
   assert.match(types, /export type RouteRequestLogConfig/);
@@ -99,8 +98,8 @@ test("request log controls are scoped to built-in routing and preserve logger se
 
 test("request log viewer is hosted by the local router for the system browser", async () => {
   const [api, overlay] = await Promise.all([
-    readFile(new URL("src/api.ts", root), "utf8"),
-    readFile(new URL("src/overlay.tsx", root), "utf8"),
+    readSource("src/api.ts"),
+    readSource("src/overlay.tsx"),
   ]);
 
   assert.match(api, /"open_route_request_logs"/);
@@ -111,10 +110,7 @@ test("request log viewer is hosted by the local router for the system browser", 
 });
 
 test("request log viewer uses a full-screen server-paginated searchable table", async () => {
-  const viewer = await readFile(
-    new URL("src/RequestLogDialog.tsx", root),
-    "utf8",
-  );
+  const viewer = await readSource("src/RequestLogDialog.tsx");
 
   assert.doesNotMatch(viewer, /<Modal/);
   assert.doesNotMatch(viewer, /antd|ant-/);
@@ -140,7 +136,7 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /protocolTagClass\(item\.upstreamTransport\)/);
   assert.doesNotMatch(viewer, /item\.requestProtocol/);
   assert.match(viewer, /<Pagination[^>]*className="w-auto"/);
-  const styles = await readFile(new URL("src/styles.request-log.css", root), "utf8");
+  const styles = await readSource("src/styles.request-log.css");
   assert.match(styles, /\.request-log-protocol-http/);
   assert.match(styles, /\.request-log-protocol-sse/);
   assert.match(styles, /\.request-log-protocol-ws/);
@@ -241,7 +237,7 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
 });
 
 test("request log preview supports clearing all history", async () => {
-  const preview = await readFile(new URL("src/dev/mockApi.ts", root), "utf8");
+  const preview = await readSource("src/dev/mockApi.ts");
 
   assert.match(preview, /command === "clear_route_request_logs"/);
   assert.match(preview, /previewRouteRequestLogs\.length = 0/);
@@ -252,7 +248,7 @@ test("request log preview supports clearing all history", async () => {
 // 搜索防抖的首次执行发生在挂载时，若此时重置分页，首页查询刚拿到的游标会被清空，
 // 第 2 页及之后的页码都会保持禁用。
 test("request log search debounce keeps the first page cursors when the query text is unchanged", async () => {
-  const viewer = await readFile(new URL("src/RequestLogDialog.tsx", root), "utf8");
+  const viewer = await readSource("src/RequestLogDialog.tsx");
   const source = viewer.match(
     /useEffect\(\(\) => \{\n\s+const nextSearch = searchInput\.trim\(\);[\s\S]*?\}, \[searchInput, search\]\);/,
   )?.[0];
