@@ -542,9 +542,9 @@ impl RequestLogMetadataProjector {
                                 probe.observe_service_tier(&String::from_utf8_lossy(&self.string));
                             }
                             ProjectedMetadataScalar::ResponseModel if !self.string_overflow => {
-                                probe.observe_upstream_response_model(
-                                    &String::from_utf8_lossy(&self.string),
-                                );
+                                probe.observe_upstream_response_model(&String::from_utf8_lossy(
+                                    &self.string,
+                                ));
                             }
                             ProjectedMetadataScalar::Delta => {
                                 self.event_delta_has_content =

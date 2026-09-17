@@ -2984,10 +2984,7 @@ pub(crate) fn upstream_response_model(value: &Value) -> Option<&str> {
 
 /// 记录上游原始响应里出现的实际使用模型。桥接线路不经过原始字节投影，
 /// 由各适配器在解析上游响应时直接调用。
-pub(crate) fn observe_upstream_response_model(
-    probe: Option<&RouteRequestLogProbe>,
-    value: &Value,
-) {
+pub(crate) fn observe_upstream_response_model(probe: Option<&RouteRequestLogProbe>, value: &Value) {
     if let Some(probe) = probe
         && let Some(model) = upstream_response_model(value)
     {
