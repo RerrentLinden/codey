@@ -685,7 +685,7 @@ test("a backend-pushed catalog updates immediately without a nested bridge reque
   const { patch } = runtime;
   const eventsBeforePush = client.events.length;
 
-  assert.equal(patch.version, "55");
+  assert.equal(patch.version, "57");
   assert.equal(await patch.setCatalog({
     status: "ok",
     models: ["gpt-5.6-sol", "provider-hot-pushed"],
@@ -4291,5 +4291,62 @@ test("thread list history is restored without an existing local binding", async 
   assert.deepEqual(resumed.request.params, {
     threadId: "history", model: "current/vendor/model", modelProvider: "codey_router",
   });
+  runtime.patch.dispose();
+});
+
+test("a proxy query client that answers with a promise-like value cannot abort catalog delivery", async () => {
+  const goodClient = activeModelQueryClient(["route-a/old-model"]);
+  let rejectedClients = 0;
+  const rpcProxyClient = {
+    getQueriesData() {
+      return { then() {}, catch() {}, finally() {} };
+    },
+    setQueryData() {
+      throw new Error("the rpc proxy must never receive cache writes");
+    },
+    invalidateQueries() {
+      rejectedClients += 1;
+      return Promise.resolve();
+    },
+  };
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["route-a/current-model"],
+    default_model: "route-a/current-model",
+  }, [statsigClient()], {
+    queryClient: rpcProxyClient,
+    reactModelState: { goodClient },
+  });
+
+  assert.deepEqual(
+    goodClient.models(),
+    ["route-a/current-model"],
+    "the usable client must still receive the catalog after an unusable one is skipped",
+  );
+  assert.equal(rejectedClients, 0, "the unusable client must be skipped before invalidation");
+  runtime.patch.dispose();
+});
+
+test("catalog delivery survives a query client whose entries are not key-value pairs", async () => {
+  const goodClient = activeModelQueryClient(["route-a/old-model"]);
+  const malformedClient = {
+    getQueriesData() {
+      return ["not-a-pair", null, 7];
+    },
+    setQueryData() {
+      throw new Error("malformed entries must never reach the cache writer");
+    },
+    async invalidateQueries() {},
+  };
+  const runtime = await loadPatch({
+    status: "ok",
+    models: ["route-a/current-model"],
+    default_model: "route-a/current-model",
+  }, [statsigClient()], {
+    queryClient: malformedClient,
+    reactModelState: { goodClient },
+  });
+
+  assert.deepEqual(goodClient.models(), ["route-a/current-model"]);
   runtime.patch.dispose();
 });

@@ -1,6 +1,6 @@
 // Keep Codex's native model allowlist aligned with the current Codey channel.
 (() => {
-  const patchVersion = "55";
+  const patchVersion = "57";
   const nativeSelectionOnly = window.__codeyNativeModelSelectionOnly === true;
   const officialProviderId = "openai";
   const localRouterProviderId = "codey_router";
@@ -1581,16 +1581,23 @@
     for (const client of scan.queryClients) {
       let entries = [];
       try {
-        entries = client.getQueriesData({
+        const result = client.getQueriesData({
           queryKey: modelQueryKey,
           exact: false,
-        }) || [];
+        });
+        if (!result || typeof result[Symbol.iterator] !== "function") {
+          knownModelQueryClients.delete(client);
+          continue;
+        }
+        entries = Array.from(result);
       } catch {
         knownModelQueryClients.delete(client);
         continue;
       }
       queryEntries += entries.length;
-      for (const [queryKey, current] of entries) {
+      for (const entry of entries) {
+        if (!Array.isArray(entry)) continue;
+        const [queryKey, current] = entry;
         const patched = patchedModelPayload(current);
         if (!patched.changed) continue;
         try {
