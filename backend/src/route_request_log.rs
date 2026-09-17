@@ -2671,6 +2671,80 @@ fn summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRequestLog
     })
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub(crate) struct RouteRequestLogModelQuery {
+    pub from_unix_ms: Option<u64>,
+    pub to_unix_ms: Option<u64>,
+    pub provider: Option<String>,
+    pub official_account_id: Option<String>,
+    pub after_model: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RouteRequestLogModelPage {
+    pub queryable: bool,
+    pub models: Vec<String>,
+    pub next_cursor: Option<String>,
+}
+
+pub(crate) fn query_route_request_log_models(
+    root: &Path,
+    backend: RouteRequestLogBackend,
+    query: RouteRequestLogModelQuery,
+) -> anyhow::Result<RouteRequestLogModelPage> {
+    let after_model = query.after_model;
+    anyhow::ensure!(
+        after_model.as_ref().is_none_or(|value| value.len() <= 4096),
+        "模型游标过长"
+    );
+    let query = RouteRequestLogQuery {
+        from_unix_ms: query.from_unix_ms,
+        to_unix_ms: query.to_unix_ms,
+        provider: query.provider,
+        official_account_id: query.official_account_id,
+        cursor_mode: true,
+        ..Default::default()
+    }
+    .normalize()?;
+    let mut result = RouteRequestLogModelPage {
+        queryable: backend == RouteRequestLogBackend::Sqlite,
+        models: Vec::new(),
+        next_cursor: None,
+    };
+    let path = root.join(SQLITE_FILE_NAME);
+    if !result.queryable || !path.is_file() {
+        return Ok(result);
+    }
+    let mut connection = open_query_connection(&path)?;
+    let transaction = connection.transaction()?;
+    let columns = sqlite_optional_columns(&transaction, &path)?;
+    let (mut filter, mut values) = sqlite_query_filters(&query, columns.official_account);
+    if query.official_account_id.is_some() && !columns.official_account {
+        return Ok(result);
+    }
+    filter.push_str(if filter.is_empty() {
+        " WHERE "
+    } else {
+        " AND "
+    });
+    filter.push_str("TRIM(COALESCE(model, requested_model)) <> ''");
+    if let Some(after) = after_model {
+        filter.push_str(" AND COALESCE(model, requested_model) COLLATE BINARY > ?");
+        values.push(SqlValue::Text(after));
+    }
+    result.models = transaction.prepare(&format!(
+        "SELECT DISTINCT COALESCE(model, requested_model) AS model_key FROM route_request_logs{filter} ORDER BY model_key COLLATE BINARY LIMIT 201"
+    ))?.query_map(params_from_iter(values.iter()), |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    if result.models.len() > 200 {
+        result.models.truncate(200);
+        result.next_cursor = result.models.last().cloned();
+    }
+    Ok(result)
+}
+
 pub(crate) fn query_route_request_log_stats(
     root: &Path,
     backend: RouteRequestLogBackend,
@@ -3327,6 +3401,64 @@ fn rename_if_exists(source: &Path, destination: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_candidates_paginate_all_models_and_apply_account_filters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(SQLITE_FILE_NAME);
+        let mut sink = SqliteSink::open(&path, 30).unwrap();
+        let mut entries = Vec::new();
+        for index in 0..251 {
+            let mut entry = sample_entry(&format!("request-{index}"));
+            entry.timestamp_unix_ms = 1000;
+            entry.model = Some(format!("model-{index:03}"));
+            entry.official_account_id = Some("account-a".into());
+            entries.push(queued(entry));
+        }
+        let mut other = sample_entry("other");
+        other.timestamp_unix_ms = 1000;
+        other.official_account_id = Some("account-b".into());
+        entries.push(queued(other));
+        sink.write_batch(&entries).unwrap();
+        sink.finish().unwrap();
+        let query = RouteRequestLogModelQuery {
+            from_unix_ms: Some(1),
+            to_unix_ms: Some(2000),
+            provider: Some("provider-a".into()),
+            official_account_id: Some("account-a".into()),
+            after_model: None,
+        };
+        let first = query_route_request_log_models(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            query.clone(),
+        )
+        .unwrap();
+        assert_eq!(first.models.len(), 200);
+        assert_eq!(first.next_cursor.as_deref(), Some("model-199"));
+        let next = query_route_request_log_models(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogModelQuery {
+                after_model: first.next_cursor,
+                ..query.clone()
+            },
+        )
+        .unwrap();
+        assert_eq!(next.models.len(), 51);
+        assert_eq!(next.models.last().map(String::as_str), Some("model-250"));
+        assert!(next.next_cursor.is_none());
+        let unmatched = query_route_request_log_models(
+            directory.path(),
+            RouteRequestLogBackend::Sqlite,
+            RouteRequestLogModelQuery {
+                provider: Some("' OR 1=1 --".into()),
+                ..query
+            },
+        )
+        .unwrap();
+        assert!(unmatched.models.is_empty());
+    }
 
     fn sample_entry(request_id: &str) -> RouteRequestLogEntry {
         RouteRequestLogEntry {

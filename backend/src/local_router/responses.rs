@@ -275,6 +275,50 @@ impl RouterServer {
                     .clone();
                 write_json_response(&mut stream, 200, &json!({"config": catalog})).await?;
             }
+            ("POST", "/codey/api/query_route_request_log_models") => {
+                let query = match serde_json::from_slice::<
+                    crate::route_request_log::RouteRequestLogModelQuery,
+                >(&request.body)
+                {
+                    Ok(query) => query,
+                    Err(error) => {
+                        write_error_response(
+                            &mut stream,
+                            400,
+                            "invalid_request_log_query",
+                            format!("模型候选查询参数无效：{error}"),
+                            None,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                let backend = self
+                    .snapshot
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .request_log_backend;
+                let root = self.request_log.root().to_path_buf();
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::route_request_log::query_route_request_log_models(&root, backend, query)
+                })
+                .await;
+                match result {
+                    Ok(Ok(page)) => {
+                        write_json_response(&mut stream, 200, &serde_json::to_value(page)?).await?
+                    }
+                    error => {
+                        write_error_response(
+                            &mut stream,
+                            500,
+                            "request_log_query_failed",
+                            format!("查询模型候选失败：{error:?}"),
+                            None,
+                        )
+                        .await?
+                    }
+                }
+            }
             (
                 "POST",
                 "/codey/api/query_route_request_logs" | "/codey/api/query_route_request_log_stats",

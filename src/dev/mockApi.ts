@@ -711,7 +711,7 @@ if (import.meta.env.DEV) {
           usedPercent: 20 + seed, windowMinutes: 10080, resetsAt: fetchedAt + 3 * 86400,
         } };
       }
-      if (command === "query_route_request_logs" || command === "query_route_request_log_stats") {
+      if (command === "query_route_request_logs" || command === "query_route_request_log_stats" || command === "query_route_request_log_models") {
         const page = Math.max(1, Number(args.page) || 1);
         const pageSize = Math.min(100, Math.max(1, Number(args.pageSize) || 20));
         const search = String(args.search || "").trim().toLocaleLowerCase();
@@ -747,6 +747,11 @@ if (import.meta.env.DEV) {
           ].some((value) => value?.toLocaleLowerCase().includes(search));
         });
         filtered.sort((left, right) => right.timestampUnixMs - left.timestampUnixMs || right.requestId.localeCompare(left.requestId));
+        if (command === "query_route_request_log_models") {
+          const models = [...new Set(filtered.map((item) => item.model ?? item.requestedModel))]
+            .filter((model) => model && (!args.afterModel || model > String(args.afterModel))).sort();
+          return { queryable: true, models: models.slice(0, 200), nextCursor: models.length > 200 ? models[199] : null };
+        }
         if (command === "query_route_request_log_stats") {
           const aggregate = (rows: typeof filtered) => {
             const sum = (values: Array<number | null | undefined>) => {

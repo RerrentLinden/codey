@@ -1,0 +1,44 @@
+import type { Config, Profile } from "./App.types";
+
+function equal(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function object(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function mergeValue(base: unknown, draft: unknown, incoming: unknown): unknown {
+  if (equal(base, draft)) return incoming;
+  if (!object(base) || !object(draft) || !object(incoming)) return draft;
+  const merged: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(base), ...Object.keys(draft), ...Object.keys(incoming)])) {
+    const value = mergeValue(base[key], draft[key], incoming[key]);
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged;
+}
+
+export function reconcileConfigDraft(base: Config | null, draft: Config | null, incoming: Config) {
+  if (base && incoming.settingsRevision < base.settingsRevision) return null;
+  if (!base || !draft) return { config: incoming, dirty: false };
+  const config = { ...mergeValue(base, draft, incoming) as Config };
+  const baseProfiles = new Map(base.profiles.map((profile) => [profile.id, profile]));
+  const draftProfiles = new Map(draft.profiles.map((profile) => [profile.id, profile]));
+  config.profiles = incoming.profiles.flatMap((profile) => {
+    const previous = baseProfiles.get(profile.id);
+    const edited = draftProfiles.get(profile.id);
+    if (profile.officialAccount || profile.officialAccountId) return [profile];
+    if (previous && !edited) return [];
+    return [(edited ? mergeValue(previous, edited, profile) : profile) as Profile];
+  });
+  const incomingIds = new Set(incoming.profiles.map((profile) => profile.id));
+  for (const profile of draft.profiles) {
+    if (!baseProfiles.has(profile.id) && !incomingIds.has(profile.id)) config.profiles.push(profile);
+  }
+  config.settingsRevision = incoming.settingsRevision;
+  if (!config.profiles.some((profile) => profile.id === config.activeProfileId)) {
+    config.activeProfileId = incoming.activeProfileId;
+  }
+  return { config, dirty: !equal(config, incoming) };
+}

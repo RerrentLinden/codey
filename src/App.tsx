@@ -11,6 +11,7 @@ import {
   IconX,
 } from "@tabler/icons-react";
 import { invoke } from "./api";
+import { reconcileConfigDraft } from "./configDraft";
 import { ModelPickerDialog } from "./AppDialogs";
 import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
 import { ModelSection } from "./ModelSection";
@@ -169,6 +170,8 @@ export function App({
     persistedConfigRef.current = next;
     setConfig(next);
   }, []);
+  const draftConfigRef = useRef(config);
+  draftConfigRef.current = config;
   const setSubagentOptimization = useCallback((enabled: boolean) => {
     setConfig((current) =>
       current ? { ...current, subagentOptimization: enabled } : current,
@@ -514,7 +517,11 @@ export function App({
     modelState?: ModelState;
     restartRequired?: boolean;
   }) {
-    setPersistedConfig(result.config);
+    const merged = reconcileConfigDraft(persistedConfigRef.current, draftConfigRef.current, result.config);
+    if (!merged) return;
+    persistedConfigRef.current = result.config;
+    draftConfigRef.current = merged.config;
+    setConfig(merged.config);
     if (result.providerStatus) setProviderStatus(result.providerStatus);
     if (result.modelState) setModelState(result.modelState);
     if (typeof result.restartRequired === "boolean") {
@@ -523,7 +530,7 @@ export function App({
         restartRequired: result.restartRequired,
       }));
     }
-    setDirty(false);
+    setDirty(merged.dirty);
     window.dispatchEvent(
       new CustomEvent("codey:config-changed", {
         detail: { config: result.config },
@@ -886,10 +893,7 @@ export function App({
         setRestartStatusError("暂时无法确认重启请求的执行状态，请点击重新查询状态");
         throw error;
       }
-      setStatus((current) => ({
-        ...current,
-        restartInProgress: true,
-      }));
+      markRestartInProgress();
     });
   }
 

@@ -9,12 +9,13 @@
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -26,6 +27,12 @@ use crate::config::{default_official_route_name, default_official_route_short_na
 pub const ACCOUNTS_DIR_NAME: &str = "official-accounts";
 const DEFAULT_FILE_NAME: &str = "default.json";
 const CODEX_AUTH_FILE_NAME: &str = "auth.json";
+static STORE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+struct StoreWriteGuard {
+    _file: fs::File,
+    _thread: MutexGuard<'static, ()>,
+}
 
 pub(crate) const OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OAUTH_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
@@ -443,6 +450,26 @@ pub enum LaunchLoginResolution {
 }
 
 impl OfficialAccountStore {
+    fn lock_writes(&self) -> Result<StoreWriteGuard> {
+        let thread = STORE_WRITE_LOCK
+            .lock()
+            .map_err(|_| anyhow!("官方账号写入锁已损坏"))?;
+        fs::create_dir_all(&self.dir)?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).truncate(false).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(self.dir.join(".write.lock"))?;
+        file.lock_exclusive()?;
+        Ok(StoreWriteGuard {
+            _file: file,
+            _thread: thread,
+        })
+    }
+
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
     }
@@ -522,6 +549,11 @@ impl OfficialAccountStore {
     }
 
     pub fn set_default_account_id(&self, id: Option<&str>) -> Result<()> {
+        let _guard = self.lock_writes()?;
+        self.set_default_account_id_unlocked(id)
+    }
+
+    fn set_default_account_id_unlocked(&self, id: Option<&str>) -> Result<()> {
         let file = DefaultAccountFile {
             default_account_id: id.map(ToString::to_string),
         };
@@ -534,13 +566,37 @@ impl OfficialAccountStore {
     /// rather than to the credential document, so the saved ones survive a
     /// re-login or a token refresh, which both arrive without them.
     pub fn upsert(&self, record: &OfficialAccountRecord) -> Result<()> {
+        let _guard = self.lock_writes()?;
         let mut record = record.clone();
         if let Some(saved) = self.get(&record.id)? {
-            record.route_name = record.route_name.or(saved.route_name);
-            record.route_short_name = record.route_short_name.or(saved.route_short_name);
-            record.upstream_proxy = record.upstream_proxy.or(saved.upstream_proxy);
+            record.route_name = saved.route_name;
+            record.route_short_name = saved.route_short_name;
+            record.upstream_proxy = saved.upstream_proxy;
         }
         self.write(&record)
+    }
+
+    pub fn update_credentials_if_current(
+        &self,
+        expected: &OfficialAccountRecord,
+        updated: &OfficialAccountRecord,
+    ) -> Result<Option<OfficialAccountRecord>> {
+        anyhow::ensure!(expected.id == updated.id, "官方账号身份不一致");
+        let _guard = self.lock_writes()?;
+        let Some(mut current) = self.get(&expected.id)? else {
+            return Ok(None);
+        };
+        if current.auth == expected.auth
+            && current.invalid_reason == expected.invalid_reason
+            && current.invalid_since == expected.invalid_since
+            && current.added_at == expected.added_at
+        {
+            current.auth = updated.auth.clone();
+            current.invalid_reason = updated.invalid_reason.clone();
+            current.invalid_since = updated.invalid_since;
+            self.write(&current)?;
+        }
+        Ok(Some(current))
     }
 
     /// Replaces the route overrides of one account; `None` restores the value
@@ -552,6 +608,7 @@ impl OfficialAccountStore {
         route_short_name: Option<String>,
         upstream_proxy: Option<String>,
     ) -> Result<()> {
+        let _guard = self.lock_writes()?;
         let mut record = self
             .get(id)?
             .ok_or_else(|| anyhow!("找不到官方账号：{id}"))?;
@@ -564,6 +621,7 @@ impl OfficialAccountStore {
     /// 只回写运行时派生后的短名称：官方与第三方线路共用短名称命名空间，
     /// 派生时可能被占用的名字挤开，账号记录跟随调整后才与线路列表一致。
     pub fn update_route_short_name(&self, id: &str, short_name: &str) -> Result<()> {
+        let _guard = self.lock_writes()?;
         let mut record = self
             .get(id)?
             .ok_or_else(|| anyhow!("找不到官方账号：{id}"))?;
@@ -575,6 +633,7 @@ impl OfficialAccountStore {
     /// 和「官1」。编号取当前未被占用的最小编号，所以移除账号后新增的账号不会
     /// 和已有名称重复；已经保存过设置的账号原样保留。
     pub fn ensure_generated_route_settings(&self) -> Result<()> {
+        let _guard = self.lock_writes()?;
         let records = self.list()?;
         let missing = |value: Option<&str>| trimmed_setting(value).is_none();
         let mut used_indices = BTreeSet::new();
@@ -627,10 +686,11 @@ impl OfficialAccountStore {
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
+        let _guard = self.lock_writes()?;
         crate::fs_util::remove_file_if_exists(&self.account_path(id))
             .with_context(|| format!("删除官方账号失败：{id}"))?;
         if self.default_account_id()?.as_deref() == Some(id) {
-            self.set_default_account_id(None)?;
+            self.set_default_account_id_unlocked(None)?;
         }
         Ok(())
     }
@@ -718,10 +778,12 @@ impl OfficialAccountStore {
         if !newer {
             return Ok(());
         }
+        let expected = record.clone();
         record.auth = auth;
         // Codex 自己刷新成功说明凭据仍然有效，之前的失效标记不再成立。
         record.clear_invalid();
-        self.upsert(&record)
+        self.update_credentials_if_current(&expected, &record)
+            .map(|_| ())
     }
 
     /// Ensures the Codex home reflects the default account. With no accounts
@@ -853,6 +915,7 @@ fn needs_token_refresh(record: &OfficialAccountRecord) -> bool {
 pub async fn refresh_if_stale(
     client: &reqwest::Client,
     record: &mut OfficialAccountRecord,
+    upstream_proxy: Option<&str>,
 ) -> Result<bool> {
     // 已确认失效的账号不再尝试刷新：官方每次都会拒绝，重复请求只会抬高
     // 风控概率；重新添加账号会写入新凭据并清除失效标记。
@@ -865,6 +928,17 @@ pub async fn refresh_if_stale(
     let Some(refresh_token) = record.refresh_token().map(ToString::to_string) else {
         return Ok(false);
     };
+    let proxy_client = upstream_proxy
+        .filter(|proxy| !proxy.trim().is_empty())
+        .map(|proxy| -> Result<reqwest::Client> {
+            Ok(reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .proxy(reqwest::Proxy::all(proxy.trim()).context("官方账号上游代理无效")?)
+                .build()?)
+        })
+        .transpose()?;
+    let client = proxy_client.as_ref().unwrap_or(client);
     let response = client
         .post(OAUTH_TOKEN_URL)
         .timeout(Duration::from_secs(20))
@@ -1258,6 +1332,125 @@ fn record_from_token_response(payload: &Value) -> Result<OfficialAccountRecord> 
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn credential_commits_preserve_route_edits_and_do_not_recreate_removed_accounts() {
+        let directory = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        let original = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&original).unwrap();
+        let mut refreshed = original.clone();
+        apply_token_response(&mut refreshed, &json!({"access_token":"refreshed"})).unwrap();
+        store
+            .update_route_settings(
+                &original.id,
+                Some("new route".into()),
+                None,
+                Some("http://127.0.0.1:1234".into()),
+            )
+            .unwrap();
+        let committed = store
+            .update_credentials_if_current(&original, &refreshed)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.route_name.as_deref(), Some("new route"));
+        assert_eq!(
+            committed.upstream_proxy.as_deref(),
+            Some("http://127.0.0.1:1234")
+        );
+        assert_eq!(committed.auth, refreshed.auth);
+        store.remove(&original.id).unwrap();
+        assert!(
+            store
+                .update_credentials_if_current(&original, &refreshed)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get(&original.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn old_refresh_and_rejection_cannot_replace_new_login_credentials() {
+        let directory = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(directory.path());
+        let original = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&original).unwrap();
+        let mut new_login = original.clone();
+        apply_token_response(&mut new_login, &json!({"access_token":"new-login"})).unwrap();
+        store.upsert(&new_login).unwrap();
+        let mut stale = original.clone();
+        stale.mark_invalid("expired");
+        let actual = store
+            .update_credentials_if_current(&original, &stale)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.auth, new_login.auth);
+        assert!(!actual.invalid());
+    }
+
+    #[tokio::test]
+    async fn invalid_account_does_not_attempt_token_refresh() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        record.mark_invalid("revoked");
+        let original = record.auth.clone();
+        let refreshed = refresh_if_stale(&client, &mut record, Some("invalid proxy URL"))
+            .await
+            .unwrap();
+        assert!(!refreshed);
+        assert!(record.invalid());
+        assert_eq!(record.auth, original);
+    }
+
+    #[tokio::test]
+    async fn token_refresh_uses_account_proxy_without_falling_back_to_direct() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 4096];
+            let count = stream.read(&mut bytes).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&bytes[..count]).to_string()
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut record = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        let original = record.auth.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            refresh_if_stale(&client, &mut record, Some(&format!("http://{address}"))),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        let request = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(request.starts_with("CONNECT auth.openai.com:443 "));
+        assert_eq!(record.auth, original);
+    }
 
     fn unsigned_jwt(payload: Value) -> String {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);

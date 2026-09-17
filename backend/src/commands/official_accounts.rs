@@ -218,14 +218,19 @@ pub(super) async fn refresh_official_account_tokens(
     if record.invalid() {
         return Ok(record);
     }
-    match refresh_if_stale(&state.http_client, &mut record).await {
+    let expected = record.clone();
+    let proxy = super::official_account_usage_proxy(state, account_id).await;
+    match refresh_if_stale(&state.http_client, &mut record, proxy.as_deref()).await {
         Ok(true) => {
             let refreshed_store = store.clone();
             let refreshed = record.clone();
-            tokio::task::spawn_blocking(move || refreshed_store.upsert(&refreshed))
-                .await
-                .map_err(|error| format!("保存官方账号任务异常退出：{error}"))?
-                .map_err(|error| format!("{error:#}"))?;
+            record = tokio::task::spawn_blocking(move || {
+                refreshed_store.update_credentials_if_current(&expected, &refreshed)
+            })
+            .await
+            .map_err(|error| format!("保存官方账号任务异常退出：{error}"))?
+            .map_err(|error| format!("{error:#}"))?
+            .ok_or_else(|| "官方账号已移除，忽略旧的刷新结果".to_string())?;
         }
         Ok(false) => {}
         Err(error) => {
@@ -235,10 +240,16 @@ pub(super) async fn refresh_official_account_tokens(
                 record.mark_invalid(invalid.reason());
                 let marked_store = store.clone();
                 let marked = record.clone();
-                tokio::task::spawn_blocking(move || marked_store.upsert(&marked))
-                    .await
-                    .map_err(|error| format!("保存官方账号任务异常退出：{error}"))?
-                    .map_err(|error| format!("{error:#}"))?;
+                record = tokio::task::spawn_blocking(move || {
+                    marked_store.update_credentials_if_current(&expected, &marked)
+                })
+                .await
+                .map_err(|error| format!("保存官方账号任务异常退出：{error}"))?
+                .map_err(|error| format!("{error:#}"))?
+                .ok_or_else(|| "官方账号已移除，忽略旧的刷新结果".to_string())?;
+                if !record.invalid() {
+                    return Ok(record);
+                }
                 error_log::record_failure(
                     "official_account_invalid",
                     "refresh_official_account_tokens",

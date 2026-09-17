@@ -33,6 +33,7 @@ const SESSION_ROLLOUT_RECORD_MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const SESSION_TRANSFER_CHUNK_BYTES: usize = 256 * 1024;
 static IMPORT_TRANSFER_LOCKS: OnceLock<Mutex<HashMap<Uuid, Weak<Mutex<()>>>>> = OnceLock::new();
 static TRANSFER_DIRECTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static IMPORT_COMMIT_LOCK: Mutex<()> = Mutex::new(());
 
 struct LimitedWriter<W> {
     inner: W,
@@ -371,6 +372,9 @@ fn import_session_bundle<R: BufRead>(
     bundle: SessionBundleMetadata,
     rollout: JsonStringReader<R>,
 ) -> Result<SessionImportResult> {
+    let _commit_guard = IMPORT_COMMIT_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("会话导入锁已损坏"))?;
     if bundle.format != SESSION_BUNDLE_FORMAT {
         anyhow::bail!("不支持的数据文件：缺少 Codey 会话格式标记");
     }
@@ -425,12 +429,14 @@ fn import_session_bundle<R: BufRead>(
         fs::create_dir_all(parent)
             .with_context(|| format!("创建导入会话目录失败：{}", parent.display()))?;
     }
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut rollout_file = options
+        .open(&rollout_path)
+        .with_context(|| format!("创建导入会话文件失败：{}", rollout_path.display()))?;
     let write_result = (|| -> Result<()> {
-        let mut rollout_file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&rollout_path)
-            .with_context(|| format!("创建导入会话文件失败：{}", rollout_path.display()))?;
         {
             let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut rollout_file);
             let mut rollout = BufReader::with_capacity(64 * 1024, rollout);
@@ -454,6 +460,7 @@ fn import_session_bundle<R: BufRead>(
             .sync_all()
             .with_context(|| format!("保存导入会话文件失败：{}", rollout_path.display()))
     })();
+    drop(rollout_file);
     if let Err(error) = write_result {
         let _ = fs::remove_file(&rollout_path);
         return Err(error);
@@ -855,8 +862,24 @@ fn rewrite_rollout_reader_to(
         }
         let mut value: Value =
             serde_json::from_str(&line).context("会话 rollout 包含无效的 JSONL 记录")?;
-        replace_exact_string(&mut value, original_id, session_id);
         if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+            anyhow::ensure!(!found_session_meta, "会话数据包含重复的 session_meta 记录");
+            let payload = value
+                .get("payload")
+                .and_then(Value::as_object)
+                .context("会话 session_meta 缺少有效 payload")?;
+            anyhow::ensure!(
+                payload.get("id").and_then(Value::as_str) == Some(original_id),
+                "会话元数据 ID 与索引不一致"
+            );
+            for key in ["session_id", "thread_id"] {
+                if let Some(identity) = payload.get(key) {
+                    anyhow::ensure!(
+                        identity.as_str() == Some(original_id),
+                        "会话元数据身份字段不一致"
+                    );
+                }
+            }
             found_session_meta = true;
             if let Some(payload) = value.get_mut("payload").and_then(Value::as_object_mut) {
                 payload.insert("cwd".to_string(), Value::String(project_path.to_string()));
@@ -866,6 +889,7 @@ fn rewrite_rollout_reader_to(
                 );
             }
         }
+        replace_exact_string(&mut value, original_id, session_id);
         records += 1;
         serde_json::to_writer(&mut *writer, &value)?;
         writer.write_all(b"\n")?;
@@ -1283,9 +1307,11 @@ fn canonical_project_path(project_path: &str) -> Result<PathBuf> {
 }
 
 fn imported_rollout_path(home: &Path, session_id: &str) -> PathBuf {
-    home.join("sessions")
-        .join("imported")
-        .join(format!("rollout-{}-{session_id}.jsonl", timestamp_millis()))
+    home.join("sessions").join("imported").join(format!(
+        "rollout-{}-{}-{session_id}.jsonl",
+        timestamp_millis(),
+        Uuid::new_v4()
+    ))
 }
 
 fn validate_import_session_id(session_id: &str) -> Result<()> {
@@ -1354,6 +1380,56 @@ mod tests {
     use base64::Engine;
     use rusqlite::params;
     use tempfile::tempdir;
+
+    #[test]
+    fn rollout_identity_must_match_bundle_before_import() {
+        for rollout in [
+            r#"{"type":"session_meta"}"#,
+            r#"{"type":"session_meta","payload":false}"#,
+            r#"{"type":"session_meta","payload":{"id":"other"}}"#,
+            r#"{"type":"session_meta","payload":{"id":"source","thread_id":"other"}}"#,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"source\"}}\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"source\"}}",
+        ] {
+            assert!(
+                rewrite_rollout_to(
+                    &mut Vec::new(),
+                    rollout,
+                    "source",
+                    "copy",
+                    "/project",
+                    "openai"
+                )
+                .is_err(),
+                "{rollout}"
+            );
+        }
+        let mut output = Vec::new();
+        rewrite_rollout_to(
+            &mut output,
+            r#"{"type":"session_meta","payload":{"id":"source","session_id":"source"}}"#,
+            "source",
+            "copy",
+            "/project",
+            "openai",
+        )
+        .unwrap();
+        let metadata: Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(metadata["payload"]["id"], "copy");
+        assert_eq!(metadata["payload"]["session_id"], "copy");
+    }
+
+    #[test]
+    fn imported_rollout_paths_are_unique_and_keep_the_session_suffix() {
+        let home = tempdir().unwrap();
+        let session_id = Uuid::new_v4().to_string();
+        let first = imported_rollout_path(home.path(), &session_id);
+        assert_ne!(first, imported_rollout_path(home.path(), &session_id));
+        assert!(
+            first
+                .to_string_lossy()
+                .ends_with(&format!("-{session_id}.jsonl"))
+        );
+    }
 
     #[test]
     #[cfg(unix)]
@@ -1577,6 +1653,56 @@ mod tests {
     }
 
     #[test]
+    fn rejected_import_leaves_existing_files_and_database_unchanged() {
+        let home = tempdir().unwrap();
+        let project = tempdir().unwrap();
+        let session_id = "01900000-0000-7000-8000-000000000003";
+        let database = create_thread_db(home.path(), session_id, project.path(), "existing");
+        let original_path = home
+            .path()
+            .join("sessions")
+            .join(format!("rollout-{session_id}.jsonl"));
+        let original = fs::read(&original_path).unwrap();
+        let (_, data) = export_via_chunks(home.path(), session_id);
+        let mut bundle: Value = serde_json::from_slice(&data).unwrap();
+        bundle["rollout"] = json!("{\"type\":\"session_meta\",\"payload\":{\"id\":\"other\"}}\n");
+        let data = format!(
+            "{{\"format\":{},\"version\":{},\"thread\":{},\"rollout\":{}}}",
+            bundle["format"], bundle["version"], bundle["thread"], bundle["rollout"]
+        );
+        let transfer = start_import_transfer(home.path()).unwrap();
+        append_import_transfer_chunk(
+            home.path(),
+            &transfer.transfer_id,
+            0,
+            &base64::engine::general_purpose::STANDARD.encode(data.as_bytes()),
+        )
+        .unwrap();
+        let error = finish_import_transfer(
+            home.path(),
+            project.path().to_str().unwrap(),
+            &transfer.transfer_id,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("会话元数据 ID 与索引不一致"));
+        assert_eq!(fs::read(original_path).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(home.path().join("sessions/imported"))
+                .unwrap()
+                .count(),
+            0
+        );
+        let database = Connection::open(database).unwrap();
+        assert_eq!(
+            database
+                .query_row("SELECT COUNT(*) FROM threads", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
     fn imports_a_duplicate_as_a_new_session() {
         let home = tempdir().unwrap();
         let project = tempdir().unwrap();
@@ -1787,21 +1913,18 @@ mod tests {
     }
 
     #[test]
-    fn session_meta_record_with_a_non_object_payload_remains_valid() {
+    fn session_meta_record_with_a_non_object_payload_is_rejected() {
         let mut output = Vec::new();
-        rewrite_rollout_to(
+        let result = rewrite_rollout_to(
             &mut output,
             "{\"type\":\"session_meta\",\"payload\":null}\n",
             "old-session",
             "new-session",
             "/tmp/project",
             "provider",
-        )
-        .unwrap();
-        assert_eq!(
-            String::from_utf8(output).unwrap(),
-            "{\"type\":\"session_meta\",\"payload\":null}\n"
         );
+        assert!(result.is_err());
+        assert!(output.is_empty());
     }
 
     #[test]

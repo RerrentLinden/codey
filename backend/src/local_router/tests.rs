@@ -9535,6 +9535,7 @@ async fn request_log_page_is_public_but_its_api_requires_the_launch_token() {
         "load_codey_config",
         "query_route_request_logs",
         "query_route_request_log_stats",
+        "query_route_request_log_models",
         "query_official_account_usage",
         "list_official_accounts",
     ] {
@@ -9563,6 +9564,35 @@ async fn request_log_page_is_public_but_its_api_requires_the_launch_token() {
     );
     assert!(catalog["config"]["profiles"][0].get("apiKey").is_none());
     assert!(catalog["config"]["profiles"][0].get("baseUrl").is_none());
+
+    let candidates = client
+        .post(format!(
+            "{gateway_root}/codey/api/query_route_request_log_models"
+        ))
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({"fromUnixMs": 1, "toUnixMs": 2000}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(candidates.status(), reqwest::StatusCode::OK);
+    let candidates = candidates.json::<Value>().await.unwrap();
+    assert!(candidates["models"].is_array());
+    assert!(candidates["queryable"].is_boolean());
+    assert!(candidates["nextCursor"].is_null());
+
+    let invalid_candidates = client
+        .post(format!(
+            "{gateway_root}/codey/api/query_route_request_log_models"
+        ))
+        .header(ROUTER_AUTH_HEADER, &endpoint.token)
+        .json(&json!({"unrecognizedField": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        invalid_candidates.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
 
     let usage = client
         .post(format!(

@@ -638,6 +638,38 @@ test("uses the current AppServerManager flow to evict, clean, resume, and refres
   }]);
 });
 
+test("persistent deletion waits for the host to release the conversation", async () => {
+  let release;
+  let deleteCalls = 0;
+  const runtime = loadInjection({
+    turnIds: ["turn-1"], selectedTurnIds: ["turn-1"],
+    codexSignalDispatcher: (signal) => signal === "unsubscribe-thread-for-host"
+      ? new Promise((resolve) => { release = resolve; }) : Promise.resolve(),
+    bridgeHandler: async (path) => {
+      if (path === "/session/delete-messages") deleteCalls += 1;
+      return { status: "ok", deleted: 1 };
+    },
+  });
+  const pending = runtime.window.__codeyDeleteSelectedMessages();
+  await flushMicrotasks();
+  assert.equal(deleteCalls, 0);
+  assert.equal(typeof release, "function");
+  release();
+  await pending;
+  assert.equal(deleteCalls, 2);
+});
+
+test("failed host release never sends a destructive delete request", async () => {
+  const runtime = loadInjection({
+    turnIds: ["turn-1"], selectedTurnIds: ["turn-1"],
+    codexSignalDispatcher: async () => { throw new Error("unsubscribe failed"); },
+  });
+  await runtime.window.__codeyDeleteSelectedMessages();
+  assert.equal(runtime.bridgeCalls.some((call) => call.path === "/session/delete-messages"), false);
+  assert.deepEqual(runtime.getVisibleTurnIds(), ["turn-1"]);
+  assert.match(runtime.alerts[0], /unsubscribe failed/);
+});
+
 test("removes a hard-deleted turn and rejects a stale React rerender", async () => {
   let deleteCalls = 0;
   const runtime = loadInjection({
@@ -712,7 +744,7 @@ test("keeps a turn visible when no persisted turn was deleted", async () => {
   await runtime.window.__codeyDeleteSelectedMessages();
 
   assert.equal(deleteCalls, 1);
-  assert.equal(dispatcherCalls, 0);
+  assert.equal(dispatcherCalls, 1);
   assert.deepEqual(runtime.getVisibleTurnIds(), ["failed-turn"]);
   assert.equal(runtime.alerts.length, 1);
   assert.match(runtime.alerts[0], /未在会话文件中找到所选轮次/);
@@ -726,6 +758,7 @@ test("reports a rejected delete bridge call without hiding the selected turn", a
   const runtime = loadInjection({
     turnIds: ["bridge-failed-turn"],
     selectedTurnIds: ["bridge-failed-turn"],
+    codexSignalDispatcher: async () => {},
     bridgeHandler: async (path) => {
       if (path === "/session/delete-messages") throw new Error("bridge stopped");
       return { status: "ok" };
@@ -743,6 +776,7 @@ test("keeps all selected rows visible when only part of a delete is confirmed", 
   const runtime = loadInjection({
     turnIds: ["turn-1", "turn-2"],
     selectedTurnIds: ["turn-1", "turn-2"],
+    codexSignalDispatcher: async () => {},
     bridgeHandler: async (path) => (
       path === "/session/delete-messages"
         ? { status: "ok", deleted: 1 }

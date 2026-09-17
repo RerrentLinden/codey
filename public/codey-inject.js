@@ -2282,18 +2282,12 @@
     }
   };
 
-  const reloadConversationAfterHardDelete = async (sessionId, messageIds) => {
+  const reloadConversationAfterHardDelete = async (sessionId, messageIds, discarded = false) => {
     const normalizedSessionId = String(sessionId || "").replace(/^local:/, "").trim();
     if (!normalizedSessionId || !messageIds.length) throw new Error("缺少会话或轮次 ID");
     const controller = await getCodexSessionController();
 
-    // Current Codex exposes AppServerManager through its renderer scope. Its
-    // discard path unsubscribes app-server and evicts React's conversation
-    // snapshot; older builds keep using the equivalent native signal.
-    await controller.discardConversation(normalizedSessionId);
-
-    // Closing a loaded thread may flush a final record. Reapply the hard delete
-    // only after unsubscribe has completed so stale memory cannot restore it.
+    if (!discarded) await controller.discardConversation(normalizedSessionId);
     const cleanup = await callBridge("/session/delete-messages", {
       sessionId: normalizedSessionId,
       messageIds,
@@ -2698,6 +2692,7 @@
     showRuntimeToast(`正在永久删除 ${logicalCount} 轮对话…`);
     let result;
     try {
+      await callNativeSessionOperation((controller) => controller.discardConversation(sessionId.replace(/^local:/, "").trim()));
       result = await callBridge("/session/delete-messages", { sessionId, messageIds });
     } catch (error) {
       const message = typeof error?.message === "string" ? error.message : String(error);
@@ -2732,10 +2727,10 @@
     syncSelectionGroups();
     updateToolbar();
     try {
-      await reloadConversationAfterHardDelete(sessionId, resolvedMessageIds);
+      await reloadConversationAfterHardDelete(sessionId, resolvedMessageIds, true);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      window.alert(`消息已从会话文件永久删除，但 Codex 内存会话卸载失败。\n请重启 Codex 后再继续对话。\n\n${message}`);
+      window.alert(`消息已从会话文件永久删除，但 Codex 会话重新加载失败。\n请重启 Codex 后再继续对话。\n\n${message}`);
       return;
     }
     showRuntimeToast(`已永久删除 ${logicalCount} 轮对话`);

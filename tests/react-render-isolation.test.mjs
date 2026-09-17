@@ -6,7 +6,7 @@ import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 
 const root = new URL("../", import.meta.url);
 
-test("settings panels keep stable handlers and skip unrelated parent renders", async () => {
+test("settings panels declare render-isolation hooks and stable handlers", async () => {
   const [
     app,
     appUpdates,

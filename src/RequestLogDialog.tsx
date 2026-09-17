@@ -21,6 +21,7 @@ import {
 import type { Config, OfficialAccount, OfficialAccountsResult, Profile } from "./App.types";
 import requestLogStyles from "./styles.request-log.css?inline";
 import { invoke } from "./api";
+import { loadRequestLogModels, type ModelPage } from "./requestLogModels";
 import { errorText } from "./appUtils";
 import { formatBytes, formatTimestamp } from "./formatters";
 import { modelIdsEqual } from "./modelIds";
@@ -527,6 +528,7 @@ export function RequestLogDialog({
   const requestRevision = useRef(0);
   const listTask = useRef(Promise.resolve());
   const statsTask = useRef(Promise.resolve());
+  const modelsTask = useRef(Promise.resolve());
   const clearInFlight = useRef(false);
 
   const handleCopyId = (requestId: string, customLabel?: string, toastSubtext = requestId) => {
@@ -644,18 +646,22 @@ export function RequestLogDialog({
   useEffect(() => {
     if (!opened || !validRange) return;
     let active = true;
-    void invoke<LogAnalytics>("query_route_request_log_stats", {
-      fromUnixMs,
-      toUnixMs,
-      groupBy: "model",
-      ...(optionalFilter(provider) ? { provider } : {}),
-      ...(optionalFilter(officialAccount) ? { officialAccountId: officialAccount } : {}),
-    })
-      .then((res) => {
-        if (!active) return;
-        setUsedModels(res.groups.map((g) => g.key).filter((k) => k.trim()));
-      })
-      .catch(() => undefined);
+    setUsedModels([]);
+    modelsTask.current = modelsTask.current.then(async () => {
+      if (!active) return;
+      try {
+        const models = await loadRequestLogModels((afterModel) => invoke<ModelPage>("query_route_request_log_models", {
+          fromUnixMs,
+          toUnixMs,
+          afterModel,
+          ...(optionalFilter(provider) ? { provider } : {}),
+          ...(optionalFilter(officialAccount) ? { officialAccountId: officialAccount } : {}),
+        }), () => active);
+        if (active && models) setUsedModels(models);
+      } catch (nextError) {
+        if (active) setError(errorText(nextError));
+      }
+    });
     return () => {
       active = false;
     };

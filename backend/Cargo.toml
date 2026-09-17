@@ -28,7 +28,6 @@ base64 = "0.22"
 bytes.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 codey-runtime-core = { path = "../vendor/CodeyRuntime/crates/codey-runtime-core" }
-codey-runtime-data = { path = "../vendor/CodeyRuntime/crates/codey-runtime-data" }
 directories = "6"
 fastctx = { git = "https://github.com/yc-duan/fastctx", rev = "22b40ea324a186a921dfe38c205e3ffacdf6546d", default-features = false }
 fs2 = "0.4"

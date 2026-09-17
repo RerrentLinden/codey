@@ -4,7 +4,8 @@ import test from "node:test";
 import ts from "typescript";
 import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 
-test("starting repair discards older status flights and queued injection refreshes", async () => {
+for (const operation of ["repair", "restart"]) {
+test(`starting ${operation} discards older status flights and queued injection refreshes`, async () => {
   const values = [];
   const requests = [];
   const react = {
@@ -43,7 +44,33 @@ test("starting repair discards older status flights and queued injection refresh
   const hook = exports.useRuntimeStatus({ active: true, embedded: false });
   const oldFlight = hook.refreshStatus();
   const queuedRefresh = hook.refreshStatusForLoad();
-  hook.markRestartInProgress();
+  if (operation === "repair") {
+    hook.markRestartInProgress();
+  } else {
+    const appSource = await readFile(new URL("../src/App.tsx", import.meta.url), "utf8");
+    const tree = ts.createSourceFile("App.tsx", appSource, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+    let handler;
+    const visit = (node) => {
+      if (ts.isFunctionDeclaration(node) && node.name?.text === "restartCodex") handler = node.getText(tree);
+      ts.forEachChild(node, visit);
+    };
+    visit(tree);
+    assert.ok(handler);
+    const calls = [];
+    const context = {
+      config: {}, dirty: false,
+      runOperation: async (_name, run) => run(),
+      setNotice: () => {},
+      withTimeout: (promise) => promise,
+      invoke: async (command) => { calls.push(command); },
+      setRestartStatusError: () => assert.fail("restart unexpectedly failed"),
+      markRestartInProgress: hook.markRestartInProgress,
+    };
+    const compiledHandler = ts.transpileModule(handler, {}).outputText;
+    const restart = new Function(...Object.keys(context), `${compiledHandler}; return restartCodex;`)(...Object.values(context));
+    await restart();
+    assert.deepEqual(calls, ["restart_codey"]);
+  }
   assert.equal(values[0].restartInProgress, true);
   const freshFlight = hook.refreshStatus();
   assert.equal(requests.length, 2);
@@ -56,3 +83,4 @@ test("starting repair discards older status flights and queued injection refresh
   assert.equal(values[0].restartInProgress, false);
   assert.equal(values[0].startupError, "修复失败，已恢复启动");
 });
+}

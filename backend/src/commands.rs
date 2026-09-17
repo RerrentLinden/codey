@@ -1208,6 +1208,28 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 Err(error) => Err(format!("请求日志查询参数无效：{error}")),
             }
         }
+        "query_route_request_log_models" => {
+            match serde_json::from_value::<crate::route_request_log::RouteRequestLogModelQuery>(
+                args.clone(),
+            ) {
+                Ok(query) => {
+                    let backend = state.config.read().await.route_request_log.backend;
+                    let root = codey_runtime_core::paths::default_app_state_dir();
+                    tokio::task::spawn_blocking(move || {
+                        crate::route_request_log::query_route_request_log_models(
+                            &root, backend, query,
+                        )
+                        .and_then(|page| serde_json::to_value(page).map_err(Into::into))
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| {
+                        result.map_err(|error| format!("查询模型候选失败：{error:#}"))
+                    })
+                }
+                Err(error) => Err(format!("模型候选查询参数无效：{error}")),
+            }
+        }
         "query_route_request_log_stats" => {
             match serde_json::from_value::<RouteRequestLogQuery>(args.clone()) {
                 Ok(query) => query_route_request_log_stats(state, query).await,
@@ -2722,12 +2744,13 @@ async fn query_stored_official_account_usage(
         == Some(account_usage::USAGE_REASON_CREDENTIAL_REJECTED);
     if credential_rejected && record.has_live_access_token() {
         let reason = "官方已拒绝该账号的凭据，账号可能已被停用，需要重新添加";
-        mark_official_account_invalid(state, &account_id, reason).await;
-        return json!({
-            "status": "error",
-            "reason": "official_account_invalid",
-            "message": reason,
-        });
+        if mark_official_account_invalid(state, &record, reason).await {
+            return json!({
+                "status": "error",
+                "reason": "official_account_invalid",
+                "message": reason,
+            });
+        }
     }
     snapshot
 }
@@ -2752,28 +2775,36 @@ async fn official_account_invalid_reason(
 }
 
 /// 把官方明确的凭据拒绝写回账号记录，让账号列表在下次读取时标识失效。
-async fn mark_official_account_invalid(state: &Arc<AppState>, account_id: &str, reason: &str) {
+async fn mark_official_account_invalid(
+    state: &Arc<AppState>,
+    expected: &crate::official_accounts::OfficialAccountRecord,
+    reason: &str,
+) -> bool {
     let store = state.official_accounts();
-    let id = account_id.to_string();
+    let account_id = expected.id.clone();
+    let expected = expected.clone();
     let reason = reason.to_string();
-    let marked = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let Some(mut record) = store.get(&id)? else {
-            return Ok(());
-        };
+    let marked = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let mut record = expected.clone();
         record.mark_invalid(&reason);
-        store.upsert(&record)
+        store
+            .update_credentials_if_current(&expected, &record)
+            .map(|current| {
+                current.is_some_and(|current| current.auth == expected.auth && current.invalid())
+            })
     })
     .await;
     let error = match marked {
-        Ok(Ok(())) => {
+        Ok(Ok(false)) => return false,
+        Ok(Ok(true)) => {
             // 失效账号的线路立刻下线，重新添加账号后由刷新流程恢复。
             official_accounts::refresh_official_routes_after_invalid_account(
                 state,
                 "mark_official_account_invalid",
-                account_id,
+                &account_id,
             )
             .await;
-            return;
+            return true;
         }
         Ok(Err(error)) => format!("{error:#}"),
         Err(error) => format!("保存官方账号失效标记任务异常退出：{error}"),
@@ -2784,6 +2815,7 @@ async fn mark_official_account_invalid(state: &Arc<AppState>, account_id: &str, 
         error,
         json!({ "accountId": account_id }),
     );
+    false
 }
 
 /// Egress proxy that belongs to one account's route. When the account has no

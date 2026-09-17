@@ -39,11 +39,11 @@ test("额度查询确认失效后重读列表，且不再请求官方接口", ()
   assert.match(store, /invalid_grant/);
 });
 
-test("失效账号不再重复请求官方接口", () => {
+test("源码约束：失效账号在刷新前返回，前端轮询包含失效分支", () => {
   // 令牌刷新前直接返回本地记录，不再向官方令牌接口发请求。
   assert.match(
     accountCommands,
-    /if record\.invalid\(\) \{\s*return Ok\(record\);\s*\}\s*match refresh_if_stale/,
+    /if record\.invalid\(\) \{\s*return Ok\(record\);\s*\}\s*let expected = record\.clone\(\);\s*let proxy = [^;]+;\s*match refresh_if_stale/,
   );
   assert.match(
     store,
