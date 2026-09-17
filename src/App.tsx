@@ -566,12 +566,44 @@ export function App({
     return saved;
   }
 
+  async function setRouteEnabled(routeId: string, enabled: boolean) {
+    if (!config || dirty || isBusy || !config.localRouterEnabled) return false;
+    const route = config.profiles.find((profile) => profile.id === routeId);
+    if (!route) return false;
+    let saved = false;
+    await runOperation("set-route-enabled", async () => {
+      const result = await invoke<{
+        config: Config;
+        providerStatus?: ProviderStatus;
+        modelState: ModelState;
+        restartRequired?: boolean;
+        modelHotReloadError?: string;
+        subagentConfigHotReloadError?: string;
+      }>("set_route_enabled", {
+        routeId,
+        enabled,
+        expectedRevision: config.settingsRevision,
+      });
+      applyRouteResult(result);
+      saved = true;
+      const reloadError = result.modelHotReloadError || result.subagentConfigHotReloadError;
+      setNotice({
+        tone: reloadError || result.restartRequired ? "info" : "success",
+        text: `线路「${route.name}」已${enabled ? "启用" : "停用"}${reloadError
+          ? `，部分运行配置未更新：${reloadError}`
+          : result.restartRequired ? "，重启 Codex 后完全生效" : ""}`,
+      });
+    });
+    return saved;
+  }
+
   async function reorderRoute(sourceId: string, targetId: string) {
     if (!config || dirty || isBusy || !config.localRouterEnabled) return;
     const profiles = [...config.profiles];
     const sourceIndex = profiles.findIndex((profile) => profile.id === sourceId);
     const targetIndex = profiles.findIndex((profile) => profile.id === targetId);
     if (sourceIndex < 0 || targetIndex < 0 || sourceIndex === targetIndex) return;
+    if ((profiles[sourceIndex].enabled === false) !== (profiles[targetIndex].enabled === false)) return;
     profiles.splice(targetIndex, 0, profiles.splice(sourceIndex, 1)[0]);
     await runOperation("reorder-routes", async () => {
       await persist({ ...config, profiles });
@@ -721,7 +753,7 @@ export function App({
         modelContexts,
         enabled,
         showAccountUsageInHeader,
-        // undefined 表示保持现状（如启用开关的快捷切换），空字符串表示清除代理。
+        // undefined 表示保持现状（如只同步模型），空字符串表示清除代理。
         ...(upstreamProxy === undefined ? {} : { upstreamProxy }),
       });
       applyRouteResult(modelResult);
@@ -1003,6 +1035,7 @@ export function App({
     (checked: boolean) => setSubagentOptimization(checked),
   );
   const handleSaveRoute = useStableEvent(saveRoute);
+  const handleSetRouteEnabled = useStableEvent(setRouteEnabled);
   const handleReorderRoute = useStableEvent(reorderRoute);
   const handleDeleteRoute = useStableEvent(requestDeleteRoute);
   const handleFetchRouteModels = useStableEvent((route: Profile) => {
@@ -1346,6 +1379,7 @@ export function App({
               onToggleLocalRouter={handleToggleLocalRouter}
               onToggleRouteRequestLog={handleToggleRouteRequestLog}
               onSaveRoute={handleSaveRoute}
+              onSetRouteEnabled={handleSetRouteEnabled}
               onReorderRoute={handleReorderRoute}
               onDeleteRoute={handleDeleteRoute}
               onFetchRouteModels={handleFetchRouteModels}

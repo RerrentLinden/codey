@@ -5,6 +5,12 @@ export function routeProviderId(profile: Profile) {
   return profile.sourceProviderId || profile.id;
 }
 
+export function sortRoutesByEnabled(profiles: readonly Profile[]) {
+  return [...profiles].sort(
+    (left, right) => Number(left.enabled === false) - Number(right.enabled === false),
+  );
+}
+
 function encodeRouteComponent(value: string) {
   const bytes = new TextEncoder().encode(value.trim());
   return Array.from(bytes, (byte) => {

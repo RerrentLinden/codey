@@ -209,6 +209,58 @@ async fn request_log_query_api_reports_ndjson_as_not_queryable() {
 }
 
 #[tokio::test]
+async fn route_toggle_api_persists_once_and_rejects_stale_requests() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut profile = ProviderProfile::new("测试线路");
+    profile.id = "test-route".into();
+    profile.base_url = "https://route.example/v1".into();
+    profile.api_key = "test-key".into();
+    let config = CodeyConfig {
+        profiles: vec![profile],
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    let state = Arc::new(AppState {
+        store: ConfigStore::new(directory.path().join("config.json")),
+        config: RwLock::new(config.clone()),
+        ..AppState::default()
+    });
+    let result = invoke_api(
+        &state,
+        "set_route_enabled",
+        json!({
+            "routeId": "test-route", "enabled": false, "expectedRevision": 0,
+        }),
+    )
+    .await;
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(result["config"]["profiles"][0]["enabled"], false);
+    assert_eq!(result["config"]["settingsRevision"], 1);
+    assert!(directory.path().join("config.json").is_file());
+    let saved = state.config.read().await.clone();
+    assert_eq!(saved.profiles[0].api_key, config.profiles[0].api_key);
+    let stale = invoke_api(
+        &state,
+        "set_route_enabled",
+        json!({
+            "routeId": "test-route", "enabled": true, "expectedRevision": 0,
+        }),
+    )
+    .await;
+    assert_eq!(stale["status"], "failed");
+    let malformed = invoke_api(
+        &state,
+        "set_route_enabled",
+        json!({
+            "routeId": "test-route", "enabled": "true", "expectedRevision": 1,
+        }),
+    )
+    .await;
+    assert_eq!(malformed["status"], "failed");
+    assert_eq!(*state.config.read().await, saved);
+}
+
+#[tokio::test]
 async fn request_log_query_api_rejects_excessive_page_sizes() {
     let state = Arc::new(AppState::default());
 

@@ -1,5 +1,65 @@
 use super::*;
 
+pub async fn set_route_enabled(
+    state: &Arc<AppState>,
+    route_id: String,
+    enabled: bool,
+    expected_revision: u64,
+) -> Result<Value, String> {
+    let config_write_guard = state.config_write_lock.lock().await;
+    let previous = state.config.read().await.clone();
+    let mut config =
+        config_after_route_enabled_change(&previous, route_id.trim(), enabled, expected_revision)?;
+    let model_state = current_model_state_async(&config).await?;
+    if config.subagent_optimization {
+        reconcile_subagent_models_for_mode(&mut config, &model_state);
+        config = config.normalize();
+    }
+    // 启停只保存线路及其模型依赖，不重新配置通知、日志保护等无关功能。
+    save_config_to_store(state, &config).await?;
+    *state.config.write().await = config.clone();
+    drop(config_write_guard);
+    let hot_reload = hot_reload_runtime_models(state, &config, &model_state).await;
+    let subagent_hot_reload = hot_reload_runtime_subagent_config(state, &config).await;
+    let restart_required = runtime_config_requires_restart(state, &config).await;
+    Ok(add_subagent_hot_reload_to_response(
+        hot_reload.add_to_response(json!({
+            "status": "ok",
+            "config": redacted_config(&config),
+            "providerStatus": codex_provider::status_from_config(&config),
+            "modelState": model_state,
+            "restartRequired": restart_required,
+        })),
+        subagent_hot_reload,
+    ))
+}
+
+pub(crate) fn config_after_route_enabled_change(
+    previous: &CodeyConfig,
+    route_id: &str,
+    enabled: bool,
+    expected_revision: u64,
+) -> Result<CodeyConfig, String> {
+    ensure_local_route_config_writable(previous)?;
+    ensure_route_revision(previous, expected_revision)?;
+    let profile_index = previous
+        .profiles
+        .iter()
+        .position(|profile| profile.id == route_id)
+        .ok_or_else(|| "找不到要更新的线路".to_string())?;
+    let profile = &previous.profiles[profile_index];
+    if enabled && profile.official_account && !previous.official_route_usable(profile) {
+        return Err("当前官方账号线路没有可用的登录态，无法启用".to_string());
+    }
+    let mut config = previous.clone();
+    config.remember_model_aliases();
+    config.profiles[profile_index].enabled = enabled;
+    config = config.normalize();
+    validate_provider_profiles(&config.profiles)?;
+    config.settings_revision = previous.settings_revision.saturating_add(1);
+    Ok(config)
+}
+
 pub async fn delete_route(
     state: &Arc<AppState>,
     route_id: String,

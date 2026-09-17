@@ -500,6 +500,86 @@ fn route_mutations_reject_a_stale_settings_revision() {
 }
 
 #[test]
+fn route_toggle_preserves_settings_and_updates_default_without_reordering() {
+    let mut route_a = configured_route("route-a", Some("model-a"));
+    route_a.short_name = "A".into();
+    let mut route_b = configured_route("route-b", Some("model-b"));
+    route_b.short_name = "B".into();
+    let previous = CodeyConfig {
+        settings_revision: 7,
+        active_profile_id: "route-b".into(),
+        profiles: vec![route_a, route_b],
+        selected_models_by_provider: BTreeMap::from([
+            ("route-a".into(), vec!["model-a".into()]),
+            ("route-b".into(), vec!["model-b".into()]),
+        ]),
+        default_model: "route-b/model-b".into(),
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    let disabled = config_after_route_enabled_change(&previous, "route-b", false, 7).unwrap();
+    assert_eq!(disabled.settings_revision, 8);
+    assert_eq!(disabled.active_profile_id, "route-a");
+    assert_eq!(disabled.default_model, "route-a/model-a");
+    assert_eq!(
+        disabled.selected_models_by_provider,
+        previous.selected_models_by_provider
+    );
+    assert_eq!(disabled.webhook, previous.webhook);
+    assert_eq!(disabled.profiles[0], previous.profiles[0]);
+    let mut expected = previous.profiles[1].clone();
+    expected.enabled = false;
+    assert_eq!(disabled.profiles[1], expected);
+    let enabled = config_after_route_enabled_change(&disabled, "route-b", true, 8).unwrap();
+    assert_eq!(enabled.profiles, previous.profiles);
+    assert_eq!(enabled.default_model, "route-a/model-a");
+    assert!(previous.profiles[1].enabled);
+    let all_disabled = config_after_route_enabled_change(&disabled, "route-a", false, 8).unwrap();
+    assert!(all_disabled.profiles.iter().all(|profile| !profile.enabled));
+}
+
+#[test]
+fn route_toggle_rejects_stale_read_only_missing_and_unavailable_official_routes() {
+    let mut config = CodeyConfig {
+        settings_revision: 3,
+        profiles: vec![configured_route("route", Some("model"))],
+        ..CodeyConfig::default()
+    }
+    .normalize();
+    assert!(
+        config_after_route_enabled_change(&config, "route", false, 2)
+            .unwrap_err()
+            .contains("重新载入")
+    );
+    assert!(
+        config_after_route_enabled_change(&config, "missing", false, 3)
+            .unwrap_err()
+            .contains("找不到")
+    );
+    config.local_router_enabled = false;
+    assert!(
+        config_after_route_enabled_change(&config, "route", false, 3)
+            .unwrap_err()
+            .contains("只读")
+    );
+    config.local_router_enabled = true;
+    let route = &mut config.profiles[0];
+    route.auth_mode = crate::config::AUTH_MODE_OFFICIAL_ACCOUNT.into();
+    route.source_provider_id = Some("openai".into());
+    route.enabled = false;
+    config = config.normalize();
+    config.official_account_available_this_launch = false;
+    assert!(
+        config_after_route_enabled_change(&config, "route", true, 3)
+            .unwrap_err()
+            .contains("登录态")
+    );
+    config.profiles[0].official_account_id = Some("stored-account".into());
+    let enabled = config_after_route_enabled_change(&config, "route", true, 3).unwrap();
+    assert!(enabled.profiles[0].enabled);
+}
+
+#[test]
 fn deleting_a_route_falls_back_global_default_and_dependent_subagent_roles() {
     let route_a = configured_route("route-a", Some("model-a"));
     let route_b = configured_route("route-b", Some("model-b"));

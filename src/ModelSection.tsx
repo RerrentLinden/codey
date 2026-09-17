@@ -43,7 +43,7 @@ import {
   type OfficialRouteSettingsDraft,
 } from "./officialRouteSettings";
 import { headersTextFromMap, parseHeadersText } from "./requestHeaders";
-import { globalDefaultForRoute, routeProviderId } from "./modelRoutes";
+import { globalDefaultForRoute, routeProviderId, sortRoutesByEnabled } from "./modelRoutes";
 import { maskEmail, maskUrl } from "./sensitiveText";
 import {
   MAX_ROUTE_SHORT_NAME_CHARACTERS,
@@ -67,6 +67,7 @@ type ModelSectionProps = {
   onToggleLocalRouter: (checked: boolean) => void;
   onToggleRouteRequestLog: (checked: boolean) => void;
   onSaveRoute: (route: Profile) => Promise<boolean>;
+  onSetRouteEnabled: (routeId: string, enabled: boolean) => Promise<boolean>;
   onReorderRoute: (sourceId: string, targetId: string) => Promise<void>;
   onDeleteRoute: (routeId: string) => void;
   onFetchRouteModels: (route: Profile) => void;
@@ -212,6 +213,7 @@ function ModelSectionComponent({
   onToggleLocalRouter,
   onToggleRouteRequestLog,
   onSaveRoute,
+  onSetRouteEnabled,
   onReorderRoute,
   onDeleteRoute,
   onFetchRouteModels,
@@ -225,6 +227,10 @@ function ModelSectionComponent({
   const [routeDialogOpen, setRouteDialogOpen] = useState(false);
   const [draggedRouteId, setDraggedRouteId] = useState<string | null>(null);
   const [dropRouteId, setDropRouteId] = useState<string | null>(null);
+  const [pendingRouteToggle, setPendingRouteToggle] = useState<{
+    id: string;
+    enabled: boolean;
+  } | null>(null);
   const [routeDraft, setRouteDraft] = useState<Profile | null>(null);
   const [routeValidationAttempted, setRouteValidationAttempted] = useState(false);
   const [routeApiKeyVisible, setRouteApiKeyVisible] = useState(false);
@@ -343,7 +349,7 @@ function ModelSectionComponent({
   const visibleProfiles = useMemo(
     () => {
       if (routeConfigReadOnly) return nativeProfile ? [nativeProfile] : [];
-      return config.profiles.filter(
+      const profiles = config.profiles.filter(
         (profile) =>
           profile.enabled === false ||
           profile.authMode !== "officialAccount" ||
@@ -351,8 +357,13 @@ function ModelSectionComponent({
           // 存储账号的官方线路自带凭据，默认登录缺失时仍由本地路由提供服务。
           Boolean(profile.officialAccountId),
       );
+      return sortRoutesByEnabled(pendingRouteToggle
+        ? profiles.map((profile) => profile.id === pendingRouteToggle.id
+          ? { ...profile, enabled: pendingRouteToggle.enabled }
+          : profile)
+        : profiles);
     },
-    [config.profiles, nativeProfile, officialAccountAvailable, routeConfigReadOnly],
+    [config.profiles, nativeProfile, officialAccountAvailable, routeConfigReadOnly, pendingRouteToggle],
   );
   const officialDisplayNames = useMemo(
     () =>
@@ -588,25 +599,20 @@ function ModelSectionComponent({
   };
 
   const handleToggleRouteEnabled = async (profile: Profile, enabled: boolean) => {
-    if (isBusy || dirty || routeConfigReadOnly) return;
-    if (profile.authMode === "officialAccount") {
-      if (!onSaveOfficialRouteSettings) return;
-      const providerId = routeProviderId(profile);
-      const configuredModels = config.selectedModelsByProvider[providerId] || [];
-      const models = configuredModels.length > 0 ? configuredModels : officialCatalog;
-      await onSaveOfficialRouteSettings(
-        profile.id,
-        models,
-        showAccountUsageInHeader,
-        enabled,
-        {},
-      );
-    } else {
-      await onSaveRoute({ ...profile, enabled });
+    if (isBusy || dirty || routeConfigReadOnly || pendingRouteToggle) return;
+    setPendingRouteToggle({ id: profile.id, enabled });
+    try {
+      await onSetRouteEnabled(profile.id, enabled);
+    } finally {
+      // 待保存状态仅用于显示，失败后自然恢复后端配置，避免改动设置草稿。
+      setPendingRouteToggle(null);
     }
   };
 
   const draftOfficialAccount = accountForRoute(routeDraft);
+  const draggedProfile = draggedRouteId
+    ? visibleProfiles.find((profile) => profile.id === draggedRouteId)
+    : undefined;
   const draftOfficialAccountLabel =
     displayedEmail(draftOfficialAccount) || draftOfficialAccount?.id || "";
 
@@ -756,6 +762,8 @@ function ModelSectionComponent({
                 const group = modelGroupByProviderId.get(providerId);
                 const isOfficial = profile.authMode === "officialAccount";
                 const disabled = profile.enabled === false;
+                const acceptsRouteDrop = draggedProfile && draggedProfile.id !== profile.id
+                  && (draggedProfile.enabled === false) === disabled;
                 const officialLoginLabel = officialLoginLabelFor(
                   isOfficial ? accountForRoute(profile) : null,
                 );
@@ -769,14 +777,14 @@ function ModelSectionComponent({
                     key={profile.id}
                     aria-labelledby={`provider-model-${profile.id}`}
                     onDragOver={(event) => {
-                      if (routeConfigReadOnly || !draggedRouteId || draggedRouteId === profile.id || isBusy || dirty) return;
+                      if (routeConfigReadOnly || !acceptsRouteDrop || isBusy || dirty) return;
                       event.preventDefault();
                       event.dataTransfer.dropEffect = "move";
                       setDropRouteId(profile.id);
                     }}
                     onDrop={(event) => {
                       event.preventDefault();
-                      if (!routeConfigReadOnly && !isBusy && !dirty && draggedRouteId && draggedRouteId !== profile.id) {
+                      if (!routeConfigReadOnly && !isBusy && !dirty && draggedRouteId && acceptsRouteDrop) {
                         void onReorderRoute(draggedRouteId, profile.id);
                       }
                       setDraggedRouteId(null);
@@ -792,7 +800,7 @@ function ModelSectionComponent({
                             disabled={isBusy || dirty}
                             draggable={!isBusy && !dirty}
                             aria-label={`调整线路 ${profile.name} 的顺序`}
-                            title="拖动排序，也可按上下方向键调整"
+                            title="在相同启用状态的线路间拖动排序，也可按上下方向键调整"
                             onDragStart={(event) => {
                               event.dataTransfer.setData("text/plain", profile.id);
                               event.dataTransfer.effectAllowed = "move";
@@ -807,7 +815,7 @@ function ModelSectionComponent({
                               event.preventDefault();
                               const index = visibleProfiles.findIndex((route) => route.id === profile.id);
                               const target = visibleProfiles[index + (event.key === "ArrowUp" ? -1 : 1)];
-                              if (target) void onReorderRoute(profile.id, target.id);
+                              if (target && (target.enabled === false) === disabled) void onReorderRoute(profile.id, target.id);
                             }}
                           >
                             <IconGripVertical size={15} aria-hidden="true" />
@@ -826,7 +834,8 @@ function ModelSectionComponent({
                                 <Switch
                                   size="xs"
                                   checked={!disabled}
-                                  disabled={isBusy || dirty}
+                                  disabled={isBusy || dirty || pendingRouteToggle !== null}
+                                  aria-busy={pendingRouteToggle?.id === profile.id}
                                   onCheckedChange={(checked) => void handleToggleRouteEnabled(profile, checked)}
                                   aria-label={`${disabled ? "启用" : "停用"}线路 ${profile.name}`}
                                   className="route-status-switch"
@@ -835,6 +844,7 @@ function ModelSectionComponent({
                             )}
                             <strong id={`provider-model-${profile.id}`} title={profile.name}>{profile.name || "未命名线路"}</strong>
                             <div className="route-item-badges">
+                              {pendingRouteToggle?.id === profile.id && <Badge variant="secondary">保存中…</Badge>}
                               {disabled ? <Badge variant="destructive">已禁用</Badge> : (
                                 <>
                                   <Badge variant="info">{group?.models.length || 0} 模型</Badge>

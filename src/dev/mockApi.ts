@@ -872,7 +872,7 @@ if (import.meta.env.DEV) {
           restartRequired: false,
         };
       }
-      if (command === "delete_route" || command === "fetch_route_models") {
+      if (command === "delete_route" || command === "fetch_route_models" || command === "set_route_enabled") {
         const expectedRevision = Number(args.expectedRevision);
         if (expectedRevision !== previewConfig.settingsRevision) {
           return {
@@ -880,6 +880,31 @@ if (import.meta.env.DEV) {
             message: "Codey 设置已被其他操作更新，请重新载入后再操作线路",
           };
         }
+      }
+      if (command === "set_route_enabled") {
+        if (!previewConfig.localRouterEnabled) return { status: "failed", message: "本地路由已关闭，线路配置只读" };
+        const routeId = String(args.routeId || "");
+        const route = previewConfig.profiles.find((profile) => profile.id === routeId);
+        if (!route) return { status: "failed", message: "找不到要更新的线路" };
+        if (typeof args.enabled !== "boolean") return { status: "failed", message: "参数 enabled 无效" };
+        const enabled = args.enabled;
+        const profiles = previewConfig.profiles.map((profile) => profile.id === routeId ? { ...profile, enabled } : profile);
+        previewConfig = {
+          ...previewConfig,
+          profiles,
+          activeProfileId: profiles.find((profile) => profile.id === previewConfig.activeProfileId && profile.enabled !== false)?.id
+            || profiles.find((profile) => profile.enabled !== false)?.id || previewConfig.activeProfileId,
+          settingsRevision: previewConfig.settingsRevision + 1,
+        };
+        refreshPreviewModelState();
+        return {
+          status: "ok",
+          config: previewConfig,
+          modelState: previewModelState,
+          providerStatus: previewProviderStatus(),
+          restartRequired: false,
+          modelHotReloaded: true,
+        };
       }
       if (command === "delete_route") {
         const routeId = String(args.routeId || "");

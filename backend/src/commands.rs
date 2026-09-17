@@ -48,7 +48,7 @@ use models::{
 };
 pub use models::{
     delete_route, fetch_route_models, save_default_model, save_official_route_models,
-    save_selected_models, sync_current_provider_command,
+    save_selected_models, set_route_enabled, sync_current_provider_command,
 };
 use official_accounts::{
     cancel_official_account_login, import_current_codex_login, list_official_accounts,
@@ -1079,6 +1079,16 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
             Err(error) => Err(error),
         },
         "sync_current_provider" => sync_current_provider_command(state).await,
+        "set_route_enabled" => match (
+            string_argument(&args, "routeId"),
+            argument::<bool>(&args, "enabled"),
+            argument::<u64>(&args, "expectedRevision"),
+        ) {
+            (Ok(route_id), Ok(enabled), Ok(expected_revision)) => {
+                set_route_enabled(state, route_id, enabled, expected_revision).await
+            }
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+        },
         "delete_route" => match (
             string_argument(&args, "routeId"),
             argument::<u64>(&args, "expectedRevision"),

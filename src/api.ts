@@ -2,6 +2,7 @@ export const CODEY_API_COMMANDS = [
   "load_codey_config",
   "save_codey_config",
   "sync_current_provider",
+  "set_route_enabled",
   "delete_route",
   "fetch_route_models",
   "save_selected_models",
