@@ -1006,6 +1006,20 @@ fn pre_tool_use_output(
     if input
         .tool_name
         .as_deref()
+        .is_some_and(is_interrupt_agent_tool)
+    {
+        crate::subagent_orchestrator::pre_interrupt_agent(
+            state_root,
+            runtime_id,
+            &input.session_id,
+            input.tool_input.as_ref(),
+            now_ms,
+        )?;
+        return Ok(json!({}));
+    }
+    if input
+        .tool_name
+        .as_deref()
         .is_some_and(is_followup_task_tool)
     {
         if let Some(reason) = protocol_issue_reason(state_root, runtime_id, &input.session_id)? {

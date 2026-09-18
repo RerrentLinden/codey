@@ -766,6 +766,163 @@ fn followup_task_rejects_unbound_or_terminal_targets_before_reactivation() {
 }
 
 #[test]
+fn interrupt_revokes_queued_writer_before_acknowledgement() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    write_test_runtime_policy(root);
+    let runtime_id = "runtime-a";
+    let session_id = "queued-interrupt-session";
+    let target = "/root/queued_writer";
+    let agent_id = "opaque-writer-thread";
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    let mut spawn = input("PreToolUse", session_id);
+    spawn.turn_id = Some("root-turn-a".into());
+    spawn.cwd = Some(workspace.to_string_lossy().into_owned());
+    spawn.tool_name = Some("agents.spawn_agent".into());
+    spawn.tool_input = Some(json!({
+        "task_name": "queued_writer", "agent_type": "codey_worker",
+        "message": "Apply the bounded change."
+    }));
+    assert_eq!(
+        handle_hook_for_runtime_at(&spawn, root, runtime_id, 10).unwrap(),
+        json!({})
+    );
+    spawn.hook_event_name = "PostToolUse".into();
+    spawn.tool_response = Some(json!({"agent_id": agent_id}));
+    handle_hook_for_runtime_at(&spawn, root, runtime_id, 20).unwrap();
+    let mut started = input("SubagentStart", session_id);
+    started.agent_id = Some(agent_id.into());
+    started.agent_type = Some("codey_worker".into());
+    handle_hook_for_runtime_at(&started, root, runtime_id, 21).unwrap();
+    let marker = agent_marker_path(&session_state_dir(root, session_id), runtime_id, agent_id);
+    assert!(marker.exists());
+
+    let mut write = input("PreToolUse", session_id);
+    write.agent_id = Some(agent_id.into());
+    write.agent_type = Some("codey_worker".into());
+    write.tool_name = Some("apply_patch".into());
+    write.tool_input = Some(json!({"patch": "*** Begin Patch\n*** End Patch"}));
+    attest_test_child(&write, root, runtime_id);
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 22).unwrap(),
+        json!({})
+    );
+
+    // The provider has already queued a followup before the root interrupts.
+    let mut followup = input("PreToolUse", session_id);
+    followup.turn_id = Some("root-turn-a".into());
+    followup.tool_name = Some("agents.followup_task".into());
+    followup.tool_input =
+        Some(json!({"target": target, "message": "Continue the bounded change."}));
+    assert_eq!(
+        handle_hook_for_runtime_at(&followup, root, runtime_id, 23).unwrap(),
+        json!({})
+    );
+    let mut interrupt = input("PreToolUse", session_id);
+    interrupt.turn_id = Some("root-turn-a".into());
+    interrupt.tool_name = Some("agents.interrupt_agent".into());
+    interrupt.tool_input = Some(json!({"target": target}));
+    assert_eq!(
+        handle_hook_for_runtime_at(&interrupt, root, runtime_id, 30).unwrap(),
+        json!({})
+    );
+
+    // A queued NEW_TASK can start before PostToolUse acknowledges the interrupt.
+    handle_hook_for_runtime_at(&started, root, runtime_id, 31).unwrap();
+    for tool in ["apply_patch", "functions.exec", "exec_command"] {
+        write.tool_name = Some(tool.into());
+        let denied = handle_hook_for_runtime_at(&write, root, runtime_id, 32).unwrap();
+        assert_eq!(
+            denied["hookSpecificOutput"]["permissionDecision"], "deny",
+            "{tool}: {denied}"
+        );
+    }
+    assert_eq!(
+        handle_hook_for_runtime_at(&followup, root, runtime_id, 33).unwrap()["hookSpecificOutput"]
+            ["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+        1
+    );
+    let mut root_write = input("PreToolUse", session_id);
+    root_write.turn_id = Some("root-turn-a".into());
+    root_write.tool_name = Some("apply_patch".into());
+    assert_eq!(
+        handle_hook_for_runtime_at(&root_write, root, runtime_id, 34).unwrap()["hookSpecificOutput"]
+            ["permissionDecision"],
+        "deny"
+    );
+    let mut replacement = input("PreToolUse", session_id);
+    replacement.turn_id = Some("root-turn-a".into());
+    replacement.cwd = spawn.cwd.clone();
+    replacement.tool_name = Some("agents.spawn_agent".into());
+    replacement.tool_input = Some(json!({
+        "task_name": "replacement_writer", "agent_type": "codey_worker",
+        "message": "Apply the bounded change after the old attempt settles."
+    }));
+    assert_eq!(
+        handle_hook_for_runtime_at(&replacement, root, runtime_id, 34).unwrap()["hookSpecificOutput"]
+            ["permissionDecision"],
+        "deny"
+    );
+
+    // Failure cannot re-enable child writes or prematurely release the root.
+    interrupt.hook_event_name = "PostToolUse".into();
+    interrupt.tool_response = Some(json!({"isError": true, "error": "interrupt transport failed"}));
+    handle_hook_for_runtime_at(&interrupt, root, runtime_id, 35).unwrap();
+    assert_eq!(
+        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+        1
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 36).unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+
+    interrupt.tool_response = Some(json!({"previous_status": "running"}));
+    handle_hook_for_runtime_at(&interrupt, root, runtime_id, 40).unwrap();
+    assert_eq!(
+        active_agent_count_for_runtime(root, runtime_id, session_id).unwrap(),
+        0
+    );
+    assert!(!marker.exists());
+    // Keep the opaque identity associated with the abandoned attempt, even
+    // when a delayed lifecycle event arrives without its canonical task path.
+    handle_hook_for_runtime_at(&started, root, runtime_id, 41).unwrap();
+    assert!(!marker.exists());
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 42).unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(&root_write, root, runtime_id, 43).unwrap(),
+        json!({})
+    );
+    assert_eq!(
+        handle_hook_for_runtime_at(&replacement, root, runtime_id, 44).unwrap(),
+        json!({})
+    );
+    replacement.hook_event_name = "PostToolUse".into();
+    replacement.tool_response = Some(json!({"agent_id": "replacement-thread"}));
+    handle_hook_for_runtime_at(&replacement, root, runtime_id, 45).unwrap();
+    // A replacement attempt cannot restore the old attempt's write permission.
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 46).unwrap()["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+    write.agent_id = Some("replacement-thread".into());
+    attest_test_child(&write, root, runtime_id);
+    assert_eq!(
+        handle_hook_for_runtime_at(&write, root, runtime_id, 47).unwrap(),
+        json!({})
+    );
+}
+
+#[test]
 fn successful_root_interrupt_fences_the_attempt_and_releases_the_gate() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();

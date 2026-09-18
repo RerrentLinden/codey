@@ -1572,9 +1572,18 @@ impl RouterServer {
                 encoded_body = None;
             }
         } else {
-            // Chat Completions 与 Anthropic Messages 都表达不了 encrypted_content，
-            // 协议转换只能丢弃该字段。第三方线路常把协作任务正文写在这个字段里，
-            // 转换前必须先改写为可见文本，否则子代理收到的任务载荷为空。
+            // 历史恢复完成后检查密文任务，避免转换时静默丢失正文。
+            if let Err(error) = validate_adapted_agent_payloads(&body) {
+                return downstream
+                    .write_error(
+                        400,
+                        "context_not_portable",
+                        error.to_string(),
+                        Some(&resolved.route),
+                    )
+                    .await;
+            }
+            // 第三方线路写入该字段的明文任务仍恢复为可见文本。
             // encoded_body 在非原生线路上只作为大请求异步转换的体积标记，正文本身
             // 以转换结果为准，保留它可以让超大请求继续走异步转换。
             if normalize_encrypted_agent_payloads(&mut body) {

@@ -6302,6 +6302,50 @@ async fn responses_v2_compaction_trigger_passes_through_the_native_route() {
 }
 
 #[tokio::test]
+async fn adapted_agent_payloads_are_rejected_before_sending() {
+    use base64::Engine as _;
+
+    let mut token_bytes = vec![0x80];
+    token_bytes.extend_from_slice(&[0x33; 8 + 16 + 16 + 32]);
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(token_bytes);
+    for protocol in [
+        crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,
+        crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES,
+    ] {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{}/v1", upstream.local_addr().unwrap()));
+        config.profiles[0].upstream_protocol = protocol.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":[{"type":"agent_message","content":[
+                    {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                    {"type":"encrypted_content","encrypted_content":token}
+                ]}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        let error = response.json::<Value>().await.unwrap();
+        assert_eq!(error["error"]["code"], "context_not_portable");
+        assert!(!error.to_string().contains(&token));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), upstream.accept())
+                .await
+                .is_err()
+        );
+        router.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn responses_compact_rejects_adapted_routes_before_sending() {
     for protocol in [
         crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS,

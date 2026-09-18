@@ -9,6 +9,7 @@ pub(crate) fn responses_to_chat_completions_request(
     body: &Value,
 ) -> Result<ConvertedResponsesRequest> {
     validate_portable_context(body)?;
+    validate_adapted_agent_payloads(body)?;
     let object = body
         .as_object()
         .ok_or_else(|| anyhow::anyhow!("Responses 请求体必须是 JSON 对象"))?;

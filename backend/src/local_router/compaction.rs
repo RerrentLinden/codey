@@ -175,8 +175,8 @@ fn is_reasoning_text_part(part: &Value) -> bool {
 /// 字段，交给持有密钥的上游解密；线路本身不判断内容。第三方线路经常把该
 /// 字段直接写成明文，接收方解密失败会拒绝整条请求。Chat Completions 和
 /// Anthropic Messages 都表达不了这个字段，转换时只能丢弃，任务正文会随之
-/// 消失，因此所有线路都在协议转换前按结构识别：令牌形态原样保留，其余形态
-/// 改写为可见文本。
+/// 消失，因此先按结构识别：令牌形态留给原生 Responses，适配线路显式拒绝；
+/// 其余形态改写为可见文本。
 pub(crate) fn normalize_encrypted_agent_payloads(body: &mut Value) -> bool {
     match body.get_mut("input") {
         Some(Value::Array(items)) => {
@@ -189,6 +189,34 @@ pub(crate) fn normalize_encrypted_agent_payloads(body: &mut Value) -> bool {
         Some(item @ Value::Object(_)) => normalize_agent_message_item(item),
         _ => false,
     }
+}
+
+/// Chat 和 Anthropic 无法解密协作任务，必须在转换丢弃不透明内容前拒绝。
+/// 只检查 agent_message，其他消息的推理状态仍按原有规则处理。
+pub(crate) fn validate_adapted_agent_payloads(body: &Value) -> Result<()> {
+    let is_encrypted_payload = |part: &Value| {
+        part.get("type").and_then(Value::as_str) == Some("encrypted_content")
+            && part
+                .get("encrypted_content")
+                .and_then(Value::as_str)
+                .is_some_and(is_codex_encrypted_payload)
+    };
+    for item in input_items(body) {
+        if item.get("type").and_then(Value::as_str) != Some("agent_message") {
+            continue;
+        }
+        if item.get("content").is_some_and(|content| {
+            is_encrypted_payload(content)
+                || content
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(is_encrypted_payload))
+        }) {
+            anyhow::bail!(
+                "context_not_portable: 当前线路无法解密子代理任务正文，请使用原生 Responses 线路或重新提供明文任务"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn normalize_agent_message_item(item: &mut Value) -> bool {
@@ -539,6 +567,82 @@ mod tests {
 
         assert!(!normalize_native_responses_context(&mut body, false));
         assert_eq!(body, original);
+        assert!(
+            ProtocolBridge::NativeResponses
+                .convert_responses_body(&body)
+                .unwrap()
+                .is_none()
+        );
+        assert!(validate_cross_route_context(&body).is_ok());
+    }
+
+    #[test]
+    fn adapted_agent_payloads_reject_encrypted_tasks_without_exposing_them() {
+        let token = fernet_token(&[0x33; 16]);
+        let part = json!({"type":"encrypted_content","encrypted_content":token});
+        for content in [
+            part.clone(),
+            json!([
+                {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+                part
+            ]),
+        ] {
+            let item = agent_message(content);
+            for input in [item.clone(), json!([item])] {
+                let mut body = json!({"model":"model","input":input});
+                let original = body.clone();
+                assert!(!normalize_encrypted_agent_payloads(&mut body));
+                for bridge in [
+                    ProtocolBridge::ResponsesToChatCompletions,
+                    ProtocolBridge::ResponsesToAnthropicMessages,
+                ] {
+                    let error = bridge
+                        .convert_responses_body(&body)
+                        .err()
+                        .unwrap()
+                        .to_string();
+                    assert!(error.contains("context_not_portable"));
+                    assert!(!error.contains(&token));
+                }
+                assert_eq!(body, original);
+            }
+        }
+    }
+
+    #[test]
+    fn adapted_agent_payloads_preserve_recovered_plaintext() {
+        let task = "检查测试结果并报告问题";
+        let mut body = json!({"model":"model","input":[agent_message(json!([
+            {"type":"input_text","text":"Message Type: NEW_TASK\nPayload:\n"},
+            {"type":"encrypted_content","encrypted_content":task}
+        ]))]});
+        assert!(normalize_encrypted_agent_payloads(&mut body));
+        for bridge in [
+            ProtocolBridge::ResponsesToChatCompletions,
+            ProtocolBridge::ResponsesToAnthropicMessages,
+        ] {
+            let converted = bridge.convert_responses_body(&body).unwrap().unwrap();
+            assert!(converted.body["messages"].to_string().contains(task));
+        }
+    }
+
+    #[test]
+    fn adapted_agent_payloads_allow_unrelated_opaque_state() {
+        let token = fernet_token(&[0x44; 16]);
+        let body = json!({"model":"model","input":[
+            {"type":"reasoning","encrypted_content":token,
+             "content":[{"type":"encrypted_content","encrypted_content":token}]},
+            {"role":"user","content":[
+                {"type":"input_text","text":"continue"},
+                {"type":"encrypted_content","encrypted_content":token}
+            ]}
+        ]});
+        for bridge in [
+            ProtocolBridge::ResponsesToChatCompletions,
+            ProtocolBridge::ResponsesToAnthropicMessages,
+        ] {
+            assert!(bridge.convert_responses_body(&body).is_ok());
+        }
     }
 
     #[test]

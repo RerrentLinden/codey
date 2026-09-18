@@ -1,5 +1,23 @@
 use super::*;
 
+fn write_subagent_test_catalog(home: &std::path::Path, models: &[&str]) {
+    let path = home.join(model_catalog::relative_path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let entries = models
+        .iter()
+        .map(|slug| {
+            serde_json::json!({
+                "slug": slug, "description": "Test model", "base_instructions": "Test instructions"
+            })
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        path,
+        serde_json::to_vec(&serde_json::json!({"models": entries})).unwrap(),
+    )
+    .unwrap();
+}
+
 fn official_subagent_config(account_count: usize) -> CodeyConfig {
     let profiles = (0..account_count)
         .map(|index| {
@@ -82,7 +100,11 @@ fn subagent_catalog_fallback_config() -> CodeyConfig {
         subagent_optimization: true,
         selected_models_by_provider: std::collections::BTreeMap::from([(
             "route-a".into(),
-            vec!["gpt-6-astra".into(), "vendor/model".into()],
+            vec![
+                "gpt-6-astra".into(),
+                "gpt-5.6-terra".into(),
+                "vendor/model".into(),
+            ],
         )]),
         subagent_model: "route-a/gpt-6-astra".into(),
         subagent_roles: crate::config::uniform_subagent_roles("route-a/gpt-6-astra", "high"),
@@ -93,7 +115,7 @@ fn subagent_catalog_fallback_config() -> CodeyConfig {
 #[test]
 fn subagent_catalog_fallback_uses_native_ids_without_mutating_saved_routes() {
     let mut config = subagent_catalog_fallback_config();
-    config.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/vendor/model".into();
+    config.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/gpt-5.6-terra".into();
     config
         .subagent_roles
         .get_mut("codey_quick_scan")
@@ -110,11 +132,113 @@ fn subagent_catalog_fallback_uses_native_ids_without_mutating_saved_routes() {
         runtime.subagent_roles["codey_quick_scan"].reasoning_effort,
         "low"
     );
-    assert_eq!(runtime.subagent_roles["codey_worker"].model, "vendor/model");
+    assert_eq!(
+        runtime.subagent_roles["codey_worker"].model,
+        "gpt-5.6-terra"
+    );
     assert_eq!(config, saved);
     // A later settings save still uses the catalog mode of the running process.
     let reloaded = router_subagent_runtime_config(&config.normalize(), false).unwrap();
     assert_eq!(reloaded.subagent_roles, runtime.subagent_roles);
+}
+
+#[test]
+fn subagent_catalog_fallback_preserves_configured_third_party_models() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = subagent_catalog_fallback_config();
+    config.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/vendor/model".into();
+    let saved = config.clone();
+    let runtime = validated_router_subagent_runtime_config(&config, false, home.path()).unwrap();
+    assert_eq!(runtime.subagent_roles["codey_worker"].model, "vendor/model");
+    assert!(runtime.subagent_optimization);
+    assert_eq!(config, saved);
+
+    let runtime = startup_router_subagent_runtime_config(&mut config, false, home.path());
+    assert!(runtime.subagent_optimization);
+    assert_eq!(runtime.subagent_roles["codey_worker"].model, "vendor/model");
+    assert_eq!(config, saved);
+
+    write_subagent_test_catalog(
+        home.path(),
+        &["route-a/gpt-6-astra", "route-a/vendor/model"],
+    );
+    let runtime = validated_router_subagent_runtime_config(&config, true, home.path()).unwrap();
+    assert_eq!(
+        runtime.subagent_roles["codey_worker"].model,
+        "route-a/vendor/model"
+    );
+    config
+        .subagent_roles
+        .get_mut("codey_worker")
+        .unwrap()
+        .enabled = false;
+    assert!(validated_router_subagent_runtime_config(&config, false, home.path()).is_ok());
+}
+
+#[test]
+fn subagent_model_validation_uses_the_preserved_user_catalog() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = subagent_catalog_fallback_config();
+    config.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/vendor/model".into();
+    write_subagent_test_catalog(
+        home.path(),
+        &["route-a/gpt-6-astra", "route-a/vendor/model"],
+    );
+    let generated = home.path().join(model_catalog::relative_path());
+    let custom = home.path().join("custom-models.json");
+    std::fs::rename(&generated, &custom).unwrap();
+    std::fs::write(
+        home.path().join("config.toml"),
+        "model_catalog_json = 'custom-models.json'\n",
+    )
+    .unwrap();
+    // An explicit custom catalog also works when Codey's own catalog is absent.
+    for install_codey in [false, true] {
+        let runtime =
+            validated_router_subagent_runtime_config(&config, install_codey, home.path()).unwrap();
+        assert_eq!(
+            runtime.subagent_roles["codey_worker"].model,
+            "route-a/vendor/model"
+        );
+    }
+    std::fs::write(&custom, "{\"models\":[]}").unwrap();
+    write_subagent_test_catalog(
+        home.path(),
+        &["route-a/gpt-6-astra", "route-a/vendor/model"],
+    );
+    assert!(validated_router_subagent_runtime_config(&config, true, home.path()).is_err());
+}
+
+#[test]
+fn subagent_models_must_exist_in_the_installed_catalog() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = subagent_catalog_fallback_config();
+    config.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/vendor/model".into();
+    // A valid but stale catalog from another machine or route cannot authorize
+    // every configured model merely because its JSON can be loaded.
+    write_subagent_test_catalog(
+        home.path(),
+        &["route-a/gpt-6-astra", "old-route/vendor/model"],
+    );
+    let error = validated_router_subagent_runtime_config(&config, true, home.path()).unwrap_err();
+    assert!(error.to_string().contains("codey_worker"), "{error}");
+    assert!(
+        error.to_string().contains("route-a/vendor/model"),
+        "{error}"
+    );
+    assert!(error.to_string().contains("未包含"), "{error}");
+
+    let mut runtime = config.clone();
+    let roles = startup_router_subagent_runtime_config(&mut runtime, true, home.path());
+    assert!(!roles.subagent_optimization);
+    runtime.subagent_optimization = true;
+    assert_eq!(runtime, config);
+    config
+        .subagent_roles
+        .get_mut("codey_worker")
+        .unwrap()
+        .enabled = false;
+    assert!(validated_router_subagent_runtime_config(&config, true, home.path()).is_ok());
 }
 
 #[test]
@@ -163,9 +287,10 @@ fn subagent_catalog_fallback_checks_enabled_roles_only_and_rejects_missing_route
 
 #[test]
 fn subagent_catalog_fallback_disables_only_this_launch_on_invalid_routes() {
+    let home = tempfile::tempdir().unwrap();
     let mut config = subagent_catalog_fallback_config();
     let saved = config.clone();
-    let roles = startup_router_subagent_runtime_config(&mut config, false);
+    let roles = startup_router_subagent_runtime_config(&mut config, false, home.path());
     assert!(roles.subagent_optimization);
     assert_eq!(roles.subagent_model, "gpt-6-astra");
     assert_eq!(config, saved);
@@ -183,13 +308,14 @@ fn subagent_catalog_fallback_disables_only_this_launch_on_invalid_routes() {
         .unwrap()
         .model = "missing/model".into();
     let mut restored = config.clone();
-    let roles = startup_router_subagent_runtime_config(&mut restored, true);
+    write_subagent_test_catalog(home.path(), &["route-a/gpt-6-astra", "route-b/gpt-6-astra"]);
+    let roles = startup_router_subagent_runtime_config(&mut restored, true, home.path());
     assert!(roles.subagent_optimization);
     assert_eq!(roles.subagent_model, "route-a/gpt-6-astra");
     assert_eq!(restored, config);
     for saved in [config, missing] {
         let mut runtime = saved.clone();
-        let roles = startup_router_subagent_runtime_config(&mut runtime, false);
+        let roles = startup_router_subagent_runtime_config(&mut runtime, false, home.path());
         assert!(!runtime.subagent_optimization);
         assert_eq!(roles, runtime);
         runtime.subagent_optimization = true;
@@ -264,7 +390,7 @@ async fn subagent_catalog_fallback_keeps_live_routes_and_roles_until_restart() {
         .get_mut("route-a")
         .unwrap()
         .reverse();
-    roles.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/vendor/model".into();
+    roles.subagent_roles.get_mut("codey_worker").unwrap().model = "route-a/gpt-5.6-terra".into();
     roles
         .subagent_roles
         .get_mut("codey_worker")
@@ -277,7 +403,7 @@ async fn subagent_catalog_fallback_keeps_live_routes_and_roles_until_restart() {
     let reloaded = runtime.subagent_reconcile_config(&roles).unwrap();
     assert_eq!(
         reloaded.subagent_roles["codey_worker"].model,
-        "vendor/model"
+        "gpt-5.6-terra"
     );
     assert_eq!(
         reloaded.subagent_roles["codey_worker"].reasoning_effort,

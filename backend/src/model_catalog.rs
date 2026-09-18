@@ -814,6 +814,24 @@ pub fn is_available(home: &Path) -> bool {
     })
 }
 
+/// 角色的模型必须存在于实际交给 Codex 的目录，不能仅凭线路配置推断可用。
+pub(crate) fn validate_runtime_subagent_models(
+    catalog_path: &Path,
+    roles: &std::collections::BTreeMap<String, crate::config::SubagentRoleConfig>,
+) -> Result<()> {
+    let models = read_runtime_catalog_models_at(catalog_path)?;
+    for (role, selection) in roles.iter().filter(|(_, selection)| selection.enabled) {
+        anyhow::ensure!(
+            models.iter().any(|model| model["slug"]
+                .as_str()
+                .is_some_and(|slug| model_id::equal(slug, &selection.model))),
+            "子代理角色 {role} 的模型 {} 未包含在本次 Codex 模型目录中；缓存目录可能已过期，请重新同步模型并重启 Codex",
+            selection.model
+        );
+    }
+    Ok(())
+}
+
 /// Makes a previously generated catalog safe to reuse when the upstream model
 /// cache cannot be refreshed. Older catalogs may still advertise capabilities
 /// whose route settings have since changed.
@@ -2070,7 +2088,11 @@ fn read_catalog_value(path: &Path) -> Option<Value> {
 
 fn read_runtime_catalog_models(home: &Path) -> Result<Vec<Value>> {
     let path = home.join(relative_path());
-    let bytes = fs::read(&path)
+    read_runtime_catalog_models_at(&path)
+}
+
+fn read_runtime_catalog_models_at(path: &Path) -> Result<Vec<Value>> {
+    let bytes = fs::read(path)
         .with_context(|| format!("读取 Codey 运行时模型目录失败：{}", path.display()))?;
     let value: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("解析 Codey 运行时模型目录失败：{}", path.display()))?;

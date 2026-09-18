@@ -1,4 +1,4 @@
-pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
+const CONSERVATIVE_SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
 默认由主代理直接处理短而明确、步骤互相依赖或即将修改关键代码/文档的任务；不要为了形式分工而派生。只在独立并行工作、宽范围检索、上下文隔离或独立高风险证据确有收益时使用子代理。不超过 2 个小文件和 3 次本地工具调用的精确任务通常由主代理完成。
 
@@ -23,12 +23,35 @@ pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 - 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。
 "#;
 
-/// Only the current text is recognised. Codey supports upgrades from the
-/// previous two releases only, and both shipped this exact text; older
-/// guidance is left untouched instead of being migrated.
-pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] = &[SUBAGENT_GUIDANCE];
+pub(crate) const SUBAGENT_GUIDANCE: &str = r#"## 子代理使用
 
-pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+主动识别可独立推进的检索、实现和核验任务；存在明确分工或上下文隔离收益时，尽早使用子代理，无需用户逐次要求。先做确定边界所需的少量检查，再派发独立任务，不必等主代理完成同一调查后再分工。单步即可完成、步骤无法分离或委派没有实际收益的任务由主代理直接处理；不按文件数量或预计工具调用次数决定是否委派。
+
+纯只读工作最多同时运行 3 个子代理；存在写入型或身份未确认的代理时最多同时运行 2 个。并发限制只约束同时运行数量，不限制后续派发次数。
+
+### 派发
+
+- 直接调用 `agents.spawn_agent`，按任务选择 `codey_quick_scan`、`codey_deep_research`、`codey_visual_analysis`、`codey_worker` 或 `codey_visual_worker`；`default` 仅兼容旧配置。`task_name` 只含小写字母、数字和下划线。
+- `message` 是唯一任务胶囊：写清目标、范围、允许操作、交付格式和必要背景，不复制整段对话，不附加 V1/V2 契约、sidecar、checks 或其他尾行协议。
+- 修改关键代码或文档时，可先派发独立的只读调查或核验；写入任务明确文件归属，避免重复调查或同时修改同一处。只读角色获得 `files.read`；写入角色获得 `command.execute`、`files.read` 和 `workspace.write`。写入角色暂按当前工作区建立互斥锁；实际权限仍由 Codex 原生 sandbox、approval policy、permission profile 和 writable roots 决定。
+
+### 返回与验收
+
+- 每个子代理只执行一轮且不得继续派生。返回首行使用 `status: completed | partial | blocked`，正文只保留影响决策的结论、最多 5 条带 `file:line`/符号/链接的证据和明确 gaps；多代理证据冲突时比较出处。
+- 子代理结果是候选产物，不是验收结论。所有代理结算后，由根代理结合用户要求、变更差异和必要的确定性检查统一验收；Codey 不再创建逐任务机械验收债或强制验收命令。
+
+### 生命周期
+
+- 先派发不超过当前并发上限的独立任务，再进入 wait/list。任一 attempt 终态或被成功中断并 fence 后，按下一个计划任务的角色重新计算并发上限；存在空余槽位时立即使用新 `task_name` 补位，否则继续等待。所有计划任务均已派发后，继续等待剩余活动 attempt 结算。活动 attempt 期间只使用必要的 `agents.*` 协作工具，普通本地工作和 Stop 仍受生命周期门禁限制。
+- `MESSAGE` 只保存证据并继续等待。`completed`、`errored`、`error`、`failed`、`shutdown`、`not_found`、`FINAL_ANSWER` 和 `task_complete` 为终态；`pending_init`、`running`、`interrupted` 仍是非终态，除非根代理成功中断并永久放弃该 attempt。
+- 成功的 `agents.interrupt_agent` 会永久 fence 该 attempt；不要再等待或追派。重复 task ID 时只做一次无筛选 `agents.list_agents` 对账：原代理存在则等待或消费结果，不存在则由根代理接管。只有任务范围实质改变时才用全新 task ID 最多重派一次。
+- 协作工具不可用时不要循环调用；依赖有界的 pending-init、超时和 Stop 恢复路径收敛。
+"#;
+
+pub(crate) const SUBAGENT_GUIDANCE_VERSIONS: &[&str] =
+    &[SUBAGENT_GUIDANCE, CONSERVATIVE_SUBAGENT_GUIDANCE];
+
+const PRE_INTERRUPT_FENCING_USAGE_HINT: &str = "\
 `agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools are direct commentary \
 tools; never call them through `functions.exec`. Dispatch up to the current concurrency limit from the \
 planned independent work before the first wait. While any attempt is active, use only the relevant \
@@ -49,10 +72,37 @@ the combined result and either continues the work or finishes. While an attempt 
 blocks non-collaboration tools and Stop. If collaboration tools are unavailable, do not loop on an \
 unregistered tool.";
 
+pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT: &str = "\
+`agents.spawn_agent`, `agents.wait_agent`, and other `agents.*` collaboration tools are direct commentary \
+tools; never call them through `functions.exec`. Dispatch up to the current concurrency limit from the \
+planned independent work before the first wait. While any attempt is active, use only the relevant \
+`agents.spawn_agent`, `agents.send_message`, `agents.followup_task`, `agents.interrupt_agent`, \
+`agents.list_agents`, or `agents.wait_agent`. After a terminal or successfully fenced update, recompute the \
+role-aware concurrency limit; if it exposes a slot, immediately use `agents.spawn_agent` with a new \
+`task_name` for the next planned, unspawned task; \
+otherwise return to `agents.wait_agent` with `timeout_ms: 30000`. `MESSAGE` and mailbox updates are not \
+completion. Use `followup_task` only for a bound nonterminal attempt. If \
+`CODEY_SUBAGENT_FOLLOWUP_REQUIRES_ACTIVE_ATTEMPT` is denied, do not retry or wait for that target; take \
+over or use a fresh `task_name` for a materially changed task. Treat `FINAL_ANSWER`, `task_complete`, \
+`completed`, `errored`, `error`, `failed`, `shutdown`, and `not_found` as terminal. A successful root \
+interrupt permanently abandons and fences that attempt and settles it for the lifecycle ledger; \
+do not wait for or follow up that target. Interrupt revokes child tool access before the provider call, \
+but keeps the writer reservation until acknowledgement or terminal reconciliation. Queued followups \
+may still start another turn; they cannot restore tool access. A failed interrupt does not release the \
+reservation. Match evidence and write reports to the exact task and attempt; never transfer another \
+attempt's no-change claim or infer a transport stall from elapsed time alone. If a wait times out or \
+lacks per-agent terminal details, call unfiltered `agents.list_agents` before waiting again. Continue until \
+all planned work has been spawned and every attempt is terminal or fenced. Then the root agent validates \
+the combined result and either continues the work or finishes. While an attempt is active, Codey's gate \
+blocks non-collaboration tools and Stop. If collaboration tools are unavailable, do not loop on an \
+unregistered tool.";
+
 pub(crate) const ROOT_AGENT_MULTI_AGENT_MODE_HINT: &str = "Proactive multi-agent delegation is \
 active. Any earlier instruction requiring an explicit user request before spawning sub-agents no \
-longer applies. Delegate only when independent parallel work, context isolation, or specialized evidence \
-materially helps; keep short, sequential, or low-benefit work with the root. When delegating, strongly \
+longer applies. Proactively identify independent research, implementation, and verification tasks and \
+delegate them early when parallel work, context isolation, or specialized evidence materially helps. \
+Do not finish the same broad investigation in the root before delegating it. Keep one-step or inseparable \
+sequential work with the root; file counts and tool-call estimates are not delegation cutoffs. When delegating, strongly \
 prefer an enabled Codey role that fits the task and explicitly set `agent_type`: `codey_quick_scan` for \
 focused read-only lookups; `codey_deep_research` for broad read-only code, log, and document research; \
 `codey_visual_analysis` for read-only visual inspection; `codey_worker` for bounded non-visual \
@@ -71,11 +121,11 @@ unfiltered `agents.list_agents` once: wait for the original if present, otherwis
 materially changed task may retry once with a fresh `task_name`. This \
 mode remains active until a later multi-agent mode developer message changes it.";
 
-/// Only the current text is recognised. Codey supports upgrades from the
-/// previous two releases only, and both shipped this exact text; older
-/// guidance is left untouched instead of being migrated.
-pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] =
-    &[ROOT_AGENT_COLLABORATION_USAGE_HINT];
+/// Remove the previous owned paragraph when installing the current guidance.
+pub(crate) const ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS: &[&str] = &[
+    ROOT_AGENT_COLLABORATION_USAGE_HINT,
+    PRE_INTERRUPT_FENCING_USAGE_HINT,
+];
 
 pub(crate) const DEFAULT_AGENT_CONFIG: &str = r#####"name = "default"
 
@@ -187,6 +237,12 @@ pub(crate) const READ_ONLY_AGENT_WRITE_GUARD: &str = "\
 当前任务类型是只读子代理，只能检查、搜索、分析和回报。不要调用 `replace`、`apply_patch`、\
 文件写入命令或任何会创建、修改、删除、移动文件及改变外部状态的工具。即使任务正文要求写入，\
 也不要尝试或重试；请停止实施，把需要修改的内容和证据交回主代理，由主代理完成写入。";
+
+pub(crate) const SUBAGENT_TASK_BOUNDARY_GUARD: &str = "\
+执行前确认本次任务正文完整可读。正文为空、缺失或无法解密时，只向主代理报告阻塞，等待明确重述；\
+不得凭继承对话或旧任务猜测目标，也不要扫描工作区或尝试写入。按本次任务指定的路径、工具和清理分工执行；\
+任务未要求时不要做全仓库哈希。中止后即使收到排队任务，也不能恢复已撤销的工具权限。\
+返回时区分本次实际修改、已清理内容和未完成要求，不能用其他尝试的结果代替本次证据。";
 
 pub(crate) const NO_WRITABLE_SUBAGENT_GUIDANCE: &str = "\
 本次运行没有启用 `codey_worker` 或 `codey_visual_worker`，因此没有可写子代理。所有创建、修改、\
@@ -487,7 +543,8 @@ mod tests {
         assert!(combined.contains("successful root interrupt permanently abandons and fences"));
         assert!(combined.contains("settles it for the lifecycle ledger"));
         assert!(combined.contains("do not wait for or follow up that target"));
-        assert!(combined.contains("active-looking provider state stale"));
+        assert!(combined.contains("Queued followups may still start another turn"));
+        assert!(!combined.contains("active-looking provider state stale"));
         assert!(combined.contains("terminal or fenced"));
         assert!(combined.contains("unfiltered `agents.list_agents`"));
         assert!(combined.contains("recompute the role-aware concurrency limit"));
@@ -499,6 +556,12 @@ mod tests {
         assert!(!combined.contains("Write-Error"));
         assert_eq!(
             append_root_agent_collaboration_usage_hint(&combined),
+            combined
+        );
+        assert_eq!(
+            append_root_agent_collaboration_usage_hint(&format!(
+                "{custom}\n\n{PRE_INTERRUPT_FENCING_USAGE_HINT}"
+            )),
             combined
         );
         let current_before_user =
@@ -538,9 +601,13 @@ mod tests {
     }
 
     #[test]
-    fn subagent_guidance_prefers_direct_work_until_delegation_has_clear_value() {
-        assert!(SUBAGENT_GUIDANCE.contains("默认由主代理直接处理"));
-        assert!(SUBAGENT_GUIDANCE.contains("不超过 2 个小文件和 3 次本地工具调用"));
+    fn subagent_guidance_delegates_independent_work_early_and_replaces_old_policy() {
+        assert!(SUBAGENT_GUIDANCE.contains("尽早使用子代理"));
+        assert!(!SUBAGENT_GUIDANCE.contains("不超过 2 个小文件和 3 次本地工具调用"));
+        assert_eq!(
+            remove_subagent_guidance(&format!("USER\n\n{CONSERVATIVE_SUBAGENT_GUIDANCE}")),
+            Some("USER".into())
+        );
         assert!(SUBAGENT_GUIDANCE.contains("直接调用 `agents.spawn_agent`"));
         assert!(SUBAGENT_GUIDANCE.contains("唯一任务胶囊"));
         assert!(SUBAGENT_GUIDANCE.contains("纯只读工作最多同时运行 3 个子代理"));

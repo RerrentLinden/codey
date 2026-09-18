@@ -988,6 +988,37 @@ fn runtime_guidance_keeps_writes_with_root_when_all_writable_roles_are_disabled(
 }
 
 #[test]
+fn runtime_guidance_upgrades_owned_defaults_without_overwriting_custom_sources() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("instructions.md");
+    for (current, versions) in [
+        (SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS),
+        (
+            ROOT_AGENT_COLLABORATION_USAGE_HINT,
+            ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
+        ),
+    ] {
+        for version in versions {
+            let original = format!("\n{version}\n");
+            fs::write(&path, &original).unwrap();
+            assert_eq!(
+                read_or_create_versioned_constraint_file(&path, current, versions).unwrap(),
+                current
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+            let customized = format!("{version}\n\n用户自定义要求");
+            fs::write(&path, &customized).unwrap();
+            assert_eq!(
+                read_or_create_versioned_constraint_file(&path, current, versions).unwrap(),
+                customized
+            );
+            assert_eq!(fs::read_to_string(&path).unwrap(), customized);
+        }
+    }
+}
+
+#[test]
 fn runtime_read_only_agents_are_explicitly_told_not_to_call_write_tools() {
     let temp = tempfile::tempdir().unwrap();
     let constraints_dir = temp.path().join("codex-constraints");
@@ -995,6 +1026,15 @@ fn runtime_read_only_agents_are_explicitly_told_not_to_call_write_tools() {
     let plans =
         plan_runtime_agent_files(&constraints_dir, &roles, Some(CODEY_FASTCTX_GUIDANCE)).unwrap();
 
+    for plan in &plans {
+        let config = parse_document(std::str::from_utf8(&plan.contents).unwrap()).unwrap();
+        assert!(
+            config["developer_instructions"]
+                .as_str()
+                .unwrap()
+                .contains(SUBAGENT_TASK_BOUNDARY_GUARD)
+        );
+    }
     let quick_scan = plans
         .iter()
         .find(|plan| plan.registration.role == crate::config::SUBAGENT_ROLE_QUICK_SCAN)
@@ -1104,6 +1144,50 @@ wire_api = "responses"
                 providers.contains_key("relay")
                     && !providers.contains_key(local_router::ROUTER_PROVIDER_ID)
             })
+    );
+}
+
+#[test]
+fn native_runtime_forwards_user_catalog_with_the_same_resolved_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir_all(&home).unwrap();
+    let original = "model_catalog_json = 'models/custom.json'\n";
+    fs::write(home.join("config.toml"), original).unwrap();
+    let marker = temp.path().join("state/codex-lease.json");
+    let backup_root = temp.path().join("state/backups");
+    let applied = apply_isolated_runtime_router_config(
+        &home,
+        RouterApplyOptions {
+            stream_max_retries: 5,
+            local_router: None,
+            use_official_catalog: false,
+            default_model: None,
+            fastctx_command: None,
+            subagent_optimization: false,
+            subagent_model: DEFAULT_SUBAGENT_MODEL,
+            subagent_reasoning_effort: DEFAULT_SUBAGENT_REASONING_EFFORT,
+            subagent_roles: None,
+            marker: &marker,
+            backup_root: &backup_root,
+        },
+    )
+    .unwrap();
+    let catalog_override = applied
+        .runtime_config_overrides
+        .iter()
+        .find(|entry| entry.starts_with("model_catalog_json="))
+        .unwrap();
+    let document = parse_document(catalog_override).unwrap();
+    let resolved = PathBuf::from(document["model_catalog_json"].as_str().unwrap());
+    assert_eq!(resolved, home.join("models/custom.json"));
+    assert_eq!(
+        Some(resolved),
+        runtime_model_catalog_path(&home, false).unwrap()
+    );
+    assert_eq!(
+        fs::read_to_string(home.join("config.toml")).unwrap(),
+        original
     );
 }
 

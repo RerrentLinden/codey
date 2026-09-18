@@ -16,9 +16,9 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, TableLike, Value, 
 use crate::codex_config_guidance::{
     CODEY_FASTCTX_GUIDANCE, NO_WRITABLE_SUBAGENT_GUIDANCE, READ_ONLY_AGENT_WRITE_GUARD,
     ROOT_AGENT_COLLABORATION_USAGE_HINT, ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
-    ROOT_AGENT_MULTI_AGENT_MODE_HINT, SUBAGENT_GUIDANCE,
-    append_root_agent_collaboration_usage_hint, remove_codey_fastctx_guidance,
-    remove_subagent_guidance, subagent_source_config,
+    ROOT_AGENT_MULTI_AGENT_MODE_HINT, SUBAGENT_GUIDANCE, SUBAGENT_GUIDANCE_VERSIONS,
+    SUBAGENT_TASK_BOUNDARY_GUARD, append_root_agent_collaboration_usage_hint,
+    remove_codey_fastctx_guidance, remove_subagent_guidance, subagent_source_config,
 };
 use crate::config::{
     CodeyConfig, SUBAGENT_REASONING_EFFORTS, SUBAGENT_ROLE_DEFAULT, SUBAGENT_ROLE_IDS,
@@ -451,12 +451,17 @@ fn apply_isolated_runtime_router_config(
         runtime_subagent_roles(subagent_roles, subagent_model, subagent_reasoning_effort);
     let (root_instructions, collaboration_hint, runtime_agents) = if subagent_optimization {
         let root_path = constraints_dir.join(CODEY_ROOT_INSTRUCTIONS_FILE);
-        let root_instructions = read_or_create_constraint_file(&root_path, SUBAGENT_GUIDANCE)?;
+        let root_instructions = read_or_create_versioned_constraint_file(
+            &root_path,
+            SUBAGENT_GUIDANCE,
+            SUBAGENT_GUIDANCE_VERSIONS,
+        )?;
         let root_instructions =
             runtime_root_instructions_for_roles(&root_instructions, &runtime_roles);
-        let collaboration_hint = read_or_create_constraint_file(
+        let collaboration_hint = read_or_create_versioned_constraint_file(
             &constraints_dir.join(CODEY_COLLABORATION_HINT_FILE),
             ROOT_AGENT_COLLABORATION_USAGE_HINT,
+            ROOT_AGENT_COLLABORATION_USAGE_HINT_VERSIONS,
         )?;
         let runtime_agents = prepare_runtime_agent_files(
             &constraints_dir,
@@ -510,11 +515,13 @@ fn apply_isolated_runtime_router_config(
     } else {
         (None, Vec::new())
     };
+    if let Some(path) = resolved_model_catalog_path(&effective_document, home) {
+        effective_document["model_catalog_json"] = value(path.to_string_lossy().into_owned());
+    }
     let runtime_config_overrides = build_isolated_runtime_overrides(
         &effective_document,
         root_instructions.as_deref(),
         &runtime_agents,
-        model_catalog_path.as_deref(),
         fastctx_namespace,
         local_router.map(|_| local_router::ROUTER_PROVIDER_ID),
         &hook_trust_entries,
@@ -649,6 +656,23 @@ fn read_or_create_constraint_file(path: &Path, default_contents: &str) -> Result
     }
     write_private_file(path, default_contents.as_bytes())?;
     Ok(default_contents.to_string())
+}
+
+fn read_or_create_versioned_constraint_file(
+    path: &Path,
+    current: &str,
+    owned_versions: &[&str],
+) -> Result<String> {
+    let source = read_or_create_constraint_file(path, current)?;
+    // 仅在运行时替换完整匹配的旧默认文本，可编辑源文件和用户改动保持原样。
+    if owned_versions
+        .iter()
+        .any(|version| source.trim() == version.trim())
+    {
+        Ok(current.to_string())
+    } else {
+        Ok(source)
+    }
 }
 
 fn runtime_subagent_roles(
@@ -824,6 +848,12 @@ fn render_runtime_agent(
             "developer_instructions",
         )?;
     }
+    append_table_constraint_text(
+        document.as_table_mut(),
+        "developer_instructions",
+        SUBAGENT_TASK_BOUNDARY_GUARD,
+        "developer_instructions",
+    )?;
     document["name"] = value(role);
     document["model"] = value(model);
     document["model_reasoning_effort"] = value(&reasoning_effort);
@@ -2319,12 +2349,10 @@ fn json_hook_group_is_codey_owned(group: &serde_json::Value) -> bool {
         })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_isolated_runtime_overrides(
     effective: &DocumentMut,
     root_instructions: Option<&str>,
     runtime_agents: &[RuntimeAgentRegistration],
-    model_catalog_path: Option<&Path>,
     fastctx_namespace: Option<&str>,
     provider_id: Option<&str>,
     hook_trust_entries: &[RuntimeHookTrustEntry],
@@ -2386,14 +2414,14 @@ fn build_isolated_runtime_overrides(
     }
     push_document_override(&mut overrides, effective, &["model"], "model")?;
 
-    if model_catalog_path.is_some() {
-        push_document_override(
-            &mut overrides,
-            effective,
-            &["model_catalog_json"],
-            "model_catalog_json",
-        )?;
-    }
+    // Include a preserved user catalog too, so child model validation and
+    // runtime catalog detection use the same effective source as Codex.
+    push_document_override(
+        &mut overrides,
+        effective,
+        &["model_catalog_json"],
+        "model_catalog_json",
+    )?;
 
     // The only runtime provider is Codey's process-local loopback gateway.
     // Upstream route tables and credentials never enter Codex's configuration.
@@ -2945,6 +2973,35 @@ fn local_router_provider_table(endpoint: &RuntimeRouterEndpoint) -> Table {
         provider["experimental_bearer_token"] = value(endpoint.token.as_str());
     }
     provider
+}
+
+pub(crate) fn runtime_model_catalog_path(
+    home: &Path,
+    use_codey_catalog: bool,
+) -> Result<Option<PathBuf>> {
+    let config_path = home.join("config.toml");
+    let source = read_optional(&config_path)?.unwrap_or_default();
+    let source = String::from_utf8(source).context("Codex 配置不是 UTF-8")?;
+    let mut document = parse_document(&source)?;
+    let desired = use_codey_catalog.then(|| home.join(crate::model_catalog::relative_path()));
+    update_model_catalog_reference(&mut document, &config_path, desired.as_deref());
+    Ok(resolved_model_catalog_path(&document, home))
+}
+
+fn resolved_model_catalog_path(document: &DocumentMut, home: &Path) -> Option<PathBuf> {
+    document
+        .get("model_catalog_json")
+        .and_then(Item::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            let path = Path::new(path);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                home.join(path)
+            }
+        })
 }
 
 fn update_model_catalog_reference(

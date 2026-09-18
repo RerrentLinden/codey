@@ -1825,11 +1825,47 @@ pub(crate) struct InterruptSettlement {
     pub(crate) agent_id_hash: Option<String>,
 }
 
+/// Revoke tool access before invoking the provider: interrupting a turn can
+/// immediately start an already queued followup. Keep the reservation active
+/// (and its writer lock held) until an acknowledgement or terminal observation
+/// arrives. A failed interrupt must not silently restore the revoked access.
+pub(crate) fn pre_interrupt_agent(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    tool_input: Option<&Value>,
+    now_ms: u64,
+) -> Result<()> {
+    let Some(target) = interrupt_task_target(tool_input) else {
+        return Ok(());
+    };
+    let store = LedgerStore::open(state_root, session_id)?;
+    let Some(mut ledger) = store.load(runtime_id, session_id, now_ms)? else {
+        return Ok(());
+    };
+    let Some(task_id) = unique_task_for_identifier(&ledger, &target)? else {
+        return Ok(());
+    };
+    let reservation = ledger
+        .reservations
+        .get_mut(&task_id)
+        .expect("resolved task");
+    if reservation.state.is_active() && reservation.fenced_at_ms.is_none() {
+        reservation.fenced_at_ms = Some(now_ms);
+        reservation.updated_at_ms = now_ms;
+        reservation.error_message =
+            Some("root requested interrupt; tool access revoked pending settlement".into());
+        store.save(&mut ledger, now_ms)?;
+    }
+    Ok(())
+}
+
 /// Applies a provider-owned interrupt acknowledgement only after every identity
 /// in that acknowledgement resolves to the exact reservation requested by the
 /// root. A live/pending acknowledgement means the root abandoned the task; a
 /// target-specific prior terminal outcome instead settles the attempt with that
-/// authoritative result.
+/// authoritative result. The provider queue may still start another turn, so
+/// retain the identity binding to deny its tools and reject late lifecycle starts.
 pub(crate) fn settle_interrupt_acknowledgement(
     state_root: &Path,
     runtime_id: &str,
@@ -1883,7 +1919,7 @@ pub(crate) fn settle_interrupt_acknowledgement(
         ReservationState::Recovered
     };
     reservation.outcome = outcome;
-    reservation.agent_id_hash = None;
+    // Retain the binding as a tombstone for queued turns using an opaque id.
     reservation.pending_init_observed_at_ms = None;
     reservation.updated_at_ms = now_ms;
     reservation.completed_at_ms = Some(now_ms);
