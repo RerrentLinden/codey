@@ -13,27 +13,31 @@ test("misc model setting is part of the saved configuration", async () => {
   assert.match(mockApiSource, /miscModel: "",/);
 });
 
-test("misc model card drives naming, commit messages, and the review fallback", async () => {
-  const cardSource = await readSource("src/MiscModelCard.tsx");
+test("misc model and retry controls sit in the route card above readonly note", async () => {
+  const modelSectionSource = await readSource("src/ModelSection.tsx");
 
-  assert.match(cardSource, /<ModelCombobox/);
-  assert.match(cardSource, /aria-label="杂事模型"/);
-  assert.match(cardSource, /恢复默认/);
-  assert.match(cardSource, /codex-auto-review/);
-  assert.match(cardSource, /misc-model-field/);
-  assert.match(cardSource, /misc-model-body/);
-  assert.match(cardSource, /miscModel: ""/);
-  assert.match(cardSource, /miscModel: value/);
-  assert.match(cardSource, /onConfigChange/);
+  assert.match(modelSectionSource, /<ModelCombobox/);
+  assert.match(modelSectionSource, /aria-label="杂事模型"/);
+  assert.match(modelSectionSource, /恢复默认/);
+  assert.match(modelSectionSource, /codex-auto-review/);
+  assert.match(modelSectionSource, /miscModel: ""/);
+  assert.match(modelSectionSource, /miscModel: value/);
+  assert.match(modelSectionSource, /streamMaxRetries/);
+  assert.match(modelSectionSource, /会话重试/);
+  assert.match(modelSectionSource, /route-auxiliary-bar/);
+
+  const miscIndex = modelSectionSource.indexOf('aria-label="杂事模型"');
+  const retryIndex = modelSectionSource.indexOf('aria-label="会话错误重试次数"');
+  const noteIndex = modelSectionSource.indexOf('className="readonly-note"');
+  assert.ok(miscIndex >= 0 && retryIndex >= 0 && noteIndex >= 0);
+  assert.ok(miscIndex < noteIndex && retryIndex < noteIndex);
 });
 
-test("misc model card sits between the prompt grid and the feature policy card", async () => {
+test("misc model card is replaced by inline route card controls", async () => {
   const appSource = await readSource("src/App.tsx");
 
-  const gridIndex = appSource.indexOf('className="prompt-subagent-grid"');
-  const cardIndex = appSource.indexOf("<MiscModelCard");
-  const policyIndex = appSource.indexOf("<FeaturePolicyCard");
-  assert.ok(gridIndex >= 0 && cardIndex >= 0 && policyIndex >= 0);
-  assert.ok(gridIndex < cardIndex && cardIndex < policyIndex);
-  assert.match(appSource, /import \{ MiscModelCard \} from "\.\/MiscModelCard";/);
+  assert.doesNotMatch(appSource, /<MiscModelCard/);
+  assert.doesNotMatch(appSource, /import \{ MiscModelCard \}/);
+  assert.match(appSource, /<ModelSection[\s\S]*?subagentModelOptions=\{subagentModelOptions\}/);
 });
+

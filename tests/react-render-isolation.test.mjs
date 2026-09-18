@@ -78,7 +78,7 @@ test("settings panels declare render-isolation hooks and stable handlers", async
   assert.match(sections, /Anthropic Messages/);
   assert.doesNotMatch(sections, /route-auth-mode-label/);
   assert.equal(sections.match(/<Select\s/g)?.length, 2);
-  assert.equal(sections.match(/<ModelCombobox\s/g)?.length, 1);
+  assert.equal(sections.match(/<ModelCombobox\s/g)?.length, 2);
   assert.doesNotMatch(sections, /<select/);
   assert.match(sections, /visibleProfiles\.map\(\(profile\) =>/);
   assert.doesNotMatch(sections, /route-list-pane|route-manager-balanced|<Listy/);

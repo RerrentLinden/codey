@@ -13,12 +13,15 @@ import {
   IconRefresh as RefreshCw,
   IconServer as Server,
   IconShieldCheck,
+  IconSparkles,
   IconTrash as Trash,
 } from "@tabler/icons-react";
 
 import type { Confirmation, Config, ModelContextConfig, ModelState, OfficialAccount, OfficialAccountsResult, Profile, ProviderStatus } from "./App.types";
 import { OfficialAccountsPanel } from "./OfficialAccountsPanel";
 import { Card } from "@heroui/react";
+import { ModelCombobox } from "./components/ModelCombobox";
+import type { SubagentModelOption } from "./subagentModels";
 import {
   Badge,
   Button,
@@ -64,6 +67,7 @@ type ModelSectionProps = {
   isBusy: boolean;
   busy: string | null;
   showAccountUsageInHeader: boolean;
+  subagentModelOptions?: SubagentModelOption[];
   onToggleLocalRouter: (checked: boolean) => void;
   onToggleRouteRequestLog: (checked: boolean) => void;
   onSaveRoute: (route: Profile) => Promise<boolean>;
@@ -210,6 +214,7 @@ function ModelSectionComponent({
   isBusy,
   busy,
   showAccountUsageInHeader,
+  subagentModelOptions = [],
   onToggleLocalRouter,
   onToggleRouteRequestLog,
   onSaveRoute,
@@ -616,6 +621,41 @@ function ModelSectionComponent({
   const draftOfficialAccountLabel =
     displayedEmail(draftOfficialAccount) || draftOfficialAccount?.id || "";
 
+  const preferredProfile =
+    config.profiles.find((profile) => profile.id === config.activeProfileId) ??
+    config.profiles[0];
+  const preferredProviderId = preferredProfile
+    ? routeProviderId(preferredProfile)
+    : undefined;
+  const miscModelDisabled = isBusy || subagentModelOptions.length === 0;
+  const selectedMiscModelKey = config.miscModel.trim().toLowerCase();
+  const miscModelUnavailable =
+    selectedMiscModelKey !== "" &&
+    !subagentModelOptions.some(
+      (option) => option.value.toLowerCase() === selectedMiscModelKey,
+    );
+
+  const miscModelTooltip = (
+    <div className="flex flex-col gap-1 text-xs leading-relaxed max-w-[360px]">
+      <div className="font-semibold text-foreground">
+        统一指定会话命名、Git 提交消息、环境建议与自动复核回退使用的模型
+      </div>
+      <div className="text-muted">
+        留空时沿用默认选择：会话命名优先使用官方 Luna，第三方线路使用已启用的 Luna 或默认模型；Git 提交消息和环境建议沿用内置模型。选择模型后，这些功能及自动复核回退使用所选模型；只要任一线路声明支持 codex-auto-review，自动复核仍使用专用模型。自动复核回退在保存后生效，其余功能需要重启 Codex，且依赖当前版本的主进程补丁支持。
+      </div>
+      {miscModelUnavailable && (
+        <div className="text-warning font-medium">
+          当前选择不在可用模型列表中，请重新选择；保存后若仍无法解析，将沿用默认行为，自动复核回退不可用。
+        </div>
+      )}
+      {!config.localRouterEnabled && (
+        <div className="text-muted italic">
+          本地路由已关闭，自动复核回退不会生效。
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <section className="route-section" aria-labelledby="route-title">
       <div className="section-title">
@@ -648,26 +688,6 @@ function ModelSectionComponent({
           </div>
         </div>
         <div className="route-heading-actions">
-          <div className="local-router-toggle route-retry-toggle">
-            <Tooltip content="流式会话中断后自动重新连接的次数，保存并重启 Codex 后生效">
-              <span className="route-retry-label cursor-help">
-                <strong>会话重试</strong>
-              </span>
-            </Tooltip>
-            <NumberInput
-              size="sm"
-              value={config.streamMaxRetries}
-              minValue={0}
-              maxValue={100}
-              disabled={isBusy}
-              onChange={(value) => {
-                if (Number.isInteger(value) && value >= 0 && value <= 100 && value !== config.streamMaxRetries) {
-                  onConfigChange?.({ ...config, streamMaxRetries: value });
-                }
-              }}
-              aria-label="会话错误重试次数"
-            />
-          </div>
           <div className="local-router-toggle local-router-toggle-group">
             <div className="local-router-toggle-item">
               <strong>本地路由</strong>
@@ -973,6 +993,71 @@ function ModelSectionComponent({
                   </section>
                 );
               })}
+            </div>
+          </div>
+        </div>
+
+        <div className="route-auxiliary-bar">
+          <div className="route-auxiliary-misc">
+            <Tooltip content={miscModelTooltip} position="top">
+              <span className="route-auxiliary-label cursor-help">
+                <IconSparkles size={14} className="route-auxiliary-icon" aria-hidden="true" />
+                <strong>杂事模型</strong>
+                <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
+              </span>
+            </Tooltip>
+            <div className="route-auxiliary-combobox">
+              <ModelCombobox
+                aria-label="杂事模型"
+                value={config.miscModel}
+                placeholder={
+                  subagentModelOptions.length === 0
+                    ? "所有线路均暂无模型"
+                    : "请选择模型"
+                }
+                disabled={miscModelDisabled}
+                options={subagentModelOptions}
+                preferredProviderId={preferredProviderId}
+                onChange={(value) => {
+                  if (!subagentModelOptions.some((option) => option.value === value)) {
+                    return;
+                  }
+                  onConfigChange?.({ ...config, miscModel: value });
+                }}
+              />
+            </div>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={isBusy || config.miscModel.trim() === ""}
+              onClick={() => onConfigChange?.({ ...config, miscModel: "" })}
+              className="route-misc-model-reset"
+            >
+              恢复默认
+            </Button>
+          </div>
+
+          <div className="route-auxiliary-retry">
+            <div className="local-router-toggle route-retry-toggle">
+              <Tooltip content="流式会话中断后自动重新连接的次数，保存并重启 Codex 后生效" position="top">
+                <span className="route-retry-label cursor-help">
+                  <strong>会话重试</strong>
+                  <IconInfoCircle size={13} className="route-auxiliary-help" aria-hidden="true" />
+                </span>
+              </Tooltip>
+              <NumberInput
+                size="sm"
+                value={config.streamMaxRetries}
+                minValue={0}
+                maxValue={100}
+                disabled={isBusy}
+                onChange={(value) => {
+                  if (Number.isInteger(value) && value >= 0 && value <= 100 && value !== config.streamMaxRetries) {
+                    onConfigChange?.({ ...config, streamMaxRetries: value });
+                  }
+                }}
+                aria-label="会话错误重试次数"
+              />
             </div>
           </div>
         </div>

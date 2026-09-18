@@ -19,7 +19,6 @@ import { OperationsPanel } from "./OperationsPanel";
 import { canRepairMainProcessInjection, isMainProcessInjectionConfirmed } from "./runtimeStatusPresentation";
 import { repairOperationResult } from "./injectionRepair";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
-import { MiscModelCard } from "./MiscModelCard";
 import {
   getNotificationChannelDefinition,
 } from "./notifications";
@@ -1376,6 +1375,7 @@ export function App({
               isBusy={isBusy}
               busy={busy}
               showAccountUsageInHeader={config.showAccountUsageInHeader}
+              subagentModelOptions={subagentModelOptions}
               onToggleLocalRouter={handleToggleLocalRouter}
               onToggleRouteRequestLog={handleToggleRouteRequestLog}
               onSaveRoute={handleSaveRoute}
@@ -1415,16 +1415,6 @@ export function App({
                 onSubagentOptimizationChange={handleSubagentOptimizationChange}
               />
             </div>
-          </div>
-
-          {/* 杂事模型：整行排列 */}
-          <div className="full-row-section">
-            <MiscModelCard
-              config={config}
-              isBusy={isBusy}
-              subagentModelOptions={subagentModelOptions}
-              onConfigChange={handleConfigChange}
-            />
           </div>
 
           {/* Codex 功能策略：整行排列 */}
