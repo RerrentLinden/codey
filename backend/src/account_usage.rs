@@ -318,6 +318,22 @@ impl AccountUsageCache {
                 Ok(snapshot)
             }
             Err(error) => {
+                // 只记录实际刷新失败；缓存命中不重复写入，相同错误由日志模块去重。
+                // 使用顶层错误提示，不展开可能包含凭据或响应原文的错误链。
+                crate::error_log::record_failure_with_metadata_async(
+                    "official_account_usage_failed",
+                    "query_official_account_usage",
+                    error.to_string(),
+                    crate::error_log::FailureMetadata {
+                        stage: Some("account_usage.refresh".to_string()),
+                        recoverable: Some(true),
+                    },
+                    serde_json::json!({
+                        "forceRefresh": force_refresh,
+                        "consecutiveFailures": self.consecutive_failures.saturating_add(1),
+                    }),
+                )
+                .await;
                 self.record_failure(error.to_string(), Instant::now());
                 Err(error)
             }

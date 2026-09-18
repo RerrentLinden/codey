@@ -758,22 +758,29 @@ impl OfficialAccountStore {
             return Ok(());
         };
         let path = codex_home.join(CODEX_AUTH_FILE_NAME);
-        let Ok(bytes) = fs::read(&path) else {
-            return Ok(());
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("读取 Codex 登录信息失败：{}", path.display()));
+            }
         };
-        let Ok(auth) = serde_json::from_slice::<Value>(&bytes) else {
-            return Ok(());
-        };
+        let auth: Value = serde_json::from_slice(&bytes)
+            .with_context(|| format!("Codex 登录信息格式无效：{}", path.display()))?;
         if !auth_is_chatgpt_login(&auth) || !record.matches_auth(&auth) || auth == record.auth {
             return Ok(());
         }
-        let newer = match (
-            auth.get("last_refresh").and_then(Value::as_str),
-            record.last_refresh(),
-        ) {
-            (Some(theirs), Some(mine)) => theirs >= mine.as_str(),
-            (Some(_), None) => true,
-            _ => false,
+        let parse_refresh = |auth: &Value| {
+            auth.get("last_refresh")
+                .and_then(Value::as_str)
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        };
+        // 缺少可比较的刷新时间时保留 Codex 当前凭据，避免重新登录后
+        // 又被账号库中的旧令牌覆盖。带时区的时间按实际时刻比较。
+        let newer = match (parse_refresh(&auth), parse_refresh(&record.auth)) {
+            (Some(theirs), Some(mine)) => theirs >= mine,
+            _ => true,
         };
         if !newer {
             return Ok(());
@@ -1760,6 +1767,129 @@ mod tests {
         let written: Value =
             serde_json::from_slice(&fs::read(home.path().join("auth.json")).unwrap()).unwrap();
         assert_eq!(written, record.auth);
+    }
+
+    #[test]
+    fn launch_resolution_preserves_current_credentials_without_comparable_refresh_times() {
+        for (saved_refresh, current_refresh) in [
+            (Some("2026-01-01T00:00:00Z"), None),
+            (Some("2026-01-01T00:00:00Z"), Some("invalid")),
+            (None, None),
+            (Some("invalid"), Some("2026-01-01T00:00:00Z")),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            let store = OfficialAccountStore::new(dir.path());
+            let mut saved_auth = chatgpt_auth("acct_1", "a@example.com", "unused");
+            saved_auth["last_refresh"] = json!(saved_refresh);
+            let mut saved = OfficialAccountRecord::from_auth(saved_auth, 1).unwrap();
+            saved.route_name = Some("saved route".into());
+            saved.mark_invalid("old credentials rejected");
+            store.upsert(&saved).unwrap();
+            store.set_default_account_id(Some(&saved.id)).unwrap();
+            let mut current = saved.auth.clone();
+            current["tokens"]["access_token"] = json!("new-login-access");
+            current["tokens"]["refresh_token"] = json!("new-login-refresh");
+            if let Some(refresh) = current_refresh {
+                current["last_refresh"] = json!(refresh);
+            } else {
+                current.as_object_mut().unwrap().remove("last_refresh");
+            }
+            fs::write(
+                home.path().join("auth.json"),
+                serde_json::to_vec(&current).unwrap(),
+            )
+            .unwrap();
+
+            for _ in 0..2 {
+                assert_eq!(
+                    store.resolve_launch_login(home.path()).unwrap(),
+                    LaunchLoginResolution::Available {
+                        account_id: saved.id.clone()
+                    }
+                );
+                let stored = store.default_account().unwrap().unwrap();
+                assert_eq!(stored.auth, current);
+                assert!(!stored.invalid());
+                assert_eq!(stored.route_name, saved.route_name);
+                assert_eq!(
+                    OfficialAccountStore::read_codex_login(home.path())
+                        .unwrap()
+                        .unwrap()
+                        .auth,
+                    current
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn launch_resolution_compares_refresh_times_as_instants() {
+        for (current_refresh, use_current) in [
+            ("2026-01-01T08:00:00+08:00", false),
+            ("2025-12-31T23:00:00-03:00", true),
+            ("2026-01-01T09:00:00+08:00", true),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let home = TempDir::new().unwrap();
+            let store = OfficialAccountStore::new(dir.path());
+            let saved = OfficialAccountRecord::from_auth(
+                chatgpt_auth("acct_1", "a@example.com", "2026-01-01T01:00:00Z"),
+                1,
+            )
+            .unwrap();
+            store.upsert(&saved).unwrap();
+            store.set_default_account_id(Some(&saved.id)).unwrap();
+            let mut current = saved.auth.clone();
+            current["last_refresh"] = json!(current_refresh);
+            current["tokens"]["access_token"] = json!("current-access");
+            fs::write(
+                home.path().join("auth.json"),
+                serde_json::to_vec(&current).unwrap(),
+            )
+            .unwrap();
+
+            store.resolve_launch_login(home.path()).unwrap();
+            let expected = if use_current { current } else { saved.auth };
+            assert_eq!(store.default_account().unwrap().unwrap().auth, expected);
+            assert_eq!(
+                OfficialAccountStore::read_codex_login(home.path())
+                    .unwrap()
+                    .unwrap()
+                    .auth,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn launch_resolution_restores_missing_auth_but_preserves_unreadable_auth() {
+        let dir = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let store = OfficialAccountStore::new(dir.path());
+        let saved = OfficialAccountRecord::from_auth(
+            chatgpt_auth("acct_1", "a@example.com", "2026-01-01T00:00:00Z"),
+            1,
+        )
+        .unwrap();
+        store.upsert(&saved).unwrap();
+        store.set_default_account_id(Some(&saved.id)).unwrap();
+        store.resolve_launch_login(home.path()).unwrap();
+        let path = home.path().join("auth.json");
+        let restored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(restored, saved.auth);
+
+        fs::write(&path, b"{unfinished").unwrap();
+        let error = store.resolve_launch_login(home.path()).unwrap_err();
+        assert!(error.to_string().contains("Codex 登录信息格式无效"));
+        assert_eq!(fs::read(&path).unwrap(), b"{unfinished");
+
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let error = store.resolve_launch_login(home.path()).unwrap_err();
+        assert!(error.to_string().contains("读取 Codex 登录信息失败"));
+        assert!(path.is_dir());
+        assert_eq!(store.default_account().unwrap().unwrap().auth, saved.auth);
     }
 
     #[test]
