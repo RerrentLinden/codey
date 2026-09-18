@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 use anyhow::Context;
 use anyhow::Result;
 #[cfg(windows)]
@@ -441,6 +441,28 @@ pub(super) fn normalized_windows_path(path: &std::path::Path) -> String {
         .to_ascii_lowercase()
 }
 
+#[cfg(any(windows, test))]
+fn windows_codex_launch_environment(
+    environment: &[(String, String)],
+    home: &Path,
+) -> Result<Vec<(String, String)>> {
+    let home = std::path::absolute(home).context("解析 Codex 配置目录失败")?;
+    let home = home.to_str().context("Codex 配置目录不是有效 UTF-8")?;
+    let mut environment = environment
+        .iter()
+        .filter(|(name, _)| !name.eq_ignore_ascii_case("CODEX_HOME"))
+        .cloned()
+        .collect::<Vec<_>>();
+    // Store 激活不继承 Codey 进程的环境，显式使用准备配置时的同一目录。
+    environment.push(("CODEX_HOME".to_string(), home.to_string()));
+    Ok(environment)
+}
+
+#[cfg(any(windows, test))]
+fn requires_codex_home_environment(configured_home: Option<&std::ffi::OsStr>) -> bool {
+    configured_home.is_some_and(|home| !home.to_string_lossy().trim().is_empty())
+}
+
 #[cfg(windows)]
 pub(super) async fn spawn_windows_codex(
     app_dir: &std::path::Path,
@@ -453,6 +475,10 @@ pub(super) async fn spawn_windows_codex(
         !require_wrapper_environment || !environment.is_empty(),
         "Codex CLI 兼容入口缺少运行环境，已停止启动"
     );
+    let environment =
+        windows_codex_launch_environment(environment, crate::codex_config::codex_home())?;
+    let require_home_environment =
+        requires_codex_home_environment(std::env::var_os("CODEX_HOME").as_deref());
     if let Some(activation) =
         codey_runtime_core::launcher::build_packaged_activation(app_dir, debug_port, extra_args)
         && let codey_runtime_core::launcher::CodexLaunch::PackagedActivation {
@@ -461,39 +487,40 @@ pub(super) async fn spawn_windows_codex(
             ..
         } = activation
     {
-        let package_debug_session = if environment.is_empty() {
-            None
-        } else {
-            match WindowsPackageDebugSession::start(app_dir, environment) {
-                Ok(session) => Some(session),
-                Err(error) => {
-                    let package_name = windows_package_full_name(app_dir)
-                        .context("无法识别待清理的 Windows Store Codex 包全名")?;
-                    if let Err(cleanup) = disable_windows_packaged_environment(&package_name) {
-                        return Err(startup_activation_error_after_cleanup(
-                            error,
-                            Ok(()),
-                            Err(cleanup),
-                        ));
-                    }
-                    if windows_package_was_replaced(
-                        &package_name,
-                        &registered_windows_packages(&package_name)?,
-                    ) {
-                        return Err(WindowsPackageChanged.into());
-                    }
-                    if require_wrapper_environment {
-                        return Err(error)
-                            .context("Codex CLI 兼容入口无法应用运行环境，已停止启动");
-                    }
-                    error_log::record_failure(
-                        "compatibility_fallback",
-                        "enable_windows_packaged_cli_environment",
-                        format!("{error:#}"),
-                        serde_json::json!({ "appPath": app_dir }),
-                    );
-                    None
+        let package_debug_session = match WindowsPackageDebugSession::start(app_dir, &environment) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                let package_name = windows_package_full_name(app_dir)
+                    .context("无法识别待清理的 Windows Store Codex 包全名")?;
+                if let Err(cleanup) = disable_windows_packaged_environment(&package_name) {
+                    return Err(startup_activation_error_after_cleanup(
+                        error,
+                        Ok(()),
+                        Err(cleanup),
+                    ));
                 }
+                if windows_package_was_replaced(
+                    &package_name,
+                    &registered_windows_packages(&package_name)?,
+                ) {
+                    return Err(WindowsPackageChanged.into());
+                }
+                if require_wrapper_environment {
+                    return Err(error)
+                        .context("Codex CLI 兼容入口无法应用运行环境，已停止启动");
+                }
+                if require_home_environment {
+                    return Err(error).context(
+                        "Windows Store Codex 无法应用 CODEX_HOME；为避免读取其他配置目录，已停止启动",
+                    );
+                }
+                error_log::record_failure(
+                    "compatibility_fallback",
+                    "enable_windows_packaged_cli_environment",
+                    format!("{error:#}"),
+                    serde_json::json!({ "appPath": app_dir }),
+                );
+                None
             }
         };
         let environment_applied = package_debug_session.is_some();
@@ -1452,5 +1479,57 @@ mod compatibility_tests {
         ])
         .unwrap();
         assert_eq!(block, "A=1\0B=two\0\0".encode_utf16().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn windows_codex_environment_keeps_the_prepared_config_home() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("自定义 配置").join(".codex");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("config.toml"), "model = 'custom-model'\n").unwrap();
+        let environment = windows_codex_launch_environment(
+            &[
+                ("CODEY_TEST_WRAPPER".into(), "enabled".into()),
+                ("Codex_Home".into(), "stale-home".into()),
+                ("CODEX_HOME".into(), "another-home".into()),
+            ],
+            &home,
+        )
+        .unwrap();
+        let block = String::from_utf16(&windows_environment_block(&environment).unwrap()).unwrap();
+        let homes = block
+            .split('\0')
+            .filter_map(|entry| entry.split_once('='))
+            .filter(|(name, _)| name.eq_ignore_ascii_case("CODEX_HOME"))
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        assert_eq!(homes, vec![home.to_str().unwrap()]);
+        assert_eq!(
+            std::fs::read_to_string(Path::new(homes[0]).join("config.toml")).unwrap(),
+            "model = 'custom-model'\n"
+        );
+        assert!(block.contains("CODEY_TEST_WRAPPER=enabled\0"));
+        assert!(block.ends_with("\0\0"));
+    }
+
+    #[test]
+    fn windows_codex_environment_resolves_relative_home_before_activation() {
+        let relative = Path::new("relative-codex-home");
+        let environment = windows_codex_launch_environment(&[], relative).unwrap();
+        let home = Path::new(&environment[0].1);
+        assert!(home.is_absolute());
+        assert_eq!(home, std::env::current_dir().unwrap().join(relative));
+    }
+
+    #[test]
+    fn windows_custom_codex_home_requires_environment_delivery() {
+        use std::ffi::OsStr;
+
+        for value in [None, Some(OsStr::new("")), Some(OsStr::new("  "))] {
+            assert!(!requires_codex_home_environment(value));
+        }
+        for value in [r"D:\Codex 配置", "relative-codex-home"] {
+            assert!(requires_codex_home_environment(Some(OsStr::new(value))));
+        }
     }
 }
