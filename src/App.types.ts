@@ -256,6 +256,7 @@ export type InlineResult = {
 export type Confirmation = {
   action:
     | "restart"
+    | "repair-codex-config"
     | "install-update"
     | "delete-notification-channel"
     | "delete-route"

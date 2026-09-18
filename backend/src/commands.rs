@@ -11,6 +11,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+mod config_repair;
 mod diagnostics;
 mod models;
 mod official_accounts;
@@ -1252,6 +1253,7 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         "restart_codey" => schedule_restart_codey_runtime(state).await,
         "clear_diagnostic_storage" => clear_diagnostic_storage(state, &args).await,
         "repair_codex_overlays" => crate::overlay_recovery::repair().await,
+        "repair_codex_config" => config_repair::repair_codex_config(state).await,
         "repair_main_process_injection" => {
             runtime::schedule_main_process_injection_repair(state).await
         }

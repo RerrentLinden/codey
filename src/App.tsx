@@ -132,6 +132,8 @@ export function App({
     useState<FastContextToolsStatus>(UNKNOWN_FAST_CONTEXT_TOOLS_STATUS);
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [configRepairNotice, setConfigRepairNotice] = useState<{ tone: "info" | "success" | "error"; text: string } | null>(null);
   const [injectionRepairRequested, setInjectionRepairRequested] = useState(false);
   const popupContainer = modalContainer ?? null;
   const noticeController = useAppNoticeController();
@@ -285,6 +287,7 @@ export function App({
   }, []);
 
   async function load() {
+    setLoadFailed(false);
     try {
       const result = await invoke<{
         config: Config;
@@ -296,6 +299,7 @@ export function App({
       }>("load_codey_config");
       setPersistedConfig(result.config);
       setProviderStatus(result.providerStatus ?? null);
+      if (!result.providerStatus) throw new Error("未能读取当前服务配置，请重新检查");
       if (typeof result.officialAccountAvailable === "boolean") {
         setStatus((current) => ({
           ...current,
@@ -324,6 +328,7 @@ export function App({
         });
       }
     } catch (error) {
+      setLoadFailed(true);
       setNotice({ tone: "error", text: errorText(error) });
     }
   }
@@ -975,6 +980,44 @@ export function App({
     });
   }
 
+  function askRepairCodexConfig() {
+    if (isBusy) return;
+    setConfirmation({
+      action: "repair-codex-config",
+      title: "修复 Codex 配置？",
+      description: "将检查配置文件及相关路径，修改已有配置前自动备份，并修复能够确认的问题。修复成功后，请从 Codey 重启 Codex 使修改生效。",
+      confirmLabel: "确认修复",
+      run: () => void repairCodexConfig(),
+    });
+  }
+
+  async function repairCodexConfig() {
+    await runOperation("repair-codex-config", async () => {
+      const report = (notice: { tone: "info" | "success" | "error"; text: string }) => {
+        setConfigRepairNotice(notice);
+        setNotice(notice);
+      };
+      report({ tone: "info", text: "正在检查并修复 Codex 配置…" });
+      try {
+        const result = await invoke<{
+          message: string;
+          configPath: string;
+          repaired: boolean;
+          backupPath?: string | null;
+        }>("repair_codex_config");
+        const summary = result.message || (result.repaired
+          ? "Codex 配置已修复"
+          : "Codex 配置检查通过，无需修改");
+        report({
+          tone: "success",
+          text: [result.repaired ? "修复成功，请从 Codey 重启 Codex 使修改生效。" : null, summary, `配置文件：${result.configPath}`, result.backupPath ? `备份文件：${result.backupPath}` : null].filter(Boolean).join("\n"),
+        });
+      } catch (error) {
+        report({ tone: "error", text: `Codex 配置修复未完成：${errorText(error)}。请查看 Codey 错误日志；连接中断时可重新检查执行结果。` });
+      }
+    });
+  }
+
   async function analyzeDiagnosticStorage(target: DiagnosticStorageTarget) {
     await runOperation("clear-diagnostic-storage", async () => {
       const title = target === "trace" ? "Trace 日志" : "Crashpad";
@@ -1111,15 +1154,30 @@ export function App({
           <GitBranch size={17} />
         </div>
         <div>
-          <strong>正在载入 Codey</strong>
+          <strong>{loadFailed ? "Codey 加载失败" : "正在载入 Codey"}</strong>
           <p>
             <NoticeLoadingText controller={noticeController} />
           </p>
+          {loadFailed && (
+            <div className="flex flex-wrap gap-2 mt-3">
+              <Button variant="outline" size="sm" disabled={isBusy} onClick={askRepairCodexConfig}>
+                {busy === "repair-codex-config" ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <RefreshCw aria-hidden="true" />}
+                {busy === "repair-codex-config" ? "检查修复中…" : "修复 Codex 配置"}
+              </Button>
+              <Button variant="secondary" size="sm" disabled={isBusy} onClick={() => void runOperation("reload-config", load)}>
+                重新检查
+              </Button>
+            </div>
+          )}
         </div>
-        <LoaderCircle
+        {!loadFailed && <LoaderCircle
           className="animate-spin loading-animate-spin"
           size={16}
           aria-hidden="true"
+        />}
+        <ConfirmationDialogHost
+          container={popupContainer}
+          controller={confirmationController}
         />
       </main>
     );
@@ -1356,6 +1414,8 @@ export function App({
             pluginMarketplaceStatus={pluginMarketplaceStatus}
             onRepairPluginMarketplace={handleRepairPluginMarketplace}
             onRepairMainProcessInjection={handleRepairMainProcessInjection}
+            onRepairCodexConfig={askRepairCodexConfig}
+            configRepairNotice={configRepairNotice}
             injectionRepairing={injectionRepairRequested || busy === "repair-main-process-injection"}
             onRestart={handleRestartCodex}
             restartStatusUnknown={Boolean(restartStatusError)}

@@ -81,6 +81,8 @@ type OperationsPanelProps = {
   pluginMarketplaceStatus: PluginMarketplaceStatus | null;
   onRepairPluginMarketplace: () => void;
   onRepairMainProcessInjection: () => void;
+  onRepairCodexConfig: () => void;
+  configRepairNotice?: { tone: "info" | "success" | "error"; text: string } | null;
   injectionRepairing?: boolean;
   onRestart: () => void;
   showRestartAction?: boolean;
@@ -96,6 +98,8 @@ function OperationsPanelComponent({
   pluginMarketplaceStatus,
   onRepairPluginMarketplace,
   onRepairMainProcessInjection,
+  onRepairCodexConfig,
+  configRepairNotice,
   injectionRepairing = false,
   onRestart,
   showRestartAction = true,
@@ -552,6 +556,24 @@ function OperationsPanelComponent({
                     </div>
                   </div>
                   <div className="expanded-card-actions">
+                    {expandedStatusCard.showInjectionScripts && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={isBusy}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          onRepairCodexConfig();
+                        }}
+                      >
+                        {busy === "repair-codex-config" ? (
+                          <LoaderCircle className="animate-spin" aria-hidden="true" />
+                        ) : (
+                          <RefreshCw aria-hidden="true" />
+                        )}
+                        {busy === "repair-codex-config" ? "检查修复中…" : "修复 Codex 配置"}
+                      </Button>
+                    )}
                     <Badge variant={expandedStatusCard.tone}>
                       {expandedStatusCard.label}
                     </Badge>
@@ -559,6 +581,11 @@ function OperationsPanelComponent({
                 </div>
 
                 <div className="expanded-card-body">
+                  {expandedStatusCard.showInjectionScripts && configRepairNotice && (
+                    <p role="status" className={`mb-3 whitespace-pre-line break-words text-sm ${configRepairNotice.tone === "error" ? "text-danger" : "text-[var(--codey-text-secondary)]"}`}>
+                      {configRepairNotice.text}
+                    </p>
+                  )}
                   {expandedStatusCard.metrics.length > 0 && (
                     <div className="expanded-card-metrics">
                       {expandedStatusCard.metrics.map((metric) => {

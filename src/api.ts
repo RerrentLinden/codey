@@ -40,6 +40,7 @@ export const CODEY_API_COMMANDS = [
   "plugin_marketplace_status",
   "repair_plugin_marketplace",
   "repair_main_process_injection",
+  "repair_codex_config",
 ] as const;
 
 export type CodeyApiCommand = (typeof CODEY_API_COMMANDS)[number];
