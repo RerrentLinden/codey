@@ -4,6 +4,7 @@ mod codex_config;
 mod codex_config_guidance;
 mod codex_provider;
 mod codex_startup_patch;
+mod codey_plugins;
 mod commands;
 mod config;
 mod crashpad_pending_guard;
@@ -152,6 +153,14 @@ fn build_async_runtime() -> Result<tokio::runtime::Runtime> {
     builder.enable_all().build().map_err(anyhow::Error::from)
 }
 
+struct PluginShutdownGuard;
+
+impl Drop for PluginShutdownGuard {
+    fn drop(&mut self) {
+        codey_plugins::shutdown();
+    }
+}
+
 async fn run(ui: NativeUpdateUi) -> Result<()> {
     // Config load, ledger read and HTTP client construction (which loads the
     // system root store) are synchronous; keep them off the async workers.
@@ -160,11 +169,21 @@ async fn run(ui: NativeUpdateUi) -> Result<()> {
         let state = AppState::default();
         let configured_codex_app_path = state.config.blocking_read().codex_app_path.clone();
         error_log::refresh_codex_app_version(None, Some(&configured_codex_app_path));
+        let plugin_root = codey_runtime_core::paths::default_app_state_dir().join("codey-plugins");
+        if let Err(error) = codey_plugins::initialize(plugin_root) {
+            error_log::record_failure(
+                "plugin_initialization_failed",
+                "initialize_codey_plugins",
+                error,
+                serde_json::json!({}),
+            );
+        }
         state
     })
     .await
     .map(Arc::new)
     .context("初始化 Codey 状态的任务异常退出")?;
+    let _plugin_shutdown = PluginShutdownGuard;
     let codex_home = codex_config::codex_home();
     let local_router_enabled = state.config.read().await.local_router_enabled;
     if let Err(error) =

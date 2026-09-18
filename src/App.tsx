@@ -16,6 +16,7 @@ import { ModelPickerDialog } from "./AppDialogs";
 import { FeaturePolicyCard, SubagentPolicyCard } from "./FeaturePolicyCard";
 import { ModelSection } from "./ModelSection";
 import { OperationsPanel } from "./OperationsPanel";
+import { CodeyPluginsSection } from "./CodeyPluginsSection";
 import { canRepairMainProcessInjection, isMainProcessInjectionConfirmed } from "./runtimeStatusPresentation";
 import { repairOperationResult } from "./injectionRepair";
 import { PromptOptimizationCard } from "./PromptOptimizationCard";
@@ -1493,6 +1494,10 @@ export function App({
               onChannelChange={handleNotificationChannelChange}
               onRequestRemoveChannel={handleRequestRemoveNotificationChannel}
             />
+          </div>
+
+          <div className="full-row-section">
+            <CodeyPluginsSection container={popupContainer} />
           </div>
 
         </div>

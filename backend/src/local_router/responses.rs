@@ -1699,6 +1699,30 @@ impl RouterServer {
                 return Ok(());
             }
         };
+        if crate::codey_plugins::has_request_plugins() {
+            let metadata = json!({
+                "requestId": current_router_request_id(),
+                "routeId": resolved.provider_id,
+                "accountId": resolved.route.official_auth.as_ref().map(|auth| auth.account_id.as_str()),
+                "requestedModel": resolved.requested_model,
+                "model": resolved.upstream_model,
+                "protocol": bridge.upstream_protocol().label(),
+                "subagent": subagent_request,
+            });
+            let visible_headers = headers
+                .iter()
+                .filter(|(name, _)| crate::codey_plugins::allowed_header_name(name.as_str()))
+                .filter_map(|(name, value)| {
+                    value
+                        .to_str()
+                        .ok()
+                        .map(|value| (name.as_str().to_owned(), value.to_owned()))
+                })
+                .collect();
+            let patches =
+                crate::codey_plugins::dispatch_request_headers(&metadata, &visible_headers);
+            apply_codey_plugin_header_patches(&mut headers, patches);
+        }
         // 请求体的模型名已还原为上游模型名，路由提示头里的模型名必须保持一致；
         // HTTP、WebSocket 握手和压缩请求共用这份头。
         align_routing_hint_model(&mut headers, &resolved.upstream_model);
@@ -2281,6 +2305,34 @@ impl RouterServer {
             }
         };
         Ok(Some(response))
+    }
+}
+
+pub(crate) fn apply_codey_plugin_header_patches(
+    headers: &mut HeaderMap,
+    patches: Vec<crate::codey_plugins::HeaderPatch>,
+) {
+    let parsed = patches
+        .into_iter()
+        .map(|patch| {
+            if !crate::codey_plugins::allowed_header_name(&patch.name) {
+                return None;
+            }
+            let name = HeaderName::from_bytes(patch.name.as_bytes()).ok()?;
+            let value = match patch.value {
+                Some(value) => Some(HeaderValue::from_str(&value).ok()?),
+                None => None,
+            };
+            Some((name, value))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(parsed) = parsed else { return };
+    for (name, value) in parsed {
+        if let Some(value) = value {
+            headers.insert(name, value);
+        } else {
+            headers.remove(name);
+        }
     }
 }
 

@@ -14,6 +14,7 @@ use std::time::Duration;
 mod config_repair;
 mod diagnostics;
 mod models;
+mod native_plugins;
 mod official_accounts;
 mod plugins;
 mod prompt_optimization;
@@ -1335,6 +1336,14 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
         },
         "plugin_marketplace_status" => plugin_marketplace_status().await,
         "repair_plugin_marketplace" => repair_plugin_marketplace().await,
+        "list_codey_plugins" => native_plugins::invoke(command, &args).await,
+        "select_codey_plugin_package" => native_plugins::invoke(command, &args).await,
+        "inspect_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "install_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "set_codey_plugin_enabled" => native_plugins::invoke(command, &args).await,
+        "configure_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "uninstall_codey_plugin" => native_plugins::invoke(command, &args).await,
+        "invoke_codey_plugin" => native_plugins::invoke(command, &args).await,
         _ => Err(format!("未知 Codey API 命令：{command}")),
     };
     result.unwrap_or_else(api_error_message)

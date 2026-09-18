@@ -373,6 +373,7 @@ dependencies = [
  "base64",
  "bytes",
  "chrono",
+ "codey-plugin-sdk",
  "codey-runtime-core",
  "directories",
  "dispatch2",
@@ -381,6 +382,7 @@ dependencies = [
  "futures-util",
  "hyper-util",
  "libc",
+ "libloading",
  "memchr",
  "objc2",
  "objc2-app-kit",
@@ -402,7 +404,31 @@ dependencies = [
  "webpki-roots 0.26.11",
  "windows 0.58.0",
  "winres",
+ "zip",
  "zstd",
+]
+
+[[package]]
+name = "codey-plugin-header-demo"
+version = "0.1.0"
+dependencies = [
+ "codey-plugin-sdk",
+]
+
+[[package]]
+name = "codey-plugin-sdk"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "fs2",
+ "libloading",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "uuid",
+ "zip",
 ]
 
 [[package]]
@@ -1616,6 +1642,16 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
+
+[[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
 
 [[package]]
 name = "libm"

@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "title": "请求头示例配置",
+  "properties": {
+    "value": {
+      "type": "string",
+      "title": "请求头值",
+      "description": "写入 X-Plugin-Demo 的文本，使用可打印 ASCII 字符。",
+      "default": "hello-codey",
+      "minLength": 1,
+      "maxLength": 128
+    }
+  },
+  "required": ["value"],
+  "additionalProperties": false
+}

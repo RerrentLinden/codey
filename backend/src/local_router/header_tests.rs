@@ -180,3 +180,53 @@ fn response_header_logs_hide_credentials_but_keep_route_tokens() {
     assert!(text.contains("set-cookie: [REDACTED]"));
     assert!(text.contains("authorization: [REDACTED]"));
 }
+
+#[test]
+fn codey_plugin_header_patches_preserve_authentication_and_support_removal() {
+    let mut headers = HeaderMap::new();
+    headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer fixture"));
+    headers.insert("x-plugin-demo", HeaderValue::from_static("old"));
+    headers.insert("x-remove-demo", HeaderValue::from_static("remove"));
+    super::responses::apply_codey_plugin_header_patches(
+        &mut headers,
+        vec![
+            crate::codey_plugins::HeaderPatch {
+                name: "x-plugin-demo".into(),
+                value: Some("new".into()),
+            },
+            crate::codey_plugins::HeaderPatch {
+                name: "x-remove-demo".into(),
+                value: None,
+            },
+        ],
+    );
+    assert_eq!(headers[AUTHORIZATION], "Bearer fixture");
+    assert_eq!(headers["x-plugin-demo"], "new");
+    assert!(!headers.contains_key("x-remove-demo"));
+}
+
+#[test]
+fn codey_plugin_invalid_patch_does_not_partially_change_headers() {
+    for (name, value) in [
+        ("authorization", "Bearer changed"),
+        ("x-plugin-other", "bad\r\nvalue"),
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-plugin-demo", HeaderValue::from_static("original"));
+        let original = headers.clone();
+        super::responses::apply_codey_plugin_header_patches(
+            &mut headers,
+            vec![
+                crate::codey_plugins::HeaderPatch {
+                    name: "x-plugin-demo".into(),
+                    value: Some("changed".into()),
+                },
+                crate::codey_plugins::HeaderPatch {
+                    name: name.into(),
+                    value: Some(value.into()),
+                },
+            ],
+        );
+        assert_eq!(headers, original);
+    }
+}

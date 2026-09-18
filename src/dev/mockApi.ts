@@ -504,6 +504,18 @@ if (import.meta.env.DEV) {
       // Wait a tiny bit to simulate network delay
       await new Promise((resolve) => setTimeout(resolve, 300));
 
+      if (command === "list_codey_plugins") {
+        const pluginPreview = new URLSearchParams(window.location.search).get("plugins");
+        if (pluginPreview === "error") throw new Error("预览：插件列表暂时不可用，请稍后刷新。");
+        const plugins = pluginPreview === "installed" ? [{
+          id: "dev.codey.header-demo", name: "请求头示例", version: "0.1.0",
+          description: "演示独立插件的请求头扩展能力。", enabled: false, status: "disabled",
+          config: {}, configSchema: { type: "object", properties: {} }, capabilities: ["request.beforeSend"],
+        }] : [];
+        return { plugins, platform: previewClientPlatform, arch: "aarch64" };
+      }
+      if (command === "select_codey_plugin_package") return null;
+
       if (command === "load_codey_config") {
         if (previewConfigLoadFailed) throw new Error("预览：配置路径不存在");
         return {
