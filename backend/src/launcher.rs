@@ -1897,7 +1897,7 @@ impl CodeyRuntime {
             validated_router_subagent_runtime_config(
                 config,
                 self.subagent_route_catalog_installed,
-                &codex_home(),
+                codex_home(),
             )
         } else {
             Ok(native_subagent_runtime_config(config))

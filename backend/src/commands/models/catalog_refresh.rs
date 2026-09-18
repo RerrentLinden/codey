@@ -46,16 +46,17 @@ fn refresh_model_catalog_or_fallback_at(
             }
             // Freshly generated catalogs already include both overrides. Only
             // a reused catalog needs a separate, single read/write pass.
-            if reused_cached_catalog && available {
-                if let Err(error) = model_catalog::apply_catalog_overrides(
+            if reused_cached_catalog
+                && available
+                && let Err(error) = model_catalog::apply_catalog_overrides(
                     home,
                     model_catalog::CatalogOverrides {
                         contexts: &runtime_model_contexts,
                         reasoning_efforts: &runtime_model_reasoning_efforts,
                     },
-                ) {
-                    return Err(rollback_model_catalog_snapshot(snapshot, error.to_string()));
-                }
+                )
+            {
+                return Err(rollback_model_catalog_snapshot(snapshot, error.to_string()));
             }
             Ok(ModelCatalogRefresh { fallback, snapshot })
         }

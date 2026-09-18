@@ -661,8 +661,7 @@ mod tests {
 
         let error = complete_recovery_handshake(&mut worker, &state)
             .await
-            .err()
-            .expect("invalid recovery response must fail the handshake");
+            .expect_err("invalid recovery response must fail the handshake");
         assert!(
             format!("{error:#}").contains("无效 initialize 响应"),
             "{error:#}"

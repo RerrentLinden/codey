@@ -3036,8 +3036,12 @@ wire_api = "responses"
         .parse::<DocumentMut>()
         .unwrap();
     assert_eq!(
-        model_catalog_override["model_catalog_json"].as_str(),
-        Some("/user/catalog.json")
+        Path::new(
+            model_catalog_override["model_catalog_json"]
+                .as_str()
+                .unwrap()
+        ),
+        home.ancestors().last().unwrap().join("user/catalog.json")
     );
     assert!(
         applied
