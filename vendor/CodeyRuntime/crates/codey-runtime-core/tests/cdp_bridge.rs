@@ -155,7 +155,7 @@ fn pick_injectable_codex_page_target_accepts_chatgpt_desktop_page() {
 }
 
 #[test]
-fn pick_injectable_codex_page_target_accepts_chatgpt_desktop_error_page() {
+fn pick_injectable_codex_page_target_rejects_chatgpt_desktop_error_page() {
     let targets = vec![target(
         "chatgpt-error",
         "page",
@@ -164,10 +164,52 @@ fn pick_injectable_codex_page_target_accepts_chatgpt_desktop_error_page() {
         Some("ws://chatgpt-error"),
     )];
 
-    let picked = pick_injectable_codex_page_target(&targets)
-        .expect("ChatGPT desktop error page should be selected");
+    assert!(!is_primary_codex_page_target(&targets[0]));
+    pick_injectable_codex_page_target(&targets)
+        .expect_err("ChatGPT desktop error page must not be selected for injection");
+}
 
-    assert_eq!(picked.id, "chatgpt-error");
+#[test]
+fn data_html_page_with_codex_in_title_or_content_is_not_a_codex_target() {
+    for (title, url) in [
+        ("Codex", "data:text/html,%3Ctitle%3EError%3C/title%3E"),
+        (
+            "ChatGPT",
+            "data:text/html;charset=utf-8,%3Cp%3ECodex%20failed%20to%20start%3C/p%3E",
+        ),
+        ("Codex", " DATA:TEXT/HTML,%3Cp%3EError%3C/p%3E "),
+    ] {
+        let targets = vec![target("error", "page", title, url, Some("ws://error"))];
+
+        assert!(!is_primary_codex_page_target(&targets[0]), "{url}");
+        pick_injectable_codex_page_target(&targets)
+            .expect_err("HTML content and title must not make a data page an injection target");
+    }
+}
+
+#[test]
+fn primary_target_selection_skips_data_html_errors_before_normal_pages() {
+    for url in [
+        "https://chatgpt.com/",
+        "https://chat.openai.com/",
+        "app://-/index.html",
+    ] {
+        let targets = vec![
+            target(
+                "error",
+                "page",
+                "ChatGPT",
+                "data:text/html;charset=utf-8,%3Cp%3ECodex%20failed%20to%20start%3C/p%3E",
+                Some("ws://error"),
+            ),
+            target("main", "page", "ChatGPT", url, Some("ws://main")),
+        ];
+
+        let selected = pick_injectable_codex_page_target(&targets)
+            .expect("normal application page should be selected after the error page");
+
+        assert_eq!(selected.id, "main", "{url}");
+    }
 }
 
 #[test]

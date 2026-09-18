@@ -2075,9 +2075,8 @@
     const declarationPattern =
       /(?<![$\w.])([$A-Z_a-z][$\w]*)(\s*=\s*)(["'`])gpt-5\.6-luna\3/g;
     const declarations = [...source.matchAll(declarationPattern)];
-    if (declarations.length === 0) {
-      throw new Error("Codey misc model Luna constants not found");
-    }
+    // 仅含模型引用或使用新版结构的 chunk 无需改写，保留 Codex 原生行为。
+    if (declarations.length === 0) return source;
     let patched = "";
     let lastIndex = 0;
     for (const declaration of declarations) {
