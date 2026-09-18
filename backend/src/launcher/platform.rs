@@ -506,8 +506,7 @@ pub(super) async fn spawn_windows_codex(
                     return Err(WindowsPackageChanged.into());
                 }
                 if require_wrapper_environment {
-                    return Err(error)
-                        .context("Codex CLI 兼容入口无法应用运行环境，已停止启动");
+                    return Err(error).context("Codex CLI 兼容入口无法应用运行环境，已停止启动");
                 }
                 if require_home_environment {
                     return Err(error).context(

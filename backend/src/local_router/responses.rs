@@ -1706,8 +1706,9 @@ impl RouterServer {
         // payload conversion, and credentials have passed local checks. A
         // rejected switch must leave the prior route available for a retry.
         // 自动复核是独立请求，复用主会话标识时也不能更改主会话的线路。
-        let auto_review_request = model_id::equal(&resolved.upstream_model, CODEX_AUTO_REVIEW_MODEL)
-            || resolved.fallback_reason.as_deref() == Some("auto_review_misc_model");
+        let auto_review_request =
+            model_id::equal(&resolved.upstream_model, CODEX_AUTO_REVIEW_MODEL)
+                || resolved.fallback_reason.as_deref() == Some("auto_review_misc_model");
         if !auto_review_request {
             let refresh_session_binding = route_hint.is_some() && !subagent_request;
             self.bindings
