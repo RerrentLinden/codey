@@ -609,8 +609,8 @@ pub(crate) struct RouterSnapshot {
     pub(crate) default_official_provider: Option<String>,
     pub(crate) default_model: String,
     /// 杂事模型。仅在没有任何线路支持 `codex-auto-review` 时用于自动复核
-    /// 请求，解析失败时保持原有报错。
-    pub(crate) misc_model: String,
+    /// 请求。构建快照时解析当前线路，避免请求时通过历史别名改换上游。
+    pub(crate) misc_model: Option<AliasTarget>,
     pub(crate) request_log_backend: RouteRequestLogBackend,
     pub(crate) request_log_catalog: RequestLogCatalog,
 }
@@ -711,7 +711,10 @@ impl RouterSnapshot {
             model_ids,
             default_official_provider,
             default_model: config.default_model().unwrap_or_default().to_string(),
-            misc_model: config.misc_model.trim().to_string(),
+            misc_model: config.misc_model_target().map(|target| AliasTarget {
+                provider_id: target.provider_id,
+                model: target.upstream_model,
+            }),
             request_log_backend: config.route_request_log.backend,
             request_log_catalog: RequestLogCatalog::from_config(config),
         }
@@ -854,20 +857,19 @@ impl RouterSnapshot {
         // binding identified a route above. A capable bound third-party route
         // still wins before this fallback.
         // 多账号并存时优先用默认账号，避免复核请求随机消耗其它账号的额度。
-        let auto_review_route = self
-            .default_official_provider
-            .as_deref()
-            .and_then(|provider_id| self.routes.get(provider_id))
-            .filter(|target| {
-                target.official_account && target.models.contains(CODEX_AUTO_REVIEW_MODEL)
-            })
-            .or_else(|| {
-                self.routes.values().find(|target| {
+        if model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
+            && let Some(official_route) = self
+                .default_official_provider
+                .as_deref()
+                .and_then(|provider_id| self.routes.get(provider_id))
+                .filter(|target| {
                     target.official_account && target.models.contains(CODEX_AUTO_REVIEW_MODEL)
                 })
-            });
-        if model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
-            && let Some(official_route) = auto_review_route
+                .or_else(|| {
+                    self.routes.values().find(|target| {
+                        target.official_account && target.models.contains(CODEX_AUTO_REVIEW_MODEL)
+                    })
+                })
         {
             return self.target_for_route_model(
                 &official_route.provider_id,
@@ -894,11 +896,10 @@ impl RouterSnapshot {
         // 没有任何线路支持自动复核时，用杂事模型承接这一请求。这里保留
         // 请求里的原始模型名，让下游的日志与提示头仍能看出这是一次回退。
         if model_id::equal(model, CODEX_AUTO_REVIEW_MODEL)
-            && !self.misc_model.is_empty()
-            && !model_id::equal(&self.misc_model, CODEX_AUTO_REVIEW_MODEL)
-            && let Ok(mut selection) = self.target_for_request(&self.misc_model, None, None)
+            && let Some(misc) = &self.misc_model
+            && let Ok(mut selection) =
+                self.target_for_route_model(&misc.provider_id, &misc.model, requested_model)
         {
-            selection.requested_model = requested_model.to_string();
             selection.fallback_reason = Some("auto_review_misc_model".to_string());
             return Ok(selection);
         }

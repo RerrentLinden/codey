@@ -29,6 +29,10 @@ function MiscModelCardComponent({
     ? routeProviderId(preferredProfile)
     : undefined;
   const controlsDisabled = isBusy || subagentModelOptions.length === 0;
+  const selectedModelKey = config.miscModel.trim().toLowerCase();
+  const selectionUnavailable = selectedModelKey !== "" &&
+    !subagentModelOptions.some((option) =>
+      option.value.toLowerCase() === selectedModelKey);
 
   return (
     <section className="secondary-section misc-model-section" aria-labelledby="misc-model-title">
@@ -40,7 +44,7 @@ function MiscModelCardComponent({
             </span>
             <div className="module-card-titles">
               <h2 id="misc-model-title">杂事模型</h2>
-              <p>统一指定会话命名、Git 提交消息与自动复核回退使用的模型。</p>
+              <p>统一指定会话命名、Git 提交消息、环境建议与自动复核回退使用的模型。</p>
             </div>
           </div>
           <div className="module-card-action">
@@ -83,7 +87,10 @@ function MiscModelCardComponent({
           <div className="subagent-policy-callout">
             <IconInfoCircle size={14} className="subagent-callout-icon" aria-hidden="true" />
             <div className="subagent-callout-text">
-              留空时保持 Codex 默认行为：会话命名和 Git 提交消息使用内置的 Luna 模型，自动复核在没有可用线路时直接报错。选择模型后，会话命名、Git 提交消息和自动复核回退都改用它；只要任一线路支持 codex-auto-review，自动复核仍优先使用专用模型。会话命名与 Git 提交消息的变更需要重启 Codex 生效。
+              留空时沿用默认选择：会话命名优先使用官方 Luna，第三方线路使用已启用的 Luna 或默认模型；Git 提交消息和环境建议沿用内置模型。选择模型后，这些功能及自动复核回退使用所选模型；只要任一线路声明支持 codex-auto-review，自动复核仍使用专用模型。自动复核回退在保存后生效，其余功能需要重启 Codex，且依赖当前版本的主进程补丁支持。
+              {selectionUnavailable
+                ? " 当前选择不在可用模型列表中，请重新选择；保存后若仍无法解析，将沿用默认行为，自动复核回退不可用。"
+                : ""}
               {config.localRouterEnabled
                 ? ""
                 : " 本地路由已关闭，自动复核回退不会生效。"}

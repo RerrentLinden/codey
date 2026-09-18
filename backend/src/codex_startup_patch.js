@@ -2071,24 +2071,19 @@
   // 变量名，也不影响同一 chunk 里其它同名导出。
   const patchCodexMiscModelConstants = (source) => {
     if (!miscModelId) return source;
-    // 打包后的 Luna 常量是一个普通标识符赋值，且同一标识符在同一 chunk 里
-    // 只声明一次。按匹配位置精确切片，避免变量名尾部重合造成误替换。
+    // 按匹配位置切片；不同作用域可以复用同一个压缩变量名。
     const declarationPattern =
-      /(?<![$\w.])([$A-Z_a-z][$\w]*)=(`gpt-5\.6-luna`)/g;
+      /(?<![$\w.])([$A-Z_a-z][$\w]*)(\s*=\s*)(["'`])gpt-5\.6-luna\3/g;
     const declarations = [...source.matchAll(declarationPattern)];
     if (declarations.length === 0) {
       throw new Error("Codey misc model Luna constants not found");
-    }
-    const names = new Set(declarations.map((declaration) => declaration[1]));
-    if (names.size !== declarations.length) {
-      throw new Error("Codey misc model Luna constants are not unique");
     }
     let patched = "";
     let lastIndex = 0;
     for (const declaration of declarations) {
       patched +=
         source.slice(lastIndex, declaration.index) +
-        `${declaration[1]}=globalThis.__CODEY_SELECT_MISC_MODEL__(\`gpt-5.6-luna\`)`;
+        `${declaration[1]}${declaration[2]}globalThis.__CODEY_SELECT_MISC_MODEL__(\`gpt-5.6-luna\`)`;
       lastIndex = declaration.index + declaration[0].length;
     }
     return patched + source.slice(lastIndex);
@@ -2501,13 +2496,16 @@
   let mainBundleFilename = "";
   let desktopAnalyticsWorkerSourcePatched = false;
   let desktopAnalyticsTransportSourcePatched = false;
+  let miscModelConstantsSourcePatched = false;
   const hasOptionalMainBundlePatchFailure = (name) =>
     optionalMainBundlePatchFailures.some((failure) => failure.name === name);
-  const applyOptionalMainBundlePatch = (name, patch, source) => {
+  const applyOptionalMainBundlePatch = (name, patch, source, filename = "") => {
+    const sameResource = (failure) =>
+      failure.name === name && (failure.filename ?? "") === filename;
     try {
       const patched = patch(source);
       const failureIndex = optionalMainBundlePatchFailures.findIndex(
-        (failure) => failure.name === name,
+        sameResource,
       );
       if (failureIndex >= 0) {
         optionalMainBundlePatchFailures.splice(failureIndex, 1);
@@ -2515,9 +2513,9 @@
       return patched;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const failure = { name, message };
+      const failure = { name, message, ...(filename ? { filename } : {}) };
       const failureIndex = optionalMainBundlePatchFailures.findIndex(
-        (entry) => entry.name === name,
+        sameResource,
       );
       if (failureIndex >= 0) {
         optionalMainBundlePatchFailures[failureIndex] = failure;
@@ -2526,6 +2524,7 @@
       }
       recordCodeyPatchFailure(`optional_main_bundle_patch:${name}`, error, {
         patchName: name,
+        filename,
       });
       console.warn(`[Codey] skipped incompatible ${name} patch: ${message}`);
       return source;
@@ -2591,20 +2590,26 @@
         globalThis.__CODEY_DESKTOP_ANALYTICS_SOURCE_PATCHED__ =
           desktopAnalyticsWorkerSourcePatched && desktopAnalyticsTransportSourcePatched;
       }
+      // 常量可由 Git 或环境建议的独立 chunk 导出，不要求同文件包含标题逻辑。
+      if (miscModelId && source.includes(threadTitleModelId)) {
+        const original = source;
+        source = applyOptionalMainBundlePatch(
+          "miscModelConstants",
+          patchCodexMiscModelConstants,
+          source,
+          filename,
+        );
+        miscModelConstantsSourcePatched ||= source !== original;
+        globalThis.__CODEY_MISC_MODEL_CONSTANTS_SOURCE_PATCHED__ =
+          miscModelConstantsSourcePatched &&
+          !hasOptionalMainBundlePatchFailure("miscModelConstants");
+      }
       if (hasThreadTitleModel) {
-        if (miscModelId) {
-          source = applyOptionalMainBundlePatch(
-            "miscModelConstants",
-            patchCodexMiscModelConstants,
-            source,
-          );
-          globalThis.__CODEY_MISC_MODEL_CONSTANTS_SOURCE_PATCHED__ =
-            !hasOptionalMainBundlePatchFailure("miscModelConstants");
-        }
         source = applyOptionalMainBundlePatch(
           "threadTitleModel",
           patchCodexMainThreadTitleModel,
           source,
+          filename,
         );
         globalThis.__CODEY_THREAD_TITLE_MODEL_SOURCE_PATCHED__ =
           !hasOptionalMainBundlePatchFailure("threadTitleModel");
@@ -2838,6 +2843,7 @@
     get routeMiscModel() {
       return (
         miscModelId !== "" &&
+        miscModelConstantsSourcePatched &&
         !hasOptionalMainBundlePatchFailure("miscModelConstants")
       );
     },

@@ -2864,6 +2864,94 @@ fn auto_review_falls_back_to_the_misc_model_only_without_a_capable_route() {
 }
 
 #[test]
+fn auto_review_misc_fallback_never_uses_historical_routes() {
+    let (mut config, provider_id, model) = router_config("https://relay.example/v1".into());
+    for source in [model.as_str(), CODEX_AUTO_REVIEW_MODEL] {
+        config.misc_model = format!("removed-route/{source}");
+        config
+            .model_alias_history
+            .insert(config.misc_model.clone(), source.into());
+        let snapshot = RouterSnapshot::from_config(&config);
+        assert!(snapshot.target_for_model(CODEX_AUTO_REVIEW_MODEL).is_err());
+    }
+
+    config.misc_model = format!("{provider_id}/{model}");
+    config.remember_model_aliases();
+    let mut other = config.profiles[0].clone();
+    other.id = "other-route".into();
+    other.source_provider_id = None;
+    config
+        .selected_models_by_provider
+        .insert(other.provider_id().into(), vec![model.clone()]);
+    config.profiles.push(other);
+    config.profiles[0].enabled = false;
+    let snapshot = RouterSnapshot::from_config(&config);
+    assert!(snapshot.target_for_model(CODEX_AUTO_REVIEW_MODEL).is_err());
+    // 普通历史会话仍可迁移，杂事模型的供应商绑定单独受到保护。
+    assert_eq!(
+        snapshot
+            .target_for_model(&config.misc_model)
+            .unwrap()
+            .provider_id,
+        "other-route"
+    );
+
+    config.profiles.remove(0);
+    assert!(
+        RouterSnapshot::from_config(&config)
+            .target_for_model(CODEX_AUTO_REVIEW_MODEL)
+            .is_err()
+    );
+}
+
+#[test]
+fn auto_review_misc_fallback_keeps_its_explicit_route_and_snapshot() {
+    let (mut config, provider_id, model) = router_config("https://relay.example/v1".into());
+    let mut other = config.profiles[0].clone();
+    other.id = "other-route".into();
+    other.source_provider_id = None;
+    config
+        .selected_models_by_provider
+        .insert(other.provider_id().into(), vec![model.clone()]);
+    config.profiles.push(other);
+    config.misc_model = format!("{provider_id}/{model}");
+    let old_snapshot = RouterSnapshot::from_config(&config);
+    assert_eq!(
+        old_snapshot
+            .target_for_request(
+                CODEX_AUTO_REVIEW_MODEL,
+                Some("other-route"),
+                Some("other-route")
+            )
+            .unwrap()
+            .provider_id,
+        provider_id
+    );
+    config.misc_model = format!("other-route/{model}");
+    let new_snapshot = RouterSnapshot::from_config(&config);
+    assert_eq!(
+        old_snapshot
+            .target_for_model(CODEX_AUTO_REVIEW_MODEL)
+            .unwrap()
+            .provider_id,
+        provider_id
+    );
+    assert_eq!(
+        new_snapshot
+            .target_for_model(CODEX_AUTO_REVIEW_MODEL)
+            .unwrap()
+            .provider_id,
+        "other-route"
+    );
+    config.misc_model = model;
+    assert!(
+        RouterSnapshot::from_config(&config)
+            .target_for_model(CODEX_AUTO_REVIEW_MODEL)
+            .is_err()
+    );
+}
+
+#[test]
 fn auto_review_keeps_failing_without_a_usable_misc_model() {
     let (mut config, provider_id, _) = router_config("https://relay.example/v1".to_string());
     config.misc_model = format!("{provider_id}/missing-model");
@@ -9034,6 +9122,88 @@ async fn upstream_response_headers_reach_the_downstream_client() {
     assert_eq!(response.json::<Value>().await.unwrap()["model"], model);
     upstream_task.await.unwrap();
     router.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn auto_review_misc_requests_do_not_replace_main_thread_bindings() {
+    for dedicated in [false, true] {
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut stream, _) = upstream.accept().await.unwrap();
+                let request = read_http_request(&mut stream).await.unwrap();
+                let authorization = request
+                    .headers
+                    .iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, value)| value.clone())
+                    .unwrap();
+                write_json_response(
+                    &mut stream,
+                    200,
+                    &json!({"object":"response", "authorization":authorization}),
+                )
+                .await
+                .unwrap();
+            }
+        });
+        let (mut config, provider_id, model) = router_config(format!("http://{address}/v1"));
+        let mut other = config.profiles[0].clone();
+        other.id = "route-b".into();
+        other.api_key = "sk-review".into();
+        other.supports_auto_review = dedicated;
+        config.selected_models_by_provider.insert(
+            other.provider_id().into(),
+            vec![model.clone(), "housekeeping".into()],
+        );
+        config.profiles.push(other);
+        config.misc_model = "route-b/housekeeping".into();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        for (requested, thread, hint, expected) in [
+            (
+                model_alias(&provider_id, &model),
+                "main-thread",
+                None,
+                "Bearer sk-upstream",
+            ),
+            (
+                CODEX_AUTO_REVIEW_MODEL.into(),
+                "main-thread",
+                Some("route-b"),
+                "Bearer sk-review",
+            ),
+            (model.clone(), "main-thread", None, "Bearer sk-upstream"),
+            (model.clone(), "child-thread", None, "Bearer sk-upstream"),
+        ] {
+            let mut request = client
+                .post(format!("{}/responses", endpoint.base_url))
+                .bearer_auth(&endpoint.token)
+                .header("thread-id", thread)
+                .header("session-id", "main-session")
+                .json(&json!({"model":requested,"input":"test"}));
+            if let Some(hint) = hint {
+                request = request.header(
+                    TURN_METADATA_HEADER,
+                    json!({ROUTE_METADATA_KEY:hint}).to_string(),
+                );
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["authorization"],
+                expected,
+                "dedicated={dedicated}, thread={thread}"
+            );
+        }
+        upstream_task.await.unwrap();
+        router.stop().await.unwrap();
+    }
 }
 
 #[tokio::test]
