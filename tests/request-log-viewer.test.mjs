@@ -81,7 +81,7 @@ test("request log controls are scoped to built-in routing and preserve logger se
   assert.match(modelSection, /\{config\.localRouterEnabled && \([\s\S]*开启日志记录/);
   assert.match(modelSection, /aria-label="开启请求日志记录"/);
   assert.match(modelSection, /查看请求日志/);
-  assert.match(modelSection, /invoke\("open_route_request_logs"\)/);
+  assert.match(modelSection, /invoke\("open_route_request_logs", \{ theme: readHostTheme\(\) \}\)/);
   assert.doesNotMatch(modelSection, /<RequestLogDialog/);
   assert.match(preview, /routeRequestLog:\s*\{/);
   assert.match(preview, /command === "query_route_request_logs"/);

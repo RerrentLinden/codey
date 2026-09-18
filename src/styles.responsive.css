@@ -9,7 +9,7 @@
   }
   .subagent-column {
     border-left: 0;
-    border-top: 1px solid rgba(0, 0, 0, 0.07);
+    border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.07);
     min-height: 0;
   }
   .prompt-column {
@@ -141,7 +141,7 @@
   }
 
   .notification-dialog-test {
-    border-top: 1px solid rgba(0, 0, 0, 0.08);
+    border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.08);
     border-left: 0;
   }
 
@@ -154,6 +154,6 @@
 
   .route-option-item + .route-option-item {
     border-left: 0;
-    border-top: 1px solid rgba(0, 0, 0, 0.06);
+    border-top: 1px solid rgba(var(--codey-ink-rgb, 0, 0, 0), 0.06);
   }
 }

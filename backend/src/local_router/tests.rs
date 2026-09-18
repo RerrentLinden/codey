@@ -9982,8 +9982,21 @@ async fn request_log_page_is_public_but_its_api_requires_the_launch_token() {
     assert_eq!(script.status(), reqwest::StatusCode::OK);
     assert!(script.text().await.unwrap().contains(REQUEST_LOG_PAGE_PATH));
     assert_eq!(
-        endpoint.request_log_url(),
+        endpoint.request_log_url(None),
         format!("{gateway_root}{REQUEST_LOG_PAGE_PATH}#{}", endpoint.token)
+    );
+    for theme in ["light", "dark"] {
+        assert_eq!(
+            endpoint.request_log_url(Some(theme)),
+            format!(
+                "{gateway_root}{REQUEST_LOG_PAGE_PATH}?theme={theme}#{}",
+                endpoint.token
+            )
+        );
+    }
+    assert_eq!(
+        endpoint.request_log_url(Some("dark#untrusted")),
+        endpoint.request_log_url(None)
     );
 
     for command in [

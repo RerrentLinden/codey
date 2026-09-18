@@ -1211,7 +1211,9 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
                 .unwrap_or(false);
             runtime_status_with_options(state, refresh_injection_status).await
         }
-        "open_route_request_logs" => open_route_request_logs(state).await,
+        "open_route_request_logs" => {
+            open_route_request_logs(state, args.get("theme").and_then(Value::as_str)).await
+        }
         "query_route_request_logs" => {
             match serde_json::from_value::<RouteRequestLogQuery>(args.clone()) {
                 Ok(query) => query_route_request_logs(state, query).await,
@@ -1336,7 +1338,10 @@ pub async fn invoke_api(state: &Arc<AppState>, command: &str, args: Value) -> Va
     result.unwrap_or_else(api_error_message)
 }
 
-pub async fn open_route_request_logs(state: &Arc<AppState>) -> Result<Value, String> {
+pub async fn open_route_request_logs(
+    state: &Arc<AppState>,
+    theme: Option<&str>,
+) -> Result<Value, String> {
     let endpoint = state
         .runtime
         .lock()
@@ -1344,7 +1349,7 @@ pub async fn open_route_request_logs(state: &Arc<AppState>) -> Result<Value, Str
         .as_ref()
         .and_then(|runtime| runtime.local_router_endpoint())
         .ok_or_else(|| "本地路由尚未运行，无法打开请求日志".to_string())?;
-    let url = endpoint.request_log_url();
+    let url = endpoint.request_log_url(theme);
     tokio::task::spawn_blocking(move || open_system_browser(&url))
         .await
         .map_err(|error| format!("打开系统浏览器任务异常退出：{error}"))??;

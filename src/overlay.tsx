@@ -16,6 +16,8 @@ import responsiveStyles from "./styles.responsive.css?inline";
 import { codeyApiPath, invoke } from "./api";
 import { SETTINGS_OVERLAY_Z_INDEX_CSS } from "./overlay.constants";
 import { SETTINGS_OPENED_EVENT } from "./useRuntimeStatus";
+import { installOverlayTheme } from "./overlayTheme";
+import { installRequestLogTheme } from "./requestLogTheme";
 import {
   RequestLogDialog,
   type RequestLogCatalog,
@@ -53,8 +55,8 @@ function RequestLogPage() {
       });
   }, []);
 
-  if (error) return <main className="p-6 text-sm text-red-700">{error}</main>;
-  if (!catalog) return <main className="p-6 text-sm text-[#6e6e73]">正在加载请求日志…</main>;
+  if (error) return <main className="p-6 text-sm text-[var(--codey-red,#b91c1c)]">{error}</main>;
+  if (!catalog) return <main className="p-6 text-sm text-[var(--codey-muted,#6e6e73)]">正在加载请求日志…</main>;
   return (
     <RequestLogDialog
       catalog={catalog}
@@ -77,7 +79,7 @@ function installBrowserBridge() {
     window.sessionStorage.setItem(REQUEST_LOG_TOKEN_KEY, hashToken);
   }
   if (window.location.hash) {
-    window.history.replaceState(null, "", window.location.pathname);
+    window.history.replaceState(null, "", window.location.pathname + window.location.search);
   }
   const token = hashToken || window.sessionStorage.getItem(REQUEST_LOG_TOKEN_KEY) || "";
   window.__codeyInvokeApi = async (command, args) => {
@@ -100,6 +102,7 @@ function getOverlayMountTarget() {
 }
 
 if (window.location.pathname === REQUEST_LOG_PATH) {
+  installRequestLogTheme();
   installBrowserBridge();
   document.title = "Codey 请求日志";
   const style = document.createElement("style");
@@ -161,19 +164,18 @@ if (!window.__codeySettingsOverlay) {
   enableShadowDOM();
   const rootElement = document.createElement("div");
   rootElement.id = "codey-overlay-root";
-  rootElement.dataset.theme = "light";
   rootElement.style.inset = "0";
   rootElement.style.pointerEvents = "none";
   rootElement.style.position = "fixed";
   rootElement.style.width = "100%";
   const modalContainer = document.createElement("div");
   modalContainer.id = "codey-overlay-modal-container";
-  modalContainer.dataset.theme = "light";
   modalContainer.style.inset = "0";
   modalContainer.style.position = "fixed";
   modalContainer.style.width = "100%";
   shadow.append(rootElement, modalContainer);
   getOverlayMountTarget().appendChild(host);
+  const theme = installOverlayTheme([rootElement, modalContainer]);
 
   let hideTimer: number | undefined;
   let visible = false;
@@ -211,6 +213,7 @@ if (!window.__codeySettingsOverlay) {
     window.clearTimeout(hideTimer);
     hideTimer = undefined;
     getOverlayMountTarget().appendChild(host);
+    theme.sync();
     host.style.display = "block";
     host.setAttribute("aria-hidden", "false");
     render(true);

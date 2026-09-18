@@ -36,9 +36,14 @@ pub(crate) struct RuntimeRouterEndpoint {
 }
 
 impl RuntimeRouterEndpoint {
-    pub(crate) fn request_log_url(&self) -> String {
+    pub(crate) fn request_log_url(&self, theme: Option<&str>) -> String {
+        let query = match theme {
+            Some("light") => "?theme=light",
+            Some("dark") => "?theme=dark",
+            _ => "",
+        };
         format!(
-            "{}/codey/request-logs#{}",
+            "{}/codey/request-logs{query}#{}",
             self.base_url.trim_end_matches("/v1"),
             self.token
         )

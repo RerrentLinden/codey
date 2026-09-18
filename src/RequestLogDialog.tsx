@@ -850,8 +850,8 @@ export function RequestLogDialog({
               role={healthWarning ? "alert" : "status"}
               className={`flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-0.5 text-[10px] font-medium ${
                 healthWarning
-                  ? "border border-amber-500/30 bg-amber-50 text-amber-900"
-                  : "border border-black/8 bg-white text-[#6e6e73]"
+                  ? "border border-amber-500/30 dark:border-amber-700/30 bg-amber-50 dark:bg-amber-950 text-amber-900 dark:text-amber-300"
+                  : "border border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface,#fff)] text-[var(--codey-muted,#6e6e73)]"
               }`}
               title={`当前记录周期已处理 ${health.entriesWritten.toLocaleString()} 条 · 待写入 ${health.pendingEntries.toLocaleString()} 条 · 异步记录；异常退出可能丢失尚未落盘的日志。${
                 healthWarning
@@ -871,7 +871,7 @@ export function RequestLogDialog({
                     ? "日志记录已停止，请重新开启记录并检查存储"
                     : "日志记录未开启"}
               </span>
-              <span className="hidden text-[10px] text-[#8e8e93] md:inline">
+              <span className="hidden text-[10px] text-[var(--codey-subtle,#8e8e93)] md:inline">
                 · 已处理 {health.entriesWritten.toLocaleString()} 条
               </span>
             </div>
@@ -950,12 +950,12 @@ export function RequestLogDialog({
                       : "搜索请求 ID、会话 ID、供应商、模型或上游"
                 }
                 value={searchInput}
-                leftSection={<IconSearch size={15} className="text-[#8e8e93]" aria-hidden="true" />}
+                leftSection={<IconSearch size={15} className="text-[var(--codey-subtle,#8e8e93)]" aria-hidden="true" />}
                 rightSection={
                   searchInput ? (
                     <button
                       type="button"
-                      className="flex h-5 w-5 cursor-pointer items-center justify-center rounded-full text-[#8e8e93] hover:bg-black/5 hover:text-[#1d1d1f]"
+                      className="flex h-5 w-5 cursor-pointer items-center justify-center rounded-full text-[var(--codey-subtle,#8e8e93)] hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 hover:text-[var(--codey-text,#1d1d1f)]"
                       onClick={() => setSearchInput("")}
                       aria-label="清空搜索"
                     >
@@ -1074,8 +1074,8 @@ export function RequestLogDialog({
           </div>
 
           {timeRange === "custom" ? (
-            <div className="flex flex-wrap items-center gap-2 border-t border-black/6 pt-2 text-xs">
-              <label className="flex items-center gap-1.5 text-xs text-[#6e6e73]">
+            <div className="flex flex-wrap items-center gap-2 border-t border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 pt-2 text-xs">
+              <label className="flex items-center gap-1.5 text-xs text-[var(--codey-muted,#6e6e73)]">
                 <span>开始时间</span>
                 <Input
                   type="datetime-local"
@@ -1088,7 +1088,7 @@ export function RequestLogDialog({
                   }}
                 />
               </label>
-              <label className="flex items-center gap-1.5 text-xs text-[#6e6e73]">
+              <label className="flex items-center gap-1.5 text-xs text-[var(--codey-muted,#6e6e73)]">
                 <span>结束时间</span>
                 <Input
                   type="datetime-local"
@@ -1106,7 +1106,7 @@ export function RequestLogDialog({
         </div>
 
 
-        {statsLoading ? <p className="m-0 text-xs text-[#6e6e73]" role="status">正在统计所选范围…</p> : null}
+        {statsLoading ? <p className="m-0 text-xs text-[var(--codey-muted,#6e6e73)]" role="status">正在统计所选范围…</p> : null}
         {statsError ? (
           <Alert status="danger">
             <Alert.Indicator />
@@ -1121,17 +1121,17 @@ export function RequestLogDialog({
           <div className="request-log-overview">
             <div className="request-log-overview-heading">
               <div className="flex items-center gap-2 min-w-0">
-                <IconChartBar size={14} className="text-[#1d1d1f] shrink-0" aria-hidden="true" />
-                <span className="text-xs font-semibold text-[#1d1d1f] shrink-0">范围概览</span>
+                <IconChartBar size={14} className="text-[var(--codey-text,#1d1d1f)] shrink-0" aria-hidden="true" />
+                <span className="text-xs font-semibold text-[var(--codey-text,#1d1d1f)] shrink-0">范围概览</span>
                 {overviewCollapsed ? (
-                  <div className="flex items-center gap-2.5 text-xs text-[#6e6e73] truncate ml-1">
-                    <span>总请求: <strong className="font-semibold text-[#1d1d1f]">{stats.total.toLocaleString()}</strong> 条</span>
-                    <span>成功率: <strong className={`font-semibold ${stats.successRate != null && stats.successRate >= 95 ? "text-emerald-600" : stats.successRate != null && stats.successRate >= 80 ? "text-amber-600" : "text-rose-600"}`}>{stats.successRate != null ? `${stats.successRate.toFixed(1)}%` : "—"}</strong></span>
-                    <span className="hidden md:inline">TTFT: <strong className="font-semibold text-[#1d1d1f]">{formatDuration(stats.avgTtft)}</strong></span>
-                    <span className="hidden lg:inline">Token: <strong className="font-semibold text-[#1d1d1f]">{formatTokens(stats.totalTokensSum)}</strong></span>
+                  <div className="flex items-center gap-2.5 text-xs text-[var(--codey-muted,#6e6e73)] truncate ml-1">
+                    <span>总请求: <strong className="font-semibold text-[var(--codey-text,#1d1d1f)]">{stats.total.toLocaleString()}</strong> 条</span>
+                    <span>成功率: <strong className={`font-semibold ${stats.successRate != null && stats.successRate >= 95 ? "text-emerald-600 dark:text-emerald-400" : stats.successRate != null && stats.successRate >= 80 ? "text-amber-600 dark:text-amber-400" : "text-rose-600 dark:text-rose-400"}`}>{stats.successRate != null ? `${stats.successRate.toFixed(1)}%` : "—"}</strong></span>
+                    <span className="hidden md:inline">TTFT: <strong className="font-semibold text-[var(--codey-text,#1d1d1f)]">{formatDuration(stats.avgTtft)}</strong></span>
+                    <span className="hidden lg:inline">Token: <strong className="font-semibold text-[var(--codey-text,#1d1d1f)]">{formatTokens(stats.totalTokensSum)}</strong></span>
                   </div>
                 ) : (
-                  <span className="text-[11px] text-[#73767d] shrink-0 hidden sm:inline">按筛选范围统计</span>
+                  <span className="text-[11px] text-[var(--codey-muted,#73767d)] shrink-0 hidden sm:inline">按筛选范围统计</span>
                 )}
               </div>
               <div className="flex items-center gap-2 shrink-0">
@@ -1159,7 +1159,7 @@ export function RequestLogDialog({
                   variant="ghost"
                   onClick={toggleOverviewCollapsed}
                   aria-expanded={!overviewCollapsed}
-                  className="text-xs text-[#6e6e73] hover:text-[#1d1d1f]"
+                  className="text-xs text-[var(--codey-muted,#6e6e73)] hover:text-[var(--codey-text,#1d1d1f)]"
                   title={overviewCollapsed ? "展开概览" : "收起概览以扩大列表区域"}
                 >
                   {overviewCollapsed ? <IconChevronDown size={13} aria-hidden="true" /> : <IconChevronUp size={13} aria-hidden="true" />}
@@ -1173,84 +1173,84 @@ export function RequestLogDialog({
                 <div className="request-log-metrics">
                   <div className="request-log-metric">
                     <div className="flex items-baseline justify-between gap-1">
-                      <span className="text-[11px] font-medium text-[#73767d]">总请求数</span>
+                      <span className="text-[11px] font-medium text-[var(--codey-muted,#73767d)]">总请求数</span>
                       <div className="flex items-baseline gap-1">
-                        <span className="text-[15px] font-bold text-[#1d1d1f] tabular-nums">
+                        <span className="text-[15px] font-bold text-[var(--codey-text,#1d1d1f)] tabular-nums">
                           {stats.total.toLocaleString()}
                         </span>
-                        <span className="text-[10px] text-[#8e8e93]">条</span>
+                        <span className="text-[10px] text-[var(--codey-subtle,#8e8e93)]">条</span>
                       </div>
                     </div>
                   </div>
                   <div className="request-log-metric">
                     <div className="flex items-baseline justify-between gap-1">
-                      <span className="text-[11px] font-medium text-[#73767d]">上游首字节</span>
-                      <span className="text-[15px] font-bold text-[#1d1d1f] tabular-nums">{formatDuration(stats.avgUpstreamFirstByte)}</span>
+                      <span className="text-[11px] font-medium text-[var(--codey-muted,#73767d)]">上游首字节</span>
+                      <span className="text-[15px] font-bold text-[var(--codey-text,#1d1d1f)] tabular-nums">{formatDuration(stats.avgUpstreamFirstByte)}</span>
                     </div>
-                    <span className="text-[10px] text-[#8e8e93] truncate">路由准备 {formatDuration(stats.avgRouterPreUpstream)} · 响应头 {formatDuration(stats.avgUpstreamHeader)}</span>
+                    <span className="text-[10px] text-[var(--codey-subtle,#8e8e93)] truncate">路由准备 {formatDuration(stats.avgRouterPreUpstream)} · 响应头 {formatDuration(stats.avgUpstreamHeader)}</span>
                   </div>
                   <div className="request-log-metric">
                     <div className="flex items-baseline justify-between gap-1">
-                      <span className="text-[11px] font-medium text-[#73767d]">下游首段内容</span>
-                      <span className="text-[15px] font-bold text-[#1d1d1f] tabular-nums">{formatDuration(stats.avgDownstreamFirstContent)}</span>
+                      <span className="text-[11px] font-medium text-[var(--codey-muted,#73767d)]">下游首段内容</span>
+                      <span className="text-[15px] font-bold text-[var(--codey-text,#1d1d1f)] tabular-nums">{formatDuration(stats.avgDownstreamFirstContent)}</span>
                     </div>
-                    <span className="text-[10px] text-[#8e8e93] truncate">日志排队 {formatDuration(stats.avgQueueDelay)}</span>
+                    <span className="text-[10px] text-[var(--codey-subtle,#8e8e93)] truncate">日志排队 {formatDuration(stats.avgQueueDelay)}</span>
                   </div>
                   <div className="request-log-metric">
                     <div className="flex items-baseline justify-between gap-1">
-                      <span className="text-[11px] font-medium text-[#73767d]">请求成功率</span>
+                      <span className="text-[11px] font-medium text-[var(--codey-muted,#73767d)]">请求成功率</span>
                       <span
                         className={`text-[15px] font-bold tabular-nums ${
                           stats.successRate != null && stats.successRate >= 95
-                            ? "text-emerald-600"
+                            ? "text-emerald-600 dark:text-emerald-400"
                             : stats.successRate != null && stats.successRate >= 80
-                              ? "text-amber-600"
-                              : "text-rose-600"
+                              ? "text-amber-600 dark:text-amber-400"
+                              : "text-rose-600 dark:text-rose-400"
                         }`}
                       >
                         {stats.successRate != null ? `${stats.successRate.toFixed(1)}%` : "—"}
                       </span>
                     </div>
-                    <span className="text-[10px] text-[#8e8e93] truncate">
+                    <span className="text-[10px] text-[var(--codey-subtle,#8e8e93)] truncate">
                       成功 {stats.succeededCount} · 失败 {stats.failedCount} · 其他 {stats.incompleteCount + stats.cancelledCount}
                     </span>
                   </div>
                   <div className="request-log-metric">
                     <div className="flex items-baseline justify-between gap-1">
-                      <span className="text-[11px] font-medium text-[#73767d]">平均首字耗时 (TTFT)</span>
-                      <span className="text-[15px] font-bold text-[#1d1d1f] tabular-nums">
+                      <span className="text-[11px] font-medium text-[var(--codey-muted,#73767d)]">平均首字耗时 (TTFT)</span>
+                      <span className="text-[15px] font-bold text-[var(--codey-text,#1d1d1f)] tabular-nums">
                         {formatDuration(stats.avgTtft)}
                       </span>
                     </div>
-                    <span className="text-[10px] text-[#8e8e93] truncate">
+                    <span className="text-[10px] text-[var(--codey-subtle,#8e8e93)] truncate">
                       平均总耗时 {formatDuration(stats.avgDuration)}
                     </span>
                   </div>
                   <div className="request-log-metric">
                     <div className="flex items-baseline justify-between gap-1">
-                      <span className="text-[11px] font-medium text-[#73767d]">所选范围 Token 消耗</span>
+                      <span className="text-[11px] font-medium text-[var(--codey-muted,#73767d)]">所选范围 Token 消耗</span>
                       <div className="flex items-baseline gap-1">
-                        <span className="text-[15px] font-bold text-[#1d1d1f] tabular-nums">
+                        <span className="text-[15px] font-bold text-[var(--codey-text,#1d1d1f)] tabular-nums">
                           {formatTokens(stats.totalTokensSum)}
                         </span>
-                        <span className="text-[10px] text-[#8e8e93]">tokens</span>
+                        <span className="text-[10px] text-[var(--codey-subtle,#8e8e93)]">tokens</span>
                       </div>
                     </div>
-                    <span className="text-[10px] text-purple-600 truncate">
+                    <span className="text-[10px] text-purple-600 dark:text-purple-400 truncate">
                       输入 {formatTokens(stats.inputTokensSum)} · 输出 {formatTokens(stats.outputTokensSum)} · 总量已知 {stats.totalTokensKnownCount.toLocaleString()} / {stats.total.toLocaleString()} 条
                     </span>
                   </div>
                 </div>
 
-                <div className="flex flex-col gap-2 rounded-lg border border-black/8 bg-[#fafafa] p-2.5 text-xs">
-                  <div className="flex flex-wrap items-center justify-between gap-1 text-[#6e6e73]">
-                    <div className="flex items-center gap-1.5 font-medium text-[#1d1d1f]">
+                <div className="flex flex-col gap-2 rounded-lg border border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface-muted,#fafafa)] p-2.5 text-xs">
+                  <div className="flex flex-wrap items-center justify-between gap-1 text-[var(--codey-muted,#6e6e73)]">
+                    <div className="flex items-center gap-1.5 font-medium text-[var(--codey-text,#1d1d1f)]">
                       <span>趋势与分组统计</span>
-                      <span className="text-[10px] font-normal text-[#8e8e93]">
+                      <span className="text-[10px] font-normal text-[var(--codey-subtle,#8e8e93)]">
                         · 成功率包含失败、未完成和中断请求
                       </span>
                     </div>
-                    <span className="text-[10px] text-[#8e8e93]">
+                    <span className="text-[10px] text-[var(--codey-subtle,#8e8e93)]">
                       {new Date(stats.fromUnixMs).toLocaleString()} 至 {new Date(stats.toUnixMs).toLocaleString()}（不含结束时间）
                       {stats.databaseBytes != null ? ` · 存储约 ${((stats.databaseBytes + (stats.walBytes ?? 0)) / 1_048_576).toFixed(1)} MiB` : ""}
                     </span>
@@ -1258,18 +1258,18 @@ export function RequestLogDialog({
 
                   <div className="grid grid-cols-2 gap-3 max-[820px]:grid-cols-1">
                     {/* 时间趋势卡片 */}
-                    <div className="flex flex-col overflow-hidden rounded-lg border border-black/6 bg-white shadow-2xs">
-                      <div className="flex items-center justify-between border-b border-black/6 bg-[#f8f8fa] px-3 py-1.5">
-                        <span className="text-[11px] font-semibold text-[#1d1d1f]">
+                    <div className="flex flex-col overflow-hidden rounded-lg border border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 bg-[var(--codey-surface,#fff)] shadow-2xs">
+                      <div className="flex items-center justify-between border-b border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 bg-[var(--codey-surface-sunken,#f8f8fa)] px-3 py-1.5">
+                        <span className="text-[11px] font-semibold text-[var(--codey-text,#1d1d1f)]">
                           {stats.bucketMs === 3_600_000 ? "每小时" : "每天"}趋势
                         </span>
-                        <span className="text-[10px] text-[#8e8e93]">
+                        <span className="text-[10px] text-[var(--codey-subtle,#8e8e93)]">
                           UTC 划分，本地时间显示
                         </span>
                       </div>
                       <div className="max-h-36 overflow-auto">
                         <table className="w-full text-left text-[11px]">
-                          <thead className="sticky top-0 z-[1] bg-[#f8f8fa] text-[10px] font-medium text-[#6e6e73] shadow-[0_1px_0_rgba(0,0,0,0.06)]">
+                          <thead className="sticky top-0 z-[1] bg-[var(--codey-surface-sunken,#f8f8fa)] text-[10px] font-medium text-[var(--codey-muted,#6e6e73)] shadow-[0_1px_0_rgba(0,0,0,0.06)]">
                             <tr>
                               <th className="py-1.5 px-2.5 font-medium">时间</th>
                               <th className="py-1.5 px-2.5 text-right font-medium">请求数</th>
@@ -1281,14 +1281,14 @@ export function RequestLogDialog({
                           <tbody className="divide-y divide-black/4 font-mono">
                             {stats.trend.length === 0 ? (
                               <tr>
-                                <td colSpan={5} className="py-4 text-center text-xs text-[#8e8e93] font-sans">
+                                <td colSpan={5} className="py-4 text-center text-xs text-[var(--codey-subtle,#8e8e93)] font-sans">
                                   所选时间范围暂无趋势数据
                                 </td>
                               </tr>
                             ) : (
                               stats.trend.map((bucket) => (
                                 <tr key={bucket.timestampUnixMs} className="transition-colors hover:bg-blue-50/30">
-                                  <td className="py-1 px-2.5 whitespace-nowrap text-[#1d1d1f]">
+                                  <td className="py-1 px-2.5 whitespace-nowrap text-[var(--codey-text,#1d1d1f)]">
                                     {new Date(bucket.timestampUnixMs).toLocaleString(undefined, {
                                       month: "2-digit",
                                       day: "2-digit",
@@ -1296,16 +1296,16 @@ export function RequestLogDialog({
                                       minute: "2-digit",
                                     })}
                                   </td>
-                                  <td className="py-1 px-2.5 text-right font-semibold text-[#1d1d1f] tabular-nums">
+                                  <td className="py-1 px-2.5 text-right font-semibold text-[var(--codey-text,#1d1d1f)] tabular-nums">
                                     {bucket.total.toLocaleString()}
                                   </td>
-                                  <td className="py-1 px-2.5 text-right text-[#48484a] tabular-nums">
+                                  <td className="py-1 px-2.5 text-right text-[var(--codey-text-soft,#48484a)] tabular-nums">
                                     {formatTokens(bucket.totalTokensSum)}
                                   </td>
-                                  <td className="py-1 px-2.5 text-right text-[#48484a] tabular-nums">
+                                  <td className="py-1 px-2.5 text-right text-[var(--codey-text-soft,#48484a)] tabular-nums">
                                     {formatDuration(bucket.avgDuration)}
                                   </td>
-                                  <td className="py-1 px-2.5 text-right text-[#48484a] tabular-nums">
+                                  <td className="py-1 px-2.5 text-right text-[var(--codey-text-soft,#48484a)] tabular-nums">
                                     {formatDuration(bucket.avgDownstreamFirstContent)}
                                   </td>
                                 </tr>
@@ -1317,18 +1317,18 @@ export function RequestLogDialog({
                     </div>
 
                     {/* 分组统计卡片 */}
-                    <div className="flex flex-col overflow-hidden rounded-lg border border-black/6 bg-white shadow-2xs">
-                      <div className="flex items-center justify-between border-b border-black/6 bg-[#f8f8fa] px-3 py-1.5">
-                        <span className="text-[11px] font-semibold text-[#1d1d1f]">
+                    <div className="flex flex-col overflow-hidden rounded-lg border border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 bg-[var(--codey-surface,#fff)] shadow-2xs">
+                      <div className="flex items-center justify-between border-b border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 bg-[var(--codey-surface-sunken,#f8f8fa)] px-3 py-1.5">
+                        <span className="text-[11px] font-semibold text-[var(--codey-text,#1d1d1f)]">
                           {groupByLabels[groupBy] || "所选维度"}统计
                         </span>
-                        <span className="text-[10px] text-[#8e8e93]">
+                        <span className="text-[10px] text-[var(--codey-subtle,#8e8e93)]">
                           {stats.groupsTruncated ? "最多展示 50 组" : `共 ${stats.groups.length} 组`}
                         </span>
                       </div>
                       <div className="max-h-36 overflow-auto">
                         <table className="w-full text-left text-[11px]">
-                          <thead className="sticky top-0 z-[1] bg-[#f8f8fa] text-[10px] font-medium text-[#6e6e73] shadow-[0_1px_0_rgba(0,0,0,0.06)]">
+                          <thead className="sticky top-0 z-[1] bg-[var(--codey-surface-sunken,#f8f8fa)] text-[10px] font-medium text-[var(--codey-muted,#6e6e73)] shadow-[0_1px_0_rgba(0,0,0,0.06)]">
                             <tr>
                               <th className="py-1.5 px-2.5 font-medium">分组</th>
                               <th className="py-1.5 px-2.5 text-right font-medium">请求数</th>
@@ -1339,7 +1339,7 @@ export function RequestLogDialog({
                           <tbody className="divide-y divide-black/4 font-mono">
                             {stats.groups.length === 0 ? (
                               <tr>
-                                <td colSpan={4} className="py-4 text-center text-xs text-[#8e8e93] font-sans">
+                                <td colSpan={4} className="py-4 text-center text-xs text-[var(--codey-subtle,#8e8e93)] font-sans">
                                   所选分组暂无数据
                                 </td>
                               </tr>
@@ -1353,25 +1353,25 @@ export function RequestLogDialog({
                                     : undefined) || group.key || "未知";
                                 return (
                                   <tr key={group.key} className="transition-colors hover:bg-blue-50/30">
-                                    <td className="py-1 px-2.5 text-[#1d1d1f]" title={label}>
+                                    <td className="py-1 px-2.5 text-[var(--codey-text,#1d1d1f)]" title={label}>
                                       <div className="flex flex-wrap items-center gap-x-2">
                                       <span className="max-w-[240px] truncate">{label}</span>
                                       </div>
                                     </td>
-                                    <td className="py-1 px-2.5 text-right font-semibold text-[#1d1d1f] tabular-nums">
+                                    <td className="py-1 px-2.5 text-right font-semibold text-[var(--codey-text,#1d1d1f)] tabular-nums">
                                       {group.total.toLocaleString()}
                                     </td>
-                                    <td className="py-1 px-2.5 text-right text-[#48484a] tabular-nums">
+                                    <td className="py-1 px-2.5 text-right text-[var(--codey-text-soft,#48484a)] tabular-nums">
                                       {formatTokens(group.totalTokensSum)}
                                     </td>
                                     <td className="py-1 px-2.5 text-right tabular-nums">
                                       <span
                                         className={`font-semibold ${
                                           rate != null && rate >= 95
-                                            ? "text-emerald-600"
+                                            ? "text-emerald-600 dark:text-emerald-400"
                                             : rate != null && rate >= 80
-                                              ? "text-amber-600"
-                                              : "text-rose-600"
+                                              ? "text-amber-600 dark:text-amber-400"
+                                              : "text-rose-600 dark:text-rose-400"
                                         }`}
                                       >
                                         {rate != null ? `${rate.toFixed(1)}%` : "—"}
@@ -1395,7 +1395,7 @@ export function RequestLogDialog({
         <div className="request-log-results relative flex min-h-0 flex-1 flex-col overflow-hidden">
           <div className="request-log-results-heading"><strong>请求记录 <span>{totalCount.toLocaleString()}</span></strong><span>最新在前 · 点击记录查看详情</span></div>
           {loading && result ? (
-            <div className="absolute top-0 left-0 right-0 z-10 h-0.5 overflow-hidden bg-blue-100">
+            <div className="absolute top-0 left-0 right-0 z-10 h-0.5 overflow-hidden bg-blue-100 dark:bg-blue-950">
               <div className="h-full w-full bg-blue-600 animate-pulse" />
             </div>
           ) : null}
@@ -1416,24 +1416,24 @@ export function RequestLogDialog({
             </div>
           ) : result?.status === "unavailable" || result?.queryable === false ? (
             <div className="grid min-h-48 flex-1 place-items-center p-6 text-center">
-              <div className="grid max-w-lg justify-items-center gap-2 text-[#6e6e73]">
+              <div className="grid max-w-lg justify-items-center gap-2 text-[var(--codey-muted,#6e6e73)]">
                 <IconDatabaseOff size={28} aria-hidden="true" />
-                <strong className="text-sm text-[#1d1d1f]">日志暂不可在线查看</strong>
+                <strong className="text-sm text-[var(--codey-text,#1d1d1f)]">日志暂不可在线查看</strong>
                 <p className="m-0 text-xs leading-5">{unavailableMessage(result?.reason)}</p>
               </div>
             </div>
           ) : !result && loading ? (
             <div className="grid min-h-48 flex-1 place-items-center" role="status">
-              <div className="flex items-center gap-2 text-xs text-[#6e6e73]">
+              <div className="flex items-center gap-2 text-xs text-[var(--codey-muted,#6e6e73)]">
                 <Spinner size="sm" />
                 正在加载请求日志…
               </div>
             </div>
           ) : result?.items.length === 0 ? (
             <div className="grid min-h-48 flex-1 place-items-center p-6 text-center">
-              <div className="grid justify-items-center gap-2 text-[#6e6e73]">
+              <div className="grid justify-items-center gap-2 text-[var(--codey-muted,#6e6e73)]">
                 <IconSearch size={26} aria-hidden="true" />
-                <strong className="text-sm text-[#1d1d1f]">
+                <strong className="text-sm text-[var(--codey-text,#1d1d1f)]">
                   {hasFilters ? "没有匹配的请求日志" : "暂无请求日志"}
                 </strong>
                 <p className="m-0 text-xs">
@@ -1476,14 +1476,14 @@ export function RequestLogDialog({
    const upstreamModelDiffers = Boolean(upstreamModel) && !modelIdsEqual(upstreamModel, sentModel);
 return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                           <div className="grid min-w-36 max-w-44 gap-0.5 font-mono">
-                            <span className="whitespace-nowrap text-[11px] text-[#1d1d1f]">
+                            <span className="whitespace-nowrap text-[11px] text-[var(--codey-text,#1d1d1f)]">
                               {formatTimestamp(item.timestampUnixMs)}
                             </span>
                             <Button
                               variant="ghost"
                               size="xs"
                               aria-label={`复制请求 ID：${item.requestId}`}
-                              className="group h-auto min-h-0 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[#8e8e93] transition-colors hover:text-[#1d1d1f] [&_svg]:size-[11px]"
+                              className="group h-auto min-h-0 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[var(--codey-subtle,#8e8e93)] transition-colors hover:text-[var(--codey-text,#1d1d1f)] [&_svg]:size-[11px]"
                               title={`请求 ID: ${item.requestId}（点击复制）`}
                               onClick={() => handleCopyId(item.requestId)}
                             >
@@ -1491,7 +1491,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                                 {copiedId === item.requestId ? "已复制" : item.requestId}
                               </span>
                               {copiedId === item.requestId ? (
-                                <IconCheck size={11} className="shrink-0 text-emerald-600" aria-hidden="true" />
+                                <IconCheck size={11} className="shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
                               ) : (
                                 <IconCopy size={11} className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100" aria-hidden="true" />
                               )}
@@ -1512,7 +1512,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                               <Button
                                 variant="ghost"
                                 size="xs"
-                                className="group h-auto min-h-0 min-w-0 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[#6e6e73] transition-colors hover:text-[#1d1d1f] [&_svg]:size-[11px]"
+                                className="group h-auto min-h-0 min-w-0 justify-start gap-1 rounded-md px-0.5 font-mono text-[10px] font-normal text-[var(--codey-muted,#6e6e73)] transition-colors hover:text-[var(--codey-text,#1d1d1f)] [&_svg]:size-[11px]"
                                 title={`${item.codexSessionIsParent ? "父会话" : "会话"} ID: ${item.codexSessionId}（点击复制）`}
                                 aria-label={`复制${item.codexSessionIsParent ? "父会话" : "会话"} ID：${item.codexSessionId}`}
                                 onClick={() => handleCopyId(item.codexSessionId!)}
@@ -1521,14 +1521,14 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                                   {copiedId === item.codexSessionId ? "已复制" : item.codexSessionId}
                                 </span>
                                 {copiedId === item.codexSessionId ? (
-                                  <IconCheck size={11} className="shrink-0 text-emerald-600" aria-hidden="true" />
+                                  <IconCheck size={11} className="shrink-0 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
                                 ) : (
                                   <IconCopy size={11} className="shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" aria-hidden="true" />
                                 )}
                               </Button>
                             </div>
                           ) : (
-                            <span className="text-[#8e8e93]">—</span>
+                            <span className="text-[var(--codey-subtle,#8e8e93)]">—</span>
                           )}
                         </div>,
                         <div>
@@ -1536,14 +1536,14 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                             <div className="flex min-w-0 items-center gap-1">
                               {item.officialAccountId ? (
                                 <span
-                                  className="shrink-0 rounded bg-blue-50 px-1 py-px text-[10px] font-medium text-blue-600"
+                                  className="shrink-0 rounded bg-blue-50 dark:bg-blue-950 px-1 py-px text-[10px] font-medium text-blue-600 dark:text-blue-400"
                                   title="官方账号"
                                 >
                                   官
                                 </span>
                               ) : null}
                               <strong
-                                className="truncate font-semibold text-[#1d1d1f]"
+                                className="truncate font-semibold text-[var(--codey-text,#1d1d1f)]"
                                 title={item.providerName || item.provider || undefined}
                               >
                                 {item.providerName || item.provider || "—"}
@@ -1551,7 +1551,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                             </div>
                             {item.officialAccountId ? (
                               <span
-                                className="truncate text-[10px] text-[#48484a]"
+                                className="truncate text-[10px] text-[var(--codey-text-soft,#48484a)]"
                                 title={`官方账号：${officialAccountLabel(item.officialAccountId)}`}
                               >
                                 {officialAccountLabel(item.officialAccountId)}
@@ -1559,7 +1559,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                             ) : null}
                             {!item.officialAccountId && item.upstreamAuthority ? (
                               <span
-                                className="truncate font-mono text-[10px] text-[#8e8e93]"
+                                className="truncate font-mono text-[10px] text-[var(--codey-subtle,#8e8e93)]"
                                 title={`上游: ${item.upstreamAuthority}`}
                               >
                                 {item.upstreamAuthority}
@@ -1569,14 +1569,14 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                         </div>,
 <div className="grid min-w-32 max-w-56 gap-0.5">
                           <span
-                            className="truncate font-medium text-[#1d1d1f]"
+                            className="truncate font-medium text-[var(--codey-text,#1d1d1f)]"
                             title={sentModel ? `请求模型（发往上游）：${sentModel}` : undefined}
                           >
                             {sentModel || "—"}
                           </span>
                           {upstreamModelDiffers ? (
                             <span
-                              className="flex min-w-0 items-center gap-1 text-[10px] text-[#8e8e93]"
+                              className="flex min-w-0 items-center gap-1 text-[10px] text-[var(--codey-subtle,#8e8e93)]"
                               title={`上游实际使用模型：${upstreamModel}`}
                             >
                               <span className="shrink-0">实际</span>
@@ -1584,7 +1584,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                             </span>
                           ) : null}
                         </div>,
-<div className="whitespace-nowrap text-[#48484a]">{reasoningLabel(item)}</div>,
+<div className="whitespace-nowrap text-[var(--codey-text-soft,#48484a)]">{reasoningLabel(item)}</div>,
 <div>
                           <Badge
                             variant="secondary"
@@ -1637,7 +1637,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                               ) : null}
                             </div>
                             {item.statusCode != null || item.errorCode || cancellation ? (
-                              <small className="whitespace-nowrap font-mono text-[10px] text-[#8e8e93]">
+                              <small className="whitespace-nowrap font-mono text-[10px] text-[var(--codey-subtle,#8e8e93)]">
                                 {item.statusCode != null
                                   ? `HTTP ${item.statusCode}`
                                   : cancellation?.label || item.errorCode}
@@ -1654,8 +1654,8 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                               className="flex items-center gap-1"
                               title={timingTitle}
                             >
-                              <span className="text-[#6e6e73]">首字</span>
-                              <span className="text-[11px] font-medium text-[#1d1d1f] tabular-nums">
+                              <span className="text-[var(--codey-muted,#6e6e73)]">首字</span>
+                              <span className="text-[11px] font-medium text-[var(--codey-text,#1d1d1f)] tabular-nums">
                                 {formatDuration(displayedTtft)}
                               </span>
                             </div>
@@ -1663,8 +1663,8 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                               className="flex items-center gap-1"
                               title={`总耗时: ${formatDuration(item.totalDurationMs)}`}
                             >
-                              <span className="text-[#6e6e73]">总用时</span>
-                              <span className="text-[11px] text-[#48484a] tabular-nums">
+                              <span className="text-[var(--codey-muted,#6e6e73)]">总用时</span>
+                              <span className="text-[11px] text-[var(--codey-text-soft,#48484a)] tabular-nums">
                                 {formatDuration(item.totalDurationMs)}
                               </span>
                             </div>
@@ -1672,10 +1672,10 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                         </div>,
 <div className="grid gap-0.5 whitespace-nowrap tabular-nums">
                           <div className="flex items-center gap-1">
-                            <span className="text-[11px] text-[#6e6e73]">总计:</span>
+                            <span className="text-[11px] text-[var(--codey-muted,#6e6e73)]">总计:</span>
                           {item.totalTokens == null ? (
                             <div className="flex min-w-20 items-center gap-1">
-                              <span className="text-[10px] font-medium text-[#8e8e93]">
+                              <span className="text-[10px] font-medium text-[var(--codey-subtle,#8e8e93)]">
                                 {usageUnavailable.label}
                               </span>
                               <Tooltip
@@ -1696,17 +1696,17 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                               </Tooltip>
                             </div>
                           ) : (
-                            <strong className="text-sm font-bold text-[#1d1d1f]">{formatTokens(item.totalTokens)}</strong>
+                            <strong className="text-sm font-bold text-[var(--codey-text,#1d1d1f)]">{formatTokens(item.totalTokens)}</strong>
                           )}
                           </div>
-                          <div className="text-[10px] leading-4 text-[#6e6e73]">
-                            输入: {formatTokens(item.inputTokens)} <span aria-hidden="true" className="text-[#c7c7cc]">|</span> 输出: {formatTokens(item.outputTokens)}
+                          <div className="text-[10px] leading-4 text-[var(--codey-muted,#6e6e73)]">
+                            输入: {formatTokens(item.inputTokens)} <span aria-hidden="true" className="text-[var(--codey-subtle,#c7c7cc)]">|</span> 输出: {formatTokens(item.outputTokens)}
                           </div>
-                          <div className="text-[10px] leading-4 text-[#6e6e73]">推理: {formatTokens(item.reasoningOutputTokens)}</div>
+                          <div className="text-[10px] leading-4 text-[var(--codey-muted,#6e6e73)]">推理: {formatTokens(item.reasoningOutputTokens)}</div>
                         </div>,
 <div className="grid gap-0.5 whitespace-nowrap tabular-nums" title="缓存命中率 = 缓存输入 Token / 输入 Token；未上报或无法计算时显示 —">
-                          <strong className="text-sm font-bold text-[#1d1d1f]">{formatTokens(item.cachedInputTokens)}</strong>
-                          <span className={`text-[10px] font-semibold leading-4 ${cacheHitRate === "—" ? "text-[#6e6e73]" : "text-[#c74735]"}`}>
+                          <strong className="text-sm font-bold text-[var(--codey-text,#1d1d1f)]">{formatTokens(item.cachedInputTokens)}</strong>
+                          <span className={`text-[10px] font-semibold leading-4 ${cacheHitRate === "—" ? "text-[var(--codey-muted,#6e6e73)]" : "text-[var(--codey-red,#c74735)]"}`}>
                             {cacheHitRate} 命中
                           </span>
                         </div>] };})}
@@ -1719,17 +1719,17 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
           )}
 
           {result?.queryable && result.status === "ok" ? (
-            <div className="request-log-pagination flex flex-none flex-wrap items-center justify-between gap-3 border-t border-black/8 px-3.5 py-2 text-xs max-[760px]:flex-col max-[760px]:items-stretch">
-              <div className="flex flex-wrap items-center gap-2 text-[#6e6e73]">
-                <span className="font-semibold text-[#1d1d1f]">
+            <div className="request-log-pagination flex flex-none flex-wrap items-center justify-between gap-3 border-t border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 px-3.5 py-2 text-xs max-[760px]:flex-col max-[760px]:items-stretch">
+              <div className="flex flex-wrap items-center gap-2 text-[var(--codey-muted,#6e6e73)]">
+                <span className="font-semibold text-[var(--codey-text,#1d1d1f)]">
                   共 {totalCount.toLocaleString()} 条
                 </span>
-                <span className="text-black/20">·</span>
+                <span className="text-[rgb(var(--codey-ink-rgb,0,0,0))]/20">·</span>
                 <span>
                   当前显示 {firstVisible.toLocaleString()}–{lastVisible.toLocaleString()} 条
                 </span>
-                <span className="text-black/20">·</span>
-                <span className="rounded bg-black/6 px-1.5 py-0.5 font-mono text-[11px] font-medium text-[#1d1d1f]">
+                <span className="text-[rgb(var(--codey-ink-rgb,0,0,0))]/20">·</span>
+                <span className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/6 px-1.5 py-0.5 font-mono text-[11px] font-medium text-[var(--codey-text,#1d1d1f)]">
                   第 {page} / {totalPages} 页
                 </span>
               </div>
@@ -1788,7 +1788,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                   </Pagination.Content>
                 </Pagination>
                 <form
-                  className="flex items-center gap-1.5 whitespace-nowrap text-[#6e6e73]"
+                  className="flex items-center gap-1.5 whitespace-nowrap text-[var(--codey-muted,#6e6e73)]"
                   aria-label="跳转页码"
                   onSubmit={(event) => {
                     event.preventDefault();
@@ -1842,7 +1842,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
               </DialogDescription>
             </DialogHeader>
             <div
-              className="mt-4 flex items-start gap-2 rounded-[9px] border border-red-700/20 bg-red-50 px-3 py-2.5 text-xs leading-5 text-red-800"
+              className="mt-4 flex items-start gap-2 rounded-[9px] border border-red-700/20 dark:border-red-700/20 bg-red-50 dark:bg-red-950 px-3 py-2.5 text-xs leading-5 text-red-800 dark:text-red-300"
               role="alert"
             >
               <IconAlertTriangle className="mt-0.5 shrink-0" size={17} aria-hidden="true" />
@@ -1880,13 +1880,13 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
             <Drawer.Content placement="right">
               <Drawer.Dialog className="w-[580px] max-w-[100vw] rounded-none p-0" aria-label="请求详情">
           <div
-            className="request-log-detail relative z-10 flex h-full w-full max-w-[580px] flex-col bg-white shadow-2xl transition-transform"
+            className="request-log-detail relative z-10 flex h-full w-full max-w-[580px] flex-col bg-[var(--codey-surface,#fff)] shadow-2xl transition-transform"
           >
             {/* 抽屉头部 */}
-            <div className="flex flex-none items-center justify-between border-b border-black/8 bg-[#fbfbfd] px-5 py-3.5">
+            <div className="flex flex-none items-center justify-between border-b border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface-muted,#fbfbfd)] px-5 py-3.5">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <h3 className="m-0 text-sm font-bold text-[#1d1d1f]">请求详情</h3>
+                  <h3 className="m-0 text-sm font-bold text-[var(--codey-text,#1d1d1f)]">请求详情</h3>
                   {(() => {
                     const pres = statusPresentation[selectedItem.status] ?? {
                       label: selectedItem.status || "未知",
@@ -1899,19 +1899,19 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                     );
                   })()}
                   {selectedItem.statusCode != null ? (
-                    <span className="font-mono text-[11px] text-[#6e6e73]">
+                    <span className="font-mono text-[11px] text-[var(--codey-muted,#6e6e73)]">
                       HTTP {selectedItem.statusCode}
                     </span>
                   ) : null}
                 </div>
-                <p className="m-0 mt-0.5 truncate font-mono text-[11px] text-[#8e8e93]">
+                <p className="m-0 mt-0.5 truncate font-mono text-[11px] text-[var(--codey-subtle,#8e8e93)]">
                   {formatTimestamp(selectedItem.timestampUnixMs)} · {selectedItem.requestId}
                 </p>
               </div>
               <div className="flex items-center gap-1.5">
                 <button
                   type="button"
-                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-lg text-[#8e8e93] hover:bg-black/5 hover:text-[#1d1d1f]"
+                  className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-lg text-[var(--codey-subtle,#8e8e93)] hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 hover:text-[var(--codey-text,#1d1d1f)]"
                   onClick={() => setSelectedItem(null)}
                   aria-label="关闭详情"
                 >
@@ -1921,59 +1921,59 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
             </div>
 
             {/* 抽屉内容区 */}
-            <div className="flex-1 overflow-y-auto p-5 space-y-4 text-xs text-[#1d1d1f]">
+            <div className="flex-1 overflow-y-auto p-5 space-y-4 text-xs text-[var(--codey-text,#1d1d1f)]">
               {/* 耗时与 Token 使用量 */}
-              <div className="rounded-xl border border-black/8 bg-[#fafafa] p-3.5">
+              <div className="rounded-xl border border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface-muted,#fafafa)] p-3.5">
                 {/* 耗时分解 */}
                 <div>
-                  <div className="flex items-center justify-between pb-2 border-b border-black/6">
-                    <span className="font-semibold text-[#1d1d1f]">端到端耗时分解</span>
-                    <span className="font-mono font-bold text-sm text-[#1d1d1f]">
+                  <div className="flex items-center justify-between pb-2 border-b border-[rgb(var(--codey-ink-rgb,0,0,0))]/6">
+                    <span className="font-semibold text-[var(--codey-text,#1d1d1f)]">端到端耗时分解</span>
+                    <span className="font-mono font-bold text-sm text-[var(--codey-text,#1d1d1f)]">
                       {formatDuration(selectedItem.totalDurationMs)}
                     </span>
                   </div>
                   <div className="mt-3 space-y-2">
                     <div className="flex items-center justify-between">
-                      <span className="text-[#6e6e73]">端到端首内容 (TTFT)</span>
-                      <span className="font-mono font-medium text-blue-600">
+                      <span className="text-[var(--codey-muted,#6e6e73)]">端到端首内容 (TTFT)</span>
+                      <span className="font-mono font-medium text-blue-600 dark:text-blue-400">
                         {formatDuration(selectedItem.downstreamFirstContentMs ?? selectedItem.ttftMs)}
                       </span>
                     </div>
                     {selectedItem.routerPreUpstreamMs != null ? (
                       <div className="flex items-center justify-between">
-                        <span className="text-[#6e6e73]">路由前置耗时</span>
+                        <span className="text-[var(--codey-muted,#6e6e73)]">路由前置耗时</span>
                         <span className="font-mono">{formatDuration(selectedItem.routerPreUpstreamMs)}</span>
                       </div>
                     ) : null}
                     {selectedItem.upstreamFirstByteMs != null ? (
                       <div className="flex items-center justify-between">
-                        <span className="text-[#6e6e73]">上游首包耗时</span>
+                        <span className="text-[var(--codey-muted,#6e6e73)]">上游首包耗时</span>
                         <span className="font-mono">{formatDuration(selectedItem.upstreamFirstByteMs)}</span>
                       </div>
                     ) : null}
                     {selectedItem.upstreamHeaderMs != null ? (
                       <div className="flex items-center justify-between">
-                        <span className="text-[#6e6e73]">上游响应头耗时</span>
+                        <span className="text-[var(--codey-muted,#6e6e73)]">上游响应头耗时</span>
                         <span className="font-mono">{formatDuration(selectedItem.upstreamHeaderMs)}</span>
                       </div>
                     ) : null}
                     {selectedItem.queueDelayMs > 0 ? (
                       <div className="flex items-center justify-between">
-                        <span className="text-[#6e6e73]">排队延迟</span>
-                        <span className="font-mono text-amber-600">{formatDuration(selectedItem.queueDelayMs)}</span>
+                        <span className="text-[var(--codey-muted,#6e6e73)]">排队延迟</span>
+                        <span className="font-mono text-amber-600 dark:text-amber-400">{formatDuration(selectedItem.queueDelayMs)}</span>
                       </div>
                     ) : null}
                   </div>
                 </div>
 
                 {/* Token 使用量 */}
-                <div className="mt-3.5 pt-3.5 border-t border-black/6">
-                  <span className="block font-semibold text-[#1d1d1f] pb-2 border-b border-black/6">
+                <div className="mt-3.5 pt-3.5 border-t border-[rgb(var(--codey-ink-rgb,0,0,0))]/6">
+                  <span className="block font-semibold text-[var(--codey-text,#1d1d1f)] pb-2 border-b border-[rgb(var(--codey-ink-rgb,0,0,0))]/6">
                     Token 使用量
                   </span>
                   {selectedItem.totalTokens == null ? (
-                    <div className="mt-3 rounded-lg border border-black/6 bg-white p-3 text-center">
-                      <span className="text-xs text-[#8e8e93]">
+                    <div className="mt-3 rounded-lg border border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 bg-[var(--codey-surface,#fff)] p-3 text-center">
+                      <span className="text-xs text-[var(--codey-subtle,#8e8e93)]">
                         {usageUnavailablePresentation(selectedItem.usageUnavailableReason).label}：
                         {usageUnavailablePresentation(selectedItem.usageUnavailableReason).message}
                       </span>
@@ -1981,41 +1981,41 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                   ) : (
                     <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2.5">
                       <div>
-                        <dt className="text-[11px] text-[#8e8e93]">总 Token</dt>
-                        <dd className="m-0 mt-0.5 font-mono text-base font-bold text-[#1d1d1f]">
+                        <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">总 Token</dt>
+                        <dd className="m-0 mt-0.5 font-mono text-base font-bold text-[var(--codey-text,#1d1d1f)]">
                           {formatTokens(selectedItem.totalTokens)}
                         </dd>
                       </div>
                       <div>
-                        <dt className="text-[11px] text-[#8e8e93]">缓存输入 Token</dt>
-                        <dd className="m-0 mt-0.5 font-mono text-base font-bold text-purple-600">
+                        <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">缓存输入 Token</dt>
+                        <dd className="m-0 mt-0.5 font-mono text-base font-bold text-purple-600 dark:text-purple-400">
                           {formatTokens(selectedItem.cachedInputTokens)}
                         </dd>
                       </div>
                       <div>
-                        <dt className="text-[11px] text-[#8e8e93]">输入 Token</dt>
-                        <dd className="m-0 mt-0.5 font-mono font-medium text-[#1d1d1f]">
+                        <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">输入 Token</dt>
+                        <dd className="m-0 mt-0.5 font-mono font-medium text-[var(--codey-text,#1d1d1f)]">
                           {formatTokens(selectedItem.inputTokens)}
                         </dd>
                       </div>
                       <div>
-                        <dt className="text-[11px] text-[#8e8e93]">输出 Token</dt>
-                        <dd className="m-0 mt-0.5 font-mono font-medium text-[#1d1d1f]">
+                        <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">输出 Token</dt>
+                        <dd className="m-0 mt-0.5 font-mono font-medium text-[var(--codey-text,#1d1d1f)]">
                           {formatTokens(selectedItem.outputTokens)}
                         </dd>
                       </div>
                       {selectedItem.reasoningOutputTokens != null ? (
                         <div>
-                          <dt className="text-[11px] text-[#8e8e93]">思考输出 Token</dt>
-                          <dd className="m-0 mt-0.5 font-mono font-medium text-[#48484a]">
+                          <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">思考输出 Token</dt>
+                          <dd className="m-0 mt-0.5 font-mono font-medium text-[var(--codey-text-soft,#48484a)]">
                             {formatTokens(selectedItem.reasoningOutputTokens)}
                           </dd>
                         </div>
                       ) : null}
                       {selectedItem.cacheCreationInputTokens != null ? (
                         <div>
-                          <dt className="text-[11px] text-[#8e8e93]">缓存创建 Token</dt>
-                          <dd className="m-0 mt-0.5 font-mono font-medium text-[#48484a]">
+                          <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">缓存创建 Token</dt>
+                          <dd className="m-0 mt-0.5 font-mono font-medium text-[var(--codey-text-soft,#48484a)]">
                             {formatTokens(selectedItem.cacheCreationInputTokens)}
                           </dd>
                         </div>
@@ -2026,22 +2026,22 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
               </div>
 
               {/* 模型与上游路由 */}
-              <div className="rounded-xl border border-black/8 bg-[#fafafa] p-3.5">
-                <span className="block font-semibold text-[#1d1d1f] pb-2 border-b border-black/6">
+              <div className="rounded-xl border border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface-muted,#fafafa)] p-3.5">
+                <span className="block font-semibold text-[var(--codey-text,#1d1d1f)] pb-2 border-b border-[rgb(var(--codey-ink-rgb,0,0,0))]/6">
                   模型与路由
                 </span>
                 <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2.5">
                   <div>
-                    <dt className="text-[11px] text-[#8e8e93]">供应商</dt>
-                    <dd className="m-0 mt-0.5 font-medium text-[#1d1d1f]">
+                    <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">供应商</dt>
+                    <dd className="m-0 mt-0.5 font-medium text-[var(--codey-text,#1d1d1f)]">
                       {selectedItem.providerName || selectedItem.provider || "—"}
                     </dd>
                   </div>
                   {selectedItem.officialAccountId ? (
                     <div>
-                      <dt className="text-[11px] text-[#8e8e93]">官方账号</dt>
+                      <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">官方账号</dt>
                       <dd
-                        className="m-0 mt-0.5 truncate font-medium text-[#1d1d1f]"
+                        className="m-0 mt-0.5 truncate font-medium text-[var(--codey-text,#1d1d1f)]"
                         title={officialAccountLabel(selectedItem.officialAccountId)}
                       >
                         {officialAccountLabel(selectedItem.officialAccountId)}
@@ -2049,23 +2049,23 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                     </div>
                   ) : null}
                   <div>
-                    <dt className="text-[11px] text-[#8e8e93]">请求模型</dt>
-                    <dd className="m-0 mt-0.5 font-medium text-[#1d1d1f]">
+                    <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">请求模型</dt>
+                    <dd className="m-0 mt-0.5 font-medium text-[var(--codey-text,#1d1d1f)]">
                       {selectedItem.model || selectedItem.requestedModel || "—"}
                     </dd>
                   </div>
                   <div>
-                    <dt className="text-[11px] text-[#8e8e93]">实际使用模型</dt>
-                    <dd className="m-0 mt-0.5 break-all font-medium text-[#1d1d1f]">
+                    <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">实际使用模型</dt>
+                    <dd className="m-0 mt-0.5 break-all font-medium text-[var(--codey-text,#1d1d1f)]">
                       {selectedItem.upstreamResponseModel?.trim() || "上游未回报"}
                     </dd>
                   </div>
                   {selectedItem.requestedModel.trim()
                   && !modelIdsEqual(selectedItem.requestedModel, selectedItem.model || selectedItem.requestedModel) ? (
                     <div>
-                      <dt className="text-[11px] text-[#8e8e93]">Codex 选择器</dt>
+                      <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">Codex 选择器</dt>
                       <dd
-                        className="m-0 mt-0.5 break-all font-mono text-[11px] text-[#48484a]"
+                        className="m-0 mt-0.5 break-all font-mono text-[11px] text-[var(--codey-text-soft,#48484a)]"
                         title="Codex 请求 Codey 时选择的模型 ID，带线路前缀"
                       >
                         {selectedItem.requestedModel}
@@ -2073,20 +2073,20 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                     </div>
                   ) : null}
                   <div>
-                    <dt className="text-[11px] text-[#8e8e93]">计费档位（请求 / 实际）</dt>
-                    <dd className="m-0 mt-0.5 font-medium text-[#1d1d1f]">
+                    <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">计费档位（请求 / 实际）</dt>
+                    <dd className="m-0 mt-0.5 font-medium text-[var(--codey-text,#1d1d1f)]">
                       {selectedItem.requestedServiceTier || "未记录"} / {selectedItem.serviceTier || "未确认"}
                     </dd>
                   </div>
                   <div>
-                    <dt className="text-[11px] text-[#8e8e93]">思考强度 / 预算</dt>
-                    <dd className="m-0 mt-0.5 font-medium text-[#1d1d1f]">
+                    <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">思考强度 / 预算</dt>
+                    <dd className="m-0 mt-0.5 font-medium text-[var(--codey-text,#1d1d1f)]">
                       {reasoningLabel(selectedItem)}
                     </dd>
                   </div>
                   <div>
-                    <dt className="text-[11px] text-[#8e8e93]">上游传输方式</dt>
-                    <dd className="m-0 mt-0.5 font-medium text-[#1d1d1f]">
+                    <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">上游传输方式</dt>
+                    <dd className="m-0 mt-0.5 font-medium text-[var(--codey-text,#1d1d1f)]">
                       <Badge
                         variant="secondary"
                         className={`request-log-protocol ${protocolTagClass(selectedItem.upstreamTransport)}`}
@@ -2096,30 +2096,30 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                     </dd>
                   </div>
                   <div>
-                    <dt className="text-[11px] text-[#8e8e93]">上游域名</dt>
-                    <dd className="m-0 mt-0.5 font-mono text-[11px] text-[#48484a] truncate" title={selectedItem.upstreamAuthority || undefined}>
+                    <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">上游域名</dt>
+                    <dd className="m-0 mt-0.5 font-mono text-[11px] text-[var(--codey-text-soft,#48484a)] truncate" title={selectedItem.upstreamAuthority || undefined}>
                       {selectedItem.upstreamAuthority || "—"}
                     </dd>
                   </div>
                   {selectedItem.upstreamRequestId ? (
                     <div className="col-span-2">
-                      <dt className="text-[11px] text-[#8e8e93]">上游请求 ID</dt>
-                      <dd className="m-0 mt-0.5 font-mono text-[11px] text-[#48484a] truncate">
+                      <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">上游请求 ID</dt>
+                      <dd className="m-0 mt-0.5 font-mono text-[11px] text-[var(--codey-text-soft,#48484a)] truncate">
                         {selectedItem.upstreamRequestId}
                       </dd>
                     </div>
                   ) : null}
                   {selectedItem.codexSessionId ? (
                     <div className="col-span-2">
-                      <dt className="text-[11px] text-[#8e8e93]">Codex 会话 ID</dt>
-                      <dd className="m-0 mt-0.5 flex items-center gap-1.5 font-mono text-[11px] text-[#48484a]">
+                      <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">Codex 会话 ID</dt>
+                      <dd className="m-0 mt-0.5 flex items-center gap-1.5 font-mono text-[11px] text-[var(--codey-text-soft,#48484a)]">
                         {selectedItem.codexSessionIsParent ? (
                           <Badge variant="secondary">父会话</Badge>
                         ) : null}
                         <span className="truncate">{selectedItem.codexSessionId}</span>
                         <button
                           type="button"
-                          className="text-blue-600 hover:text-blue-700 ml-1 cursor-pointer"
+                          className="text-blue-600 dark:text-blue-400 hover:text-blue-700 ml-1 cursor-pointer"
                           onClick={() => handleCopyId(selectedItem.codexSessionId!, selectedItem.codexSessionIsParent ? "父会话 ID" : "会话 ID")}
                         >
                           复制
@@ -2129,24 +2129,24 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                   ) : null}
                   {selectedItem.subagent ? (
                     <div>
-                      <dt className="text-[11px] text-[#8e8e93]">子代理请求</dt>
-                      <dd className="m-0 mt-0.5 font-medium text-purple-600">是</dd>
+                      <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">子代理请求</dt>
+                      <dd className="m-0 mt-0.5 font-medium text-purple-600 dark:text-purple-400">是</dd>
                     </div>
                   ) : null}
                   {selectedItem.protocolBridge ? (
                     <div>
-                      <dt className="text-[11px] text-[#8e8e93]">协议桥接</dt>
-                      <dd className="m-0 mt-0.5 font-mono text-[11px] text-[#48484a]">
+                      <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">协议桥接</dt>
+                      <dd className="m-0 mt-0.5 font-mono text-[11px] text-[var(--codey-text-soft,#48484a)]">
                         {selectedItem.protocolBridge}
                       </dd>
                     </div>
                   ) : null}
                   {selectedItem.requestInputState || selectedItem.upstreamInputState ? (
                     <div className="col-span-2">
-                      <dt className="text-[11px] text-[#8e8e93]">请求体 input 形态（客户端 / 发往上游）</dt>
+                      <dt className="text-[11px] text-[var(--codey-subtle,#8e8e93)]">请求体 input 形态（客户端 / 发往上游）</dt>
                       <dd className="m-0 mt-0.5 grid gap-0.5">
                         <span
-                          className={`font-medium ${isEmptyInputArray(selectedItem.requestInputState, selectedItem.requestInputItems) ? "text-red-600" : "text-[#1d1d1f]"}`}
+                          className={`font-medium ${isEmptyInputArray(selectedItem.requestInputState, selectedItem.requestInputItems) ? "text-red-600 dark:text-red-400" : "text-[var(--codey-text,#1d1d1f)]"}`}
                         >
                           客户端：
                           {requestShapeText(
@@ -2157,7 +2157,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                           {selectedItem.requestBytes != null ? ` · ${formatBytes(selectedItem.requestBytes)}` : ""}
                         </span>
                         <span
-                          className={`font-medium ${isEmptyInputArray(selectedItem.upstreamInputState, selectedItem.upstreamInputItems) ? "text-red-600" : "text-[#1d1d1f]"}`}
+                          className={`font-medium ${isEmptyInputArray(selectedItem.upstreamInputState, selectedItem.upstreamInputItems) ? "text-red-600 dark:text-red-400" : "text-[var(--codey-text,#1d1d1f)]"}`}
                         >
                           上游：
                           {requestShapeText(
@@ -2174,20 +2174,20 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
               </div>
 
               {/* 请求头与响应头 */}
-              <div className="rounded-xl border border-black/8 bg-[#fafafa] p-3.5 text-xs">
-                <span className="block font-semibold text-[#1d1d1f] pb-2 border-b border-black/6">
+              <div className="rounded-xl border border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface-muted,#fafafa)] p-3.5 text-xs">
+                <span className="block font-semibold text-[var(--codey-text,#1d1d1f)] pb-2 border-b border-[rgb(var(--codey-ink-rgb,0,0,0))]/6">
                   请求头与响应头
                 </span>
                 <div className="mt-3 grid gap-3">
                   <div>
                     <div className="flex items-center gap-1">
-                      <span className="text-[11px] font-medium text-[#48484a]">
+                      <span className="text-[11px] font-medium text-[var(--codey-text-soft,#48484a)]">
                         请求头（Codey 发往上游，敏感值已脱敏）
                       </span>
                       {selectedItem.upstreamRequestHeaders ? (
                         <button
                           type="button"
-                          className="inline-flex items-center rounded p-0.5 text-[#8e8e93] transition-colors hover:bg-black/8 hover:text-[#1d1d1f] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                          className="inline-flex items-center rounded p-0.5 text-[var(--codey-subtle,#8e8e93)] transition-colors hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/8 hover:text-[var(--codey-text,#1d1d1f)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                           onClick={() => handleCopyId(selectedItem.upstreamRequestHeaders!, "上游请求头", "请求头内容")}
                           aria-label="复制上游请求头"
                           title="复制上游请求头"
@@ -2197,24 +2197,24 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                       ) : null}
                     </div>
                     {selectedItem.upstreamRequestHeaders ? (
-                      <pre className="m-0 mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-black/5 p-2 font-mono text-[10px] leading-relaxed text-[#48484a] break-words">
+                      <pre className="m-0 mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 p-2 font-mono text-[10px] leading-relaxed text-[var(--codey-text-soft,#48484a)] break-words">
                         {selectedItem.upstreamRequestHeaders}
                       </pre>
                     ) : (
-                      <p className="m-0 mt-1 rounded-lg bg-black/5 p-2 text-[11px] text-[#8e8e93]">
+                      <p className="m-0 mt-1 rounded-lg bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 p-2 text-[11px] text-[var(--codey-subtle,#8e8e93)]">
                         未记录
                       </p>
                     )}
                   </div>
                   <div>
                     <div className="flex items-center gap-1">
-                      <span className="text-[11px] font-medium text-[#48484a]">
+                      <span className="text-[11px] font-medium text-[var(--codey-text-soft,#48484a)]">
                         响应头（上游返回，敏感值已脱敏）
                       </span>
                       {selectedItem.upstreamResponseHeaders ? (
                         <button
                           type="button"
-                          className="inline-flex items-center rounded p-0.5 text-[#8e8e93] transition-colors hover:bg-black/8 hover:text-[#1d1d1f] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+                          className="inline-flex items-center rounded p-0.5 text-[var(--codey-subtle,#8e8e93)] transition-colors hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/8 hover:text-[var(--codey-text,#1d1d1f)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                           onClick={() => handleCopyId(selectedItem.upstreamResponseHeaders!, "上游响应头", "响应头内容")}
                           aria-label="复制上游响应头"
                           title="复制上游响应头"
@@ -2224,11 +2224,11 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                       ) : null}
                     </div>
                     {selectedItem.upstreamResponseHeaders ? (
-                      <pre className="m-0 mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-black/5 p-2 font-mono text-[10px] leading-relaxed text-[#48484a] break-words">
+                      <pre className="m-0 mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded-lg bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 p-2 font-mono text-[10px] leading-relaxed text-[var(--codey-text-soft,#48484a)] break-words">
                         {selectedItem.upstreamResponseHeaders}
                       </pre>
                     ) : (
-                      <p className="m-0 mt-1 rounded-lg bg-black/5 p-2 text-[11px] text-[#8e8e93]">
+                      <p className="m-0 mt-1 rounded-lg bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 p-2 text-[11px] text-[var(--codey-subtle,#8e8e93)]">
                         未记录
                       </p>
                     )}
@@ -2238,23 +2238,23 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
 
               {/* 异常与降级诊断 */}
               {(selectedItem.status !== "succeeded" || selectedItem.fallbackCount > 0 || selectedItem.upstreamErrorSummary || selectedItem.errorCode) ? (
-                <div className="rounded-xl border border-red-200 bg-red-50/50 p-3.5">
-                  <span className="block font-semibold text-red-900 pb-2 border-b border-red-200">
+                <div className="rounded-xl border border-red-200 dark:border-red-700 bg-red-50/50 dark:bg-red-950/50 p-3.5">
+                  <span className="block font-semibold text-red-900 dark:text-red-300 pb-2 border-b border-red-200 dark:border-red-700">
                     异常与诊断
                   </span>
                   <div className="mt-3 space-y-2">
                     {selectedItem.errorCode ? (
                       <div>
-                        <span className="text-[11px] font-medium text-red-800">错误码：</span>
-                        <code className="ml-1 rounded bg-red-100 px-1 py-0.5 font-mono text-[11px] text-red-900">
+                        <span className="text-[11px] font-medium text-red-800 dark:text-red-300">错误码：</span>
+                        <code className="ml-1 rounded bg-red-100 dark:bg-red-950 px-1 py-0.5 font-mono text-[11px] text-red-900 dark:text-red-300">
                           {selectedItem.errorCode}
                         </code>
                       </div>
                     ) : null}
                     {selectedItem.upstreamErrorSummary ? (
                       <div>
-                        <span className="text-[11px] font-medium text-red-800">上游错误内容（已脱敏）：</span>
-                        <pre className="m-0 mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-lg bg-white p-2 text-[11px] leading-relaxed text-red-900 break-words">
+                        <span className="text-[11px] font-medium text-red-800 dark:text-red-300">上游错误内容（已脱敏）：</span>
+                        <pre className="m-0 mt-1 max-h-80 overflow-auto whitespace-pre-wrap rounded-lg bg-[var(--codey-surface,#fff)] p-2 text-[11px] leading-relaxed text-red-900 dark:text-red-300 break-words">
                           {selectedItem.upstreamErrorSummary}
                         </pre>
                       </div>
@@ -2263,8 +2263,8 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                       const canc = cancellationPresentation(selectedItem);
                       return canc ? (
                         <div>
-                          <span className="text-[11px] font-medium text-amber-800">中断原因：</span>
-                          <p className="m-0 mt-1 rounded-lg bg-white p-2 text-[11px] leading-relaxed text-[#48484a]">
+                          <span className="text-[11px] font-medium text-amber-800 dark:text-amber-300">中断原因：</span>
+                          <p className="m-0 mt-1 rounded-lg bg-[var(--codey-surface,#fff)] p-2 text-[11px] leading-relaxed text-[var(--codey-text-soft,#48484a)]">
                             <strong className="font-semibold">{canc.label}：</strong>{canc.message}
                           </p>
                         </div>
@@ -2272,11 +2272,11 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                     })()}
                     {selectedItem.fallbackCount > 0 ? (
                       <div>
-                        <span className="text-[11px] font-medium text-amber-800">
+                        <span className="text-[11px] font-medium text-amber-800 dark:text-amber-300">
                           降级重试：已尝试 {selectedItem.fallbackCount} 次
                         </span>
                         {selectedItem.fallbackReason ? (
-                          <p className="m-0 mt-1 text-[11px] text-[#6e6e73]">
+                          <p className="m-0 mt-1 text-[11px] text-[var(--codey-muted,#6e6e73)]">
                             原因: {selectedItem.fallbackReason}
                           </p>
                         ) : null}
@@ -2288,7 +2288,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
             </div>
 
             {/* 抽屉底部操作栏 */}
-            <div className="flex flex-none items-center justify-end gap-2 border-t border-black/8 bg-[#fafafa] px-5 py-3">
+            <div className="flex flex-none items-center justify-end gap-2 border-t border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface-muted,#fafafa)] px-5 py-3">
               <Button
                 size="sm"
                 variant="outline"
@@ -2316,22 +2316,22 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
         <div
           role="status"
           aria-live="polite"
-          className="pointer-events-auto fixed bottom-6 right-6 z-[1000] flex max-w-[min(420px,calc(100vw-32px))] items-center gap-2.5 rounded-xl border border-black/10 border-l-4 border-l-[#34c759] bg-white/95 px-4 py-3 text-xs text-[#1d1d1f] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-2xl transition-all duration-200"
+          className="pointer-events-auto fixed bottom-6 right-6 z-[1000] flex max-w-[min(420px,calc(100vw-32px))] items-center gap-2.5 rounded-xl border border-[rgb(var(--codey-ink-rgb,0,0,0))]/10 border-l-4 border-l-[#34c759] bg-[var(--codey-surface,#fff)]/95 px-4 py-3 text-xs text-[var(--codey-text,#1d1d1f)] shadow-[0_12px_32px_rgba(0,0,0,0.14)] backdrop-blur-2xl transition-all duration-200"
         >
-          <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-50 text-emerald-600">
+          <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-emerald-50 dark:bg-emerald-950 text-emerald-600 dark:text-emerald-400">
             <IconCheck size={15} stroke={2.5} aria-hidden="true" />
           </div>
           <div className="min-w-0 flex-1">
-            <p className="m-0 font-medium text-[#1d1d1f]">{copyToast.text}</p>
+            <p className="m-0 font-medium text-[var(--codey-text,#1d1d1f)]">{copyToast.text}</p>
             {copyToast.subtext ? (
-              <p className="m-0 mt-0.5 truncate font-mono text-[11px] text-[#8e8e93]">
+              <p className="m-0 mt-0.5 truncate font-mono text-[11px] text-[var(--codey-subtle,#8e8e93)]">
                 {copyToast.subtext}
               </p>
             ) : null}
           </div>
           <button
             type="button"
-            className="ml-1 -mr-1 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-[#8e8e93] hover:bg-black/5 hover:text-[#1d1d1f]"
+            className="ml-1 -mr-1 flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-md border-0 bg-transparent text-[var(--codey-subtle,#8e8e93)] hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 hover:text-[var(--codey-text,#1d1d1f)]"
             onClick={() => setCopyToast(null)}
             aria-label="关闭提示"
           >

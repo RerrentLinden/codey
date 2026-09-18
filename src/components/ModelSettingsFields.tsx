@@ -68,26 +68,26 @@ export function ModelSettingsFields({
 
   return (
     <details className="group model-settings-details w-full text-xs">
-      <summary className="model-settings-summary flex cursor-pointer select-none list-none items-center gap-1.5 py-0.5 pl-6 text-[11px] text-[#6e6e73] transition-colors hover:text-[#1d1d1f] outline-none [&::-webkit-details-marker]:hidden">
+      <summary className="model-settings-summary flex cursor-pointer select-none list-none items-center gap-1.5 py-0.5 pl-6 text-[11px] text-[var(--codey-muted,#6e6e73)] transition-colors hover:text-[var(--codey-text,#1d1d1f)] outline-none [&::-webkit-details-marker]:hidden">
         <IconChevronRight
           size={12}
-          className="shrink-0 text-[#86868b] transition-transform duration-150 group-open:rotate-90"
+          className="shrink-0 text-[var(--codey-subtle,#86868b)] transition-transform duration-150 group-open:rotate-90"
           aria-hidden="true"
         />
         <span className="font-medium">模型设置</span>
         {summaryBadges.length > 0 ? (
-          <span className="inline-flex items-center rounded border border-blue-500/20 bg-blue-500/10 px-1.5 py-0.2 text-[10px] font-semibold text-[#007aff]">
+          <span className="inline-flex items-center rounded border border-blue-500/20 dark:border-blue-700/20 bg-blue-500/10 px-1.5 py-0.2 text-[10px] font-semibold text-[var(--codey-blue,#007aff)]">
             {summaryBadges.join(" · ")}
           </span>
         ) : (
-          <span className="inline-flex items-center rounded border border-black/5 bg-black/[0.04] px-1.5 py-0.2 text-[10px] font-normal text-[#86868b]">
+          <span className="inline-flex items-center rounded border border-[rgb(var(--codey-ink-rgb,0,0,0))]/5 bg-[rgb(var(--codey-ink-rgb,0,0,0))]/[0.04] px-1.5 py-0.2 text-[10px] font-normal text-[var(--codey-subtle,#86868b)]">
             默认
           </span>
         )}
       </summary>
-      <div className="mt-1.5 rounded-[9px] border border-black/[0.08] bg-[#f8f8fa] p-3 shadow-[0_1px_2px_rgba(0,0,0,0.02)]">
+      <div className="mt-1.5 rounded-[9px] border border-[rgb(var(--codey-ink-rgb,0,0,0))]/[0.08] bg-[var(--codey-surface-sunken,#f8f8fa)] p-3 shadow-[0_1px_2px_rgba(0,0,0,0.02)]">
         <div className="mb-2.5 flex items-start justify-between gap-2">
-          <p className="text-[11px] leading-[1.45] text-[#6e6e73]">
+          <p className="text-[11px] leading-[1.45] text-[var(--codey-muted,#6e6e73)]">
             自定义值优先于上游模板；清空窗口恢复默认。未知模型默认使用 200000 Token 保守预算，不代表服务端容量。窗口与压缩阈值的修改需重启 Codex 生效。
           </p>
           {policy && (
@@ -99,7 +99,7 @@ export function ModelSettingsFields({
                 event.stopPropagation();
                 onChange(undefined);
               }}
-              className="shrink-0 text-[10.5px] font-medium text-[#007aff] transition-colors hover:text-[#d70015] hover:underline disabled:opacity-40"
+              className="shrink-0 text-[10.5px] font-medium text-[var(--codey-blue,#007aff)] transition-colors hover:text-[var(--codey-red,#d70015)] hover:underline disabled:opacity-40"
             >
               恢复默认
             </button>
@@ -107,8 +107,8 @@ export function ModelSettingsFields({
         </div>
         <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-3">
           <label className="flex flex-col gap-1">
-            <span className="text-[11px] font-medium text-[#4b5563]">
-              窗口 <span className="text-[10px] text-[#86868b]">（Token）</span>
+            <span className="text-[11px] font-medium text-[var(--codey-text-soft,#4b5563)]">
+              窗口 <span className="text-[10px] text-[var(--codey-subtle,#86868b)]">（Token）</span>
             </span>
             <ModelContextWindowCombobox
               ariaLabel={`${model} 窗口 Token`}
@@ -128,8 +128,8 @@ export function ModelSettingsFields({
             ["reserveOutputTokens", "输出预留", 1, "不单独预留"],
           ] as const).map(([field, label, min, placeholder]) => (
             <label key={field} className="flex flex-col gap-1">
-              <span className="text-[11px] font-medium text-[#4b5563]">
-                {label} <span className="text-[10px] text-[#86868b]">（Token）</span>
+              <span className="text-[11px] font-medium text-[var(--codey-text-soft,#4b5563)]">
+                {label} <span className="text-[10px] text-[var(--codey-subtle,#86868b)]">（Token）</span>
               </span>
               <Input
                 type="number"
@@ -137,7 +137,7 @@ export function ModelSettingsFields({
                 max={10_000_000}
                 step={1}
                 disabled={disabled}
-                className="h-7 rounded-md border-black/10 bg-white text-xs focus:border-[#007aff]"
+                className="h-7 rounded-md border-[rgb(var(--codey-ink-rgb,0,0,0))]/10 bg-[var(--codey-surface,#fff)] text-xs focus:border-[var(--codey-blue,#007aff)]"
                 aria-label={`${model} ${label} Token`}
                 placeholder={placeholder}
                 value={policy?.[field] ?? ""}
@@ -153,20 +153,20 @@ export function ModelSettingsFields({
             </label>
           ))}
         </div>
-        <p className="mt-2 text-[10px] leading-relaxed text-[#86868b]">
+        <p className="mt-2 text-[10px] leading-relaxed text-[var(--codey-subtle,#86868b)]">
           阈值不能超过窗口的 90% 和预留后的有效空间；预留按整百分比向下取整，不是输出长度上限。
         </p>
         {reasoning && (
-          <div className="mt-3 border-t border-black/6 pt-2.5">
+          <div className="mt-3 border-t border-[rgb(var(--codey-ink-rgb,0,0,0))]/6 pt-2.5">
             <div className="mb-2 flex items-center justify-between gap-2">
               <div className="flex items-center gap-1.5">
-                <span className="text-[11px] font-medium text-[#4b5563]">思考强度</span>
+                <span className="text-[11px] font-medium text-[var(--codey-text-soft,#4b5563)]">思考强度</span>
                 {followsTemplate ? (
-                  <span className="rounded bg-black/[0.04] px-1.5 py-0.5 text-[9.5px] font-normal text-[#86868b]">
+                  <span className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/[0.04] px-1.5 py-0.5 text-[9.5px] font-normal text-[var(--codey-subtle,#86868b)]">
                     跟随模板
                   </span>
                 ) : (
-                  <span className="rounded border border-blue-500/20 bg-blue-500/10 px-1.5 py-0.5 text-[9.5px] font-medium text-[#007aff]">
+                  <span className="rounded border border-blue-500/20 dark:border-blue-700/20 bg-blue-500/10 px-1.5 py-0.5 text-[9.5px] font-medium text-[var(--codey-blue,#007aff)]">
                     已自定义 {selectedLevels.size > 0 ? `(${selectedLevels.size})` : "（已清空）"}
                   </span>
                 )}
@@ -182,8 +182,8 @@ export function ModelSettingsFields({
                 className={cn(
                   "shrink-0 text-[10.5px] font-medium transition-colors",
                   followsTemplate
-                    ? "cursor-default text-[#86868b] opacity-40"
-                    : "cursor-pointer text-[#007aff] hover:text-[#d70015] hover:underline",
+                    ? "cursor-default text-[var(--codey-subtle,#86868b)] opacity-40"
+                    : "cursor-pointer text-[var(--codey-blue,#007aff)] hover:text-[var(--codey-red,#d70015)] hover:underline",
                   disabled && "cursor-not-allowed opacity-40",
                 )}
               >
@@ -205,15 +205,15 @@ export function ModelSettingsFields({
                       "group relative flex w-full select-none rounded-[8px] border p-0 transition-all duration-150",
                       "[&>[data-slot=checkbox-content]]:flex [&>[data-slot=checkbox-content]]:w-full [&>[data-slot=checkbox-content]]:cursor-pointer [&>[data-slot=checkbox-content]]:items-center [&>[data-slot=checkbox-content]]:gap-2 [&>[data-slot=checkbox-content]]:px-2.5 [&>[data-slot=checkbox-content]]:py-1.5",
                       isChecked
-                        ? "border-[#007aff]/35 bg-[#007aff]/[0.07] shadow-2xs"
-                        : "border-black/[0.08] bg-white hover:border-black/20 hover:bg-black/[0.015]",
+                        ? "border-[var(--codey-blue,#007aff)]/35 bg-[var(--codey-blue,#007aff)]/[0.07] shadow-2xs"
+                        : "border-[rgb(var(--codey-ink-rgb,0,0,0))]/[0.08] bg-[var(--codey-surface,#fff)] hover:border-[rgb(var(--codey-ink-rgb,0,0,0))]/20 hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/[0.015]",
                       disabled && "pointer-events-none cursor-not-allowed opacity-45",
                     )}
                   >
                     <span
                       className={cn(
                         "select-none text-[11.5px] tracking-tight transition-colors",
-                        isChecked ? "font-semibold text-[#007aff]" : "font-medium text-[#1d1d1f]",
+                        isChecked ? "font-semibold text-[var(--codey-blue,#007aff)]" : "font-medium text-[var(--codey-text,#1d1d1f)]",
                       )}
                     >
                       {level}
@@ -222,7 +222,7 @@ export function ModelSettingsFields({
                 );
               })}
             </div>
-            <p className="mt-2 text-[10px] leading-relaxed text-[#86868b]">
+            <p className="mt-2 text-[10px] leading-relaxed text-[var(--codey-subtle,#86868b)]">
               勾选该模型支持的思考强度，档位名称即发送给上游的取值。未声明时跟随上游模板自动适配，保存后立即生效。
             </p>
           </div>

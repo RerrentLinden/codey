@@ -55,6 +55,7 @@ import {
 import { flushCardClass } from "./uiClasses";
 import { validateOutboundApiUrl, validateOutboundProxyUrl } from "./urlValidation";
 import { invoke } from "./api";
+import { readHostTheme } from "./overlayTheme";
 
 type ModelSectionProps = {
   config: Config;
@@ -149,10 +150,10 @@ const UPSTREAM_PROXY_TOOLTIP_CONTENT = (
   <div className="space-y-1.5 text-xs text-left leading-relaxed">
     <div className="font-semibold">上游代理格式与提示</div>
     <div>
-      支持协议：<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">http://</code>、<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">https://</code>、<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">socks5://</code>、<code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">socks5h://</code>
+      支持协议：<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">http://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">https://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5://</code>、<code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">socks5h://</code>
     </div>
     <div>
-      支持代理认证：允许携带用户名与密码（如 <code className="rounded bg-black/10 px-1 py-0.5 font-mono text-[11px] dark:bg-white/15">user:pass@host:port</code>）。
+      支持代理认证：允许携带用户名与密码（如 <code className="rounded bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 px-1 py-0.5 font-mono text-[11px] dark:bg-[var(--codey-surface,#fff)]/15">user:pass@host:port</code>）。
     </div>
     <div className="pt-0.5">
       <div className="font-semibold text-[11px] opacity-80">常见示例：</div>
@@ -719,7 +720,7 @@ function ModelSectionComponent({
             <Button
               color="primary"
               variant="filled"
-              onClick={() => void invoke("open_route_request_logs")}
+              onClick={() => void invoke("open_route_request_logs", { theme: readHostTheme() })}
             >
               <IconListDetails size={14} aria-hidden="true" />
               <span>查看请求日志</span>
@@ -816,7 +817,7 @@ function ModelSectionComponent({
                         {!routeConfigReadOnly && (
                           <button
                             type="button"
-                            className="route-item-drag-handle cursor-grab text-gray-400 hover:text-gray-600 active:cursor-grabbing disabled:cursor-default"
+                            className="route-item-drag-handle cursor-grab text-gray-400 dark:text-gray-400 hover:text-gray-600 active:cursor-grabbing disabled:cursor-default"
                             disabled={isBusy || dirty}
                             draggable={!isBusy && !dirty}
                             aria-label={`调整线路 ${profile.name} 的顺序`}
@@ -1162,7 +1163,7 @@ function ModelSectionComponent({
                           (officialRouteDraft?.routeName.length ?? 0) > 0) ? (
                           <small
                             id="official-route-name-error"
-                            className="text-[#d70015]"
+                            className="text-[var(--codey-red,#d70015)]"
                             role="alert"
                           >
                             {officialRouteDraftErrors.routeName}
@@ -1202,7 +1203,7 @@ function ModelSectionComponent({
                           (officialRouteDraft?.routeShortName.length ?? 0) > 0) ? (
                           <small
                             id="official-route-short-name-error"
-                            className="text-[#d70015]"
+                            className="text-[var(--codey-red,#d70015)]"
                             role="alert"
                           >
                             {officialRouteDraftErrors.shortName}
@@ -1243,7 +1244,7 @@ function ModelSectionComponent({
                           updateOfficialRouteDraft({ upstreamProxy: event.target.value })}
                       />
                       {officialRouteDraftErrors?.upstreamProxy ? (
-                        <small id="official-route-proxy-error" className="text-[#d70015]" role="alert">
+                        <small id="official-route-proxy-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                           {officialRouteDraftErrors.upstreamProxy}
                         </small>
                       ) : null}
@@ -1323,7 +1324,7 @@ function ModelSectionComponent({
                     />
                     {routeDraftErrors?.name &&
                     (routeValidationAttempted || routeDraft.name.length > 0) ? (
-                      <small id="route-name-error" className="text-[#d70015]" role="alert">
+                      <small id="route-name-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                         {routeDraftErrors.name}
                       </small>
                     ) : null}
@@ -1354,7 +1355,7 @@ function ModelSectionComponent({
                     (routeValidationAttempted || routeDraft.shortName.length > 0) ? (
                       <small
                         id="route-short-name-error"
-                        className="text-[#d70015]"
+                        className="text-[var(--codey-red,#d70015)]"
                         role="alert"
                       >
                         {routeDraftErrors.shortName}
@@ -1466,7 +1467,7 @@ function ModelSectionComponent({
                   />
                   {routeDraftErrors?.baseUrl &&
                   (routeValidationAttempted || routeDraft.baseUrl.trim()) ? (
-                    <small id="route-url-error" className="text-[#d70015]" role="alert">
+                    <small id="route-url-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                       {routeDraftErrors.baseUrl}
                     </small>
                   ) : null}
@@ -1502,7 +1503,7 @@ function ModelSectionComponent({
                     }}
                   />
                   {routeValidationAttempted && routeDraftErrors?.apiKey ? (
-                    <small id="route-key-error" className="text-[#d70015]" role="alert">
+                    <small id="route-key-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                       {routeDraftErrors.apiKey}
                     </small>
                   ) : null}
@@ -1545,7 +1546,7 @@ function ModelSectionComponent({
                   />
                   {routeDraftErrors?.upstreamProxy &&
                   (routeValidationAttempted || (routeDraft.upstreamProxy || "").trim()) ? (
-                    <small id="route-proxy-error" className="text-[#d70015]" role="alert">
+                    <small id="route-proxy-error" className="text-[var(--codey-red,#d70015)]" role="alert">
                       {routeDraftErrors.upstreamProxy}
                     </small>
                   ) : null}
@@ -1553,7 +1554,7 @@ function ModelSectionComponent({
               </div>
             )}
 
-            {headerError && <small className="text-[#d70015]" role="alert">{headerError}；请先在线路的请求头编辑器中修正。</small>}
+            {headerError && <small className="text-[var(--codey-red,#d70015)]" role="alert">{headerError}；请先在线路的请求头编辑器中修正。</small>}
             <DialogFooter className="route-editor-footer">
               <Button
                 variant="outline"
@@ -1602,11 +1603,11 @@ function ModelSectionComponent({
                 value={routeHeadersText}
                 disabled={isBusy}
                 rows={10}
-                className="min-h-48 rounded-lg border border-black/10 bg-white p-2 font-mono text-xs"
+                className="min-h-48 rounded-lg border border-[rgb(var(--codey-ink-rgb,0,0,0))]/10 bg-[var(--codey-surface,#fff)] p-2 font-mono text-xs"
                 onChange={(event) => { setRouteHeadersText(event.target.value); setHeaderError(""); }}
                 placeholder={'{"X-Custom-Header": "value"}'}
               />
-              {headerError && <small id="request-headers-error" className="text-[#d70015]" role="alert">{headerError}</small>}
+              {headerError && <small id="request-headers-error" className="text-[var(--codey-red,#d70015)]" role="alert">{headerError}</small>}
             </label>
             <DialogFooter className="route-editor-footer">
               <Button variant="outline" disabled={isBusy} onClick={() => setHeaderDialogProfile(null)}>取消</Button>

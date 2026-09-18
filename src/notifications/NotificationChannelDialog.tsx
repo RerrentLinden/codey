@@ -167,7 +167,7 @@ function NotificationChannelDialogComponent({
             <div className="notification-channel-select-row mt-[18px]">
               <span
                 id="notification-channel-select-label"
-                className="text-[11px] font-semibold text-[#6e6e73]"
+                className="text-[11px] font-semibold text-[var(--codey-muted,#6e6e73)]"
               >
                 发送渠道
               </span>

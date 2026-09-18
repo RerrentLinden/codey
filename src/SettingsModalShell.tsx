@@ -16,7 +16,7 @@ type SettingsModalShellProps = {
 export function CodeyBrandMark() {
   return (
     <svg
-      className="block size-[38px] rounded-[10px] text-[#007aff] shadow-[0_1px_2px_rgba(0,122,255,0.12),0_4px_12px_rgba(0,122,255,0.14)] max-[760px]:size-8"
+      className="block size-[38px] rounded-[10px] text-[var(--codey-blue,#007aff)] shadow-[0_1px_2px_rgba(0,122,255,0.12),0_4px_12px_rgba(0,122,255,0.14)] max-[760px]:size-8"
       viewBox="0 0 350 350"
       aria-hidden="true"
       focusable="false"

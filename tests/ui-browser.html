@@ -10,6 +10,11 @@
     import "../src/dev/mockApi";
     const mock = window.__codeyInvokeApi;
     const view = new URLSearchParams(location.search).get("view");
+    const requestedTheme = new URLSearchParams(location.search).get("theme");
+    if (requestedTheme === "light" || requestedTheme === "dark") {
+      document.documentElement.dataset.theme = requestedTheme;
+      document.documentElement.style.colorScheme = requestedTheme;
+    }
     if (view === "quota") {
       window.__codeyInvokeApi = async (command, args) => {
         if (command !== "query_route_request_logs" || args.provider !== "openai") return mock(command, args);
@@ -22,6 +27,8 @@
       };
     }
     if (view === "logs" || view === "quota") {
+      const { installRequestLogTheme } = await import("../src/requestLogTheme.ts");
+      installRequestLogTheme();
       await import("../src/tailwind.css");
       await import("../src/styles.css");
       const { RequestLogDialog } = await import("../src/RequestLogDialog.tsx");
@@ -31,7 +38,7 @@
           React.createElement(RequestLogDialog, { catalog: { ...config, officialAccountAvailable: true }, opened: true, standalone: true, onClose() {} }))
       );
     } else {
-      if (new URLSearchParams(location.search).get("theme") === "dark") {
+      if (new URLSearchParams(location.search).get("theme") === "dark" || new URLSearchParams(location.search).get("check") === "theme-sync") {
         document.documentElement.style.colorScheme = "dark";
         document.body.style.background = "#181818";
         document.body.style.color = "#ffffff";
@@ -43,6 +50,43 @@
       button.onclick = () => window.__codeySettingsOverlay.open();
       document.body.append(button);
       window.__codeySettingsOverlay.open();
+      if (new URLSearchParams(location.search).get("check") === "theme-sync") {
+        const host = document.querySelector("#codey-settings-overlay-host");
+        const containers = ["codey-overlay-root", "codey-overlay-modal-container"].map(id => host.shadowRoot.getElementById(id));
+        const expectTheme = (theme) => {
+          if (containers.some(container => container.dataset.theme !== theme || getComputedStyle(container).colorScheme !== theme)) {
+            throw new Error(`主题同步失败：预期 ${theme}`);
+          }
+        };
+        const nextFrame = () => new Promise(requestAnimationFrame);
+        expectTheme("dark");
+        document.documentElement.dataset.theme = "light";
+        await nextFrame();
+        expectTheme("light");
+        document.documentElement.dataset.theme = "dark";
+        await nextFrame();
+        expectTheme("dark");
+        delete document.documentElement.dataset.theme;
+        document.documentElement.classList.add("light");
+        await nextFrame();
+        expectTheme("light");
+        document.documentElement.classList.remove("light");
+        document.documentElement.classList.add("dark");
+        await nextFrame();
+        expectTheme("dark");
+        window.__codeySettingsOverlay.close();
+        document.documentElement.classList.remove("dark");
+        document.documentElement.style.colorScheme = "light";
+        window.__codeySettingsOverlay.open();
+        expectTheme("light");
+        document.documentElement.style.colorScheme = "dark";
+        await nextFrame();
+        expectTheme("dark");
+        const result = document.createElement("pre");
+        result.id = "theme-sync-result";
+        result.textContent = "PASS：首次打开、主题属性、主题类、颜色方案及关闭后重开均同步两个挂载容器";
+        document.body.append(result);
+      }
       if (new URLSearchParams(location.search).get("check") === "toast-close") {
         const { toast } = await import("@heroui/react");
         const shadow = document.querySelector("#codey-settings-overlay-host").shadowRoot;

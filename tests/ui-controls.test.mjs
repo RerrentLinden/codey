@@ -43,8 +43,8 @@ test("frontend uses a single component library and keeps popups inside the overl
   }
   const overlay = readFileSync(new URL("src/overlay.tsx", root), "utf8");
   assert.match(overlay, /enableShadowDOM\(\)/);
-  assert.match(overlay, /rootElement\.dataset\.theme = "light"/);
-  assert.match(overlay, /modalContainer\.dataset\.theme = "light"/);
+  assert.match(overlay, /installOverlayTheme\(\[rootElement, modalContainer\]\)/);
+  assert.doesNotMatch(overlay, /(?:rootElement|modalContainer)\.dataset\.theme = "light"/);
   assert.match(overlay, /<UiProvider container=\{modalContainer\}>/);
   const provider = readFileSync(new URL("src/UiProvider.tsx", root), "utf8");
   assert.match(provider, /<UNSAFE_PortalProvider getContainer=\{getContainer\}>/);

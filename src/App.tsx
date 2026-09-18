@@ -1160,7 +1160,7 @@ export function App({
         <CodeyBrandMark />
         <div className="flex min-w-0 flex-col">
           <div className="flex min-w-0 items-center gap-2">
-            <h1 className="m-0 whitespace-nowrap text-base font-bold tracking-[-0.02em] text-[#1d1d1f]">Codey 控制台</h1>
+            <h1 className="m-0 whitespace-nowrap text-base font-bold tracking-[-0.02em] text-[var(--codey-text,#1d1d1f)]">Codey 控制台</h1>
             <div className="flex items-center gap-1.5">
               <span className="header-version-badge">
                 v{status.appVersion || "0.0.1"}
@@ -1220,7 +1220,7 @@ export function App({
               </Badge>
             )}
           </div>
-          <p className="m-0 mt-0.5 text-[11px] text-[#6e6e73] max-[760px]:hidden">管理 Codex 线路、模型服务、运行策略与诊断日志</p>
+          <p className="m-0 mt-0.5 text-[11px] text-[var(--codey-muted,#6e6e73)] max-[760px]:hidden">管理 Codex 线路、模型服务、运行策略与诊断日志</p>
         </div>
       </div>
 
@@ -1309,21 +1309,21 @@ export function App({
             <Button
               variant="ghost"
               size="icon"
-              className="size-3! min-w-3! rounded-full! border! border-black/15! bg-[#ff5f56]! p-0! shadow-none! hover:opacity-85"
+              className="size-3! min-w-3! rounded-full! border! border-[rgb(var(--codey-ink-rgb,0,0,0))]/15! bg-[#ff5f56]! p-0! shadow-none! hover:opacity-85"
               title="关闭"
               aria-label="关闭窗口"
             />
             <Button
               variant="ghost"
               size="icon"
-              className="size-3! min-w-3! rounded-full! border! border-black/15! bg-[#ffbd2e]! p-0! shadow-none! hover:opacity-85"
+              className="size-3! min-w-3! rounded-full! border! border-[rgb(var(--codey-ink-rgb,0,0,0))]/15! bg-[#ffbd2e]! p-0! shadow-none! hover:opacity-85"
               title="最小化"
               aria-label="最小化窗口"
             />
             <Button
               variant="ghost"
               size="icon"
-              className="size-3! min-w-3! rounded-full! border! border-black/15! bg-[#27c93f]! p-0! shadow-none! hover:opacity-85"
+              className="size-3! min-w-3! rounded-full! border! border-[rgb(var(--codey-ink-rgb,0,0,0))]/15! bg-[#27c93f]! p-0! shadow-none! hover:opacity-85"
               title="缩放"
               aria-label="全屏缩放"
             />
@@ -1339,7 +1339,7 @@ export function App({
       )}
 
       {!embedded && (
-        <header className="z-30 flex flex-col border-b border-black/8 bg-white/75 px-5 py-2.5 backdrop-blur-xl shadow-[0_3px_8px_rgba(0,0,0,0.04),0_1px_2px_rgba(0,0,0,0.02)]">
+        <header className="z-30 flex flex-col border-b border-[rgb(var(--codey-ink-rgb,0,0,0))]/8 bg-[var(--codey-surface,#fff)]/75 px-5 py-2.5 backdrop-blur-xl shadow-[0_3px_8px_rgba(0,0,0,0.04),0_1px_2px_rgba(0,0,0,0.02)]">
           {configHeaderContent}
         </header>
       )}

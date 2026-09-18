@@ -277,18 +277,18 @@ export function NumberInput({
     >
       <HeroNumberField.Group
         className={cn(
-          "rounded-md border border-black/15 bg-white shadow-2xs transition-colors hover:border-black/30 focus-within:border-[#007aff]",
+          "rounded-md border border-[rgb(var(--codey-ink-rgb,0,0,0))]/15 bg-[var(--codey-surface,#fff)] shadow-2xs transition-colors hover:border-[rgb(var(--codey-ink-rgb,0,0,0))]/30 focus-within:border-[var(--codey-blue,#007aff)]",
           isSm ? "h-[25px]" : "h-7"
         )}
       >
-        <HeroNumberField.DecrementButton className="hover:bg-black/5 active:bg-black/10 transition-colors" />
+        <HeroNumberField.DecrementButton className="hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 active:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 transition-colors" />
         <HeroNumberField.Input
           className={cn(
             "bg-transparent text-center font-medium tabular-nums",
             isSm ? "text-[11.5px]" : "text-xs"
           )}
         />
-        <HeroNumberField.IncrementButton className="hover:bg-black/5 active:bg-black/10 transition-colors" />
+        <HeroNumberField.IncrementButton className="hover:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/5 active:bg-[rgb(var(--codey-ink-rgb,0,0,0))]/10 transition-colors" />
       </HeroNumberField.Group>
     </HeroNumberField>
   );

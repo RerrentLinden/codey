@@ -70,6 +70,9 @@
 @import "@heroui/styles/utilities";
 @import "@heroui/styles/variants";
 
+/* 主题由宿主同步后显式设置，避免系统深色覆盖 Codex 手动选择的浅色。 */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
 /* Tailwind 只需扫描实际导入的 HeroUI 组件源码。 */
 @source "../node_modules/@heroui/react/dist/utils";
 @source "../node_modules/@heroui/react/dist/hooks";
@@ -120,5 +123,19 @@
     --field-border: rgba(0, 0, 0, 0.12);
     --field-border-hover: rgba(0, 0, 0, 0.24);
     --field-border-focus: #007aff;
+  }
+
+  [data-theme="dark"] {
+    --accent: #0a84ff;
+    --accent-foreground: #ffffff;
+    --link: #66adff;
+    --danger: #ff6961;
+    --success: #4bd26d;
+    --warning: #ffb340;
+    --background: #202024;
+    --field-shadow: 0 0 0 0 transparent;
+    --field-border: rgba(255, 255, 255, 0.18);
+    --field-border-hover: rgba(255, 255, 255, 0.32);
+    --field-border-focus: #0a84ff;
   }
 }
