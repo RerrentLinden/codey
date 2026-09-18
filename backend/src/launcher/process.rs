@@ -1983,6 +1983,28 @@ async fn wait_for_cli_wrapper(
     })?
 }
 
+pub(super) async fn reap_owned_child_before_exit(child: &Mutex<Option<Child>>) -> Result<()> {
+    let mut slot = child.lock().await;
+    let Some(child) = slot.as_mut() else {
+        return Ok(());
+    };
+    let process_id = child.id();
+    if child
+        .try_wait()
+        .context("检查直属 Codex 子进程失败")?
+        .is_none()
+    {
+        // 使用持有的 Child，不依赖可能失效的进程快照，也不扩大终止范围。
+        child.start_kill().context("终止直属 Codex 子进程失败")?;
+        tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .with_context(|| format!("等待直属 Codex 子进程退出超时：{process_id:?}"))?
+            .context("回收直属 Codex 子进程失败")?;
+    }
+    slot.take();
+    Ok(())
+}
+
 pub(super) async fn reap_child_after_cleanup(mut child: Child, operation: &'static str) {
     let process_id = child.id();
     let needs_kill = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {

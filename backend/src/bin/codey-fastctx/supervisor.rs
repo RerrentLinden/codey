@@ -9,11 +9,12 @@ use codey_lib::fastctx::protocol::{
 };
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 pub const RECOVERABLE_WORKER_EXIT_CODE: i32 = 75;
 const RECOVERY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_EOF_GRACE_PERIOD: Duration = Duration::from_secs(5);
 const RECOVERY_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RECOVERIES_IN_WINDOW: usize = 3;
 
@@ -31,21 +32,39 @@ pub async fn run(worker_argument: &str) -> Result<()> {
     };
     let mut worker = Worker::spawn(worker_argument, limits).await?;
     let (client_tx, mut client_rx) = mpsc::channel(32);
-    let client_task = tokio::spawn(read_client_input(client_tx, FrameReader::new(limits)));
+    let (eof_tx, eof_rx) = oneshot::channel();
+    let client_task = tokio::spawn(read_client_input(
+        client_tx,
+        eof_tx,
+        FrameReader::new(limits),
+    ));
 
-    let outcome = supervise(
-        worker_config,
-        &mut worker,
-        &mut client_rx,
-        tokio::io::stdout(),
-    )
-    .await;
+    // EOF 的期限独立于协议消息队列，也覆盖转发 stdout、stdin 和排空输出时的等待。
+    // 仅在整体退出时取消监督 future，取消的写操作不会被重试或继续使用。
+    let outcome = tokio::select! {
+        biased;
+        () = wait_for_client_eof_deadline(eof_rx) => {
+            Err(anyhow::anyhow!(
+                "MCP stdin 关闭后 FastCtx worker 未在 {} 秒宽限期内完成退出及输出转发",
+                CLIENT_EOF_GRACE_PERIOD.as_secs()
+            ))
+        }
+        outcome = supervise(worker_config, &mut worker, &mut client_rx, tokio::io::stdout()) => outcome,
+    };
     client_task.abort();
     let _ = client_task.await;
     client_rx.close();
     while client_rx.try_recv().is_ok() {}
     let finalized = worker.finalize().await;
     combine_supervision_and_finalization(outcome, finalized)
+}
+
+async fn wait_for_client_eof_deadline(eof_rx: oneshot::Receiver<tokio::time::Instant>) {
+    match eof_rx.await {
+        Ok(observed_at) => tokio::time::sleep_until(observed_at + CLIENT_EOF_GRACE_PERIOD).await,
+        // 输入错误仍由监督流程报告，不能把 reader 退出误判为正常 EOF。
+        Err(_) => std::future::pending::<()>().await,
+    }
 }
 
 async fn supervise<W>(
@@ -282,7 +301,7 @@ where
         .finalize()
         .await
         .context("回收已断开的 FastCtx worker 失败")?;
-    *worker = recover_worker(worker_config.argument, worker_config.limits, state).await?;
+    recover_worker(worker_config.argument, worker_config.limits, worker, state).await?;
     Ok(true)
 }
 
@@ -314,20 +333,22 @@ impl RecoveryBudget {
 async fn recover_worker(
     worker_argument: &str,
     limits: ProtocolLimits,
+    worker: &mut Worker,
     state: &ProtocolState,
-) -> Result<Worker> {
-    let worker = Worker::spawn(worker_argument, limits).await?;
+) -> Result<()> {
+    // 握手可能被客户端 EOF 期限取消；先交回 run 持有，确保它总能终止并 wait 新 worker。
+    *worker = Worker::spawn(worker_argument, limits).await?;
     complete_recovery_handshake(worker, state).await
 }
 
-async fn complete_recovery_handshake(mut worker: Worker, state: &ProtocolState) -> Result<Worker> {
+async fn complete_recovery_handshake(worker: &mut Worker, state: &ProtocolState) -> Result<()> {
     let recovery = tokio::time::timeout(
         RECOVERY_HANDSHAKE_TIMEOUT,
-        replay_initialization(&mut worker, state),
+        replay_initialization(worker, state),
     )
     .await;
     match recovery {
-        Ok(Ok(())) => Ok(worker),
+        Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
             let finalized = worker.finalize().await;
             fail_after_finalization(error, finalized)
@@ -505,8 +526,13 @@ impl Worker {
         self.output_rx.close();
         while self.output_rx.try_recv().is_ok() {}
 
-        if let Err(error) = self.child.wait().await {
-            errors.push(format!("等待 worker 退出失败：{error}"));
+        match tokio::time::timeout(WORKER_EXIT_TIMEOUT, self.child.wait()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => errors.push(format!("等待 worker 退出失败：{error}")),
+            Err(_) => errors.push(format!(
+                "终止 FastCtx worker 后未在 {} 秒内确认退出",
+                WORKER_EXIT_TIMEOUT.as_secs()
+            )),
         }
         if errors.is_empty() {
             Ok(())
@@ -522,7 +548,11 @@ enum ClientInput {
     Error(String),
 }
 
-async fn read_client_input(sender: mpsc::Sender<ClientInput>, frame_reader: FrameReader) {
+async fn read_client_input(
+    sender: mpsc::Sender<ClientInput>,
+    eof_sender: oneshot::Sender<tokio::time::Instant>,
+    frame_reader: FrameReader,
+) {
     let mut stdin = BufReader::new(tokio::io::stdin());
     loop {
         match frame_reader.read_line(&mut stdin).await {
@@ -532,6 +562,7 @@ async fn read_client_input(sender: mpsc::Sender<ClientInput>, frame_reader: Fram
                 }
             }
             Ok(None) => {
+                let _ = eof_sender.send(tokio::time::Instant::now());
                 let _ = sender.send(ClientInput::Eof).await;
                 return;
             }
@@ -587,21 +618,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn recovery_handshake_failure_terminates_and_reaps_the_new_worker() {
-        let mut state = ProtocolState::with_default_limits();
-        state
-            .observe_client(
-                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
-            )
-            .unwrap();
-
+    fn handshake_test_worker(script: &str) -> (Worker, u32) {
         let mut command = Command::new("sh");
         command
             .arg("-c")
-            .arg(
-                "IFS= read -r line; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1}'; IFS= read -r hold; while :; do :; done",
-            )
+            .arg(script)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -622,8 +643,23 @@ mod tests {
             output_rx,
             output_task: Some(output_task),
         };
+        (worker, pid)
+    }
 
-        let error = complete_recovery_handshake(worker, &state)
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_handshake_failure_terminates_and_reaps_the_new_worker() {
+        let mut state = ProtocolState::with_default_limits();
+        state
+            .observe_client(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+            )
+            .unwrap();
+        let (mut worker, pid) = handshake_test_worker(
+            "IFS= read -r line; printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1}'; IFS= read -r hold; exec sleep 30",
+        );
+
+        let error = complete_recovery_handshake(&mut worker, &state)
             .await
             .err()
             .expect("invalid recovery response must fail the handshake");
@@ -633,6 +669,34 @@ mod tests {
         );
         let exists = unsafe { libc::kill(pid as i32, 0) };
         assert_eq!(exists, -1, "failed recovery worker {pid} was not reaped");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_recovery_handshake_leaves_worker_available_for_finalization() {
+        let mut state = ProtocolState::with_default_limits();
+        state
+            .observe_client(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+            )
+            .unwrap();
+        let (mut worker, pid) = handshake_test_worker("IFS= read -r line; exec sleep 30");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                complete_recovery_handshake(&mut worker, &state),
+            )
+            .await
+            .is_err()
+        );
+        assert!(worker.child.try_wait().unwrap().is_none());
+        worker.finalize().await.unwrap();
+        assert!(worker.child.try_wait().unwrap().is_some());
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)

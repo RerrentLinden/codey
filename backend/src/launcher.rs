@@ -2110,6 +2110,20 @@ impl CodeyRuntime {
         .await
     }
 
+    /// 仅用于主程序最终退出：进程树清理失败后，回收仍由本实例持有的直接子进程。
+    /// 此操作不表示后代已全部退出，也不允许提前恢复配置或关闭仍可能被使用的路由。
+    pub(crate) async fn reap_owned_child_before_exit(&self) -> Result<()> {
+        stop_runtime_watcher(
+            &self.exit_watchdog_shutdown,
+            &self.exit_watchdog_task,
+            "process_watch_failed",
+            "stop_codex_exit_watcher_before_final_reap",
+            "最终退出前关闭 Codex 退出监听器失败",
+        )
+        .await;
+        process::reap_owned_child_before_exit(&self.child).await
+    }
+
     async fn stop_with_cleanup(
         &self,
         process_stop: impl std::future::Future<Output = Result<()>>,

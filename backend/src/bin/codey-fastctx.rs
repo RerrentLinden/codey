@@ -17,6 +17,7 @@ const CODEY_FASTCTX_MCP_WORKER_ARGUMENT: &str = "--codey-fastctx-mcp-worker";
 const CODEY_FASTCTX_TEST_WORKER_ARGUMENT: &str = "--codey-fastctx-mcp-test-worker";
 const TEST_WORKER_ARGUMENT_ENV: &str = "CODEY_FASTCTX_TEST_WORKER_ARGUMENT";
 const TEST_WORKER_PID_LOG_ENV: &str = "CODEY_FASTCTX_TEST_WORKER_PID_LOG";
+const TEST_WORKER_EOF_BEHAVIOR_ENV: &str = "CODEY_FASTCTX_TEST_WORKER_EOF_BEHAVIOR";
 
 fn main() {
     let mode = FastCtxMode::from_arguments(std::env::args_os());
@@ -83,6 +84,7 @@ fn run(mode: FastCtxMode) -> anyhow::Result<()> {
 /// - `test/large_response`（参数 `bytes`）：按请求字节数分块写出单行大响应，
 ///   强迫监督器跨多次 poll 读取；
 /// - `test/exit`（参数 `code`）：以指定状态码退出，模拟 transport 断开；
+/// - 测试环境变量可指定 EOF 后静默等待、持续输出或返回最后一个大响应；
 /// - 其他方法（含 `notifications/cancelled`）：忽略。
 fn run_test_worker() -> anyhow::Result<()> {
     use std::fs::OpenOptions;
@@ -146,6 +148,28 @@ fn run_test_worker() -> anyhow::Result<()> {
             }
             _ => {}
         }
+    }
+    match std::env::var(TEST_WORKER_EOF_BEHAVIOR_ENV).as_deref() {
+        Ok("idle") => loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        },
+        Ok("stream") => {
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/test",
+                "params": {"text": "A".repeat(16 * 1024)}
+            });
+            loop {
+                serde_json::to_writer(&mut stdout, &notification)?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        Ok("response") => {
+            write_large_test_response(&mut stdout, &serde_json::json!(99), 256 * 1024)?;
+        }
+        _ => {}
     }
     stdout.flush()?;
     Ok(())

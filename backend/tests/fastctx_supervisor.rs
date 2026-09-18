@@ -426,6 +426,113 @@ fn supervisor_reaps_worker_after_client_stdin_failure() {
     wait_for_process_gone(worker_pid);
 }
 
+#[test]
+fn supervisor_forwards_complete_final_response_after_client_eof() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, mut stdin, responses_rx) = spawn_supervisor_with_test_worker_env(
+        &temp,
+        &[("CODEY_FASTCTX_TEST_WORKER_EOF_BEHAVIOR", "response")],
+    );
+    initialize_test_worker_session(&mut stdin, &responses_rx);
+    let worker_pid = wait_for_test_worker_start(temp.path(), 1)[0];
+
+    let disconnected_at = Instant::now();
+    drop(stdin);
+    let response = response_with_id(&responses_rx, 99);
+    let text = response["result"]["text"].as_str().unwrap();
+    let framing = "{\"jsonrpc\":\"2.0\",\"id\":99,\"result\":{\"text\":\"\"}}\n";
+    assert_eq!(text.len(), 256 * 1024 - framing.len());
+    assert!(text.bytes().all(|byte| byte == b'A'));
+    let status = wait_for_eof_shutdown(&mut child, worker_pid, disconnected_at);
+    assert!(status.success(), "normal EOF failed with {status}");
+}
+
+#[test]
+fn supervisor_reaps_silent_worker_that_ignores_client_eof() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, mut stdin, responses_rx) = spawn_supervisor_with_test_worker_env(
+        &temp,
+        &[("CODEY_FASTCTX_TEST_WORKER_EOF_BEHAVIOR", "idle")],
+    );
+    initialize_test_worker_session(&mut stdin, &responses_rx);
+    let worker_pid = wait_for_test_worker_start(temp.path(), 1)[0];
+
+    let disconnected_at = Instant::now();
+    drop(stdin);
+    let status = wait_for_eof_shutdown(&mut child, worker_pid, disconnected_at);
+    assert!(!status.success(), "EOF deadline must report a failure");
+    assert!(disconnected_at.elapsed() >= Duration::from_secs(5));
+}
+
+#[test]
+fn supervisor_eof_deadline_is_not_extended_by_continuous_output() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut child, mut stdin, responses_rx) = spawn_supervisor_with_test_worker_env(
+        &temp,
+        &[("CODEY_FASTCTX_TEST_WORKER_EOF_BEHAVIOR", "stream")],
+    );
+    initialize_test_worker_session(&mut stdin, &responses_rx);
+    let worker_pid = wait_for_test_worker_start(temp.path(), 1)[0];
+
+    let disconnected_at = Instant::now();
+    drop(stdin);
+    let status = wait_for_eof_shutdown(&mut child, worker_pid, disconnected_at);
+    assert!(!status.success(), "EOF deadline must report a failure");
+    assert!(disconnected_at.elapsed() >= Duration::from_secs(5));
+    assert!(
+        responses_rx.try_iter().filter_map(Result::ok).count() > 1,
+        "worker output was not forwarded during the EOF grace period"
+    );
+}
+
+#[test]
+fn supervisor_eof_deadline_applies_when_client_stops_reading_stdout() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut child = spawn_test_supervisor_process(
+        &temp,
+        &[("CODEY_FASTCTX_TEST_WORKER_EOF_BEHAVIOR", "stream")],
+    );
+    let mut stdin = child.stdin.take().unwrap();
+    // 读完初始化后仍持有管道，但不再读取，使 stdout 写入确实受背压阻塞。
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    send(
+        &mut stdin,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+    );
+    let mut response = String::new();
+    stdout.read_line(&mut response).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["id"], 1);
+    let worker_pid = wait_for_test_worker_start(temp.path(), 1)[0];
+
+    let disconnected_at = Instant::now();
+    drop(stdin);
+    let status = wait_for_eof_shutdown(&mut child, worker_pid, disconnected_at);
+    assert!(!status.success(), "EOF deadline must report a failure");
+    assert!(disconnected_at.elapsed() >= Duration::from_secs(5));
+    drop(stdout);
+}
+
+fn wait_for_eof_shutdown(
+    child: &mut Child,
+    worker_pid: u32,
+    disconnected_at: Instant,
+) -> std::process::ExitStatus {
+    let deadline = disconnected_at + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            wait_for_process_gone(worker_pid);
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            terminate_process(worker_pid, false);
+            panic!("supervisor did not exit within 10 seconds of client EOF");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn supervisor_reaps_worker_after_worker_stdout_failure() {
@@ -631,7 +738,6 @@ fn spawn_test_supervisor_process(temp: &tempfile::TempDir, extra_env: &[(&str, &
     command.spawn().unwrap()
 }
 
-#[cfg(unix)]
 fn wait_for_test_worker_start(root: &Path, count: usize) -> Vec<u32> {
     let path = root.join("test-worker-pids.log");
     let deadline = Instant::now() + PROCESS_TIMEOUT;

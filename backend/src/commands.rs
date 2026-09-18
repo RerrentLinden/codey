@@ -61,10 +61,10 @@ use prompt_optimization::{
     fetch_prompt_optimization_models_command, optimize_prompt_command,
     test_prompt_optimization_command,
 };
-pub(crate) use runtime::cleanup_failed_runtime_start;
 use runtime::runtime_status_with_options;
 #[cfg(test)]
 use runtime::{begin_shutdown, launch_codey_inner};
+pub(crate) use runtime::{cleanup_failed_runtime_start, reap_runtime_child_before_exit};
 pub use runtime::{
     launch_codey_runtime, runtime_status, schedule_restart_codey_runtime, stop_codey_runtime,
 };

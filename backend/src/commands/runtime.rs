@@ -573,6 +573,18 @@ pub async fn stop_codey_runtime(state: &Arc<AppState>) -> Result<Value, String> 
     stop_codey_runtime_locked(state).await
 }
 
+pub(crate) async fn reap_runtime_child_before_exit(state: &Arc<AppState>) -> Result<(), String> {
+    let _operation = state.runtime_operation.lock().await;
+    let runtime = state.runtime.lock().await.clone();
+    if let Some(runtime) = runtime {
+        runtime
+            .reap_owned_child_before_exit()
+            .await
+            .map_err(|error| format!("{error:#}"))?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn cleanup_failed_runtime_start(state: &Arc<AppState>) -> Result<Value, String> {
     // Recovery retries within this process, so do not mark the app as shutting down.
     let _operation = state.runtime_operation.lock().await;

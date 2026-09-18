@@ -970,8 +970,25 @@ async fn runtime_stop_preserves_resources_on_failure_and_allows_retry() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     assert!(client.get(&router_url).send().await.is_ok());
 
-    // The real test child exits while its watcher still owns Child. A failed
-    // config write must leave the router available until restoration succeeds.
+    // 最终退出的精确回收必须从 watcher 取回 Child，不能终止无关进程，
+    // 也不能将局部回收视为整个进程树清理成功而恢复配置或关闭路由。
+    let mut unrelated_child = Command::new("sleep")
+        .arg("30")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    runtime.reap_owned_child_before_exit().await.unwrap();
+    runtime.reap_owned_child_before_exit().await.unwrap();
+    assert!(runtime.child.lock().await.is_none());
+    assert!(unrelated_child.try_wait().unwrap().is_none());
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        "runtime config"
+    );
+    assert!(client.get(&router_url).send().await.is_ok());
+    unrelated_child.kill().await.unwrap();
+
+    // 配置恢复失败后仍保留路由，后续完整清理成功才将它关闭。
     let failure = runtime
         .stop_with_cleanup(
             stop_codex_processes(

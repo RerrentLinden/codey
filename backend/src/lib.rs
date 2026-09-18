@@ -348,12 +348,17 @@ async fn stop_runtime_with_retry(state: &Arc<AppState>) -> Result<(), String> {
     match commands::stop_codey_runtime(state).await {
         Ok(_) => Ok(()),
         Err(first_error) => {
-            eprintln!("Codey 恢复 Codex 配置失败，正在重试：{first_error}");
+            eprintln!("Codey 停止 Codex 或恢复配置失败，正在重试：{first_error}");
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            commands::stop_codey_runtime(state)
-                .await
-                .map(|_| ())
-                .map_err(|retry_error| format!("{first_error}；重试失败：{retry_error}"))
+            let retry_error = match commands::stop_codey_runtime(state).await {
+                Ok(_) => return Ok(()),
+                Err(error) => error,
+            };
+            let error = format!("{first_error}；重试失败：{retry_error}");
+            match commands::reap_runtime_child_before_exit(state).await {
+                Ok(()) => Err(error),
+                Err(reap_error) => Err(format!("{error}；最终回收直属子进程失败：{reap_error}")),
+            }
         }
     }
 }
