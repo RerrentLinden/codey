@@ -467,13 +467,14 @@ export function RequestLogDialog({
   const [status, setStatus] = useState("all");
   const [protocol, setProtocol] = useState("all");
   const [page, setPage] = useState(1);
+  const [pageJumpInput, setPageJumpInput] = useState("1");
   const [pageSize, setPageSize] = useState(20);
-  const [cursors, setCursors] = useState<Array<LogCursor | null>>([null]);
-  // Reset page and cursors together in the same handler; a separate effect
-  // would run one render late and let a stale cursor reach the query.
+  const [cursors, setCursors] = useState<Record<number, LogCursor>>({});
+  // 筛选变化时同步重置页码和游标，避免新查询使用旧筛选下的游标。
   const resetPagination = useCallback(() => {
     setPage(1);
-    setCursors([null]);
+    setPageJumpInput("1");
+    setCursors({});
   }, []);
   const [timeRange, setTimeRange] = useState("24h");
   const [customFrom, setCustomFrom] = useState("");
@@ -571,7 +572,7 @@ export function RequestLogDialog({
     ...(optionalFilter(protocol) ? { protocol } : {}),
     ...(optionalFilter(requestKind) ? { requestKind } : {}),
   }), [fromUnixMs, toUnixMs, search, searchMode, provider, officialAccount, model, status, protocol, requestKind]);
-  const cursor = page === 1 ? null : cursors[page - 1] ?? null;
+  const cursor = page === 1 ? null : cursors[page] ?? null;
   const health = stats?.recordingHealth;
   const dropped = health ? health.droppedFull + health.droppedClosed + health.writeDropped : 0;
   const healthWarning = health && (dropped > 0 || !health.active || health.sampleRatePerMillion < 1_000_000
@@ -667,8 +668,7 @@ export function RequestLogDialog({
     };
   }, [opened, fromUnixMs, toUnixMs, provider, officialAccount, validRange, refreshRevision]);
 
-  // 挂载时这个 effect 也会跑一次，若无条件重置分页，会把首页查询刚写入的
-  // 下一页游标清空，导致除第 1 页外的页码都判为不可用。
+  // 搜索内容未变时保留分页，避免挂载时清空首页查询刚写入的下一页游标。
   useEffect(() => {
     const nextSearch = searchInput.trim();
     if (nextSearch === search) return;
@@ -696,17 +696,18 @@ export function RequestLogDialog({
       if (!active || revision !== requestRevision.current) return;
       try {
         const nextResult = await invoke<RouteRequestLogQueryPage>("query_route_request_logs", {
-          ...filters, pageSize, cursor,
+          ...filters, page, pageSize, cursor,
+          // 已知游标时继续使用游标分页，其余页直接按页码查询。
+          cursorMode: page === 1 || cursor !== null,
         });
         if (active && revision === requestRevision.current) {
           setResult(nextResult);
-          if (nextResult?.nextCursor) {
-            setCursors((prev) => {
-              const next = [...prev];
-              next[page] = nextResult.nextCursor;
-              return next;
-            });
-          }
+          setCursors((prev) => {
+            const next = { ...prev };
+            if (nextResult.nextCursor) next[page + 1] = nextResult.nextCursor;
+            else delete next[page + 1];
+            return next;
+          });
         }
       } catch (nextError) {
         if (active) setError(errorText(nextError));
@@ -715,7 +716,7 @@ export function RequestLogDialog({
       }
     });
     return () => { active = false; };
-  }, [opened, filters, pageSize, cursor, validRange, refreshRevision]);
+  }, [opened, filters, page, pageSize, cursor, validRange, refreshRevision]);
 
   useEffect(() => {
     if (!opened) return;
@@ -826,6 +827,14 @@ export function RequestLogDialog({
   const lastVisible = result?.items.length ? firstVisible + result.items.length - 1 : 0;
   const totalCount = stats?.total ?? result?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(totalCount / pageSize));
+  const jumpPage = Number(pageJumpInput);
+  const validJumpPage = /^\d+$/.test(pageJumpInput) && Number.isSafeInteger(jumpPage)
+    && jumpPage >= 1 && jumpPage <= totalPages;
+  const goToPage = (nextPage: number) => {
+    if (loading || !Number.isSafeInteger(nextPage) || nextPage < 1 || nextPage > totalPages) return;
+    setPageJumpInput(String(nextPage));
+    setPage(nextPage);
+  };
 
   if (!opened) return null;
 
@@ -1710,7 +1719,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
           )}
 
           {result?.queryable && result.status === "ok" ? (
-            <div className="request-log-pagination flex flex-none items-center justify-between gap-3 border-t border-black/8 px-3.5 py-2 text-xs max-[760px]:flex-col max-[760px]:items-stretch">
+            <div className="request-log-pagination flex flex-none flex-wrap items-center justify-between gap-3 border-t border-black/8 px-3.5 py-2 text-xs max-[760px]:flex-col max-[760px]:items-stretch">
               <div className="flex flex-wrap items-center gap-2 text-[#6e6e73]">
                 <span className="font-semibold text-[#1d1d1f]">
                   共 {totalCount.toLocaleString()} 条
@@ -1724,7 +1733,7 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                   第 {page} / {totalPages} 页
                 </span>
               </div>
-              <div className="flex items-center gap-2.5 shrink-0 max-[760px]:justify-end">
+              <div className="flex flex-wrap items-center gap-2.5 max-[760px]:justify-end">
                 <Select
                   aria-label="每页条数"
                   className="w-28 shrink-0"
@@ -1736,14 +1745,15 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                     if (!Number.isFinite(newPageSize) || newPageSize === pageSize) return;
                     setPageSize(newPageSize);
                     resetPagination();
-                                      }}
+                  }}
                 />
                 <Pagination size="sm" aria-label="请求日志分页" className="w-auto">
                   <Pagination.Content>
                     <Pagination.Item>
                       <Pagination.Previous
                         isDisabled={loading || page <= 1}
-                        onPress={() => setPage(page - 1)}
+                        aria-label="上一页"
+                        onPress={() => goToPage(page - 1)}
                       >
                         <Pagination.PreviousIcon />
                       </Pagination.Previous>
@@ -1757,14 +1767,9 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                         <Pagination.Item key={entry}>
                           <Pagination.Link
                             isActive={entry === page}
-                            isDisabled={loading || entry > cursors.length}
-                            aria-disabled={entry > cursors.length || undefined}
+                            isDisabled={loading}
                             aria-label={`第 ${entry} 页`}
-                            className={entry > cursors.length ? "cursor-not-allowed opacity-40" : undefined}
-                            onPress={() => {
-                              if (entry === page || entry > cursors.length) return;
-                              setPage(entry);
-                            }}
+                            onPress={() => goToPage(entry)}
                           >
                             {entry}
                           </Pagination.Link>
@@ -1773,16 +1778,41 @@ return { key: `${item.timestampUnixMs}:${item.requestId}`, item, cells: [<div>
                     )}
                     <Pagination.Item>
                       <Pagination.Next
-                        isDisabled={loading || page >= totalPages || !result?.hasMore || !result.nextCursor}
-                        onPress={() => {
-                          if (page + 1 <= cursors.length) setPage(page + 1);
-                        }}
+                        isDisabled={loading || page >= totalPages || !result?.hasMore}
+                        aria-label="下一页"
+                        onPress={() => goToPage(page + 1)}
                       >
                         <Pagination.NextIcon />
                       </Pagination.Next>
                     </Pagination.Item>
                   </Pagination.Content>
                 </Pagination>
+                <form
+                  className="flex items-center gap-1.5 whitespace-nowrap text-[#6e6e73]"
+                  aria-label="跳转页码"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    if (validJumpPage) goToPage(jumpPage);
+                  }}
+                >
+                  <span>前往</span>
+                  <Input
+                    aria-label="跳转到指定页"
+                    className="h-7 w-16 min-w-0 px-1.5 text-center text-xs tabular-nums"
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]+"
+                    title={`请输入 1 到 ${totalPages} 之间的整数页码`}
+                    value={pageJumpInput}
+                    disabled={loading}
+                    aria-invalid={pageJumpInput !== "" && !validJumpPage}
+                    onChange={(event) => setPageJumpInput(event.target.value)}
+                  />
+                  <span>页</span>
+                  <Button type="submit" variant="outline" size="xs" disabled={loading || !validJumpPage}>
+                    跳转
+                  </Button>
+                </form>
               </div>
             </div>
           ) : null}

@@ -145,7 +145,7 @@ test("request log viewer uses a full-screen server-paginated searchable table", 
   assert.match(viewer, /onRowAction=\{\(key\) =>[\s\S]*setSelectedItem\(record\)/);
   assert.match(viewer, /aria-label=\{`复制请求 ID：\$\{item\.requestId\}`\}/);
   assert.match(viewer, /cursorMode: true/);
-  assert.match(viewer, /result\.nextCursor/);
+  assert.match(viewer, /nextResult\.nextCursor/);
   assert.match(viewer, /query_route_request_log_stats/);
   assert.doesNotMatch(viewer, /for \(const item of result\.items\)/);
   assert.match(viewer, /总量已知/);

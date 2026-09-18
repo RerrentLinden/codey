@@ -173,12 +173,14 @@ test("Windows startup patch requires app-server runtime override validation", as
     /match startup_result \{\s*Ok\(mode\) => \{\s*spawned\.startup_injection_mode = mode\.as_str\(\)\.to_string\(\);\s*spawned\.performance_status = "ready"/,
   );
   assert.match(windowsSpawn, /WindowsPackageDebugSession::finish/);
-  assert.match(launcherPlatform, /WindowsPackageDebugSession::start\(app_dir, environment\)/);
+  assert.match(launcherPlatform, /WindowsPackageDebugSession::start\(app_dir, &environment\)/);
   assert.match(launcherPlatform, /settings\.EnableDebugging\(/);
   assert.match(launcherPlatform, /settings\.DisableDebugging\(/);
   assert.match(launcherPlatform, /child_command\.envs\(environment/);
-  const packageSetup = launcherPlatform.indexOf("match WindowsPackageDebugSession::start(app_dir, environment)");
+  const packageSetup = launcherPlatform.indexOf("match WindowsPackageDebugSession::start(app_dir, &environment)");
+  assert.ok(packageSetup >= 0);
   const activation = launcherPlatform.indexOf("codey_runtime_core::launcher::activate_packaged_app", packageSetup);
+  assert.ok(activation > packageSetup);
   assert.match(launcherPlatform.slice(packageSetup, activation), /if require_wrapper_environment \{\s*return Err\(error\)/);
 });
 
