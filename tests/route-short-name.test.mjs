@@ -160,8 +160,8 @@ test("the route-name limit is shared by the renderer and the official account co
     ),
   ]);
 
-  assert.match(settings, /export const MAX_ROUTE_NAME_CHARACTERS = 10;/);
-  assert.match(backendConfig, /pub const MAX_ROUTE_NAME_CHARS: usize = 10;/);
+  assert.match(settings, /export const MAX_ROUTE_NAME_CHARACTERS = 15;/);
+  assert.match(backendConfig, /pub const MAX_ROUTE_NAME_CHARS: usize = 15;/);
   // 后端保存线路时使用同一个上限，直接调用接口也写不进界面存不下的名称。
   assert.match(
     officialAccounts,

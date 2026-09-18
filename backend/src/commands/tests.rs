@@ -528,7 +528,7 @@ fn provider_secret_merge_allows_changing_official_routes_to_api_key() {
 
 #[test]
 fn route_name_limit_matches_the_renderer_and_legacy_names_stay_saveable() {
-    let mut legacy = ProviderProfile::new("一条超过十个字符的旧线路名称");
+    let mut legacy = ProviderProfile::new("一条长度超过十五个字符限制的旧线路名称");
     legacy.id = "legacy-route".to_string();
     legacy.base_url = "https://relay.example/v1".to_string();
     legacy.api_key = "sk-relay".to_string();
@@ -547,11 +547,16 @@ fn route_name_limit_matches_the_renderer_and_legacy_names_stay_saveable() {
     assert_eq!(merged[0].name, legacy.name);
     assert_eq!(merged[0].api_key, "sk-relay-updated");
 
+    let mut at_limit = legacy.clone();
+    at_limit.name = "名".repeat(15);
+    let merged = merge_profile_secrets(vec![at_limit.clone()], &previous).unwrap();
+    assert_eq!(merged[0].name, at_limit.name);
+
     // 改名以后超过上限会被拒绝,直接调用后端接口也无法写进界面存不下的名称。
     let mut renamed = legacy.clone();
-    renamed.name = "改名后依然超过十个字符".to_string();
+    renamed.name = "名".repeat(16);
     let error = merge_profile_secrets(vec![renamed], &previous).unwrap_err();
-    assert!(error.contains("最多 10 个字符"), "{error}");
+    assert!(error.contains("最多 15 个字符"), "{error}");
 }
 
 #[test]

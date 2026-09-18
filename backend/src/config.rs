@@ -77,7 +77,7 @@ pub const OFFICIAL_ROUTE_SHORT_NAME_LETTERS: &str =
 pub const MAX_ROUTE_SHORT_NAME_CHARS: usize = 2;
 /// 线路名在界面、线路列表和模型选择器里都要能完整显示，前后端共用同一个上限。
 /// 旧配置里超过上限的名称仍然可以加载，但保存时的改动会被拒绝。
-pub const MAX_ROUTE_NAME_CHARS: usize = 10;
+pub const MAX_ROUTE_NAME_CHARS: usize = 15;
 
 /// 官方账号默认线路名按添加顺序编号，第一个账号是「官方账号1」。
 pub fn default_official_route_name(index: usize) -> String {
