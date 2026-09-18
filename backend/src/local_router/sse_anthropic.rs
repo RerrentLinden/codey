@@ -555,6 +555,7 @@ where
         if error.is::<DownstreamClosed>() {
             return Err(error);
         }
+        observe_upstream_stream_error(request_log_probe.as_ref(), &error, route);
         let (code, message) = streaming_failure_message(&error, route);
         let _ = output.fail(downstream, code, &message).await;
         return Err(error);

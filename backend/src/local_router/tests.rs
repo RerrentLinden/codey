@@ -7289,6 +7289,247 @@ async fn chat_completions_route_uses_its_path_key_and_returns_responses_sse() {
 }
 
 #[tokio::test]
+async fn chat_stream_tool_type_tolerates_blank_deltas_and_rejects_unknown_types() {
+    for (call_type, accepted) in [
+        ("", true),
+        (" \t\r\n", true),
+        ("function", true),
+        ("unknown", false),
+        (" function ", false),
+    ] {
+        let chunks = [
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"id":"call-first","type":call_type,"function":{"name":"lookup","arguments":"{\"q\":\""}},
+                {"index":1,"id":"call-second","function":{"name":"count","arguments":"{\"n\":"}}
+            ]}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":1,"type":" \t","function":{"arguments":"2"}},
+                {"index":0,"type":"","function":{"arguments":"hello"}}
+            ]}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"\"}"}},
+                {"index":1,"type":"","function":{"arguments":"}"}}
+            ]},"finish_reason":"tool_calls"}]}),
+        ];
+        let mut sse = chunks
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .collect::<String>();
+        sse.push_str("data: [DONE]\n\n");
+
+        // 缓冲解析和实时转发对类型的处理必须一致。
+        let collected = parse_chat_completion_sse_bytes(sse.as_bytes(), "provider-model");
+        if accepted {
+            let collected = collected.unwrap();
+            let calls = collected["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["function"]["arguments"], r#"{"q":"hello"}"#);
+            assert_eq!(calls[1]["function"]["arguments"], r#"{"n":2}"#);
+        } else {
+            assert!(collected.unwrap_err().to_string().contains("不受支持"));
+        }
+
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            read_http_request(&mut stream).await.unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                        sse.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol =
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS.into();
+        config.profiles[0].normalize();
+        let router = LocalRouter::start(&config).await.unwrap();
+        let endpoint = router.endpoint();
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),
+                "input":"hello", "stream":true
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.text().await.unwrap();
+        let events = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        if accepted {
+            assert!(!body.contains("response.failed"));
+            let completed = events
+                .iter()
+                .find(|event| event["type"] == "response.completed")
+                .unwrap();
+            let calls = completed["response"]["output"].as_array().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0]["call_id"], "call-first");
+            assert_eq!(calls[0]["name"], "lookup");
+            assert_eq!(calls[0]["arguments"], r#"{"q":"hello"}"#);
+            assert_eq!(calls[1]["call_id"], "call-second");
+            assert_eq!(calls[1]["name"], "count");
+            assert_eq!(calls[1]["arguments"], r#"{"n":2}"#);
+        } else {
+            assert!(!body.contains("response.completed"));
+            let failed = events
+                .iter()
+                .find(|event| event["type"] == "response.failed")
+                .unwrap();
+            assert_eq!(failed["response"]["error"]["code"], "upstream_stream_error");
+        }
+        upstream_task.await.unwrap();
+        router.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn adapted_stream_failures_keep_redacted_diagnostics_in_request_logs() {
+    for case in [
+        "provider_error",
+        "anthropic_json",
+        "custom_tool_calls",
+        "custom_length",
+    ] {
+        let logs = tempfile::tempdir().unwrap();
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await.unwrap();
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let sse = match case {
+                "provider_error" => format!(
+                    "data: {}\n\n",
+                    json!({"error":{"message":format!("Bearer sk-upstream {}", "错误".repeat(3000))}})
+                ),
+                "anthropic_json" => "data: {invalid JSON}\n\n".to_string(),
+                _ => {
+                    let name = body["tools"][0]["function"]["name"].as_str().unwrap();
+                    let finish_reason = if case == "custom_length" {
+                        "length"
+                    } else {
+                        "tool_calls"
+                    };
+                    format!(
+                        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                        json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+                            "index":0,"id":"call-patch","type":"function",
+                            "function":{"name":name,"arguments":"{\"input\":\"unfinished"}
+                        }]}}]}),
+                        json!({"choices":[{"index":0,"delta":{"tool_calls":[{
+                            "index":0,"type":"","function":{"arguments":" patch"}
+                        }]},"finish_reason":finish_reason}]})
+                    )
+                }
+            };
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nx-oneapi-request-id: relay-stream-123\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let (mut config, provider_id, model) =
+            router_config(format!("http://{upstream_address}/v1"));
+        config.profiles[0].upstream_protocol = if case == "anthropic_json" {
+            crate::config::UPSTREAM_PROTOCOL_ANTHROPIC_MESSAGES
+        } else {
+            crate::config::UPSTREAM_PROTOCOL_OPENAI_CHAT_COMPLETIONS
+        }
+        .into();
+        config.profiles[0].normalize();
+        config.route_request_log.enabled = true;
+        config.route_request_log.backend = RouteRequestLogBackend::Sqlite;
+        config.route_request_log.batch_size = 1;
+        let router = LocalRouter::start_with_logger(
+            &config,
+            Arc::new(RouteRequestLogController::with_root(
+                logs.path().to_path_buf(),
+            )),
+        )
+        .await
+        .unwrap();
+        let endpoint = router.endpoint();
+        let response = reqwest::Client::new()
+            .post(format!("{}/responses", endpoint.base_url))
+            .bearer_auth(&endpoint.token)
+            .json(&json!({
+                "model":model_alias(&provider_id, &model),"input":"hello","stream":true,
+                "tools":[{"type":"custom","name":"apply_patch"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("response.failed"), "{case}: {body}");
+        assert!(!body.contains("response.completed"), "{case}: {body}");
+        assert!(
+            !body.contains("response.output_item.done"),
+            "{case}: {body}"
+        );
+        assert!(!body.contains("sk-upstream"));
+        upstream_task.await.unwrap();
+        router.stop().await.unwrap();
+
+        let page = crate::route_request_log::query_route_request_logs(
+            logs.path(),
+            RouteRequestLogBackend::Sqlite,
+            crate::route_request_log::RouteRequestLogQuery::default(),
+        )
+        .unwrap();
+        assert_eq!(page.total, 1, "{case}");
+        let item = &page.items[0];
+        assert_eq!(item.error_code.as_deref(), Some("upstream_stream_error"));
+        assert_eq!(
+            item.upstream_request_id.as_deref(),
+            Some("relay-stream-123")
+        );
+        let summary = item.upstream_error_summary.as_deref().expect(case);
+        assert!(!summary.contains("sk-upstream"));
+        assert!(summary.chars().count() <= 4097);
+        match case {
+            "provider_error" => {
+                assert!(summary.contains("Chat Completions 流返回错误"));
+                assert!(summary.contains("***"));
+                assert!(summary.ends_with('…'));
+            }
+            "anthropic_json" => {
+                assert!(summary.contains("Anthropic Messages SSE data 不是有效 JSON"))
+            }
+            _ => {
+                let reason = if case == "custom_length" {
+                    "length"
+                } else {
+                    "tool_calls"
+                };
+                assert!(
+                    summary.contains(&format!("finish_reason={reason}")),
+                    "{summary}"
+                );
+                assert!(summary.contains("Chat custom tool_call.function.arguments 不是有效 JSON"));
+                assert!(summary.contains("EOF while parsing a string"));
+                assert!(!summary.contains("unfinished patch"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn request_log_keeps_the_upstream_model_apart_from_the_codex_selector() {
     let logs = tempfile::tempdir().unwrap();
     let upstream = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

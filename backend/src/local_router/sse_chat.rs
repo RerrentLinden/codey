@@ -388,11 +388,7 @@ impl ChatSseAccumulator {
             {
                 state.id = id.to_string();
             }
-            if let Some(call_type) = object.get("type").and_then(Value::as_str)
-                && call_type != "function"
-            {
-                anyhow::bail!("Chat stream tool_call 类型 {call_type} 不受支持");
-            }
+            validate_chat_stream_tool_type(object.get("type"))?;
             if let Some(function) = object.get("function").and_then(Value::as_object) {
                 if let Some(name_delta) = function.get("name").and_then(Value::as_str) {
                     state.name.push_str(name_delta);
@@ -567,8 +563,16 @@ where
         }
         let chat = accumulator.into_chat_completion(done)?;
         observe_upstream_response_model(request_log_probe.as_ref(), &chat);
+        let finish_reason = chat
+            .pointer("/choices/0/finish_reason")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned();
         let completed =
-            chat_completion_to_responses_body_with_tool_bridge(chat, model, tool_bridge)?;
+            chat_completion_to_responses_body_with_tool_bridge(chat, model, tool_bridge)
+                .with_context(|| {
+                    format!("转换 Chat Completions 流式结果失败（finish_reason={finish_reason}）")
+                })?;
         if output.output_order.is_empty() {
             let events = output.ensure_message();
             output.write_events(downstream, events).await?;
@@ -589,9 +593,21 @@ where
         if error.is::<DownstreamClosed>() {
             return Err(error);
         }
+        observe_upstream_stream_error(request_log_probe.as_ref(), &error, route);
         let (code, message) = streaming_failure_message(&error, route);
         let _ = output.fail(downstream, code, &message).await;
         return Err(error);
+    }
+    Ok(())
+}
+
+fn validate_chat_stream_tool_type(call_type: Option<&Value>) -> Result<()> {
+    // 部分上游会在工具参数增量中重复发送空类型，按字段省略处理。
+    if let Some(call_type) = call_type.and_then(Value::as_str)
+        && !call_type.trim().is_empty()
+        && call_type != "function"
+    {
+        anyhow::bail!("Chat stream tool_call 类型 {call_type} 不受支持");
     }
     Ok(())
 }
@@ -640,11 +656,7 @@ where
                 let tool_call = tool_call
                     .as_object()
                     .ok_or_else(|| anyhow::anyhow!("Chat stream tool_call delta 必须是对象"))?;
-                if let Some(call_type) = tool_call.get("type").and_then(Value::as_str)
-                    && call_type != "function"
-                {
-                    anyhow::bail!("Chat stream tool_call 类型 {call_type} 不受支持");
-                }
+                validate_chat_stream_tool_type(tool_call.get("type"))?;
                 let index = tool_call
                     .get("index")
                     .and_then(Value::as_u64)

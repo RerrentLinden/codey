@@ -102,6 +102,19 @@ pub(crate) fn redact_upstream_error_text(value: &str, route: &RouteTarget) -> St
     sanitized
 }
 
+pub(crate) fn observe_upstream_stream_error(
+    probe: Option<&RouteRequestLogProbe>,
+    error: &anyhow::Error,
+    route: &RouteTarget,
+) {
+    // 在发送失败终态前记录，避免请求日志先完成后遗漏底层原因。
+    if let Some(probe) = probe
+        && let Some(summary) = sanitize_upstream_error_text(&format!("{error:#}"), route, 4096)
+    {
+        probe.mark_upstream_error_summary(&summary);
+    }
+}
+
 pub(crate) fn upstream_error_summary(value: &Value, route: &RouteTarget) -> UpstreamErrorSummary {
     let message = first_string_at(
         value,
@@ -188,10 +201,16 @@ pub(crate) fn bounded_upstream_request_id(value: &str) -> Option<String> {
 }
 
 pub(crate) fn upstream_request_id_from_headers(headers: &HeaderMap) -> Option<String> {
-    ["x-request-id", "request-id", "x-amzn-requestid", "cf-ray"]
-        .iter()
-        .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
-        .and_then(bounded_upstream_request_id)
+    [
+        "x-request-id",
+        "request-id",
+        "x-oneapi-request-id",
+        "x-amzn-requestid",
+        "cf-ray",
+    ]
+    .iter()
+    .find_map(|name| headers.get(*name).and_then(|value| value.to_str().ok()))
+    .and_then(bounded_upstream_request_id)
 }
 
 /// 部分第三方 thinking 模式要求把上一轮的 reasoning 明文原样回传，请求缺少
