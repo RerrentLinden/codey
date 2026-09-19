@@ -5,7 +5,11 @@
   if (window.__codeySessionToolsInjectLoaded) return;
   if (window.__codeySessionToolsInjectLoading) return;
   window.__codeySessionToolsInjectLoading = true;
+  let disposeInstall;
   try {
+  // Release a failed installation before publishing any replacement callbacks.
+  window.__codeySessionToolsInstall?.dispose?.();
+  let disposed = false;
   const rendererSettingsButtonSelector = "#codey-settings-button";
   const toolbarId = "codey-message-toolbar";
   const toastId = "codey-runtime-toast";
@@ -44,6 +48,8 @@
   `;
   let lastSelectedRow = null;
   let scanTimer = 0;
+  let initialScanHandle = 0;
+  let initialScanUsesIdleCallback = false;
   let scanDeadline = 0;
   const scanDebounceMs = 60;
   const maxScanLatencyMs = 250;
@@ -186,6 +192,7 @@
   };
 
   const syncSidebarTitles = (root = document) => {
+    if (disposed) return;
     const titles = sidebarTitles(root).filter(({ sessionId, title }) => (
       sidebarTitleCache.get(sessionId) !== title
     ));
@@ -198,6 +205,7 @@
     ));
     void callBridge("/session/titles", { titles })
       .then((result) => {
+        if (disposed) return;
         if (result?.status !== "failed") return;
         previousTitles.forEach(([sessionId, previousTitle], index) => {
           if (sidebarTitleCache.get(sessionId) !== titles[index].title) return;
@@ -206,6 +214,7 @@
         });
       })
       .catch(() => {
+        if (disposed) return;
         previousTitles.forEach(([sessionId, previousTitle], index) => {
           if (sidebarTitleCache.get(sessionId) !== titles[index].title) return;
           if (previousTitle === undefined) sidebarTitleCache.delete(sessionId);
@@ -215,7 +224,7 @@
   };
 
   const wakeSessionWatcher = () => {
-    if (document.visibilityState === "hidden" || watcherWakeTimer) return;
+    if (disposed || document.visibilityState === "hidden" || watcherWakeTimer) return;
     void callBridge("/session/wake-watcher").catch(() => {});
     watcherWakeTimer = window.setTimeout(() => {
       watcherWakeTimer = 0;
@@ -734,6 +743,7 @@
       sharedToast(message, tone);
       return;
     }
+    if (disposed) return;
     document.getElementById(toastId)?.remove();
     const toast = document.createElement("div");
     toast.id = toastId;
@@ -774,11 +784,12 @@
   };
 
   const scheduleSidebarActionTooltip = (button, label, delay) => {
+    if (disposed) return;
     hideSidebarActionTooltip();
     sidebarActionTooltipAnchor = button;
     sidebarActionTooltipTimer = window.setTimeout(() => {
       sidebarActionTooltipTimer = 0;
-      if (sidebarActionTooltipAnchor !== button) return;
+      if (disposed || sidebarActionTooltipAnchor !== button) return;
       if (button.isConnected === false || button.getClientRects().length === 0) {
         hideSidebarActionTooltip();
         return;
@@ -821,20 +832,21 @@
   };
 
   const attachSidebarActionTooltip = (button, label) => {
+    // Existing action buttons survive reinjection. Dispatch their interactions
+    // through the current installation instead of reviving a disposed timer.
+    const show = (delay) => window.__codeySessionToolsInstall?.tooltip?.show(button, label, delay);
+    const hide = () => window.__codeySessionToolsInstall?.tooltip?.hide(button);
+    const hideAll = () => window.__codeySessionToolsInstall?.tooltip?.hide();
     button.addEventListener("mouseenter", () => {
-      scheduleSidebarActionTooltip(button, label, 400);
+      show(400);
     });
-    button.addEventListener("mouseleave", () => {
-      if (sidebarActionTooltipAnchor === button) hideSidebarActionTooltip();
-    });
+    button.addEventListener("mouseleave", hide);
     button.addEventListener("focus", () => {
-      scheduleSidebarActionTooltip(button, label, 0);
+      show(0);
     });
-    button.addEventListener("blur", () => {
-      if (sidebarActionTooltipAnchor === button) hideSidebarActionTooltip();
-    });
-    button.addEventListener("pointerdown", hideSidebarActionTooltip);
-    button.addEventListener("click", hideSidebarActionTooltip);
+    button.addEventListener("blur", hide);
+    button.addEventListener("pointerdown", hideAll);
+    button.addEventListener("click", hideAll);
   };
 
   const encodeBase64Bytes = (bytes) => {
@@ -1342,9 +1354,10 @@
   };
 
   const scheduleThreadRunningRecheck = (cacheKey, delayMs) => {
-    if (!cacheKey || threadRunningRecheckTimers.has(cacheKey)) return;
+    if (disposed || !cacheKey || threadRunningRecheckTimers.has(cacheKey)) return;
     const timer = window.setTimeout(() => {
       threadRunningRecheckTimers.delete(cacheKey);
+      if (disposed) return;
       const state = threadRunningStateByCacheKey.get(cacheKey);
       if (!state || !Number.isFinite(state.missingSince)) return;
       const remainingMs = threadRunningLossGraceMs - (Date.now() - state.missingSince);
@@ -1707,13 +1720,14 @@
   };
 
   const flushThreadUpdatedAtFetch = async () => {
-    if (threadUpdatedAtFetchInFlight || !pendingThreadUpdatedAtRefs.size) return;
+    if (disposed || threadUpdatedAtFetchInFlight || !pendingThreadUpdatedAtRefs.size) return;
     const refs = [...pendingThreadUpdatedAtRefs.values()].slice(0, maxPendingThreadTimestampRefs);
     refs.forEach(({ cacheKey }) => pendingThreadUpdatedAtRefs.delete(cacheKey));
     threadUpdatedAtFetchInFlight = true;
     try {
       const sessionIds = [...new Set(refs.map(({ sessionId }) => sessionId))];
       const result = await callBridge(threadTimestampBridgePath, { sessionIds });
+      if (disposed) return;
       if (result?.status !== "ok" || !result.timestamps || typeof result.timestamps !== "object") {
         throw new Error(result?.message || "Codey thread timestamp bridge is unavailable");
       }
@@ -1739,12 +1753,13 @@
     } catch {
       // A failed read keeps the previous label and waits for the ordinary
       // one-minute refresh. Never retry in a tight loop on the renderer thread.
+      if (disposed) return;
       refs.forEach(({ cacheKey }) => {
         rememberBoundedMapValue(threadUpdatedAtRequestedAt, cacheKey, Date.now());
       });
     } finally {
       threadUpdatedAtFetchInFlight = false;
-      if (pendingThreadUpdatedAtRefs.size) {
+      if (!disposed && pendingThreadUpdatedAtRefs.size) {
         threadUpdatedAtFetchTimer = window.setTimeout(() => {
           threadUpdatedAtFetchTimer = 0;
           void flushThreadUpdatedAtFetch();
@@ -1754,7 +1769,7 @@
   };
 
   const scheduleThreadUpdatedAtFetch = () => {
-    if (threadUpdatedAtFetchTimer || threadUpdatedAtFetchInFlight || !pendingThreadUpdatedAtRefs.size) return;
+    if (disposed || threadUpdatedAtFetchTimer || threadUpdatedAtFetchInFlight || !pendingThreadUpdatedAtRefs.size) return;
     threadUpdatedAtFetchTimer = window.setTimeout(() => {
       threadUpdatedAtFetchTimer = 0;
       void flushThreadUpdatedAtFetch();
@@ -1806,6 +1821,7 @@
   };
 
   const refreshTrackedThreadUpdatedTimes = (forceRefresh = false) => {
+    if (disposed) return;
     const now = Date.now();
     // The mutation observer and deferred initial scan register visible rows.
     // Periodic and focus/page recovery only revisit those tracked rows, keeping
@@ -2197,7 +2213,7 @@
   window.__codeyReadAccountRateLimits = readAccountRateLimits;
 
   const reconcileStaleCompletedTask = async () => {
-    if (document.visibilityState === "hidden") return false;
+    if (disposed || document.visibilityState === "hidden") return false;
     const sessionId = getSessionId();
     if (!sessionId) {
       completionReconcileSessionId = "";
@@ -2216,7 +2232,8 @@
     try {
       return await callNativeCompletionReconcileOperation(async (controller) => {
         if (
-          controller?.kind !== "manager"
+          disposed
+          || controller?.kind !== "manager"
           || typeof controller.reconcileCompletedConversation !== "function"
           || document.visibilityState === "hidden"
           || getSessionId() !== sessionId
@@ -2231,6 +2248,7 @@
           showThreadGoalResumeConfirmation: false,
         });
         return reconciled === true
+          && !disposed
           && document.visibilityState !== "hidden"
           && getSessionId() === sessionId;
       });
@@ -2243,7 +2261,7 @@
       completionReconcileInFlight = false;
       // A navigation event can arrive while the previous task is reconciling.
       // Check the newly visible task as soon as that operation settles.
-      if (getSessionId() !== sessionId) {
+      if (!disposed && getSessionId() !== sessionId) {
         completionNextReconcileAt = 0;
         void reconcileStaleCompletedTask();
       }
@@ -2390,7 +2408,9 @@
       transferId = "";
       const refreshed = await refreshRecentLocalSessions();
       showRuntimeToast(result.message || "会话数据已导入");
-      if (!refreshed) window.setTimeout(() => location.reload(), 700);
+      if (!disposed && !refreshed) window.setTimeout(() => {
+        if (!disposed) location.reload();
+      }, 700);
     } catch (error) {
       showRuntimeToast(`导入失败：${error instanceof Error ? error.message : String(error)}`, "error");
     } finally {
@@ -3146,7 +3166,6 @@
   window.__codeyDeleteSelectedMessages = deleteSelected;
   window.__codeyReloadConversationAfterHardDelete = reloadConversationAfterHardDelete;
   window.__codeyInstallMessageSelection = installMessageSelection;
-  addStyle();
 
   const codeyOwnedSelector = [
     rendererSettingsButtonSelector,
@@ -3232,6 +3251,7 @@
     pendingScanRoots.add(root);
   };
   const flushIncrementalScans = () => {
+    if (disposed) return;
     scanTimer = 0;
     scanDeadline = 0;
     const roots = [...pendingScanRoots]
@@ -3244,6 +3264,7 @@
     roots.forEach((root) => scan(root, true));
   };
   const scheduleIncrementalScan = (root) => {
+    if (disposed) return;
     addPendingScanRoot(root);
     const now = Date.now();
     if (!scanDeadline) scanDeadline = now + maxScanLatencyMs;
@@ -3255,6 +3276,8 @@
   };
   const scheduleInitialScan = () => {
     const run = () => {
+      initialScanHandle = 0;
+      if (disposed) return;
       try {
         scan();
       } catch (error) {
@@ -3268,9 +3291,10 @@
       // Do not force this optional full-page discovery through a timeout: on a
       // continuously scrolling/animating renderer that would move the same
       // synchronous work back onto a latency-sensitive frame.
-      window.requestIdleCallback(run);
+      initialScanUsesIdleCallback = true;
+      initialScanHandle = window.requestIdleCallback(run);
     } else {
-      window.setTimeout(run, 0);
+      initialScanHandle = window.setTimeout(run, 0);
     }
   };
 
@@ -3316,6 +3340,7 @@
     }
   };
   const closeConversationRichTooltip = () => {
+    if (disposed) return;
     const trigger = conversationRichTooltipHandoffTrigger;
     clearConversationRichTooltipHandoff();
     conversationRichTooltipHandoffTrigger = null;
@@ -3329,6 +3354,7 @@
     trigger.dispatchEvent(event);
   };
   const holdConversationRichTooltipOpen = (event) => {
+    if (disposed) return;
     if (event[conversationRichTooltipCloseEvent]) return;
     const target = event.target instanceof Element ? event.target : null;
     const relatedTarget = event.relatedTarget instanceof Element ? event.relatedTarget : null;
@@ -3390,6 +3416,7 @@
   const handleSessionToolMutations = (mutations) =>
     codeyTimed("codey-inject.sessionToolMutations", mutations?.length ?? 0, () => handleSessionToolMutationsImpl(mutations));
   const handleSessionToolMutationsImpl = (mutations) => {
+    if (disposed) return;
     for (const mutation of mutations) {
       const target = mutation.target instanceof HTMLElement
         ? mutation.target
@@ -3501,33 +3528,54 @@
   };
   const mutationDispatcher = window.__codeyMutationDispatcher;
   let sessionToolObserver = null;
-  // A previous load that threw after installing listeners is re-run by the
-  // loader; dispose what that run left behind so observers, listeners and
-  // intervals never accumulate in the same document.
-  const previousInstall = window.__codeySessionToolsInstall;
-  if (typeof previousInstall?.dispose === "function") {
-    try { previousInstall.dispose(); } catch {}
-  }
   const installedIntervals = [];
   const installedListeners = [];
+  disposeInstall = () => {
+    if (disposed) return;
+    disposed = true;
+    try { sessionToolObserver?.disconnect?.(); } catch {}
+    for (const [target, type, handler, options] of installedListeners) {
+      try { target.removeEventListener?.(type, handler, options); } catch {}
+    }
+    for (const id of installedIntervals) window.clearInterval?.(id);
+    for (const id of [scanTimer, watcherWakeTimer, threadUpdatedAtFetchTimer]) {
+      window.clearTimeout(id);
+    }
+    if (initialScanUsesIdleCallback) window.cancelIdleCallback?.(initialScanHandle);
+    else window.clearTimeout(initialScanHandle);
+    clearConversationRichTooltipHandoff();
+    conversationRichTooltipHandoffTrigger = null;
+    hideSidebarActionTooltip();
+    for (const id of threadRunningRecheckTimers.values()) window.clearTimeout(id);
+    threadRunningRecheckTimers.clear();
+    pendingScanRoots.clear();
+    pendingThreadUpdatedAtRefs.clear();
+    threadUpdatedAtRows.clear();
+    // Native-operation timeout promises must still settle after disposal.
+    // Resource cleanup timers (toast, file input, object URL) also finish.
+    if (window.__codeyShowRuntimeToast === showRuntimeToast) delete window.__codeyShowRuntimeToast;
+    if (window.__codeyReadAccountRateLimits === readAccountRateLimits) delete window.__codeyReadAccountRateLimits;
+    window.__codeySessionToolsInjectLoaded = false;
+  };
   window.__codeySessionToolsInstall = {
-    dispose() {
-      try { sessionToolObserver?.disconnect?.(); } catch {}
-      for (const [target, type, handler, options] of installedListeners) {
-        try { target.removeEventListener?.(type, handler, options); } catch {}
-      }
-      for (const id of installedIntervals) window.clearInterval?.(id);
+    dispose: disposeInstall,
+    tooltip: {
+      show: scheduleSidebarActionTooltip,
+      hide(button) {
+        if (!button || sidebarActionTooltipAnchor === button) hideSidebarActionTooltip();
+      },
     },
   };
+  addStyle();
   if (typeof mutationDispatcher?.subscribe === "function") {
     const unsubscribe = mutationDispatcher.subscribe(
       handleSessionToolMutations,
       sessionToolMutationOptions,
     );
-    if (mutationDispatcher.snapshot?.().observerInstalled) {
-      sessionToolObserver = { disconnect: unsubscribe };
-    } else {
+    sessionToolObserver = { disconnect: unsubscribe };
+    if (!mutationDispatcher.snapshot?.().observerInstalled) {
       unsubscribe?.();
+      sessionToolObserver = null;
     }
   }
   if (!sessionToolObserver) {
@@ -3553,12 +3601,6 @@
   };
   if (typeof document.addEventListener === "function") {
     const pointerdownOptions = { capture: true, passive: true };
-    document.addEventListener("visibilitychange", wakeSessionWatcher);
-    document.addEventListener("visibilitychange", reconcileOnVisible);
-    document.addEventListener("pointerout", holdConversationRichTooltipOpen, true);
-    document.addEventListener("pointerover", continueConversationRichTooltipHandoff, true);
-    document.addEventListener("pointerdown", wakeSessionWatcher, pointerdownOptions);
-    document.addEventListener("keydown", wakeSessionWatcherFromKey, true);
     installedListeners.push(
       [document, "visibilitychange", wakeSessionWatcher, undefined],
       [document, "visibilitychange", reconcileOnVisible, undefined],
@@ -3567,19 +3609,25 @@
       [document, "pointerdown", wakeSessionWatcher, pointerdownOptions],
       [document, "keydown", wakeSessionWatcherFromKey, true],
     );
+    document.addEventListener("visibilitychange", wakeSessionWatcher);
+    document.addEventListener("visibilitychange", reconcileOnVisible);
+    document.addEventListener("pointerout", holdConversationRichTooltipOpen, true);
+    document.addEventListener("pointerover", continueConversationRichTooltipHandoff, true);
+    document.addEventListener("pointerdown", wakeSessionWatcher, pointerdownOptions);
+    document.addEventListener("keydown", wakeSessionWatcherFromKey, true);
   }
   if (typeof window.addEventListener === "function") {
+    for (const type of ["focus", "pageshow"]) {
+      for (const handler of [wakeSessionWatcher, refreshThreadUpdatedTimesOnReturn, reconcileStaleCompletedTask]) {
+        installedListeners.push([window, type, handler, undefined]);
+      }
+    }
     window.addEventListener("focus", wakeSessionWatcher);
     window.addEventListener("focus", refreshThreadUpdatedTimesOnReturn);
     window.addEventListener("focus", reconcileStaleCompletedTask);
     window.addEventListener("pageshow", wakeSessionWatcher);
     window.addEventListener("pageshow", refreshThreadUpdatedTimesOnReturn);
     window.addEventListener("pageshow", reconcileStaleCompletedTask);
-    for (const type of ["focus", "pageshow"]) {
-      for (const handler of [wakeSessionWatcher, refreshThreadUpdatedTimesOnReturn, reconcileStaleCompletedTask]) {
-        installedListeners.push([window, type, handler, undefined]);
-      }
-    }
   }
   if (typeof window.setInterval === "function") {
     installedIntervals.push(window.setInterval(() => {
@@ -3597,6 +3645,7 @@
   scheduleInitialScan();
   } catch (error) {
     window.__codeySessionToolsInjectLoading = false;
+    disposeInstall?.();
     throw error;
   }
 })();

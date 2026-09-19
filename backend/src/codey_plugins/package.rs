@@ -10,6 +10,7 @@ use std::{
 };
 
 pub const MAX_PACKAGE: u64 = 64 * 1024 * 1024;
+pub const MAX_CONFIG_UI: u64 = 1024 * 1024;
 const MAX_EXTRACTED: u64 = 128 * 1024 * 1024;
 
 #[derive(Clone, Serialize)]
@@ -95,6 +96,19 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), String> {
     }
     if !safe_relative(&manifest.entry) || !safe_relative(&manifest.config_schema) {
         return Err("插件入口或配置路径无效".into());
+    }
+    if let Some(ui) = &manifest.config_ui {
+        if ui.kind != "html" || !safe_relative(&ui.entry) {
+            return Err("插件配置页类型或路径无效".into());
+        }
+        if ui.sha256.len() != 64
+            || !ui
+                .sha256
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return Err("configUi.sha256 必须是小写 SHA-256".into());
+        }
     }
     let extension = if cfg!(target_os = "windows") {
         "dll"
@@ -220,6 +234,9 @@ pub fn read(path: &Path) -> Result<Package, String> {
     let manifest: Manifest =
         serde_json::from_slice(manifest_bytes).map_err(|e| format!("manifest 无效: {e}"))?;
     validate_manifest(&manifest)?;
+    if let Some(ui) = &manifest.config_ui {
+        validate_config_ui_bytes(ui, files.get(&ui.entry).ok_or("找不到插件配置页")?)?;
+    }
     let library = files.get(&manifest.entry).ok_or("找不到插件入口动态库")?;
     if digest(library) != manifest.library_sha256 {
         return Err("插件动态库 SHA-256 不匹配".into());
@@ -242,6 +259,19 @@ pub fn read(path: &Path) -> Result<Package, String> {
         },
         files,
     })
+}
+
+pub fn validate_config_ui_bytes<'a>(
+    ui: &super::ConfigUi,
+    bytes: &'a [u8],
+) -> Result<&'a str, String> {
+    if bytes.len() as u64 > MAX_CONFIG_UI {
+        return Err("插件配置页超过 1 MiB".into());
+    }
+    if digest(bytes) != ui.sha256 {
+        return Err("插件配置页 SHA-256 不匹配".into());
+    }
+    std::str::from_utf8(bytes).map_err(|_| "插件配置页必须为 UTF-8".into())
 }
 
 #[cfg(test)]

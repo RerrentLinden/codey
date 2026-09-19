@@ -45,6 +45,60 @@ fn package_with_header(path: &Path, library: &[u8], version: &str, header: &str)
     archive.finish().unwrap();
 }
 
+fn uninstall_loaded_plugin(root: &Path, remove_data: bool) {
+    #[cfg(windows)]
+    let trash_before: std::collections::BTreeSet<_> = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+
+    let result = host::uninstall("dev.codey.header-demo", remove_data);
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        result.unwrap();
+    }
+    #[cfg(windows)]
+    if let Err(error) = result {
+        // The host pins native mappings until process exit, so Windows may keep
+        // a loaded DLL in the trash after the uninstall state has committed.
+        let trash: Vec<_> = fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| !trash_before.contains(path))
+            .collect();
+        assert_eq!(trash.len(), 1, "{error}");
+        assert!(
+            trash[0]
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".trash-"),
+            "{error}"
+        );
+        let expected = format!(
+            "插件已卸载，但文件清理失败；请退出 Codey 后删除 {}: ",
+            trash[0].canonicalize().unwrap().display()
+        );
+        assert!(error.starts_with(&expected), "{error}");
+        assert!(error.ends_with("(os error 5)"), "{error}");
+        let mut pending = trash;
+        let mut retained_dll = false;
+        while let Some(directory) = pending.pop() {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else if entry.file_name() == "plugin.dll" {
+                    retained_dll = true;
+                }
+            }
+        }
+        assert!(retained_dll, "{error}");
+    }
+    assert!(host::list().unwrap().plugins.is_empty());
+}
+
 #[test]
 fn complete_native_plugin_lifecycle() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -97,6 +151,12 @@ fn complete_native_plugin_lifecycle() {
     assert!(host::list().unwrap().plugins.is_empty());
     let installed = host::install(&path, &inspection.sha256).unwrap();
     assert!(!installed.plugins[0].enabled);
+    assert!(installed.plugins[0].config_ui.is_none());
+    assert!(
+        host::get_config_ui("dev.codey.header-demo")
+            .unwrap()
+            .is_none()
+    );
     assert!(host::invoke("dev.codey.header-demo", "ping", json!(null)).is_err());
     // A failed consent persistence must not publish a newly loaded instance.
     let state_path = temp.path().join("host/state.json");
@@ -184,7 +244,7 @@ fn complete_native_plugin_lifecycle() {
         fs::remove_file(&source).unwrap();
         fs::rename(&outside, &source).unwrap();
     }
-    host::uninstall("dev.codey.header-demo", false).unwrap();
+    uninstall_loaded_plugin(&temp.path().join("host"), false);
     assert!(plugin_dir.join("data/example.json").exists());
     assert!(plugin_dir.join("logs/plugin.log").exists());
     assert!(!plugin_dir.join("versions").exists());
@@ -197,7 +257,7 @@ fn complete_native_plugin_lifecycle() {
         json!({"saved":42})
     );
     host::set_enabled("dev.codey.header-demo", false).unwrap();
-    host::uninstall("dev.codey.header-demo", true).unwrap();
+    uninstall_loaded_plugin(&temp.path().join("host"), true);
     assert!(!plugin_dir.exists());
     let reset = host::install(&path, &inspection.sha256).unwrap();
     assert_eq!(reset.plugins[0].config["value"], "hello-codey");

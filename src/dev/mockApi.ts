@@ -2,6 +2,7 @@
 // main.tsx via a dynamic import that only exists in Vite dev builds, so this
 // module never ships in the production overlay.
 import type { ProviderStatus, Config, ModelState, OfficialAccount, Profile } from "../App.types";
+import pluginConfigHtml from "../../examples/plugins/header-demo/ui/config.html?raw";
 import {
   AUTO_REVIEW_MODEL,
   includesModelId,
@@ -499,6 +500,14 @@ if (import.meta.env.DEV) {
       };
     });
 
+    const pluginPreviewMode = new URLSearchParams(window.location.search).get("plugins");
+    const previewPlugins = ["installed", "html", "html-error"].includes(pluginPreviewMode ?? "") ? [{
+      id: "dev.codey.header-demo", name: "请求头示例", version: "0.1.0",
+      description: "演示独立插件的请求头扩展能力。", enabled: false, status: "disabled", restartRequired: false,
+      config: { value: "demo" } as Record<string, unknown>, configSchema: { type: "object", properties: { value: { type: "string", title: "请求头值", minLength: 1 } }, required: ["value"] }, capabilities: ["request.beforeSend"],
+      pluginDir: "/preview/codey-plugins/installed/dev.codey.header-demo", dataDir: "/preview/codey-plugins/installed/dev.codey.header-demo/data", logDir: "/preview/codey-plugins/installed/dev.codey.header-demo/logs",
+      configUi: pluginPreviewMode?.startsWith("html") ? { type: "html", entry: "ui/config.html", sha256: "preview" } : null,
+    }] : [];
     window.__codeyInvokeApi = async (command, args) => {
       console.log(`[Mock API Call] ${command}`, args);
       // Wait a tiny bit to simulate network delay
@@ -507,14 +516,26 @@ if (import.meta.env.DEV) {
       if (command === "list_codey_plugins") {
         const pluginPreview = new URLSearchParams(window.location.search).get("plugins");
         if (pluginPreview === "error") throw new Error("预览：插件列表暂时不可用，请稍后刷新。");
-        const plugins = pluginPreview === "installed" ? [{
-          id: "dev.codey.header-demo", name: "请求头示例", version: "0.1.0",
-          description: "演示独立插件的请求头扩展能力。", enabled: false, status: "disabled",
-          config: {}, configSchema: { type: "object", properties: {} }, capabilities: ["request.beforeSend"],
-        }] : [];
-        return { plugins, platform: previewClientPlatform, arch: "aarch64" };
+        return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
+      }
+      if (command === "set_codey_plugin_enabled" || command === "configure_codey_plugin") {
+        const plugin = previewPlugins.find(item => item.id === args?.pluginId);
+        if (!plugin) throw new Error("预览：插件不存在");
+        if (command === "set_codey_plugin_enabled") { plugin.enabled = Boolean(args?.enabled); plugin.status = plugin.enabled ? "enabled" : "disabled"; plugin.restartRequired = false; }
+        else { plugin.config = args?.config as Record<string, unknown>; plugin.restartRequired = plugin.enabled; }
+        return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
+      }
+      if (command === "uninstall_codey_plugin") {
+        const index = previewPlugins.findIndex(item => item.id === args?.pluginId);
+        if (index >= 0) previewPlugins.splice(index, 1);
+        return { plugins: structuredClone(previewPlugins), platform: previewClientPlatform, arch: "aarch64" };
       }
       if (command === "select_codey_plugin_package") return null;
+      if (command === "get_codey_plugin_config_ui") {
+        if (pluginPreviewMode === "html-error") throw new Error("预览：插件配置页面校验失败");
+        const plugin = previewPlugins.find(item => item.id === args?.pluginId);
+        return plugin?.configUi ? { pluginId: plugin.id, version: plugin.version, html: pluginConfigHtml } : null;
+      }
 
       if (command === "load_codey_config") {
         if (previewConfigLoadFailed) throw new Error("预览：配置路径不存在");

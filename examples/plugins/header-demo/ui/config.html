@@ -1,0 +1,35 @@
+<style>
+  :root { color-scheme: light; font: 14px system-ui, sans-serif; color: #20232a; background: #fff; }
+  * { box-sizing: border-box; } body { margin: 0; padding: 24px; }
+  h2 { margin: 0 0 8px; font-size: 20px; } p { color: #697386; line-height: 1.6; }
+  label { display: block; margin: 22px 0 8px; font-weight: 600; }
+  input { width: 100%; padding: 12px; border: 1px solid #c9d0da; border-radius: 8px; font: inherit; background: transparent; color: inherit; }
+  input:focus { outline: 2px solid #1677ff; outline-offset: 2px; }
+  pre { padding: 16px; border-radius: 8px; background: #f2f6fc; white-space: pre-wrap; overflow-wrap: anywhere; color: #2365ad; }
+  html[data-theme=dark] { color-scheme: dark; color: #eee; background: #202126; }
+  html[data-theme=dark] pre { background: #292f3b; color: #99c6ff; }
+  @media(max-width:400px) { body { padding: 16px; } }
+</style>
+<h2>请求头设置</h2>
+<p>为路由请求附加示例请求头，输入后可查看预览。</p>
+<label for="value">请求头值</label>
+<input id="value" autocomplete="off" placeholder="例如 demo">
+<pre id="preview"></pre>
+<script>
+  const field = document.getElementById('value');
+  const preview = document.getElementById('preview');
+  let config = {};
+  function update() {
+    config = { ...config, value: field.value };
+    preview.textContent = 'X-Plugin-Demo: ' + field.value;
+    CodeyPluginConfig.setConfig(config);
+    CodeyPluginConfig.setValidity(field.value.length > 0, '请输入请求头值');
+  }
+  CodeyPluginConfig.onInit(initial => {
+    config = initial.config;
+    document.documentElement.dataset.theme = initial.theme;
+    field.value = typeof config.value === 'string' ? config.value : '';
+    update();
+  });
+  field.addEventListener('input', update);
+</script>

@@ -48,10 +48,10 @@ fn check(schema: &Value, depth: usize) -> Result<(), String> {
             return Err(format!("{key} 必须是字符串"));
         }
     }
-    if let Some(values) = schema.get("enum") {
-        if values.as_array().is_none_or(|v| v.is_empty()) {
-            return Err("enum 必须是非空数组".into());
-        }
+    if let Some(values) = schema.get("enum")
+        && values.as_array().is_none_or(|v| v.is_empty())
+    {
+        return Err("enum 必须是非空数组".into());
     }
     for key in ["properties", "required", "additionalProperties"] {
         if schema.get(key).is_some() && kind != "object" {
@@ -82,10 +82,10 @@ fn check(schema: &Value, depth: usize) -> Result<(), String> {
         return Err("additionalProperties 只支持布尔值".into());
     }
     for key in ["minimum", "maximum"] {
-        if let Some(v) = schema.get(key) {
-            if !["number", "integer"].contains(&kind) || !v.is_number() {
-                return Err(format!("{key} 必须用于数值类型"));
-            }
+        if let Some(v) = schema.get(key)
+            && (!["number", "integer"].contains(&kind) || !v.is_number())
+        {
+            return Err(format!("{key} 必须用于数值类型"));
         }
     }
     for (key, expected) in [
@@ -94,10 +94,10 @@ fn check(schema: &Value, depth: usize) -> Result<(), String> {
         ("minItems", "array"),
         ("maxItems", "array"),
     ] {
-        if let Some(v) = schema.get(key) {
-            if kind != expected || v.as_u64().is_none() {
-                return Err(format!("{key} 必须用于 {expected} 且为非负整数"));
-            }
+        if let Some(v) = schema.get(key)
+            && (kind != expected || v.as_u64().is_none())
+        {
+            return Err(format!("{key} 必须用于 {expected} 且为非负整数"));
         }
     }
     if let Some(items) = schema.get("items") {
@@ -114,10 +114,9 @@ fn check(schema: &Value, depth: usize) -> Result<(), String> {
         if let (Some(a), Some(b)) = (
             schema.get(min).and_then(Value::as_f64),
             schema.get(max).and_then(Value::as_f64),
-        ) {
-            if a > b {
-                return Err(format!("{min} 不能大于 {max}"));
-            }
+        ) && a > b
+        {
+            return Err(format!("{min} 不能大于 {max}"));
         }
     }
     if let Some(default) = schema.get("default") {
@@ -163,10 +162,10 @@ pub fn validate(schema: &Value, value: &Value) -> Result<(), String> {
     if !valid {
         return Err(format!("配置值类型应为 {kind}"));
     }
-    if let Some(options) = schema.get("enum").and_then(Value::as_array) {
-        if !options.contains(value) {
-            return Err("配置值不在 enum 允许范围内".into());
-        }
+    if let Some(options) = schema.get("enum").and_then(Value::as_array)
+        && !options.contains(value)
+    {
+        return Err("配置值不在 enum 允许范围内".into());
     }
     if let Some(object) = value.as_object() {
         if let Some(required) = schema.get("required").and_then(Value::as_array) {

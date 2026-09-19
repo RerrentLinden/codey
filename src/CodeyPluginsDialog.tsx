@@ -1,18 +1,12 @@
-import { SchemaConfigForm } from "./SchemaConfigForm";
+import { PluginConfigDialog } from "./PluginConfigDialog";
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "./api";
 import { errorText } from "./appUtils";
+import { IconPuzzle } from "@tabler/icons-react";
 import { Badge, Button, Checkbox, Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Input } from "./components/ui";
 import { pluginStatusLabel, type CodeyPlugin, type CodeyPluginPreview, type CodeyPluginsResult } from "./codeyPlugins";
 
 const panel = "rounded-xl border border-gray-200 dark:border-gray-700 p-4";
-function ConfigEditor({ plugin, busy, onSave }: { plugin: CodeyPlugin; busy: boolean; onSave: (config: Record<string, unknown>) => void }) {
-  return <section className={`${panel} grid gap-3`} aria-label={`${plugin.name} 配置`}>
-    <h3 className="m-0 text-sm font-semibold">插件配置</h3>
-    <SchemaConfigForm schema={plugin.configSchema ?? {}} value={plugin.config} disabled={busy} onSave={onSave} />
-    <p className="m-0 text-xs text-muted">保存后，正在运行的实例需要停用并重新启用，或重启 Codey 后生效。</p>
-  </section>;
-}
 
 export function CodeyPluginsDialog({ open, onClose, onChanged, container }: { open: boolean; onClose: () => void; onChanged?: (result: CodeyPluginsResult) => void; container?: HTMLElement | null }) {
   const [result, setResult] = useState<CodeyPluginsResult | null>(null);
@@ -80,7 +74,21 @@ export function CodeyPluginsDialog({ open, onClose, onChanged, container }: { op
         </section>}
         {result?.plugins.length === 0 && <div className={`${panel} py-10 text-center`}><p className="m-0 font-medium">尚未安装插件</p><p className="mb-0 text-xs text-muted">导入 .codey-plugin 文件，添加你需要的功能。</p></div>}
         {result?.plugins.map(plugin => <div key={plugin.id} className="grid gap-3"><section className={`${panel} grid gap-3`}>
-          <div className="flex flex-wrap justify-between gap-2"><div><h3 className="m-0 text-sm font-semibold">{plugin.name} <span className="font-normal text-muted">{plugin.version}</span></h3><p className="mb-0 text-xs text-muted break-all">{plugin.id}</p></div><Badge variant={plugin.restartRequired ? "warning" : plugin.lastError ? "destructive" : plugin.enabled ? "success" : "secondary"}>{pluginStatusLabel(plugin)}</Badge></div>
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <div className="flex items-start gap-3 min-w-0 flex-1">
+              <div className={`size-9 rounded-lg flex items-center justify-center shrink-0 ${plugin.enabled ? "bg-blue-50 text-blue-600 dark:bg-blue-950/60 dark:text-blue-400 ring-1 ring-blue-500/20" : "bg-gray-100 text-gray-400 dark:bg-gray-800 dark:text-gray-500"}`}>
+                <IconPuzzle size={18} stroke={1.75} aria-hidden="true" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <h3 className="m-0 text-sm font-semibold text-gray-900 dark:text-gray-100 truncate">{plugin.name}</h3>
+                  <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10.5px] font-mono font-medium bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400 border border-black/[0.04] dark:border-white/[0.06]">v{plugin.version}</span>
+                </div>
+                <p className="mb-0 mt-0.5 text-xs text-muted font-mono truncate">{plugin.id}</p>
+              </div>
+            </div>
+            <Badge variant={plugin.restartRequired ? "warning" : plugin.lastError ? "destructive" : plugin.enabled ? "success" : "secondary"}>{pluginStatusLabel(plugin)}</Badge>
+          </div>
           {plugin.description && <p className="m-0 text-xs text-muted">{plugin.description}</p>}
           {plugin.pluginDir && <details className="text-xs text-muted"><summary className="cursor-pointer">插件文件位置</summary><dl className="mt-2 grid gap-1 break-all">
             <dt>插件目录</dt><dd className="ml-0 select-text">{plugin.pluginDir}</dd>
@@ -93,7 +101,7 @@ export function CodeyPluginsDialog({ open, onClose, onChanged, container }: { op
           <div className="flex flex-wrap gap-2"><Button size="sm" variant="outline" disabled={busy} onClick={() => {
             if (plugin.enabled) void run(() => toggle(plugin, false)); else { setConfirm({ kind: "enable", plugin }); setPreview(null); }
           }}>{plugin.enabled ? "停用" : "启用"}</Button><Button size="sm" variant="outline" disabled={busy} onClick={() => setEditId(editId === plugin.id ? null : plugin.id)}>{editId === plugin.id ? "收起配置" : "配置"}</Button><Button size="sm" variant="destructive-light" disabled={busy || plugin.enabled} title={plugin.enabled ? "请先停用插件再卸载" : undefined} onClick={() => { setRemoveData(false); setConfirm({ kind: "uninstall", plugin }); setPreview(null); }}>卸载</Button></div>
-        </section>{editId === plugin.id && <ConfigEditor key={`${plugin.id}:${JSON.stringify(plugin.config)}`} plugin={plugin} busy={busy} onSave={config => void run(async () => { setResult(await invoke("configure_codey_plugin", { pluginId: plugin.id, config })); setNotice("配置已保存，请查看插件状态确认是否需要重新启用"); })} />}</div>)}
+        </section>{editId === plugin.id && <PluginConfigDialog key={plugin.id} plugin={plugin} container={container} onClose={() => setEditId(null)} onChanged={data => { setResult(data); setNotice("配置已保存，请查看插件状态确认是否需要重新启用"); }} />}</div>)}
       </div>
     </DialogContent>
   </Dialog>;

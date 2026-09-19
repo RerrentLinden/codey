@@ -42,3 +42,6 @@ Desktop.ini
 
 # Rust formatter and compiler backups
 **/*.rs.bk
+
+
+/plugins

@@ -45,7 +45,7 @@ python3 scripts/package-plugin.py --library target/debug/libcodey_plugin_header_
 
 插件提供 `config.schema.json`，Codey 的统一表单据此呈现输入框、开关、枚举选择、嵌套对象以及可增删的数组。`title` 和 `description` 提供名称及说明，`required` 标记必填字段，显式 `default` 用于初始化缺失值。可选字段可以清除，空数字输入会阻止保存。前端提供字段校验反馈，后端仍作最终校验；保存不会改变当前运行实例。
 
-这是 JSON Schema 子集，非完整实现：不支持 `$ref`、条件分支、联合类型、自定义控件或任意扩展属性。不执行插件提供的 HTML 或 JavaScript。自由对象或无法直接呈现的结构可使用 JSON 辅助编辑。已有未知字段保留，`additionalProperties: false` 时必须删除这些字段后才能保存。配置中的敏感文本目前不具备专门的密钥输入及存储机制。
+这是 JSON Schema 子集，非完整实现：不支持 `$ref`、条件分支、联合类型、自定义控件或任意扩展属性。默认表单不执行插件提供的 HTML 或 JavaScript；需要定制布局和交互时可声明下述 HTML 配置页。自由对象或无法直接呈现的结构可使用 JSON 辅助编辑。已有未知字段保留，`additionalProperties: false` 时必须删除这些字段后才能保存。配置中的敏感文本目前不具备专门的密钥输入及存储机制。
 
 例如需要代理池的插件可声明以下配置；这仅展示通用表单结构，不为请求头示例增加代理功能：
 
@@ -72,3 +72,36 @@ python3 scripts/package-plugin.py --library target/debug/libcodey_plugin_header_
   }
 }
 ```
+
+## 自定义 HTML 配置页
+
+可在 manifest 中增加可选的 `configUi`，未声明时继续使用统一配置表单，原生 ABI 不变：
+
+```json
+{
+  "configUi": {
+    "type": "html",
+    "entry": "ui/config.html",
+    "sha256": "配置页文件内容的小写SHA-256"
+  }
+}
+```
+
+配置页必须为单文件 UTF-8 HTML，最多 1 MiB，CSS 和 JavaScript 内嵌。入口使用包内相对路径，禁止符号链接、特殊文件及目录穿越。打包工具通过 `--config-ui examples/plugins/header-demo/ui/config.html` 自动加入 `ui/config.html` 并计算摘要；不传该参数时生成原有格式。安装检查及读取已安装配置页均校验摘要；摘要只用于内容完整性检查。列表只返回配置页元数据，打开配置时通过 `get_codey_plugin_config_ui` 读取当前安装版本，不加载动态库。
+
+安装与检查不执行 HTML。打开配置弹窗时，页面 JavaScript 在仅启用 `allow-scripts`、未启用 `allow-same-origin` 的 sandbox iframe 中执行。页面通过独立 MessageChannel 交换本插件的配置草稿，不能调用 Codey 全局 API；宿主统一保存并再次使用配置 schema 校验。因此即使提供 HTML，`configSchema` 仍必需，保存后已启用的原生实例仍需重新启用才能应用配置。
+
+宿主注入的接口为：
+
+```js
+window.CodeyPluginConfig.onInit(({ config, theme }) => {
+  // config 为当前草稿，theme 为 light 或 dark。
+  renderSettings(config, theme);
+});
+window.CodeyPluginConfig.setConfig({ value: "edited-value" });
+window.CodeyPluginConfig.setValidity(true);
+// 字段无效时阻止宿主保存，并显示原因。
+window.CodeyPluginConfig.setValidity(false, "请填写有效配置");
+```
+
+页面应在初始化完成后操作草稿，并通过宿主的保存按钮提交；接口不提供文件读取、网络请求、原生方法调用或其他插件的数据。CSP 限制网络资源、表单提交及子框架，页面不应依赖远程脚本或外部样式。此隔离针对配置页，不为原生动态库提供沙箱，也不承诺 CSP 能阻止 iframe 自身的所有导航。

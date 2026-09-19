@@ -23,33 +23,6 @@ fn record_failure_with(failure: ConfigRepairFailure, log: impl FnOnce(&str, Valu
     message
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn config_repair_failure_is_forwarded_with_stage_and_path() {
-        let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("config.toml");
-        let log_file = temp.path().join("errors.log");
-        let failure = ConfigRepairFailure::new("解析配置", &target, "TOML 语法无效");
-        let returned = record_failure_with(failure, |message, context| {
-            std::fs::write(
-                &log_file,
-                serde_json::to_vec(&json!({"error":message, "context":context})).unwrap(),
-            )
-            .unwrap();
-        });
-        let record: Value = serde_json::from_slice(&std::fs::read(log_file).unwrap()).unwrap();
-        assert_eq!(record["context"]["stage"], "解析配置");
-        assert_eq!(
-            record["context"]["targetPath"],
-            target.to_string_lossy().as_ref()
-        );
-        assert_eq!(record["error"], returned);
-    }
-}
-
 pub(super) async fn repair_codex_config(state: &Arc<AppState>) -> Result<Value, String> {
     let path = codex_config::codex_home().join("config.toml");
     // Keep lock ownership inside the spawned task: closing the requesting page
@@ -99,4 +72,31 @@ pub(super) async fn repair_codex_config(state: &Arc<AppState>) -> Result<Value, 
             "配置修复调度任务异常退出，请重试",
         ))
     })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_repair_failure_is_forwarded_with_stage_and_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("config.toml");
+        let log_file = temp.path().join("errors.log");
+        let failure = ConfigRepairFailure::new("解析配置", &target, "TOML 语法无效");
+        let returned = record_failure_with(failure, |message, context| {
+            std::fs::write(
+                &log_file,
+                serde_json::to_vec(&json!({"error":message, "context":context})).unwrap(),
+            )
+            .unwrap();
+        });
+        let record: Value = serde_json::from_slice(&std::fs::read(log_file).unwrap()).unwrap();
+        assert_eq!(record["context"]["stage"], "解析配置");
+        assert_eq!(
+            record["context"]["targetPath"],
+            target.to_string_lossy().as_ref()
+        );
+        assert_eq!(record["error"], returned);
+    }
 }

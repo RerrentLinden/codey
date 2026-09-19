@@ -9,6 +9,10 @@ use crate::codey_plugins;
 pub(super) async fn invoke(command: &str, args: &Value) -> Result<Value, String> {
     match command {
         "list_codey_plugins" => blocking(codey_plugins::list).await,
+        "get_codey_plugin_config_ui" => {
+            let id = string_argument(args, "pluginId")?;
+            blocking(move || codey_plugins::get_config_ui(&id)).await
+        }
         "select_codey_plugin_package" => select_package().await,
         "inspect_codey_plugin" => {
             let path = PathBuf::from(string_argument(args, "path")?);
@@ -89,6 +93,7 @@ mod tests {
                 json!({"path":"/tmp/demo.codey-plugin"}),
             ),
             ("configure_codey_plugin", json!({"pluginId":"demo"})),
+            ("get_codey_plugin_config_ui", json!({"pluginId":42})),
             (
                 "uninstall_codey_plugin",
                 json!({"pluginId":"demo","removeData":1}),

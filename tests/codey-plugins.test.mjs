@@ -1,14 +1,9 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
-import ts from "typescript";
+import { loadTypeScriptModule } from "./helpers/load-typescript-module.mjs";
 
-const source = readFileSync(new URL("../src/codeyPlugins.ts", import.meta.url), "utf8");
-const compiled = ts.transpileModule(source, {
-  compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
-}).outputText;
-const { validatePluginConfig, pluginStatusLabel, applyPluginDefaults, initialPluginValue, setPluginProperty } = await import(
-  `data:text/javascript;base64,${Buffer.from(compiled).toString("base64")}`
+const { validatePluginConfig, pluginStatusLabel, applyPluginDefaults, initialPluginValue, setPluginProperty } = await loadTypeScriptModule(
+  new URL("../src/codeyPlugins.ts", import.meta.url),
 );
 
 test("plugin configuration rejects invalid values before saving", () => {

@@ -10,12 +10,15 @@ cargo build -p codey-plugin-header-demo
 python3 scripts/package-plugin.py \
   --library target/debug/libcodey_plugin_header_demo.dylib \
   --schema examples/plugins/header-demo/config.schema.json \
+  --config-ui examples/plugins/header-demo/ui/config.html \
   --output /tmp/header-demo.codey-plugin \
   --id dev.codey.header-demo --name HeaderDemo --version 0.1.0 \
   --header x-plugin-demo
 ```
 
 Linux 改用 `.so`；Windows 使用 `codey_plugin_header_demo.dll`。跨平台构建时传入实际制品的 `--platform` 与 `--arch`，不能直接使用打包机器的平台信息。
+
+`ui/config.html` 演示自定义布局和请求头预览，仍只编辑原有 `value` 配置。页面通过 `CodeyPluginConfig.onInit` 接收配置，通过 `setConfig` 更新草稿，并通过 `setValidity` 提供校验提示；Codey 的保存按钮负责持久化。HTML 必须内嵌脚本与样式，不能请求网络资源。省略 `--config-ui` 时使用自动生成的表单。
 
 导入后默认禁用。启用后只在路由扩展点修改声明的 `X-Plugin-Demo`，可通过 `ping` 方法检查配置。配置更新和版本更新会提示重新启用，运行中的实例继续使用自己的配置快照。
 

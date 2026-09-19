@@ -21,10 +21,10 @@ name = "codey-fastctx"
 path = "src/bin/codey-fastctx.rs"
 
 [dependencies]
-anyhow = "1"
+anyhow.workspace = true
 arc-swap.workspace = true
 async-trait = "0.1"
-base64 = "0.22"
+base64.workspace = true
 bytes.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 codey-runtime-core = { path = "../vendor/CodeyRuntime/crates/codey-runtime-core" }
@@ -32,29 +32,29 @@ codey-plugin-sdk = { path = "../crates/codey-plugin-sdk" }
 libloading = "0.8"
 zip.workspace = true
 tempfile.workspace = true
-directories = "6"
+directories.workspace = true
 fastctx = { git = "https://github.com/yc-duan/fastctx", rev = "22b40ea324a186a921dfe38c205e3ffacdf6546d", default-features = false }
-fs2 = "0.4"
+fs2.workspace = true
 futures-util.workspace = true
 hyper-util = { version = "0.1", features = ["client-proxy", "client-proxy-system"], default-features = false }
 memchr = "2"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
-reqwest = { version = "0.12", features = ["http2", "json", "socks", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"], default-features = false }
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+reqwest = { workspace = true, features = ["socks"] }
+rusqlite = { workspace = true, features = ["hooks"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 semver = "1"
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { workspace = true, features = ["io-std", "io-util", "net", "signal", "sync"] }
 tokio-tungstenite.workspace = true
-toml_edit = "0.22"
-uuid = { version = "1", features = ["v4"] }
+toml_edit.workspace = true
+uuid.workspace = true
 webpki-roots = "0.26"
 zstd = "0.13"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "fastctx_protocol"

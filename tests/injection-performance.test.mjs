@@ -118,7 +118,7 @@ test("renderer core loads session tools after idle time or sidebar use", async (
   );
   assert.match(
     sessionTools,
-    /catch \(error\) \{\s*window\.__codeySessionToolsInjectLoading = false;\s*throw error;/,
+    /catch \(error\) \{\s*window\.__codeySessionToolsInjectLoading = false;\s*disposeInstall\?\.\(\);\s*throw error;/,
   );
   assert.match(
     promptOptimize,

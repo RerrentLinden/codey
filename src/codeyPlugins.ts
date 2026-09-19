@@ -10,6 +10,7 @@ export type CodeyPlugin = {
   capabilities: string[]; lastError?: string; restartRequired?: boolean;
   activeVersion?: string | null; activeConfig?: Record<string, unknown> | null;
   pluginDir?: string; dataDir?: string; logDir?: string;
+  configUi?: { type: "html"; entry: string; sha256: string } | null;
 };
 export type CodeyPluginsResult = { plugins: CodeyPlugin[]; platform: string; arch: string };
 export type CodeyPluginPreview = {

@@ -42,6 +42,7 @@ export const CODEY_API_COMMANDS = [
   "repair_main_process_injection",
   "repair_codex_config",
   "list_codey_plugins",
+  "get_codey_plugin_config_ui",
   "select_codey_plugin_package",
   "inspect_codey_plugin",
   "install_codey_plugin",

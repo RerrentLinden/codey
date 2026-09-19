@@ -51,7 +51,7 @@ pub fn find_latest_codex_app_dir(root: &Path) -> Option<PathBuf> {
         .filter_map(|path| {
             let spec = package_spec_from_path(&path)?;
             let version = version_tuple(&path)?;
-            let app_dir = package_entry_dir(&path, spec)?;
+            let app_dir = package_entry_dir(&path)?;
             Some((spec.priority, version, app_dir))
         })
         .collect::<Vec<_>>();
@@ -666,17 +666,10 @@ fn app_dir_sort_key(app_dir: &Path) -> Option<(std::cmp::Reverse<u8>, Vec<u32>)>
     ))
 }
 
-fn package_entry_dir(package_dir: &Path, spec: AppPackageSpec) -> Option<PathBuf> {
-    let app = package_dir.join("app");
-    if app.is_dir() {
-        return Some(app);
-    }
-    for name in spec.executable_names {
-        if package_dir.join(name).is_file() {
-            return Some(package_dir.to_path_buf());
-        }
-    }
-    None
+fn package_entry_dir(package_dir: &Path) -> Option<PathBuf> {
+    [package_dir.join("app"), package_dir.to_path_buf()]
+        .into_iter()
+        .find(|dir| executable_in_dir(dir).is_some())
 }
 
 fn executable_in_dir(dir: &Path) -> Option<PathBuf> {
@@ -729,16 +722,56 @@ fn codex_package_parts(package_name: &str) -> Option<(AppPackageSpec, &str, &str
 }
 
 fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    if value.len() < prefix.len() {
-        return None;
-    }
-    let (head, rest) = value.split_at(prefix.len());
+    let (head, rest) = value.split_at_checked(prefix.len())?;
     head.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_discovery_skips_incomplete_newer_installations() {
+        let temp = tempfile::tempdir().unwrap();
+        let valid = temp
+            .path()
+            .join("OpenAI.Codex_1.0.0.0_x64__publisher")
+            .join("app");
+        let incomplete = temp
+            .path()
+            .join("OpenAI.Codex_2.0.0.0_x64__publisher")
+            .join("app");
+        std::fs::create_dir_all(&valid).unwrap();
+        std::fs::write(valid.join("Codex.exe"), []).unwrap();
+        std::fs::create_dir_all(&incomplete).unwrap();
+        // A directory named like an executable is not a runnable installation.
+        std::fs::create_dir(incomplete.join("Codex.exe")).unwrap();
+        assert_eq!(find_latest_codex_app_dir(temp.path()), Some(valid));
+    }
+
+    #[test]
+    fn package_discovery_uses_root_launcher_when_app_directory_is_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("OpenAI.Codex_1.0.0.0_x64__publisher");
+        let nested = package.join("app");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(find_latest_codex_app_dir(temp.path()), None);
+        std::fs::write(package.join("Codex.exe"), []).unwrap();
+        assert_eq!(find_latest_codex_app_dir(temp.path()), Some(package));
+        std::fs::write(nested.join("ChatGPT.exe"), []).unwrap();
+        assert_eq!(find_latest_codex_app_dir(temp.path()), Some(nested));
+    }
+
+    #[test]
+    fn package_discovery_ignores_non_ascii_directory_names() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join("中文应用目录")).unwrap();
+        assert_eq!(find_latest_codex_app_dir(temp.path()), None);
+        assert_eq!(
+            strip_prefix_ignore_ascii_case("openai.codex_suffix", "OpenAI.Codex"),
+            Some("_suffix")
+        );
+    }
 
     #[test]
     fn standalone_discovery_includes_local_programs_codex() {
