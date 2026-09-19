@@ -3,27 +3,19 @@
   const defaultChineseLocale = "zh-CN";
   const defaultChineseLanguages = [defaultChineseLocale, "zh", "en-US", "en"];
   const statsigI18nDynamicConfigId = "72216192";
-  const localeReloadStorageKey = "codey.defaultChineseLocale.reload.v1";
 
+  // Codex i18n is enabled here, but the UI language itself follows the
+  // language chosen in Codex settings; this bootstrap never writes it.
   const installDefaultChineseLocale = () => {
     const existing = window.__codeyDefaultChineseLocale;
-    if (existing?.version === 5 && existing.locale === defaultChineseLocale) {
-      existing.ensureSynced?.();
-      return;
-    }
+    if (existing?.version === 6 && existing.locale === defaultChineseLocale) return;
 
     const state = {
-      version: 5,
+      version: 6,
       locale: defaultChineseLocale,
       navigatorPatched: false,
       statsigClientsPatched: 0,
       statsigRootPatched: false,
-      settingSyncStarted: false,
-      settingSynced: false,
-      settingSyncInFlight: false,
-      settingSyncAttempts: 0,
-      settingSyncError: null,
-      ensureSynced: null,
       snapshot() {
         return {
           version: this.version,
@@ -33,11 +25,6 @@
           navigatorPatched: this.navigatorPatched,
           statsigClientsPatched: this.statsigClientsPatched,
           statsigRootPatched: this.statsigRootPatched,
-          settingSyncStarted: this.settingSyncStarted,
-          settingSynced: this.settingSynced,
-          settingSyncInFlight: this.settingSyncInFlight,
-          settingSyncAttempts: this.settingSyncAttempts,
-          settingSyncError: this.settingSyncError,
         };
       },
     };
@@ -84,7 +71,6 @@
         dynamicConfig.value = {
           ...value,
           enable_i18n: true,
-          locale_source: "SYSTEM",
         };
       } catch {
       }
@@ -92,7 +78,6 @@
         const originalGet = dynamicConfig.get.bind(dynamicConfig);
         dynamicConfig.get = (key, fallback) => {
           if (key === "enable_i18n") return true;
-          if (key === "locale_source") return "SYSTEM";
           return originalGet(key, fallback);
         };
         dynamicConfig.__codeyDefaultChineseLocaleGetPatched = true;
@@ -244,152 +229,8 @@
       for (const client of statsigClients()) patchStatsigClient(client);
     };
 
-    const waitForElectronBridge = () => new Promise((resolve) => {
-      if (typeof window.setTimeout !== "function") {
-        resolve(null);
-        return;
-      }
-      const startedAt = Date.now();
-      const check = () => {
-        const bridge = window.electronBridge;
-        if (bridge && typeof bridge.sendMessageFromView === "function") {
-          resolve(bridge);
-          return;
-        }
-        if (Date.now() - startedAt >= 5000) {
-          resolve(null);
-          return;
-        }
-        window.setTimeout(check, 50);
-      };
-      check();
-    });
-
-    const callCodexSettingApi = (bridge, method, params) => new Promise((resolve, reject) => {
-      const requestId = globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
-        ? globalThis.crypto.randomUUID()
-        : `codey-locale-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-      let timeout = 0;
-      const cleanup = () => {
-        window.clearTimeout?.(timeout);
-        window.removeEventListener?.("message", onMessage);
-      };
-      const onMessage = (event) => {
-        const message = event?.data;
-        if (!message || message.type !== "fetch-response" || message.requestId !== requestId) return;
-        cleanup();
-        if (message.responseType !== "success") {
-          reject(new Error(message.error || `Codex ${method} failed`));
-          return;
-        }
-        try {
-          resolve(JSON.parse(message.bodyJsonString || "null"));
-        } catch (error) {
-          reject(error);
-        }
-      };
-      window.addEventListener?.("message", onMessage);
-      timeout = window.setTimeout?.(() => {
-        cleanup();
-        reject(new Error(`Codex ${method} timed out`));
-      }, 5000);
-      const message = {
-        type: "fetch",
-        requestId,
-        method: "POST",
-        url: `vscode://codex/${method}`,
-        body: JSON.stringify(params),
-      };
-      Promise.resolve(bridge.sendMessageFromView(message)).catch((error) => {
-        cleanup();
-        reject(error);
-      });
-    });
-
-    const reloadAfterLocaleChange = () => {
-      try {
-        if (window.sessionStorage?.getItem(localeReloadStorageKey) === defaultChineseLocale) {
-          return;
-        }
-        window.sessionStorage?.setItem(localeReloadStorageKey, defaultChineseLocale);
-      } catch {
-      }
-      window.location?.reload?.();
-    };
-
-    const clearLocaleReloadMarker = () => {
-      try {
-        window.sessionStorage?.removeItem(localeReloadStorageKey);
-      } catch {
-      }
-    };
-
-    const syncCodexLocaleSettingOnce = async () => {
-      state.settingSyncStarted = true;
-      const bridge = await waitForElectronBridge();
-      if (!bridge) throw new Error("Codex Electron bridge unavailable");
-      const response = await callCodexSettingApi(bridge, "get-setting", { key: "localeOverride" });
-      if (response?.value === defaultChineseLocale) {
-        state.settingSynced = true;
-        state.settingSyncError = null;
-        clearLocaleReloadMarker();
-        return;
-      }
-      await callCodexSettingApi(bridge, "set-setting", {
-        key: "localeOverride",
-        value: defaultChineseLocale,
-      });
-      const verification = await callCodexSettingApi(
-        bridge,
-        "get-setting",
-        { key: "localeOverride" },
-      );
-      if (verification?.value !== defaultChineseLocale) {
-        throw new Error("Codex localeOverride was not persisted");
-      }
-      state.settingSynced = true;
-      state.settingSyncError = null;
-      reloadAfterLocaleChange();
-    };
-
-    const ensureCodexLocaleSetting = () => {
-      if (state.settingSynced || state.settingSyncInFlight) return;
-      state.settingSyncInFlight = true;
-      void (async () => {
-        const retryDelays = [0, 250, 750, 1500, 3000, 5000];
-        for (const delay of retryDelays) {
-          if (delay > 0) {
-            await new Promise((resolve) => {
-              if (typeof window.setTimeout === "function") {
-                window.setTimeout(resolve, delay);
-              } else {
-                resolve();
-              }
-            });
-          }
-          state.settingSyncAttempts += 1;
-          try {
-            await syncCodexLocaleSettingOnce();
-            return;
-          } catch (error) {
-            state.settingSyncError = error instanceof Error ? error.message : String(error);
-          }
-        }
-        console.warn(
-          "[Codey] Codex 中文语言设置同步失败，将在窗口重新聚焦时重试",
-          state.settingSyncError,
-        );
-      })().finally(() => {
-        state.settingSyncInFlight = false;
-      });
-    };
-    state.ensureSynced = ensureCodexLocaleSetting;
-
     patchNavigatorLocale();
     patchStatsigClients();
-    ensureCodexLocaleSetting();
-    window.addEventListener?.("focus", ensureCodexLocaleSetting);
-    window.addEventListener?.("pageshow", ensureCodexLocaleSetting);
 
     const startedAt = Date.now();
     const scanStatsigUntilReady = () => {

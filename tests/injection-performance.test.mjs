@@ -185,6 +185,8 @@ test("locale bootstrap patches navigator and Statsig independently from renderer
     readSource("public/renderer-inject.js"),
   ]);
   assert.doesNotMatch(rendererSource, /installDefaultChineseLocale/);
+  // The UI language belongs to Codex's own setting.
+  assert.doesNotMatch(localeSource, /localeOverride|set-setting/);
 
   function Navigator() {}
   const dynamicConfig = {
@@ -217,7 +219,7 @@ test("locale bootstrap patches navigator and Statsig independently from renderer
   assert.equal(window.navigator.language, "zh-CN");
   assert.deepEqual([...window.navigator.languages], ["zh-CN", "zh", "en-US", "en"]);
   assert.equal(dynamicConfig.get("enable_i18n", false), true);
-  assert.equal(dynamicConfig.get("locale_source", ""), "SYSTEM");
+  assert.equal(dynamicConfig.get("locale_source", "IDE"), "IDE");
   assert.equal(firstState.snapshot().locale, "zh-CN");
   assert.equal(firstState.snapshot().statsigClientsPatched, 1);
   assert.match(localeSource, /window\.setTimeout\?\.\(scanStatsigUntilReady, 250\)/);

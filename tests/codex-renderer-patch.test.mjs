@@ -761,11 +761,11 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     const resolveLocale = Function(`${patchedLocaleSource};return resolveLocale`)();
     assert.deepEqual(
       resolveLocale(
-        { get: () => false },
+        { get: (key) => (key === "locale_source" ? "IDE" : false) },
         () => "en-US",
         { localeOverride: {} },
       ),
-      { enabled: true, source: "SYSTEM", locale: "zh-CN" },
+      { enabled: true, source: "IDE", locale: "en-US" },
     );
     assert.equal(
       globalThis.__CODEY_DEFAULT_CHINESE_LOCALE_RENDERER_PATCH__,
@@ -787,11 +787,12 @@ test("an incompatible optional renderer patch never blocks the Codex module resp
     });
     const patchedLocaleProps = await localePropsResponse.text();
     const resolveProps = Function(`${patchedLocaleProps};return resolveProps`)();
-    for (const override of [undefined, "en-US"]) {
+    for (const [override, locale] of [[undefined, "zh-CN"], ["en-US", "en-US"]]) {
       assert.deepEqual(
-        resolveProps({ ideLocale: "en-US", systemLocale: "en-US" }, { get: () => false }, override,
+        resolveProps({ ideLocale: "zh-CN", systemLocale: "en-US" },
+          { get: (key) => (key === "locale_source" ? "IDE" : false) }, override,
           (locale) => locale?.startsWith("en") ?? false),
-        { enabled: true, source: "SYSTEM", locale: "zh-CN", english: false },
+        { enabled: true, source: "IDE", locale, english: override === "en-US" },
       );
     }
     assert.equal(globalThis.__CODEY_DEFAULT_CHINESE_LOCALE_RENDERER_PATCH__, true);
