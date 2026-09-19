@@ -421,11 +421,11 @@ impl LedgerStore {
         let mut ledger = match serde_json::from_slice::<SessionLedger>(&bytes) {
             Ok(ledger) if ledger.session_id_hash == hash_component(session_id) => ledger,
             Ok(_) => {
-                self.quarantine_for_session_end(&bytes, "会话标识不一致")?;
+                self.quarantine_corrupt_ledger(&bytes, "会话标识不一致")?;
                 return Ok(());
             }
             Err(error) => {
-                self.quarantine_for_session_end(&bytes, &format!("JSON 无法解析：{error}"))?;
+                self.quarantine_corrupt_ledger(&bytes, &format!("JSON 无法解析：{error}"))?;
                 return Ok(());
             }
         };
@@ -460,7 +460,7 @@ impl LedgerStore {
         self.remove()
     }
 
-    fn quarantine_for_session_end(&self, bytes: &[u8], reason: &str) -> Result<()> {
+    fn quarantine_corrupt_ledger(&self, bytes: &[u8], reason: &str) -> Result<()> {
         let digest = hash_component_bytes(bytes);
         let quarantine_path = self.ledger_path.with_file_name(format!(
             "orchestrator-ledger-v1.corrupt-{}.json",
@@ -488,7 +488,7 @@ impl LedgerStore {
             })?;
         }
         eprintln!(
-            "Codey SessionEnd 已隔离不可读的子代理账本（{reason}）：{}",
+            "Codey 已隔离不可读的子代理账本（{reason}）：{}",
             quarantine_path.display()
         );
         cleanup_old_quarantines(
@@ -1664,6 +1664,44 @@ pub(crate) fn active_reservation_count(
     )
 }
 
+/// A single-target status reply may only update that target, even if a provider
+/// accidentally returns another child's identity or a multi-agent envelope.
+pub(crate) fn single_agent_status_matches_target(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    tool_input: Option<&Value>,
+    tool_response: Option<&Value>,
+    now_ms: u64,
+) -> Result<bool> {
+    let (Some(target), Some(response)) = (interrupt_task_target(tool_input), tool_response) else {
+        return Ok(false);
+    };
+    let mut observations = Vec::new();
+    crate::subagent::protocol::collect_agent_status_observations(response, &mut observations);
+    let mut terminal = Vec::new();
+    crate::subagent::protocol::collect_terminal_observations(response, &mut terminal);
+    let identifiers = observations
+        .iter()
+        .flat_map(|observation| observation.identifiers.iter())
+        .chain(terminal.iter().map(|observation| &observation.identifier))
+        .collect::<Vec<_>>();
+    if identifiers.is_empty() {
+        return Ok(false);
+    }
+    let store = LedgerStore::open(state_root, session_id)?;
+    let Some(ledger) = store.load(runtime_id, session_id, now_ms)? else {
+        return Ok(identifiers
+            .iter()
+            .all(|identifier| identifier.as_str() == target));
+    };
+    let expected = identity_task_candidates(&ledger, &target);
+    Ok(expected.len() == 1
+        && identifiers
+            .iter()
+            .all(|identifier| identity_task_candidates(&ledger, identifier) == expected))
+}
+
 pub(crate) fn active_reservation_projection(
     state_root: &Path,
     runtime_id: &str,
@@ -1778,6 +1816,47 @@ pub(crate) fn recover_active_reservations(
         store.save(&mut ledger, now_ms)?;
     }
     Ok(recovered)
+}
+
+/// Called only after the gate's corruption grace expires. A damaged marker
+/// must also fence a healthy ledger; an unreadable ledger is kept for diagnosis.
+pub(crate) fn recover_corrupt_gate_state(
+    state_root: &Path,
+    runtime_id: &str,
+    session_id: &str,
+    now_ms: u64,
+) -> Result<()> {
+    let store = LedgerStore::open(state_root, session_id)?;
+    if let Some(bytes) = store.read_bytes()? {
+        let corrupt = match serde_json::from_slice::<SessionLedger>(&bytes) {
+            Ok(mut ledger) => {
+                anyhow::ensure!(
+                    !ledger
+                        .retired_runtime_id_hashes
+                        .contains(&hash_component(runtime_id)),
+                    "{STALE_RUNTIME_ERROR_CODE}: 已退役 runtime 不得回收当前账本"
+                );
+                ledger.session_id_hash != hash_component(session_id)
+                    || !(MIN_LEDGER_SCHEMA_VERSION..=LEDGER_SCHEMA_VERSION)
+                        .contains(&ledger.schema_version)
+                    || validate_ledger(&mut ledger).is_err()
+                    || validate_unique_agent_bindings(&ledger).is_err()
+            }
+            Err(_) => true,
+        };
+        if corrupt {
+            return store.quarantine_corrupt_ledger(&bytes, "门禁状态持续损坏且恢复等待期已结束");
+        }
+    }
+    drop(store);
+    recover_active_reservations(
+        state_root,
+        runtime_id,
+        session_id,
+        "gate state remained corrupt beyond recovery grace",
+        now_ms,
+    )?;
+    Ok(())
 }
 
 /// A full provider snapshot with no children is authoritative for a spawn that

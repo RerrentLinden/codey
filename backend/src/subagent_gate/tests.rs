@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 use super::read_only_sql::sql_is_read_only;
 use super::*;
 
+#[path = "recovery_tests.rs"]
+mod recovery_tests;
+
 fn input(event: &str, session: &str) -> HookInput {
     HookInput {
         hook_event_name: event.to_string(),
@@ -1834,6 +1837,8 @@ fn child_can_only_send_collaboration_reports_to_root() {
     for tool in [
         "agents.wait_agent",
         "agents.list_agents",
+        "agents.agent_status",
+        "agents__agent_status",
         "agents.interrupt_agent",
         "agents.followup_task",
     ] {
@@ -3367,21 +3372,21 @@ fn repeated_interrupted_snapshots_do_not_extend_the_stall_grace() {
         "updates": [{ "agent_id": "agent-a", "status": "interrupted" }]
     }));
     handle_hook_for_runtime_at(&wait, root, runtime_id, 3_000).unwrap();
-    assert!(!stalled.exists());
+    assert_eq!(fs::read_to_string(&stalled).unwrap(), "3000\n");
 
     handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 4_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "4000\n");
+    assert_eq!(fs::read_to_string(&stalled).unwrap(), "3000\n");
     handle_hook_for_runtime_at(&wait, root, runtime_id, 5_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "4000\n");
+    assert_eq!(fs::read_to_string(&stalled).unwrap(), "3000\n");
 
     wait.tool_response = Some(json!({
         "updates": [{ "agent_id": "agent-a", "status": "running" }]
     }));
     handle_hook_for_runtime_at(&wait, root, runtime_id, 6_000).unwrap();
-    assert!(!stalled.exists());
+    assert_eq!(fs::read_to_string(&stalled).unwrap(), "6000\n");
     handle_hook_for_runtime_at(&input("Stop", session_id), root, runtime_id, 7_000).unwrap();
     handle_hook_for_runtime_at(&wait, root, runtime_id, 8_000).unwrap();
-    assert_eq!(fs::read_to_string(&stalled).unwrap(), "7000\n");
+    assert_eq!(fs::read_to_string(&stalled).unwrap(), "6000\n");
     let stop_trace = hook_trace_events(root)
         .into_iter()
         .find(|event| event.timestamp_ms == 7_000 && event.event == TraceEventKind::HookEvaluated)
@@ -3473,6 +3478,15 @@ fn stop_absolute_release_still_allows_later_stall_cleanup() {
 
     // 持续到绝对上限前仍有有效等待结果，避免 10 分钟停滞窗口提前回收。
     let absolute_deadline = 2_000 + STOP_ABSOLUTE_GRACE_MILLIS;
+    for now_ms in (4_000..absolute_deadline).step_by((STOP_STALL_GRACE_MILLIS / 2) as usize) {
+        wait.tool_response = Some(json!({
+            "updates": [{ "agent_id": "agent-a", "status": "message", "message": format!("progress at {now_ms}") }]
+        }));
+        assert_eq!(
+            handle_hook_for_runtime_at(&wait, root, runtime_id, now_ms).unwrap()["decision"],
+            "block"
+        );
+    }
     handle_hook_for_runtime_at(&wait, root, runtime_id, absolute_deadline - 1).unwrap();
 
     let released = handle_hook_for_runtime_at(
